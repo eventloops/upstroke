@@ -1,0 +1,26 @@
+[package]
+name = "tactus"
+version = "0.1.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+description = "Headless orchestration engine for AI coding agents — the conductor, not an instrument"
+repository = "https://github.com/keybindings/tactus"
+
+[dependencies]
+anyhow = "1"
+# default-features off drops terminal color (anstream → windows-sys), which
+# needs MSVC Build Tools or MinGW to link; the validate table is plain text.
+clap = { version = "4", default-features = false, features = [
+    "derive",
+    "std",
+    "help",
+    "usage",
+    "error-context",
+    "suggestions",
+] }
+globset = "0.4"
+pulldown-cmark = { version = "0.13", default-features = false }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+toml = "0.8"
