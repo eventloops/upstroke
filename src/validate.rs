@@ -37,7 +37,19 @@ pub struct Report {
     pub task_count: usize,
 }
 
-pub fn run(opts: &ValidateOptions) -> Result<Report, TactusError> {
+/// The shared front half of `validate` and the engine's pre-flight (§14:
+/// "plan parses cycle-free"): parse, load config, check the graph, resolve
+/// every routing chain. Executes nothing.
+#[derive(Debug)]
+pub struct Analysis {
+    pub plan: Plan,
+    pub config: Config,
+    /// One resolved chain per task, aligned with `plan.tasks`.
+    pub chains: Vec<ResolvedChain>,
+    pub warnings: Vec<String>,
+}
+
+pub fn analyze(opts: &ValidateOptions) -> Result<Analysis, TactusError> {
     let raw = fs::read_to_string(&opts.plan_path).map_err(|source| TactusError::Io {
         path: opts.plan_path.clone(),
         source,
@@ -46,23 +58,40 @@ pub fn run(opts: &ValidateOptions) -> Result<Report, TactusError> {
         plan,
         warnings: mut all_warnings,
     } = plan::detect(&raw)?.parse_with_warnings(&raw)?;
-    let cfg = config::load(
+    let config = config::load(
         opts.config_path.as_deref(),
         opts.pools_path.as_deref(),
         &mut all_warnings,
     )?;
     check_graph(&plan, &mut all_warnings)?;
-    let rows = plan
+    let chains = plan
         .tasks
         .iter()
-        .map(|t| to_row(t, route::resolve(t, &cfg)))
+        .map(|t| route::resolve(t, &config))
+        .collect();
+    Ok(Analysis {
+        plan,
+        config,
+        chains,
+        warnings: all_warnings,
+    })
+}
+
+pub fn run(opts: &ValidateOptions) -> Result<Report, TactusError> {
+    let analysis = analyze(opts)?;
+    let rows = analysis
+        .plan
+        .tasks
+        .iter()
+        .zip(&analysis.chains)
+        .map(|(task, chain)| to_row(task, chain.clone()))
         .collect();
     Ok(Report {
-        task_count: plan.tasks.len(),
+        task_count: analysis.plan.tasks.len(),
         rows,
-        warnings: all_warnings,
-        strategy: strategy_echo(&cfg),
-        plan,
+        warnings: analysis.warnings,
+        strategy: strategy_echo(&analysis.config),
+        plan: analysis.plan,
     })
 }
 

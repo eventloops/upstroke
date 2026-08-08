@@ -7,8 +7,11 @@
 pub mod agent;
 pub mod catalog;
 pub mod config;
+pub mod engine;
 pub mod error;
 pub mod ir;
 pub mod plan;
 pub mod route;
+pub mod ulid;
 pub mod validate;
+pub mod workspace;
