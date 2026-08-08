@@ -7,9 +7,8 @@ use std::path::{Path, PathBuf};
 
 use crate::config::{self, Config};
 use crate::error::{TactusError, ValidationErrors};
-use crate::ir::{Plan, Task};
-use crate::plan::Parsed;
-use crate::plan::markdown::MarkdownPlanAdapter;
+use crate::ir::{Plan, Task, TaskId};
+use crate::plan::{self, Parsed};
 use crate::route::{self, ResolvedChain};
 
 #[derive(Debug, Clone)]
@@ -46,13 +45,13 @@ pub fn run(opts: &ValidateOptions) -> Result<Report, TactusError> {
     let Parsed {
         plan,
         warnings: mut all_warnings,
-    } = MarkdownPlanAdapter.parse_with_warnings(&raw)?;
+    } = plan::detect(&raw)?.parse_with_warnings(&raw)?;
     let cfg = config::load(
         opts.config_path.as_deref(),
         opts.pools_path.as_deref(),
         &mut all_warnings,
     )?;
-    check_graph(&plan)?;
+    check_graph(&plan, &mut all_warnings)?;
     let rows = plan
         .tasks
         .iter()
@@ -68,8 +67,9 @@ pub fn run(opts: &ValidateOptions) -> Result<Report, TactusError> {
 }
 
 /// Duplicate ids, unknown `depends` targets, then cycles — all collected so a
-/// broken plan reports everything in one run.
-fn check_graph(plan: &Plan) -> Result<(), TactusError> {
+/// broken plan reports everything in one run. On a clean graph, artifact
+/// wiring that contradicts the dependency order is surfaced as warnings.
+fn check_graph(plan: &Plan, warnings: &mut Vec<String>) -> Result<(), TactusError> {
     let mut problems = Vec::new();
     let mut seen: BTreeMap<&str, usize> = BTreeMap::new();
     for task in &plan.tasks {
@@ -93,11 +93,57 @@ fn check_graph(plan: &Plan) -> Result<(), TactusError> {
     {
         problems.push(format!("dependency cycle: {}", cycle.join(" -> ")));
     }
-    if problems.is_empty() {
-        Ok(())
-    } else {
-        Err(TactusError::Validation(ValidationErrors(problems)))
+    if !problems.is_empty() {
+        return Err(TactusError::Validation(ValidationErrors(problems)));
     }
+    check_artifact_wiring(plan, warnings);
+    Ok(())
+}
+
+/// A task that `needs` an artifact should depend — directly or transitively —
+/// on its producer, or execution order cannot guarantee the artifact exists.
+/// The plan is frozen (§5), so this warns rather than inventing edges.
+fn check_artifact_wiring(plan: &Plan, warnings: &mut Vec<String>) {
+    for task in &plan.tasks {
+        for needed in &task.artifacts_in {
+            let producer = plan
+                .artifacts
+                .iter()
+                .find(|a| a.id == *needed)
+                .and_then(|a| a.produced_by.as_ref());
+            // Unknown producers already warned during parsing.
+            let Some(producer) = producer else { continue };
+            if *producer != task.id && !depends_transitively(plan, &task.id, producer) {
+                warnings.push(format!(
+                    "task `{}` needs artifact `{needed}` produced by `{producer}` but does not \
+                     depend on it (directly or transitively)",
+                    task.id
+                ));
+            }
+        }
+    }
+}
+
+fn depends_transitively(plan: &Plan, from: &TaskId, target: &TaskId) -> bool {
+    let index: BTreeMap<&str, &Task> = plan.tasks.iter().map(|t| (t.id.as_str(), t)).collect();
+    let mut queue: Vec<&TaskId> = index
+        .get(from.as_str())
+        .map(|t| t.depends_on.iter().collect())
+        .unwrap_or_default();
+    let mut visited: Vec<&str> = Vec::new();
+    while let Some(dep) = queue.pop() {
+        if dep == target {
+            return true;
+        }
+        if visited.contains(&dep.as_str()) {
+            continue;
+        }
+        visited.push(dep.as_str());
+        if let Some(task) = index.get(dep.as_str()) {
+            queue.extend(task.depends_on.iter());
+        }
+    }
+    false
 }
 
 fn find_cycle(plan: &Plan) -> Option<Vec<String>> {
@@ -338,6 +384,54 @@ mod tests {
         o.plan_path = plan;
         let err = run(&o).expect_err("duplicate ids must fail");
         assert!(err.to_string().contains("duplicate task id `same`"));
+    }
+
+    #[test]
+    fn steps_plan_validates_via_ordered_list_fallback() {
+        let report = run(&opts("fixtures/steps-plan.md")).expect("steps plan validates");
+        let rendered = report.render();
+        assert!(rendered.contains("ok: 4 tasks, no cycles"));
+        assert!(rendered.contains("design-the-limiter-interface-and-storage-schema"));
+    }
+
+    #[test]
+    fn artifact_needed_from_a_non_dependency_warns() {
+        let dir = env::temp_dir().join(format!("tactus-wiring-{}", std::process::id()));
+        fs::create_dir_all(&dir).expect("scratch dir");
+        let plan = dir.join("wiring.md");
+        fs::write(
+            &plan,
+            "## Design\n<!-- tactus: id=d out=contract depends= -->\n\n\
+             ## Build\n<!-- tactus: id=b needs=contract depends= -->\n",
+        )
+        .expect("write plan");
+        let mut o = opts("x");
+        o.plan_path = plan;
+        let report = run(&o).expect("wiring problems warn, not fail");
+        assert!(
+            report
+                .warnings
+                .iter()
+                .any(|w| w.contains("`b` needs artifact `contract` produced by `d`")),
+            "warnings: {:?}",
+            report.warnings
+        );
+
+        // The sample plan wires artifacts along its dependency chain — silent.
+        let clean = run(&opts("fixtures/sample-plan.md")).expect("sample validates");
+        assert!(clean.warnings.is_empty(), "warnings: {:?}", clean.warnings);
+    }
+
+    #[test]
+    fn unrecognized_plan_format_names_available_adapters() {
+        let dir = env::temp_dir().join(format!("tactus-sniff-{}", std::process::id()));
+        fs::create_dir_all(&dir).expect("scratch dir");
+        let plan = dir.join("plan.json");
+        fs::write(&plan, "{\"tasks\": []}\n").expect("write file");
+        let mut o = opts("x");
+        o.plan_path = plan;
+        let err = run(&o).expect_err("json must not sniff as markdown");
+        assert!(err.to_string().contains("no plan adapter recognizes"));
     }
 
     #[test]

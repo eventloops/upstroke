@@ -1,8 +1,9 @@
 //! Markdown plan adapter (DESIGN.md §9).
 //!
 //! `##`/`###` sections become tasks (heading → title, prose → body). A plan
-//! with no such sections falls back to top-level checklist items. The
-//! `<!-- tactus: ... -->` annotation grammar overrides the heuristics;
+//! with no such sections falls back to top-level checklist items or numbered
+//! plan-mode steps. The `<!-- tactus: ... -->` annotation grammar overrides
+//! the heuristics;
 //! annotations are read from pulldown-cmark HTML events, never regexed out of
 //! raw text. Unknown annotation attributes warn and never error.
 
@@ -26,18 +27,13 @@ impl PlanAdapter for MarkdownPlanAdapter {
     }
 
     fn sniff(&self, raw: &str) -> bool {
-        raw.lines()
-            .any(|l| l.starts_with('#') || l.trim_start().starts_with("- ["))
+        raw.lines().any(|l| {
+            let t = l.trim_start();
+            t.starts_with('#') || t.starts_with("- [") || is_ordered_item(t)
+        })
     }
 
-    // Trait path drops warnings; `validate` uses `parse_with_warnings`.
-    fn parse(&self, raw: &str) -> Result<Plan, TactusError> {
-        self.parse_with_warnings(raw).map(|p| p.plan)
-    }
-}
-
-impl MarkdownPlanAdapter {
-    pub fn parse_with_warnings(&self, raw: &str) -> Result<Parsed, TactusError> {
+    fn parse_with_warnings(&self, raw: &str) -> Result<Parsed, TactusError> {
         let mut warnings = Vec::new();
         let sections = split_sections(raw);
         let drafts: Vec<Draft> = if sections.is_empty() {
@@ -50,7 +46,8 @@ impl MarkdownPlanAdapter {
         };
         if drafts.is_empty() {
             return Err(TactusError::Parse {
-                message: "no tasks found: expected `##`/`###` sections or a top-level checklist"
+                message: "no tasks found: expected `##`/`###` sections, a top-level checklist, \
+                          or numbered steps"
                     .to_owned(),
             });
         }
@@ -74,6 +71,13 @@ fn md_options() -> Options {
     let mut options = Options::empty();
     options.insert(Options::ENABLE_TASKLISTS);
     options
+}
+
+/// `1. step` / `1) step` — Claude Code plan mode often writes numbered steps.
+fn is_ordered_item(line: &str) -> bool {
+    let digits = line.chars().take_while(char::is_ascii_digit).count();
+    let rest = &line[digits..];
+    digits > 0 && (rest.starts_with(". ") || rest.starts_with(") "))
 }
 
 // ---------------------------------------------------------------------------
@@ -252,23 +256,31 @@ fn is_acceptance_header(text: &str) -> bool {
 }
 
 /// Fallback when a plan has no `##`/`###` sections: top-level checklist items
-/// (`- [ ]` / `- [x]`) become tasks. Nested content joins the body.
+/// (`- [ ]` / `- [x]`) and ordered-list steps (`1.` — the common Claude Code
+/// plan-mode shape) become tasks. Plain unordered bullets do not; prose lists
+/// would false-positive. Nested content joins the body.
 fn checklist_drafts(raw: &str, warnings: &mut Vec<String>) -> Vec<Draft> {
     let mut drafts = Vec::new();
     let mut list_depth = 0usize;
     let mut item_depth = 0usize;
     let mut current: Option<Draft> = None;
     let mut is_task_item = false;
+    let mut top_list_ordered = false;
 
     for (event, _range) in Parser::new_ext(raw, md_options()).into_offset_iter() {
         match event {
-            Event::Start(Tag::List(_)) => list_depth += 1,
+            Event::Start(Tag::List(start)) => {
+                if list_depth == 0 {
+                    top_list_ordered = start.is_some();
+                }
+                list_depth += 1;
+            }
             Event::End(TagEnd::List(_)) => list_depth = list_depth.saturating_sub(1),
             Event::Start(Tag::Item) => {
                 item_depth += 1;
                 if list_depth == 1 && item_depth == 1 {
                     current = Some(Draft::default());
-                    is_task_item = false;
+                    is_task_item = top_list_ordered;
                 }
             }
             Event::End(TagEnd::Item) => {
@@ -791,6 +803,41 @@ mod tests {
             !tasks[0].title.contains("tactus"),
             "annotation not in title"
         );
+    }
+
+    #[test]
+    fn ordered_step_plans_become_tasks() {
+        let parsed = parse(&fixture("steps-plan.md"));
+        let tasks = &parsed.plan.tasks;
+        assert_eq!(tasks.len(), 4);
+        let kinds: Vec<TaskKind> = tasks.iter().map(|t| t.kind).collect();
+        assert_eq!(
+            kinds,
+            [
+                TaskKind::Design,
+                TaskKind::Implement,
+                TaskKind::Fix,
+                TaskKind::Docs,
+            ]
+        );
+        assert_eq!(tasks[1].depends_on, [tasks[0].id.clone()]);
+        assert!(
+            tasks[1]
+                .path_hints
+                .iter()
+                .any(|h| h == "src/limit/bucket.rs"),
+            "nested bullet feeds hints: {:?}",
+            tasks[1].path_hints
+        );
+    }
+
+    #[test]
+    fn plain_unordered_bullets_are_not_tasks() {
+        let raw = "# Notes\n\n- just a thought\n- another thought\n";
+        let err = MarkdownPlanAdapter
+            .parse_with_warnings(raw)
+            .expect_err("prose bullets must not become tasks");
+        assert!(err.to_string().contains("no tasks found"));
     }
 
     #[test]
