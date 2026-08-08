@@ -119,9 +119,12 @@ impl Workspace {
         self.head_sha()
     }
 
-    /// §14 rollback on failed attempt: back to the last commit, discarding
-    /// staged, unstaged, and untracked changes.
-    pub fn rollback(&self) -> Result<(), TactusError> {
+    /// Discard everything since the last commit: staged, unstaged, and
+    /// untracked (ignored files survive). This is both the §14 rollback on a
+    /// failed attempt and the post-commit scrub that keeps gate side-effects
+    /// (build artifacts, lockfile churn) from leaking into the next task's
+    /// captured diff.
+    pub fn discard_uncommitted(&self) -> Result<(), TactusError> {
         self.git(&["reset", "-q", "--hard", "HEAD"])?;
         self.git(&["clean", "-qfd"]).map(|_| ())
     }
@@ -178,7 +181,7 @@ mod tests {
         fs::write(repo.join("stray.txt"), "untracked\n").expect("stray");
         assert!(!ws.is_clean().expect("dirty check"));
 
-        ws.rollback().expect("rollback");
+        ws.discard_uncommitted().expect("discard");
         assert!(ws.is_clean().expect("clean again"));
         assert!(!repo.join("stray.txt").exists(), "untracked cleaned");
         // core.autocrlf may legitimately restore CRLF on Windows checkouts.

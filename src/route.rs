@@ -157,7 +157,9 @@ mod tests {
             .join("tactus-route-missing")
             .join("x.toml");
         let mut warnings = Vec::new();
-        config::load(None, Some(&missing), &mut warnings).expect("default config")
+        let hermetic = std::env::temp_dir().join("tactus-route-hermetic");
+        let _ = std::fs::create_dir_all(&hermetic);
+        config::load(None, &hermetic, Some(&missing), &mut warnings).expect("default config")
     }
 
     fn task(kind: TaskKind) -> Task {
@@ -239,7 +241,7 @@ mod tests {
         .expect("write config");
         let missing = dir.join("missing-pools.toml");
         let mut warnings = Vec::new();
-        let cfg = config::load(Some(&cfg_path), Some(&missing), &mut warnings).expect("load");
+        let cfg = config::load(Some(&cfg_path), &dir, Some(&missing), &mut warnings).expect("load");
 
         let mut t = task(TaskKind::Fix);
         t.path_hints.push("src/auth/login.rs".to_owned());
@@ -267,7 +269,7 @@ mod tests {
         .expect("write config");
         let missing = dir.join("missing-pools.toml");
         let mut warnings = Vec::new();
-        let cfg = config::load(Some(&cfg_path), Some(&missing), &mut warnings).expect("load");
+        let cfg = config::load(Some(&cfg_path), &dir, Some(&missing), &mut warnings).expect("load");
 
         let rc = resolve(&task(TaskKind::Design), &cfg);
         assert_eq!(rc.rungs[0].binding.model, "claude-opus-4-8");

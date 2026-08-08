@@ -15,6 +15,7 @@ use crate::gates::{self, ShellGate};
 use crate::ir::{Outcome, OutcomeStatus, PermissionMode, Plan, Task, TaskKind, WorkerProfile};
 use crate::route::ResolvedChain;
 use crate::ulid;
+use crate::util;
 use crate::validate::{self, ValidateOptions};
 use crate::workspace::Workspace;
 
@@ -91,6 +92,7 @@ pub fn run_with(opts: &RunOptions, adapters: &dyn AdapterSource) -> Result<RunRe
     let analysis = validate::analyze(&ValidateOptions {
         plan_path: opts.plan_path.clone(),
         config_path: opts.config_path.clone(),
+        config_root: opts.repo_root.clone(),
         pools_path: opts.pools_path.clone(),
     })?;
 
@@ -120,23 +122,15 @@ pub fn run_with(opts: &RunOptions, adapters: &dyn AdapterSource) -> Result<RunRe
         adapter.probe()?;
     }
 
-    // Effective gates: `[[gates]]` verbatim, else derived from the repo's
-    // shape (§17). Every gate command must resolve at pre-flight (§14).
+    // Effective gates come from the shared analysis (single derivation point
+    // with `validate`). §14 pre-flight: the shell and every gate command must
+    // resolve before any agent tokens are spent.
     let mut warnings = analysis.warnings.clone();
-    let gates_from_config = analysis.config.gates.is_some();
-    let effective_gates: Vec<ShellGate> = match &analysis.config.gates {
-        Some(configured) => configured
-            .iter()
-            .map(|g| ShellGate {
-                name: g.name.clone(),
-                cmd: g.cmd.clone(),
-                timeout: g.timeout,
-                shell: analysis.config.shell,
-            })
-            .collect(),
-        None => gates::derive(&opts.repo_root, analysis.config.shell),
-    };
-    gates::resolve_programs(&effective_gates, &mut warnings)?;
+    let effective_gates: &[ShellGate] = &analysis.gates;
+    if !effective_gates.is_empty() {
+        gates::shell_available(analysis.config.shell)?;
+        gates::resolve_programs(effective_gates, &opts.repo_root, &mut warnings)?;
+    }
     let gate_cmds: Vec<String> = effective_gates.iter().map(|g| g.cmd.clone()).collect();
 
     let run_id = ulid::ulid();
@@ -159,7 +153,7 @@ pub fn run_with(opts: &RunOptions, adapters: &dyn AdapterSource) -> Result<RunRe
         run_id,
         branch,
         gates: effective_gates.iter().map(|g| g.name.clone()).collect(),
-        gates_from_config,
+        gates_from_config: analysis.gates_from_config,
         warnings,
         tasks: Vec::with_capacity(analysis.plan.tasks.len()),
         halted_at: None,
@@ -186,7 +180,7 @@ pub fn run_with(opts: &RunOptions, adapters: &dyn AdapterSource) -> Result<RunRe
             chain,
             &workspace,
             &run_dir,
-            &effective_gates,
+            effective_gates,
             &gate_cmds,
             opts,
             adapters,
@@ -243,14 +237,18 @@ fn attempt_task(
         })?;
 
     // §16/§20: edit profiles may run exactly the gate commands, nothing else.
-    let settings_path = run_dir.join("settings").join(format!("{}.json", task.id));
+    // File names from user-authored ids go through filename_component.
+    let task_file_id = util::filename_component(task.id.as_str());
+    let settings_path = run_dir
+        .join("settings")
+        .join(format!("{task_file_id}.json"));
     write_json(
         &settings_path,
         &claude::permission_settings(&profile, gate_cmds),
     )?;
 
     let task_run = TaskRun {
-        prompt: materialize_prompt(task),
+        prompt: materialize_prompt(task, gate_cmds),
         profile: profile.clone(),
         workspace: workspace.root().to_path_buf(),
         resume_session: None,
@@ -261,13 +259,13 @@ fn attempt_task(
 
     let transcript_path = run_dir
         .join("transcripts")
-        .join(format!("{}-1.json", task.id));
+        .join(format!("{task_file_id}-1.json"));
     write_text(&transcript_path, &output.stdout)?;
     if !output.stderr.trim().is_empty() {
         write_text(
             &run_dir
                 .join("transcripts")
-                .join(format!("{}-1.stderr.log", task.id)),
+                .join(format!("{task_file_id}-1.stderr.log")),
             &output.stderr,
         )?;
     }
@@ -276,23 +274,9 @@ fn attempt_task(
     outcome.diff = workspace.capture_diff()?;
     outcome.transcript_path = transcript_path;
 
-    // Verification ladder so far (§11): outcome sanity → gates → provenance.
-    // Review joins in step 6.
+    // Verification ladder so far (§11): outcome sanity → cheap static
+    // provenance → gates. Review joins in step 6.
     let mut failure = evaluate_outcome(&outcome, &output);
-    if failure.is_none()
-        && let Err(gate_failure) = gates::run_all(
-            effective_gates,
-            workspace,
-            &run_dir.join("gates"),
-            &task.id,
-            1,
-        )
-    {
-        failure = Some(format!(
-            "gate `{}` failed: {}",
-            gate_failure.gate, gate_failure.summary
-        ));
-    }
     if failure.is_none() && task.kind == TaskKind::Test && !gates::diff_adds_tests(&outcome.diff) {
         failure = Some(
             "test provenance: this Test task adds no test code — a Test task that changes no \
@@ -300,14 +284,32 @@ fn attempt_task(
                 .to_owned(),
         );
     }
+    if failure.is_none()
+        && let Some(gate_failure) = gates::run_all(
+            effective_gates,
+            workspace,
+            &run_dir.join("gates"),
+            &task.id,
+            1,
+        )?
+    {
+        failure = Some(format!(
+            "gate `{}` failed: {}",
+            gate_failure.gate, gate_failure.summary
+        ));
+    }
 
     let status = match failure {
         None => {
             let sha = workspace.commit(&format!("[tactus] {}: {}", task.id, task.title))?;
+            // Scrub gate side-effects (build artifacts, lockfile churn) so
+            // they cannot leak into the next task's captured diff; the commit
+            // recorded exactly the verified staged set.
+            workspace.discard_uncommitted()?;
             TaskRunStatus::Committed { sha }
         }
         Some(reason) => {
-            workspace.rollback()?;
+            workspace.discard_uncommitted()?;
             TaskRunStatus::Failed { reason }
         }
     };
@@ -337,7 +339,7 @@ fn evaluate_outcome(outcome: &Outcome, output: &proc::ProcessOutput) -> Option<S
         OutcomeStatus::AgentError => Some(format!(
             "agent error (exit {:?}): {}",
             output.code,
-            tail(&output.stderr, 400)
+            util::tail(&output.stderr, 400)
         )),
         OutcomeStatus::Timeout => Some("attempt hit the wall-clock timeout".to_owned()),
         OutcomeStatus::RateLimited => {
@@ -346,9 +348,11 @@ fn evaluate_outcome(outcome: &Outcome, output: &proc::ProcessOutput) -> Option<S
     }
 }
 
-/// §14 prompt materialization: body + acceptance + artifact inputs. The
-/// conventions brief joins once design-phase artifacts carry content.
-fn materialize_prompt(task: &Task) -> String {
+/// §14 prompt materialization: body + acceptance + artifact inputs + the
+/// exact gate commands the agent is permitted to run (the allow rules are
+/// exact-match, so the agent must know the literal strings). The conventions
+/// brief joins once design-phase artifacts carry content.
+fn materialize_prompt(task: &Task, gate_cmds: &[String]) -> String {
     let mut prompt = String::new();
     prompt.push_str(
         "You are executing one task from a frozen plan, conducted by the tactus engine.\n\n",
@@ -372,6 +376,16 @@ fn materialize_prompt(task: &Task) -> String {
             "Inputs produced by earlier tasks: {}\n",
             needs.join(", ")
         );
+    }
+    if !gate_cmds.is_empty() {
+        prompt.push_str(
+            "Verification gates run after you finish. You may run EXACTLY these commands \
+             yourself to check your work (any other shell command is denied):\n",
+        );
+        for cmd in gate_cmds {
+            let _ = writeln!(prompt, "- {cmd}");
+        }
+        prompt.push('\n');
     }
     prompt.push_str(
         "Rules:\n\
@@ -417,18 +431,6 @@ fn topo_order(plan: &Plan) -> Vec<usize> {
         }
     }
     order
-}
-
-fn tail(text: &str, max: usize) -> String {
-    let trimmed = text.trim();
-    if trimmed.len() <= max {
-        return trimmed.to_owned();
-    }
-    let start = trimmed.len() - max;
-    let start = (start..trimmed.len())
-        .find(|i| trimmed.is_char_boundary(*i))
-        .unwrap_or(start);
-    format!("…{}", &trimmed[start..])
 }
 
 fn write_json<T: serde::Serialize>(path: &std::path::Path, value: &T) -> Result<(), TactusError> {
@@ -891,6 +893,60 @@ mod tests {
             report.tasks[0].status,
             TaskRunStatus::Committed { .. }
         ));
+    }
+
+    #[test]
+    fn gate_residue_is_scrubbed_not_committed() {
+        let repo = temp_engine_repo("residue");
+        // A gate that creates a file: residue must never reach a commit nor
+        // survive the task.
+        fs::write(
+            repo.join("tactus.toml"),
+            "[[gates]]\nname = \"leaky\"\ncmd = \"echo residue> residue.txt\"\n",
+        )
+        .expect("config");
+        git_in(&repo, &["add", "-A"]);
+        git_in(&repo, &["commit", "-q", "-m", "config"]);
+
+        let mut opts = options(&repo);
+        opts.config_path = Some(repo.join("tactus.toml"));
+        let source = FakeSource {
+            adapter: FakeAdapter {
+                effect: Effect::EditFile,
+            },
+        };
+        let report = run_with(&opts, &source).expect("run");
+        assert!(report.halted_at.is_none(), "report: {report:?}");
+        assert!(!repo.join("residue.txt").exists(), "residue scrubbed");
+        assert!(
+            git_in(&repo, &["status", "--porcelain"]).trim().is_empty(),
+            "clean tree after run"
+        );
+        // Neither commit contains the gate's file.
+        let log = git_in(&repo, &["log", "--name-only", "--format=", "main..HEAD"]);
+        assert!(!log.contains("residue.txt"), "log: {log}");
+    }
+
+    #[test]
+    fn prompt_names_the_allowed_gate_commands() {
+        let task = Task {
+            id: crate::ir::TaskId::from("t1"),
+            kind: TaskKind::Implement,
+            title: "Do the thing".to_owned(),
+            body: String::new(),
+            depends_on: Vec::new(),
+            acceptance: Vec::new(),
+            path_hints: Vec::new(),
+            suggested_tier: None,
+            min_tier: None,
+            artifacts_in: Vec::new(),
+            artifacts_out: Vec::new(),
+        };
+        let prompt = materialize_prompt(&task, &["cargo check --all-targets".to_owned()]);
+        assert!(prompt.contains("EXACTLY these commands"));
+        assert!(prompt.contains("- cargo check --all-targets"));
+        let bare = materialize_prompt(&task, &[]);
+        assert!(!bare.contains("EXACTLY these commands"));
     }
 
     #[test]

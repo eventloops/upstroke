@@ -14,5 +14,6 @@ pub mod ir;
 pub mod plan;
 pub mod route;
 pub mod ulid;
+pub mod util;
 pub mod validate;
 pub mod workspace;

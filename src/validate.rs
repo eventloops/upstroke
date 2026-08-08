@@ -7,6 +7,7 @@ use std::path::{Path, PathBuf};
 
 use crate::config::{self, Config};
 use crate::error::{TactusError, ValidationErrors};
+use crate::gates::{self, ShellGate};
 use crate::ir::{Plan, Task, TaskId};
 use crate::plan::{self, Parsed};
 use crate::route::{self, ResolvedChain};
@@ -14,8 +15,12 @@ use crate::route::{self, ResolvedChain};
 #[derive(Debug, Clone)]
 pub struct ValidateOptions {
     pub plan_path: PathBuf,
-    /// Explicit `--config` path; `None` looks for `./tactus.toml`.
+    /// Explicit `--config` path; `None` looks for `tactus.toml` in
+    /// `config_root`.
     pub config_path: Option<PathBuf>,
+    /// Root of the repo the plan targets: config discovery and gate
+    /// derivation both resolve here, never against the process CWD.
+    pub config_root: PathBuf,
     /// Pools file override for tests; `None` discovers `~/.tactus/pools.toml`.
     pub pools_path: Option<PathBuf>,
 }
@@ -34,6 +39,8 @@ pub struct Report {
     pub rows: Vec<Row>,
     pub warnings: Vec<String>,
     pub strategy: String,
+    pub gates: Vec<String>,
+    pub gates_from_config: bool,
     pub task_count: usize,
 }
 
@@ -46,6 +53,10 @@ pub struct Analysis {
     pub config: Config,
     /// One resolved chain per task, aligned with `plan.tasks`.
     pub chains: Vec<ResolvedChain>,
+    /// Effective gates: `[[gates]]` verbatim, else derived from the repo's
+    /// shape (§17) — the single derivation point for validate and the engine.
+    pub gates: Vec<ShellGate>,
+    pub gates_from_config: bool,
     pub warnings: Vec<String>,
 }
 
@@ -60,6 +71,7 @@ pub fn analyze(opts: &ValidateOptions) -> Result<Analysis, TactusError> {
     } = plan::detect(&raw)?.parse_with_warnings(&raw)?;
     let config = config::load(
         opts.config_path.as_deref(),
+        &opts.config_root,
         opts.pools_path.as_deref(),
         &mut all_warnings,
     )?;
@@ -69,16 +81,34 @@ pub fn analyze(opts: &ValidateOptions) -> Result<Analysis, TactusError> {
         .iter()
         .map(|t| route::resolve(t, &config))
         .collect();
+    let gates_from_config = config.gates.is_some();
+    let gates = match &config.gates {
+        Some(configured) => configured
+            .iter()
+            .map(|g| ShellGate {
+                name: g.name.clone(),
+                cmd: g.cmd.clone(),
+                timeout: g.timeout,
+                shell: config.shell,
+            })
+            .collect(),
+        None => gates::derive(&opts.config_root, config.shell),
+    };
     Ok(Analysis {
         plan,
         config,
         chains,
+        gates,
+        gates_from_config,
         warnings: all_warnings,
     })
 }
 
 pub fn run(opts: &ValidateOptions) -> Result<Report, TactusError> {
     let analysis = analyze(opts)?;
+    let mut warnings = analysis.warnings;
+    // Zero-spend preview of the §14 gate pre-flight: warn, never refuse.
+    gates::preview_resolution(&analysis.gates, &opts.config_root, &mut warnings);
     let rows = analysis
         .plan
         .tasks
@@ -89,8 +119,10 @@ pub fn run(opts: &ValidateOptions) -> Result<Report, TactusError> {
     Ok(Report {
         task_count: analysis.plan.tasks.len(),
         rows,
-        warnings: analysis.warnings,
+        warnings,
         strategy: strategy_echo(&analysis.config),
+        gates: analysis.gates.iter().map(|g| g.name.clone()).collect(),
+        gates_from_config: analysis.gates_from_config,
         plan: analysis.plan,
     })
 }
@@ -310,6 +342,19 @@ impl Report {
                 out.push_str(&format!("  - {warning}\n"));
             }
         }
+        if self.gates.is_empty() {
+            out.push_str("gates: none\n");
+        } else {
+            out.push_str(&format!(
+                "gates: {} [{}]\n",
+                self.gates.join(", "),
+                if self.gates_from_config {
+                    "from config"
+                } else {
+                    "derived"
+                }
+            ));
+        }
         out.push_str(&self.strategy);
         out.push('\n');
         out.push_str("capacity: not connected\n");
@@ -338,15 +383,38 @@ mod tests {
     use std::env;
 
     fn opts(plan: &str) -> ValidateOptions {
+        let hermetic_root =
+            env::temp_dir().join(format!("tactus-validate-hermetic-{}", std::process::id()));
+        fs::create_dir_all(&hermetic_root).expect("hermetic root");
         ValidateOptions {
             plan_path: PathBuf::from(plan),
             config_path: None,
+            config_root: hermetic_root,
             pools_path: Some(
                 env::temp_dir()
                     .join("tactus-validate-missing")
                     .join("p.toml"),
             ),
         }
+    }
+
+    #[test]
+    fn derived_gates_appear_in_the_preview() {
+        let root = env::temp_dir().join(format!("tactus-validate-gates-{}", std::process::id()));
+        fs::create_dir_all(&root).expect("root");
+        fs::write(root.join("Cargo.toml"), "[package]\nname='x'\n").expect("marker");
+        let mut o = opts("fixtures/sample-plan.md");
+        o.config_root = root;
+        let report = run(&o).expect("validates");
+        let rendered = report.render();
+        assert!(
+            rendered.contains("gates: check, test [derived]"),
+            "rendered:\n{rendered}"
+        );
+
+        // Hermetic root with no markers: no gates, still explicit.
+        let report = run(&opts("fixtures/sample-plan.md")).expect("validates");
+        assert!(report.render().contains("gates: none"));
     }
 
     #[test]

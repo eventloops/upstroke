@@ -23,8 +23,11 @@ use crate::ir::{TaskKind, Tier};
 struct RawRepoConfig {
     routing: Option<RawRouting>,
     pins: Option<Vec<RawPin>>,
-    gates: Option<Vec<RawGate>>,
-    engine: Option<RawEngine>,
+    // Parsed as raw values so shape mistakes get actionable messages instead
+    // of bare serde errors (configs written before these sections were
+    // consumed must not brick on upgrade with cryptic output).
+    gates: Option<toml::Value>,
+    engine: Option<toml::Value>,
     // Other sections (interaction, budgets) are legal in tactus.toml but not
     // consumed yet; serde ignores them.
 }
@@ -165,15 +168,18 @@ pub fn default_chain(kind: TaskKind) -> Vec<Tier> {
 /// Load effective config.
 ///
 /// `repo_config`: explicit `--config` path (missing file = error) or `None`
-/// to look for `./tactus.toml` (missing = silent defaults).
+/// to look for `tactus.toml` in `discover_in` (missing = silent defaults).
+/// `discover_in` is the repo root the run targets — never the process CWD,
+/// which can differ and would load another repo's config.
 /// `pools_file`: explicit pools path (tests) or `None` to discover
 /// `~/.tactus/pools.toml` (missing = silent).
 pub fn load(
     repo_config: Option<&Path>,
+    discover_in: &Path,
     pools_file: Option<&Path>,
     warnings: &mut Vec<String>,
 ) -> Result<Config, TactusError> {
-    let (raw, repo_path) = read_repo_config(repo_config)?;
+    let (raw, repo_path) = read_repo_config(repo_config, discover_in)?;
 
     let mut chains: BTreeMap<TaskKind, KindChain> = TaskKind::ALL
         .iter()
@@ -289,42 +295,8 @@ pub fn load(
         });
     }
 
-    let gates = match raw.gates {
-        None => None,
-        Some(raw_gates) => {
-            let mut list = Vec::with_capacity(raw_gates.len());
-            for g in raw_gates {
-                if g.name.trim().is_empty() || g.cmd.trim().is_empty() {
-                    return Err(TactusError::Config {
-                        path: repo_path.clone(),
-                        message: "each [[gates]] entry needs a non-empty `name` and `cmd`"
-                            .to_owned(),
-                    });
-                }
-                list.push(GateConfig {
-                    name: g.name,
-                    cmd: g.cmd,
-                    timeout: g
-                        .timeout_secs
-                        .map_or(DEFAULT_GATE_TIMEOUT, Duration::from_secs),
-                });
-            }
-            Some(list)
-        }
-    };
-
-    let mut shell = ShellKind::native();
-    if let Some(engine) = raw.engine
-        && let Some(requested) = engine.shell
-    {
-        match ShellKind::parse(&requested) {
-            Some(kind) => shell = kind,
-            None => warnings.push(format!(
-                "unknown [engine] shell `{requested}` in {} (using the platform default)",
-                repo_path.display()
-            )),
-        }
-    }
+    let gates = parse_gates(raw.gates, &repo_path)?;
+    let shell = parse_engine_shell(raw.engine, &repo_path, warnings)?;
 
     let pool_names = read_pools(pools_file)?;
 
@@ -339,10 +311,92 @@ pub fn load(
     })
 }
 
-fn read_repo_config(repo_config: Option<&Path>) -> Result<(RawRepoConfig, PathBuf), TactusError> {
+/// `[[gates]]` parsing with actionable shape errors: a `[gates]` table, a
+/// wrong-typed field, or `timeout_secs = 0` all name what was expected.
+fn parse_gates(
+    raw: Option<toml::Value>,
+    repo_path: &Path,
+) -> Result<Option<Vec<GateConfig>>, TactusError> {
+    let config_error = |message: String| TactusError::Config {
+        path: repo_path.to_path_buf(),
+        message,
+    };
+    let Some(value) = raw else { return Ok(None) };
+    let toml::Value::Array(entries) = value else {
+        return Err(config_error(format!(
+            "`gates` must be an array of tables — write `[[gates]]` entries (double brackets, \
+             one per gate), found a {}",
+            value.type_str()
+        )));
+    };
+    let mut list = Vec::with_capacity(entries.len());
+    for (index, entry) in entries.into_iter().enumerate() {
+        let n = index + 1;
+        let g: RawGate = entry.try_into().map_err(|e| {
+            config_error(format!(
+                "[[gates]] entry {n}: {e} (each entry takes `name`, `cmd`, and an optional \
+                 `timeout_secs` integer)"
+            ))
+        })?;
+        if g.name.trim().is_empty() || g.cmd.trim().is_empty() {
+            return Err(config_error(format!(
+                "[[gates]] entry {n} needs a non-empty `name` and `cmd`"
+            )));
+        }
+        if g.timeout_secs == Some(0) {
+            return Err(config_error(format!(
+                "[[gates]] entry {n} (`{}`): timeout_secs must be at least 1 — omit it for the \
+                 {}s default",
+                g.name,
+                DEFAULT_GATE_TIMEOUT.as_secs()
+            )));
+        }
+        list.push(GateConfig {
+            name: g.name,
+            cmd: g.cmd,
+            timeout: g
+                .timeout_secs
+                .map_or(DEFAULT_GATE_TIMEOUT, Duration::from_secs),
+        });
+    }
+    Ok(Some(list))
+}
+
+fn parse_engine_shell(
+    raw: Option<toml::Value>,
+    repo_path: &Path,
+    warnings: &mut Vec<String>,
+) -> Result<ShellKind, TactusError> {
+    let Some(value) = raw else {
+        return Ok(ShellKind::native());
+    };
+    let engine: RawEngine = value.try_into().map_err(|e| TactusError::Config {
+        path: repo_path.to_path_buf(),
+        message: format!("[engine]: {e} (expected a table with an optional `shell` string)"),
+    })?;
+    let Some(requested) = engine.shell else {
+        return Ok(ShellKind::native());
+    };
+    match ShellKind::parse(&requested) {
+        Some(kind) => Ok(kind),
+        None => {
+            warnings.push(format!(
+                "unknown [engine] shell `{requested}` in {} (using the platform default; known: \
+                 cmd, sh, bash, powershell, pwsh)",
+                repo_path.display()
+            ));
+            Ok(ShellKind::native())
+        }
+    }
+}
+
+fn read_repo_config(
+    repo_config: Option<&Path>,
+    discover_in: &Path,
+) -> Result<(RawRepoConfig, PathBuf), TactusError> {
     let (path, required) = match repo_config {
         Some(p) => (p.to_path_buf(), true),
-        None => (PathBuf::from("tactus.toml"), false),
+        None => (discover_in.join("tactus.toml"), false),
     };
     if !path.exists() {
         if required {
@@ -409,10 +463,17 @@ mod tests {
             .join("pools.toml")
     }
 
+    /// Empty discovery root so tests never pick up a real tactus.toml.
+    fn hermetic() -> PathBuf {
+        let dir = env::temp_dir().join(format!("tactus-config-hermetic-{}", std::process::id()));
+        fs::create_dir_all(&dir).expect("hermetic dir");
+        dir
+    }
+
     #[test]
     fn missing_files_fall_back_to_derived_defaults() {
         let mut warnings = Vec::new();
-        let cfg = load(None, Some(&missing()), &mut warnings).expect("load defaults");
+        let cfg = load(None, &hermetic(), Some(&missing()), &mut warnings).expect("load defaults");
         assert!(warnings.is_empty());
         assert_eq!(
             cfg.chain_for(TaskKind::Fix).chain,
@@ -429,8 +490,13 @@ mod tests {
     #[test]
     fn explicit_config_path_must_exist() {
         let mut warnings = Vec::new();
-        let err = load(Some(&missing()), Some(&missing()), &mut warnings)
-            .expect_err("missing --config errors");
+        let err = load(
+            Some(&missing()),
+            &hermetic(),
+            Some(&missing()),
+            &mut warnings,
+        )
+        .expect_err("missing --config errors");
         assert!(matches!(err, TactusError::Config { .. }));
     }
 
@@ -460,7 +526,8 @@ model = "claude-opus-4-8"
 "#,
         );
         let mut warnings = Vec::new();
-        let cfg = load(Some(&path), Some(&missing()), &mut warnings).expect("load full config");
+        let cfg = load(Some(&path), &hermetic(), Some(&missing()), &mut warnings)
+            .expect("load full config");
         assert_eq!(cfg.chain_for(TaskKind::Fix).attempts_per, 3);
         assert_eq!(
             cfg.chain_for(TaskKind::Implement).chain,
@@ -491,7 +558,8 @@ model = "claude-opus-4-8"
             "[[pins]]\ntier = \"mid\"\nagent = \"claude-code\"\nmodel = \"claude-nonexistent\"\n",
         );
         let mut warnings = Vec::new();
-        let err = load(Some(&path), Some(&missing()), &mut warnings).expect_err("unknown model");
+        let err = load(Some(&path), &hermetic(), Some(&missing()), &mut warnings)
+            .expect_err("unknown model");
         let msg = err.to_string();
         assert!(msg.contains("claude-nonexistent"));
         assert!(
@@ -517,7 +585,7 @@ model = "gpt-5"
 "#,
         );
         let mut warnings = Vec::new();
-        let cfg = load(Some(&path), Some(&missing()), &mut warnings).expect("load");
+        let cfg = load(Some(&path), &hermetic(), Some(&missing()), &mut warnings).expect("load");
         assert_eq!(cfg.pins.len(), 1);
         assert_eq!(cfg.pins[0].model, "claude-opus-5");
         assert!(warnings.iter().any(|w| w.contains("duplicate pin")));
@@ -538,11 +606,68 @@ agent = "copilot"
 "#,
         );
         let mut warnings = Vec::new();
-        let cfg = load(None, Some(&path), &mut warnings).expect("load pools");
+        let cfg = load(None, &hermetic(), Some(&path), &mut warnings).expect("load pools");
         assert_eq!(
             cfg.pool_names,
             vec!["claude-max".to_owned(), "copilot".to_owned()]
         );
+    }
+
+    #[test]
+    fn wrong_section_shapes_get_actionable_errors() {
+        // `[gates]` as a table — the classic array-of-tables mistake.
+        let path = scratch("gatestable.toml", "[gates]\ncheck = \"cargo check\"\n");
+        let mut warnings = Vec::new();
+        let err = load(Some(&path), &hermetic(), Some(&missing()), &mut warnings)
+            .expect_err("table shape must error");
+        let msg = err.to_string();
+        assert!(msg.contains("[[gates]]"), "names the expected shape: {msg}");
+
+        // Wrong field type inside an entry.
+        let path = scratch(
+            "gatestype.toml",
+            "[[gates]]\nname = \"t\"\ncmd = \"cargo test\"\ntimeout_secs = \"600\"\n",
+        );
+        let err = load(Some(&path), &hermetic(), Some(&missing()), &mut warnings)
+            .expect_err("string timeout must error");
+        assert!(err.to_string().contains("timeout_secs"), "got: {err}");
+
+        // [engine] with a wrong type.
+        let path = scratch("enginetype.toml", "[engine]\nshell = 5\n");
+        let err = load(Some(&path), &hermetic(), Some(&missing()), &mut warnings)
+            .expect_err("numeric shell must error");
+        assert!(err.to_string().contains("[engine]"), "got: {err}");
+    }
+
+    #[test]
+    fn zero_gate_timeout_is_rejected_at_load() {
+        let path = scratch(
+            "zerotimeout.toml",
+            "[[gates]]\nname = \"test\"\ncmd = \"cargo test\"\ntimeout_secs = 0\n",
+        );
+        let mut warnings = Vec::new();
+        let err = load(Some(&path), &hermetic(), Some(&missing()), &mut warnings)
+            .expect_err("zero timeout must error");
+        assert!(err.to_string().contains("at least 1"), "got: {err}");
+    }
+
+    #[test]
+    fn discovery_uses_the_given_root_not_cwd() {
+        let root = scratch("discovery-root.toml", "unused = true\n")
+            .parent()
+            .expect("parent")
+            .to_path_buf();
+        let repo_root = root.join("discovery-repo");
+        fs::create_dir_all(&repo_root).expect("repo root");
+        fs::write(
+            repo_root.join("tactus.toml"),
+            "[[gates]]\nname = \"only-here\"\ncmd = \"git --version\"\n",
+        )
+        .expect("write config");
+        let mut warnings = Vec::new();
+        let cfg = load(None, &repo_root, Some(&missing()), &mut warnings).expect("discover");
+        let gates = cfg.gates.expect("gates found via repo root");
+        assert_eq!(gates[0].name, "only-here");
     }
 
     #[test]
@@ -564,7 +689,8 @@ timeout_secs = 1200
 "#,
         );
         let mut warnings = Vec::new();
-        let cfg = load(Some(&path), Some(&missing()), &mut warnings).expect("load gates");
+        let cfg =
+            load(Some(&path), &hermetic(), Some(&missing()), &mut warnings).expect("load gates");
         let gates = cfg.gates.expect("gates configured");
         assert_eq!(gates.len(), 2);
         assert_eq!(gates[0].timeout, DEFAULT_GATE_TIMEOUT);
@@ -576,12 +702,13 @@ timeout_secs = 1200
     #[test]
     fn absent_gates_mean_derive_and_empty_means_none() {
         let mut warnings = Vec::new();
-        let cfg = load(None, Some(&missing()), &mut warnings).expect("defaults");
+        let cfg = load(None, &hermetic(), Some(&missing()), &mut warnings).expect("defaults");
         assert!(cfg.gates.is_none(), "absent section derives at run time");
         assert_eq!(cfg.shell, ShellKind::native());
 
         let path = scratch("nogates.toml", "gates = []\n");
-        let cfg = load(Some(&path), Some(&missing()), &mut warnings).expect("empty gates");
+        let cfg =
+            load(Some(&path), &hermetic(), Some(&missing()), &mut warnings).expect("empty gates");
         assert_eq!(cfg.gates.expect("explicit").len(), 0);
     }
 
@@ -592,11 +719,13 @@ timeout_secs = 1200
             "[[gates]]\nname = \"\"\ncmd = \"cargo test\"\n",
         );
         let mut warnings = Vec::new();
-        let err = load(Some(&path), Some(&missing()), &mut warnings).expect_err("blank name");
+        let err = load(Some(&path), &hermetic(), Some(&missing()), &mut warnings)
+            .expect_err("blank name");
         assert!(err.to_string().contains("non-empty"));
 
         let path = scratch("badshell.toml", "[engine]\nshell = \"fish\"\n");
-        let cfg = load(Some(&path), Some(&missing()), &mut warnings).expect("tolerated");
+        let cfg =
+            load(Some(&path), &hermetic(), Some(&missing()), &mut warnings).expect("tolerated");
         assert_eq!(cfg.shell, ShellKind::native());
         assert!(
             warnings

@@ -61,6 +61,7 @@ fn run() -> anyhow::Result<()> {
             let report = validate::run(&ValidateOptions {
                 plan_path: plan,
                 config_path: config,
+                config_root: std::env::current_dir().context("resolving current directory")?,
                 pools_path: None,
             })?;
             if emit_json {
@@ -82,6 +83,7 @@ fn run() -> anyhow::Result<()> {
                 let report = validate::run(&ValidateOptions {
                     plan_path: plan,
                     config_path: config,
+                    config_root: std::env::current_dir().context("resolving current directory")?,
                     pools_path: None,
                 })?;
                 print!("{}", report.render());
