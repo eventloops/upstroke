@@ -44,6 +44,9 @@ pub enum TactusError {
         known: String,
     },
 
+    #[error("agent error: {message}")]
+    Agent { message: String },
+
     #[error("{0}")]
     Validation(ValidationErrors),
 }

@@ -4,6 +4,7 @@
 //! into the IR, load optional config, resolve routing chains with a binder
 //! preview, and report — executing nothing.
 
+pub mod agent;
 pub mod catalog;
 pub mod config;
 pub mod error;

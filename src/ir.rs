@@ -1,6 +1,9 @@
-//! Core data model — the DESIGN.md §7 subset needed by `tactus validate`.
+//! Core data model (DESIGN.md §7): the plan-side types `validate` consumes
+//! and the execution-side types the agent adapters produce.
 
 use std::fmt;
+use std::path::PathBuf;
+use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 
@@ -167,6 +170,78 @@ pub struct Plan {
     pub source: PlanSource,
     pub tasks: Vec<Task>,
     pub artifacts: Vec<Artifact>,
+}
+
+/// What an agent subprocess may touch (§20). Edit profiles get file tools and
+/// the gate commands; reviewers are read-only. Neither gets network tools.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum PermissionMode {
+    Edit,
+    ReadOnly,
+}
+
+/// §7 `WorkerProfile` — v2.1: an optional PIN. Tiers bind late by default; a
+/// profile forces a fixed binding for one tier.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WorkerProfile {
+    pub name: String,
+    /// Agent adapter id: `claude-code` | `copilot` | `aider`.
+    pub agent: String,
+    pub model: String,
+    /// Which capacity pool this profile drains (identity only until the
+    /// capacity engine lands).
+    pub pool: String,
+    pub permissions: PermissionMode,
+    pub max_turns: Option<u32>,
+    pub extra_args: Vec<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OutcomeStatus {
+    Completed,
+    AgentError,
+    Timeout,
+    RateLimited,
+}
+
+/// Token accounting as reported by the agent CLI, parsed defensively — any
+/// field may be absent and absence never fails an attempt.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Usage {
+    pub input_tokens: Option<u64>,
+    pub output_tokens: Option<u64>,
+    pub cache_creation_input_tokens: Option<u64>,
+    pub cache_read_input_tokens: Option<u64>,
+    pub num_turns: Option<u32>,
+}
+
+/// Pool units consumed by an attempt. Stub until the capacity engine (§13);
+/// adapters leave it `None`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PoolDrain {
+    pub pool: String,
+    pub tokens: Option<u64>,
+    pub usd: Option<f64>,
+}
+
+/// §7 `Outcome` — what one agent attempt produced. The adapter fills status,
+/// session, usage, and cost from process output; the engine owns `diff`
+/// (invariant 3: ground truth is the engine-captured diff), `transcript_path`,
+/// and `pool_drain`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Outcome {
+    pub status: OutcomeStatus,
+    pub diff: String,
+    pub session_id: Option<String>,
+    pub usage: Option<Usage>,
+    /// API-equivalent dollars as reported by the CLI (subscription spend is
+    /// notional — §13).
+    pub cost_usd: Option<f64>,
+    pub pool_drain: Option<PoolDrain>,
+    pub transcript_path: PathBuf,
+    pub duration: Duration,
 }
 
 /// FNV-1a 64-bit content hash. Dependency-free and stable across platforms and
