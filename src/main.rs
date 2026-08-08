@@ -50,6 +50,17 @@ fn main() -> ExitCode {
     }
 }
 
+/// One construction point so `validate` and `run --dry-run` can never drift
+/// into previewing different things.
+fn validate_options(plan: PathBuf, config: Option<PathBuf>) -> anyhow::Result<ValidateOptions> {
+    Ok(ValidateOptions {
+        plan_path: plan,
+        config_path: config,
+        config_root: std::env::current_dir().context("resolving current directory")?,
+        pools_path: None,
+    })
+}
+
 fn run() -> anyhow::Result<()> {
     let cli = Cli::parse();
     match cli.command {
@@ -58,12 +69,7 @@ fn run() -> anyhow::Result<()> {
             emit_json,
             config,
         } => {
-            let report = validate::run(&ValidateOptions {
-                plan_path: plan,
-                config_path: config,
-                config_root: std::env::current_dir().context("resolving current directory")?,
-                pools_path: None,
-            })?;
+            let report = validate::run(&validate_options(plan, config)?)?;
             if emit_json {
                 let path = PathBuf::from("plan.normalized.json");
                 report
@@ -80,12 +86,7 @@ fn run() -> anyhow::Result<()> {
             config,
         } => {
             if dry_run {
-                let report = validate::run(&ValidateOptions {
-                    plan_path: plan,
-                    config_path: config,
-                    config_root: std::env::current_dir().context("resolving current directory")?,
-                    pools_path: None,
-                })?;
+                let report = validate::run(&validate_options(plan, config)?)?;
                 print!("{}", report.render());
                 println!("dry run: no agents executed, nothing spent");
                 return Ok(());

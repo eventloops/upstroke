@@ -16,7 +16,6 @@ use std::time::Duration;
 
 use crate::agent::proc;
 use crate::error::TactusError;
-use crate::ir::TaskId;
 use crate::util;
 use crate::workspace::Workspace;
 
@@ -197,7 +196,7 @@ pub fn run_all(
     gates: &[ShellGate],
     ws: &Workspace,
     log_dir: &Path,
-    task: &TaskId,
+    task: &str,
     attempt: u32,
 ) -> Result<Option<GateFailure>, TactusError> {
     for gate in gates {
@@ -210,7 +209,7 @@ pub fn run_all(
         if !log.trim().is_empty() {
             let file_name = format!(
                 "{}-{attempt}-{}.log",
-                util::filename_component(task.as_str()),
+                util::filename_component(task),
                 util::filename_component(&gate.name)
             );
             if let Err(e) = fs::write(log_dir.join(&file_name), &log) {
@@ -597,7 +596,7 @@ mod tests {
             },
             gate("git --version", 30),
         ];
-        let failure = run_all(&gates, &ws, &logs, &TaskId::from("t1"), 1)
+        let failure = run_all(&gates, &ws, &logs, "t1", 1)
             .expect("no environment error")
             .expect("second gate fails");
         assert_eq!(failure.gate, "bad");
@@ -618,7 +617,7 @@ mod tests {
             timeout: Duration::from_secs(30),
             shell: ShellKind::native(),
         }];
-        let failure = run_all(&gates, &ws, &logs, &TaskId::from("a/b"), 1)
+        let failure = run_all(&gates, &ws, &logs, "a/b", 1)
             .expect("no environment error")
             .expect("gate fails");
         assert_eq!(failure.gate, "lint:fast/unit", "report keeps the real name");

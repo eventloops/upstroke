@@ -137,6 +137,9 @@ pub struct Config {
     /// configured; `None` means derive from the repo.
     pub gates: Option<Vec<GateConfig>>,
     pub shell: ShellKind,
+    /// `[routing] review = { tier = … }` — parsed and echoed; the reviewer
+    /// that consumes it arrives in step 6.
+    pub review_tier: Option<Tier>,
 }
 
 impl Config {
@@ -195,6 +198,7 @@ pub fn load(
         })
         .collect();
     let mut overrides = Vec::new();
+    let mut review_tier: Option<Tier> = None;
     let mut strategy = Strategy {
         mode: "conserve".to_owned(),
         spend_down_after: None,
@@ -204,6 +208,20 @@ pub fn load(
     if let Some(routing) = raw.routing {
         for (key, value) in routing.kinds {
             let Some(kind) = TaskKind::parse(&key) else {
+                // `review` is a routing ROLE, not a task kind (DESIGN §17's
+                // own example configures it). Parse and echo it rather than
+                // warning users off their own documented config; the reviewer
+                // consumes it in step 6.
+                if key == "review" {
+                    let rr: RawKindRouting = value.try_into().map_err(|e| TactusError::Config {
+                        path: repo_path.clone(),
+                        message: format!("routing entry `review`: {e}"),
+                    })?;
+                    review_tier = rr
+                        .tier
+                        .or_else(|| rr.chain.and_then(|c| c.first().copied()));
+                    continue;
+                }
                 warnings.push(format!(
                     "unknown routing kind `{key}` in {} (ignored)",
                     repo_path.display()
@@ -214,6 +232,15 @@ pub fn load(
                 path: repo_path.clone(),
                 message: format!("routing entry `{key}`: {e}"),
             })?;
+            if kr.attempts_per == Some(0) {
+                return Err(TactusError::Config {
+                    path: repo_path.clone(),
+                    message: format!(
+                        "[routing] `{key}`: attempts_per must be at least 1 — omit it for the \
+                         default of {DEFAULT_ATTEMPTS_PER}"
+                    ),
+                });
+            }
             let chain = match (kr.chain, kr.tier) {
                 (Some(chain), _) if !chain.is_empty() => chain,
                 (_, Some(tier)) => vec![tier],
@@ -308,6 +335,7 @@ pub fn load(
         pool_names,
         gates,
         shell,
+        review_tier,
     })
 }
 
@@ -543,12 +571,22 @@ model = "claude-opus-4-8"
         assert_eq!(cfg.pins.len(), 1);
         assert_eq!(cfg.strategy.mode, "value-max");
         assert_eq!(cfg.strategy.spend_down_after, Some(0.7));
-        // `review` is not a step-1 TaskKind — tolerated with a warning.
-        assert!(
-            warnings
-                .iter()
-                .any(|w| w.contains("unknown routing kind `review`"))
+        // `review` is a routing role, not a task kind: parsed, echoed, and
+        // never warned about (DESIGN §17 configures it in its own example).
+        assert_eq!(cfg.review_tier, Some(Tier::Frontier));
+        assert!(warnings.is_empty(), "warnings: {warnings:?}");
+    }
+
+    #[test]
+    fn zero_attempts_per_is_rejected() {
+        let path = scratch(
+            "zeroattempts.toml",
+            "[routing]\nfix = { chain = [\"small\"], attempts_per = 0 }\n",
         );
+        let mut warnings = Vec::new();
+        let err = load(Some(&path), &hermetic(), Some(&missing()), &mut warnings)
+            .expect_err("zero attempts must error");
+        assert!(err.to_string().contains("at least 1"), "got: {err}");
     }
 
     #[test]

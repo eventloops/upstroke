@@ -75,13 +75,20 @@ pub fn resolve(task: &Task, cfg: &Config) -> ResolvedChain {
         }
     }
 
-    // `tier=` is advisory: it becomes the chain start only if it outranks (or
-    // matches — the designer said it explicitly) the current start.
-    if let Some(tier) = task.suggested_tier
-        && tiers.first().is_some_and(|(start, _)| tier >= *start)
-    {
-        raise_start(&mut tiers, tier, ChainSource::Annotation);
-        if let Some(first) = tiers.first_mut() {
+    // `tier=` is advisory: it becomes the chain start only if it outranks the
+    // current start. An annotation that merely agrees with a blast-radius
+    // floor must not take credit for it — the override is what binds, and the
+    // preview has to say so (§10.2: blast radius beats nominal difficulty).
+    if let Some(tier) = task.suggested_tier {
+        let raised = raise_start(&mut tiers, tier, ChainSource::Annotation);
+        // Agreeing with a silent default still counts as the designer's
+        // decision; agreeing with an override does not — the override is what
+        // holds the start up, and removing the annotation would not lower it.
+        if !raised
+            && let Some(first) = tiers.first_mut()
+            && first.0 == tier
+            && first.1 == ChainSource::Default
+        {
             first.1 = ChainSource::Annotation;
         }
     }
@@ -255,6 +262,18 @@ mod tests {
         unmatched.path_hints.push("src/api/list.rs".to_owned());
         let rc = resolve(&unmatched, &cfg);
         assert_eq!(tiers(&rc), [Tier::Small, Tier::Mid, Tier::Frontier]);
+
+        // An annotation agreeing with the override must not take credit for
+        // a floor the override is holding up.
+        let mut agreeing = task(TaskKind::Fix);
+        agreeing.path_hints.push("src/auth/login.rs".to_owned());
+        agreeing.suggested_tier = Some(Tier::Frontier);
+        let rc = resolve(&agreeing, &cfg);
+        assert_eq!(
+            rc.rungs[0].source,
+            ChainSource::Override,
+            "blast radius is what binds"
+        );
     }
 
     #[test]

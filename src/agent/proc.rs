@@ -93,12 +93,22 @@ pub fn run_with_timeout(
     };
     let duration = started.elapsed();
 
-    let _ = stdin_thread.join();
     let grace = if timed_out {
         DRAIN_GRACE_KILL
     } else {
         DRAIN_GRACE_EXIT
     };
+    // Bounded like the read drains: a prompt larger than the pipe buffer plus
+    // an orphan holding the read end would otherwise block write_all forever
+    // and hang the supervisor past its own timeout. Abandoning the thread is
+    // safe — it owns its handle and exits when the last reader closes.
+    let stdin_deadline = Instant::now() + grace;
+    while !stdin_thread.is_finished() && Instant::now() < stdin_deadline {
+        thread::sleep(Duration::from_millis(20));
+    }
+    if stdin_thread.is_finished() {
+        let _ = stdin_thread.join();
+    }
     let stdout = stdout_drain.map(|d| d.collect(grace)).unwrap_or_default();
     let stderr = stderr_drain.map(|d| d.collect(grace)).unwrap_or_default();
 

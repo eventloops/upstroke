@@ -89,40 +89,155 @@ struct Section {
     /// Byte range of the section body in the original text: from the end of
     /// the heading block to the start of the next `##`/`###` heading.
     content: Range<usize>,
+    /// Annotation written inline on the heading line itself.
+    inline_annotation: Option<String>,
+}
+
+/// Heading state while scanning: accumulated title text, the heading block
+/// span, and any inline annotation found on the heading line.
+struct HeadingScan {
+    title: String,
+    span: Range<usize>,
+    annotation: Option<String>,
 }
 
 fn split_sections(raw: &str) -> Vec<Section> {
     let mut sections: Vec<Section> = Vec::new();
-    // (accumulated title text, heading block span)
-    let mut in_heading: Option<(String, Range<usize>)> = None;
+    let mut in_heading: Option<HeadingScan> = None;
+    // Headings nested in blockquotes or list items are quoted material, not
+    // plan structure — only container-free headings delimit tasks.
+    let mut container_depth = 0usize;
+
     for (event, range) in Parser::new_ext(raw, md_options()).into_offset_iter() {
         match event {
+            Event::Start(Tag::BlockQuote(_)) | Event::Start(Tag::Item) => container_depth += 1,
+            Event::End(TagEnd::BlockQuote(_)) | Event::End(TagEnd::Item) => {
+                container_depth = container_depth.saturating_sub(1);
+            }
             Event::Start(Tag::Heading {
                 level: HeadingLevel::H2 | HeadingLevel::H3,
                 ..
-            }) => {
-                in_heading = Some((String::new(), range));
+            }) if container_depth == 0 => {
+                in_heading = Some(HeadingScan {
+                    title: String::new(),
+                    span: range,
+                    annotation: None,
+                });
             }
             Event::End(TagEnd::Heading(HeadingLevel::H2 | HeadingLevel::H3)) => {
-                if let Some((title, span)) = in_heading.take() {
+                if let Some(scan) = in_heading.take() {
+                    let title = scan.title.trim().to_owned();
+                    // `### Acceptance` and friends label the criteria of the
+                    // section above, so they are not task boundaries; the
+                    // section body flows through and section_draft arms on it.
+                    if is_acceptance_header(strip_trailing_colon(&title)) {
+                        continue;
+                    }
                     if let Some(prev) = sections.last_mut() {
-                        prev.content.end = span.start;
+                        prev.content.end = scan.span.start;
                     }
                     sections.push(Section {
-                        title: title.trim().to_owned(),
-                        content: span.end..raw.len(),
+                        title,
+                        content: scan.span.end..raw.len(),
+                        inline_annotation: scan.annotation,
                     });
                 }
             }
             Event::Text(t) | Event::Code(t) => {
-                if let Some((buf, _)) = in_heading.as_mut() {
-                    buf.push_str(&t);
+                if let Some(scan) = in_heading.as_mut() {
+                    scan.title.push_str(&t);
+                }
+            }
+            Event::InlineHtml(t) | Event::Html(t) => {
+                if let Some(scan) = in_heading.as_mut() {
+                    for comment in comments_in(&t) {
+                        if let Some(body) = tactus_body(comment.inner)
+                            && scan.annotation.is_none()
+                        {
+                            scan.annotation = Some(body.to_owned());
+                        }
+                    }
                 }
             }
             _ => {}
         }
     }
     sections
+}
+
+fn strip_trailing_colon(text: &str) -> &str {
+    text.trim().trim_end_matches(':').trim_end()
+}
+
+/// The body of a `<!-- tactus: ... -->` comment, or `None` for ordinary
+/// author comments.
+fn tactus_body(inner: &str) -> Option<&str> {
+    inner.trim().strip_prefix("tactus:")
+}
+
+/// Accumulates consecutive HTML events before scanning for annotations:
+/// pulldown-cmark emits one event per line inside an HTML block, so a
+/// multi-line `<!-- tactus: ... -->` comment is only complete once its
+/// neighbours are joined. Consecutive events are contiguous in the source, so
+/// buffer offsets map linearly back to absolute spans.
+#[derive(Default)]
+struct HtmlAccumulator {
+    buffer: String,
+    start: usize,
+}
+
+impl HtmlAccumulator {
+    fn push(&mut self, text: &str, range: &Range<usize>) {
+        if self.buffer.is_empty() {
+            self.start = range.start;
+        }
+        self.buffer.push_str(text);
+    }
+
+    /// Complete comments in the buffer, as (absolute span, inner text).
+    fn take_comments(&mut self) -> Vec<(Range<usize>, String)> {
+        if self.buffer.is_empty() {
+            return Vec::new();
+        }
+        let found: Vec<(Range<usize>, String)> = comments_in(&self.buffer)
+            .into_iter()
+            .map(|c| {
+                (
+                    self.start + c.span.start..self.start + c.span.end,
+                    c.inner.to_owned(),
+                )
+            })
+            .collect();
+        // Keep a trailing partial comment buffered for the next event.
+        match self.buffer.rfind("<!--") {
+            Some(open) if !self.buffer[open..].contains("-->") => {
+                self.start += open;
+                self.buffer = self.buffer[open..].to_owned();
+            }
+            _ => {
+                self.buffer.clear();
+            }
+        }
+        found
+    }
+}
+
+/// First-wins annotation intake shared by the section and checklist paths.
+#[derive(Default)]
+struct AnnotationSink {
+    annotation: Option<Annotation>,
+}
+
+impl AnnotationSink {
+    fn accept(&mut self, body: &str, ctx: &str, warnings: &mut Vec<String>) {
+        if self.annotation.is_some() {
+            warnings.push(format!(
+                "multiple tactus annotations in {ctx}; using the first"
+            ));
+            return;
+        }
+        self.annotation = Some(parse_annotation(body, ctx, warnings));
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -135,8 +250,13 @@ struct Draft {
     body: String,
     acceptance: Vec<String>,
     hints: Vec<String>,
-    ann: Annotation,
-    ann_found: bool,
+    ann: Option<Annotation>,
+}
+
+impl Draft {
+    fn annotation(&self) -> Annotation {
+        self.ann.clone().unwrap_or_default()
+    }
 }
 
 fn section_draft(raw: &str, section: &Section, warnings: &mut Vec<String>) -> Draft {
@@ -146,34 +266,47 @@ fn section_draft(raw: &str, section: &Section, warnings: &mut Vec<String>) -> Dr
         title: section.title.clone(),
         ..Draft::default()
     };
+    let mut sink = AnnotationSink::default();
+    if let Some(inline) = &section.inline_annotation {
+        sink.accept(inline, &ctx, warnings);
+    }
     // Spans of tactus annotation comments (slice-relative), removed from body.
     let mut annotation_spans: Vec<Range<usize>> = Vec::new();
+    let mut html = HtmlAccumulator::default();
 
     let mut para_text = String::new();
     let mut in_para = false;
-    // An `Acceptance:`-style paragraph arms the next top-level list.
+    let mut heading_text = String::new();
+    let mut in_heading = false;
+    // An `Acceptance:` paragraph or heading arms the next list.
     let mut armed = false;
     let mut acceptance_list_depth = 0usize;
-    let mut item_text = String::new();
-    let mut in_item = false;
+    // Slots in `draft.acceptance`, one per open item, so a criterion with a
+    // nested sub-list keeps both its own text and the children, in order.
+    let mut item_slots: Vec<usize> = Vec::new();
 
     for (event, range) in Parser::new_ext(slice, md_options()).into_offset_iter() {
+        // HTML accumulates across events; everything else flushes it first.
+        if let Event::Html(t) | Event::InlineHtml(t) = &event {
+            html.push(t, &range);
+        } else {
+            for (span, inner) in html.take_comments() {
+                if let Some(body) = tactus_body(&inner) {
+                    sink.accept(body, &ctx, warnings);
+                    annotation_spans.push(span);
+                }
+            }
+        }
+
         match event {
-            Event::Html(t) | Event::InlineHtml(t) => {
-                for comment in comments_in(&t) {
-                    let Some(body) = comment.inner.trim().strip_prefix("tactus:") else {
-                        continue; // ordinary HTML comments are author content
-                    };
-                    if draft.ann_found {
-                        warnings.push(format!(
-                            "multiple tactus annotations in {ctx}; using the first"
-                        ));
-                    } else {
-                        draft.ann = parse_annotation(body, &ctx, warnings);
-                        draft.ann_found = true;
-                    }
-                    annotation_spans
-                        .push(range.start + comment.span.start..range.start + comment.span.end);
+            Event::Start(Tag::Heading { .. }) => {
+                in_heading = true;
+                heading_text.clear();
+            }
+            Event::End(TagEnd::Heading(_)) => {
+                in_heading = false;
+                if is_acceptance_header(strip_trailing_colon(&heading_text)) {
+                    armed = true;
                 }
             }
             Event::Start(Tag::Paragraph) => {
@@ -183,11 +316,14 @@ fn section_draft(raw: &str, section: &Section, warnings: &mut Vec<String>) -> Dr
             }
             Event::End(TagEnd::Paragraph) => {
                 in_para = false;
-                let text = para_text.trim().trim_end_matches(':').trim_end();
-                if is_acceptance_header(text) {
+                if is_acceptance_header(strip_trailing_colon(&para_text)) {
                     armed = true;
                 }
             }
+            // Blocks that end an acceptance run; HTML comments and headings
+            // deliberately do not, so an invisible annotation between the
+            // header and its list cannot silently disarm collection.
+            Event::Start(Tag::CodeBlock(_)) | Event::Start(Tag::Table(_)) => armed = false,
             Event::Start(Tag::List(_)) => {
                 if armed || acceptance_list_depth > 0 {
                     acceptance_list_depth += 1;
@@ -199,52 +335,66 @@ fn section_draft(raw: &str, section: &Section, warnings: &mut Vec<String>) -> Dr
             }
             Event::Start(Tag::Item) => {
                 if acceptance_list_depth > 0 {
-                    in_item = true;
-                    item_text.clear();
+                    item_slots.push(draft.acceptance.len());
+                    draft.acceptance.push(String::new());
                 }
             }
             Event::End(TagEnd::Item) => {
-                if acceptance_list_depth > 0 && in_item {
-                    let text = item_text.trim();
-                    if !text.is_empty() {
-                        draft.acceptance.push(text.to_owned());
-                    }
-                    in_item = false;
-                }
-            }
-            Event::Start(_) => {
-                armed = false;
+                item_slots.pop();
             }
             Event::Text(t) => {
-                if in_item {
-                    item_text.push_str(&t);
+                if let Some(slot) = item_slots.last() {
+                    draft.acceptance[*slot].push_str(&t);
                 }
                 if in_para {
                     para_text.push_str(&t);
+                }
+                if in_heading {
+                    heading_text.push_str(&t);
                 }
                 collect_text_hints(&t, &mut draft.hints);
             }
             Event::Code(t) => {
-                if in_item {
-                    item_text.push_str(&t);
+                if let Some(slot) = item_slots.last() {
+                    draft.acceptance[*slot].push_str(&t);
                 }
                 if in_para {
                     para_text.push_str(&t);
                 }
+                if in_heading {
+                    heading_text.push_str(&t);
+                }
                 collect_code_hint(&t, &mut draft.hints);
             }
             Event::SoftBreak | Event::HardBreak => {
-                if in_item {
-                    item_text.push(' ');
+                if let Some(slot) = item_slots.last() {
+                    draft.acceptance[*slot].push(' ');
                 }
                 if in_para {
                     para_text.push(' ');
+                }
+                if in_heading {
+                    heading_text.push(' ');
                 }
             }
             _ => {}
         }
     }
+    for (span, inner) in html.take_comments() {
+        if let Some(body) = tactus_body(&inner) {
+            sink.accept(body, &ctx, warnings);
+            annotation_spans.push(span);
+        }
+    }
 
+    draft.acceptance = draft
+        .acceptance
+        .into_iter()
+        .map(|c| c.trim().to_owned())
+        .filter(|c| !c.is_empty())
+        .collect();
+    draft.ann = sink.annotation;
+    annotation_spans.sort_by_key(|s| s.start);
     draft.body = strip_spans(slice, &annotation_spans).trim().to_owned();
     draft
 }
@@ -263,11 +413,24 @@ fn checklist_drafts(raw: &str, warnings: &mut Vec<String>) -> Vec<Draft> {
     let mut drafts = Vec::new();
     let mut list_depth = 0usize;
     let mut item_depth = 0usize;
-    let mut current: Option<Draft> = None;
+    let mut current: Option<(Draft, AnnotationSink)> = None;
     let mut is_task_item = false;
     let mut top_list_ordered = false;
+    let mut html = HtmlAccumulator::default();
 
-    for (event, _range) in Parser::new_ext(raw, md_options()).into_offset_iter() {
+    for (event, range) in Parser::new_ext(raw, md_options()).into_offset_iter() {
+        if let Event::Html(t) | Event::InlineHtml(t) = &event {
+            html.push(t, &range);
+        } else if let Some((_, sink)) = current.as_mut() {
+            for (_, inner) in html.take_comments() {
+                if let Some(body) = tactus_body(&inner) {
+                    sink.accept(body, "checklist item", warnings);
+                }
+            }
+        } else {
+            let _ = html.take_comments();
+        }
+
         match event {
             Event::Start(Tag::List(start)) => {
                 if list_depth == 0 {
@@ -279,17 +442,18 @@ fn checklist_drafts(raw: &str, warnings: &mut Vec<String>) -> Vec<Draft> {
             Event::Start(Tag::Item) => {
                 item_depth += 1;
                 if list_depth == 1 && item_depth == 1 {
-                    current = Some(Draft::default());
+                    current = Some((Draft::default(), AnnotationSink::default()));
                     is_task_item = top_list_ordered;
                 }
             }
             Event::End(TagEnd::Item) => {
                 if list_depth == 1
                     && item_depth == 1
-                    && let Some(mut draft) = current.take()
+                    && let Some((mut draft, sink)) = current.take()
                 {
                     draft.title = draft.title.trim().to_owned();
                     draft.body = draft.body.trim().to_owned();
+                    draft.ann = sink.annotation;
                     if is_task_item && !draft.title.is_empty() {
                         drafts.push(draft);
                     }
@@ -301,26 +465,8 @@ fn checklist_drafts(raw: &str, warnings: &mut Vec<String>) -> Vec<Draft> {
                     is_task_item = true;
                 }
             }
-            Event::Html(t) | Event::InlineHtml(t) => {
-                if let Some(draft) = current.as_mut() {
-                    for comment in comments_in(&t) {
-                        let Some(body) = comment.inner.trim().strip_prefix("tactus:") else {
-                            continue;
-                        };
-                        if draft.ann_found {
-                            warnings.push(
-                                "multiple tactus annotations in checklist item; using the first"
-                                    .to_owned(),
-                            );
-                        } else {
-                            draft.ann = parse_annotation(body, "checklist item", warnings);
-                            draft.ann_found = true;
-                        }
-                    }
-                }
-            }
             Event::Text(t) | Event::Code(t) => {
-                if let Some(draft) = current.as_mut() {
+                if let Some((draft, _)) = current.as_mut() {
                     if list_depth == 1 && item_depth == 1 {
                         draft.title.push_str(&t);
                     } else {
@@ -328,6 +474,16 @@ fn checklist_drafts(raw: &str, warnings: &mut Vec<String>) -> Vec<Draft> {
                         draft.body.push(' ');
                     }
                     collect_text_hints(&t, &mut draft.hints);
+                }
+            }
+            // A wrapped title must not run its words together.
+            Event::SoftBreak | Event::HardBreak => {
+                if let Some((draft, _)) = current.as_mut() {
+                    if list_depth == 1 && item_depth == 1 {
+                        draft.title.push(' ');
+                    } else {
+                        draft.body.push(' ');
+                    }
                 }
             }
             _ => {}
@@ -340,7 +496,7 @@ fn checklist_drafts(raw: &str, warnings: &mut Vec<String>) -> Vec<Draft> {
 // Annotation grammar
 // ---------------------------------------------------------------------------
 
-#[derive(Default)]
+#[derive(Default, Clone)]
 struct Annotation {
     id: Option<String>,
     kind: Option<TaskKind>,
@@ -495,23 +651,24 @@ fn push_unique(items: &mut Vec<String>, candidate: &str) {
 fn assemble(drafts: Vec<Draft>) -> Vec<Task> {
     // Reserve explicit ids first so derived slugs never collide with them.
     // Explicit duplicates are left intact for validation to report.
-    let mut taken: Vec<String> = drafts.iter().filter_map(|d| d.ann.id.clone()).collect();
+    let mut taken: Vec<String> = drafts
+        .iter()
+        .filter_map(|d| d.annotation().id.clone())
+        .collect();
     let mut previous_id: Option<TaskId> = None;
     let mut tasks = Vec::with_capacity(drafts.len());
     for draft in drafts {
-        let id = match draft.ann.id.clone() {
+        let ann = draft.annotation();
+        let id = match ann.id.clone() {
             Some(explicit) => explicit,
             None => unique_slug(&draft.title, &mut taken),
         };
-        let kind = draft
-            .ann
-            .kind
-            .unwrap_or_else(|| heuristic_kind(&draft.title));
-        let depends_on: Vec<TaskId> = match &draft.ann.depends {
+        let kind = ann.kind.unwrap_or_else(|| heuristic_kind(&draft.title));
+        let depends_on: Vec<TaskId> = match &ann.depends {
             Some(ids) => ids.iter().map(|s| TaskId::from(s.as_str())).collect(),
             None => previous_id.clone().into_iter().collect(),
         };
-        let mut path_hints = draft.ann.paths.clone();
+        let mut path_hints = ann.paths.clone();
         for hint in &draft.hints {
             push_unique(&mut path_hints, hint);
         }
@@ -523,16 +680,14 @@ fn assemble(drafts: Vec<Draft>) -> Vec<Task> {
             depends_on,
             acceptance: draft.acceptance,
             path_hints,
-            suggested_tier: draft.ann.tier,
-            min_tier: draft.ann.min,
-            artifacts_in: draft
-                .ann
+            suggested_tier: ann.tier,
+            min_tier: ann.min,
+            artifacts_in: ann
                 .needs
                 .iter()
                 .map(|s| ArtifactId::from(s.as_str()))
                 .collect(),
-            artifacts_out: draft
-                .ann
+            artifacts_out: ann
                 .out
                 .iter()
                 .map(|s| ArtifactId::from(s.as_str()))
@@ -863,6 +1018,128 @@ mod tests {
         assert_eq!(hints[0], "src/api/**", "annotation paths come first");
         assert!(hints.iter().any(|h| h == "src/api/cursor.rs"));
         assert!(hints.iter().any(|h| h == "src/api/mod.rs"));
+    }
+
+    #[test]
+    fn nested_acceptance_items_keep_the_parent_criterion() {
+        let parsed = parse(
+            "## Task\n\nAcceptance:\n- Cursor format documented\n  - covers the base64 form\n- Errors covered\n",
+        );
+        assert_eq!(
+            parsed.plan.tasks[0].acceptance,
+            [
+                "Cursor format documented",
+                "covers the base64 form",
+                "Errors covered"
+            ],
+            "parent and child criteria both survive, in document order"
+        );
+    }
+
+    #[test]
+    fn acceptance_heading_forms_arm_without_becoming_tasks() {
+        let parsed = parse(
+            "## Implement search\n\nBuild it.\n\n### Acceptance\n- Field list agreed\n\n## Next task\n",
+        );
+        let tasks = &parsed.plan.tasks;
+        assert_eq!(tasks.len(), 2, "`### Acceptance` is not a task: {tasks:?}");
+        assert_eq!(tasks[0].acceptance, ["Field list agreed"]);
+        assert_eq!(tasks[1].title, "Next task");
+
+        // Deeper heading form inside a section arms too.
+        let parsed = parse("## Task\n\n#### Done when\n- it works\n");
+        assert_eq!(parsed.plan.tasks[0].acceptance, ["it works"]);
+    }
+
+    #[test]
+    fn an_invisible_comment_does_not_disarm_acceptance() {
+        let parsed = parse(
+            "## Task\n<!-- tactus: id=t1 -->\n\nAcceptance:\n\n<!-- note -->\n\n- still collected\n",
+        );
+        assert_eq!(parsed.plan.tasks[0].acceptance, ["still collected"]);
+    }
+
+    #[test]
+    fn headings_inside_containers_are_not_tasks() {
+        let raw = "## Review notes\n\n> ## Original proposal\n> keep cursors opaque\n\nOur take.\n";
+        let parsed = parse(raw);
+        let tasks = &parsed.plan.tasks;
+        assert_eq!(
+            tasks.len(),
+            1,
+            "quoted heading must not spawn a task: {tasks:?}"
+        );
+        assert_eq!(tasks[0].title, "Review notes");
+        assert!(
+            tasks[0].body.contains("Our take"),
+            "body survives past the quote"
+        );
+    }
+
+    #[test]
+    fn multi_line_annotations_are_parsed() {
+        let parsed = parse(
+            "## Design the API\n<!-- tactus: id=api-design kind=design\n     depends= tier=frontier -->\nBody text.\n",
+        );
+        let task = &parsed.plan.tasks[0];
+        assert_eq!(task.id, TaskId::from("api-design"));
+        assert_eq!(task.kind, TaskKind::Design);
+        assert_eq!(task.suggested_tier, Some(Tier::Frontier));
+        assert!(task.depends_on.is_empty(), "depends= honored across lines");
+        assert!(
+            !task.body.contains("tactus:"),
+            "annotation stripped: {}",
+            task.body
+        );
+        assert!(
+            parsed.warnings.is_empty(),
+            "warnings: {:?}",
+            parsed.warnings
+        );
+    }
+
+    #[test]
+    fn inline_heading_annotations_are_parsed() {
+        let parsed = parse("## Fix the parser <!-- tactus: id=fix-1 depends= -->\nBody.\n");
+        let task = &parsed.plan.tasks[0];
+        assert_eq!(task.id, TaskId::from("fix-1"));
+        assert!(task.depends_on.is_empty());
+        assert!(!task.title.contains("tactus"), "title: {}", task.title);
+    }
+
+    #[test]
+    fn wrapped_checklist_titles_keep_word_spacing() {
+        let raw =
+            "# Plan\n\n1. Implement the token-bucket\n   middleware for the API\n2. Ship it\n";
+        let parsed = parse(raw);
+        assert_eq!(
+            parsed.plan.tasks[0].title,
+            "Implement the token-bucket middleware for the API"
+        );
+        assert_eq!(
+            parsed.plan.tasks[0].id,
+            TaskId::from("implement-the-token-bucket-middleware-for-the-api")
+        );
+    }
+
+    #[test]
+    fn crlf_plans_parse_identically() {
+        let lf = fixture("sample-plan.md").replace("\r\n", "\n");
+        let crlf = lf.replace('\n', "\r\n");
+        let from_lf = MarkdownPlanAdapter
+            .parse_with_warnings(&lf)
+            .expect("lf parses");
+        let from_crlf = MarkdownPlanAdapter
+            .parse_with_warnings(&crlf)
+            .expect("crlf parses");
+        assert_eq!(from_lf.plan.source.hash, from_crlf.plan.source.hash);
+        let ids =
+            |p: &Parsed| -> Vec<String> { p.plan.tasks.iter().map(|t| t.id.to_string()).collect() };
+        assert_eq!(ids(&from_lf), ids(&from_crlf));
+        assert_eq!(
+            from_lf.plan.tasks[0].acceptance,
+            from_crlf.plan.tasks[0].acceptance
+        );
     }
 
     #[test]

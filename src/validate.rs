@@ -5,6 +5,7 @@ use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 
+use crate::agent;
 use crate::config::{self, Config};
 use crate::error::{TactusError, ValidationErrors};
 use crate::gates::{self, ShellGate};
@@ -39,9 +40,9 @@ pub struct Report {
     pub rows: Vec<Row>,
     pub warnings: Vec<String>,
     pub strategy: String,
+    pub capacity: String,
     pub gates: Vec<String>,
     pub gates_from_config: bool,
-    pub task_count: usize,
 }
 
 /// The shared front half of `validate` and the engine's pre-flight (§14:
@@ -76,6 +77,30 @@ pub fn analyze(opts: &ValidateOptions) -> Result<Analysis, TactusError> {
         &mut all_warnings,
     )?;
     check_graph(&plan, &mut all_warnings)?;
+    // A pin naming an agent with no adapter must fail the same way in
+    // `validate` and `run`; otherwise the preview promises a binding the run
+    // then refuses at pre-flight (§18).
+    for pin in &config.pins {
+        if agent::by_id(&pin.agent).is_none() {
+            return Err(TactusError::Config {
+                path: opts
+                    .config_path
+                    .clone()
+                    .unwrap_or_else(|| opts.config_root.join("tactus.toml")),
+                message: format!(
+                    "pin for tier `{}` names agent `{}`, which has no adapter in this build \
+                     (available: {})",
+                    pin.tier,
+                    pin.agent,
+                    agent::ADAPTERS
+                        .iter()
+                        .map(|a| a.id())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ),
+            });
+        }
+    }
     let chains = plan
         .tasks
         .iter()
@@ -117,14 +142,28 @@ pub fn run(opts: &ValidateOptions) -> Result<Report, TactusError> {
         .map(|(task, chain)| to_row(task, chain.clone()))
         .collect();
     Ok(Report {
-        task_count: analysis.plan.tasks.len(),
         rows,
         warnings,
         strategy: strategy_echo(&analysis.config),
+        capacity: capacity_echo(&analysis.config),
         gates: analysis.gates.iter().map(|g| g.name.clone()).collect(),
         gates_from_config: analysis.gates_from_config,
         plan: analysis.plan,
     })
+}
+
+/// §13 is read-only until the capacity engine lands: name the pools that were
+/// connected so the preview reflects what `tactus connect` actually wrote.
+fn capacity_echo(cfg: &Config) -> String {
+    if cfg.pool_names.is_empty() {
+        "capacity: not connected".to_owned()
+    } else {
+        format!(
+            "capacity: {} pool(s) connected — {} (estimates arrive with the capacity engine)",
+            cfg.pool_names.len(),
+            cfg.pool_names.join(", ")
+        )
+    }
 }
 
 /// Duplicate ids, unknown `depends` targets, then cycles — all collected so a
@@ -165,6 +204,7 @@ fn check_graph(plan: &Plan, warnings: &mut Vec<String>) -> Result<(), TactusErro
 /// on its producer, or execution order cannot guarantee the artifact exists.
 /// The plan is frozen (§5), so this warns rather than inventing edges.
 fn check_artifact_wiring(plan: &Plan, warnings: &mut Vec<String>) {
+    let index = index_by_id(plan);
     for task in &plan.tasks {
         for needed in &task.artifacts_in {
             let producer = plan
@@ -174,7 +214,7 @@ fn check_artifact_wiring(plan: &Plan, warnings: &mut Vec<String>) {
                 .and_then(|a| a.produced_by.as_ref());
             // Unknown producers already warned during parsing.
             let Some(producer) = producer else { continue };
-            if *producer != task.id && !depends_transitively(plan, &task.id, producer) {
+            if *producer != task.id && !depends_transitively(&index, &task.id, producer) {
                 warnings.push(format!(
                     "task `{}` needs artifact `{needed}` produced by `{producer}` but does not \
                      depend on it (directly or transitively)",
@@ -185,8 +225,12 @@ fn check_artifact_wiring(plan: &Plan, warnings: &mut Vec<String>) {
     }
 }
 
-fn depends_transitively(plan: &Plan, from: &TaskId, target: &TaskId) -> bool {
-    let index: BTreeMap<&str, &Task> = plan.tasks.iter().map(|t| (t.id.as_str(), t)).collect();
+/// Id → task, built once per pass and shared by the graph checks.
+fn index_by_id(plan: &Plan) -> BTreeMap<&str, &Task> {
+    plan.tasks.iter().map(|t| (t.id.as_str(), t)).collect()
+}
+
+fn depends_transitively(index: &BTreeMap<&str, &Task>, from: &TaskId, target: &TaskId) -> bool {
     let mut queue: Vec<&TaskId> = index
         .get(from.as_str())
         .map(|t| t.depends_on.iter().collect())
@@ -357,8 +401,9 @@ impl Report {
         }
         out.push_str(&self.strategy);
         out.push('\n');
-        out.push_str("capacity: not connected\n");
-        out.push_str(&format!("ok: {} tasks, no cycles\n", self.task_count));
+        out.push_str(&self.capacity);
+        out.push('\n');
+        out.push_str(&format!("ok: {} tasks, no cycles\n", self.plan.tasks.len()));
         out
     }
 
@@ -396,6 +441,45 @@ mod tests {
                     .join("p.toml"),
             ),
         }
+    }
+
+    #[test]
+    fn a_pin_without_an_adapter_fails_validate_not_just_run() {
+        let root = env::temp_dir().join(format!("tactus-validate-pin-{}", std::process::id()));
+        fs::create_dir_all(&root).expect("root");
+        let cfg = root.join("tactus.toml");
+        // copilot is in the capability catalog but has no adapter until step 9.
+        fs::write(
+            &cfg,
+            "[[pins]]\ntier = \"frontier\"\nagent = \"copilot\"\nmodel = \"gpt-5\"\n",
+        )
+        .expect("config");
+        let mut o = opts("fixtures/sample-plan.md");
+        o.config_path = Some(cfg);
+        let err = run(&o).expect_err("preview must not promise a binding run would refuse");
+        let message = err.to_string();
+        assert!(message.contains("no adapter"), "got: {message}");
+        assert!(
+            message.contains("claude-code"),
+            "lists what is available: {message}"
+        );
+    }
+
+    #[test]
+    fn connected_pools_are_named_in_the_capacity_line() {
+        let dir = env::temp_dir().join(format!("tactus-validate-pools-{}", std::process::id()));
+        fs::create_dir_all(&dir).expect("dir");
+        let pools = dir.join("pools.toml");
+        fs::write(
+            &pools,
+            "[pools.claude-max]\nkind = \"subscription-window\"\nagent = \"claude-code\"\n",
+        )
+        .expect("pools");
+        let mut o = opts("fixtures/sample-plan.md");
+        o.pools_path = Some(pools);
+        let rendered = run(&o).expect("validates").render();
+        assert!(rendered.contains("claude-max"), "rendered:\n{rendered}");
+        assert!(!rendered.contains("capacity: not connected"));
     }
 
     #[test]

@@ -9,6 +9,7 @@
 
 use std::path::PathBuf;
 use std::process::Command;
+use std::sync::OnceLock;
 use std::time::Duration;
 
 use serde_json::{Value, json};
@@ -17,6 +18,7 @@ use super::proc::{self, ProcessOutput};
 use super::{AgentAdapter, Caps, TaskRun};
 use crate::error::TactusError;
 use crate::ir::{Outcome, OutcomeStatus, PermissionMode, Usage, WorkerProfile};
+use crate::util;
 
 pub const ADAPTER_ID: &str = "claude-code";
 
@@ -31,9 +33,11 @@ impl AgentAdapter for ClaudeCodeAdapter {
 
     fn probe(&self) -> Result<Caps, TactusError> {
         let invocation = locate()?;
-        let mut cmd = invocation.command();
-        cmd.arg("--version");
-        let out = proc::run_with_timeout(cmd, "", PROBE_TIMEOUT)?;
+        let out = proc::run_with_timeout(
+            invocation.command(&["--version".to_owned()]),
+            "",
+            PROBE_TIMEOUT,
+        )?;
         if out.timed_out {
             return Err(TactusError::Agent {
                 message: format!("`{}` --version timed out", invocation.display()),
@@ -49,28 +53,79 @@ impl AgentAdapter for ClaudeCodeAdapter {
                 ),
             });
         }
+        let version = extract_version(&out.stdout);
+
+        // Capabilities are read from `--help`, not assumed: this CLI has
+        // removed and hidden flags between releases, and a missing flag must
+        // surface as a pre-flight refusal rather than as per-task failures
+        // once a run is already spending (§16, §19).
+        let help = proc::run_with_timeout(
+            invocation.command(&["--help".to_owned()]),
+            "",
+            PROBE_TIMEOUT,
+        )?;
+        let help_text = format!("{}{}", help.stdout, help.stderr);
+        // An unreadable --help is not fatal; fall back to assuming the flags
+        // this adapter needs are present and let build/parse report reality.
+        let has = |flag: &str| !help.stdout.is_empty() && help_text.contains(flag);
+        let readable = help.code == Some(0) && !help_text.trim().is_empty();
+        if readable {
+            let required = [
+                "-p",
+                "--output-format",
+                "--model",
+                "--settings",
+                "--setting-sources",
+                "--permission-mode",
+            ];
+            let missing: Vec<&str> = required
+                .into_iter()
+                .filter(|flag| !help_text.contains(flag))
+                .collect();
+            if !missing.is_empty() {
+                return Err(TactusError::Agent {
+                    message: format!(
+                        "claude {version} does not advertise required flag(s): {}. This adapter \
+                         pins known-good behavior per version — upgrade tactus or pin an older \
+                         claude.",
+                        missing.join(", ")
+                    ),
+                });
+            }
+        }
         Ok(Caps {
-            version: extract_version(&out.stdout),
-            json_output: true,
-            session_resume: true,
+            version,
+            json_output: !readable || has("--output-format"),
+            session_resume: !readable || has("--resume"),
             cost_reporting: true,
             // No single flag; achieved through the permission settings.
             read_only_mode: true,
-            acp: false,
-            model_list: false,
+            acp: readable && has("--acp"),
+            model_list: readable && has("--list-models"),
         })
     }
 
     fn build(&self, run: &TaskRun) -> Result<Command, TactusError> {
         let invocation = locate()?;
-        let mut cmd = invocation.command();
-        cmd.args(build_args(run));
+        let mut cmd = invocation.command(&build_args(run));
         cmd.current_dir(&run.workspace);
         Ok(cmd)
     }
 
     fn parse(&self, out: &ProcessOutput) -> Result<Outcome, TactusError> {
         Ok(parse_output(out))
+    }
+
+    fn materialize_permissions(
+        &self,
+        profile: &WorkerProfile,
+        gate_cmds: &[String],
+        dir: &std::path::Path,
+        stem: &str,
+    ) -> Result<Option<PathBuf>, TactusError> {
+        let path = dir.join(format!("{stem}.json"));
+        util::write_json(&path, &permission_settings(profile, gate_cmds))?;
+        Ok(Some(path))
     }
 }
 
@@ -83,6 +138,16 @@ pub fn build_args(run: &TaskRun) -> Vec<String> {
         "json".to_owned(),
         "--model".to_owned(),
         run.profile.model.clone(),
+        // Anything not explicitly allowed is denied rather than prompted:
+        // an unattended run must never sit waiting on a permission question.
+        "--permission-mode".to_owned(),
+        "dontAsk".to_owned(),
+        // Load NO user/project/local settings: the per-run settings file is
+        // the whole permission surface. Without this, allow rules from
+        // ~/.claude/settings.json (or a repo's own .claude/settings.json)
+        // union with ours and silently widen the sandbox (§20).
+        "--setting-sources".to_owned(),
+        String::new(),
     ];
     if let Some(turns) = run.profile.max_turns {
         args.push("--max-turns".to_owned());
@@ -119,7 +184,22 @@ pub fn permission_settings(profile: &WorkerProfile, gate_cmds: &[String]) -> Val
     json!({
         "permissions": {
             "allow": allow,
-            "deny": ["WebFetch", "WebSearch", "Bash(curl:*)", "Bash(wget:*)"],
+            // No network tools; and no writing to the files that decide what
+            // later attempts may do — an agent that can edit .claude/ or
+            // .git/ config escalates its own permissions for the rest of the
+            // run (invariant 1 and §20).
+            "deny": [
+                "WebFetch",
+                "WebSearch",
+                "Bash(curl:*)",
+                "Bash(wget:*)",
+                "Write(.claude/**)",
+                "Edit(.claude/**)",
+                "Write(**/.claude/**)",
+                "Edit(**/.claude/**)",
+                "Write(.git/**)",
+                "Edit(.git/**)",
+            ],
         }
     })
 }
@@ -149,6 +229,7 @@ fn parse_output(out: &ProcessOutput) -> Outcome {
     let mut outcome = Outcome {
         status: OutcomeStatus::AgentError,
         diff: String::new(),
+        detail: None,
         session_id: None,
         usage: None,
         cost_usd: None,
@@ -158,6 +239,8 @@ fn parse_output(out: &ProcessOutput) -> Outcome {
     };
 
     let payload: Option<Value> = serde_json::from_str(out.stdout.trim()).ok();
+    let mut result_text: Option<String> = None;
+    let mut subtype: Option<String> = None;
     if let Some(payload) = &payload {
         outcome.session_id = payload
             .get("session_id")
@@ -168,30 +251,61 @@ fn parse_output(out: &ProcessOutput) -> Outcome {
             .or_else(|| payload.get("cost_usd"))
             .and_then(Value::as_f64);
         outcome.usage = parse_usage(payload);
+        result_text = payload
+            .get("result")
+            .and_then(Value::as_str)
+            .map(str::to_owned);
+        subtype = payload
+            .get("subtype")
+            .and_then(Value::as_str)
+            .map(str::to_owned);
     }
 
     if out.timed_out {
         outcome.status = OutcomeStatus::Timeout;
+        outcome.detail = Some("attempt exceeded its wall-clock timeout".to_owned());
         return outcome;
     }
-    if looks_rate_limited(&out.stderr)
-        || payload.as_ref().is_some_and(|p| {
-            p.get("result")
-                .and_then(Value::as_str)
-                .is_some_and(looks_rate_limited)
-        })
-    {
-        outcome.status = OutcomeStatus::RateLimited;
-        return outcome;
-    }
-    let succeeded = out.code == Some(0)
-        && payload
-            .as_ref()
-            .is_some_and(|p| !p.get("is_error").and_then(Value::as_bool).unwrap_or(false));
-    if succeeded {
+
+    let is_error = payload
+        .as_ref()
+        .is_some_and(|p| p.get("is_error").and_then(Value::as_bool).unwrap_or(false));
+    let failed = out.code != Some(0) || payload.is_none() || is_error;
+    if !failed {
         outcome.status = OutcomeStatus::Completed;
+        return outcome;
     }
+
+    // Rate-limit detection only applies to failures: a SUCCESSFUL task about
+    // rate limiting ("added backoff for 429 responses") must never be read as
+    // the pool being exhausted.
+    let rate_limited = looks_rate_limited(&out.stderr)
+        || result_text.as_deref().is_some_and(looks_rate_limited)
+        || subtype.as_deref().is_some_and(looks_rate_limited);
+    outcome.status = if rate_limited {
+        OutcomeStatus::RateLimited
+    } else {
+        OutcomeStatus::AgentError
+    };
+    // Give the engine something to report: the CLI signals most failures
+    // through the JSON body with an empty stderr.
+    outcome.detail = first_non_empty([
+        result_text.as_deref(),
+        subtype.as_deref(),
+        Some(out.stderr.trim()),
+        (payload.is_none() && !out.stdout.trim().is_empty())
+            .then_some("agent produced unparseable output"),
+    ]);
     outcome
+}
+
+fn first_non_empty<'a>(candidates: impl IntoIterator<Item = Option<&'a str>>) -> Option<String> {
+    candidates
+        .into_iter()
+        .flatten()
+        .map(str::trim)
+        .find(|c| !c.is_empty())
+        .map(str::to_owned)
 }
 
 fn parse_usage(payload: &Value) -> Option<Usage> {
@@ -209,13 +323,25 @@ fn parse_usage(payload: &Value) -> Option<Usage> {
     })
 }
 
-/// Rate-limit signals are ground truth for the capacity engine (§13); detect
-/// them from either stream, case-insensitively.
+/// Rate-limit signals are ground truth for the capacity engine (§13). Phrases
+/// cover both the subscription-window wording the CLI prints ("5-hour limit
+/// reached", "Weekly limit reached") and API-level errors. Only consulted for
+/// failed attempts — see `parse_output`.
 fn looks_rate_limited(text: &str) -> bool {
     let lower = text.to_ascii_lowercase();
-    ["usage limit", "rate limit", "overloaded", "429"]
-        .iter()
-        .any(|needle| lower.contains(needle))
+    [
+        "usage limit",
+        "rate limit",
+        "rate_limit",
+        "limit reached",
+        "limit exceeded",
+        "overloaded",
+        "quota exceeded",
+        "insufficient credits",
+        "429",
+    ]
+    .iter()
+    .any(|needle| lower.contains(needle))
 }
 
 // ---------------------------------------------------------------------------
@@ -226,23 +352,73 @@ fn looks_rate_limited(text: &str) -> bool {
 #[derive(Debug, Clone)]
 pub struct Invocation {
     path: PathBuf,
+    /// `.cmd`/`.bat` shims (npm installs) are batch scripts: CreateProcess
+    /// cannot exec them, so they run through `cmd /C`.
     via_cmd_shell: bool,
 }
 
 impl Invocation {
-    fn command(&self) -> Command {
+    fn command(&self, args: &[String]) -> Command {
         if self.via_cmd_shell {
             let mut cmd = Command::new("cmd");
-            cmd.arg("/C").arg(&self.path);
+            cmd.arg("/C");
+            // std quotes each arg for CommandLineToArgvW, which cmd.exe does
+            // NOT follow: with more than one quoted argument its
+            // strip-first-and-last-quote rule mangles the shim path. Build the
+            // whole line ourselves and pass it verbatim, wrapped in the outer
+            // quote pair cmd strips.
+            #[cfg(windows)]
+            {
+                use std::os::windows::process::CommandExt;
+                cmd.raw_arg(cmd_c_line(&self.path, args));
+            }
+            #[cfg(not(windows))]
+            {
+                cmd.arg(&self.path).args(args);
+            }
             cmd
         } else {
-            Command::new(&self.path)
+            let mut cmd = Command::new(&self.path);
+            cmd.args(args);
+            cmd
         }
     }
 
     fn display(&self) -> String {
         self.path.to_string_lossy().into_owned()
     }
+}
+
+/// `"<program>" <args…>` wrapped in the outer quote pair `cmd /C` strips.
+fn cmd_c_line(program: &std::path::Path, args: &[String]) -> String {
+    let mut line = String::from("\"");
+    line.push_str(&quote_for_cmd(&program.to_string_lossy()));
+    for arg in args {
+        line.push(' ');
+        line.push_str(&quote_for_cmd(arg));
+    }
+    line.push('"');
+    line
+}
+
+fn quote_for_cmd(arg: &str) -> String {
+    let needs_quotes = arg.is_empty()
+        || arg.chars().any(|c| {
+            c.is_whitespace() || matches!(c, '"' | '&' | '|' | '<' | '>' | '^' | '(' | ')')
+        });
+    if !needs_quotes {
+        return arg.to_owned();
+    }
+    let mut out = String::with_capacity(arg.len() + 2);
+    out.push('"');
+    for ch in arg.chars() {
+        if ch == '"' {
+            out.push('\\');
+        }
+        out.push(ch);
+    }
+    out.push('"');
+    out
 }
 
 fn candidate_names() -> &'static [&'static str] {
@@ -253,28 +429,33 @@ fn candidate_names() -> &'static [&'static str] {
     }
 }
 
+/// PATH resolution is process-stable, and the engine builds one command per
+/// task after probing — resolve once.
+static RESOLVED: OnceLock<Option<Invocation>> = OnceLock::new();
+
 fn locate() -> Result<Invocation, TactusError> {
-    let path_var = std::env::var_os("PATH").unwrap_or_default();
-    for dir in std::env::split_paths(&path_var) {
-        for name in candidate_names() {
-            let candidate = dir.join(name);
-            if candidate.is_file() {
-                let via_cmd_shell = candidate.extension().is_some_and(|e| {
-                    e.eq_ignore_ascii_case("cmd") || e.eq_ignore_ascii_case("bat")
-                });
-                return Ok(Invocation {
-                    path: candidate,
-                    via_cmd_shell,
-                });
-            }
-        }
-    }
-    Err(TactusError::Agent {
-        message: format!(
-            "claude binary not found on PATH (looked for {}); install Claude Code or adjust PATH",
-            candidate_names().join(", ")
-        ),
-    })
+    RESOLVED
+        .get_or_init(|| {
+            candidate_names().iter().find_map(|name| {
+                // util::find_program skips empty PATH segments, which would
+                // otherwise resolve a bare name against the current directory
+                // — i.e. run a binary out of the repo being worked on.
+                util::find_program(name).map(|path| Invocation {
+                    via_cmd_shell: path.extension().is_some_and(|e| {
+                        e.eq_ignore_ascii_case("cmd") || e.eq_ignore_ascii_case("bat")
+                    }),
+                    path,
+                })
+            })
+        })
+        .clone()
+        .ok_or_else(|| TactusError::Agent {
+            message: format!(
+                "claude binary not found on PATH (looked for {}); install Claude Code or adjust \
+                 PATH",
+                candidate_names().join(", ")
+            ),
+        })
 }
 
 #[cfg(test)]
@@ -411,6 +592,115 @@ mod tests {
         let stdout = r#"{"type":"result","is_error":true,"result":"5-hour rate limit hit"}"#;
         let outcome = parse_output(&output(Some(0), stdout, ""));
         assert_eq!(outcome.status, OutcomeStatus::RateLimited);
+    }
+
+    #[test]
+    fn shipped_subscription_limit_phrasings_are_detected() {
+        for phrase in [
+            "5-hour limit reached ∙ resets 6pm",
+            "Weekly limit reached",
+            "Session limit reached",
+            "API error: rate_limit_error",
+            "quota exceeded",
+        ] {
+            let stdout = format!(
+                r#"{{"type":"result","is_error":true,"result":"{}"}}"#,
+                phrase.replace('"', "")
+            );
+            assert_eq!(
+                parse_output(&output(Some(1), &stdout, "")).status,
+                OutcomeStatus::RateLimited,
+                "phrase should signal a rate limit: {phrase}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_successful_task_about_rate_limits_is_not_rate_limited() {
+        // The agent's own summary mentioning 429s must not be read as the
+        // pool being exhausted — that would roll back verified work.
+        let stdout = r#"{"type":"result","subtype":"success","is_error":false,
+            "result":"Added backoff handling for HTTP 429 rate limit responses.",
+            "session_id":"s1","total_cost_usd":0.2}"#;
+        let outcome = parse_output(&output(Some(0), stdout, ""));
+        assert_eq!(outcome.status, OutcomeStatus::Completed);
+    }
+
+    #[test]
+    fn json_error_failures_carry_a_reportable_detail() {
+        let stdout = r#"{"type":"result","subtype":"error_max_turns","is_error":true,
+            "session_id":"s1","result":"Reached the maximum number of turns."}"#;
+        let outcome = parse_output(&output(Some(0), stdout, ""));
+        assert_eq!(outcome.status, OutcomeStatus::AgentError);
+        assert_eq!(
+            outcome.detail.as_deref(),
+            Some("Reached the maximum number of turns."),
+            "the engine has something to show without opening the transcript"
+        );
+
+        // Falls back to the subtype, then stderr, then a pointer.
+        let stdout = r#"{"is_error":true,"subtype":"error_during_execution"}"#;
+        let outcome = parse_output(&output(Some(0), stdout, ""));
+        assert_eq!(outcome.detail.as_deref(), Some("error_during_execution"));
+        let outcome = parse_output(&output(Some(2), "", "spawn failed"));
+        assert_eq!(outcome.detail.as_deref(), Some("spawn failed"));
+    }
+
+    #[test]
+    fn headless_args_pin_the_sandbox() {
+        let joined = build_args(&task_run()).join(" ");
+        assert!(
+            joined.contains("--permission-mode dontAsk"),
+            "unattended runs must deny rather than wait: {joined}"
+        );
+        assert!(
+            joined.contains("--setting-sources "),
+            "external settings must not widen the sandbox: {joined}"
+        );
+        let args = build_args(&task_run());
+        let index = args
+            .iter()
+            .position(|a| a == "--setting-sources")
+            .expect("flag");
+        assert_eq!(args[index + 1], "", "empty list loads no external sources");
+    }
+
+    #[test]
+    fn permission_settings_protect_the_permission_files_themselves() {
+        let deny = permission_settings(&profile(PermissionMode::Edit), &[])["permissions"]["deny"]
+            .to_string();
+        assert!(
+            deny.contains(".claude/**"),
+            "cannot widen its own sandbox: {deny}"
+        );
+        assert!(
+            deny.contains(".git/**"),
+            "cannot rewrite git config: {deny}"
+        );
+    }
+
+    #[test]
+    fn cmd_shim_quoting_survives_spaces_and_multiple_quoted_args() {
+        let line = cmd_c_line(
+            std::path::Path::new(r"C:\Users\John Smith\npm\claude.cmd"),
+            &[
+                "-p".to_owned(),
+                "--settings".to_owned(),
+                r"C:\repo with spaces\settings.json".to_owned(),
+                String::new(),
+            ],
+        );
+        assert!(
+            line.starts_with('"') && line.ends_with('"'),
+            "outer pair: {line}"
+        );
+        assert!(line.contains(r#""C:\Users\John Smith\npm\claude.cmd""#));
+        assert!(line.contains(r#""C:\repo with spaces\settings.json""#));
+        assert!(
+            line.contains(r#" "" "#) || line.ends_with(r#""""#),
+            "empty arg kept: {line}"
+        );
+        assert_eq!(quote_for_cmd("simple"), "simple");
     }
 
     #[test]

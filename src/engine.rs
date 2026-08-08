@@ -9,7 +9,9 @@ use std::fs;
 use std::path::PathBuf;
 use std::time::Duration;
 
-use crate::agent::{self, AgentAdapter, TaskRun, claude, proc};
+use serde::{Deserialize, Serialize};
+
+use crate::agent::{self, AgentAdapter, TaskRun, proc};
 use crate::error::TactusError;
 use crate::gates::{self, ShellGate};
 use crate::ir::{Outcome, OutcomeStatus, PermissionMode, Plan, Task, TaskKind, WorkerProfile};
@@ -46,19 +48,21 @@ pub struct RunOptions {
     pub attempt_timeout: Duration,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(tag = "status", rename_all = "snake_case")]
 pub enum TaskRunStatus {
     Committed {
         sha: String,
     },
     Failed {
+        kind: FailureKind,
         reason: String,
     },
     /// Not attempted because the run halted earlier.
     Skipped,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct TaskReport {
     pub id: String,
     pub title: String,
@@ -69,11 +73,11 @@ pub struct TaskReport {
     pub session_id: Option<String>,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct RunReport {
     pub run_id: String,
     pub branch: String,
-    /// Effective gate names, with provenance ("config" / "derived" / none).
+    /// Effective gate names, and whether they came from config or derivation.
     pub gates: Vec<String>,
     pub gates_from_config: bool,
     pub warnings: Vec<String>,
@@ -139,13 +143,14 @@ pub fn run_with(opts: &RunOptions, adapters: &dyn AdapterSource) -> Result<RunRe
     let transcripts = run_dir.join("transcripts");
     let settings_dir = run_dir.join("settings");
     let gates_dir = run_dir.join("gates");
-    for dir in [&transcripts, &settings_dir, &gates_dir] {
+    let artifacts_dir = run_dir.join("artifacts");
+    for dir in [&transcripts, &settings_dir, &gates_dir, &artifacts_dir] {
         fs::create_dir_all(dir).map_err(|source| TactusError::Io {
             path: dir.clone(),
             source,
         })?;
     }
-    write_json(&run_dir.join("plan.normalized.json"), &analysis.plan)?;
+    util::write_json(&run_dir.join("plan.normalized.json"), &analysis.plan)?;
 
     workspace.create_branch(&branch)?;
 
@@ -160,6 +165,15 @@ pub fn run_with(opts: &RunOptions, adapters: &dyn AdapterSource) -> Result<RunRe
         total_cost_usd: 0.0,
     };
 
+    let report_path = run_dir.join("report.json");
+    let cx = RunCx {
+        workspace: &workspace,
+        run_dir,
+        gates: effective_gates,
+        gate_cmds,
+        adapters,
+        attempt_timeout: opts.attempt_timeout,
+    };
     for index in topo_order(&analysis.plan) {
         let task = &analysis.plan.tasks[index];
         if report.halted_at.is_some() {
@@ -175,45 +189,191 @@ pub fn run_with(opts: &RunOptions, adapters: &dyn AdapterSource) -> Result<RunRe
             continue;
         }
         let chain = &analysis.chains[index];
-        let task_report = attempt_task(
-            task,
-            chain,
-            &workspace,
-            &run_dir,
-            effective_gates,
-            &gate_cmds,
-            opts,
-            adapters,
-        )?;
+        // Task ids are user-authored and may sanitize to the same string, so
+        // the plan index makes each run-artifact stem unique.
+        let stem = format!("{index:02}-{}", util::filename_component(task.id.as_str()));
+        let task_report = attempt_task(task, chain, stem, &cx)
+            // Persist what completed before an aborting error: a mid-run failure
+            // must not take the record of already-committed work and spend with
+            // it. (Replaced by the event log in step 8.)
+            .inspect_err(|_| {
+                let _ = util::write_json(&report_path, &report);
+            })?;
         if let TaskRunStatus::Failed { .. } = task_report.status {
             report.halted_at = Some(task_report.id.clone());
         }
         report.total_cost_usd += task_report.cost_usd.unwrap_or(0.0);
         report.tasks.push(task_report);
+        util::write_json(&report_path, &report)?;
     }
+    util::write_json(&report_path, &report)?;
     Ok(report)
+}
+
+/// Why an attempt did not pass. The kind is kept separate from the prose so
+/// the step-7 ladder can dispatch on it (rate limits defer without burning an
+/// attempt; gate failures retry with feedback) and step 8 can log it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FailureKind {
+    NoChain,
+    EmptyDiff,
+    AgentError,
+    Timeout,
+    RateLimited,
+    GateFailed,
+    TestProvenance,
+}
+
+#[derive(Debug, Clone)]
+pub struct AttemptFailure {
+    pub kind: FailureKind,
+    pub reason: String,
+    /// Feedback for the retry that step 7 will send back to the agent.
+    pub feedback: Option<String>,
+}
+
+impl AttemptFailure {
+    fn new(kind: FailureKind, reason: impl Into<String>) -> Self {
+        Self {
+            kind,
+            reason: reason.into(),
+            feedback: None,
+        }
+    }
+
+    fn with_feedback(mut self, feedback: String) -> Self {
+        self.feedback = Some(feedback);
+        self
+    }
+}
+
+/// Everything one attempt needs, so the step-7 ladder can loop over
+/// (rung, attempt) without re-deriving any of it.
+struct AttemptCx<'a> {
+    task: &'a Task,
+    profile: WorkerProfile,
+    adapter: &'a dyn AgentAdapter,
+    attempt: u32,
+    /// Collision-free file stem for this task's run artifacts.
+    stem: String,
+    run_dir: &'a std::path::Path,
+    gates: &'a [ShellGate],
+    gate_cmds: &'a [String],
+    timeout: Duration,
+}
+
+struct AttemptResult {
+    outcome: Outcome,
+    failure: Option<AttemptFailure>,
+}
+
+/// Run one attempt and verify it, without deciding what happens next: the
+/// caller owns commit, rollback, retry, and escalation (§11/§14).
+fn run_attempt(
+    cx: &AttemptCx<'_>,
+    workspace: &Workspace,
+    resume_session: Option<String>,
+) -> Result<AttemptResult, TactusError> {
+    let settings_path = cx.adapter.materialize_permissions(
+        &cx.profile,
+        cx.gate_cmds,
+        &cx.run_dir.join("settings"),
+        &format!("{}-{}", cx.stem, cx.attempt),
+    )?;
+
+    let task_run = TaskRun {
+        prompt: materialize_prompt(cx.task, cx.gate_cmds, cx.run_dir),
+        profile: cx.profile.clone(),
+        workspace: workspace.root().to_path_buf(),
+        resume_session,
+        settings_path,
+    };
+    let command = cx.adapter.build(&task_run)?;
+    let output = proc::run_with_timeout(command, cx.adapter.stdin_payload(&task_run), cx.timeout)?;
+
+    let transcripts = cx.run_dir.join("transcripts");
+    let transcript_path = transcripts.join(format!("{}-{}.json", cx.stem, cx.attempt));
+    util::write_text(&transcript_path, &output.stdout)?;
+    if !output.stderr.trim().is_empty() {
+        util::write_text(
+            &transcripts.join(format!("{}-{}.stderr.log", cx.stem, cx.attempt)),
+            &output.stderr,
+        )?;
+    }
+
+    let mut outcome: Outcome = cx.adapter.parse(&output)?;
+    outcome.diff = workspace.capture_diff()?;
+    outcome.transcript_path = transcript_path;
+
+    // Verification ladder so far (§11): outcome sanity → cheap static
+    // provenance → gates. Review joins in step 6.
+    let mut failure = evaluate_outcome(&outcome, &output);
+    if failure.is_none() && cx.task.kind == TaskKind::Test && !gates::diff_adds_tests(&outcome.diff)
+    {
+        failure = Some(AttemptFailure::new(
+            FailureKind::TestProvenance,
+            "test provenance: this Test task adds no test code — a Test task that changes no \
+             tests proves nothing",
+        ));
+    }
+    if failure.is_none()
+        && let Some(gate_failure) = gates::run_all(
+            cx.gates,
+            workspace,
+            &cx.run_dir.join("gates"),
+            cx.task.id.as_str(),
+            cx.attempt,
+        )?
+    {
+        failure = Some(
+            AttemptFailure::new(
+                FailureKind::GateFailed,
+                format!(
+                    "gate `{}` failed: {}",
+                    gate_failure.gate, gate_failure.summary
+                ),
+            )
+            .with_feedback(gate_failure.log_tail),
+        );
+    }
+    Ok(AttemptResult { outcome, failure })
+}
+
+/// Run-wide context every task attempt draws on, fixed at pre-flight.
+struct RunCx<'a> {
+    workspace: &'a Workspace,
+    run_dir: PathBuf,
+    gates: &'a [ShellGate],
+    gate_cmds: Vec<String>,
+    adapters: &'a dyn AdapterSource,
+    attempt_timeout: Duration,
 }
 
 /// One attempt on the chain's first rung (retry and escalation are step 7).
 /// Environment failures (spawn, git) abort the run as `Err`; agent failures
 /// roll back and report.
-#[allow(clippy::too_many_arguments)] // collapses into an AttemptCx when step 7 adds the ladder
 fn attempt_task(
     task: &Task,
     chain: &ResolvedChain,
-    workspace: &Workspace,
-    run_dir: &std::path::Path,
-    effective_gates: &[ShellGate],
-    gate_cmds: &[String],
-    opts: &RunOptions,
-    adapters: &dyn AdapterSource,
+    stem: String,
+    cx: &RunCx<'_>,
 ) -> Result<TaskReport, TactusError> {
+    let RunCx {
+        workspace,
+        run_dir,
+        gates: effective_gates,
+        gate_cmds,
+        adapters,
+        attempt_timeout,
+    } = cx;
     let Some(rung) = chain.rungs.first() else {
         return Ok(TaskReport {
             id: task.id.to_string(),
             title: task.title.clone(),
             model: String::new(),
             status: TaskRunStatus::Failed {
+                kind: FailureKind::NoChain,
                 reason: "resolved chain is empty".to_owned(),
             },
             duration: Duration::ZERO,
@@ -235,71 +395,30 @@ fn attempt_task(
         .ok_or_else(|| TactusError::Agent {
             message: format!("no adapter registered for agent `{}`", profile.agent),
         })?;
-
-    // §16/§20: edit profiles may run exactly the gate commands, nothing else.
-    // File names from user-authored ids go through filename_component.
-    let task_file_id = util::filename_component(task.id.as_str());
-    let settings_path = run_dir
-        .join("settings")
-        .join(format!("{task_file_id}.json"));
-    write_json(
-        &settings_path,
-        &claude::permission_settings(&profile, gate_cmds),
-    )?;
-
-    let task_run = TaskRun {
-        prompt: materialize_prompt(task, gate_cmds),
+    let attempt_cx = AttemptCx {
+        task,
         profile: profile.clone(),
-        workspace: workspace.root().to_path_buf(),
-        resume_session: None,
-        settings_path: Some(settings_path),
+        adapter,
+        attempt: 1,
+        stem,
+        run_dir,
+        gates: effective_gates,
+        gate_cmds,
+        timeout: *attempt_timeout,
     };
-    let command = adapter.build(&task_run)?;
-    let output = proc::run_with_timeout(command, &task_run.prompt, opts.attempt_timeout)?;
 
-    let transcript_path = run_dir
-        .join("transcripts")
-        .join(format!("{task_file_id}-1.json"));
-    write_text(&transcript_path, &output.stdout)?;
-    if !output.stderr.trim().is_empty() {
-        write_text(
-            &run_dir
-                .join("transcripts")
-                .join(format!("{task_file_id}-1.stderr.log")),
-            &output.stderr,
-        )?;
-    }
+    // Any error between the agent editing files and the verdict leaves the
+    // tree dirty; the run cannot continue but must not hand the user a
+    // half-staged workspace either (§14).
+    let attempt = match run_attempt(&attempt_cx, workspace, None) {
+        Ok(attempt) => attempt,
+        Err(error) => {
+            let _ = workspace.discard_uncommitted();
+            return Err(error);
+        }
+    };
 
-    let mut outcome: Outcome = adapter.parse(&output)?;
-    outcome.diff = workspace.capture_diff()?;
-    outcome.transcript_path = transcript_path;
-
-    // Verification ladder so far (§11): outcome sanity → cheap static
-    // provenance → gates. Review joins in step 6.
-    let mut failure = evaluate_outcome(&outcome, &output);
-    if failure.is_none() && task.kind == TaskKind::Test && !gates::diff_adds_tests(&outcome.diff) {
-        failure = Some(
-            "test provenance: this Test task adds no test code — a Test task that changes no \
-             tests proves nothing"
-                .to_owned(),
-        );
-    }
-    if failure.is_none()
-        && let Some(gate_failure) = gates::run_all(
-            effective_gates,
-            workspace,
-            &run_dir.join("gates"),
-            &task.id,
-            1,
-        )?
-    {
-        failure = Some(format!(
-            "gate `{}` failed: {}",
-            gate_failure.gate, gate_failure.summary
-        ));
-    }
-
-    let status = match failure {
+    let status = match attempt.failure {
         None => {
             let sha = workspace.commit(&format!("[tactus] {}: {}", task.id, task.title))?;
             // Scrub gate side-effects (build artifacts, lockfile churn) so
@@ -308,9 +427,12 @@ fn attempt_task(
             workspace.discard_uncommitted()?;
             TaskRunStatus::Committed { sha }
         }
-        Some(reason) => {
+        Some(failure) => {
             workspace.discard_uncommitted()?;
-            TaskRunStatus::Failed { reason }
+            TaskRunStatus::Failed {
+                kind: failure.kind,
+                reason: failure.reason,
+            }
         }
     };
     Ok(TaskReport {
@@ -318,33 +440,56 @@ fn attempt_task(
         title: task.title.clone(),
         model: profile.model,
         status,
-        duration: outcome.duration,
-        cost_usd: outcome.cost_usd,
-        session_id: outcome.session_id,
+        duration: attempt.outcome.duration,
+        cost_usd: attempt.outcome.cost_usd,
+        session_id: attempt.outcome.session_id,
     })
 }
 
 /// Outcome-level failure reasons, before gates get a say.
-fn evaluate_outcome(outcome: &Outcome, output: &proc::ProcessOutput) -> Option<String> {
+fn evaluate_outcome(outcome: &Outcome, output: &proc::ProcessOutput) -> Option<AttemptFailure> {
+    let detail = || {
+        outcome
+            .detail
+            .clone()
+            .filter(|d| !d.trim().is_empty())
+            .unwrap_or_else(|| {
+                let stderr = util::tail(&output.stderr, 400);
+                if stderr.is_empty() {
+                    "no diagnostic output; see the transcript".to_owned()
+                } else {
+                    stderr
+                }
+            })
+    };
     match outcome.status {
         OutcomeStatus::Completed if outcome.diff.trim().is_empty() => {
             // §11 evidence axis, enforced early: an empty diff can never pass.
-            Some(
-                "agent reported success but the diff is empty — \"done\" claims require \
-                  changed code"
-                    .to_owned(),
-            )
+            Some(AttemptFailure::new(
+                FailureKind::EmptyDiff,
+                "agent reported success but the diff is empty — \"done\" claims require changed \
+                 code",
+            ))
         }
         OutcomeStatus::Completed => None,
-        OutcomeStatus::AgentError => Some(format!(
-            "agent error (exit {:?}): {}",
-            output.code,
-            util::tail(&output.stderr, 400)
+        OutcomeStatus::AgentError => Some(
+            AttemptFailure::new(
+                FailureKind::AgentError,
+                format!("agent error (exit {:?}): {}", output.code, detail()),
+            )
+            .with_feedback(detail()),
+        ),
+        OutcomeStatus::Timeout => Some(AttemptFailure::new(
+            FailureKind::Timeout,
+            "attempt hit the wall-clock timeout",
         )),
-        OutcomeStatus::Timeout => Some("attempt hit the wall-clock timeout".to_owned()),
-        OutcomeStatus::RateLimited => {
-            Some("pool rate-limited (deferral arrives with the capacity engine)".to_owned())
-        }
+        OutcomeStatus::RateLimited => Some(AttemptFailure::new(
+            FailureKind::RateLimited,
+            format!(
+                "pool rate-limited: {} (deferral arrives with the capacity engine)",
+                detail()
+            ),
+        )),
     }
 }
 
@@ -352,7 +497,7 @@ fn evaluate_outcome(outcome: &Outcome, output: &proc::ProcessOutput) -> Option<S
 /// exact gate commands the agent is permitted to run (the allow rules are
 /// exact-match, so the agent must know the literal strings). The conventions
 /// brief joins once design-phase artifacts carry content.
-fn materialize_prompt(task: &Task, gate_cmds: &[String]) -> String {
+fn materialize_prompt(task: &Task, gate_cmds: &[String], run_dir: &std::path::Path) -> String {
     let mut prompt = String::new();
     prompt.push_str(
         "You are executing one task from a frozen plan, conducted by the tactus engine.\n\n",
@@ -369,12 +514,33 @@ fn materialize_prompt(task: &Task, gate_cmds: &[String]) -> String {
         }
         prompt.push('\n');
     }
-    if !task.artifacts_in.is_empty() {
-        let needs: Vec<&str> = task.artifacts_in.iter().map(|a| a.as_str()).collect();
+    // Artifacts are real files in the run directory: a consumer is shown the
+    // content that exists, never told to look for something nothing wrote.
+    for id in &task.artifacts_in {
+        let path = artifact_path(run_dir, id.as_str());
+        match fs::read_to_string(&path) {
+            Ok(content) if !content.trim().is_empty() => {
+                let _ = writeln!(
+                    prompt,
+                    "Input artifact `{id}` (produced by an earlier task):\n---\n{}\n---\n",
+                    content.trim()
+                );
+            }
+            _ => {
+                let _ = writeln!(
+                    prompt,
+                    "Note: this task expected input artifact `{id}`, but the earlier task did \
+                     not leave one. Work from the repository as it stands.\n"
+                );
+            }
+        }
+    }
+    for id in &task.artifacts_out {
         let _ = writeln!(
             prompt,
-            "Inputs produced by earlier tasks: {}\n",
-            needs.join(", ")
+            "Before you finish, write artifact `{id}` — the notes later tasks depend on — to:\n\
+             {}\n",
+            artifact_path(run_dir, id.as_str()).display()
         );
     }
     if !gate_cmds.is_empty() {
@@ -395,6 +561,13 @@ fn materialize_prompt(task: &Task, gate_cmds: &[String]) -> String {
          - When the acceptance criteria hold, stop and summarize what changed.\n",
     );
     prompt
+}
+
+/// Where an artifact lives for the duration of a run (§15 `artifacts/`).
+fn artifact_path(run_dir: &std::path::Path, id: &str) -> PathBuf {
+    run_dir
+        .join("artifacts")
+        .join(format!("{}.md", util::filename_component(id)))
 }
 
 /// Stable topological order: among ready tasks, lowest plan index first (§14).
@@ -433,20 +606,6 @@ fn topo_order(plan: &Plan) -> Vec<usize> {
     order
 }
 
-fn write_json<T: serde::Serialize>(path: &std::path::Path, value: &T) -> Result<(), TactusError> {
-    let json = serde_json::to_string_pretty(value).map_err(|e| TactusError::Parse {
-        message: format!("serializing {}: {e}", path.display()),
-    })?;
-    write_text(path, &(json + "\n"))
-}
-
-fn write_text(path: &std::path::Path, content: &str) -> Result<(), TactusError> {
-    fs::write(path, content).map_err(|source| TactusError::Io {
-        path: path.to_path_buf(),
-        source,
-    })
-}
-
 impl RunReport {
     pub fn render(&self) -> String {
         let mut out = String::new();
@@ -474,14 +633,15 @@ impl RunReport {
                 TaskRunStatus::Committed { sha } => {
                     let _ = writeln!(
                         out,
-                        "  {}: committed {sha} ({}s, {}, ${:.4})",
+                        "  {}: committed {sha} — {} ({:.1}s, {}, ${:.4})",
                         task.id,
-                        task.duration.as_secs(),
+                        task.title,
+                        task.duration.as_secs_f64(),
                         task.model,
                         task.cost_usd.unwrap_or(0.0),
                     );
                 }
-                TaskRunStatus::Failed { reason } => {
+                TaskRunStatus::Failed { reason, .. } => {
                     let _ = writeln!(out, "  {}: FAILED — {reason}", task.id);
                 }
                 TaskRunStatus::Skipped => {
@@ -601,6 +761,8 @@ mod tests {
             Ok(Outcome {
                 status,
                 diff: String::new(),
+                detail: matches!(self.effect, Effect::Error)
+                    .then(|| "fake adapter error detail".to_owned()),
                 session_id: Some("fake-session".to_owned()),
                 usage: Some(Usage::default()),
                 cost_usd: Some(0.01),
@@ -721,7 +883,7 @@ mod tests {
         let report = run_with(&options(&repo), &source).expect("engine itself is fine");
 
         assert_eq!(report.halted_at.as_deref(), Some("t1"));
-        let TaskRunStatus::Failed { reason } = &report.tasks[0].status else {
+        let TaskRunStatus::Failed { reason, .. } = &report.tasks[0].status else {
             panic!("t1 should fail: {report:?}");
         };
         assert!(reason.contains("empty"), "evidence rule cited: {reason}");
@@ -741,7 +903,7 @@ mod tests {
         };
         let report = run_with(&options(&repo), &source).expect("engine ok");
         assert_eq!(report.halted_at.as_deref(), Some("t1"));
-        let TaskRunStatus::Failed { reason } = &report.tasks[0].status else {
+        let TaskRunStatus::Failed { reason, .. } = &report.tasks[0].status else {
             panic!("t1 should fail");
         };
         assert!(reason.contains("agent error"), "reason: {reason}");
@@ -807,7 +969,7 @@ mod tests {
         };
         let report = run_with(&opts, &source).expect("engine ok");
         assert_eq!(report.halted_at.as_deref(), Some("t1"));
-        let TaskRunStatus::Failed { reason } = &report.tasks[0].status else {
+        let TaskRunStatus::Failed { reason, .. } = &report.tasks[0].status else {
             panic!("t1 should fail on the gate");
         };
         assert!(reason.contains("gate `never` failed"), "reason: {reason}");
@@ -865,7 +1027,7 @@ mod tests {
         };
         let report = run_with(&options(&repo), &source).expect("engine ok");
         assert_eq!(report.halted_at.as_deref(), Some("tt"));
-        let TaskRunStatus::Failed { reason } = &report.tasks[0].status else {
+        let TaskRunStatus::Failed { reason, .. } = &report.tasks[0].status else {
             panic!("provenance should fail");
         };
         assert!(reason.contains("provenance"), "reason: {reason}");
@@ -942,11 +1104,118 @@ mod tests {
             artifacts_in: Vec::new(),
             artifacts_out: Vec::new(),
         };
-        let prompt = materialize_prompt(&task, &["cargo check --all-targets".to_owned()]);
+        let run_dir = std::env::temp_dir().join(format!("tactus-prompt-{}", std::process::id()));
+        fs::create_dir_all(run_dir.join("artifacts")).expect("run dir");
+        let prompt = materialize_prompt(&task, &["cargo check --all-targets".to_owned()], &run_dir);
         assert!(prompt.contains("EXACTLY these commands"));
         assert!(prompt.contains("- cargo check --all-targets"));
-        let bare = materialize_prompt(&task, &[]);
+        let bare = materialize_prompt(&task, &[], &run_dir);
         assert!(!bare.contains("EXACTLY these commands"));
+    }
+
+    #[test]
+    fn the_run_record_survives_completion() {
+        let repo = temp_engine_repo("record");
+        let source = FakeSource {
+            adapter: FakeAdapter {
+                effect: Effect::EditFile,
+            },
+        };
+        let report = run_with(&options(&repo), &source).expect("run");
+        let report_path = repo
+            .join(".tactus")
+            .join("runs")
+            .join(&report.run_id)
+            .join("report.json");
+        let text = fs::read_to_string(&report_path).expect("report.json written");
+        let restored: RunReport = serde_json::from_str(&text).expect("report round-trips");
+        assert_eq!(restored.tasks.len(), 2);
+        assert_eq!(restored.branch, report.branch);
+        assert!(matches!(
+            restored.tasks[0].status,
+            TaskRunStatus::Committed { .. }
+        ));
+    }
+
+    #[test]
+    fn failures_carry_a_machine_readable_kind() {
+        let repo = temp_engine_repo("kind");
+        let source = FakeSource {
+            adapter: FakeAdapter {
+                effect: Effect::NoEdit,
+            },
+        };
+        let report = run_with(&options(&repo), &source).expect("engine ok");
+        let TaskRunStatus::Failed { kind, .. } = &report.tasks[0].status else {
+            panic!("t1 should fail");
+        };
+        assert_eq!(*kind, FailureKind::EmptyDiff, "step 7 dispatches on this");
+    }
+
+    #[test]
+    fn agent_error_reports_the_adapter_detail() {
+        let repo = temp_engine_repo("detail");
+        let source = FakeSource {
+            adapter: FakeAdapter {
+                effect: Effect::Error,
+            },
+        };
+        let report = run_with(&options(&repo), &source).expect("engine ok");
+        let TaskRunStatus::Failed { kind, reason } = &report.tasks[0].status else {
+            panic!("t1 should fail");
+        };
+        assert_eq!(*kind, FailureKind::AgentError);
+        assert!(
+            reason.contains("fake adapter error detail"),
+            "the JSON-body detail reaches the report: {reason}"
+        );
+    }
+
+    #[test]
+    fn prompt_wires_artifacts_to_real_files() {
+        let run_dir = std::env::temp_dir().join(format!("tactus-artifact-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&run_dir);
+        fs::create_dir_all(run_dir.join("artifacts")).expect("run dir");
+        let mut task = Task {
+            id: crate::ir::TaskId::from("t1"),
+            kind: TaskKind::Implement,
+            title: "Build it".to_owned(),
+            body: String::new(),
+            depends_on: Vec::new(),
+            acceptance: Vec::new(),
+            path_hints: Vec::new(),
+            suggested_tier: None,
+            min_tier: None,
+            artifacts_in: vec![crate::ir::ArtifactId::from("api-contract")],
+            artifacts_out: vec![crate::ir::ArtifactId::from("notes")],
+        };
+
+        // Missing input: say so plainly rather than pointing at nothing.
+        let prompt = materialize_prompt(&task, &[], &run_dir);
+        assert!(
+            prompt.contains("did \n     not leave one") || prompt.contains("did not leave one")
+        );
+        assert!(
+            prompt.contains("write artifact `notes`"),
+            "producer told where to write"
+        );
+
+        // Present input: content is inlined.
+        fs::write(
+            artifact_path(&run_dir, "api-contract"),
+            "cursor = base64(offset)",
+        )
+        .expect("artifact");
+        let prompt = materialize_prompt(&task, &[], &run_dir);
+        assert!(
+            prompt.contains("cursor = base64(offset)"),
+            "content inlined"
+        );
+
+        task.artifacts_in.clear();
+        task.artifacts_out.clear();
+        let bare = materialize_prompt(&task, &[], &run_dir);
+        assert!(!bare.contains("artifact"));
     }
 
     #[test]

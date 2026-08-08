@@ -57,6 +57,25 @@ pub trait AgentAdapter: Send + Sync {
     fn probe(&self) -> Result<Caps, TactusError>;
     fn build(&self, run: &TaskRun) -> Result<Command, TactusError>;
     fn parse(&self, out: &ProcessOutput) -> Result<Outcome, TactusError>;
+
+    /// What to write to the child's stdin. Delivery is the adapter's call:
+    /// CLIs that take the prompt as an argument instead return empty here.
+    fn stdin_payload<'a>(&self, run: &'a TaskRun) -> &'a str {
+        &run.prompt
+    }
+
+    /// Materialize this agent's permission surface (§20) into `dir`, returning
+    /// the file the command should reference. Claude Code writes a settings
+    /// JSON; Copilot will encode permissions as argv flags and write nothing.
+    fn materialize_permissions(
+        &self,
+        _profile: &WorkerProfile,
+        _gate_cmds: &[String],
+        _dir: &std::path::Path,
+        _stem: &str,
+    ) -> Result<Option<PathBuf>, TactusError> {
+        Ok(None)
+    }
 }
 
 /// Registry in routing order; ids match `WorkerProfile.agent`.

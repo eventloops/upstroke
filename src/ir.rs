@@ -234,6 +234,11 @@ pub struct PoolDrain {
 pub struct Outcome {
     pub status: OutcomeStatus,
     pub diff: String,
+    /// The agent's own account of what happened — its final message, or the
+    /// error text for a failure. Most CLI failures arrive through the JSON
+    /// body with an empty stderr, so without this a report has nothing to
+    /// show the user.
+    pub detail: Option<String>,
     pub session_id: Option<String>,
     pub usage: Option<Usage>,
     /// API-equivalent dollars as reported by the CLI (subscription spend is
@@ -245,10 +250,12 @@ pub struct Outcome {
 }
 
 /// FNV-1a 64-bit content hash. Dependency-free and stable across platforms and
-/// releases — identity only, nothing cryptographic.
+/// releases — identity only, nothing cryptographic. CR bytes are skipped so a
+/// plan checked out with CRLF hashes the same as the LF original (git's
+/// autocrlf would otherwise make the same plan look changed across machines).
 pub fn content_hash(bytes: &[u8]) -> String {
     let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
-    for byte in bytes {
+    for byte in bytes.iter().filter(|b| **b != b'\r') {
         hash ^= u64::from(*byte);
         hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
     }
@@ -286,5 +293,14 @@ mod tests {
         assert_eq!(content_hash(b""), "cbf29ce484222325");
         assert_eq!(content_hash(b"tactus"), content_hash(b"tactus"));
         assert_ne!(content_hash(b"tactus"), content_hash(b"tactvs"));
+    }
+
+    #[test]
+    fn content_hash_ignores_line_ending_style() {
+        assert_eq!(
+            content_hash(b"# Plan\r\n\r\n## Task\r\n"),
+            content_hash(b"# Plan\n\n## Task\n"),
+            "a CRLF checkout must not look like a changed plan"
+        );
     }
 }
