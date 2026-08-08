@@ -9,6 +9,7 @@ pub mod catalog;
 pub mod config;
 pub mod engine;
 pub mod error;
+pub mod gates;
 pub mod ir;
 pub mod plan;
 pub mod route;

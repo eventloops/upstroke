@@ -9,20 +9,36 @@ use std::collections::BTreeMap;
 use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use globset::{Glob, GlobSet, GlobSetBuilder};
 use serde::Deserialize;
 
 use crate::catalog;
 use crate::error::TactusError;
+use crate::gates::ShellKind;
 use crate::ir::{TaskKind, Tier};
 
 #[derive(Debug, Default, Deserialize)]
 struct RawRepoConfig {
     routing: Option<RawRouting>,
     pins: Option<Vec<RawPin>>,
-    // Other sections (engine, interaction, budgets, gates) are legal in
-    // tactus.toml but not consumed by validate; serde ignores them.
+    gates: Option<Vec<RawGate>>,
+    engine: Option<RawEngine>,
+    // Other sections (interaction, budgets) are legal in tactus.toml but not
+    // consumed yet; serde ignores them.
+}
+
+#[derive(Debug, Deserialize)]
+struct RawGate {
+    name: String,
+    cmd: String,
+    timeout_secs: Option<u64>,
+}
+
+#[derive(Debug, Deserialize)]
+struct RawEngine {
+    shell: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -96,6 +112,17 @@ pub struct Pin {
     pub model: String,
 }
 
+/// One `[[gates]]` entry (§17). `None` for the whole list means the section
+/// was absent and the engine derives defaults from the repo's shape.
+#[derive(Debug, Clone)]
+pub struct GateConfig {
+    pub name: String,
+    pub cmd: String,
+    pub timeout: Duration,
+}
+
+pub const DEFAULT_GATE_TIMEOUT: Duration = Duration::from_secs(600);
+
 #[derive(Debug)]
 pub struct Config {
     pub chains: BTreeMap<TaskKind, KindChain>,
@@ -103,6 +130,10 @@ pub struct Config {
     pub pins: Vec<Pin>,
     pub strategy: Strategy,
     pub pool_names: Vec<String>,
+    /// `Some` (possibly empty — explicitly no gates) when `[[gates]]` was
+    /// configured; `None` means derive from the repo.
+    pub gates: Option<Vec<GateConfig>>,
+    pub shell: ShellKind,
 }
 
 impl Config {
@@ -258,6 +289,43 @@ pub fn load(
         });
     }
 
+    let gates = match raw.gates {
+        None => None,
+        Some(raw_gates) => {
+            let mut list = Vec::with_capacity(raw_gates.len());
+            for g in raw_gates {
+                if g.name.trim().is_empty() || g.cmd.trim().is_empty() {
+                    return Err(TactusError::Config {
+                        path: repo_path.clone(),
+                        message: "each [[gates]] entry needs a non-empty `name` and `cmd`"
+                            .to_owned(),
+                    });
+                }
+                list.push(GateConfig {
+                    name: g.name,
+                    cmd: g.cmd,
+                    timeout: g
+                        .timeout_secs
+                        .map_or(DEFAULT_GATE_TIMEOUT, Duration::from_secs),
+                });
+            }
+            Some(list)
+        }
+    };
+
+    let mut shell = ShellKind::native();
+    if let Some(engine) = raw.engine
+        && let Some(requested) = engine.shell
+    {
+        match ShellKind::parse(&requested) {
+            Some(kind) => shell = kind,
+            None => warnings.push(format!(
+                "unknown [engine] shell `{requested}` in {} (using the platform default)",
+                repo_path.display()
+            )),
+        }
+    }
+
     let pool_names = read_pools(pools_file)?;
 
     Ok(Config {
@@ -266,6 +334,8 @@ pub fn load(
         pins,
         strategy,
         pool_names,
+        gates,
+        shell,
     })
 }
 
@@ -472,6 +542,66 @@ agent = "copilot"
         assert_eq!(
             cfg.pool_names,
             vec!["claude-max".to_owned(), "copilot".to_owned()]
+        );
+    }
+
+    #[test]
+    fn gates_parse_with_default_timeout() {
+        let path = scratch(
+            "gates.toml",
+            r#"
+[engine]
+shell = "powershell"
+
+[[gates]]
+name = "check"
+cmd = "cargo check --all-targets"
+
+[[gates]]
+name = "test"
+cmd = "cargo test"
+timeout_secs = 1200
+"#,
+        );
+        let mut warnings = Vec::new();
+        let cfg = load(Some(&path), Some(&missing()), &mut warnings).expect("load gates");
+        let gates = cfg.gates.expect("gates configured");
+        assert_eq!(gates.len(), 2);
+        assert_eq!(gates[0].timeout, DEFAULT_GATE_TIMEOUT);
+        assert_eq!(gates[1].timeout, Duration::from_secs(1200));
+        assert_eq!(cfg.shell, ShellKind::PowerShell);
+        assert!(warnings.is_empty(), "warnings: {warnings:?}");
+    }
+
+    #[test]
+    fn absent_gates_mean_derive_and_empty_means_none() {
+        let mut warnings = Vec::new();
+        let cfg = load(None, Some(&missing()), &mut warnings).expect("defaults");
+        assert!(cfg.gates.is_none(), "absent section derives at run time");
+        assert_eq!(cfg.shell, ShellKind::native());
+
+        let path = scratch("nogates.toml", "gates = []\n");
+        let cfg = load(Some(&path), Some(&missing()), &mut warnings).expect("empty gates");
+        assert_eq!(cfg.gates.expect("explicit").len(), 0);
+    }
+
+    #[test]
+    fn blank_gate_fields_and_unknown_shell_are_handled() {
+        let path = scratch(
+            "badgate.toml",
+            "[[gates]]\nname = \"\"\ncmd = \"cargo test\"\n",
+        );
+        let mut warnings = Vec::new();
+        let err = load(Some(&path), Some(&missing()), &mut warnings).expect_err("blank name");
+        assert!(err.to_string().contains("non-empty"));
+
+        let path = scratch("badshell.toml", "[engine]\nshell = \"fish\"\n");
+        let cfg = load(Some(&path), Some(&missing()), &mut warnings).expect("tolerated");
+        assert_eq!(cfg.shell, ShellKind::native());
+        assert!(
+            warnings
+                .iter()
+                .any(|w| w.contains("unknown [engine] shell"))
         );
     }
 }

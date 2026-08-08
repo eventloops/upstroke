@@ -50,6 +50,9 @@ pub enum TactusError {
     #[error("git error: {message}")]
     Git { message: String },
 
+    #[error("gate error: {message}")]
+    Gate { message: String },
+
     #[error("{0}")]
     Validation(ValidationErrors),
 }

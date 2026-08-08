@@ -1,8 +1,8 @@
-//! Sequential execution engine (DESIGN.md §14) — step 4 scope: pre-flight,
-//! run branch, one agent attempt per task on its chain's first rung,
-//! engine-captured diff, engine-owned commit per task, rollback + halt on
-//! failure. Gates arrive in step 5, review in step 6, retry/escalation in
-//! step 7, the event log and resume in step 8.
+//! Sequential execution engine (DESIGN.md §14): pre-flight, run branch, one
+//! agent attempt per task on its chain's first rung, engine-captured diff,
+//! gates with evidence axes (§11.1), engine-owned commit per task, rollback +
+//! halt on failure. Review arrives in step 6, retry/escalation in step 7, the
+//! event log and resume in step 8.
 
 use std::fmt::Write as _;
 use std::fs;
@@ -11,7 +11,8 @@ use std::time::Duration;
 
 use crate::agent::{self, AgentAdapter, TaskRun, claude, proc};
 use crate::error::TactusError;
-use crate::ir::{Outcome, OutcomeStatus, PermissionMode, Plan, Task, WorkerProfile};
+use crate::gates::{self, ShellGate};
+use crate::ir::{Outcome, OutcomeStatus, PermissionMode, Plan, Task, TaskKind, WorkerProfile};
 use crate::route::ResolvedChain;
 use crate::ulid;
 use crate::validate::{self, ValidateOptions};
@@ -71,6 +72,10 @@ pub struct TaskReport {
 pub struct RunReport {
     pub run_id: String,
     pub branch: String,
+    /// Effective gate names, with provenance ("config" / "derived" / none).
+    pub gates: Vec<String>,
+    pub gates_from_config: bool,
+    pub warnings: Vec<String>,
     pub tasks: Vec<TaskReport>,
     /// Task id the run halted at, if any.
     pub halted_at: Option<String>,
@@ -115,12 +120,32 @@ pub fn run_with(opts: &RunOptions, adapters: &dyn AdapterSource) -> Result<RunRe
         adapter.probe()?;
     }
 
+    // Effective gates: `[[gates]]` verbatim, else derived from the repo's
+    // shape (§17). Every gate command must resolve at pre-flight (§14).
+    let mut warnings = analysis.warnings.clone();
+    let gates_from_config = analysis.config.gates.is_some();
+    let effective_gates: Vec<ShellGate> = match &analysis.config.gates {
+        Some(configured) => configured
+            .iter()
+            .map(|g| ShellGate {
+                name: g.name.clone(),
+                cmd: g.cmd.clone(),
+                timeout: g.timeout,
+                shell: analysis.config.shell,
+            })
+            .collect(),
+        None => gates::derive(&opts.repo_root, analysis.config.shell),
+    };
+    gates::resolve_programs(&effective_gates, &mut warnings)?;
+    let gate_cmds: Vec<String> = effective_gates.iter().map(|g| g.cmd.clone()).collect();
+
     let run_id = ulid::ulid();
     let branch = format!("tactus/run-{run_id}");
     let run_dir = opts.repo_root.join(".tactus").join("runs").join(&run_id);
     let transcripts = run_dir.join("transcripts");
     let settings_dir = run_dir.join("settings");
-    for dir in [&transcripts, &settings_dir] {
+    let gates_dir = run_dir.join("gates");
+    for dir in [&transcripts, &settings_dir, &gates_dir] {
         fs::create_dir_all(dir).map_err(|source| TactusError::Io {
             path: dir.clone(),
             source,
@@ -133,6 +158,9 @@ pub fn run_with(opts: &RunOptions, adapters: &dyn AdapterSource) -> Result<RunRe
     let mut report = RunReport {
         run_id,
         branch,
+        gates: effective_gates.iter().map(|g| g.name.clone()).collect(),
+        gates_from_config,
+        warnings,
         tasks: Vec::with_capacity(analysis.plan.tasks.len()),
         halted_at: None,
         total_cost_usd: 0.0,
@@ -153,7 +181,16 @@ pub fn run_with(opts: &RunOptions, adapters: &dyn AdapterSource) -> Result<RunRe
             continue;
         }
         let chain = &analysis.chains[index];
-        let task_report = attempt_task(task, chain, &workspace, &run_dir, opts, adapters)?;
+        let task_report = attempt_task(
+            task,
+            chain,
+            &workspace,
+            &run_dir,
+            &effective_gates,
+            &gate_cmds,
+            opts,
+            adapters,
+        )?;
         if let TaskRunStatus::Failed { .. } = task_report.status {
             report.halted_at = Some(task_report.id.clone());
         }
@@ -166,11 +203,14 @@ pub fn run_with(opts: &RunOptions, adapters: &dyn AdapterSource) -> Result<RunRe
 /// One attempt on the chain's first rung (retry and escalation are step 7).
 /// Environment failures (spawn, git) abort the run as `Err`; agent failures
 /// roll back and report.
+#[allow(clippy::too_many_arguments)] // collapses into an AttemptCx when step 7 adds the ladder
 fn attempt_task(
     task: &Task,
     chain: &ResolvedChain,
     workspace: &Workspace,
     run_dir: &std::path::Path,
+    effective_gates: &[ShellGate],
+    gate_cmds: &[String],
     opts: &RunOptions,
     adapters: &dyn AdapterSource,
 ) -> Result<TaskReport, TactusError> {
@@ -202,9 +242,12 @@ fn attempt_task(
             message: format!("no adapter registered for agent `{}`", profile.agent),
         })?;
 
-    // Gates arrive in step 5 — until then edit profiles get no shell at all.
+    // §16/§20: edit profiles may run exactly the gate commands, nothing else.
     let settings_path = run_dir.join("settings").join(format!("{}.json", task.id));
-    write_json(&settings_path, &claude::permission_settings(&profile, &[]))?;
+    write_json(
+        &settings_path,
+        &claude::permission_settings(&profile, gate_cmds),
+    )?;
 
     let task_run = TaskRun {
         prompt: materialize_prompt(task),
@@ -233,7 +276,41 @@ fn attempt_task(
     outcome.diff = workspace.capture_diff()?;
     outcome.transcript_path = transcript_path;
 
-    let status = decide(task, &outcome, workspace, &output)?;
+    // Verification ladder so far (§11): outcome sanity → gates → provenance.
+    // Review joins in step 6.
+    let mut failure = evaluate_outcome(&outcome, &output);
+    if failure.is_none()
+        && let Err(gate_failure) = gates::run_all(
+            effective_gates,
+            workspace,
+            &run_dir.join("gates"),
+            &task.id,
+            1,
+        )
+    {
+        failure = Some(format!(
+            "gate `{}` failed: {}",
+            gate_failure.gate, gate_failure.summary
+        ));
+    }
+    if failure.is_none() && task.kind == TaskKind::Test && !gates::diff_adds_tests(&outcome.diff) {
+        failure = Some(
+            "test provenance: this Test task adds no test code — a Test task that changes no \
+             tests proves nothing"
+                .to_owned(),
+        );
+    }
+
+    let status = match failure {
+        None => {
+            let sha = workspace.commit(&format!("[tactus] {}: {}", task.id, task.title))?;
+            TaskRunStatus::Committed { sha }
+        }
+        Some(reason) => {
+            workspace.rollback()?;
+            TaskRunStatus::Failed { reason }
+        }
+    };
     Ok(TaskReport {
         id: task.id.to_string(),
         title: task.title.clone(),
@@ -245,13 +322,9 @@ fn attempt_task(
     })
 }
 
-fn decide(
-    task: &Task,
-    outcome: &Outcome,
-    workspace: &Workspace,
-    output: &proc::ProcessOutput,
-) -> Result<TaskRunStatus, TactusError> {
-    let failure = match outcome.status {
+/// Outcome-level failure reasons, before gates get a say.
+fn evaluate_outcome(outcome: &Outcome, output: &proc::ProcessOutput) -> Option<String> {
+    match outcome.status {
         OutcomeStatus::Completed if outcome.diff.trim().is_empty() => {
             // §11 evidence axis, enforced early: an empty diff can never pass.
             Some(
@@ -269,16 +342,6 @@ fn decide(
         OutcomeStatus::Timeout => Some("attempt hit the wall-clock timeout".to_owned()),
         OutcomeStatus::RateLimited => {
             Some("pool rate-limited (deferral arrives with the capacity engine)".to_owned())
-        }
-    };
-    match failure {
-        None => {
-            let sha = workspace.commit(&format!("[tactus] {}: {}", task.id, task.title))?;
-            Ok(TaskRunStatus::Committed { sha })
-        }
-        Some(reason) => {
-            workspace.rollback()?;
-            Ok(TaskRunStatus::Failed { reason })
         }
     }
 }
@@ -387,6 +450,23 @@ impl RunReport {
         let mut out = String::new();
         let _ = writeln!(out, "run: {}", self.run_id);
         let _ = writeln!(out, "branch: {} (return with: git switch -)", self.branch);
+        if self.gates.is_empty() {
+            let _ = writeln!(out, "gates: none");
+        } else {
+            let _ = writeln!(
+                out,
+                "gates: {} [{}]",
+                self.gates.join(", "),
+                if self.gates_from_config {
+                    "from config"
+                } else {
+                    "derived"
+                }
+            );
+        }
+        for warning in &self.warnings {
+            let _ = writeln!(out, "warning: {warning}");
+        }
         for task in &self.tasks {
             match &task.status {
                 TaskRunStatus::Committed { sha } => {
@@ -445,6 +525,8 @@ mod tests {
     enum Effect {
         /// Simulates an agent that edits the workspace and succeeds.
         EditFile,
+        /// Simulates an agent that writes real test code.
+        EditTest,
         /// Simulates a lying agent: success report, no changes.
         NoEdit,
         /// Simulates an agent-side failure.
@@ -476,14 +558,25 @@ mod tests {
         }
 
         fn build(&self, run: &TaskRun) -> Result<std::process::Command, TactusError> {
-            if matches!(self.effect, Effect::EditFile) {
-                let marker = run.workspace.join("agent-output.txt");
-                let previous = fs::read_to_string(&marker).unwrap_or_default();
-                fs::write(&marker, format!("{previous}edited: {}\n", run.prompt.len())).map_err(
-                    |e| TactusError::Agent {
-                        message: format!("fake edit failed: {e}"),
-                    },
-                )?;
+            let edit: Option<(&str, String)> = match self.effect {
+                Effect::EditFile => {
+                    let marker = run.workspace.join("agent-output.txt");
+                    let previous = fs::read_to_string(&marker).unwrap_or_default();
+                    Some((
+                        "agent-output.txt",
+                        format!("{previous}edited: {}\n", run.prompt.len()),
+                    ))
+                }
+                Effect::EditTest => Some((
+                    "widget_test.rs",
+                    "#[test]\nfn widget_works() {\n    assert!(true);\n}\n".to_owned(),
+                )),
+                Effect::NoEdit | Effect::Error => None,
+            };
+            if let Some((name, content)) = edit {
+                fs::write(run.workspace.join(name), content).map_err(|e| TactusError::Agent {
+                    message: format!("fake edit failed: {e}"),
+                })?;
             }
             let mut cmd = if cfg!(windows) {
                 let mut c = Command::new("cmd");
@@ -501,7 +594,7 @@ mod tests {
         fn parse(&self, out: &ProcessOutput) -> Result<Outcome, TactusError> {
             let status = match self.effect {
                 Effect::Error => OutcomeStatus::AgentError,
-                Effect::EditFile | Effect::NoEdit => OutcomeStatus::Completed,
+                Effect::EditFile | Effect::EditTest | Effect::NoEdit => OutcomeStatus::Completed,
             };
             Ok(Outcome {
                 status,
@@ -665,6 +758,139 @@ mod tests {
         assert!(err.to_string().contains("not clean"), "got: {err}");
         let branch = git_in(&repo, &["rev-parse", "--abbrev-ref", "HEAD"]);
         assert_eq!(branch.trim(), "main", "no run branch created");
+    }
+
+    #[test]
+    fn passing_configured_gates_commit_and_are_reported() {
+        let repo = temp_engine_repo("gatepass");
+        fs::write(
+            repo.join("tactus.toml"),
+            "[[gates]]\nname = \"version\"\ncmd = \"git --version\"\n",
+        )
+        .expect("config");
+        git_in(&repo, &["add", "-A"]);
+        git_in(&repo, &["commit", "-q", "-m", "config"]);
+
+        let mut opts = options(&repo);
+        opts.config_path = Some(repo.join("tactus.toml"));
+        let source = FakeSource {
+            adapter: FakeAdapter {
+                effect: Effect::EditFile,
+            },
+        };
+        let report = run_with(&opts, &source).expect("run");
+        assert!(report.halted_at.is_none(), "report: {report:?}");
+        assert_eq!(report.gates, ["version"]);
+        assert!(report.gates_from_config);
+        assert!(report.render().contains("gates: version [from config]"));
+    }
+
+    #[test]
+    fn failing_gate_halts_with_log_and_rollback() {
+        let repo = temp_engine_repo("gatefail");
+        fs::write(
+            repo.join("tactus.toml"),
+            "[[gates]]\nname = \"never\"\ncmd = \"git frobnicate-not-a-command\"\n",
+        )
+        .expect("config");
+        git_in(&repo, &["add", "-A"]);
+        git_in(&repo, &["commit", "-q", "-m", "config"]);
+
+        let mut opts = options(&repo);
+        opts.config_path = Some(repo.join("tactus.toml"));
+        let source = FakeSource {
+            adapter: FakeAdapter {
+                effect: Effect::EditFile,
+            },
+        };
+        let report = run_with(&opts, &source).expect("engine ok");
+        assert_eq!(report.halted_at.as_deref(), Some("t1"));
+        let TaskRunStatus::Failed { reason } = &report.tasks[0].status else {
+            panic!("t1 should fail on the gate");
+        };
+        assert!(reason.contains("gate `never` failed"), "reason: {reason}");
+        assert!(
+            git_in(&repo, &["status", "--porcelain"]).trim().is_empty(),
+            "rolled back"
+        );
+        let gates_dir = repo
+            .join(".tactus")
+            .join("runs")
+            .join(&report.run_id)
+            .join("gates");
+        assert!(gates_dir.join("t1-1-never.log").is_file(), "full log kept");
+    }
+
+    #[test]
+    fn unresolvable_gate_refuses_at_preflight() {
+        let repo = temp_engine_repo("gateresolve");
+        fs::write(
+            repo.join("tactus.toml"),
+            "[[gates]]\nname = \"ghost\"\ncmd = \"definitely-not-a-real-tool-xyz build\"\n",
+        )
+        .expect("config");
+        git_in(&repo, &["add", "-A"]);
+        git_in(&repo, &["commit", "-q", "-m", "config"]);
+
+        let mut opts = options(&repo);
+        opts.config_path = Some(repo.join("tactus.toml"));
+        let source = FakeSource {
+            adapter: FakeAdapter {
+                effect: Effect::EditFile,
+            },
+        };
+        let err = run_with(&opts, &source).expect_err("must refuse");
+        assert!(err.to_string().contains("not found on PATH"), "got: {err}");
+        let branch = git_in(&repo, &["rev-parse", "--abbrev-ref", "HEAD"]);
+        assert_eq!(branch.trim(), "main", "refused before branching");
+    }
+
+    #[test]
+    fn test_task_without_test_code_fails_provenance() {
+        let repo = temp_engine_repo("provenance");
+        fs::write(
+            repo.join("plan.md"),
+            "## Test the widget\n<!-- tactus: id=tt depends= -->\nAdd coverage.\n",
+        )
+        .expect("plan");
+        git_in(&repo, &["add", "-A"]);
+        git_in(&repo, &["commit", "-q", "-m", "test plan"]);
+
+        let source = FakeSource {
+            adapter: FakeAdapter {
+                effect: Effect::EditFile, // writes a txt file — no test markers
+            },
+        };
+        let report = run_with(&options(&repo), &source).expect("engine ok");
+        assert_eq!(report.halted_at.as_deref(), Some("tt"));
+        let TaskRunStatus::Failed { reason } = &report.tasks[0].status else {
+            panic!("provenance should fail");
+        };
+        assert!(reason.contains("provenance"), "reason: {reason}");
+    }
+
+    #[test]
+    fn test_task_adding_real_tests_passes_provenance() {
+        let repo = temp_engine_repo("provenance-ok");
+        fs::write(
+            repo.join("plan.md"),
+            "## Test the widget\n<!-- tactus: id=tt depends= -->\n",
+        )
+        .expect("plan");
+        git_in(&repo, &["add", "-A"]);
+        git_in(&repo, &["commit", "-q", "-m", "test plan"]);
+
+        let source = FakeSource {
+            adapter: FakeAdapter {
+                effect: Effect::EditTest,
+            },
+        };
+        let report = run_with(&options(&repo), &source).expect("engine ok");
+        assert!(report.halted_at.is_none(), "report: {report:?}");
+        assert!(matches!(
+            report.tasks[0].status,
+            TaskRunStatus::Committed { .. }
+        ));
     }
 
     #[test]
