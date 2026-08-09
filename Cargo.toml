@@ -1,6 +1,8 @@
 [package]
 name = "tactus"
-version = "0.1.0"
+# 0.0.x while the v0.1 milestone (DESIGN.md §21) is still being built — 0.1.0
+# is reserved for the release that actually meets its definition of done.
+version = "0.0.1"
 edition = "2024"
 license = "AGPL-3.0-only"
 description = "Headless orchestration engine for AI coding agents — the conductor, not an instrument"
