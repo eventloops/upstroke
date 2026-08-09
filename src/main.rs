@@ -11,6 +11,8 @@ use std::time::Duration;
 use anyhow::Context;
 use clap::{Parser, Subcommand, ValueEnum};
 use tactus::answer::{self, Reply};
+use tactus::capacity;
+use tactus::connect;
 use tactus::engine::{self, RunOutcome};
 use tactus::interaction::{InteractionMode, RealSleeper};
 use tactus::status;
@@ -21,6 +23,12 @@ use tactus::validate::{self, ValidateOptions};
 /// it gets its own status.
 const EXIT_PARKED: u8 = 2;
 
+/// §13: a run stopped by its own budget completed neither cleanly, in error,
+/// nor waiting on a human. CI has to tell "your ceiling stopped it" from "a task
+/// failed" without parsing prose — and `tactus resume --budget` is what it does
+/// about it, which is different from what it does about either of the others.
+const EXIT_BUDGET: u8 = 3;
+
 #[derive(Parser)]
 #[command(name = "tactus", version, about = "Conductor for AI coding agents")]
 struct Cli {
@@ -30,6 +38,25 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
+    /// Discover installed agent CLIs and write ~/.tactus/pools.toml
+    Connect {
+        /// Replace an existing pools file that differs from what this would
+        /// write. Without it, connect prints the difference and refuses.
+        #[arg(long)]
+        force: bool,
+        /// Pools file path (default: ~/.tactus/pools.toml)
+        #[arg(long)]
+        pools: Option<PathBuf>,
+    },
+    /// Show every pool: remaining estimate, resets, and what each strategy would do
+    Capacity {
+        /// Repo config path (default: ./tactus.toml, optional)
+        #[arg(long)]
+        config: Option<PathBuf>,
+        /// Pools file path (default: ~/.tactus/pools.toml)
+        #[arg(long)]
+        pools: Option<PathBuf>,
+    },
     /// Parse a plan, resolve routing, and print the task table (no execution)
     Validate {
         /// Path to the plan file (annotated or bare markdown)
@@ -56,8 +83,12 @@ enum Command {
         /// park their tasks and the run reports them instead of waiting
         #[arg(long, value_enum)]
         interaction: Option<Interaction>,
+        /// Ceiling on api-equivalent dollars, overriding [budgets] run_usd.
+        /// The run stops (exit 3) before the attempt that would cross it
+        #[arg(long)]
+        budget: Option<f64>,
     },
-    /// Continue a run that was interrupted or ended with tasks parked
+    /// Continue a run that was interrupted, parked, or stopped at its budget
     Resume {
         /// Run id, or any unambiguous prefix of one
         run_id: String,
@@ -66,6 +97,10 @@ enum Command {
         config: Option<PathBuf>,
         #[arg(long, value_enum)]
         interaction: Option<Interaction>,
+        /// Raise the ceiling and continue. Budgets are re-derived at resume
+        /// rather than inherited from the stopped run
+        #[arg(long)]
+        budget: Option<f64>,
     },
     /// Show a run: what happened, what it cost, and what it is waiting for
     Status {
@@ -134,6 +169,32 @@ fn validate_options(plan: PathBuf, config: Option<PathBuf>) -> anyhow::Result<Va
 fn run() -> anyhow::Result<ExitCode> {
     let cli = Cli::parse();
     match cli.command {
+        Command::Connect { force, pools } => {
+            let report = connect::run(&connect::ConnectOptions {
+                pools_path: pools,
+                force,
+            })?;
+            print!("{}", connect::render_report(&report));
+            // A refusal to clobber is not something a retry fixes, and a script
+            // that cannot tell it from success would go on to run against a
+            // pools file that says something else entirely.
+            if report.refused() {
+                return Ok(ExitCode::FAILURE);
+            }
+            Ok(ExitCode::SUCCESS)
+        }
+        Command::Capacity { config, pools } => {
+            let report = capacity::report(
+                &capacity::CapacityOptions {
+                    config_path: config,
+                    pools_path: pools,
+                    repo_root: std::env::current_dir().context("resolving current directory")?,
+                },
+                &engine::BuiltinAdapters,
+            )?;
+            print!("{}", report.render());
+            Ok(ExitCode::SUCCESS)
+        }
         Command::Validate {
             plan,
             emit_json,
@@ -155,10 +216,16 @@ fn run() -> anyhow::Result<ExitCode> {
             dry_run,
             config,
             interaction,
+            budget,
         } => {
             if dry_run {
                 let report = validate::run(&validate_options(plan, config)?)?;
                 print!("{}", report.render());
+                if let Some(budget) = budget {
+                    println!(
+                        "budget: ${budget:.2} would cap this run; nothing is spent in a dry run"
+                    );
+                }
                 println!("dry run: no agents executed, nothing spent");
                 return Ok(ExitCode::SUCCESS);
             }
@@ -166,6 +233,7 @@ fn run() -> anyhow::Result<ExitCode> {
             let mut opts = engine::RunOptions::new(plan, repo_root);
             opts.config_path = config;
             opts.interaction = interaction.map(Into::into);
+            opts.budget_usd = budget;
             let report = engine::run(&opts)?;
             finish(&report)
         }
@@ -173,11 +241,13 @@ fn run() -> anyhow::Result<ExitCode> {
             run_id,
             config,
             interaction,
+            budget,
         } => {
             let repo_root = std::env::current_dir().context("resolving current directory")?;
             let mut opts = engine::ResumeOptions::new(run_id, repo_root);
             opts.config_path = config;
             opts.interaction = interaction.map(Into::into);
+            opts.budget_usd = budget;
             let report = engine::resume(&opts)?;
             finish(&report)
         }
@@ -250,6 +320,10 @@ fn finish(report: &engine::RunReport) -> anyhow::Result<ExitCode> {
         // §12: parked is neither clean nor broken. Distinguishable so CI can
         // gate on it without parsing prose.
         RunOutcome::Parked => Ok(ExitCode::from(EXIT_PARKED)),
+        // §13: nor is a budget stop. It is not an error — the run did exactly
+        // what the ceiling asked — so it does not `bail`, and the report above
+        // already printed the resume command that continues it.
+        RunOutcome::BudgetExceeded => Ok(ExitCode::from(EXIT_BUDGET)),
         RunOutcome::Halted => anyhow::bail!(
             "run halted at task `{}`",
             report.halted_at.as_deref().unwrap_or("?")

@@ -83,6 +83,13 @@ const EXAMPLE_FRONTIER: CatalogEntry = entry(
 ///
 /// **Table order is preference order.** [`different_family_at`] returns the
 /// first match, so moving an entry up promotes it for cross-family review.
+///
+/// The Copilot half was checked against GitHub's supported-models reference on
+/// 2026-08-09; plain `gpt-5` and `gemini-2.5-pro` had already left the roster
+/// and were replaced (see the entries). Slugs churn faster than releases do, so
+/// treat every name here as point-in-time: `tactus connect` cross-checks the
+/// roster against what the installed CLI advertises wherever that CLI can
+/// actually enumerate models, and says so when it cannot (today, neither can).
 pub const CATALOG: &[CatalogEntry] = &[
     EXAMPLE_SMALL,
     entry(
@@ -100,9 +107,19 @@ pub const CATALOG: &[CatalogEntry] = &[
     ),
     EXAMPLE_FRONTIER,
     entry("copilot", "gpt-5-mini", Tier::Small, Family::OpenAI),
-    entry("copilot", "gemini-2.5-pro", Tier::Mid, Family::Google),
+    // Slug pattern-derived, not verbatim: GitHub's reference lists the model as
+    // "Gemini 3.1 Pro" and writes dots inside versions elsewhere
+    // (`claude-sonnet-4.6`), but no example spells this one out. Lower
+    // confidence than the entries around it — the `connect` cross-check is what
+    // is meant to catch it once a CLI can enumerate models.
+    entry("copilot", "gemini-3.1-pro", Tier::Mid, Family::Google),
     entry("copilot", "claude-sonnet-5", Tier::Mid, Family::Anthropic),
-    entry("copilot", "gpt-5", Tier::Frontier, Family::OpenAI),
+    // Verbatim from GitHub's CLI programmatic reference, where it appears as a
+    // `--model` example — the highest exact-slug confidence available without
+    // enumeration. It is also load-bearing: `different_family_at` picks it for
+    // every cross-vendor second opinion at frontier, so a wrong name here fails
+    // §11.3 reviews at runtime on exactly the paths blast radius protects.
+    entry("copilot", "gpt-5.3-codex", Tier::Frontier, Family::OpenAI),
     entry(
         "copilot",
         "claude-opus-5",
@@ -157,9 +174,51 @@ pub fn different_family_at(
         .find(|e| e.tier == tier && e.family != not_family && has_adapter(e.agent))
 }
 
+/// Catalog entries for `agent` that the installed CLI does not advertise.
+///
+/// The guard the step-9 review asked for, and the reason `Discovery.models`
+/// exists: this table is hand-maintained point-in-time data, and two of its
+/// entries had already gone stale by Aug 2026 — including the one
+/// [`different_family_at`] picks for every frontier second opinion, where a
+/// wrong slug fails §11.3 review at runtime on exactly the blast-radius paths
+/// the second opinion exists to protect.
+///
+/// **`advertised` is empty on both adapters today** (neither CLI enumerates
+/// models non-interactively), and an empty list means *the CLI said nothing*,
+/// not *the CLI has no models* — so it returns nothing rather than condemning
+/// the whole roster. The check fires when a future CLI grows enumeration;
+/// `Caps::model_list` is what gates asking at all.
+pub fn missing_from(agent: &str, advertised: &[String]) -> Vec<&'static str> {
+    if advertised.is_empty() {
+        return Vec::new();
+    }
+    CATALOG
+        .iter()
+        .filter(|entry| entry.agent == agent)
+        .map(|entry| entry.model)
+        .filter(|model| !advertised.iter().any(|seen| seen == model))
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_cli_that_enumerates_models_is_cross_checked_against_the_catalog() {
+        // Silence is not disagreement: a CLI that advertises nothing must not
+        // read as one that has repudiated the whole roster.
+        assert!(missing_from("copilot", &[]).is_empty());
+
+        let advertised: Vec<String> = ["gpt-5-mini", "gpt-5.3-codex", "claude-sonnet-5"]
+            .map(str::to_owned)
+            .to_vec();
+        let missing = missing_from("copilot", &advertised);
+        assert_eq!(missing, ["gemini-3.1-pro", "claude-opus-5"], "{missing:?}");
+        // Scoped to the agent asked about — Claude Code's roster is not
+        // evidence about Copilot's.
+        assert!(!missing.contains(&"claude-haiku-4-5"));
+    }
 
     #[test]
     fn example_bindings_cover_every_tier_and_exist_in_catalog() {
@@ -180,7 +239,7 @@ mod tests {
     #[test]
     fn known_models_scoped_to_agent() {
         let models = known_models("copilot");
-        assert!(models.contains(&"gpt-5"));
+        assert!(models.contains(&"gpt-5.3-codex"));
         assert!(!models.contains(&"claude-opus-4-8"));
     }
 
@@ -197,11 +256,11 @@ mod tests {
         let picked = different_family_at(Tier::Frontier, Family::Anthropic, everything)
             .expect("an openai frontier model exists");
         assert_eq!(picked.family, Family::OpenAI);
-        assert_eq!((picked.agent, picked.model), ("copilot", "gpt-5"));
+        assert_eq!((picked.agent, picked.model), ("copilot", "gpt-5.3-codex"));
 
         let picked = different_family_at(Tier::Mid, Family::Anthropic, everything)
             .expect("a non-anthropic mid model exists");
-        assert_eq!((picked.agent, picked.model), ("copilot", "gemini-2.5-pro"));
+        assert_eq!((picked.agent, picked.model), ("copilot", "gemini-3.1-pro"));
 
         // Asked from the other side, it comes back to Anthropic.
         let picked = different_family_at(Tier::Frontier, Family::OpenAI, everything)

@@ -1,5 +1,9 @@
-//! Probe every registered agent adapter and print what pre-flight would see:
+//! Probe and discover every registered agent adapter — what pre-flight would
+//! see, and what `tactus connect` would write about it:
 //! `cargo run --example probe`
+//!
+//! Zero spend: `probe()` reads `--version` and `--help`, and `discover()` asks
+//! each vendor's CLI about its own account. Neither runs a model.
 
 use tactus::agent;
 
@@ -18,7 +22,35 @@ fn main() {
                 caps.acp,
                 caps.model_list,
             ),
-            Err(e) => println!("{}: probe failed — {e}", adapter.id()),
+            Err(e) => {
+                println!("{}: probe failed — {e}", adapter.id());
+                // Discovery on a CLI that cannot report its own version would
+                // be reading tea leaves, so it is not attempted.
+                continue;
+            }
+        }
+        match adapter.discover() {
+            Ok(discovery) => {
+                println!(
+                    "  discovery: auth={} shape={} models={}",
+                    discovery.auth,
+                    discovery
+                        .shape
+                        .map_or_else(|| "unknown".to_owned(), |kind| kind.to_string()),
+                    if discovery.models.is_empty() {
+                        // The honest answer on both adapters today: neither CLI
+                        // offers non-interactive enumeration (§13), so the
+                        // roster comes from the shipped catalog.
+                        "(none advertised; the catalog is the roster)".to_owned()
+                    } else {
+                        discovery.models.join(", ")
+                    }
+                );
+                for note in &discovery.notes {
+                    println!("    {note}");
+                }
+            }
+            Err(e) => println!("  discovery failed — {e}"),
         }
     }
 }

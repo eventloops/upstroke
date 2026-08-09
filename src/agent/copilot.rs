@@ -54,7 +54,7 @@ use serde_json::json;
 
 use super::bin::{self, Invocation};
 use super::proc::{self, ProcessOutput};
-use super::{AgentAdapter, Caps, TaskRun, looks_rate_limited};
+use super::{AgentAdapter, Caps, Discovery, TaskRun, looks_rate_limited};
 use crate::error::TactusError;
 use crate::ir::{Outcome, OutcomeStatus, PermissionMode, WorkerProfile};
 use crate::util;
@@ -181,6 +181,43 @@ impl AgentAdapter for CopilotAdapter {
 
     fn parse(&self, out: &ProcessOutput) -> Result<Outcome, TactusError> {
         Ok(parse_output(out))
+    }
+
+    /// Honestly, almost nothing — and the same pessimistic temperament as this
+    /// adapter's `Caps`.
+    ///
+    /// GitHub's programmatic CLI reference documents no non-interactive auth
+    /// query and no model listing (checked Aug 2026), so there is nothing to
+    /// subprocess that would answer either question. Reporting
+    /// [`AuthState::Unknown`] is the truthful result: inferring "signed in"
+    /// from the binary merely existing would put a confident wrong line in a
+    /// file the operator then trusts.
+    ///
+    /// The `probe()` this runs beside is what has actually been load-bearing
+    /// here, and it still is: [`Caps::model_list`] gates any future
+    /// enumeration, so the day this CLI grows one, `connect` starts
+    /// cross-checking the catalog without another decision being made.
+    fn discover(&self) -> Result<Discovery, TactusError> {
+        // Still located, so `connect` fails this agent the same way pre-flight
+        // would rather than writing a pool for a binary that is not there.
+        let invocation = locate()?;
+        let caps = self.probe()?;
+        let mut discovery = Discovery::unknown().with_note(format!(
+            "`{}` reports no non-interactive auth state, so whether this account is signed in \
+             could not be checked without spending",
+            invocation.display()
+        ));
+        if !caps.model_list {
+            discovery.notes.push(
+                "and no model listing either, so the roster for this agent is the catalog \
+                 shipped with tactus, not something confirmed here"
+                    .to_owned(),
+            );
+        }
+        // §13 gives Copilot two billing shapes — credits (post-Jun 2026) and
+        // legacy premium requests — and nothing this CLI prints distinguishes
+        // them. `shape: None` is what makes the writer say so in the file.
+        Ok(discovery)
     }
 
     /// Nothing to reference: permissions ride on argv, so this returns `None`
@@ -373,7 +410,7 @@ mod tests {
         WorkerProfile {
             name: "impl-frontier".to_owned(),
             agent: ADAPTER_ID.to_owned(),
-            model: "gpt-5".to_owned(),
+            model: "gpt-5.3-codex".to_owned(),
             pool: "copilot".to_owned(),
             permissions,
             max_turns: Some(30),
@@ -407,7 +444,7 @@ mod tests {
         let joined = build_args(&task_run()).join(" ");
         assert!(joined.contains("-s"), "response only: {joined}");
         assert!(joined.contains("--no-ask-user"));
-        assert!(joined.contains("--model=gpt-5"));
+        assert!(joined.contains("--model=gpt-5.3-codex"));
         assert!(!joined.contains("--resume"), "no session to resume");
     }
 
@@ -500,10 +537,14 @@ mod tests {
         // today, so this pins the gap rather than the behaviour: whoever makes
         // profiles config-driven has to come here and decide.
         let mut run = task_run();
-        run.profile.max_turns = Some(3);
+        // A digit that appears nowhere else in the args — model slugs carry
+        // version numbers, so a cap of 3 would collide with `gpt-5.3-codex` and
+        // the substitution check below would fail on the model rather than on a
+        // turn cap that leaked.
+        run.profile.max_turns = Some(7);
         let joined = build_args(&run).join(" ");
         assert!(
-            !joined.contains("max-turns") && !joined.contains('3'),
+            !joined.contains("max-turns") && !joined.contains('7'),
             "no invented flag, and no silent substitution: {joined}"
         );
     }

@@ -9,12 +9,22 @@ only what passes.
 It never edits a file, never implements an agentic loop, and never calls a model API. It is the
 conductor, not an instrument.
 
-> **Status: early. Not yet usable end to end.** The build order is public in `DESIGN.md` §21;
-> steps 1–6 are done (plan ingestion, routing, the Claude Code adapter, the sequential engine
-> with git ownership, gates, and review). Retry and escalation, the event log, the Copilot
-> adapter, and the capacity engine are not built yet.
+> **Status: v0.1 feature-complete, not yet proven end to end.** The build order is public in
+> `DESIGN.md` §21; steps 1–10 are done — plan ingestion, routing, the Claude Code and Copilot
+> adapters, the sequential engine with git ownership, gates, cross-family review, the
+> verification ladder, the event log with resume and status, and the capacity engine
+> **read-only**. What remains for v0.1 is the acceptance run on a real repository. Parallelism,
+> worktrees, Aider, and capacity-driven routing are v0.2.
 
 ## What works today
+
+```bash
+tactus connect
+```
+
+Discovers the agent CLIs installed on this machine, asks each one about its own account, and
+writes `~/.tactus/pools.toml`. No HTTP, no token ever handled — it subprocesses the vendors'
+own CLIs. The file is hand-editable and never overwritten without `--force`.
 
 ```bash
 tactus validate plan.md
@@ -27,15 +37,41 @@ chain, and prints the table with the source of every decision — at zero spend.
 tactus run plan.md --dry-run
 ```
 
-Everything except the agents: parse, route, show the effective gates, spend nothing.
+Everything except the agents: parse, route, show the effective gates, and preview each pool's
+estimated capacity and what your strategy would do with it. Spends nothing, probes nothing.
 
 ```bash
-tactus run plan.md
+tactus capacity
+```
+
+Every pool: auth state, estimated remaining with its confidence, resets, margins, and what
+`conserve` / `value-max` / `deadline` *would* do. Estimates are conservative by construction —
+an unmeasured pool reads as **unknown**, never as full.
+
+```bash
+tactus run plan.md --budget 15
 ```
 
 Executes for real: creates a `tactus/run-<id>` branch, runs one agent per task, captures the
 diff itself, runs your gates, has a read-only reviewer judge the diff against the task's
-acceptance criteria, and commits per task. Halts on the first failure.
+acceptance criteria, and commits per task. Every transition lands in `events.jsonl`, which is
+what `tactus status`, `tactus answer`, and `tactus resume` read back.
+
+```bash
+tactus resume <run-id> --budget 30
+```
+
+Continues a run that was interrupted, ended with tasks parked on questions, or stopped at its
+budget. Budgets are re-read at resume, so raising the ceiling and continuing is one command.
+
+### Exit codes
+
+| Code | Meaning |
+|---|---|
+| 0 | complete |
+| 1 | a task failed and the run halted |
+| 2 | the run ended with tasks parked on unanswered questions |
+| 3 | the run stopped at its budget — raise it and `tactus resume` |
 
 ## Plans
 
@@ -55,7 +91,11 @@ Unknown attributes warn; they never fail a plan.
 
 ## Configuration
 
-A fresh repo runs with zero config. `tactus.toml` overrides the derived defaults:
+Config splits along its natural seam: **pools are user-level** — your subscriptions travel with
+you — while **routing, gates and budgets are repo-level** overrides on derived defaults. A fresh
+repo runs with zero config.
+
+`tactus.toml`, in the repo:
 
 ```toml
 [routing]
@@ -68,6 +108,15 @@ start_at = "frontier"                  # blast radius beats nominal difficulty
 second_opinion = "different-vendor"    # a second reviewer from another model family;
                                        # both must pass. Needs the Copilot CLI installed.
 
+[budgets]
+run_usd  = 15.0                        # api-equivalent; omit for unlimited
+task_usd = 4.0                         # either ceiling ends the run (exit 3)
+
+[interaction]
+ask_before = { frontier_escalation_over_usd = 5.0 }
+                                       # park and ask before escalating onto a frontier
+                                       # rung once the run has reported this much spend
+
 [[gates]]
 name = "test"
 cmd = "cargo test"
@@ -75,6 +124,24 @@ timeout_secs = 1200
 ```
 
 Gates are derived from the repo's shape when unconfigured (Cargo.toml, go.mod, package.json).
+
+`~/.tactus/pools.toml`, written by `tactus connect` and yours to edit:
+
+```toml
+[pools.claude-max]
+kind = "subscription-window"           # credits | request-pool | api-key | unmetered
+agent = "claude-code"
+window = "5h"
+weekly = true
+sources = ["signals", "self"]          # trust order; local-logs and provider-endpoint
+                                       # are parsed but not read in v0.1
+safety_margin = 0.15                   # usage on your other machines is invisible
+reserve = 0.20                         # headroom kept for your interactive sessions
+```
+
+Spend reported by the CLIs is api-equivalent and, on subscriptions, notional. Where a route
+reports nothing at all — Copilot's does not — the ledger marks the total `?` rather than
+presenting a floor as a figure.
 
 ## Design guarantees
 
@@ -92,11 +159,16 @@ These are invariants, not aspirations — they're what make it safe to leave run
   the reviewer rebinds to a different model family; on blast-radius paths a second reviewer from
   another family judges the same diff independently, and both must pass.
 - **An empty diff can never pass.** "Done" claims require changed code.
+- **Estimates are never optimistic.** A capacity pool nothing has measured reads as *unknown*,
+  not as full, and every estimate is discounted by a safety margin and a reserve floor before
+  it is shown.
 
 ## Requirements
 
 Rust 1.85+ (edition 2024) and [Claude Code](https://docs.claude.com/en/docs/claude-code/overview)
-on `PATH`. Windows, macOS and Linux are all first-class.
+on `PATH`. The [GitHub Copilot CLI](https://docs.github.com/en/copilot/reference/copilot-cli-reference/cli-programmatic-reference)
+is optional and unlocks the cross-family second opinion. Windows, macOS and Linux are all
+first-class.
 
 ## Licence
 

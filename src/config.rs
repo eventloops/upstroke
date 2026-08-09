@@ -13,6 +13,7 @@ use std::time::Duration;
 use globset::{Glob, GlobSet, GlobSetBuilder};
 use serde::Deserialize;
 
+use crate::capacity::{self, Allowance, Pool, PoolKind, Source};
 use crate::catalog;
 use crate::error::TactusError;
 use crate::gates::ShellKind;
@@ -30,8 +31,7 @@ struct RawRepoConfig {
     gates: Option<toml::Value>,
     engine: Option<toml::Value>,
     interaction: Option<toml::Value>,
-    // Other sections (budgets) are legal in tactus.toml but not consumed yet;
-    // serde ignores them.
+    budgets: Option<toml::Value>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -54,10 +54,36 @@ struct RawInteraction {
     /// Seconds a detached interactive run waits at a hard block for an answer
     /// to arrive as an event; `0` disables waiting.
     wait_on_block_secs: Option<u64>,
-    /// `ask_before = { frontier_escalation_over_usd = 5.0 }` (§12). Accepted
-    /// and echoed so a config written to spec does not error, but nothing
-    /// raises `ApproveSpend` until the ledger exists (step 8/10).
+    /// `ask_before = { frontier_escalation_over_usd = 5.0 }` (§12).
     ask_before: Option<toml::Value>,
+}
+
+/// `[interaction] ask_before` (§12) — the thresholds that turn a routing move
+/// into a question for a person.
+///
+/// One key today, and an unknown one is a **hard error** naming the accepted
+/// set: a typo here silently deletes a spend approval, which is the same harm
+/// that made `second_opinion` error rather than warn.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AskBefore {
+    /// Ask before escalating onto a **frontier** rung once the run's reported
+    /// spend has reached this many api-equivalent dollars.
+    ///
+    /// Deliberately spend-to-*date*, not a forward projection. A literal
+    /// reading of "this escalation will cost more than $N" needs per-model
+    /// $/token rates the catalog does not ship, and §10's whole position is
+    /// that guessing costs is worse than measuring them — inventing a price
+    /// table would pile unverifiable static data on top of model names that
+    /// have already proved perishable. v0.2 can project forward from *observed*
+    /// per-rung costs once decision logs hold them.
+    pub frontier_escalation_over_usd: Option<f64>,
+}
+
+impl AskBefore {
+    /// Accepted keys, named once so the parser and its error message cannot
+    /// disagree about what is legal.
+    const ACCEPTED: [&'static str; 1] = ["frontier_escalation_over_usd"];
 }
 
 #[derive(Debug, Deserialize)]
@@ -107,6 +133,40 @@ struct RawKindRouting {
 #[derive(Debug, Default, Deserialize)]
 struct RawPools {
     pools: Option<BTreeMap<String, toml::Value>>,
+}
+
+/// One `[pools.<name>]` entry, before validation. Every field is optional here
+/// so a shape mistake reports as a named problem rather than a serde error
+/// about a struct the config author never wrote.
+#[derive(Debug, Default, Deserialize)]
+struct RawPool {
+    kind: Option<String>,
+    agent: Option<String>,
+    window: Option<String>,
+    weekly: Option<bool>,
+    sources: Option<Vec<String>>,
+    safety_margin: Option<f64>,
+    reserve: Option<f64>,
+    monthly_allowance: Option<toml::Value>,
+    endpoint: Option<String>,
+    /// §13's credential-profile seam (D2): which account this pool draws from.
+    profile: Option<String>,
+    /// Everything else, so a typo warns by name instead of vanishing.
+    #[serde(flatten)]
+    unknown: BTreeMap<String, toml::Value>,
+}
+
+/// `[budgets]` (§17). API-equivalent dollars; omitting either means unlimited.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Deserialize)]
+pub struct Budgets {
+    pub run_usd: Option<f64>,
+    pub task_usd: Option<f64>,
+}
+
+impl Budgets {
+    pub fn any(self) -> bool {
+        self.run_usd.is_some() || self.task_usd.is_some()
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -205,7 +265,13 @@ pub struct Config {
     pub overrides: Vec<CompiledOverride>,
     pub pins: Vec<Pin>,
     pub strategy: Strategy,
-    pub pool_names: Vec<String>,
+    /// `~/.tactus/pools.toml`, in file order — which is preference order for
+    /// [`crate::capacity::pool_for`].
+    pub pools: Vec<Pool>,
+    /// `[budgets]` (§17); both keys optional, both meaning unlimited when absent.
+    pub budgets: Budgets,
+    /// `[interaction] ask_before` (§12).
+    pub ask_before: AskBefore,
     /// `Some` (possibly empty — explicitly no gates) when `[[gates]]` was
     /// configured; `None` means derive from the repo.
     pub gates: Option<Vec<GateConfig>>,
@@ -234,6 +300,7 @@ struct InteractionSettings {
     mode: InteractionMode,
     notify: Vec<String>,
     wait_on_block: Duration,
+    ask_before: AskBefore,
 }
 
 /// §12's default hard-block wait for a detached interactive run: long enough
@@ -466,15 +533,18 @@ pub fn load(
     let gates = parse_gates(raw.gates, &repo_path)?;
     let (shell, on_task_failure) = parse_engine(raw.engine, &repo_path, warnings)?;
     let interaction = parse_interaction(raw.interaction, &repo_path, warnings)?;
+    let budgets = parse_budgets(raw.budgets, &repo_path)?;
 
-    let pool_names = read_pools(pools_file)?;
+    let pools = read_pools(pools_file, warnings)?;
 
     Ok(Config {
         chains,
         overrides,
         pins,
         strategy,
-        pool_names,
+        pools,
+        budgets,
+        ask_before: interaction.ask_before,
         gates,
         shell,
         review_tier,
@@ -484,6 +554,35 @@ pub fn load(
         notify: interaction.notify,
         wait_on_block: interaction.wait_on_block,
     })
+}
+
+/// `[budgets]` (§17). A ceiling that is zero, negative, or not a number is a
+/// hard error: every one of those readings would either stop the run before it
+/// began or be ignored, and which of the two happened must not be a surprise.
+fn parse_budgets(raw: Option<toml::Value>, repo_path: &Path) -> Result<Budgets, TactusError> {
+    let Some(value) = raw else {
+        return Ok(Budgets::default());
+    };
+    let budgets: Budgets = value.try_into().map_err(|e| TactusError::Config {
+        path: repo_path.to_path_buf(),
+        message: format!(
+            "[budgets]: {e} (expected optional `run_usd` and `task_usd` numbers, in \
+             api-equivalent dollars)"
+        ),
+    })?;
+    for (name, limit) in [("run_usd", budgets.run_usd), ("task_usd", budgets.task_usd)] {
+        let Some(limit) = limit else { continue };
+        if !limit.is_finite() || limit <= 0.0 {
+            return Err(TactusError::Config {
+                path: repo_path.to_path_buf(),
+                message: format!(
+                    "[budgets] `{name} = {limit}` is not a spendable ceiling — omit the key for \
+                     unlimited, or give it a positive number of dollars"
+                ),
+            });
+        }
+    }
+    Ok(budgets)
 }
 
 /// `[[gates]]` parsing with actionable shape errors: a `[gates]` table, a
@@ -578,12 +677,13 @@ fn parse_engine(
     Ok((shell, on_task_failure))
 }
 
-/// `[interaction]` (§12). Mode decides whether a human can ever be asked, so a
-/// typo errors; notifier ids only decide delivery, so they warn.
+/// `[interaction]` (§12). Mode and `ask_before` decide whether a human is ever
+/// asked, so a typo in either errors; notifier ids only decide delivery, so
+/// they warn.
 fn parse_interaction(
     raw: Option<toml::Value>,
     repo_path: &Path,
-    warnings: &mut Vec<String>,
+    _warnings: &mut Vec<String>,
 ) -> Result<InteractionSettings, TactusError> {
     let default_notify = || vec!["cli".to_owned()];
     let Some(value) = raw else {
@@ -591,6 +691,7 @@ fn parse_interaction(
             mode: InteractionMode::default(),
             notify: default_notify(),
             wait_on_block: DEFAULT_WAIT_ON_BLOCK,
+            ask_before: AskBefore::default(),
         });
     };
     let interaction: RawInteraction = value.try_into().map_err(|e| TactusError::Config {
@@ -600,12 +701,30 @@ fn parse_interaction(
              `wait_on_block_secs`, and `ask_before` table)"
         ),
     })?;
-    if interaction.ask_before.is_some() {
-        warnings.push(
-            "[interaction] ask_before is parsed but not acted on yet — spend approvals need the \
-             ledger (§13), so no ApproveSpend question is raised"
-                .to_owned(),
-        );
+    // An unknown key inside `ask_before` errors rather than warning: the whole
+    // point of the table is to stop the run and ask, so a misspelling that
+    // silently drops the threshold spends the money the operator asked to be
+    // consulted about. Same reasoning as `second_opinion`.
+    let ask_before = match interaction.ask_before {
+        None => AskBefore::default(),
+        Some(value) => value.try_into().map_err(|e| TactusError::Config {
+            path: repo_path.to_path_buf(),
+            message: format!(
+                "[interaction] ask_before: {e} (accepted: {})",
+                AskBefore::ACCEPTED.join(", ")
+            ),
+        })?,
+    };
+    if let Some(threshold) = ask_before.frontier_escalation_over_usd
+        && (!threshold.is_finite() || threshold < 0.0)
+    {
+        return Err(TactusError::Config {
+            path: repo_path.to_path_buf(),
+            message: format!(
+                "[interaction] ask_before `frontier_escalation_over_usd = {threshold}` is not a \
+                 spend threshold — omit the key to never ask, or give it a number of dollars"
+            ),
+        });
     }
     let mode = match interaction.mode {
         None => InteractionMode::default(),
@@ -625,6 +744,7 @@ fn parse_interaction(
         wait_on_block: interaction
             .wait_on_block_secs
             .map_or(DEFAULT_WAIT_ON_BLOCK, Duration::from_secs),
+        ask_before,
     })
 }
 
@@ -656,7 +776,25 @@ fn read_repo_config(
     Ok((raw, path))
 }
 
-fn read_pools(pools_file: Option<&Path>) -> Result<Vec<String>, TactusError> {
+/// Read `~/.tactus/pools.toml` into typed pools (§17).
+///
+/// Temperament matches the rest of this file: anything that would silently
+/// change what the estimator does is an error, and anything that only degrades
+/// what it can say is a warning.
+///
+/// - unknown `kind` → **error**; it decides which estimator rule runs.
+/// - unknown `sources` entry → **error**; dropping `signals` by typo would
+///   discard §13's ground truth while the file still claims to have it.
+/// - `safety_margin` / `reserve` outside `0.0..=1.0` → **error**; both are
+///   fractions, and a "150% margin" has no reading that is merely degraded.
+/// - `agent` with no adapter in this build → **warn**, pool kept and marked
+///   unusable. §17's own example ships `[pools.local] agent = "aider"`, so
+///   erroring would brick anyone who copied the documented file.
+/// - unknown keys → **warn**, by name.
+fn read_pools(
+    pools_file: Option<&Path>,
+    warnings: &mut Vec<String>,
+) -> Result<Vec<Pool>, TactusError> {
     let path = match pools_file {
         Some(p) => p.to_path_buf(),
         None => match discovered_pools_path() {
@@ -675,7 +813,142 @@ fn read_pools(pools_file: Option<&Path>) -> Result<Vec<String>, TactusError> {
         path: path.clone(),
         message: e.to_string(),
     })?;
-    Ok(raw.pools.unwrap_or_default().into_keys().collect())
+    let mut pools = Vec::new();
+    for (name, value) in raw.pools.unwrap_or_default() {
+        pools.push(parse_pool(&name, value, &path, warnings)?);
+    }
+    Ok(pools)
+}
+
+fn parse_pool(
+    name: &str,
+    value: toml::Value,
+    path: &Path,
+    warnings: &mut Vec<String>,
+) -> Result<Pool, TactusError> {
+    let config_error = |message: String| TactusError::Config {
+        path: path.to_path_buf(),
+        message,
+    };
+    let raw: RawPool = value.try_into().map_err(|e| {
+        config_error(format!(
+            "[pools.{name}]: {e} (expected `kind` and `agent` strings, with optional `window`, \
+             `weekly`, `sources`, `safety_margin`, `reserve`, `monthly_allowance`, `endpoint`, \
+             and `profile`)"
+        ))
+    })?;
+
+    let kind_text = raw.kind.ok_or_else(|| {
+        config_error(format!(
+            "[pools.{name}] has no `kind` — one of: {}",
+            PoolKind::ACCEPTED.join(", ")
+        ))
+    })?;
+    let kind = PoolKind::parse(&kind_text).ok_or_else(|| {
+        config_error(format!(
+            "[pools.{name}] `kind = \"{kind_text}\"` is not recognized (accepted: {})",
+            PoolKind::ACCEPTED.join(", ")
+        ))
+    })?;
+    let agent = raw
+        .agent
+        .ok_or_else(|| config_error(format!("[pools.{name}] has no `agent`")))?;
+
+    let window = match raw.window {
+        None => None,
+        Some(text) => Some(capacity::parse_duration(&text).ok_or_else(|| {
+            config_error(format!(
+                "[pools.{name}] `window = \"{text}\"` is not a duration — write a number and one \
+                 of s, m, h, d (for example \"5h\")"
+            ))
+        })?),
+    };
+
+    let mut sources = Vec::new();
+    for entry in raw.sources.unwrap_or_default() {
+        let source = Source::parse(&entry).ok_or_else(|| {
+            config_error(format!(
+                "[pools.{name}] `sources` entry `{entry}` is not recognized (accepted: {})",
+                Source::ACCEPTED.join(", ")
+            ))
+        })?;
+        if !sources.contains(&source) {
+            sources.push(source);
+        }
+    }
+
+    let fraction = |field: &str, value: Option<f64>, default: f64| -> Result<f64, TactusError> {
+        let Some(value) = value else {
+            return Ok(default);
+        };
+        if !value.is_finite() || !(0.0..=1.0).contains(&value) {
+            return Err(config_error(format!(
+                "[pools.{name}] `{field} = {value}` is out of range — it is a fraction of the \
+                 pool between 0.0 and 1.0"
+            )));
+        }
+        Ok(value)
+    };
+    let safety_margin = fraction(
+        "safety_margin",
+        raw.safety_margin,
+        capacity::DEFAULT_SAFETY_MARGIN,
+    )?;
+    let reserve = fraction("reserve", raw.reserve, capacity::DEFAULT_RESERVE)?;
+
+    let monthly_allowance = match raw.monthly_allowance {
+        None => Allowance::Auto,
+        Some(toml::Value::String(text)) if text.trim().eq_ignore_ascii_case("auto") => {
+            Allowance::Auto
+        }
+        Some(toml::Value::Integer(units)) => Allowance::Units(units as f64),
+        Some(toml::Value::Float(units)) => Allowance::Units(units),
+        Some(other) => {
+            return Err(config_error(format!(
+                "[pools.{name}] `monthly_allowance` must be a number of units or the string \
+                 \"auto\", found a {}",
+                other.type_str()
+            )));
+        }
+    };
+    if let Allowance::Units(units) = monthly_allowance
+        && (!units.is_finite() || units <= 0.0)
+    {
+        return Err(config_error(format!(
+            "[pools.{name}] `monthly_allowance = {units}` is not an allowance — write \"auto\" if \
+             you do not know its size"
+        )));
+    }
+
+    for key in raw.unknown.keys() {
+        warnings.push(format!(
+            "unknown key `{key}` in [pools.{name}] in {} (ignored)",
+            path.display()
+        ));
+    }
+
+    let usable = crate::agent::by_id(&agent).is_some();
+    if !usable {
+        warnings.push(format!(
+            "[pools.{name}] names agent `{agent}`, which has no adapter in this build — the pool \
+             is listed but this engine can never draw from it"
+        ));
+    }
+
+    Ok(Pool {
+        name: name.to_owned(),
+        kind,
+        agent,
+        window,
+        weekly: raw.weekly.unwrap_or(false),
+        sources,
+        safety_margin,
+        reserve,
+        monthly_allowance,
+        endpoint: raw.endpoint,
+        profile: raw.profile,
+        usable,
+    })
 }
 
 fn discovered_pools_path() -> Option<PathBuf> {
@@ -722,7 +995,7 @@ mod tests {
         assert!(!cfg.strategy.from_config);
         assert!(cfg.overrides.is_empty());
         assert!(cfg.pins.is_empty());
-        assert!(cfg.pool_names.is_empty());
+        assert!(cfg.pools.is_empty());
     }
 
     #[test]
@@ -893,7 +1166,7 @@ model = "claude-opus-5"
 [[pins]]
 tier = "frontier"
 agent = "copilot"
-model = "gpt-5"
+model = "gpt-5.3-codex"
 "#,
         );
         let mut warnings = Vec::new();
@@ -920,8 +1193,146 @@ agent = "copilot"
         let mut warnings = Vec::new();
         let cfg = load(None, &hermetic(), Some(&path), &mut warnings).expect("load pools");
         assert_eq!(
-            cfg.pool_names,
-            vec!["claude-max".to_owned(), "copilot".to_owned()]
+            cfg.pools
+                .iter()
+                .map(|p| p.name.as_str())
+                .collect::<Vec<_>>(),
+            ["claude-max", "copilot"]
+        );
+    }
+
+    #[test]
+    fn every_pool_key_parses_into_the_shape_the_estimator_reads() {
+        let path = scratch(
+            "fullpools.toml",
+            r#"
+[pools.claude-max]
+kind = "subscription-window"
+agent = "claude-code"
+window = "5h"
+weekly = true
+sources = ["signals", "self", "local-logs"]
+safety_margin = 0.25
+reserve = 0.10
+profile = "personal"
+
+[pools.claude-max-work]
+kind = "subscription-window"
+agent = "claude-code"
+profile = "work"
+
+[pools.copilot]
+kind = "credits"
+agent = "copilot"
+sources = ["signals", "self"]
+monthly_allowance = 300
+"#,
+        );
+        let mut warnings = Vec::new();
+        let cfg = load(None, &hermetic(), Some(&path), &mut warnings).expect("load pools");
+        assert!(warnings.is_empty(), "warnings: {warnings:?}");
+
+        let max = &cfg.pools[0];
+        assert_eq!(max.kind, PoolKind::SubscriptionWindow);
+        assert_eq!(max.window, Some(Duration::from_secs(5 * 3600)));
+        assert!(max.weekly);
+        assert_eq!(
+            max.sources,
+            [Source::Signals, Source::SelfMetered, Source::LocalLogs]
+        );
+        assert_eq!(max.safety_margin, 0.25);
+        assert_eq!(max.reserve, 0.10);
+        assert_eq!(max.monthly_allowance, Allowance::Auto);
+        assert!(max.usable);
+
+        // D2's seam: two Claude Max pools differing only in `profile` parse and
+        // stay distinct. Nothing acts on the field in v0.1 — this is the shape
+        // being right ahead of the behaviour, deliberately.
+        assert_eq!(max.profile.as_deref(), Some("personal"));
+        assert_eq!(cfg.pools[1].profile.as_deref(), Some("work"));
+        assert_eq!(
+            capacity::pool_for("claude-code", &cfg.pools).map(|p| p.name.as_str()),
+            Some("claude-max"),
+            "first match in file order wins"
+        );
+
+        assert_eq!(cfg.pools[2].kind, PoolKind::Credits);
+        assert_eq!(cfg.pools[2].monthly_allowance, Allowance::Units(300.0));
+    }
+
+    #[test]
+    fn pool_mistakes_error_where_they_would_change_the_estimate_and_warn_where_they_degrade_it() {
+        let mut warnings = Vec::new();
+        let load_pools = |name: &str, body: &str, warnings: &mut Vec<String>| {
+            let path = scratch(name, body);
+            load(None, &hermetic(), Some(&path), warnings)
+        };
+
+        // `kind` decides which estimator rule runs.
+        let err = load_pools(
+            "badkind.toml",
+            "[pools.p]\nkind = \"subscription\"\nagent = \"claude-code\"\n",
+            &mut warnings,
+        )
+        .expect_err("unknown kind must error");
+        assert!(
+            err.to_string().contains("subscription-window"),
+            "lists what is accepted: {err}"
+        );
+
+        // Dropping `signals` by typo would discard §13's ground truth while the
+        // file still claims to have it.
+        let err = load_pools(
+            "badsource.toml",
+            "[pools.p]\nkind = \"credits\"\nagent = \"copilot\"\nsources = [\"signal\"]\n",
+            &mut warnings,
+        )
+        .expect_err("unknown source must error");
+        assert!(err.to_string().contains("signals"), "got: {err}");
+
+        // A "150% margin" has no degraded reading, only a wrong one.
+        for bad in ["safety_margin = 1.5", "reserve = -0.2"] {
+            let err = load_pools(
+                "badfraction.toml",
+                &format!("[pools.p]\nkind = \"credits\"\nagent = \"copilot\"\n{bad}\n"),
+                &mut warnings,
+            )
+            .expect_err("an out-of-range fraction must error");
+            assert!(err.to_string().contains("fraction"), "got: {err}");
+        }
+
+        let err = load_pools(
+            "badwindow.toml",
+            "[pools.p]\nkind = \"subscription-window\"\nagent = \"claude-code\"\nwindow = \
+             \"five hours\"\n",
+            &mut warnings,
+        )
+        .expect_err("an unparseable window must error");
+        assert!(err.to_string().contains("duration"), "got: {err}");
+
+        // §17's own example ships `agent = "aider"`, which has no adapter in
+        // v0.1. Erroring would brick anyone who copied the documented file.
+        warnings.clear();
+        let cfg = load_pools(
+            "aider.toml",
+            "[pools.local]\nkind = \"unmetered\"\nagent = \"aider\"\nendpoint = \
+             \"http://homeserver:11434/v1\"\nbogus = 1\n",
+            &mut warnings,
+        )
+        .expect("a pool for an agent this build cannot drive is still a pool");
+        assert_eq!(cfg.pools.len(), 1);
+        assert!(!cfg.pools[0].usable);
+        assert_eq!(
+            cfg.pools[0].endpoint.as_deref(),
+            Some("http://homeserver:11434/v1")
+        );
+        assert!(
+            warnings.iter().any(|w| w.contains("no adapter")),
+            "warnings: {warnings:?}"
+        );
+        assert!(
+            warnings.iter().any(|w| w.contains("bogus")),
+            "an unknown key warns by name: {warnings:?}"
         );
     }
 
@@ -1070,11 +1481,56 @@ ask_before = { frontier_escalation_over_usd = 5.0 }
         assert_eq!(cfg.notify, ["cli", "desktop"]);
         assert_eq!(cfg.wait_on_block, Duration::from_secs(120));
         assert_eq!(cfg.on_task_failure, OnTaskFailure::Continue);
-        // Accepted per §17's own example, but honestly reported as inert.
-        assert!(
-            warnings.iter().any(|w| w.contains("ask_before")),
-            "warnings: {warnings:?}"
+        // Parsed and acted on since step 10 — the "needs the ledger" warning it
+        // used to carry expired when the ledger landed.
+        assert_eq!(cfg.ask_before.frontier_escalation_over_usd, Some(5.0));
+        assert!(warnings.is_empty(), "warnings: {warnings:?}");
+    }
+
+    #[test]
+    fn a_misspelled_ask_before_key_is_a_hard_error() {
+        // Warning and carrying on would run past the spend the operator asked
+        // to approve, with nothing said — the `second_opinion` lesson, applied
+        // to money.
+        let path = scratch(
+            "badask.toml",
+            "[interaction]\nask_before = { frontier_escalation_over_usdd = 5.0 }\n",
         );
+        let mut warnings = Vec::new();
+        let err = load(Some(&path), &hermetic(), Some(&missing()), &mut warnings)
+            .expect_err("an unknown ask_before key must error");
+        let msg = err.to_string();
+        assert!(msg.contains("ask_before"), "names the section: {msg}");
+        assert!(
+            msg.contains("frontier_escalation_over_usd"),
+            "lists what is accepted: {msg}"
+        );
+    }
+
+    #[test]
+    fn budgets_parse_and_a_meaningless_ceiling_is_refused() {
+        let path = scratch(
+            "budgets.toml",
+            "[budgets]\nrun_usd = 15.0\ntask_usd = 4.0\n",
+        );
+        let mut warnings = Vec::new();
+        let cfg = load(Some(&path), &hermetic(), Some(&missing()), &mut warnings).expect("load");
+        assert_eq!(cfg.budgets.run_usd, Some(15.0));
+        assert_eq!(cfg.budgets.task_usd, Some(4.0));
+        assert!(cfg.budgets.any());
+
+        // Zero and negative both have two readings — "stop before starting" and
+        // "no limit" — and which one happened must never be a surprise.
+        for bad in ["run_usd = 0.0", "task_usd = -1.0"] {
+            let path = scratch("badbudget.toml", &format!("[budgets]\n{bad}\n"));
+            let err = load(Some(&path), &hermetic(), Some(&missing()), &mut warnings)
+                .expect_err("a non-positive ceiling must error");
+            assert!(err.to_string().contains("ceiling"), "got: {err}");
+        }
+
+        // Absent means unlimited, silently.
+        let cfg = load(None, &hermetic(), Some(&missing()), &mut warnings).expect("defaults");
+        assert!(!cfg.budgets.any());
     }
 
     #[test]

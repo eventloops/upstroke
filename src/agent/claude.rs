@@ -16,7 +16,8 @@ use serde_json::{Value, json};
 
 use super::bin::{self, Invocation};
 use super::proc::{self, ProcessOutput};
-use super::{AgentAdapter, Caps, TaskRun, looks_rate_limited};
+use super::{AgentAdapter, AuthState, Caps, Discovery, TaskRun, looks_rate_limited};
+use crate::capacity::PoolKind;
 use crate::error::TactusError;
 use crate::ir::{Outcome, OutcomeStatus, PermissionMode, Usage, WorkerProfile};
 use crate::util;
@@ -115,6 +116,28 @@ impl AgentAdapter for ClaudeCodeAdapter {
 
     fn parse(&self, out: &ProcessOutput) -> Result<Outcome, TactusError> {
         Ok(parse_output(out))
+    }
+
+    /// `claude auth status --json` — a zero-spend auth probe that handles no
+    /// token and reads no credential file: the CLI answers about itself, and
+    /// this reads its answer.
+    fn discover(&self) -> Result<Discovery, TactusError> {
+        let invocation = locate()?;
+        let out = proc::run_with_timeout(
+            invocation.command(&["auth".to_owned(), "status".to_owned(), "--json".to_owned()]),
+            "",
+            PROBE_TIMEOUT,
+        )?;
+        let mut discovery = parse_auth_status(&out);
+        // §13's tier classification comes from the catalog either way, but
+        // saying so is what stops the pools file reading as though the roster
+        // had been confirmed against this machine.
+        discovery.notes.push(
+            "this CLI offers no non-interactive model listing, so the roster for this agent is \
+             the catalog shipped with tactus, not something confirmed here"
+                .to_owned(),
+        );
+        Ok(discovery)
     }
 
     fn materialize_permissions(
@@ -304,6 +327,78 @@ fn parse_output(out: &ProcessOutput) -> Outcome {
             .then_some("agent produced unparseable output"),
     ]);
     outcome
+}
+
+/// Read `claude auth status --json`, as defensively as every other payload this
+/// adapter parses: a missing or malformed field yields
+/// [`AuthState::Unknown`], never an error and never a confident wrong answer.
+///
+/// The observed shape (Aug 2026) is
+/// `{"loggedIn": bool, "authMethod": "…", "apiProvider": "…"}`. `loggedIn`
+/// drives the auth state; the other two distinguish §13's two billing shapes —
+/// a subscription window from api-key dollars — because that decides which
+/// estimator rule the written pool gets.
+fn parse_auth_status(out: &ProcessOutput) -> Discovery {
+    let mut discovery = Discovery::unknown();
+    if out.timed_out {
+        return discovery.with_note("`claude auth status --json` timed out; auth state unknown");
+    }
+    let Some(payload): Option<Value> = serde_json::from_str(out.stdout.trim()).ok() else {
+        // A non-zero exit with no JSON is the shape an older CLI without the
+        // subcommand leaves. Not being able to ask is not the same as an
+        // answer, so it stays Unknown.
+        return discovery.with_note(format!(
+            "`claude auth status --json` did not return JSON (exit {:?}); auth state unknown — \
+             this CLI may predate the subcommand",
+            out.code
+        ));
+    };
+    discovery.auth = match payload.get("loggedIn").and_then(Value::as_bool) {
+        Some(true) => AuthState::Authenticated,
+        Some(false) => AuthState::NotAuthenticated,
+        None => AuthState::Unknown,
+    };
+    let method = payload
+        .get("authMethod")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    let provider = payload
+        .get("apiProvider")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    let described = format!("{method} {provider}").to_ascii_lowercase();
+    // Only two readings are confident enough to act on. Anything else leaves
+    // `shape` as None and lets the caller apply a documented default it can
+    // then tell the operator about.
+    discovery.shape = if described.contains("bedrock")
+        || described.contains("vertex")
+        || described.contains("api")
+        || described.contains("key")
+    {
+        Some(PoolKind::ApiKey)
+    } else if described.contains("subscription")
+        || described.contains("claudeai")
+        || described.contains("oauth")
+        || described.contains("max")
+        || described.contains("pro")
+    {
+        Some(PoolKind::SubscriptionWindow)
+    } else {
+        None
+    };
+    if !method.is_empty() || !provider.is_empty() {
+        discovery
+            .notes
+            .push(format!("auth method `{method}`, provider `{provider}`"));
+    }
+    if discovery.shape.is_none() {
+        discovery.notes.push(
+            "the CLI did not say whether this account bills as a subscription window or as api \
+             dollars, so the pool below takes a default — change `kind` if it is wrong"
+                .to_owned(),
+        );
+    }
+    discovery
 }
 
 fn first_non_empty<'a>(candidates: impl IntoIterator<Item = Option<&'a str>>) -> Option<String> {

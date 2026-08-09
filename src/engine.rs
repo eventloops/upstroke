@@ -32,7 +32,8 @@ use std::time::Duration;
 use serde::{Deserialize, Serialize};
 
 use crate::agent::{self, AgentAdapter, Caps, TaskRun, proc};
-use crate::config::OnTaskFailure;
+use crate::capacity;
+use crate::config::{self, OnTaskFailure};
 use crate::error::TactusError;
 use crate::events::{
     self, ChainSummary, EventBody, EventLog, Feedback, Progress, RunState, TaskState,
@@ -60,9 +61,17 @@ pub use crate::ladder::{AttemptFailure, FailureKind, FailureOrigin};
 pub const DEFAULT_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(30 * 60);
 
 /// How many rate limits (or reviewer outages) one task rides out before the
-/// pool counts as down and a human is asked instead. §13's reset times arrive
-/// with the capacity engine; until then this bound is what keeps an exhausted
-/// pool from deferring forever.
+/// pool counts as down and a human is asked instead.
+///
+/// Step 10 gave the capacity engine reset times — [`crate::capacity`] carries
+/// them on an estimate, and `pool_exhausted` records one whenever a signal
+/// includes it — so the obvious question is why this bound still exists. Two
+/// reasons, both current: neither CLI actually reports a machine-readable reset
+/// time today, so the field is almost always `None`; and §13 ships the capacity
+/// engine read-only in v0.1, so nothing routes on a reset even when there is
+/// one. Waiting for a reset instead of counting deferrals is capacity-*driven*
+/// behaviour, and it arrives with the rest of it in v0.2. Until then this is
+/// what keeps an exhausted pool from deferring forever.
 pub const DEFAULT_MAX_DEFERS: u32 = 3;
 
 /// Most recent feedback entries carried into an escalated prompt. Older
@@ -124,6 +133,8 @@ pub struct RunOptions {
     /// Override `[interaction] wait_on_block_secs` — how long a detached
     /// interactive run waits at a hard block. `None` takes the config's.
     pub wait_on_block: Option<Duration>,
+    /// `--budget <usd>`, overriding `[budgets] run_usd` (§17).
+    pub budget_usd: Option<f64>,
 }
 
 impl RunOptions {
@@ -140,6 +151,7 @@ impl RunOptions {
             max_defers: DEFAULT_MAX_DEFERS,
             private_root: None,
             wait_on_block: None,
+            budget_usd: None,
         }
     }
 
@@ -260,12 +272,18 @@ impl TaskReport {
     }
 }
 
-/// How the run ended. `Parked` is deliberately not `Halted`: §12 requires CI
-/// to tell a clean completion from one that left questions unanswered.
+/// How the run ended.
+///
+/// `Parked` is deliberately not `Halted`: §12 requires CI to tell a clean
+/// completion from one that left questions unanswered. `BudgetExceeded` earns
+/// its own variant for the same reason one step further out — "your ceiling
+/// stopped it" is neither a failure nor a question, and `tactus resume` means
+/// something different after each of the three.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RunOutcome {
     Complete,
     Halted,
+    BudgetExceeded,
     Parked,
 }
 
@@ -282,7 +300,26 @@ pub struct RunReport {
     pub halted_at: Option<String>,
     /// Every question raised, with its answer where one arrived (§12).
     pub questions: Vec<QuestionRecord>,
+    /// The §13 ceiling that stopped the run, if one did.
+    #[serde(default)]
+    pub budget_stop: Option<events::BudgetExceeded>,
     pub total_cost_usd: f64,
+    /// What each pool drained, folded from this run's own attempts (§13).
+    #[serde(default)]
+    pub pool_drain: Vec<PoolDrainRow>,
+}
+
+/// One pool's line in the ledger: what this run drew from which subscription.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct PoolDrainRow {
+    pub pool: String,
+    pub attempts: u32,
+    /// Reported api-equivalent dollars, `None` when nothing on this pool
+    /// reported any.
+    pub cost_usd: Option<f64>,
+    /// Attempts whose route reports no spend at all (§13), making the figure
+    /// above a floor rather than a total.
+    pub unpriced: u32,
 }
 
 impl RunReport {
@@ -294,9 +331,18 @@ impl RunReport {
             .collect()
     }
 
+    /// Precedence: a halt outranks a budget stop, which outranks parked work.
+    ///
+    /// That order falls out of what actually happened rather than being a
+    /// policy: a halt stops the drain before any further budget check can run,
+    /// so a run with both is one that halted and then found its ceiling
+    /// irrelevant. And a budget stop leaves tasks parked-or-skipped behind it,
+    /// so reporting `Parked` would name a symptom instead of the cause.
     pub fn outcome(&self) -> RunOutcome {
         if self.halted_at.is_some() {
             RunOutcome::Halted
+        } else if self.budget_stop.is_some() {
+            RunOutcome::BudgetExceeded
         } else if self.parked_tasks().is_empty() {
             RunOutcome::Complete
         } else {
@@ -582,6 +628,8 @@ fn run_harness_inner(
         defer_backoff: opts.defer_backoff,
         max_defers: opts.max_defers,
         on_task_failure: analysis.config.on_task_failure,
+        budgets: effective_budgets(analysis.config.budgets, opts.budget_usd),
+        ask_before: analysis.config.ask_before,
         run_id,
         branch,
         warnings,
@@ -590,8 +638,25 @@ fn run_harness_inner(
     run.emit(EventBody::RunStarted {
         data: Box::new(started),
     })?;
+    // A fresh run has no signals of its own yet, and §13's other sources are
+    // not read in v0.1 — so this snapshot is honestly a record of how little
+    // was known when the run started.
+    run.emit_capacity_snapshot(&BTreeMap::new())?;
     let report = run.drain_and_report()?;
     Ok((report, run.state.clone()))
+}
+
+/// `[budgets]` with `--budget` folded in.
+///
+/// The flag overrides `run_usd` only. `task_usd` has no flag because a
+/// per-task ceiling is a property of how the plan is shaped, not of one
+/// invocation — and a single `--budget` that quietly moved both would be
+/// impossible to reason about at the ledger afterwards.
+fn effective_budgets(configured: config::Budgets, flag: Option<f64>) -> config::Budgets {
+    config::Budgets {
+        run_usd: flag.or(configured.run_usd),
+        task_usd: configured.task_usd,
+    }
 }
 
 /// A path as the run record should carry it: relative to the repo root where
@@ -634,6 +699,16 @@ pub struct ResumeOptions {
     pub max_defers: u32,
     pub private_root: Option<PathBuf>,
     pub wait_on_block: Option<Duration>,
+    /// `--budget <usd>` (§17), overriding `[budgets] run_usd` for this resume.
+    ///
+    /// Budgets are **re-derived from today's config and flags** rather than
+    /// recorded-and-refused, unlike the plan hash and the resolved chains
+    /// (§15). Those refusals protect a run's *identity*: replaying progress
+    /// against a moved plan would attribute work to the wrong task. A budget is
+    /// not identity — it is an operator's ceiling on their own spending, and
+    /// re-reading it is precisely what makes a budget stop recoverable in one
+    /// command instead of a dead run and a new branch.
+    pub budget_usd: Option<f64>,
 }
 
 impl ResumeOptions {
@@ -649,6 +724,7 @@ impl ResumeOptions {
             max_defers: DEFAULT_MAX_DEFERS,
             private_root: None,
             wait_on_block: None,
+            budget_usd: None,
         }
     }
 }
@@ -801,9 +877,12 @@ fn resume_harness_inner(
                 replayed.state.halted_at.as_deref().unwrap_or("?")
             )));
         }
-        // Ended parked, or never ended at all — both are exactly what resume
-        // is for.
-        Some(events::RunOutcome::Parked) | None => {}
+        // Ended parked, at a budget, or never ended at all — all three are
+        // exactly what resume is for. A budget stop in particular is *designed*
+        // to be resumable: `--budget` re-derives the ceiling (see
+        // `ResumeOptions::budget_usd`), so raising it and continuing is one
+        // command rather than a new run and a lost branch.
+        Some(events::RunOutcome::Parked | events::RunOutcome::BudgetExceeded) | None => {}
     }
 
     let workspace = Workspace::open(&opts.repo_root)?;
@@ -895,6 +974,10 @@ fn resume_harness_inner(
         wait_on_block.unwrap_or(analysis.config.wait_on_block),
         sleeper,
     );
+    // §13's ground-truth signals, folded from this run's own log before its
+    // state is moved into the scheduler — what the earlier process learned
+    // about the pools, which a resumed run's snapshot must not forget.
+    let prior_signals = capacity::observe(&replayed.events).exhausted;
     let log = EventLog::open(&paths.events(), &mut warnings)?;
     let mut run = Run {
         state: replayed.state,
@@ -913,6 +996,11 @@ fn resume_harness_inner(
         defer_backoff: opts.defer_backoff,
         max_defers: opts.max_defers,
         on_task_failure: analysis.config.on_task_failure,
+        // Re-derived from today's config and flags, deliberately (see
+        // `ResumeOptions::budget_usd`): raising the ceiling and resuming is the
+        // one-command recovery a budget stop is supposed to have.
+        budgets: effective_budgets(analysis.config.budgets, opts.budget_usd),
+        ask_before: analysis.config.ask_before,
         run_id,
         branch: started.branch.clone(),
         warnings,
@@ -961,6 +1049,11 @@ fn resume_harness_inner(
             discarded,
         },
     })?;
+    // §14 takes a capacity snapshot at pre-flight, and §15 makes a resume
+    // re-establish everything a fresh run establishes. A resume that skipped it
+    // would leave the log claiming the pools looked, hours later, exactly as
+    // they did when the run began.
+    run.emit_capacity_snapshot(&prior_signals)?;
     let report = run.drain_and_report()?;
     Ok((report, run.state.clone()))
 }
@@ -1031,6 +1124,11 @@ struct Run<'a> {
     defer_backoff: Duration,
     max_defers: u32,
     on_task_failure: OnTaskFailure,
+    /// §17's ceilings, with `--budget` already folded in. Checked before every
+    /// spawn; never consulted when deciding *what* binds.
+    budgets: config::Budgets,
+    /// §12's `ask_before` thresholds.
+    ask_before: config::AskBefore,
     run_id: String,
     branch: String,
     warnings: Vec<String>,
@@ -1081,6 +1179,7 @@ impl Run<'_> {
                     RunOutcome::Complete => events::RunOutcome::Complete,
                     RunOutcome::Parked => events::RunOutcome::Parked,
                     RunOutcome::Halted => events::RunOutcome::Halted,
+                    RunOutcome::BudgetExceeded => events::RunOutcome::BudgetExceeded,
                 },
                 halted_at: report.halted_at.clone(),
                 committed: u32::try_from(committed).unwrap_or(u32::MAX),
@@ -1132,7 +1231,10 @@ impl Run<'_> {
                 }
                 continue;
             }
-            if self.state.states.contains(&TaskState::Deferred) && self.state.halted_at.is_none() {
+            if self.state.states.contains(&TaskState::Deferred)
+                && self.state.halted_at.is_none()
+                && self.state.budget_stop.is_none()
+            {
                 let waited = interaction::defer_backoff(self.defer_backoff, defer_round);
                 self.sleeper.sleep(waited);
                 defer_round = defer_round.saturating_add(1);
@@ -1149,7 +1251,10 @@ impl Run<'_> {
             // a human's attention on a decision the scheduler cannot act on —
             // and a decline would relabel `halted_at` with a task that was not
             // the cause. The questions stay open on disk for a resume (§15).
-            if self.state.halted_at.is_none() && self.resolve_one_question()? {
+            if self.state.halted_at.is_none()
+                && self.state.budget_stop.is_none()
+                && self.resolve_one_question()?
+            {
                 continue;
             }
             break;
@@ -1161,7 +1266,11 @@ impl Run<'_> {
     /// index first (§14). Parked, deferred, and blocked tasks are simply not
     /// ready — which is exactly the skip-ahead §14 asks for.
     fn next_ready(&self) -> Option<usize> {
-        if self.state.halted_at.is_some() {
+        // A halt and a budget stop both end scheduling, for the same reason:
+        // whatever runs next would be work the run has already decided not to
+        // do. The remaining tasks settle as skipped exactly as they do after a
+        // halt, and the questions already open stay open for a resume (§15).
+        if self.state.halted_at.is_some() || self.state.budget_stop.is_some() {
             return None;
         }
         let tasks = &self.analysis.plan.tasks;
@@ -1211,11 +1320,26 @@ impl Run<'_> {
                 )?;
                 return Ok(false);
             };
+            // §13's ceiling, checked before EVERY spawn rather than once per
+            // task. The placement is the whole point: an escalation onto a
+            // frontier rung happens inside this loop, so a check that ran only
+            // on the way in would let the most expensive attempt of the run be
+            // the one that dodged the budget. It never influences *what* binds
+            // — capacity-driven routing is v0.2 (§13) — only whether the next
+            // attempt happens at all.
+            if let Some(exceeded) = self.budget_breach(index) {
+                self.emit(EventBody::BudgetExceeded { data: exceeded })?;
+                return Ok(false);
+            }
+
             let profile = WorkerProfile {
                 name: format!("{}-{}", rung.tier, rung.binding.model),
                 agent: rung.binding.agent.clone(),
                 model: rung.binding.model.clone(),
-                pool: String::new(), // pool identity arrives with the capacity engine
+                // Attribution only (§13 read-only): which subscription pays for
+                // this attempt, so the ledger and the estimator can say so.
+                // Nothing routes on it.
+                pool: self.pool_name_for(&rung.binding.agent).unwrap_or_default(),
                 permissions: PermissionMode::Edit,
                 max_turns: None,
                 extra_args: Vec::new(),
@@ -1247,6 +1371,7 @@ impl Run<'_> {
                     tier: rung.tier.to_string(),
                     agent: profile.agent.clone(),
                     model: profile.model.clone(),
+                    pool: pool_option(&profile.pool),
                     resume_session: resume.clone(),
                 },
             })?;
@@ -1296,6 +1421,7 @@ impl Run<'_> {
                     attempt,
                     tier: rung.tier.to_string(),
                     model: profile.model.clone(),
+                    pool: pool_option(&profile.pool),
                     resumed: resume.is_some(),
                     duration: result.outcome.duration,
                     cost_usd: result.outcome.cost_usd,
@@ -1329,6 +1455,16 @@ impl Run<'_> {
                 })?;
                 return Ok(false);
             };
+
+            // §13 source 1: a rate-limit signal is ground truth about a pool,
+            // and the only thing in v0.1 that can call one empty rather than
+            // unmeasured. Recorded separately from the deferral that follows
+            // because they are facts with different lifetimes — the deferral is
+            // about this task's next move, this is about a subscription, and a
+            // later run's estimator reads it back out of the log.
+            if failure.kind == FailureKind::RateLimited {
+                self.record_pool_exhausted(&task_id, &profile, &result.reviews, &failure)?;
+            }
 
             let resumable = self.state.progress[index].session.is_some()
                 && self
@@ -1366,6 +1502,14 @@ impl Run<'_> {
                     })?;
                 }
                 Next::Escalate => {
+                    let onto = chain.rungs.get(rung_index + 1).map(|next| next.tier);
+                    // Escalate FIRST, then ask. The order is what makes the
+                    // approval path need no special case anywhere else: the
+                    // escalation's own fold moves the rung and resets
+                    // `attempts_on_rung`, so an approved task un-parks already
+                    // standing on the frontier rung with a fresh allowance —
+                    // rather than re-running the rung it had just exhausted, or
+                    // arriving back here and asking the same question again.
                     self.emit(EventBody::LadderEscalated {
                         task: task_id.clone(),
                         attempt,
@@ -1377,6 +1521,23 @@ impl Run<'_> {
                             detail: failure.feedback.clone(),
                         },
                     })?;
+                    if let Some(onto) = onto
+                        && self.should_approve_spend(rung.tier, onto)
+                    {
+                        let question = self.raise_spend_approval(index, onto)?;
+                        self.emit(EventBody::TaskParked {
+                            task: task_id.clone(),
+                            data: events::TaskParked {
+                                question: question.to_string(),
+                                // The attempt that caused this escalation was
+                                // genuinely judged and genuinely failed, so its
+                                // allowance stays spent (§12's refund is for
+                                // work nobody judged).
+                                refund_attempt: false,
+                            },
+                        })?;
+                        return Ok(false);
+                    }
                 }
                 Next::Defer => {
                     // No attempt was spent on the work itself, so the event's
@@ -1391,7 +1552,9 @@ impl Run<'_> {
                     return Ok(true);
                 }
                 Next::AskHuman(kind) => {
-                    let question = self.raise_question(index, kind, &failure)?;
+                    let context =
+                        question_context(task, kind, &failure, &self.state.progress[index]);
+                    let question = self.raise_question(index, kind, context)?;
                     self.emit(EventBody::TaskParked {
                         task: task_id.clone(),
                         data: events::TaskParked {
@@ -1433,6 +1596,11 @@ impl Run<'_> {
             .passes_for(index, &running_on)
             .into_iter()
             .map(|pass: ReviewPass| {
+                let mut profile = pass.profile();
+                // A cross-vendor second opinion draws on a different
+                // subscription than the implementer (§11.3, §13), so its pool
+                // is looked up from its own agent rather than inherited.
+                profile.pool = self.pool_name_for(&profile.agent).unwrap_or_default();
                 Ok(Reviewer {
                     adapter: self.adapters.get(&pass.binding.agent).ok_or_else(|| {
                         TactusError::Agent {
@@ -1444,11 +1612,172 @@ impl Run<'_> {
                             ),
                         }
                     })?,
-                    profile: pass.profile(),
+                    profile,
                     lens: pass.lens,
                 })
             })
             .collect()
+    }
+
+    /// §14's pre-flight capacity snapshot, from the state this run has folded
+    /// so far.
+    ///
+    /// Deliberately does **not** probe. Everything a probe would add — auth
+    /// state, versions — is already established by pre-flight, and spawning the
+    /// vendors' CLIs a second time to fill in a metadata event would be work
+    /// nothing reads. The estimator's inputs come from the run's own log, which
+    /// on a fresh run is empty and on a resume carries every signal the earlier
+    /// process recorded.
+    fn emit_capacity_snapshot(
+        &mut self,
+        signals: &BTreeMap<String, Option<String>>,
+    ) -> Result<(), TactusError> {
+        let pools = &self.analysis.config.pools;
+        if pools.is_empty() {
+            return Ok(());
+        }
+        // Signals come from the caller's fold of this run's log (empty on a
+        // fresh run) rather than from a field kept here, so there is exactly one
+        // place that turns `pool_exhausted` events into observations — the same
+        // reasoning that keeps `RunState::apply` the only writer of run state.
+        let estimates = capacity::estimate(
+            pools,
+            &capacity::Observations {
+                exhausted: signals.clone(),
+                self_spend: capacity::drain_of(
+                    self.state
+                        .progress
+                        .iter()
+                        .flat_map(|progress| progress.records.iter()),
+                ),
+            },
+        );
+        let snapshot = events::CapacitySnapshot {
+            strategy: self.analysis.config.strategy.mode.clone(),
+            pools: estimates
+                .iter()
+                .map(|estimate| events::PoolSnapshot {
+                    pool: estimate.pool.clone(),
+                    agent: estimate.agent.clone(),
+                    kind: estimate.kind.to_string(),
+                    remaining: estimate.remaining.to_string(),
+                    confidence: estimate.confidence.to_string(),
+                    reset_at: estimate.reset_at.clone(),
+                })
+                .collect(),
+        };
+        self.emit(EventBody::CapacitySnapshot { data: snapshot })
+    }
+
+    /// Which pool an agent's attempts drain (§13), or `None` when the pools
+    /// file names none for it. Attribution only — nothing routes on it.
+    fn pool_name_for(&self, agent: &str) -> Option<String> {
+        capacity::pool_for(agent, &self.analysis.config.pools).map(|pool| pool.name.clone())
+    }
+
+    /// §13's reported spend so far — the ledger's own figure, with the ledger's
+    /// own honesty: unpriced attempts contribute nothing, so this is a floor
+    /// wherever a route reports no spend at all.
+    fn reported_spend(&self, task: Option<usize>) -> f64 {
+        let indices: Vec<usize> = match task {
+            Some(index) => vec![index],
+            None => (0..self.state.progress.len()).collect(),
+        };
+        indices
+            .into_iter()
+            .filter_map(|index| self.state.progress.get(index))
+            .flat_map(|progress| progress.records.iter())
+            .map(|record| record.cost_usd.unwrap_or(0.0) + record.review_cost_usd().unwrap_or(0.0))
+            .sum()
+    }
+
+    /// Whether a ceiling has been reached, and which one.
+    ///
+    /// `run_usd` is checked before `task_usd` because it is the stricter claim:
+    /// a run at its overall ceiling is done whatever any individual task has
+    /// spent, and naming the run budget is what tells the operator which number
+    /// to raise.
+    fn budget_breach(&self, index: usize) -> Option<events::BudgetExceeded> {
+        let task = self.analysis.plan.tasks[index].id.to_string();
+        if let Some(limit) = self.budgets.run_usd {
+            let spent = self.reported_spend(None);
+            if spent >= limit {
+                return Some(events::BudgetExceeded {
+                    budget: events::BudgetKind::Run,
+                    limit_usd: limit,
+                    spent_usd: spent,
+                    task,
+                });
+            }
+        }
+        if let Some(limit) = self.budgets.task_usd {
+            let spent = self.reported_spend(Some(index));
+            if spent >= limit {
+                return Some(events::BudgetExceeded {
+                    budget: events::BudgetKind::Task,
+                    limit_usd: limit,
+                    spent_usd: spent,
+                    task,
+                });
+            }
+        }
+        None
+    }
+
+    /// §12's `ask_before`: does this escalation need a person's approval first?
+    ///
+    /// Only a move *onto* a frontier rung from somewhere cheaper counts. A
+    /// chain that starts at frontier is where the operator deliberately routed
+    /// the task in config or in an annotation, and §12's concern is silent
+    /// escalation — asking permission for a decision the operator already made
+    /// in writing would train them to answer without reading.
+    fn should_approve_spend(&self, from: crate::ir::Tier, onto: crate::ir::Tier) -> bool {
+        let Some(threshold) = self.ask_before.frontier_escalation_over_usd else {
+            return false;
+        };
+        onto == crate::ir::Tier::Frontier
+            && from != crate::ir::Tier::Frontier
+            && self.reported_spend(None) >= threshold
+    }
+
+    /// §13 source 1, recorded: attribute a rate limit to the pool that hit it.
+    ///
+    /// A reviewer's rate limit belongs to the *reviewer's* pool, which on a
+    /// cross-vendor second opinion is a different subscription from the one the
+    /// implementer drained — attributing it to the implementer's would mark a
+    /// healthy pool exhausted and leave the empty one looking fine.
+    fn record_pool_exhausted(
+        &mut self,
+        task: &str,
+        implementer: &WorkerProfile,
+        reviews: &[events::ReviewRecord],
+        failure: &AttemptFailure,
+    ) -> Result<(), TactusError> {
+        let (pool, agent) = match failure.origin {
+            FailureOrigin::Reviewer => match reviews.last() {
+                Some(review) => (review.pool.clone(), review.agent.clone()),
+                None => return Ok(()),
+            },
+            FailureOrigin::Worker => (pool_option(&implementer.pool), implementer.agent.clone()),
+        };
+        // No pool named for that agent means no subscription to mark. The
+        // signal is still in the log on the attempt record; inventing a pool id
+        // to hang it on would put a fact about nothing into the estimator.
+        let Some(pool) = pool else { return Ok(()) };
+        self.emit(EventBody::PoolExhausted {
+            task: task.to_owned(),
+            data: events::PoolExhausted {
+                pool,
+                agent,
+                // §13 wants a retry-at-reset timer here. Neither CLI reports a
+                // machine-readable reset time today, and parsing one out of
+                // prose would be a guess dressed as a timestamp — so it stays
+                // `None`, `DEFAULT_MAX_DEFERS` stays the bound, and the estimate
+                // says the reset is unknown.
+                reset_at: None,
+                detail: util::head(&failure.reason, 400),
+            },
+        })
     }
 
     fn fail_task(
@@ -1474,11 +1803,42 @@ impl Run<'_> {
 
     /// §12: raise eagerly, park exactly the affected task, tell the notifiers,
     /// and write the payload where a UI or `tactus answer` can read it.
+    /// §12's `ask_before` question: this task is about to escalate onto a
+    /// frontier rung, and the run has already reported enough spend that the
+    /// operator asked to be consulted first.
+    fn raise_spend_approval(
+        &mut self,
+        index: usize,
+        onto: crate::ir::Tier,
+    ) -> Result<QuestionId, TactusError> {
+        let context = spend_question_context(
+            &self.analysis.plan.tasks[index],
+            onto,
+            self.reported_spend(None),
+            self.ask_before.frontier_escalation_over_usd.unwrap_or(0.0),
+            self.unpriced_attempts() > 0,
+        );
+        self.raise_question(index, QuestionKind::ApproveSpend, context)
+    }
+
+    /// Attempts whose route reported no spend at all (§13), so the figures this
+    /// run quotes are floors rather than totals.
+    fn unpriced_attempts(&self) -> u32 {
+        let unpriced = self
+            .state
+            .progress
+            .iter()
+            .flat_map(|progress| progress.records.iter())
+            .filter(|record| record.cost_usd.is_none() || record.review_cost_incomplete())
+            .count();
+        u32::try_from(unpriced).unwrap_or(u32::MAX)
+    }
+
     fn raise_question(
         &mut self,
         index: usize,
         kind: QuestionKind,
-        failure: &AttemptFailure,
+        context: String,
     ) -> Result<QuestionId, TactusError> {
         let task = &self.analysis.plan.tasks[index];
         let question = Question {
@@ -1488,7 +1848,7 @@ impl Run<'_> {
             // the graph, not by the question, so they stay eligible the moment
             // an answer arrives.
             affected_tasks: vec![task.id.clone()],
-            context: question_context(task, kind, failure, &self.state.progress[index]),
+            context,
             options: question_options(kind),
         };
         let id = question.id.clone();
@@ -1724,6 +2084,18 @@ fn build_report(
         .iter()
         .filter_map(TaskReport::total_cost_usd)
         .sum::<f64>();
+    // §13's second currency: what each subscription drained, folded from the
+    // same attempt records the dollar column comes from — so the two halves of
+    // the ledger cannot disagree about the same attempt.
+    let pool_drain = capacity::drain_of(state.progress.iter().flat_map(|p| p.records.iter()))
+        .into_iter()
+        .map(|(pool, spend)| PoolDrainRow {
+            pool,
+            attempts: spend.attempts,
+            cost_usd: spend.usd,
+            unpriced: spend.unpriced,
+        })
+        .collect();
     RunReport {
         run_id: run_id.to_owned(),
         branch: branch.to_owned(),
@@ -1733,7 +2105,9 @@ fn build_report(
         tasks,
         halted_at: state.halted_at.clone(),
         questions: state.questions.clone(),
+        budget_stop: state.budget_stop.clone(),
         total_cost_usd,
+        pool_drain,
     }
 }
 
@@ -1907,16 +2281,71 @@ fn question_context(
     context
 }
 
+/// §12's spend approval, in the operator's terms: what is about to happen, what
+/// it has cost so far, and how confident that figure is.
+///
+/// The threshold is a **spend-to-date** reading rather than a forward
+/// projection, and the text says so — see [`crate::config::AskBefore`] for why.
+/// The figure itself is quoted with the ledger's own `?` honesty: a run whose
+/// Copilot attempts report nothing has a reported total that is a floor, and
+/// presenting a floor as a total is how someone approves a number they did not
+/// actually see.
+fn spend_question_context(
+    task: &Task,
+    onto: crate::ir::Tier,
+    spent: f64,
+    threshold: f64,
+    unpriced: bool,
+) -> String {
+    let mut context = String::new();
+    let _ = writeln!(context, "Task `{}` — {}", task.id, task.title);
+    let _ = writeln!(
+        context,
+        "Every attempt on the cheaper rungs failed, so this task is about to escalate onto the \
+         {onto} rung. You asked to approve that once the run had reported \
+         ${threshold:.2} of spend (`ask_before.frontier_escalation_over_usd`)."
+    );
+    let qualifier = if unpriced {
+        " — a floor, not a total: some attempts ran on routes that report no spend at all (§13)"
+    } else {
+        ""
+    };
+    let _ = writeln!(
+        context,
+        "Reported spend so far: ${spent:.4}{qualifier}. This is what the run has already cost, \
+         not an estimate of what the {onto} attempt will cost — tactus measures spend rather than \
+         predicting it (§10)."
+    );
+    if !task.acceptance.is_empty() {
+        context.push_str("Acceptance criteria this task must meet:\n");
+        for item in &task.acceptance {
+            let _ = writeln!(context, "- {item}");
+        }
+    }
+    context
+}
+
 fn question_options(kind: QuestionKind) -> Vec<String> {
     match kind {
         QuestionKind::Clarify => {
             vec!["answer in your own words (typed free text is sent back to the agent)".to_owned()]
         }
+        QuestionKind::ApproveSpend => vec![
+            "approve: run the escalated attempt".to_owned(),
+            "decline (`skip`) — this task fails and its dependents are blocked".to_owned(),
+        ],
         _ => vec![
             "retry this task with guidance you type below".to_owned(),
             "give up on this task (`skip`) — its dependents will be blocked".to_owned(),
         ],
     }
+}
+
+/// A `WorkerProfile.pool` as the log records it: `None` rather than `""` when
+/// no pool is configured, so a reader can tell "no pools file" from "a pool
+/// whose name is empty" — and so a fold never attributes spend to `""`.
+fn pool_option(pool: &str) -> Option<String> {
+    (!pool.is_empty()).then(|| pool.to_owned())
 }
 
 /// Everything one attempt needs, so the ladder can loop over (rung, attempt)
@@ -2079,6 +2508,7 @@ fn run_attempt(
                 pass: reviewer.lens.name().to_owned(),
                 agent: reviewer.profile.agent.clone(),
                 model: reviewer.profile.model.clone(),
+                pool: pool_option(&reviewer.profile.pool),
                 cost_usd,
                 outcome: match (unavailable, failure.is_none()) {
                     (true, _) => events::ReviewPassOutcome::Unavailable,
@@ -2613,6 +3043,19 @@ impl RunReport {
                     self.branch
                 );
             }
+            RunOutcome::BudgetExceeded => {
+                let (budget, limit, spent) = self.budget_stop.as_ref().map_or_else(
+                    || ("run_usd".to_owned(), 0.0, 0.0),
+                    |stop| (stop.budget.to_string(), stop.limit_usd, stop.spent_usd),
+                );
+                let _ = writeln!(
+                    out,
+                    "run stopped at its budget: [budgets] {budget} = ${limit:.2}, reported spend \
+                     ${spent:.4}. Committed tasks are on {}; raise the ceiling and continue \
+                     with:\n    tactus resume {} --budget <usd>",
+                    self.branch, self.run_id
+                );
+            }
             RunOutcome::Parked => {
                 let _ = writeln!(
                     out,
@@ -2715,9 +3158,42 @@ impl RunReport {
                 "  `?` marks a total missing a reviewer whose route reports no spend (§13)"
             );
         }
-        // Pool drain arrives with the capacity engine; saying so beats an
-        // empty column that looks like "nothing was spent".
-        let _ = writeln!(out, "  per-pool drain: not connected");
+        // §13's second currency. An empty section means no attempt in this run
+        // named a pool — which is the honest reading of "no pools connected",
+        // and is said rather than left as a blank column that looks like
+        // "nothing was spent".
+        if self.pool_drain.is_empty() {
+            let _ = writeln!(
+                out,
+                "  per-pool drain: no pool is connected for the agents this run used — run \
+                 `tactus connect`"
+            );
+        } else {
+            let _ = writeln!(out, "  per-pool drain:");
+            for row in &self.pool_drain {
+                let spend = match row.cost_usd {
+                    Some(cost) if row.unpriced > 0 => format!("${cost:.4}?"),
+                    Some(cost) => format!("${cost:.4}"),
+                    // Every attempt on this pool ran on a route that reports no
+                    // spend (§13) — saying "$0.0000" would read as free.
+                    None => "— (this route reports no spend)".to_owned(),
+                };
+                let _ = writeln!(
+                    out,
+                    "    {}: {} attempt(s), {spend}",
+                    row.pool, row.attempts
+                );
+            }
+        }
+        if let Some(stop) = &self.budget_stop {
+            let _ = writeln!(
+                out,
+                "  stopped by [budgets] {} = ${:.2}: reported spend had reached ${:.4} when `{}` \
+                 asked for its next attempt. Raise the ceiling and continue with:\n    tactus \
+                 resume {} --budget <usd>",
+                stop.budget, stop.limit_usd, stop.spent_usd, stop.task, self.run_id
+            );
+        }
         out
     }
 }
@@ -3534,7 +4010,7 @@ mod tests {
     fn a_second_opinion_runs_a_second_family_and_leaves_the_primary_alone() {
         // §11.3: both verdicts must pass. And the primary must NOT rebind here
         // even though it matches the implementer — rebinding would resolve both
-        // passes to copilot/gpt-5 and drop the Anthropic review entirely, which
+        // passes to copilot/gpt-5.3-codex and drop the Anthropic review entirely, which
         // is worse than the self-review the rebind exists to prevent.
         let repo = temp_engine_repo("secondopinion");
         seed(&repo, FRONTIER_AUTH_PLAN, Some(SECOND_OPINION_CONFIG));
@@ -3549,7 +4025,7 @@ mod tests {
         let t1 = task(&report, "t1");
         assert_eq!(
             t1.review_models,
-            ["claude-opus-5", "gpt-5"],
+            ["claude-opus-5", "gpt-5.3-codex"],
             "one pass per family, primary first"
         );
         assert_eq!(t1.model, "claude-opus-5", "written by the frontier model");
@@ -3560,7 +4036,7 @@ mod tests {
         assert_eq!(t1.cost_usd, Some(0.01), "implementer's own");
         let rendered = report.render();
         assert!(
-            rendered.contains("+ review claude-opus-5, gpt-5"),
+            rendered.contains("+ review claude-opus-5, gpt-5.3-codex"),
             "{rendered}"
         );
     }
@@ -3637,7 +4113,7 @@ mod tests {
         let report = run_with(&cross_vendor_opts(&repo), &source).expect("run");
 
         assert!(committed(&report, "t1"), "{report:?}");
-        assert_eq!(task(&report, "t1").review_models, ["gpt-5"]);
+        assert_eq!(task(&report, "t1").review_models, ["gpt-5.3-codex"]);
         assert_eq!(source.adapter.reviews_run(), 0, "never judged its own work");
         assert_eq!(source.copilot().reviews_run(), 1);
     }
@@ -3998,7 +4474,7 @@ mod tests {
         assert_eq!(t1.attempts.len(), 2, "escalated: {t1:?}");
         assert_eq!(
             t1.review_models,
-            ["claude-opus-5", "gpt-5"],
+            ["claude-opus-5", "gpt-5.3-codex"],
             "both judges, in the order they judged"
         );
     }
@@ -4982,6 +5458,7 @@ mod tests {
             attempt,
             tier: tier.to_owned(),
             model: "m".to_owned(),
+            pool: None,
             resumed: false,
             duration: Duration::ZERO,
             cost_usd: None,
@@ -5310,6 +5787,26 @@ mod tests {
                 vec![Effect::EditFile],
             )
             .cross_vendor(FRONTIER_AUTH_PLAN, vec![ReviewBehavior::Pass]),
+            // Step 10's two new branches. `budget_exceeded` folds into a
+            // run-level field and `capacity_snapshot` folds into nothing —
+            // opposite shapes, and both have to come back the same on replay.
+            Scenario::new(
+                "budget-stop",
+                "[routing]\nimplement = { chain = [\"small\"], attempts_per = 1 }\n\n\
+                 [budgets]\nrun_usd = 0.05\n",
+                vec![Effect::EditFile],
+            ),
+            // And the ApproveSpend park, whose fold depends on the escalation
+            // having landed *before* the park — the ordering D3 turns on.
+            Scenario::new(
+                "approve-spend",
+                "[routing]\nimplement = { chain = [\"mid\", \"frontier\"], attempts_per = 1 }\n\n\
+                 [interaction]\nask_before = { frontier_escalation_over_usd = 0.005 }\n",
+                vec![Effect::NoEdit, Effect::EditFile],
+            )
+            .answered(vec![Answer::Answered {
+                text: "approve: run the escalated attempt".to_owned(),
+            }]),
         ];
 
         for Scenario {
@@ -6055,8 +6552,11 @@ mod tests {
         assert!(rendered.contains("ledger:"), "{rendered}");
         assert!(rendered.contains("t1"), "{rendered}");
         assert!(
-            rendered.contains("not connected"),
-            "pool drain is honest about arriving with the capacity engine"
+            // No pools file in these tests, so no attempt names a pool — and
+            // the ledger says exactly that rather than showing a blank column
+            // that reads as "nothing was spent".
+            rendered.contains("per-pool drain: no pool is connected"),
+            "{rendered}"
         );
         assert!(
             rendered.contains(&loaded.paths.private.display().to_string()),
@@ -6574,5 +7074,431 @@ mod tests {
              instead of timing out its silence: {} sleeps",
             sleeper.waits()
         );
+    }
+
+    // ---- step 10: pools, budgets, and spend approval (§13) ------------------
+
+    /// A pools file beside the repo — never `~/.tactus`, which is the
+    /// operator's, and never inside the workspace, where §14's `git clean -fd`
+    /// would delete it.
+    fn pools_file(repo: &Path, content: &str) -> PathBuf {
+        let dir = private_root_for(repo);
+        fs::create_dir_all(&dir).expect("pools dir");
+        let path = dir.join("pools.toml");
+        fs::write(&path, content).expect("pools file");
+        path
+    }
+
+    const CLAUDE_POOL: &str = "[pools.claude-max]\nkind = \"subscription-window\"\nagent = \
+                               \"claude-code\"\nsources = [\"signals\", \"self\"]\n";
+
+    fn events_of(repo: &Path, run_id: &str) -> Vec<events::Event> {
+        let mut ignored = Vec::new();
+        events::read_all(&paths_of(repo, run_id).events(), &mut ignored).expect("the log reads")
+    }
+
+    fn budget_events(events: &[events::Event]) -> Vec<&events::BudgetExceeded> {
+        events
+            .iter()
+            .filter_map(|event| match &event.body {
+                EventBody::BudgetExceeded { data } => Some(data),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_run_budget_stops_the_run_exactly_once_and_survives_replay() {
+        // The one-fold property, on the branch step 10 added: the stop is an
+        // event, `RunState::apply` is what turns it into state, and a replay of
+        // the log lands on the same state the live run held.
+        let repo = temp_engine_repo("budgetstop");
+        seed(
+            &repo,
+            "## One\n<!-- tactus: id=t1 kind=implement depends= -->\n\n\
+             ## Two\n<!-- tactus: id=t2 kind=implement depends= -->\n\n\
+             ## Three\n<!-- tactus: id=t3 kind=implement depends= -->\n",
+            Some(
+                "[routing]\nimplement = { chain = [\"small\"], attempts_per = 1 }\n\n\
+                 [budgets]\nrun_usd = 0.05\n",
+            ),
+        );
+        let mut opts = options(&repo);
+        opts.config_path = Some(repo.join("tactus.toml"));
+        let source = fake(Effect::EditFile);
+        let (report, live) = run_harness_inner(
+            &opts,
+            &Harness {
+                adapters: &source,
+                answers: None,
+                sleeper: None,
+            },
+        )
+        .expect("a budget stop is not an engine error");
+
+        // Each task costs 0.06 (0.01 implementer + 0.05 review), so the ceiling
+        // is crossed after the first and the second task is refused before it
+        // spawns anything.
+        assert_eq!(report.outcome(), RunOutcome::BudgetExceeded, "{report:?}");
+        assert!(committed(&report, "t1"));
+        let stop = report.budget_stop.as_ref().expect("a recorded stop");
+        assert_eq!(stop.budget, events::BudgetKind::Run);
+        assert_eq!(stop.task, "t2", "names the task that did not start");
+        assert!(stop.spent_usd >= 0.05, "spent: {}", stop.spent_usd);
+
+        // Exactly once: the scheduler stops scheduling on the first stop, so a
+        // second would describe a spawn that never happened.
+        let events = events_of(&repo, &report.run_id);
+        assert_eq!(
+            budget_events(&events).len(),
+            1,
+            "{:?}",
+            budget_events(&events)
+        );
+
+        // Nothing after t1 ran, and the untouched tasks settle as skipped.
+        assert!(matches!(task(&report, "t2").status, TaskRunStatus::Skipped));
+        assert!(task(&report, "t2").attempts.is_empty());
+        assert_live_equals_replay(&repo, &live, &report);
+    }
+
+    #[test]
+    fn a_task_budget_also_ends_the_run_and_says_which_ceiling_it_was() {
+        let repo = temp_engine_repo("taskbudget");
+        seed(
+            &repo,
+            "## One\n<!-- tactus: id=t1 kind=implement depends= -->\n",
+            Some(
+                "[routing]\nimplement = { chain = [\"small\", \"mid\"], attempts_per = 1 }\n\n\
+                 [budgets]\ntask_usd = 0.005\n",
+            ),
+        );
+        let mut opts = options(&repo);
+        opts.config_path = Some(repo.join("tactus.toml"));
+        // Fails on the first rung, so a second attempt is asked for — and
+        // refused, because this task has already spent past its own ceiling.
+        let source = source(
+            vec![Effect::NoEdit, Effect::EditFile],
+            vec![ReviewBehavior::Pass],
+        );
+        let report = run_with(&opts, &source).expect("run");
+        assert_eq!(report.outcome(), RunOutcome::BudgetExceeded, "{report:?}");
+        let stop = report.budget_stop.as_ref().expect("a recorded stop");
+        assert_eq!(stop.budget, events::BudgetKind::Task);
+        assert_eq!(stop.task, "t1");
+        assert_eq!(
+            task(&report, "t1").attempts.len(),
+            1,
+            "the escalated attempt never spawned"
+        );
+        let rendered = report.render();
+        assert!(rendered.contains("task_usd"), "{rendered}");
+        assert!(rendered.contains("tactus resume"), "{rendered}");
+    }
+
+    #[test]
+    fn resuming_with_a_higher_ceiling_continues_the_run_the_budget_stopped() {
+        // D4's whole point: a budget stop is recoverable in one command,
+        // because budgets are re-derived at resume rather than inherited.
+        let repo = temp_engine_repo("budgetresume");
+        seed(
+            &repo,
+            "## One\n<!-- tactus: id=t1 kind=implement depends= -->\n\n\
+             ## Two\n<!-- tactus: id=t2 kind=implement depends= -->\n",
+            Some("[routing]\nimplement = { chain = [\"small\"], attempts_per = 1 }\n"),
+        );
+        let mut opts = options(&repo);
+        opts.config_path = Some(repo.join("tactus.toml"));
+        opts.budget_usd = Some(0.05);
+        let source = fake(Effect::EditFile);
+        let stopped = run_with(&opts, &source).expect("run");
+        assert_eq!(stopped.outcome(), RunOutcome::BudgetExceeded);
+        assert!(!committed(&stopped, "t2"));
+
+        let mut resume_opts = resume_options(&repo, &stopped.run_id);
+        resume_opts.budget_usd = Some(10.0);
+        let source = fake(Effect::EditFile);
+        let resumed = resume_harness(
+            &resume_opts,
+            &Harness {
+                adapters: &source,
+                answers: None,
+                sleeper: None,
+            },
+        )
+        .expect("a budget stop is exactly what resume is for");
+        assert_eq!(resumed.outcome(), RunOutcome::Complete, "{resumed:?}");
+        assert!(committed(&resumed, "t2"));
+        assert!(
+            resumed.budget_stop.is_none(),
+            "the stop the resume got past must not still be reported"
+        );
+    }
+
+    #[test]
+    fn a_resume_that_does_not_raise_the_ceiling_stops_again_rather_than_running_past_it() {
+        let repo = temp_engine_repo("budgetresumelow");
+        seed(
+            &repo,
+            "## One\n<!-- tactus: id=t1 kind=implement depends= -->\n\n\
+             ## Two\n<!-- tactus: id=t2 kind=implement depends= -->\n",
+            Some(
+                "[routing]\nimplement = { chain = [\"small\"], attempts_per = 1 }\n\n\
+                 [budgets]\nrun_usd = 0.05\n",
+            ),
+        );
+        let mut opts = options(&repo);
+        opts.config_path = Some(repo.join("tactus.toml"));
+        let source = fake(Effect::EditFile);
+        let stopped = run_with(&opts, &source).expect("run");
+        assert_eq!(stopped.outcome(), RunOutcome::BudgetExceeded);
+
+        let source = fake(Effect::EditFile);
+        let again = resume_harness(
+            &resume_options(&repo, &stopped.run_id),
+            &Harness {
+                adapters: &source,
+                answers: None,
+                sleeper: None,
+            },
+        )
+        .expect("resume");
+        assert_eq!(again.outcome(), RunOutcome::BudgetExceeded, "{again:?}");
+        assert!(!committed(&again, "t2"));
+    }
+
+    #[test]
+    fn a_frontier_escalation_over_the_threshold_parks_for_approval_then_runs_it() {
+        // D3, end to end. The engine escalates FIRST and then asks, so an
+        // approved task un-parks already standing on the frontier rung with a
+        // fresh allowance — and `answer_question` needs no ApproveSpend arm.
+        let repo = temp_engine_repo("approvespend");
+        seed(
+            &repo,
+            "## One\n<!-- tactus: id=t1 kind=implement depends= -->\n",
+            Some(
+                "[routing]\nimplement = { chain = [\"mid\", \"frontier\"], attempts_per = 1 }\n\n\
+                 [interaction]\nask_before = { frontier_escalation_over_usd = 0.005 }\n",
+            ),
+        );
+        let mut opts = options(&repo);
+        opts.config_path = Some(repo.join("tactus.toml"));
+        let source = source(
+            vec![Effect::NoEdit, Effect::EditFile],
+            vec![ReviewBehavior::Pass],
+        );
+        let scripted = ScriptedAnswers::new(vec![Answer::Answered {
+            text: "approve: run the escalated attempt".to_owned(),
+        }]);
+        let (report, live) = run_harness_inner(
+            &opts,
+            &Harness {
+                adapters: &source,
+                answers: Some(&scripted),
+                sleeper: None,
+            },
+        )
+        .expect("run");
+
+        assert_eq!(report.outcome(), RunOutcome::Complete, "{report:?}");
+        assert!(committed(&report, "t1"));
+        let asked: Vec<&QuestionRecord> = report
+            .questions
+            .iter()
+            .filter(|q| q.question.kind == QuestionKind::ApproveSpend)
+            .collect();
+        assert_eq!(asked.len(), 1, "asked once: {:?}", report.questions);
+        assert!(
+            asked[0].question.context.contains("frontier"),
+            "the question names where the money is going: {}",
+            asked[0].question.context
+        );
+        assert!(
+            asked[0].question.context.contains("$0.0100"),
+            "and quotes reported spend to date: {}",
+            asked[0].question.context
+        );
+
+        // The approved attempt really ran on the frontier rung with the
+        // allowance the escalation reset — not a re-run of the mid rung.
+        let tiers: Vec<&str> = task(&report, "t1")
+            .attempts
+            .iter()
+            .map(|a| a.tier.as_str())
+            .collect();
+        assert_eq!(tiers, ["mid", "frontier"], "{tiers:?}");
+        assert_live_equals_replay(&repo, &live, &report);
+    }
+
+    #[test]
+    fn a_declined_spend_approval_fails_the_task_through_the_halt_policy() {
+        let repo = temp_engine_repo("declinespend");
+        seed(
+            &repo,
+            "## One\n<!-- tactus: id=t1 kind=implement depends= -->\n",
+            Some(
+                "[routing]\nimplement = { chain = [\"mid\", \"frontier\"], attempts_per = 1 }\n\n\
+                 [interaction]\nask_before = { frontier_escalation_over_usd = 0.005 }\n",
+            ),
+        );
+        let mut opts = options(&repo);
+        opts.config_path = Some(repo.join("tactus.toml"));
+        let source = source(
+            vec![Effect::NoEdit, Effect::EditFile],
+            vec![ReviewBehavior::Pass],
+        );
+        let scripted = ScriptedAnswers::new(vec![Answer::Declined]);
+        let report = run_harness(
+            &opts,
+            &Harness {
+                adapters: &source,
+                answers: Some(&scripted),
+                sleeper: None,
+            },
+        )
+        .expect("run");
+
+        // Through `ingest_answer`'s existing Declined path — the one place that
+        // owns the halt policy, with no ApproveSpend special case beside it.
+        assert_eq!(report.outcome(), RunOutcome::Halted, "{report:?}");
+        assert!(matches!(
+            task(&report, "t1").status,
+            TaskRunStatus::Failed {
+                kind: FailureKind::Declined,
+                ..
+            }
+        ));
+        assert_eq!(
+            task(&report, "t1").attempts.len(),
+            1,
+            "declining must not have spent the frontier attempt"
+        );
+    }
+
+    #[test]
+    fn a_chain_that_starts_at_frontier_never_asks_to_approve_spend() {
+        // §12's target is silent escalation. A task the operator deliberately
+        // routed to frontier in config was not escalated onto it silently, and
+        // asking anyway trains people to approve without reading.
+        let repo = temp_engine_repo("frontierstart");
+        seed(
+            &repo,
+            "## One\n<!-- tactus: id=t1 kind=implement depends= -->\n",
+            Some(
+                "[routing]\nimplement = { chain = [\"frontier\"], attempts_per = 2 }\n\n\
+                 [interaction]\nask_before = { frontier_escalation_over_usd = 0.0 }\n",
+            ),
+        );
+        let mut opts = options(&repo);
+        opts.config_path = Some(repo.join("tactus.toml"));
+        let source = source(
+            vec![Effect::NoEdit, Effect::EditFile],
+            vec![ReviewBehavior::Pass],
+        );
+        let report = run_with(&opts, &source).expect("run");
+        assert_eq!(report.outcome(), RunOutcome::Complete, "{report:?}");
+        assert!(
+            report
+                .questions
+                .iter()
+                .all(|q| q.question.kind != QuestionKind::ApproveSpend),
+            "questions: {:?}",
+            report.questions
+        );
+    }
+
+    #[test]
+    fn attempts_are_attributed_to_the_pool_that_paid_them() {
+        let repo = temp_engine_repo("poolattrib");
+        seed(
+            &repo,
+            "## One\n<!-- tactus: id=t1 kind=implement depends= -->\n",
+            Some("[routing]\nimplement = { chain = [\"small\"], attempts_per = 1 }\n"),
+        );
+        let mut opts = options(&repo);
+        opts.config_path = Some(repo.join("tactus.toml"));
+        opts.pools_path = Some(pools_file(&repo, CLAUDE_POOL));
+        let source = fake(Effect::EditFile);
+        let report = run_with(&opts, &source).expect("run");
+
+        let attempt = &task(&report, "t1").attempts[0];
+        assert_eq!(attempt.pool.as_deref(), Some("claude-max"));
+        assert!(
+            attempt
+                .reviews
+                .iter()
+                .all(|r| r.pool.as_deref() == Some("claude-max")),
+            "the reviewer's own pool is attributed too: {:?}",
+            attempt.reviews
+        );
+
+        // §13's second currency in the ledger, folded from the same records the
+        // dollar column comes from.
+        let drain = &report.pool_drain;
+        assert_eq!(drain.len(), 1, "{drain:?}");
+        assert_eq!(drain[0].pool, "claude-max");
+        assert_eq!(drain[0].attempts, 2, "implementer plus its reviewer");
+        let ledger = report.render_ledger();
+        assert!(ledger.contains("claude-max"), "{ledger}");
+
+        // And §14's pre-flight snapshot is on the record — folding to nothing,
+        // which `assert_live_equals_replay` elsewhere is what proves.
+        let events = events_of(&repo, &report.run_id);
+        let snapshots: Vec<&events::CapacitySnapshot> = events
+            .iter()
+            .filter_map(|e| match &e.body {
+                EventBody::CapacitySnapshot { data } => Some(data),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(snapshots.len(), 1, "one snapshot per run start (§14)");
+        assert_eq!(snapshots[0].pools.len(), 1);
+        assert_eq!(
+            snapshots[0].pools[0].remaining, "unknown",
+            "never optimistic: an unmeasured pool is unknown, not full"
+        );
+    }
+
+    #[test]
+    fn a_rate_limit_marks_its_pool_exhausted_and_a_later_fold_reads_it_back() {
+        // §13 source 1 made real: the signal is ground truth, and the estimator
+        // that reads it back must never let a self-metered figure talk it up.
+        let repo = temp_engine_repo("poolexhausted");
+        seed(
+            &repo,
+            "## One\n<!-- tactus: id=t1 kind=implement depends= -->\n",
+            Some("[routing]\nimplement = { chain = [\"small\"], attempts_per = 1 }\n"),
+        );
+        let mut opts = options(&repo);
+        opts.config_path = Some(repo.join("tactus.toml"));
+        let pools = pools_file(&repo, CLAUDE_POOL);
+        opts.pools_path = Some(pools.clone());
+        let source = source(
+            vec![Effect::RateLimited, Effect::EditFile],
+            vec![ReviewBehavior::Pass],
+        );
+        let report = run_with(&opts, &source).expect("run");
+        assert_eq!(report.outcome(), RunOutcome::Complete, "{report:?}");
+
+        let events = events_of(&repo, &report.run_id);
+        let signals: Vec<&events::PoolExhausted> = events
+            .iter()
+            .filter_map(|e| match &e.body {
+                EventBody::PoolExhausted { data, .. } => Some(data),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(signals.len(), 1, "{signals:?}");
+        assert_eq!(signals[0].pool, "claude-max");
+        assert_eq!(signals[0].agent, "claude-code");
+
+        // The fold a later reader performs picks it up as ground truth.
+        let observations = capacity::observe(&events);
+        assert!(observations.exhausted.contains_key("claude-max"));
+        let mut warnings = Vec::new();
+        let cfg = config::load(None, &repo, Some(&pools), &mut warnings).expect("pools");
+        let estimates = capacity::estimate(&cfg.pools, &observations);
+        assert_eq!(estimates[0].remaining, capacity::Remaining::Exhausted);
+        assert_eq!(estimates[0].confidence, capacity::Confidence::Signal);
     }
 }

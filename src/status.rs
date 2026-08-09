@@ -218,6 +218,31 @@ pub fn describe(event: &Event) -> String {
         EventBody::DesignDefect { data } => {
             format!("design defect recorded for {}", data.question)
         }
+        EventBody::CapacitySnapshot { data } => format!(
+            "capacity snapshot under `{}`: {}",
+            data.strategy,
+            if data.pools.is_empty() {
+                "no pools connected".to_owned()
+            } else {
+                data.pools
+                    .iter()
+                    .map(|pool| format!("{} {} [{}]", pool.pool, pool.remaining, pool.confidence))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            }
+        ),
+        EventBody::PoolExhausted { task, data } => format!(
+            "{task}: pool `{}` reported exhausted{}",
+            data.pool,
+            match &data.reset_at {
+                Some(at) => format!(", resets {at}"),
+                None => ", reset time unknown".to_owned(),
+            }
+        ),
+        EventBody::BudgetExceeded { data } => format!(
+            "budget {} = ${:.2} reached at ${:.4}; `{}` did not start",
+            data.budget, data.limit_usd, data.spent_usd, data.task
+        ),
         EventBody::RunFinished { data } => format!(
             "run finished: {:?} ({} committed, {} parked)",
             data.outcome, data.committed, data.parked
@@ -305,6 +330,7 @@ mod tests {
                     tier: "small".to_owned(),
                     agent: "claude-code".to_owned(),
                     model: "claude-haiku-4-5".to_owned(),
+                    pool: Some("claude-max".to_owned()),
                     resume_session: None,
                 },
             }),
@@ -376,6 +402,7 @@ mod tests {
                     attempt: 1,
                     tier: "small".to_owned(),
                     model: "claude-haiku-4-5".to_owned(),
+                    pool: Some("claude-max".to_owned()),
                     resumed: false,
                     duration: Duration::from_secs(3),
                     cost_usd: Some(0.01),
@@ -386,16 +413,26 @@ mod tests {
             }],
             halted_at: None,
             questions: Vec::new(),
+            budget_stop: None,
             total_cost_usd: 0.06,
+            pool_drain: vec![crate::engine::PoolDrainRow {
+                pool: "claude-max".to_owned(),
+                attempts: 1,
+                cost_usd: Some(0.01),
+                unpriced: 0,
+            }],
         };
         let ledger = report.render_ledger();
         assert!(ledger.contains("worker"), "{ledger}");
         assert!(ledger.contains("$0.0100"), "implementer's own spend");
         assert!(ledger.contains("$0.0500"), "reviewer's, kept apart");
         assert!(ledger.contains("$0.0600"), "and the total");
+        // §13's second currency, beside the dollars and derived from the same
+        // attempt records.
+        assert!(ledger.contains("per-pool drain:"), "{ledger}");
         assert!(
-            ledger.contains("not connected"),
-            "pool drain is honest about arriving with the capacity engine"
+            ledger.contains("claude-max: 1 attempt(s), $0.0100"),
+            "{ledger}"
         );
     }
 
@@ -422,7 +459,9 @@ mod tests {
             }],
             halted_at: None,
             questions: Vec::new(),
+            budget_stop: None,
             total_cost_usd: 0.0,
+            pool_drain: Vec::new(),
         };
         let ledger = report.render_ledger();
         assert!(

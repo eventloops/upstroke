@@ -1109,7 +1109,7 @@ mod tests {
     fn plan_with(second: Option<PassBinding>) -> ReviewPlan {
         ReviewPlan {
             primary: Some(binding("claude-code", "claude-opus-5")),
-            alternative: Some(binding("copilot", "gpt-5")),
+            alternative: Some(binding("copilot", "gpt-5.3-codex")),
             second_opinion: vec![second],
         }
     }
@@ -1122,7 +1122,7 @@ mod tests {
         let passes = plan.passes_for(0, &binding("claude-code", "claude-opus-5"));
         assert_eq!(passes.len(), 1);
         assert_eq!(passes[0].lens, Lens::Acceptance);
-        assert_eq!(passes[0].binding, binding("copilot", "gpt-5"));
+        assert_eq!(passes[0].binding, binding("copilot", "gpt-5.3-codex"));
     }
 
     #[test]
@@ -1148,15 +1148,15 @@ mod tests {
     #[test]
     fn a_second_opinion_adds_a_pass_and_suppresses_the_rebind() {
         // The trap: rebinding the primary here would resolve BOTH passes to
-        // copilot/gpt-5, and opus-written code would lose its Anthropic review
+        // copilot/gpt-5.3-codex, and opus-written code would lose its Anthropic review
         // entirely — strictly worse than the self-review being avoided.
-        let plan = plan_with(Some(binding("copilot", "gpt-5")));
+        let plan = plan_with(Some(binding("copilot", "gpt-5.3-codex")));
         let passes = plan.passes_for(0, &binding("claude-code", "claude-opus-5"));
         assert_eq!(passes.len(), 2, "both verdicts must pass (§11.3)");
         assert_eq!(passes[0].lens, Lens::Acceptance);
         assert_eq!(passes[0].binding, binding("claude-code", "claude-opus-5"));
         assert_eq!(passes[1].lens, Lens::SecondOpinion);
-        assert_eq!(passes[1].binding, binding("copilot", "gpt-5"));
+        assert_eq!(passes[1].binding, binding("copilot", "gpt-5.3-codex"));
         assert_ne!(
             passes[0].binding, passes[1].binding,
             "two passes on one model is one pass wearing a hat"
@@ -1180,13 +1180,13 @@ mod tests {
     fn the_probe_set_separates_required_agents_from_the_optional_one() {
         // The alternative is opportunistic, so its probe may fail without
         // taking the run down; everything else is load-bearing.
-        let plan = plan_with(Some(binding("copilot", "gpt-5")));
+        let plan = plan_with(Some(binding("copilot", "gpt-5.3-codex")));
         assert_eq!(plan.agents(), ["claude-code", "copilot"]);
         assert_eq!(plan.required_agents(), ["claude-code", "copilot"]);
 
         let optional_only = ReviewPlan {
             primary: Some(binding("claude-code", "claude-opus-5")),
-            alternative: Some(binding("copilot", "gpt-5")),
+            alternative: Some(binding("copilot", "gpt-5.3-codex")),
             second_opinion: vec![None],
         };
         assert_eq!(optional_only.agents(), ["claude-code", "copilot"]);
@@ -1203,9 +1203,9 @@ mod tests {
         assert_eq!(Lens::SecondOpinion.file_suffix(), "-second-opinion");
         let pass = ReviewPass {
             lens: Lens::SecondOpinion,
-            binding: binding("copilot", "gpt-5"),
+            binding: binding("copilot", "gpt-5.3-codex"),
         };
-        assert_eq!(pass.profile().name, "second-opinion-gpt-5");
+        assert_eq!(pass.profile().name, "second-opinion-gpt-5.3-codex");
         assert_eq!(pass.profile().permissions, PermissionMode::ReadOnly);
     }
 
@@ -1269,7 +1269,7 @@ mod tests {
         );
         assert_eq!(
             resolved.second_opinion[0],
-            Some(binding("copilot", "gpt-5"))
+            Some(binding("copilot", "gpt-5.3-codex"))
         );
         assert!(warnings.is_empty(), "warnings: {warnings:?}");
     }
@@ -1333,7 +1333,10 @@ mod tests {
         // With the second vendor present there is nothing to warn about.
         let mut quiet = Vec::new();
         let resolved = plan_for(&plan, &chains, &cfg, both_vendors, &mut quiet).expect("resolves");
-        assert_eq!(resolved.alternative, Some(binding("copilot", "gpt-5")));
+        assert_eq!(
+            resolved.alternative,
+            Some(binding("copilot", "gpt-5.3-codex"))
+        );
         assert!(quiet.is_empty(), "warnings: {quiet:?}");
     }
 
@@ -1405,7 +1408,7 @@ mod tests {
         // whatever the pin landed on, not to the catalog's default.
         let cfg = scratch_config(
             "pinned.toml",
-            "[[pins]]\ntier = \"frontier\"\nagent = \"copilot\"\nmodel = \"gpt-5\"\n\n\
+            "[[pins]]\ntier = \"frontier\"\nagent = \"copilot\"\nmodel = \"gpt-5.3-codex\"\n\n\
              [[routing.overrides]]\npaths = [\"src/auth/**\"]\nsecond_opinion = \
              \"different-vendor\"\n",
         );
@@ -1413,7 +1416,7 @@ mod tests {
         let mut warnings = Vec::new();
         let resolved =
             plan_for(&plan, &chains, &cfg, both_vendors, &mut warnings).expect("resolves");
-        assert_eq!(resolved.primary, Some(binding("copilot", "gpt-5")));
+        assert_eq!(resolved.primary, Some(binding("copilot", "gpt-5.3-codex")));
         assert_eq!(
             resolved.second_opinion[0],
             Some(binding("claude-code", "claude-opus-4-8")),
@@ -1425,7 +1428,7 @@ mod tests {
     fn the_recorded_plan_survives_the_wire() {
         // It rides on `run_started`, so a resume reads back exactly what the
         // run resolved (§15).
-        let plan = plan_with(Some(binding("copilot", "gpt-5")));
+        let plan = plan_with(Some(binding("copilot", "gpt-5.3-codex")));
         let json = serde_json::to_string(&plan).expect("serialize");
         let back: ReviewPlan = serde_json::from_str(&json).expect("deserialize");
         assert_eq!(back, plan);
@@ -1440,7 +1443,7 @@ mod tests {
         let task = task();
         let cx = ReviewCx {
             adapter: &crate::agent::claude::ClaudeCodeAdapter,
-            profile: profile_for("copilot", "gpt-5", "second-opinion-gpt-5"),
+            profile: profile_for("copilot", "gpt-5.3-codex", "second-opinion-gpt-5.3-codex"),
             lens: Lens::SecondOpinion,
             task: &task,
             diff: "+++ b/src/api.rs\n+fn encode() {}\n",

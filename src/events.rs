@@ -19,6 +19,7 @@
 //! back, so the belief is false and §14's pairing of session-resume with
 //! tree-retention is broken. `run_resumed` clears both.
 
+use std::fmt;
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
@@ -33,9 +34,17 @@ use crate::ladder::{FailureKind, FailureOrigin};
 use crate::util;
 
 /// Bumped when an event's meaning changes in a way an older binary would
-/// misread. A newer log is refused rather than folded on a guess — silently
+/// **misread**. A newer log is refused rather than folded on a guess — silently
 /// deriving the wrong state from a log we half-understand is the one failure
 /// mode an event-sourced design must not have.
+///
+/// Misread is the operative word, and it is why step 10 did not bump it despite
+/// adding three event kinds and three fields. Every added field carries
+/// `#[serde(default)]`, so an old log folds to exactly the state it always did;
+/// and an *old binary* meeting a new event kind gets serde's unknown-variant
+/// error naming the log — a refusal, not a wrong answer. The one visible
+/// consequence, recorded rather than glossed: a budget-stopped run's log cannot
+/// be read by a pre-step-10 binary at all.
 pub const SCHEMA_VERSION: u32 = 1;
 
 // ---------------------------------------------------------------------------
@@ -166,6 +175,37 @@ pub enum EventBody {
     DesignDefect {
         data: DesignDefect,
     },
+    /// §14's pre-flight capacity snapshot, taken again after every `run_resumed`
+    /// because a resume re-establishes everything a fresh run does (§15).
+    ///
+    /// Folds to **nothing**, like `design_defect`: v0.1's capacity engine is
+    /// read-only (§13), so nothing routes on it and recording it as state would
+    /// imply otherwise. It is in the log because "what did the pools look like
+    /// when this run made its choices" is unanswerable afterwards.
+    CapacitySnapshot {
+        data: CapacitySnapshot,
+    },
+    /// §15: a rate-limit signal attributed to a pool — §13's source 1, and the
+    /// only thing in v0.1 that can say a pool is empty rather than unmeasured.
+    ///
+    /// Separate from the `task_deferred` that follows it because they are
+    /// different facts with different lifetimes: the deferral is about one
+    /// task's next move, while this is about a subscription, and a later fold
+    /// reads it back as ground truth for every pool estimate ([`crate::capacity::observe`]).
+    PoolExhausted {
+        task: String,
+        data: PoolExhausted,
+    },
+    /// §13's budget ceiling stopped the run before an attempt was spawned.
+    ///
+    /// **Downgrade consequence, stated plainly:** `SCHEMA_VERSION` does not
+    /// bump for this (see its docs), so a binary older than step 10 folding a
+    /// budget-stopped log fails on an unknown variant — a loud refusal naming
+    /// the log, never a silent misread. That is the trade the version contract
+    /// is written around.
+    BudgetExceeded {
+        data: BudgetExceeded,
+    },
     RunFinished {
         data: RunFinished,
     },
@@ -183,12 +223,15 @@ impl EventBody {
             | Self::TaskParked { task, .. }
             | Self::TaskCommitted { task, .. }
             | Self::TaskFailed { task, .. }
+            | Self::PoolExhausted { task, .. }
             | Self::QuestionRaised { task, .. } => Some(task),
             Self::RunStarted { .. }
             | Self::RunResumed { .. }
             | Self::DeferWaitElapsed { .. }
             | Self::QuestionAnswered { .. }
             | Self::DesignDefect { .. }
+            | Self::CapacitySnapshot { .. }
+            | Self::BudgetExceeded { .. }
             | Self::RunFinished { .. } => None,
         }
     }
@@ -211,6 +254,9 @@ impl EventBody {
             Self::QuestionRaised { .. } => "question_raised",
             Self::QuestionAnswered { .. } => "question_answered",
             Self::DesignDefect { .. } => "design_defect",
+            Self::CapacitySnapshot { .. } => "capacity_snapshot",
+            Self::PoolExhausted { .. } => "pool_exhausted",
+            Self::BudgetExceeded { .. } => "budget_exceeded",
             Self::RunFinished { .. } => "run_finished",
         }
     }
@@ -292,6 +338,12 @@ pub struct AttemptStarted {
     pub tier: String,
     pub agent: String,
     pub model: String,
+    /// The capacity pool this attempt draws on (§13), recorded before the
+    /// spawn so an attempt the engine died inside can still be attributed: it
+    /// really ran and really drained a subscription, and the settlement record
+    /// has no other way to know which.
+    #[serde(default)]
+    pub pool: Option<String>,
     /// The session this attempt resumed, if any (§11.4).
     pub resume_session: Option<String>,
 }
@@ -304,6 +356,12 @@ pub struct AttemptRecord {
     pub attempt: u32,
     pub tier: String,
     pub model: String,
+    /// Which capacity pool this attempt drained (§13), where the pools file
+    /// names one for its agent. Pure addition: `#[serde(default)]` means a log
+    /// written before step 10 folds to exactly the same state it always did,
+    /// which is why `SCHEMA_VERSION` did not move for it.
+    #[serde(default)]
+    pub pool: Option<String>,
     /// Whether this attempt resumed the previous one's session (§11.4).
     pub resumed: bool,
     #[serde(rename = "duration_ms", with = "crate::util::duration_millis")]
@@ -358,6 +416,12 @@ pub struct ReviewRecord {
     pub pass: String,
     pub agent: String,
     pub model: String,
+    /// Which capacity pool this pass drained (§13). A cross-vendor second
+    /// opinion draws on a *different* subscription than the implementer, so a
+    /// per-pool ledger that read only the implementer's line would attribute
+    /// the whole attempt to one pool that did not pay for all of it.
+    #[serde(default)]
+    pub pool: Option<String>,
     /// `None` where the agent's route reports no spend.
     pub cost_usd: Option<f64>,
     /// What this pass concluded. A later pass only exists because every earlier
@@ -480,12 +544,81 @@ pub struct DesignDefect {
     pub answer: String,
 }
 
+/// §14's pre-flight capacity snapshot: what every pool looked like at the
+/// moment the run made its choices.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CapacitySnapshot {
+    /// `[routing.strategy] mode`, echoed because what a snapshot *means*
+    /// depends on which strategy was reading it.
+    pub strategy: String,
+    pub pools: Vec<PoolSnapshot>,
+}
+
+/// One pool's line in a snapshot, already rendered.
+///
+/// Strings rather than the [`crate::capacity`] enums: this is a record of what
+/// a past run believed, and pinning it to today's variants would make a future
+/// rename either break old logs or silently re-interpret them.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PoolSnapshot {
+    pub pool: String,
+    pub agent: String,
+    pub kind: String,
+    pub remaining: String,
+    pub confidence: String,
+    pub reset_at: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PoolExhausted {
+    pub pool: String,
+    pub agent: String,
+    /// When the signal said the window reopens, where it said so at all.
+    pub reset_at: Option<String>,
+    /// The CLI's own words, quoted — the evidence for calling the pool empty.
+    pub detail: String,
+}
+
+/// Which ceiling stopped the run (§17 `[budgets]`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BudgetKind {
+    Run,
+    Task,
+}
+
+impl fmt::Display for BudgetKind {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::Run => "run_usd",
+            Self::Task => "task_usd",
+        })
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct BudgetExceeded {
+    pub budget: BudgetKind,
+    pub limit_usd: f64,
+    /// Reported spend to date. A floor where any attempt's route reports no
+    /// spend at all (§13) — which is why the ceiling is checked against
+    /// *reported* dollars and the report says so.
+    pub spent_usd: f64,
+    /// The task whose next attempt was refused. Not a failed task: nothing
+    /// judged it, and nothing was spent on it.
+    pub task: String,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum RunOutcome {
     Complete,
     Parked,
     Halted,
+    /// §13's ceiling stopped the run. Distinct from `Halted` because `resume`
+    /// means something different afterwards — raise the ceiling and continue —
+    /// and CI needs to tell "your budget stopped it" from "a task failed".
+    BudgetExceeded,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -532,6 +665,7 @@ pub struct InFlight {
     pub tier: String,
     pub model: String,
     pub profile: String,
+    pub pool: Option<String>,
 }
 
 /// A dangling attempt, with the task it belongs to.
@@ -553,6 +687,10 @@ impl InterruptedAttempt {
                 attempt: self.flight.attempt,
                 tier: self.flight.tier.clone(),
                 model: self.flight.model.clone(),
+                // Its spend is unknown, but which subscription it drew on is
+                // not: the pool was recorded before the spawn precisely so this
+                // line does not have to shrug.
+                pool: self.flight.pool.clone(),
                 resumed: false,
                 duration: Duration::ZERO,
                 cost_usd: None,
@@ -618,6 +756,14 @@ pub struct RunState {
     /// happened.
     pub order: Vec<usize>,
     pub halted_at: Option<String>,
+    /// The ceiling that stopped the run (§13), if one did. Folded from the
+    /// event rather than recomputed by each reader, so a `status` looking at a
+    /// finished run and the engine that finished it reach the same verdict —
+    /// the reader has no config and could not recompute it anyway.
+    ///
+    /// First stop wins, like `halted_at`: the scheduler stops scheduling once
+    /// this is set, so a second one would describe a spawn that never happened.
+    pub budget_stop: Option<BudgetExceeded>,
     pub finished: Option<RunFinished>,
 }
 
@@ -632,6 +778,7 @@ impl RunState {
             questions: Vec::new(),
             order: Vec::new(),
             halted_at: None,
+            budget_stop: None,
             finished: None,
         }
     }
@@ -649,7 +796,26 @@ impl RunState {
     pub fn apply(&mut self, event: &Event) {
         match &event.body {
             // Metadata for the reader; contributes no task state.
-            EventBody::RunStarted { .. } | EventBody::DesignDefect { .. } => {}
+            //
+            // `capacity_snapshot` and `pool_exhausted` sit here for opposite
+            // reasons. The snapshot folds to nothing because nothing routes on
+            // capacity in v0.1 (§13 read-only) — state it produced would be
+            // state no branch consults. `pool_exhausted` folds to nothing
+            // because its consumer is a *later* run's estimator, which reads it
+            // out of the log directly ([`crate::capacity::observe`]); the task
+            // consequence of the same rate limit rides on `task_deferred`,
+            // which is where the scheduler already looks.
+            EventBody::RunStarted { .. }
+            | EventBody::DesignDefect { .. }
+            | EventBody::CapacitySnapshot { .. }
+            | EventBody::PoolExhausted { .. } => {}
+
+            // §13: the run's ceiling refused the next attempt. It stops the
+            // drain but fails nothing — the task it names never ran, and the
+            // tasks behind it settle as skipped exactly as they do after a halt.
+            EventBody::BudgetExceeded { data } => {
+                self.budget_stop.get_or_insert_with(|| data.clone());
+            }
 
             // §14: a resumed run cannot trust a session that believed it left
             // edits in a tree that has since been rolled back, and deferred
@@ -664,6 +830,15 @@ impl RunState {
                         *state = TaskState::Pending;
                     }
                 }
+                // A budget stop is cleared here for the same reason deferred
+                // work wakes: it describes a *ceiling a previous process was
+                // working under*, and the resume has just re-read the ceiling
+                // from today's config and flags (§13/D4). Leaving it folded in
+                // would make `tactus resume --budget` a command that changes
+                // nothing — the run would replay straight back into the stop it
+                // was resumed to get past. If the new ceiling is still too low,
+                // the very next `step_task` records a fresh stop and says so.
+                self.budget_stop = None;
             }
 
             EventBody::AttemptStarted {
@@ -689,6 +864,7 @@ impl RunState {
                     tier: data.tier.clone(),
                     model: data.model.clone(),
                     profile: profile.clone(),
+                    pool: data.pool.clone(),
                 });
             }
 
@@ -1269,6 +1445,7 @@ mod tests {
                 tier: tier.to_owned(),
                 agent: "claude-code".to_owned(),
                 model: "model".to_owned(),
+                pool: Some("claude-max".to_owned()),
                 resume_session: None,
             },
         }
@@ -1284,6 +1461,7 @@ mod tests {
                 attempt,
                 tier: tier.to_owned(),
                 model: "model".to_owned(),
+                pool: Some("claude-max".to_owned()),
                 resumed: false,
                 duration: Duration::from_millis(1500),
                 cost_usd: Some(0.01),

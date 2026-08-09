@@ -13,10 +13,75 @@ use std::process::Command;
 
 use serde::{Deserialize, Serialize};
 
+use crate::capacity::PoolKind;
 use crate::error::TactusError;
 use crate::ir::{Outcome, WorkerProfile};
 
 pub use proc::ProcessOutput;
+
+/// Whether the vendor's CLI says it is signed in.
+///
+/// Three states, not two. "Could not tell" must never render as "not
+/// connected": `tactus connect` writes a file an operator then trusts, and a
+/// confident *wrong* "you are not logged in" sends them to re-authenticate an
+/// account that was fine.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AuthState {
+    Authenticated,
+    NotAuthenticated,
+    Unknown,
+}
+
+impl std::fmt::Display for AuthState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Authenticated => "authenticated",
+            Self::NotAuthenticated => "not authenticated",
+            Self::Unknown => "unknown",
+        })
+    }
+}
+
+/// What one agent's CLI could be got to say about itself, without the network
+/// and without touching a credential (invariants 2 and 5).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Discovery {
+    pub auth: AuthState,
+    /// The models the CLI itself advertises.
+    ///
+    /// **Empty on both adapters today**, and that is a fact about the CLIs
+    /// rather than a gap here: as of Aug 2026 neither Claude Code nor Copilot
+    /// offers non-interactive model enumeration (checked against `--help` and
+    /// GitHub's programmatic reference respectively). The seam exists so the
+    /// version that does gets cross-checked against the catalog instead of
+    /// silently disagreeing with it; [`Caps::model_list`] is the gate.
+    pub models: Vec<String>,
+    /// §13's pool-kind hint, read from whatever the CLI says about the account
+    /// it is signed into. `None` means it said nothing conclusive, and the
+    /// caller picks a documented default rather than guessing.
+    pub shape: Option<PoolKind>,
+    /// Everything the operator should know about how this was worked out —
+    /// including what could not be.
+    pub notes: Vec<String>,
+}
+
+impl Discovery {
+    /// What an adapter that does not implement discovery reports: nothing,
+    /// said out loud.
+    pub fn unknown() -> Self {
+        Self {
+            auth: AuthState::Unknown,
+            models: Vec::new(),
+            shape: None,
+            notes: Vec::new(),
+        }
+    }
+
+    pub fn with_note(mut self, note: impl Into<String>) -> Self {
+        self.notes.push(note.into());
+        self
+    }
+}
 
 /// Capabilities discovered by `probe()` at pre-flight (§14). Copilot's CLI
 /// has shipped breaking flag removals, so capability probing is load-bearing,
@@ -67,6 +132,21 @@ pub trait AgentAdapter: Send + Sync {
     fn probe(&self) -> Result<Caps, TactusError>;
     fn build(&self, run: &TaskRun) -> Result<Command, TactusError>;
     fn parse(&self, out: &ProcessOutput) -> Result<Outcome, TactusError>;
+
+    /// §13's `tactus connect`: ask this agent's CLI about the account behind
+    /// it — signed in or not, what shape its quota is, which models it offers.
+    ///
+    /// Subprocesses the vendor's own CLI and parses what came back. No HTTP, no
+    /// token ever handled, no credential file read: a vendor CLI talking to its
+    /// own vendor is the design (invariant 2), the same posture §9 sets for
+    /// plan importers.
+    ///
+    /// The default reports nothing rather than being required, so an adapter
+    /// cannot silently claim discovery it does not do — [`Discovery::unknown`]
+    /// is an honest "could not tell", and every consumer treats it as one.
+    fn discover(&self) -> Result<Discovery, TactusError> {
+        Ok(Discovery::unknown())
+    }
 
     /// What to write to the child's stdin. Delivery is the adapter's call:
     /// CLIs that take the prompt as an argument instead return empty here.

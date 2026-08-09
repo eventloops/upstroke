@@ -6,6 +6,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use crate::agent;
+use crate::capacity;
 use crate::config::{self, Config};
 use crate::error::{TactusError, ValidationErrors};
 use crate::gates::{self, ShellGate};
@@ -190,11 +191,12 @@ pub fn run(opts: &ValidateOptions) -> Result<Report, TactusError> {
             to_row(task, chain.clone(), second)
         })
         .collect();
+    let (observations, run_id) = latest_run_observations(&opts.config_root);
     Ok(Report {
         rows,
         warnings,
         strategy: strategy_echo(&analysis.config),
-        capacity: capacity_echo(&analysis.config),
+        capacity: capacity_echo(&analysis.config, &observations, run_id.as_deref()),
         review: review_echo(&reviews),
         gates: analysis.gates.iter().map(|g| g.name.clone()).collect(),
         gates_from_config: analysis.gates_from_config,
@@ -232,17 +234,72 @@ fn review_echo(plan: &ReviewPlan) -> String {
     line
 }
 
-/// §13 is read-only until the capacity engine lands: name the pools that were
-/// connected so the preview reflects what `tactus connect` actually wrote.
-fn capacity_echo(cfg: &Config) -> String {
-    if cfg.pool_names.is_empty() {
-        "capacity: not connected".to_owned()
-    } else {
-        format!(
-            "capacity: {} pool(s) connected — {} (estimates arrive with the capacity engine)",
-            cfg.pool_names.len(),
-            cfg.pool_names.join(", ")
-        )
+/// §13's capacity block, for a command that executes nothing.
+///
+/// `validate` and `--dry-run` **do not probe** (§18): every figure here comes
+/// from files — the pools file, and the latest run's event log in this
+/// repository. That is a real distinction rather than a technicality, and the
+/// block says which side of it each line is on, because `tactus capacity` shows
+/// strictly more by being allowed to spawn the vendors' CLIs.
+///
+/// The same reason the review line says "if installed": a preview that reads as
+/// a promise is worse than one that reads as a plan.
+fn capacity_echo(cfg: &Config, obs: &capacity::Observations, run: Option<&str>) -> String {
+    use std::fmt::Write as _;
+
+    if cfg.pools.is_empty() {
+        return "capacity: not connected — run `tactus connect` to write ~/.tactus/pools.toml"
+            .to_owned();
+    }
+    let estimates = capacity::estimate(&cfg.pools, obs);
+    let mut out = format!("capacity: {} pool(s) connected\n", cfg.pools.len());
+    for (pool, estimate) in cfg.pools.iter().zip(&estimates) {
+        let _ = writeln!(out, "  {}", pool.describe());
+        let _ = writeln!(out, "    {}", estimate.describe());
+        for note in &estimate.notes {
+            let _ = writeln!(out, "    - {note}");
+        }
+    }
+    match run {
+        Some(run_id) => {
+            let _ = writeln!(
+                out,
+                "  self-metered draw is folded from run {run_id}, the latest in this repository"
+            );
+        }
+        None => {
+            let _ = writeln!(
+                out,
+                "  no run in this repository yet, so nothing has been self-metered"
+            );
+        }
+    }
+    for line in capacity::strategy_preview(&cfg.strategy.mode, &estimates) {
+        let _ = writeln!(out, "  {line}");
+    }
+    let _ = write!(
+        out,
+        "  this preview reads files only and never probes (§18) — `tactus capacity` asks the \
+         installed CLIs as well"
+    );
+    out
+}
+
+/// §13's observations, without executing anything: fold the latest run in this
+/// repository, if there is one.
+///
+/// A missing or unreadable run is not an error here. `validate` describes a
+/// plan; a broken run directory beside it is somebody else's problem, and
+/// refusing to preview a plan over one would be a strange trade.
+fn latest_run_observations(repo_root: &Path) -> (capacity::Observations, Option<String>) {
+    let Some(run_id) = crate::rundir::latest_run(repo_root) else {
+        return (capacity::Observations::default(), None);
+    };
+    let events_path = crate::rundir::public_dir(repo_root, &run_id).join("events.jsonl");
+    let mut ignored = Vec::new();
+    match crate::events::read_all(&events_path, &mut ignored) {
+        Ok(events) => (capacity::observe(&events), Some(run_id)),
+        Err(_) => (capacity::Observations::default(), None),
     }
 }
 
@@ -554,7 +611,7 @@ mod tests {
         let pins = vec![config::Pin {
             tier: crate::ir::Tier::Frontier,
             agent: "copilot".to_owned(),
-            model: "gpt-5".to_owned(),
+            model: "gpt-5.3-codex".to_owned(),
         }];
         assert!(
             check_pin_adapters(&pins, builtin_adapter, Path::new("tactus.toml")).is_ok(),
@@ -605,7 +662,7 @@ mod tests {
             .find(|l| l.starts_with("rotate"))
             .expect("row");
         assert!(
-            rotate.contains("[second opinion: copilot/gpt-5]"),
+            rotate.contains("[second opinion: copilot/gpt-5.3-codex]"),
             "{rotate}"
         );
         let note = rendered
@@ -616,20 +673,49 @@ mod tests {
     }
 
     #[test]
-    fn connected_pools_are_named_in_the_capacity_line() {
+    fn the_capacity_block_estimates_without_probing_and_never_reads_unknown_as_full() {
         let dir = env::temp_dir().join(format!("tactus-validate-pools-{}", std::process::id()));
         fs::create_dir_all(&dir).expect("dir");
         let pools = dir.join("pools.toml");
         fs::write(
             &pools,
-            "[pools.claude-max]\nkind = \"subscription-window\"\nagent = \"claude-code\"\n",
+            "[pools.claude-max]\nkind = \"subscription-window\"\nagent = \
+             \"claude-code\"\nwindow = \"5h\"\nweekly = true\nsources = [\"signals\", \"self\", \
+             \"local-logs\"]\nprofile = \"personal\"\n",
         )
         .expect("pools");
         let mut o = opts("fixtures/sample-plan.md");
         o.pools_path = Some(pools);
         let rendered = run(&o).expect("validates").render();
+
         assert!(rendered.contains("claude-max"), "rendered:\n{rendered}");
         assert!(!rendered.contains("capacity: not connected"));
+        assert!(rendered.contains("window=5h"), "rendered:\n{rendered}");
+        // D2's seam is echoed even though nothing acts on it.
+        assert!(
+            rendered.contains("profile=personal"),
+            "rendered:\n{rendered}"
+        );
+        // §13's conservatism, visible: an unmeasured pool reads as unknown, and
+        // the block says that is not the same as full.
+        assert!(
+            rendered.contains("claude-max: unknown [unknown]"),
+            "rendered:\n{rendered}"
+        );
+        assert!(rendered.contains("not full"), "rendered:\n{rendered}");
+        // A source the estimate did not read must not pass as accounted for.
+        assert!(
+            rendered.contains("local-logs") && rendered.contains("not read in v0.1"),
+            "rendered:\n{rendered}"
+        );
+        // §18: this command executes nothing, and says which side of that line
+        // it is on rather than letting a preview read as a promise.
+        assert!(rendered.contains("never probes"), "rendered:\n{rendered}");
+        assert!(rendered.contains("read-only"), "rendered:\n{rendered}");
+        assert!(
+            rendered.contains("no run in this repository yet"),
+            "rendered:\n{rendered}"
+        );
     }
 
     #[test]

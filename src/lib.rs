@@ -14,14 +14,23 @@
 //! Commercial licences are available for use that the AGPL does not permit —
 //! see README.md.
 //!
-//! Step 1 scope: `tactus validate` only. Parse an annotated markdown plan
-//! into the IR, load optional config, resolve routing chains with a binder
-//! preview, and report — executing nothing.
+//! v0.1 scope (DESIGN.md §21, steps 1–10): parse an annotated markdown plan
+//! into the IR, resolve a routing chain per task, and execute it sequentially —
+//! one agent subprocess per attempt, gates and read-only review over the
+//! engine-captured diff, one commit per task, every transition an event in
+//! `events.jsonl`. `resume`, `status`, and `answer` are folds over that log.
+//!
+//! The capacity engine (§13) ships **read-only**: `connect` discovers the agent
+//! CLIs and writes the pools file, `capacity` and the dry-run preview estimate
+//! what is left and what each strategy *would* do, and budgets stop a run at a
+//! ceiling — but nothing routes on any of it. Capacity-driven binding is v0.2.
 
 pub mod agent;
 pub mod answer;
+pub mod capacity;
 pub mod catalog;
 pub mod config;
+pub mod connect;
 pub mod engine;
 pub mod error;
 pub mod events;
