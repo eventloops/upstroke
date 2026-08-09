@@ -79,7 +79,10 @@ struct RawStrategy {
 #[derive(Debug, Deserialize)]
 struct RawOverride {
     paths: Vec<String>,
-    start_at: Tier,
+    /// Optional since step 9: an override may raise the tier floor, ask for a
+    /// cross-family second opinion, or both. Requiring it would force a no-op
+    /// `start_at = "small"` on anyone who wants only the second reviewer.
+    start_at: Option<Tier>,
     second_opinion: Option<String>,
 }
 
@@ -113,11 +116,39 @@ pub struct KindChain {
     pub from_config: bool,
 }
 
+/// `second_opinion` on a `[[routing.overrides]]` (§11.3).
+///
+/// One variant today. It stays an enum rather than a bool because §11.5
+/// generalizes the reviewer into a list of passes with a lens each, and the
+/// security lens arrives here as a second variant with a different ladder
+/// dispatch — not as a second boolean.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SecondOpinion {
+    /// A second reviewer from a different model *family* must also pass. The
+    /// spelling is §17's; the semantics are §11.3's ("a different model
+    /// family"), which is the stricter of the two — see [`crate::catalog::Family`].
+    DifferentVendor,
+}
+
+impl SecondOpinion {
+    /// Accepted spellings, named once so the parser and its error message
+    /// cannot disagree about what is legal.
+    const ACCEPTED: [&'static str; 1] = ["different-vendor"];
+
+    fn parse(s: &str) -> Option<Self> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "different-vendor" => Some(Self::DifferentVendor),
+            _ => None,
+        }
+    }
+}
+
 #[derive(Debug)]
 pub struct CompiledOverride {
     pub raw_paths: Vec<String>,
-    pub start_at: Tier,
-    pub second_opinion: Option<String>,
+    /// `None` when this override exists only to request a second opinion.
+    pub start_at: Option<Tier>,
+    pub second_opinion: Option<SecondOpinion>,
     pub globs: GlobSet,
 }
 
@@ -329,7 +360,43 @@ pub fn load(
                 },
             );
         }
-        for ov in routing.overrides.unwrap_or_default() {
+        for (index, ov) in routing
+            .overrides
+            .unwrap_or_default()
+            .into_iter()
+            .enumerate()
+        {
+            let n = index + 1;
+            // A misspelled value here silently deletes a verification layer:
+            // the operator asked for two model families on their blast-radius
+            // paths and would get one, with nothing said. That is the same
+            // reason `[interaction] mode` errors rather than warns.
+            let second_opinion = match ov.second_opinion.as_deref() {
+                None => None,
+                Some(raw) => Some(SecondOpinion::parse(raw).ok_or_else(|| {
+                    TactusError::Config {
+                        path: repo_path.clone(),
+                        message: format!(
+                            "[[routing.overrides]] entry {n}: `second_opinion = \"{raw}\"` is not \
+                         recognized (accepted: {})",
+                            SecondOpinion::ACCEPTED.join(", ")
+                        ),
+                    }
+                })?),
+            };
+            // Both keys are optional individually, but an override that raises
+            // nothing and asks for nothing does nothing — and reads exactly
+            // like one whose key was misspelled into oblivion.
+            if ov.start_at.is_none() && second_opinion.is_none() {
+                return Err(TactusError::Config {
+                    path: repo_path.clone(),
+                    message: format!(
+                        "[[routing.overrides]] entry {n} has neither `start_at` nor \
+                         `second_opinion`, so it would have no effect — give it a tier floor, a \
+                         second opinion, or remove it"
+                    ),
+                });
+            }
             let mut builder = GlobSetBuilder::new();
             for pattern in &ov.paths {
                 let glob = Glob::new(pattern).map_err(|e| TactusError::Config {
@@ -345,7 +412,7 @@ pub fn load(
             overrides.push(CompiledOverride {
                 raw_paths: ov.paths,
                 start_at: ov.start_at,
-                second_opinion: ov.second_opinion,
+                second_opinion,
                 globs,
             });
         }
@@ -711,6 +778,11 @@ model = "claude-opus-4-8"
         assert_eq!(cfg.overrides.len(), 1);
         assert!(cfg.overrides[0].globs.is_match("src/auth/login.rs"));
         assert!(!cfg.overrides[0].globs.is_match("src/api/list.rs"));
+        assert_eq!(cfg.overrides[0].start_at, Some(Tier::Frontier));
+        assert_eq!(
+            cfg.overrides[0].second_opinion,
+            Some(SecondOpinion::DifferentVendor)
+        );
         assert_eq!(cfg.pins.len(), 1);
         assert_eq!(cfg.strategy.mode, "value-max");
         assert_eq!(cfg.strategy.spend_down_after, Some(0.7));
@@ -718,6 +790,65 @@ model = "claude-opus-4-8"
         // never warned about (DESIGN §17 configures it in its own example).
         assert_eq!(cfg.review_tier, Some(Tier::Frontier));
         assert!(warnings.is_empty(), "warnings: {warnings:?}");
+    }
+
+    #[test]
+    fn an_override_may_ask_for_a_second_opinion_without_raising_the_floor() {
+        // Requiring `start_at` would force a no-op `start_at = "small"` on
+        // anyone who wants a cross-family reviewer on paths whose difficulty
+        // is already routed correctly.
+        let path = scratch(
+            "soonly.toml",
+            "[[routing.overrides]]\npaths = [\"docs/**\"]\nsecond_opinion = \
+             \"different-vendor\"\n",
+        );
+        let mut warnings = Vec::new();
+        let cfg = load(Some(&path), &hermetic(), Some(&missing()), &mut warnings).expect("load");
+        assert_eq!(cfg.overrides[0].start_at, None);
+        assert_eq!(
+            cfg.overrides[0].second_opinion,
+            Some(SecondOpinion::DifferentVendor)
+        );
+        // With no floor to apply, routing is untouched.
+        assert_eq!(
+            cfg.chain_for(TaskKind::Fix).chain,
+            vec![Tier::Small, Tier::Mid, Tier::Frontier]
+        );
+        assert!(warnings.is_empty(), "warnings: {warnings:?}");
+    }
+
+    #[test]
+    fn a_misspelled_second_opinion_is_a_hard_error() {
+        // Warning and carrying on would run the task with ONE reviewer while
+        // the config says two — a verification layer deleted in silence.
+        let path = scratch(
+            "badso.toml",
+            "[[routing.overrides]]\npaths = [\"src/auth/**\"]\nstart_at = \"frontier\"\n\
+             second_opinion = \"different-model\"\n",
+        );
+        let mut warnings = Vec::new();
+        let err = load(Some(&path), &hermetic(), Some(&missing()), &mut warnings)
+            .expect_err("unknown second_opinion must error");
+        let msg = err.to_string();
+        assert!(msg.contains("different-model"), "names the typo: {msg}");
+        assert!(
+            msg.contains("different-vendor"),
+            "lists what is accepted: {msg}"
+        );
+    }
+
+    #[test]
+    fn an_override_that_does_nothing_is_a_hard_error() {
+        // Indistinguishable from one whose only key was misspelled into a
+        // section serde ignores, so it cannot be waved through.
+        let path = scratch(
+            "emptyov.toml",
+            "[[routing.overrides]]\npaths = [\"src/**\"]\n",
+        );
+        let mut warnings = Vec::new();
+        let err = load(Some(&path), &hermetic(), Some(&missing()), &mut warnings)
+            .expect_err("an inert override must error");
+        assert!(err.to_string().contains("no effect"), "got: {err}");
     }
 
     #[test]

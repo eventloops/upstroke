@@ -62,15 +62,17 @@ pub fn resolve(task: &Task, cfg: &Config) -> ResolvedChain {
     let mut notes = Vec::new();
 
     // Blast-radius floors: a matching override raises the start. Blast radius
-    // beats nominal difficulty (§10.2).
+    // beats nominal difficulty (§10.2). An override carrying only a
+    // `second_opinion` has no floor to apply and is handled by the reviewer
+    // (§11.3), not here.
     for ov in &cfg.overrides {
-        if task.path_hints.iter().any(|h| ov.globs.is_match(h))
-            && raise_start(&mut tiers, ov.start_at, ChainSource::Override)
+        if let Some(start_at) = ov.start_at
+            && task.path_hints.iter().any(|h| ov.globs.is_match(h))
+            && raise_start(&mut tiers, start_at, ChainSource::Override)
         {
             notes.push(format!(
-                "override paths [{}] raised start to {}",
+                "override paths [{}] raised start to {start_at}",
                 ov.raw_paths.join(", "),
-                ov.start_at
             ));
         }
     }

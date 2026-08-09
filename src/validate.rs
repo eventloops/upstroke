@@ -11,6 +11,7 @@ use crate::error::{TactusError, ValidationErrors};
 use crate::gates::{self, ShellGate};
 use crate::ir::{Plan, Task, TaskId};
 use crate::plan::{self, Parsed};
+use crate::review::{self, PassBinding, ReviewPlan};
 use crate::route::{self, ResolvedChain};
 
 #[derive(Debug, Clone)]
@@ -41,6 +42,8 @@ pub struct Report {
     pub warnings: Vec<String>,
     pub strategy: String,
     pub capacity: String,
+    /// Who reviews, and where a second opinion applies (§11.2–§11.3).
+    pub review: String,
     pub gates: Vec<String>,
     pub gates_from_config: bool,
 }
@@ -77,31 +80,13 @@ pub fn analyze(opts: &ValidateOptions) -> Result<Analysis, TactusError> {
         &mut all_warnings,
     )?;
     check_graph(&plan, &mut all_warnings)?;
-    // A pin naming an agent with no adapter must fail the same way in
-    // `validate` and `run`; otherwise the preview promises a binding the run
-    // then refuses at pre-flight (§18).
-    for pin in &config.pins {
-        if agent::by_id(&pin.agent).is_none() {
-            return Err(TactusError::Config {
-                path: opts
-                    .config_path
-                    .clone()
-                    .unwrap_or_else(|| opts.config_root.join("tactus.toml")),
-                message: format!(
-                    "pin for tier `{}` names agent `{}`, which has no adapter in this build \
-                     (available: {})",
-                    pin.tier,
-                    pin.agent,
-                    agent::ADAPTERS
-                        .iter()
-                        .map(|a| a.id())
-                        .collect::<Vec<_>>()
-                        .join(", ")
-                ),
-            });
-        }
-    }
-    let chains = plan
+    let config_path = || {
+        opts.config_path
+            .clone()
+            .unwrap_or_else(|| opts.config_root.join("tactus.toml"))
+    };
+    check_pin_adapters(&config.pins, builtin_adapter, &config_path())?;
+    let chains: Vec<ResolvedChain> = plan
         .tasks
         .iter()
         .map(|t| route::resolve(t, &config))
@@ -129,27 +114,122 @@ pub fn analyze(opts: &ValidateOptions) -> Result<Analysis, TactusError> {
     })
 }
 
+/// Whether this build ships an adapter for `agent`.
+///
+/// Injected into the checks below rather than called from them, so the guards
+/// can be tested against agents that do and do not exist without waiting for
+/// the registry to grow one.
+pub fn builtin_adapter(agent: &str) -> bool {
+    agent::by_id(agent).is_some()
+}
+
+fn adapter_list() -> String {
+    agent::ADAPTERS
+        .iter()
+        .map(|a| a.id())
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// A pin naming an agent with no adapter must fail the same way in `validate`
+/// and `run`; otherwise the preview promises a binding the run then refuses at
+/// pre-flight (§18).
+///
+/// Currently unreachable through `tactus.toml` alone — `config::load` rejects
+/// any pin whose (agent, model) is absent from the catalog, and every catalog
+/// agent has an adapter as of step 9. It stays because that is a coincidence of
+/// today's table, not a property: §13 says the catalog ships ahead of support
+/// (Aider models are catalogued in v0.2 before its adapter lands), and the
+/// moment it does, this is what stops a preview from promising them.
+fn check_pin_adapters(
+    pins: &[config::Pin],
+    has_adapter: impl Fn(&str) -> bool,
+    config_path: &Path,
+) -> Result<(), TactusError> {
+    for pin in pins {
+        if !has_adapter(&pin.agent) {
+            return Err(TactusError::Config {
+                path: config_path.to_path_buf(),
+                message: format!(
+                    "pin for tier `{}` names agent `{}`, which has no adapter in this build \
+                     (available: {})",
+                    pin.tier,
+                    pin.agent,
+                    adapter_list()
+                ),
+            });
+        }
+    }
+    Ok(())
+}
+
 pub fn run(opts: &ValidateOptions) -> Result<Report, TactusError> {
     let analysis = analyze(opts)?;
     let mut warnings = analysis.warnings;
     // Zero-spend preview of the §14 gate pre-flight: warn, never refuse.
     gates::preview_resolution(&analysis.gates, &opts.config_root, &mut warnings);
+    // Who would judge the work (§11.2–§11.3), against the adapters this binary
+    // ships. A run asks the same question of the adapters its own harness
+    // holds, which in production is the same set — so the preview cannot
+    // promise a reviewer the run would then refuse.
+    let reviews = review::plan_for(
+        &analysis.plan,
+        &analysis.chains,
+        &analysis.config,
+        builtin_adapter,
+        &mut warnings,
+    )?;
     let rows = analysis
         .plan
         .tasks
         .iter()
         .zip(&analysis.chains)
-        .map(|(task, chain)| to_row(task, chain.clone()))
+        .enumerate()
+        .map(|(index, (task, chain))| {
+            let second = reviews.second_opinion.get(index).and_then(Option::as_ref);
+            to_row(task, chain.clone(), second)
+        })
         .collect();
     Ok(Report {
         rows,
         warnings,
         strategy: strategy_echo(&analysis.config),
         capacity: capacity_echo(&analysis.config),
+        review: review_echo(&reviews),
         gates: analysis.gates.iter().map(|g| g.name.clone()).collect(),
         gates_from_config: analysis.gates_from_config,
         plan: analysis.plan,
     })
+}
+
+/// Who judges the work (§11.2–§11.3), for the preview.
+///
+/// Resolved against the adapters this build ships, not against binaries found
+/// on PATH: `validate` and `--dry-run` execute nothing (§18), so they cannot
+/// probe. Pre-flight is where a named reviewer has to prove it can actually
+/// run — and where a missing one either warns or refuses. The line says so,
+/// because a preview that reads as a promise is worse than one that reads as a
+/// plan.
+fn review_echo(plan: &ReviewPlan) -> String {
+    let Some(primary) = &plan.primary else {
+        return "review: disabled ([routing] review = { enabled = false })".to_owned();
+    };
+    let mut line = format!("review: {}", primary.describe());
+    match &plan.alternative {
+        Some(alt) => line.push_str(&format!(
+            " (tasks it implements itself would be reviewed by {} instead, if installed)",
+            alt.describe()
+        )),
+        None => line.push_str(" (no cross-family reviewer exists in this build)"),
+    }
+    let demanded = plan.second_opinion.iter().flatten().count();
+    if demanded > 0 {
+        line.push_str(&format!(
+            "; {demanded} task(s) also require a second opinion, which pre-flight refuses to \
+             start without"
+        ));
+    }
+    line
 }
 
 /// §13 is read-only until the capacity engine lands: name the pools that were
@@ -308,7 +388,7 @@ fn find_cycle(plan: &Plan) -> Option<Vec<String>> {
     None
 }
 
-fn to_row(task: &Task, resolved: ResolvedChain) -> Row {
+fn to_row(task: &Task, resolved: ResolvedChain, second_opinion: Option<&PassBinding>) -> Row {
     let deps = if task.depends_on.is_empty() {
         "-".to_owned()
     } else {
@@ -336,6 +416,11 @@ fn to_row(task: &Task, resolved: ResolvedChain) -> Row {
         .join(" -> ");
     for note in &resolved.notes {
         chain.push_str(&format!(" [{note}]"));
+    }
+    // §11.3: a second reviewer is a per-task routing decision like any other,
+    // so it belongs in the column that shows what this task's paths bought it.
+    if let Some(binding) = second_opinion {
+        chain.push_str(&format!(" [second opinion: {}]", binding.describe()));
     }
     Row {
         id: task.id.to_string(),
@@ -399,6 +484,8 @@ impl Report {
                 }
             ));
         }
+        out.push_str(&self.review);
+        out.push('\n');
         out.push_str(&self.strategy);
         out.push('\n');
         out.push_str(&self.capacity);
@@ -445,24 +532,87 @@ mod tests {
 
     #[test]
     fn a_pin_without_an_adapter_fails_validate_not_just_run() {
-        let root = env::temp_dir().join(format!("tactus-validate-pin-{}", std::process::id()));
-        fs::create_dir_all(&root).expect("root");
-        let cfg = root.join("tactus.toml");
-        // copilot is in the capability catalog but has no adapter until step 9.
-        fs::write(
-            &cfg,
-            "[[pins]]\ntier = \"frontier\"\nagent = \"copilot\"\nmodel = \"gpt-5\"\n",
-        )
-        .expect("config");
-        let mut o = opts("fixtures/sample-plan.md");
-        o.config_path = Some(cfg);
-        let err = run(&o).expect_err("preview must not promise a binding run would refuse");
+        // Every catalogued agent has an adapter as of step 9, so the guard is
+        // driven directly rather than through a config file it can no longer be
+        // reached from. §13 ships the catalog ahead of adapter support, which is
+        // when this fires for real.
+        let pins = vec![config::Pin {
+            tier: crate::ir::Tier::Frontier,
+            agent: "aider".to_owned(),
+            model: "qwen-3-coder".to_owned(),
+        }];
+        let err = check_pin_adapters(&pins, builtin_adapter, Path::new("tactus.toml"))
+            .expect_err("preview must not promise a binding run would refuse");
         let message = err.to_string();
         assert!(message.contains("no adapter"), "got: {message}");
         assert!(
-            message.contains("claude-code"),
+            message.contains("claude-code") && message.contains("copilot"),
             "lists what is available: {message}"
         );
+
+        // And it passes what this build really does ship.
+        let pins = vec![config::Pin {
+            tier: crate::ir::Tier::Frontier,
+            agent: "copilot".to_owned(),
+            model: "gpt-5".to_owned(),
+        }];
+        assert!(
+            check_pin_adapters(&pins, builtin_adapter, Path::new("tactus.toml")).is_ok(),
+            "copilot gained an adapter in step 9"
+        );
+    }
+
+    #[test]
+    fn the_preview_shows_who_reviews_without_promising_a_binary_it_cannot_probe() {
+        // §18: `validate` and `--dry-run` execute nothing, so they cannot check
+        // that a named reviewer is installed. Saying "would be, if installed"
+        // is the difference between a plan and a promise.
+        let root = env::temp_dir().join(format!("tactus-validate-review-{}", std::process::id()));
+        fs::create_dir_all(&root).expect("root");
+        let plan = root.join("plan.md");
+        fs::write(
+            &plan,
+            "## Rotate the signing key\n\
+             <!-- tactus: id=rotate kind=implement depends= paths=src/auth/** -->\n\n\
+             ## Note it down\n<!-- tactus: id=note kind=docs depends=rotate -->\n",
+        )
+        .expect("plan");
+        let cfg = root.join("tactus.toml");
+        fs::write(
+            &cfg,
+            "[[routing.overrides]]\npaths = [\"src/auth/**\"]\nsecond_opinion = \
+             \"different-vendor\"\n",
+        )
+        .expect("config");
+        let mut o = opts("unused");
+        o.plan_path = plan;
+        o.config_path = Some(cfg);
+        let rendered = run(&o).expect("validate").render();
+
+        assert!(
+            rendered.contains("review: claude-code/claude-opus-5"),
+            "{rendered}"
+        );
+        assert!(rendered.contains("if installed"), "{rendered}");
+        assert!(
+            rendered.contains("1 task(s) also require a second opinion"),
+            "{rendered}"
+        );
+        // The per-task decision belongs in the row that explains what this
+        // task's paths bought it — and only on the task whose paths matched.
+        let rotate = rendered
+            .lines()
+            .find(|l| l.starts_with("rotate"))
+            .expect("row");
+        assert!(
+            rotate.contains("[second opinion: copilot/gpt-5]"),
+            "{rotate}"
+        );
+        let note = rendered
+            .lines()
+            .find(|l| l.starts_with("note"))
+            .expect("row");
+        assert!(!note.contains("second opinion"), "{note}");
     }
 
     #[test]

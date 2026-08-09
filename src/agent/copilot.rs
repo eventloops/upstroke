@@ -1,0 +1,538 @@
+//! GitHub Copilot CLI adapter (DESIGN.md §16) — the multi-vendor pool.
+//!
+//! One subscription reaches Anthropic, OpenAI, and Google models through one
+//! harness, which is what makes §11.3's cross-vendor second opinion a `--model`
+//! flag rather than a second product.
+//!
+//! **Route A, not ACP (v0.1).** §16 names two routes and prefers ACP "once
+//! stable for us". It is not yet: neither `--acp` nor `--stdio` appears in
+//! GitHub's programmatic CLI reference, so there is no documented surface to
+//! pin known-good behaviour against — and pinning per version is exactly what
+//! §16 says this adapter must do. ACP also needs a persistent bidirectional
+//! JSON-RPC session, where every other part of v0.1 spawns a process, feeds it,
+//! and reads what came back ([`super::proc`]). `probe()` still records
+//! [`Caps::acp`], so switching routes stays a change inside this file.
+//!
+//! **The prompt goes on stdin, and there is no `-p`.** GitHub documents
+//! `echo "…" | copilot` as a programmatic form, and documents that "piped input
+//! is ignored if you also provide a prompt with the `-p` option" — so passing
+//! both would silently discard the real prompt. Stdin is also the only delivery
+//! that works: npm installs this CLI as `copilot.cmd` on Windows, which runs
+//! through `cmd /C`, whose command line caps at ~8,191 characters. A review
+//! prompt carries up to [`crate::review::MAX_DIFF_BYTES`] of diff.
+//!
+//! **What this CLI does not give us**, recorded honestly rather than guessed at:
+//! no JSON envelope (so no session id, no usage, no cost — the ledger shows
+//! Copilot attempts as unpriced), and no documented session resume (so §11.4's
+//! same-rung retry starts fresh with accumulated feedback instead of resuming a
+//! conversation). Both are `Caps` axes the engine already dispatches on.
+//!
+//! **Permissions are argv** (§20). There is no settings file and no path-deny
+//! surface as Claude Code has, so the guarantee is the allow-list plus §15's
+//! split: an allow-list that names exactly the gate commands, no URL grant at
+//! all, and never a skip-all flag. Docs:
+//! <https://docs.github.com/en/copilot/reference/copilot-cli-reference/cli-programmatic-reference>
+//! (flags verified Aug 2026).
+
+use std::path::PathBuf;
+use std::process::Command;
+use std::sync::OnceLock;
+use std::time::Duration;
+
+use serde_json::json;
+
+use super::bin::{self, Invocation};
+use super::proc::{self, ProcessOutput};
+use super::{AgentAdapter, Caps, TaskRun, looks_rate_limited};
+use crate::error::TactusError;
+use crate::ir::{Outcome, OutcomeStatus, PermissionMode, WorkerProfile};
+use crate::util;
+
+pub const ADAPTER_ID: &str = "copilot";
+
+const PROBE_TIMEOUT: Duration = Duration::from_secs(15);
+
+/// Flags this adapter actually passes. §16: this CLI auto-updates and has
+/// removed programmatic flags without deprecation, so a missing one must
+/// surface as a pre-flight refusal rather than as per-task failures once a run
+/// is already spending (§19).
+const REQUIRED_FLAGS: [&str; 4] = ["--model", "--allow-tool", "--deny-tool", "--no-ask-user"];
+
+pub struct CopilotAdapter;
+
+impl AgentAdapter for CopilotAdapter {
+    fn id(&self) -> &'static str {
+        ADAPTER_ID
+    }
+
+    fn probe(&self) -> Result<Caps, TactusError> {
+        let invocation = locate()?;
+        let out = proc::run_with_timeout(
+            invocation.command(&["--version".to_owned()]),
+            "",
+            PROBE_TIMEOUT,
+        )?;
+        if out.timed_out {
+            return Err(TactusError::Agent {
+                message: format!("`{}` --version timed out", invocation.display()),
+            });
+        }
+        if out.code != Some(0) {
+            return Err(TactusError::Agent {
+                message: format!(
+                    "`{}` --version exited with {:?}: {}",
+                    invocation.display(),
+                    out.code,
+                    out.stderr.trim()
+                ),
+            });
+        }
+        let version = bin::extract_version(&out.stdout);
+
+        let help = proc::run_with_timeout(
+            invocation.command(&["--help".to_owned()]),
+            "",
+            PROBE_TIMEOUT,
+        )?;
+        let help_text = format!("{}{}", help.stdout, help.stderr);
+        let readable = help.code == Some(0) && !help_text.trim().is_empty();
+        let has = |flag: &str| readable && help_text.contains(flag);
+        if readable {
+            let missing: Vec<&str> = REQUIRED_FLAGS
+                .into_iter()
+                .filter(|flag| !help_text.contains(flag))
+                .collect();
+            if !missing.is_empty() {
+                return Err(TactusError::Agent {
+                    message: format!(
+                        "copilot {version} does not advertise required flag(s): {}. This adapter \
+                         pins known-good behavior per version — upgrade tactus or pin an older \
+                         copilot.",
+                        missing.join(", ")
+                    ),
+                });
+            }
+        }
+        Ok(Caps {
+            version,
+            // Deliberately PESSIMISTIC where the Claude adapter is optimistic.
+            // Its flags are long-standing, so an unreadable --help there is
+            // safely assumed benign. Here, claiming a capability this CLI turns
+            // out not to have is not a degraded run but a broken one: every
+            // same-rung retry would pass `--resume` to a binary that rejects
+            // it, failing attempts for a reason that has nothing to do with the
+            // code. Under-claiming only costs the conversation cache.
+            json_output: has("--output-format"),
+            session_resume: has("--resume"),
+            // No JSON envelope on this route, so nothing reports spend. The
+            // ledger says so rather than recording zero (§13).
+            cost_reporting: false,
+            // No single flag; achieved by denying the write and shell tools.
+            read_only_mode: true,
+            acp: has("--acp"),
+            model_list: has("--list-models"),
+        })
+    }
+
+    fn build(&self, run: &TaskRun) -> Result<Command, TactusError> {
+        let invocation = locate()?;
+        let mut cmd = invocation.command(&build_args(run));
+        cmd.current_dir(&run.workspace);
+        Ok(cmd)
+    }
+
+    fn parse(&self, out: &ProcessOutput) -> Result<Outcome, TactusError> {
+        Ok(parse_output(out))
+    }
+
+    /// Nothing to reference: permissions ride on argv, so this returns `None`
+    /// and the command carries them itself.
+    ///
+    /// The file is still written. §15 calls `settings/<task>-<attempt>.json`
+    /// "the per-attempt permission surface", and an audit trail that exists for
+    /// one agent and silently not for another is worse than none — someone
+    /// reading a run tomorrow should be able to see what each attempt was
+    /// allowed to do without reconstructing it from this source file.
+    fn materialize_permissions(
+        &self,
+        profile: &WorkerProfile,
+        gate_cmds: &[String],
+        dir: &std::path::Path,
+        stem: &str,
+    ) -> Result<Option<PathBuf>, TactusError> {
+        let path = dir.join(format!("{stem}.json"));
+        util::write_json(
+            &path,
+            &json!({
+                "agent": ADAPTER_ID,
+                "profile": profile.name,
+                "permissions": profile.permissions,
+                "note": "recorded for audit only; copilot takes permissions as argv flags",
+                "args": permission_args(profile, gate_cmds),
+            }),
+        )?;
+        Ok(None)
+    }
+}
+
+/// Argument list, kept separate from binary resolution so it is testable on
+/// machines without the CLI installed.
+pub fn build_args(run: &TaskRun) -> Vec<String> {
+    // NOTE: no `-p`. The prompt arrives on stdin, and GitHub documents that
+    // piped input is ignored when `-p` is also given — passing both would send
+    // the CLI an empty task and discard the real one.
+    let mut args = vec![
+        // Only the agent's response on stdout, with no stats or decoration
+        // around it: `parse_output` treats stdout as the final message, and
+        // that message is where a reviewer's verdict travels.
+        "-s".to_owned(),
+        // An unattended run must never sit waiting on a clarifying question.
+        "--no-ask-user".to_owned(),
+        format!("--model={}", run.profile.model),
+    ];
+    args.extend(permission_args(&run.profile, &run.gate_cmds));
+    // Only reachable on a build whose `--help` advertises `--resume`, because
+    // that is what sets `Caps::session_resume` and the engine will not offer a
+    // session otherwise. Honouring it here means a future release that ships
+    // the flag needs no change beyond the probe noticing it.
+    if let Some(session) = &run.resume_session {
+        args.push(format!("--resume={session}"));
+    }
+    args.extend(run.profile.extra_args.iter().cloned());
+    args
+}
+
+/// The per-attempt permission surface as argv (§20).
+///
+/// Edit profiles get the write tool and *exactly* the configured gate commands;
+/// reviewers get neither. Nobody is granted a URL, so network access stays
+/// behind a permission this adapter never gives — and with `--no-ask-user` the
+/// agent cannot ask for one either.
+///
+/// Reading is not granted explicitly because this CLI allows the working
+/// directory by default and `--add-dir` is what widens that; the engine never
+/// widens it, so an agent sees the workspace and nothing else.
+pub fn permission_args(profile: &WorkerProfile, gate_cmds: &[String]) -> Vec<String> {
+    let mut args = Vec::new();
+    match profile.permissions {
+        PermissionMode::Edit => {
+            args.push("--allow-tool=write".to_owned());
+            for gate in gate_cmds {
+                args.push(format!("--allow-tool=shell({gate})"));
+            }
+        }
+        PermissionMode::ReadOnly => {
+            // Denied rather than merely not-allowed: a reviewer that edits the
+            // code it is judging invalidates the verdict, and one that runs
+            // commands is executing the very diff under review.
+            args.push("--deny-tool=write".to_owned());
+            args.push("--deny-tool=shell".to_owned());
+        }
+    }
+    args
+}
+
+/// Outcome parsing for a CLI with no JSON envelope.
+///
+/// With `-s` the whole of stdout is the agent's final message, so that is what
+/// lands in `detail` on success — the field a reviewer's verdict is read from
+/// (step-6 finding #1: leaving it empty makes every review unparseable). Diff,
+/// transcript path, and pool drain are engine-owned and left empty here.
+fn parse_output(out: &ProcessOutput) -> Outcome {
+    let mut outcome = Outcome {
+        status: OutcomeStatus::AgentError,
+        diff: String::new(),
+        detail: None,
+        // No JSON envelope: nothing to read a session, usage, or cost from.
+        session_id: None,
+        usage: None,
+        cost_usd: None,
+        pool_drain: None,
+        transcript_path: PathBuf::new(),
+        duration: out.duration,
+    };
+
+    if out.timed_out {
+        outcome.status = OutcomeStatus::Timeout;
+        outcome.detail = Some("attempt exceeded its wall-clock timeout".to_owned());
+        return outcome;
+    }
+
+    let response = out.stdout.trim();
+    if out.code == Some(0) {
+        outcome.status = OutcomeStatus::Completed;
+        outcome.detail = (!response.is_empty()).then(|| response.to_owned());
+        return outcome;
+    }
+
+    // Rate-limit detection applies to failures only — see `looks_rate_limited`.
+    outcome.status = if looks_rate_limited(&out.stderr) || looks_rate_limited(response) {
+        OutcomeStatus::RateLimited
+    } else {
+        OutcomeStatus::AgentError
+    };
+    // Give the engine something to report without opening the transcript.
+    // stderr first: on a failure it carries the diagnostic, while stdout may
+    // hold half an answer.
+    let stderr = out.stderr.trim();
+    outcome.detail = if !stderr.is_empty() {
+        Some(util::tail(stderr, 2000))
+    } else if !response.is_empty() {
+        Some(util::tail(response, 2000))
+    } else {
+        None
+    };
+    outcome
+}
+
+// ---------------------------------------------------------------------------
+// Binary discovery — npm ships this as copilot.cmd on Windows, which
+// CreateProcess cannot exec directly; `super::bin` owns the mechanics.
+// ---------------------------------------------------------------------------
+
+fn candidate_names() -> &'static [&'static str] {
+    if cfg!(windows) {
+        &["copilot.exe", "copilot.cmd", "copilot.bat"]
+    } else {
+        &["copilot"]
+    }
+}
+
+/// This adapter's own resolution cache; `bin::locate` fills it once.
+static RESOLVED: OnceLock<Option<Invocation>> = OnceLock::new();
+
+fn locate() -> Result<Invocation, TactusError> {
+    bin::locate(candidate_names(), &RESOLVED, |tried| {
+        format!(
+            "copilot binary not found on PATH (looked for {}); install the GitHub Copilot CLI \
+             (`npm install -g @github/copilot`) or adjust PATH",
+            tried.join(", ")
+        )
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Permission flags that hand an agent the whole machine, and the URL grant
+    /// that would put it on the network. §20 says none of these is ever used,
+    /// so the list lives here: its only job is to be asserted against.
+    const SKIP_ALL_FLAGS: [&str; 6] = [
+        "--allow-all",
+        "--yolo",
+        "--allow-all-tools",
+        "--allow-all-paths",
+        "--allow-all-urls",
+        "--allow-url",
+    ];
+
+    fn profile(permissions: PermissionMode) -> WorkerProfile {
+        WorkerProfile {
+            name: "impl-frontier".to_owned(),
+            agent: ADAPTER_ID.to_owned(),
+            model: "gpt-5".to_owned(),
+            pool: "copilot".to_owned(),
+            permissions,
+            max_turns: Some(30),
+            extra_args: Vec::new(),
+        }
+    }
+
+    fn task_run() -> TaskRun {
+        TaskRun {
+            prompt: "Do the thing.".to_owned(),
+            profile: profile(PermissionMode::Edit),
+            workspace: PathBuf::from("."),
+            gate_cmds: vec!["cargo test".to_owned()],
+            resume_session: None,
+            settings_path: None,
+        }
+    }
+
+    fn output(code: Option<i32>, stdout: &str, stderr: &str) -> ProcessOutput {
+        ProcessOutput {
+            code,
+            stdout: stdout.to_owned(),
+            stderr: stderr.to_owned(),
+            duration: Duration::from_secs(1),
+            timed_out: false,
+        }
+    }
+
+    #[test]
+    fn build_args_cover_the_programmatic_contract() {
+        let joined = build_args(&task_run()).join(" ");
+        assert!(joined.contains("-s"), "response only: {joined}");
+        assert!(joined.contains("--no-ask-user"));
+        assert!(joined.contains("--model=gpt-5"));
+        assert!(!joined.contains("--resume"), "no session to resume");
+    }
+
+    #[test]
+    fn the_prompt_travels_on_stdin_and_never_as_an_argument() {
+        // GitHub documents that piped input is ignored when `-p` is given, so
+        // passing both would send an empty task. Stdin is also the only
+        // delivery a 60 KB review prompt survives through a Windows cmd shim.
+        let args = build_args(&task_run());
+        assert!(
+            !args.iter().any(|a| a == "-p" || a.starts_with("--prompt")),
+            "`-p` would discard the piped prompt: {args:?}"
+        );
+        let run = task_run();
+        assert_eq!(
+            CopilotAdapter.stdin_payload(&run),
+            "Do the thing.",
+            "the prompt is delivered on stdin"
+        );
+    }
+
+    #[test]
+    fn edit_profiles_get_write_and_exactly_the_gate_commands() {
+        let gates = vec![
+            "cargo check --all-targets".to_owned(),
+            "cargo test".to_owned(),
+        ];
+        let args = permission_args(&profile(PermissionMode::Edit), &gates);
+        assert!(args.contains(&"--allow-tool=write".to_owned()));
+        assert!(args.contains(&"--allow-tool=shell(cargo test)".to_owned()));
+        assert!(args.contains(&"--allow-tool=shell(cargo check --all-targets)".to_owned()));
+        assert!(
+            !args.iter().any(|a| a == "--allow-tool=shell"),
+            "no blanket shell: {args:?}"
+        );
+    }
+
+    #[test]
+    fn reviewers_may_neither_write_nor_run_anything() {
+        // A reviewer that edits the code it is judging invalidates its own
+        // verdict; one that runs commands is executing the diff under review.
+        let args = permission_args(
+            &profile(PermissionMode::ReadOnly),
+            &["cargo test".to_owned()],
+        );
+        assert!(args.contains(&"--deny-tool=write".to_owned()));
+        assert!(args.contains(&"--deny-tool=shell".to_owned()));
+        assert!(
+            !args.iter().any(|a| a.starts_with("--allow-tool")),
+            "reviewers are granted nothing: {args:?}"
+        );
+    }
+
+    #[test]
+    fn no_profile_is_ever_handed_the_whole_machine() {
+        // §20: the skip-all class of flags is never used, and no URL is ever
+        // granted — that is what keeps an edit profile off the network.
+        for permissions in [PermissionMode::Edit, PermissionMode::ReadOnly] {
+            let mut run = task_run();
+            run.profile = profile(permissions);
+            let joined = build_args(&run).join(" ");
+            for flag in SKIP_ALL_FLAGS {
+                assert!(
+                    !joined.contains(flag),
+                    "{permissions:?} must never carry {flag}: {joined}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn extra_args_are_appended_last() {
+        let mut run = task_run();
+        run.profile.extra_args = vec!["--add-dir=/srv/shared".to_owned()];
+        assert!(
+            build_args(&run)
+                .join(" ")
+                .ends_with("--add-dir=/srv/shared")
+        );
+    }
+
+    #[test]
+    fn a_successful_run_carries_its_response_as_the_detail() {
+        // The reviewer's verdict travels in exactly this field on the SUCCESS
+        // path — leaving it empty makes every review unparseable (step-6 #1).
+        let verdict = "```json\n{\"pass\": true, \"reasons\": [\"ok\"]}\n```";
+        let outcome = parse_output(&output(Some(0), &format!("  {verdict}  \n"), ""));
+        assert_eq!(outcome.status, OutcomeStatus::Completed);
+        assert_eq!(outcome.detail.as_deref(), Some(verdict));
+        assert!(outcome.diff.is_empty(), "diff is engine-owned");
+    }
+
+    #[test]
+    fn unreported_spend_is_none_rather_than_zero() {
+        // This route has no JSON envelope. Recording 0.0 would tell the ledger
+        // a frontier attempt was free (§13); None says it is unknown.
+        let outcome = parse_output(&output(Some(0), "done", ""));
+        assert_eq!(outcome.cost_usd, None);
+        assert_eq!(outcome.session_id, None);
+        assert!(outcome.usage.is_none());
+    }
+
+    #[test]
+    fn failures_carry_a_reportable_detail() {
+        let outcome = parse_output(&output(
+            Some(1),
+            "",
+            "error: model `gpt-9` is not available",
+        ));
+        assert_eq!(outcome.status, OutcomeStatus::AgentError);
+        assert_eq!(
+            outcome.detail.as_deref(),
+            Some("error: model `gpt-9` is not available")
+        );
+
+        // Falls back to stdout when the CLI reports through it instead.
+        let outcome = parse_output(&output(Some(1), "I could not finish.", ""));
+        assert_eq!(outcome.detail.as_deref(), Some("I could not finish."));
+
+        // Nothing at all is still a reportable failure, not a pass.
+        let outcome = parse_output(&output(Some(1), "", ""));
+        assert_eq!(outcome.status, OutcomeStatus::AgentError);
+        assert!(outcome.detail.is_none());
+    }
+
+    #[test]
+    fn rate_limit_signals_win_over_exit_codes() {
+        let outcome = parse_output(&output(
+            Some(1),
+            "",
+            "You are out of credits for this month",
+        ));
+        assert_eq!(outcome.status, OutcomeStatus::RateLimited);
+
+        let outcome = parse_output(&output(Some(1), "premium request allowance exhausted", ""));
+        assert_eq!(outcome.status, OutcomeStatus::RateLimited);
+    }
+
+    #[test]
+    fn a_successful_task_about_rate_limits_is_not_rate_limited() {
+        // The agent's own summary mentioning 429s must not be read as the pool
+        // being exhausted — that would roll back verified work.
+        let outcome = parse_output(&output(
+            Some(0),
+            "Added backoff handling for HTTP 429 rate limit responses.",
+            "",
+        ));
+        assert_eq!(outcome.status, OutcomeStatus::Completed);
+    }
+
+    #[test]
+    fn timeout_maps_to_timeout_status() {
+        let mut out = output(None, "", "");
+        out.timed_out = true;
+        assert_eq!(parse_output(&out).status, OutcomeStatus::Timeout);
+    }
+
+    // Runs only where the real CLI exists; skips silently elsewhere so CI
+    // without the Copilot CLI stays green.
+    #[test]
+    fn probe_against_real_binary_when_present() {
+        if locate().is_err() {
+            eprintln!("copilot not on PATH; skipping live probe");
+            return;
+        }
+        let caps = CopilotAdapter.probe().expect("probe should succeed");
+        assert!(!caps.version.is_empty());
+        assert!(!caps.cost_reporting, "this route reports no spend");
+    }
+}

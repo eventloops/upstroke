@@ -3,7 +3,9 @@
 //! never commit, and never speak HTTP — they only build commands and read
 //! process output. One file per agent.
 
+pub mod bin;
 pub mod claude;
+pub mod copilot;
 pub mod proc;
 
 use std::path::PathBuf;
@@ -41,6 +43,14 @@ pub struct TaskRun {
     pub profile: WorkerProfile,
     /// Working directory for the subprocess (the workspace repo root).
     pub workspace: PathBuf,
+    /// The gate commands this profile may run, and nothing else (§20). Empty
+    /// for reviewers, which run nothing at all.
+    ///
+    /// Carried on the run rather than only handed to
+    /// [`AgentAdapter::materialize_permissions`] because not every agent has a
+    /// settings file to put them in: Copilot's permission surface is argv, so
+    /// its `build` needs them at command-construction time.
+    pub gate_cmds: Vec<String>,
     /// Same-rung retry: resume this session with feedback instead of starting
     /// fresh (§11.4).
     pub resume_session: Option<String>,
@@ -79,10 +89,40 @@ pub trait AgentAdapter: Send + Sync {
 }
 
 /// Registry in routing order; ids match `WorkerProfile.agent`.
-pub static ADAPTERS: &[&dyn AgentAdapter] = &[&claude::ClaudeCodeAdapter];
+pub static ADAPTERS: &[&dyn AgentAdapter] = &[&claude::ClaudeCodeAdapter, &copilot::CopilotAdapter];
 
 pub fn by_id(id: &str) -> Option<&'static dyn AgentAdapter> {
     ADAPTERS.iter().copied().find(|a| a.id() == id)
+}
+
+/// Rate-limit signals are ground truth for the capacity engine (§13), so both
+/// adapters read from one vocabulary rather than two that drift apart.
+///
+/// Phrases cover the subscription-window wording Claude Code prints ("5-hour
+/// limit reached", "Weekly limit reached"), Copilot's credit and premium-request
+/// wording (§13's two billing shapes), and API-level errors underneath either.
+///
+/// Only ever consulted for a FAILED attempt: a successful task *about* rate
+/// limiting ("added backoff for 429 responses") must never be read as the pool
+/// being exhausted, or verified work gets rolled back.
+pub fn looks_rate_limited(text: &str) -> bool {
+    let lower = text.to_ascii_lowercase();
+    [
+        "usage limit",
+        "rate limit",
+        "rate_limit",
+        "limit reached",
+        "limit exceeded",
+        "overloaded",
+        "quota exceeded",
+        "insufficient credits",
+        "out of credits",
+        "premium request",
+        "monthly limit",
+        "429",
+    ]
+    .iter()
+    .any(|needle| lower.contains(needle))
 }
 
 #[cfg(test)]
@@ -90,8 +130,24 @@ mod tests {
     use super::*;
 
     #[test]
-    fn registry_resolves_claude_code() {
+    fn registry_resolves_both_v0_1_adapters() {
         assert!(by_id("claude-code").is_some());
-        assert!(by_id("copilot").is_none(), "copilot arrives in step 9");
+        assert!(by_id("copilot").is_some());
+        assert!(by_id("aider").is_none(), "aider arrives in v0.2");
+    }
+
+    #[test]
+    fn rate_limit_vocabulary_covers_both_vendors() {
+        for phrase in [
+            "5-hour limit reached ∙ resets 6pm",
+            "Weekly limit reached",
+            "API error: rate_limit_error",
+            "You are out of credits for this month",
+            "premium request allowance exhausted",
+            "HTTP 429",
+        ] {
+            assert!(looks_rate_limited(phrase), "should signal: {phrase}");
+        }
+        assert!(!looks_rate_limited("wrote the pagination cursor encoder"));
     }
 }

@@ -1,29 +1,54 @@
-//! Reviewer (DESIGN.md §11.2): an ordinary read-only worker profile judges
-//! the engine-captured diff against the task's acceptance criteria and must
-//! end its answer with a fenced JSON verdict.
+//! Review (DESIGN.md §11.2–§11.3): read-only worker profiles judge the
+//! engine-captured diff against the task's acceptance criteria, each ending its
+//! answer with a fenced JSON verdict.
 //!
-//! Two things make this more than a second opinion from the same model: the
+//! Two things make this more than a second opinion from the same model: a
 //! reviewer sees the *diff* rather than the implementer's account of it
 //! (invariant 3), and its prompt is explicitly anti-sycophantic — its job is
 //! to find reasons to fail, not to agree. Unparseable output earns exactly
 //! one re-ask; after that the attempt fails, because a reviewer that cannot
 //! answer in the required shape has not reviewed anything.
 //!
-//! Everything the reviewer is shown — the diff, and any artifacts — was
+//! Everything a reviewer is shown — the diff, and any artifacts — was
 //! written by an agent, so it is quoted as data behind a fence the payload
 //! cannot close and labelled untrusted. Parsing is deliberately fail-closed:
 //! a mangled answer costs a re-ask and then a failure, and never falls back
 //! to some earlier passing-looking object in the reply.
+//!
+//! # A list of passes, not one reviewer
+//!
+//! §11.5 generalizes review "from a single pass into a **list of passes, each
+//! with a lens and a pass rule**", and §11.3's cross-vendor second opinion is
+//! the first user of that shape: on blast-radius paths a second reviewer from a
+//! different *model family* judges the same diff, and **both verdicts must
+//! pass**. [`ReviewPlan`] resolves which passes a task gets; [`Lens`] is what
+//! distinguishes them.
+//!
+//! The passes are independent on purpose. Neither reviewer is told the other's
+//! verdict — a second opinion that has already read "the first reviewer passed
+//! this" is an agreement machine, which is the same failure the anti-sycophancy
+//! instruction exists to prevent.
+//!
+//! §11.5's security lens joins [`Lens`] in v0.2, and it is **not** just another
+//! entry: its ladder dispatch differs deliberately, because a security finding
+//! that enters the retry-until-it-passes loop is a finding being laundered into
+//! a commit. It goes to an `Unblock` question instead. Nothing here should make
+//! that harder to add — which is why a lens is an enum with behaviour hanging
+//! off it rather than a bool.
 
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::agent::{AgentAdapter, TaskRun, proc};
+use crate::catalog::{self, Family};
+use crate::config::{Config, SecondOpinion};
 use crate::error::TactusError;
-use crate::ir::{OutcomeStatus, PermissionMode, Task, Verdict, WorkerProfile};
+use crate::ir::{OutcomeStatus, PermissionMode, Plan, Task, Tier, Verdict, WorkerProfile};
+use crate::route::ResolvedChain;
 use crate::util;
 
 /// Diff bytes shown to the reviewer. `git diff` orders files by path, so an
@@ -32,9 +57,337 @@ use crate::util;
 /// what one review can meaningfully judge anyway.
 pub const MAX_DIFF_BYTES: usize = 60 * 1024;
 
+/// What one review pass is looking for, and how its artifacts are named.
+///
+/// v0.2 adds `Security` here (§11.5) — with a different ladder dispatch, since
+/// a security finding must never enter the retry loop.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum Lens {
+    /// §11.2: does this change meet its acceptance criteria without breaking
+    /// anything? The pass every reviewed task gets.
+    Acceptance,
+    /// §11.3: the same diff, judged independently by a different model family.
+    SecondOpinion,
+}
+
+impl Lens {
+    /// Short id used in profile names, event records, and the ledger.
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Acceptance => "review",
+            Self::SecondOpinion => "second-opinion",
+        }
+    }
+
+    /// Suffix distinguishing this pass's on-disk artifacts. The acceptance pass
+    /// keeps the bare names it has had since step 6, so a run directory reads
+    /// the same way whether or not a second opinion was configured.
+    fn file_suffix(self) -> &'static str {
+        match self {
+            Self::Acceptance => "",
+            Self::SecondOpinion => "-second-opinion",
+        }
+    }
+
+    /// Prepended to the prompt. The acceptance pass adds nothing: it *is* the
+    /// baseline the rest of the prompt already describes.
+    fn preamble(self) -> &'static str {
+        match self {
+            Self::Acceptance => "",
+            Self::SecondOpinion => {
+                "You are one of two independent reviewers on this change. The other reviewer is \
+                 from a different model family and is judging the same diff separately. You are \
+                 not told its verdict and it is not told yours — that is deliberate, because a \
+                 reviewer who knows another already approved something stops looking. Both \
+                 verdicts must pass, so judge this change entirely on its own merits, and pay \
+                 particular attention to the kinds of defect a different model would be prone to \
+                 overlook.\n\n"
+            }
+        }
+    }
+}
+
+/// Which agent and model a pass runs on. Plain data so the run record can carry
+/// it (§15) and a resume can honour what actually judged this run's code.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PassBinding {
+    pub agent: String,
+    pub model: String,
+}
+
+impl PassBinding {
+    pub fn new(agent: impl Into<String>, model: impl Into<String>) -> Self {
+        Self {
+            agent: agent.into(),
+            model: model.into(),
+        }
+    }
+
+    fn from_entry(entry: catalog::CatalogEntry) -> Self {
+        Self::new(entry.agent, entry.model)
+    }
+
+    pub fn describe(&self) -> String {
+        format!("{}/{}", self.agent, self.model)
+    }
+}
+
+/// One resolved pass: a lens and the binding that will apply it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReviewPass {
+    pub lens: Lens,
+    pub binding: PassBinding,
+}
+
+/// Which passes each task gets, resolved once before any agent is spawned.
+///
+/// Resolved up front rather than per attempt so that pre-flight can probe every
+/// agent that might judge this run (step-6 finding #10: a reviewer that cannot
+/// be built must never silently degrade the run to gates-only) and so the run
+/// record can pin what its verification standard was.
+///
+/// `second_opinion` is aligned to `plan.tasks` by index rather than keyed by
+/// task id, which is safe for the same reason `Progress` is: a resume refuses
+/// outright when the plan hash or the resolved chains moved, so the task list
+/// this was built against and the one it is read back against are the same list.
+#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ReviewPlan {
+    /// `None` ⟺ `[routing] review = { enabled = false }`. Anything else that
+    /// fails to resolve is an error, never an empty plan.
+    pub primary: Option<PassBinding>,
+    /// A different-family binding at the review tier, where this build can
+    /// reach one. Used *only* to stop a task being reviewed by the model that
+    /// wrote it; absent on a single-vendor install, which warns instead.
+    pub alternative: Option<PassBinding>,
+    /// Per task, aligned with `plan.tasks`: the §11.3 second opinion this
+    /// task's paths asked for.
+    pub second_opinion: Vec<Option<PassBinding>>,
+}
+
+impl ReviewPlan {
+    /// Every agent that could be asked to judge something — the set pre-flight
+    /// must probe, deduped and stable.
+    pub fn agents(&self) -> Vec<&str> {
+        let mut ids: Vec<&str> = self
+            .primary
+            .iter()
+            .chain(self.alternative.iter())
+            .chain(self.second_opinion.iter().flatten())
+            .map(|b| b.agent.as_str())
+            .collect();
+        ids.sort_unstable();
+        ids.dedup();
+        ids
+    }
+
+    /// Agents whose absence is fatal: everything except the opportunistic
+    /// [`Self::alternative`], which degrades to a warning (see
+    /// [`Self::drop_alternative`]).
+    pub fn required_agents(&self) -> Vec<&str> {
+        let mut ids: Vec<&str> = self
+            .primary
+            .iter()
+            .chain(self.second_opinion.iter().flatten())
+            .map(|b| b.agent.as_str())
+            .collect();
+        ids.sort_unstable();
+        ids.dedup();
+        ids
+    }
+
+    /// Give up on the anti-self-review rebind — the alternative agent would not
+    /// probe. Reviews still happen; some may be same-model.
+    pub fn drop_alternative(&mut self) {
+        self.alternative = None;
+    }
+
+    /// The ordered passes for one task, given the binding the implementer is
+    /// actually running on.
+    ///
+    /// Two rules meet here, and the order matters:
+    ///
+    /// 1. A task with a configured second opinion keeps its primary reviewer
+    ///    **unrebound**. Rebinding it would let both passes resolve to the same
+    ///    different-family model, and Anthropic-written code would lose its
+    ///    Anthropic review entirely — strictly worse than the self-review the
+    ///    rebind exists to prevent.
+    /// 2. Otherwise the primary rebinds when it would be the *same model* that
+    ///    wrote the code. Exact `(agent, model)` equality, not family
+    ///    similarity: `claude-sonnet-5` reviewed by `claude-opus-5` is a
+    ///    genuine second look, and rebinding it would spend cross-vendor
+    ///    capacity on half the tasks in a run for no verification gain.
+    pub fn passes_for(&self, index: usize, implementer: &PassBinding) -> Vec<ReviewPass> {
+        let Some(primary) = self.primary.clone() else {
+            return Vec::new();
+        };
+        if let Some(second) = self.second_opinion.get(index).and_then(Option::as_ref) {
+            return vec![
+                ReviewPass {
+                    lens: Lens::Acceptance,
+                    binding: primary,
+                },
+                ReviewPass {
+                    lens: Lens::SecondOpinion,
+                    binding: second.clone(),
+                },
+            ];
+        }
+        let binding = match &self.alternative {
+            Some(alt) if primary == *implementer => alt.clone(),
+            _ => primary,
+        };
+        vec![ReviewPass {
+            lens: Lens::Acceptance,
+            binding,
+        }]
+    }
+}
+
+/// Resolve every task's review passes (§11.2, §11.3).
+///
+/// `has_adapter` is injected rather than read from the registry so the engine
+/// can ask about the adapters its own harness holds — which under test is not
+/// the built-in set — and so `validate` and `run` reach the same answer.
+///
+/// Failure is asymmetric, and deliberately so. An explicitly configured
+/// `second_opinion` that cannot resolve is an **error**: the operator asked for
+/// two model families on their blast-radius paths, and quietly giving them one
+/// is step-6 finding #10 all over again. The implicit anti-self-review rebind
+/// merely **warns**, because nobody asked for it and refusing would make
+/// tactus unusable on a single-vendor install.
+pub fn plan_for(
+    plan: &Plan,
+    chains: &[ResolvedChain],
+    cfg: &Config,
+    has_adapter: impl Fn(&str) -> bool,
+    warnings: &mut Vec<String>,
+) -> Result<ReviewPlan, TactusError> {
+    let tier = cfg.review_tier.unwrap_or(Tier::Frontier);
+    let demanded: Vec<Option<&crate::config::CompiledOverride>> = plan
+        .tasks
+        .iter()
+        .map(|task| {
+            cfg.overrides.iter().find(|ov| {
+                ov.second_opinion == Some(SecondOpinion::DifferentVendor)
+                    && task.path_hints.iter().any(|h| ov.globs.is_match(h))
+            })
+        })
+        .collect();
+
+    if !cfg.review_enabled {
+        // Contradictory config: one key says judge nothing, another says judge
+        // twice. Only an error where it would actually change what runs.
+        if let Some(index) = demanded.iter().position(Option::is_some) {
+            return Err(TactusError::Refused {
+                message: format!(
+                    "task `{}` matches a [[routing.overrides]] asking for a cross-vendor second \
+                     opinion, but [routing] review = {{ enabled = false }} turns review off \
+                     entirely. Remove one of the two — they cannot both be what you meant.",
+                    plan.tasks[index].id
+                ),
+            });
+        }
+        return Ok(ReviewPlan {
+            second_opinion: vec![None; plan.tasks.len()],
+            ..ReviewPlan::default()
+        });
+    }
+
+    // The same rules the router uses: a pin for the tier, else the catalog's
+    // example binding.
+    let primary = match cfg.pins.iter().find(|p| p.tier == tier) {
+        Some(pin) => PassBinding::new(pin.agent.clone(), pin.model.clone()),
+        None => PassBinding::from_entry(catalog::example_binding(tier)),
+    };
+
+    // Every binding above comes from the catalog (pins are validated against it
+    // at load), so this is belt-and-braces — but without a family there is no
+    // way to tell "different" from "same", and guessing is how a reviewer ends
+    // up quietly paired with itself.
+    let primary_family = catalog::lookup(&primary.agent, &primary.model).map(|e| e.family);
+    let cross = |family: Family| {
+        catalog::different_family_at(tier, family, &has_adapter).map(PassBinding::from_entry)
+    };
+    let alternative = primary_family.and_then(cross);
+    if primary_family.is_none() {
+        warnings.push(format!(
+            "review binds to {} which is not in the capability catalog, so no cross-family \
+             reviewer can be chosen for it (§11.3)",
+            primary.describe()
+        ));
+    }
+
+    let mut second_opinion = Vec::with_capacity(plan.tasks.len());
+    for (task, matched) in plan.tasks.iter().zip(&demanded) {
+        let Some(ov) = matched else {
+            second_opinion.push(None);
+            continue;
+        };
+        let family = primary_family.ok_or_else(|| TactusError::Refused {
+            message: format!(
+                "task `{}` requires a cross-vendor second opinion, but the review binding {} is \
+                 not in the capability catalog, so its model family is unknown",
+                task.id,
+                primary.describe()
+            ),
+        })?;
+        let binding = cross(family).ok_or_else(|| TactusError::Refused {
+            message: format!(
+                "task `{}` matches [[routing.overrides]] paths [{}], which require a second \
+                 opinion from a different model family — but no {tier}-tier model outside the \
+                 `{family}` family has an adapter in this build. Install the GitHub Copilot CLI, \
+                 or remove `second_opinion` from that override.",
+                task.id,
+                ov.raw_paths.join(", ")
+            ),
+        })?;
+        second_opinion.push(Some(binding));
+    }
+
+    // The carried step-6 item, now visible: say when a task will be judged by
+    // the model that wrote it and nothing in this build can prevent it.
+    if alternative.is_none() {
+        let mut self_reviewed: Vec<String> = plan
+            .tasks
+            .iter()
+            .zip(chains)
+            .zip(&second_opinion)
+            .filter(|((_, chain), second)| {
+                second.is_none()
+                    && chain.rungs.iter().any(|r| {
+                        r.binding.agent == primary.agent && r.binding.model == primary.model
+                    })
+            })
+            .map(|((task, _), _)| task.id.to_string())
+            .collect();
+        if !self_reviewed.is_empty() {
+            self_reviewed.sort();
+            warnings.push(format!(
+                "task(s) {} can run on {}, which is also the reviewer — a model reviewing its own \
+                 work is a weak check. No {tier}-tier model from another family has an adapter in \
+                 this build; install the GitHub Copilot CLI, or set `second_opinion = \
+                 \"different-vendor\"` on a [[routing.overrides]] covering these paths (§11.3).",
+                self_reviewed.join(", "),
+                primary.describe()
+            ));
+        }
+    }
+
+    Ok(ReviewPlan {
+        primary: Some(primary),
+        alternative,
+        second_opinion,
+    })
+}
+
 pub struct ReviewCx<'a> {
     pub adapter: &'a dyn AgentAdapter,
     pub profile: WorkerProfile,
+    /// Which pass this is (§11.5). Decides the prompt preamble and the names of
+    /// this review's artifacts on disk.
+    pub lens: Lens,
     pub task: &'a Task,
     pub diff: &'a str,
     /// Artifacts the reviewer should judge against (conventions brief first).
@@ -77,6 +430,18 @@ pub struct ReviewOutcome {
     pub transcript: PathBuf,
 }
 
+impl ReviewPass {
+    /// The read-only profile this pass runs under. Named for its lens and its
+    /// model, so an event log and a ledger both say which judgement is whose.
+    pub fn profile(&self) -> WorkerProfile {
+        profile_for(
+            &self.binding.agent,
+            &self.binding.model,
+            &format!("{}-{}", self.lens.name(), self.binding.model),
+        )
+    }
+}
+
 /// A read-only profile bound to the same rung the reviewer is configured for.
 pub fn profile_for(agent: &str, model: &str, name: &str) -> WorkerProfile {
     WorkerProfile {
@@ -92,14 +457,15 @@ pub fn profile_for(agent: &str, model: &str, name: &str) -> WorkerProfile {
 
 pub fn run_review(cx: &ReviewCx<'_>) -> Result<ReviewOutcome, TactusError> {
     // Reviewers run nothing: no gate commands, no edit tools (§20).
+    let suffix = cx.lens.file_suffix();
     let settings_path = cx.adapter.materialize_permissions(
         &cx.profile,
         &[],
         cx.settings_dir,
-        &format!("{}-review", cx.stem),
+        &format!("{}{suffix}-review", cx.stem),
     )?;
     let reviews_dir = cx.reviews_dir;
-    let transcript = reviews_dir.join(format!("{}-review.json", cx.stem));
+    let transcript = reviews_dir.join(format!("{}{suffix}-review.json", cx.stem));
 
     let mut cost = None;
     let mut session = None;
@@ -119,6 +485,10 @@ pub fn run_review(cx: &ReviewCx<'_>) -> Result<ReviewOutcome, TactusError> {
             prompt,
             profile: cx.profile.clone(),
             workspace: cx.workspace.to_path_buf(),
+            // Reviewers run nothing, so there is nothing to allow (§20). This
+            // is the same empty list handed to `materialize_permissions` above
+            // — an agent whose permissions ride on argv reads it from here.
+            gate_cmds: Vec::new(),
             resume_session: resume,
             settings_path: settings_path.clone(),
         };
@@ -129,7 +499,7 @@ pub fn run_review(cx: &ReviewCx<'_>) -> Result<ReviewOutcome, TactusError> {
         last_path = if invocation == 1 {
             transcript.clone()
         } else {
-            reviews_dir.join(format!("{}-review-reask.json", cx.stem))
+            reviews_dir.join(format!("{}{suffix}-review-reask.json", cx.stem))
         };
         util::write_text(&last_path, &output.stdout)?;
 
@@ -194,6 +564,9 @@ const REASK_PROMPT: &str = "Your previous answer did not contain a parseable ver
 fn materialize_prompt(cx: &ReviewCx<'_>) -> String {
     let task = cx.task;
     let mut prompt = String::new();
+    // What distinguishes this pass from the others, if anything (§11.5). It
+    // leads, because it frames everything below it.
+    prompt.push_str(cx.lens.preamble());
     prompt.push_str(
         "You are reviewing one task's changes for the tactus engine. You have READ-ONLY access: \
          do not edit files, do not run commands.\n\n\
@@ -548,6 +921,7 @@ mod tests {
         let cx = ReviewCx {
             adapter: &crate::agent::claude::ClaudeCodeAdapter,
             profile: profile_for("claude-code", "claude-opus-5", "review"),
+            lens: Lens::Acceptance,
             task: &task,
             diff: "+++ b/src/api.rs\n+fn encode() {}\n",
             artifacts: &[],
@@ -587,6 +961,7 @@ mod tests {
         let cx = ReviewCx {
             adapter: &crate::agent::claude::ClaudeCodeAdapter,
             profile: profile_for("claude-code", "claude-opus-5", "review"),
+            lens: Lens::Acceptance,
             task: &task,
             diff: "+++ b/src/api.rs\n+fn encode() {}\n",
             artifacts: &artifacts,
@@ -641,6 +1016,7 @@ mod tests {
         let cx = ReviewCx {
             adapter: &crate::agent::claude::ClaudeCodeAdapter,
             profile: profile_for("claude-code", "claude-opus-5", "review"),
+            lens: Lens::Acceptance,
             task: &task,
             diff: &huge,
             artifacts: &[],
@@ -675,6 +1051,7 @@ mod tests {
         let cx = ReviewCx {
             adapter: &crate::agent::claude::ClaudeCodeAdapter,
             profile: profile_for("claude-code", "claude-opus-5", "review"),
+            lens: Lens::Acceptance,
             task: &task,
             diff,
             artifacts: &[("brief".to_owned(), "Use ``` for code.".to_owned())],
@@ -688,6 +1065,382 @@ mod tests {
         // The fence around the diff must be longer than any run inside it.
         assert!(prompt.contains("````diff"), "fence escalated: {prompt}");
         assert!(prompt.contains("DATA UNDER REVIEW"), "framed as untrusted");
+    }
+
+    // ---------------------------------------------------------------------
+    // §11.3/§11.5: the pass list
+    // ---------------------------------------------------------------------
+
+    fn binding(agent: &str, model: &str) -> PassBinding {
+        PassBinding::new(agent, model)
+    }
+
+    /// Primary at frontier, a reachable OpenAI alternative, one task.
+    fn plan_with(second: Option<PassBinding>) -> ReviewPlan {
+        ReviewPlan {
+            primary: Some(binding("claude-code", "claude-opus-5")),
+            alternative: Some(binding("copilot", "gpt-5")),
+            second_opinion: vec![second],
+        }
+    }
+
+    #[test]
+    fn a_task_reviewed_by_its_own_author_rebinds_to_another_family() {
+        // The step-6 carried item: at the frontier rung both binders resolve
+        // identically, so without this the reviewer IS the implementer.
+        let plan = plan_with(None);
+        let passes = plan.passes_for(0, &binding("claude-code", "claude-opus-5"));
+        assert_eq!(passes.len(), 1);
+        assert_eq!(passes[0].lens, Lens::Acceptance);
+        assert_eq!(passes[0].binding, binding("copilot", "gpt-5"));
+    }
+
+    #[test]
+    fn a_different_model_from_the_same_family_is_left_alone() {
+        // sonnet-written code judged by opus is a genuine second look. Rebinding
+        // it would spend cross-vendor capacity on most of a run for nothing.
+        let plan = plan_with(None);
+        let passes = plan.passes_for(0, &binding("claude-code", "claude-sonnet-5"));
+        assert_eq!(passes[0].binding, binding("claude-code", "claude-opus-5"));
+    }
+
+    #[test]
+    fn without_an_alternative_the_primary_stands_even_when_it_wrote_the_code() {
+        // Single-vendor install: `plan_for` has already warned about this. The
+        // review still happens — refusing would make tactus unusable without a
+        // second CLI installed.
+        let mut plan = plan_with(None);
+        plan.drop_alternative();
+        let passes = plan.passes_for(0, &binding("claude-code", "claude-opus-5"));
+        assert_eq!(passes[0].binding, binding("claude-code", "claude-opus-5"));
+    }
+
+    #[test]
+    fn a_second_opinion_adds_a_pass_and_suppresses_the_rebind() {
+        // The trap: rebinding the primary here would resolve BOTH passes to
+        // copilot/gpt-5, and opus-written code would lose its Anthropic review
+        // entirely — strictly worse than the self-review being avoided.
+        let plan = plan_with(Some(binding("copilot", "gpt-5")));
+        let passes = plan.passes_for(0, &binding("claude-code", "claude-opus-5"));
+        assert_eq!(passes.len(), 2, "both verdicts must pass (§11.3)");
+        assert_eq!(passes[0].lens, Lens::Acceptance);
+        assert_eq!(passes[0].binding, binding("claude-code", "claude-opus-5"));
+        assert_eq!(passes[1].lens, Lens::SecondOpinion);
+        assert_eq!(passes[1].binding, binding("copilot", "gpt-5"));
+        assert_ne!(
+            passes[0].binding, passes[1].binding,
+            "two passes on one model is one pass wearing a hat"
+        );
+    }
+
+    #[test]
+    fn review_disabled_yields_no_passes_at_all() {
+        let plan = ReviewPlan {
+            second_opinion: vec![None],
+            ..ReviewPlan::default()
+        };
+        assert!(
+            plan.passes_for(0, &binding("claude-code", "claude-opus-5"))
+                .is_empty()
+        );
+        assert!(plan.agents().is_empty());
+    }
+
+    #[test]
+    fn the_probe_set_separates_required_agents_from_the_optional_one() {
+        // The alternative is opportunistic, so its probe may fail without
+        // taking the run down; everything else is load-bearing.
+        let plan = plan_with(Some(binding("copilot", "gpt-5")));
+        assert_eq!(plan.agents(), ["claude-code", "copilot"]);
+        assert_eq!(plan.required_agents(), ["claude-code", "copilot"]);
+
+        let optional_only = ReviewPlan {
+            primary: Some(binding("claude-code", "claude-opus-5")),
+            alternative: Some(binding("copilot", "gpt-5")),
+            second_opinion: vec![None],
+        };
+        assert_eq!(optional_only.agents(), ["claude-code", "copilot"]);
+        assert_eq!(
+            optional_only.required_agents(),
+            ["claude-code"],
+            "copilot is only wanted, not needed, when nothing configured it"
+        );
+    }
+
+    #[test]
+    fn passes_name_their_artifacts_apart_and_the_primary_keeps_its_old_names() {
+        assert_eq!(Lens::Acceptance.file_suffix(), "");
+        assert_eq!(Lens::SecondOpinion.file_suffix(), "-second-opinion");
+        let pass = ReviewPass {
+            lens: Lens::SecondOpinion,
+            binding: binding("copilot", "gpt-5"),
+        };
+        assert_eq!(pass.profile().name, "second-opinion-gpt-5");
+        assert_eq!(pass.profile().permissions, PermissionMode::ReadOnly);
+    }
+
+    // ---------------------------------------------------------------------
+    // plan_for: what each task's passes resolve to, before anything is spawned
+    // ---------------------------------------------------------------------
+
+    fn scratch_config(name: &str, body: &str) -> Config {
+        let dir = std::env::temp_dir().join(format!("tactus-review-plan-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("scratch dir");
+        let path = dir.join(name);
+        std::fs::write(&path, body).expect("write config");
+        let missing = dir.join("no-pools.toml");
+        let mut warnings = Vec::new();
+        crate::config::load(Some(&path), &dir, Some(&missing), &mut warnings).expect("load")
+    }
+
+    /// A one-task plan whose paths can match an override.
+    fn auth_plan(cfg: &Config) -> (Plan, Vec<ResolvedChain>) {
+        let mut task = task();
+        task.path_hints = vec!["src/auth/login.rs".to_owned()];
+        task.suggested_tier = Some(Tier::Frontier);
+        let plan = Plan {
+            source: crate::ir::PlanSource {
+                adapter: "markdown".to_owned(),
+                hash: "test".to_owned(),
+            },
+            tasks: vec![task],
+            artifacts: Vec::new(),
+        };
+        let chains = plan
+            .tasks
+            .iter()
+            .map(|t| crate::route::resolve(t, cfg))
+            .collect();
+        (plan, chains)
+    }
+
+    fn both_vendors(agent: &str) -> bool {
+        matches!(agent, "claude-code" | "copilot")
+    }
+
+    fn claude_only(agent: &str) -> bool {
+        agent == "claude-code"
+    }
+
+    #[test]
+    fn a_matching_override_earns_a_second_opinion_from_another_family() {
+        let cfg = scratch_config(
+            "so.toml",
+            "[[routing.overrides]]\npaths = [\"src/auth/**\"]\nsecond_opinion = \
+             \"different-vendor\"\n",
+        );
+        let (plan, chains) = auth_plan(&cfg);
+        let mut warnings = Vec::new();
+        let resolved =
+            plan_for(&plan, &chains, &cfg, both_vendors, &mut warnings).expect("resolves");
+        assert_eq!(
+            resolved.primary,
+            Some(binding("claude-code", "claude-opus-5"))
+        );
+        assert_eq!(
+            resolved.second_opinion[0],
+            Some(binding("copilot", "gpt-5"))
+        );
+        assert!(warnings.is_empty(), "warnings: {warnings:?}");
+    }
+
+    #[test]
+    fn a_task_the_override_does_not_match_gets_no_second_opinion() {
+        let cfg = scratch_config(
+            "somiss.toml",
+            "[[routing.overrides]]\npaths = [\"migrations/**\"]\nsecond_opinion = \
+             \"different-vendor\"\n",
+        );
+        let (plan, chains) = auth_plan(&cfg);
+        let mut warnings = Vec::new();
+        let resolved =
+            plan_for(&plan, &chains, &cfg, both_vendors, &mut warnings).expect("resolves");
+        assert_eq!(resolved.second_opinion[0], None);
+    }
+
+    #[test]
+    fn a_second_opinion_that_cannot_resolve_refuses_and_says_what_to_do() {
+        // Step-6 finding #10's posture. The operator asked for two families;
+        // silently giving them one is the failure that finding exists to stop.
+        let cfg = scratch_config(
+            "sononone.toml",
+            "[[routing.overrides]]\npaths = [\"src/auth/**\"]\nsecond_opinion = \
+             \"different-vendor\"\n",
+        );
+        let (plan, chains) = auth_plan(&cfg);
+        let mut warnings = Vec::new();
+        let error = plan_for(&plan, &chains, &cfg, claude_only, &mut warnings)
+            .expect_err("no other family is reachable");
+        let message = error.to_string();
+        assert!(message.contains("t1"), "names the task: {message}");
+        assert!(
+            message.contains("src/auth/**"),
+            "names the paths: {message}"
+        );
+        assert!(message.contains("Copilot CLI"), "says the fix: {message}");
+    }
+
+    #[test]
+    fn a_single_vendor_build_warns_that_a_task_will_review_itself() {
+        // The visible half of the step-6 carried item: the run continues, but
+        // it says the check is weaker than it looks.
+        let cfg = scratch_config(
+            "selfrev.toml",
+            "[routing]\nimplement = { tier = \"frontier\" }\n",
+        );
+        let (plan, chains) = auth_plan(&cfg);
+        let mut warnings = Vec::new();
+        let resolved =
+            plan_for(&plan, &chains, &cfg, claude_only, &mut warnings).expect("still resolves");
+        assert_eq!(resolved.alternative, None);
+        assert!(
+            warnings
+                .iter()
+                .any(|w| w.contains("t1") && w.contains("also the reviewer")),
+            "warnings: {warnings:?}"
+        );
+
+        // With the second vendor present there is nothing to warn about.
+        let mut quiet = Vec::new();
+        let resolved = plan_for(&plan, &chains, &cfg, both_vendors, &mut quiet).expect("resolves");
+        assert_eq!(resolved.alternative, Some(binding("copilot", "gpt-5")));
+        assert!(quiet.is_empty(), "warnings: {quiet:?}");
+    }
+
+    #[test]
+    fn a_task_that_never_runs_at_the_review_tier_is_not_warned_about() {
+        // Only a chain that can actually reach the reviewer's own binding is a
+        // self-review risk; warning about the rest is noise that trains people
+        // to ignore the warning that matters.
+        let cfg = scratch_config(
+            "lowrung.toml",
+            "[routing]\nimplement = { tier = \"mid\" }\n",
+        );
+        let mut task = task();
+        task.path_hints = vec!["src/api/list.rs".to_owned()];
+        let plan = Plan {
+            source: crate::ir::PlanSource {
+                adapter: "markdown".to_owned(),
+                hash: "test".to_owned(),
+            },
+            tasks: vec![task],
+            artifacts: Vec::new(),
+        };
+        let chains: Vec<ResolvedChain> = plan
+            .tasks
+            .iter()
+            .map(|t| crate::route::resolve(t, &cfg))
+            .collect();
+        let mut warnings = Vec::new();
+        plan_for(&plan, &chains, &cfg, claude_only, &mut warnings).expect("resolves");
+        assert!(warnings.is_empty(), "warnings: {warnings:?}");
+    }
+
+    #[test]
+    fn review_disabled_and_a_second_opinion_asked_for_is_a_contradiction() {
+        // One key says judge nothing, the other says judge twice. Picking a
+        // winner silently would be the engine deciding how much verification
+        // the operator meant.
+        let cfg = scratch_config(
+            "contradiction.toml",
+            "[routing]\nreview = { enabled = false }\n\n\
+             [[routing.overrides]]\npaths = [\"src/auth/**\"]\nsecond_opinion = \
+             \"different-vendor\"\n",
+        );
+        let (plan, chains) = auth_plan(&cfg);
+        let mut warnings = Vec::new();
+        let error = plan_for(&plan, &chains, &cfg, both_vendors, &mut warnings)
+            .expect_err("the config contradicts itself");
+        assert!(
+            error.to_string().contains("cannot both be what you meant"),
+            "got: {error}"
+        );
+    }
+
+    #[test]
+    fn review_disabled_alone_resolves_to_nothing_without_complaint() {
+        let cfg = scratch_config("off.toml", "[routing]\nreview = { enabled = false }\n");
+        let (plan, chains) = auth_plan(&cfg);
+        let mut warnings = Vec::new();
+        let resolved =
+            plan_for(&plan, &chains, &cfg, both_vendors, &mut warnings).expect("resolves");
+        assert_eq!(resolved.primary, None);
+        assert_eq!(resolved.second_opinion.len(), plan.tasks.len());
+        assert!(warnings.is_empty(), "warnings: {warnings:?}");
+    }
+
+    #[test]
+    fn a_pinned_review_tier_still_gets_a_cross_family_partner() {
+        // A pin fixes the primary; the second opinion is chosen relative to
+        // whatever the pin landed on, not to the catalog's default.
+        let cfg = scratch_config(
+            "pinned.toml",
+            "[[pins]]\ntier = \"frontier\"\nagent = \"copilot\"\nmodel = \"gpt-5\"\n\n\
+             [[routing.overrides]]\npaths = [\"src/auth/**\"]\nsecond_opinion = \
+             \"different-vendor\"\n",
+        );
+        let (plan, chains) = auth_plan(&cfg);
+        let mut warnings = Vec::new();
+        let resolved =
+            plan_for(&plan, &chains, &cfg, both_vendors, &mut warnings).expect("resolves");
+        assert_eq!(resolved.primary, Some(binding("copilot", "gpt-5")));
+        assert_eq!(
+            resolved.second_opinion[0],
+            Some(binding("claude-code", "claude-opus-4-8")),
+            "the partner crosses back to the other family"
+        );
+    }
+
+    #[test]
+    fn the_recorded_plan_survives_the_wire() {
+        // It rides on `run_started`, so a resume reads back exactly what the
+        // run resolved (§15).
+        let plan = plan_with(Some(binding("copilot", "gpt-5")));
+        let json = serde_json::to_string(&plan).expect("serialize");
+        let back: ReviewPlan = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(back, plan);
+
+        // A log written before step 9 has no such field at all.
+        let empty: ReviewPlan = serde_json::from_str("{}").expect("absent field defaults");
+        assert_eq!(empty, ReviewPlan::default());
+    }
+
+    #[test]
+    fn the_second_opinion_prompt_is_independent_and_says_so() {
+        let task = task();
+        let cx = ReviewCx {
+            adapter: &crate::agent::claude::ClaudeCodeAdapter,
+            profile: profile_for("copilot", "gpt-5", "second-opinion-gpt-5"),
+            lens: Lens::SecondOpinion,
+            task: &task,
+            diff: "+++ b/src/api.rs\n+fn encode() {}\n",
+            artifacts: &[],
+            workspace: Path::new("."),
+            settings_dir: Path::new("."),
+            reviews_dir: Path::new("."),
+            stem: "00-t1-1".to_owned(),
+            timeout: Duration::from_secs(60),
+        };
+        let prompt = materialize_prompt(&cx);
+        assert!(prompt.contains("two independent reviewers"));
+        assert!(
+            prompt.contains("not told its verdict"),
+            "a reviewer told the other approved stops looking"
+        );
+        // Whatever the lens adds, the step-6 guards still hold.
+        assert!(prompt.contains("find reasons this change should NOT be accepted"));
+        assert!(prompt.contains("DATA UNDER REVIEW"));
+        assert!(
+            parse_verdict(&prompt).is_none(),
+            "the prompt's own schema must never parse as a verdict"
+        );
+
+        // And the acceptance pass is unchanged by any of it.
+        let mut plain = cx;
+        plain.lens = Lens::Acceptance;
+        let baseline = materialize_prompt(&plain);
+        assert!(!baseline.contains("two independent reviewers"));
+        assert!(baseline.starts_with("You are reviewing one task's changes"));
     }
 
     #[test]

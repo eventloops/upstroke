@@ -46,7 +46,7 @@ use crate::ir::{
     TaskKind, WorkerProfile,
 };
 use crate::ladder::{self, LadderPolicy, LadderState, Next};
-use crate::review;
+use crate::review::{self, PassBinding, ReviewPass, ReviewPlan};
 use crate::rundir::{self, RunLock, RunPaths};
 use crate::ulid;
 use crate::util;
@@ -73,11 +73,20 @@ const MAX_FEEDBACK_ENTRIES: usize = 6;
 /// teaches this marker; nothing else in the engine parses agent prose.
 const QUESTION_MARKER: &str = "TACTUS-QUESTION:";
 
-/// The reviewer reads a diff and answers — it has no shell and no edit tools,
-/// so it does not need the implementer's budget. Giving it the full one lets a
-/// single task consume several multiples of the attempt timeout.
-fn review_timeout(attempt_timeout: Duration) -> Duration {
-    (attempt_timeout / 4).max(Duration::from_secs(60))
+/// What each review pass gets of the attempt's wall clock.
+///
+/// A reviewer reads a diff and answers — it has no shell and no edit tools, so
+/// it does not need the implementer's budget. Step-6 finding #13 was that
+/// giving it the full one let a single task consume several multiples of the
+/// attempt timeout, and the fix was a quarter.
+///
+/// That quarter is the budget for *review*, not for one reviewer, so it splits
+/// across the passes (§11.3). Otherwise configuring a second opinion would
+/// silently double a bound that was set deliberately. The 60s floor is per
+/// pass, because a budget too small to answer in is not a budget.
+fn review_timeout(attempt_timeout: Duration, passes: usize) -> Duration {
+    let share = attempt_timeout / 4 / u32::try_from(passes.max(1)).unwrap_or(u32::MAX);
+    share.max(Duration::from_secs(60))
 }
 
 /// Where the engine finds agent adapters. Injectable so the engine is fully
@@ -198,7 +207,9 @@ pub struct TaskReport {
     pub status: TaskRunStatus,
     pub duration: Duration,
     pub cost_usd: Option<f64>,
-    pub review_model: Option<String>,
+    /// Every model that judged the final attempt, in pass order — one for an
+    /// ordinary review, two where §11.3 asked for a second opinion.
+    pub review_models: Vec<String>,
     pub review_cost_usd: Option<f64>,
     pub session_id: Option<String>,
     /// Every attempt, oldest first — the escalation trail.
@@ -304,7 +315,7 @@ pub fn run_with(opts: &RunOptions, adapters: &dyn AdapterSource) -> Result<RunRe
 struct Preflight {
     analysis: Analysis,
     caps: BTreeMap<String, Caps>,
-    review_binding: Option<(String, String)>,
+    review_plan: ReviewPlan,
     gate_cmds: Vec<String>,
     warnings: Vec<String>,
     mode: InteractionMode,
@@ -312,6 +323,19 @@ struct Preflight {
 }
 
 fn preflight(opts: &RunOptions, harness: &Harness<'_>) -> Result<Preflight, TactusError> {
+    preflight_with_reviews(opts, harness, None)
+}
+
+/// `recorded` is the review plan a previous process resolved for this run.
+/// `Some` on resume: §15's record is what says how this run's code was judged,
+/// and re-deriving it against today's machine would let a CLI installed (or
+/// removed) since the run started change the verification standard halfway
+/// through. `None` for a fresh run, which resolves it now.
+fn preflight_with_reviews(
+    opts: &RunOptions,
+    harness: &Harness<'_>,
+    recorded: Option<ReviewPlan>,
+) -> Result<Preflight, TactusError> {
     // §14: plan parses cycle-free, config loads, chains resolve.
     let analysis = validate::analyze(&ValidateOptions {
         plan_path: opts.plan_path.clone(),
@@ -320,18 +344,56 @@ fn preflight(opts: &RunOptions, harness: &Harness<'_>) -> Result<Preflight, Tact
         pools_path: opts.pools_path.clone(),
     })?;
 
+    let mut warnings = analysis.warnings.clone();
+    let resumed = recorded.is_some();
+    let mut review_plan = match recorded {
+        Some(plan) => plan,
+        // Resolved against the adapters *this harness* holds, not the built-in
+        // registry: the harness is what can actually spawn something, and
+        // asking the wrong one would let a preview's answer stand in for a
+        // capability the run does not have.
+        None => review::plan_for(
+            &analysis.plan,
+            &analysis.chains,
+            &analysis.config,
+            |id| harness.adapters.get(id).is_some(),
+            &mut warnings,
+        )?,
+    };
+
     // Probe every agent the chains reference; a missing binary is a refusal
     // to start, not a task failure (§19). The capabilities are kept, not
     // discarded: §11.4's same-rung retry resumes a session only where the
     // adapter says it can.
-    let review_binding = review_binding(&analysis.config);
+    //
+    // Reviewers are probed on the same footing as implementers — step-6
+    // finding #10 — but in two classes. Everything the config *asked* for is
+    // required. The anti-self-review alternative was tactus's own idea, so a
+    // machine that cannot run it loses the upgrade rather than the run.
+    //
+    // On resume even the alternative is required: the record says this run's
+    // earlier tasks were judged cross-family, and quietly dropping to
+    // same-model review for the back half gives one run two standards.
+    let required = review_plan.required_agents();
+    let optional: Vec<String> = if resumed {
+        Vec::new()
+    } else {
+        review_plan
+            .agents()
+            .into_iter()
+            .filter(|id| !required.contains(id))
+            .map(str::to_owned)
+            .collect()
+    };
     let mut agent_ids: Vec<&str> = analysis
         .chains
         .iter()
         .flat_map(|c| c.rungs.iter().map(|r| r.binding.agent.as_str()))
-        // The reviewer's binary is as load-bearing as any implementer's, and
-        // it is frequently an agent no chain rung names.
-        .chain(review_binding.iter().map(|(agent, _)| agent.as_str()))
+        .chain(if resumed {
+            review_plan.agents()
+        } else {
+            required
+        })
         .collect();
     agent_ids.sort_unstable();
     agent_ids.dedup();
@@ -342,11 +404,39 @@ fn preflight(opts: &RunOptions, harness: &Harness<'_>) -> Result<Preflight, Tact
         })?;
         caps.insert(id.to_owned(), adapter.probe()?);
     }
+    for id in optional {
+        if caps.contains_key(&id) {
+            continue;
+        }
+        let probed = harness
+            .adapters
+            .get(&id)
+            .ok_or_else(|| TactusError::Agent {
+                message: format!("no adapter registered for agent `{id}`"),
+            })
+            .and_then(|adapter| adapter.probe());
+        match probed {
+            Ok(caps_for_id) => {
+                caps.insert(id, caps_for_id);
+            }
+            Err(error) => {
+                let binding = review_plan
+                    .alternative
+                    .as_ref()
+                    .map_or_else(|| id.clone(), PassBinding::describe);
+                warnings.push(format!(
+                    "{binding} would have reviewed tasks their own model implemented, but it \
+                     could not be probed: {error}. Those tasks fall back to same-model review \
+                     (§11.3)."
+                ));
+                review_plan.drop_alternative();
+            }
+        }
+    }
 
     // Effective gates come from the shared analysis (single derivation point
     // with `validate`). §14 pre-flight: the shell and every gate command must
     // resolve before any agent tokens are spent.
-    let mut warnings = analysis.warnings.clone();
     if !analysis.gates.is_empty() {
         gates::shell_available(analysis.config.shell)?;
         gates::resolve_programs(&analysis.gates, &opts.repo_root, &mut warnings)?;
@@ -359,7 +449,7 @@ fn preflight(opts: &RunOptions, harness: &Harness<'_>) -> Result<Preflight, Tact
     Ok(Preflight {
         analysis,
         caps,
-        review_binding,
+        review_plan,
         gate_cmds,
         warnings,
         mode,
@@ -382,7 +472,7 @@ fn run_harness_inner(
     let Preflight {
         analysis,
         caps,
-        review_binding,
+        review_plan,
         gate_cmds,
         mut warnings,
         mode,
@@ -441,6 +531,7 @@ fn run_harness_inner(
         gates_from_config: analysis.gates_from_config,
         interaction_mode: mode.to_string(),
         chains: chain_summaries(&analysis),
+        reviews: review_plan.clone(),
     };
 
     let sleeper = harness.sleeper.unwrap_or(&RealSleeper);
@@ -470,7 +561,7 @@ fn run_harness_inner(
         notifiers,
         sleeper,
         caps,
-        review_binding,
+        review_plan,
         attempt_timeout: opts.attempt_timeout,
         defer_backoff: opts.defer_backoff,
         max_defers: opts.max_defers,
@@ -612,16 +703,18 @@ fn resume_harness_inner(
     run_opts.wait_on_block = opts.wait_on_block;
     let wait_on_block = opts.wait_on_block;
 
-    // Re-probes agents and re-resolves gates, exactly as a fresh run does.
+    // Re-probes agents and re-resolves gates, exactly as a fresh run does —
+    // except for who reviews, which is read from the record rather than
+    // re-derived (see `preflight_with_reviews`).
     let Preflight {
         analysis,
         caps,
-        review_binding,
+        review_plan,
         gate_cmds,
         warnings: preflight_warnings,
         mode,
         notifiers,
-    } = preflight(&run_opts, harness)?;
+    } = preflight_with_reviews(&run_opts, harness, Some(started.reviews.clone()))?;
     warnings.extend(preflight_warnings);
 
     // The plan is frozen. A different hash means the file moved under the run,
@@ -791,7 +884,7 @@ fn resume_harness_inner(
         notifiers,
         sleeper,
         caps,
-        review_binding,
+        review_plan,
         attempt_timeout: opts.attempt_timeout,
         defer_backoff: opts.defer_backoff,
         max_defers: opts.max_defers,
@@ -907,8 +1000,9 @@ struct Run<'a> {
     sleeper: &'a dyn Sleeper,
     /// Probe results per agent id — `session_resume` gates §11.4's resume.
     caps: BTreeMap<String, Caps>,
-    /// (agent, model) the reviewer binds to, resolved once at pre-flight.
-    review_binding: Option<(String, String)>,
+    /// Who judges each task (§11.2–§11.3), resolved once at pre-flight and
+    /// recorded in `run_started`.
+    review_plan: ReviewPlan,
     attempt_timeout: Duration,
     defer_backoff: Duration,
     max_defers: u32,
@@ -1152,7 +1246,7 @@ impl Run<'_> {
                     paths: &self.paths,
                     gates: &analysis.gates,
                     gate_cmds: &self.gate_cmds,
-                    reviewer: self.reviewer()?,
+                    reviewers: self.reviewers(index, &profile)?,
                     timeout: self.attempt_timeout,
                     retry,
                 };
@@ -1181,8 +1275,7 @@ impl Run<'_> {
                     resumed: resume.is_some(),
                     duration: result.outcome.duration,
                     cost_usd: result.outcome.cost_usd,
-                    review_model: result.review_model.clone(),
-                    review_cost_usd: result.review_cost_usd,
+                    reviews: result.reviews.clone(),
                     session_id: result.outcome.session_id.clone(),
                     failure: result.failure.as_ref().map(|f| FailureRecord {
                         kind: f.kind,
@@ -1294,24 +1387,44 @@ impl Run<'_> {
         }
     }
 
-    /// §11.2/§10: the reviewer is its own read-only binding, at the configured
-    /// review tier (frontier by default) rather than the implementer's rung —
-    /// a small model reviewing its own work is not verification. A reviewer
-    /// that cannot be built must never silently degrade the run to gates-only:
-    /// verification vanishing without a word is worse than a refusal.
-    fn reviewer(&self) -> Result<Option<Reviewer<'_>>, TactusError> {
-        let adapters = self.adapters;
-        match self.review_binding.as_ref() {
-            None => Ok(None),
-            Some((agent, model)) => Ok(Some(Reviewer {
-                adapter: adapters.get(agent).ok_or_else(|| TactusError::Agent {
-                    message: format!(
-                        "review tier binds to agent `{agent}`, which has no adapter in this build"
-                    ),
-                })?,
-                profile: review::profile_for(agent, model, &format!("review-{model}")),
-            })),
-        }
+    /// §11.2/§11.3: the read-only passes that judge one task's attempt.
+    ///
+    /// Reviewers bind at the configured review tier (frontier by default)
+    /// rather than the implementer's rung — a small model reviewing its own
+    /// work is not verification — and [`ReviewPlan::passes_for`] decides
+    /// whether that means one pass or two, and whether the primary rebinds
+    /// away from the model that wrote the code.
+    ///
+    /// An empty list means review is switched off explicitly. A pass whose
+    /// adapter cannot be built is a hard error: verification vanishing without
+    /// a word is worse than a refusal, and pre-flight has already probed every
+    /// agent named here.
+    fn reviewers(
+        &self,
+        index: usize,
+        implementer: &WorkerProfile,
+    ) -> Result<Vec<Reviewer<'_>>, TactusError> {
+        let running_on = PassBinding::new(implementer.agent.clone(), implementer.model.clone());
+        self.review_plan
+            .passes_for(index, &running_on)
+            .into_iter()
+            .map(|pass: ReviewPass| {
+                Ok(Reviewer {
+                    adapter: self.adapters.get(&pass.binding.agent).ok_or_else(|| {
+                        TactusError::Agent {
+                            message: format!(
+                                "the {} pass binds to agent `{}`, which has no adapter in this \
+                                 build",
+                                pass.lens.name(),
+                                pass.binding.agent
+                            ),
+                        }
+                    })?,
+                    profile: pass.profile(),
+                    lens: pass.lens,
+                })
+            })
+            .collect()
     }
 
     fn fail_task(
@@ -1691,8 +1804,8 @@ fn task_report(task: &Task, state: &TaskState, progress: &Progress) -> TaskRepor
         },
         duration: records.iter().map(|r| r.duration).sum(),
         cost_usd: sum_opt(records.iter().map(|r| r.cost_usd)),
-        review_model: last.and_then(|r| r.review_model.clone()),
-        review_cost_usd: sum_opt(records.iter().map(|r| r.review_cost_usd)),
+        review_models: last.map(AttemptRecord::review_models).unwrap_or_default(),
+        review_cost_usd: sum_opt(records.iter().map(AttemptRecord::review_cost_usd)),
         session_id: last.and_then(|r| r.session_id.clone()),
         attempts: records.clone(),
     }
@@ -1782,7 +1895,9 @@ struct AttemptCx<'a> {
     paths: &'a RunPaths,
     gates: &'a [ShellGate],
     gate_cmds: &'a [String],
-    reviewer: Option<Reviewer<'a>>,
+    /// The ordered review passes for this task (§11.3). Empty only when review
+    /// is switched off explicitly.
+    reviewers: Vec<Reviewer<'a>>,
     timeout: Duration,
     /// `None` on the first attempt.
     retry: Option<RetryBrief>,
@@ -1796,24 +1911,24 @@ struct RetryBrief {
     feedback: Vec<Feedback>,
 }
 
-/// The read-only worker that judges each attempt (§11.2). `None` only when
-/// the user explicitly set `review = { enabled = false }`; a reviewer that
+/// One read-only worker judging an attempt (§11.2). The list is empty only
+/// when the user explicitly set `review = { enabled = false }`; a pass that
 /// cannot be resolved is a hard error, never a silent downgrade.
 #[derive(Clone)]
 struct Reviewer<'a> {
     adapter: &'a dyn AgentAdapter,
     profile: WorkerProfile,
+    lens: review::Lens,
 }
 
 struct AttemptResult {
     outcome: Outcome,
     failure: Option<AttemptFailure>,
-    /// The reviewer that actually judged this attempt, and its spend — both
-    /// `None` when the cheap checks failed first and no review ran. Derived
-    /// from the review having happened rather than from one being configured,
-    /// so the ledger never credits a model with work it did not do (§13).
-    review_model: Option<String>,
-    review_cost_usd: Option<f64>,
+    /// The passes that actually ran, in order — empty when the cheap checks
+    /// failed first and no review happened. Derived from the reviews having
+    /// happened rather than from passes being configured, so the ledger never
+    /// credits a model with work it did not do (§13).
+    reviews: Vec<events::ReviewRecord>,
 }
 
 /// Run one attempt and verify it, without deciding what happens next: the
@@ -1839,6 +1954,7 @@ fn run_attempt(
         ),
         profile: cx.profile.clone(),
         workspace: workspace.root().to_path_buf(),
+        gate_cmds: cx.gate_cmds.to_vec(),
         resume_session,
         settings_path,
     };
@@ -1894,33 +2010,49 @@ fn run_attempt(
 
     // §11.2: gates are objective but shallow — a strong reviewer judges the
     // diff against the acceptance criteria only once the cheap checks pass.
-    let mut review_model = None;
-    let mut review_cost_usd = None;
-    if failure.is_none()
-        && let Some(reviewer) = &cx.reviewer
-    {
-        review_model = Some(reviewer.profile.model.clone());
-        let review = review::run_review(&review::ReviewCx {
-            adapter: reviewer.adapter,
-            profile: reviewer.profile.clone(),
-            task: cx.task,
-            diff: &outcome.diff,
-            artifacts: &load_artifacts(&cx.paths.artifacts(), cx.task),
-            workspace: workspace.root(),
-            settings_dir: &cx.paths.settings(),
-            reviews_dir: &cx.paths.reviews(),
-            stem: format!("{}-{}", cx.stem, cx.attempt),
-            timeout: review_timeout(cx.timeout),
-        })?;
-        review_cost_usd = review.cost_usd;
-        failure = review_failure(review.result);
+    // §11.3: on blast-radius paths a second reviewer from another model family
+    // judges the same diff, and both must pass.
+    //
+    // Passes short-circuit, like gates do (§11.1): once one has said no, a
+    // second opinion on the same diff changes nothing about what happens next
+    // and costs another frontier invocation to learn it.
+    let mut reviews = Vec::new();
+    if failure.is_none() && !cx.reviewers.is_empty() {
+        let artifacts = load_artifacts(&cx.paths.artifacts(), cx.task);
+        let budget = review_timeout(cx.timeout, cx.reviewers.len());
+        for reviewer in &cx.reviewers {
+            let review = review::run_review(&review::ReviewCx {
+                adapter: reviewer.adapter,
+                profile: reviewer.profile.clone(),
+                lens: reviewer.lens,
+                task: cx.task,
+                diff: &outcome.diff,
+                artifacts: &artifacts,
+                workspace: workspace.root(),
+                settings_dir: &cx.paths.settings(),
+                reviews_dir: &cx.paths.reviews(),
+                stem: format!("{}-{}", cx.stem, cx.attempt),
+                timeout: budget,
+            })?;
+            let cost_usd = review.cost_usd;
+            failure = review_failure(review.result);
+            reviews.push(events::ReviewRecord {
+                pass: reviewer.lens.name().to_owned(),
+                agent: reviewer.profile.agent.clone(),
+                model: reviewer.profile.model.clone(),
+                cost_usd,
+                passed: failure.is_none(),
+            });
+            if failure.is_some() {
+                break;
+            }
+        }
     }
 
     Ok(AttemptResult {
         outcome,
         failure,
-        review_model,
-        review_cost_usd,
+        reviews,
     })
 }
 
@@ -2288,21 +2420,6 @@ fn feedback_section(feedback: &[Feedback], all: bool) -> String {
     out
 }
 
-/// The reviewer's binding: `[routing] review = { tier = … }` if configured,
-/// else frontier (§17's default), honouring a pin for that tier and otherwise
-/// taking the catalog's example binding — the same rules the router uses.
-fn review_binding(cfg: &crate::config::Config) -> Option<(String, String)> {
-    if !cfg.review_enabled {
-        return None;
-    }
-    let tier = cfg.review_tier.unwrap_or(crate::ir::Tier::Frontier);
-    if let Some(pin) = cfg.pins.iter().find(|p| p.tier == tier) {
-        return Some((pin.agent.clone(), pin.model.clone()));
-    }
-    let example = crate::catalog::example_binding(tier);
-    Some((example.agent.to_owned(), example.model.to_owned()))
-}
-
 /// Where an artifact lives for the duration of a run (§15 `artifacts/`).
 fn artifact_path(artifacts_dir: &Path, id: &str) -> PathBuf {
     artifacts_dir.join(format!("{}.md", util::filename_component(id)))
@@ -2370,10 +2487,14 @@ impl RunReport {
         for task in &self.tasks {
             match &task.status {
                 TaskRunStatus::Committed { sha } => {
-                    let review = match (&task.review_model, task.review_cost_usd) {
-                        (Some(model), Some(cost)) => format!(" + review {model} ${cost:.4}"),
-                        (Some(model), None) => format!(" + review {model}"),
-                        _ => String::new(),
+                    let review = match (task.review_models.as_slice(), task.review_cost_usd) {
+                        ([], _) => String::new(),
+                        (models, Some(cost)) => {
+                            format!(" + review {} ${cost:.4}", models.join(", "))
+                        }
+                        // Reviewed by a route that reports no spend (§13) —
+                        // say who judged it rather than imply it was free.
+                        (models, None) => format!(" + review {}", models.join(", ")),
                     };
                     let _ = writeln!(
                         out,
@@ -2593,8 +2714,15 @@ mod tests {
     /// Both scripts are consumed per invocation and the final entry repeats,
     /// so a one-element script behaves exactly like the fixed adapter did.
     struct FakeAdapter {
+        /// Which agent this stands in for. Cross-vendor tests (§11.3) need two
+        /// ids, because "a different model family" is unreachable otherwise.
+        id: &'static str,
         effects: Vec<Effect>,
         reviews: Vec<ReviewBehavior>,
+        /// Simulates a CLI that is installed but broken, for the pre-flight
+        /// probe classes: required agents refuse the run, the opportunistic
+        /// cross-family one only warns.
+        probe_error: Option<&'static str>,
         calls: Mutex<Calls>,
     }
 
@@ -2619,10 +2747,29 @@ mod tests {
     impl FakeAdapter {
         fn new(effects: Vec<Effect>, reviews: Vec<ReviewBehavior>) -> Self {
             Self {
+                id: "claude-code",
                 effects,
                 reviews,
+                probe_error: None,
                 calls: Mutex::new(Calls::default()),
             }
+        }
+
+        /// The second vendor. It only ever reviews in these tests, so it needs
+        /// no effects script.
+        fn copilot(reviews: Vec<ReviewBehavior>) -> Self {
+            Self {
+                id: "copilot",
+                effects: Vec::new(),
+                reviews,
+                probe_error: None,
+                calls: Mutex::new(Calls::default()),
+            }
+        }
+
+        fn broken(mut self, message: &'static str) -> Self {
+            self.probe_error = Some(message);
+            self
         }
 
         fn runs(&self) -> Vec<RecordedRun> {
@@ -2630,6 +2777,11 @@ mod tests {
                 .lock()
                 .map(|c| c.runs.clone())
                 .unwrap_or_default()
+        }
+
+        /// How many review invocations this adapter was asked for.
+        fn reviews_run(&self) -> usize {
+            self.calls.lock().map(|c| c.review).unwrap_or_default()
         }
     }
 
@@ -2640,6 +2792,22 @@ mod tests {
     fn source(effects: Vec<Effect>, reviews: Vec<ReviewBehavior>) -> FakeSource {
         FakeSource {
             adapter: FakeAdapter::new(effects, reviews),
+            copilot: None,
+        }
+    }
+
+    /// A machine with both CLIs installed: claude-code implements and gives the
+    /// acceptance verdict, copilot gives the §11.3 second opinion. Each adapter
+    /// keeps its own review script and counter, so a test can say what each
+    /// vendor answered and check which of them was asked at all.
+    fn cross_vendor(
+        effects: Vec<Effect>,
+        reviews: Vec<ReviewBehavior>,
+        second: Vec<ReviewBehavior>,
+    ) -> FakeSource {
+        FakeSource {
+            adapter: FakeAdapter::new(effects, reviews),
+            copilot: Some(FakeAdapter::copilot(second)),
         }
     }
 
@@ -2654,10 +2822,15 @@ mod tests {
 
     impl AgentAdapter for FakeAdapter {
         fn id(&self) -> &'static str {
-            "claude-code"
+            self.id
         }
 
         fn probe(&self) -> Result<Caps, TactusError> {
+            if let Some(message) = self.probe_error {
+                return Err(TactusError::Agent {
+                    message: message.to_owned(),
+                });
+            }
             Ok(Caps {
                 version: "0.0.0-fake".to_owned(),
                 json_output: true,
@@ -2844,11 +3017,26 @@ mod tests {
 
     struct FakeSource {
         adapter: FakeAdapter,
+        /// `None` is the single-vendor machine — which is also the shape that
+        /// makes a cross-family reviewer unresolvable.
+        copilot: Option<FakeAdapter>,
+    }
+
+    impl FakeSource {
+        fn copilot(&self) -> &FakeAdapter {
+            self.copilot.as_ref().expect("this source has a copilot")
+        }
     }
 
     impl AdapterSource for FakeSource {
         fn get(&self, id: &str) -> Option<&dyn AgentAdapter> {
-            (id == "claude-code").then_some(&self.adapter as &dyn AgentAdapter)
+            if id == self.adapter.id {
+                return Some(&self.adapter as &dyn AgentAdapter);
+            }
+            self.copilot
+                .as_ref()
+                .filter(|a| a.id == id)
+                .map(|a| a as &dyn AgentAdapter)
         }
     }
 
@@ -3225,7 +3413,7 @@ mod tests {
         let source = source(vec![Effect::EditFile], vec![ReviewBehavior::Fail]);
         let report = run_with(&opts, &source).expect("run");
         assert_eq!(report.outcome(), RunOutcome::Complete, "report: {report:?}");
-        assert!(report.tasks[0].review_model.is_none());
+        assert!(report.tasks[0].review_models.is_empty());
         assert!(report.tasks[0].review_cost_usd.is_none());
     }
 
@@ -3237,10 +3425,370 @@ mod tests {
         let t1 = task(&report, "t1");
         assert_eq!(t1.cost_usd, Some(0.01), "implementer's own spend");
         assert_eq!(t1.review_cost_usd, Some(0.05), "reviewer's, kept apart");
-        assert_eq!(t1.review_model.as_deref(), Some("claude-opus-5"));
+        assert_eq!(t1.review_models, ["claude-opus-5"]);
         assert!((t1.total_cost_usd().expect("both") - 0.06).abs() < 1e-9);
         let rendered = report.render();
         assert!(rendered.contains("+ review claude-opus-5"), "{rendered}");
+    }
+
+    // ---- step 9: cross-vendor review (§11.3) -----------------------------
+
+    /// A plan whose one task runs at frontier and touches `src/auth/**`, so
+    /// both step-9 mechanisms are in play: its implementer binds to the same
+    /// model as the reviewer, and its paths can match a `second_opinion`
+    /// override.
+    const FRONTIER_AUTH_PLAN: &str = "## Rotate the signing key\n\
+         <!-- tactus: id=t1 kind=implement depends= tier=frontier paths=src/auth/** -->\n\
+         Rotate it.\n";
+
+    const SECOND_OPINION_CONFIG: &str = "[routing]\n\
+         implement = { chain = [\"frontier\"], attempts_per = 1 }\n\n\
+         [[routing.overrides]]\n\
+         paths = [\"src/auth/**\"]\n\
+         second_opinion = \"different-vendor\"\n";
+
+    /// Same task, no override — the implicit anti-self-review path.
+    const FRONTIER_ONLY_CONFIG: &str =
+        "[routing]\nimplement = { chain = [\"frontier\"], attempts_per = 1 }\n";
+
+    fn cross_vendor_opts(repo: &Path) -> RunOptions {
+        let mut opts = options(repo);
+        opts.config_path = Some(repo.join("tactus.toml"));
+        opts
+    }
+
+    #[test]
+    fn a_second_opinion_runs_a_second_family_and_leaves_the_primary_alone() {
+        // §11.3: both verdicts must pass. And the primary must NOT rebind here
+        // even though it matches the implementer — rebinding would resolve both
+        // passes to copilot/gpt-5 and drop the Anthropic review entirely, which
+        // is worse than the self-review the rebind exists to prevent.
+        let repo = temp_engine_repo("secondopinion");
+        seed(&repo, FRONTIER_AUTH_PLAN, Some(SECOND_OPINION_CONFIG));
+        let source = cross_vendor(
+            vec![Effect::EditFile],
+            vec![ReviewBehavior::Pass],
+            vec![ReviewBehavior::Pass],
+        );
+        let report = run_with(&cross_vendor_opts(&repo), &source).expect("run");
+
+        assert!(committed(&report, "t1"), "both passed: {report:?}");
+        let t1 = task(&report, "t1");
+        assert_eq!(
+            t1.review_models,
+            ["claude-opus-5", "gpt-5"],
+            "one pass per family, primary first"
+        );
+        assert_eq!(t1.model, "claude-opus-5", "written by the frontier model");
+        assert_eq!(source.adapter.reviews_run(), 1);
+        assert_eq!(source.copilot().reviews_run(), 1);
+        // Both reviewers' spend lands in the review column, not the worker's.
+        assert_eq!(t1.review_cost_usd, Some(0.10), "0.05 per pass");
+        assert_eq!(t1.cost_usd, Some(0.01), "implementer's own");
+        let rendered = report.render();
+        assert!(
+            rendered.contains("+ review claude-opus-5, gpt-5"),
+            "{rendered}"
+        );
+    }
+
+    #[test]
+    fn a_second_opinion_that_fails_fails_the_attempt() {
+        // The point of two passes: the one that says no decides, even when the
+        // first already approved.
+        let repo = temp_engine_repo("secondopinionfail");
+        seed(&repo, FRONTIER_AUTH_PLAN, Some(SECOND_OPINION_CONFIG));
+        let source = cross_vendor(
+            vec![Effect::EditFile],
+            vec![ReviewBehavior::Pass],
+            vec![ReviewBehavior::Fail],
+        );
+        let report = run_with(&cross_vendor_opts(&repo), &source).expect("run");
+
+        assert!(!committed(&report, "t1"), "a rejected change cannot commit");
+        let t1 = task(&report, "t1");
+        let last = t1.attempts.last().expect("an attempt ran");
+        assert_eq!(
+            last.failure.as_ref().map(|f| f.kind),
+            Some(FailureKind::ReviewFailed)
+        );
+        assert_eq!(
+            last.reviews.iter().map(|r| r.passed).collect::<Vec<_>>(),
+            [true, false],
+            "the record says which pass objected"
+        );
+        assert_eq!(last.reviews[1].agent, "copilot");
+    }
+
+    #[test]
+    fn a_failing_first_pass_never_spends_the_second_reviewer() {
+        // Passes short-circuit like gates do (§11.1): once one has said no, a
+        // second opinion on the same diff changes nothing and costs a frontier
+        // invocation to learn it.
+        let repo = temp_engine_repo("shortcircuit");
+        seed(&repo, FRONTIER_AUTH_PLAN, Some(SECOND_OPINION_CONFIG));
+        let source = cross_vendor(
+            vec![Effect::EditFile],
+            vec![ReviewBehavior::Fail],
+            vec![ReviewBehavior::Pass],
+        );
+        let report = run_with(&cross_vendor_opts(&repo), &source).expect("run");
+
+        assert!(!committed(&report, "t1"));
+        assert_eq!(source.adapter.reviews_run(), 1);
+        assert_eq!(
+            source.copilot().reviews_run(),
+            0,
+            "the second vendor was never asked"
+        );
+        let last = task(&report, "t1").attempts.last().expect("attempt");
+        assert_eq!(last.reviews.len(), 1, "only what actually ran is recorded");
+    }
+
+    #[test]
+    fn a_frontier_task_is_not_reviewed_by_the_model_that_wrote_it() {
+        // The item carried since step 6: both binders resolve `frontier`
+        // identically, so without the rebind the reviewer IS the implementer.
+        let repo = temp_engine_repo("selfreview");
+        seed(&repo, FRONTIER_AUTH_PLAN, Some(FRONTIER_ONLY_CONFIG));
+        // The claude adapter's review script says FAIL and the copilot one says
+        // PASS, so a committed task proves which of them was actually asked.
+        let source = cross_vendor(
+            vec![Effect::EditFile],
+            vec![ReviewBehavior::Fail],
+            vec![ReviewBehavior::Pass],
+        );
+        let report = run_with(&cross_vendor_opts(&repo), &source).expect("run");
+
+        assert!(committed(&report, "t1"), "{report:?}");
+        assert_eq!(task(&report, "t1").review_models, ["gpt-5"]);
+        assert_eq!(source.adapter.reviews_run(), 0, "never judged its own work");
+        assert_eq!(source.copilot().reviews_run(), 1);
+    }
+
+    #[test]
+    fn a_lower_rung_keeps_the_frontier_reviewer() {
+        // A mid-tier implementer judged by the frontier reviewer is already a
+        // genuine second look, so nothing rebinds. Triggering on family
+        // similarity instead of exact identity would send most of a run
+        // cross-vendor for no verification gain.
+        let repo = temp_engine_repo("noneedtorebind");
+        seed(
+            &repo,
+            "## Implement the widget\n<!-- tactus: id=t1 kind=implement depends= -->\n",
+            Some("[routing]\nimplement = { chain = [\"mid\"], attempts_per = 1 }\n"),
+        );
+        let source = cross_vendor(
+            vec![Effect::EditFile],
+            vec![ReviewBehavior::Pass],
+            vec![ReviewBehavior::Pass],
+        );
+        let report = run_with(&cross_vendor_opts(&repo), &source).expect("run");
+
+        assert_eq!(task(&report, "t1").model, "claude-sonnet-5");
+        assert_eq!(task(&report, "t1").review_models, ["claude-opus-5"]);
+        assert_eq!(source.copilot().reviews_run(), 0);
+    }
+
+    #[test]
+    fn a_configured_second_opinion_with_no_second_family_refuses_before_spending() {
+        // Step-6 finding #10's posture: the operator asked for two model
+        // families on their blast-radius paths. Quietly giving them one is the
+        // failure that finding exists to prevent, so this refuses instead.
+        let repo = temp_engine_repo("nosecondfamily");
+        seed(&repo, FRONTIER_AUTH_PLAN, Some(SECOND_OPINION_CONFIG));
+        let source = source(vec![Effect::EditFile], vec![ReviewBehavior::Pass]);
+        let error = run_with(&cross_vendor_opts(&repo), &source)
+            .expect_err("a promised reviewer that cannot exist must stop the run");
+        let message = error.to_string();
+        assert!(message.contains("t1"), "names the task: {message}");
+        assert!(
+            message.contains("src/auth/**"),
+            "names the override: {message}"
+        );
+        assert!(
+            message.contains("second opinion"),
+            "says what is missing: {message}"
+        );
+        assert_eq!(source.adapter.runs().len(), 0, "nothing was spent");
+    }
+
+    #[test]
+    fn without_a_second_vendor_self_review_warns_rather_than_refusing() {
+        // The implicit rebind is tactus's own idea, not the operator's, so a
+        // single-vendor machine loses the upgrade rather than the run — but it
+        // is told, because a verification property that quietly is not there is
+        // exactly what step 6 objected to.
+        let repo = temp_engine_repo("selfreviewwarn");
+        seed(&repo, FRONTIER_AUTH_PLAN, Some(FRONTIER_ONLY_CONFIG));
+        let source = source(vec![Effect::EditFile], vec![ReviewBehavior::Pass]);
+        let report = run_with(&cross_vendor_opts(&repo), &source).expect("run still works");
+
+        assert!(committed(&report, "t1"));
+        assert_eq!(task(&report, "t1").review_models, ["claude-opus-5"]);
+        assert!(
+            report
+                .warnings
+                .iter()
+                .any(|w| w.contains("t1") && w.contains("also the reviewer")),
+            "warnings: {:?}",
+            report.warnings
+        );
+    }
+
+    #[test]
+    fn an_unprobeable_cross_family_reviewer_downgrades_instead_of_halting() {
+        // Installed but broken is different from absent, and the two probe
+        // classes have to agree about which is which: the opportunistic
+        // reviewer only warns.
+        let repo = temp_engine_repo("brokencopilot");
+        seed(&repo, FRONTIER_AUTH_PLAN, Some(FRONTIER_ONLY_CONFIG));
+        let source = FakeSource {
+            adapter: FakeAdapter::new(vec![Effect::EditFile], vec![ReviewBehavior::Pass]),
+            copilot: Some(FakeAdapter::copilot(vec![ReviewBehavior::Pass]).broken("not logged in")),
+        };
+        let report = run_with(&cross_vendor_opts(&repo), &source)
+            .expect("a broken upgrade is not a broken run");
+
+        assert!(committed(&report, "t1"));
+        assert_eq!(
+            task(&report, "t1").review_models,
+            ["claude-opus-5"],
+            "fell back to same-model review"
+        );
+        assert!(
+            report
+                .warnings
+                .iter()
+                .any(|w| w.contains("not logged in") && w.contains("same-model review")),
+            "warnings: {:?}",
+            report.warnings
+        );
+    }
+
+    #[test]
+    fn the_same_broken_reviewer_is_fatal_when_the_config_asked_for_it() {
+        // Same machine, same breakage — but now a `second_opinion` names it, so
+        // it is load-bearing rather than opportunistic.
+        let repo = temp_engine_repo("brokenrequired");
+        seed(&repo, FRONTIER_AUTH_PLAN, Some(SECOND_OPINION_CONFIG));
+        let source = FakeSource {
+            adapter: FakeAdapter::new(vec![Effect::EditFile], vec![ReviewBehavior::Pass]),
+            copilot: Some(FakeAdapter::copilot(vec![ReviewBehavior::Pass]).broken("not logged in")),
+        };
+        let error = run_with(&cross_vendor_opts(&repo), &source)
+            .expect_err("a required reviewer that cannot run stops the run");
+        assert!(error.to_string().contains("not logged in"), "got: {error}");
+    }
+
+    #[test]
+    fn the_review_budget_is_shared_between_passes_not_doubled_by_them() {
+        // Step-6 finding #13 capped review at a quarter of the attempt. That
+        // cap is for review, not per reviewer — otherwise configuring a second
+        // opinion silently doubles a bound that was chosen deliberately.
+        let attempt = Duration::from_secs(40 * 60);
+        assert_eq!(review_timeout(attempt, 1), Duration::from_secs(10 * 60));
+        assert_eq!(review_timeout(attempt, 2), Duration::from_secs(5 * 60));
+        // The floor is per pass: a budget too small to answer in is not one.
+        assert_eq!(
+            review_timeout(Duration::from_secs(60), 2),
+            Duration::from_secs(60)
+        );
+    }
+
+    #[test]
+    fn a_resume_keeps_the_reviewers_the_run_started_with() {
+        // Who judged this run is a fact about the run, not about today's
+        // machine — step-8 finding #8's lesson on `private_dir`. Re-deriving it
+        // would let a CLI installed since the run began become the judge for
+        // the back half, leaving one run with two verification standards.
+        //
+        // The work left over has to be work the rebind would OTHERWISE claim,
+        // or this proves nothing: the task resumed onto is at frontier, where
+        // the implementer and the reviewer are the same model.
+        let repo = temp_engine_repo("resumereviewers");
+        seed(
+            &repo,
+            "## Rotate the signing key\n\
+             <!-- tactus: id=t1 kind=implement depends= tier=frontier -->\n",
+            Some(
+                "[interaction]\nmode = \"never\"\n\n\
+                 [routing]\nimplement = { chain = [\"frontier\"], attempts_per = 1 }\n",
+            ),
+        );
+
+        // First process: no copilot on the machine, and the agent changes
+        // nothing — so t1 exhausts its chain and parks, still unbuilt.
+        let source = source(vec![Effect::NoEdit], vec![ReviewBehavior::Pass]);
+        let first = run_with(&cross_vendor_opts(&repo), &source).expect("run");
+        assert!(
+            matches!(task(&first, "t1").status, TaskRunStatus::Parked { .. }),
+            "{first:?}"
+        );
+
+        let paths = paths_of(&repo, &first.run_id);
+        let recorded = {
+            let mut warnings = Vec::new();
+            let events = events::read_all(&paths.events(), &mut warnings).expect("log");
+            events::started_of(&events, &paths.events())
+                .expect("run_started")
+                .reviews
+                .clone()
+        };
+        assert_eq!(
+            recorded.alternative, None,
+            "there was nothing to rebind to when this run started"
+        );
+
+        crate::answer::answer(
+            &repo,
+            &first.questions[0].question.id.to_string(),
+            crate::answer::Reply::Text("put the key in src/auth/keys.rs".to_owned()),
+        )
+        .expect("answer");
+
+        // Second process: copilot has appeared since. The record still rules,
+        // so the retry is judged by the model the run started with.
+        let later = cross_vendor(
+            vec![Effect::EditFile],
+            vec![ReviewBehavior::Pass],
+            vec![ReviewBehavior::Pass],
+        );
+        let resumed =
+            resume_with(&resume_options(&repo, &first.run_id), &later).expect("resume continues");
+
+        assert!(committed(&resumed, "t1"), "{resumed:?}");
+        assert_eq!(
+            task(&resumed, "t1").review_models,
+            ["claude-opus-5"],
+            "the recorded reviewer judged the resumed attempt"
+        );
+        assert_eq!(
+            later.copilot().reviews_run(),
+            0,
+            "a CLI installed since the run began must not become its judge"
+        );
+    }
+
+    #[test]
+    fn each_pass_writes_its_own_verdict_transcript() {
+        // Two reviewers, two records. The acceptance pass keeps the bare name
+        // it has had since step 6, so a run directory reads the same way
+        // whether or not a second opinion was configured.
+        let repo = temp_engine_repo("passtranscripts");
+        seed(&repo, FRONTIER_AUTH_PLAN, Some(SECOND_OPINION_CONFIG));
+        let source = cross_vendor(
+            vec![Effect::EditFile],
+            vec![ReviewBehavior::Pass],
+            vec![ReviewBehavior::Pass],
+        );
+        let report = run_with(&cross_vendor_opts(&repo), &source).expect("run");
+        let reviews = paths_of(&repo, &report.run_id).reviews();
+        assert!(reviews.join("00-t1-1-review.json").is_file());
+        assert!(
+            reviews.join("00-t1-1-second-opinion-review.json").is_file(),
+            "the second verdict cannot overwrite the first"
+        );
     }
 
     #[test]
@@ -4183,7 +4731,7 @@ mod tests {
             status: TaskRunStatus::Skipped,
             duration: Duration::ZERO,
             cost_usd: None,
-            review_model: None,
+            review_models: Vec::new(),
             review_cost_usd: None,
             session_id: None,
             attempts: vec![
@@ -4203,8 +4751,7 @@ mod tests {
             resumed: false,
             duration: Duration::ZERO,
             cost_usd: None,
-            review_model: None,
-            review_cost_usd: None,
+            reviews: Vec::new(),
             session_id: None,
             failure: failed.then(|| FailureRecord {
                 kind: FailureKind::GateFailed,
@@ -4382,8 +4929,13 @@ mod tests {
     struct Scenario {
         name: &'static str,
         config: &'static str,
+        /// Overrides the default two-task plan where a scenario needs path
+        /// hints or a particular tier.
+        plan: Option<&'static str>,
         effects: Vec<Effect>,
         reviews: Vec<ReviewBehavior>,
+        /// `Some` puts a second vendor on the machine (§11.3).
+        second_opinion: Option<Vec<ReviewBehavior>>,
         answers: Vec<Answer>,
     }
 
@@ -4392,14 +4944,22 @@ mod tests {
             Self {
                 name,
                 config,
+                plan: None,
                 effects,
                 reviews: vec![ReviewBehavior::Pass],
+                second_opinion: None,
                 answers: Vec::new(),
             }
         }
 
         fn reviewed(mut self, reviews: Vec<ReviewBehavior>) -> Self {
             self.reviews = reviews;
+            self
+        }
+
+        fn cross_vendor(mut self, plan: &'static str, second: Vec<ReviewBehavior>) -> Self {
+            self.plan = Some(plan);
+            self.second_opinion = Some(second);
             self
         }
 
@@ -4488,26 +5048,62 @@ mod tests {
                 vec![Effect::EditFile],
             )
             .reviewed(vec![ReviewBehavior::NeedsHuman]),
+            // §11.3: two review passes per attempt, so `AttemptRecord.reviews`
+            // carries more than one entry through serialize → deserialize. The
+            // list replaced a scalar pair in step 9; this is what proves the
+            // new shape survives the wire.
+            Scenario::new(
+                "second-opinion-passes",
+                SECOND_OPINION_CONFIG,
+                vec![Effect::EditFile],
+            )
+            .cross_vendor(FRONTIER_AUTH_PLAN, vec![ReviewBehavior::Pass]),
+            // And the same with the second reviewer rejecting, so a `false`
+            // verdict on a non-final pass replays too.
+            Scenario::new(
+                "second-opinion-rejects",
+                SECOND_OPINION_CONFIG,
+                vec![Effect::EditFile],
+            )
+            .cross_vendor(FRONTIER_AUTH_PLAN, vec![ReviewBehavior::Fail])
+            .answered(vec![Answer::Declined]),
+            // The anti-self-review rebind: the acceptance pass runs on a model
+            // no chain rung names, so the record has to carry the binding
+            // rather than let a replay re-derive it.
+            Scenario::new(
+                "self-review-rebind",
+                FRONTIER_ONLY_CONFIG,
+                vec![Effect::EditFile],
+            )
+            .cross_vendor(FRONTIER_AUTH_PLAN, vec![ReviewBehavior::Pass]),
         ];
 
         for Scenario {
             name,
             config,
+            plan,
             effects,
             reviews,
+            second_opinion,
             answers,
         } in scenarios
         {
             let repo = temp_engine_repo(&format!("replay-{name}"));
             seed(
                 &repo,
-                "## Implement the widget\n<!-- tactus: id=t1 kind=implement depends= -->\n\n\
-                 ## Independent\n<!-- tactus: id=t3 kind=implement depends= -->\n",
+                plan.unwrap_or(
+                    "## Implement the widget\n<!-- tactus: id=t1 kind=implement depends= -->\n\n\
+                     ## Independent\n<!-- tactus: id=t3 kind=implement depends= -->\n",
+                ),
                 Some(config),
             );
             let mut opts = options(&repo);
             opts.config_path = Some(repo.join("tactus.toml"));
-            let source = source(effects, reviews);
+            let cross_vendor_scenario = second_opinion.is_some();
+            let source = match second_opinion {
+                Some(second) => cross_vendor(effects, reviews, second),
+                None => source(effects, reviews),
+            };
             let scripted = ScriptedAnswers::new(answers);
             let (report, live) = run_harness_inner(
                 &opts,
@@ -4518,6 +5114,24 @@ mod tests {
                 },
             )
             .unwrap_or_else(|e| panic!("{name}: {e}"));
+            // A cross-vendor scenario that quietly resolved to one pass would
+            // still replay identically and prove nothing about the shape this
+            // step introduced. Check the run did what the scenario claims
+            // before trusting the equality below.
+            if cross_vendor_scenario {
+                let judged: Vec<&str> = report
+                    .tasks
+                    .iter()
+                    .flat_map(|t| &t.attempts)
+                    .flat_map(|a| &a.reviews)
+                    .map(|r| r.agent.as_str())
+                    .collect();
+                assert!(
+                    judged.contains(&"copilot"),
+                    "{name}: the second vendor never judged anything, so this scenario \
+                     exercises nothing new: {judged:?}"
+                );
+            }
             assert_live_equals_replay(&repo, &live, &report);
         }
     }

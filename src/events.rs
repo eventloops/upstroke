@@ -247,6 +247,15 @@ pub struct RunStarted {
     /// that config moved: `Progress.rung` is an index into this chain, and
     /// re-resolving a different one would silently point it at another tier.
     pub chains: Vec<ChainSummary>,
+    /// Who judges this run's code (§11.2–§11.3), resolved at pre-flight.
+    ///
+    /// Recorded because it is a fact about the run, not about today's machine.
+    /// The cross-family reviewer is chosen from what has an adapter *and*
+    /// probes, so a Copilot CLI installed or removed between a run and its
+    /// resume would otherwise change the verification standard halfway through
+    /// — the same reasoning that made resume honour the recorded `private_dir`.
+    #[serde(default)]
+    pub reviews: crate::review::ReviewPlan,
 }
 
 /// One task's resolved escalation chain, as it stood when the run started.
@@ -293,11 +302,48 @@ pub struct AttemptRecord {
     #[serde(rename = "duration_ms", with = "crate::util::duration_millis")]
     pub duration: Duration,
     pub cost_usd: Option<f64>,
-    pub review_model: Option<String>,
-    pub review_cost_usd: Option<f64>,
+    /// The review passes that actually ran, in order (§11.3). Empty when the
+    /// gates failed first and nothing was reviewed.
+    ///
+    /// A list rather than the single `review_model`/`review_cost_usd` pair it
+    /// replaces: §11.5 generalizes review into a list of passes, and a
+    /// second-opinion verdict has to be attributable to the model that gave it.
+    /// Logs written before step 9 read back with this empty — their review
+    /// spend does not replay, which is the price of the shape being right.
+    #[serde(default)]
+    pub reviews: Vec<ReviewRecord>,
     pub session_id: Option<String>,
     /// `None` when the attempt passed.
     pub failure: Option<FailureRecord>,
+}
+
+impl AttemptRecord {
+    /// Total review spend for this attempt, or `None` when nothing reported any
+    /// — which is not the same as nothing costing anything (§13: the Copilot
+    /// route reports no spend at all).
+    pub fn review_cost_usd(&self) -> Option<f64> {
+        let reported: Vec<f64> = self.reviews.iter().filter_map(|r| r.cost_usd).collect();
+        (!reported.is_empty()).then(|| reported.iter().sum())
+    }
+
+    /// The models that judged this attempt, in pass order.
+    pub fn review_models(&self) -> Vec<String> {
+        self.reviews.iter().map(|r| r.model.clone()).collect()
+    }
+}
+
+/// One review pass's ledger line (§11.2–§11.3).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ReviewRecord {
+    /// The lens that ran — `review` or `second-opinion`.
+    pub pass: String,
+    pub agent: String,
+    pub model: String,
+    /// `None` where the agent's route reports no spend.
+    pub cost_usd: Option<f64>,
+    /// Whether this pass approved. A later pass only exists because every
+    /// earlier one passed, so at most the last entry is ever `false`.
+    pub passed: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -469,8 +515,9 @@ impl InterruptedAttempt {
                 resumed: false,
                 duration: Duration::ZERO,
                 cost_usd: None,
-                review_model: None,
-                review_cost_usd: None,
+                // Nothing judged the code, so nothing is attributed to a
+                // reviewer.
+                reviews: Vec::new(),
                 session_id: None,
                 failure: Some(FailureRecord {
                     kind: FailureKind::Interrupted,
@@ -1160,6 +1207,7 @@ mod tests {
                 private_dir: "/home/x/.tactus/runs/01RUN".to_owned(),
                 gates: vec!["check".to_owned()],
                 gates_from_config: true,
+                reviews: crate::review::ReviewPlan::default(),
                 interaction_mode: "on_block".to_owned(),
                 chains: vec![ChainSummary {
                     task: "t1".to_owned(),
@@ -1198,8 +1246,7 @@ mod tests {
                 resumed: false,
                 duration: Duration::from_millis(1500),
                 cost_usd: Some(0.01),
-                review_model: None,
-                review_cost_usd: None,
+                reviews: Vec::new(),
                 session_id: Some("s0".to_owned()),
                 failure: None,
             }),

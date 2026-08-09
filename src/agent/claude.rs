@@ -14,8 +14,9 @@ use std::time::Duration;
 
 use serde_json::{Value, json};
 
+use super::bin::{self, Invocation};
 use super::proc::{self, ProcessOutput};
-use super::{AgentAdapter, Caps, TaskRun};
+use super::{AgentAdapter, Caps, TaskRun, looks_rate_limited};
 use crate::error::TactusError;
 use crate::ir::{Outcome, OutcomeStatus, PermissionMode, Usage, WorkerProfile};
 use crate::util;
@@ -53,7 +54,7 @@ impl AgentAdapter for ClaudeCodeAdapter {
                 ),
             });
         }
-        let version = extract_version(&out.stdout);
+        let version = bin::extract_version(&out.stdout);
 
         // Capabilities are read from `--help`, not assumed: this CLI has
         // removed and hidden flags between releases, and a missing flag must
@@ -223,23 +224,6 @@ pub fn permission_settings(profile: &WorkerProfile, gate_cmds: &[String]) -> Val
     })
 }
 
-/// First `digits.digits.digits` token wins; otherwise the trimmed first line
-/// verbatim (`--version` formats have churned before).
-fn extract_version(stdout: &str) -> String {
-    let first_line = stdout.lines().next().unwrap_or_default().trim();
-    first_line
-        .split_whitespace()
-        .find(|token| {
-            let mut parts = token.trim_start_matches('v').split('.');
-            let numeric = |s: Option<&str>| {
-                s.is_some_and(|p| !p.is_empty() && p.chars().all(|c| c.is_ascii_digit()))
-            };
-            numeric(parts.next()) && numeric(parts.next()) && parts.next().is_some()
-        })
-        .map(|t| t.trim_start_matches('v').to_owned())
-        .unwrap_or_else(|| first_line.to_owned())
-}
-
 /// Defensive outcome parsing: the JSON result is trusted when present, but a
 /// missing or malformed field never panics and never fails the parse — status
 /// degrades to `AgentError` instead. Diff, transcript path, and pool drain
@@ -346,109 +330,11 @@ fn parse_usage(payload: &Value) -> Option<Usage> {
     })
 }
 
-/// Rate-limit signals are ground truth for the capacity engine (§13). Phrases
-/// cover both the subscription-window wording the CLI prints ("5-hour limit
-/// reached", "Weekly limit reached") and API-level errors. Only consulted for
-/// failed attempts — see `parse_output`.
-fn looks_rate_limited(text: &str) -> bool {
-    let lower = text.to_ascii_lowercase();
-    [
-        "usage limit",
-        "rate limit",
-        "rate_limit",
-        "limit reached",
-        "limit exceeded",
-        "overloaded",
-        "quota exceeded",
-        "insufficient credits",
-        "429",
-    ]
-    .iter()
-    .any(|needle| lower.contains(needle))
-}
-
 // ---------------------------------------------------------------------------
 // Binary discovery — Windows-first-class: the CLI may be a native claude.exe
-// or an npm claude.cmd shim, which CreateProcess cannot exec directly.
+// or an npm claude.cmd shim, which CreateProcess cannot exec directly. The
+// mechanics live in `super::bin`, shared with every other adapter.
 // ---------------------------------------------------------------------------
-
-#[derive(Debug, Clone)]
-pub struct Invocation {
-    path: PathBuf,
-    /// `.cmd`/`.bat` shims (npm installs) are batch scripts: CreateProcess
-    /// cannot exec them, so they run through `cmd /C`.
-    via_cmd_shell: bool,
-}
-
-impl Invocation {
-    fn command(&self, args: &[String]) -> Command {
-        if self.via_cmd_shell {
-            let mut cmd = Command::new("cmd");
-            cmd.arg("/C");
-            // std quotes each arg for CommandLineToArgvW, which cmd.exe does
-            // NOT follow: with more than one quoted argument its
-            // strip-first-and-last-quote rule mangles the shim path. Build the
-            // whole line ourselves and pass it verbatim, wrapped in the outer
-            // quote pair cmd strips.
-            #[cfg(windows)]
-            {
-                use std::os::windows::process::CommandExt;
-                cmd.raw_arg(cmd_c_line(&self.path, args));
-            }
-            #[cfg(not(windows))]
-            {
-                cmd.arg(&self.path).args(args);
-            }
-            cmd
-        } else {
-            let mut cmd = Command::new(&self.path);
-            cmd.args(args);
-            cmd
-        }
-    }
-
-    fn display(&self) -> String {
-        self.path.to_string_lossy().into_owned()
-    }
-}
-
-/// `"<program>" <args…>` wrapped in the outer quote pair `cmd /C` strips.
-///
-/// Only reachable on Windows, but compiled and unit-tested everywhere: the
-/// quoting rules are pure string logic, and a bug in them should be caught by
-/// whichever platform's CI job runs first, not only by the Windows one.
-#[cfg_attr(not(windows), allow(dead_code))]
-fn cmd_c_line(program: &std::path::Path, args: &[String]) -> String {
-    let mut line = String::from("\"");
-    line.push_str(&quote_for_cmd(&program.to_string_lossy()));
-    for arg in args {
-        line.push(' ');
-        line.push_str(&quote_for_cmd(arg));
-    }
-    line.push('"');
-    line
-}
-
-#[cfg_attr(not(windows), allow(dead_code))]
-fn quote_for_cmd(arg: &str) -> String {
-    let needs_quotes = arg.is_empty()
-        || arg.chars().any(|c| {
-            c.is_whitespace() || matches!(c, '"' | '&' | '|' | '<' | '>' | '^' | '(' | ')')
-        });
-    if !needs_quotes {
-        return arg.to_owned();
-    }
-    let mut out = String::with_capacity(arg.len() + 2);
-    out.push('"');
-    for ch in arg.chars() {
-        if ch == '"' {
-            out.push('\\');
-        }
-        out.push(ch);
-    }
-    out.push('"');
-    out
-}
 
 fn candidate_names() -> &'static [&'static str] {
     if cfg!(windows) {
@@ -458,33 +344,16 @@ fn candidate_names() -> &'static [&'static str] {
     }
 }
 
-/// PATH resolution is process-stable, and the engine builds one command per
-/// task after probing — resolve once.
+/// This adapter's own resolution cache; `bin::locate` fills it once.
 static RESOLVED: OnceLock<Option<Invocation>> = OnceLock::new();
 
 fn locate() -> Result<Invocation, TactusError> {
-    RESOLVED
-        .get_or_init(|| {
-            candidate_names().iter().find_map(|name| {
-                // util::find_program skips empty PATH segments, which would
-                // otherwise resolve a bare name against the current directory
-                // — i.e. run a binary out of the repo being worked on.
-                util::find_program(name).map(|path| Invocation {
-                    via_cmd_shell: path.extension().is_some_and(|e| {
-                        e.eq_ignore_ascii_case("cmd") || e.eq_ignore_ascii_case("bat")
-                    }),
-                    path,
-                })
-            })
-        })
-        .clone()
-        .ok_or_else(|| TactusError::Agent {
-            message: format!(
-                "claude binary not found on PATH (looked for {}); install Claude Code or adjust \
-                 PATH",
-                candidate_names().join(", ")
-            ),
-        })
+    bin::locate(candidate_names(), &RESOLVED, |tried| {
+        format!(
+            "claude binary not found on PATH (looked for {}); install Claude Code or adjust PATH",
+            tried.join(", ")
+        )
+    })
 }
 
 #[cfg(test)]
@@ -509,6 +378,7 @@ mod tests {
             prompt: "Do the thing.".to_owned(),
             profile: profile(PermissionMode::Edit),
             workspace: PathBuf::from("."),
+            gate_cmds: Vec::new(),
             resume_session: None,
             settings_path: None,
         }
@@ -742,41 +612,10 @@ mod tests {
     }
 
     #[test]
-    fn cmd_shim_quoting_survives_spaces_and_multiple_quoted_args() {
-        let line = cmd_c_line(
-            std::path::Path::new(r"C:\Users\John Smith\npm\claude.cmd"),
-            &[
-                "-p".to_owned(),
-                "--settings".to_owned(),
-                r"C:\repo with spaces\settings.json".to_owned(),
-                String::new(),
-            ],
-        );
-        assert!(
-            line.starts_with('"') && line.ends_with('"'),
-            "outer pair: {line}"
-        );
-        assert!(line.contains(r#""C:\Users\John Smith\npm\claude.cmd""#));
-        assert!(line.contains(r#""C:\repo with spaces\settings.json""#));
-        assert!(
-            line.contains(r#" "" "#) || line.ends_with(r#""""#),
-            "empty arg kept: {line}"
-        );
-        assert_eq!(quote_for_cmd("simple"), "simple");
-    }
-
-    #[test]
     fn timeout_maps_to_timeout_status() {
         let mut out = output(None, "", "");
         out.timed_out = true;
         assert_eq!(parse_output(&out).status, OutcomeStatus::Timeout);
-    }
-
-    #[test]
-    fn version_extraction_handles_known_formats() {
-        assert_eq!(extract_version("2.1.35 (Claude Code)\n"), "2.1.35");
-        assert_eq!(extract_version("claude v1.0.128\n"), "1.0.128");
-        assert_eq!(extract_version("weird output\n"), "weird output");
     }
 
     // Runs only where the real CLI exists; skips silently elsewhere so CI

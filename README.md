@@ -65,6 +65,8 @@ review = { tier = "frontier" }        # or { enabled = false }
 [[routing.overrides]]
 paths = ["src/auth/**", "migrations/**"]
 start_at = "frontier"                  # blast radius beats nominal difficulty
+second_opinion = "different-vendor"    # a second reviewer from another model family;
+                                       # both must pass. Needs the Copilot CLI installed.
 
 [[gates]]
 name = "test"
@@ -86,6 +88,9 @@ These are invariants, not aspirations — they're what make it safe to leave run
   engine captured, never the agent's own account of what it did.
 - **Narrow permissions.** Unattended agents get file tools plus exactly the configured gate
   commands — never a skip-all-permissions flag. Reviewers are read-only.
+- **Nothing reviews its own work.** Where a task runs on the model that would have reviewed it,
+  the reviewer rebinds to a different model family; on blast-radius paths a second reviewer from
+  another family judges the same diff independently, and both must pass.
 - **An empty diff can never pass.** "Done" claims require changed code.
 
 ## Requirements
