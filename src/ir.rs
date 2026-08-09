@@ -30,6 +30,30 @@ impl From<&str> for TaskId {
     }
 }
 
+/// Identifier for one question raised during a run. Short enough to type at a
+/// prompt: `tactus answer <id>` (step 8) accepts any unambiguous prefix.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct QuestionId(pub String);
+
+impl QuestionId {
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl fmt::Display for QuestionId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl From<&str> for QuestionId {
+    fn from(s: &str) -> Self {
+        Self(s.to_owned())
+    }
+}
+
 /// Identifier for an artifact flowing between tasks (contracts, briefs).
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(transparent)]
@@ -259,6 +283,62 @@ pub struct Verdict {
     pub reasons: Vec<String>,
     #[serde(default)]
     pub required_changes: Vec<String>,
+    /// §12: the reviewer may decline to judge and ask for a human instead.
+    /// Defaulted so a verdict written before this field existed still parses,
+    /// and so silence means "I judged it" rather than "escalate".
+    #[serde(default)]
+    pub needs_human: bool,
+}
+
+/// §7 `Question` — why the run is asking, and exactly which tasks park for it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum QuestionKind {
+    /// Nothing else can move this task forward: the chain is exhausted, or a
+    /// pool stayed down. The human is the top rung (§11.4).
+    Unblock,
+    /// Spend crossed an `ask_before` threshold. Raised once budgets exist
+    /// (§12); the variant is here so the shape is settled.
+    ApproveSpend,
+    /// Proceed / stop at a milestone.
+    Continue,
+    /// A worker or reviewer hit a decision it should not make alone (§12).
+    Clarify,
+}
+
+impl fmt::Display for QuestionKind {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::Unblock => "unblock",
+            Self::ApproveSpend => "approve-spend",
+            Self::Continue => "continue",
+            Self::Clarify => "clarify",
+        })
+    }
+}
+
+/// §7 `Question`. `affected_tasks` is load-bearing, not descriptive: exactly
+/// those tasks park, and everything else keeps running (invariant 6).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Question {
+    pub id: QuestionId,
+    pub kind: QuestionKind,
+    pub affected_tasks: Vec<TaskId>,
+    /// Human-facing framing. Any agent-authored text inside it is quoted and
+    /// labelled as such by whoever built the question.
+    pub context: String,
+    pub options: Vec<String>,
+}
+
+/// What came back — or did not. `Unanswered` is not a decline: it means no
+/// channel could reach a human at all (CI, detached terminal), which parks the
+/// task rather than failing it (§12).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "answer", rename_all = "snake_case")]
+pub enum Answer {
+    Answered { text: String },
+    Declined,
+    Unanswered,
 }
 
 /// FNV-1a 64-bit content hash. Dependency-free and stable across platforms and
@@ -298,6 +378,34 @@ mod tests {
         assert_eq!(json, "\"frontier\"");
         let back: Tier = serde_json::from_str("\"mid\"").expect("deserialize");
         assert_eq!(back, Tier::Mid);
+    }
+
+    #[test]
+    fn a_verdict_without_needs_human_is_a_judgement_not_an_escalation() {
+        // Silence must mean "I judged it". A verdict written before the field
+        // existed, or by a model that ignored it, must not park the task.
+        let verdict: Verdict =
+            serde_json::from_str(r#"{"pass": false, "reasons": ["no tests"]}"#).expect("parse");
+        assert!(!verdict.needs_human);
+        assert!(!verdict.pass);
+    }
+
+    #[test]
+    fn answers_round_trip_and_keep_declined_apart_from_unanswered() {
+        // The distinction decides whether a task Fails or parks (§12), so it
+        // has to survive serialization.
+        for answer in [
+            Answer::Answered {
+                text: "use the cursor format".to_owned(),
+            },
+            Answer::Declined,
+            Answer::Unanswered,
+        ] {
+            let json = serde_json::to_string(&answer).expect("serialize");
+            let back: Answer = serde_json::from_str(&json).expect("deserialize");
+            assert_eq!(back, answer, "{json}");
+        }
+        assert_ne!(Answer::Declined, Answer::Unanswered);
     }
 
     #[test]

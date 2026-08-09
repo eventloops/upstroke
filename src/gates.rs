@@ -188,15 +188,17 @@ pub struct GateFailure {
 pub const FEEDBACK_TAIL_BYTES: usize = 8 * 1024;
 
 /// Run gates sequentially, short-circuiting on the first failure. Every gate
-/// with output gets its log written to `log_dir/<task>-<attempt>-<gate>.log`
+/// with output gets its log written to `log_dir/<stem>-<attempt>-<gate>.log`
 /// (pass and fail — the pass logs are the evidence trail for committed
-/// tasks). Returns `Ok(Some(failure))` for a gate failure (attempt fails),
-/// `Err` for environment problems (run aborts, §19).
+/// tasks). `stem` is the caller's collision-free per-task file stem, not the
+/// raw task id: two ids that sanitize to the same string would otherwise
+/// overwrite each other's evidence. Returns `Ok(Some(failure))` for a gate
+/// failure (attempt fails), `Err` for environment problems (run aborts, §19).
 pub fn run_all(
     gates: &[ShellGate],
     ws: &Workspace,
     log_dir: &Path,
-    task: &str,
+    stem: &str,
     attempt: u32,
 ) -> Result<Option<GateFailure>, TactusError> {
     for gate in gates {
@@ -209,7 +211,7 @@ pub fn run_all(
         if !log.trim().is_empty() {
             let file_name = format!(
                 "{}-{attempt}-{}.log",
-                util::filename_component(task),
+                util::filename_component(stem),
                 util::filename_component(&gate.name)
             );
             if let Err(e) = fs::write(log_dir.join(&file_name), &log) {

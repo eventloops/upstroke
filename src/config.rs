@@ -17,6 +17,7 @@ use serde::Deserialize;
 use crate::catalog;
 use crate::error::TactusError;
 use crate::gates::ShellKind;
+use crate::interaction::InteractionMode;
 use crate::ir::{TaskKind, Tier};
 
 #[derive(Debug, Default, Deserialize)]
@@ -28,8 +29,9 @@ struct RawRepoConfig {
     // consumed must not brick on upgrade with cryptic output).
     gates: Option<toml::Value>,
     engine: Option<toml::Value>,
-    // Other sections (interaction, budgets) are legal in tactus.toml but not
-    // consumed yet; serde ignores them.
+    interaction: Option<toml::Value>,
+    // Other sections (budgets) are legal in tactus.toml but not consumed yet;
+    // serde ignores them.
 }
 
 #[derive(Debug, Deserialize)]
@@ -42,6 +44,17 @@ struct RawGate {
 #[derive(Debug, Deserialize)]
 struct RawEngine {
     shell: Option<String>,
+    on_task_failure: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct RawInteraction {
+    mode: Option<String>,
+    notify: Option<Vec<String>>,
+    /// `ask_before = { frontier_escalation_over_usd = 5.0 }` (§12). Accepted
+    /// and echoed so a config written to spec does not error, but nothing
+    /// raises `ApproveSpend` until the ledger exists (step 8/10).
+    ask_before: Option<toml::Value>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -130,6 +143,28 @@ pub struct GateConfig {
 
 pub const DEFAULT_GATE_TIMEOUT: Duration = Duration::from_secs(600);
 
+/// `[engine] on_task_failure` (§17).
+///
+/// This governs only a *genuinely failed* task — one a human declined to
+/// unblock, or one whose chain resolved to nothing. A task parked on a
+/// question never halts the run whatever this says: invariant 6 ("questions
+/// never stop the runnable frontier") is not configurable.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OnTaskFailure {
+    Halt,
+    Continue,
+}
+
+impl OnTaskFailure {
+    fn parse(s: &str) -> Option<Self> {
+        match s.to_ascii_lowercase().as_str() {
+            "halt" => Some(Self::Halt),
+            "continue" => Some(Self::Continue),
+            _ => None,
+        }
+    }
+}
+
 #[derive(Debug)]
 pub struct Config {
     pub chains: BTreeMap<TaskKind, KindChain>,
@@ -146,6 +181,12 @@ pub struct Config {
     pub review_tier: Option<Tier>,
     /// `[routing] review = { enabled = false }` opts out of review entirely.
     pub review_enabled: bool,
+    /// `[engine] on_task_failure` (§17); default `Halt`.
+    pub on_task_failure: OnTaskFailure,
+    /// `[interaction] mode` (§12); default `on_block`.
+    pub interaction_mode: InteractionMode,
+    /// `[interaction] notify` (§12); default `["cli"]`.
+    pub notify: Vec<String>,
 }
 
 impl Config {
@@ -334,7 +375,8 @@ pub fn load(
     }
 
     let gates = parse_gates(raw.gates, &repo_path)?;
-    let shell = parse_engine_shell(raw.engine, &repo_path, warnings)?;
+    let (shell, on_task_failure) = parse_engine(raw.engine, &repo_path, warnings)?;
+    let (interaction_mode, notify) = parse_interaction(raw.interaction, &repo_path, warnings)?;
 
     let pool_names = read_pools(pools_file)?;
 
@@ -348,6 +390,9 @@ pub fn load(
         shell,
         review_tier,
         review_enabled,
+        on_task_failure,
+        interaction_mode,
+        notify,
     })
 }
 
@@ -402,32 +447,84 @@ fn parse_gates(
     Ok(Some(list))
 }
 
-fn parse_engine_shell(
+fn parse_engine(
     raw: Option<toml::Value>,
     repo_path: &Path,
     warnings: &mut Vec<String>,
-) -> Result<ShellKind, TactusError> {
+) -> Result<(ShellKind, OnTaskFailure), TactusError> {
     let Some(value) = raw else {
-        return Ok(ShellKind::native());
+        return Ok((ShellKind::native(), OnTaskFailure::Halt));
     };
     let engine: RawEngine = value.try_into().map_err(|e| TactusError::Config {
         path: repo_path.to_path_buf(),
-        message: format!("[engine]: {e} (expected a table with an optional `shell` string)"),
+        message: format!(
+            "[engine]: {e} (expected a table with optional `shell` and `on_task_failure` strings)"
+        ),
     })?;
-    let Some(requested) = engine.shell else {
-        return Ok(ShellKind::native());
-    };
-    match ShellKind::parse(&requested) {
-        Some(kind) => Ok(kind),
-        None => {
+    let shell = match engine.shell {
+        None => ShellKind::native(),
+        Some(requested) => ShellKind::parse(&requested).unwrap_or_else(|| {
             warnings.push(format!(
                 "unknown [engine] shell `{requested}` in {} (using the platform default; known: \
                  cmd, sh, bash, powershell, pwsh)",
                 repo_path.display()
             ));
-            Ok(ShellKind::native())
-        }
+            ShellKind::native()
+        }),
+    };
+    // A misspelling here decides whether a failed task stops the run, so it
+    // errors rather than warning: silently halting a run the user asked to
+    // continue (or the reverse) is not a recoverable surprise.
+    let on_task_failure = match engine.on_task_failure {
+        None => OnTaskFailure::Halt,
+        Some(requested) => OnTaskFailure::parse(&requested).ok_or_else(|| TactusError::Config {
+            path: repo_path.to_path_buf(),
+            message: format!(
+                "[engine] on_task_failure `{requested}` is not recognized (expected `halt` or \
+                     `continue`)"
+            ),
+        })?,
+    };
+    Ok((shell, on_task_failure))
+}
+
+/// `[interaction]` (§12). Mode decides whether a human can ever be asked, so a
+/// typo errors; notifier ids only decide delivery, so they warn.
+fn parse_interaction(
+    raw: Option<toml::Value>,
+    repo_path: &Path,
+    warnings: &mut Vec<String>,
+) -> Result<(InteractionMode, Vec<String>), TactusError> {
+    let default_notify = || vec!["cli".to_owned()];
+    let Some(value) = raw else {
+        return Ok((InteractionMode::default(), default_notify()));
+    };
+    let interaction: RawInteraction = value.try_into().map_err(|e| TactusError::Config {
+        path: repo_path.to_path_buf(),
+        message: format!(
+            "[interaction]: {e} (expected optional `mode`, `notify` list, and `ask_before` table)"
+        ),
+    })?;
+    if interaction.ask_before.is_some() {
+        warnings.push(
+            "[interaction] ask_before is parsed but not acted on yet — spend approvals need the \
+             ledger (§13), so no ApproveSpend question is raised"
+                .to_owned(),
+        );
     }
+    let mode = match interaction.mode {
+        None => InteractionMode::default(),
+        Some(requested) => {
+            InteractionMode::parse(&requested).ok_or_else(|| TactusError::Config {
+                path: repo_path.to_path_buf(),
+                message: format!(
+                    "[interaction] mode `{requested}` is not recognized (expected `never`, \
+                     `on_block`, or `on_milestone`)"
+                ),
+            })?
+        }
+    };
+    Ok((mode, interaction.notify.unwrap_or_else(default_notify)))
 }
 
 fn read_repo_config(
@@ -760,6 +857,58 @@ timeout_secs = 1200
         let cfg =
             load(Some(&path), &hermetic(), Some(&missing()), &mut warnings).expect("empty gates");
         assert_eq!(cfg.gates.expect("explicit").len(), 0);
+    }
+
+    #[test]
+    fn interaction_and_failure_policy_default_without_config() {
+        let mut warnings = Vec::new();
+        let cfg = load(None, &hermetic(), Some(&missing()), &mut warnings).expect("defaults");
+        assert_eq!(cfg.interaction_mode, InteractionMode::OnBlock);
+        assert_eq!(cfg.notify, ["cli"]);
+        assert_eq!(cfg.on_task_failure, OnTaskFailure::Halt, "§17's default");
+        assert!(warnings.is_empty(), "warnings: {warnings:?}");
+    }
+
+    #[test]
+    fn interaction_and_failure_policy_parse_from_config() {
+        let path = scratch(
+            "interaction.toml",
+            r#"
+[engine]
+on_task_failure = "continue"
+
+[interaction]
+mode = "never"
+notify = ["cli", "desktop"]
+ask_before = { frontier_escalation_over_usd = 5.0 }
+"#,
+        );
+        let mut warnings = Vec::new();
+        let cfg = load(Some(&path), &hermetic(), Some(&missing()), &mut warnings).expect("load");
+        assert_eq!(cfg.interaction_mode, InteractionMode::Never);
+        assert_eq!(cfg.notify, ["cli", "desktop"]);
+        assert_eq!(cfg.on_task_failure, OnTaskFailure::Continue);
+        // Accepted per §17's own example, but honestly reported as inert.
+        assert!(
+            warnings.iter().any(|w| w.contains("ask_before")),
+            "warnings: {warnings:?}"
+        );
+    }
+
+    #[test]
+    fn misspelled_mode_or_failure_policy_is_a_hard_error() {
+        // Both decide whether the run stops or waits for a human. A typo that
+        // silently reverts to the default is not a recoverable surprise.
+        let path = scratch("badmode.toml", "[interaction]\nmode = \"always\"\n");
+        let mut warnings = Vec::new();
+        let err = load(Some(&path), &hermetic(), Some(&missing()), &mut warnings)
+            .expect_err("unknown mode must error");
+        assert!(err.to_string().contains("on_block"), "got: {err}");
+
+        let path = scratch("badfailure.toml", "[engine]\non_task_failure = \"stop\"\n");
+        let err = load(Some(&path), &hermetic(), Some(&missing()), &mut warnings)
+            .expect_err("unknown policy must error");
+        assert!(err.to_string().contains("continue"), "got: {err}");
     }
 
     #[test]

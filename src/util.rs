@@ -38,6 +38,28 @@ pub fn head(text: &str, max: usize) -> String {
     format!("{}…", &trimmed[..end])
 }
 
+/// A fence long enough to quote `payload` without the payload closing it.
+///
+/// Everything the engine quotes back to a model or a human — a diff, an
+/// artifact, an agent's question, an operator's answer — is untrusted text that
+/// routinely contains fences of its own (any repo with markdown does). A fence
+/// that closes early hands the remainder of the payload to the reader as if it
+/// were instructions, so the invariant is load-bearing rather than cosmetic:
+/// it lives in one place so it cannot drift between callers.
+pub fn fence_for(payload: &str) -> String {
+    let mut longest = 0usize;
+    let mut current = 0usize;
+    for ch in payload.chars() {
+        if ch == '`' {
+            current += 1;
+            longest = longest.max(current);
+        } else {
+            current = 0;
+        }
+    }
+    "`".repeat(longest.max(2) + 1)
+}
+
 /// Make an arbitrary string (task id, gate name — both user-authored) safe to
 /// use as a single file-name component: no separators, no Windows-reserved
 /// characters, no dot-only names, bounded length. Not injective — callers
