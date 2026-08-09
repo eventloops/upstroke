@@ -1,8 +1,8 @@
 //! Sequential execution engine (DESIGN.md §14): pre-flight, run branch, one
 //! agent attempt per task on its chain's first rung, engine-captured diff,
-//! gates with evidence axes (§11.1), engine-owned commit per task, rollback +
-//! halt on failure. Review arrives in step 6, retry/escalation in step 7, the
-//! event log and resume in step 8.
+//! gates with evidence axes (§11.1), read-only review with a structured
+//! verdict (§11.2), engine-owned commit per task, rollback + halt on failure.
+//! Retry/escalation arrives in step 7, the event log and resume in step 8.
 
 use std::fmt::Write as _;
 use std::fs;
@@ -24,6 +24,13 @@ use crate::workspace::Workspace;
 
 /// §14: per-attempt wall clock, default 30 minutes.
 pub const DEFAULT_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(30 * 60);
+
+/// The reviewer reads a diff and answers — it has no shell and no edit tools,
+/// so it does not need the implementer's budget. Giving it the full one lets a
+/// single task consume several multiples of the attempt timeout.
+fn review_timeout(attempt_timeout: Duration) -> Duration {
+    (attempt_timeout / 4).max(Duration::from_secs(60))
+}
 
 /// Where the engine finds agent adapters. Injectable so the engine is fully
 /// testable without any real agent CLI on the machine.
@@ -67,11 +74,27 @@ pub enum TaskRunStatus {
 pub struct TaskReport {
     pub id: String,
     pub title: String,
+    /// The implementer's model — `cost_usd` is its spend alone. Reviewer
+    /// spend is a separate field because it is a different model at a
+    /// different tier, and folding them together makes cheap rungs look
+    /// expensive to anyone reading the ledger (§13).
     pub model: String,
     pub status: TaskRunStatus,
     pub duration: Duration,
     pub cost_usd: Option<f64>,
+    pub review_model: Option<String>,
+    pub review_cost_usd: Option<f64>,
     pub session_id: Option<String>,
+}
+
+impl TaskReport {
+    /// Implementer plus reviewer.
+    pub fn total_cost_usd(&self) -> Option<f64> {
+        match (self.cost_usd, self.review_cost_usd) {
+            (None, None) => None,
+            (worker, review) => Some(worker.unwrap_or(0.0) + review.unwrap_or(0.0)),
+        }
+    }
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -113,10 +136,14 @@ pub fn run_with(opts: &RunOptions, adapters: &dyn AdapterSource) -> Result<RunRe
 
     // Probe every agent the chains reference; a missing binary is a refusal
     // to start, not a task failure (§19).
+    let review_binding = review_binding(&analysis.config);
     let mut agent_ids: Vec<&str> = analysis
         .chains
         .iter()
         .flat_map(|c| c.rungs.iter().map(|r| r.binding.agent.as_str()))
+        // The reviewer's binary is as load-bearing as any implementer's, and
+        // it is frequently an agent no chain rung names.
+        .chain(review_binding.iter().map(|(agent, _)| agent.as_str()))
         .collect();
     agent_ids.sort_unstable();
     agent_ids.dedup();
@@ -180,7 +207,7 @@ pub fn run_with(opts: &RunOptions, adapters: &dyn AdapterSource) -> Result<RunRe
         gates: effective_gates,
         gate_cmds,
         adapters,
-        review_binding: review_binding(&analysis.config),
+        review_binding,
         attempt_timeout: opts.attempt_timeout,
     };
     for index in topo_order(&analysis.plan) {
@@ -193,6 +220,8 @@ pub fn run_with(opts: &RunOptions, adapters: &dyn AdapterSource) -> Result<RunRe
                 status: TaskRunStatus::Skipped,
                 duration: Duration::ZERO,
                 cost_usd: None,
+                review_model: None,
+                review_cost_usd: None,
                 session_id: None,
             });
             continue;
@@ -211,7 +240,7 @@ pub fn run_with(opts: &RunOptions, adapters: &dyn AdapterSource) -> Result<RunRe
         if let TaskRunStatus::Failed { .. } = task_report.status {
             report.halted_at = Some(task_report.id.clone());
         }
-        report.total_cost_usd += task_report.cost_usd.unwrap_or(0.0);
+        report.total_cost_usd += task_report.total_cost_usd().unwrap_or(0.0);
         report.tasks.push(task_report);
         util::write_json(&report_path, &report)?;
     }
@@ -233,6 +262,9 @@ pub enum FailureKind {
     GateFailed,
     TestProvenance,
     ReviewFailed,
+    /// The reviewer could not run — an environment failure, not a judgement
+    /// on the change.
+    ReviewUnavailable,
 }
 
 #[derive(Debug, Clone)]
@@ -274,8 +306,10 @@ struct AttemptCx<'a> {
     timeout: Duration,
 }
 
-/// The read-only worker that judges each attempt (§11.2). `None` disables
-/// review — only when no adapter can serve the configured review tier.
+/// The read-only worker that judges each attempt (§11.2). `None` only when
+/// the user explicitly set `review = { enabled = false }`; a reviewer that
+/// cannot be resolved is a hard error, never a silent downgrade.
+#[derive(Clone)]
 struct Reviewer<'a> {
     adapter: &'a dyn AgentAdapter,
     profile: WorkerProfile,
@@ -327,8 +361,8 @@ fn run_attempt(
     outcome.diff = workspace.capture_diff()?;
     outcome.transcript_path = transcript_path;
 
-    // Verification ladder so far (§11): outcome sanity → cheap static
-    // provenance → gates. Review joins in step 6.
+    // Verification ladder (§11): outcome sanity → cheap static provenance →
+    // gates → review. Cheapest and most objective first.
     let mut failure = evaluate_outcome(&outcome, &output);
     if failure.is_none() && cx.task.kind == TaskKind::Test && !gates::diff_adds_tests(&outcome.diff)
     {
@@ -373,30 +407,11 @@ fn run_attempt(
             artifacts: &load_artifacts(cx.run_dir, cx.task),
             workspace: workspace.root(),
             run_dir: cx.run_dir,
-            stem: cx.stem.clone(),
-            timeout: cx.timeout,
+            stem: format!("{}-{}", cx.stem, cx.attempt),
+            timeout: review_timeout(cx.timeout),
         })?;
         review_cost_usd = review.cost_usd;
-        if !review.verdict.pass {
-            let summary = if review.verdict.reasons.is_empty() {
-                "no reasons given".to_owned()
-            } else {
-                review.verdict.reasons.join("; ")
-            };
-            // required_changes is what the retry gets back verbatim (§11.4).
-            let feedback = if review.verdict.required_changes.is_empty() {
-                summary.clone()
-            } else {
-                review.verdict.required_changes.join("\n- ")
-            };
-            failure = Some(
-                AttemptFailure::new(
-                    FailureKind::ReviewFailed,
-                    format!("review failed: {}", util::tail(&summary, 400)),
-                )
-                .with_feedback(feedback),
-            );
-        }
+        failure = review_failure(review.result);
     }
 
     Ok(AttemptResult {
@@ -406,18 +421,86 @@ fn run_attempt(
     })
 }
 
+/// Turn a review result into an attempt failure, or `None` if it passed.
+fn review_failure(result: review::ReviewResult) -> Option<AttemptFailure> {
+    let verdict = match result {
+        // The judge could not run. That is an environment problem, not a
+        // rejection of the code: it keeps its own kind so the step-7 ladder
+        // defers on a rate limit instead of blaming the implementer.
+        review::ReviewResult::Unavailable { status, detail } => {
+            let kind = match status {
+                OutcomeStatus::RateLimited => FailureKind::RateLimited,
+                OutcomeStatus::Timeout => FailureKind::Timeout,
+                _ => FailureKind::ReviewUnavailable,
+            };
+            return Some(AttemptFailure::new(
+                kind,
+                format!("reviewer unavailable: {}", util::head(&detail, 400)),
+            ));
+        }
+        review::ReviewResult::Judged(verdict) => verdict,
+    };
+
+    // A pass carrying required changes contradicts itself, and the engine is
+    // about to commit on the strength of it — fail closed and say why rather
+    // than discard the blockers the reviewer took the trouble to write.
+    let contradictory = verdict.pass && !verdict.required_changes.is_empty();
+    if verdict.pass && !contradictory {
+        return None;
+    }
+    let summary = if contradictory {
+        format!(
+            "reviewer passed the change but still required: {}",
+            verdict.required_changes.join("; ")
+        )
+    } else if verdict.reasons.is_empty() {
+        "no reasons given".to_owned()
+    } else {
+        verdict.reasons.join("; ")
+    };
+    // required_changes is what the retry gets back verbatim (§11.4).
+    let feedback = if verdict.required_changes.is_empty() {
+        summary.clone()
+    } else {
+        verdict
+            .required_changes
+            .iter()
+            .map(|c| format!("- {c}"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+    Some(
+        AttemptFailure::new(
+            FailureKind::ReviewFailed,
+            // Head, not tail: the reviewer's first reason is its primary
+            // finding, and that is what has to reach the user.
+            format!("review failed: {}", util::head(&summary, 400)),
+        )
+        .with_feedback(feedback),
+    )
+}
+
 /// Artifacts this task should be judged against: its declared inputs, plus
 /// the conventions brief whenever one exists (§11.2 injects it into every
 /// downstream prompt).
 fn load_artifacts(run_dir: &std::path::Path, task: &Task) -> Vec<(String, String)> {
     let mut wanted: Vec<String> = vec![CONVENTIONS_BRIEF.to_owned()];
-    for id in &task.artifacts_in {
-        if id.as_str() != CONVENTIONS_BRIEF {
-            wanted.push(id.as_str().to_owned());
-        }
-    }
+    wanted.extend(task.artifacts_in.iter().map(|id| id.as_str().to_owned()));
+    // A task's own outputs are not evidence for judging it: the reviewer
+    // would be validating the change against a standard the same attempt just
+    // wrote. Declared inputs and the brief only.
+    let produced: Vec<&str> = task.artifacts_out.iter().map(|id| id.as_str()).collect();
+    let mut seen: Vec<String> = Vec::new();
     wanted
         .into_iter()
+        .filter(|id| !produced.contains(&id.as_str()))
+        .filter(|id| {
+            let fresh = !seen.contains(id);
+            if fresh {
+                seen.push(id.clone());
+            }
+            fresh
+        })
         .filter_map(|id| {
             let content = fs::read_to_string(artifact_path(run_dir, &id)).ok()?;
             (!content.trim().is_empty()).then_some((id, content))
@@ -468,6 +551,8 @@ fn attempt_task(
             },
             duration: Duration::ZERO,
             cost_usd: None,
+            review_model: None,
+            review_cost_usd: None,
             session_id: None,
         });
     };
@@ -488,12 +573,20 @@ fn attempt_task(
     // §11.2/§10: the reviewer is its own read-only binding, at the configured
     // review tier (frontier by default) rather than the implementer's rung —
     // a small model reviewing its own work is not verification.
-    let reviewer = cx.review_binding.as_ref().and_then(|(agent, model)| {
-        adapters.get(agent).map(|adapter| Reviewer {
-            adapter,
+    // A reviewer that cannot be built must never silently degrade the run to
+    // gates-only: verification vanishing without a word is worse than a
+    // refusal (§11.2, §19).
+    let reviewer = match cx.review_binding.as_ref() {
+        None => None,
+        Some((agent, model)) => Some(Reviewer {
+            adapter: adapters.get(agent).ok_or_else(|| TactusError::Agent {
+                message: format!(
+                    "review tier binds to agent `{agent}`, which has no adapter in this build"
+                ),
+            })?,
             profile: review::profile_for(agent, model, &format!("review-{model}")),
-        })
-    });
+        }),
+    };
 
     let attempt_cx = AttemptCx {
         task,
@@ -542,10 +635,9 @@ fn attempt_task(
         model: profile.model,
         status,
         duration: attempt.outcome.duration,
-        cost_usd: match (attempt.outcome.cost_usd, attempt.review_cost_usd) {
-            (None, None) => None,
-            (worker, review) => Some(worker.unwrap_or(0.0) + review.unwrap_or(0.0)),
-        },
+        cost_usd: attempt.outcome.cost_usd,
+        review_model: attempt_cx.reviewer.map(|r| r.profile.model),
+        review_cost_usd: attempt.review_cost_usd,
         session_id: attempt.outcome.session_id,
     })
 }
@@ -671,6 +763,9 @@ fn materialize_prompt(task: &Task, gate_cmds: &[String], run_dir: &std::path::Pa
 /// else frontier (§17's default), honouring a pin for that tier and otherwise
 /// taking the catalog's example binding — the same rules the router uses.
 fn review_binding(cfg: &crate::config::Config) -> Option<(String, String)> {
+    if !cfg.review_enabled {
+        return None;
+    }
     let tier = cfg.review_tier.unwrap_or(crate::ir::Tier::Frontier);
     if let Some(pin) = cfg.pins.iter().find(|p| p.tier == tier) {
         return Some((pin.agent.clone(), pin.model.clone()));
@@ -747,9 +842,14 @@ impl RunReport {
         for task in &self.tasks {
             match &task.status {
                 TaskRunStatus::Committed { sha } => {
+                    let review = match (&task.review_model, task.review_cost_usd) {
+                        (Some(model), Some(cost)) => format!(" + review {model} ${cost:.4}"),
+                        (Some(model), None) => format!(" + review {model}"),
+                        _ => String::new(),
+                    };
                     let _ = writeln!(
                         out,
-                        "  {}: committed {sha} — {} ({:.1}s, {}, ${:.4})",
+                        "  {}: committed {sha} — {} ({:.1}s, {} ${:.4}{review})",
                         task.id,
                         task.title,
                         task.duration.as_secs_f64(),
@@ -1311,9 +1411,9 @@ mod tests {
             .join("runs")
             .join(&report.run_id)
             .join("reviews");
-        assert!(reviews.join("00-t1-review.json").is_file());
+        assert!(reviews.join("00-t1-1-review.json").is_file());
         assert!(
-            reviews.join("00-t1-review-reask.json").is_file(),
+            reviews.join("00-t1-1-review-reask.json").is_file(),
             "one re-ask before giving up (§11.2)"
         );
     }
@@ -1339,7 +1439,7 @@ mod tests {
                 .collect()
         };
 
-        let reviewer = allow_list("00-t1-review.json");
+        let reviewer = allow_list("00-t1-1-review.json");
         assert_eq!(reviewer, ["Read", "Glob", "Grep"], "read-only, no shell");
 
         let implementer = allow_list("00-t1-1.json");
@@ -1347,6 +1447,119 @@ mod tests {
             implementer.contains(&"Edit".to_owned()),
             "implementer can edit"
         );
+    }
+
+    #[test]
+    fn a_contradictory_pass_fails_closed() {
+        let failure = review_failure(review::ReviewResult::Judged(crate::ir::Verdict {
+            pass: true,
+            reasons: vec!["looks fine".to_owned()],
+            required_changes: vec!["parameterize the SQL".to_owned()],
+        }))
+        .expect("a pass that still demands changes cannot commit");
+        assert_eq!(failure.kind, FailureKind::ReviewFailed);
+        assert!(
+            failure.reason.contains("parameterize the SQL"),
+            "{}",
+            failure.reason
+        );
+
+        // A clean pass still passes.
+        assert!(
+            review_failure(review::ReviewResult::Judged(crate::ir::Verdict {
+                pass: true,
+                reasons: vec!["meets the criteria".to_owned()],
+                required_changes: Vec::new(),
+            }))
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn an_unavailable_reviewer_is_not_a_rejection() {
+        // A rate-limited or hung judge must not read as "your code is wrong",
+        // or step 7 retries the implementer for an outage.
+        let failure = review_failure(review::ReviewResult::Unavailable {
+            status: OutcomeStatus::RateLimited,
+            detail: "5-hour limit reached".to_owned(),
+        })
+        .expect("still fails the attempt");
+        assert_eq!(failure.kind, FailureKind::RateLimited);
+        assert!(failure.reason.contains("reviewer unavailable"));
+
+        let failure = review_failure(review::ReviewResult::Unavailable {
+            status: OutcomeStatus::Timeout,
+            detail: String::new(),
+        })
+        .expect("still fails");
+        assert_eq!(failure.kind, FailureKind::Timeout);
+
+        let failure = review_failure(review::ReviewResult::Unavailable {
+            status: OutcomeStatus::AgentError,
+            detail: "spawn failed".to_owned(),
+        })
+        .expect("still fails");
+        assert_eq!(failure.kind, FailureKind::ReviewUnavailable);
+    }
+
+    #[test]
+    fn required_changes_reach_the_retry_as_a_clean_list() {
+        let failure = review_failure(review::ReviewResult::Judged(crate::ir::Verdict {
+            pass: false,
+            reasons: vec!["incomplete".to_owned()],
+            required_changes: vec![
+                "handle the empty-input case".to_owned(),
+                "add a round-trip test".to_owned(),
+            ],
+        }))
+        .expect("fails");
+        assert_eq!(
+            failure.feedback.as_deref(),
+            Some("- handle the empty-input case\n- add a round-trip test"),
+            "every item bulleted, including the first"
+        );
+    }
+
+    #[test]
+    fn review_can_be_switched_off_explicitly() {
+        let repo = temp_engine_repo("noreview");
+        fs::write(
+            repo.join("tactus.toml"),
+            "[routing]\nreview = { enabled = false }\n",
+        )
+        .expect("config");
+        git_in(&repo, &["add", "-A"]);
+        git_in(&repo, &["commit", "-q", "-m", "config"]);
+
+        let mut opts = options(&repo);
+        opts.config_path = Some(repo.join("tactus.toml"));
+        // A reviewer that would REJECT everything: if review still ran, the
+        // run would halt.
+        let source = FakeSource {
+            adapter: FakeAdapter {
+                effect: Effect::EditFile,
+                review: ReviewBehavior::Fail,
+            },
+        };
+        let report = run_with(&opts, &source).expect("run");
+        assert!(report.halted_at.is_none(), "review opted out: {report:?}");
+        assert!(report.tasks[0].review_model.is_none());
+        assert!(report.tasks[0].review_cost_usd.is_none());
+    }
+
+    #[test]
+    fn reviewer_spend_is_attributed_separately() {
+        let repo = temp_engine_repo("reviewcost");
+        let source = fake(Effect::EditFile);
+        let report = run_with(&options(&repo), &source).expect("run");
+        let task = &report.tasks[0];
+        assert_eq!(task.cost_usd, Some(0.01), "implementer's own spend");
+        assert_eq!(task.review_cost_usd, Some(0.05), "reviewer's, kept apart");
+        assert_eq!(task.review_model.as_deref(), Some("claude-opus-5"));
+        assert!((task.total_cost_usd().unwrap() - 0.06).abs() < 1e-9);
+        // The render must not bill review to the implementer's model.
+        let rendered = report.render();
+        assert!(rendered.contains("+ review claude-opus-5"), "{rendered}");
     }
 
     #[test]

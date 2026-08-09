@@ -79,6 +79,10 @@ struct RawKindRouting {
     chain: Option<Vec<Tier>>,
     tier: Option<Tier>,
     attempts_per: Option<u32>,
+    /// `[routing] review = { enabled = false }` — the explicit opt-out of
+    /// §11.2 review, for plans where a frontier judgement per task costs more
+    /// than the work it is judging.
+    enabled: Option<bool>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -137,9 +141,11 @@ pub struct Config {
     /// configured; `None` means derive from the repo.
     pub gates: Option<Vec<GateConfig>>,
     pub shell: ShellKind,
-    /// `[routing] review = { tier = … }` — parsed and echoed; the reviewer
-    /// that consumes it arrives in step 6.
+    /// `[routing] review = { tier = … }` (§11.2). `None` means the frontier
+    /// default.
     pub review_tier: Option<Tier>,
+    /// `[routing] review = { enabled = false }` opts out of review entirely.
+    pub review_enabled: bool,
 }
 
 impl Config {
@@ -199,6 +205,7 @@ pub fn load(
         .collect();
     let mut overrides = Vec::new();
     let mut review_tier: Option<Tier> = None;
+    let mut review_enabled = true;
     let mut strategy = Strategy {
         mode: "conserve".to_owned(),
         spend_down_after: None,
@@ -215,8 +222,12 @@ pub fn load(
                 if key == "review" {
                     let rr: RawKindRouting = value.try_into().map_err(|e| TactusError::Config {
                         path: repo_path.clone(),
-                        message: format!("routing entry `review`: {e}"),
+                        message: format!(
+                            "routing entry `review`: {e} (expected `tier`, or \
+                             `enabled = false` to run without review)"
+                        ),
                     })?;
+                    review_enabled = rr.enabled.unwrap_or(true);
                     review_tier = rr
                         .tier
                         .or_else(|| rr.chain.and_then(|c| c.first().copied()));
@@ -336,6 +347,7 @@ pub fn load(
         gates,
         shell,
         review_tier,
+        review_enabled,
     })
 }
 

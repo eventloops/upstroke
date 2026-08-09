@@ -273,6 +273,10 @@ fn parse_output(out: &ProcessOutput) -> Outcome {
     let failed = out.code != Some(0) || payload.is_none() || is_error;
     if !failed {
         outcome.status = OutcomeStatus::Completed;
+        // The agent's final message, not just error text: the reviewer's
+        // verdict travels in exactly this field on the SUCCESS path, so
+        // leaving it None here makes every review unparseable.
+        outcome.detail = result_text;
         return outcome;
     }
 
@@ -563,6 +567,12 @@ mod tests {
         assert_eq!(usage.cache_read_input_tokens, Some(9000));
         assert_eq!(usage.num_turns, Some(6));
         assert!(outcome.diff.is_empty(), "diff is engine-owned");
+        assert_eq!(
+            outcome.detail.as_deref(),
+            Some("done"),
+            "the final message must survive on the success path — the reviewer's \
+             verdict travels in it"
+        );
     }
 
     #[test]

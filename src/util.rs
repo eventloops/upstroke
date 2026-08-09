@@ -22,6 +22,22 @@ pub fn tail(text: &str, max: usize) -> String {
     format!("…{}", &trimmed[start..])
 }
 
+/// First `max` bytes of trimmed text, cut on a char boundary, with an
+/// ellipsis marker when truncated. For ordered lists whose first entry is the
+/// most important — a reviewer's reasons, say — where [`tail`] would drop
+/// exactly the part that mattered.
+pub fn head(text: &str, max: usize) -> String {
+    let trimmed = text.trim();
+    if trimmed.len() <= max {
+        return trimmed.to_owned();
+    }
+    let end = (0..=max)
+        .rev()
+        .find(|i| trimmed.is_char_boundary(*i))
+        .unwrap_or(0);
+    format!("{}…", &trimmed[..end])
+}
+
 /// Make an arbitrary string (task id, gate name — both user-authored) safe to
 /// use as a single file-name component: no separators, no Windows-reserved
 /// characters, no dot-only names, bounded length. Not injective — callers
