@@ -319,7 +319,7 @@ impl fmt::Display for QuestionKind {
 
 /// §7 `Question`. `affected_tasks` is load-bearing, not descriptive: exactly
 /// those tasks park, and everything else keeps running (invariant 6).
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Question {
     pub id: QuestionId,
     pub kind: QuestionKind,

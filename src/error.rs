@@ -53,6 +53,23 @@ pub enum TactusError {
     #[error("gate error: {message}")]
     Gate { message: String },
 
+    #[error("event log {}: {message}", .path.display())]
+    EventLog { path: PathBuf, message: String },
+
+    /// A resume precondition failed (§15). Always carries what to do about it:
+    /// refusing to continue is only useful if the operator can tell whether
+    /// the run, the plan, or the branch is the thing that moved.
+    #[error("cannot resume run `{run_id}`: {message}")]
+    Resume { run_id: String, message: String },
+
+    /// A request we could not act on — an id that matches nothing or too many
+    /// things, a question already answered, an option that does not exist.
+    /// Carries its own whole sentence, because prefixing these with a
+    /// command's name (`cannot resume …` on a `status` lookup) misdescribes
+    /// what the operator was actually doing.
+    #[error("{message}")]
+    Refused { message: String },
+
     #[error("{0}")]
     Validation(ValidationErrors),
 }

@@ -282,7 +282,7 @@ An **attempt** = agent run → gates → review. The ladder:
 - **Raised eagerly** — at detection, not at attempt: the designer resolves most at design time; at runtime a worker can flag uncertainty in its outcome and the reviewer can emit a `needs-human` verdict, both of which raise the question immediately while unrelated work proceeds.
 - **Pre-filtered by the architect**: question + decisions record → frontier profile → "already answered?" Only novel questions reach a human, and every one that does is logged as a `design_defect`.
 - **Hard block has a precise definition**: the runnable frontier is empty and every remaining task transitively depends on an open question. Anything less keeps running.
-- **Channels**: `tactus answer <id>` and attached-terminal prompts in v0.1, desktop notifications in v0.1, Telegram/Slack notifier plugins in v0.2 (delivery only — answers always arrive as events, so a run survives its notifier).
+- **Channels**: `tactus answer <id>` and attached-terminal prompts in v0.1, desktop notifications in v0.1, Telegram/Slack notifier plugins in v0.2 (delivery only — answers always arrive as events, so a run survives its notifier). `tactus answer` writes a file beside the question rather than appending to the log, keeping `events.jsonl` single-writer; the engine ingests it and records the `question_answered` event itself, on its next scheduler turn if it is live or at the next resume if it is not. Which channel a hard block uses is not a mode question alone: `on_block` at an attached terminal prompts, and the identical config detached waits for `tactus answer` up to `[interaction] wait_on_block_secs`.
 - **Spend approvals**: `ask_before` thresholds (e.g. frontier escalation projected over $N, or any run past its soft budget) raise `ApproveSpend` questions instead of silently spending.
 - **CI mode** (`interaction = "never"`): questions degrade to parked-task reporting; exit status distinguishes clean completion from completion-with-parked-tasks.
 
@@ -325,18 +325,32 @@ The ledger accounts every attempt in both currencies: API-equivalent dollars (ho
 
 ## 15. Event log, resume, run layout (P6)
 
+The run directory is **split in two**, by who is allowed to read each half:
+
 ```
-.tactus/
-  runs/<run-id>/                  # run-id = ULID
-    plan.normalized.json
+<repo>/.tactus/runs/<run-id>/     # run-id = ULID — the ops surface
     events.jsonl                  # append-only source of truth
+    plan.normalized.json          # the frozen plan this run executes
     artifacts/                    # conventions-brief.md, decisions-record.md, contracts
-    transcripts/<task>-<attempt>.json
     questions/<question-id>.json  # rendered question payloads for notifiers
+    answers/<question-id>.json    # answers dropped by `tactus answer`
+    run.lock                      # advisory; OS-released, so a crash leaves nothing stale
+    report.json                   # projection of the log for humans; never read back
+~/.tactus/runs/<run-id>/          # agent-authored — outside every agent's reach
+    transcripts/<task>-<attempt>.json
+    reviews/<task>-<attempt>-review.json
+    settings/<task>-<attempt>.json    # the per-attempt permission surface
+    gates/<task>-<attempt>-<gate>.log
 tactus.toml                       # repo-root config, checked in
 ```
 
-Every transition is an event `{ts, event, task?, attempt?, rung?, profile?, data}` — including `question_raised`, `question_answered`, `design_defect`, `capacity_snapshot`, `pool_exhausted`, and `spend_down_engaged`. `status`, the ledger, and the capacity view are pure folds over this file. `tactus resume <run-id>` replays, verifies the run branch HEAD matches the last committed event (mismatch = refuse with an explanation), re-probes agents, re-snapshots capacity, and continues — parked questions intact.
+The split is enforcement, not tidiness. A reviewer is a read-only agent pointed at the workspace, so *anything in the workspace is reachable* — including the implementer's transcript, which invariant 3 says is exactly not the evidence a reviewer should judge on. Deny rules cannot close that on their own: gates execute repository code the implementer just wrote, and that code reads any workspace path no permission rule ever sees. So the agent-authored half lives where there is no path to it, and the deny rules on `.tactus/**` become defence in depth rather than the mechanism. Writes there are denied outright — with the log load-bearing, an agent that could append to it could forge a `task_committed`.
+
+Every transition is an event `{ts, event, task?, attempt?, rung?, profile?, data}` — including `question_raised`, `question_answered`, `design_defect`, `capacity_snapshot`, `pool_exhausted`, and `spend_down_engaged`. `status`, the ledger, and the capacity view are pure folds over this file.
+
+**One fold, not two.** The engine never mutates run state directly: it appends an event and folds it back in through the same function `resume` and `status` use to rebuild state from the file, and it applies the event *as it will be read back* rather than as constructed. A live run and a replay of its own log are therefore the same computation, not two that agree by inspection. Two things deliberately do not survive replay — a session id and its `resume_next` flag, because both describe a conversation that believed it had left edits in a working tree that a crash has since rolled back (§14 pairs session-resume with tree retention precisely so the two never diverge).
+
+`tactus resume <run-id>` replays, verifies the run branch HEAD matches the last committed event (mismatch = refuse with an explanation), re-probes agents, re-snapshots capacity, and continues — parked questions intact. It also refuses when the frozen plan's hash moved, when routing resolved differently (a recorded rung is an index into a chain, so a changed chain silently means a different tier), when the branch is gone, and when another process holds the run. An attempt the log ends mid-flight is settled as `attempt_interrupted`: recorded in the ledger with unknown spend, but not counted against the rung's allowance, because nothing judged the code — the same rule §19 applies to an outage.
 
 ## 16. Agent adapters (P2)
 

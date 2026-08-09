@@ -6,7 +6,6 @@
 //! and falls back to derived defaults silently.
 
 use std::collections::BTreeMap;
-use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -19,6 +18,7 @@ use crate::error::TactusError;
 use crate::gates::ShellKind;
 use crate::interaction::InteractionMode;
 use crate::ir::{TaskKind, Tier};
+use crate::util;
 
 #[derive(Debug, Default, Deserialize)]
 struct RawRepoConfig {
@@ -51,6 +51,9 @@ struct RawEngine {
 struct RawInteraction {
     mode: Option<String>,
     notify: Option<Vec<String>>,
+    /// Seconds a detached interactive run waits at a hard block for an answer
+    /// to arrive as an event; `0` disables waiting.
+    wait_on_block_secs: Option<u64>,
     /// `ask_before = { frontier_escalation_over_usd = 5.0 }` (§12). Accepted
     /// and echoed so a config written to spec does not error, but nothing
     /// raises `ApproveSpend` until the ledger exists (step 8/10).
@@ -187,7 +190,26 @@ pub struct Config {
     pub interaction_mode: InteractionMode,
     /// `[interaction] notify` (§12); default `["cli"]`.
     pub notify: Vec<String>,
+    /// `[interaction] wait_on_block_secs` (§12/§19). How long a detached but
+    /// interactive run waits at a hard block for an answer to arrive as an
+    /// event before ending parked. `ZERO` disables the wait, which is what a
+    /// terminal-attached run and CI both want.
+    pub wait_on_block: Duration,
 }
+
+/// Everything `[interaction]` contributes, kept together so adding a knob does
+/// not widen a tuple every caller has to re-destructure.
+struct InteractionSettings {
+    mode: InteractionMode,
+    notify: Vec<String>,
+    wait_on_block: Duration,
+}
+
+/// §12's default hard-block wait for a detached interactive run: long enough
+/// that an operator answering from a phone finds the run still going, short
+/// enough that a forgotten run gives its workspace and branch back the same
+/// day.
+pub const DEFAULT_WAIT_ON_BLOCK: Duration = Duration::from_secs(30 * 60);
 
 impl Config {
     pub fn chain_for(&self, kind: TaskKind) -> KindChain {
@@ -376,7 +398,7 @@ pub fn load(
 
     let gates = parse_gates(raw.gates, &repo_path)?;
     let (shell, on_task_failure) = parse_engine(raw.engine, &repo_path, warnings)?;
-    let (interaction_mode, notify) = parse_interaction(raw.interaction, &repo_path, warnings)?;
+    let interaction = parse_interaction(raw.interaction, &repo_path, warnings)?;
 
     let pool_names = read_pools(pools_file)?;
 
@@ -391,8 +413,9 @@ pub fn load(
         review_tier,
         review_enabled,
         on_task_failure,
-        interaction_mode,
-        notify,
+        interaction_mode: interaction.mode,
+        notify: interaction.notify,
+        wait_on_block: interaction.wait_on_block,
     })
 }
 
@@ -494,15 +517,20 @@ fn parse_interaction(
     raw: Option<toml::Value>,
     repo_path: &Path,
     warnings: &mut Vec<String>,
-) -> Result<(InteractionMode, Vec<String>), TactusError> {
+) -> Result<InteractionSettings, TactusError> {
     let default_notify = || vec!["cli".to_owned()];
     let Some(value) = raw else {
-        return Ok((InteractionMode::default(), default_notify()));
+        return Ok(InteractionSettings {
+            mode: InteractionMode::default(),
+            notify: default_notify(),
+            wait_on_block: DEFAULT_WAIT_ON_BLOCK,
+        });
     };
     let interaction: RawInteraction = value.try_into().map_err(|e| TactusError::Config {
         path: repo_path.to_path_buf(),
         message: format!(
-            "[interaction]: {e} (expected optional `mode`, `notify` list, and `ask_before` table)"
+            "[interaction]: {e} (expected optional `mode`, `notify` list, \
+             `wait_on_block_secs`, and `ask_before` table)"
         ),
     })?;
     if interaction.ask_before.is_some() {
@@ -524,7 +552,13 @@ fn parse_interaction(
             })?
         }
     };
-    Ok((mode, interaction.notify.unwrap_or_else(default_notify)))
+    Ok(InteractionSettings {
+        mode,
+        notify: interaction.notify.unwrap_or_else(default_notify),
+        wait_on_block: interaction
+            .wait_on_block_secs
+            .map_or(DEFAULT_WAIT_ON_BLOCK, Duration::from_secs),
+    })
 }
 
 fn read_repo_config(
@@ -578,13 +612,13 @@ fn read_pools(pools_file: Option<&Path>) -> Result<Vec<String>, TactusError> {
 }
 
 fn discovered_pools_path() -> Option<PathBuf> {
-    let home = env::var_os("HOME").or_else(|| env::var_os("USERPROFILE"))?;
-    Some(PathBuf::from(home).join(".tactus").join("pools.toml"))
+    Some(util::user_tactus_dir()?.join("pools.toml"))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::env;
 
     fn scratch(name: &str, content: &str) -> PathBuf {
         let dir = env::temp_dir().join(format!("tactus-config-tests-{}", std::process::id()));
@@ -866,7 +900,22 @@ timeout_secs = 1200
         assert_eq!(cfg.interaction_mode, InteractionMode::OnBlock);
         assert_eq!(cfg.notify, ["cli"]);
         assert_eq!(cfg.on_task_failure, OnTaskFailure::Halt, "§17's default");
+        assert_eq!(cfg.wait_on_block, DEFAULT_WAIT_ON_BLOCK);
         assert!(warnings.is_empty(), "warnings: {warnings:?}");
+    }
+
+    #[test]
+    fn wait_on_block_is_configurable_and_zero_means_do_not_wait() {
+        let path = scratch("wait.toml", "[interaction]\nwait_on_block_secs = 90\n");
+        let mut warnings = Vec::new();
+        let cfg = load(Some(&path), &hermetic(), Some(&missing()), &mut warnings).expect("load");
+        assert_eq!(cfg.wait_on_block, Duration::from_secs(90));
+
+        // Zero is a real setting, not "unset" — it is how an operator says a
+        // detached run should end parked rather than hold the workspace.
+        let path = scratch("nowait.toml", "[interaction]\nwait_on_block_secs = 0\n");
+        let cfg = load(Some(&path), &hermetic(), Some(&missing()), &mut warnings).expect("load");
+        assert_eq!(cfg.wait_on_block, Duration::ZERO);
     }
 
     #[test]
@@ -880,6 +929,7 @@ on_task_failure = "continue"
 [interaction]
 mode = "never"
 notify = ["cli", "desktop"]
+wait_on_block_secs = 120
 ask_before = { frontier_escalation_over_usd = 5.0 }
 "#,
         );
@@ -887,6 +937,7 @@ ask_before = { frontier_escalation_over_usd = 5.0 }
         let cfg = load(Some(&path), &hermetic(), Some(&missing()), &mut warnings).expect("load");
         assert_eq!(cfg.interaction_mode, InteractionMode::Never);
         assert_eq!(cfg.notify, ["cli", "desktop"]);
+        assert_eq!(cfg.wait_on_block, Duration::from_secs(120));
         assert_eq!(cfg.on_task_failure, OnTaskFailure::Continue);
         // Accepted per §17's own example, but honestly reported as inert.
         assert!(

@@ -41,6 +41,13 @@ pub enum FailureKind {
     /// A human was asked to unblock the task and said no. Never produced by
     /// [`next_step`] — it is how a question resolves, not how an attempt fails.
     Declined,
+    /// The engine died between an attempt starting and finishing, so nothing
+    /// judged the code. Never produced by [`next_step`] either — replay
+    /// synthesizes it for a dangling `attempt_started` and hands the task back
+    /// to the scheduler still on the same rung. It appears in the ledger with
+    /// unknown spend, because an attempt that really ran and really drained a
+    /// pool must not vanish from the record just because we cannot price it.
+    Interrupted,
 }
 
 /// Who the failure happened to. `Timeout` and `RateLimited` mean opposite

@@ -15,13 +15,18 @@
 //! waiting on an answer. That is the moment — and the only moment — a human is
 //! asked.
 //!
-//! The event log and resume arrive in step 8; until then `report.json` and
-//! `questions/<id>.json` are the durable record.
+//! Every transition here is an event (invariant 4). The engine never mutates
+//! run state directly: it appends to `events.jsonl` and folds the event back in
+//! through [`RunState::apply`], the same function `resume` and `status` use to
+//! rebuild state from the file. A live run and a replay of its own log
+//! therefore cannot disagree — there is no second path for them to disagree
+//! along. `report.json` is written from that state as a projection for humans;
+//! nothing ever reads it back.
 
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
@@ -29,21 +34,26 @@ use serde::{Deserialize, Serialize};
 use crate::agent::{self, AgentAdapter, Caps, TaskRun, proc};
 use crate::config::OnTaskFailure;
 use crate::error::TactusError;
+use crate::events::{
+    self, ChainSummary, EventBody, EventLog, Feedback, Progress, RunState, TaskState,
+};
 use crate::gates::{self, ShellGate};
 use crate::interaction::{
     self, AnswerSource, InteractionMode, Notifier, QuestionRecord, RealSleeper, Sleeper,
 };
 use crate::ir::{
     Answer, Outcome, OutcomeStatus, PermissionMode, Plan, Question, QuestionId, QuestionKind, Task,
-    TaskId, TaskKind, WorkerProfile,
+    TaskKind, WorkerProfile,
 };
 use crate::ladder::{self, LadderPolicy, LadderState, Next};
 use crate::review;
+use crate::rundir::{self, RunLock, RunPaths};
 use crate::ulid;
 use crate::util;
 use crate::validate::{self, Analysis, ValidateOptions};
 use crate::workspace::Workspace;
 
+pub use crate::events::{AttemptRecord, FailureRecord};
 pub use crate::ladder::{AttemptFailure, FailureKind, FailureOrigin};
 
 /// §14: per-attempt wall clock, default 30 minutes.
@@ -98,6 +108,13 @@ pub struct RunOptions {
     /// round of nothing-but-deferred-work.
     pub defer_backoff: Duration,
     pub max_defers: u32,
+    /// Where the agent-authored half of the run directory goes (§15 split).
+    /// `None` takes `~/.tactus`; tests point it at a scratch directory so they
+    /// never touch the real one.
+    pub private_root: Option<PathBuf>,
+    /// Override `[interaction] wait_on_block_secs` — how long a detached
+    /// interactive run waits at a hard block. `None` takes the config's.
+    pub wait_on_block: Option<Duration>,
 }
 
 impl RunOptions {
@@ -112,6 +129,15 @@ impl RunOptions {
             interaction: None,
             defer_backoff: interaction::DEFAULT_DEFER_BACKOFF,
             max_defers: DEFAULT_MAX_DEFERS,
+            private_root: None,
+            wait_on_block: None,
+        }
+    }
+
+    fn paths(&self, run_id: &str) -> RunPaths {
+        match &self.private_root {
+            Some(root) => RunPaths::with_private_root(&self.repo_root, run_id, root),
+            None => RunPaths::new(&self.repo_root, run_id),
         }
     }
 }
@@ -158,32 +184,6 @@ pub enum TaskRunStatus {
     },
     /// Not attempted because the run halted earlier.
     Skipped,
-}
-
-/// One attempt's ledger line: which rung it ran on, what it cost, and what
-/// went wrong. This is the §21 definition-of-done (e) record, and the shape
-/// step 8 folds into events.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct AttemptRecord {
-    pub attempt: u32,
-    pub tier: String,
-    pub model: String,
-    /// Whether this attempt resumed the previous one's session (§11.4).
-    pub resumed: bool,
-    pub duration: Duration,
-    pub cost_usd: Option<f64>,
-    pub review_model: Option<String>,
-    pub review_cost_usd: Option<f64>,
-    pub session_id: Option<String>,
-    /// `None` when the attempt passed.
-    pub failure: Option<FailureRecord>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct FailureRecord {
-    pub kind: FailureKind,
-    pub origin: FailureOrigin,
-    pub reason: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -296,24 +296,29 @@ pub fn run_with(opts: &RunOptions, adapters: &dyn AdapterSource) -> Result<RunRe
     run_harness(opts, &Harness::new(adapters))
 }
 
-pub fn run_harness(opts: &RunOptions, harness: &Harness<'_>) -> Result<RunReport, TactusError> {
-    // Pre-flight (§14): plan parses cycle-free, config loads, chains resolve.
+/// Everything `run` and `resume` both establish before an agent is spawned.
+///
+/// Shared so the two cannot drift: §15 requires a resume to re-probe agents
+/// and re-check gates, and the surest way to guarantee it performs the same
+/// checks as a fresh run is for there to be one function that performs them.
+struct Preflight {
+    analysis: Analysis,
+    caps: BTreeMap<String, Caps>,
+    review_binding: Option<(String, String)>,
+    gate_cmds: Vec<String>,
+    warnings: Vec<String>,
+    mode: InteractionMode,
+    notifiers: Vec<&'static dyn Notifier>,
+}
+
+fn preflight(opts: &RunOptions, harness: &Harness<'_>) -> Result<Preflight, TactusError> {
+    // §14: plan parses cycle-free, config loads, chains resolve.
     let analysis = validate::analyze(&ValidateOptions {
         plan_path: opts.plan_path.clone(),
         config_path: opts.config_path.clone(),
         config_root: opts.repo_root.clone(),
         pools_path: opts.pools_path.clone(),
     })?;
-
-    let workspace = Workspace::open(&opts.repo_root)?;
-    workspace.ensure_run_exclusions()?;
-    if !workspace.is_clean()? {
-        return Err(TactusError::Git {
-            message: "working tree is not clean; commit or stash first (the engine refuses \
-                      dirty trees)"
-                .to_owned(),
-        });
-    }
 
     // Probe every agent the chains reference; a missing binary is a refusal
     // to start, not a task failure (§19). The capabilities are kept, not
@@ -351,125 +356,458 @@ pub fn run_harness(opts: &RunOptions, harness: &Harness<'_>) -> Result<RunReport
     let mode = opts.interaction.unwrap_or(analysis.config.interaction_mode);
     let notifiers = interaction::notifiers_for(&analysis.config.notify, &mut warnings);
 
+    Ok(Preflight {
+        analysis,
+        caps,
+        review_binding,
+        gate_cmds,
+        warnings,
+        mode,
+        notifiers,
+    })
+}
+
+pub fn run_harness(opts: &RunOptions, harness: &Harness<'_>) -> Result<RunReport, TactusError> {
+    run_harness_inner(opts, harness).map(|(report, _)| report)
+}
+
+/// Also hands back the state the run ended with — its own fold of its own log.
+///
+/// Only tests use the second half, to hold the live fold and a replay of the
+/// same file side by side. Nothing in the engine reads state back.
+fn run_harness_inner(
+    opts: &RunOptions,
+    harness: &Harness<'_>,
+) -> Result<(RunReport, RunState), TactusError> {
+    let Preflight {
+        analysis,
+        caps,
+        review_binding,
+        gate_cmds,
+        mut warnings,
+        mode,
+        notifiers,
+    } = preflight(opts, harness)?;
+
+    let workspace = Workspace::open(&opts.repo_root)?;
+    workspace.ensure_run_exclusions()?;
+    if !workspace.is_clean()? {
+        return Err(TactusError::Git {
+            message: "working tree is not clean; commit or stash first (the engine refuses \
+                      dirty trees)"
+                .to_owned(),
+        });
+    }
+    let base_sha = workspace.head_sha_full()?;
+    let wait_on_block = opts.wait_on_block;
+
     let run_id = ulid::ulid();
     let branch = format!("tactus/run-{run_id}");
-    let run_dir = opts.repo_root.join(".tactus").join("runs").join(&run_id);
-    for dir in [
-        "transcripts",
-        "settings",
-        "gates",
-        "artifacts",
-        "reviews",
-        "questions",
-    ] {
-        let dir = run_dir.join(dir);
-        fs::create_dir_all(&dir).map_err(|source| TactusError::Io {
-            path: dir.clone(),
-            source,
-        })?;
-    }
-    util::write_json(&run_dir.join("plan.normalized.json"), &analysis.plan)?;
+    let paths = opts.paths(&run_id);
+    paths.create()?;
+    // Held for the whole run, released by the OS if this process dies — so a
+    // crash leaves nothing for `resume` to clear by hand.
+    let _lock = RunLock::acquire(&paths)?;
+    util::write_json(&paths.plan_json(), &analysis.plan)?;
 
     workspace.create_branch(&branch)?;
 
-    let task_count = analysis.plan.tasks.len();
+    let started = events::RunStarted {
+        schema: events::SCHEMA_VERSION,
+        tactus_version: env!("CARGO_PKG_VERSION").to_owned(),
+        run_id: run_id.clone(),
+        branch: branch.clone(),
+        base_sha,
+        plan_path: repo_relative(&opts.repo_root, &opts.plan_path),
+        config_path: opts
+            .config_path
+            .as_ref()
+            .map(|path| repo_relative(&opts.repo_root, path)),
+        plan_hash: analysis.plan.source.hash.clone(),
+        private_dir: paths.private.to_string_lossy().into_owned(),
+        gates: analysis.gates.iter().map(|g| g.name.clone()).collect(),
+        gates_from_config: analysis.gates_from_config,
+        interaction_mode: mode.to_string(),
+        chains: chain_summaries(&analysis),
+    };
+
+    let sleeper = harness.sleeper.unwrap_or(&RealSleeper);
+    let default_answers = interaction::answers_for(
+        mode,
+        paths.answers(),
+        wait_on_block.unwrap_or(analysis.config.wait_on_block),
+        sleeper,
+    );
+    let log = EventLog::open(&paths.events(), &mut warnings)?;
     let mut run = Run {
+        state: RunState::new(
+            analysis
+                .plan
+                .tasks
+                .iter()
+                .map(|task| task.id.to_string())
+                .collect(),
+        ),
         analysis: &analysis,
         workspace: &workspace,
-        run_dir,
+        paths,
+        log,
         gate_cmds,
         adapters: harness.adapters,
-        answers: harness
-            .answers
-            .unwrap_or_else(|| interaction::answers_for(mode)),
+        answers: harness.answers.unwrap_or(default_answers.as_ref()),
         notifiers,
-        sleeper: harness.sleeper.unwrap_or(&RealSleeper),
+        sleeper,
         caps,
         review_binding,
         attempt_timeout: opts.attempt_timeout,
         defer_backoff: opts.defer_backoff,
         max_defers: opts.max_defers,
         on_task_failure: analysis.config.on_task_failure,
-        report_path: PathBuf::new(),
         run_id,
         branch,
         warnings,
-        states: vec![TaskState::Pending; task_count],
-        progress: (0..task_count).map(|_| Progress::default()).collect(),
-        questions: Vec::new(),
         unanswerable: Vec::new(),
-        order: Vec::new(),
-        halted_at: None,
     };
-    run.report_path = run.run_dir.join("report.json");
+    run.emit(EventBody::RunStarted {
+        data: Box::new(started),
+    })?;
+    let report = run.drain_and_report()?;
+    Ok((report, run.state.clone()))
+}
 
-    // Persist what completed before an aborting error: a mid-run failure must
-    // not take the record of already-committed work and spend with it.
-    // (Replaced by the event log in step 8.)
-    if let Err(error) = run.drain() {
-        let partial = run.finish();
-        let _ = util::write_json(&run.report_path, &partial);
-        return Err(error);
+/// A path as the run record should carry it: relative to the repo root where
+/// possible, so the record survives the repository being moved or cloned
+/// somewhere else before a resume.
+fn repo_relative(repo_root: &std::path::Path, path: &std::path::Path) -> String {
+    path.strip_prefix(repo_root)
+        .unwrap_or(path)
+        .to_string_lossy()
+        .into_owned()
+}
+
+/// The resolved chain per task, as it stood at this moment.
+fn chain_summaries(analysis: &Analysis) -> Vec<ChainSummary> {
+    analysis
+        .plan
+        .tasks
+        .iter()
+        .zip(&analysis.chains)
+        .map(|(task, chain)| ChainSummary {
+            task: task.id.to_string(),
+            tiers: chain.rungs.iter().map(|rung| rung.tier).collect(),
+            attempts_per: chain.attempts_per,
+        })
+        .collect()
+}
+
+/// What to continue, and what may be overridden while continuing it.
+#[derive(Debug, Clone)]
+pub struct ResumeOptions {
+    /// Run id, or any unambiguous prefix of one.
+    pub run_id: String,
+    pub repo_root: PathBuf,
+    /// `None` takes the config the run recorded.
+    pub config_path: Option<PathBuf>,
+    pub pools_path: Option<PathBuf>,
+    pub interaction: Option<InteractionMode>,
+    pub attempt_timeout: Duration,
+    pub defer_backoff: Duration,
+    pub max_defers: u32,
+    pub private_root: Option<PathBuf>,
+    pub wait_on_block: Option<Duration>,
+}
+
+impl ResumeOptions {
+    pub fn new(run_id: String, repo_root: PathBuf) -> Self {
+        Self {
+            run_id,
+            repo_root,
+            config_path: None,
+            pools_path: None,
+            interaction: None,
+            attempt_timeout: DEFAULT_ATTEMPT_TIMEOUT,
+            defer_backoff: interaction::DEFAULT_DEFER_BACKOFF,
+            max_defers: DEFAULT_MAX_DEFERS,
+            private_root: None,
+            wait_on_block: None,
+        }
     }
-    let report = run.finish();
-    util::write_json(&run.report_path, &report)?;
-    Ok(report)
 }
 
-/// Scheduler state for one task. Readiness is derived (deps all `Done`), not
-/// stored, so it can never drift from the graph.
-#[derive(Debug, Clone)]
-enum TaskState {
-    /// Runnable once its dependencies are done — the state a task returns to
-    /// after an answer un-parks it.
-    Pending,
-    /// A pool was busy. No attempt was spent; try again after a wait (§19).
-    Deferred,
-    /// Parked on a question (§12). Exactly this task, never its neighbours.
-    AwaitingInput(QuestionId),
-    Done(String),
-    Failed {
-        kind: FailureKind,
-        reason: String,
-    },
-    Blocked(TaskId),
-    Skipped,
+pub fn resume(opts: &ResumeOptions) -> Result<RunReport, TactusError> {
+    resume_with(opts, &BuiltinAdapters)
 }
 
-/// Everything one task accumulates across its attempts.
-#[derive(Debug, Default)]
-struct Progress {
-    /// Index into the resolved chain.
-    rung: usize,
-    /// Attempts spent on the current rung.
-    attempts_on_rung: u32,
-    /// Total attempts, which also numbers this task's run artifacts.
-    attempts: u32,
-    /// Session id from the most recent attempt, for §11.4's resume.
-    session: Option<String>,
-    /// Whether the next attempt should resume `session`.
-    resume_next: bool,
-    feedback: Vec<Feedback>,
-    defers: u32,
-    records: Vec<AttemptRecord>,
+pub fn resume_with(
+    opts: &ResumeOptions,
+    adapters: &dyn AdapterSource,
+) -> Result<RunReport, TactusError> {
+    resume_harness(opts, &Harness::new(adapters))
 }
 
-/// One thing the next attempt should know. `human` matters: an operator's
-/// answer is an instruction, while a gate log or a reviewer's demand is
-/// tool-authored text quoted back.
-#[derive(Debug, Clone)]
-struct Feedback {
-    attempt: u32,
-    tier: String,
-    summary: String,
-    detail: Option<String>,
-    human: bool,
+/// §15: replay, verify the run branch still matches the record, re-probe, and
+/// continue — parked questions intact.
+///
+/// Every refusal below exists because continuing would produce a *wrong*
+/// result rather than merely an awkward one, and each says which of the three
+/// things moved — the run, the plan, or the branch — because that is what
+/// decides what the operator does next.
+pub fn resume_harness(
+    opts: &ResumeOptions,
+    harness: &Harness<'_>,
+) -> Result<RunReport, TactusError> {
+    resume_harness_inner(opts, harness).map(|(report, _)| report)
+}
+
+fn resume_harness_inner(
+    opts: &ResumeOptions,
+    harness: &Harness<'_>,
+) -> Result<(RunReport, RunState), TactusError> {
+    let run_id = rundir::resolve_run_id(&opts.repo_root, &opts.run_id)?;
+    let public = rundir::public_dir(&opts.repo_root, &run_id);
+    let refuse = |message: String| TactusError::Resume {
+        run_id: run_id.clone(),
+        message,
+    };
+
+    // Claimed before anything is read, so two resumes cannot race each other
+    // into the same branch.
+    let probe_paths = RunPaths::from_parts(public.clone(), public.clone());
+    let _lock = RunLock::acquire(&probe_paths)?;
+
+    let mut warnings = Vec::new();
+    let events_path = public.join("events.jsonl");
+    let events = events::read_all(&events_path, &mut warnings)?;
+    let started = events::started_of(&events, &events_path)?.clone();
+
+    // The run knows its own plan and config; the CLI may override the config
+    // but never the plan, which is frozen (§5).
+    let mut run_opts = RunOptions::new(
+        opts.repo_root.join(&started.plan_path),
+        opts.repo_root.clone(),
+    );
+    run_opts.config_path = opts
+        .config_path
+        .clone()
+        .or_else(|| started.config_path.as_ref().map(|p| opts.repo_root.join(p)));
+    run_opts.pools_path = opts.pools_path.clone();
+    run_opts.interaction = opts.interaction;
+    run_opts.attempt_timeout = opts.attempt_timeout;
+    run_opts.defer_backoff = opts.defer_backoff;
+    run_opts.max_defers = opts.max_defers;
+    run_opts.private_root = opts.private_root.clone();
+    run_opts.wait_on_block = opts.wait_on_block;
+    let wait_on_block = opts.wait_on_block;
+
+    // Re-probes agents and re-resolves gates, exactly as a fresh run does.
+    let Preflight {
+        analysis,
+        caps,
+        review_binding,
+        gate_cmds,
+        warnings: preflight_warnings,
+        mode,
+        notifiers,
+    } = preflight(&run_opts, harness)?;
+    warnings.extend(preflight_warnings);
+
+    // The plan is frozen. A different hash means the file moved under the run,
+    // so every task index in the log — which is what `Progress` is keyed by —
+    // may now mean a different task.
+    if analysis.plan.source.hash != started.plan_hash {
+        return Err(refuse(format!(
+            "the plan at {} has changed since this run froze it (recorded {}, now {}). Task \
+             progress is recorded per task, so replaying it against a different plan would \
+             attribute work to the wrong tasks. Restore the plan, or start a new run.",
+            run_opts.plan_path.display(),
+            started.plan_hash,
+            analysis.plan.source.hash
+        )));
+    }
+
+    // Chains moved means config moved. `Progress.rung` is an index into the
+    // chain, so re-resolving a different one silently points a task at a
+    // different tier than the one it actually reached.
+    let chains = chain_summaries(&analysis);
+    if chains != started.chains {
+        let moved: Vec<String> = chains
+            .iter()
+            .zip(&started.chains)
+            .filter(|(now, then)| now != then)
+            .map(|(now, then)| {
+                format!(
+                    "`{}` ran on [{}] and would now run on [{}]",
+                    now.task,
+                    render_tiers(then),
+                    render_tiers(now)
+                )
+            })
+            .collect();
+        return Err(refuse(format!(
+            "routing has changed since this run started, so a recorded rung would now mean a \
+             different tier: {}. Restore the config it ran with, or start a new run.",
+            moved.join("; ")
+        )));
+    }
+
+    let task_ids: Vec<String> = analysis
+        .plan
+        .tasks
+        .iter()
+        .map(|task| task.id.to_string())
+        .collect();
+    let replayed = events::replay(events, task_ids, &events_path)?;
+
+    match replayed.state.finished.as_ref().map(|f| &f.outcome) {
+        Some(events::RunOutcome::Complete) => {
+            return Err(refuse(
+                "this run already completed; there is nothing left to continue".to_owned(),
+            ));
+        }
+        Some(events::RunOutcome::Halted) => {
+            return Err(refuse(format!(
+                "this run halted at `{}` under `on_task_failure = \"halt\"`. Nothing can run \
+                 while it is halted — fix what failed and start a new run.",
+                replayed.state.halted_at.as_deref().unwrap_or("?")
+            )));
+        }
+        // Ended parked, or never ended at all — both are exactly what resume
+        // is for.
+        Some(events::RunOutcome::Parked) | None => {}
+    }
+
+    let workspace = Workspace::open(&opts.repo_root)?;
+    workspace.ensure_run_exclusions()?;
+    if !workspace.branch_exists(&started.branch)? {
+        return Err(refuse(format!(
+            "the run branch `{}` no longer exists. Its commits are what this run's record \
+             refers to; without it there is nothing to continue onto.",
+            started.branch
+        )));
+    }
+    if workspace.current_branch()? != started.branch {
+        if !workspace.is_clean()? {
+            return Err(refuse(format!(
+                "you have uncommitted changes and are not on `{}`. Commit or stash them, then \
+                 resume — switching branches over them would lose work that is not this run's \
+                 to discard.",
+                started.branch
+            )));
+        }
+        workspace.switch_branch(&started.branch)?;
+    }
+
+    // §15's check, before anything is discarded: if HEAD moved, refusing has
+    // to leave the operator's tree exactly as they left it.
+    let expected_head = last_committed_sha(&replayed.events).unwrap_or(started.base_sha.clone());
+    let head = workspace.head_sha_full()?;
+    if head != expected_head {
+        return Err(refuse(format!(
+            "`{}` is at {head}, but this run's record ends at {expected_head}. Something \
+             committed, reset, or rebased the branch after the run stopped, so replaying the \
+             log would describe work that is no longer what is on the branch. Move the branch \
+             back to {expected_head}, or start a new run.",
+            started.branch
+        )));
+    }
+
+    // Crash residue: a dead agent's half-written edits. §14 rolls a failed
+    // attempt back to the last commit, and an attempt that never reported is
+    // no different — the session that would have explained these edits is
+    // gone, so nothing can verify them.
+    let discarded = workspace.uncommitted_summary()?;
+    if !discarded.is_empty() {
+        warnings.push(format!(
+            "discarded {} uncommitted path(s) left by the interrupted run: {}",
+            discarded.len(),
+            discarded.join(", ")
+        ));
+        workspace.discard_uncommitted()?;
+    }
+
+    let paths = run_opts.paths(&run_id);
+    paths.create()?;
+    let sleeper = harness.sleeper.unwrap_or(&RealSleeper);
+    let default_answers = interaction::answers_for(
+        mode,
+        paths.answers(),
+        wait_on_block.unwrap_or(analysis.config.wait_on_block),
+        sleeper,
+    );
+    let log = EventLog::open(&paths.events(), &mut warnings)?;
+    let mut run = Run {
+        state: replayed.state,
+        analysis: &analysis,
+        workspace: &workspace,
+        paths,
+        log,
+        gate_cmds,
+        adapters: harness.adapters,
+        answers: harness.answers.unwrap_or(default_answers.as_ref()),
+        notifiers,
+        sleeper,
+        caps,
+        review_binding,
+        attempt_timeout: opts.attempt_timeout,
+        defer_backoff: opts.defer_backoff,
+        max_defers: opts.max_defers,
+        on_task_failure: analysis.config.on_task_failure,
+        run_id,
+        branch: started.branch.clone(),
+        warnings,
+        unanswerable: Vec::new(),
+    };
+    // Write the `attempt_finished` the dead process never got to.
+    //
+    // Recorded rather than settled in memory, because a settlement only a
+    // reader performs is lost the moment someone else replays the log: the
+    // ledger line vanishes and, worse, the rung's refunded allowance vanishes
+    // with it, so a later resume would think the attempt had been spent.
+    let interrupted = run.state.interrupted_attempts();
+    for attempt in &interrupted {
+        run.emit(attempt.event())?;
+    }
+
+    // Applying this is what drops every session and wakes deferred work — the
+    // §14 pairing, enforced by the same fold a replay uses rather than by this
+    // function remembering to do it.
+    run.emit(EventBody::RunResumed {
+        data: events::RunResumed {
+            head_sha: head,
+            interrupted_attempts: u32::try_from(interrupted.len()).unwrap_or(u32::MAX),
+            discarded,
+        },
+    })?;
+    let report = run.drain_and_report()?;
+    Ok((report, run.state.clone()))
+}
+
+fn render_tiers(chain: &ChainSummary) -> String {
+    chain
+        .tiers
+        .iter()
+        .map(ToString::to_string)
+        .collect::<Vec<_>>()
+        .join(" → ")
+}
+
+/// The sha the run's record ends at — what HEAD must still be.
+fn last_committed_sha(events: &[events::Event]) -> Option<String> {
+    events.iter().rev().find_map(|event| match &event.body {
+        EventBody::TaskCommitted { data, .. } => Some(data.sha.clone()),
+        _ => None,
+    })
 }
 
 struct Run<'a> {
     analysis: &'a Analysis,
     workspace: &'a Workspace,
-    run_dir: PathBuf,
+    paths: RunPaths,
+    /// The append-only record. Every mutation below goes through
+    /// [`Run::emit`], never straight at `state`.
+    log: EventLog,
+    /// Derived state — the same fold `resume` and `status` build from the log.
+    state: RunState,
     gate_cmds: Vec<String>,
     adapters: &'a dyn AdapterSource,
     answers: &'a dyn AnswerSource,
@@ -483,60 +821,125 @@ struct Run<'a> {
     defer_backoff: Duration,
     max_defers: u32,
     on_task_failure: OnTaskFailure,
-    report_path: PathBuf,
     run_id: String,
     branch: String,
     warnings: Vec<String>,
-    states: Vec<TaskState>,
-    progress: Vec<Progress>,
-    questions: Vec<QuestionRecord>,
     /// Questions no channel could reach a human for. Never asked twice — that
     /// is what stops a hard block spinning.
+    ///
+    /// Deliberately *not* replayed: it records that a channel was unreachable
+    /// in this process, not something true about the run. A question nobody
+    /// could answer at 2am is exactly the one the operator answers when they
+    /// come back, so a resume has to be free to ask it again.
     unanswerable: Vec<QuestionId>,
-    /// Task indices in the order they first ran, so the report reads as the
-    /// run happened.
-    order: Vec<usize>,
-    halted_at: Option<String>,
 }
 
 impl Run<'_> {
+    /// Append an event and fold it in.
+    ///
+    /// The only way run state changes. Everything below emits; nothing reaches
+    /// past this into `state`, which is what makes a live run and a replay of
+    /// its own log the same computation rather than two that agree by
+    /// inspection.
+    fn emit(&mut self, body: EventBody) -> Result<(), TactusError> {
+        let event = self.log.append(body)?;
+        self.state.apply(&event);
+        Ok(())
+    }
+
+    /// Drain, settle, and report.
+    fn drain_and_report(&mut self) -> Result<RunReport, TactusError> {
+        if let Err(error) = self.drain() {
+            // The log already holds everything that happened, including the
+            // attempt this died inside — that is what `resume` reads. The
+            // report beside it is a courtesy for whoever opens the directory
+            // next, and failing to write it must not mask the error that
+            // actually stopped the run.
+            let partial = self.finish();
+            let _ = util::write_json(&self.paths.report_json(), &partial);
+            return Err(error);
+        }
+        let report = self.finish();
+        let committed = report
+            .tasks
+            .iter()
+            .filter(|task| matches!(task.status, TaskRunStatus::Committed { .. }))
+            .count();
+        self.emit(EventBody::RunFinished {
+            data: events::RunFinished {
+                outcome: match report.outcome() {
+                    RunOutcome::Complete => events::RunOutcome::Complete,
+                    RunOutcome::Parked => events::RunOutcome::Parked,
+                    RunOutcome::Halted => events::RunOutcome::Halted,
+                },
+                halted_at: report.halted_at.clone(),
+                committed: u32::try_from(committed).unwrap_or(u32::MAX),
+                parked: u32::try_from(report.parked_tasks().len()).unwrap_or(u32::MAX),
+            },
+        })?;
+        util::write_json(&self.paths.report_json(), &report)?;
+        Ok(report)
+    }
+
     /// Drain the graph (§14, §12).
     ///
-    /// The three branches are the whole interaction model: run what is ready;
-    /// if only deferred work is left, wait for the pool rather than burning
-    /// attempts against it; and only when neither is possible — the precise
-    /// definition of a hard block — ask a human.
+    /// The four branches are the whole interaction model: pick up answers that
+    /// arrived from somewhere else; run what is ready; if only deferred work is
+    /// left, wait for the pool rather than burning attempts against it; and
+    /// only when none of those is possible — the precise definition of a hard
+    /// block — ask a human.
+    ///
+    /// **Why this terminates.** Every branch consumes something finite and
+    /// nothing replenishes any of them:
+    ///
+    /// - the answer sweep fires only for an *open* question and closes it, and
+    ///   questions are created only by `step_task`;
+    /// - `step_task` moves its task out of `Pending`, and the only routes back
+    ///   are a deferral — bounded by `max_defers`, after which the ladder parks
+    ///   the task instead — or an answer, which closed a question to get there;
+    /// - the wait branch requires a `Deferred` task, which only a deferral
+    ///   creates;
+    /// - the ask branch either closes a question or adds it to `unanswerable`,
+    ///   which is only ever appended to and is checked before asking.
+    ///
+    /// So no cycle exists that does not spend an attempt, a deferral, or a
+    /// question. `an_exhausted_pool_and_a_silent_operator_still_terminate`
+    /// holds it to that against an adapter that never succeeds and an operator
+    /// who never replies.
     fn drain(&mut self) -> Result<(), TactusError> {
         let mut defer_round = 0u32;
         loop {
+            // Invariant 6 in its most useful form: an answer that arrives while
+            // other work is still running un-parks its task there and then,
+            // rather than waiting for the run to have nothing else to do.
+            if self.sweep_answers()? {
+                continue;
+            }
             if let Some(index) = self.next_ready() {
                 let deferred = self.step_task(index)?;
                 if !deferred {
                     defer_round = 0;
                 }
-                util::write_json(&self.report_path, &self.snapshot())?;
                 continue;
             }
-            if self.states.iter().any(|s| matches!(s, TaskState::Deferred))
-                && self.halted_at.is_none()
-            {
-                self.sleeper
-                    .sleep(interaction::defer_backoff(self.defer_backoff, defer_round));
+            if self.state.states.contains(&TaskState::Deferred) && self.state.halted_at.is_none() {
+                let waited = interaction::defer_backoff(self.defer_backoff, defer_round);
+                self.sleeper.sleep(waited);
                 defer_round = defer_round.saturating_add(1);
-                for state in &mut self.states {
-                    if matches!(state, TaskState::Deferred) {
-                        *state = TaskState::Pending;
-                    }
-                }
+                self.emit(EventBody::DeferWaitElapsed {
+                    data: events::DeferWaitElapsed {
+                        waited,
+                        round: defer_round,
+                    },
+                })?;
                 continue;
             }
-            // Guarded like the other two branches: once the run has halted,
-            // no answer can reach an attempt this session, so asking would
-            // spend a human's attention on a decision the scheduler cannot
-            // act on — and a decline would route through `fail_task` and
-            // relabel `halted_at` with a task that was not the cause. The
-            // questions stay open on disk for a later resume (§15).
-            if self.halted_at.is_none() && self.resolve_one_question()? {
+            // Guarded like the other branches: once the run has halted, no
+            // answer can reach an attempt this session, so asking would spend
+            // a human's attention on a decision the scheduler cannot act on —
+            // and a decline would relabel `halted_at` with a task that was not
+            // the cause. The questions stay open on disk for a resume (§15).
+            if self.state.halted_at.is_none() && self.resolve_one_question()? {
                 continue;
             }
             break;
@@ -548,12 +951,12 @@ impl Run<'_> {
     /// index first (§14). Parked, deferred, and blocked tasks are simply not
     /// ready — which is exactly the skip-ahead §14 asks for.
     fn next_ready(&self) -> Option<usize> {
-        if self.halted_at.is_some() {
+        if self.state.halted_at.is_some() {
             return None;
         }
         let tasks = &self.analysis.plan.tasks;
         (0..tasks.len()).find(|&i| {
-            matches!(self.states[i], TaskState::Pending)
+            matches!(self.state.states[i], TaskState::Pending)
                 && tasks[i].depends_on.iter().all(|dep| {
                     tasks
                         .iter()
@@ -561,7 +964,7 @@ impl Run<'_> {
                         // An unknown dependency cannot exist on a validated
                         // plan; treating it as satisfied keeps the scheduler
                         // total rather than deadlocking.
-                        .is_none_or(|j| matches!(self.states[j], TaskState::Done(_)))
+                        .is_none_or(|j| matches!(self.state.states[j], TaskState::Done(_)))
                 })
         })
     }
@@ -573,15 +976,13 @@ impl Run<'_> {
     ///
     /// Returns whether the task ended deferred.
     fn step_task(&mut self, index: usize) -> Result<bool, TactusError> {
-        if !self.order.contains(&index) {
-            self.order.push(index);
-        }
         // Copied out of `self` so they carry the run's lifetime rather than
         // this method's `&mut self` borrow.
         let analysis = self.analysis;
         let adapters = self.adapters;
         let workspace = self.workspace;
         let task = &analysis.plan.tasks[index];
+        let task_id = task.id.to_string();
         let chain = &analysis.chains[index];
         let policy = LadderPolicy {
             attempts_per: chain.attempts_per,
@@ -591,12 +992,13 @@ impl Run<'_> {
         let stem = format!("{index:02}-{}", util::filename_component(task.id.as_str()));
 
         loop {
-            let Some(rung) = chain.rungs.get(self.progress[index].rung) else {
+            let rung_index = self.state.progress[index].rung;
+            let Some(rung) = chain.rungs.get(rung_index) else {
                 self.fail_task(
                     index,
                     FailureKind::NoChain,
                     "resolved chain has no rung to run on".to_owned(),
-                );
+                )?;
                 return Ok(false);
             };
             let profile = WorkerProfile {
@@ -614,11 +1016,30 @@ impl Run<'_> {
                     message: format!("no adapter registered for agent `{}`", profile.agent),
                 })?;
 
-            let attempt = self.progress[index].attempts + 1;
-            let resume = self.progress[index]
+            let attempt = self.state.progress[index].attempts + 1;
+            let resume = self.state.progress[index]
                 .resume_next
-                .then(|| self.progress[index].session.clone())
+                .then(|| self.state.progress[index].session.clone())
                 .flatten();
+
+            // Recorded *before* the agent is spawned, so a process that dies
+            // mid-attempt leaves an `attempt_started` with no
+            // `attempt_finished`. That dangling pair is precisely what tells a
+            // later replay an attempt was interrupted (§19's crash row) — the
+            // engine cannot write a record of its own death afterwards.
+            let rung_number = u32::try_from(rung_index).unwrap_or(u32::MAX);
+            self.emit(EventBody::AttemptStarted {
+                task: task_id.clone(),
+                attempt,
+                rung: rung_number,
+                profile: profile.name.clone(),
+                data: events::AttemptStarted {
+                    tier: rung.tier.to_string(),
+                    agent: profile.agent.clone(),
+                    model: profile.model.clone(),
+                    resume_session: resume.clone(),
+                },
+            })?;
 
             // Scoped so every borrow the attempt takes on `self` is released
             // before the ladder updates this task's progress below.
@@ -628,7 +1049,7 @@ impl Run<'_> {
                     // Owned: the ladder appends to this task's feedback the
                     // moment the attempt returns, and one clone per attempt
                     // costs less than threading that borrow through.
-                    feedback: self.progress[index].feedback.clone(),
+                    feedback: self.state.progress[index].feedback.clone(),
                 });
                 let attempt_cx = AttemptCx {
                     task,
@@ -636,7 +1057,7 @@ impl Run<'_> {
                     adapter,
                     attempt,
                     stem: stem.clone(),
-                    run_dir: &self.run_dir,
+                    paths: &self.paths,
                     gates: &analysis.gates,
                     gate_cmds: &self.gate_cmds,
                     reviewer: self.reviewer()?,
@@ -656,52 +1077,59 @@ impl Run<'_> {
                 }
             };
 
-            let progress = &mut self.progress[index];
-            progress.attempts = attempt;
-            progress.attempts_on_rung += 1;
-            progress.session = result
-                .outcome
-                .session_id
-                .clone()
-                .or_else(|| progress.session.clone());
-            progress.records.push(AttemptRecord {
+            self.emit(EventBody::AttemptFinished {
+                task: task_id.clone(),
                 attempt,
-                tier: rung.tier.to_string(),
-                model: profile.model.clone(),
-                resumed: resume.is_some(),
-                duration: result.outcome.duration,
-                cost_usd: result.outcome.cost_usd,
-                review_model: result.review_model.clone(),
-                review_cost_usd: result.review_cost_usd,
-                session_id: result.outcome.session_id.clone(),
-                failure: result.failure.as_ref().map(|f| FailureRecord {
-                    kind: f.kind,
-                    origin: f.origin,
-                    reason: f.reason.clone(),
+                rung: rung_number,
+                profile: profile.name.clone(),
+                data: Box::new(AttemptRecord {
+                    attempt,
+                    tier: rung.tier.to_string(),
+                    model: profile.model.clone(),
+                    resumed: resume.is_some(),
+                    duration: result.outcome.duration,
+                    cost_usd: result.outcome.cost_usd,
+                    review_model: result.review_model.clone(),
+                    review_cost_usd: result.review_cost_usd,
+                    session_id: result.outcome.session_id.clone(),
+                    failure: result.failure.as_ref().map(|f| FailureRecord {
+                        kind: f.kind,
+                        origin: f.origin,
+                        reason: f.reason.clone(),
+                    }),
                 }),
-            });
+            })?;
 
             let Some(failure) = result.failure else {
-                let sha = self
-                    .workspace
-                    .commit(&format!("[tactus] {}: {}", task.id, task.title))?;
+                let message = format!("[tactus] {}: {}", task.id, task.title);
+                self.workspace.commit(&message)?;
+                // The full sha, not `commit`'s abbreviated one: `resume`
+                // compares this against HEAD, and abbreviation length varies
+                // with `core.abbrev` and the repo's object count.
+                let full_sha = self.workspace.head_sha_full()?;
                 // Scrub gate side-effects (build artifacts, lockfile churn) so
                 // they cannot leak into the next task's captured diff; the
                 // commit recorded exactly the verified staged set.
                 self.workspace.discard_uncommitted()?;
-                self.states[index] = TaskState::Done(sha);
+                self.emit(EventBody::TaskCommitted {
+                    task: task_id.clone(),
+                    data: events::TaskCommitted {
+                        sha: full_sha,
+                        message,
+                    },
+                })?;
                 return Ok(false);
             };
 
-            let resumable = self.progress[index].session.is_some()
+            let resumable = self.state.progress[index].session.is_some()
                 && self
                     .caps
                     .get(&profile.agent)
                     .is_some_and(|c| c.session_resume);
             let state = LadderState {
-                rung: self.progress[index].rung,
-                attempts_on_rung: self.progress[index].attempts_on_rung,
-                defers: self.progress[index].defers,
+                rung: self.state.progress[index].rung,
+                attempts_on_rung: self.state.progress[index].attempts_on_rung,
+                defers: self.state.progress[index].defers,
                 resumable,
             };
             let next = ladder::next_step(&failure, &state, &policy);
@@ -716,42 +1144,58 @@ impl Run<'_> {
 
             match next {
                 Next::RetrySameRung { resume } => {
-                    self.record_feedback(index, rung.tier.to_string(), attempt, &failure);
-                    self.progress[index].resume_next = resume;
+                    self.emit(EventBody::LadderRetry {
+                        task: task_id.clone(),
+                        attempt,
+                        rung: rung_number,
+                        data: events::LadderRetry {
+                            resume,
+                            tier: rung.tier.to_string(),
+                            summary: failure.reason.clone(),
+                            detail: failure.feedback.clone(),
+                        },
+                    })?;
                 }
                 Next::Escalate => {
-                    self.record_feedback(index, rung.tier.to_string(), attempt, &failure);
-                    let progress = &mut self.progress[index];
-                    progress.rung += 1;
-                    progress.attempts_on_rung = 0;
-                    // Fresh session on a new rung (§11.4): a different model
-                    // cannot inherit another's conversation, and the
-                    // accumulated feedback is what carries the history over.
-                    progress.session = None;
-                    progress.resume_next = false;
+                    self.emit(EventBody::LadderEscalated {
+                        task: task_id.clone(),
+                        attempt,
+                        rung: rung_number,
+                        data: events::LadderEscalated {
+                            to_rung: rung_number.saturating_add(1),
+                            tier: rung.tier.to_string(),
+                            summary: failure.reason.clone(),
+                            detail: failure.feedback.clone(),
+                        },
+                    })?;
                 }
                 Next::Defer => {
-                    // No attempt was spent on the work itself, so give the
-                    // rung its allowance back (§19).
-                    let progress = &mut self.progress[index];
-                    progress.attempts_on_rung = progress.attempts_on_rung.saturating_sub(1);
-                    progress.defers += 1;
-                    progress.resume_next = false;
-                    self.states[index] = TaskState::Deferred;
+                    // No attempt was spent on the work itself, so the event's
+                    // fold gives the rung its allowance back (§19).
+                    self.emit(EventBody::TaskDeferred {
+                        task: task_id.clone(),
+                        data: events::TaskDeferred {
+                            reason: failure.reason.clone(),
+                            defers: self.state.progress[index].defers.saturating_add(1),
+                        },
+                    })?;
                     return Ok(true);
                 }
                 Next::AskHuman(kind) => {
-                    if kind == QuestionKind::Clarify {
-                        // Nobody judged the code: the attempt is not spent.
-                        let progress = &mut self.progress[index];
-                        progress.attempts_on_rung = progress.attempts_on_rung.saturating_sub(1);
-                    }
                     let question = self.raise_question(index, kind, &failure)?;
-                    self.states[index] = TaskState::AwaitingInput(question);
+                    self.emit(EventBody::TaskParked {
+                        task: task_id.clone(),
+                        data: events::TaskParked {
+                            question: question.to_string(),
+                            // Nobody judged the code, so the attempt is not
+                            // spent (§12).
+                            refund_attempt: kind == QuestionKind::Clarify,
+                        },
+                    })?;
                     return Ok(false);
                 }
                 Next::Fail => {
-                    self.fail_task(index, failure.kind, failure.reason.clone());
+                    self.fail_task(index, failure.kind, failure.reason.clone())?;
                     return Ok(false);
                 }
             }
@@ -778,24 +1222,25 @@ impl Run<'_> {
         }
     }
 
-    fn record_feedback(&mut self, index: usize, tier: String, attempt: u32, f: &AttemptFailure) {
-        self.progress[index].feedback.push(Feedback {
-            attempt,
-            tier,
-            summary: f.reason.clone(),
-            detail: f.feedback.clone(),
-            human: false,
-        });
-    }
-
-    fn fail_task(&mut self, index: usize, kind: FailureKind, reason: String) {
-        let id = self.analysis.plan.tasks[index].id.clone();
-        self.states[index] = TaskState::Failed { kind, reason };
-        if self.on_task_failure == OnTaskFailure::Halt {
-            // First failure wins. `halted_at` is what the report and the CLI
-            // name as the cause, so a later failure must not relabel it.
-            self.halted_at.get_or_insert_with(|| id.to_string());
-        }
+    fn fail_task(
+        &mut self,
+        index: usize,
+        kind: FailureKind,
+        reason: String,
+    ) -> Result<(), TactusError> {
+        let task = self.analysis.plan.tasks[index].id.to_string();
+        // The halt policy is resolved here and recorded, not re-derived on
+        // replay: a `tactus.toml` edited between a run and its resume must not
+        // rewrite which task the report blames for stopping.
+        let halts_run = self.on_task_failure == OnTaskFailure::Halt;
+        self.emit(EventBody::TaskFailed {
+            task,
+            data: events::TaskFailed {
+                kind,
+                reason,
+                halts_run,
+            },
+        })
     }
 
     /// §12: raise eagerly, park exactly the affected task, tell the notifiers,
@@ -814,7 +1259,7 @@ impl Run<'_> {
             // the graph, not by the question, so they stay eligible the moment
             // an answer arrives.
             affected_tasks: vec![task.id.clone()],
-            context: question_context(task, kind, failure, &self.progress[index]),
+            context: question_context(task, kind, failure, &self.state.progress[index]),
             options: question_options(kind),
         };
         let id = question.id.clone();
@@ -828,166 +1273,271 @@ impl Run<'_> {
                 ));
             }
         }
-        let record = QuestionRecord::open(question);
-        interaction::write_question(&self.run_dir.join("questions"), &record)?;
-        self.questions.push(record);
+        // The payload lands on disk before the event, so a reader that sees
+        // `question_raised` can always open the file it names.
+        interaction::write_question(
+            &self.paths.questions(),
+            &QuestionRecord::open(question.clone()),
+        )?;
+        self.emit(EventBody::QuestionRaised {
+            task: self.analysis.plan.tasks[index].id.to_string(),
+            data: Box::new(events::QuestionRaised { question }),
+        })?;
         Ok(id)
     }
 
-    /// Resolve the oldest open question. Returns whether anything changed.
+    /// Ingest answers left by `tactus answer` in another process.
+    ///
+    /// Returns whether anything changed. This is what makes the answer command
+    /// useful while a run is alive rather than only between runs: an operator
+    /// answering from a phone at 2am un-parks the task on the next scheduler
+    /// turn, with no resume needed.
+    fn sweep_answers(&mut self) -> Result<bool, TactusError> {
+        let open: Vec<QuestionId> = self
+            .state
+            .open_questions()
+            .iter()
+            .map(|record| record.question.id.clone())
+            .collect();
+        if open.is_empty() {
+            return Ok(false);
+        }
+        let dir = self.paths.answers();
+        let mut changed = false;
+        for id in open {
+            let Some(answer) = interaction::read_answer(&dir, &id)? else {
+                continue;
+            };
+            self.ingest_answer(&id, answer, "answer-file")?;
+            changed = true;
+        }
+        Ok(changed)
+    }
+
+    /// Record an answer and let it take effect.
+    ///
+    /// One path for every channel — a terminal reply, a file written by
+    /// `tactus answer`, or an answer picked up on resume — so what an answer
+    /// *does* cannot depend on where it came from.
+    fn ingest_answer(
+        &mut self,
+        id: &QuestionId,
+        answer: Answer,
+        via: &str,
+    ) -> Result<(), TactusError> {
+        let Some(record) = self
+            .state
+            .questions
+            .iter()
+            .find(|record| record.question.id == *id)
+        else {
+            return Ok(());
+        };
+        if !record.is_open() || answer == Answer::Unanswered {
+            return Ok(());
+        }
+        let context = record.question.context.clone();
+        let affected = record.question.affected_tasks.clone();
+
+        self.emit(EventBody::QuestionAnswered {
+            data: events::QuestionAnswered {
+                question: id.clone(),
+                answer: answer.clone(),
+                via: via.to_owned(),
+            },
+        })?;
+
+        // §5: a question that reached a human at runtime is, by definition, a
+        // design-phase defect — logged as one so the accumulated defects can
+        // become review material for the designer prompt.
+        self.emit(EventBody::DesignDefect {
+            data: events::DesignDefect {
+                question: id.clone(),
+                context: util::head(context.trim(), 600),
+                answer: match &answer {
+                    Answer::Answered { text } => text.clone(),
+                    _ => "declined".to_owned(),
+                },
+            },
+        })?;
+
+        // A decline is the task's failure, not the question's, so it goes
+        // through the one place that owns the halt policy. `apply` leaves a
+        // declined task parked precisely so this can still see who was waiting.
+        if answer == Answer::Declined {
+            for task_id in affected {
+                let Some(index) = self.state.index_of(task_id.as_str()) else {
+                    continue;
+                };
+                if !matches!(&self.state.states[index], TaskState::AwaitingInput(q) if q == id) {
+                    continue;
+                }
+                let reason = format!(
+                    "declined at the human rung: {}",
+                    last_reason(&self.state.progress[index])
+                );
+                self.fail_task(index, FailureKind::Declined, reason)?;
+            }
+        }
+
+        // Rewrite the payload so a late reader — a UI, or someone opening the
+        // directory tomorrow — sees the whole exchange, not just the question.
+        if let Some(record) = self
+            .state
+            .questions
+            .iter()
+            .find(|record| record.question.id == *id)
+        {
+            interaction::write_question(&self.paths.questions(), record)?;
+        }
+        Ok(())
+    }
+
+    /// Ask about the oldest open question. Returns whether anything changed.
     ///
     /// This runs only at a hard block, and each question is asked at most
     /// once: an `Unanswered` result marks it unreachable rather than looping
     /// back to a channel that already said nobody is there.
     fn resolve_one_question(&mut self) -> Result<bool, TactusError> {
-        let Some(position) = self.questions.iter().position(|record| {
+        let Some(position) = self.state.questions.iter().position(|record| {
             record.is_open() && !self.unanswerable.contains(&record.question.id)
         }) else {
             return Ok(false);
         };
-        let answer = self.answers.resolve(&self.questions[position].question)?;
-        let id = self.questions[position].question.id.clone();
+        let question = self.state.questions[position].question.clone();
+        let answer = self.answers.resolve(&question)?;
+
+        // The channel may have been waiting on the very file the sweep reads;
+        // ingesting first means an answer that arrived during the wait is
+        // applied once, by whichever path saw it, and never twice.
+        if self.sweep_answers()? {
+            return Ok(true);
+        }
         if answer == Answer::Unanswered {
             // §12 CI mode: the task stays parked and the run's exit status
             // reports it. Not a failure — nobody rejected anything.
-            self.unanswerable.push(id);
+            self.unanswerable.push(question.id);
             return Ok(true);
         }
-
-        let kind = self.questions[position].question.kind;
-        let affected = self.questions[position].question.affected_tasks.clone();
-        self.questions[position].answer = Some(answer.clone());
-        interaction::write_question(&self.run_dir.join("questions"), &self.questions[position])?;
-
-        for task_id in affected {
-            let Some(index) = self
-                .analysis
-                .plan
-                .tasks
-                .iter()
-                .position(|t| t.id == task_id)
-            else {
-                continue;
-            };
-            if !matches!(&self.states[index], TaskState::AwaitingInput(q) if *q == id) {
-                continue;
-            }
-            match &answer {
-                Answer::Declined => {
-                    self.fail_task(
-                        index,
-                        FailureKind::Declined,
-                        format!(
-                            "declined at the human rung: {}",
-                            last_reason(&self.progress[index])
-                        ),
-                    );
-                }
-                Answer::Answered { text } => {
-                    let progress = &mut self.progress[index];
-                    progress.feedback.push(Feedback {
-                        attempt: progress.attempts,
-                        tier: String::new(),
-                        summary: "the operator answered the open question".to_owned(),
-                        detail: Some(text.clone()),
-                        human: true,
-                    });
-                    // The answer buys a fresh allowance on the rung the task
-                    // is standing on, and clears the deferrals that a pool
-                    // outage racked up. It never moves the rung: if the chain
-                    // exhausted, the task is already at the top of it.
-                    if kind == QuestionKind::Unblock {
-                        progress.attempts_on_rung = 0;
-                    }
-                    progress.defers = 0;
-                    // Never resume out of a park, however tempting the warm
-                    // session looks. Parking always discards the working tree
-                    // — it has to, because another task runs before this one
-                    // does again — so the session's account of what it wrote
-                    // no longer matches the repository. Resuming would hand
-                    // the agent a terse prompt and a conversation asserting
-                    // edits that have been reverted. §14 pairs session resume
-                    // with tree retention precisely so the two never diverge;
-                    // the full prompt plus the operator's answer, which
-                    // `feedback_section` labels as a human instruction, is
-                    // what makes the retry correct rather than merely cheap.
-                    progress.resume_next = false;
-                    self.states[index] = TaskState::Pending;
-                }
-                Answer::Unanswered => unreachable!("handled above"),
-            }
-        }
+        self.ingest_answer(&question.id, answer, self.answers.id())?;
         Ok(true)
     }
 
-    /// Report of the run so far, safe to call mid-drain.
-    fn snapshot(&self) -> RunReport {
-        let tasks: Vec<TaskReport> = self
-            .order
-            .iter()
-            .copied()
-            // Tasks that never started append in plan order, so the report
-            // reads as the run happened and still accounts for everything.
-            .chain((0..self.analysis.plan.tasks.len()).filter(|i| !self.order.contains(i)))
-            .map(|index| {
-                task_report(
-                    &self.analysis.plan.tasks[index],
-                    &self.states[index],
-                    &self.progress[index],
-                )
-            })
-            .collect();
-        let total_cost_usd = tasks
-            .iter()
-            .filter_map(TaskReport::total_cost_usd)
-            .sum::<f64>();
-        RunReport {
-            run_id: self.run_id.clone(),
-            branch: self.branch.clone(),
-            gates: self.analysis.gates.iter().map(|g| g.name.clone()).collect(),
-            gates_from_config: self.analysis.gates_from_config,
-            warnings: self.warnings.clone(),
-            tasks,
-            halted_at: self.halted_at.clone(),
-            questions: self.questions.clone(),
-            total_cost_usd,
-        }
-    }
-
     /// Settle every task that never ran, then report.
-    fn finish(&mut self) -> RunReport {
-        let tasks = &self.analysis.plan.tasks;
-        // Blocking propagates: a dependent of a blocked task is blocked too.
-        // Repeat until stable rather than assuming plan order carries it.
-        loop {
-            let mut changed = false;
-            for index in 0..tasks.len() {
-                if !matches!(self.states[index], TaskState::Pending) {
-                    continue;
-                }
-                let blocker = tasks[index].depends_on.iter().find(|dep| {
-                    tasks
-                        .iter()
-                        .position(|t| t.id == **dep)
-                        .is_some_and(|j| !matches!(self.states[j], TaskState::Done(_)))
-                });
-                if let Some(blocker) = blocker {
-                    self.states[index] = TaskState::Blocked(blocker.clone());
-                    changed = true;
-                }
-            }
-            if !changed {
-                break;
-            }
-        }
-        // Whatever is still Pending was never reached: the run halted.
-        for state in &mut self.states {
-            if matches!(state, TaskState::Pending) {
-                *state = TaskState::Skipped;
-            }
-        }
-        self.snapshot()
+    fn finish(&self) -> RunReport {
+        build_report(
+            &self.run_id,
+            &self.branch,
+            self.analysis.gates.iter().map(|g| g.name.clone()).collect(),
+            self.analysis.gates_from_config,
+            self.warnings.clone(),
+            &self.analysis.plan,
+            &self.state,
+        )
     }
+}
+
+impl RunReport {
+    /// Build a report from a replayed log.
+    ///
+    /// `status` and the `report.json` a run writes go through the same
+    /// function, so what an operator sees mid-run and what the file says
+    /// afterwards cannot drift into disagreeing.
+    pub fn from_state(
+        started: &events::RunStarted,
+        plan: &Plan,
+        state: &RunState,
+        warnings: Vec<String>,
+    ) -> Self {
+        build_report(
+            &started.run_id,
+            &started.branch,
+            started.gates.clone(),
+            started.gates_from_config,
+            warnings,
+            plan,
+            state,
+        )
+    }
+}
+
+fn build_report(
+    run_id: &str,
+    branch: &str,
+    gates: Vec<String>,
+    gates_from_config: bool,
+    warnings: Vec<String>,
+    plan: &Plan,
+    state: &RunState,
+) -> RunReport {
+    let settled = settle(plan, &state.states);
+    let tasks: Vec<TaskReport> = state
+        .order
+        .iter()
+        .copied()
+        // Tasks that never started append in plan order, so the report reads
+        // as the run happened and still accounts for everything.
+        .chain((0..plan.tasks.len()).filter(|i| !state.order.contains(i)))
+        .map(|index| task_report(&plan.tasks[index], &settled[index], &state.progress[index]))
+        .collect();
+    let total_cost_usd = tasks
+        .iter()
+        .filter_map(TaskReport::total_cost_usd)
+        .sum::<f64>();
+    RunReport {
+        run_id: run_id.to_owned(),
+        branch: branch.to_owned(),
+        gates,
+        gates_from_config,
+        warnings,
+        tasks,
+        halted_at: state.halted_at.clone(),
+        questions: state.questions.clone(),
+        total_cost_usd,
+    }
+}
+
+/// Derive how an ended run's untouched tasks are reported.
+///
+/// This is a *view*, not state, and deliberately not recorded as events. A
+/// task blocked behind an unanswered question has to become runnable again the
+/// moment that question is answered — so if `Blocked` were folded in from the
+/// log, every resume would have to un-fold it. Deriving it fresh from whatever
+/// the log says is true right now means there is nothing to undo.
+fn settle(plan: &Plan, states: &[TaskState]) -> Vec<TaskState> {
+    let tasks = &plan.tasks;
+    let mut settled = states.to_vec();
+    // Blocking propagates: a dependent of a blocked task is blocked too.
+    // Repeat until stable rather than assuming plan order carries it — a plan
+    // may list a dependent before the task it waits on.
+    loop {
+        let mut changed = false;
+        for index in 0..tasks.len() {
+            if settled[index] != TaskState::Pending {
+                continue;
+            }
+            let blocker = tasks[index].depends_on.iter().find(|dep| {
+                tasks
+                    .iter()
+                    .position(|t| t.id == **dep)
+                    .is_some_and(|j| !matches!(settled[j], TaskState::Done(_)))
+            });
+            if let Some(blocker) = blocker {
+                settled[index] = TaskState::Blocked(blocker.to_string());
+                changed = true;
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+    // Whatever is still Pending was never reached: the run halted.
+    for state in &mut settled {
+        if *state == TaskState::Pending {
+            *state = TaskState::Skipped;
+        }
+    }
+    settled
 }
 
 /// Why a task is parked or failed, for the report.
@@ -1031,7 +1581,7 @@ fn task_report(task: &Task, state: &TaskState, progress: &Progress) -> TaskRepor
                 question: question.to_string(),
                 reason: last_reason(progress),
             },
-            TaskState::Blocked(by) => TaskRunStatus::Blocked { by: by.to_string() },
+            TaskState::Blocked(by) => TaskRunStatus::Blocked { by: by.clone() },
             // Deferred cannot survive `finish`, and Pending is settled there
             // too; both mean the run stopped before this task got its turn.
             TaskState::Deferred | TaskState::Pending | TaskState::Skipped => TaskRunStatus::Skipped,
@@ -1126,7 +1676,7 @@ struct AttemptCx<'a> {
     attempt: u32,
     /// Collision-free file stem for this task's run artifacts.
     stem: String,
-    run_dir: &'a std::path::Path,
+    paths: &'a RunPaths,
     gates: &'a [ShellGate],
     gate_cmds: &'a [String],
     reviewer: Option<Reviewer<'a>>,
@@ -1173,12 +1723,17 @@ fn run_attempt(
     let settings_path = cx.adapter.materialize_permissions(
         &cx.profile,
         cx.gate_cmds,
-        &cx.run_dir.join("settings"),
+        &cx.paths.settings(),
         &format!("{}-{}", cx.stem, cx.attempt),
     )?;
 
     let task_run = TaskRun {
-        prompt: materialize_prompt(cx.task, cx.gate_cmds, cx.run_dir, cx.retry.as_ref()),
+        prompt: materialize_prompt(
+            cx.task,
+            cx.gate_cmds,
+            &cx.paths.artifacts(),
+            cx.retry.as_ref(),
+        ),
         profile: cx.profile.clone(),
         workspace: workspace.root().to_path_buf(),
         resume_session,
@@ -1187,7 +1742,7 @@ fn run_attempt(
     let command = cx.adapter.build(&task_run)?;
     let output = proc::run_with_timeout(command, cx.adapter.stdin_payload(&task_run), cx.timeout)?;
 
-    let transcripts = cx.run_dir.join("transcripts");
+    let transcripts = cx.paths.transcripts();
     let transcript_path = transcripts.join(format!("{}-{}.json", cx.stem, cx.attempt));
     util::write_text(&transcript_path, &output.stdout)?;
     if !output.stderr.trim().is_empty() {
@@ -1219,13 +1774,8 @@ fn run_attempt(
         );
     }
     if failure.is_none()
-        && let Some(gate_failure) = gates::run_all(
-            cx.gates,
-            workspace,
-            &cx.run_dir.join("gates"),
-            &cx.stem,
-            cx.attempt,
-        )?
+        && let Some(gate_failure) =
+            gates::run_all(cx.gates, workspace, &cx.paths.gates(), &cx.stem, cx.attempt)?
     {
         failure = Some(
             AttemptFailure::new(
@@ -1252,9 +1802,10 @@ fn run_attempt(
             profile: reviewer.profile.clone(),
             task: cx.task,
             diff: &outcome.diff,
-            artifacts: &load_artifacts(cx.run_dir, cx.task),
+            artifacts: &load_artifacts(&cx.paths.artifacts(), cx.task),
             workspace: workspace.root(),
-            run_dir: cx.run_dir,
+            settings_dir: &cx.paths.settings(),
+            reviews_dir: &cx.paths.reviews(),
             stem: format!("{}-{}", cx.stem, cx.attempt),
             timeout: review_timeout(cx.timeout),
         })?;
@@ -1353,7 +1904,7 @@ fn review_failure(result: review::ReviewResult) -> Option<AttemptFailure> {
 /// Artifacts this task should be judged against: its declared inputs, plus
 /// the conventions brief whenever one exists (§11.2 injects it into every
 /// downstream prompt).
-fn load_artifacts(run_dir: &std::path::Path, task: &Task) -> Vec<(String, String)> {
+fn load_artifacts(artifacts_dir: &Path, task: &Task) -> Vec<(String, String)> {
     let mut wanted: Vec<String> = vec![CONVENTIONS_BRIEF.to_owned()];
     wanted.extend(task.artifacts_in.iter().map(|id| id.as_str().to_owned()));
     // A task's own outputs are not evidence for judging it: the reviewer
@@ -1372,7 +1923,7 @@ fn load_artifacts(run_dir: &std::path::Path, task: &Task) -> Vec<(String, String
             fresh
         })
         .filter_map(|id| {
-            let content = fs::read_to_string(artifact_path(run_dir, &id)).ok()?;
+            let content = fs::read_to_string(artifact_path(artifacts_dir, &id)).ok()?;
             (!content.trim().is_empty()).then_some((id, content))
         })
         .collect()
@@ -1479,7 +2030,7 @@ fn worker_question(detail: Option<&str>) -> Option<String> {
 fn materialize_prompt(
     task: &Task,
     gate_cmds: &[String],
-    run_dir: &std::path::Path,
+    artifacts_dir: &Path,
     retry: Option<&RetryBrief>,
 ) -> String {
     // A resumed session already holds the task, the artifacts, and the rules;
@@ -1518,7 +2069,7 @@ fn materialize_prompt(
     // Artifacts are real files in the run directory: a consumer is shown the
     // content that exists, never told to look for something nothing wrote.
     for id in &task.artifacts_in {
-        let path = artifact_path(run_dir, id.as_str());
+        let path = artifact_path(artifacts_dir, id.as_str());
         match fs::read_to_string(&path) {
             Ok(content) if !content.trim().is_empty() => {
                 let _ = writeln!(
@@ -1541,7 +2092,7 @@ fn materialize_prompt(
             prompt,
             "Before you finish, write artifact `{id}` — the notes later tasks depend on — to:\n\
              {}\n",
-            artifact_path(run_dir, id.as_str()).display()
+            artifact_path(artifacts_dir, id.as_str()).display()
         );
     }
     if !gate_cmds.is_empty() {
@@ -1650,10 +2201,8 @@ fn review_binding(cfg: &crate::config::Config) -> Option<(String, String)> {
 }
 
 /// Where an artifact lives for the duration of a run (§15 `artifacts/`).
-fn artifact_path(run_dir: &std::path::Path, id: &str) -> PathBuf {
-    run_dir
-        .join("artifacts")
-        .join(format!("{}.md", util::filename_component(id)))
+fn artifact_path(artifacts_dir: &Path, id: &str) -> PathBuf {
+    artifacts_dir.join(format!("{}.md", util::filename_component(id)))
 }
 
 /// Stable topological order: among ready tasks, lowest plan index first (§14).
@@ -1816,6 +2365,75 @@ impl RunReport {
         }
         out
     }
+
+    /// §21's definition-of-done (e): what each task cost, and on what.
+    ///
+    /// Implementer and reviewer spend stay in separate columns because they
+    /// are different models at different tiers — folding them together makes a
+    /// cheap rung look expensive to anyone reading the ledger (§13). An
+    /// unreported cost prints as `—` rather than `$0.0000`: a ledger that
+    /// cannot tell free from unreported is worse than no ledger.
+    pub fn render_ledger(&self) -> String {
+        let mut out = String::new();
+        let money = |value: Option<f64>| match value {
+            Some(amount) => format!("${amount:.4}"),
+            None => "—".to_owned(),
+        };
+        let rows: Vec<[String; 6]> = self
+            .tasks
+            .iter()
+            .map(|task| {
+                [
+                    task.id.clone(),
+                    task.attempts.len().to_string(),
+                    if task.trail().is_empty() {
+                        "—".to_owned()
+                    } else {
+                        task.trail()
+                    },
+                    money(task.cost_usd),
+                    money(task.review_cost_usd),
+                    money(task.total_cost_usd()),
+                ]
+            })
+            .collect();
+        let headers = ["task", "attempts", "trail", "worker", "review", "total"];
+        let widths: Vec<usize> = (0..headers.len())
+            .map(|column| {
+                rows.iter()
+                    .map(|row| row[column].chars().count())
+                    .chain(std::iter::once(headers[column].chars().count()))
+                    .max()
+                    .unwrap_or(0)
+            })
+            .collect();
+        let line = |cells: &[String]| {
+            let mut rendered = String::from("  ");
+            for (index, cell) in cells.iter().enumerate() {
+                let pad = widths[index].saturating_sub(cell.chars().count());
+                let _ = write!(rendered, "{cell}{:pad$}", "", pad = pad);
+                if index + 1 < cells.len() {
+                    rendered.push_str("  ");
+                }
+            }
+            rendered.trim_end().to_owned()
+        };
+
+        let _ = writeln!(out, "ledger:");
+        let _ = writeln!(out, "{}", line(&headers.map(str::to_owned)));
+        for row in &rows {
+            let _ = writeln!(out, "{}", line(row));
+        }
+        let _ = writeln!(
+            out,
+            "  total ${:.4} (api-equivalent; subscription spend is notional — §13)",
+            self.total_cost_usd
+        );
+        // Pool drain arrives with the capacity engine; saying so beats an
+        // empty column that looks like "nothing was spent".
+        let _ = writeln!(out, "  per-pool drain: not connected");
+        out
+    }
 }
 
 #[cfg(test)]
@@ -1841,7 +2459,15 @@ mod tests {
         RateLimited,
         /// Edits, then stops and asks the operator a question (§12).
         AskQuestion,
+        /// Kills the whole process partway through the attempt, leaving the
+        /// on-disk shape a `kill -9` or a power loss leaves: a dirty working
+        /// tree and an `attempt_started` with no `attempt_finished`.
+        Exit,
     }
+
+    /// Distinctive so the parent can tell a deliberate death from a panic,
+    /// which would also exit non-zero.
+    const CRASH_EXIT_CODE: i32 = 42;
 
     #[derive(Clone, Copy, PartialEq)]
     enum ReviewBehavior {
@@ -1961,6 +2587,19 @@ mod tests {
             };
             let edit: Option<(&str, String)> =
                 match scripted(&self.effects, index, Effect::EditFile) {
+                    Effect::Exit => {
+                        // Half-finished edits first, then die without
+                        // unwinding — no destructors, no flush of anything the
+                        // engine has not already synced. That is what makes
+                        // this a faithful stand-in for a kill rather than a
+                        // tidy shutdown, and it happens at a deterministic
+                        // point instead of racing a signal.
+                        let _ = fs::write(
+                            run.workspace.join("agent-output.txt"),
+                            "half-written by an agent that never came back\n",
+                        );
+                        std::process::exit(CRASH_EXIT_CODE);
+                    }
                     Effect::EditFile | Effect::AskQuestion => {
                         let marker = run.workspace.join("agent-output.txt");
                         let previous = fs::read_to_string(&marker).unwrap_or_default();
@@ -2051,9 +2690,12 @@ mod tests {
             let status = match effect {
                 Effect::Error => OutcomeStatus::AgentError,
                 Effect::RateLimited => OutcomeStatus::RateLimited,
-                Effect::EditFile | Effect::EditTest | Effect::NoEdit | Effect::AskQuestion => {
-                    OutcomeStatus::Completed
-                }
+                // `Exit` never reaches here — `build` ends the process.
+                Effect::EditFile
+                | Effect::EditTest
+                | Effect::NoEdit
+                | Effect::AskQuestion
+                | Effect::Exit => OutcomeStatus::Completed,
             };
             let detail = match effect {
                 Effect::Error => Some("fake adapter error detail".to_owned()),
@@ -2213,9 +2855,49 @@ mod tests {
                 .join("pools.toml"),
         );
         opts.attempt_timeout = Duration::from_secs(60);
-        // Tests must never actually wait out a rate limit.
+        // Tests must never actually wait — not out a rate limit, and not at a
+        // hard block either. The test harness has no terminal, so an
+        // interactive mode resolves to the waiting answer channel; without a
+        // zero budget every parking test would sit out the real one.
         opts.defer_backoff = Duration::ZERO;
+        opts.wait_on_block = Some(Duration::ZERO);
+        opts.private_root = Some(private_root_for(repo));
         opts
+    }
+
+    /// A scratch stand-in for `~/.tactus`, so tests never touch the real one.
+    ///
+    /// A *sibling* of the repo, never a directory inside it. That is not
+    /// tidiness: §14's rollback is `git clean -fd`, which deletes untracked
+    /// directories — a private root inside the workspace would have its
+    /// transcripts and verdicts destroyed by the first failed attempt. The
+    /// same reasoning is why production puts it under the user's home.
+    fn private_root_for(repo: &Path) -> PathBuf {
+        let name = repo
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "run".to_owned());
+        repo.with_file_name(format!("{name}-home"))
+    }
+
+    /// Resume options matching [`options`], for the same reasons.
+    fn resume_options(repo: &Path, run_id: &str) -> ResumeOptions {
+        let mut opts = ResumeOptions::new(run_id.to_owned(), repo.to_path_buf());
+        opts.pools_path = Some(
+            std::env::temp_dir()
+                .join("tactus-engine-missing")
+                .join("pools.toml"),
+        );
+        opts.attempt_timeout = Duration::from_secs(60);
+        opts.defer_backoff = Duration::ZERO;
+        opts.wait_on_block = Some(Duration::ZERO);
+        opts.private_root = Some(private_root_for(repo));
+        opts
+    }
+
+    /// The paths a test's run wrote to.
+    fn paths_of(repo: &Path, run_id: &str) -> RunPaths {
+        RunPaths::with_private_root(repo, run_id, &private_root_for(repo))
     }
 
     fn committed(report: &RunReport, id: &str) -> bool {
@@ -2394,11 +3076,7 @@ mod tests {
         let repo = temp_engine_repo("reviewbinding");
         let source = fake(Effect::EditFile);
         let report = run_with(&options(&repo), &source).expect("run");
-        let settings = repo
-            .join(".tactus")
-            .join("runs")
-            .join(&report.run_id)
-            .join("settings");
+        let settings = paths_of(&repo, &report.run_id).settings();
         let allow_list = |file: &str| -> Vec<String> {
             let text = fs::read_to_string(settings.join(file)).expect("settings written");
             let value: serde_json::Value = serde_json::from_str(&text).expect("json");
@@ -2417,6 +3095,14 @@ mod tests {
         assert!(
             implementer.contains(&"Edit".to_owned()),
             "implementer can edit"
+        );
+
+        // §15 split: the file describing an agent's own sandbox is not
+        // somewhere that agent can read.
+        assert!(
+            !settings.starts_with(&repo),
+            "settings live outside the workspace: {}",
+            settings.display()
         );
     }
 
@@ -3339,11 +4025,7 @@ mod tests {
             failure.reason
         );
         // The re-ask actually happened, and both sides are on record.
-        let reviews = repo
-            .join(".tactus")
-            .join("runs")
-            .join(&report.run_id)
-            .join("reviews");
+        let reviews = paths_of(&repo, &report.run_id).reviews();
         assert!(reviews.join("00-t1-1-review.json").is_file());
         assert!(
             reviews.join("00-t1-1-review-reask.json").is_file(),
@@ -3377,11 +4059,7 @@ mod tests {
             .as_ref()
             .expect("gate should fail");
         assert_eq!(failure.kind, FailureKind::GateFailed);
-        let gates_dir = repo
-            .join(".tactus")
-            .join("runs")
-            .join(&report.run_id)
-            .join("gates");
+        let gates_dir = paths_of(&repo, &report.run_id).gates();
         assert!(
             gates_dir.join("00-t1-1-never.log").is_file(),
             "the log stem matches the task's other artifacts, so two ids that \
@@ -3588,5 +4266,934 @@ mod tests {
             sum_opt([Some(0.01), None, Some(0.02)].into_iter()),
             Some(0.03)
         );
+    }
+
+    // ---- step 8: the event log is the state ------------------------------
+
+    /// Fold a run's log the way `status` and `resume` do.
+    fn replay_of(repo: &Path, run_id: &str) -> crate::status::RunStatus {
+        crate::status::load(repo, Some(run_id)).expect("the run reads back")
+    }
+
+    /// One path through the ladder, for the live-equals-replay property.
+    struct Scenario {
+        name: &'static str,
+        config: &'static str,
+        effects: Vec<Effect>,
+        reviews: Vec<ReviewBehavior>,
+        answers: Vec<Answer>,
+    }
+
+    impl Scenario {
+        fn new(name: &'static str, config: &'static str, effects: Vec<Effect>) -> Self {
+            Self {
+                name,
+                config,
+                effects,
+                reviews: vec![ReviewBehavior::Pass],
+                answers: Vec::new(),
+            }
+        }
+
+        fn reviewed(mut self, reviews: Vec<ReviewBehavior>) -> Self {
+            self.reviews = reviews;
+            self
+        }
+
+        fn answered(mut self, answers: Vec<Answer>) -> Self {
+            self.answers = answers;
+            self
+        }
+    }
+
+    /// The property the whole design rests on: a live run and a replay of its
+    /// own log are the same computation, not two that happen to agree.
+    ///
+    /// Asserted on `RunState` rather than on the report, because the report is
+    /// a lossy projection — it drops `feedback`, `resume_next`, `session`, and
+    /// the rung a task is standing on, which are exactly the fields a resume
+    /// depends on being right.
+    fn assert_live_equals_replay(repo: &Path, live: &RunState, report: &RunReport) {
+        let replayed = replay_of(repo, &report.run_id);
+        assert_eq!(
+            &replayed.state, live,
+            "replaying the log produced different state than the run that wrote it"
+        );
+        // Warnings are the one field deliberately excluded. They are
+        // diagnostics of the *process* — what this invocation noticed about a
+        // missing notifier or a discarded working tree — not facts about the
+        // run, so a later reader legitimately has different ones. Anything
+        // that genuinely belongs to the run is an event instead (a discarded
+        // tree, for instance, rides on `run_resumed`).
+        let strip = |report: &RunReport| {
+            let mut value = serde_json::to_value(report).expect("serialize");
+            if let Some(object) = value.as_object_mut() {
+                object.remove("warnings");
+            }
+            value
+        };
+        assert_eq!(
+            strip(&replayed.report()),
+            strip(report),
+            "the report derived from the log differs from the one the run wrote"
+        );
+    }
+
+    #[test]
+    fn live_state_equals_replayed_state_across_every_ladder_path() {
+        // One scenario per branch the engine can take, so the equality is
+        // exercised against commits, retries, escalations, deferrals, parks,
+        // answers, and a halt — not just the happy path.
+        let scenarios = vec![
+            Scenario::new(
+                "commit",
+                "[routing]\nimplement = { chain = [\"small\"], attempts_per = 1 }\n",
+                vec![Effect::EditFile],
+            ),
+            Scenario::new(
+                "retry",
+                "[routing]\nimplement = { chain = [\"small\"], attempts_per = 2 }\n",
+                vec![Effect::NoEdit, Effect::EditFile],
+            ),
+            Scenario::new(
+                "escalate",
+                "[routing]\nimplement = { chain = [\"small\", \"mid\"], attempts_per = 1 }\n",
+                vec![Effect::NoEdit, Effect::EditFile],
+            ),
+            Scenario::new(
+                "defer",
+                "[routing]\nimplement = { chain = [\"small\"], attempts_per = 1 }\n",
+                vec![Effect::RateLimited, Effect::EditFile],
+            ),
+            Scenario::new(
+                "park-then-answer",
+                "[routing]\nimplement = { chain = [\"small\"], attempts_per = 1 }\n",
+                vec![Effect::NoEdit, Effect::EditFile],
+            )
+            .answered(vec![Answer::Answered {
+                text: "the widget lives in src/widget.rs".to_owned(),
+            }]),
+            Scenario::new(
+                "decline-and-halt",
+                "[routing]\nimplement = { chain = [\"small\"], attempts_per = 1 }\n",
+                vec![Effect::NoEdit],
+            )
+            .answered(vec![Answer::Declined]),
+            Scenario::new(
+                "reviewer-asks-for-a-human",
+                "[routing]\nimplement = { chain = [\"small\", \"mid\"], attempts_per = 2 }\n",
+                vec![Effect::EditFile],
+            )
+            .reviewed(vec![ReviewBehavior::NeedsHuman]),
+        ];
+
+        for Scenario {
+            name,
+            config,
+            effects,
+            reviews,
+            answers,
+        } in scenarios
+        {
+            let repo = temp_engine_repo(&format!("replay-{name}"));
+            seed(
+                &repo,
+                "## Implement the widget\n<!-- tactus: id=t1 kind=implement depends= -->\n\n\
+                 ## Independent\n<!-- tactus: id=t3 kind=implement depends= -->\n",
+                Some(config),
+            );
+            let mut opts = options(&repo);
+            opts.config_path = Some(repo.join("tactus.toml"));
+            let source = source(effects, reviews);
+            let scripted = ScriptedAnswers::new(answers);
+            let (report, live) = run_harness_inner(
+                &opts,
+                &Harness {
+                    adapters: &source,
+                    answers: Some(&scripted),
+                    sleeper: None,
+                },
+            )
+            .unwrap_or_else(|e| panic!("{name}: {e}"));
+            assert_live_equals_replay(&repo, &live, &report);
+        }
+    }
+
+    #[test]
+    fn an_aborting_error_still_leaves_a_replayable_log() {
+        // The engine dying between the agent's edits and a verdict is §19's
+        // "engine crash" row. Nothing gets to write a tidy ending, so the log
+        // has to be enough on its own.
+        let repo = temp_engine_repo("abortlog");
+        seed(
+            &repo,
+            "## Implement the widget\n<!-- tactus: id=t1 kind=implement depends= -->\n",
+            Some("[routing]\nimplement = { chain = [\"small\"], attempts_per = 1 }\n"),
+        );
+        let mut opts = options(&repo);
+        opts.config_path = Some(repo.join("tactus.toml"));
+        // No adapter for the agent the chain names: the failure lands inside
+        // `step_task`, after `attempt_started` would have been emitted.
+        let source = source(vec![Effect::EditFile], vec![ReviewBehavior::Pass]);
+        opts.attempt_timeout = Duration::from_secs(60);
+        let report = run_with(&opts, &source).expect("this one succeeds");
+
+        // Now truncate the log to the moment before the attempt reported, the
+        // exact on-disk shape a kill leaves, and confirm it still folds.
+        let paths = paths_of(&repo, &report.run_id);
+        let text = fs::read_to_string(paths.events()).expect("log");
+        let lines: Vec<&str> = text.lines().collect();
+        let cut = lines
+            .iter()
+            .position(|line| line.contains("\"attempt_finished\""))
+            .expect("the run recorded an attempt");
+        fs::write(paths.events(), format!("{}\n", lines[..cut].join("\n"))).expect("truncate");
+
+        let replayed = replay_of(&repo, &report.run_id);
+        assert_eq!(replayed.interrupted, 1, "the dangling attempt is settled");
+        assert!(
+            replayed.interrupted_run(),
+            "and the run reads as interrupted rather than finished"
+        );
+        assert_eq!(replayed.state.states[0], TaskState::Pending);
+    }
+
+    #[test]
+    fn a_truncated_run_resumes_without_spending_the_interrupted_attempt() {
+        // Decision 3, end to end: the attempt shows up in the ledger, the
+        // rung's allowance does not, and the task completes on the retry.
+        let repo = temp_engine_repo("resumetrunc");
+        seed(
+            &repo,
+            "## Implement the widget\n<!-- tactus: id=t1 kind=implement depends= -->\n",
+            // One attempt on one rung: if the interrupted attempt had been
+            // counted, the task could never commit.
+            Some("[routing]\nimplement = { chain = [\"small\"], attempts_per = 1 }\n"),
+        );
+        let mut opts = options(&repo);
+        opts.config_path = Some(repo.join("tactus.toml"));
+        let source = fake(Effect::EditFile);
+        let report = run_with(&opts, &source).expect("run");
+        let run_id = report.run_id.clone();
+        let paths = paths_of(&repo, &run_id);
+
+        // Rewind the record to mid-attempt and put the tree back the way a
+        // dead agent would have left it.
+        let text = fs::read_to_string(paths.events()).expect("log");
+        let lines: Vec<&str> = text.lines().collect();
+        let cut = lines
+            .iter()
+            .position(|line| line.contains("\"attempt_finished\""))
+            .expect("an attempt");
+        fs::write(paths.events(), format!("{}\n", lines[..cut].join("\n"))).expect("truncate");
+        git_in(&repo, &["reset", "-q", "--hard", "HEAD~1"]);
+        fs::write(repo.join("agent-output.txt"), "half-written\n").expect("residue");
+
+        let source = fake(Effect::EditFile);
+        let (resumed, state) = resume_harness_inner(
+            &resume_options(&repo, &run_id),
+            &Harness {
+                adapters: &source,
+                answers: None,
+                sleeper: None,
+            },
+        )
+        .expect("resume");
+
+        assert_eq!(resumed.outcome(), RunOutcome::Complete, "{resumed:?}");
+        assert!(committed(&resumed, "t1"));
+
+        let t1 = task(&resumed, "t1");
+        assert_eq!(
+            t1.attempts.len(),
+            2,
+            "the interrupted attempt is on the record beside the one that worked"
+        );
+        assert_eq!(
+            t1.attempts[0].failure.as_ref().map(|f| f.kind),
+            Some(FailureKind::Interrupted)
+        );
+        assert_eq!(
+            t1.attempts[0].cost_usd, None,
+            "unknown spend is reported as unknown, not as free"
+        );
+        assert_eq!(t1.attempts[1].tier, "small", "still on the same rung");
+        assert!(
+            !t1.attempts[1].resumed,
+            "§14: the tree was discarded, so the session cannot be trusted"
+        );
+
+        // The residue is gone and the branch is linear.
+        assert!(
+            git_in(&repo, &["status", "--porcelain"]).trim().is_empty(),
+            "crash residue discarded"
+        );
+        assert_eq!(
+            git_in(&repo, &["rev-list", "--count", "main..HEAD"]).trim(),
+            "1",
+            "one commit, not a duplicate of the interrupted attempt's work"
+        );
+        assert!(
+            resumed
+                .warnings
+                .iter()
+                .any(|w| w.contains("discarded") && w.contains("agent-output.txt")),
+            "the operator is told what was thrown away: {:?}",
+            resumed.warnings
+        );
+        assert_live_equals_replay(&repo, &state, &resumed);
+    }
+
+    #[test]
+    fn killing_a_run_mid_attempt_leaves_a_resumable_record() {
+        // The real thing: a separate process is driven into an attempt and
+        // dies inside it, exactly as `kill -9` or a power cut would.
+        let repo = temp_engine_repo("crashkill");
+        seed(
+            &repo,
+            "## First\n<!-- tactus: id=t1 kind=implement depends= -->\n\n\
+             ## Second\n<!-- tactus: id=t2 kind=implement depends=t1 -->\n",
+            Some("[routing]\nimplement = { chain = [\"small\"], attempts_per = 1 }\n"),
+        );
+
+        let exe = std::env::current_exe().expect("test binary");
+        let status = Command::new(exe)
+            .args([
+                "--exact",
+                "engine::tests::crash_child_dies_inside_an_attempt",
+                "--ignored",
+                "--test-threads",
+                "1",
+            ])
+            .env("TACTUS_CRASH_REPO", &repo)
+            .output()
+            .expect("spawn the child run");
+        assert_eq!(
+            status.status.code(),
+            Some(CRASH_EXIT_CODE),
+            "the child must die inside the attempt, not finish or panic: {}",
+            String::from_utf8_lossy(&status.stderr)
+        );
+
+        let run_id = rundir::latest_run(&repo).expect("the child started a run");
+        let paths = paths_of(&repo, &run_id);
+
+        // What a kill leaves: a dirty tree and an attempt that never reported.
+        assert!(
+            !git_in(&repo, &["status", "--porcelain"]).trim().is_empty(),
+            "the dead agent's edits are still in the tree"
+        );
+        let log = fs::read_to_string(paths.events()).expect("log");
+        let last = log.lines().last().expect("events");
+        assert!(
+            last.contains("\"attempt_started\"") && last.contains("\"t2\""),
+            "the log ends mid-attempt: {last}"
+        );
+        assert!(
+            !log.contains("\"run_finished\""),
+            "a killed run never records an ending"
+        );
+
+        let before = replay_of(&repo, &run_id);
+        assert!(before.interrupted_run(), "status calls it interrupted");
+        assert_eq!(before.interrupted, 1);
+        assert!(
+            crate::status::render(&before).contains(&format!("tactus resume {run_id}")),
+            "and tells the operator how to continue it"
+        );
+
+        // The lock died with the process, so nothing has to be cleared by hand.
+        assert!(!rundir::is_running(&paths), "the OS released the lock");
+
+        let source = fake(Effect::EditFile);
+        let (resumed, state) = resume_harness_inner(
+            &resume_options(&repo, &run_id),
+            &Harness {
+                adapters: &source,
+                answers: None,
+                sleeper: None,
+            },
+        )
+        .expect("resume the killed run");
+
+        assert_eq!(resumed.outcome(), RunOutcome::Complete, "{resumed:?}");
+        assert!(committed(&resumed, "t1"), "the work it did survived");
+        assert!(
+            committed(&resumed, "t2"),
+            "and the work it died in got done"
+        );
+        assert_eq!(
+            git_in(&repo, &["rev-list", "--count", "main..HEAD"]).trim(),
+            "2",
+            "one commit per task, with nothing duplicated by the resume"
+        );
+        let t2 = task(&resumed, "t2");
+        assert_eq!(
+            t2.attempts[0].failure.as_ref().map(|f| f.kind),
+            Some(FailureKind::Interrupted),
+            "the attempt it died in is on the record: {t2:?}"
+        );
+        assert_live_equals_replay(&repo, &state, &resumed);
+    }
+
+    /// Spawned by `killing_a_run_mid_attempt_leaves_a_resumable_record`.
+    /// Ends its own process on purpose, which is why it must never run as part
+    /// of the ordinary suite.
+    #[test]
+    #[ignore = "spawned by killing_a_run_mid_attempt_leaves_a_resumable_record"]
+    fn crash_child_dies_inside_an_attempt() {
+        let Ok(repo) = std::env::var("TACTUS_CRASH_REPO") else {
+            return;
+        };
+        let repo = PathBuf::from(repo);
+        let mut opts = options(&repo);
+        opts.config_path = Some(repo.join("tactus.toml"));
+        // t1 commits; the process dies inside t2's first attempt.
+        let source = source(
+            vec![Effect::EditFile, Effect::Exit],
+            vec![ReviewBehavior::Pass],
+        );
+        let _ = run_with(&opts, &source);
+        // Only reachable if the adapter never got a second invocation, which
+        // would mean this test is not exercising what it claims to.
+        std::process::exit(0);
+    }
+
+    #[test]
+    fn a_parked_run_is_answered_out_of_band_and_resumed() {
+        // §21's definition-of-done (d) across processes: the run ends parked,
+        // a person answers with `tactus answer` while nothing is running, and
+        // the resume picks the answer up.
+        let repo = temp_engine_repo("answerresume");
+        seed(
+            &repo,
+            "## Doomed\n<!-- tactus: id=t1 kind=implement depends= -->\n\n\
+             ## Depends on it\n<!-- tactus: id=t2 kind=implement depends=t1 -->\n",
+            Some(
+                "[interaction]\nmode = \"never\"\n\n\
+                 [routing]\nimplement = { chain = [\"small\"], attempts_per = 1 }\n",
+            ),
+        );
+        let mut opts = options(&repo);
+        opts.config_path = Some(repo.join("tactus.toml"));
+        let source = source(vec![Effect::NoEdit], vec![ReviewBehavior::Pass]);
+        let report = run_with(&opts, &source).expect("run");
+
+        assert_eq!(report.outcome(), RunOutcome::Parked);
+        let run_id = report.run_id.clone();
+        let question = report
+            .questions
+            .first()
+            .expect("a question was raised")
+            .question
+            .id
+            .to_string();
+
+        // Nothing is running; the answer is written by the CLI path.
+        let recorded = crate::answer::answer(
+            &repo,
+            &question[..8],
+            crate::answer::Reply::Text("the widget lives in src/widget.rs".to_owned()),
+        )
+        .expect("answer by prefix");
+        assert_eq!(recorded.run_id, run_id);
+        assert!(!recorded.run_is_live);
+
+        let source = fake(Effect::EditFile);
+        let (resumed, state) = resume_harness_inner(
+            &resume_options(&repo, &run_id),
+            &Harness {
+                adapters: &source,
+                answers: None,
+                sleeper: None,
+            },
+        )
+        .expect("resume");
+
+        assert_eq!(resumed.outcome(), RunOutcome::Complete, "{resumed:?}");
+        assert!(committed(&resumed, "t1"), "the answer un-parked it");
+        assert!(committed(&resumed, "t2"), "and its dependent ran");
+
+        // This adapter is fresh for the resume, so its first invocation is
+        // t1's retry — the one the answer released. t2 runs after it.
+        let runs = source.adapter.runs();
+        let retry = runs.first().expect("a retry ran");
+        assert!(
+            retry.prompt.contains("src/widget.rs"),
+            "the operator's answer reached the agent: {}",
+            retry.prompt
+        );
+        assert!(
+            retry.prompt.contains("instruction from a person"),
+            "labelled as an instruction, not quoted as data"
+        );
+        assert_live_equals_replay(&repo, &state, &resumed);
+    }
+
+    #[test]
+    fn an_answer_arriving_mid_run_unparks_without_a_hard_block() {
+        // Invariant 6 at its most useful: the operator answers from elsewhere
+        // while other work is still going, and the task is released on the
+        // next scheduler turn rather than at the end of the run.
+        let repo = temp_engine_repo("midrun");
+        seed(
+            &repo,
+            "## Asks a question\n<!-- tactus: id=t1 kind=implement depends= -->\n\n\
+             ## Independent\n<!-- tactus: id=t3 kind=implement depends= -->\n",
+            Some("[routing]\nimplement = { chain = [\"small\"], attempts_per = 2 }\n"),
+        );
+        let mut opts = options(&repo);
+        opts.config_path = Some(repo.join("tactus.toml"));
+        let source = source(
+            vec![Effect::AskQuestion, Effect::EditFile],
+            vec![ReviewBehavior::Pass],
+        );
+        // Nobody is reachable through the answer *channel* at all: if the
+        // sweep did not exist, t1 could only ever end parked.
+        let report = run_harness(
+            &opts,
+            &Harness {
+                adapters: &source,
+                answers: Some(&AnsweringViaFile { repo: repo.clone() }),
+                sleeper: None,
+            },
+        )
+        .expect("run");
+
+        assert_eq!(report.outcome(), RunOutcome::Complete, "{report:?}");
+        assert!(committed(&report, "t1"), "the file answer released it");
+        assert!(committed(&report, "t3"));
+        let answered = report.questions.first().expect("one question");
+        assert!(
+            matches!(&answered.answer, Some(Answer::Answered { text }) if text.contains("opaque")),
+            "the answer is recorded against the question: {answered:?}"
+        );
+    }
+
+    /// Stands in for an operator running `tactus answer` in another terminal
+    /// while the run is still going: it writes the file and tells the engine
+    /// nobody replied, so only the sweep can find it.
+    struct AnsweringViaFile {
+        repo: PathBuf,
+    }
+
+    impl AnswerSource for AnsweringViaFile {
+        fn id(&self) -> &'static str {
+            "test-file-writer"
+        }
+
+        fn resolve(&self, question: &Question) -> Result<Answer, TactusError> {
+            let _ = crate::answer::answer(
+                &self.repo,
+                question.id.as_str(),
+                crate::answer::Reply::Text("opaque cursors".to_owned()),
+            );
+            Ok(Answer::Unanswered)
+        }
+    }
+
+    #[test]
+    fn blocking_propagates_transitively_and_against_plan_order() {
+        // The chain is listed backwards on purpose: a single pass in plan
+        // order would settle `late` before `mid` was known to be blocked, and
+        // report it as merely skipped.
+        let repo = temp_engine_repo("blocked");
+        seed(
+            &repo,
+            "## Last\n<!-- tactus: id=late kind=implement depends=mid -->\n\n\
+             ## Middle\n<!-- tactus: id=mid kind=implement depends=first -->\n\n\
+             ## First\n<!-- tactus: id=first kind=implement depends= -->\n",
+            Some(
+                "[interaction]\nmode = \"never\"\n\n\
+                 [routing]\nimplement = { chain = [\"small\"], attempts_per = 1 }\n",
+            ),
+        );
+        let mut opts = options(&repo);
+        opts.config_path = Some(repo.join("tactus.toml"));
+        let source = source(vec![Effect::NoEdit], vec![ReviewBehavior::Pass]);
+        let report = run_with(&opts, &source).expect("run");
+
+        assert!(matches!(
+            task(&report, "first").status,
+            TaskRunStatus::Parked { .. }
+        ));
+        assert!(
+            matches!(&task(&report, "mid").status, TaskRunStatus::Blocked { by } if by == "first"),
+            "the direct dependent is blocked: {report:?}"
+        );
+        assert!(
+            matches!(&task(&report, "late").status, TaskRunStatus::Blocked { by } if by == "mid"),
+            "and so is its dependent, naming the nearest blocker: {report:?}"
+        );
+    }
+
+    #[test]
+    fn answering_a_blocker_releases_the_chain_behind_it() {
+        // Blocked is a *view*, not recorded state — which is what lets an
+        // answer make a whole chain runnable again on resume.
+        let repo = temp_engine_repo("unblock");
+        seed(
+            &repo,
+            "## Last\n<!-- tactus: id=late kind=implement depends=mid -->\n\n\
+             ## Middle\n<!-- tactus: id=mid kind=implement depends=first -->\n\n\
+             ## First\n<!-- tactus: id=first kind=implement depends= -->\n",
+            Some(
+                "[interaction]\nmode = \"never\"\n\n\
+                 [routing]\nimplement = { chain = [\"small\"], attempts_per = 1 }\n",
+            ),
+        );
+        let mut opts = options(&repo);
+        opts.config_path = Some(repo.join("tactus.toml"));
+        let source = source(vec![Effect::NoEdit], vec![ReviewBehavior::Pass]);
+        let report = run_with(&opts, &source).expect("run");
+        let run_id = report.run_id.clone();
+        let question = report.questions[0].question.id.to_string();
+
+        crate::answer::answer(
+            &repo,
+            &question,
+            crate::answer::Reply::Text("write src/first.rs".to_owned()),
+        )
+        .expect("answer");
+
+        let source = fake(Effect::EditFile);
+        let resumed = resume_with(&resume_options(&repo, &run_id), &source).expect("resume");
+        assert_eq!(resumed.outcome(), RunOutcome::Complete, "{resumed:?}");
+        for id in ["first", "mid", "late"] {
+            assert!(committed(&resumed, id), "{id} should have run: {resumed:?}");
+        }
+    }
+
+    #[test]
+    fn an_exhausted_pool_and_a_silent_operator_still_terminate() {
+        // The drain loop's termination argument, executed: an adapter that
+        // never succeeds, a pool that never returns, and a channel nobody
+        // answers. Every branch of the loop fires and the run still ends.
+        let repo = temp_engine_repo("terminate");
+        seed(
+            &repo,
+            "## One\n<!-- tactus: id=t1 kind=implement depends= -->\n\n\
+             ## Two\n<!-- tactus: id=t2 kind=implement depends= -->\n\n\
+             ## After one\n<!-- tactus: id=t3 kind=implement depends=t1 -->\n",
+            Some("[routing]\nimplement = { chain = [\"small\", \"mid\"], attempts_per = 2 }\n"),
+        );
+        let mut opts = options(&repo);
+        opts.config_path = Some(repo.join("tactus.toml"));
+        opts.max_defers = 2;
+        let source = source(vec![Effect::RateLimited], vec![ReviewBehavior::Pass]);
+        let answers = CountingAnswers::default();
+        let sleeper = RecordingSleeper::default();
+        let report = run_harness(
+            &opts,
+            &Harness {
+                adapters: &source,
+                answers: Some(&answers),
+                sleeper: Some(&sleeper),
+            },
+        )
+        .expect("the run terminates rather than spinning");
+
+        assert_eq!(report.outcome(), RunOutcome::Parked);
+        for id in ["t1", "t2"] {
+            assert!(
+                matches!(task(&report, id).status, TaskRunStatus::Parked { .. }),
+                "{id}: {report:?}"
+            );
+        }
+        assert!(matches!(
+            task(&report, "t3").status,
+            TaskRunStatus::Blocked { .. }
+        ));
+        assert_eq!(
+            answers.count(),
+            2,
+            "each question is asked exactly once, however many times the loop turns"
+        );
+        assert!(
+            !sleeper.waits().is_empty(),
+            "the deferral branch really fired"
+        );
+        assert!(
+            sleeper.waits().len() <= 8,
+            "and it was bounded: {:?}",
+            sleeper.waits()
+        );
+    }
+
+    // ---- step 8: resume refuses rather than guessing -----------------------
+
+    fn resume_err(repo: &Path, run_id: &str) -> String {
+        let source = fake(Effect::EditFile);
+        resume_with(&resume_options(repo, run_id), &source)
+            .expect_err("resume must refuse")
+            .to_string()
+    }
+
+    /// A run that ends parked — the resumable shape every refusal test starts
+    /// from, so each one isolates exactly the thing it breaks.
+    fn parked_run(tag: &str) -> (PathBuf, String) {
+        let repo = temp_engine_repo(tag);
+        seed(
+            &repo,
+            "## Doomed\n<!-- tactus: id=t1 kind=implement depends= -->\n",
+            Some(
+                "[interaction]\nmode = \"never\"\n\n\
+                 [routing]\nimplement = { chain = [\"small\"], attempts_per = 1 }\n",
+            ),
+        );
+        let mut opts = options(&repo);
+        opts.config_path = Some(repo.join("tactus.toml"));
+        let source = source(vec![Effect::NoEdit], vec![ReviewBehavior::Pass]);
+        let report = run_with(&opts, &source).expect("run");
+        assert_eq!(report.outcome(), RunOutcome::Parked);
+        (repo, report.run_id)
+    }
+
+    #[test]
+    fn resume_refuses_when_the_branch_moved_under_it() {
+        // §15's HEAD check. Something committed after the run stopped, so the
+        // log no longer describes what is on the branch.
+        let (repo, run_id) = parked_run("headmoved");
+        fs::write(repo.join("someone-else.txt"), "a hand-made commit\n").expect("file");
+        git_in(&repo, &["add", "-A"]);
+        git_in(&repo, &["commit", "-q", "-m", "not the engine's work"]);
+
+        let err = resume_err(&repo, &run_id);
+        assert!(err.contains("record ends at"), "got: {err}");
+        assert!(
+            err.contains("Move the branch back"),
+            "and says what to do: {err}"
+        );
+    }
+
+    #[test]
+    fn resume_refuses_when_the_frozen_plan_changed() {
+        let (repo, run_id) = parked_run("planmoved");
+        fs::write(
+            repo.join("plan.md"),
+            "## Doomed\n<!-- tactus: id=t1 kind=implement depends= -->\nNow with a body.\n",
+        )
+        .expect("edit the plan");
+
+        let err = resume_err(&repo, &run_id);
+        assert!(
+            err.contains("has changed since this run froze it"),
+            "got: {err}"
+        );
+        assert!(
+            err.contains("attribute work to the wrong tasks"),
+            "and why it matters: {err}"
+        );
+    }
+
+    #[test]
+    fn resume_refuses_when_routing_moved_under_a_recorded_rung() {
+        // `Progress.rung` is an index into the chain; re-resolving a different
+        // chain would point it at another tier without saying so.
+        let (repo, run_id) = parked_run("chainmoved");
+        fs::write(
+            repo.join("tactus.toml"),
+            "[interaction]\nmode = \"never\"\n\n\
+             [routing]\nimplement = { chain = [\"mid\", \"frontier\"], attempts_per = 1 }\n",
+        )
+        .expect("edit config");
+
+        let err = resume_err(&repo, &run_id);
+        assert!(err.contains("routing has changed"), "got: {err}");
+        assert!(err.contains("`t1` ran on [small]"), "names the task: {err}");
+    }
+
+    #[test]
+    fn resume_refuses_when_the_run_branch_is_gone() {
+        let (repo, run_id) = parked_run("branchgone");
+        let branch = git_in(&repo, &["rev-parse", "--abbrev-ref", "HEAD"])
+            .trim()
+            .to_owned();
+        git_in(&repo, &["switch", "-q", "main"]);
+        git_in(&repo, &["branch", "-q", "-D", &branch]);
+
+        let err = resume_err(&repo, &run_id);
+        assert!(err.contains("no longer exists"), "got: {err}");
+    }
+
+    #[test]
+    fn resume_refuses_to_switch_over_uncommitted_work() {
+        let (repo, run_id) = parked_run("dirtyelsewhere");
+        git_in(&repo, &["switch", "-q", "main"]);
+        fs::write(
+            repo.join("my-own-work.txt"),
+            "not the engine's to discard\n",
+        )
+        .expect("file");
+
+        let err = resume_err(&repo, &run_id);
+        assert!(err.contains("Commit or stash"), "got: {err}");
+        assert!(
+            repo.join("my-own-work.txt").exists(),
+            "a refusal must not destroy the work it refused over"
+        );
+    }
+
+    #[test]
+    fn resume_refuses_a_run_that_already_finished_or_halted() {
+        let repo = temp_engine_repo("finished");
+        let complete = fake(Effect::EditFile);
+        let report = run_with(&options(&repo), &complete).expect("run");
+        assert_eq!(report.outcome(), RunOutcome::Complete);
+        let err = resume_err(&repo, &report.run_id);
+        assert!(err.contains("already completed"), "got: {err}");
+
+        let repo = temp_engine_repo("halted");
+        seed(
+            &repo,
+            "## Doomed\n<!-- tactus: id=t1 kind=implement depends= -->\n",
+            Some("[routing]\nimplement = { chain = [\"small\"], attempts_per = 1 }\n"),
+        );
+        let mut opts = options(&repo);
+        opts.config_path = Some(repo.join("tactus.toml"));
+        let source = source(vec![Effect::NoEdit], vec![ReviewBehavior::Pass]);
+        let answers = ScriptedAnswers::new(vec![Answer::Declined]);
+        let report = run_harness(
+            &opts,
+            &Harness {
+                adapters: &source,
+                answers: Some(&answers),
+                sleeper: None,
+            },
+        )
+        .expect("run");
+        assert_eq!(report.outcome(), RunOutcome::Halted);
+        let err = resume_err(&repo, &report.run_id);
+        assert!(err.contains("halted at `t1`"), "got: {err}");
+    }
+
+    #[test]
+    fn resume_refuses_while_another_process_holds_the_run() {
+        let (repo, run_id) = parked_run("locked");
+        let paths = paths_of(&repo, &run_id);
+        let _held = RunLock::acquire(&paths).expect("hold it");
+
+        let err = resume_err(&repo, &run_id);
+        assert!(err.contains("already driving run"), "got: {err}");
+    }
+
+    #[test]
+    fn an_unknown_run_id_lists_what_is_there() {
+        let (repo, _) = parked_run("unknownid");
+        let err = resume_err(&repo, "01NOPE");
+        assert!(err.contains("known runs"), "got: {err}");
+    }
+
+    // ---- step 8: status and the ledger -------------------------------------
+
+    #[test]
+    fn status_reports_a_live_run_and_the_ledger_reads_from_the_log() {
+        let repo = temp_engine_repo("statusledger");
+        let source = fake(Effect::EditFile);
+        let report = run_with(&options(&repo), &source).expect("run");
+
+        let loaded = replay_of(&repo, &report.run_id);
+        assert!(!loaded.running, "nothing holds a finished run");
+        assert!(!loaded.interrupted_run());
+
+        let rendered = crate::status::render(&loaded);
+        assert!(rendered.contains("ledger:"), "{rendered}");
+        assert!(rendered.contains("t1"), "{rendered}");
+        assert!(
+            rendered.contains("not connected"),
+            "pool drain is honest about arriving with the capacity engine"
+        );
+        assert!(
+            rendered.contains(&loaded.paths.private.display().to_string()),
+            "and points at where the transcripts actually are"
+        );
+
+        // The ledger totals are the run's, derived from the log rather than
+        // carried over from the process that wrote it.
+        assert!(
+            (loaded.report().total_cost_usd - report.total_cost_usd).abs() < 1e-9,
+            "{} vs {}",
+            loaded.report().total_cost_usd,
+            report.total_cost_usd
+        );
+
+        // A live run says so.
+        let paths = paths_of(&repo, &report.run_id);
+        let _held = RunLock::acquire(&paths).expect("simulate a live engine");
+        let live = replay_of(&repo, &report.run_id);
+        assert!(live.running);
+        assert!(crate::status::render(&live).contains("running now"));
+    }
+
+    #[test]
+    fn following_a_finished_run_replays_it_and_stops() {
+        let repo = temp_engine_repo("follow");
+        let source = fake(Effect::EditFile);
+        let report = run_with(&options(&repo), &source).expect("run");
+
+        let loaded = replay_of(&repo, &report.run_id);
+        let sleeper = RecordingSleeper::default();
+        let mut out: Vec<u8> = Vec::new();
+        crate::status::follow(&loaded, &sleeper, Duration::ZERO, 2, &mut out).expect("follow");
+        let text = String::from_utf8(out).expect("utf8");
+
+        assert!(text.contains("run"), "{text}");
+        assert!(text.contains("t1: committed"), "{text}");
+        assert!(
+            text.contains("run finished"),
+            "it stops at the ending rather than idling: {text}"
+        );
+        assert!(
+            sleeper.waits().is_empty(),
+            "a finished run needs no waiting at all"
+        );
+        for line in text.lines() {
+            assert!(!line.is_empty());
+        }
+    }
+
+    #[test]
+    fn transcripts_live_outside_the_workspace_and_survive_a_rollback() {
+        // The §15 split, and the reason the private root cannot be inside the
+        // repo: §14's rollback is `git clean -fd`, which would delete it.
+        let repo = temp_engine_repo("private");
+        seed(
+            &repo,
+            "## Implement the widget\n<!-- tactus: id=t1 kind=implement depends= -->\n",
+            Some("[routing]\nimplement = { chain = [\"small\"], attempts_per = 2 }\n"),
+        );
+        let mut opts = options(&repo);
+        opts.config_path = Some(repo.join("tactus.toml"));
+        // The first attempt fails, so a rollback happens before the second.
+        let adapters = source(
+            vec![Effect::NoEdit, Effect::EditFile],
+            vec![ReviewBehavior::Pass],
+        );
+        let report = run_with(&opts, &adapters).expect("run");
+        let paths = paths_of(&repo, &report.run_id);
+
+        for private in [paths.transcripts(), paths.reviews(), paths.settings()] {
+            assert!(
+                !private.starts_with(&repo),
+                "{} must be outside the workspace",
+                private.display()
+            );
+            assert!(
+                fs::read_dir(&private).into_iter().flatten().count() > 0,
+                "{} kept its contents across the rollback",
+                private.display()
+            );
+        }
+        // The ops surface stays where §15 documents it.
+        assert!(paths.events().starts_with(&repo));
+        assert!(paths.questions().starts_with(&repo));
+        // And nothing agent-authored is reachable from the repo.
+        let in_repo = repo.join(".tactus").join("runs").join(&report.run_id);
+        for leaked in ["transcripts", "reviews", "settings", "gates"] {
+            assert!(
+                !in_repo.join(leaked).exists(),
+                "{leaked}/ must not exist inside the workspace"
+            );
+        }
     }
 }

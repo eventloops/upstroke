@@ -19,10 +19,12 @@
 //! preview, and report — executing nothing.
 
 pub mod agent;
+pub mod answer;
 pub mod catalog;
 pub mod config;
 pub mod engine;
 pub mod error;
+pub mod events;
 pub mod gates;
 pub mod interaction;
 pub mod ir;
@@ -30,6 +32,8 @@ pub mod ladder;
 pub mod plan;
 pub mod review;
 pub mod route;
+pub mod rundir;
+pub mod status;
 pub mod ulid;
 pub mod util;
 pub mod validate;

@@ -82,8 +82,48 @@ impl Workspace {
             .to_owned())
     }
 
+    /// Full HEAD sha. The event log records these rather than short ones
+    /// because `--short` picks its length from `core.abbrev` and the repo's
+    /// object count — a sha written by one checkout would not compare equal to
+    /// the same sha read by another, which is exactly the check §15 asks
+    /// `resume` to make.
+    pub fn head_sha_full(&self) -> Result<String, TactusError> {
+        Ok(self.git(&["rev-parse", "HEAD"])?.trim().to_owned())
+    }
+
     pub fn create_branch(&self, name: &str) -> Result<(), TactusError> {
         self.git(&["switch", "-q", "-c", name]).map(|_| ())
+    }
+
+    /// Move to an existing branch — how `resume` gets back onto the run's own
+    /// branch when the operator has wandered off it.
+    pub fn switch_branch(&self, name: &str) -> Result<(), TactusError> {
+        self.git(&["switch", "-q", name]).map(|_| ())
+    }
+
+    /// Whether a branch exists locally.
+    pub fn branch_exists(&self, name: &str) -> Result<bool, TactusError> {
+        let output = Command::new("git")
+            .arg("-C")
+            .arg(&self.root)
+            .args(["rev-parse", "--verify", "--quiet"])
+            .arg(format!("refs/heads/{name}"))
+            .output()
+            .map_err(|e| TactusError::Git {
+                message: format!("failed to run git: {e}"),
+            })?;
+        Ok(output.status.success())
+    }
+
+    /// A one-line-per-path summary of everything uncommitted, for telling the
+    /// operator what a resume is about to discard.
+    pub fn uncommitted_summary(&self) -> Result<Vec<String>, TactusError> {
+        Ok(self
+            .git(&["status", "--porcelain"])?
+            .lines()
+            .map(|line| line.trim_end().to_owned())
+            .filter(|line| !line.is_empty())
+            .collect())
     }
 
     /// Keep `.tactus/` (run dirs, transcripts) out of `status` and out of the

@@ -188,6 +188,19 @@ pub fn permission_settings(profile: &WorkerProfile, gate_cmds: &[String]) -> Val
             // later attempts may do — an agent that can edit .claude/ or
             // .git/ config escalates its own permissions for the rest of the
             // run (invariant 1 and §20).
+            //
+            // `.tactus/` joins them now that `events.jsonl` is the source of
+            // truth: an agent that can append to it could forge a
+            // `task_committed`, and one that can truncate it could erase its
+            // own failures. Writes there are also never legitimate — the
+            // engine owns that directory the way it owns git.
+            //
+            // The `Read` denials are defence in depth rather than the
+            // mechanism. A gate runs repository code the implementer just
+            // wrote, and that code can read any workspace path no permission
+            // rule ever sees. The actual guarantee comes from §15's split:
+            // transcripts, verdicts, and settings live outside the workspace,
+            // where there is no path to them at all.
             "deny": [
                 "WebFetch",
                 "WebSearch",
@@ -199,6 +212,12 @@ pub fn permission_settings(profile: &WorkerProfile, gate_cmds: &[String]) -> Val
                 "Edit(**/.claude/**)",
                 "Write(.git/**)",
                 "Edit(.git/**)",
+                "Write(.tactus/**)",
+                "Edit(.tactus/**)",
+                "Write(**/.tactus/**)",
+                "Edit(**/.tactus/**)",
+                "Read(.tactus/**)",
+                "Read(**/.tactus/**)",
             ],
         }
     })
@@ -543,6 +562,33 @@ mod tests {
         assert!(!allow.iter().any(|a| a == &"Bash"), "no blanket shell");
         let deny = settings["permissions"]["deny"].to_string();
         assert!(deny.contains("WebFetch"), "no network tools: {deny}");
+    }
+
+    #[test]
+    fn no_profile_may_write_to_the_run_record() {
+        // The event log is the source of truth (invariant 4). An agent that
+        // could append to it could forge a `task_committed`; one that could
+        // truncate it could erase its own failures. Neither is a permission a
+        // worker or a reviewer has any legitimate use for.
+        for permissions in [PermissionMode::Edit, PermissionMode::ReadOnly] {
+            let settings = permission_settings(&profile(permissions), &["cargo test".to_owned()]);
+            let deny = settings["permissions"]["deny"].to_string();
+            for rule in [
+                "Write(.tactus/**)",
+                "Edit(.tactus/**)",
+                "Write(**/.tactus/**)",
+                "Edit(**/.tactus/**)",
+            ] {
+                assert!(
+                    deny.contains(rule),
+                    "{permissions:?} is missing {rule}: {deny}"
+                );
+            }
+            // Defence in depth only — the enforceable half of withholding is
+            // §15's split, which puts transcripts outside the workspace where
+            // no rule is needed.
+            assert!(deny.contains("Read(.tactus/**)"), "{deny}");
+        }
     }
 
     #[test]

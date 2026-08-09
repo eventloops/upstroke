@@ -1,8 +1,9 @@
 //! Small shared helpers used across the engine, gates, adapters, and
 //! reporting: text truncation, filename sanitizing, PATH program resolution,
-//! and run-artifact writes.
+//! run-artifact writes, and event timestamps.
 
 use std::path::{Path, PathBuf};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::error::TactusError;
 
@@ -120,6 +121,22 @@ pub fn probe_extensions(base: &Path) -> Option<PathBuf> {
     None
 }
 
+/// The user-level `~/.tactus` directory: pools live here (§17), and so do the
+/// agent-authored artifacts a run must keep outside the workspace (§15).
+///
+/// `USERPROFILE` wins on Windows because shells like Git Bash set `HOME` to an
+/// MSYS-style path (`/c/Users/...`) that the Windows file APIs cannot open —
+/// trusting it there would write run artifacts somewhere nothing can read them
+/// back. Elsewhere `HOME` is authoritative and `USERPROFILE` is the fallback.
+pub fn user_tactus_dir() -> Option<PathBuf> {
+    let home = if cfg!(windows) {
+        std::env::var_os("USERPROFILE").or_else(|| std::env::var_os("HOME"))
+    } else {
+        std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE"))
+    };
+    Some(PathBuf::from(home?).join(".tactus"))
+}
+
 /// Resolve a bare program name against PATH. Empty PATH segments are skipped:
 /// they mean "current directory" to some shells, and resolving a program
 /// against the repo under automation would execute repo-controlled code.
@@ -152,6 +169,80 @@ pub fn write_json<T: serde::Serialize>(path: &Path, value: &T) -> Result<(), Tac
         message: format!("serializing {}: {e}", path.display()),
     })?;
     write_text(path, &(json + "\n"))
+}
+
+/// Serialize a [`Duration`](std::time::Duration) as whole milliseconds.
+///
+/// Durations ride in both the event log and the report, and serde's default
+/// `{"secs":3,"nanos":120000000}` is neither readable in a JSONL ops log nor
+/// stable across serde's internally-tagged buffering path. Milliseconds are
+/// finer than anything the ledger reports and survive both.
+pub mod duration_millis {
+    use std::time::Duration;
+
+    use serde::{Deserialize, Deserializer, Serializer};
+
+    pub fn serialize<S: Serializer>(value: &Duration, out: S) -> Result<S::Ok, S::Error> {
+        out.serialize_u64(u64::try_from(value.as_millis()).unwrap_or(u64::MAX))
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(input: D) -> Result<Duration, D::Error> {
+        Ok(Duration::from_millis(u64::deserialize(input)?))
+    }
+}
+
+/// Now, as an RFC 3339 UTC timestamp — the `ts` on every event (§15).
+///
+/// Std-only rather than a date dependency: this is one field on one line of
+/// JSON, and the conversion below is a closed-form algorithm with no table and
+/// no locale. A clock that cannot read (`SystemTime` before the epoch) yields
+/// the epoch rather than failing — a timestamp is metadata on the event, and
+/// losing the event to a clock problem would be the worse trade.
+pub fn rfc3339_utc_now() -> String {
+    let seconds = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |since| since.as_secs());
+    rfc3339_utc(seconds)
+}
+
+fn rfc3339_utc(unix_seconds: u64) -> String {
+    let days = i64::try_from(unix_seconds / 86_400).unwrap_or(0);
+    let second_of_day = unix_seconds % 86_400;
+    let (year, month, day) = civil_from_days(days);
+    format!(
+        "{year:04}-{month:02}-{day:02}T{:02}:{:02}:{:02}Z",
+        second_of_day / 3600,
+        (second_of_day % 3600) / 60,
+        second_of_day % 60
+    )
+}
+
+/// Civil date from a day count since 1970-01-01 (Howard Hinnant's
+/// `civil_from_days`). The era starts on 0000-03-01 so that a leap day always
+/// lands at the end of a cycle, which is what lets the month and day fall out
+/// of integer arithmetic instead of a lookup table.
+fn civil_from_days(days: i64) -> (i64, i64, i64) {
+    let shifted = days + 719_468;
+    let era = if shifted >= 0 {
+        shifted
+    } else {
+        shifted - 146_096
+    } / 146_097;
+    let day_of_era = shifted - era * 146_097;
+    let year_of_era =
+        (day_of_era - day_of_era / 1460 + day_of_era / 36_524 - day_of_era / 146_096) / 365;
+    let year = year_of_era + era * 400;
+    let day_of_year = day_of_era - (365 * year_of_era + year_of_era / 4 - year_of_era / 100);
+    let shifted_month = (5 * day_of_year + 2) / 153;
+    let day = day_of_year - (153 * shifted_month + 2) / 5 + 1;
+    // March is month 0 in the shifted era; roll January and February into the
+    // following calendar year.
+    let month = if shifted_month < 10 {
+        shifted_month + 3
+    } else {
+        shifted_month - 9
+    };
+    (year + i64::from(month <= 2), month, day)
 }
 
 #[cfg(test)]
@@ -191,6 +282,40 @@ mod tests {
     fn find_program_resolves_real_tools_and_misses_fake_ones() {
         assert!(find_program("git").is_some(), "git is on PATH in this repo");
         assert!(find_program("tactus-definitely-not-real-xyz").is_none());
+    }
+
+    #[test]
+    fn timestamps_are_rfc3339_utc() {
+        assert_eq!(rfc3339_utc(0), "1970-01-01T00:00:00Z");
+        assert_eq!(rfc3339_utc(1_000_000_000), "2001-09-09T01:46:40Z");
+        assert_eq!(rfc3339_utc(1_700_000_000), "2023-11-14T22:13:20Z");
+        // Both leap rules: 2024 by the /4 rule, 2000 by the /400 exception.
+        assert_eq!(rfc3339_utc(1_709_164_800), "2024-02-29T00:00:00Z");
+        assert_eq!(rfc3339_utc(951_782_400), "2000-02-29T00:00:00Z");
+        // A day boundary and the last second before one.
+        assert_eq!(rfc3339_utc(86_399), "1970-01-01T23:59:59Z");
+        assert_eq!(rfc3339_utc(86_400), "1970-01-02T00:00:00Z");
+    }
+
+    #[test]
+    fn timestamps_sort_chronologically_as_strings() {
+        // The log is read back with a plain string compare in places; the
+        // zero-padded fixed-width form is what makes that legitimate.
+        let mut stamps = [
+            rfc3339_utc(1_700_000_000),
+            rfc3339_utc(0),
+            rfc3339_utc(951_782_400),
+        ];
+        stamps.sort();
+        assert_eq!(
+            stamps,
+            [
+                rfc3339_utc(0),
+                rfc3339_utc(951_782_400),
+                rfc3339_utc(1_700_000_000)
+            ]
+        );
+        assert_eq!(rfc3339_utc_now().len(), "1970-01-01T00:00:00Z".len());
     }
 
     #[test]

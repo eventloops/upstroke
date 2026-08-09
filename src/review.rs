@@ -40,7 +40,13 @@ pub struct ReviewCx<'a> {
     /// Artifacts the reviewer should judge against (conventions brief first).
     pub artifacts: &'a [(String, String)],
     pub workspace: &'a Path,
-    pub run_dir: &'a Path,
+    /// Where this review's permission settings are materialized. Outside the
+    /// workspace (§15 split), so the reviewer cannot read the description of
+    /// its own sandbox.
+    pub settings_dir: &'a Path,
+    /// Where the verdict transcripts land — also outside the workspace, since
+    /// they are agent-authored.
+    pub reviews_dir: &'a Path,
     /// Unique file stem for this task's review artifacts, attempt included —
     /// step 7 reviews the same task more than once and each verdict is the
     /// evidence for its own retry.
@@ -89,10 +95,10 @@ pub fn run_review(cx: &ReviewCx<'_>) -> Result<ReviewOutcome, TactusError> {
     let settings_path = cx.adapter.materialize_permissions(
         &cx.profile,
         &[],
-        &cx.run_dir.join("settings"),
+        cx.settings_dir,
         &format!("{}-review", cx.stem),
     )?;
-    let reviews_dir = cx.run_dir.join("reviews");
+    let reviews_dir = cx.reviews_dir;
     let transcript = reviews_dir.join(format!("{}-review.json", cx.stem));
 
     let mut cost = None;
@@ -546,7 +552,8 @@ mod tests {
             diff: "+++ b/src/api.rs\n+fn encode() {}\n",
             artifacts: &[],
             workspace: Path::new("."),
-            run_dir: Path::new("."),
+            settings_dir: Path::new("."),
+            reviews_dir: Path::new("."),
             stem: "00-t1-1".to_owned(),
             timeout: Duration::from_secs(60),
         };
@@ -584,7 +591,8 @@ mod tests {
             diff: "+++ b/src/api.rs\n+fn encode() {}\n",
             artifacts: &artifacts,
             workspace: Path::new("."),
-            run_dir: Path::new("."),
+            settings_dir: Path::new("."),
+            reviews_dir: Path::new("."),
             stem: "00-t1".to_owned(),
             timeout: Duration::from_secs(60),
         };
@@ -637,7 +645,8 @@ mod tests {
             diff: &huge,
             artifacts: &[],
             workspace: Path::new("."),
-            run_dir: Path::new("."),
+            settings_dir: Path::new("."),
+            reviews_dir: Path::new("."),
             stem: "00-t1-1".to_owned(),
             timeout: Duration::from_secs(60),
         };
@@ -670,7 +679,8 @@ mod tests {
             diff,
             artifacts: &[("brief".to_owned(), "Use ``` for code.".to_owned())],
             workspace: Path::new("."),
-            run_dir: Path::new("."),
+            settings_dir: Path::new("."),
+            reviews_dir: Path::new("."),
             stem: "00-t1-1".to_owned(),
             timeout: Duration::from_secs(60),
         };
