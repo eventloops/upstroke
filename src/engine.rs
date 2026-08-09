@@ -407,10 +407,22 @@ fn run_harness_inner(
     paths.create()?;
     // Held for the whole run, released by the OS if this process dies — so a
     // crash leaves nothing for `resume` to clear by hand.
-    let _lock = RunLock::acquire(&paths)?;
-    util::write_json(&paths.plan_json(), &analysis.plan)?;
+    let _lock = RunLock::acquire(&paths.public)?;
 
-    workspace.create_branch(&branch)?;
+    // Nothing is on the record until the first event lands, so a failure in
+    // this window would leave a run directory with no `events.jsonl` in it —
+    // and that husk becomes `latest_run`, so a bare `tactus status` reports
+    // "no event log here" for a run that never began, shadowing the real
+    // latest one until someone deletes it by hand. Best-effort: failing to
+    // tidy up must not mask the error that actually stopped the run.
+    let opened = util::write_json(&paths.plan_json(), &analysis.plan)
+        .and_then(|()| workspace.create_branch(&branch));
+    if let Err(error) = opened {
+        drop(_lock);
+        let _ = fs::remove_dir_all(&paths.public);
+        let _ = fs::remove_dir_all(&paths.private);
+        return Err(error);
+    }
 
     let started = events::RunStarted {
         schema: events::SCHEMA_VERSION,
@@ -571,9 +583,10 @@ fn resume_harness_inner(
     };
 
     // Claimed before anything is read, so two resumes cannot race each other
-    // into the same branch.
-    let probe_paths = RunPaths::from_parts(public.clone(), public.clone());
-    let _lock = RunLock::acquire(&probe_paths)?;
+    // into the same branch. The lock sits beside the ops surface, which is the
+    // only half of the run directory known this early: where the private half
+    // went is recorded in `run_started`, and that has not been read yet.
+    let _lock = RunLock::acquire(&public)?;
 
     let mut warnings = Vec::new();
     let events_path = public.join("events.jsonl");
@@ -699,14 +712,36 @@ fn resume_harness_inner(
 
     // §15's check, before anything is discarded: if HEAD moved, refusing has
     // to leave the operator's tree exactly as they left it.
-    let expected_head = last_committed_sha(&replayed.events).unwrap_or(started.base_sha.clone());
+    let recorded_head = last_committed_sha(&replayed.events).unwrap_or(started.base_sha.clone());
     let head = workspace.head_sha_full()?;
-    if head != expected_head {
+
+    // One commit past the record can be this run's own work rather than
+    // foreign history. §14 commits, reads the sha back, scrubs the tree, and
+    // only then appends `task_committed` — a process that dies inside those
+    // three git calls leaves exactly this shape. Refusing it would tell the
+    // operator to throw away a commit that already passed its gates and its
+    // review, and to spend the attempt again. So the engine adopts its own
+    // commit, but only when every part of the shape agrees: the other reading
+    // of an unexpected commit is that somebody else made it.
+    let mut adopted = None;
+    if head != recorded_head
+        && let Some((task, message)) = unrecorded_commit(&replayed, &analysis.plan)
+        && workspace.parent_sha(&head)?.as_deref() == Some(recorded_head.as_str())
+        && workspace.commit_subject(&head)? == message
+    {
+        warnings.push(format!(
+            "adopted commit {head} as `{task}`: the run committed it and stopped before \
+             recording it, which left the branch one commit ahead of its own log"
+        ));
+        adopted = Some((task, message));
+    }
+
+    if adopted.is_none() && head != recorded_head {
         return Err(refuse(format!(
-            "`{}` is at {head}, but this run's record ends at {expected_head}. Something \
+            "`{}` is at {head}, but this run's record ends at {recorded_head}. Something \
              committed, reset, or rebased the branch after the run stopped, so replaying the \
              log would describe work that is no longer what is on the branch. Move the branch \
-             back to {expected_head}, or start a new run.",
+             back to {recorded_head}, or start a new run.",
             started.branch
         )));
     }
@@ -725,7 +760,16 @@ fn resume_harness_inner(
         workspace.discard_uncommitted()?;
     }
 
-    let paths = run_opts.paths(&run_id);
+    // Where the agent-authored half lives is a fact about the run, not about
+    // today's defaults. A resume under a different HOME — a service account, a
+    // container, the no-home fallback — would otherwise scatter the rest of
+    // this run's transcripts into a second private root while `status` went on
+    // pointing at the first. An explicit override still wins, for a private
+    // root that has genuinely moved.
+    let paths = match &opts.private_root {
+        Some(root) => RunPaths::with_private_root(&opts.repo_root, &run_id, root),
+        None => RunPaths::from_parts(public.clone(), PathBuf::from(&started.private_dir)),
+    };
     paths.create()?;
     let sleeper = harness.sleeper.unwrap_or(&RealSleeper);
     let default_answers = interaction::answers_for(
@@ -757,6 +801,28 @@ fn resume_harness_inner(
         warnings,
         unanswerable: Vec::new(),
     };
+    // The `task_committed` the dead process never got to, now that the commit
+    // has been checked against the record. First of everything this resume
+    // writes, because it is the thing that happened first.
+    if let Some((task, message)) = adopted {
+        run.emit(EventBody::TaskCommitted {
+            task,
+            data: events::TaskCommitted {
+                sha: head.clone(),
+                message,
+            },
+        })?;
+    }
+
+    // A crash between `question_answered` and the payload rewrite leaves a
+    // file that still reads as open, which `tactus answer` would accept a
+    // second answer against — one no engine can ever ingest, because the
+    // question is already closed in the log. The log is what is authoritative;
+    // make the payloads agree with it again.
+    for record in &run.state.questions {
+        interaction::write_question(&run.paths.questions(), record)?;
+    }
+
     // Write the `attempt_finished` the dead process never got to.
     //
     // Recorded rather than settled in memory, because a settlement only a
@@ -797,6 +863,32 @@ fn last_committed_sha(events: &[events::Event]) -> Option<String> {
         EventBody::TaskCommitted { data, .. } => Some(data.sha.clone()),
         _ => None,
     })
+}
+
+/// The task an interrupted run committed without living long enough to record.
+///
+/// The shape is narrow, which is what makes it safe to act on: the log must
+/// *end* at an attempt that passed, for a task that never reached `Done`. No
+/// other event can follow, because the process that would have written one is
+/// the process that died. Returns the task and the message the engine would
+/// have used, so the caller can confirm the commit really is the one it is
+/// about to adopt rather than trusting the log's shape alone.
+fn unrecorded_commit(replayed: &events::Replay, plan: &Plan) -> Option<(String, String)> {
+    let EventBody::AttemptFinished { task, data, .. } = &replayed.events.last()?.body else {
+        return None;
+    };
+    if data.failure.is_some() {
+        return None;
+    }
+    let index = replayed.state.index_of(task)?;
+    if replayed.state.states[index] != TaskState::Pending {
+        return None;
+    }
+    let task = plan.tasks.get(index)?;
+    Some((
+        task.id.to_string(),
+        format!("[tactus] {}: {}", task.id, task.title),
+    ))
 }
 
 struct Run<'a> {
@@ -1308,33 +1400,42 @@ impl Run<'_> {
             let Some(answer) = interaction::read_answer(&dir, &id)? else {
                 continue;
             };
-            self.ingest_answer(&id, answer, "answer-file")?;
-            changed = true;
+            // Only what actually applied counts as change. A file the engine
+            // reads but declines to act on — an `Unanswered` one, say, which
+            // nothing in `tactus answer` will write but a hand-edit can —
+            // would otherwise report progress on every turn, and the drain
+            // loop would spin on it forever: this branch is only bounded
+            // because it closes the question it fires for.
+            if self.ingest_answer(&id, answer, "answer-file")? {
+                changed = true;
+            }
         }
         Ok(changed)
     }
 
-    /// Record an answer and let it take effect.
+    /// Record an answer and let it take effect. Returns whether it applied.
     ///
     /// One path for every channel — a terminal reply, a file written by
     /// `tactus answer`, or an answer picked up on resume — so what an answer
-    /// *does* cannot depend on where it came from.
+    /// *does* cannot depend on where it came from. The guards below are also
+    /// what makes it safe to offer the same answer twice: a question that is
+    /// already closed absorbs the second one instead of applying it.
     fn ingest_answer(
         &mut self,
         id: &QuestionId,
         answer: Answer,
         via: &str,
-    ) -> Result<(), TactusError> {
+    ) -> Result<bool, TactusError> {
         let Some(record) = self
             .state
             .questions
             .iter()
             .find(|record| record.question.id == *id)
         else {
-            return Ok(());
+            return Ok(false);
         };
         if !record.is_open() || answer == Answer::Unanswered {
-            return Ok(());
+            return Ok(false);
         }
         let context = record.question.context.clone();
         let affected = record.question.affected_tasks.clone();
@@ -1390,7 +1491,7 @@ impl Run<'_> {
         {
             interaction::write_question(&self.paths.questions(), record)?;
         }
-        Ok(())
+        Ok(true)
     }
 
     /// Ask about the oldest open question. Returns whether anything changed.
@@ -1407,12 +1508,14 @@ impl Run<'_> {
         let question = self.state.questions[position].question.clone();
         let answer = self.answers.resolve(&question)?;
 
-        // The channel may have been waiting on the very file the sweep reads;
-        // ingesting first means an answer that arrived during the wait is
-        // applied once, by whichever path saw it, and never twice.
-        if self.sweep_answers()? {
-            return Ok(true);
-        }
+        // The channel may have been waiting on the very file the sweep reads,
+        // so sweep before applying what it returned — and then still apply it.
+        // `ingest_answer` is guarded on the question being open, which is what
+        // makes doing both safe: if the sweep answered *this* question the
+        // typed reply is absorbed, and if it answered a different one — an
+        // operator working through a backlog of parked tasks — this reply
+        // still lands instead of being discarded along with it.
+        self.sweep_answers()?;
         if answer == Answer::Unanswered {
             // §12 CI mode: the task stays parked and the run's exit status
             // reports it. Not a failure — nobody rejected anything.
@@ -4432,11 +4535,12 @@ mod tests {
         );
         let mut opts = options(&repo);
         opts.config_path = Some(repo.join("tactus.toml"));
-        // No adapter for the agent the chain names: the failure lands inside
-        // `step_task`, after `attempt_started` would have been emitted.
+        // Run it through, then rewind the log by hand: reproducing a real
+        // abort at exactly this point needs a failure the fake adapter cannot
+        // raise, and the on-disk shape is what this test is actually about.
         let source = source(vec![Effect::EditFile], vec![ReviewBehavior::Pass]);
         opts.attempt_timeout = Duration::from_secs(60);
-        let report = run_with(&opts, &source).expect("this one succeeds");
+        let report = run_with(&opts, &source).expect("the run itself succeeds");
 
         // Now truncate the log to the moment before the attempt reported, the
         // exact on-disk shape a kill leaves, and confirm it still folds.
@@ -4603,7 +4707,10 @@ mod tests {
         );
 
         // The lock died with the process, so nothing has to be cleared by hand.
-        assert!(!rundir::is_running(&paths), "the OS released the lock");
+        assert!(
+            !rundir::is_running(&paths.public),
+            "the OS released the lock"
+        );
 
         let source = fake(Effect::EditFile);
         let (resumed, state) = resume_harness_inner(
@@ -5071,7 +5178,7 @@ mod tests {
     fn resume_refuses_while_another_process_holds_the_run() {
         let (repo, run_id) = parked_run("locked");
         let paths = paths_of(&repo, &run_id);
-        let _held = RunLock::acquire(&paths).expect("hold it");
+        let _held = RunLock::acquire(&paths.public).expect("hold it");
 
         let err = resume_err(&repo, &run_id);
         assert!(err.contains("already driving run"), "got: {err}");
@@ -5119,7 +5226,7 @@ mod tests {
 
         // A live run says so.
         let paths = paths_of(&repo, &report.run_id);
-        let _held = RunLock::acquire(&paths).expect("simulate a live engine");
+        let _held = RunLock::acquire(&paths.public).expect("simulate a live engine");
         let live = replay_of(&repo, &report.run_id);
         assert!(live.running);
         assert!(crate::status::render(&live).contains("running now"));
@@ -5195,5 +5302,429 @@ mod tests {
                 "{leaked}/ must not exist inside the workspace"
             );
         }
+    }
+
+    // ---- step 8.1: the seams either side of the log ------------------------
+
+    /// Rewind a log to just before the named event — the shape a process
+    /// killed at that instant leaves behind.
+    fn truncate_log_before(paths: &RunPaths, event: &str) {
+        let text = fs::read_to_string(paths.events()).expect("log");
+        let lines: Vec<&str> = text.lines().collect();
+        let cut = lines
+            .iter()
+            .position(|line| line.contains(&format!("\"{event}\"")))
+            .unwrap_or_else(|| panic!("the run recorded no {event}"));
+        fs::write(paths.events(), format!("{}\n", lines[..cut].join("\n"))).expect("truncate");
+    }
+
+    #[test]
+    fn resume_adopts_the_commit_it_made_but_never_recorded() {
+        // §14 commits, reads the sha back, scrubs the tree, and only then
+        // appends `task_committed`. A process killed inside those three git
+        // calls leaves the branch one commit past its own log — which is what
+        // foreign history looks like too. Refusing would tell the operator to
+        // reset away a commit that already passed its gates and its review,
+        // and to spend the attempt a second time.
+        let repo = temp_engine_repo("adoptcommit");
+        seed(
+            &repo,
+            "## Implement the widget\n<!-- tactus: id=t1 kind=implement depends= -->\n",
+            Some("[routing]\nimplement = { chain = [\"small\"], attempts_per = 1 }\n"),
+        );
+        let mut opts = options(&repo);
+        opts.config_path = Some(repo.join("tactus.toml"));
+        let report = run_with(&opts, &fake(Effect::EditFile)).expect("run");
+        let run_id = report.run_id.clone();
+        let paths = paths_of(&repo, &run_id);
+        let sha = git_in(&repo, &["rev-parse", "HEAD"]).trim().to_owned();
+
+        // The commit is on the branch; the log stops just short of it.
+        truncate_log_before(&paths, "task_committed");
+
+        let source = fake(Effect::EditFile);
+        let (resumed, state) = resume_harness_inner(
+            &resume_options(&repo, &run_id),
+            &Harness {
+                adapters: &source,
+                answers: None,
+                sleeper: None,
+            },
+        )
+        .expect("resume");
+
+        assert_eq!(resumed.outcome(), RunOutcome::Complete, "{resumed:?}");
+        assert!(committed(&resumed, "t1"), "adopted rather than redone");
+        assert_eq!(
+            git_in(&repo, &["rev-parse", "HEAD"]).trim(),
+            sha,
+            "and the branch was left exactly where it stood"
+        );
+        assert_eq!(
+            git_in(&repo, &["rev-list", "--count", "main..HEAD"]).trim(),
+            "1",
+            "one commit, not a second one for the same work"
+        );
+        assert_eq!(
+            task(&resumed, "t1").attempts.len(),
+            1,
+            "the attempt that passed was not spent again: {resumed:?}"
+        );
+        assert!(
+            resumed
+                .warnings
+                .iter()
+                .any(|w| w.contains("adopted commit")),
+            "and the operator is told: {:?}",
+            resumed.warnings
+        );
+        assert_live_equals_replay(&repo, &state, &resumed);
+    }
+
+    #[test]
+    fn resume_refuses_a_commit_it_would_not_have_written() {
+        // The adoption above is deliberately narrow: one commit past the
+        // record, carrying the message this engine would have used for the
+        // task whose attempt just passed. Anything else is someone's history.
+        let repo = temp_engine_repo("adoptforeign");
+        seed(
+            &repo,
+            "## Implement the widget\n<!-- tactus: id=t1 kind=implement depends= -->\n",
+            Some("[routing]\nimplement = { chain = [\"small\"], attempts_per = 1 }\n"),
+        );
+        let mut opts = options(&repo);
+        opts.config_path = Some(repo.join("tactus.toml"));
+        let report = run_with(&opts, &fake(Effect::EditFile)).expect("run");
+        truncate_log_before(&paths_of(&repo, &report.run_id), "task_committed");
+        // Same place on the branch, different hand.
+        git_in(
+            &repo,
+            &["commit", "-q", "--amend", "-m", "not the engine's"],
+        );
+
+        let err = resume_err(&repo, &report.run_id);
+        assert!(err.contains("record ends at"), "got: {err}");
+    }
+
+    #[test]
+    fn resume_writes_where_the_run_recorded_not_where_defaults_point() {
+        // Which private root a run used is a fact about that run. Recomputing
+        // it from today's environment — another HOME, a service account, the
+        // no-home fallback — would scatter the rest of its transcripts
+        // somewhere `status` never looks.
+        let repo = temp_engine_repo("privatedir");
+        seed(
+            &repo,
+            "## Implement the widget\n<!-- tactus: id=t1 kind=implement depends= -->\n",
+            Some("[routing]\nimplement = { chain = [\"small\"], attempts_per = 1 }\n"),
+        );
+        let mut opts = options(&repo);
+        opts.config_path = Some(repo.join("tactus.toml"));
+        let report = run_with(&opts, &fake(Effect::EditFile)).expect("run");
+        let run_id = report.run_id.clone();
+        let recorded = paths_of(&repo, &run_id);
+        truncate_log_before(&recorded, "task_committed");
+        git_in(&repo, &["reset", "-q", "--hard", "HEAD~1"]);
+
+        // No override, so the resume has to read the location off the record.
+        let mut resume = resume_options(&repo, &run_id);
+        resume.private_root = None;
+        let source = fake(Effect::EditFile);
+        let resumed = resume_harness(
+            &resume,
+            &Harness {
+                adapters: &source,
+                answers: None,
+                sleeper: None,
+            },
+        )
+        .expect("resume");
+        assert_eq!(resumed.outcome(), RunOutcome::Complete, "{resumed:?}");
+        assert!(
+            recorded.transcripts().join("00-t1-2.json").is_file(),
+            "the resumed attempt wrote under {}",
+            recorded.transcripts().display()
+        );
+    }
+
+    #[test]
+    fn resume_makes_a_stale_question_payload_agree_with_the_log() {
+        // The engine emits `question_answered` and then rewrites the payload
+        // beside it. A crash in between leaves a file that still reads as
+        // open — and `tactus answer` will accept a second answer against it,
+        // one no engine can ever ingest, because the log has already closed
+        // the question.
+        let repo = temp_engine_repo("stalepayload");
+        seed(
+            &repo,
+            "## Doomed\n<!-- tactus: id=t1 kind=implement depends= -->\n",
+            Some(
+                "[interaction]\nmode = \"never\"\n\n\
+                 [routing]\nimplement = { chain = [\"small\"], attempts_per = 1 }\n",
+            ),
+        );
+        let mut opts = options(&repo);
+        opts.config_path = Some(repo.join("tactus.toml"));
+        let doomed = source(vec![Effect::NoEdit], vec![ReviewBehavior::Pass]);
+        let report = run_with(&opts, &doomed).expect("run");
+        let run_id = report.run_id.clone();
+        let first = report.questions[0].question.id.to_string();
+
+        crate::answer::answer(
+            &repo,
+            &first,
+            crate::answer::Reply::Text("try again".to_owned()),
+        )
+        .expect("answer");
+
+        // The retry fails the same way, so the run ends parked on a *second*
+        // question with the first one answered in the log.
+        let retry = source(vec![Effect::NoEdit], vec![ReviewBehavior::Pass]);
+        let resumed = resume_with(&resume_options(&repo, &run_id), &retry).expect("resume");
+        assert_eq!(resumed.outcome(), RunOutcome::Parked, "{resumed:?}");
+
+        // Rewind the payload to what a crash mid-ingest leaves.
+        let questions = rundir::public_dir(&repo, &run_id).join("questions");
+        let path = questions.join(format!("{first}.json"));
+        let mut record: QuestionRecord =
+            serde_json::from_str(&fs::read_to_string(&path).expect("read")).expect("parse");
+        record.answer = None;
+        interaction::write_question(&questions, &record).expect("rewrite");
+        crate::answer::answer(&repo, &first, crate::answer::Reply::Decline)
+            .expect("a stale payload is exactly what makes a second answer look acceptable");
+
+        let source = fake(Effect::EditFile);
+        resume_with(&resume_options(&repo, &run_id), &source).expect("second resume");
+
+        let record: QuestionRecord =
+            serde_json::from_str(&fs::read_to_string(&path).expect("read")).expect("parse");
+        assert!(
+            !record.is_open(),
+            "the payload agrees with the log again, so nobody answers it twice"
+        );
+    }
+
+    #[test]
+    fn a_run_that_never_started_leaves_no_directory_behind() {
+        // Nothing is on the record until the first event lands. A failure in
+        // that window would otherwise leave a run directory with no
+        // `events.jsonl`, and since run ids sort newest-last it becomes what a
+        // bare `tactus status` reports on — "no event log here" for a run that
+        // never began, shadowing the real latest one.
+        let repo = temp_engine_repo("husk");
+        seed(
+            &repo,
+            "## Implement the widget\n<!-- tactus: id=t1 kind=implement depends= -->\n",
+            Some("[routing]\nimplement = { chain = [\"small\"], attempts_per = 1 }\n"),
+        );
+        // Git stores refs as paths, so a branch literally named `tactus` is a
+        // file where `tactus/run-<id>` needs a directory: branch creation
+        // cannot succeed.
+        git_in(&repo, &["branch", "tactus"]);
+
+        let mut opts = options(&repo);
+        opts.config_path = Some(repo.join("tactus.toml"));
+        let source = fake(Effect::EditFile);
+        run_with(&opts, &source).expect_err("the run branch cannot be created");
+
+        assert_eq!(
+            rundir::latest_run(&repo),
+            None,
+            "no husk left behind to shadow the next run"
+        );
+    }
+
+    /// An operator working a backlog: they answer some other parked question
+    /// out of band, reply to this one at the prompt, and then walk away — so a
+    /// dropped answer never gets a second chance.
+    struct BacklogAnswers {
+        repo: PathBuf,
+        used: Mutex<bool>,
+    }
+
+    impl AnswerSource for BacklogAnswers {
+        fn id(&self) -> &'static str {
+            "backlog"
+        }
+
+        fn resolve(&self, question: &Question) -> Result<Answer, TactusError> {
+            let Ok(mut used) = self.used.lock() else {
+                return Ok(Answer::Unanswered);
+            };
+            if *used {
+                return Ok(Answer::Unanswered);
+            }
+            *used = true;
+            let run = rundir::latest_run(&self.repo).expect("a run");
+            let dir = rundir::public_dir(&self.repo, &run).join("questions");
+            let other = fs::read_dir(&dir)
+                .expect("questions dir")
+                .flatten()
+                .filter_map(|entry| {
+                    let name = entry.file_name().to_string_lossy().into_owned();
+                    name.strip_suffix(".json").map(str::to_owned)
+                })
+                .find(|id| id.as_str() != question.id.as_str());
+            if let Some(other) = other {
+                let _ = crate::answer::answer(
+                    &self.repo,
+                    &other,
+                    crate::answer::Reply::Text("write src/other.rs".to_owned()),
+                );
+            }
+            Ok(Answer::Answered {
+                text: "write src/widget.rs".to_owned(),
+            })
+        }
+    }
+
+    #[test]
+    fn a_typed_answer_survives_another_question_being_answered_at_the_same_time() {
+        // Both channels can produce an answer on one scheduler turn. The sweep
+        // must not swallow the reply the operator typed: it closed a different
+        // question, and discarding this one throws away words a person sat and
+        // wrote — words nothing will ask for again.
+        let repo = temp_engine_repo("backlog");
+        seed(
+            &repo,
+            "## First\n<!-- tactus: id=t1 kind=implement depends= -->\n\n\
+             ## Second\n<!-- tactus: id=t2 kind=implement depends= -->\n",
+            Some("[routing]\nimplement = { chain = [\"small\"], attempts_per = 1 }\n"),
+        );
+        let mut opts = options(&repo);
+        opts.config_path = Some(repo.join("tactus.toml"));
+        // Both tasks fail into a question, then both succeed once released.
+        let source = source(
+            vec![Effect::NoEdit, Effect::NoEdit, Effect::EditFile],
+            vec![ReviewBehavior::Pass],
+        );
+        let answers = BacklogAnswers {
+            repo: repo.clone(),
+            used: Mutex::new(false),
+        };
+        let report = run_harness(
+            &opts,
+            &Harness {
+                adapters: &source,
+                answers: Some(&answers),
+                sleeper: None,
+            },
+        )
+        .expect("run");
+
+        assert_eq!(report.outcome(), RunOutcome::Complete, "{report:?}");
+        for id in ["t1", "t2"] {
+            assert!(committed(&report, id), "{id} was released: {report:?}");
+        }
+    }
+
+    #[test]
+    fn an_answer_file_that_changes_nothing_does_not_spin_the_scheduler() {
+        // `sweep_answers` reports whether anything *changed*, and the drain
+        // loop trusts that to mean it made progress. A file the sweep reads
+        // but declines to apply — `unanswered`, which `tactus answer` refuses
+        // to write but a hand-edit produces — must not read as progress: that
+        // branch terminates only because it closes the question it fires for.
+        // A regression here hangs this test rather than failing it.
+        let repo = temp_engine_repo("nullanswer");
+        seed(
+            &repo,
+            "## Doomed\n<!-- tactus: id=t1 kind=implement depends= -->\n",
+            Some(
+                "[interaction]\nmode = \"never\"\n\n\
+                 [routing]\nimplement = { chain = [\"small\"], attempts_per = 1 }\n",
+            ),
+        );
+        let mut opts = options(&repo);
+        opts.config_path = Some(repo.join("tactus.toml"));
+        let source = source(vec![Effect::NoEdit], vec![ReviewBehavior::Pass]);
+        let report = run_with(&opts, &source).expect("run");
+        assert_eq!(report.outcome(), RunOutcome::Parked);
+        let run_id = report.run_id.clone();
+        let question = report.questions[0].question.id.clone();
+
+        let answers = rundir::public_dir(&repo, &run_id).join("answers");
+        fs::create_dir_all(&answers).expect("answers dir");
+        interaction::write_answer(&answers, &question, &Answer::Unanswered).expect("write");
+
+        let source = fake(Effect::EditFile);
+        let resumed = resume_with(&resume_options(&repo, &run_id), &source).expect("resume");
+        assert_eq!(
+            resumed.outcome(),
+            RunOutcome::Parked,
+            "still waiting on a real answer, and the run ended saying so: {resumed:?}"
+        );
+    }
+
+    /// Holds a run's lock and lets go after a set number of sleeps — an engine
+    /// that finishes while a follower is waiting on it.
+    struct LockReleasingSleeper {
+        waits: Mutex<u32>,
+        release_after: u32,
+        lock: Mutex<Option<RunLock>>,
+    }
+
+    impl LockReleasingSleeper {
+        fn new(lock: RunLock, release_after: u32) -> Self {
+            Self {
+                waits: Mutex::new(0),
+                release_after,
+                lock: Mutex::new(Some(lock)),
+            }
+        }
+
+        fn waits(&self) -> u32 {
+            self.waits.lock().map(|w| *w).unwrap_or(0)
+        }
+    }
+
+    impl Sleeper for LockReleasingSleeper {
+        fn sleep(&self, _: Duration) {
+            let Ok(mut waits) = self.waits.lock() else {
+                return;
+            };
+            *waits += 1;
+            if *waits == self.release_after
+                && let Ok(mut lock) = self.lock.lock()
+            {
+                drop(lock.take());
+            }
+        }
+    }
+
+    #[test]
+    fn following_waits_out_a_silent_live_run_and_stops_once_it_dies() {
+        // A whole attempt — the agent's thinking, its tool calls, the gates,
+        // the review — folds into one `attempt_finished`, so a healthy run
+        // says nothing for minutes at a time. The idle budget exists to
+        // release a terminal attached to a dead engine; spending it on a live
+        // one drops the operator's view mid-run.
+        let repo = temp_engine_repo("followlive");
+        let source = fake(Effect::EditFile);
+        let report = run_with(&options(&repo), &source).expect("run");
+        let paths = paths_of(&repo, &report.run_id);
+
+        // Drop the ending, so `follow` idles rather than stopping at it.
+        let text = fs::read_to_string(paths.events()).expect("log");
+        let kept: Vec<&str> = text
+            .lines()
+            .filter(|line| !line.contains("\"run_finished\""))
+            .collect();
+        fs::write(paths.events(), format!("{}\n", kept.join("\n"))).expect("truncate");
+
+        let loaded = replay_of(&repo, &report.run_id);
+        let held = RunLock::acquire(&paths.public).expect("simulate a live engine");
+        let sleeper = LockReleasingSleeper::new(held, 5);
+        let mut out: Vec<u8> = Vec::new();
+        // A budget of one idle poll: without the liveness check this returns
+        // after two sleeps, whatever the run is doing.
+        crate::status::follow(&loaded, &sleeper, Duration::ZERO, 1, &mut out).expect("follow");
+
+        assert!(
+            sleeper.waits() > 5,
+            "watched the live run past its idle budget and stopped once the lock went, \
+             instead of timing out its silence: {} sleeps",
+            sleeper.waits()
+        );
     }
 }

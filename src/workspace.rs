@@ -91,6 +91,37 @@ impl Workspace {
         Ok(self.git(&["rev-parse", "HEAD"])?.trim().to_owned())
     }
 
+    /// The full sha of a commit's first parent — `None` at a root commit.
+    ///
+    /// How `resume` tells a commit sitting directly on its own record apart
+    /// from history that arrived some other way.
+    pub fn parent_sha(&self, sha: &str) -> Result<Option<String>, TactusError> {
+        let output = Command::new("git")
+            .arg("-C")
+            .arg(&self.root)
+            .args(["rev-parse", "--verify", "--quiet"])
+            .arg(format!("{sha}^"))
+            .output()
+            .map_err(|e| TactusError::Git {
+                message: format!("failed to run git: {e}"),
+            })?;
+        if !output.status.success() {
+            // A root commit has no parent. That is an answer, not a failure.
+            return Ok(None);
+        }
+        Ok(Some(
+            String::from_utf8_lossy(&output.stdout).trim().to_owned(),
+        ))
+    }
+
+    /// A commit's subject — the first line of its message.
+    pub fn commit_subject(&self, sha: &str) -> Result<String, TactusError> {
+        Ok(self
+            .git(&["log", "-1", "--format=%s", sha, "--"])?
+            .trim()
+            .to_owned())
+    }
+
     pub fn create_branch(&self, name: &str) -> Result<(), TactusError> {
         self.git(&["switch", "-q", "-c", name]).map(|_| ())
     }
@@ -261,6 +292,20 @@ mod tests {
         assert!(!sha.is_empty());
         assert!(ws.is_clean().expect("clean after commit"));
         assert!(ws.capture_diff().expect("empty diff").trim().is_empty());
+
+        // What `resume` reads to recognise a commit as its own.
+        let full = ws.head_sha_full().expect("full sha");
+        assert_eq!(
+            ws.commit_subject(&full).expect("subject"),
+            "[tactus] t1: demo"
+        );
+        let parent = ws.parent_sha(&full).expect("parent").expect("has a parent");
+        assert_ne!(parent, full);
+        assert_eq!(
+            ws.parent_sha(&parent).expect("root lookup"),
+            None,
+            "the seed commit is the root, and that is an answer rather than an error"
+        );
     }
 
     #[test]

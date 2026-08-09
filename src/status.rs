@@ -86,7 +86,7 @@ pub fn load(repo_root: &Path, run_id: Option<&str>) -> Result<RunStatus, TactusE
     // run it is merely looking at. A resume records the same settlement as
     // events instead.
     let interrupted = replayed.state.settle_interrupted();
-    let running = rundir::is_running(&paths);
+    let running = rundir::is_running(&paths.public);
 
     Ok(RunStatus {
         run_id,
@@ -235,9 +235,10 @@ fn short(sha: &str) -> String {
 /// Starting from the beginning is deliberate: `--follow` on a run already in
 /// progress should show how it got here, not drop the reader into the middle
 /// of a story. Reads only whole lines, so a follower attached to a live engine
-/// never sees half an event. Returns once the run records that it is done — or
-/// after `max_idle_polls` with nothing new, so a follower attached to a run
-/// whose engine has died gives up instead of waiting forever.
+/// never sees half an event. Returns once the run records that it is done —
+/// or, once nothing is driving the run any more, after `max_idle_polls` with
+/// nothing new, so a follower attached to a run whose engine has died gives up
+/// instead of waiting forever.
 pub fn follow(
     status: &RunStatus,
     sleeper: &dyn Sleeper,
@@ -251,9 +252,20 @@ pub fn follow(
     loop {
         let events = tail.poll(&mut warnings)?;
         if events.is_empty() {
-            idle += 1;
-            if idle > max_idle_polls {
-                return Ok(());
+            // The idle budget is not a timeout on silence. A whole attempt —
+            // the agent's thinking, its tool calls, the gates, the review —
+            // folds into a single `attempt_finished`, so a healthy run says
+            // nothing for minutes at a time; giving up on one would drop the
+            // live view mid-run. The budget exists only to release a terminal
+            // attached to an engine that has died, so it starts counting when
+            // the run's lock does not.
+            if rundir::is_running(&status.paths.public) {
+                idle = 0;
+            } else {
+                idle += 1;
+                if idle > max_idle_polls {
+                    return Ok(());
+                }
             }
             sleeper.sleep(poll);
             continue;

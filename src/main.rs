@@ -3,7 +3,7 @@
 // see LICENSE, or <https://www.gnu.org/licenses/>. Commercial licences are
 // available for use the AGPL does not permit — see README.md.
 
-use std::io::{IsTerminal, Read};
+use std::io::{BufRead, IsTerminal, Read};
 use std::path::PathBuf;
 use std::process::ExitCode;
 use std::time::Duration;
@@ -236,9 +236,11 @@ fn run() -> anyhow::Result<ExitCode> {
     }
 }
 
-/// Roughly two minutes of silence before a follower concludes nothing more is
-/// coming — long enough to ride out a slow agent turn, short enough that a
-/// follower attached to a dead engine does not hang a terminal.
+/// How long a follower keeps watching a run that nothing is driving any more:
+/// roughly two minutes. A live run holds its lock and `follow` waits on that
+/// for as long as an agent turn takes, so this budget is not a limit on
+/// silence — it starts only once the lock is gone, and exists so a terminal
+/// attached to a dead engine does not hang.
 const IDLE_POLLS_BEFORE_GIVING_UP: u32 = 240;
 
 fn finish(report: &engine::RunReport) -> anyhow::Result<ExitCode> {
@@ -255,20 +257,29 @@ fn finish(report: &engine::RunReport) -> anyhow::Result<ExitCode> {
     }
 }
 
-/// Show the question, then take one line.
+/// Show the question, then take the operator's answer.
 fn prompt_for_answer(repo_root: &std::path::Path, question_id: &str) -> anyhow::Result<String> {
     eprint!("{}", answer::show(repo_root, question_id)?);
     let stdin = std::io::stdin();
-    if stdin.is_terminal() {
-        eprint!("answer (a number picks an option, empty aborts): ");
-    }
     let mut line = String::new();
-    // Read to end rather than one line so a piped answer can span lines; the
-    // interpreter trims and treats the whole thing as the operator's words.
-    stdin
-        .lock()
-        .take(64 * 1024)
-        .read_to_string(&mut line)
-        .context("reading an answer from stdin")?;
+    if stdin.is_terminal() {
+        // Enter submits — what the legend promises, and the only thing a
+        // person typing at a prompt will try. Reading to end here would wait
+        // for EOF instead (Ctrl+D, or Ctrl+Z then Enter on Windows), so
+        // pressing Enter would leave the command sitting there saying nothing.
+        eprint!("answer (a number picks an option, empty aborts): ");
+        stdin
+            .lock()
+            .read_line(&mut line)
+            .context("reading an answer from stdin")?;
+    } else {
+        // Piped: read to end so an answer can span lines. The interpreter
+        // trims and treats the whole thing as the operator's words.
+        stdin
+            .lock()
+            .take(64 * 1024)
+            .read_to_string(&mut line)
+            .context("reading an answer from stdin")?;
+    }
     Ok(line)
 }

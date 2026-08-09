@@ -80,7 +80,9 @@ pub fn answer(repo_root: &Path, wanted: &str, reply: Reply) -> Result<Answered, 
                         if record.question.options.is_empty() {
                             "none (answer it in your own words instead)".to_owned()
                         } else {
-                            format!("1..{}", record.question.options.len())
+                            // Not `1..N`: every operator of this tool reads
+                            // Rust, where that is the range that excludes N.
+                            format!("1-{}", record.question.options.len())
                         }
                     ),
                 })?;
@@ -109,12 +111,12 @@ pub fn answer(repo_root: &Path, wanted: &str, reply: Reply) -> Result<Answered, 
     })?;
     interaction::write_answer(&answers, &id, &answer)?;
 
-    let paths = crate::rundir::RunPaths::from_parts(found.public.clone(), found.public.clone());
+    let run_is_live = rundir::is_running(&found.public);
     Ok(Answered {
         run_id: found.run_id,
         question_id: found.question_id,
         answer,
-        run_is_live: rundir::is_running(&paths),
+        run_is_live,
     })
 }
 
@@ -212,7 +214,11 @@ mod tests {
         // meant a specific option.
         seed(&repo, "02RUN", "q-2");
         let err = answer(&repo, "q-2", Reply::Option(9)).expect_err("no option 9");
-        assert!(err.to_string().contains("1..2"), "got: {err}");
+        assert!(err.to_string().contains("1-2"), "got: {err}");
+        assert!(
+            !err.to_string().contains("1..2"),
+            "`1..2` is the range excluding 2 to anyone who writes Rust: {err}"
+        );
     }
 
     #[test]

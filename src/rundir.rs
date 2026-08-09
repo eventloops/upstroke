@@ -98,7 +98,7 @@ impl RunPaths {
 
     /// Held for the lifetime of a run so two engines cannot drive one branch.
     pub fn lock_file(&self) -> PathBuf {
-        self.public.join("run.lock")
+        lock_file(&self.public)
     }
 
     pub fn questions(&self) -> PathBuf {
@@ -183,8 +183,12 @@ pub fn latest_run(repo_root: &Path) -> Option<String> {
 pub fn resolve_run_id(repo_root: &Path, wanted: &str) -> Result<String, TactusError> {
     let runs = list_runs(repo_root);
     let wanted_upper = wanted.to_ascii_uppercase();
-    if runs.iter().any(|id| id.eq_ignore_ascii_case(wanted)) {
-        return Ok(wanted_upper);
+    // The entry as it exists on disk, not the uppercased input. The comparison
+    // is case-insensitive because a run directory can arrive from a
+    // case-insensitive filesystem, and on a case-sensitive one only the real
+    // name builds a path that opens — everything downstream joins this id.
+    if let Some(matched) = runs.iter().find(|id| id.eq_ignore_ascii_case(wanted)) {
+        return Ok(matched.clone());
     }
     let matches: Vec<&String> = runs
         .iter()
@@ -280,6 +284,19 @@ pub fn find_question(repo_root: &Path, wanted: &str) -> Result<FoundQuestion, Ta
     }
 }
 
+/// The lock beside one run's ops surface.
+///
+/// Takes the public directory rather than a whole [`RunPaths`] because the
+/// lock lives in the public half by construction. Two callers only ever want
+/// to know whether a run is live — `tactus answer`, and the resume that must
+/// claim the run *before* it has read where the private half went — and
+/// neither has a private path to offer. Asking them for one invited passing
+/// the public path twice, which would have quietly become wrong the moment
+/// liveness consulted anything but the lock.
+pub fn lock_file(public: &Path) -> PathBuf {
+    public.join("run.lock")
+}
+
 /// An exclusive hold on one run, released when this value drops.
 ///
 /// Two engines on one run directory would interleave events into the log and
@@ -294,9 +311,9 @@ pub struct RunLock {
 }
 
 impl RunLock {
-    /// Take the lock, or explain who has it.
-    pub fn acquire(paths: &RunPaths) -> Result<Self, TactusError> {
-        let path = paths.lock_file();
+    /// Take the lock on a run's public directory, or explain who has it.
+    pub fn acquire(public: &Path) -> Result<Self, TactusError> {
+        let path = lock_file(public);
         let file = File::options()
             .create(true)
             .truncate(false)
@@ -313,11 +330,7 @@ impl RunLock {
                     "another tactus process is already driving run `{}` (lock held on {}). Two \
                      engines would interleave events and fight over the same branch — wait for \
                      it to finish, or stop it first.",
-                    paths
-                        .public
-                        .file_name()
-                        .unwrap_or_default()
-                        .to_string_lossy(),
+                    public.file_name().unwrap_or_default().to_string_lossy(),
                     path.display()
                 ),
             }),
@@ -331,8 +344,8 @@ impl RunLock {
 /// it takes a shared lock and immediately gives it back. A file that cannot be
 /// opened at all is not a running run — the lock is only ever created by a run
 /// that started.
-pub fn is_running(paths: &RunPaths) -> bool {
-    let Ok(file) = File::open(paths.lock_file()) else {
+pub fn is_running(public: &Path) -> bool {
+    let Ok(file) = File::open(lock_file(public)) else {
         return false;
     };
     match file.try_lock_shared() {
@@ -472,13 +485,13 @@ mod tests {
         paths.create().expect("create");
 
         assert!(
-            !is_running(&paths),
+            !is_running(&paths.public),
             "nothing holds a run that never started"
         );
-        let held = RunLock::acquire(&paths).expect("first acquire");
-        assert!(is_running(&paths), "status can see the run is live");
+        let held = RunLock::acquire(&paths.public).expect("first acquire");
+        assert!(is_running(&paths.public), "status can see the run is live");
 
-        let err = RunLock::acquire(&paths).expect_err("second engine must be refused");
+        let err = RunLock::acquire(&paths.public).expect_err("second engine must be refused");
         assert!(
             err.to_string().contains("already driving run"),
             "got: {err}"
@@ -487,7 +500,21 @@ mod tests {
         // Dropping releases it — which is also what a crash does, so resume
         // never has to clear a stale marker by hand.
         drop(held);
-        assert!(!is_running(&paths));
-        RunLock::acquire(&paths).expect("re-acquire after release");
+        assert!(!is_running(&paths.public));
+        RunLock::acquire(&paths.public).expect("re-acquire after release");
+    }
+
+    #[test]
+    fn an_exact_match_resolves_to_the_name_on_disk() {
+        // The comparison is case-insensitive, so the answer has to be the
+        // directory that actually exists: on a case-sensitive filesystem the
+        // uppercased input names nothing, and every caller joins this id onto
+        // a path.
+        let root = scratch("ondisk");
+        let repo = root.join("repo");
+        fs::create_dir_all(runs_root(&repo).join("01AbCd")).expect("run dir");
+
+        assert_eq!(resolve_run_id(&repo, "01abcd").expect("exact"), "01AbCd");
+        assert_eq!(resolve_run_id(&repo, "01AB").expect("prefix"), "01AbCd");
     }
 }

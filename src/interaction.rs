@@ -118,8 +118,12 @@ pub fn answer_path(dir: &Path, id: &QuestionId) -> PathBuf {
 /// Write an answer atomically.
 ///
 /// Temp file plus rename, because the engine may be reading this directory at
-/// any moment: a partially written file would parse as corrupt exactly once
-/// and then be skipped forever.
+/// any moment. That atomicity is what lets [`read_answer`] be strict: it
+/// refuses a file it cannot parse rather than skipping it, which is only a
+/// safe policy because a half-written file can never be observed. A corrupt
+/// one therefore means something outside tactus wrote here, and silently
+/// ignoring what might be an operator's answer is worse than stopping to say
+/// so.
 pub fn write_answer(dir: &Path, id: &QuestionId, answer: &Answer) -> Result<(), TactusError> {
     let component = util::filename_component(id.as_str());
     let staged = dir.join(format!("{component}.json.partial"));
