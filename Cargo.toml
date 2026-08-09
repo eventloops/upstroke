@@ -2,7 +2,7 @@
 name = "tactus"
 version = "0.1.0"
 edition = "2024"
-license = "MIT OR Apache-2.0"
+license = "AGPL-3.0-only"
 description = "Headless orchestration engine for AI coding agents — the conductor, not an instrument"
 repository = "https://github.com/keybindings/tactus"
 readme = "README.md"

@@ -1,3 +1,8 @@
+// tactus — headless orchestration engine for AI coding agents.
+// Copyright (C) 2026 Cameron Lambert. Licensed under the GNU AGPL v3 only;
+// see LICENSE, or <https://www.gnu.org/licenses/>. Commercial licences are
+// available for use the AGPL does not permit — see README.md.
+
 use std::path::PathBuf;
 use std::process::ExitCode;
 

@@ -95,5 +95,20 @@ on `PATH`. Windows, macOS and Linux are all first-class.
 
 ## Licence
 
-See `Cargo.toml`. Not yet finalised — do not assume the current declaration is the one this will
-ship under.
+**GNU AGPL v3 only** — see [LICENSE](LICENSE).
+
+In plain terms, for the two things people usually want to know:
+
+- **Running it costs you nothing and obliges you to nothing.** The AGPL's obligations attach to
+  *distributing* the software or *offering a modified version to others over a network*. Using
+  tactus on your own machine — including at work, including on proprietary code — triggers
+  neither. Nothing links into your code: tactus is a separate process that shells out to other
+  separate processes, so your repository is not a derivative work of it.
+- **Building on it means sharing back.** Fork it, modify it, sell it if you like — but the source
+  stays open under the same licence, including if you offer it to others as a hosted service.
+
+If that doesn't suit — an internal policy that prohibits AGPL, or a product you need to keep
+closed — a **commercial licence** is available. Open an issue or get in touch.
+
+Contributions are welcome under the CLA in [CONTRIBUTING.md](CONTRIBUTING.md), which keeps that
+dual-licensing possible.
