@@ -394,6 +394,11 @@ impl Invocation {
 }
 
 /// `"<program>" <args…>` wrapped in the outer quote pair `cmd /C` strips.
+///
+/// Only reachable on Windows, but compiled and unit-tested everywhere: the
+/// quoting rules are pure string logic, and a bug in them should be caught by
+/// whichever platform's CI job runs first, not only by the Windows one.
+#[cfg_attr(not(windows), allow(dead_code))]
 fn cmd_c_line(program: &std::path::Path, args: &[String]) -> String {
     let mut line = String::from("\"");
     line.push_str(&quote_for_cmd(&program.to_string_lossy()));
@@ -405,6 +410,7 @@ fn cmd_c_line(program: &std::path::Path, args: &[String]) -> String {
     line
 }
 
+#[cfg_attr(not(windows), allow(dead_code))]
 fn quote_for_cmd(arg: &str) -> String {
     let needs_quotes = arg.is_empty()
         || arg.chars().any(|c| {
