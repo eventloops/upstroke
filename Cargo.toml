@@ -5,6 +5,12 @@ edition = "2024"
 license = "MIT OR Apache-2.0"
 description = "Headless orchestration engine for AI coding agents — the conductor, not an instrument"
 repository = "https://github.com/keybindings/tactus"
+readme = "README.md"
+keywords = ["ai", "agents", "orchestration", "automation", "cli"]
+categories = ["command-line-utilities", "development-tools"]
+# Internal working documents: useful in the repo, noise in the published
+# crate. Fixtures stay — the parser tests are fixture-driven.
+exclude = ["reviews/", ".github/", ".tactus/"]
 
 [dependencies]
 anyhow = "1"
