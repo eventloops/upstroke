@@ -45,7 +45,7 @@ use serde_json::Value;
 
 use crate::agent::{AgentAdapter, TaskRun, proc};
 use crate::catalog::{self, Family};
-use crate::config::{Config, SecondOpinion};
+use crate::config::Config;
 use crate::error::TactusError;
 use crate::ir::{OutcomeStatus, PermissionMode, Plan, Task, Tier, Verdict, WorkerProfile};
 use crate::route::ResolvedChain;
@@ -203,6 +203,56 @@ impl ReviewPlan {
         self.alternative = None;
     }
 
+    /// Which tasks will be judged by the model that wrote them, and why nothing
+    /// prevented it — or `None` when the rebind is available or nothing is at
+    /// risk.
+    ///
+    /// Called from two places on purpose. Resolution reaches it when no
+    /// cross-family model has an adapter at all; **pre-flight reaches it again
+    /// after a probe failure drops the alternative**, which is the case that
+    /// actually happens to people. A real build always ships the Copilot
+    /// adapter, so resolution alone would never fire this — the warning would
+    /// have been dead code in every shipped binary.
+    pub fn self_review_warning(
+        &self,
+        plan: &Plan,
+        chains: &[ResolvedChain],
+        tier: Tier,
+    ) -> Option<String> {
+        if self.alternative.is_some() {
+            return None;
+        }
+        let primary = self.primary.as_ref()?;
+        let mut at_risk: Vec<String> = plan
+            .tasks
+            .iter()
+            .zip(chains)
+            .enumerate()
+            .filter(|(index, (_, chain))| {
+                self.second_opinion
+                    .get(*index)
+                    .and_then(Option::as_ref)
+                    .is_none()
+                    && chain.rungs.iter().any(|r| {
+                        r.binding.agent == primary.agent && r.binding.model == primary.model
+                    })
+            })
+            .map(|(_, (task, _))| task.id.to_string())
+            .collect();
+        if at_risk.is_empty() {
+            return None;
+        }
+        at_risk.sort();
+        Some(format!(
+            "task(s) {} can run on {}, which is also the reviewer — a model reviewing its own work \
+             is a weak check. No {tier}-tier model from another family is usable here; install the \
+             GitHub Copilot CLI, or set `second_opinion = \"different-vendor\"` on a \
+             [[routing.overrides]] covering these paths (§11.3).",
+            at_risk.join(", "),
+            primary.describe()
+        ))
+    }
+
     /// The ordered passes for one task, given the binding the implementer is
     /// actually running on.
     ///
@@ -269,9 +319,12 @@ pub fn plan_for(
         .tasks
         .iter()
         .map(|task| {
+            // `is_some`, not a match on the one variant that exists today:
+            // §11.5 adds a security lens to this key, and a new variant should
+            // arrive as a compile error where it needs handling — not as a
+            // silently-ignored override here.
             cfg.overrides.iter().find(|ov| {
-                ov.second_opinion == Some(SecondOpinion::DifferentVendor)
-                    && task.path_hints.iter().any(|h| ov.globs.is_match(h))
+                ov.second_opinion.is_some() && task.path_hints.iter().any(|h| ov.globs.is_match(h))
             })
         })
         .collect();
@@ -346,40 +399,17 @@ pub fn plan_for(
         second_opinion.push(Some(binding));
     }
 
-    // The carried step-6 item, now visible: say when a task will be judged by
-    // the model that wrote it and nothing in this build can prevent it.
-    if alternative.is_none() {
-        let mut self_reviewed: Vec<String> = plan
-            .tasks
-            .iter()
-            .zip(chains)
-            .zip(&second_opinion)
-            .filter(|((_, chain), second)| {
-                second.is_none()
-                    && chain.rungs.iter().any(|r| {
-                        r.binding.agent == primary.agent && r.binding.model == primary.model
-                    })
-            })
-            .map(|((task, _), _)| task.id.to_string())
-            .collect();
-        if !self_reviewed.is_empty() {
-            self_reviewed.sort();
-            warnings.push(format!(
-                "task(s) {} can run on {}, which is also the reviewer — a model reviewing its own \
-                 work is a weak check. No {tier}-tier model from another family has an adapter in \
-                 this build; install the GitHub Copilot CLI, or set `second_opinion = \
-                 \"different-vendor\"` on a [[routing.overrides]] covering these paths (§11.3).",
-                self_reviewed.join(", "),
-                primary.describe()
-            ));
-        }
-    }
-
-    Ok(ReviewPlan {
+    let resolved = ReviewPlan {
         primary: Some(primary),
         alternative,
         second_opinion,
-    })
+    };
+    // The carried step-6 item, now visible: say when a task will be judged by
+    // the model that wrote it and nothing in this build can prevent it.
+    if let Some(warning) = resolved.self_review_warning(plan, chains, tier) {
+        warnings.push(warning);
+    }
+    Ok(resolved)
 }
 
 pub struct ReviewCx<'a> {

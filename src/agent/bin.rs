@@ -1,17 +1,29 @@
 //! Locating and invoking an agent CLI — the parts every adapter needs and
 //! none of them should own privately.
 //!
-//! Windows is first-class here, and that is the whole reason this module
-//! exists. Both agent CLIs ship as npm packages, so the thing on PATH is
-//! frequently a `.cmd` shim rather than a native executable, and `CreateProcess`
-//! cannot exec a batch script. Running one means going through `cmd /C`, whose
-//! quoting rules are not `CommandLineToArgvW`'s — so the command line has to be
-//! built by hand. That logic is subtle enough that two copies of it would be two
-//! chances to get it wrong; Copilot in particular passes
-//! `--allow-tool=shell(cargo test)`, which carries spaces *and* parentheses
-//! through exactly that path.
+//! Windows is why this module exists. Both agent CLIs ship as npm packages, so
+//! the thing on PATH is frequently a `.cmd` shim rather than a native
+//! executable, and `CreateProcess` cannot exec a batch script. That used to be
+//! handled here by building a `cmd /C` command line by hand and passing it
+//! through `raw_arg`.
+//!
+//! **It is not any more, and the reason is worth recording.** `raw_arg` opts
+//! out of everything the standard library does for batch targets, including the
+//! argument escaping added in Rust 1.77.2 for CVE-2024-24576; this crate is
+//! edition 2024, so that fix is unconditionally present. Measured against a
+//! real npm-shape shim, the hand-rolled version expanded `%VAR%` inside
+//! arguments — turning `--allow-tool=shell(echo %PATH%)` into the machine's
+//! entire PATH — while `Command::args` carried every case through intact:
+//! `&`, `|`, `%`, embedded quotes, `^`, spaces, and the empty argument.
+//!
+//! Copilot is what made that matter. Its permission surface is argv, so gate
+//! commands — strings a user writes in `tactus.toml` — now reach a Windows
+//! command line, and a mangled `--allow-tool=shell(<gate>)` is a permission
+//! grant that no longer matches the command it is meant to authorize. The
+//! module comment used to argue that two copies of the quoting logic would be
+//! two chances to get it wrong. The right number was zero.
 
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::process::Command;
 use std::sync::OnceLock;
 
@@ -22,79 +34,23 @@ use crate::util;
 #[derive(Debug, Clone)]
 pub struct Invocation {
     path: PathBuf,
-    /// `.cmd`/`.bat` shims (npm installs) are batch scripts: CreateProcess
-    /// cannot exec them, so they run through `cmd /C`.
-    via_cmd_shell: bool,
 }
 
 impl Invocation {
+    /// The command to run, with `args` handed to the standard library verbatim.
+    ///
+    /// Nothing is quoted, escaped, or wrapped here on purpose: `std` knows
+    /// whether the resolved path is a batch shim and applies the right rules,
+    /// and every attempt to help it has been a way to get this wrong.
     pub fn command(&self, args: &[String]) -> Command {
-        if self.via_cmd_shell {
-            let mut cmd = Command::new("cmd");
-            cmd.arg("/C");
-            // std quotes each arg for CommandLineToArgvW, which cmd.exe does
-            // NOT follow: with more than one quoted argument its
-            // strip-first-and-last-quote rule mangles the shim path. Build the
-            // whole line ourselves and pass it verbatim, wrapped in the outer
-            // quote pair cmd strips.
-            #[cfg(windows)]
-            {
-                use std::os::windows::process::CommandExt;
-                cmd.raw_arg(cmd_c_line(&self.path, args));
-            }
-            #[cfg(not(windows))]
-            {
-                cmd.arg(&self.path).args(args);
-            }
-            cmd
-        } else {
-            let mut cmd = Command::new(&self.path);
-            cmd.args(args);
-            cmd
-        }
+        let mut cmd = Command::new(&self.path);
+        cmd.args(args);
+        cmd
     }
 
     pub fn display(&self) -> String {
         self.path.to_string_lossy().into_owned()
     }
-}
-
-/// `"<program>" <args…>` wrapped in the outer quote pair `cmd /C` strips.
-///
-/// Only reachable on Windows, but compiled and unit-tested everywhere: the
-/// quoting rules are pure string logic, and a bug in them should be caught by
-/// whichever platform's CI job runs first, not only by the Windows one.
-#[cfg_attr(not(windows), allow(dead_code))]
-fn cmd_c_line(program: &Path, args: &[String]) -> String {
-    let mut line = String::from("\"");
-    line.push_str(&quote_for_cmd(&program.to_string_lossy()));
-    for arg in args {
-        line.push(' ');
-        line.push_str(&quote_for_cmd(arg));
-    }
-    line.push('"');
-    line
-}
-
-#[cfg_attr(not(windows), allow(dead_code))]
-fn quote_for_cmd(arg: &str) -> String {
-    let needs_quotes = arg.is_empty()
-        || arg.chars().any(|c| {
-            c.is_whitespace() || matches!(c, '"' | '&' | '|' | '<' | '>' | '^' | '(' | ')')
-        });
-    if !needs_quotes {
-        return arg.to_owned();
-    }
-    let mut out = String::with_capacity(arg.len() + 2);
-    out.push('"');
-    for ch in arg.chars() {
-        if ch == '"' {
-            out.push('\\');
-        }
-        out.push(ch);
-    }
-    out.push('"');
-    out
 }
 
 /// Resolve the first of `names` that exists on PATH, caching the answer in the
@@ -117,12 +73,7 @@ pub fn locate(
                 // util::find_program skips empty PATH segments, which would
                 // otherwise resolve a bare name against the current directory
                 // — i.e. run a binary out of the repo being worked on.
-                util::find_program(name).map(|path| Invocation {
-                    via_cmd_shell: path.extension().is_some_and(|e| {
-                        e.eq_ignore_ascii_case("cmd") || e.eq_ignore_ascii_case("bat")
-                    }),
-                    path,
-                })
+                util::find_program(name).map(|path| Invocation { path })
             })
         })
         .clone()
@@ -151,52 +102,42 @@ pub fn extract_version(stdout: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::ffi::OsStr;
+    use std::path::Path;
 
-    #[test]
-    fn cmd_shim_quoting_survives_spaces_and_multiple_quoted_args() {
-        let line = cmd_c_line(
-            Path::new(r"C:\Users\John Smith\npm\claude.cmd"),
-            &[
-                "-p".to_owned(),
-                "--settings".to_owned(),
-                r"C:\repo with spaces\settings.json".to_owned(),
-                String::new(),
-            ],
-        );
-        assert!(
-            line.starts_with('"') && line.ends_with('"'),
-            "outer pair: {line}"
-        );
-        assert!(line.contains(r#""C:\Users\John Smith\npm\claude.cmd""#));
-        assert!(line.contains(r#""C:\repo with spaces\settings.json""#));
-        assert!(
-            line.contains(r#" "" "#) || line.ends_with(r#""""#),
-            "empty arg kept: {line}"
-        );
-        assert_eq!(quote_for_cmd("simple"), "simple");
+    fn invocation(path: &str) -> Invocation {
+        Invocation {
+            path: PathBuf::from(path),
+        }
     }
 
     #[test]
-    fn tool_permission_args_survive_the_cmd_shim() {
-        // Copilot's permission surface is argv, and `shell(cargo test)` carries
-        // both a space and parentheses — the latter are cmd.exe metacharacters,
-        // so an unquoted one would end the command mid-line.
-        let line = cmd_c_line(
-            Path::new(r"C:\Users\me\npm\copilot.cmd"),
-            &[
-                "--allow-tool=shell(cargo test)".to_owned(),
-                "--deny-tool=write".to_owned(),
-            ],
-        );
-        assert!(
-            line.contains(r#""--allow-tool=shell(cargo test)""#),
-            "quoted whole: {line}"
-        );
+    fn arguments_reach_the_command_untouched() {
+        // The property the deleted quoting code kept breaking. These are the
+        // exact shapes Copilot's permission surface produces: a gate command
+        // with spaces and parentheses, a cmd metacharacter, a percent sign, an
+        // embedded quote, and an empty argument.
+        let args: Vec<String> = [
+            "-s",
+            "--allow-tool=shell(cargo test)",
+            "--allow-tool=shell(echo hi & whoami)",
+            "--allow-tool=shell(echo %PATH%)",
+            r#"--allow-tool=shell(cargo test -- --exact "my test")"#,
+            "--setting-sources",
+            "",
+        ]
+        .map(str::to_owned)
+        .to_vec();
+
+        let cmd = invocation(r"C:\Users\John Smith\npm\copilot.cmd").command(&args);
         assert_eq!(
-            quote_for_cmd("--deny-tool=write"),
-            "--deny-tool=write",
-            "nothing to escape, so nothing added"
+            cmd.get_program(),
+            OsStr::new(r"C:\Users\John Smith\npm\copilot.cmd"),
+            "the shim is the program; nothing wraps it in a shell"
         );
+        let seen: Vec<&OsStr> = cmd.get_args().collect();
+        let expected: Vec<&OsStr> = args.iter().map(OsStr::new).collect();
+        assert_eq!(seen, expected, "every argument survives verbatim");
     }
 
     #[test]
@@ -220,5 +161,40 @@ mod tests {
                 .contains("tactus-definitely-not-a-real-binary"),
             "got: {error}"
         );
+    }
+
+    /// A `.cmd` shim really does execute, and an argument really does arrive.
+    ///
+    /// Asserting on the constructed `Command` proves we hand `std` the right
+    /// thing; only spawning proves `std` then does the right thing with a batch
+    /// target, which is the half the old hand-rolled code got wrong.
+    #[cfg(windows)]
+    #[test]
+    fn a_batch_shim_runs_and_receives_its_argument() {
+        let dir = std::env::temp_dir().join(format!("tactus-bin-shim-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("scratch dir");
+        let shim = dir.join("tactus-test-shim.cmd");
+        // `%~1` strips the quotes the child got; a benign argument keeps this
+        // about plumbing rather than about batch re-parsing.
+        std::fs::write(&shim, "@echo off\r\necho GOT:%~1\r\n").expect("write shim");
+
+        let out = invocation(&shim.to_string_lossy())
+            .command(&["hello world".to_owned()])
+            .output()
+            .expect("the shim spawns");
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            stdout.contains("GOT:hello world"),
+            "the shim ran and saw its argument: {stdout:?}"
+        );
+    }
+
+    #[test]
+    fn display_is_the_resolved_path() {
+        assert_eq!(
+            invocation("/usr/local/bin/claude").display(),
+            "/usr/local/bin/claude"
+        );
+        assert!(Path::new("/usr/local/bin/claude").is_absolute() || cfg!(windows));
     }
 }

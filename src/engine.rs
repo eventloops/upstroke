@@ -207,10 +207,16 @@ pub struct TaskReport {
     pub status: TaskRunStatus,
     pub duration: Duration,
     pub cost_usd: Option<f64>,
-    /// Every model that judged the final attempt, in pass order — one for an
-    /// ordinary review, two where §11.3 asked for a second opinion.
+    /// Every model that judged this task, in the order first seen.
+    ///
+    /// Across *all* attempts, not just the last, because `review_cost_usd`
+    /// beside it sums all of them — a list scoped to the final attempt next to
+    /// a total scoped to every attempt reads as though one explains the other.
     pub review_models: Vec<String>,
     pub review_cost_usd: Option<f64>,
+    /// At least one review pass reported no spend, so `review_cost_usd` is a
+    /// floor (§13). Rendered as a `?` rather than left to look exact.
+    pub review_cost_incomplete: bool,
     pub session_id: Option<String>,
     /// Every attempt, oldest first — the escalation trail.
     pub attempts: Vec<AttemptRecord>,
@@ -327,10 +333,14 @@ fn preflight(opts: &RunOptions, harness: &Harness<'_>) -> Result<Preflight, Tact
 }
 
 /// `recorded` is the review plan a previous process resolved for this run.
+///
 /// `Some` on resume: §15's record is what says how this run's code was judged,
 /// and re-deriving it against today's machine would let a CLI installed (or
 /// removed) since the run started change the verification standard halfway
-/// through. `None` for a fresh run, which resolves it now.
+/// through. `None` for a fresh run — and also for a resume of a log written
+/// before step 9, which recorded no reviewers at all. That case must re-derive
+/// rather than inherit an empty plan, because an empty plan reads as "review is
+/// switched off" and would finish the run unverified.
 fn preflight_with_reviews(
     opts: &RunOptions,
     harness: &Harness<'_>,
@@ -345,7 +355,6 @@ fn preflight_with_reviews(
     })?;
 
     let mut warnings = analysis.warnings.clone();
-    let resumed = recorded.is_some();
     let mut review_plan = match recorded {
         Some(plan) => plan,
         // Resolved against the adapters *this harness* holds, not the built-in
@@ -371,29 +380,23 @@ fn preflight_with_reviews(
     // required. The anti-self-review alternative was tactus's own idea, so a
     // machine that cannot run it loses the upgrade rather than the run.
     //
-    // On resume even the alternative is required: the record says this run's
-    // earlier tasks were judged cross-family, and quietly dropping to
-    // same-model review for the back half gives one run two standards.
+    // Resume draws the line in the same place. Requiring the alternative there
+    // — on the grounds that a run should keep one verification standard — would
+    // refuse to continue over a reviewer that may never have judged anything,
+    // and the per-attempt record already names who judged each attempt, so the
+    // ledger stays honest either way. A loud warning beats a dead run.
     let required = review_plan.required_agents();
-    let optional: Vec<String> = if resumed {
-        Vec::new()
-    } else {
-        review_plan
-            .agents()
-            .into_iter()
-            .filter(|id| !required.contains(id))
-            .map(str::to_owned)
-            .collect()
-    };
+    let optional: Vec<String> = review_plan
+        .agents()
+        .into_iter()
+        .filter(|id| !required.contains(id))
+        .map(str::to_owned)
+        .collect();
     let mut agent_ids: Vec<&str> = analysis
         .chains
         .iter()
         .flat_map(|c| c.rungs.iter().map(|r| r.binding.agent.as_str()))
-        .chain(if resumed {
-            review_plan.agents()
-        } else {
-            required
-        })
+        .chain(required)
         .collect();
     agent_ids.sort_unstable();
     agent_ids.dedup();
@@ -430,6 +433,19 @@ fn preflight_with_reviews(
                      (§11.3)."
                 ));
                 review_plan.drop_alternative();
+                // Now say WHICH tasks. Resolution could not: a shipped binary
+                // always has the Copilot adapter, so the only way the rebind
+                // actually goes missing is right here, and naming the tasks is
+                // the difference between a note and something actionable.
+                let tier = analysis
+                    .config
+                    .review_tier
+                    .unwrap_or(crate::ir::Tier::Frontier);
+                if let Some(warning) =
+                    review_plan.self_review_warning(&analysis.plan, &analysis.chains, tier)
+                {
+                    warnings.push(warning);
+                }
             }
         }
     }
@@ -531,7 +547,7 @@ fn run_harness_inner(
         gates_from_config: analysis.gates_from_config,
         interaction_mode: mode.to_string(),
         chains: chain_summaries(&analysis),
-        reviews: review_plan.clone(),
+        reviews: Some(review_plan.clone()),
     };
 
     let sleeper = harness.sleeper.unwrap_or(&RealSleeper);
@@ -714,7 +730,15 @@ fn resume_harness_inner(
         warnings: preflight_warnings,
         mode,
         notifiers,
-    } = preflight_with_reviews(&run_opts, harness, Some(started.reviews.clone()))?;
+    } = preflight_with_reviews(&run_opts, harness, started.reviews.clone())?;
+    if started.reviews.is_none() {
+        warnings.push(
+            "this run's log predates the review record (step 9), so who reviews was re-derived \
+             from today's config rather than read from the run — earlier tasks may have been \
+             judged differently"
+                .to_owned(),
+        );
+    }
     warnings.extend(preflight_warnings);
 
     // The plan is frozen. A different hash means the file moved under the run,
@@ -1804,8 +1828,20 @@ fn task_report(task: &Task, state: &TaskState, progress: &Progress) -> TaskRepor
         },
         duration: records.iter().map(|r| r.duration).sum(),
         cost_usd: sum_opt(records.iter().map(|r| r.cost_usd)),
-        review_models: last.map(AttemptRecord::review_models).unwrap_or_default(),
+        review_models: {
+            // Deduped, first-seen order: an escalated task can be judged by one
+            // model on its first rung and another on the next, and both belong
+            // beside a cost that counts both.
+            let mut seen: Vec<String> = Vec::new();
+            for model in records.iter().flat_map(AttemptRecord::review_models) {
+                if !seen.contains(&model) {
+                    seen.push(model);
+                }
+            }
+            seen
+        },
         review_cost_usd: sum_opt(records.iter().map(AttemptRecord::review_cost_usd)),
+        review_cost_incomplete: records.iter().any(AttemptRecord::review_cost_incomplete),
         session_id: last.and_then(|r| r.session_id.clone()),
         attempts: records.clone(),
     }
@@ -2035,13 +2071,20 @@ fn run_attempt(
                 timeout: budget,
             })?;
             let cost_usd = review.cost_usd;
+            // Read before the result is consumed: a judge that never ran is not
+            // a judge that said no, and the ledger has to show which happened.
+            let unavailable = matches!(review.result, review::ReviewResult::Unavailable { .. });
             failure = review_failure(review.result);
             reviews.push(events::ReviewRecord {
                 pass: reviewer.lens.name().to_owned(),
                 agent: reviewer.profile.agent.clone(),
                 model: reviewer.profile.model.clone(),
                 cost_usd,
-                passed: failure.is_none(),
+                outcome: match (unavailable, failure.is_none()) {
+                    (true, _) => events::ReviewPassOutcome::Unavailable,
+                    (false, true) => events::ReviewPassOutcome::Passed,
+                    (false, false) => events::ReviewPassOutcome::Failed,
+                },
             });
             if failure.is_some() {
                 break;
@@ -2487,14 +2530,18 @@ impl RunReport {
         for task in &self.tasks {
             match &task.status {
                 TaskRunStatus::Committed { sha } => {
+                    // `?` marks a total with unreported components — the
+                    // Copilot route bills nothing back, so a two-pass review
+                    // shows one reviewer's spend and must not read as both.
+                    let partial = if task.review_cost_incomplete { "?" } else { "" };
                     let review = match (task.review_models.as_slice(), task.review_cost_usd) {
                         ([], _) => String::new(),
                         (models, Some(cost)) => {
-                            format!(" + review {} ${cost:.4}", models.join(", "))
+                            format!(" + review {} ${cost:.4}{partial}", models.join(", "))
                         }
-                        // Reviewed by a route that reports no spend (§13) —
+                        // Reviewed only by routes that report no spend (§13) —
                         // say who judged it rather than imply it was free.
-                        (models, None) => format!(" + review {}", models.join(", ")),
+                        (models, None) => format!(" + review {} $?", models.join(", ")),
                     };
                     let _ = writeln!(
                         out,
@@ -2603,6 +2650,15 @@ impl RunReport {
             Some(amount) => format!("${amount:.4}"),
             None => "—".to_owned(),
         };
+        // A figure that omits a reviewer whose route bills nothing back is not
+        // the total, and this column is where someone decides what a run cost.
+        let partial = |rendered: String, incomplete: bool| {
+            if incomplete && rendered != "—" {
+                format!("{rendered}?")
+            } else {
+                rendered
+            }
+        };
         let rows: Vec<[String; 6]> = self
             .tasks
             .iter()
@@ -2616,8 +2672,8 @@ impl RunReport {
                         task.trail()
                     },
                     money(task.cost_usd),
-                    money(task.review_cost_usd),
-                    money(task.total_cost_usd()),
+                    partial(money(task.review_cost_usd), task.review_cost_incomplete),
+                    partial(money(task.total_cost_usd()), task.review_cost_incomplete),
                 ]
             })
             .collect();
@@ -2653,6 +2709,12 @@ impl RunReport {
             "  total ${:.4} (api-equivalent; subscription spend is notional — §13)",
             self.total_cost_usd
         );
+        if self.tasks.iter().any(|t| t.review_cost_incomplete) {
+            let _ = writeln!(
+                out,
+                "  `?` marks a total missing a reviewer whose route reports no spend (§13)"
+            );
+        }
         // Pool drain arrives with the capacity engine; saying so beats an
         // empty column that looks like "nothing was spent".
         let _ = writeln!(out, "  per-pool drain: not connected");
@@ -2723,6 +2785,8 @@ mod tests {
         /// probe classes: required agents refuse the run, the opportunistic
         /// cross-family one only warns.
         probe_error: Option<&'static str>,
+        /// Whether this route reports spend. Copilot's does not.
+        reports_cost: bool,
         calls: Mutex<Calls>,
     }
 
@@ -2751,6 +2815,7 @@ mod tests {
                 effects,
                 reviews,
                 probe_error: None,
+                reports_cost: true,
                 calls: Mutex::new(Calls::default()),
             }
         }
@@ -2763,12 +2828,20 @@ mod tests {
                 effects: Vec::new(),
                 reviews,
                 probe_error: None,
+                reports_cost: true,
                 calls: Mutex::new(Calls::default()),
             }
         }
 
         fn broken(mut self, message: &'static str) -> Self {
             self.probe_error = Some(message);
+            self
+        }
+
+        /// Stands in for the Copilot route, which has no JSON envelope and so
+        /// reports no spend at all (§13).
+        fn unpriced(mut self) -> Self {
+            self.reports_cost = false;
             self
         }
 
@@ -2952,7 +3025,7 @@ mod tests {
                     OutcomeStatus::Completed,
                     Some(answer.to_owned()),
                     "fake-review-session",
-                    Some(0.05),
+                    self.reports_cost.then_some(0.05),
                     out.duration,
                 ));
             }
@@ -3513,9 +3586,12 @@ mod tests {
             Some(FailureKind::ReviewFailed)
         );
         assert_eq!(
-            last.reviews.iter().map(|r| r.passed).collect::<Vec<_>>(),
-            [true, false],
-            "the record says which pass objected"
+            last.reviews.iter().map(|r| r.outcome).collect::<Vec<_>>(),
+            [
+                events::ReviewPassOutcome::Passed,
+                events::ReviewPassOutcome::Failed
+            ],
+            "the record says which pass objected, and that it really judged"
         );
         assert_eq!(last.reviews[1].agent, "copilot");
     }
@@ -3664,6 +3740,18 @@ mod tests {
             "warnings: {:?}",
             report.warnings
         );
+        // And it names the tasks. Resolution cannot reach this warning — a
+        // shipped binary always has the Copilot adapter, so the only way the
+        // rebind really goes missing is a probe failure, and a warning that
+        // never fires for a real user is not a warning.
+        assert!(
+            report
+                .warnings
+                .iter()
+                .any(|w| w.contains("t1") && w.contains("also the reviewer")),
+            "warnings: {:?}",
+            report.warnings
+        );
     }
 
     #[test]
@@ -3735,6 +3823,7 @@ mod tests {
                 .reviews
                 .clone()
         };
+        let recorded = recorded.expect("step 9 records who reviews");
         assert_eq!(
             recorded.alternative, None,
             "there was nothing to rebind to when this run started"
@@ -3767,6 +3856,150 @@ mod tests {
             later.copilot().reviews_run(),
             0,
             "a CLI installed since the run began must not become its judge"
+        );
+    }
+
+    #[test]
+    fn a_log_written_before_step_9_still_gets_reviewed_on_resume() {
+        // `RunStarted.reviews` is #[serde(default)] so a step-8 log still
+        // parses — but the default is an EMPTY plan, which every later reader
+        // cannot tell apart from `review = { enabled = false }`.
+        let repo = temp_engine_repo("oldlogresume");
+        seed(
+            &repo,
+            "## Rotate the signing key\n\
+             <!-- tactus: id=t1 kind=implement depends= tier=frontier -->\n",
+            Some(
+                "[interaction]\nmode = \"never\"\n\n\
+                 [routing]\nimplement = { chain = [\"frontier\"], attempts_per = 1 }\n",
+            ),
+        );
+        let first_source = source(vec![Effect::NoEdit], vec![ReviewBehavior::Pass]);
+        let first = run_with(&cross_vendor_opts(&repo), &first_source).expect("run");
+
+        // Rewrite run_started as a pre-step-9 process would have written it.
+        let paths = paths_of(&repo, &first.run_id);
+        let text = fs::read_to_string(paths.events()).expect("log");
+        let rewritten: Vec<String> = text
+            .lines()
+            .map(|line| {
+                let mut value: serde_json::Value =
+                    serde_json::from_str(line).expect("every line is an event");
+                if value.get("event").and_then(|e| e.as_str()) == Some("run_started")
+                    && let Some(data) = value.get_mut("data").and_then(|d| d.as_object_mut())
+                {
+                    data.remove("reviews").expect("step 9 wrote this field");
+                }
+                value.to_string()
+            })
+            .collect();
+        fs::write(paths.events(), format!("{}\n", rewritten.join("\n"))).expect("rewrite");
+
+        crate::answer::answer(
+            &repo,
+            &first.questions[0].question.id.to_string(),
+            crate::answer::Reply::Text("put the key in src/auth/keys.rs".to_owned()),
+        )
+        .expect("answer");
+
+        // A reviewer that rejects everything: if review still runs, nothing can
+        // commit. If the absent field read as "review disabled", it commits —
+        // verification gone without a word, which is step-6 finding #10.
+        let later = source(vec![Effect::EditFile], vec![ReviewBehavior::Fail]);
+        let resumed =
+            resume_with(&resume_options(&repo, &first.run_id), &later).expect("resume continues");
+        assert!(
+            !committed(&resumed, "t1"),
+            "an older log must not silently switch review off: {resumed:?}"
+        );
+    }
+
+    #[test]
+    fn an_unavailable_reviewer_is_recorded_as_such_not_as_a_rejection() {
+        // Step-6 finding #8's distinction, carried into the ledger: a judge
+        // that never ran said nothing about the code, and recording it as a
+        // plain "did not pass" puts a rejection against a model that never read
+        // the diff.
+        let repo = temp_engine_repo("outagerecord");
+        seed(&repo, FRONTIER_AUTH_PLAN, Some(SECOND_OPINION_CONFIG));
+        let source = cross_vendor(
+            vec![Effect::EditFile],
+            vec![ReviewBehavior::Pass],
+            vec![ReviewBehavior::RateLimited, ReviewBehavior::Pass],
+        );
+        let report = run_with(&cross_vendor_opts(&repo), &source).expect("run");
+
+        let first = &task(&report, "t1").attempts[0];
+        assert_eq!(
+            first.reviews.iter().map(|r| r.outcome).collect::<Vec<_>>(),
+            [
+                events::ReviewPassOutcome::Passed,
+                events::ReviewPassOutcome::Unavailable
+            ],
+            "the second vendor was down, not unimpressed"
+        );
+        // And the ladder treated it as an outage: deferred, then committed.
+        assert!(committed(&report, "t1"), "{report:?}");
+    }
+
+    #[test]
+    fn a_total_missing_an_unreported_reviewer_is_marked_rather_than_implied() {
+        // The Copilot route bills nothing back (§13), so a two-pass review
+        // shows one reviewer's spend. Presenting that as the total is exactly
+        // what `render_ledger` says is worse than no ledger at all.
+        let repo = temp_engine_repo("partialcost");
+        seed(&repo, FRONTIER_AUTH_PLAN, Some(SECOND_OPINION_CONFIG));
+        let source = FakeSource {
+            adapter: FakeAdapter::new(vec![Effect::EditFile], vec![ReviewBehavior::Pass]),
+            copilot: Some(FakeAdapter::copilot(vec![ReviewBehavior::Pass]).unpriced()),
+        };
+        let report = run_with(&cross_vendor_opts(&repo), &source).expect("run");
+
+        let t1 = task(&report, "t1");
+        assert_eq!(t1.review_cost_usd, Some(0.05), "only what was reported");
+        assert!(t1.review_cost_incomplete, "and it is not the whole story");
+        assert!(
+            report.render().contains("$0.0500?"),
+            "the summary marks it: {}",
+            report.render()
+        );
+        let ledger = report.render_ledger();
+        assert!(ledger.contains("$0.0500?"), "{ledger}");
+        assert!(
+            ledger.contains("reports no spend"),
+            "legend present: {ledger}"
+        );
+    }
+
+    #[test]
+    fn every_model_that_judged_a_task_is_listed_beside_the_cost_of_all_of_them() {
+        // An escalated task can be judged on one rung by one model and on the
+        // next by another. `review_cost_usd` sums every attempt, so a list
+        // scoped to the final attempt would read as though it explained a total
+        // it does not cover.
+        let repo = temp_engine_repo("reviewtrail");
+        seed(
+            &repo,
+            "## Implement the widget\n<!-- tactus: id=t1 kind=implement depends= -->\n",
+            Some(
+                "[interaction]\nmode = \"never\"\n\n\
+                 [routing]\nimplement = { chain = [\"mid\", \"frontier\"], attempts_per = 1 }\n",
+            ),
+        );
+        // Mid fails review, escalates to frontier, which passes. The frontier
+        // rung is self-review, so its pass rebinds to the other family.
+        let source = cross_vendor(
+            vec![Effect::EditFile],
+            vec![ReviewBehavior::Fail, ReviewBehavior::Pass],
+            vec![ReviewBehavior::Pass],
+        );
+        let report = run_with(&cross_vendor_opts(&repo), &source).expect("run");
+        let t1 = task(&report, "t1");
+        assert_eq!(t1.attempts.len(), 2, "escalated: {t1:?}");
+        assert_eq!(
+            t1.review_models,
+            ["claude-opus-5", "gpt-5"],
+            "both judges, in the order they judged"
         );
     }
 
@@ -4733,6 +4966,7 @@ mod tests {
             cost_usd: None,
             review_models: Vec::new(),
             review_cost_usd: None,
+            review_cost_incomplete: false,
             session_id: None,
             attempts: vec![
                 attempt_record(1, "small", true),

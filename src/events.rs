@@ -254,8 +254,15 @@ pub struct RunStarted {
     /// probes, so a Copilot CLI installed or removed between a run and its
     /// resume would otherwise change the verification standard halfway through
     /// — the same reasoning that made resume honour the recorded `private_dir`.
+    ///
+    /// `None` means the log predates step 9 and says nothing about reviewers —
+    /// which is emphatically **not** the same as saying there were none. A
+    /// default-constructed plan has no primary, and every reader treats that as
+    /// `review = { enabled = false }`; a resume that made that mistake would
+    /// finish the run with verification silently switched off (step-6 finding
+    /// #10, from the other direction). Absent means re-derive and say so.
     #[serde(default)]
-    pub reviews: crate::review::ReviewPlan,
+    pub reviews: Option<crate::review::ReviewPlan>,
 }
 
 /// One task's resolved escalation chain, as it stood when the run started.
@@ -326,6 +333,18 @@ impl AttemptRecord {
         (!reported.is_empty()).then(|| reported.iter().sum())
     }
 
+    /// Whether any pass that ran reported nothing, making the total above a
+    /// floor rather than a figure.
+    ///
+    /// This is not pedantry: a cross-vendor review is the normal case for the
+    /// paths §11.3 covers, and the Copilot route reports no spend at all — so
+    /// "review: $0.05" on a two-pass attempt is one reviewer's bill presented
+    /// as the whole. `render_ledger`'s own contract is that a ledger which
+    /// cannot tell free from unreported is worse than no ledger.
+    pub fn review_cost_incomplete(&self) -> bool {
+        self.reviews.iter().any(|r| r.cost_usd.is_none())
+    }
+
     /// The models that judged this attempt, in pass order.
     pub fn review_models(&self) -> Vec<String> {
         self.reviews.iter().map(|r| r.model.clone()).collect()
@@ -341,9 +360,31 @@ pub struct ReviewRecord {
     pub model: String,
     /// `None` where the agent's route reports no spend.
     pub cost_usd: Option<f64>,
-    /// Whether this pass approved. A later pass only exists because every
-    /// earlier one passed, so at most the last entry is ever `false`.
-    pub passed: bool,
+    /// What this pass concluded. A later pass only exists because every earlier
+    /// one approved, so at most the last entry is ever anything else.
+    pub outcome: ReviewPassOutcome,
+}
+
+/// How one review pass ended.
+///
+/// Three states, not two: step-6 finding #8 established that a reviewer which
+/// could not run says nothing about the code, and the ladder already dispatches
+/// on that distinction. Recording it as a plain "did not pass" would put a
+/// rejection in the ledger against a model that never read the diff — and the
+/// ledger is what a person reads when deciding whether to trust a run.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReviewPassOutcome {
+    Passed,
+    Failed,
+    /// Rate-limited, timed out, or otherwise never reached a verdict.
+    Unavailable,
+}
+
+impl ReviewPassOutcome {
+    pub fn passed(self) -> bool {
+        self == Self::Passed
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1207,7 +1248,7 @@ mod tests {
                 private_dir: "/home/x/.tactus/runs/01RUN".to_owned(),
                 gates: vec!["check".to_owned()],
                 gates_from_config: true,
-                reviews: crate::review::ReviewPlan::default(),
+                reviews: Some(crate::review::ReviewPlan::default()),
                 interaction_mode: "on_block".to_owned(),
                 chains: vec![ChainSummary {
                     task: "t1".to_owned(),

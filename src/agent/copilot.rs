@@ -17,9 +17,10 @@
 //! `echo "…" | copilot` as a programmatic form, and documents that "piped input
 //! is ignored if you also provide a prompt with the `-p` option" — so passing
 //! both would silently discard the real prompt. Stdin is also the only delivery
-//! that works: npm installs this CLI as `copilot.cmd` on Windows, which runs
-//! through `cmd /C`, whose command line caps at ~8,191 characters. A review
-//! prompt carries up to [`crate::review::MAX_DIFF_BYTES`] of diff.
+//! that works: npm installs this CLI as `copilot.cmd` on Windows, and a batch
+//! target is spawned through the command processor whoever does it — so the
+//! ~8,191-character command line applies, while a review prompt carries up to
+//! [`crate::review::MAX_DIFF_BYTES`] of diff.
 //!
 //! **What this CLI does not give us**, recorded honestly rather than guessed at:
 //! no JSON envelope (so no session id, no usage, no cost — the ledger shows
@@ -27,10 +28,20 @@
 //! same-rung retry starts fresh with accumulated feedback instead of resuming a
 //! conversation). Both are `Caps` axes the engine already dispatches on.
 //!
+//! Two further gaps, named rather than papered over: `max_turns` has no
+//! counterpart here, so a per-profile turn cap does not apply to Copilot
+//! attempts (the wall-clock timeout is the only bound); and whether
+//! `--no-ask-user` also suppresses *tool-permission* prompts is undocumented,
+//! so an un-allowed tool could in principle hang an attempt until that timeout.
+//!
 //! **Permissions are argv** (§20). There is no settings file and no path-deny
 //! surface as Claude Code has, so the guarantee is the allow-list plus §15's
 //! split: an allow-list that names exactly the gate commands, no URL grant at
-//! all, and never a skip-all flag. Docs:
+//! all, and never a skip-all flag. That rests on un-allowed tools being denied
+//! by default — which `--allow-url`'s existence implies but nothing here can
+//! verify without the binary, so the reviewer profile denies `write` and
+//! `shell` outright rather than trusting it where the stakes are highest.
+//! Docs:
 //! <https://docs.github.com/en/copilot/reference/copilot-cli-reference/cli-programmatic-reference>
 //! (flags verified Aug 2026).
 
@@ -52,11 +63,28 @@ pub const ADAPTER_ID: &str = "copilot";
 
 const PROBE_TIMEOUT: Duration = Duration::from_secs(15);
 
-/// Flags this adapter actually passes. §16: this CLI auto-updates and has
-/// removed programmatic flags without deprecation, so a missing one must
-/// surface as a pre-flight refusal rather than as per-task failures once a run
-/// is already spending (§19).
+/// Long flags this adapter passes. §16: this CLI auto-updates and has removed
+/// programmatic flags without deprecation, so a missing one must surface as a
+/// pre-flight refusal rather than as per-task failures once a run is already
+/// spending (§19).
 const REQUIRED_FLAGS: [&str; 4] = ["--model", "--allow-tool", "--deny-tool", "--no-ask-user"];
+
+/// Short flags this adapter passes, checked separately because a substring
+/// search for them is worthless: `"-s"` occurs inside `--settings`, `--share`
+/// and `--stdio`. Since none of `Caps`' other fields drives behaviour yet, this
+/// refusal is most of what probing actually buys.
+const REQUIRED_SHORT_FLAGS: [&str; 1] = ["-s"];
+
+/// Whether `help` advertises `flag` as a flag rather than as a fragment of a
+/// longer one. Help layouts vary, so this tokenizes on whitespace and the comma
+/// that separates a short form from its long one, then compares whole tokens.
+fn advertises(help: &str, flag: &str) -> bool {
+    help.split(|c: char| c.is_whitespace() || c == ',')
+        // `-s=VALUE` and `-s:VALUE` both advertise `-s`; the separator is where
+        // the flag stops and its argument starts.
+        .map(|token| token.split(['=', ':']).next().unwrap_or(token))
+        .any(|name| name == flag)
+}
 
 pub struct CopilotAdapter;
 
@@ -101,6 +129,11 @@ impl AgentAdapter for CopilotAdapter {
             let missing: Vec<&str> = REQUIRED_FLAGS
                 .into_iter()
                 .filter(|flag| !help_text.contains(flag))
+                .chain(
+                    REQUIRED_SHORT_FLAGS
+                        .into_iter()
+                        .filter(|flag| !advertises(&help_text, flag)),
+                )
                 .collect();
             if !missing.is_empty() {
                 return Err(TactusError::Agent {
@@ -115,14 +148,19 @@ impl AgentAdapter for CopilotAdapter {
         }
         Ok(Caps {
             version,
-            // Deliberately PESSIMISTIC where the Claude adapter is optimistic.
-            // Its flags are long-standing, so an unreadable --help there is
-            // safely assumed benign. Here, claiming a capability this CLI turns
-            // out not to have is not a degraded run but a broken one: every
-            // same-rung retry would pass `--resume` to a binary that rejects
-            // it, failing attempts for a reason that has nothing to do with the
-            // code. Under-claiming only costs the conversation cache.
-            json_output: has("--output-format"),
+            // False even if a JSON flag exists: `Caps` describes what this
+            // adapter's route delivers, and Route A neither asks for JSON nor
+            // parses it. Reporting the flag would promise a structured envelope
+            // no caller could read.
+            json_output: false,
+            // The probed axes are deliberately PESSIMISTIC where the Claude
+            // adapter is optimistic. Its flags are long-standing, so an
+            // unreadable --help there is safely assumed benign. Here, claiming a
+            // capability this CLI turns out not to have is not a degraded run
+            // but a broken one: every same-rung retry would pass `--resume` to a
+            // binary that rejects it, failing attempts for a reason that has
+            // nothing to do with the code. Under-claiming costs only the
+            // conversation cache.
             session_resume: has("--resume"),
             // No JSON envelope on this route, so nothing reports spend. The
             // ledger says so rather than recording zero (§13).
@@ -190,6 +228,10 @@ pub fn build_args(run: &TaskRun) -> Vec<String> {
         "--no-ask-user".to_owned(),
         format!("--model={}", run.profile.model),
     ];
+    // `profile.max_turns` has no counterpart on this CLI and is therefore
+    // NOT applied — see the module header. Nothing sets it today, and it is
+    // named here rather than silently skipped so that whoever first does has
+    // to decide what an unbounded Copilot attempt should cost.
     args.extend(permission_args(&run.profile, &run.gate_cmds));
     // Only reachable on a build whose `--help` advertises `--resume`, because
     // that is what sets `Caps::session_resume` and the engine will not offer a
@@ -434,6 +476,36 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn the_short_flag_check_is_not_fooled_by_longer_flags() {
+        // A bare `contains("-s")` matches `--settings`, `--share` and `--stdio`,
+        // so probing would pass on a build that had dropped `-s` — and every
+        // attempt would then fail at runtime, which is the failure §16 says
+        // probing exists to catch.
+        assert!(!advertises(
+            "--settings <path>  --share <path>  --stdio",
+            "-s"
+        ));
+        assert!(advertises("  -s, --silent    Suppress stats", "-s"));
+        assert!(advertises("  -s  Suppress stats and decoration", "-s"));
+        assert!(advertises("-s=VALUE", "-s"), "trailing = is a value marker");
+        assert!(!advertises("", "-s"));
+    }
+
+    #[test]
+    fn a_turn_cap_is_not_quietly_pretended_to_apply() {
+        // There is no `--max-turns` on this CLI. Nothing sets `max_turns`
+        // today, so this pins the gap rather than the behaviour: whoever makes
+        // profiles config-driven has to come here and decide.
+        let mut run = task_run();
+        run.profile.max_turns = Some(3);
+        let joined = build_args(&run).join(" ");
+        assert!(
+            !joined.contains("max-turns") && !joined.contains('3'),
+            "no invented flag, and no silent substitution: {joined}"
+        );
     }
 
     #[test]

@@ -370,6 +370,7 @@ mod tests {
                 cost_usd: Some(0.01),
                 review_models: vec!["claude-opus-5".to_owned()],
                 review_cost_usd: Some(0.05),
+                review_cost_incomplete: false,
                 session_id: None,
                 attempts: vec![AttemptRecord {
                     attempt: 1,
@@ -415,6 +416,7 @@ mod tests {
                 cost_usd: None,
                 review_models: Vec::new(),
                 review_cost_usd: None,
+                review_cost_incomplete: false,
                 session_id: None,
                 attempts: Vec::new(),
             }],
