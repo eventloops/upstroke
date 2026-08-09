@@ -622,7 +622,7 @@ impl Run<'_> {
 
             // Scoped so every borrow the attempt takes on `self` is released
             // before the ladder updates this task's progress below.
-            let (result, review_model) = {
+            let result = {
                 let retry = (attempt > 1).then(|| RetryBrief {
                     resumed: resume.is_some(),
                     // Owned: the ladder appends to this task's feedback the
@@ -647,18 +647,13 @@ impl Run<'_> {
                 // Any error between the agent editing files and the verdict
                 // leaves the tree dirty; the run cannot continue but must not
                 // hand the user a half-staged workspace either (§14).
-                let result = match run_attempt(&attempt_cx, workspace, resume.clone()) {
+                match run_attempt(&attempt_cx, workspace, resume.clone()) {
                     Ok(result) => result,
                     Err(error) => {
                         let _ = workspace.discard_uncommitted();
                         return Err(error);
                     }
-                };
-                let review_model = attempt_cx
-                    .reviewer
-                    .as_ref()
-                    .map(|r| r.profile.model.clone());
-                (result, review_model)
+                }
             };
 
             let progress = &mut self.progress[index];
@@ -676,7 +671,7 @@ impl Run<'_> {
                 resumed: resume.is_some(),
                 duration: result.outcome.duration,
                 cost_usd: result.outcome.cost_usd,
-                review_model,
+                review_model: result.review_model.clone(),
                 review_cost_usd: result.review_cost_usd,
                 session_id: result.outcome.session_id.clone(),
                 failure: result.failure.as_ref().map(|f| FailureRecord {
@@ -905,7 +900,18 @@ impl Run<'_> {
                         progress.attempts_on_rung = 0;
                     }
                     progress.defers = 0;
-                    progress.resume_next = progress.session.is_some();
+                    // Never resume out of a park, however tempting the warm
+                    // session looks. Parking always discards the working tree
+                    // — it has to, because another task runs before this one
+                    // does again — so the session's account of what it wrote
+                    // no longer matches the repository. Resuming would hand
+                    // the agent a terse prompt and a conversation asserting
+                    // edits that have been reverted. §14 pairs session resume
+                    // with tree retention precisely so the two never diverge;
+                    // the full prompt plus the operator's answer, which
+                    // `feedback_section` labels as a human instruction, is
+                    // what makes the retry correct rather than merely cheap.
+                    progress.resume_next = false;
                     self.states[index] = TaskState::Pending;
                 }
                 Answer::Unanswered => unreachable!("handled above"),
@@ -984,17 +990,26 @@ impl Run<'_> {
     }
 }
 
+/// Why a task is parked or failed, for the report.
+///
+/// The most recent *attempt failure* wins, not the most recent feedback entry:
+/// the branches that park a task never record feedback, so once an operator has
+/// answered anything, their answer would otherwise shadow every later failure
+/// and the report would tell them a task is parked because they answered a
+/// question. Human entries are excluded from the fallback for the same reason.
 fn last_reason(progress: &Progress) -> String {
     progress
-        .feedback
+        .records
         .last()
-        .map(|f| f.summary.clone())
+        .and_then(|r| r.failure.as_ref())
+        .map(|f| f.reason.clone())
         .or_else(|| {
             progress
-                .records
-                .last()
-                .and_then(|r| r.failure.as_ref())
-                .map(|f| f.reason.clone())
+                .feedback
+                .iter()
+                .rev()
+                .find(|f| !f.human)
+                .map(|f| f.summary.clone())
         })
         .unwrap_or_else(|| "no attempt on record".to_owned())
 }
@@ -1140,8 +1155,11 @@ struct Reviewer<'a> {
 struct AttemptResult {
     outcome: Outcome,
     failure: Option<AttemptFailure>,
-    /// Reviewer spend, kept separate from the implementer's so the ledger can
-    /// attribute both (§13).
+    /// The reviewer that actually judged this attempt, and its spend — both
+    /// `None` when the cheap checks failed first and no review ran. Derived
+    /// from the review having happened rather than from one being configured,
+    /// so the ledger never credits a model with work it did not do (§13).
+    review_model: Option<String>,
     review_cost_usd: Option<f64>,
 }
 
@@ -1223,10 +1241,12 @@ fn run_attempt(
 
     // §11.2: gates are objective but shallow — a strong reviewer judges the
     // diff against the acceptance criteria only once the cheap checks pass.
+    let mut review_model = None;
     let mut review_cost_usd = None;
     if failure.is_none()
         && let Some(reviewer) = &cx.reviewer
     {
+        review_model = Some(reviewer.profile.model.clone());
         let review = review::run_review(&review::ReviewCx {
             adapter: reviewer.adapter,
             profile: reviewer.profile.clone(),
@@ -1245,6 +1265,7 @@ fn run_attempt(
     Ok(AttemptResult {
         outcome,
         failure,
+        review_model,
         review_cost_usd,
     })
 }
@@ -3144,9 +3165,34 @@ mod tests {
             2,
             "asking cost no attempt — only the retry after the answer"
         );
+        // Parking rolled the tree back, so the session's account of what it
+        // wrote no longer matches the repository (§14 pairs resume with tree
+        // retention). The retry therefore starts fresh and carries the whole
+        // task again, with the operator's answer as an instruction.
         assert!(
-            t1.attempts[1].resumed,
-            "the agent that asked keeps its context to hear the answer"
+            !t1.attempts[1].resumed,
+            "a parked task never resumes into a tree that was reverted underneath it"
+        );
+        // Invocation order across the whole run, not just this task: t1 asks
+        // (0), the independent t3 proceeds while t1 is parked (1), then t1
+        // retries once the answer arrives (2). That interleaving is the point
+        // of invariant 6, so the retry is the third invocation.
+        let runs = source.adapter.runs();
+        let retry = &runs[2];
+        assert_eq!(retry.resume, None, "fresh session, not --resume");
+        assert!(
+            retry.prompt.contains("# Task:"),
+            "the whole task is re-sent, since the session no longer carries it: {}",
+            retry.prompt
+        );
+        assert!(
+            retry.prompt.contains("opaque cursors"),
+            "and the operator's answer travels with it: {}",
+            retry.prompt
+        );
+        assert!(
+            retry.prompt.contains("instruction from a person"),
+            "labelled as an instruction rather than quoted as data"
         );
     }
 

@@ -38,16 +38,35 @@ bundle**. Two consequences:
 The scope line in the launch dialog is the check — it reported 2,783 insertions
 where the true diff was 3,665.
 
+## Second pass: local `/code-review high` over the committed step
+
+Run against `ecc6ca9` to cover what the ultrareview's scope missed. Three
+findings, all real, all in `engine.rs`; fixed in the follow-up commit.
+
+| # | Finding | Severity | Fix |
+|---|---------|----------|-----|
+| 6 | **Answering a question resumed a session whose working tree had been rolled back.** Parking always discards the tree — it must, since another task runs before this one does again — but un-parking set `resume_next` from the session id alone. The retry then passed `--resume` *and* took the terse prompt branch, so the agent continued from a conversation asserting edits to files that had reverted | normal | `resume_next = false` on un-park; the full prompt plus the operator's answer (labelled a human instruction by `feedback_section`) is what makes the retry correct rather than merely cheap |
+| 7 | `AttemptRecord.review_model` was derived from a reviewer being *configured*, not from one having run, so a gate failure recorded `{ review_model: Some(…), review_cost_usd: None }` — indistinguishable from a review that ran free | low | `review_model` moved onto `AttemptResult` and set inside the review block |
+| 8 | `last_reason` preferred the newest feedback entry over the newest attempt failure, and the parking branches record no feedback — so a task that parked, was answered, then parked again reported "the operator answered the open question" as its cause | low | Prefers the last attempt failure; human entries excluded from the fallback |
+
+Finding 6 is the one that matters, and it landed in the exact place flagged in
+advance as thinnest: the keep-the-tree-on-resume invariant. Both halves were
+individually correct — rolling back on park is *necessary*, resuming on answer is
+*desirable* — and the defect was that they were decided in different functions and
+never reconciled. The pre-existing test asserted `attempts[1].resumed` and so
+pinned the wrong behaviour; the fake adapter rewrites its file unconditionally,
+which is why nothing observed the loss.
+
 ## Still open (deliberately, with reasons)
 
-- **`ladder.rs` and `interaction.rs` remain unreviewed by anything but their own
-  tests.** A local `/code-review` over the working diff covers them without
-  spending an ultrareview run.
+- **`ladder.rs` and `interaction.rs` drew no findings in the local pass.** Given
+  they are one pure function and a parsing/IO layer with tests per branch, that is
+  plausible rather than suspicious — but it is one review, not a proof.
 - **`fail_task`'s first-failure-wins guard is belt-and-braces.** With the
   `drain` branch now guarded, a second `fail_task` after a halt is unreachable,
   so the `get_or_insert_with` is defensive rather than exercised. Kept because it
   is free and makes the invariant local rather than emergent.
-- **Blocked-propagation, the drain-loop termination argument, and the
-  keep-the-tree-on-resume invariant** were flagged in advance as the thinnest
-  parts of the change. The review reached none of them — absence of findings there
-  is not evidence of correctness, since nothing was executed.
+- **Blocked-propagation and the drain-loop termination argument** were flagged in
+  advance alongside the keep-the-tree invariant. Two reviews have now passed over
+  them without a finding; neither executed a crash-and-resume, which is what would
+  actually test them. Step 8 is where that becomes possible.
