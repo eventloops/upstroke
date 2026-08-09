@@ -15,6 +15,7 @@ use crate::agent::{self, AgentAdapter, TaskRun, proc};
 use crate::error::TactusError;
 use crate::gates::{self, ShellGate};
 use crate::ir::{Outcome, OutcomeStatus, PermissionMode, Plan, Task, TaskKind, WorkerProfile};
+use crate::review;
 use crate::route::ResolvedChain;
 use crate::ulid;
 use crate::util;
@@ -144,7 +145,14 @@ pub fn run_with(opts: &RunOptions, adapters: &dyn AdapterSource) -> Result<RunRe
     let settings_dir = run_dir.join("settings");
     let gates_dir = run_dir.join("gates");
     let artifacts_dir = run_dir.join("artifacts");
-    for dir in [&transcripts, &settings_dir, &gates_dir, &artifacts_dir] {
+    let reviews_dir = run_dir.join("reviews");
+    for dir in [
+        &transcripts,
+        &settings_dir,
+        &gates_dir,
+        &artifacts_dir,
+        &reviews_dir,
+    ] {
         fs::create_dir_all(dir).map_err(|source| TactusError::Io {
             path: dir.clone(),
             source,
@@ -172,6 +180,7 @@ pub fn run_with(opts: &RunOptions, adapters: &dyn AdapterSource) -> Result<RunRe
         gates: effective_gates,
         gate_cmds,
         adapters,
+        review_binding: review_binding(&analysis.config),
         attempt_timeout: opts.attempt_timeout,
     };
     for index in topo_order(&analysis.plan) {
@@ -223,6 +232,7 @@ pub enum FailureKind {
     RateLimited,
     GateFailed,
     TestProvenance,
+    ReviewFailed,
 }
 
 #[derive(Debug, Clone)]
@@ -260,12 +270,23 @@ struct AttemptCx<'a> {
     run_dir: &'a std::path::Path,
     gates: &'a [ShellGate],
     gate_cmds: &'a [String],
+    reviewer: Option<Reviewer<'a>>,
     timeout: Duration,
+}
+
+/// The read-only worker that judges each attempt (§11.2). `None` disables
+/// review — only when no adapter can serve the configured review tier.
+struct Reviewer<'a> {
+    adapter: &'a dyn AgentAdapter,
+    profile: WorkerProfile,
 }
 
 struct AttemptResult {
     outcome: Outcome,
     failure: Option<AttemptFailure>,
+    /// Reviewer spend, kept separate from the implementer's so the ledger can
+    /// attribute both (§13).
+    review_cost_usd: Option<f64>,
 }
 
 /// Run one attempt and verify it, without deciding what happens next: the
@@ -337,8 +358,74 @@ fn run_attempt(
             .with_feedback(gate_failure.log_tail),
         );
     }
-    Ok(AttemptResult { outcome, failure })
+
+    // §11.2: gates are objective but shallow — a strong reviewer judges the
+    // diff against the acceptance criteria only once the cheap checks pass.
+    let mut review_cost_usd = None;
+    if failure.is_none()
+        && let Some(reviewer) = &cx.reviewer
+    {
+        let review = review::run_review(&review::ReviewCx {
+            adapter: reviewer.adapter,
+            profile: reviewer.profile.clone(),
+            task: cx.task,
+            diff: &outcome.diff,
+            artifacts: &load_artifacts(cx.run_dir, cx.task),
+            workspace: workspace.root(),
+            run_dir: cx.run_dir,
+            stem: cx.stem.clone(),
+            timeout: cx.timeout,
+        })?;
+        review_cost_usd = review.cost_usd;
+        if !review.verdict.pass {
+            let summary = if review.verdict.reasons.is_empty() {
+                "no reasons given".to_owned()
+            } else {
+                review.verdict.reasons.join("; ")
+            };
+            // required_changes is what the retry gets back verbatim (§11.4).
+            let feedback = if review.verdict.required_changes.is_empty() {
+                summary.clone()
+            } else {
+                review.verdict.required_changes.join("\n- ")
+            };
+            failure = Some(
+                AttemptFailure::new(
+                    FailureKind::ReviewFailed,
+                    format!("review failed: {}", util::tail(&summary, 400)),
+                )
+                .with_feedback(feedback),
+            );
+        }
+    }
+
+    Ok(AttemptResult {
+        outcome,
+        failure,
+        review_cost_usd,
+    })
 }
+
+/// Artifacts this task should be judged against: its declared inputs, plus
+/// the conventions brief whenever one exists (§11.2 injects it into every
+/// downstream prompt).
+fn load_artifacts(run_dir: &std::path::Path, task: &Task) -> Vec<(String, String)> {
+    let mut wanted: Vec<String> = vec![CONVENTIONS_BRIEF.to_owned()];
+    for id in &task.artifacts_in {
+        if id.as_str() != CONVENTIONS_BRIEF {
+            wanted.push(id.as_str().to_owned());
+        }
+    }
+    wanted
+        .into_iter()
+        .filter_map(|id| {
+            let content = fs::read_to_string(artifact_path(run_dir, &id)).ok()?;
+            (!content.trim().is_empty()).then_some((id, content))
+        })
+        .collect()
+}
+
+const CONVENTIONS_BRIEF: &str = "conventions-brief";
 
 /// Run-wide context every task attempt draws on, fixed at pre-flight.
 struct RunCx<'a> {
@@ -347,6 +434,8 @@ struct RunCx<'a> {
     gates: &'a [ShellGate],
     gate_cmds: Vec<String>,
     adapters: &'a dyn AdapterSource,
+    /// (agent, model) the reviewer binds to, resolved once at pre-flight.
+    review_binding: Option<(String, String)>,
     attempt_timeout: Duration,
 }
 
@@ -366,6 +455,7 @@ fn attempt_task(
         gate_cmds,
         adapters,
         attempt_timeout,
+        ..
     } = cx;
     let Some(rung) = chain.rungs.first() else {
         return Ok(TaskReport {
@@ -395,6 +485,16 @@ fn attempt_task(
         .ok_or_else(|| TactusError::Agent {
             message: format!("no adapter registered for agent `{}`", profile.agent),
         })?;
+    // §11.2/§10: the reviewer is its own read-only binding, at the configured
+    // review tier (frontier by default) rather than the implementer's rung —
+    // a small model reviewing its own work is not verification.
+    let reviewer = cx.review_binding.as_ref().and_then(|(agent, model)| {
+        adapters.get(agent).map(|adapter| Reviewer {
+            adapter,
+            profile: review::profile_for(agent, model, &format!("review-{model}")),
+        })
+    });
+
     let attempt_cx = AttemptCx {
         task,
         profile: profile.clone(),
@@ -404,6 +504,7 @@ fn attempt_task(
         run_dir,
         gates: effective_gates,
         gate_cmds,
+        reviewer,
         timeout: *attempt_timeout,
     };
 
@@ -441,7 +542,10 @@ fn attempt_task(
         model: profile.model,
         status,
         duration: attempt.outcome.duration,
-        cost_usd: attempt.outcome.cost_usd,
+        cost_usd: match (attempt.outcome.cost_usd, attempt.review_cost_usd) {
+            (None, None) => None,
+            (worker, review) => Some(worker.unwrap_or(0.0) + review.unwrap_or(0.0)),
+        },
         session_id: attempt.outcome.session_id,
     })
 }
@@ -561,6 +665,18 @@ fn materialize_prompt(task: &Task, gate_cmds: &[String], run_dir: &std::path::Pa
          - When the acceptance criteria hold, stop and summarize what changed.\n",
     );
     prompt
+}
+
+/// The reviewer's binding: `[routing] review = { tier = … }` if configured,
+/// else frontier (§17's default), honouring a pin for that tier and otherwise
+/// taking the catalog's example binding — the same rules the router uses.
+fn review_binding(cfg: &crate::config::Config) -> Option<(String, String)> {
+    let tier = cfg.review_tier.unwrap_or(crate::ir::Tier::Frontier);
+    if let Some(pin) = cfg.pins.iter().find(|p| p.tier == tier) {
+        return Some((pin.agent.clone(), pin.model.clone()));
+    }
+    let example = crate::catalog::example_binding(tier);
+    Some((example.agent.to_owned(), example.model.to_owned()))
 }
 
 /// Where an artifact lives for the duration of a run (§15 `artifacts/`).
@@ -697,9 +813,33 @@ mod tests {
 
     /// Scripted stand-in for a real CLI: `build` performs the "agent edit"
     /// directly (test-only shortcut) and returns a trivial command; `parse`
-    /// reports the scripted outcome.
+    /// reports the scripted outcome. Read-only profiles are review
+    /// invocations and answer with a verdict, exercising the real
+    /// command → stdout → parse → verdict path.
     struct FakeAdapter {
         effect: Effect,
+        review: ReviewBehavior,
+    }
+
+    #[derive(Clone, Copy, PartialEq)]
+    enum ReviewBehavior {
+        Pass,
+        Fail,
+        /// Prose with no verdict block: drives the re-ask path.
+        Unparseable,
+    }
+
+    /// Marker the fake's review command prints so `parse` can tell a review
+    /// invocation from an implementation one.
+    const REVIEW_MARKER: &str = "TACTUS-FAKE-REVIEW";
+
+    fn fake(effect: Effect) -> FakeSource {
+        FakeSource {
+            adapter: FakeAdapter {
+                effect,
+                review: ReviewBehavior::Pass,
+            },
+        }
     }
 
     impl AgentAdapter for FakeAdapter {
@@ -720,6 +860,11 @@ mod tests {
         }
 
         fn build(&self, run: &TaskRun) -> Result<std::process::Command, TactusError> {
+            if run.profile.permissions == PermissionMode::ReadOnly {
+                let mut cmd = shell_command(&format!("echo {REVIEW_MARKER}"));
+                cmd.current_dir(&run.workspace);
+                return Ok(cmd);
+            }
             let edit: Option<(&str, String)> = match self.effect {
                 Effect::EditFile => {
                     let marker = run.workspace.join("agent-output.txt");
@@ -740,20 +885,50 @@ mod tests {
                     message: format!("fake edit failed: {e}"),
                 })?;
             }
-            let mut cmd = if cfg!(windows) {
-                let mut c = Command::new("cmd");
-                c.args(["/C", "exit 0"]);
-                c
-            } else {
-                let mut c = Command::new("sh");
-                c.args(["-c", "exit 0"]);
-                c
-            };
+            let mut cmd = shell_command("exit 0");
             cmd.current_dir(&run.workspace);
             Ok(cmd)
         }
 
+        // Delegate to the real generator so the engine's permission wiring is
+        // exercised, not stubbed out.
+        fn materialize_permissions(
+            &self,
+            profile: &WorkerProfile,
+            gate_cmds: &[String],
+            dir: &Path,
+            stem: &str,
+        ) -> Result<Option<PathBuf>, TactusError> {
+            crate::agent::claude::ClaudeCodeAdapter
+                .materialize_permissions(profile, gate_cmds, dir, stem)
+        }
+
         fn parse(&self, out: &ProcessOutput) -> Result<Outcome, TactusError> {
+            if out.stdout.contains(REVIEW_MARKER) {
+                let answer = match self.review {
+                    ReviewBehavior::Pass => {
+                        "Checked every criterion.\n```json\n{\"pass\": true, \"reasons\": \
+                         [\"meets the acceptance criteria\"], \"required_changes\": []}\n```"
+                    }
+                    ReviewBehavior::Fail => {
+                        "The diff misses a case.\n```json\n{\"pass\": false, \"reasons\": \
+                         [\"no error handling for empty input\"], \"required_changes\": \
+                         [\"handle the empty-input case\"]}\n```"
+                    }
+                    ReviewBehavior::Unparseable => "Looks fine to me, ship it.",
+                };
+                return Ok(Outcome {
+                    status: OutcomeStatus::Completed,
+                    diff: String::new(),
+                    detail: Some(answer.to_owned()),
+                    session_id: Some("fake-review-session".to_owned()),
+                    usage: None,
+                    cost_usd: Some(0.05),
+                    pool_drain: None,
+                    transcript_path: PathBuf::new(),
+                    duration: out.duration,
+                });
+            }
             let status = match self.effect {
                 Effect::Error => OutcomeStatus::AgentError,
                 Effect::EditFile | Effect::EditTest | Effect::NoEdit => OutcomeStatus::Completed,
@@ -781,6 +956,12 @@ mod tests {
         fn get(&self, id: &str) -> Option<&dyn AgentAdapter> {
             (id == "claude-code").then_some(&self.adapter as &dyn AgentAdapter)
         }
+    }
+
+    /// Shared with the production path so tests exercise the same shell
+    /// invocation (including its Windows quoting) rather than a parallel one.
+    fn shell_command(script: &str) -> Command {
+        crate::gates::ShellKind::native().command(script)
     }
 
     fn git_in(repo: &Path, args: &[&str]) -> String {
@@ -834,11 +1015,7 @@ mod tests {
     #[test]
     fn happy_path_commits_one_commit_per_task() {
         let repo = temp_engine_repo("happy");
-        let source = FakeSource {
-            adapter: FakeAdapter {
-                effect: Effect::EditFile,
-            },
-        };
+        let source = fake(Effect::EditFile);
         let report = run_with(&options(&repo), &source).expect("run succeeds");
 
         assert!(report.halted_at.is_none());
@@ -850,7 +1027,13 @@ mod tests {
                 .all(|t| matches!(t.status, TaskRunStatus::Committed { .. })),
             "report: {report:?}"
         );
-        assert!((report.total_cost_usd - 0.02).abs() < 1e-9);
+        // Per task: implementer 0.01 + reviewer 0.05 (§11.2 reviews every
+        // attempt), so both spends are accounted for.
+        assert!(
+            (report.total_cost_usd - 0.12).abs() < 1e-9,
+            "worker and reviewer spend both counted: {}",
+            report.total_cost_usd
+        );
 
         let branch = git_in(&repo, &["rev-parse", "--abbrev-ref", "HEAD"]);
         assert!(branch.trim().starts_with("tactus/run-"), "on run branch");
@@ -875,11 +1058,7 @@ mod tests {
     #[test]
     fn empty_diff_fails_rolls_back_and_halts() {
         let repo = temp_engine_repo("nodiff");
-        let source = FakeSource {
-            adapter: FakeAdapter {
-                effect: Effect::NoEdit,
-            },
-        };
+        let source = fake(Effect::NoEdit);
         let report = run_with(&options(&repo), &source).expect("engine itself is fine");
 
         assert_eq!(report.halted_at.as_deref(), Some("t1"));
@@ -896,11 +1075,7 @@ mod tests {
     #[test]
     fn agent_error_halts_with_reason() {
         let repo = temp_engine_repo("agenterr");
-        let source = FakeSource {
-            adapter: FakeAdapter {
-                effect: Effect::Error,
-            },
-        };
+        let source = fake(Effect::Error);
         let report = run_with(&options(&repo), &source).expect("engine ok");
         assert_eq!(report.halted_at.as_deref(), Some("t1"));
         let TaskRunStatus::Failed { reason, .. } = &report.tasks[0].status else {
@@ -913,11 +1088,7 @@ mod tests {
     fn dirty_tree_is_refused() {
         let repo = temp_engine_repo("dirty");
         fs::write(repo.join("stray.txt"), "uncommitted\n").expect("stray");
-        let source = FakeSource {
-            adapter: FakeAdapter {
-                effect: Effect::EditFile,
-            },
-        };
+        let source = fake(Effect::EditFile);
         let err = run_with(&options(&repo), &source).expect_err("must refuse");
         assert!(err.to_string().contains("not clean"), "got: {err}");
         let branch = git_in(&repo, &["rev-parse", "--abbrev-ref", "HEAD"]);
@@ -937,11 +1108,7 @@ mod tests {
 
         let mut opts = options(&repo);
         opts.config_path = Some(repo.join("tactus.toml"));
-        let source = FakeSource {
-            adapter: FakeAdapter {
-                effect: Effect::EditFile,
-            },
-        };
+        let source = fake(Effect::EditFile);
         let report = run_with(&opts, &source).expect("run");
         assert!(report.halted_at.is_none(), "report: {report:?}");
         assert_eq!(report.gates, ["version"]);
@@ -962,11 +1129,7 @@ mod tests {
 
         let mut opts = options(&repo);
         opts.config_path = Some(repo.join("tactus.toml"));
-        let source = FakeSource {
-            adapter: FakeAdapter {
-                effect: Effect::EditFile,
-            },
-        };
+        let source = fake(Effect::EditFile);
         let report = run_with(&opts, &source).expect("engine ok");
         assert_eq!(report.halted_at.as_deref(), Some("t1"));
         let TaskRunStatus::Failed { reason, .. } = &report.tasks[0].status else {
@@ -998,11 +1161,7 @@ mod tests {
 
         let mut opts = options(&repo);
         opts.config_path = Some(repo.join("tactus.toml"));
-        let source = FakeSource {
-            adapter: FakeAdapter {
-                effect: Effect::EditFile,
-            },
-        };
+        let source = fake(Effect::EditFile);
         let err = run_with(&opts, &source).expect_err("must refuse");
         assert!(err.to_string().contains("not found on PATH"), "got: {err}");
         let branch = git_in(&repo, &["rev-parse", "--abbrev-ref", "HEAD"]);
@@ -1020,11 +1179,7 @@ mod tests {
         git_in(&repo, &["add", "-A"]);
         git_in(&repo, &["commit", "-q", "-m", "test plan"]);
 
-        let source = FakeSource {
-            adapter: FakeAdapter {
-                effect: Effect::EditFile, // writes a txt file — no test markers
-            },
-        };
+        let source = fake(Effect::EditFile);
         let report = run_with(&options(&repo), &source).expect("engine ok");
         assert_eq!(report.halted_at.as_deref(), Some("tt"));
         let TaskRunStatus::Failed { reason, .. } = &report.tasks[0].status else {
@@ -1044,11 +1199,7 @@ mod tests {
         git_in(&repo, &["add", "-A"]);
         git_in(&repo, &["commit", "-q", "-m", "test plan"]);
 
-        let source = FakeSource {
-            adapter: FakeAdapter {
-                effect: Effect::EditTest,
-            },
-        };
+        let source = fake(Effect::EditTest);
         let report = run_with(&options(&repo), &source).expect("engine ok");
         assert!(report.halted_at.is_none(), "report: {report:?}");
         assert!(matches!(
@@ -1072,11 +1223,7 @@ mod tests {
 
         let mut opts = options(&repo);
         opts.config_path = Some(repo.join("tactus.toml"));
-        let source = FakeSource {
-            adapter: FakeAdapter {
-                effect: Effect::EditFile,
-            },
-        };
+        let source = fake(Effect::EditFile);
         let report = run_with(&opts, &source).expect("run");
         assert!(report.halted_at.is_none(), "report: {report:?}");
         assert!(!repo.join("residue.txt").exists(), "residue scrubbed");
@@ -1114,13 +1261,98 @@ mod tests {
     }
 
     #[test]
-    fn the_run_record_survives_completion() {
-        let repo = temp_engine_repo("record");
+    fn a_failed_review_blocks_the_commit() {
+        let repo = temp_engine_repo("reviewfail");
         let source = FakeSource {
             adapter: FakeAdapter {
                 effect: Effect::EditFile,
+                review: ReviewBehavior::Fail,
             },
         };
+        let report = run_with(&options(&repo), &source).expect("engine ok");
+
+        assert_eq!(report.halted_at.as_deref(), Some("t1"));
+        let TaskRunStatus::Failed { kind, reason } = &report.tasks[0].status else {
+            panic!("review should fail the task: {report:?}");
+        };
+        assert_eq!(*kind, FailureKind::ReviewFailed);
+        assert!(
+            reason.contains("no error handling for empty input"),
+            "the reviewer's reasons reach the report: {reason}"
+        );
+        // Gates passed and the diff was real — only the reviewer objected.
+        assert_eq!(
+            git_in(&repo, &["rev-list", "--count", "main..HEAD"]).trim(),
+            "0",
+            "nothing commits without a passing verdict"
+        );
+        assert!(git_in(&repo, &["status", "--porcelain"]).trim().is_empty());
+    }
+
+    #[test]
+    fn an_unparseable_reviewer_fails_after_one_reask() {
+        let repo = temp_engine_repo("reviewprose");
+        let source = FakeSource {
+            adapter: FakeAdapter {
+                effect: Effect::EditFile,
+                review: ReviewBehavior::Unparseable,
+            },
+        };
+        let report = run_with(&options(&repo), &source).expect("engine ok");
+
+        let TaskRunStatus::Failed { kind, reason } = &report.tasks[0].status else {
+            panic!("a reviewer that never answers cannot pass a task");
+        };
+        assert_eq!(*kind, FailureKind::ReviewFailed);
+        assert!(reason.contains("re-ask"), "reason: {reason}");
+        // The re-ask actually happened, and both sides are on record.
+        let reviews = repo
+            .join(".tactus")
+            .join("runs")
+            .join(&report.run_id)
+            .join("reviews");
+        assert!(reviews.join("00-t1-review.json").is_file());
+        assert!(
+            reviews.join("00-t1-review-reask.json").is_file(),
+            "one re-ask before giving up (§11.2)"
+        );
+    }
+
+    #[test]
+    fn the_reviewer_is_read_only_and_bound_to_the_review_tier() {
+        let repo = temp_engine_repo("reviewbinding");
+        let source = fake(Effect::EditFile);
+        let report = run_with(&options(&repo), &source).expect("run");
+        let settings = repo
+            .join(".tactus")
+            .join("runs")
+            .join(&report.run_id)
+            .join("settings");
+        let allow_list = |file: &str| -> Vec<String> {
+            let text = fs::read_to_string(settings.join(file)).expect("settings written");
+            let value: serde_json::Value = serde_json::from_str(&text).expect("json");
+            value["permissions"]["allow"]
+                .as_array()
+                .expect("allow list")
+                .iter()
+                .map(|v| v.as_str().unwrap_or_default().to_owned())
+                .collect()
+        };
+
+        let reviewer = allow_list("00-t1-review.json");
+        assert_eq!(reviewer, ["Read", "Glob", "Grep"], "read-only, no shell");
+
+        let implementer = allow_list("00-t1-1.json");
+        assert!(
+            implementer.contains(&"Edit".to_owned()),
+            "implementer can edit"
+        );
+    }
+
+    #[test]
+    fn the_run_record_survives_completion() {
+        let repo = temp_engine_repo("record");
+        let source = fake(Effect::EditFile);
         let report = run_with(&options(&repo), &source).expect("run");
         let report_path = repo
             .join(".tactus")
@@ -1140,11 +1372,7 @@ mod tests {
     #[test]
     fn failures_carry_a_machine_readable_kind() {
         let repo = temp_engine_repo("kind");
-        let source = FakeSource {
-            adapter: FakeAdapter {
-                effect: Effect::NoEdit,
-            },
-        };
+        let source = fake(Effect::NoEdit);
         let report = run_with(&options(&repo), &source).expect("engine ok");
         let TaskRunStatus::Failed { kind, .. } = &report.tasks[0].status else {
             panic!("t1 should fail");
@@ -1155,11 +1383,7 @@ mod tests {
     #[test]
     fn agent_error_reports_the_adapter_detail() {
         let repo = temp_engine_repo("detail");
-        let source = FakeSource {
-            adapter: FakeAdapter {
-                effect: Effect::Error,
-            },
-        };
+        let source = fake(Effect::Error);
         let report = run_with(&options(&repo), &source).expect("engine ok");
         let TaskRunStatus::Failed { kind, reason } = &report.tasks[0].status else {
             panic!("t1 should fail");
@@ -1230,11 +1454,7 @@ mod tests {
         git_in(&repo, &["add", "-A"]);
         git_in(&repo, &["commit", "-q", "-m", "forward plan"]);
 
-        let source = FakeSource {
-            adapter: FakeAdapter {
-                effect: Effect::EditFile,
-            },
-        };
+        let source = fake(Effect::EditFile);
         let report = run_with(&options(&repo), &source).expect("run");
         let ids: Vec<&str> = report.tasks.iter().map(|t| t.id.as_str()).collect();
         assert_eq!(ids, ["early", "late"], "dependency beats document order");

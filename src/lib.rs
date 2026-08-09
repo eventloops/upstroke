@@ -12,6 +12,7 @@ pub mod error;
 pub mod gates;
 pub mod ir;
 pub mod plan;
+pub mod review;
 pub mod route;
 pub mod ulid;
 pub mod util;

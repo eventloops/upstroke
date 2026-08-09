@@ -249,6 +249,18 @@ pub struct Outcome {
     pub duration: Duration,
 }
 
+/// §7 `Verdict` — a reviewer's structured judgement of one diff. `pass` is
+/// the only thing the ladder branches on; `required_changes` becomes the
+/// retry feedback (§11.4).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Verdict {
+    pub pass: bool,
+    #[serde(default)]
+    pub reasons: Vec<String>,
+    #[serde(default)]
+    pub required_changes: Vec<String>,
+}
+
 /// FNV-1a 64-bit content hash. Dependency-free and stable across platforms and
 /// releases — identity only, nothing cryptographic. CR bytes are skipped so a
 /// plan checked out with CRLF hashes the same as the LF original (git's
