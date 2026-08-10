@@ -422,6 +422,12 @@ pub struct ReviewCx<'a> {
     pub diff: &'a str,
     /// Artifacts the reviewer should judge against (conventions brief first).
     pub artifacts: &'a [(String, String)],
+    /// What the operator has already settled about this task (§12). A question
+    /// parks a task precisely because its acceptance criteria turn on a
+    /// decision the repository cannot supply, so a judge that cannot see the
+    /// answer will look for it, fail to find it, and reject the change for
+    /// having obeyed it.
+    pub decisions: &'a [String],
     pub workspace: &'a Path,
     /// Where this review's permission settings are materialized. Outside the
     /// workspace (§15 split), so the reviewer cannot read the description of
@@ -618,6 +624,23 @@ fn materialize_prompt(cx: &ReviewCx<'_>) -> String {
         prompt.push_str("Acceptance criteria (every one must hold):\n");
         for item in &task.acceptance {
             let _ = writeln!(prompt, "- {item}");
+        }
+        prompt.push('\n');
+    }
+    // Above the fence, and framed as instruction rather than data: unlike
+    // everything below, this came from the operator, and a criterion that
+    // reads "the policy the operator chose" is unjudgeable without it.
+    if !cx.decisions.is_empty() {
+        prompt.push_str(
+            "The operator was asked to settle something about this task, and answered. This is a \
+             decision from a person — not agent-authored text, and not open for you to \
+             re-litigate. Judge the change against it: a change that follows it is correct even \
+             where you would have chosen otherwise, and a change that departs from it is a \
+             defect however well argued.\n",
+        );
+        for decision in cx.decisions {
+            let fence = util::fence_for(decision);
+            let _ = writeln!(prompt, "{fence}\n{}\n{fence}", decision.trim());
         }
         prompt.push('\n');
     }
@@ -955,6 +978,7 @@ mod tests {
             task: &task,
             diff: "+++ b/src/api.rs\n+fn encode() {}\n",
             artifacts: &[],
+            decisions: &[],
             workspace: Path::new("."),
             settings_dir: Path::new("."),
             reviews_dir: Path::new("."),
@@ -977,6 +1001,47 @@ mod tests {
     }
 
     #[test]
+    fn the_operators_answer_reaches_the_judge_as_a_decision() {
+        // §12's loop, closed. A task parks because its acceptance criteria
+        // turn on something the repository cannot settle; the worker is handed
+        // the answer and complies. A judge that never sees it goes looking for
+        // the decision, finds no trace, and rejects the change for obeying an
+        // instruction it was not shown — re-raising the same question forever.
+        let task = task();
+        let decisions = ["Render bare bytes when the value is not an exact multiple.".to_owned()];
+        let cx = ReviewCx {
+            adapter: &crate::agent::claude::ClaudeCodeAdapter,
+            profile: profile_for("claude-code", "claude-opus-5", "review"),
+            lens: Lens::Acceptance,
+            task: &task,
+            diff: "+++ b/src/api.rs\n+fn encode() {}\n",
+            artifacts: &[],
+            decisions: &decisions,
+            workspace: Path::new("."),
+            settings_dir: Path::new("."),
+            reviews_dir: Path::new("."),
+            stem: "00-t1-1".to_owned(),
+            timeout: Duration::from_secs(60),
+        };
+        let prompt = materialize_prompt(&cx);
+        assert!(prompt.contains(&decisions[0]), "the answer itself: {prompt}");
+        assert!(
+            prompt.contains("decision from a person"),
+            "framed as instruction, not as agent-authored data: {prompt}"
+        );
+        // It has to outrank the reviewer's own taste, or the anti-sycophancy
+        // stance above simply argues with the operator instead of the diff.
+        assert!(prompt.contains("re-litigate"), "{prompt}");
+
+        // And it is the operator's answer that earns this framing, not any
+        // text near it: with nothing settled, none of it appears.
+        let mut bare = cx;
+        bare.decisions = &[];
+        let plain = materialize_prompt(&bare);
+        assert!(!plain.contains("decision from a person"), "{plain}");
+    }
+
+    #[test]
     fn rejects_prose_and_shapeless_json() {
         assert!(parse_verdict("This looks good to me, ship it.").is_none());
         assert!(parse_verdict("```json\n{\"verdict\": \"good\"}\n```").is_none());
@@ -995,6 +1060,7 @@ mod tests {
             task: &task,
             diff: "+++ b/src/api.rs\n+fn encode() {}\n",
             artifacts: &artifacts,
+            decisions: &[],
             workspace: Path::new("."),
             settings_dir: Path::new("."),
             reviews_dir: Path::new("."),
@@ -1050,6 +1116,7 @@ mod tests {
             task: &task,
             diff: &huge,
             artifacts: &[],
+            decisions: &[],
             workspace: Path::new("."),
             settings_dir: Path::new("."),
             reviews_dir: Path::new("."),
@@ -1085,6 +1152,7 @@ mod tests {
             task: &task,
             diff,
             artifacts: &[("brief".to_owned(), "Use ``` for code.".to_owned())],
+            decisions: &[],
             workspace: Path::new("."),
             settings_dir: Path::new("."),
             reviews_dir: Path::new("."),
@@ -1456,6 +1524,7 @@ mod tests {
             task: &task,
             diff: "+++ b/src/api.rs\n+fn encode() {}\n",
             artifacts: &[],
+            decisions: &[],
             workspace: Path::new("."),
             settings_dir: Path::new("."),
             reviews_dir: Path::new("."),

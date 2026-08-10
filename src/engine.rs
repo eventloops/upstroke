@@ -1453,6 +1453,14 @@ impl Run<'_> {
                     reviewers: self.reviewers(index, &profile)?,
                     timeout: self.attempt_timeout,
                     retry,
+                    // The same entries the worker prompt quotes as operator
+                    // instruction, routed to the judge as well (§12).
+                    decisions: self.state.progress[index]
+                        .feedback
+                        .iter()
+                        .filter(|entry| entry.human)
+                        .filter_map(|entry| entry.detail.clone())
+                        .collect(),
                 };
 
                 // Any error between the agent editing files and the verdict
@@ -2490,6 +2498,9 @@ struct AttemptCx<'a> {
     timeout: Duration,
     /// `None` on the first attempt.
     retry: Option<RetryBrief>,
+    /// Answers the operator has given about this task (§12), in the order they
+    /// arrived. The worker gets these as instructions; so must the judge.
+    decisions: Vec<String>,
 }
 
 /// What the retry prompt needs to know (§11.4).
@@ -2617,6 +2628,7 @@ fn run_attempt(
                 task: cx.task,
                 diff: &outcome.diff,
                 artifacts: &artifacts,
+                decisions: &cx.decisions,
                 workspace: workspace.root(),
                 settings_dir: &cx.paths.settings(),
                 reviews_dir: &cx.paths.reviews(),
