@@ -128,7 +128,7 @@ Gates are derived from the repo's shape when unconfigured (Cargo.toml, go.mod, p
 `~/.tactus/pools.toml`, written by `tactus connect` and yours to edit:
 
 ```toml
-[pools.claude-max]
+[pools.claude-code]
 kind = "subscription-window"           # credits | request-pool | api-key | unmetered
 agent = "claude-code"
 window = "5h"
@@ -137,7 +137,12 @@ sources = ["signals", "self"]          # trust order; local-logs and provider-en
                                        # are parsed but not read in v0.1
 safety_margin = 0.15                   # usage on your other machines is invisible
 reserve = 0.20                         # headroom kept for your interactive sessions
+profile = "work"                       # optional: which account, when one vendor backs
+                                       # several pools. Yours to write; connect keeps it
 ```
+
+Pools are listed in **file order**, and the first one matching an agent is the one attempts
+are attributed to — so moving a pool up the file promotes it.
 
 Spend reported by the CLIs is api-equivalent and, on subscriptions, notional. Where a route
 reports nothing at all — Copilot's does not — the ledger marks the total `?` rather than
@@ -160,8 +165,10 @@ These are invariants, not aspirations — they're what make it safe to leave run
   another family judges the same diff independently, and both must pass.
 - **An empty diff can never pass.** "Done" claims require changed code.
 - **Estimates are never optimistic.** A capacity pool nothing has measured reads as *unknown*,
-  not as full, and every estimate is discounted by a safety margin and a reserve floor before
-  it is shown.
+  not as full; a figure derived from what tactus alone has spent is shown as a ceiling (`≤`)
+  rather than a measurement, because everything it cannot see — other repositories, your own
+  interactive sessions — only ever drew *more*; and every estimate is discounted by a safety
+  margin and a reserve floor before it is shown.
 
 ## Requirements
 

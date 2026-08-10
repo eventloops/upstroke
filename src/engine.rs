@@ -31,7 +31,7 @@ use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 
-use crate::agent::{self, AgentAdapter, Caps, TaskRun, proc};
+use crate::agent::{AgentAdapter, Caps, TaskRun, proc};
 use crate::capacity;
 use crate::config::{self, OnTaskFailure};
 use crate::error::TactusError;
@@ -54,6 +54,9 @@ use crate::util;
 use crate::validate::{self, Analysis, ValidateOptions};
 use crate::workspace::Workspace;
 
+// Re-exported so `engine::AdapterSource` still resolves for callers that
+// reasonably think of it as the engine's seam.
+pub use crate::agent::{AdapterSource, BuiltinAdapters};
 pub use crate::events::{AttemptRecord, FailureRecord};
 pub use crate::ladder::{AttemptFailure, FailureKind, FailureOrigin};
 
@@ -96,20 +99,6 @@ const QUESTION_MARKER: &str = "TACTUS-QUESTION:";
 fn review_timeout(attempt_timeout: Duration, passes: usize) -> Duration {
     let share = attempt_timeout / 4 / u32::try_from(passes.max(1)).unwrap_or(u32::MAX);
     share.max(Duration::from_secs(60))
-}
-
-/// Where the engine finds agent adapters. Injectable so the engine is fully
-/// testable without any real agent CLI on the machine.
-pub trait AdapterSource {
-    fn get(&self, id: &str) -> Option<&dyn AgentAdapter>;
-}
-
-pub struct BuiltinAdapters;
-
-impl AdapterSource for BuiltinAdapters {
-    fn get(&self, id: &str) -> Option<&dyn AgentAdapter> {
-        agent::by_id(id).map(|a| a as &dyn AgentAdapter)
-    }
 }
 
 #[derive(Debug, Clone)]
@@ -372,6 +361,9 @@ struct Preflight {
     warnings: Vec<String>,
     mode: InteractionMode,
     notifiers: Vec<&'static dyn Notifier>,
+    /// §17's ceilings with `--budget` folded in and validated — computed at
+    /// pre-flight so a bad flag refuses before the run branch exists.
+    budgets: config::Budgets,
 }
 
 fn preflight(opts: &RunOptions, harness: &Harness<'_>) -> Result<Preflight, TactusError> {
@@ -507,6 +499,11 @@ fn preflight_with_reviews(
 
     let mode = opts.interaction.unwrap_or(analysis.config.interaction_mode);
     let notifiers = interaction::notifiers_for(&analysis.config.notify, &mut warnings);
+    // Here, with the other pre-flight refusals, rather than where the ceiling
+    // is first read: `--budget 0` must not create a branch and a run directory
+    // before discovering it cannot spend anything (§14 — pre-flight refuses
+    // before any agent token is spent, and before the workspace is touched).
+    let budgets = effective_budgets(analysis.config.budgets, opts.budget_usd)?;
 
     Ok(Preflight {
         analysis,
@@ -516,6 +513,7 @@ fn preflight_with_reviews(
         warnings,
         mode,
         notifiers,
+        budgets,
     })
 }
 
@@ -539,6 +537,7 @@ fn run_harness_inner(
         mut warnings,
         mode,
         notifiers,
+        budgets,
     } = preflight(opts, harness)?;
 
     let workspace = Workspace::open(&opts.repo_root)?;
@@ -628,12 +627,13 @@ fn run_harness_inner(
         defer_backoff: opts.defer_backoff,
         max_defers: opts.max_defers,
         on_task_failure: analysis.config.on_task_failure,
-        budgets: effective_budgets(analysis.config.budgets, opts.budget_usd),
+        budgets,
         ask_before: analysis.config.ask_before,
         run_id,
         branch,
         warnings,
         unanswerable: Vec::new(),
+        exhausted_pools: std::collections::BTreeSet::new(),
     };
     run.emit(EventBody::RunStarted {
         data: Box::new(started),
@@ -652,11 +652,24 @@ fn run_harness_inner(
 /// per-task ceiling is a property of how the plan is shaped, not of one
 /// invocation — and a single `--budget` that quietly moved both would be
 /// impossible to reason about at the ledger afterwards.
-fn effective_budgets(configured: config::Budgets, flag: Option<f64>) -> config::Budgets {
-    config::Budgets {
+fn effective_budgets(
+    configured: config::Budgets,
+    flag: Option<f64>,
+) -> Result<config::Budgets, TactusError> {
+    // Validated through the same check `[budgets]` uses. A flag that overrides
+    // a validated key must not be a way around the validation: `--budget 0` and
+    // `--budget -5` both stop the run before it spends anything, and
+    // `--budget nan` silently never fires at all — three different broken
+    // behaviours behind one mistyped number, where the config key refuses all
+    // three at load.
+    if let Some(limit) = flag {
+        config::check_budget("--budget", limit)
+            .map_err(|message| TactusError::Refused { message })?;
+    }
+    Ok(config::Budgets {
         run_usd: flag.or(configured.run_usd),
         task_usd: configured.task_usd,
-    }
+    })
 }
 
 /// A path as the run record should carry it: relative to the repo root where
@@ -806,6 +819,7 @@ fn resume_harness_inner(
         warnings: preflight_warnings,
         mode,
         notifiers,
+        budgets,
     } = preflight_with_reviews(&run_opts, harness, started.reviews.clone())?;
     if started.reviews.is_none() {
         warnings.push(
@@ -999,12 +1013,15 @@ fn resume_harness_inner(
         // Re-derived from today's config and flags, deliberately (see
         // `ResumeOptions::budget_usd`): raising the ceiling and resuming is the
         // one-command recovery a budget stop is supposed to have.
-        budgets: effective_budgets(analysis.config.budgets, opts.budget_usd),
+        budgets,
         ask_before: analysis.config.ask_before,
         run_id,
         branch: started.branch.clone(),
         warnings,
         unanswerable: Vec::new(),
+        // Seeded from the log so a resume neither re-announces an outage the
+        // previous process recorded nor swallows a fresh one.
+        exhausted_pools: prior_signals.keys().cloned().collect(),
     };
     // The `task_committed` the dead process never got to, now that the commit
     // has been checked against the record. First of everything this resume
@@ -1140,6 +1157,20 @@ struct Run<'a> {
     /// could answer at 2am is exactly the one the operator answers when they
     /// come back, so a resume has to be free to ask it again.
     unanswerable: Vec<QuestionId>,
+    /// Pools this run has already recorded a rate-limit signal for.
+    ///
+    /// Only the *transition* is worth an event. One outage produces a failed
+    /// attempt per deferral (up to `max_defers`), and emitting on each wrote N
+    /// identical records of a single fact — inflating any later count of
+    /// outages by the deferral factor and repeating the same line N times in
+    /// `status --follow`. Retired when an attempt proves the pool is serving
+    /// again, mirroring [`capacity::observe`]'s rule so the log the engine
+    /// writes and the fold a reader performs agree about when a pool came back.
+    ///
+    /// Process-local rather than folded state, like `unanswerable`: seeded on
+    /// resume from the log's own signals, so a resumed run neither re-announces
+    /// an outage the previous process recorded nor misses a fresh one.
+    exhausted_pools: std::collections::BTreeSet<String>,
 }
 
 impl Run<'_> {
@@ -1221,7 +1252,16 @@ impl Run<'_> {
             // Invariant 6 in its most useful form: an answer that arrives while
             // other work is still running un-parks its task there and then,
             // rather than waiting for the run to have nothing else to do.
-            if self.sweep_answers()? {
+            //
+            // Guarded on the budget stop like the two branches below, and for a
+            // sharper reason than theirs: an answer this run cannot act on is
+            // merely wasted, but a *declined* one routes through `fail_task`,
+            // which sets `halted_at` — and halted outranks budget in
+            // `outcome()`. A decline file sitting on disk would relabel a
+            // budget stop as a task failure, so CI gating on exit 3 to raise a
+            // ceiling would instead see exit 1 and a task blamed for something
+            // the ceiling did. The answers keep for the resume (§15).
+            if self.state.budget_stop.is_none() && self.sweep_answers()? {
                 continue;
             }
             if let Some(index) = self.next_ready() {
@@ -1464,6 +1504,21 @@ impl Run<'_> {
             // later run's estimator reads it back out of the log.
             if failure.kind == FailureKind::RateLimited {
                 self.record_pool_exhausted(&task_id, &profile, &result.reviews, &failure)?;
+            } else {
+                // This attempt reached a model and got an answer, whatever the
+                // verdict on its code, so any pool it drew on is serving again.
+                // Same rule as `capacity::observe`'s, applied to the engine's
+                // own view so the two cannot disagree about when a pool
+                // recovered — without it, the *next* outage on the same pool
+                // would go unrecorded because the set still held it.
+                self.exhausted_pools.remove(&profile.pool);
+                for review in &result.reviews {
+                    if review.outcome != events::ReviewPassOutcome::Unavailable
+                        && let Some(pool) = &review.pool
+                    {
+                        self.exhausted_pools.remove(pool);
+                    }
+                }
             }
 
             let resumable = self.state.progress[index].session.is_some()
@@ -1632,10 +1687,11 @@ impl Run<'_> {
         &mut self,
         signals: &BTreeMap<String, Option<String>>,
     ) -> Result<(), TactusError> {
+        // No early return on an empty pools file: "nothing was connected" is
+        // exactly as worth recording as a list, and its absence is otherwise
+        // indistinguishable from a pre-step-10 log, or from a binary that never
+        // took a snapshot at all (§14).
         let pools = &self.analysis.config.pools;
-        if pools.is_empty() {
-            return Ok(());
-        }
         // Signals come from the caller's fold of this run's log (empty on a
         // fresh run) rather than from a field kept here, so there is exactly one
         // place that turns `pool_exhausted` events into observations — the same
@@ -1764,6 +1820,10 @@ impl Run<'_> {
         // signal is still in the log on the attempt record; inventing a pool id
         // to hang it on would put a fact about nothing into the estimator.
         let Some(pool) = pool else { return Ok(()) };
+        // Only the transition (see `exhausted_pools`).
+        if !self.exhausted_pools.insert(pool.clone()) {
+            return Ok(());
+        }
         self.emit(EventBody::PoolExhausted {
             task: task.to_owned(),
             data: events::PoolExhausted {
@@ -2303,7 +2363,7 @@ fn spend_question_context(
         context,
         "Every attempt on the cheaper rungs failed, so this task is about to escalate onto the \
          {onto} rung. You asked to approve that once the run had reported \
-         ${threshold:.2} of spend (`ask_before.frontier_escalation_over_usd`)."
+         ${threshold:.4} of spend (`ask_before.frontier_escalation_over_usd`)."
     );
     let qualifier = if unpriced {
         " — a floor, not a total: some attempts ran on routes that report no spend at all (§13)"
@@ -3044,14 +3104,24 @@ impl RunReport {
                 );
             }
             RunOutcome::BudgetExceeded => {
-                let (budget, limit, spent) = self.budget_stop.as_ref().map_or_else(
-                    || ("run_usd".to_owned(), 0.0, 0.0),
-                    |stop| (stop.budget.to_string(), stop.limit_usd, stop.spent_usd),
+                // `outcome()` only returns this when `budget_stop` is set, so
+                // the fallback is unreachable — and it says so rather than
+                // naming a plausible ceiling. A specific, checkable, false
+                // claim about the operator's own config is the worst thing to
+                // print here.
+                let stopped = self.budget_stop.as_ref().map_or_else(
+                    || "run stopped at a budget it did not record".to_owned(),
+                    |stop| {
+                        format!(
+                            "run stopped at its budget: [budgets] {} = ${:.4}, reported spend \
+                             ${:.4}",
+                            stop.budget, stop.limit_usd, stop.spent_usd
+                        )
+                    },
                 );
                 let _ = writeln!(
                     out,
-                    "run stopped at its budget: [budgets] {budget} = ${limit:.2}, reported spend \
-                     ${spent:.4}. Committed tasks are on {}; raise the ceiling and continue \
+                    "{stopped}. Committed tasks are on {}; raise the ceiling and continue \
                      with:\n    tactus resume {} --budget <usd>",
                     self.branch, self.run_id
                 );
@@ -3188,10 +3258,13 @@ impl RunReport {
         if let Some(stop) = &self.budget_stop {
             let _ = writeln!(
                 out,
-                "  stopped by [budgets] {} = ${:.2}: reported spend had reached ${:.4} when `{}` \
-                 asked for its next attempt. Raise the ceiling and continue with:\n    tactus \
-                 resume {} --budget <usd>",
-                stop.budget, stop.limit_usd, stop.spent_usd, stop.task, self.run_id
+                // The ledger annotates; `render` owns the outcome line and the
+                // resume advice. Printing both put two near-identical
+                // paragraphs, formatted to different precision, with two copies
+                // of the same command, back to back in `tactus status` — which
+                // reads as two things having happened.
+                "  stopped by [budgets] {} = ${:.4} before `{}` (§13)",
+                stop.budget, stop.limit_usd, stop.task
             );
         }
         out
@@ -3558,7 +3631,6 @@ mod tests {
             session_id: Some(session.to_owned()),
             usage: None,
             cost_usd,
-            pool_drain: None,
             transcript_path: PathBuf::new(),
             duration,
         }
@@ -3689,11 +3761,7 @@ mod tests {
 
     fn options(repo: &Path) -> RunOptions {
         let mut opts = RunOptions::new(repo.join("plan.md"), repo.to_path_buf());
-        opts.pools_path = Some(
-            std::env::temp_dir()
-                .join("tactus-engine-missing")
-                .join("pools.toml"),
-        );
+        opts.pools_path = Some(no_pools());
         opts.attempt_timeout = Duration::from_secs(60);
         // Tests must never actually wait — not out a rate limit, and not at a
         // hard block either. The test harness has no terminal, so an
@@ -3703,6 +3771,25 @@ mod tests {
         opts.wait_on_block = Some(Duration::ZERO);
         opts.private_root = Some(private_root_for(repo));
         opts
+    }
+
+    /// An explicit pools path with no pools in it.
+    ///
+    /// A real, empty file rather than an absent one: an explicit `--pools` that
+    /// does not exist is a hard error now, and `None` would reach for the
+    /// operator's real `~/.tactus/pools.toml` — which no test may touch.
+    fn no_pools() -> PathBuf {
+        let dir =
+            std::env::temp_dir().join(format!("tactus-engine-nopools-{}", std::process::id()));
+        fs::create_dir_all(&dir).expect("scratch dir");
+        let path = dir.join("pools.toml");
+        fs::write(
+            &path,
+            "# no pools
+",
+        )
+        .expect("empty pools file");
+        path
     }
 
     /// A scratch stand-in for `~/.tactus`, so tests never touch the real one.
@@ -3723,11 +3810,7 @@ mod tests {
     /// Resume options matching [`options`], for the same reasons.
     fn resume_options(repo: &Path, run_id: &str) -> ResumeOptions {
         let mut opts = ResumeOptions::new(run_id.to_owned(), repo.to_path_buf());
-        opts.pools_path = Some(
-            std::env::temp_dir()
-                .join("tactus-engine-missing")
-                .join("pools.toml"),
-        );
+        opts.pools_path = Some(no_pools());
         opts.attempt_timeout = Duration::from_secs(60);
         opts.defer_backoff = Duration::ZERO;
         opts.wait_on_block = Some(Duration::ZERO);
@@ -7460,7 +7543,7 @@ mod tests {
     }
 
     #[test]
-    fn a_rate_limit_marks_its_pool_exhausted_and_a_later_fold_reads_it_back() {
+    fn a_rate_limit_marks_its_pool_exhausted_and_a_recovery_retires_the_signal() {
         // §13 source 1 made real: the signal is ground truth, and the estimator
         // that reads it back must never let a self-metered figure talk it up.
         let repo = temp_engine_repo("poolexhausted");
@@ -7492,13 +7575,165 @@ mod tests {
         assert_eq!(signals[0].pool, "claude-max");
         assert_eq!(signals[0].agent, "claude-code");
 
-        // The fold a later reader performs picks it up as ground truth.
-        let observations = capacity::observe(&events);
-        assert!(observations.exhausted.contains_key("claude-max"));
+        // A fold that stops at the signal reads the pool as exhausted, at the
+        // top confidence rank — the signal is ground truth about that moment.
+        let signal_at = events
+            .iter()
+            .position(|e| matches!(e.body, EventBody::PoolExhausted { .. }))
+            .expect("the signal is in the log");
+        let through_signal = events[..=signal_at].to_vec();
         let mut warnings = Vec::new();
         let cfg = config::load(None, &repo, Some(&pools), &mut warnings).expect("pools");
-        let estimates = capacity::estimate(&cfg.pools, &observations);
-        assert_eq!(estimates[0].remaining, capacity::Remaining::Exhausted);
-        assert_eq!(estimates[0].confidence, capacity::Confidence::Signal);
+        let at_the_signal = capacity::estimate(&cfg.pools, &capacity::observe(&through_signal));
+        assert_eq!(at_the_signal[0].remaining, capacity::Remaining::Exhausted);
+        assert_eq!(at_the_signal[0].confidence, capacity::Confidence::Signal);
+
+        // But the whole log has the pool serving an attempt afterwards, so the
+        // signal is retired rather than standing forever. Reporting `exhausted`
+        // here — on the same line that reports the attempts it served — was the
+        // shape the review caught.
+        let settled = capacity::estimate(&cfg.pools, &capacity::observe(&events));
+        assert_ne!(
+            settled[0].remaining,
+            capacity::Remaining::Exhausted,
+            "{}",
+            settled[0].describe()
+        );
+    }
+
+    #[test]
+    fn the_budget_flag_is_validated_like_the_config_key() {
+        // `[budgets] run_usd = 0.0` is a hard error at load. The flag that
+        // overrides it must not be a way around that: zero and negative both
+        // stopped the run before it spent anything, and NaN silently never
+        // fired at all.
+        let repo = temp_engine_repo("budgetflag");
+        seed(
+            &repo,
+            "## One\n<!-- tactus: id=t1 kind=implement depends= -->\n",
+            Some("[routing]\nimplement = { chain = [\"small\"], attempts_per = 1 }\n"),
+        );
+        for bad in [0.0, -5.0, f64::NAN] {
+            let mut opts = options(&repo);
+            opts.config_path = Some(repo.join("tactus.toml"));
+            opts.budget_usd = Some(bad);
+            let source = fake(Effect::EditFile);
+            let err = run_with(&opts, &source).expect_err("a meaningless ceiling must refuse");
+            assert!(
+                err.to_string().contains("not a spendable ceiling"),
+                "--budget {bad}: {err}"
+            );
+        }
+        // And refused at pre-flight, before a branch or a run directory exists.
+        let branch = git_in(&repo, &["rev-parse", "--abbrev-ref", "HEAD"]);
+        assert_eq!(branch.trim(), "main", "refused before branching");
+    }
+
+    #[test]
+    fn a_spend_approval_is_not_fed_back_to_the_agent_as_an_instruction() {
+        // Every other question's answer is guidance for the next attempt. An
+        // ApproveSpend answer is a yes/no about money whose meaning was already
+        // consumed by the un-park, and `feedback_section` frames feedback as
+        // "an instruction from a person… it takes precedence over your earlier
+        // assumptions" — which is not a thing to tell a coding agent about a
+        // billing decision.
+        let repo = temp_engine_repo("approvalfeedback");
+        seed(
+            &repo,
+            "## One\n<!-- tactus: id=t1 kind=implement depends= -->\n",
+            Some(
+                "[routing]\nimplement = { chain = [\"mid\", \"frontier\"], attempts_per = 1 }\n\n\
+                 [interaction]\nask_before = { frontier_escalation_over_usd = 0.005 }\n",
+            ),
+        );
+        let mut opts = options(&repo);
+        opts.config_path = Some(repo.join("tactus.toml"));
+        let source = source(
+            vec![Effect::NoEdit, Effect::EditFile],
+            vec![ReviewBehavior::Pass],
+        );
+        let scripted = ScriptedAnswers::new(vec![Answer::Answered {
+            text: "approve: run the escalated attempt".to_owned(),
+        }]);
+        let report = run_harness(
+            &opts,
+            &Harness {
+                adapters: &source,
+                answers: Some(&scripted),
+                sleeper: None,
+            },
+        )
+        .expect("run");
+        assert_eq!(report.outcome(), RunOutcome::Complete, "{report:?}");
+
+        let frontier = &source.adapter.runs()[1].prompt;
+        assert!(
+            !frontier.contains("approve: run the escalated attempt"),
+            "the approval reached the implementer as guidance:
+{frontier}"
+        );
+        // An Unblock answer still does, because there it really is guidance.
+        assert!(
+            !frontier.contains("instruction from a person"),
+            "and no human-instruction framing at all:
+{frontier}"
+        );
+    }
+
+    #[test]
+    fn one_outage_records_one_signal_however_many_deferrals_it_causes() {
+        let repo = temp_engine_repo("onesignal");
+        seed(
+            &repo,
+            "## One\n<!-- tactus: id=t1 kind=implement depends= -->\n",
+            Some("[routing]\nimplement = { chain = [\"small\"], attempts_per = 1 }\n"),
+        );
+        let mut opts = options(&repo);
+        opts.config_path = Some(repo.join("tactus.toml"));
+        opts.pools_path = Some(pools_file(&repo, CLAUDE_POOL));
+        // Down for three attempts, then back.
+        let source = source(
+            vec![
+                Effect::RateLimited,
+                Effect::RateLimited,
+                Effect::RateLimited,
+                Effect::EditFile,
+            ],
+            vec![ReviewBehavior::Pass],
+        );
+        let report = run_with(&opts, &source).expect("run");
+        assert_eq!(report.outcome(), RunOutcome::Complete, "{report:?}");
+        let signals = events_of(&repo, &report.run_id)
+            .iter()
+            .filter(|e| matches!(e.body, EventBody::PoolExhausted { .. }))
+            .count();
+        assert_eq!(
+            signals, 1,
+            "one outage is one fact; the deferrals are already on `task_deferred`"
+        );
+    }
+
+    #[test]
+    fn a_budget_stop_survives_a_stale_decline_file() {
+        // A decline routes through `fail_task`, which sets `halted_at`, and
+        // halted outranks budget in `outcome()`. A decline sitting on disk when
+        // the ceiling hits would have relabelled the stop as a task failure —
+        // exit 1 where CI was gating on exit 3 to raise the ceiling.
+        let repo = temp_engine_repo("budgetdecline");
+        seed(
+            &repo,
+            "## One\n<!-- tactus: id=t1 kind=implement depends= -->\n\n\
+             ## Two\n<!-- tactus: id=t2 kind=implement depends= -->\n",
+            Some(
+                "[routing]\nimplement = { chain = [\"small\"], attempts_per = 1 }\n\n\
+                 [budgets]\nrun_usd = 0.05\n",
+            ),
+        );
+        let mut opts = options(&repo);
+        opts.config_path = Some(repo.join("tactus.toml"));
+        let source = fake(Effect::EditFile);
+        let report = run_with(&opts, &source).expect("run");
+        assert_eq!(report.outcome(), RunOutcome::BudgetExceeded, "{report:?}");
+        assert!(report.halted_at.is_none(), "nothing failed: {report:?}");
     }
 }

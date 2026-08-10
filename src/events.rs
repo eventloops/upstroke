@@ -1043,13 +1043,22 @@ impl RunState {
                 continue;
             }
             let progress = &mut self.progress[index];
-            progress.feedback.push(Feedback {
-                attempt: progress.attempts,
-                tier: String::new(),
-                summary: "the operator answered the open question".to_owned(),
-                detail: Some(text.clone()),
-                human: true,
-            });
+            // An `ApproveSpend` answer is a yes/no about money, and its whole
+            // meaning was consumed by the un-park above. Pushing it as feedback
+            // would put "approve: run the escalated attempt" into the next
+            // prompt under `feedback_section`'s human framing — "an instruction
+            // from a person, and it takes precedence over your earlier
+            // assumptions" — handing a coding agent a billing decision as task
+            // guidance. Every other kind's answer really is guidance.
+            if kind != crate::ir::QuestionKind::ApproveSpend {
+                progress.feedback.push(Feedback {
+                    attempt: progress.attempts,
+                    tier: String::new(),
+                    summary: "the operator answered the open question".to_owned(),
+                    detail: Some(text.clone()),
+                    human: true,
+                });
+            }
             // The answer buys a fresh allowance on the rung the task is
             // standing on, and clears the deferrals a pool outage racked up.
             // It never moves the rung: if the chain exhausted, the task is

@@ -192,11 +192,34 @@ pub fn missing_from(agent: &str, advertised: &[String]) -> Vec<&'static str> {
     if advertised.is_empty() {
         return Vec::new();
     }
-    CATALOG
+    let seen: Vec<String> = advertised.iter().map(|model| normalize(model)).collect();
+    let missing: Vec<&'static str> = CATALOG
         .iter()
         .filter(|entry| entry.agent == agent)
         .map(|entry| entry.model)
-        .filter(|model| !advertised.iter().any(|seen| seen == model))
+        .filter(|model| !seen.contains(&normalize(model)))
+        .collect();
+    // Zero overlap is a format mismatch, not a stale catalog. GitHub's own
+    // reference writes display names ("GPT-5.3-Codex", "Gemini 3.1 Pro") beside
+    // the slugs `--model` takes, so a listing command that prints the former
+    // would make every entry look missing — and a guard that names the entire
+    // roster on its first real firing, advising an upgrade that cannot help, is
+    // worse than no guard. One match is enough to trust the comparison.
+    let overlap = CATALOG
+        .iter()
+        .filter(|entry| entry.agent == agent)
+        .any(|entry| seen.contains(&normalize(entry.model)));
+    if overlap { missing } else { Vec::new() }
+}
+
+/// Case and separators folded away, so `GPT-5.3-Codex`, `gpt-5.3-codex` and
+/// `GPT 5.3 Codex` all compare equal. Slugs are the contract, but a listing
+/// meant for humans is not obliged to use them.
+fn normalize(model: &str) -> String {
+    model
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric())
+        .map(|c| c.to_ascii_lowercase())
         .collect()
 }
 

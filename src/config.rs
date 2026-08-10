@@ -130,9 +130,19 @@ struct RawKindRouting {
     enabled: Option<bool>,
 }
 
+/// `[pools.*]`, with each entry's byte offset kept.
+///
+/// `toml::Spanned` rather than a plain value because a `BTreeMap` iterates in
+/// **sorted key order**, and both `Config.pools` and
+/// [`crate::capacity::pool_for`] promise *file* order — "moving a pool up the
+/// file promotes it" is the whole mechanism an operator has for choosing
+/// between two accounts on one vendor (§13's profiles). Sorting silently
+/// substituted an alphabet for that choice. The span is the offset of the
+/// entry's value in the source, so re-sorting by it restores exactly what was
+/// written, with no new dependency.
 #[derive(Debug, Default, Deserialize)]
 struct RawPools {
-    pools: Option<BTreeMap<String, toml::Value>>,
+    pools: Option<BTreeMap<String, toml::Spanned<toml::Value>>>,
 }
 
 /// One `[pools.<name>]` entry, before validation. Every field is optional here
@@ -157,7 +167,14 @@ struct RawPool {
 }
 
 /// `[budgets]` (§17). API-equivalent dollars; omitting either means unlimited.
+///
+/// `deny_unknown_fields` because §13 lists a third budget kind this build does
+/// not have — per-pool fractions — so `pool_fraction` is the key an operator
+/// reading the design reaches for first. Accepting it silently would let them
+/// believe they had capped a pool while the run spent against no ceiling at
+/// all, which is the one failure mode a budget must not have.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Budgets {
     pub run_usd: Option<f64>,
     pub task_usd: Option<f64>,
@@ -167,6 +184,23 @@ impl Budgets {
     pub fn any(self) -> bool {
         self.run_usd.is_some() || self.task_usd.is_some()
     }
+}
+
+/// One ceiling, checked the same way wherever it came from.
+///
+/// Shared with the `--budget` flag rather than living only in the `[budgets]`
+/// parser: a flag that overrides a validated key must not be a way around the
+/// validation. Zero and negative both stop the run before it spends anything,
+/// and NaN silently never fires — three different broken behaviours behind one
+/// mistyped number.
+pub fn check_budget(name: &str, limit: f64) -> Result<(), String> {
+    if !limit.is_finite() || limit <= 0.0 {
+        return Err(format!(
+            "`{name} = {limit}` is not a spendable ceiling — omit it for unlimited, or give it a \
+             positive number of dollars"
+        ));
+    }
+    Ok(())
 }
 
 #[derive(Debug, Clone)]
@@ -347,6 +381,31 @@ pub fn load(
     repo_config: Option<&Path>,
     discover_in: &Path,
     pools_file: Option<&Path>,
+    warnings: &mut Vec<String>,
+) -> Result<Config, TactusError> {
+    load_with(
+        repo_config,
+        discover_in,
+        pools_file,
+        &|agent| crate::agent::by_id(agent).is_some(),
+        warnings,
+    )
+}
+
+/// [`load`] with the adapter registry injected.
+///
+/// Only `[pools]` consults it, to decide whether a pool names an agent this
+/// build can drive. Injected for the same reason
+/// [`crate::validate::builtin_adapter`] is: the engine resolves adapters
+/// through a `Harness`, not through the global registry, so a guard that asks
+/// the registry directly is answering a question about a different set than the
+/// one that will actually run — and the unusable-pool path could only ever be
+/// tested with an agent the binary genuinely lacks.
+pub fn load_with(
+    repo_config: Option<&Path>,
+    discover_in: &Path,
+    pools_file: Option<&Path>,
+    has_adapter: &dyn Fn(&str) -> bool,
     warnings: &mut Vec<String>,
 ) -> Result<Config, TactusError> {
     let (raw, repo_path) = read_repo_config(repo_config, discover_in)?;
@@ -532,10 +591,10 @@ pub fn load(
 
     let gates = parse_gates(raw.gates, &repo_path)?;
     let (shell, on_task_failure) = parse_engine(raw.engine, &repo_path, warnings)?;
-    let interaction = parse_interaction(raw.interaction, &repo_path, warnings)?;
+    let interaction = parse_interaction(raw.interaction, &repo_path)?;
     let budgets = parse_budgets(raw.budgets, &repo_path)?;
 
-    let pools = read_pools(pools_file, warnings)?;
+    let pools = read_pools(pools_file, has_adapter, warnings)?;
 
     Ok(Config {
         chains,
@@ -572,15 +631,10 @@ fn parse_budgets(raw: Option<toml::Value>, repo_path: &Path) -> Result<Budgets, 
     })?;
     for (name, limit) in [("run_usd", budgets.run_usd), ("task_usd", budgets.task_usd)] {
         let Some(limit) = limit else { continue };
-        if !limit.is_finite() || limit <= 0.0 {
-            return Err(TactusError::Config {
-                path: repo_path.to_path_buf(),
-                message: format!(
-                    "[budgets] `{name} = {limit}` is not a spendable ceiling — omit the key for \
-                     unlimited, or give it a positive number of dollars"
-                ),
-            });
-        }
+        check_budget(name, limit).map_err(|message| TactusError::Config {
+            path: repo_path.to_path_buf(),
+            message: format!("[budgets] {message}"),
+        })?;
     }
     Ok(budgets)
 }
@@ -677,13 +731,16 @@ fn parse_engine(
     Ok((shell, on_task_failure))
 }
 
-/// `[interaction]` (§12). Mode and `ask_before` decide whether a human is ever
-/// asked, so a typo in either errors; notifier ids only decide delivery, so
-/// they warn.
+/// `[interaction]` (§12).
+///
+/// Everything here is a hard error or nothing: `mode` and `ask_before` both
+/// decide whether a human is ever asked, so a typo in either must not degrade
+/// quietly. Notifier ids are the one soft setting, and they are validated by
+/// `notifiers_for` at run time rather than here — which is why this function
+/// takes no warning sink.
 fn parse_interaction(
     raw: Option<toml::Value>,
     repo_path: &Path,
-    _warnings: &mut Vec<String>,
 ) -> Result<InteractionSettings, TactusError> {
     let default_notify = || vec!["cli".to_owned()];
     let Some(value) = raw else {
@@ -791,18 +848,32 @@ fn read_repo_config(
 ///   unusable. §17's own example ships `[pools.local] agent = "aider"`, so
 ///   erroring would brick anyone who copied the documented file.
 /// - unknown keys → **warn**, by name.
+///
+/// An **explicit** `--pools` path that does not exist is an error, the way an
+/// explicit `--config` is in [`read_repo_config`]: a path someone typed and
+/// that is not there is a typo, and answering it with "no pools connected —
+/// run `tactus connect`" sends them to regenerate a file that was never the
+/// problem. A *discovered* one that is absent is the normal fresh case and
+/// stays silent.
 fn read_pools(
     pools_file: Option<&Path>,
+    has_adapter: &dyn Fn(&str) -> bool,
     warnings: &mut Vec<String>,
 ) -> Result<Vec<Pool>, TactusError> {
-    let path = match pools_file {
-        Some(p) => p.to_path_buf(),
+    let (path, required) = match pools_file {
+        Some(p) => (p.to_path_buf(), true),
         None => match discovered_pools_path() {
-            Some(p) => p,
+            Some(p) => (p, false),
             None => return Ok(Vec::new()),
         },
     };
     if !path.exists() {
+        if required {
+            return Err(TactusError::Config {
+                path,
+                message: "pools file not found".to_owned(),
+            });
+        }
         return Ok(Vec::new());
     }
     let text = fs::read_to_string(&path).map_err(|source| TactusError::Io {
@@ -813,9 +884,19 @@ fn read_pools(
         path: path.clone(),
         message: e.to_string(),
     })?;
+    // Back into the order they were written in — see [`RawPools`].
+    let mut entries: Vec<(String, toml::Spanned<toml::Value>)> =
+        raw.pools.unwrap_or_default().into_iter().collect();
+    entries.sort_by_key(|(_, spanned)| spanned.span().start);
     let mut pools = Vec::new();
-    for (name, value) in raw.pools.unwrap_or_default() {
-        pools.push(parse_pool(&name, value, &path, warnings)?);
+    for (name, spanned) in entries {
+        pools.push(parse_pool(
+            &name,
+            spanned.into_inner(),
+            &path,
+            has_adapter,
+            warnings,
+        )?);
     }
     Ok(pools)
 }
@@ -824,12 +905,25 @@ fn parse_pool(
     name: &str,
     value: toml::Value,
     path: &Path,
+    has_adapter: &dyn Fn(&str) -> bool,
     warnings: &mut Vec<String>,
 ) -> Result<Pool, TactusError> {
     let config_error = |message: String| TactusError::Config {
         path: path.to_path_buf(),
         message,
     };
+    // A pool's name is its identity everywhere downstream — it is what an
+    // attempt is attributed to and what the ledger prints. A blank one is
+    // indistinguishable from "no pool" by the time it reaches the engine
+    // (`pool_option` maps `""` to `None`), so the attribution would vanish
+    // while the pool still matched for routing. Same reasoning as the
+    // non-empty `[[gates]]` `name`.
+    if name.trim().is_empty() {
+        return Err(config_error(
+            "a pool needs a non-empty name — `[pools.<name>]` is what attempts are attributed to"
+                .to_owned(),
+        ));
+    }
     let raw: RawPool = value.try_into().map_err(|e| {
         config_error(format!(
             "[pools.{name}]: {e} (expected `kind` and `agent` strings, with optional `window`, \
@@ -927,7 +1021,7 @@ fn parse_pool(
         ));
     }
 
-    let usable = crate::agent::by_id(&agent).is_some();
+    let usable = has_adapter(&agent);
     if !usable {
         warnings.push(format!(
             "[pools.{name}] names agent `{agent}`, which has no adapter in this build — the pool \
@@ -968,10 +1062,23 @@ mod tests {
         path
     }
 
+    /// An explicit pools path with no pools in it.
+    ///
+    /// A real, empty file rather than an absent one: an explicit `--pools` that
+    /// does not exist is now a hard error (a path someone typed and that is not
+    /// there is a typo), and passing `None` here would reach for the operator's
+    /// real `~/.tactus/pools.toml` — which no test may touch.
     fn missing() -> PathBuf {
-        env::temp_dir()
-            .join("tactus-definitely-missing")
-            .join("pools.toml")
+        let dir = env::temp_dir().join(format!("tactus-config-nopools-{}", std::process::id()));
+        fs::create_dir_all(&dir).expect("scratch dir");
+        let path = dir.join("pools.toml");
+        fs::write(
+            &path,
+            "# no pools
+",
+        )
+        .expect("empty pools file");
+        path
     }
 
     /// Empty discovery root so tests never pick up a real tactus.toml.
@@ -1001,13 +1108,11 @@ mod tests {
     #[test]
     fn explicit_config_path_must_exist() {
         let mut warnings = Vec::new();
-        let err = load(
-            Some(&missing()),
-            &hermetic(),
-            Some(&missing()),
-            &mut warnings,
-        )
-        .expect_err("missing --config errors");
+        let absent = env::temp_dir()
+            .join("tactus-definitely-missing")
+            .join("tactus.toml");
+        let err = load(Some(&absent), &hermetic(), Some(&missing()), &mut warnings)
+            .expect_err("missing --config errors");
         assert!(matches!(err, TactusError::Config { .. }));
     }
 
@@ -1569,5 +1674,92 @@ ask_before = { frontier_escalation_over_usd = 5.0 }
                 .iter()
                 .any(|w| w.contains("unknown [engine] shell"))
         );
+    }
+
+    #[test]
+    fn pools_keep_the_order_they_were_written_in() {
+        // `pool_for` takes the first match and its doc promises "table order as
+        // preference", which is the only mechanism an operator has for choosing
+        // between two accounts on one vendor. A `BTreeMap` silently substituted
+        // an alphabet for that choice — and every fixture happened to be
+        // alphabetical already, so nothing noticed.
+        let path = scratch(
+            "orderpools.toml",
+            "[pools.work]
+kind = \"subscription-window\"
+agent = \"claude-code\"
+
+             [pools.personal]
+kind = \"subscription-window\"
+agent = \"claude-code\"
+",
+        );
+        let mut warnings = Vec::new();
+        let cfg = load(None, &hermetic(), Some(&path), &mut warnings).expect("load");
+        assert_eq!(
+            cfg.pools
+                .iter()
+                .map(|p| p.name.as_str())
+                .collect::<Vec<_>>(),
+            ["work", "personal"],
+            "file order, not alphabetical"
+        );
+        assert_eq!(
+            capacity::pool_for("claude-code", &cfg.pools).map(|p| p.name.as_str()),
+            Some("work"),
+            "the first pool in the FILE is the preferred one"
+        );
+    }
+
+    #[test]
+    fn an_unbuilt_budget_key_is_refused_rather_than_ignored() {
+        // §13 lists per-pool budgets, so `pool_fraction` is the key someone
+        // reading the design reaches for first. Accepting it silently would let
+        // them believe a pool was capped while nothing capped it.
+        let path = scratch(
+            "poolbudget.toml",
+            "[budgets]
+run_usd = 10.0
+pool_fraction = 0.5
+",
+        );
+        let mut warnings = Vec::new();
+        let err = load(Some(&path), &hermetic(), Some(&missing()), &mut warnings)
+            .expect_err("an unknown budget key must not pass");
+        assert!(err.to_string().contains("pool_fraction"), "got: {err}");
+    }
+
+    #[test]
+    fn an_explicit_pools_path_that_does_not_exist_is_a_typo_not_an_empty_machine() {
+        // Same rule `--config` has had: a path someone typed and that is not
+        // there is a mistake, and answering it with "no pools connected — run
+        // `tactus connect`" sends them to regenerate a file that was fine.
+        let absent = env::temp_dir()
+            .join("tactus-definitely-missing")
+            .join("pools.toml");
+        let mut warnings = Vec::new();
+        let err = load(None, &hermetic(), Some(&absent), &mut warnings)
+            .expect_err("an explicit pools path must exist");
+        assert!(
+            err.to_string().contains("pools file not found"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn a_blank_pool_name_is_refused() {
+        // The name is what an attempt is attributed to; blank is
+        // indistinguishable from "no pool" by the time it reaches the ledger.
+        let path = scratch(
+            "blankname.toml",
+            "[pools.\"\"]
+kind = \"credits\"
+agent = \"copilot\"
+",
+        );
+        let mut warnings = Vec::new();
+        let err = load(None, &hermetic(), Some(&path), &mut warnings)
+            .expect_err("a blank pool name must error");
+        assert!(err.to_string().contains("non-empty name"), "got: {err}");
     }
 }

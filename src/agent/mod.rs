@@ -32,12 +32,23 @@ pub enum AuthState {
     Unknown,
 }
 
+/// One rendering, used by `connect` and `capacity` alike.
+///
+/// There were two: a terse `Display` here and a fuller `describe_auth` in
+/// `connect`, so the same fact read as "not authenticated" from one command and
+/// "NOT signed in — log in with the vendor's own CLI before running" from the
+/// other, and an operator comparing them could not tell whether they described
+/// the same thing. The rule this enum exists to enforce — "could not tell"
+/// never renders as "not connected" — was then enforced in one place and merely
+/// observed in the other.
 impl std::fmt::Display for AuthState {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(match self {
-            Self::Authenticated => "authenticated",
-            Self::NotAuthenticated => "not authenticated",
-            Self::Unknown => "unknown",
+            Self::Authenticated => "signed in",
+            Self::NotAuthenticated => {
+                "NOT signed in — log in with the vendor's own CLI before running"
+            }
+            Self::Unknown => "auth state could not be determined",
         })
     }
 }
@@ -141,10 +152,17 @@ pub trait AgentAdapter: Send + Sync {
     /// own vendor is the design (invariant 2), the same posture §9 sets for
     /// plan importers.
     ///
+    /// Takes the `Caps` the caller already probed rather than re-probing:
+    /// discovery always runs beside a probe (a CLI that cannot report its own
+    /// version is in no state to be asked about its account), and an adapter
+    /// that called `probe()` again spawned `--version` and `--help` a second
+    /// time — four subprocesses where two would do, each carrying the probe
+    /// timeout.
+    ///
     /// The default reports nothing rather than being required, so an adapter
     /// cannot silently claim discovery it does not do — [`Discovery::unknown`]
     /// is an honest "could not tell", and every consumer treats it as one.
-    fn discover(&self) -> Result<Discovery, TactusError> {
+    fn discover(&self, _caps: &Caps) -> Result<Discovery, TactusError> {
         Ok(Discovery::unknown())
     }
 
@@ -165,6 +183,26 @@ pub trait AgentAdapter: Send + Sync {
         _stem: &str,
     ) -> Result<Option<PathBuf>, TactusError> {
         Ok(None)
+    }
+}
+
+/// Where a caller finds agent adapters. Injectable so the engine, `connect`
+/// and `capacity` are all fully testable without any real agent CLI on the
+/// machine.
+///
+/// Lives here rather than in `engine` because resolving an adapter id has
+/// nothing to do with running a plan: `capacity` documents itself as a pure
+/// estimator over plain values, and `connect` executes nothing at all, yet both
+/// had to import the execution engine for this two-line trait.
+pub trait AdapterSource {
+    fn get(&self, id: &str) -> Option<&dyn AgentAdapter>;
+}
+
+pub struct BuiltinAdapters;
+
+impl AdapterSource for BuiltinAdapters {
+    fn get(&self, id: &str) -> Option<&dyn AgentAdapter> {
+        by_id(id).map(|a| a as &dyn AgentAdapter)
     }
 }
 

@@ -9,7 +9,8 @@ use tactus::agent;
 
 fn main() {
     for adapter in agent::ADAPTERS {
-        match adapter.probe() {
+        let probed = adapter.probe();
+        match &probed {
             Ok(caps) => println!(
                 "{}: version {} | json_output={} session_resume={} cost_reporting={} \
                  read_only_mode={} acp={} model_list={}",
@@ -29,7 +30,8 @@ fn main() {
                 continue;
             }
         }
-        match adapter.discover() {
+        let Ok(caps) = &probed else { continue };
+        match adapter.discover(caps) {
             Ok(discovery) => {
                 println!(
                     "  discovery: auth={} shape={} models={}",

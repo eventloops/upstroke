@@ -15,17 +15,19 @@
 //!   writes one pool per agent and leaves `profile` for the operator to add by
 //!   hand. See [`crate::capacity`]'s module docs for the v0.2 sketch.
 //! - **It never clobbers.** §17 calls the pools file hand-editable, and it is
-//!   the file that says which subscriptions exist. An existing file that
-//!   differs is printed and the command exits asking for `--force`; an
-//!   identical one reports "unchanged" and rewrites nothing.
+//!   the file that says which subscriptions exist. An existing file whose
+//!   *settings* differ is printed and the command exits asking for `--force`;
+//!   one that already says the same thing reports "unchanged" and rewrites
+//!   nothing. `--force` still carries the operator's own keys across, because
+//!   `profile`, `monthly_allowance` and `endpoint` are things discovery cannot
+//!   supply and replacing the file must not quietly delete.
 
 use std::fmt::Write as _;
 use std::fs;
 use std::path::PathBuf;
 
-use crate::agent::{AuthState, Discovery};
+use crate::agent::{AdapterSource, BuiltinAdapters, Discovery};
 use crate::capacity::{Pool, PoolKind, Source};
-use crate::engine::{AdapterSource, BuiltinAdapters};
 use crate::error::TactusError;
 use crate::util;
 
@@ -44,8 +46,9 @@ pub struct ConnectOptions {
 pub enum Wrote {
     /// The file did not exist, or `--force` replaced one that differed.
     Written,
-    /// Configures exactly what is already there. Compared over settings rather
-    /// than bytes — see [`settings_of`].
+    /// Configures exactly what is already there, and says exactly the same
+    /// thing about it — compared over [`settings_of`] and [`stable_content`]
+    /// rather than over bytes.
     Unchanged,
     /// An existing file differs and `--force` was not given.
     Refused,
@@ -101,16 +104,33 @@ pub fn run_with<'a>(
             })?,
     };
 
+    // Read before anything is written: `--force` must not silently discard the
+    // keys only an operator can supply.
+    let existing_text = fs::read_to_string(&path).ok();
+    let carried = existing_text
+        .as_deref()
+        .map(operator_keys)
+        .unwrap_or_default();
+
     let mut warnings = Vec::new();
-    let mut agents = Vec::new();
+    let mut agents: Vec<AgentReport> = Vec::new();
+    let mut seen: Vec<&str> = Vec::new();
     for id in ids {
+        // Two entries for one agent would render `[pools.<name>]` twice, and
+        // TOML rejects duplicate keys — so `connect` would write a file that
+        // `config::load` then refuses to read. The built-in registry has no
+        // duplicates, but `run_with` is the public seam and takes any ids.
+        if seen.contains(&id) {
+            continue;
+        }
+        seen.push(id);
         let Some(adapter) = adapters.get(id) else {
             continue;
         };
         // Probe first: §14 already treats a missing or broken binary as a
         // refusal to start, and discovery on a CLI that cannot even report its
         // version would be reading tea leaves.
-        let discovered = adapter.probe().and_then(|_| adapter.discover());
+        let discovered = adapter.probe().and_then(|caps| adapter.discover(&caps));
         match discovered {
             Ok(discovery) => {
                 // D1's cross-check, at the moment the roster's provenance is
@@ -127,7 +147,10 @@ pub fn run_with<'a>(
                         missing.join(", ")
                     ));
                 }
-                let pool = pool_for_agent(id, &discovery);
+                let mut pool = pool_for_agent(id, &discovery);
+                if let Some(kept) = carried.get(&pool.name) {
+                    kept.apply(&mut pool);
+                }
                 agents.push(AgentReport {
                     agent: id.to_owned(),
                     outcome: Ok(discovery),
@@ -146,10 +169,22 @@ pub fn run_with<'a>(
     }
 
     let content = render(&agents);
-    let existing = fs::read_to_string(&path).ok();
-    let outcome = match existing {
-        Some(existing) if settings_of(&existing) == settings_of(&content) => Wrote::Unchanged,
-        Some(_) if !opts.force => Wrote::Refused,
+    let existing = existing_text;
+    // Two comparisons, because two different questions are being asked.
+    //
+    // *May* this file be replaced turns on the **settings** — the operator's
+    // hand edits are what must not be clobbered, and a comment carries none.
+    // *Should* it be rewritten turns on everything except the one genuinely
+    // volatile line, the header's timestamp. Collapsing the two into a single
+    // settings comparison meant a login between two connects reported
+    // `unchanged` and left the file still saying NOT signed in; collapsing them
+    // the other way made every re-connect a conflict resolvable only by
+    // `--force`, the flag that discards hand edits.
+    let outcome = match &existing {
+        Some(existing) if settings_of(existing) != settings_of(&content) && !opts.force => {
+            Wrote::Refused
+        }
+        Some(existing) if stable_content(existing) == stable_content(&content) => Wrote::Unchanged,
         _ => {
             if let Some(parent) = path.parent() {
                 fs::create_dir_all(parent).map_err(|source| TactusError::Io {
@@ -183,10 +218,45 @@ pub fn run_with<'a>(
 ///
 /// The other direction holds too: an operator who edits only a comment has
 /// changed no setting, and being told their file conflicts would be noise.
-fn settings_of(text: &str) -> Vec<&str> {
+fn settings_of(text: &str) -> Vec<String> {
     text.lines()
-        .map(str::trim)
-        .filter(|line| !line.is_empty() && !line.starts_with('#'))
+        .map(strip_comment)
+        .filter(|line| !line.is_empty())
+        .collect()
+}
+
+/// A line with any comment removed, whole-line or trailing.
+///
+/// Trailing matters because this module writes one: `render_pool` decorates
+/// `reserve` with `# headroom kept for your own interactive sessions`, so the
+/// single line an operator is most likely to tidy is the one a whole-line-only
+/// filter would treat as a changed setting. `#` inside a quoted value is not a
+/// comment, so quotes are tracked.
+fn strip_comment(line: &str) -> String {
+    let mut quoted = false;
+    let mut out = String::new();
+    for ch in line.chars() {
+        match ch {
+            '"' => {
+                quoted = !quoted;
+                out.push(ch);
+            }
+            '#' if !quoted => break,
+            _ => out.push(ch),
+        }
+    }
+    out.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+/// Everything except the one line that moves on its own.
+///
+/// The header records when `connect` ran, so comparing whole bytes would call
+/// two runs a second apart different. Everything else — including every
+/// discovery note and the auth line — is content a reader relies on being
+/// current, so it belongs in the comparison that decides whether to rewrite.
+fn stable_content(text: &str) -> Vec<&str> {
+    text.lines()
+        .filter(|line| !line.starts_with("# Written by `tactus connect`"))
         .collect()
 }
 
@@ -215,13 +285,83 @@ fn pool_for_agent(agent: &str, discovery: &Discovery) -> Pool {
     )
 }
 
-/// Stable, human-meaningful pool names, so a hand edit and a re-`connect`
-/// converge on the same file rather than accumulating duplicates.
-fn default_pool_name(agent: &str) -> &str {
-    match agent {
-        "claude-code" => "claude-max",
-        other => other,
+/// The keys only an operator can supply, carried across a `--force`.
+///
+/// `connect` discovers subscriptions; it cannot discover *which account*
+/// (`profile`), *how big* an allowance is (`monthly_allowance`), or where a
+/// local model lives (`endpoint`). All three are hand-written, and rewriting
+/// the file without them would delete the operator's own work — with the
+/// refusal message that recommends `--force` never saying so. `profile` in
+/// particular is the entire point of §13's multi-account seam, and
+/// `monthly_allowance` is the only thing that makes a self-metered estimate
+/// possible at all (`Auto` yields `Unknown`).
+#[derive(Debug, Default, Clone, PartialEq, serde::Deserialize)]
+struct OperatorKeys {
+    profile: Option<String>,
+    monthly_allowance: Option<toml::Value>,
+    endpoint: Option<String>,
+}
+
+impl OperatorKeys {
+    fn apply(&self, pool: &mut Pool) {
+        if let Some(profile) = &self.profile {
+            pool.profile = Some(profile.clone());
+        }
+        if let Some(endpoint) = &self.endpoint {
+            pool.endpoint = Some(endpoint.clone());
+        }
+        if let Some(units) = self.monthly_allowance.as_ref().and_then(allowance_of) {
+            pool.monthly_allowance = units;
+        }
     }
+
+    fn any(&self) -> bool {
+        self.profile.is_some() || self.monthly_allowance.is_some() || self.endpoint.is_some()
+    }
+}
+
+fn allowance_of(value: &toml::Value) -> Option<crate::capacity::Allowance> {
+    match value {
+        toml::Value::String(text) if text.trim().eq_ignore_ascii_case("auto") => {
+            Some(crate::capacity::Allowance::Auto)
+        }
+        toml::Value::Integer(units) => Some(crate::capacity::Allowance::Units(*units as f64)),
+        toml::Value::Float(units) => Some(crate::capacity::Allowance::Units(*units)),
+        _ => None,
+    }
+}
+
+/// Pull the operator-written keys out of an existing pools file, by pool name.
+///
+/// Parsed leniently on purpose: a file this cannot read is one `--force` was
+/// always going to replace, and failing the whole command over it would be
+/// worse than losing keys that were unreadable anyway.
+fn operator_keys(text: &str) -> std::collections::BTreeMap<String, OperatorKeys> {
+    #[derive(serde::Deserialize)]
+    struct Doc {
+        pools: Option<std::collections::BTreeMap<String, OperatorKeys>>,
+    }
+    toml::from_str::<Doc>(text)
+        .ok()
+        .and_then(|doc| doc.pools)
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|(_, keys)| keys.any())
+        .collect()
+}
+
+/// The pool name for an agent: the agent's own id.
+///
+/// Deliberately not a plan name. Naming every Claude Code pool `claude-max`
+/// asserted a subscription tier discovery never established — a Pro subscriber,
+/// or someone on API-key billing, got a pool claiming a plan they do not have,
+/// in the one file whose whole purpose is to describe their actual
+/// subscriptions, from a module that marks its other defaults as defaults. It
+/// also put a per-agent alias table here, so adding an adapter meant editing
+/// `connect`. Renaming the pool is the operator's call, and the file is
+/// hand-editable precisely so they can make it.
+fn default_pool_name(agent: &str) -> &str {
+    agent
 }
 
 /// Render the pools file: §17's shape, plus a header saying who wrote it, when,
@@ -250,7 +390,7 @@ fn render(agents: &[AgentReport]) -> String {
         out.push('\n');
         match (&report.outcome, &report.pool) {
             (Ok(discovery), Some(pool)) => {
-                let _ = writeln!(out, "# {}: {}", report.agent, describe_auth(discovery.auth));
+                let _ = writeln!(out, "# {}: {}", report.agent, discovery.auth);
                 for note in &discovery.notes {
                     let _ = writeln!(out, "#   {note}");
                 }
@@ -273,17 +413,6 @@ fn render(agents: &[AgentReport]) -> String {
         }
     }
     out
-}
-
-fn describe_auth(auth: AuthState) -> String {
-    match auth {
-        AuthState::Authenticated => "signed in".to_owned(),
-        AuthState::NotAuthenticated => {
-            "NOT signed in — log in with the vendor's own CLI before running".to_owned()
-        }
-        // Never rendered as "not connected": see `AuthState`.
-        AuthState::Unknown => "auth state could not be determined".to_owned(),
-    }
 }
 
 fn render_pool(pool: &Pool) -> String {
@@ -309,6 +438,20 @@ fn render_pool(pool: &Pool) -> String {
         "reserve = {:.2}                     # headroom kept for your own interactive sessions",
         pool.reserve
     );
+    // The operator's own keys, written back out. `connect` never invents any of
+    // these — it cannot discover which account, how large an allowance is, or
+    // where a local model lives — but once one is in the file it has to survive
+    // being rewritten, or `--force` would delete exactly what the refusal it
+    // overrides existed to protect.
+    if let Some(profile) = &pool.profile {
+        let _ = writeln!(out, "profile = \"{profile}\"");
+    }
+    if let crate::capacity::Allowance::Units(units) = pool.monthly_allowance {
+        let _ = writeln!(out, "monthly_allowance = {units}");
+    }
+    if let Some(endpoint) = &pool.endpoint {
+        let _ = writeln!(out, "endpoint = \"{endpoint}\"");
+    }
     out
 }
 
@@ -321,10 +464,7 @@ pub fn render_report(report: &ConnectReport) -> String {
                 let _ = writeln!(
                     out,
                     "{}: {} — pool `{}` [{}]",
-                    agent.agent,
-                    describe_auth(discovery.auth),
-                    pool.name,
-                    pool.kind
+                    agent.agent, discovery.auth, pool.name, pool.kind
                 );
                 for note in &discovery.notes {
                     let _ = writeln!(out, "  {note}");
@@ -375,7 +515,7 @@ impl ConnectReport {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::agent::{AgentAdapter, Caps, ProcessOutput, TaskRun};
+    use crate::agent::{AgentAdapter, AuthState, Caps, ProcessOutput, TaskRun};
     use crate::ir::Outcome;
     use std::path::Path;
     use std::process::Command;
@@ -417,7 +557,7 @@ mod tests {
             unreachable!("connect never parses an attempt")
         }
 
-        fn discover(&self) -> Result<Discovery, TactusError> {
+        fn discover(&self, _caps: &Caps) -> Result<Discovery, TactusError> {
             self.discovery.clone().ok_or_else(|| TactusError::Agent {
                 message: "binary not found on PATH".to_owned(),
             })
@@ -483,7 +623,7 @@ mod tests {
         let report = connect(&path, false);
         assert_eq!(report.outcome, Wrote::Written);
         let written = fs::read_to_string(&path).expect("file");
-        assert!(written.contains("[pools.claude-max]"), "{written}");
+        assert!(written.contains("[pools.claude-code]"), "{written}");
         assert!(
             !written.contains("[pools.copilot]"),
             "no pool for a CLI that is not installed: {written}"
@@ -512,7 +652,7 @@ mod tests {
             .expect("the written file parses");
         assert_eq!(cfg.pools.len(), 1);
         let pool = &cfg.pools[0];
-        assert_eq!(pool.name, "claude-max");
+        assert_eq!(pool.name, "claude-code");
         assert_eq!(pool.kind, PoolKind::SubscriptionWindow);
         assert_eq!(pool.agent, "claude-code");
         assert_eq!(pool.sources, [Source::Signals, Source::SelfMetered]);
@@ -527,8 +667,8 @@ mod tests {
         // §17 says the file is hand-editable, so silently overwriting a hand
         // edit destroys the operator's own record of their subscriptions.
         let path = scratch("clobber");
-        let mine = "[pools.claude-max]\nkind = \"subscription-window\"\nagent = \
-                    \"claude-code\"\nprofile = \"work\"\n";
+        let mine = "[pools.claude-code]\nkind = \"subscription-window\"\nagent = \
+                    \"claude-code\"\nprofile = \"work\"\nmonthly_allowance = 300\n";
         fs::write(&path, mine).expect("hand-written file");
 
         let report = connect(&path, false);
@@ -542,18 +682,27 @@ mod tests {
         let rendered = render_report(&report);
         assert!(rendered.contains("--force"), "{rendered}");
         assert!(
-            rendered.contains("[pools.claude-max]"),
+            rendered.contains("[pools.claude-code]"),
             "it shows what it would have written: {rendered}"
         );
 
-        // --force is the escape hatch, and it really does replace.
+        // --force is the escape hatch, and it really does replace — but it
+        // carries the operator's own keys across. `profile` is the whole point
+        // of §13's multi-account seam and discovery cannot supply it, so a
+        // replacement that dropped it would silently delete the one setting
+        // the refusal above existed to protect.
         let forced = connect(&path, true);
         assert_eq!(forced.outcome, Wrote::Written);
+        let after = fs::read_to_string(&path).expect("file");
         assert!(
-            !fs::read_to_string(&path)
-                .expect("file")
-                .contains("profile = \"work\""),
-            "--force replaces"
+            after.contains("profile = \"work\"") && after.contains("monthly_allowance = 300"),
+            "--force keeps operator keys:
+{after}"
+        );
+        assert!(
+            after.contains("weekly = true"),
+            "and still refreshes the rest:
+{after}"
         );
     }
 
@@ -576,10 +725,65 @@ mod tests {
             "nothing changed, so nothing was rewritten — including the date it says it was written"
         );
 
-        // And a comment-only hand edit is still no change: comments carry no
-        // settings, so being told they conflict would be noise.
+        // A comment-only difference is never a *conflict* — settings are what
+        // may not be clobbered — but it is a rewrite, because the comments are
+        // where discovery's findings live. The trade is deliberate: a note an
+        // operator adds is regenerated away, and in exchange a login between
+        // two connects cannot leave the file insisting they are signed out.
+        // Their real edits (`profile`, `monthly_allowance`, `endpoint`) survive
+        // both paths — see `an_existing_file_that_differs_is_never_clobbered`.
         fs::write(&path, format!("# my own note\n{first}")).expect("annotate");
-        assert_eq!(connect(&path, false).outcome, Wrote::Unchanged);
+        assert_eq!(connect(&path, false).outcome, Wrote::Written);
+    }
+
+    #[test]
+    fn a_login_between_connects_updates_the_file() {
+        // Auth state is rendered only as a comment, so a settings-only
+        // comparison reported `unchanged` and left the file telling an operator
+        // who had just logged in that they were not signed in.
+        let path = scratch("relogin");
+        let with = |auth: AuthState| Machine {
+            adapters: vec![FakeAdapter {
+                id: "claude-code",
+                discovery: Some(Discovery {
+                    auth,
+                    models: Vec::new(),
+                    shape: Some(PoolKind::SubscriptionWindow),
+                    notes: Vec::new(),
+                }),
+            }],
+        };
+        let opts = |force| ConnectOptions {
+            pools_path: Some(path.clone()),
+            force,
+        };
+        run_with(
+            &opts(false),
+            &with(AuthState::NotAuthenticated),
+            ["claude-code"],
+        )
+        .expect("first connect");
+        assert!(
+            fs::read_to_string(&path)
+                .expect("file")
+                .contains("NOT signed in"),
+            "precondition"
+        );
+
+        let second = run_with(
+            &opts(false),
+            &with(AuthState::Authenticated),
+            ["claude-code"],
+        )
+        .expect("second connect");
+        assert_eq!(second.outcome, Wrote::Written, "the auth state changed");
+        assert!(
+            !fs::read_to_string(&path)
+                .expect("file")
+                .contains("NOT signed in"),
+            "the file must not still say the operator is signed out:\n{}",
+            fs::read_to_string(&path).expect("file")
+        );
     }
 
     #[test]
@@ -593,7 +797,17 @@ mod tests {
                 discovery: Some(Discovery {
                     auth: AuthState::Authenticated,
                     // A roster that has moved on without the catalog.
-                    models: vec!["gpt-6".to_owned()],
+                    // Overlaps the roster — zero overlap is a format
+                    // mismatch, not a stale catalog — but has moved on from
+                    // the frontier slug the second opinion depends on.
+                    models: [
+                        "gpt-5-mini",
+                        "gemini-3.1-pro",
+                        "claude-sonnet-5",
+                        "claude-opus-5",
+                    ]
+                    .map(str::to_owned)
+                    .to_vec(),
                     shape: Some(PoolKind::Credits),
                     notes: Vec::new(),
                 }),
@@ -668,7 +882,7 @@ mod tests {
             return;
         };
         let discovery = crate::agent::claude::ClaudeCodeAdapter
-            .discover()
+            .discover(&caps)
             .expect("discovery never fails on a CLI that probes");
         // Whatever it answers, it must be one of the three states and it must
         // explain itself — including when the answer is "could not tell".

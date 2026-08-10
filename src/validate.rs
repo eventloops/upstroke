@@ -191,7 +191,11 @@ pub fn run(opts: &ValidateOptions) -> Result<Report, TactusError> {
             to_row(task, chain.clone(), second)
         })
         .collect();
-    let (observations, run_id) = latest_run_observations(&opts.config_root);
+    let (observations, run_id) = latest_run_observations(
+        &opts.config_root,
+        !analysis.config.pools.is_empty(),
+        &mut warnings,
+    );
     Ok(Report {
         rows,
         warnings,
@@ -291,15 +295,37 @@ fn capacity_echo(cfg: &Config, obs: &capacity::Observations, run: Option<&str>) 
 /// A missing or unreadable run is not an error here. `validate` describes a
 /// plan; a broken run directory beside it is somebody else's problem, and
 /// refusing to preview a plan over one would be a strange trade.
-fn latest_run_observations(repo_root: &Path) -> (capacity::Observations, Option<String>) {
+/// `has_pools` short-circuits the whole fold. With no pools connected the
+/// capacity block is one line and the observations are never consulted, so
+/// parsing an entire run's log for it is work with no reader — and `validate`
+/// is the fast, zero-spend iteration loop §18 puts on day one.
+fn latest_run_observations(
+    repo_root: &Path,
+    has_pools: bool,
+    warnings: &mut Vec<String>,
+) -> (capacity::Observations, Option<String>) {
+    let none = || (capacity::Observations::default(), None);
+    if !has_pools {
+        return none();
+    }
     let Some(run_id) = crate::rundir::latest_run(repo_root) else {
-        return (capacity::Observations::default(), None);
+        return none();
     };
     let events_path = crate::rundir::public_dir(repo_root, &run_id).join("events.jsonl");
     let mut ignored = Vec::new();
     match crate::events::read_all(&events_path, &mut ignored) {
         Ok(events) => (capacity::observe(&events), Some(run_id)),
-        Err(_) => (capacity::Observations::default(), None),
+        // A run that exists but cannot be folded is not "no run" — and
+        // `read_all`'s refusal ("the log has been rewritten…") is exactly the
+        // loud error the event-log design exists to produce, so swallowing it
+        // and reporting an empty repository hid two things at once.
+        Err(error) => {
+            warnings.push(format!(
+                "run {run_id} exists but its event log could not be folded for self-metered \
+                 spend ({error}); the capacity block below rests on rate-limit signals alone"
+            ));
+            none()
+        }
     }
 }
 
@@ -579,11 +605,22 @@ mod tests {
             plan_path: PathBuf::from(plan),
             config_path: None,
             config_root: hermetic_root,
-            pools_path: Some(
-                env::temp_dir()
-                    .join("tactus-validate-missing")
-                    .join("p.toml"),
-            ),
+            pools_path: Some({
+                // A real, empty pools file: an explicit `--pools` that does not
+                // exist is a hard error, and `None` would reach for the
+                // operator's own `~/.tactus/pools.toml`.
+                let dir =
+                    env::temp_dir().join(format!("tactus-validate-nopools-{}", std::process::id()));
+                fs::create_dir_all(&dir).expect("scratch dir");
+                let path = dir.join("pools.toml");
+                fs::write(
+                    &path,
+                    "# no pools
+",
+                )
+                .expect("empty pools file");
+                path
+            }),
         }
     }
 

@@ -121,7 +121,7 @@ impl AgentAdapter for ClaudeCodeAdapter {
     /// `claude auth status --json` — a zero-spend auth probe that handles no
     /// token and reads no credential file: the CLI answers about itself, and
     /// this reads its answer.
-    fn discover(&self) -> Result<Discovery, TactusError> {
+    fn discover(&self, _caps: &Caps) -> Result<Discovery, TactusError> {
         let invocation = locate()?;
         let out = proc::run_with_timeout(
             invocation.command(&["auth".to_owned(), "status".to_owned(), "--json".to_owned()]),
@@ -259,7 +259,6 @@ fn parse_output(out: &ProcessOutput) -> Outcome {
         session_id: None,
         usage: None,
         cost_usd: None,
-        pool_drain: None,
         transcript_path: PathBuf::new(),
         duration: out.duration,
     };
@@ -366,26 +365,7 @@ fn parse_auth_status(out: &ProcessOutput) -> Discovery {
         .get("apiProvider")
         .and_then(Value::as_str)
         .unwrap_or_default();
-    let described = format!("{method} {provider}").to_ascii_lowercase();
-    // Only two readings are confident enough to act on. Anything else leaves
-    // `shape` as None and lets the caller apply a documented default it can
-    // then tell the operator about.
-    discovery.shape = if described.contains("bedrock")
-        || described.contains("vertex")
-        || described.contains("api")
-        || described.contains("key")
-    {
-        Some(PoolKind::ApiKey)
-    } else if described.contains("subscription")
-        || described.contains("claudeai")
-        || described.contains("oauth")
-        || described.contains("max")
-        || described.contains("pro")
-    {
-        Some(PoolKind::SubscriptionWindow)
-    } else {
-        None
-    };
+    discovery.shape = classify_shape(method, provider);
     if !method.is_empty() || !provider.is_empty() {
         discovery
             .notes
@@ -399,6 +379,45 @@ fn parse_auth_status(out: &ProcessOutput) -> Discovery {
         );
     }
     discovery
+}
+
+/// §13's two billing shapes, from what the CLI says about the account.
+///
+/// Whole tokens against known sets, not substrings. Substring matching read
+/// "api" and "pro" out of the middle of unrelated words — `pro` sits inside
+/// `provider` — and, worse, tested the api-key set first, so a description
+/// carrying both an api-ish and a subscription-ish word came out as `ApiKey`.
+///
+/// A wrong answer here is worse than no answer, and asymmetrically so:
+/// `connect` prints "kind below is a default, not something detected" only when
+/// this returns `None`, so a confident misclassification is written into the
+/// pools file with the caveat suppressed. Anything ambiguous — a description
+/// matching both sets, or neither — is therefore `None` on purpose.
+fn classify_shape(method: &str, provider: &str) -> Option<PoolKind> {
+    const API: [&str; 6] = ["api", "apikey", "api_key", "key", "bedrock", "vertex"];
+    const SUBSCRIPTION: [&str; 7] = [
+        "subscription",
+        "claudeai",
+        "claude.ai",
+        "oauth",
+        "max",
+        "pro",
+        "team",
+    ];
+    let tokens: Vec<String> = format!("{method} {provider}")
+        .to_ascii_lowercase()
+        .split(|c: char| !c.is_ascii_alphanumeric() && c != '.')
+        .filter(|token| !token.is_empty())
+        .map(str::to_owned)
+        .collect();
+    let matches = |set: &[&str]| tokens.iter().any(|t| set.contains(&t.as_str()));
+    match (matches(&API), matches(&SUBSCRIPTION)) {
+        (true, false) => Some(PoolKind::ApiKey),
+        (false, true) => Some(PoolKind::SubscriptionWindow),
+        // Both or neither: say so by saying nothing, and let the writer mark
+        // the pool's kind as the default it is.
+        _ => None,
+    }
 }
 
 fn first_non_empty<'a>(candidates: impl IntoIterator<Item = Option<&'a str>>) -> Option<String> {

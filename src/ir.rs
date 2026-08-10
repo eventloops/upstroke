@@ -241,19 +241,17 @@ pub struct Usage {
     pub num_turns: Option<u32>,
 }
 
-/// Pool units consumed by an attempt. Stub until the capacity engine (§13);
-/// adapters leave it `None`.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct PoolDrain {
-    pub pool: String,
-    pub tokens: Option<u64>,
-    pub usd: Option<f64>,
-}
-
 /// §7 `Outcome` — what one agent attempt produced. The adapter fills status,
 /// session, usage, and cost from process output; the engine owns `diff`
-/// (invariant 3: ground truth is the engine-captured diff), `transcript_path`,
-/// and `pool_drain`.
+/// (invariant 3: ground truth is the engine-captured diff) and
+/// `transcript_path`.
+///
+/// There is no per-attempt pool field here. §13's second currency is recorded
+/// where the attribution actually lives — `AttemptRecord.pool` and
+/// `ReviewRecord.pool`, set by the engine from the pools file — because an
+/// adapter has no idea which subscription the engine bound it to. A stub that
+/// every adapter filled with `None` and nothing ever read was a second,
+/// dead mechanism for a job the first one does.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Outcome {
     pub status: OutcomeStatus,
@@ -268,7 +266,6 @@ pub struct Outcome {
     /// API-equivalent dollars as reported by the CLI (subscription spend is
     /// notional — §13).
     pub cost_usd: Option<f64>,
-    pub pool_drain: Option<PoolDrain>,
     pub transcript_path: PathBuf,
     pub duration: Duration,
 }

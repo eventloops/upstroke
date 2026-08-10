@@ -1218,7 +1218,15 @@ mod tests {
         std::fs::create_dir_all(&dir).expect("scratch dir");
         let path = dir.join(name);
         std::fs::write(&path, body).expect("write config");
+        // A real, empty file: an explicit pools path that does not exist is a
+        // hard error, and `None` would read the operator's own pools file.
         let missing = dir.join("no-pools.toml");
+        std::fs::write(
+            &missing,
+            "# no pools
+",
+        )
+        .expect("empty pools file");
         let mut warnings = Vec::new();
         crate::config::load(Some(&path), &dir, Some(&missing), &mut warnings).expect("load")
     }

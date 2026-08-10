@@ -49,7 +49,8 @@ use std::collections::BTreeMap;
 use std::fmt;
 use std::time::Duration;
 
-use crate::events::{AttemptRecord, Event, EventBody};
+use crate::events::{AttemptRecord, Event, EventBody, ReviewPassOutcome};
+use crate::ladder::FailureKind;
 
 /// §13's pool shapes. Which one a pool is decides which estimator rule applies,
 /// so an unknown value is a config error rather than a warning.
@@ -321,11 +322,50 @@ pub fn observe(events: &[Event]) -> Observations {
             EventBody::AttemptFinished { data, .. }
             | EventBody::AttemptInterrupted { data, .. } => {
                 accumulate(&mut obs.self_spend, data);
+                retire_signals(&mut obs.exhausted, data);
             }
             _ => {}
         }
     }
     obs
+}
+
+/// Withdraw the exhausted mark from any pool this attempt proves is serving
+/// again.
+///
+/// Without this a rate limit is permanent: `exhausted` was only ever inserted
+/// into, nothing emits a recovery event, and [`Confidence::Signal`] outranks
+/// every other source **by design** — so the one thing that could correct the
+/// record was the one thing forbidden from doing so. A pool that refused an
+/// attempt at 10:00, came back at 10:05 and served the rest of the run still
+/// read `exhausted [signal]` at midnight, on the same line that reported the
+/// successful attempts it had served since.
+///
+/// Events arrive in order, so a later signal re-marks a pool this retired —
+/// which is right: the pool went down again.
+///
+/// What counts as proof is deliberately narrow. A *completed* attempt reached
+/// the model and got an answer, whatever the verdict on its code — a gate
+/// failure says nothing about the subscription. A rate-limited one proves the
+/// opposite. An interrupted one proves nothing at all: the engine died without
+/// ever learning whether a reply was coming.
+fn retire_signals(exhausted: &mut BTreeMap<String, Option<String>>, record: &AttemptRecord) {
+    let served = record
+        .failure
+        .as_ref()
+        .is_none_or(|f| !matches!(f.kind, FailureKind::RateLimited | FailureKind::Interrupted));
+    if served && let Some(pool) = &record.pool {
+        exhausted.remove(pool);
+    }
+    // A review pass that reached a verdict proves its own pool served, which on
+    // a cross-vendor second opinion is a different subscription entirely.
+    for review in &record.reviews {
+        if review.outcome != ReviewPassOutcome::Unavailable
+            && let Some(pool) = &review.pool
+        {
+            exhausted.remove(pool);
+        }
+    }
 }
 
 /// The same fold, over attempt records rather than events — what the ledger
@@ -373,9 +413,18 @@ pub enum Remaining {
     Unknown,
     /// A rate-limit signal said so. Ground truth.
     Exhausted,
-    /// Fraction of the allowance still available after `safety_margin` and
-    /// `reserve`, clamped to `0.0..=1.0`.
-    Fraction(f64),
+    /// An **upper bound** on the fraction still available, after
+    /// `safety_margin` and `reserve`, clamped to `0.0..=1.0`.
+    ///
+    /// Deliberately not "the fraction remaining". Self-metering sees only what
+    /// this engine spawned in this repository, so `1 − draw/allowance` is what
+    /// is left *if nothing else drew on the pool* — and something else almost
+    /// always did: earlier runs, other repositories, and the operator's own
+    /// interactive sessions (§13's source 3, which v0.1 parses and does not
+    /// read). Every one of those can only reduce what is left, never increase
+    /// it, so the figure is sound as a ceiling and false as a measurement.
+    /// Rendered with `≤` for exactly that reason.
+    AtMost(f64),
     /// Hardware-bound rather than quota-bound (§13's local pools).
     Unmetered,
 }
@@ -385,7 +434,7 @@ impl fmt::Display for Remaining {
         match self {
             Self::Unknown => f.write_str("unknown"),
             Self::Exhausted => f.write_str("exhausted"),
-            Self::Fraction(fraction) => write!(f, "{:.0}%", fraction * 100.0),
+            Self::AtMost(bound) => write!(f, "≤{:.0}%", bound * 100.0),
             Self::Unmetered => f.write_str("unmetered"),
         }
     }
@@ -515,15 +564,22 @@ fn estimate_one(pool: &Pool, obs: &Observations) -> PoolEstimate {
     {
         let raw = 1.0 - (usd / allowance);
         if take(
-            Remaining::Fraction(effective_remaining(raw, pool)),
+            Remaining::AtMost(effective_remaining(raw, pool)),
             Confidence::SelfMetered,
-        ) && spend.unpriced > 0
-        {
-            notes.push(format!(
-                "{} attempt(s) on this pool reported no spend, so the draw behind this estimate \
-                 is a floor (§13)",
-                spend.unpriced
-            ));
+        ) {
+            notes.push(
+                "a ceiling, not a measurement: this counts only what tactus spawned in this \
+                 repository, so earlier runs, other repositories, and your own interactive \
+                 sessions have all drawn against the same allowance unseen"
+                    .to_owned(),
+            );
+            if spend.unpriced > 0 {
+                notes.push(format!(
+                    "{} attempt(s) on this pool reported no spend, so even the draw behind that \
+                     ceiling is a floor (§13)",
+                    spend.unpriced
+                ));
+            }
         }
     }
 
@@ -716,7 +772,7 @@ pub struct AgentStatus {
 /// spend from the latest run in this repo, and a live probe per agent.
 pub fn report(
     opts: &CapacityOptions,
-    adapters: &dyn crate::engine::AdapterSource,
+    adapters: &dyn crate::agent::AdapterSource,
 ) -> Result<CapacityReport, crate::error::TactusError> {
     let mut warnings = Vec::new();
     let config = crate::config::load(
@@ -762,8 +818,8 @@ pub fn report(
         };
         match adapter.probe().and_then(|caps| {
             adapter
-                .discover()
-                .map(|discovery| (caps.version, discovery))
+                .discover(&caps)
+                .map(|discovery| (caps.version.clone(), discovery))
         }) {
             Ok((version, discovery)) => {
                 // D1's cross-check: where the CLI can actually list its models,
@@ -932,10 +988,95 @@ mod tests {
         assert_eq!(estimates[0].confidence, Confidence::SelfMetered);
         // Half the allowance spent, and the margins take it down from there —
         // it must never come out at the raw 50%.
-        let Remaining::Fraction(left) = estimates[0].remaining else {
-            panic!("expected a fraction: {:?}", estimates[0].remaining);
+        let Remaining::AtMost(left) = estimates[0].remaining else {
+            panic!("expected an upper bound: {:?}", estimates[0].remaining);
         };
         assert!((left - 0.225).abs() < 1e-9, "left: {left}");
+        // And it is presented as the ceiling it is, not as a measurement: this
+        // counts one run's draw against a *monthly* allowance, so every earlier
+        // run and every interactive session is unseen.
+        assert!(
+            estimates[0].describe().contains("≤22%"),
+            "{}",
+            estimates[0].describe()
+        );
+        assert!(
+            estimates[0]
+                .notes
+                .iter()
+                .any(|n| n.contains("a ceiling, not a measurement")),
+            "notes: {:?}",
+            estimates[0].notes
+        );
+    }
+
+    #[test]
+    fn a_pool_that_serves_again_stops_reading_as_exhausted() {
+        // A signal is ground truth about the moment it was recorded, not
+        // forever. Without retirement `Confidence::Signal` outranks every
+        // source that could correct it, so one rate limit at 10:00 makes the
+        // pool read as empty at midnight — on the same line that reports the
+        // attempts it served in between.
+        use crate::events::{AttemptRecord, Event, EventBody, PoolExhausted};
+        use crate::ladder::{FailureKind, FailureOrigin};
+
+        let record = |failure: Option<FailureKind>| {
+            Event::now(EventBody::AttemptFinished {
+                task: "t1".to_owned(),
+                attempt: 1,
+                rung: 0,
+                profile: "p".to_owned(),
+                data: Box::new(AttemptRecord {
+                    attempt: 1,
+                    tier: "small".to_owned(),
+                    model: "m".to_owned(),
+                    pool: Some("claude-max".to_owned()),
+                    resumed: false,
+                    duration: Duration::ZERO,
+                    cost_usd: None,
+                    reviews: Vec::new(),
+                    session_id: None,
+                    failure: failure.map(|kind| crate::events::FailureRecord {
+                        kind,
+                        origin: FailureOrigin::Worker,
+                        reason: "r".to_owned(),
+                    }),
+                }),
+            })
+        };
+        let signal = Event::now(EventBody::PoolExhausted {
+            task: "t1".to_owned(),
+            data: PoolExhausted {
+                pool: "claude-max".to_owned(),
+                agent: "claude-code".to_owned(),
+                reset_at: None,
+                detail: "5-hour limit reached".to_owned(),
+            },
+        });
+
+        // Signal, then an attempt that completed: the pool is serving.
+        let obs = observe(&[signal.clone(), record(None)]);
+        assert!(obs.exhausted.is_empty(), "{:?}", obs.exhausted);
+
+        // A gate failure also proves the model answered — the verdict on the
+        // code says nothing about the subscription.
+        let obs = observe(&[signal.clone(), record(Some(FailureKind::GateFailed))]);
+        assert!(obs.exhausted.is_empty(), "{:?}", obs.exhausted);
+
+        // A second rate limit proves the opposite, and an interrupted attempt
+        // proves nothing at all — the engine died without learning whether a
+        // reply was coming.
+        for still_down in [FailureKind::RateLimited, FailureKind::Interrupted] {
+            let obs = observe(&[signal.clone(), record(Some(still_down))]);
+            assert!(
+                obs.exhausted.contains_key("claude-max"),
+                "{still_down:?} must not retire the signal"
+            );
+        }
+
+        // And order is respected: recovery then a fresh outage stays down.
+        let obs = observe(&[signal.clone(), record(None), signal]);
+        assert!(obs.exhausted.contains_key("claude-max"));
     }
 
     #[test]

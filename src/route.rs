@@ -162,13 +162,14 @@ mod tests {
     use std::path::PathBuf;
 
     fn default_config() -> Config {
-        let missing = std::env::temp_dir()
-            .join("tactus-route-missing")
-            .join("x.toml");
         let mut warnings = Vec::new();
         let hermetic = std::env::temp_dir().join("tactus-route-hermetic");
         let _ = std::fs::create_dir_all(&hermetic);
-        config::load(None, &hermetic, Some(&missing), &mut warnings).expect("default config")
+        // A real, empty pools file: an explicit pools path that does not exist
+        // is a hard error, and `None` would read the operator's own.
+        let empty = hermetic.join("no-pools.toml");
+        std::fs::write(&empty, "# no pools\n").expect("empty pools file");
+        config::load(None, &hermetic, Some(&empty), &mut warnings).expect("default config")
     }
 
     fn task(kind: TaskKind) -> Task {
@@ -249,6 +250,12 @@ mod tests {
         )
         .expect("write config");
         let missing = dir.join("missing-pools.toml");
+        std::fs::write(
+            &missing,
+            "# no pools
+",
+        )
+        .expect("empty pools file");
         let mut warnings = Vec::new();
         let cfg = config::load(Some(&cfg_path), &dir, Some(&missing), &mut warnings).expect("load");
 
@@ -289,6 +296,12 @@ mod tests {
         )
         .expect("write config");
         let missing = dir.join("missing-pools.toml");
+        std::fs::write(
+            &missing,
+            "# no pools
+",
+        )
+        .expect("empty pools file");
         let mut warnings = Vec::new();
         let cfg = config::load(Some(&cfg_path), &dir, Some(&missing), &mut warnings).expect("load");
 

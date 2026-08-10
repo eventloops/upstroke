@@ -197,11 +197,10 @@ impl AgentAdapter for CopilotAdapter {
     /// here, and it still is: [`Caps::model_list`] gates any future
     /// enumeration, so the day this CLI grows one, `connect` starts
     /// cross-checking the catalog without another decision being made.
-    fn discover(&self) -> Result<Discovery, TactusError> {
+    fn discover(&self, caps: &Caps) -> Result<Discovery, TactusError> {
         // Still located, so `connect` fails this agent the same way pre-flight
         // would rather than writing a pool for a binary that is not there.
         let invocation = locate()?;
-        let caps = self.probe()?;
         let mut discovery = Discovery::unknown().with_note(format!(
             "`{}` reports no non-interactive auth state, so whether this account is signed in \
              could not be checked without spending",
@@ -326,7 +325,6 @@ fn parse_output(out: &ProcessOutput) -> Outcome {
         session_id: None,
         usage: None,
         cost_usd: None,
-        pool_drain: None,
         transcript_path: PathBuf::new(),
         duration: out.duration,
     };
