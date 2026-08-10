@@ -1383,6 +1383,15 @@ impl Run<'_> {
             // — capacity-driven routing is v0.2 (§13) — only whether the next
             // attempt happens at all.
             if let Some(exceeded) = self.budget_breach(index) {
+                // The tree may still hold a rejected attempt's edits, kept by
+                // the ladder below for a resumed retry that is now never going
+                // to run. Handing those back is the one thing §14 rules out —
+                // they are unverified, and staged changes follow `git switch`
+                // onto whatever branch the operator visits next. Nor can they
+                // be saved for the resume: `run_resumed` discards every
+                // uncommitted path and clears the session they belong to, so
+                // keeping them past this point buys nothing at all.
+                self.workspace.discard_uncommitted()?;
                 self.emit(EventBody::BudgetExceeded { data: exceeded })?;
                 return Ok(false);
             }
@@ -7931,6 +7940,66 @@ mod tests {
         assert_eq!(
             signals, 1,
             "one outage is one fact; the deferrals are already on `task_deferred`"
+        );
+    }
+
+    #[test]
+    fn a_budget_stop_hands_back_a_clean_tree() {
+        // §14 keeps the working tree for a resumed same-rung retry, because
+        // that retry re-gates the *cumulative* diff. The ceiling is checked at
+        // the top of the same loop, so a budget reached between the two
+        // returns to the operator with a rejected attempt's edits still staged
+        // in their repository — and staged changes follow `git switch` onto
+        // whatever branch is visited next. Observed on a real repository:
+        // run 01KZNMR59E5ATC9MBYY29WZB6E left two files staged after exit 3.
+        //
+        // Keeping them buys nothing even in principle: `run_resumed` discards
+        // every uncommitted path and clears `session`/`resume_next` on every
+        // task, so the retry those edits were preserved for cannot use them.
+        let repo = temp_engine_repo("budgetdirty");
+        seed(
+            &repo,
+            "## One\n<!-- tactus: id=t1 kind=implement depends= -->\n",
+            Some("[routing]\nimplement = { chain = [\"small\"], attempts_per = 2 }\n"),
+        );
+        let mut opts = options(&repo);
+        opts.config_path = Some(repo.join("tactus.toml"));
+        // Enough for the first attempt, not for the retry that attempt asks
+        // for — so the stop lands exactly between the two.
+        opts.budget_usd = Some(0.05);
+        let rejected = source(vec![Effect::EditFile], vec![ReviewBehavior::Fail]);
+        let stopped = run_with(&opts, &rejected).expect("run");
+        assert_eq!(stopped.outcome(), RunOutcome::BudgetExceeded, "{stopped:?}");
+
+        let workspace = Workspace::open(&repo).expect("open");
+        let left = workspace.uncommitted_summary().expect("status");
+        assert!(
+            left.is_empty(),
+            "a clean stop left the rejected attempt in the operator's tree: {left:?}"
+        );
+
+        // And the run is still exactly as resumable as it was before.
+        let mut resume_opts = resume_options(&repo, &stopped.run_id);
+        resume_opts.budget_usd = Some(10.0);
+        let accepted = source(vec![Effect::EditFile], vec![ReviewBehavior::Pass]);
+        let resumed = resume_harness(
+            &resume_opts,
+            &Harness {
+                adapters: &accepted,
+                answers: None,
+                sleeper: None,
+            },
+        )
+        .expect("resume");
+        assert_eq!(resumed.outcome(), RunOutcome::Complete, "{resumed:?}");
+        assert!(committed(&resumed, "t1"));
+        assert!(
+            !resumed
+                .warnings
+                .iter()
+                .any(|w| w.contains("discarded") && w.contains("uncommitted")),
+            "nothing should have been left for the resume to discard: {:?}",
+            resumed.warnings
         );
     }
 
