@@ -95,7 +95,16 @@ pub fn extract_version(stdout: &str) -> String {
             };
             numeric(parts.next()) && numeric(parts.next()) && parts.next().is_some()
         })
-        .map(|t| t.trim_start_matches('v').to_owned())
+        // Trailing punctuation is not part of a version. The Copilot CLI ends
+        // its line with a full stop — `GitHub Copilot CLI 1.0.78.` — which
+        // otherwise rides along into `Caps.version` and out through every
+        // message that quotes it (`tactus capacity`, and the probe refusal that
+        // names the version an adapter would not support).
+        .map(|t| {
+            t.trim_start_matches('v')
+                .trim_end_matches(['.', ',', ';'])
+                .to_owned()
+        })
         .unwrap_or_else(|| first_line.to_owned())
 }
 
@@ -145,6 +154,14 @@ mod tests {
         assert_eq!(extract_version("2.1.35 (Claude Code)\n"), "2.1.35");
         assert_eq!(extract_version("claude v1.0.128\n"), "1.0.128");
         assert_eq!(extract_version("weird output\n"), "weird output");
+        // Verbatim from the Copilot CLI: the sentence's full stop is not part
+        // of the version, and rode into `Caps.version` when it was not trimmed.
+        assert_eq!(
+            extract_version(
+                "GitHub Copilot CLI 1.0.78.\nRun 'copilot update' to check for updates.\n"
+            ),
+            "1.0.78"
+        );
     }
 
     #[test]
