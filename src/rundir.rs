@@ -18,7 +18,8 @@
 //! `run_started` event records where that directory is, so the record stays
 //! self-describing rather than depending on this function's defaults.
 
-use std::fs::{self, File};
+use std::fs::{self, File, TryLockError};
+use std::io;
 use std::path::{Path, PathBuf};
 
 use crate::error::TactusError;
@@ -323,17 +324,30 @@ impl RunLock {
                 path: path.clone(),
                 source,
             })?;
-        match file.try_lock() {
-            Ok(()) => Ok(Self { _file: file }),
-            Err(_) => Err(TactusError::Refused {
-                message: format!(
-                    "another tactus process is already driving run `{}` (lock held on {}). Two \
-                     engines would interleave events and fight over the same branch — wait for \
-                     it to finish, or stop it first.",
-                    public.file_name().unwrap_or_default().to_string_lossy(),
-                    path.display()
-                ),
-            }),
+        // Only *contention* may be reported as contention. `flock` is
+        // interruptible, so a signal — SIGCHLD from any of the git and agent
+        // subprocesses a run spawns — makes `try_lock` fail with `Interrupted`
+        // having learned nothing about who holds what. Treating every error as
+        // "someone else has it" turned that into a run refusing to start,
+        // naming a second engine that does not exist. Retry the interrupted
+        // case, and let a genuine IO failure surface as one.
+        loop {
+            return match file.try_lock() {
+                Ok(()) => Ok(Self { _file: file }),
+                Err(TryLockError::WouldBlock) => Err(TactusError::Refused {
+                    message: format!(
+                        "another tactus process is already driving run `{}` (lock held on {}). \
+                         Two engines would interleave events and fight over the same branch — \
+                         wait for it to finish, or stop it first.",
+                        public.file_name().unwrap_or_default().to_string_lossy(),
+                        path.display()
+                    ),
+                }),
+                Err(TryLockError::Error(source)) if source.kind() == io::ErrorKind::Interrupted => {
+                    continue;
+                }
+                Err(TryLockError::Error(source)) => Err(TactusError::Io { path, source }),
+            };
         }
     }
 }

@@ -46,12 +46,28 @@ jobs:
       # is the confirmation.
       #
       # The cost is a slower suite and a hiding place for the next such race,
-      # so this should not survive. The real fix is to stop the tests sharing
-      # process-wide state; one confirmed instance is `no_pools()`, which
-      # rewrites a single `/tmp/tactus-engine-nopools-<pid>/pools.toml` that
-      # every engine test truncates while others read it. That was not proven
-      # to be the culprit, and finding the culprit needs a Linux reproduction
-      # rather than more inference from a Windows box.
+      # so this should not survive.
+      #
+      # Reproduced in a Linux container (rust:1, 8 cores): 2 of 4 parallel runs
+      # failed, a different test each time, always with `RunLock::acquire`
+      # reporting the run as already driven. Two findings from that, and only
+      # the first is fixed:
+      #
+      #  1. `acquire` mapped EVERY `try_lock` error to "another process holds
+      #     it", including `Interrupted` — and `flock` is interruptible, which
+      #     a run spawning git and agent subprocesses does constantly. Fixed;
+      #     a spurious refusal was reachable in production, not just in tests.
+      #  2. It did NOT fix the race: 3 of 8 runs still fail. With EINTR now
+      #     retried, those are genuine `WouldBlock`, i.e. a lock still held
+      #     after the run that took it returned. A `/proc/self/fd` dump at the
+      #     failure showed several run.lock descriptors open at once. Whether
+      #     those are concurrent tests legitimately holding their own locks or
+      #     a leak is the open question, and it is where the next attempt
+      #     should start.
+      #
+      # `no_pools()` also writes one shared /tmp/…/pools.toml that every engine
+      # test rewrites while others read it — real, unrelated to the lock, and
+      # worth fixing regardless.
       - run: cargo test --all-targets -- --test-threads=1
 
   lint:
