@@ -9,12 +9,17 @@ only what passes.
 It never edits a file, never implements an agentic loop, and never calls a model API. It is the
 conductor, not an instrument.
 
-> **Status: v0.1 feature-complete, not yet proven end to end.** The build order is public in
+> **Status: v0.1 done — proven end to end on a real repository.** The build order is public in
 > `DESIGN.md` §21; steps 1–10 are done — plan ingestion, routing, the Claude Code and Copilot
 > adapters, the sequential engine with git ownership, gates, cross-family review, the
 > verification ladder, the event log with resume and status, and the capacity engine
-> **read-only**. What remains for v0.1 is the acceptance run on a real repository. Parallelism,
-> worktrees, Aider, and capacity-driven routing are v0.2.
+> **read-only**. §21's acceptance run passed on 2026-08-10: a five-task plan completed
+> unattended for $6.04, with a small model committing first try, a same-rung retry recovering
+> from a reviewer's verdict, an escalation to a stronger rung, a design question parking one
+> task while an independent one kept moving, and the engine killed mid-attempt and resumed to
+> completion. It found two reporting defects, both fixed and re-verified on the live run —
+> `acceptance/RESULT.md` is the write-up. Parallelism, worktrees, Aider, and capacity-driven
+> routing are v0.2.
 
 ## What works today
 
