@@ -42,6 +42,7 @@ impl RunStatus {
             &self.plan,
             &self.state,
             self.warnings.clone(),
+            self.running,
         )
     }
 
@@ -82,11 +83,21 @@ pub fn load(repo_root: &Path, run_id: Option<&str>) -> Result<RunStatus, TactusE
 
     let task_ids = plan.tasks.iter().map(|task| task.id.to_string()).collect();
     let mut replayed = events::replay(events, task_ids, &events_path)?;
+    let running = rundir::is_running(&paths.public);
     // Settled in memory only: status is a pure read and must not write to a
     // run it is merely looking at. A resume records the same settlement as
     // events instead.
-    let interrupted = replayed.state.settle_interrupted();
-    let running = rundir::is_running(&paths.public);
+    //
+    // And only for a run nothing is driving. An attempt in flight under a live
+    // engine has not been interrupted — it is working — so settling it here
+    // would report a running attempt as a failure and the whole run as halted.
+    // `status` is the only window into a run that holds its own terminal, so
+    // that reading is worse than no reading at all.
+    let interrupted = if running {
+        0
+    } else {
+        replayed.state.settle_interrupted()
+    };
 
     Ok(RunStatus {
         run_id,
@@ -414,6 +425,7 @@ mod tests {
             halted_at: None,
             questions: Vec::new(),
             budget_stop: None,
+            running: false,
             total_cost_usd: 0.06,
             pool_drain: vec![crate::engine::PoolDrainRow {
                 pool: "claude-max".to_owned(),
@@ -460,6 +472,7 @@ mod tests {
             halted_at: None,
             questions: Vec::new(),
             budget_stop: None,
+            running: false,
             total_cost_usd: 0.0,
             pool_drain: Vec::new(),
         };

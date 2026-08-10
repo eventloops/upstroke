@@ -194,6 +194,16 @@ pub enum TaskRunStatus {
     },
     /// Not attempted because the run halted earlier.
     Skipped,
+    /// An attempt is running right now. Only a live `status` produces this: a
+    /// run that has ended has nothing left in flight.
+    Running {
+        attempt: u32,
+        tier: String,
+        model: String,
+    },
+    /// Its turn has not come yet, and the run is still going — distinct from
+    /// `Skipped`, which means the run ended before this task got a turn.
+    Queued,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -296,6 +306,11 @@ pub struct RunReport {
     /// What each pool drained, folded from this run's own attempts (§13).
     #[serde(default)]
     pub pool_drain: Vec<PoolDrainRow>,
+    /// Whether an engine is driving this run right now. A live run must not be
+    /// rendered as a finished one: its in-flight attempt has not failed, and
+    /// the tasks queued behind it have not been skipped.
+    #[serde(default)]
+    pub running: bool,
 }
 
 /// One pool's line in the ledger: what this run drew from which subscription.
@@ -2086,11 +2101,15 @@ impl Run<'_> {
     /// Settle every task that never ran, then report.
     fn finish(&self) -> RunReport {
         build_report(
-            &self.run_id,
-            &self.branch,
-            self.analysis.gates.iter().map(|g| g.name.clone()).collect(),
-            self.analysis.gates_from_config,
-            self.warnings.clone(),
+            ReportHeader {
+                run_id: &self.run_id,
+                branch: &self.branch,
+                gates: self.analysis.gates.iter().map(|g| g.name.clone()).collect(),
+                gates_from_config: self.analysis.gates_from_config,
+                warnings: self.warnings.clone(),
+                // The engine only reports on itself once it has stopped.
+                running: false,
+            },
             &self.analysis.plan,
             &self.state,
         )
@@ -2108,29 +2127,45 @@ impl RunReport {
         plan: &Plan,
         state: &RunState,
         warnings: Vec<String>,
+        running: bool,
     ) -> Self {
         build_report(
-            &started.run_id,
-            &started.branch,
-            started.gates.clone(),
-            started.gates_from_config,
-            warnings,
+            ReportHeader {
+                run_id: &started.run_id,
+                branch: &started.branch,
+                gates: started.gates.clone(),
+                gates_from_config: started.gates_from_config,
+                warnings,
+                running,
+            },
             plan,
             state,
         )
     }
 }
 
-fn build_report(
-    run_id: &str,
-    branch: &str,
+/// Everything a report needs that is not the plan or the state, kept together
+/// so `build_report` stays readable at its call sites.
+struct ReportHeader<'a> {
+    run_id: &'a str,
+    branch: &'a str,
     gates: Vec<String>,
     gates_from_config: bool,
     warnings: Vec<String>,
-    plan: &Plan,
-    state: &RunState,
-) -> RunReport {
-    let settled = settle(plan, &state.states);
+    /// Whether an engine is driving this run right now.
+    running: bool,
+}
+
+fn build_report(header: ReportHeader<'_>, plan: &Plan, state: &RunState) -> RunReport {
+    let ReportHeader {
+        run_id,
+        branch,
+        gates,
+        gates_from_config,
+        warnings,
+        running,
+    } = header;
+    let settled = settle(plan, &state.states, running);
     let tasks: Vec<TaskReport> = state
         .order
         .iter()
@@ -2138,7 +2173,14 @@ fn build_report(
         // Tasks that never started append in plan order, so the report reads
         // as the run happened and still accounts for everything.
         .chain((0..plan.tasks.len()).filter(|i| !state.order.contains(i)))
-        .map(|index| task_report(&plan.tasks[index], &settled[index], &state.progress[index]))
+        .map(|index| {
+            task_report(
+                &plan.tasks[index],
+                &settled[index],
+                &state.progress[index],
+                running,
+            )
+        })
         .collect();
     let total_cost_usd = tasks
         .iter()
@@ -2168,6 +2210,7 @@ fn build_report(
         budget_stop: state.budget_stop.clone(),
         total_cost_usd,
         pool_drain,
+        running,
     }
 }
 
@@ -2178,7 +2221,7 @@ fn build_report(
 /// moment that question is answered — so if `Blocked` were folded in from the
 /// log, every resume would have to un-fold it. Deriving it fresh from whatever
 /// the log says is true right now means there is nothing to undo.
-fn settle(plan: &Plan, states: &[TaskState]) -> Vec<TaskState> {
+fn settle(plan: &Plan, states: &[TaskState], running: bool) -> Vec<TaskState> {
     let tasks = &plan.tasks;
     let mut settled = states.to_vec();
     // Blocking propagates: a dependent of a blocked task is blocked too.
@@ -2205,10 +2248,15 @@ fn settle(plan: &Plan, states: &[TaskState]) -> Vec<TaskState> {
             break;
         }
     }
-    // Whatever is still Pending was never reached: the run halted.
-    for state in &mut settled {
-        if *state == TaskState::Pending {
-            *state = TaskState::Skipped;
+    // Whatever is still Pending was never reached: the run halted. A run that
+    // is still going has not halted — those tasks are queued, or one of them
+    // is working right now — so leave them Pending for `task_report` to tell
+    // apart.
+    if !running {
+        for state in &mut settled {
+            if *state == TaskState::Pending {
+                *state = TaskState::Skipped;
+            }
         }
     }
     settled
@@ -2238,7 +2286,12 @@ fn last_reason(progress: &Progress) -> String {
         .unwrap_or_else(|| "no attempt on record".to_owned())
 }
 
-fn task_report(task: &Task, state: &TaskState, progress: &Progress) -> TaskReport {
+fn task_report(
+    task: &Task,
+    state: &TaskState,
+    progress: &Progress,
+    running: bool,
+) -> TaskReport {
     let records = &progress.records;
     let last = records.last();
     TaskReport {
@@ -2256,9 +2309,20 @@ fn task_report(task: &Task, state: &TaskState, progress: &Progress) -> TaskRepor
                 reason: last_reason(progress),
             },
             TaskState::Blocked(by) => TaskRunStatus::Blocked { by: by.clone() },
-            // Deferred cannot survive `finish`, and Pending is settled there
-            // too; both mean the run stopped before this task got its turn.
-            TaskState::Deferred | TaskState::Pending | TaskState::Skipped => TaskRunStatus::Skipped,
+            // On an ended run, Deferred cannot survive `finish` and Pending is
+            // settled away, so both mean the run stopped before this task got
+            // its turn. On a live one `settle` leaves them alone, and the
+            // attempt record says which of the two it is.
+            TaskState::Deferred | TaskState::Pending => match &progress.in_flight {
+                Some(flight) => TaskRunStatus::Running {
+                    attempt: flight.attempt,
+                    tier: flight.tier.clone(),
+                    model: flight.model.clone(),
+                },
+                None if running => TaskRunStatus::Queued,
+                None => TaskRunStatus::Skipped,
+            },
+            TaskState::Skipped => TaskRunStatus::Skipped,
         },
         duration: records.iter().map(|r| r.duration).sum(),
         cost_usd: sum_opt(records.iter().map(|r| r.cost_usd)),
@@ -3061,6 +3125,20 @@ impl RunReport {
                 TaskRunStatus::Skipped => {
                     let _ = writeln!(out, "  {}: skipped (run halted)", task.id);
                 }
+                TaskRunStatus::Running {
+                    attempt,
+                    tier,
+                    model,
+                } => {
+                    let _ = writeln!(
+                        out,
+                        "  {}: running now — attempt {attempt} on {tier} ({model})",
+                        task.id
+                    );
+                }
+                TaskRunStatus::Queued => {
+                    let _ = writeln!(out, "  {}: queued", task.id);
+                }
             }
         }
         let open: Vec<&QuestionRecord> = self.questions.iter().filter(|q| q.is_open()).collect();
@@ -3094,6 +3172,21 @@ impl RunReport {
             );
         }
         let _ = writeln!(out, "total: ${:.4} (api-equivalent)", self.total_cost_usd);
+        // A live run has no outcome yet, and every arm below claims one. Say
+        // what is true instead: how far it has got.
+        if self.running {
+            let committed = self
+                .tasks
+                .iter()
+                .filter(|t| matches!(t.status, TaskRunStatus::Committed { .. }))
+                .count();
+            let _ = writeln!(
+                out,
+                "run in progress: {committed} task(s) committed so far on {}",
+                self.branch
+            );
+            return out;
+        }
         match self.outcome() {
             RunOutcome::Halted => {
                 let _ = writeln!(
@@ -5988,6 +6081,67 @@ mod tests {
             "and the run reads as interrupted rather than finished"
         );
         assert_eq!(replayed.state.states[0], TaskState::Pending);
+    }
+
+    #[test]
+    fn a_live_run_reads_as_running_rather_than_halted() {
+        // The settlement above, inverted. A run an engine is still driving has
+        // a dangling attempt at every instant, exactly like a killed one — so
+        // settling unconditionally reports a working attempt as a failure and
+        // the whole run as halted. `status` is the only window into a run that
+        // holds its own terminal, and a window that lies is worse than none.
+        let repo = temp_engine_repo("livestatus");
+        seed(
+            &repo,
+            "## Implement the widget\n<!-- tactus: id=t1 kind=implement depends= -->\n\n\
+             ## Independent\n<!-- tactus: id=t3 kind=implement depends= -->\n",
+            Some("[routing]\nimplement = { chain = [\"small\"], attempts_per = 1 }\n"),
+        );
+        let mut opts = options(&repo);
+        opts.config_path = Some(repo.join("tactus.toml"));
+        let report = run_with(&opts, &fake(Effect::EditFile)).expect("run");
+        let paths = paths_of(&repo, &report.run_id);
+
+        // Rewind to mid-attempt: the shape a live engine's log has the whole
+        // time it is working, not only the shape a kill leaves behind.
+        let text = fs::read_to_string(paths.events()).expect("log");
+        let lines: Vec<&str> = text.lines().collect();
+        let cut = lines
+            .iter()
+            .position(|line| line.contains("\"attempt_finished\""))
+            .expect("an attempt");
+        fs::write(paths.events(), format!("{}\n", lines[..cut].join("\n"))).expect("truncate");
+
+        // With nothing holding the run, that shape still means interrupted.
+        let stopped = replay_of(&repo, &report.run_id);
+        assert!(stopped.interrupted_run());
+        assert!(
+            crate::status::render(&stopped).contains("skipped (run halted)"),
+            "the settled reading is unchanged"
+        );
+
+        // Now hold the lock the way a working engine does.
+        let lock = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(paths.lock_file())
+            .expect("lock file");
+        lock.lock().expect("hold it exclusively");
+
+        let live = replay_of(&repo, &report.run_id);
+        assert!(live.running, "a held lock means an engine is driving this");
+        assert_eq!(
+            live.interrupted, 0,
+            "an attempt in flight has not been interrupted"
+        );
+        let out = crate::status::render(&live);
+        assert!(out.contains("t1: running now"), "{out}");
+        assert!(out.contains("t3: queued"), "{out}");
+        assert!(out.contains("run in progress"), "{out}");
+        for lie in ["small failed", "skipped (run halted)", "run complete"] {
+            assert!(!out.contains(lie), "a live run reported `{lie}`:\n{out}");
+        }
+        let _ = lock.unlock();
     }
 
     #[test]
