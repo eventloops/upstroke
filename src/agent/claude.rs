@@ -344,11 +344,13 @@ fn parse_output(out: &ProcessOutput) -> Outcome {
 /// adapter parses: a missing or malformed field yields
 /// [`AuthState::Unknown`], never an error and never a confident wrong answer.
 ///
-/// The observed shape (Aug 2026) is
-/// `{"loggedIn": bool, "authMethod": "…", "apiProvider": "…"}`. `loggedIn`
-/// drives the auth state; the other two distinguish §13's two billing shapes —
-/// a subscription window from api-key dollars — because that decides which
-/// estimator rule the written pool gets.
+/// The observed signed-out shape (Aug 2026) is
+/// `{"loggedIn": bool, "authMethod": "…", "apiProvider": "…"}`; signed in
+/// (observed 2026-08-10, Max plan) it grows `email`, `orgId`, `orgName`, and
+/// `subscriptionType: "max"`. `loggedIn` drives the auth state; the rest
+/// distinguish §13's two billing shapes — a subscription window from api-key
+/// dollars — because that decides which estimator rule the written pool gets,
+/// and `subscriptionType` is the definitive one where present.
 fn parse_auth_status(out: &ProcessOutput) -> Discovery {
     let mut discovery = Discovery::unknown();
     if out.timed_out {
@@ -377,11 +379,24 @@ fn parse_auth_status(out: &ProcessOutput) -> Discovery {
         .get("apiProvider")
         .and_then(Value::as_str)
         .unwrap_or_default();
-    discovery.shape = classify_shape(method, provider);
+    // Only present while signed in (observed 2026-08-10: `"max"`), and the one
+    // field that names the billing relationship outright rather than implying
+    // it — an enterprise SSO whose `authMethod` matches no token still says
+    // `subscriptionType: "enterprise"` here.
+    let subscription = payload
+        .get("subscriptionType")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    discovery.shape = classify_shape(method, provider, subscription);
     if !method.is_empty() || !provider.is_empty() {
-        discovery
-            .notes
-            .push(format!("auth method `{method}`, provider `{provider}`"));
+        let plan = if subscription.is_empty() {
+            String::new()
+        } else {
+            format!(", plan `{subscription}`")
+        };
+        discovery.notes.push(format!(
+            "auth method `{method}`, provider `{provider}`{plan}"
+        ));
     }
     if discovery.shape.is_none() {
         discovery.notes.push(
@@ -405,9 +420,9 @@ fn parse_auth_status(out: &ProcessOutput) -> Discovery {
 /// this returns `None`, so a confident misclassification is written into the
 /// pools file with the caveat suppressed. Anything ambiguous — a description
 /// matching both sets, or neither — is therefore `None` on purpose.
-fn classify_shape(method: &str, provider: &str) -> Option<PoolKind> {
+fn classify_shape(method: &str, provider: &str, subscription_type: &str) -> Option<PoolKind> {
     const API: [&str; 6] = ["api", "apikey", "api_key", "key", "bedrock", "vertex"];
-    const SUBSCRIPTION: [&str; 7] = [
+    const SUBSCRIPTION: [&str; 8] = [
         "subscription",
         "claudeai",
         "claude.ai",
@@ -415,8 +430,9 @@ fn classify_shape(method: &str, provider: &str) -> Option<PoolKind> {
         "max",
         "pro",
         "team",
+        "enterprise",
     ];
-    let tokens: Vec<String> = format!("{method} {provider}")
+    let tokens: Vec<String> = format!("{method} {provider} {subscription_type}")
         .to_ascii_lowercase()
         .split(|c: char| !c.is_ascii_alphanumeric() && c != '.')
         .filter(|token| !token.is_empty())
@@ -755,5 +771,52 @@ mod tests {
         let caps = ClaudeCodeAdapter.probe().expect("probe should succeed");
         assert!(caps.json_output);
         assert!(!caps.version.is_empty());
+    }
+
+    #[test]
+    fn auth_status_reads_the_signed_in_shape_including_the_plan() {
+        // Verbatim field set observed on a real signed-in machine (2026-08-10,
+        // Max plan), identifiers dummied. `subscriptionType` is the definitive
+        // billing field: it must classify even if `authMethod` were something
+        // no token matches (an enterprise SSO spelling, say).
+        let signed_in = output(
+            Some(0),
+            r#"{"loggedIn":true,"authMethod":"claude.ai","apiProvider":"firstParty",
+                "email":"dev@example.com","orgId":"00000000-0000-0000-0000-000000000000",
+                "orgName":"dev's Organization","subscriptionType":"max"}"#,
+            "",
+        );
+        let discovery = parse_auth_status(&signed_in);
+        assert_eq!(discovery.auth, AuthState::Authenticated);
+        assert_eq!(discovery.shape, Some(PoolKind::SubscriptionWindow));
+        assert!(
+            discovery.notes.iter().any(|n| n.contains("plan `max`")),
+            "the plan is worth telling the operator: {:?}",
+            discovery.notes
+        );
+
+        // The same payload with an unrecognized auth method still classifies,
+        // because subscriptionType alone names the billing relationship.
+        let sso = output(
+            Some(0),
+            r#"{"loggedIn":true,"authMethod":"corp-sso","apiProvider":"firstParty",
+                "subscriptionType":"enterprise"}"#,
+            "",
+        );
+        assert_eq!(
+            parse_auth_status(&sso).shape,
+            Some(PoolKind::SubscriptionWindow)
+        );
+
+        // Signed out (verbatim from this machine, earlier the same day): no
+        // subscriptionType, nothing conclusive — shape honestly None.
+        let signed_out = output(
+            Some(1),
+            r#"{"loggedIn":false,"authMethod":"none","apiProvider":"firstParty"}"#,
+            "",
+        );
+        let discovery = parse_auth_status(&signed_out);
+        assert_eq!(discovery.auth, AuthState::NotAuthenticated);
+        assert_eq!(discovery.shape, None);
     }
 }
