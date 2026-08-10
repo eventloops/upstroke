@@ -37,13 +37,21 @@ jobs:
           git config --global user.email "ci@tactus.local"
           git config --global user.name "tactus CI"
 
-      # DIAGNOSTIC, not a fix. CI has been red on Linux since 75af362 with a
-      # *different* test failing each run — 6059461 lost one, f6e8c47 lost four
-      # — which is the signature of tests racing each other rather than of a
-      # broken assertion. Windows nearly always passes, so it is scheduling.
-      # If Linux goes green serially, that is the confirmation, and the real
-      # fix is to stop the tests sharing state (`no_pools()` rewrites one
-      # `pools.toml` for the whole process, for a start). Revert this line.
+      # Serial on purpose, and it is a workaround rather than a fix — recorded
+      # so the next person knows which it is. Linux CI was red from 75af362 to
+      # 12ed1bf with a *different* test failing each run (6059461 lost one,
+      # f6e8c47 lost four), which is tests racing each other rather than a
+      # broken assertion; Windows hid it by scheduling differently. Serialising
+      # turned all three platforms green with no test or engine change, which
+      # is the confirmation.
+      #
+      # The cost is a slower suite and a hiding place for the next such race,
+      # so this should not survive. The real fix is to stop the tests sharing
+      # process-wide state; one confirmed instance is `no_pools()`, which
+      # rewrites a single `/tmp/tactus-engine-nopools-<pid>/pools.toml` that
+      # every engine test truncates while others read it. That was not proven
+      # to be the culprit, and finding the culprit needs a Linux reproduction
+      # rather than more inference from a Windows box.
       - run: cargo test --all-targets -- --test-threads=1
 
   lint:
