@@ -61,7 +61,19 @@ use crate::util;
 
 pub const ADAPTER_ID: &str = "copilot";
 
-const PROBE_TIMEOUT: Duration = Duration::from_secs(15);
+/// Budget for one probe call.
+///
+/// Sixty seconds for `--version` looks absurd until you watch it: this CLI is a
+/// Node program behind an npm shim that runs an update check on startup, and it
+/// takes ~5s warm on an unloaded machine. Under a loaded one — a full test
+/// suite, a CI runner, a laptop doing anything else — 15s was not enough, and
+/// the failure mode is the expensive one: §19 makes a probe failure a refusal
+/// to START, so a slow machine loses the whole run rather than one attempt.
+///
+/// Probing happens once per run at pre-flight, so the cost of being generous
+/// here is bounded and paid only when something is genuinely wrong. Waiting a
+/// minute before refusing beats refusing a working machine in fifteen seconds.
+const PROBE_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// Long flags this adapter passes. §16: this CLI auto-updates and has removed
 /// programmatic flags without deprecation, so a missing one must surface as a
