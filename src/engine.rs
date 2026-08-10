@@ -2300,12 +2300,7 @@ fn last_reason(progress: &Progress) -> String {
         .unwrap_or_else(|| "no attempt on record".to_owned())
 }
 
-fn task_report(
-    task: &Task,
-    state: &TaskState,
-    progress: &Progress,
-    running: bool,
-) -> TaskReport {
+fn task_report(task: &Task, state: &TaskState, progress: &Progress, running: bool) -> TaskReport {
     let records = &progress.records;
     let last = records.last();
     TaskReport {

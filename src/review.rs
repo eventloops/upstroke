@@ -1024,7 +1024,10 @@ mod tests {
             timeout: Duration::from_secs(60),
         };
         let prompt = materialize_prompt(&cx);
-        assert!(prompt.contains(&decisions[0]), "the answer itself: {prompt}");
+        assert!(
+            prompt.contains(&decisions[0]),
+            "the answer itself: {prompt}"
+        );
         assert!(
             prompt.contains("decision from a person"),
             "framed as instruction, not as agent-authored data: {prompt}"
