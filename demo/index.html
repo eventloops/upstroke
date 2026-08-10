@@ -1,0 +1,275 @@
+<title>Watch it fail safely — tactus</title>
+<style>
+:root{--bg:#fff;--fg:#16150f;--dim:#5f5e5a;--faint:#8a8880;--line:#e2e0d8;--card:#faf9f5;
+--ok:#3b6d11;--okbg:#eaf3de;--run:#185fa5;--runbg:#e6f1fb;--park:#854f0b;--parkbg:#faeeda;--idle:#8a8880;--idlebg:#f1efe8;--code:#f5f3ec}
+@media (prefers-color-scheme:dark){:root{--bg:#1a1915;--fg:#f0efe8;--dim:#a8a69d;--faint:#7d7b73;--line:#33322c;--card:#211f1a;
+--ok:#c0dd97;--okbg:#27500a;--run:#b5d4f4;--runbg:#0c447c;--park:#fac775;--parkbg:#633806;--idle:#8a8880;--idlebg:#2a2924;--code:#211f1a}}
+:root[data-theme=dark]{--bg:#1a1915;--fg:#f0efe8;--dim:#a8a69d;--faint:#7d7b73;--line:#33322c;--card:#211f1a;
+--ok:#c0dd97;--okbg:#27500a;--run:#b5d4f4;--runbg:#0c447c;--park:#fac775;--parkbg:#633806;--idle:#8a8880;--idlebg:#2a2924;--code:#211f1a}
+:root[data-theme=light]{--bg:#fff;--fg:#16150f;--dim:#5f5e5a;--faint:#8a8880;--line:#e2e0d8;--card:#faf9f5;
+--ok:#3b6d11;--okbg:#eaf3de;--run:#185fa5;--runbg:#e6f1fb;--park:#854f0b;--parkbg:#faeeda;--idle:#8a8880;--idlebg:#f1efe8;--code:#f5f3ec}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--fg);font:400 17px/1.65 ui-sans-serif,system-ui,-apple-system,"Segoe UI",sans-serif;
+-webkit-font-smoothing:antialiased}
+.wrap{max-width:820px;margin:0 auto;padding:56px 24px 96px}
+h1{font-size:34px;line-height:1.2;font-weight:500;margin:0 0 8px;letter-spacing:-.02em}
+h2{font-size:21px;font-weight:500;margin:52px 0 14px;letter-spacing:-.01em}
+.sub{color:var(--dim);font-size:19px;margin:0 0 40px}
+p{margin:0 0 18px}
+.lede{font-size:19px}
+em{font-style:italic}
+code{font:400 14px/1.5 ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;background:var(--code);padding:1px 5px;border-radius:4px}
+pre{background:var(--code);border:1px solid var(--line);border-radius:10px;padding:16px 18px;overflow-x:auto;margin:0 0 20px}
+pre code{background:none;padding:0;font-size:13px;line-height:1.55;white-space:pre}
+blockquote{margin:0 0 20px;padding:18px 22px;background:var(--card);border-left:3px solid var(--park);border-radius:0}
+blockquote p{margin:0;font-size:16px;color:var(--fg)}
+blockquote cite{display:block;margin-top:10px;font-style:normal;font-size:14px;color:var(--faint)}
+.panel{background:var(--card);border:1px solid var(--line);border-radius:12px;padding:20px;margin:0 0 20px}
+.ctl{display:flex;align-items:center;gap:14px;margin:4px 0 14px}
+button{font:500 14px ui-sans-serif,system-ui,sans-serif;background:var(--fg);color:var(--bg);border:0;
+border-radius:8px;padding:8px 18px;cursor:pointer}
+input[type=range]{flex:1;accent-color:var(--run)}
+.tick{font:400 13px ui-monospace,monospace;color:var(--faint);min-width:56px;text-align:right}
+.cap{font:400 14px/1.5 ui-monospace,SFMono-Regular,Menlo,monospace;color:var(--dim);min-height:22px;margin:0 0 4px}
+table{width:100%;border-collapse:collapse;font-size:14px;margin-top:6px}
+th{text-align:left;font-weight:500;color:var(--faint);font-size:12px;letter-spacing:.04em;
+text-transform:uppercase;padding:0 8px 7px 0;border-bottom:1px solid var(--line)}
+td{padding:7px 8px 7px 0;border-bottom:1px solid var(--line);font-variant-numeric:tabular-nums}
+td.n{text-align:right}
+.pill{display:inline-block;padding:2px 9px;border-radius:20px;font-size:12px;font-weight:500}
+.legend{display:flex;flex-wrap:wrap;gap:16px;margin-top:14px;font-size:13px;color:var(--dim)}
+.legend i{display:inline-block;width:11px;height:11px;border-radius:3px;margin-right:6px;vertical-align:-1px}
+.note{font-size:15px;color:var(--dim);border-top:1px solid var(--line);padding-top:8px;margin-top:34px}
+.scroll{overflow-x:auto}
+.src{font:400 12px ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;color:var(--faint);
+letter-spacing:.03em;margin:0 0 7px}
+.src b{font-weight:400;color:var(--dim)}
+:where(button,input,a):focus-visible{outline:2px solid var(--run);outline-offset:3px}
+@media (prefers-reduced-motion:reduce){*{transition:none!important;animation:none!important}}
+</style>
+
+<div class="wrap">
+
+<h1>Watch it fail safely</h1>
+<p class="sub">An agent wrote code that compiled clean and passed all 722 tests. It was still wrong.</p>
+
+<p class="lede">This is a record of tactus running unattended against <em>FluentRoslyn</em> — a real, published .NET library — fixing two open findings from its own code-review log. Everything below is captured output. Nothing is reconstructed.</p>
+
+<p>The claim worth testing is narrow and falsifiable: <strong>gates are not enough, and a reviewer from a different model family catches things no gate can.</strong> What follows is one case where that happened, with the receipt.</p>
+
+<h2>Before spending anything</h2>
+
+<p>A dry run costs nothing and answers the two questions worth asking first — what will it do, and what could it cost.</p>
+
+<pre class="scroll"><code>$ tactus run plan.md --config tactus.toml --budget 12 --dry-run
+
+id           kind  deps  chain
+-----------  ----  ----  -----
+literals     fix   -     small=claude-haiku-4-5 -&gt; mid=claude-sonnet-5 -&gt; frontier=claude-opus-5
+array-ranks  fix   -     small=claude-haiku-4-5 -&gt; mid=claude-sonnet-5 -&gt; frontier=claude-opus-5
+
+gates: build, test [from config]
+review: claude-code/claude-opus-5
+capacity: 2 pool(s) connected
+  claude-code: unknown [unknown]
+  - nothing has measured this pool, so what is left is unknown — not full
+ok: 2 tasks, no cycles
+budget: $12.00 would cap this run; nothing is spent in a dry run
+dry run: no agents executed, nothing spent</code></pre>
+
+<p>Note what it declines to claim. No pool reports "full" — it reports <em>unknown</em>, because nothing has measured it yet. A capacity estimate that flatters is worse than none.</p>
+
+<h2>The run, as the log recorded it</h2>
+
+<p>The engine holds its own terminal, so this is the view from the second one. Scrub through a real 45-minute run — five tasks, one dependency chain, one independent task. Every state below is derived from the run's append-only event log, which is exactly how the dashboard would work.</p>
+
+<div class="panel">
+  <p class="src"><b>replaying</b> .tactus/runs/01KZNG12FJA9DSJEYSK46NVBSC/events.jsonl — 45 events, 45 minutes</p>
+  <div class="ctl">
+    <button id="play">Play</button>
+    <input type="range" id="scrub" min="0" value="0">
+    <span class="tick" id="clock">00:00</span>
+  </div>
+  <p class="cap" id="cap"></p>
+  <svg id="dag" width="100%" viewBox="0 0 900 250" role="img" aria-labelledby="dagt">
+    <title id="dagt">Task graph of a tactus run, coloured by state</title>
+  </svg>
+  <div class="legend">
+    <span><i style="background:var(--okbg);border:1px solid var(--ok)"></i>committed</span>
+    <span><i style="background:var(--runbg);border:1px solid var(--run)"></i>running</span>
+    <span><i style="background:var(--parkbg);border:1px solid var(--park)"></i>parked — waiting on you</span>
+    <span><i style="background:var(--idlebg);border:1px solid var(--idle)"></i>queued or blocked</span>
+  </div>
+  <table id="ledger">
+    <thead><tr><th>task</th><th>trail</th><th class="n">worker</th><th class="n">review</th></tr></thead>
+    <tbody></tbody>
+  </table>
+</div>
+
+<p>The moment worth pausing on is around 17 minutes, when <code>format-policy</code> turns amber. It hit a decision the repository could not settle and stopped to ask. Watch what <code>changelog</code> does next: it keeps going, because nothing depends on the parked task. A question parks exactly the task that raised it and the runnable frontier keeps draining — which is a property of the <em>graph</em>, and the reason a list view cannot show it.</p>
+
+<h2>The catch</h2>
+
+<p>On a different task, the first attempt produced a fix that built cleanly and passed all 722 tests. The reviewer — a different model from the one that wrote it — rejected it anyway:</p>
+
+<blockquote>
+<p>Negative zero is emitted as <code>System.BitConverter.Int64BitsToDouble(...)</code>, which is not a compile-time constant. <code>FieldBuilder.WithInitializer</code> is reachable with <code>Const()</code>, so a const float/double field initialized from <code>-0.0</code> now fails in the consumer with <strong>CS0133</strong>. That case compiled before this change.</p>
+<cite>claude-opus-5, reviewing work by claude-haiku-4-5</cite>
+</blockquote>
+
+<p>No gate could have caught that. The code compiles — in <em>this</em> repository. It breaks in a <em>consumer's</em> build, in a case the test suite never exercises, and it silently removes a capability that previously worked. The reviewer also knew that <code>Int32BitsToSingle</code> does not exist in the library's <code>netstandard2.0</code> target, pointed at the two files where the codebase already solves this correctly, and cited the duplication cluster closed three commits earlier. It had read the git history.</p>
+
+<p>The retry resumed the same session with that verdict fed back, and the second attempt shipped the correct fix: a prefix-minus over an explicitly floating-point token, which stays a compile-time constant.</p>
+
+<h2>What it cost, and on what</h2>
+
+<p>The whole ledger is seventeen lines. Per task: how many attempts, which rungs it climbed, what the implementer spent, and what the reviewer spent — kept in separate columns, because folding them together makes a cheap rung look expensive.</p>
+
+<p class="src"><b>$</b> tactus status 01KZNG12FJA9DSJEYSK46NVBSC</p>
+<pre class="scroll"><code>  task           attempts  trail                  worker   review   total
+  readme         1         small ok               $0.0980  $0.4313  $0.5292
+  parse-basic    2         small×2 ok             $0.1502  $1.0475  $1.1977
+  parse-edges    2         small failed → mid ok  $0.6046  $1.2133  $1.8179
+  format-policy  4         small×4 ok             $0.4776  $1.6852  $2.1629
+  changelog      1         small ok               $0.0311  $0.2975  $0.3287
+  total $6.0363 (api-equivalent; subscription spend is notional)
+  per-pool drain:
+    claude-code: 19 attempt(s), $6.0363</code></pre>
+
+<p>An unreported cost prints as <code>—</code>, never <code>$0.0000</code>: a ledger that cannot tell free from unreported is worse than no ledger.</p>
+
+<h2>Where the work landed</h2>
+
+<p>The engine commits to its own branch. Your working branch is never touched, and every commit arrives already reviewed by a model from a different family than the one that wrote it.</p>
+
+<pre class="scroll"><code>$ git log --oneline -n 2 tactus/run-01KZNMR59E5ATC9MBYY29WZB6E
+54a5909 [tactus] literals: Emit float and double special values as source that compiles
+9580f55 correct ROADMAP's coverage claim, which Review 3 closed
+
+$ git log --oneline -n 1 main
+9580f55 correct ROADMAP's coverage claim, which Review 3 closed</code></pre>
+
+<h2>What this does not show</h2>
+
+<p>It cost $12.44 to fix one finding, and the run stopped at its ceiling before reaching the second. Review was roughly half of that, and on this evidence it is the half that earns its keep — but it is not cheap, and anyone deciding whether to adopt this should price it at <strong>$3–12 per real task</strong> rather than from a toy example.</p>
+
+<p>Nor is any of this deterministic. The same task, on the same model, from the same commit, failed review in one run and stopped to ask a question in another. That is worth stating plainly, because it means a single run proves less than its clean numbers suggest — including the runs on this page.</p>
+
+<p class="note">Every figure and quotation here is taken from run logs on disk. The graph above is driven by the actual event log of run <code>01KZNG12FJA9DSJEYSK46NVBSC</code>.</p>
+
+</div>
+
+<script>
+const DATA = {"run":"01KZNG12FJA9DSJEYSK46NVBSC","tasks":[{"id":"readme","title":"Document the size-parsing API","deps":[]},{"id":"parse-basic","title":"Implement the happy path","deps":["readme"]},{"id":"parse-edges","title":"Handle the edge cases","deps":["parse-basic"]},{"id":"format-policy","title":"Decide the rendering contract","deps":["parse-edges"]},{"id":"changelog","title":"Start a changelog","deps":[]}],"events":[{"t":0,"e":"run_started"},{"t":0,"e":"capacity_snapshot"},{"t":0,"e":"attempt_started","task":"readme","n":1,"r":0,"tier":"small","model":"claude-haiku-4-5"},{"t":128,"e":"attempt_finished","task":"readme","n":1,"r":0,"tier":"small","model":"claude-haiku-4-5","cost":0.098,"rcost":0.4313},{"t":128,"e":"task_committed","task":"readme"},{"t":128,"e":"attempt_started","task":"parse-basic","n":1,"r":0,"tier":"small","model":"claude-haiku-4-5"},{"t":314,"e":"attempt_finished","task":"parse-basic","n":1,"r":0,"tier":"small","model":"claude-haiku-4-5","cost":0.0701,"rcost":0.5537,"fail":"review_failed"},{"t":314,"e":"ladder_retry","task":"parse-basic","n":1,"r":0,"tier":"small","resume":true},{"t":314,"e":"attempt_started","task":"parse-basic","n":2,"r":0,"tier":"small","model":"claude-haiku-4-5"},{"t":510,"e":"attempt_finished","task":"parse-basic","n":2,"r":0,"tier":"small","model":"claude-haiku-4-5","cost":0.0801,"rcost":0.4938,"resumed":true},{"t":510,"e":"task_committed","task":"parse-basic"},{"t":510,"e":"attempt_started","task":"parse-edges","n":1,"r":0,"tier":"small","model":"claude-haiku-4-5"},{"t":704,"e":"attempt_finished","task":"parse-edges","n":1,"r":0,"tier":"small","model":"claude-haiku-4-5","cost":0.1166,"rcost":0.4795,"fail":"review_failed"},{"t":704,"e":"ladder_escalated","task":"parse-edges","n":1,"r":0,"tier":"small"},{"t":704,"e":"attempt_started","task":"parse-edges","n":2,"r":1,"tier":"mid","model":"claude-sonnet-5"},{"t":1000,"e":"attempt_finished","task":"parse-edges","n":2,"r":1,"tier":"mid","model":"claude-sonnet-5","cost":0.488,"rcost":0.7338},{"t":1001,"e":"task_committed","task":"parse-edges"},{"t":1001,"e":"attempt_started","task":"format-policy","n":1,"r":0,"tier":"small","model":"claude-haiku-4-5"},{"t":1034,"e":"attempt_finished","task":"format-policy","n":1,"r":0,"tier":"small","model":"claude-haiku-4-5","cost":0.0753,"fail":"needs_human"},{"t":1034,"e":"question_raised","task":"format-policy"},{"t":1034,"e":"task_parked","task":"format-policy"},{"t":1034,"e":"attempt_started","task":"changelog","n":1,"r":0,"tier":"small","model":"claude-haiku-4-5"},{"t":1088,"e":"attempt_finished","task":"changelog","n":1,"r":0,"tier":"small","model":"claude-haiku-4-5","cost":0.0311,"rcost":0.2975},{"t":1088,"e":"task_committed","task":"changelog"},{"t":1088,"e":"run_finished"},{"t":1188,"e":"run_resumed"},{"t":1188,"e":"capacity_snapshot"},{"t":1188,"e":"question_answered"},{"t":1188,"e":"design_defect"},{"t":1188,"e":"attempt_started","task":"format-policy","n":2,"r":0,"tier":"small","model":"claude-haiku-4-5"},{"t":1355,"e":"attempt_finished","task":"format-policy","n":2,"r":0,"tier":"small","model":"claude-haiku-4-5","cost":0.1233,"rcost":0.5203,"fail":"needs_human"},{"t":1355,"e":"question_raised","task":"format-policy"},{"t":1355,"e":"task_parked","task":"format-policy"},{"t":1355,"e":"run_finished"},{"t":2320,"e":"run_resumed"},{"t":2320,"e":"capacity_snapshot"},{"t":2320,"e":"question_answered"},{"t":2320,"e":"design_defect"},{"t":2320,"e":"attempt_started","task":"format-policy","n":3,"r":0,"tier":"small","model":"claude-haiku-4-5"},{"t":2522,"e":"attempt_finished","task":"format-policy","n":3,"r":0,"tier":"small","model":"claude-haiku-4-5","cost":0.1214,"rcost":0.5929,"fail":"review_failed"},{"t":2522,"e":"ladder_retry","task":"format-policy","n":3,"r":0,"tier":"small","resume":true},{"t":2522,"e":"attempt_started","task":"format-policy","n":4,"r":0,"tier":"small","model":"claude-haiku-4-5"},{"t":2702,"e":"attempt_finished","task":"format-policy","n":4,"r":0,"tier":"small","model":"claude-haiku-4-5","cost":0.1576,"rcost":0.572,"resumed":true},{"t":2702,"e":"task_committed","task":"format-policy"},{"t":2702,"e":"run_finished"}]};
+const EV = DATA.events, TASKS = DATA.tasks;
+const POS = {"readme":[40,40],"parse-basic":[250,40],"parse-edges":[460,40],"format-policy":[670,40],"changelog":[670,150]};
+const W = 160, H = 64;
+const SK = {committed:["--okbg","--ok"],running:["--runbg","--run"],parked:["--parkbg","--park"],
+            queued:["--idlebg","--idle"],blocked:["--idlebg","--idle"]};
+
+function stateAt(i){
+  const st = {};
+  TASKS.forEach(t => st[t.id] = {state:"queued",attempts:0,worker:0,review:0,trail:[]});
+  for (let k=0;k<=i;k++){
+    const e = EV[k], s = e.task ? st[e.task] : null;
+    if (e.e==="attempt_started" && s){ s.state="running"; if(e.tier) s.trail.push(e.tier); }
+    else if (e.e==="attempt_finished" && s){
+      s.attempts++; if(e.cost) s.worker+=e.cost; if(e.rcost) s.review+=e.rcost; s.fail=e.fail||null;
+    }
+    else if (e.e==="task_committed" && s){ s.state="committed"; }
+    else if (e.e==="task_parked" && s){ s.state="parked"; }
+    else if (e.e==="question_answered"){ TASKS.forEach(t=>{ if(st[t.id].state==="parked") st[t.id].state="queued"; }); }
+  }
+  TASKS.forEach(t=>{
+    const s = st[t.id];
+    if (s.state==="queued" && t.deps.some(d=>st[d].state!=="committed")) s.state="blocked";
+  });
+  return st;
+}
+
+function trailOf(list){
+  if(!list.length) return "—";
+  const out=[]; let cur=null,n=0;
+  list.forEach(t=>{ if(t===cur){n++;} else {if(cur)out.push([cur,n]); cur=t; n=1;} });
+  out.push([cur,n]);
+  return out.map(([t,n])=>n>1?`${t}×${n}`:t).join(" → ");
+}
+
+function describe(e){
+  const t = e.task ? e.task+": " : "";
+  switch(e.e){
+    case "run_started": return "run started";
+    case "run_resumed": return "resumed after an answer arrived";
+    case "attempt_started": return `${t}attempt ${e.n} on ${e.tier||"?"} (${e.model||"?"})`;
+    case "attempt_finished": return e.fail ? `${t}attempt ${e.n} failed — ${e.fail}` : `${t}attempt ${e.n} passed review`;
+    case "ladder_retry": return `${t}retrying the same rung${e.resume?", session resumed":""}`;
+    case "ladder_escalated": return `${t}escalating a rung`;
+    case "question_raised": return `${t}stopped to ask a question`;
+    case "task_parked": return `${t}parked — the run continues`;
+    case "question_answered": return "operator answered; the task un-parks";
+    case "task_committed": return `${t}committed`;
+    case "design_defect": return "recorded: the plan left something unsettled";
+    case "run_finished": return "run finished";
+    default: return e.e.replace(/_/g," ");
+  }
+}
+
+const svg=document.getElementById("dag"), scrub=document.getElementById("scrub"),
+      cap=document.getElementById("cap"), clock=document.getElementById("clock"),
+      tbody=document.querySelector("#ledger tbody"), playBtn=document.getElementById("play");
+scrub.max = EV.length-1;
+const NS="http://www.w3.org/2000/svg";
+function el(n,a){const x=document.createElementNS(NS,n);for(const k in a)x.setAttribute(k,a[k]);return x;}
+
+function draw(i){
+  const st = stateAt(i);
+  while(svg.childNodes.length>1) svg.removeChild(svg.lastChild);
+  const chain=["readme","parse-basic","parse-edges","format-policy"];
+  for(let k=0;k<chain.length-1;k++){
+    const a=POS[chain[k]], b=POS[chain[k+1]];
+    svg.appendChild(el("line",{x1:a[0]+W+6,y1:a[1]+H/2,x2:b[0]-10,y2:b[1]+H/2,
+      stroke:"var(--line)","stroke-width":2}));
+    svg.appendChild(el("path",{d:`M${b[0]-14} ${b[1]+H/2-5}L${b[0]-7} ${b[1]+H/2}L${b[0]-14} ${b[1]+H/2+5}`,
+      fill:"none",stroke:"var(--faint)","stroke-width":2,"stroke-linecap":"round","stroke-linejoin":"round"}));
+  }
+  TASKS.forEach(t=>{
+    const p=POS[t.id], s=st[t.id], sk=SK[s.state];
+    svg.appendChild(el("rect",{x:p[0],y:p[1],width:W,height:H,rx:8,
+      fill:`var(${sk[0]})`,stroke:`var(${sk[1]})`,"stroke-width":1.5}));
+    const a=el("text",{x:p[0]+W/2,y:p[1]+26,"text-anchor":"middle",fill:`var(${sk[1]})`,
+      "font-size":14,"font-weight":500,"font-family":"ui-sans-serif,system-ui,sans-serif"});
+    a.textContent=t.id; svg.appendChild(a);
+    const b=el("text",{x:p[0]+W/2,y:p[1]+46,"text-anchor":"middle",fill:`var(${sk[1]})`,
+      "font-size":12,"font-family":"ui-sans-serif,system-ui,sans-serif","fill-opacity":.85});
+    b.textContent = s.state==="parked" ? "waiting on you" : s.state;
+    svg.appendChild(b);
+  });
+  tbody.innerHTML="";
+  TASKS.forEach(t=>{
+    const s=st[t.id], tr=document.createElement("tr");
+    tr.innerHTML=`<td>${t.id}</td><td>${trailOf(s.trail)}</td>`+
+      `<td class="n">${s.worker?"$"+s.worker.toFixed(4):"—"}</td>`+
+      `<td class="n">${s.review?"$"+s.review.toFixed(4):"—"}</td>`;
+    tbody.appendChild(tr);
+  });
+  const e=EV[i];
+  cap.textContent=describe(e);
+  const m=Math.floor(e.t/60), sec=e.t%60;
+  clock.textContent=`${String(m).padStart(2,"0")}:${String(sec).padStart(2,"0")}`;
+}
+
+let timer=null;
+function stop(){ clearInterval(timer); timer=null; playBtn.textContent="Play"; }
+playBtn.onclick=()=>{
+  if(timer){ stop(); return; }
+  if(+scrub.value>=EV.length-1) scrub.value=0;
+  playBtn.textContent="Pause";
+  timer=setInterval(()=>{
+    const n=+scrub.value+1;
+    if(n>=EV.length){ stop(); return; }
+    scrub.value=n; draw(n);
+  },420);
+};
+scrub.oninput=()=>{ stop(); draw(+scrub.value); };
+draw(0);
+</script>
