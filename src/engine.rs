@@ -2190,10 +2190,7 @@ fn build_report(header: ReportHeader<'_>, plan: &Plan, state: &RunState) -> RunR
             )
         })
         .collect();
-    let total_cost_usd = tasks
-        .iter()
-        .filter_map(TaskReport::total_cost_usd)
-        .sum::<f64>();
+    let total_cost_usd = total_of(&tasks);
     // §13's second currency: what each subscription drained, folded from the
     // same attempt records the dollar column comes from — so the two halves of
     // the ledger cannot disagree about the same attempt.
@@ -2351,6 +2348,22 @@ fn task_report(
         session_id: last.and_then(|r| r.session_id.clone()),
         attempts: records.clone(),
     }
+}
+
+/// What every task cost, added up.
+///
+/// Deliberately not `Iterator::sum`, which folds floats from `-0.0`. That is
+/// the *correct* additive identity in IEEE 754 — `-0.0 + x` preserves the sign
+/// of `x` where `0.0 + x` does not — but it means the sum of no costs at all is
+/// negative zero, and a run that has not yet spent anything rendered its ledger
+/// as `total: $-0.0000`. Folding from `+0.0` cannot change a non-empty sum,
+/// because the only value `+0.0` fails to preserve is `-0.0`, and a cost is
+/// never that.
+fn total_of(tasks: &[TaskReport]) -> f64 {
+    tasks
+        .iter()
+        .filter_map(TaskReport::total_cost_usd)
+        .fold(0.0, |total, cost| total + cost)
 }
 
 /// Sum, preserving "nothing was reported" as `None` rather than `0.0` — a
@@ -6093,6 +6106,48 @@ mod tests {
             "and the run reads as interrupted rather than finished"
         );
         assert_eq!(replayed.state.states[0], TaskState::Pending);
+    }
+
+    #[test]
+    fn a_run_that_has_spent_nothing_totals_positive_zero() {
+        // Observed as `total: $-0.0000` in the ledger of a run whose first
+        // attempt was still in flight. This first assertion is the diagnosis,
+        // kept because it is the whole reason `total_of` exists: if std ever
+        // folds from `+0.0`, the helper can go.
+        let nothing: [f64; 0] = [];
+        assert!(
+            nothing.iter().sum::<f64>().is_sign_negative(),
+            "`sum` no longer folds from -0.0, so `total_of` is obsolete"
+        );
+
+        assert!(!total_of(&[]).is_sign_negative(), "a spent-nothing total");
+        assert_eq!(format!("${:.4}", total_of(&[])), "$0.0000");
+
+        // And the fold change cannot have moved a real total: `+0.0` preserves
+        // every value a cost can be.
+        let spent = vec![
+            task_report_costing(Some(0.25), Some(1.5)),
+            task_report_costing(None, None),
+            task_report_costing(Some(0.0), None),
+        ];
+        assert!((total_of(&spent) - 1.75).abs() < f64::EPSILON);
+    }
+
+    /// A report carrying nothing but the two cost columns.
+    fn task_report_costing(worker: Option<f64>, review: Option<f64>) -> TaskReport {
+        TaskReport {
+            id: "t".to_owned(),
+            title: String::new(),
+            model: String::new(),
+            status: TaskRunStatus::Skipped,
+            duration: Duration::ZERO,
+            cost_usd: worker,
+            review_models: Vec::new(),
+            review_cost_usd: review,
+            review_cost_incomplete: false,
+            session_id: None,
+            attempts: Vec::new(),
+        }
     }
 
     #[test]
