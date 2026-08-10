@@ -21,6 +21,7 @@
 use std::fs::{self, File, TryLockError};
 use std::io;
 use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 
 use crate::error::TactusError;
 use crate::util;
@@ -324,33 +325,58 @@ impl RunLock {
                 path: path.clone(),
                 source,
             })?;
-        // Only *contention* may be reported as contention. `flock` is
-        // interruptible, so a signal — SIGCHLD from any of the git and agent
-        // subprocesses a run spawns — makes `try_lock` fail with `Interrupted`
-        // having learned nothing about who holds what. Treating every error as
-        // "someone else has it" turned that into a run refusing to start,
-        // naming a second engine that does not exist. Retry the interrupted
-        // case, and let a genuine IO failure surface as one.
+        // Only *contention* may be reported as contention, and two things can
+        // fake it.
+        //
+        // `flock` is interruptible: a signal — SIGCHLD from any of the git and
+        // agent subprocesses a run spawns — makes `try_lock` fail with
+        // `Interrupted`, having learned nothing about who holds what.
+        //
+        // And `flock` is inherited across `fork`. A subprocess spawned by
+        // *anything else in this process* duplicates every open descriptor,
+        // this lock among them, and the child keeps holding it until it execs
+        // (where close-on-exec drops it). So an uncontested lock reads as taken
+        // for as long as some unrelated fork is between `fork` and `exec`.
+        // Measured under a parallel test suite, where it made runs refuse to
+        // start against a second engine that did not exist.
+        //
+        // What separates the two from the real thing is duration: a genuine
+        // engine holds the lock for its whole run, a fork window for
+        // microseconds. So believe `WouldBlock` only if it persists.
+        let deadline = Instant::now() + CONTENTION_GRACE;
         loop {
-            return match file.try_lock() {
-                Ok(()) => Ok(Self { _file: file }),
-                Err(TryLockError::WouldBlock) => Err(TactusError::Refused {
-                    message: format!(
-                        "another tactus process is already driving run `{}` (lock held on {}). \
-                         Two engines would interleave events and fight over the same branch — \
-                         wait for it to finish, or stop it first.",
-                        public.file_name().unwrap_or_default().to_string_lossy(),
-                        path.display()
-                    ),
-                }),
+            match file.try_lock() {
+                Ok(()) => return Ok(Self { _file: file }),
                 Err(TryLockError::Error(source)) if source.kind() == io::ErrorKind::Interrupted => {
-                    continue;
                 }
-                Err(TryLockError::Error(source)) => Err(TactusError::Io { path, source }),
-            };
+                Err(TryLockError::Error(source)) => {
+                    return Err(TactusError::Io { path, source });
+                }
+                Err(TryLockError::WouldBlock) => {
+                    if Instant::now() >= deadline {
+                        return Err(TactusError::Refused {
+                            message: format!(
+                                "another tactus process is already driving run `{}` (lock held on \
+                                 {}). Two engines would interleave events and fight over the same \
+                                 branch — wait for it to finish, or stop it first.",
+                                public.file_name().unwrap_or_default().to_string_lossy(),
+                                path.display()
+                            ),
+                        });
+                    }
+                    std::thread::sleep(RETRY_PAUSE);
+                }
+            }
         }
     }
 }
+
+/// How long an apparently-held lock must stay held before it is believed.
+///
+/// Long enough to outlast any `fork`/`exec` window, short enough that a real
+/// second engine still refuses promptly rather than appearing to hang.
+const CONTENTION_GRACE: Duration = Duration::from_millis(500);
+const RETRY_PAUSE: Duration = Duration::from_millis(5);
 
 /// Whether a run is being driven right now, without disturbing the holder.
 ///
@@ -505,10 +531,26 @@ mod tests {
         let held = RunLock::acquire(&paths.public).expect("first acquire");
         assert!(is_running(&paths.public), "status can see the run is live");
 
+        // Timed, because the refusal now waits before it believes itself: a
+        // `fork` elsewhere in the process can make an uncontested lock look
+        // taken for a moment, so `acquire` re-checks for `CONTENTION_GRACE`
+        // before reporting contention. That grace must stay short enough to
+        // read as a refusal rather than a hang — raise it much further and the
+        // operator is left watching a command that looks stuck.
+        let started = Instant::now();
         let err = RunLock::acquire(&paths.public).expect_err("second engine must be refused");
+        let waited = started.elapsed();
         assert!(
             err.to_string().contains("already driving run"),
             "got: {err}"
+        );
+        assert!(
+            waited >= CONTENTION_GRACE,
+            "a real holder is only believed after the grace: {waited:?}"
+        );
+        assert!(
+            waited < Duration::from_secs(5),
+            "and refusing must still feel like a refusal: {waited:?}"
         );
 
         // Dropping releases it — which is also what a crash does, so resume

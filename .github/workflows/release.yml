@@ -43,10 +43,7 @@ jobs:
       - run: |
           git config --global user.email "ci@tactus.local"
           git config --global user.name "tactus CI"
-      # Serial, for the reason recorded in ci.yml: the suite races itself under
-      # parallel execution. A release that fails this way publishes nothing,
-      # but it does so by luck rather than by the gate meaning what it says.
-      - run: cargo test --all-targets -- --test-threads=1
+      - run: cargo test --all-targets
 
   binaries:
     name: binary (${{ matrix.target }})
