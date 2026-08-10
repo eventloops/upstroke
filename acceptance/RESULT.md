@@ -76,7 +76,7 @@ the trigger differs, and it is the stronger of the two.
 |---|--------|----------|----------|-----|
 | 1 | **`status` reported a live run as halted, with its working attempt as a failure.** `status::load` called `settle_interrupted()` unconditionally, then checked `is_running` — so the settlement that makes a *killed* run read correctly was also applied to a run an engine was actively driving | normal | Run 1, while `readme` attempt 1 was mid-review (it went on to pass and commit `fc5c72c`): `readme: skipped (run halted)`, ledger `readme 1 small failed`, `run complete: 0 task(s) committed`. All three false; the lock check three lines below printed the correct `state: running now` | `2e5ab10`. Settle only when nothing holds the run's lock; give `RunReport` a `running` flag so the projection has its own vocabulary. Regression test fails without it (`left: 1, right: 0`) |
 | 2 | **The operator's answer never reached the reviewer.** `feedback_section` quotes a human answer to the *worker* as a binding instruction; the review prompt was built from the task, its acceptance criteria, reference artifacts and the diff — and answers live in `.tactus/runs/<id>/answers/`, which is not the repository | **serious** | Run 2's first resume. Operator answered "fall back to bare bytes"; the worker complied ("following Policy 3"); the reviewer failed it: *"no operator choice for the inexact-value policy exists anywhere in the repository (checked plan.md, tactus.toml, README.md, CHANGELOG.md, and all five commits) … the implementer made it anyway"*. `format-policy` re-parked on `q-01KZNHAEGX7JBGYQ3Z65Q15DP4`, a duplicate of its own question | `7626543`. Route the same human feedback entries into the review prompt, above the fence and framed as a decision rather than agent-authored data |
-| 3 | **`$-0.0000` — a negative zero in the total**, in both the summary and the ledger line | nit | Run 1 live status: `total: $-0.0000 (api-equivalent)` and `total $-0.0000 (api-equivalent; …)` | **Not fixed, not explained.** Both sites format `total_cost_usd` with `{:.4}`; that value is `filter_map(...).sum::<f64>()`, which is `+0.0` on an empty iterator, and no input to it can be negative. Seen only in the defect-1 rendering path and it has not recurred since. Left open rather than guessed at |
+| 3 | **`$-0.0000` — a negative zero in the total**, in both the summary and the ledger line | nit | Run 1 live status: `total: $-0.0000 (api-equivalent)` and `total $-0.0000 (api-equivalent; …)` | `4f7628c`. Left open here because the reasoning below it was wrong: `Iterator::sum` does **not** fold f64 from `+0.0`. It folds from `-0.0`, the true additive identity in IEEE 754 — `-0.0 + x` preserves the sign of `x` where `0.0 + x` does not — so the sum of no costs at all is negative zero and `{:.4}` prints the sign. Nothing was negative; the empty sum was. Reproduced on the first real-repo run and fixed by folding from `+0.0`, which cannot change a non-empty total |
 
 ### Why defect 2 is the serious one
 
@@ -113,10 +113,10 @@ run in progress: 4 task(s) committed so far on tactus/run-01KZNG12FJA9DSJEYSK46N
   installed the new build into the **npm-global** prefix instead. PATH reaches
   the scoop shim first, so every subsequent launch died with `'…\claude.exe' is
   not recognized`. Runs 2+ pin `DISABLE_AUTOUPDATER=1` and put the npm prefix
-  first. **The broken scoop shim is still on the machine and will break any
-  bare `claude` invocation** until it is removed or repointed; the working
-  binary is `C:\Users\camer\AppData\Roaming\npm\claude.cmd` (2.1.226, signed in,
-  Max).
+  first. *(Resolved later the same day: the stale scoop install was removed, so
+  a bare `claude` now finds the working 2.1.226 binary at
+  `C:\Users\camer\AppData\Roaming\npm`. `DISABLE_AUTOUPDATER=1` on unattended
+  runs remains the lesson — a mid-run self-update is what caused this.)*
 - **An infrastructure error consumes the ladder.** During that outage
   `parse-edges` burned all three rungs — `[small failed → mid failed → frontier
   failed]` — on a missing executable. No model change could ever have fixed it,
