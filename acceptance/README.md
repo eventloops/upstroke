@@ -3,6 +3,12 @@
 DESIGN.md §21's definition of done, staged. **This spends real quota** — it is
 operator-triggered, never launched by an agent.
 
+> **This run has happened.** It passed on 2026-08-10 and shipped as `0.1.0`.
+> [`RESULT.md`](RESULT.md) is the write-up: which run demonstrated each
+> criterion, the ledger lines, and the four engine defects the runs found. What
+> follows is still the run book — keep it working, because §21's criteria are
+> the regression suite for the engine's behaviour, not a one-off ceremony.
+
 The two files beside this one go into a *scratch* repository, not into tactus:
 
 - `plan.md` — five tasks, each shaped to provoke one §21 criterion

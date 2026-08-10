@@ -1,8 +1,11 @@
 [package]
 name = "tactus"
-# 0.0.x while the v0.1 milestone (DESIGN.md §21) is still being built — 0.1.0
-# is reserved for the release that actually meets its definition of done.
-version = "0.0.1"
+# 0.1.0 because §21's definition of done was actually met, on 2026-08-10: a
+# five-task plan ran unattended on a real repository through every one of its
+# five criteria and the kill/resume test — `acceptance/RESULT.md` is the
+# evidence, including the three engine defects the run found. 0.0.1 was the
+# crates.io name reservation and never claimed to be more.
+version = "0.1.0"
 edition = "2024"
 license = "AGPL-3.0-only"
 description = "Headless orchestration engine for AI coding agents — the conductor, not an instrument"
@@ -11,8 +14,9 @@ readme = "README.md"
 keywords = ["ai", "agents", "orchestration", "automation", "cli"]
 categories = ["command-line-utilities", "development-tools"]
 # Internal working documents: useful in the repo, noise in the published
-# crate. Fixtures stay — the parser tests are fixture-driven.
-exclude = ["reviews/", ".github/", ".tactus/", "acceptance/"]
+# crate. Fixtures stay — the parser tests are fixture-driven. `docs/` is the
+# GitHub Pages source, so it is a website rather than part of the library.
+exclude = ["reviews/", ".github/", ".tactus/", "acceptance/", "docs/"]
 
 [dependencies]
 anyhow = "1"
