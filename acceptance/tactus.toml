@@ -1,0 +1,81 @@
+# Acceptance-run config (DESIGN.md §21's definition of done).
+#
+# Every value here is chosen to provoke one of the five criteria. This is not a
+# config to copy into a real repository — a real one would not set
+# `attempts_per = 1` on `fix`, and would not run three gates on every attempt.
+
+[engine]
+# The default. Left explicit because an acceptance run that limps past a broken
+# task and reports "complete" proves nothing: if something fails, the run should
+# stop where it failed and say so.
+on_task_failure = "halt"
+
+[interaction]
+mode = "on_block"
+# Only consulted when the run is DETACHED from a terminal. Attached, the engine
+# prompts on stdin instead — see the README's note on which one you want.
+wait_on_block_secs = 900
+
+# §12's spend approval. Left off by default: it parks a SECOND task, which makes
+# the (c) escalation harder to read on a first run. Uncomment once the run works
+# end to end, and the `parse-edges` escalation onto frontier will stop and ask.
+# ask_before = { frontier_escalation_over_usd = 0.50 }
+
+[budgets]
+# The seatbelt. Frontier review runs on every attempt, so the realistic cost of
+# this plan is roughly $1–3 — this is a ceiling, not an estimate. Crossing it
+# stops the run at exit 3, and `tactus resume <id> --budget 30` continues.
+run_usd = 15.0
+
+[routing]
+# §21(a). One rung, so there is nowhere to escalate to: this task either passes
+# on a small model or the run has found a real problem. Two attempts because a
+# markdown task failing twice is a signal worth having, not noise to absorb.
+docs = { chain = ["small"], attempts_per = 2 }
+
+# §21(b). Two attempts on the FIRST rung is what makes a same-rung retry
+# possible at all — the ladder only escalates once `attempts_per` is spent. The
+# Claude Code adapter advertises `session_resume`, so that retry resumes the
+# conversation and feeds back the gate log rather than starting cold.
+implement = { chain = ["small", "mid"], attempts_per = 2 }
+
+# §21(c). One attempt per rung, so ANY first failure escalates instead of
+# retrying. Three rungs give it somewhere to go twice.
+fix = { chain = ["small", "mid", "frontier"], attempts_per = 1 }
+
+# The judge. Frontier by default already; explicit because the whole run turns
+# on the reviewer being strong enough to reject a small model's first pass.
+review = { tier = "frontier" }
+
+# Cross-vendor second opinion (§11.3). Needs the Copilot CLI installed —
+# pre-flight REFUSES to start without it rather than quietly reviewing once, so
+# leave this commented until `tactus capacity` shows a copilot pool.
+#
+# Watch what it matches. A task with no explicit `paths=` gets path hints
+# INFERRED from its prose, so `readme` and `changelog` both carry `src/` purely
+# because they mention it — and a `src/**` override may well buy a second
+# frontier reviewer for two markdown tasks. The dry run tags every matched row
+# with `[second opinion: …]`; read those before spending, not after.
+# [[routing.overrides]]
+# paths = ["src/**"]
+# second_opinion = "different-vendor"
+
+# The gates, and `lint` is the load-bearing one. `check` and `test` catch code
+# that does not compile or does not work — but a small model writing new Rust
+# fails those less often than it trips a pedantic lint, and clippy's output is
+# exactly the kind of specific, actionable feedback a resumed session fixes in
+# one turn. Without `-D warnings` there is no reliable way to provoke §21(b).
+[[gates]]
+name = "check"
+cmd = "cargo check --all-targets"
+timeout_secs = 300
+
+[[gates]]
+name = "lint"
+cmd = "cargo clippy --all-targets -- -D warnings"
+timeout_secs = 300
+
+[[gates]]
+name = "test"
+cmd = "cargo test"
+timeout_secs = 600

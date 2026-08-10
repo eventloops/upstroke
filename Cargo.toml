@@ -12,7 +12,7 @@ keywords = ["ai", "agents", "orchestration", "automation", "cli"]
 categories = ["command-line-utilities", "development-tools"]
 # Internal working documents: useful in the repo, noise in the published
 # crate. Fixtures stay — the parser tests are fixture-driven.
-exclude = ["reviews/", ".github/", ".tactus/"]
+exclude = ["reviews/", ".github/", ".tactus/", "acceptance/"]
 
 [dependencies]
 anyhow = "1"
