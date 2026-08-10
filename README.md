@@ -20,6 +20,10 @@ conductor, not an instrument.
 > completion. It found two reporting defects, both fixed and re-verified on the live run —
 > `acceptance/RESULT.md` is the write-up. Parallelism, worktrees, Aider, and capacity-driven
 > routing are v0.2.
+>
+> **[See a run, start to finish →](https://keybindings.github.io/tactus/)** — a real run against a
+> published .NET library, including the verdict where a reviewer rejected a fix that built clean
+> and passed all 722 tests. Built entirely from captured output.
 
 ## What works today
 
