@@ -522,9 +522,17 @@ mod imp {
     use std::io;
     use std::os::fd::AsRawFd;
 
+    /// `F_WRLCK` and `F_UNLCK` are `c_int` on Linux and `c_short` on macOS,
+    /// while `flock.l_type` is `c_short` on both. `Into<c_int>` accepts either
+    /// — the reflexive conversion on Linux, the widening one on macOS — so the
+    /// narrowing to `l_type` happens here and nowhere else.
+    fn l_type(kind: impl Into<libc::c_int>) -> libc::c_short {
+        kind.into() as libc::c_short
+    }
+
     /// Take the exclusive lock, or say who has it.
     pub(super) fn take(file: &File) -> Holder {
-        match set_lock(file, libc::F_WRLCK) {
+        match set_lock(file, l_type(libc::F_WRLCK)) {
             Ok(()) => Holder::Nobody,
             Err(error) if would_block(&error) => Holder::Someone {
                 pid: holding_pid(file),
@@ -555,8 +563,8 @@ mod imp {
         }
     }
 
-    fn set_lock(file: &File, kind: libc::c_int) -> io::Result<()> {
-        let request = describe(kind as libc::c_short);
+    fn set_lock(file: &File, kind: libc::c_short) -> io::Result<()> {
+        let request = describe(kind);
         // `F_SETLK` never blocks, so unlike `flock` it has no interruptible
         // wait to be cut short — the `EINTR` retry the old loop carried has
         // nothing left to guard.
@@ -568,11 +576,11 @@ mod imp {
 
     /// `Some(pid)` if a conflicting lock exists, `None` if the file is free.
     fn query(file: &File) -> io::Result<Option<u32>> {
-        let mut request = describe(libc::F_WRLCK as libc::c_short);
+        let mut request = describe(l_type(libc::F_WRLCK));
         if unsafe { libc::fcntl(file.as_raw_fd(), libc::F_GETLK, &mut request) } != 0 {
             return Err(io::Error::last_os_error());
         }
-        if request.l_type == libc::F_UNLCK as libc::c_short {
+        if request.l_type == l_type(libc::F_UNLCK) {
             return Ok(None);
         }
         Ok(Some(u32::try_from(request.l_pid).unwrap_or_default()))
