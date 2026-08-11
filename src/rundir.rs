@@ -343,29 +343,55 @@ impl RunLock {
         // What separates the two from the real thing is duration: a genuine
         // engine holds the lock for its whole run, a fork window for
         // microseconds. So believe `WouldBlock` only if it persists.
-        let deadline = Instant::now() + CONTENTION_GRACE;
-        loop {
-            match file.try_lock() {
-                Ok(()) => return Ok(Self { _file: file }),
-                Err(TryLockError::Error(source)) if source.kind() == io::ErrorKind::Interrupted => {
+        match probe(|| file.try_lock(), CONTENTION_GRACE) {
+            Verdict::Free => Ok(Self { _file: file }),
+            Verdict::Held => Err(TactusError::Refused {
+                message: format!(
+                    "another tactus process is already driving run `{}` (lock held on {}). Two \
+                     engines would interleave events and fight over the same branch — wait for it \
+                     to finish, or stop it first.",
+                    public.file_name().unwrap_or_default().to_string_lossy(),
+                    path.display()
+                ),
+            }),
+            // A lock that cannot be taken is not a lock that was taken. Say
+            // what actually failed rather than blaming an engine that may not
+            // exist.
+            Verdict::Unanswered(source) => Err(TactusError::Io { path, source }),
+        }
+    }
+}
+
+/// What one lock call, retried until it means something, established.
+#[derive(Debug)]
+enum Verdict {
+    /// Nobody holds it.
+    Free,
+    /// Somebody does, and went on holding it long enough to be believed.
+    Held,
+    /// The call failed without answering the question.
+    Unanswered(io::Error),
+}
+
+/// Retry a lock call until it says something a caller can act on.
+///
+/// Both callers below face the same problem — a single `try_lock` reports
+/// contention that is not contention — and both want the same discipline
+/// applied to it, so they share one loop rather than two that have to be kept
+/// in step. `grace` is a parameter because it is the only thing they disagree
+/// about: a caller that will ask again in half a second wants the answer now.
+fn probe(mut attempt: impl FnMut() -> Result<(), TryLockError>, grace: Duration) -> Verdict {
+    let deadline = Instant::now() + grace;
+    loop {
+        match attempt() {
+            Ok(()) => return Verdict::Free,
+            Err(TryLockError::Error(source)) if source.kind() == io::ErrorKind::Interrupted => {}
+            Err(TryLockError::Error(source)) => return Verdict::Unanswered(source),
+            Err(TryLockError::WouldBlock) => {
+                if Instant::now() >= deadline {
+                    return Verdict::Held;
                 }
-                Err(TryLockError::Error(source)) => {
-                    return Err(TactusError::Io { path, source });
-                }
-                Err(TryLockError::WouldBlock) => {
-                    if Instant::now() >= deadline {
-                        return Err(TactusError::Refused {
-                            message: format!(
-                                "another tactus process is already driving run `{}` (lock held on \
-                                 {}). Two engines would interleave events and fight over the same \
-                                 branch — wait for it to finish, or stop it first.",
-                                public.file_name().unwrap_or_default().to_string_lossy(),
-                                path.display()
-                            ),
-                        });
-                    }
-                    std::thread::sleep(RETRY_PAUSE);
-                }
+                std::thread::sleep(RETRY_PAUSE);
             }
         }
     }
@@ -388,30 +414,33 @@ pub fn is_running(public: &Path) -> bool {
     let Ok(file) = File::open(lock_file(public)) else {
         return false;
     };
-    // The same two traps `RunLock::acquire` documents, and the same answer.
-    // A signal makes the call fail having learned nothing, and a `fork`
-    // anywhere else in this process duplicates the descriptor so that an
-    // *unheld* lock refuses a shared one until that child execs. Either read
-    // as "a run is live" — which is the one thing `status` must not invent,
-    // since it is what tells an operator their run is still going.
-    let deadline = Instant::now() + CONTENTION_GRACE;
-    loop {
-        match file.try_lock_shared() {
-            Ok(()) => {
-                let _ = file.unlock();
-                return false;
-            }
-            Err(TryLockError::Error(source)) if source.kind() == io::ErrorKind::Interrupted => {}
-            // Cannot tell — and the doc above already says an unreadable lock
-            // is not a running run. `acquire` is the real guard either way.
-            Err(TryLockError::Error(_)) => return false,
-            Err(TryLockError::WouldBlock) => {
-                if Instant::now() >= deadline {
-                    return true;
-                }
-                std::thread::sleep(RETRY_PAUSE);
-            }
+    // The same two traps `RunLock::acquire` documents, and the same answer: a
+    // `fork` anywhere else in this process duplicates the descriptor so that an
+    // *unheld* lock refuses a shared one until that child execs, and that must
+    // not read as "a run is live" — which is the one thing `status` must not
+    // invent, since it is what tells an operator their run is still going.
+    match probe(|| file.try_lock_shared(), CONTENTION_GRACE) {
+        Verdict::Free => {
+            let _ = file.unlock();
+            false
         }
+        Verdict::Held => true,
+        // The opened-fine-but-cannot-be-locked case, which is not the same as
+        // the unopenable file above and does not get the same answer.
+        // `flock` returns `ENOLCK` or `EOPNOTSUPP` on filesystems that do not
+        // carry locks — NFS, SMB, some container overlays — and it does so
+        // whether or not an engine is driving the run.
+        //
+        // So the question is which way to be wrong when the OS refuses to say.
+        // Answering "not running" makes `status` settle a working attempt as
+        // cut off and print `state: interrupted … Continue it with: tactus
+        // resume <id>`, sending the operator to start a second engine on a
+        // live run. Answering "running" costs a `status` that declines to
+        // settle and says another process holds the run. One of those invents
+        // a fact the operator will act on; the other admits the run may still
+        // be going. `acquire` is the real guard against two engines either
+        // way, and it now reports this case as the IO error it is.
+        Verdict::Unanswered(_) => true,
     }
 }
 
@@ -607,6 +636,32 @@ mod tests {
         );
         releaser.join().expect("releaser");
     }
+
+    #[test]
+    fn a_lock_call_that_never_answers_is_not_a_free_lock() {
+        // No filesystem CI runs on returns `ENOLCK`, so the decision is tested
+        // where it is made rather than through a real lock. The arms that
+        // matter are the two that are not `Ok`: a lock the OS declines to
+        // report on must not come back as "nobody is running", because that is
+        // the reading that tells an operator to resume a run still in flight.
+        let unsupported = || {
+            Err(TryLockError::Error(io::Error::from_raw_os_error(
+                ENOLCK_LIKE,
+            )))
+        };
+        assert!(
+            matches!(probe(unsupported, Duration::ZERO), Verdict::Unanswered(_)),
+            "an error is not an answer"
+        );
+        assert!(matches!(probe(|| Ok(()), Duration::ZERO), Verdict::Free));
+        assert!(matches!(
+            probe(|| Err(TryLockError::WouldBlock), Duration::ZERO),
+            Verdict::Held
+        ));
+    }
+
+    /// Any errno that is not `Interrupted`; the value itself does not matter.
+    const ENOLCK_LIKE: i32 = 37;
 
     #[test]
     fn an_exact_match_resolves_to_the_name_on_disk() {
