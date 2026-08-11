@@ -37,10 +37,18 @@
 
 **Why taking the record is better, not merely different.** It is *stronger*: refusing detects a weakened gate and stops the run; taking the record means the weakened gate never governs anything and the run continues. It matches what the codebase already does twice — the review plan and `private_dir` are read from the record for the same stated reason, "a fact about the run, not about today's machine" — and what a live run does by construction, which is this record's own opening finding: config is parsed once into the analysis, so a mid-run edit cannot change a live run's gates. Honouring that snapshot across an interruption is what makes a resume the same run rather than a new one wearing its branch.
 
-**What it costs, stated plainly.** An operator who genuinely needs different gates — a typo'd command, a gate that cannot pass — must start a new run rather than resume; the warning says so. That is the same constraint a live run has, now honest instead of silently re-derived.
+**What it costs, stated plainly.** An operator who wants different gates on an existing run cannot have them: they start a new run, and the warning says so. That is the same constraint a live run has, now honest instead of silently re-derived. Whether that cost is ever worth buying back is the deferred question below.
 
 **Also revised:** `shell` and `timeout` are recorded. The first implementation omitted `shell` on portability grounds the review found unsupported (DESIGN.md §15 claims no such portability, §21 recommends running the whole conductor under WSL, and `private_dir` records an absolute host path, so a Windows-started/WSL-resumed run is already impossible). Shell is half of what a command means: `cmd = "true"` — the finding's own example of a weakened gate — always passes under `sh` and is not a program at all under `cmd.exe`.
 
 **The pre-record population is closed too.** A log written before the record existed has nowhere to carry it, so its first resume must re-derive — and if that resume records nothing, so must every resume after it, leaving a gate weakened between two of them silently adopted. That resume now writes what it settled on into its own `run_resumed`, and every resume after it is an ordinary record-bearing one.
 
 **The hardening half of the original verdict, now landed:** the blast-radius override this record prescribed did not exist, because the repo had no `tactus.toml` at all — so a diff touching gate definitions would have gone to ordinary same-family review. Added in the same change, with gates matching CI. The "proportionate pair" now reads: cross-family review of config diffs, plus the record governing what a resume verifies against.
+
+## Deferred candidate — adopting new gates mid-run
+
+Once the record governs a resume, an operator cannot change what verifies a run without starting a new one. **That is the design working, not a gap** — a review finding claiming otherwise was withdrawn, because the example did not survive being taken apart: a typo that always *fails* commits nothing, so a new run costs almost nothing, and a typo that always *passes* commits work that a new run is the correct answer to.
+
+What remains is narrower: a gate that was legitimately fine and needs *adjusting* after real commits — plausibly a `timeout_secs` too tight for a slower attempt — where the operator must redo honest work to widen a limit. An opt-in `tactus resume --adopt-gates`, recording the switch as an event so the ledger can say which tasks were verified against which standard, is the obvious shape.
+
+**Deliberately not built**, under this project's own evidence rule: the scenario has not occurred here, the shape above is a guess rather than a measured requirement, and the first real occurrence will say more about what it should be than any amount of reasoning now. Revisit when it bites.
