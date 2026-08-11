@@ -514,7 +514,7 @@ Build order (each step leaves a runnable binary): 1 IR + config + validate → 2
 
 **v0.2 definition of done:** a plan with two independent branches runs at `max_parallel = 3`, visibly interleaves in `status --follow`; one deliberate merge conflict is auto-resolved by a spawned fix task; one question is answered from a phone while the run keeps moving; and near a window reset with surplus capacity, spend-down mode observably biases assignments up-tier — with the ledger proving what each pool paid.
 
-**v0.3 — direction.** The design pane (interactive Phase-1 product) and a web dashboard, both as thin clients over the event log; a GitHub Action wrapping `tactus run`; the design-defect feedback loop surfacing into the designer prompt; learned routing from exported decisions.
+**v0.3 — direction.** The design pane (interactive Phase-1 product) and a web dashboard, both as thin clients over the event log; a GitHub Action wrapping `tactus run`; the design-defect feedback loop surfacing into the designer prompt; and routing *prediction* — a frontier model predicting rung and cost at `--dry-run`, shipped only if §23.2's calibration test passes. Learned routing from exported decisions is parked indefinitely at personal scale — single-digit samples per routing cell, and quarterly model churn decays the dataset about as fast as it grows (`decisions/2026-08-11-design-council.md`); the telemetry keeps landing because it is what makes small data interpretable, not because it will train anything.
 
 ## 22. Adopted from the field (with credit)
 
