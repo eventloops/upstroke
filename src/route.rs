@@ -160,16 +160,34 @@ mod tests {
     use crate::config;
     use crate::ir::{TaskId, TaskKind};
     use std::path::PathBuf;
+    use std::sync::OnceLock;
+
+    /// A directory with no config and one empty pools file, built once.
+    ///
+    /// Every test here routes through it, and it used to be rewritten on every
+    /// call at a path shared by *every process on the machine* — not even
+    /// pid-scoped, so a second `cargo test` binary truncated it under this
+    /// one's readers. The content is identical for every caller, so there was
+    /// never anything to rewrite.
+    fn hermetic() -> (PathBuf, PathBuf) {
+        static DIRS: OnceLock<(PathBuf, PathBuf)> = OnceLock::new();
+        DIRS.get_or_init(|| {
+            let dir =
+                std::env::temp_dir().join(format!("tactus-route-hermetic-{}", std::process::id()));
+            std::fs::create_dir_all(&dir).expect("scratch dir");
+            // A real, empty pools file: an explicit pools path that does not
+            // exist is a hard error, and `None` would read the operator's own.
+            let empty = dir.join("no-pools.toml");
+            std::fs::write(&empty, "# no pools\n").expect("empty pools file");
+            (dir, empty)
+        })
+        .clone()
+    }
 
     fn default_config() -> Config {
         let mut warnings = Vec::new();
-        let hermetic = std::env::temp_dir().join("tactus-route-hermetic");
-        let _ = std::fs::create_dir_all(&hermetic);
-        // A real, empty pools file: an explicit pools path that does not exist
-        // is a hard error, and `None` would read the operator's own.
-        let empty = hermetic.join("no-pools.toml");
-        std::fs::write(&empty, "# no pools\n").expect("empty pools file");
-        config::load(None, &hermetic, Some(&empty), &mut warnings).expect("default config")
+        let (dir, empty) = hermetic();
+        config::load(None, &dir, Some(&empty), &mut warnings).expect("default config")
     }
 
     fn task(kind: TaskKind) -> Task {

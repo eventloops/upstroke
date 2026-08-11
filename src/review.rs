@@ -1289,17 +1289,29 @@ mod tests {
         std::fs::create_dir_all(&dir).expect("scratch dir");
         let path = dir.join(name);
         std::fs::write(&path, body).expect("write config");
-        // A real, empty file: an explicit pools path that does not exist is a
-        // hard error, and `None` would read the operator's own pools file.
-        let missing = dir.join("no-pools.toml");
-        std::fs::write(
-            &missing,
-            "# no pools
-",
-        )
-        .expect("empty pools file");
         let mut warnings = Vec::new();
-        crate::config::load(Some(&path), &dir, Some(&missing), &mut warnings).expect("load")
+        crate::config::load(Some(&path), &dir, Some(&no_pools()), &mut warnings).expect("load")
+    }
+
+    /// An explicit pools path with no pools in it, built once.
+    ///
+    /// A real, empty file rather than an absent one: an explicit pools path
+    /// that does not exist is a hard error, and `None` would reach for the
+    /// operator's own `~/.tactus/pools.toml`. Created once because every caller
+    /// wants the same bytes, and rewriting one shared path from parallel tests
+    /// truncates it under a reader — `name` above is unique per test, this was
+    /// the one file they all shared.
+    fn no_pools() -> std::path::PathBuf {
+        static PATH: std::sync::OnceLock<std::path::PathBuf> = std::sync::OnceLock::new();
+        PATH.get_or_init(|| {
+            let dir =
+                std::env::temp_dir().join(format!("tactus-review-nopools-{}", std::process::id()));
+            std::fs::create_dir_all(&dir).expect("scratch dir");
+            let path = dir.join("pools.toml");
+            std::fs::write(&path, "# no pools\n").expect("empty pools file");
+            path
+        })
+        .clone()
     }
 
     /// A one-task plan whose paths can match an override.
