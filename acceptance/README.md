@@ -148,9 +148,13 @@ The two criteria that cannot be forced are **(b)** and **(c)** — you cannot ma
 a model fail on cue. If everything passes first try:
 
 - Tighten the `lint` gate (add `-W clippy::pedantic`) to make (b) more likely.
-- Make `parse-edges` harsher — more required error variants, an explicit "no
-  `unwrap` anywhere" criterion — to make a frontier reviewer more likely to
-  reject the first pass.
+- Make `parse-edges` genuinely harder with another boundary whose expected
+  result is explicit — for example, accept exactly `u64::MAX` and return the
+  overflow variant for the next value.
+
+Do not add an arbitrary syntax ban merely to manufacture a review failure. If
+no model fails, record the criterion as not demonstrated rather than replacing
+observable behaviour with a judgement call.
 
 Re-running is cheap in effort and not in money, so change one lever at a time.
 

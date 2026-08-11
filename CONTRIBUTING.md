@@ -14,9 +14,9 @@ cargo clippy --all-targets -- -D warnings
 cargo test --all-targets
 ```
 
-Conventions worth knowing: edition 2024, no `unwrap`/`expect` outside tests, `anyhow` only at the
-binary edge (libraries return `thiserror` types), and all paths through `std::path` — Windows is a
-first-class target, not an afterthought.
+Conventions worth knowing: edition 2024, no panicking `.unwrap()` or `.expect()` calls outside
+tests, `anyhow` only at the binary edge (libraries return `thiserror` types), and all paths through
+`std::path` — Windows is a first-class target, not an afterthought.
 
 ## Contributor Licence Agreement
 

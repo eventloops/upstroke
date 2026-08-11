@@ -73,8 +73,9 @@ is a failure, and so is an error type that cannot tell the cases apart.
   (`"4PB"`, `"4 potatoes"`).
 - A negative number (`"-1"`).
 - A fractional value (`"1.5KiB"`) — reject it rather than rounding.
-- A value that overflows `u64` when multiplied by its unit (`"17179869184GiB"`).
-  This must return an error, not wrap and not panic.
+- A bare value greater than `u64::MAX` (`"18446744073709551616"`), and a value
+  that overflows `u64` when multiplied by its unit (`"17179869184GiB"`). Both
+  must return the overflow error, not wrap or truncate.
 - Leading and trailing whitespace around an otherwise valid input.
 
 **Acceptance criteria**
@@ -83,16 +84,18 @@ is a failure, and so is an error type that cannot tell the cases apart.
   that some error occurred.
 - `SizeError` distinguishes at least: empty input, missing number, unknown unit,
   negative value, fractional value, and overflow.
-- No code path can panic on any `&str` input — no `unwrap`, no `expect`, no
-  arithmetic that can overflow in release mode.
+- `parse_size` returns a `Result` without panicking for every `&str`; a test
+  covers malformed non-ASCII input.
+- A numeric value outside `u64`, whether before or during unit scaling, returns
+  `SizeError::Overflow`; it never wraps or truncates.
 - `cargo test` and `cargo clippy --all-targets -- -D warnings` both pass.
 
 <!-- §21(c): `fix` gets `attempts_per = 1` across three rungs, so ANY first
-     failure escalates rather than retrying. The overflow case is the trap: the
-     obvious implementation multiplies before checking, which is a silent wrap
-     in release and a panic in debug. A frontier reviewer judging against the
-     "no code path can panic" criterion is the thing most likely to reject a
-     small model's first pass — which is exactly the escalation this needs. -->
+     failure escalates rather than retrying. The two overflow paths and the
+     non-ASCII case are the traps: an implementation can wrap, truncate, or
+     confuse character and byte boundaries while still looking correct on the
+     happy path. A reviewer can reject those observable failures without making
+     a judgement call about which Rust idioms are allowed. -->
 
 ## Decide the rendering contract
 

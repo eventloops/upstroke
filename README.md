@@ -105,6 +105,29 @@ renders:
 
 Unknown attributes warn; they never fail a plan.
 
+### Definition of Ready for agents
+
+An unattended task is ready when its worker and reviewer can reach the same
+verdict from the artifacts they receive. Before running a plan:
+
+- State acceptance criteria as observable outcomes, not preferred implementation
+  idioms.
+- Name boundary conditions and failure behaviour, with representative examples
+  where the edge would otherwise be ambiguous.
+- Make the evidence for each criterion inspectable: a test, command result,
+  generated artifact, or property of the diff.
+- Resolve choices that change what "correct" means while the user is present. If
+  a choice is intentionally deferred, make the question and its affected tasks
+  explicit.
+- Keep implementation constraints separate from acceptance behaviour. When a
+  particular syntax, dependency, or platform mechanism really is required, say
+  why and make the constraint mechanically unambiguous.
+
+For example, "must return an overflow error rather than panic, wrap, or
+truncate" is reviewable behaviour. "No `unwrap`" is not: it can be read as
+banning either the panicking `.unwrap()` call or every non-panicking method
+whose name shares that prefix.
+
 ## Configuration
 
 Config splits along its natural seam: **pools are user-level** — your subscriptions travel with
