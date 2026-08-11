@@ -1383,6 +1383,13 @@ impl Run<'_> {
             // — capacity-driven routing is v0.2 (§13) — only whether the next
             // attempt happens at all.
             if let Some(exceeded) = self.budget_breach(index) {
+                // The ceiling is recorded first, and nothing below may take it
+                // back. It is what `outcome()` reads to return `BudgetExceeded`
+                // rather than a task failure, what turns into exit 3 for the CI
+                // job gating on it, and what `resume --budget` needs to find in
+                // order to have a stop to get past. Tidying up afterwards is a
+                // courtesy; the record is the run's account of itself.
+                self.emit(EventBody::BudgetExceeded { data: exceeded })?;
                 // The tree may still hold a rejected attempt's edits, kept by
                 // the ladder below for a resumed retry that is now never going
                 // to run. Handing those back is the one thing §14 rules out —
@@ -1391,8 +1398,18 @@ impl Run<'_> {
                 // be saved for the resume: `run_resumed` discards every
                 // uncommitted path and clears the session they belong to, so
                 // keeping them past this point buys nothing at all.
-                self.workspace.discard_uncommitted()?;
-                self.emit(EventBody::BudgetExceeded { data: exceeded })?;
+                //
+                // A git that cannot do it says so and the run still stops at
+                // its ceiling, the way it did before the tidying existed. The
+                // sibling discard on the error path below is `let _ =` for the
+                // same reason; this one warns, because here there is a report
+                // left to carry the warning.
+                if let Err(error) = workspace.discard_uncommitted() {
+                    self.warnings.push(format!(
+                        "the budget stopped the run, but the working tree could not be cleaned: \
+                         {error}"
+                    ));
+                }
                 return Ok(false);
             }
 
@@ -8043,6 +8060,56 @@ mod tests {
                 .any(|w| w.contains("discarded") && w.contains("uncommitted")),
             "nothing should have been left for the resume to discard: {:?}",
             resumed.warnings
+        );
+    }
+
+    #[test]
+    fn a_budget_stop_survives_a_git_that_cannot_clean_the_tree() {
+        // Handing back a clean tree was added *before* the ceiling was
+        // recorded, with a `?` on it. So a `git reset --hard` that failed for
+        // any of the ordinary reasons — a locked index, a read-only path, a
+        // hook that exits non-zero — took the whole budget stop with it: no
+        // `budget_exceeded` event, `budget_stop` left `None`, exit 1 with a git
+        // error where CI was gating on exit 3, and a `resume --budget` with no
+        // stop to get past. The tidying is a courtesy; the ceiling is the run's
+        // account of why it stopped.
+        //
+        // The gate plants a stale `.git/index.lock`, which is the most faithful
+        // portable version of that: every later git command that writes the
+        // index refuses, and nothing else changes.
+        let repo = temp_engine_repo("budgetjam");
+        seed(
+            &repo,
+            "## One\n<!-- tactus: id=t1 kind=implement depends= -->\n",
+            Some(
+                "[routing]\nimplement = { chain = [\"small\"], attempts_per = 2 }\n\n\
+                 [[gates]]\nname = \"jam\"\ncmd = \"echo jam> .git/index.lock\"\n",
+            ),
+        );
+        let mut opts = options(&repo);
+        opts.config_path = Some(repo.join("tactus.toml"));
+        opts.budget_usd = Some(0.05);
+        let rejected = source(vec![Effect::EditFile], vec![ReviewBehavior::Fail]);
+        let stopped = run_with(&opts, &rejected).expect("the ceiling still ends the run");
+
+        assert_eq!(
+            stopped.outcome(),
+            RunOutcome::BudgetExceeded,
+            "a failed cleanup relabelled the stop: {stopped:?}"
+        );
+        let stop = stopped
+            .budget_stop
+            .as_ref()
+            .expect("the ceiling is on the record even when the cleanup failed");
+        assert_eq!(stop.budget, events::BudgetKind::Run);
+        // And it says so rather than leaving the operator to find the mess.
+        assert!(
+            stopped
+                .warnings
+                .iter()
+                .any(|w| w.contains("could not be cleaned")),
+            "the dirty tree went unmentioned: {:?}",
+            stopped.warnings
         );
     }
 
