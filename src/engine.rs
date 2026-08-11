@@ -254,6 +254,24 @@ impl TaskReport {
         }
     }
 
+    /// Whether an attempt reported no spend, making `cost_usd` a floor.
+    ///
+    /// The worker-side twin of [`Self::review_cost_incomplete`], and a method
+    /// rather than a field because it is derivable from the attempts already
+    /// carried here — no schema change, so an older `report.json` reads back
+    /// with the same answer this computes.
+    ///
+    /// Two kinds of attempt land here, and both genuinely spent something
+    /// nobody can name: one on a route that reports no dollars at all (Codex
+    /// reports tokens — §13), and one the engine was killed inside, whose
+    /// `cost_usd` is `null` precisely because the record of its ending was
+    /// never written. `unpriced_attempts` counts the same condition for the
+    /// capacity estimator, so the ledger and the estimator now agree about
+    /// which attempts are unpriced.
+    pub fn cost_incomplete(&self) -> bool {
+        self.attempts.iter().any(|record| record.cost_usd.is_none())
+    }
+
     /// Compact escalation trail, e.g. `small×2 failed → mid ok`.
     pub fn trail(&self) -> String {
         let mut parts: Vec<(String, u32, bool)> = Vec::new();
@@ -357,6 +375,24 @@ impl RunReport {
             .filter(|t| matches!(t.status, TaskRunStatus::Parked { .. }))
             .map(|t| t.id.as_str())
             .collect()
+    }
+
+    /// Whether `total_cost_usd` is a floor rather than a figure.
+    ///
+    /// `total_cost_usd` is an `f64`, so it cannot say this for itself: a run
+    /// that reported nothing and a run that genuinely cost nothing both arrive
+    /// as `0.0`. The distinction has to be carried alongside, and §13 is
+    /// explicit that a ledger which cannot tell free from unreported is worse
+    /// than no ledger.
+    ///
+    /// Both halves count. The review side has been marked since step 9; the
+    /// worker side became reachable the moment an implementer could report
+    /// tokens without dollars, and is now the *normal* case for a
+    /// codex-implemented run rather than an edge one.
+    pub fn total_is_floor(&self) -> bool {
+        self.tasks
+            .iter()
+            .any(|task| task.cost_incomplete() || task.review_cost_incomplete)
     }
 
     /// How much of the plan actually landed — the one figure every ending
@@ -3325,7 +3361,12 @@ impl RunReport {
                     .display()
             );
         }
-        let _ = writeln!(out, "total: ${:.4} (api-equivalent)", self.total_cost_usd);
+        let _ = writeln!(
+            out,
+            "total: ${:.4}{} (api-equivalent)",
+            self.total_cost_usd,
+            if self.total_is_floor() { "?" } else { "" }
+        );
         // A live run has no outcome yet, and every arm below claims one. Say
         // what is true instead: how far it has got.
         if self.running {
@@ -3443,9 +3484,12 @@ impl RunReport {
                     } else {
                         task.trail()
                     },
-                    money(task.cost_usd),
+                    partial(money(task.cost_usd), task.cost_incomplete()),
                     partial(money(task.review_cost_usd), task.review_cost_incomplete),
-                    partial(money(task.total_cost_usd()), task.review_cost_incomplete),
+                    partial(
+                        money(task.total_cost_usd()),
+                        task.cost_incomplete() || task.review_cost_incomplete,
+                    ),
                 ]
             })
             .collect();
@@ -3478,13 +3522,15 @@ impl RunReport {
         }
         let _ = writeln!(
             out,
-            "  total ${:.4} (api-equivalent; subscription spend is notional — §13)",
-            self.total_cost_usd
+            "  total ${:.4}{} (api-equivalent; subscription spend is notional — §13)",
+            self.total_cost_usd,
+            if self.total_is_floor() { "?" } else { "" }
         );
-        if self.tasks.iter().any(|t| t.review_cost_incomplete) {
+        if self.total_is_floor() {
             let _ = writeln!(
                 out,
-                "  `?` marks a total missing a reviewer whose route reports no spend (§13)"
+                "  `?` marks a figure missing an attempt whose route reports no spend, or one \
+                 the engine was killed inside — a floor, not a total (§13)"
             );
         }
         // §13's second currency. An empty section means no attempt in this run
@@ -8257,6 +8303,49 @@ mod tests {
         );
     }
 
+    /// One attempt that reported its spend and one that did not — the shape a
+    /// kill/resume leaves, and a mixed-route ladder too.
+    fn priced_and_unpriced_attempts() -> TaskReport {
+        let attempt = |cost: Option<f64>| AttemptRecord {
+            attempt: 1,
+            tier: "frontier".to_owned(),
+            model: "m".to_owned(),
+            pool: None,
+            resumed: false,
+            duration: Duration::ZERO,
+            cost_usd: cost,
+            reviews: Vec::new(),
+            session_id: None,
+            usage: None,
+            failure: None,
+        };
+        let mut task = task_report_costing(Some(0.2020), None);
+        task.status = TaskRunStatus::Committed {
+            sha: "abc123".to_owned(),
+        };
+        task.attempts = vec![attempt(None), attempt(Some(0.2020))];
+        task
+    }
+
+    /// A `RunReport` with nothing in it, for tests that care about one field.
+    fn empty_report() -> RunReport {
+        RunReport {
+            run_id: "01RUN".to_owned(),
+            branch: "b".to_owned(),
+            gates: Vec::new(),
+            gates_from_config: false,
+            warnings: Vec::new(),
+            tasks: Vec::new(),
+            halted_at: None,
+            questions: Vec::new(),
+            budget_stop: None,
+            total_cost_usd: 0.0,
+            pool_drain: Vec::new(),
+            running: false,
+            interrupted: false,
+        }
+    }
+
     #[test]
     fn an_unpriced_worker_reads_as_unreported_rather_than_free() {
         // §13's rule, on the line an operator actually reads. The ledger has
@@ -8271,20 +8360,26 @@ mod tests {
         task.status = TaskRunStatus::Committed {
             sha: "abc123".to_owned(),
         };
+        // The attempt that actually ran, as a route reporting no dollars
+        // records it. Without this the task has no attempts at all, which is a
+        // different thing entirely — nothing ran, so nothing is missing, and
+        // the ledger correctly prints `—` rather than a floor.
+        task.attempts = vec![AttemptRecord {
+            attempt: 1,
+            tier: "frontier".to_owned(),
+            model: "gpt-5.6-sol".to_owned(),
+            pool: None,
+            resumed: false,
+            duration: Duration::from_secs(46),
+            cost_usd: None,
+            reviews: Vec::new(),
+            session_id: None,
+            usage: None,
+            failure: None,
+        }];
         let report = RunReport {
-            run_id: "01RUN".to_owned(),
-            branch: "b".to_owned(),
-            gates: Vec::new(),
-            gates_from_config: false,
-            warnings: Vec::new(),
             tasks: vec![task],
-            halted_at: None,
-            questions: Vec::new(),
-            budget_stop: None,
-            total_cost_usd: 0.0,
-            pool_drain: Vec::new(),
-            running: false,
-            interrupted: false,
+            ..empty_report()
         };
 
         let rendered = report.render();
@@ -8297,12 +8392,44 @@ mod tests {
             !task_line.contains("$0.0000"),
             "unreported spend rendered as free: {task_line}"
         );
-        // NOTE: `total:` below still prints `$0.0000` for this run, because
-        // `RunReport::total_cost_usd` is an `f64` that cannot distinguish a
-        // zero sum from an unreported one, and only `review_cost_incomplete`
-        // currently marks a total as a floor. A worker that reports nothing
-        // sets no such flag. Same §13 rule, one level up, and a wider change —
-        // recorded here rather than silently widened into this fix.
+        // And the same rule one level up. `total_cost_usd` is an `f64`, so it
+        // cannot distinguish a zero sum from an unreported one — the floor has
+        // to be carried beside it. Measured on run 01KZRTZ9ZKKF1YS7MVT4350X7M,
+        // where a codex-implemented task made `total $0.1561` read as complete
+        // while the worker's real spend was unknown.
+        assert!(
+            report.total_is_floor(),
+            "an unpriced worker makes it a floor"
+        );
+        assert!(rendered.contains("total: $0.0000?"), "{rendered}");
+        let ledger = report.render_ledger();
+        assert!(ledger.contains("total $0.0000?"), "{ledger}");
+        assert!(ledger.contains("a floor, not a total"), "{ledger}");
+        // Here every attempt was unpriced, so the worker column is `—`, which
+        // already says "unreported" — `partial` leaves it alone rather than
+        // decorating it into `—?`.
+        let row = ledger
+            .lines()
+            .find(|l| l.trim_start().starts_with("t1"))
+            .expect("the ledger row");
+        assert!(row.contains('—'), "{row}");
+
+        // The `?` belongs on a figure that exists but is short: two attempts,
+        // one priced and one not. That is what a resumed run looks like after
+        // the engine was killed inside the first attempt, and what a mixed
+        // ladder looks like when one rung reports and another does not.
+        let mut mixed = priced_and_unpriced_attempts();
+        mixed.id = "t2".to_owned();
+        let row = RunReport {
+            tasks: vec![mixed],
+            ..empty_report()
+        }
+        .render_ledger();
+        let row = row
+            .lines()
+            .find(|l| l.trim_start().starts_with("t2"))
+            .expect("the ledger row");
+        assert!(row.contains("$0.2020?"), "a floor must say so: {row}");
 
         // And a route that does report keeps its figure.
         let mut priced = report;
