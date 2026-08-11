@@ -6945,12 +6945,24 @@ mod tests {
             report.total_cost_usd
         );
 
-        // A live run says so.
+        // Holding the lock on a run that has already recorded its finish does
+        // not make it live again. It says a process has claimed the run —
+        // which is what a `resume` looks like before it writes anything — and
+        // leaves the outcome above alone. A live run is covered by
+        // `a_live_run_reads_as_running_rather_than_halted`, which truncates the
+        // log so that the run genuinely has somewhere left to go.
         let paths = paths_of(&repo, &report.run_id);
-        let _held = RunLock::acquire(&paths.public).expect("simulate a live engine");
-        let live = replay_of(&repo, &report.run_id);
-        assert!(live.running);
-        assert!(crate::status::render(&live).contains("running now"));
+        let _held = RunLock::acquire(&paths.public).expect("claim the finished run");
+        let claimed = replay_of(&repo, &report.run_id);
+        assert!(!claimed.running, "a finished run is not running");
+        assert!(claimed.held, "but something does hold it");
+        let rendered = crate::status::render(&claimed);
+        assert!(
+            rendered.contains("another process holds this run"),
+            "{rendered}"
+        );
+        assert!(rendered.contains("run complete"), "{rendered}");
+        assert!(!rendered.contains("run in progress"), "{rendered}");
     }
 
     #[test]
@@ -8061,6 +8073,47 @@ mod tests {
             "nothing should have been left for the resume to discard: {:?}",
             resumed.warnings
         );
+    }
+
+    #[test]
+    fn a_budget_stop_keeps_its_outcome_while_a_resume_holds_the_lock() {
+        // `resume` takes the run's lock and then does a dozen git subprocesses
+        // — branch checks, a switch, a discard — before it writes
+        // `run_resumed`. Deriving liveness from the lock alone made that whole
+        // window read as a live run: `status` printed `run in progress: N
+        // task(s) committed so far` and returned early, dropping the stop
+        // reason, the parked list, and the `resume --budget` line an operator
+        // at a budget stop is running `status` to find.
+        //
+        // The lock answers who has claimed the run. Whether the run still has
+        // anywhere to go is a question only its log answers.
+        let repo = temp_engine_repo("resumewindow");
+        seed(
+            &repo,
+            "## One\n<!-- tactus: id=t1 kind=implement depends= -->\n",
+            Some("[routing]\nimplement = { chain = [\"small\"], attempts_per = 2 }\n"),
+        );
+        let mut opts = options(&repo);
+        opts.config_path = Some(repo.join("tactus.toml"));
+        opts.budget_usd = Some(0.05);
+        let rejected = source(vec![Effect::EditFile], vec![ReviewBehavior::Fail]);
+        let stopped = run_with(&opts, &rejected).expect("run");
+        assert_eq!(stopped.outcome(), RunOutcome::BudgetExceeded, "{stopped:?}");
+
+        let paths = paths_of(&repo, &stopped.run_id);
+        let _held = RunLock::acquire(&paths.public).expect("the resume claims it");
+
+        let seen = replay_of(&repo, &stopped.run_id);
+        assert!(
+            !seen.running,
+            "a run that recorded its finish is not running"
+        );
+        assert!(seen.held, "though a resume does hold it");
+        let out = crate::status::render(&seen);
+        assert!(out.contains("run stopped at its budget"), "{out}");
+        assert!(out.contains("tactus resume"), "{out}");
+        assert!(out.contains("another process holds this run"), "{out}");
+        assert!(!out.contains("run in progress"), "{out}");
     }
 
     #[test]

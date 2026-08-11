@@ -27,8 +27,19 @@ pub struct RunStatus {
     pub started: RunStarted,
     pub state: RunState,
     pub plan: Plan,
-    /// Whether an engine is driving this run right now.
+    /// Whether an engine is driving this run *and* the run has not recorded
+    /// that it finished — the two halves of "still going", which the lock
+    /// alone does not answer.
     pub running: bool,
+    /// Whether anything holds the run's lock, finished or not.
+    ///
+    /// Kept beside `running` rather than folded into it because a process
+    /// claiming a run that already ended is real and worth saying: `resume`
+    /// takes the lock and holds it across a dozen git subprocesses before it
+    /// writes `run_resumed`. During that window the run has an owner and an
+    /// outcome at the same time, and an operator asking `status` deserves
+    /// both.
+    pub held: bool,
     /// Attempts that were in flight when a previous process stopped.
     pub interrupted: u32,
     pub warnings: Vec<String>,
@@ -83,7 +94,16 @@ pub fn load(repo_root: &Path, run_id: Option<&str>) -> Result<RunStatus, TactusE
 
     let task_ids = plan.tasks.iter().map(|task| task.id.to_string()).collect();
     let mut replayed = events::replay(events, task_ids, &events_path)?;
-    let running = rundir::is_running(&paths.public);
+    // Two questions, not one. The lock says whether a process has claimed this
+    // run; the log says whether the run still has anywhere to go. `running`
+    // needs both, for the same reason `interrupted_run` below does: `resume`
+    // claims the lock before it writes anything, so a budget-stopped run has an
+    // owner for as long as that resume takes to get going. Reading the lock
+    // alone made those seconds render as `run in progress`, dropping the stop
+    // reason, the parked list, and the `resume --budget` line the operator is
+    // there to find.
+    let held = rundir::is_running(&paths.public);
+    let running = held && replayed.state.finished.is_none();
     // Settled in memory only: status is a pure read and must not write to a
     // run it is merely looking at. A resume records the same settlement as
     // events instead.
@@ -106,6 +126,7 @@ pub fn load(repo_root: &Path, run_id: Option<&str>) -> Result<RunStatus, TactusE
         state: replayed.state,
         plan,
         running,
+        held,
         interrupted,
         warnings,
     })
@@ -137,6 +158,14 @@ pub fn render(status: &RunStatus) -> String {
                 String::new()
             },
             status.run_id
+        );
+    } else if status.held {
+        // Finished, and somebody has claimed it anyway — a `resume` between
+        // taking the lock and writing `run_resumed`. The outcome above is still
+        // this run's outcome; it may just not be the last word for long.
+        let _ = writeln!(
+            out,
+            "state: another process holds this run (a resume, most likely)"
         );
     }
 
