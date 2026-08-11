@@ -579,6 +579,36 @@ mod tests {
     }
 
     #[test]
+    fn a_lock_held_for_only_an_instant_is_not_a_running_run() {
+        // The reading half of what `a_run_can_only_be_held_once_at_a_time`
+        // times on `acquire`. That test holds the lock permanently and drops
+        // it permanently, so `is_running` could go back to believing every
+        // refusal on sight and stay green — which is exactly the state it was
+        // in when a `fork` window made a finished run report itself as live.
+        //
+        // The cost was not only a wrong status line. `RunReport` carries
+        // `running`, and it decides whether unreached tasks settle as skipped
+        // or stay pending, so one spurious yes made a run's own report differ
+        // from a replay of its log — the invariant the event log rests on.
+        // Measured at 50 false positives in 3000 probes under a parallel suite
+        // spawning subprocesses.
+        let root = scratch("transient");
+        let paths = paths_in(&root, "RUN1");
+        paths.create().expect("create");
+
+        let held = RunLock::acquire(&paths.public).expect("acquire");
+        let releaser = std::thread::spawn(move || {
+            std::thread::sleep(CONTENTION_GRACE / 5);
+            drop(held);
+        });
+        assert!(
+            !is_running(&paths.public),
+            "a hold that does not outlast the grace is a fork window, not an engine"
+        );
+        releaser.join().expect("releaser");
+    }
+
+    #[test]
     fn an_exact_match_resolves_to_the_name_on_disk() {
         // The comparison is case-insensitive, so the answer has to be the
         // directory that actually exists: on a case-sensitive filesystem the
