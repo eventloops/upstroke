@@ -324,7 +324,15 @@ pub fn follow(
             // live view mid-run. The budget exists only to release a terminal
             // attached to an engine that has died, so it starts counting when
             // the run's lock does not.
-            if rundir::is_running(&status.paths.public) {
+            //
+            // The cheap probe, because this is the one caller that asks over
+            // and over. The full check waits out its contention grace every
+            // time the answer is yes — a live engine holds the lock
+            // continuously, so the retry never clears — which on a healthy run
+            // is every poll. A hold that turns out to be a `fork` window costs
+            // nothing here but one idle tick not counted, and the next poll
+            // asks again.
+            if rundir::lock_is_held_now(&status.paths.public) {
                 idle = 0;
             } else {
                 idle += 1;

@@ -424,6 +424,30 @@ const RETRY_PAUSE: Duration = Duration::from_millis(5);
 /// opened at all is not a running run — the lock is only ever created by a run
 /// that started.
 pub fn is_running(public: &Path) -> bool {
+    held_within(public, CONTENTION_GRACE)
+}
+
+/// Whether anything holds the run's lock at this instant.
+///
+/// [`is_running`] without the grace, for a caller that is going to ask again in
+/// a moment anyway. The grace exists to disbelieve a hold that is really a
+/// `fork` window, and disbelieving it costs the full 500ms *every time the
+/// answer is yes* — because a live engine holds the lock continuously, so the
+/// retry loop never clears and always runs to the deadline.
+///
+/// `status --follow` paid that on every idle poll, which is the worst place for
+/// it: the poll cycle went from 500ms to a second, doubling the latency of the
+/// live view, and flock syscalls went from about two a second to about two
+/// hundred. Over a ten-minute silent agent turn, 600 calls became 60,000.
+///
+/// A caller polling in a loop does not need the grace, because believing a
+/// transient hold costs it nothing: `follow` only resets an idle counter, and
+/// the next poll asks again. Err toward "held" and keep the view open.
+pub fn lock_is_held_now(public: &Path) -> bool {
+    held_within(public, Duration::ZERO)
+}
+
+fn held_within(public: &Path, grace: Duration) -> bool {
     let Ok(file) = File::open(lock_file(public)) else {
         return false;
     };
@@ -432,7 +456,7 @@ pub fn is_running(public: &Path) -> bool {
     // *unheld* lock refuses a shared one until that child execs, and that must
     // not read as "a run is live" — which is the one thing `status` must not
     // invent, since it is what tells an operator their run is still going.
-    match probe(|| file.try_lock_shared(), CONTENTION_GRACE) {
+    match probe(|| file.try_lock_shared(), grace) {
         Verdict::Free => {
             let _ = file.unlock();
             false
@@ -671,6 +695,30 @@ mod tests {
             probe(|| Err(TryLockError::WouldBlock), Duration::ZERO),
             Verdict::Held
         ));
+    }
+
+    #[test]
+    fn the_cheap_probe_answers_a_held_lock_without_waiting_out_the_grace() {
+        // The grace is paid in full precisely when the answer is yes, because a
+        // live engine never lets go and the retry loop runs to the deadline
+        // every time. `status --follow` asked once per idle poll, so a healthy
+        // run cost it 500ms and ~100 flock calls per cycle — the poll period
+        // doubled, and a ten-minute silent agent turn went from about 600
+        // syscalls to 60,000.
+        let root = scratch("cheapprobe");
+        let paths = paths_in(&root, "RUN1");
+        paths.create().expect("create");
+
+        assert!(!lock_is_held_now(&paths.public), "nothing holds it yet");
+        let _held = RunLock::acquire(&paths.public).expect("acquire");
+
+        let started = Instant::now();
+        assert!(lock_is_held_now(&paths.public), "and now something does");
+        let waited = started.elapsed();
+        assert!(
+            waited < CONTENTION_GRACE / 2,
+            "the polling probe paid the grace: {waited:?}"
+        );
     }
 
     #[test]
