@@ -293,6 +293,24 @@ pub struct RunStarted {
     /// that config moved: `Progress.rung` is an index into this chain, and
     /// re-resolving a different one would silently point it at another tier.
     pub chains: Vec<ChainSummary>,
+    /// The effective gates, command and name both, as the run resolved them.
+    /// `gates` above names them for the reader; this is what resume verifies.
+    /// Names alone cannot: a `[[gates]]` edit that keeps a name and changes its
+    /// command (`cmd = "cargo test"` → `cmd = "true"`) reads identically — and
+    /// the workspace an implementer edits contains the very `tactus.toml` the
+    /// gates are read from, so a resume that re-derived them would adopt a
+    /// standard the run never promised. Gate commands are verification
+    /// identity, recorded-and-refused like the plan hash and the chains;
+    /// budgets stay deliberately re-derived
+    /// ([`ResumeOptions::budget_usd`](crate::engine::ResumeOptions)).
+    ///
+    /// `None` means the log predates this record and says nothing about the
+    /// commands — not that there were none. Absent means re-derive and warn,
+    /// exactly the `reviews` contract below. Pure addition otherwise:
+    /// `#[serde(default)]` folds an old log to the state it always had, so
+    /// `SCHEMA_VERSION` does not move.
+    #[serde(default)]
+    pub gate_cmds: Option<Vec<GateSummary>>,
     /// Who judges this run's code (§11.2–§11.3), resolved at pre-flight.
     ///
     /// Recorded because it is a fact about the run, not about today's machine.
@@ -317,6 +335,20 @@ pub struct ChainSummary {
     pub task: String,
     pub tiers: Vec<Tier>,
     pub attempts_per: u32,
+}
+
+/// One effective gate as it stood when the run started: the name the ledger
+/// and the log tail call it, and the command that is that gate's whole meaning.
+///
+/// Deliberately not `timeout` or `shell`: those say how long a gate may take
+/// and how it is spawned — operational settings a resume is free to re-read,
+/// like a budget, and pinning `shell` would refuse a record §15 wants portable
+/// (a run started on Windows, resumed under WSL). Name and command are what
+/// decide *what passing meant*.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GateSummary {
+    pub name: String,
+    pub cmd: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1489,6 +1521,10 @@ mod tests {
                     tiers: vec![Tier::Small, Tier::Mid],
                     attempts_per: 2,
                 }],
+                gate_cmds: Some(vec![GateSummary {
+                    name: "check".to_owned(),
+                    cmd: "cargo check".to_owned(),
+                }]),
             }),
         }
     }
@@ -1785,6 +1821,32 @@ mod tests {
         let err = replay(events, vec!["t1".to_owned()], Path::new("events.jsonl"))
             .expect_err("must refuse a newer log");
         assert!(err.to_string().contains("Upgrade"), "got: {err}");
+    }
+
+    #[test]
+    fn a_run_started_without_gate_commands_reads_as_unrecorded() {
+        // The shape every log written before the gate-command record has.
+        // `None`, not an empty list: "said nothing about the commands" and
+        // "said there were none" must stay distinguishable — the same rule
+        // `reviews` follows for logs that predate step 9.
+        let EventBody::RunStarted { data } = started() else {
+            panic!("started() builds a run_started");
+        };
+        let mut json =
+            serde_json::to_value(Event::now(EventBody::RunStarted { data })).expect("serialize");
+        assert!(
+            json["data"]
+                .as_object_mut()
+                .expect("data")
+                .remove("gate_cmds")
+                .is_some(),
+            "a fresh run records its gate commands"
+        );
+        let event: Event = serde_json::from_value(json).expect("an old log still parses");
+        let EventBody::RunStarted { data } = event.body else {
+            panic!("still a run_started");
+        };
+        assert_eq!(data.gate_cmds, None);
     }
 
     #[test]

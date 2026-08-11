@@ -93,3 +93,7 @@ All five wrap-up threads approved by the owner the same day: (1) this folder cre
 **Fix (flagged for a separate implement session):** record gate commands (or a fingerprint) in `run_started`; resume refuses on mismatch with the chains-refusal phrasing; logs predating the record warn and re-derive, like the pre-step-9 review record; DESIGN.md §15's refusal list gains gates alongside the plan hash and chains.
 
 **Config hardening before the first self-hosted run:** blast-radius override in this repo's `tactus.toml` — `paths = ["tactus.toml"]` with `second_opinion = "different-vendor"` — so any diff touching gate definitions gets cross-family eyes. **Rejected:** hard-denying `tactus.toml` edits to implementers — self-hosting tasks legitimately touch config, and gate commands execute repository scripts anyway (§21's runner rationale); review plus refusal-on-resume is the proportionate pair.
+
+## Addendum D (2026-08-11) — Addendum C's resume gap: closed
+
+Implemented as flagged: `run_started` now records each gate's name **and command** (`gate_cmds`), and resume refuses on mismatch with the chains-refusal shape ("Restore the config it ran with, or start a new run."). Logs predating the record warn and re-derive, like the pre-step-9 review record. DESIGN.md §15's refusal list gains gates alongside the plan hash and chains; `timeout`/`shell` stay deliberately re-derived (operational settings, and pinning `shell` would refuse the Windows-started/WSL-resumed record §15 wants portable).

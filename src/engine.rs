@@ -36,7 +36,7 @@ use crate::capacity;
 use crate::config::{self, OnTaskFailure};
 use crate::error::TactusError;
 use crate::events::{
-    self, ChainSummary, EventBody, EventLog, Feedback, Progress, RunState, TaskState,
+    self, ChainSummary, EventBody, EventLog, Feedback, GateSummary, Progress, RunState, TaskState,
 };
 use crate::gates::{self, ShellGate};
 use crate::interaction::{
@@ -677,6 +677,7 @@ fn run_harness_inner(
         interaction_mode: mode.to_string(),
         chains: chain_summaries(&analysis),
         reviews: Some(review_plan.clone()),
+        gate_cmds: Some(gate_summaries(&analysis)),
     };
 
     let sleeper = harness.sleeper.unwrap_or(&RealSleeper);
@@ -781,6 +782,18 @@ fn chain_summaries(analysis: &Analysis) -> Vec<ChainSummary> {
         .collect()
 }
 
+/// The effective gates, name and command both, as they stood at this moment.
+fn gate_summaries(analysis: &Analysis) -> Vec<GateSummary> {
+    analysis
+        .gates
+        .iter()
+        .map(|gate| GateSummary {
+            name: gate.name.clone(),
+            cmd: gate.cmd.clone(),
+        })
+        .collect()
+}
+
 /// What to continue, and what may be overridden while continuing it.
 #[derive(Debug, Clone)]
 pub struct ResumeOptions {
@@ -799,12 +812,14 @@ pub struct ResumeOptions {
     /// `--budget <usd>` (§17), overriding `[budgets] run_usd` for this resume.
     ///
     /// Budgets are **re-derived from today's config and flags** rather than
-    /// recorded-and-refused, unlike the plan hash and the resolved chains
-    /// (§15). Those refusals protect a run's *identity*: replaying progress
-    /// against a moved plan would attribute work to the wrong task. A budget is
-    /// not identity — it is an operator's ceiling on their own spending, and
-    /// re-reading it is precisely what makes a budget stop recoverable in one
-    /// command instead of a dead run and a new branch.
+    /// recorded-and-refused, unlike the plan hash, the resolved chains, and
+    /// the gate commands (§15). Those refusals protect a run's *identity*:
+    /// replaying progress against a moved plan would attribute work to the
+    /// wrong task, and continuing under moved gates would verify it against a
+    /// standard the record never promised. A budget is not identity — it is an
+    /// operator's ceiling on their own spending, and re-reading it is
+    /// precisely what makes a budget stop recoverable in one command instead
+    /// of a dead run and a new branch.
     pub budget_usd: Option<f64>,
 }
 
@@ -841,9 +856,9 @@ pub fn resume_with(
 /// continue — parked questions intact.
 ///
 /// Every refusal below exists because continuing would produce a *wrong*
-/// result rather than merely an awkward one, and each says which of the three
-/// things moved — the run, the plan, or the branch — because that is what
-/// decides what the operator does next.
+/// result rather than merely an awkward one, and each says which of the four
+/// things moved — the run, the plan, the config, or the branch — because that
+/// is what decides what the operator does next.
 pub fn resume_harness(
     opts: &ResumeOptions,
     harness: &Harness<'_>,
@@ -894,7 +909,10 @@ fn resume_harness_inner(
 
     // Re-probes agents and re-resolves gates, exactly as a fresh run does —
     // except for who reviews, which is read from the record rather than
-    // re-derived (see `preflight_with_reviews`).
+    // re-derived (see `preflight_with_reviews`). The re-resolved gates are not
+    // trusted either: they are checked against the record below, beside the
+    // plan hash and the chains, because they are verification identity rather
+    // than an operator ceiling.
     let Preflight {
         analysis,
         caps,
@@ -952,6 +970,32 @@ fn resume_harness_inner(
              different tier: {}. Restore the config it ran with, or start a new run.",
             moved.join("; ")
         )));
+    }
+
+    // Gates moved means the verification standard moved. Every `task_committed`
+    // in this log says "passed the recorded commands"; adopting different ones
+    // would verify the rest of the run against a standard the earlier tasks
+    // never met — including a weaker one an implementer wrote into the
+    // workspace's own `tactus.toml` before the interruption, which is exactly
+    // the tree a self-hosting run hands its agents.
+    match &started.gate_cmds {
+        // A log written before the record can say nothing about its commands —
+        // `run_started` carried only names then, which cannot tell a
+        // name-preserving command edit from no edit at all. Re-derive and say
+        // so, like the pre-step-9 review record above: refusing would strand
+        // every older run over a field it could never have written.
+        None => warnings.push(
+            "this run's log predates the gate-command record (v0.2), so the gates were \
+             re-derived from today's config rather than checked against the run — earlier \
+             tasks may have been verified by different commands"
+                .to_owned(),
+        ),
+        Some(recorded) => {
+            let gates_now = gate_summaries(&analysis);
+            if gates_now != *recorded {
+                return Err(refuse(gates_moved_message(recorded, &gates_now)));
+            }
+        }
     }
 
     let task_ids: Vec<String> = analysis
@@ -1166,6 +1210,50 @@ fn render_tiers(chain: &ChainSummary) -> String {
         .map(ToString::to_string)
         .collect::<Vec<_>>()
         .join(" → ")
+}
+
+/// The gates refusal, itemized: what each moved gate ran and would now run.
+///
+/// Unlike the chains, the two lists need not be the same length — a gate can
+/// be edited, removed, or added — so this walks by name rather than zipping.
+fn gates_moved_message(recorded: &[GateSummary], now: &[GateSummary]) -> String {
+    fn cmd_of<'a>(gates: &'a [GateSummary], name: &str) -> Option<&'a str> {
+        gates
+            .iter()
+            .find(|g| g.name == name)
+            .map(|g| g.cmd.as_str())
+    }
+    let mut moved: Vec<String> = Vec::new();
+    for gate in recorded {
+        match cmd_of(now, &gate.name) {
+            Some(cmd) if *cmd == gate.cmd => {}
+            Some(cmd) => moved.push(format!(
+                "`{}` ran `{}` and would now run `{cmd}`",
+                gate.name, gate.cmd
+            )),
+            None => moved.push(format!(
+                "`{}` (`{}`) would no longer run",
+                gate.name, gate.cmd
+            )),
+        }
+    }
+    for gate in now {
+        if cmd_of(recorded, &gate.name).is_none() {
+            moved.push(format!("`{}` (`{}`) would newly run", gate.name, gate.cmd));
+        }
+    }
+    if moved.is_empty() {
+        // Same names, same commands, different order — the walk above cannot
+        // see it, but the record and today still disagree about what a pass
+        // meant.
+        moved.push("the same gates would now run in a different order".to_owned());
+    }
+    format!(
+        "the gates have changed since this run started, so the tasks still to run would be \
+         verified by different commands than the tasks already committed: {}. Restore the \
+         config it ran with, or start a new run.",
+        moved.join("; ")
+    )
 }
 
 /// The sha the run's record ends at — what HEAD must still be.
@@ -6985,6 +7073,126 @@ mod tests {
         let err = resume_err(&repo, &run_id);
         assert!(err.contains("routing has changed"), "got: {err}");
         assert!(err.contains("`t1` ran on [small]"), "names the task: {err}");
+    }
+
+    /// [`parked_run`], but with a `[[gates]]` section — the resumable shape
+    /// for the gate refusals, which need a recorded command to move.
+    fn parked_run_with_gate(tag: &str, cmd: &str) -> (PathBuf, String) {
+        let repo = temp_engine_repo(tag);
+        seed(
+            &repo,
+            "## Doomed\n<!-- tactus: id=t1 kind=implement depends= -->\n",
+            Some(&format!(
+                "[interaction]\nmode = \"never\"\n\n\
+                 [routing]\nimplement = {{ chain = [\"small\"], attempts_per = 1 }}\n\n\
+                 [[gates]]\nname = \"check\"\ncmd = \"{cmd}\"\n"
+            )),
+        );
+        let mut opts = options(&repo);
+        opts.config_path = Some(repo.join("tactus.toml"));
+        let source = source(vec![Effect::NoEdit], vec![ReviewBehavior::Pass]);
+        let report = run_with(&opts, &source).expect("run");
+        assert_eq!(report.outcome(), RunOutcome::Parked);
+        (repo, report.run_id)
+    }
+
+    #[test]
+    fn resume_refuses_when_a_gate_command_moved_under_it() {
+        // A name-preserving edit is the one a name comparison cannot see:
+        // `check` still exists, but passing it now means something else. The
+        // workspace an implementer edits contains tactus.toml itself, so this
+        // is also the self-hosting hole (decisions/2026-08-11-design-council.md,
+        // Addendum C): weaken a gate before an interruption and let resume
+        // adopt it.
+        let (repo, run_id) = parked_run_with_gate("gatecmdmoved", "git --version");
+        fs::write(
+            repo.join("tactus.toml"),
+            "[interaction]\nmode = \"never\"\n\n\
+             [routing]\nimplement = { chain = [\"small\"], attempts_per = 1 }\n\n\
+             [[gates]]\nname = \"check\"\ncmd = \"git status\"\n",
+        )
+        .expect("edit config");
+
+        let err = resume_err(&repo, &run_id);
+        assert!(err.contains("the gates have changed"), "got: {err}");
+        assert!(
+            err.contains("`check` ran `git --version` and would now run `git status`"),
+            "names the edit: {err}"
+        );
+        assert!(
+            err.contains("Restore the config it ran with"),
+            "and says what to do: {err}"
+        );
+    }
+
+    #[test]
+    fn resume_refuses_when_a_gate_appeared_or_vanished() {
+        // Removed: the recorded command would no longer run at all.
+        let (repo, run_id) = parked_run_with_gate("gategone", "git --version");
+        fs::write(
+            repo.join("tactus.toml"),
+            "[interaction]\nmode = \"never\"\n\n\
+             [routing]\nimplement = { chain = [\"small\"], attempts_per = 1 }\n",
+        )
+        .expect("edit config");
+        let err = resume_err(&repo, &run_id);
+        assert!(
+            err.contains("`check` (`git --version`) would no longer run"),
+            "got: {err}"
+        );
+
+        // Added: the rest of the run would be held to a bar the earlier tasks
+        // never faced — a change of standard in the other direction, refused
+        // for the same reason rather than waved through as an upgrade.
+        let (repo, run_id) = parked_run("gatenew");
+        let config = fs::read_to_string(repo.join("tactus.toml")).expect("config");
+        fs::write(
+            repo.join("tactus.toml"),
+            format!("{config}\n[[gates]]\nname = \"late\"\ncmd = \"git --version\"\n"),
+        )
+        .expect("edit config");
+        let err = resume_err(&repo, &run_id);
+        assert!(
+            err.contains("`late` (`git --version`) would newly run"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn a_log_that_predates_the_gate_record_warns_and_rederives() {
+        // A v0.1 log recorded gate names only. Refusing it would strand every
+        // run written before the record existed over a field it could never
+        // have carried, so resume re-derives and says so — the same shape as
+        // the pre-step-9 review record.
+        let (repo, run_id) = parked_run_with_gate("oldgatelog", "git --version");
+        let paths = paths_of(&repo, &run_id);
+        let text = fs::read_to_string(paths.events()).expect("log");
+        let mut lines: Vec<String> = text.lines().map(str::to_owned).collect();
+        let mut first: serde_json::Value =
+            serde_json::from_str(&lines[0]).expect("run_started parses");
+        assert!(
+            first["data"]
+                .as_object_mut()
+                .expect("data")
+                .remove("gate_cmds")
+                .is_some(),
+            "the run recorded its gate commands"
+        );
+        lines[0] = serde_json::to_string(&first).expect("rewrite");
+        fs::write(paths.events(), format!("{}\n", lines.join("\n"))).expect("write");
+
+        let source = fake(Effect::NoEdit);
+        let resumed = resume_with(&resume_options(&repo, &run_id), &source)
+            .expect("an old log resumes rather than being refused over the record it never had");
+        assert_eq!(resumed.outcome(), RunOutcome::Parked, "{resumed:?}");
+        assert!(
+            resumed
+                .warnings
+                .iter()
+                .any(|w| w.contains("predates the gate-command record")),
+            "the operator is told: {:?}",
+            resumed.warnings
+        );
     }
 
     #[test]
