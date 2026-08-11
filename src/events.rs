@@ -29,7 +29,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::error::TactusError;
 use crate::interaction::QuestionRecord;
-use crate::ir::{Answer, Question, QuestionId, Tier};
+use crate::ir::{Answer, Effort, Question, QuestionId, Tier};
 use crate::ladder::{FailureKind, FailureOrigin};
 use crate::util;
 
@@ -410,6 +410,18 @@ pub struct AttemptStarted {
     pub tier: String,
     pub agent: String,
     pub model: String,
+    /// Adapter id used for this attempt. `agent` remains for wire compatibility.
+    #[serde(default)]
+    pub adapter: Option<String>,
+    /// CLI version observed during pre-flight; this is not a per-attempt probe.
+    #[serde(default)]
+    pub preflight_cli_version: Option<String>,
+    /// Resolved effort passed to the adapter.
+    #[serde(default)]
+    pub effort: Option<Effort>,
+    /// Why this binding was selected. Old logs did not record this fact.
+    #[serde(default)]
+    pub selection_origin: SelectionOrigin,
     /// The capacity pool this attempt draws on (§13), recorded before the
     /// spawn so an attempt the engine died inside can still be attributed: it
     /// really ran and really drained a subscription, and the settlement record
@@ -513,6 +525,15 @@ pub struct ReviewRecord {
     pub pass: String,
     pub agent: String,
     pub model: String,
+    /// Adapter id used for this pass. `agent` remains for wire compatibility.
+    #[serde(default)]
+    pub adapter: Option<String>,
+    /// CLI version observed during pre-flight; this is not a per-pass probe.
+    #[serde(default)]
+    pub preflight_cli_version: Option<String>,
+    /// Resolved review effort passed to the adapter.
+    #[serde(default)]
+    pub effort: Option<Effort>,
     /// Which capacity pool this pass drained (§13). A cross-vendor second
     /// opinion draws on a *different* subscription than the implementer, so a
     /// per-pool ledger that read only the implementer's line would attribute
@@ -524,6 +545,19 @@ pub struct ReviewRecord {
     /// What this pass concluded. A later pass only exists because every earlier
     /// one approved, so at most the last entry is ever anything else.
     pub outcome: ReviewPassOutcome,
+}
+
+/// Where the worker binding came from. The latter two variants are reserved
+/// for future selectors and deliberately have no producer yet.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SelectionOrigin {
+    #[default]
+    Unknown,
+    Auto,
+    Pin,
+    UserOverride,
+    Exploration,
 }
 
 /// How one review pass ended.
@@ -1596,6 +1630,10 @@ mod tests {
             rung,
             profile: format!("{tier}-model"),
             data: AttemptStarted {
+                adapter: None,
+                preflight_cli_version: None,
+                effort: None,
+                selection_origin: SelectionOrigin::Unknown,
                 tier: tier.to_owned(),
                 agent: "claude-code".to_owned(),
                 model: "model".to_owned(),
@@ -1943,6 +1981,60 @@ mod tests {
     }
 
     #[test]
+    fn selection_origins_round_trip_and_old_starts_stay_unknown() {
+        for origin in [
+            SelectionOrigin::Auto,
+            SelectionOrigin::Pin,
+            SelectionOrigin::UserOverride,
+            SelectionOrigin::Exploration,
+        ] {
+            let json = serde_json::to_string(&origin).expect("serialize origin");
+            assert_eq!(
+                serde_json::from_str::<SelectionOrigin>(&json).expect("read origin"),
+                origin
+            );
+        }
+
+        let mut json = serde_json::to_value(Event::now(attempt_started("t1", 1, 0, "small")))
+            .expect("serialize start");
+        let data = json["data"].as_object_mut().expect("start data");
+        data.remove("adapter");
+        data.remove("preflight_cli_version");
+        data.remove("effort");
+        data.remove("selection_origin");
+        let event: Event = serde_json::from_value(json).expect("old start still parses");
+        let EventBody::AttemptStarted { data, .. } = event.body else {
+            panic!("still an attempt start");
+        };
+        assert_eq!(data.adapter, None);
+        assert_eq!(data.preflight_cli_version, None);
+        assert_eq!(data.effort, None);
+        assert_eq!(data.selection_origin, SelectionOrigin::Unknown);
+
+        let review = ReviewRecord {
+            pass: "review".to_owned(),
+            agent: "claude-code".to_owned(),
+            model: "claude-opus-5".to_owned(),
+            adapter: Some("claude-code".to_owned()),
+            preflight_cli_version: Some("1.2.3".to_owned()),
+            effort: Some(Effort::High),
+            pool: Some("claude-max".to_owned()),
+            cost_usd: Some(0.05),
+            outcome: ReviewPassOutcome::Passed,
+        };
+        let mut json = serde_json::to_value(review).expect("serialize review");
+        let data = json.as_object_mut().expect("review data");
+        data.remove("adapter");
+        data.remove("preflight_cli_version");
+        data.remove("effort");
+        let review: ReviewRecord = serde_json::from_value(json).expect("old review still parses");
+        assert_eq!(review.adapter, None);
+        assert_eq!(review.preflight_cli_version, None);
+        assert_eq!(review.effort, None);
+        assert_eq!(SCHEMA_VERSION, 1);
+    }
+
+    #[test]
     fn a_log_without_a_beginning_cannot_be_verified() {
         let events = vec![Event::now(attempt_started("t1", 1, 0, "small"))];
         let err = replay(events, vec!["t1".to_owned()], Path::new("events.jsonl"))
@@ -2176,6 +2268,7 @@ mod tests {
                 },
             }));
         }
+
         assert_eq!(
             state.halted_at.as_deref(),
             Some("t1"),

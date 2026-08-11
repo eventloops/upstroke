@@ -1785,6 +1785,17 @@ impl Run<'_> {
                     tier: rung.tier.to_string(),
                     agent: profile.agent.clone(),
                     model: profile.model.clone(),
+                    adapter: Some(adapter.id().to_owned()),
+                    preflight_cli_version: self
+                        .caps
+                        .get(&profile.agent)
+                        .map(|caps| caps.version.clone()),
+                    effort: profile.effort,
+                    selection_origin: if rung.binding.pinned {
+                        events::SelectionOrigin::Pin
+                    } else {
+                        events::SelectionOrigin::Auto
+                    },
                     pool: pool_option(&profile.pool),
                     resume_session: resume.clone(),
                 },
@@ -2055,6 +2066,10 @@ impl Run<'_> {
                     })?,
                     profile,
                     lens: pass.lens,
+                    preflight_cli_version: self
+                        .caps
+                        .get(&pass.binding.agent)
+                        .map(|caps| caps.version.clone()),
                 })
             })
             .collect()
@@ -2937,6 +2952,7 @@ struct Reviewer<'a> {
     adapter: &'a dyn AgentAdapter,
     profile: WorkerProfile,
     lens: review::Lens,
+    preflight_cli_version: Option<String>,
 }
 
 struct AttemptResult {
@@ -3062,6 +3078,9 @@ fn run_attempt(
                 pass: reviewer.lens.name().to_owned(),
                 agent: reviewer.profile.agent.clone(),
                 model: reviewer.profile.model.clone(),
+                adapter: Some(reviewer.adapter.id().to_owned()),
+                preflight_cli_version: reviewer.preflight_cli_version.clone(),
+                effort: reviewer.profile.effort,
                 pool: pool_option(&reviewer.profile.pool),
                 cost_usd,
                 outcome: match (unavailable, failure.is_none()) {
@@ -8624,6 +8643,28 @@ mod tests {
         // And §14's pre-flight snapshot is on the record — folding to nothing,
         // which `assert_live_equals_replay` elsewhere is what proves.
         let events = events_of(&repo, &report.run_id);
+        let started = events
+            .iter()
+            .find_map(|event| match &event.body {
+                EventBody::AttemptStarted { data, .. } => Some(data),
+                _ => None,
+            })
+            .expect("worker start was emitted");
+        assert_eq!(started.adapter.as_deref(), Some("claude-code"));
+        assert_eq!(started.preflight_cli_version.as_deref(), Some("0.0.0-fake"));
+        assert_eq!(started.effort, Some(Effort::Low));
+        assert_eq!(started.selection_origin, events::SelectionOrigin::Auto);
+
+        let review = events
+            .iter()
+            .find_map(|event| match &event.body {
+                EventBody::AttemptFinished { data, .. } => data.reviews.first(),
+                _ => None,
+            })
+            .expect("review pass actually ran");
+        assert_eq!(review.adapter.as_deref(), Some("claude-code"));
+        assert_eq!(review.preflight_cli_version.as_deref(), Some("0.0.0-fake"));
+        assert_eq!(review.effort, Some(Effort::High));
         let snapshots: Vec<&events::CapacitySnapshot> = events
             .iter()
             .filter_map(|e| match &e.body {
@@ -8637,6 +8678,33 @@ mod tests {
             snapshots[0].pools[0].remaining, "unknown",
             "never optimistic: an unmeasured pool is unknown, not full"
         );
+    }
+
+    #[test]
+    fn a_pinned_live_attempt_records_its_selection_origin() {
+        let repo = temp_engine_repo("pinorigin");
+        seed(
+            &repo,
+            "## One\n<!-- tactus: id=t1 kind=implement depends= -->\n",
+            Some(
+                "[routing]\nimplement = { chain = [\"small\"], attempts_per = 1 }\n\
+                 [[pins]]\ntier = \"small\"\nagent = \"claude-code\"\n\
+                 model = \"claude-haiku-4-5\"\neffort = \"max\"\n",
+            ),
+        );
+        let mut opts = options(&repo);
+        opts.config_path = Some(repo.join("tactus.toml"));
+        let report = run_with(&opts, &fake(Effect::EditFile)).expect("run");
+        let events = events_of(&repo, &report.run_id);
+        let started = events
+            .iter()
+            .find_map(|event| match &event.body {
+                EventBody::AttemptStarted { data, .. } => Some(data),
+                _ => None,
+            })
+            .expect("worker start was emitted");
+        assert_eq!(started.selection_origin, events::SelectionOrigin::Pin);
+        assert_eq!(started.effort, Some(Effort::Max));
     }
 
     #[test]

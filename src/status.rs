@@ -374,6 +374,10 @@ mod tests {
                 rung: 0,
                 profile: "small-haiku".to_owned(),
                 data: AttemptStarted {
+                    adapter: None,
+                    preflight_cli_version: None,
+                    effort: None,
+                    selection_origin: crate::events::SelectionOrigin::Unknown,
                     tier: "small".to_owned(),
                     agent: "claude-code".to_owned(),
                     model: "claude-haiku-4-5".to_owned(),
