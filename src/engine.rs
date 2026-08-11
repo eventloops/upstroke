@@ -6279,13 +6279,11 @@ mod tests {
         assert!(out.contains("skipped (run halted)"), "{out}");
         assert!(out.contains("t2: blocked by `t1`"), "{out}");
 
-        // Now hold the lock the way a working engine does.
-        let lock = fs::OpenOptions::new()
-            .read(true)
-            .write(true)
-            .open(paths.lock_file())
-            .expect("lock file");
-        lock.lock().expect("hold it exclusively");
+        // Now hold the lock the way a working engine does — through the same
+        // `RunLock` a run takes, not a hand-rolled `flock` on the same path.
+        // Which primitive holds a run is `rundir`'s to decide, and a test that
+        // reaches around it is testing a lock nothing else uses.
+        let lock = RunLock::acquire(&paths.public).expect("simulate a live engine");
 
         let live = replay_of(&repo, &report.run_id);
         assert!(live.running, "a held lock means an engine is driving this");
@@ -6309,7 +6307,7 @@ mod tests {
         ] {
             assert!(!out.contains(lie), "a live run reported `{lie}`:\n{out}");
         }
-        let _ = lock.unlock();
+        drop(lock);
     }
 
     #[test]

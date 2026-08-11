@@ -18,10 +18,11 @@
 //! `run_started` event records where that directory is, so the record stays
 //! self-describing rather than depending on this function's defaults.
 
-use std::fs::{self, File, TryLockError};
+use std::collections::BTreeSet;
+use std::fs::{self, File};
 use std::io;
 use std::path::{Path, PathBuf};
-use std::time::{Duration, Instant};
+use std::sync::Mutex;
 
 use crate::error::TactusError;
 use crate::util;
@@ -307,173 +308,166 @@ pub fn lock_file(public: &Path) -> PathBuf {
 /// holder dies: a crashed run — the case `resume` exists for — leaves no stale
 /// marker to clear by hand, which is exactly what a lock *file* would have
 /// forced on the common path.
+///
+/// Which OS lock, though, is not a detail. See [`imp`].
 #[derive(Debug)]
 pub struct RunLock {
     _file: File,
+    /// The run this claimed in [`claims`], given back on drop.
+    claim: PathBuf,
+}
+
+impl Drop for RunLock {
+    fn drop(&mut self) {
+        // Before the file closes, so no window exists where the OS has let go
+        // and this process still thinks it holds the run.
+        claims().remove(&self.claim);
+    }
 }
 
 impl RunLock {
     /// Take the lock on a run's public directory, or explain who has it.
     pub fn acquire(public: &Path) -> Result<Self, TactusError> {
-        Self::acquire_within(public, CONTENTION_GRACE)
-    }
-
-    /// `acquire` with the grace named, so a test can pin the *rule* — a holder
-    /// is believed only after the grace — without spending the real constant's
-    /// half-second of wall clock on every suite run.
-    fn acquire_within(public: &Path, grace: Duration) -> Result<Self, TactusError> {
         let path = lock_file(public);
-        let file = File::options()
+        let claim = claim_key(public);
+        // This process first, and not only as an optimisation: the OS lock
+        // below is per-*process*, so it cannot tell one thread here from
+        // another. `claims` is what makes two `acquire`s in one process behave
+        // the way two engines do, and it is exact rather than advisory.
+        if !claims().insert(claim.clone()) {
+            return Err(refused(public, &path, Some(std::process::id())));
+        }
+        let taken = File::options()
             .create(true)
             .truncate(false)
             .write(true)
+            .read(true)
             .open(&path)
             .map_err(|source| TactusError::Io {
                 path: path.clone(),
                 source,
-            })?;
-        // Only *contention* may be reported as contention, and what fakes it
-        // is `fork`.
-        //
-        // `flock` is inherited across `fork`. A subprocess spawned by
-        // *anything else in this process* duplicates every open descriptor,
-        // this lock among them, and the child keeps holding it until it execs
-        // (where close-on-exec drops it). So an uncontested lock reads as taken
-        // for as long as some unrelated fork is between `fork` and `exec`.
-        // Measured under a parallel test suite, where it made runs refuse to
-        // start against a second engine that did not exist.
-        //
-        // What separates that from the real thing is duration: a genuine
-        // engine holds the lock for its whole run, a fork window for
-        // microseconds. So believe `WouldBlock` only if it persists.
-        match probe(|| file.try_lock(), grace) {
-            Verdict::Free => Ok(Self { _file: file }),
-            Verdict::Held => Err(TactusError::Refused {
-                message: format!(
-                    "another tactus process is already driving run `{}` (lock held on {}). Two \
-                     engines would interleave events and fight over the same branch — wait for it \
-                     to finish, or stop it first.",
-                    public.file_name().unwrap_or_default().to_string_lossy(),
-                    path.display()
-                ),
-            }),
-            // A lock that cannot be taken is not a lock that was taken. Say
-            // what actually failed rather than blaming an engine that may not
-            // exist.
-            Verdict::Unanswered(source) => Err(TactusError::Io { path, source }),
+            })
+            .and_then(|file| match imp::take(&file) {
+                Holder::Nobody => Ok(file),
+                Holder::Someone { pid } => Err(refused(public, &path, pid)),
+                // A lock that cannot be taken is not a lock that was taken. Say
+                // what actually failed rather than blaming an engine that may
+                // not exist.
+                Holder::Unknown(source) => Err(TactusError::Io {
+                    path: path.clone(),
+                    source,
+                }),
+            });
+        match taken {
+            Ok(file) => Ok(Self { _file: file, claim }),
+            Err(error) => {
+                claims().remove(&claim);
+                Err(error)
+            }
         }
     }
 }
 
-/// What one lock call, retried until it means something, established.
+fn refused(public: &Path, path: &Path, pid: Option<u32>) -> TactusError {
+    let who = match pid {
+        Some(pid) => format!(" (pid {pid})"),
+        None => String::new(),
+    };
+    TactusError::Refused {
+        message: format!(
+            "another tactus process{who} is already driving run `{}` (lock held on {}). Two \
+             engines would interleave events and fight over the same branch — wait for it to \
+             finish, or stop it first.",
+            public.file_name().unwrap_or_default().to_string_lossy(),
+            path.display()
+        ),
+    }
+}
+
+/// Who holds a run's lock.
 #[derive(Debug)]
-enum Verdict {
-    /// Nobody holds it.
-    Free,
-    /// Somebody does, and went on holding it long enough to be believed.
-    Held,
+enum Holder {
+    Nobody,
+    /// Somebody does. `pid` where the platform will say.
+    Someone {
+        pid: Option<u32>,
+    },
     /// The call failed without answering the question.
-    Unanswered(io::Error),
+    Unknown(io::Error),
 }
 
-/// Retry a lock call until it says something a caller can act on.
+/// Runs this process holds, so that two `acquire`s here behave like two
+/// engines.
 ///
-/// Both callers below face the same problem — a single `try_lock` reports
-/// contention that is not contention — and both want the same discipline
-/// applied to it, so they share one loop rather than two that have to be kept
-/// in step.
-///
-/// `grace` bounds the whole call, `EINTR` included. An interruption is not an
-/// answer, so it can never be believed the way a persistent `WouldBlock`
-/// eventually is — but it cannot be retried forever either, and unbounded is
-/// what it was: that arm neither slept nor looked at the deadline, so any
-/// sustained interruption became a spin that never returned and never refused,
-/// hanging `run`, `status`, `status --follow` and `answer` alike.
-///
-/// Whether the hazard it guards exists here at all is genuinely unclear.
-/// `flock` is interruptible by a *handled* signal, and this crate installs no
-/// handler; the subprocesses a run spawns raise SIGCHLD, which at its default
-/// disposition interrupts nothing. So the arm is defence against a dependency,
-/// a debugger, or a profiler that installs one — cheap to keep, and worth
-/// nothing at all if it can hang the process it is defending.
-fn probe(mut attempt: impl FnMut() -> Result<(), TryLockError>, grace: Duration) -> Verdict {
-    let deadline = Instant::now() + grace;
-    loop {
-        match attempt() {
-            Ok(()) => return Verdict::Free,
-            Err(TryLockError::Error(source)) if source.kind() == io::ErrorKind::Interrupted => {
-                if Instant::now() >= deadline {
-                    return Verdict::Unanswered(source);
-                }
-            }
-            Err(TryLockError::Error(source)) => return Verdict::Unanswered(source),
-            Err(TryLockError::WouldBlock) => {
-                if Instant::now() >= deadline {
-                    return Verdict::Held;
-                }
-            }
-        }
-        std::thread::sleep(RETRY_PAUSE);
+/// It also keeps [`is_running`] away from a lock file this process already
+/// holds — which on Unix is not tidiness but a correctness requirement, because
+/// closing *any* descriptor for a file releases every `fcntl` lock this process
+/// has on it. A bare `File::open` + drop in the holder would silently hand the
+/// run away. Answering from here means that open never happens.
+fn claims() -> &'static Claims {
+    static CLAIMS: Claims = Claims {
+        runs: Mutex::new(BTreeSet::new()),
+    };
+    &CLAIMS
+}
+
+#[derive(Debug)]
+struct Claims {
+    runs: Mutex<BTreeSet<PathBuf>>,
+}
+
+impl Claims {
+    /// `true` if this process did not already hold it.
+    fn insert(&self, key: PathBuf) -> bool {
+        self.held().insert(key)
+    }
+
+    fn remove(&self, key: &Path) {
+        self.held().remove(key);
+    }
+
+    fn contains(&self, key: &Path) -> bool {
+        self.held().contains(key)
+    }
+
+    /// A panic in a lock holder must not take the run lock's bookkeeping with
+    /// it: the set is still exactly as valid as it was before the panic.
+    fn held(&self) -> std::sync::MutexGuard<'_, BTreeSet<PathBuf>> {
+        self.runs
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 }
 
-/// How long an apparently-held lock must stay held before it is believed.
-///
-/// Long enough to outlast any `fork`/`exec` window, short enough that a real
-/// second engine still refuses promptly rather than appearing to hang.
-const CONTENTION_GRACE: Duration = Duration::from_millis(500);
-const RETRY_PAUSE: Duration = Duration::from_millis(5);
+/// The run's identity for [`claims`], resolved so that two spellings of one
+/// directory cannot look like two runs.
+fn claim_key(public: &Path) -> PathBuf {
+    fs::canonicalize(public).unwrap_or_else(|_| public.to_path_buf())
+}
 
 /// Whether a run is being driven right now, without disturbing the holder.
 ///
-/// Read-only: `status` uses it to tell a live run from an interrupted one, so
-/// it takes a shared lock and immediately gives it back. A file that cannot be
-/// opened at all is not a running run — the lock is only ever created by a run
-/// that started.
+/// Read-only, and on Unix genuinely read-only: `F_GETLK` asks who holds the
+/// lock without taking one, so there is nothing to give back and nothing to
+/// race. A file that cannot be opened at all is not a running run — the lock is
+/// only ever created by a run that started.
 pub fn is_running(public: &Path) -> bool {
-    held_within(public, CONTENTION_GRACE)
-}
-
-/// Whether anything holds the run's lock at this instant.
-///
-/// [`is_running`] without the grace, for a caller that is going to ask again in
-/// a moment anyway. The grace exists to disbelieve a hold that is really a
-/// `fork` window, and disbelieving it costs the full 500ms *every time the
-/// answer is yes* — because a live engine holds the lock continuously, so the
-/// retry loop never clears and always runs to the deadline.
-///
-/// `status --follow` paid that on every idle poll, which is the worst place for
-/// it: the poll cycle went from 500ms to a second, doubling the latency of the
-/// live view, and flock syscalls went from about two a second to about two
-/// hundred. Over a ten-minute silent agent turn, 600 calls became 60,000.
-///
-/// A caller polling in a loop does not need the grace, because believing a
-/// transient hold costs it nothing: `follow` only resets an idle counter, and
-/// the next poll asks again. Err toward "held" and keep the view open.
-pub fn lock_is_held_now(public: &Path) -> bool {
-    held_within(public, Duration::ZERO)
-}
-
-fn held_within(public: &Path, grace: Duration) -> bool {
+    // Asked and answered without touching the file. On Unix this is the branch
+    // that keeps `fcntl`'s release-on-any-close from applying to us at all.
+    if claims().contains(&claim_key(public)) {
+        return true;
+    }
     let Ok(file) = File::open(lock_file(public)) else {
         return false;
     };
-    // The same two traps `RunLock::acquire` documents, and the same answer: a
-    // `fork` anywhere else in this process duplicates the descriptor so that an
-    // *unheld* lock refuses a shared one until that child execs, and that must
-    // not read as "a run is live" — which is the one thing `status` must not
-    // invent, since it is what tells an operator their run is still going.
-    match probe(|| file.try_lock_shared(), grace) {
-        Verdict::Free => {
-            let _ = file.unlock();
-            false
-        }
-        Verdict::Held => true,
+    match imp::holder(&file) {
+        Holder::Nobody => false,
+        Holder::Someone { .. } => true,
         // The opened-fine-but-cannot-be-locked case, which is not the same as
-        // the unopenable file above and does not get the same answer.
-        // `flock` returns `ENOLCK` or `EOPNOTSUPP` on filesystems that do not
-        // carry locks — NFS, SMB, some container overlays — and it does so
-        // whether or not an engine is driving the run.
+        // the unopenable file above and does not get the same answer. Locking
+        // fails with `ENOLCK` or `EOPNOTSUPP` on filesystems that do not carry
+        // locks — NFS, SMB, some container overlays — and it does so whether or
+        // not an engine is driving the run.
         //
         // So the question is which way to be wrong when the OS refuses to say.
         // Answering "not running" makes `status` settle a working attempt as
@@ -483,14 +477,154 @@ fn held_within(public: &Path, grace: Duration) -> bool {
         // settle and says another process holds the run. One of those invents
         // a fact the operator will act on; the other admits the run may still
         // be going. `acquire` is the real guard against two engines either
-        // way, and it now reports this case as the IO error it is.
-        Verdict::Unanswered(_) => true,
+        // way, and it reports this case as the IO error it is.
+        Holder::Unknown(_) => true,
+    }
+}
+
+/// The lock primitive, and why it is not `std`'s.
+///
+/// `File::try_lock` is `flock(2)` on Unix, and `flock` locks are held by the
+/// *open file description*. `fork` duplicates every descriptor, so a child
+/// inherits this lock and keeps holding it until it execs — which means an
+/// engine that has finished and let go stays "locked" for as long as some
+/// unrelated subprocess spawn is between `fork` and `exec`. Measured: hold a
+/// lock, fork, release it, and a fresh probe still reports it taken.
+///
+/// That was papered over with a 500ms grace — believe contention only if it
+/// persists — which is a timing proxy for a property the platform states
+/// outright, and only ever probabilistic: a fork window longer than the grace
+/// on a loaded machine still refuses a run that nothing is driving, and every
+/// `status` of a live run paid the full half-second to find out.
+///
+/// `fcntl(F_SETLK)` locks are held by the *process*, and are documented not to
+/// be inherited across `fork`. The grace disappears rather than being tuned.
+///
+/// Two things come with that, both measured rather than assumed:
+///
+/// - They do not exclude the same process from itself, which is what [`claims`]
+///   is for.
+/// - Closing **any** descriptor for the file releases every lock this process
+///   holds on it, so a holder must never open its own lock file again.
+///   [`is_running`] answers from [`claims`] before it would.
+///
+/// `F_OFD_SETLK` is not an escape from the first two: it is scoped to the open
+/// file description, exactly like `flock`, and is inherited across `fork` in
+/// exactly the same way.
+///
+/// Windows has neither hazard — `LockFileEx` is per-handle and there is no
+/// `fork` — so it keeps std's implementation and this module is where the two
+/// meet.
+#[cfg(unix)]
+mod imp {
+    use super::Holder;
+    use std::fs::File;
+    use std::io;
+    use std::os::fd::AsRawFd;
+
+    /// Take the exclusive lock, or say who has it.
+    pub(super) fn take(file: &File) -> Holder {
+        match set_lock(file, libc::F_WRLCK) {
+            Ok(()) => Holder::Nobody,
+            Err(error) if would_block(&error) => Holder::Someone {
+                pid: holding_pid(file),
+            },
+            Err(error) => Holder::Unknown(error),
+        }
+    }
+
+    /// Ask who holds it, taking nothing. There is no shared lock to give back
+    /// here and so no window in which this call is itself the holder.
+    pub(super) fn holder(file: &File) -> Holder {
+        match query(file) {
+            Ok(Some(pid)) => Holder::Someone { pid: Some(pid) },
+            Ok(None) => Holder::Nobody,
+            Err(error) => Holder::Unknown(error),
+        }
+    }
+
+    fn describe(kind: libc::c_short) -> libc::flock {
+        libc::flock {
+            l_type: kind,
+            l_whence: libc::SEEK_SET as libc::c_short,
+            // A zero length locks the whole file, however long it grows. The
+            // file's contents are never read; it exists to be locked.
+            l_start: 0,
+            l_len: 0,
+            l_pid: 0,
+        }
+    }
+
+    fn set_lock(file: &File, kind: libc::c_int) -> io::Result<()> {
+        let request = describe(kind as libc::c_short);
+        // `F_SETLK` never blocks, so unlike `flock` it has no interruptible
+        // wait to be cut short — the `EINTR` retry the old loop carried has
+        // nothing left to guard.
+        if unsafe { libc::fcntl(file.as_raw_fd(), libc::F_SETLK, &request) } == 0 {
+            return Ok(());
+        }
+        Err(io::Error::last_os_error())
+    }
+
+    /// `Some(pid)` if a conflicting lock exists, `None` if the file is free.
+    fn query(file: &File) -> io::Result<Option<u32>> {
+        let mut request = describe(libc::F_WRLCK as libc::c_short);
+        if unsafe { libc::fcntl(file.as_raw_fd(), libc::F_GETLK, &mut request) } != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        if request.l_type == libc::F_UNLCK as libc::c_short {
+            return Ok(None);
+        }
+        Ok(Some(u32::try_from(request.l_pid).unwrap_or_default()))
+    }
+
+    /// Best effort: the holder may let go between the refusal and the question,
+    /// and a name that might be stale is worth more than no name at all.
+    fn holding_pid(file: &File) -> Option<u32> {
+        query(file).ok().flatten()
+    }
+
+    fn would_block(error: &io::Error) -> bool {
+        // POSIX allows either, and says a portable caller must accept both.
+        matches!(
+            error.raw_os_error(),
+            Some(code) if code == libc::EACCES || code == libc::EAGAIN
+        )
+    }
+}
+
+#[cfg(not(unix))]
+mod imp {
+    use super::Holder;
+    use std::fs::{File, TryLockError};
+
+    pub(super) fn take(file: &File) -> Holder {
+        match file.try_lock() {
+            Ok(()) => Holder::Nobody,
+            // `LockFileEx` names no owner, and inventing one would be worse
+            // than the shorter sentence.
+            Err(TryLockError::WouldBlock) => Holder::Someone { pid: None },
+            Err(TryLockError::Error(source)) => Holder::Unknown(source),
+        }
+    }
+
+    pub(super) fn holder(file: &File) -> Holder {
+        match file.try_lock_shared() {
+            Ok(()) => {
+                let _ = file.unlock();
+                Holder::Nobody
+            }
+            Err(TryLockError::WouldBlock) => Holder::Someone { pid: None },
+            Err(TryLockError::Error(source)) => Holder::Unknown(source),
+        }
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    use std::time::{Duration, Instant};
 
     fn scratch(tag: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!("tactus-rundir-{tag}-{}", std::process::id()));
@@ -622,33 +756,22 @@ mod tests {
         let held = RunLock::acquire(&paths.public).expect("first acquire");
         assert!(is_running(&paths.public), "status can see the run is live");
 
-        // Timed, because the refusal waits before it believes itself: a `fork`
-        // elsewhere in the process can make an uncontested lock look taken for
-        // a moment, so `acquire` re-checks before reporting contention.
-        //
-        // The grace is named rather than taken from the constant, because what
-        // is under test is the rule and not the number. Spending the real
-        // half-second here bought no extra coverage and added it to every run
-        // of the suite.
-        let brief = Duration::from_millis(50);
-        let started = Instant::now();
-        let err =
-            RunLock::acquire_within(&paths.public, brief).expect_err("a second engine is refused");
-        let waited = started.elapsed();
+        // This one is `claims`, not the OS: `fcntl` locks belong to the process,
+        // so both of these would succeed if the file were the only guard.
+        // Cross-process exclusion — the property that actually matters — is
+        // `a_second_process_is_refused_the_run_lock` below.
+        let err = RunLock::acquire(&paths.public).expect_err("a second engine is refused");
         assert!(
             err.to_string().contains("already driving run"),
             "got: {err}"
         );
+
+        // A refusal that failed still leaves the run exactly as claimed as it
+        // was — a bookkeeping slip here would either free a live run or strand
+        // a dead one.
         assert!(
-            waited >= brief,
-            "a real holder is only believed after the grace: {waited:?}"
-        );
-        // The constant itself has one requirement, and it is about how the
-        // refusal reads rather than about any elapsed time: raise it much
-        // further and the operator is left watching a command that looks stuck.
-        assert!(
-            CONTENTION_GRACE < Duration::from_secs(5),
-            "a refusal, not a hang"
+            is_running(&paths.public),
+            "the failed acquire changed nothing"
         );
 
         // Dropping releases it — which is also what a crash does, so resume
@@ -659,150 +782,208 @@ mod tests {
     }
 
     #[test]
-    fn a_lock_held_for_only_an_instant_is_not_a_running_run() {
-        // The reading half of what `a_run_can_only_be_held_once_at_a_time`
-        // times on `acquire`. That test holds the lock permanently and drops
-        // it permanently, so `is_running` could go back to believing every
-        // refusal on sight and stay green — which is exactly the state it was
-        // in when a `fork` window made a finished run report itself as live.
+    fn the_lock_answers_at_once_rather_than_waiting_to_be_sure() {
+        // There was a 500ms contention grace here, and it was paid in full
+        // exactly when the answer was yes: a live engine never lets go, so the
+        // retry loop always ran to the deadline. Every `tactus status` and
+        // `tactus answer` against a working run paid it, and `--follow` paid it
+        // once per idle poll until it was given a cheaper question to ask.
         //
-        // The cost was not only a wrong status line. `RunReport` carries
-        // `running`, and it decides whether unreached tasks settle as skipped
-        // or stay pending, so one spurious yes made a run's own report differ
-        // from a replay of its log — the invariant the event log rests on.
-        // Measured at 50 false positives in 3000 probes under a parallel suite
-        // spawning subprocesses.
-        //
-        // The rule itself is pinned without a clock, because the threaded
-        // version below cannot be: it used to hold for a fifth of the grace and
-        // assert that the probe outlived it, which is a 400ms scheduling margin
-        // that a loaded box — or the very parallel subprocess-spawning suite
-        // this was written for — can eat, failing for the reason it exists to
-        // rule out.
-        let mut tries = 0;
-        assert!(
-            matches!(
-                probe(
-                    || {
-                        tries += 1;
-                        if tries > 2 {
-                            Ok(())
-                        } else {
-                            Err(TryLockError::WouldBlock)
-                        }
-                    },
-                    CONTENTION_GRACE,
-                ),
-                Verdict::Free
-            ),
-            "a hold that lets go inside the grace was never a holder"
-        );
+        // The grace existed to disbelieve a `fork` window. The primitive now
+        // rules that out outright, so there is nothing left to wait for.
+        let root = scratch("prompt");
+        let paths = paths_in(&root, "RUN1");
+        paths.create().expect("create");
+        let _held = RunLock::acquire(&paths.public).expect("acquire");
 
-        // And end to end against a real `flock`, with a grace long enough that
-        // no scheduling delay can pass for an engine. The releaser drops as
-        // soon as it is told to; the short pause only makes it near-certain the
-        // probe sees the lock held at least once, so a regression to believing
-        // the first refusal fails here rather than passing by luck.
-        let root = scratch("transient");
+        let started = Instant::now();
+        for _ in 0..20 {
+            assert!(is_running(&paths.public));
+        }
+        let waited = started.elapsed();
+        assert!(
+            waited < Duration::from_millis(100),
+            "twenty probes of a live run took {waited:?} — something is waiting again"
+        );
+    }
+
+    /// A `fork` that has not reached its `exec` yet, held open on purpose.
+    ///
+    /// The child does nothing but sleep and `_exit`, both of which are safe in
+    /// the child of a threaded process — no allocation, no locks, no
+    /// destructors.
+    #[cfg(unix)]
+    fn fork_a_sleeper(ms: u64) -> libc::pid_t {
+        let pid = unsafe { libc::fork() };
+        if pid == 0 {
+            std::thread::sleep(Duration::from_millis(ms));
+            unsafe { libc::_exit(0) };
+        }
+        assert!(pid > 0, "fork failed");
+        pid
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_fork_cannot_keep_a_released_run_locked() {
+        // The bug the whole design turns on, deterministically.
+        //
+        // `flock` belongs to the open file description, and `fork` duplicates
+        // every descriptor — so a child holds the run's lock until it execs,
+        // and an engine that has finished and let go still reads as live for
+        // that whole window. It was measured at 50 false positives in 3000
+        // probes under a suite that spawns subprocesses, and each one made a
+        // run refuse to start against an engine that did not exist, or a
+        // finished run report itself as running.
+        //
+        // Against `flock` this test fails outright: the probe below sees the
+        // lock held by the sleeping child. `fcntl` locks are not inherited, so
+        // releasing really releases.
+        let root = scratch("forkwindow");
         let paths = paths_in(&root, "RUN1");
         paths.create().expect("create");
 
         let held = RunLock::acquire(&paths.public).expect("acquire");
-        let (tx, rx) = std::sync::mpsc::channel();
-        let releaser = std::thread::spawn(move || {
-            rx.recv().expect("the go-ahead");
-            std::thread::sleep(RETRY_PAUSE * 5);
-            drop(held);
-        });
-        tx.send(()).expect("let it go");
+        let sleeper = fork_a_sleeper(400);
+        // The engine finishes while that child is still between fork and exec.
+        drop(held);
+
         assert!(
-            !held_within(&paths.public, PATIENT_GRACE),
-            "a hold that does not outlast the grace is a fork window, not an engine"
+            !is_running(&paths.public),
+            "a forked child was still holding the run's lock"
         );
-        releaser.join().expect("releaser");
+        RunLock::acquire(&paths.public).expect("and a second engine can start");
+
+        let mut status = 0;
+        unsafe { libc::waitpid(sleeper, &mut status, 0) };
     }
 
-    /// Longer than any plausible scheduling delay, so the assertion above turns
-    /// on the rule rather than on how loaded the machine is. Nothing waits this
-    /// long: the probe returns the moment the lock is free.
-    const PATIENT_GRACE: Duration = Duration::from_secs(30);
-
+    /// The child half of `a_second_process_is_refused_the_run_lock`: takes the
+    /// lock, says so, and holds it until it is killed.
+    ///
+    /// An `#[ignore]`d test re-invoked as a subprocess, which is how
+    /// `killing_a_run_mid_attempt_leaves_a_resumable_record` gets a real second
+    /// process too.
     #[test]
-    fn a_lock_call_that_never_answers_is_not_a_free_lock() {
-        // No filesystem CI runs on returns `ENOLCK`, so the decision is tested
-        // where it is made rather than through a real lock. The arms that
-        // matter are the two that are not `Ok`: a lock the OS declines to
-        // report on must not come back as "nobody is running", because that is
-        // the reading that tells an operator to resume a run still in flight.
-        let unsupported = || {
-            Err(TryLockError::Error(io::Error::from_raw_os_error(
-                ENOLCK_LIKE,
-            )))
-        };
-        assert!(
-            matches!(probe(unsupported, Duration::ZERO), Verdict::Unanswered(_)),
-            "an error is not an answer"
-        );
-        assert!(matches!(probe(|| Ok(()), Duration::ZERO), Verdict::Free));
-        assert!(matches!(
-            probe(|| Err(TryLockError::WouldBlock), Duration::ZERO),
-            Verdict::Held
-        ));
+    #[ignore = "spawned as a subprocess by a_second_process_is_refused_the_run_lock"]
+    fn lock_child_holds_the_run() {
+        let public = PathBuf::from(std::env::var("TACTUS_TEST_LOCK_DIR").expect("run dir"));
+        let _held = RunLock::acquire(&public).expect("the child takes the lock");
+        println!("held");
+        std::io::Write::flush(&mut std::io::stdout()).expect("flush");
+        std::thread::sleep(Duration::from_secs(30));
     }
 
     #[test]
-    fn the_cheap_probe_answers_a_held_lock_without_waiting_out_the_grace() {
-        // The grace is paid in full precisely when the answer is yes, because a
-        // live engine never lets go and the retry loop runs to the deadline
-        // every time. `status --follow` asked once per idle poll, so a healthy
-        // run cost it 500ms and ~100 flock calls per cycle — the poll period
-        // doubled, and a ten-minute silent agent turn went from about 600
-        // syscalls to 60,000.
-        let root = scratch("cheapprobe");
+    fn a_second_process_is_refused_the_run_lock() {
+        // The property `claims` cannot provide and the file lock exists for.
+        // Two engines are two processes, and `fcntl` locks are per-process —
+        // which is exactly why this has to be tested across a real process
+        // boundary rather than against a second `acquire` here.
+        let root = scratch("twoprocs");
         let paths = paths_in(&root, "RUN1");
         paths.create().expect("create");
 
-        assert!(!lock_is_held_now(&paths.public), "nothing holds it yet");
+        let exe = std::env::current_exe().expect("test binary");
+        let mut child = std::process::Command::new(exe)
+            .args([
+                "--exact",
+                "rundir::tests::lock_child_holds_the_run",
+                "--ignored",
+                "--nocapture",
+            ])
+            .env("TACTUS_TEST_LOCK_DIR", &paths.public)
+            .stdout(std::process::Stdio::piped())
+            .spawn()
+            .expect("spawn the second engine");
+
+        // Wait for it to say it has the lock, rather than sleeping and hoping.
+        let mut out = std::io::BufReader::new(child.stdout.take().expect("stdout"));
+        let mut line = String::new();
+        let deadline = Instant::now() + Duration::from_secs(30);
+        loop {
+            line.clear();
+            let read = std::io::BufRead::read_line(&mut out, &mut line).expect("read");
+            assert!(read > 0, "the child ended without taking the lock");
+            if line.trim() == "held" {
+                break;
+            }
+            assert!(Instant::now() < deadline, "the child never took the lock");
+        }
+
+        let err = RunLock::acquire(&paths.public).expect_err("a second engine must be refused");
+        assert!(
+            err.to_string().contains("already driving run"),
+            "got: {err}"
+        );
+        assert!(is_running(&paths.public), "and status agrees it is live");
+
+        // `F_GETLK` names the holder, so the refusal can say who instead of
+        // leaving the operator to find it. Asserted here rather than against a
+        // second `acquire` in this process, because that one is refused by
+        // `claims`, which knows this pid without asking the OS anything — it
+        // would pass whatever the lock did.
+        #[cfg(unix)]
+        assert!(
+            err.to_string().contains(&format!("pid {}", child.id())),
+            "the refusal should name the process actually holding it: {err}"
+        );
+
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_holder_never_opens_its_own_lock_file() {
+        // `fcntl`'s sharpest edge: closing *any* descriptor for a file releases
+        // every lock this process holds on it. So a holder that does what
+        // `is_running` does — open the lock file, look, drop it — hands the run
+        // away silently, and the next `acquire` anywhere succeeds against a
+        // live engine.
+        //
+        // `is_running` answers from `claims` before it would open anything,
+        // which is what makes that unreachable. This test is here because the
+        // rule is invisible in the code that depends on it.
+        let root = scratch("selfclose");
+        let paths = paths_in(&root, "RUN1");
+        paths.create().expect("create");
         let _held = RunLock::acquire(&paths.public).expect("acquire");
 
-        let started = Instant::now();
-        assert!(lock_is_held_now(&paths.public), "and now something does");
-        let waited = started.elapsed();
-        assert!(
-            waited < CONTENTION_GRACE / 2,
-            "the polling probe paid the grace: {waited:?}"
+        // The call a holder is most likely to make.
+        assert!(is_running(&paths.public));
+
+        // If that had gone to the file, the lock would be gone by now — ask
+        // from a process that has no claim of its own to answer from.
+        let pid = unsafe { libc::fork() };
+        if pid == 0 {
+            let file = File::open(lock_file(&paths.public)).expect("open");
+            let free = matches!(imp::holder(&file), Holder::Nobody);
+            unsafe { libc::_exit(i32::from(free)) };
+        }
+        let mut status = 0;
+        unsafe { libc::waitpid(pid, &mut status, 0) };
+        assert_eq!(
+            libc::WEXITSTATUS(status),
+            0,
+            "the holder released its own lock by looking at it"
         );
     }
 
     #[test]
-    fn a_lock_call_that_only_ever_gets_interrupted_gives_up() {
-        // `EINTR` used to be the one arm with no way out: it neither slept nor
-        // consulted the deadline, so a sustained interruption spun a core at
-        // 100% forever and every command that reads the lock hung with it.
-        let grace = Duration::from_millis(50);
-        let mut calls = 0u32;
-        let started = Instant::now();
-        let verdict = probe(
-            || {
-                calls += 1;
-                Err(TryLockError::Error(io::Error::from(
-                    io::ErrorKind::Interrupted,
-                )))
-            },
-            grace,
-        );
-
+    fn a_lock_the_os_will_not_report_on_is_not_a_free_lock() {
+        // No filesystem CI runs on returns `ENOLCK`, so the decision is checked
+        // where it is made. A lock the OS declines to report on must not come
+        // back as "nobody is running", because that is the reading that tells
+        // an operator to resume a run that is still in flight.
+        let unknown = Holder::Unknown(io::Error::from_raw_os_error(ENOLCK_LIKE));
         assert!(
-            matches!(verdict, Verdict::Unanswered(_)),
-            "an interruption never becomes a holder"
+            !matches!(unknown, Holder::Nobody),
+            "an error is not an answer"
         );
-        assert!(started.elapsed() >= grace, "it gave up before the deadline");
-        // A spin would be millions. The exact count depends on the platform's
-        // timer resolution, which is why the bound is loose rather than tight.
-        assert!(calls < 100, "{calls} calls in {grace:?} is a spin");
     }
 
-    /// Any errno that is not `Interrupted`; the value itself does not matter.
+    /// Any errno at all; the value is not what is under test.
     const ENOLCK_LIKE: i32 = 37;
 
     #[test]

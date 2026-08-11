@@ -325,14 +325,12 @@ pub fn follow(
             // attached to an engine that has died, so it starts counting when
             // the run's lock does not.
             //
-            // The cheap probe, because this is the one caller that asks over
-            // and over. The full check waits out its contention grace every
-            // time the answer is yes — a live engine holds the lock
-            // continuously, so the retry never clears — which on a healthy run
-            // is every poll. A hold that turns out to be a `fork` window costs
-            // nothing here but one idle tick not counted, and the next poll
-            // asks again.
-            if rundir::lock_is_held_now(&status.paths.public) {
+            // One syscall per poll, asked plainly. This used to need a cheaper
+            // variant of its own, because the check waited out a contention
+            // grace every time the answer was yes — which on a healthy run is
+            // every poll. The lock now answers exactly, so there is no cheaper
+            // question to ask.
+            if rundir::is_running(&status.paths.public) {
                 idle = 0;
             } else {
                 idle += 1;
