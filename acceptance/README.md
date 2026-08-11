@@ -5,7 +5,8 @@ operator-triggered, never launched by an agent.
 
 > **This run has happened.** It passed on 2026-08-10 and shipped as `0.1.0`.
 > [`RESULT.md`](RESULT.md) is the write-up: which run demonstrated each
-> criterion, the ledger lines, and the four engine defects the runs found. What
+> criterion, the ledger lines, and the three engine defects this run found —
+> plus the fourth that the first real-library run turned up afterwards. What
 > follows is still the run book — keep it working, because §21's criteria are
 > the regression suite for the engine's behaviour, not a one-off ceremony.
 

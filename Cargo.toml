@@ -1,10 +1,15 @@
 [package]
 name = "tactus"
 # 0.1.0 because §21's definition of done was actually met, on 2026-08-10: a
-# five-task plan ran unattended on a real repository through every one of its
-# five criteria and the kill/resume test — `acceptance/RESULT.md` is the
-# evidence, including the three engine defects the run found. 0.0.1 was the
+# five-task plan ran unattended against a scratch repository through every one
+# of its five criteria and the kill/resume test — `acceptance/RESULT.md` is the
+# evidence, including the three engine defects that run found. 0.0.1 was the
 # crates.io name reservation and never claimed to be more.
+#
+# The 0.1.0 published to crates.io says "on a real repository" here, which is
+# wrong: the acceptance run was against a scratch repo, and the real published
+# library came after it. Package metadata is immutable once published, so that
+# copy stays wrong and this one is right from the next release on.
 version = "0.1.0"
 edition = "2024"
 license = "AGPL-3.0-only"

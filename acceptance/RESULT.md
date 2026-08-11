@@ -8,7 +8,8 @@
   `01KZNG12FJA9DSJEYSK46NVBSC` (run 2)
 - **Result:** **all five criteria and the kill test demonstrated.** Run 2 ends
   `run complete: 5 task(s) committed`, exit 0, $6.0363. Three engine defects
-  found; two fixed and re-verified on the live run, one recorded unexplained.
+  found, all since fixed — two of them re-verified live on this run, the third
+  left open here and explained and fixed the same day.
 - **Question the run was asked:** *does the conductor actually work, unattended,
   on a real repo?*
 
@@ -72,6 +73,11 @@ the trigger differs, and it is the stronger of the two.
 
 ## Defects found
 
+Three, all from this run. A fourth — the budget stop handing back a dirty tree
+— came from the **first real-library run** later the same day and is recorded
+[below](#the-fourth-defect-from-the-first-real-library-run), because "three"
+and "four" are both true of this day and the difference is which run is meant.
+
 | # | Defect | Severity | Evidence | Fix |
 |---|--------|----------|----------|-----|
 | 1 | **`status` reported a live run as halted, with its working attempt as a failure.** `status::load` called `settle_interrupted()` unconditionally, then checked `is_running` — so the settlement that makes a *killed* run read correctly was also applied to a run an engine was actively driving | normal | Run 1, while `readme` attempt 1 was mid-review (it went on to pass and commit `fc5c72c`): `readme: skipped (run halted)`, ledger `readme 1 small failed`, `run complete: 0 task(s) committed`. All three false; the lock check three lines below printed the correct `state: running now` | `2e5ab10`. Settle only when nothing holds the run's lock; give `RunReport` a `running` flag so the projection has its own vocabulary. Regression test fails without it (`left: 1, right: 0`) |
@@ -103,6 +109,28 @@ Defect 1 was likewise re-verified live, mid-run:
   format-policy: running now — attempt 3 on small (claude-haiku-4-5)
 run in progress: 4 task(s) committed so far on tactus/run-01KZNG12FJA9DSJEYSK46NVBSC
 ```
+
+### The fourth defect, from the first real-library run
+
+Not this run's, and kept here so the count has one place to live. The first run
+against a real published library stopped at its `--budget` ceiling (exit 3) and
+**left two files staged in the operator's own repository**:
+
+```
+attempt_finished array-ranks attempt=1 FAIL=review_failed
+ladder_retry     array-ranks attempt=1        (resume: true)
+budget_exceeded
+```
+
+§14 keeps the tree between a rejected attempt and its same-rung retry on
+purpose, because that retry re-gates the *cumulative* diff. But the ceiling is
+checked at the top of the same loop, so a budget reached between the ladder's
+decision and the retry it asked for returns straight to the operator with a
+rejected attempt's edits staged — and staged changes follow `git switch` onto
+whatever branch is visited next. That is how unverified agent output escapes a
+run branch. Keeping them could not have helped even in principle: `run_resumed`
+discards every uncommitted path and clears the session they belong to, so the
+retry they were preserved for always starts cold. Fixed in `7829ad0`.
 
 ## Surprises worth keeping
 

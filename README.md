@@ -13,21 +13,24 @@ only what passes.
 It never edits a file, never implements an agentic loop, and never calls a model API. It is the
 conductor, not an instrument.
 
-> **Status: v0.1 done — proven end to end on a real repository.** The build order is public in
-> `DESIGN.md` §21; steps 1–10 are done — plan ingestion, routing, the Claude Code and Copilot
-> adapters, the sequential engine with git ownership, gates, cross-family review, the
-> verification ladder, the event log with resume and status, and the capacity engine
-> **read-only**. §21's acceptance run passed on 2026-08-10: a five-task plan completed
-> unattended for $6.04, with a small model committing first try, a same-rung retry recovering
-> from a reviewer's verdict, an escalation to a stronger rung, a design question parking one
-> task while an independent one kept moving, and the engine killed mid-attempt and resumed to
-> completion. It found two reporting defects, both fixed and re-verified on the live run —
+> **Status: v0.1 done — the acceptance run passed, and the engine has since been used on a real
+> published library.** The build order is public in `DESIGN.md` §21; steps 1–10 are done — plan
+> ingestion, routing, the Claude Code and Copilot adapters, the sequential engine with git
+> ownership, gates, cross-family review, the verification ladder, the event log with resume and
+> status, and the capacity engine **read-only**. §21's acceptance run passed on 2026-08-10,
+> across two runs against a *scratch* repository: the first was killed mid-attempt and resumed
+> to completion, and the second took a five-task plan through unattended for $6.04 — a small
+> model committing first try, a same-rung retry recovering from a reviewer's verdict, an
+> escalation to a stronger rung, and a design question parking one task while an independent one
+> kept moving. It found three engine defects, all fixed and two of them re-verified live on the
+> run that found them; a fourth turned up on the first real-library run afterwards.
 > `acceptance/RESULT.md` is the write-up. Parallelism, worktrees, Aider, and capacity-driven
 > routing are v0.2.
 >
-> **[See a run, start to finish →](https://keybindings.github.io/tactus/)** — a real run against a
-> published .NET library, including the verdict where a reviewer rejected a fix that built clean
-> and passed all 722 tests. Built entirely from captured output.
+> **[See a run, start to finish →](https://keybindings.github.io/tactus/)** — captured output from
+> both: the verdict where a reviewer rejected a fix that built clean and passed all 722 tests
+> comes from the run against a published .NET library, and the interactive replay and ledger come
+> from the acceptance run. The page says which is which.
 
 ## What works today
 
