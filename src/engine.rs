@@ -2251,7 +2251,7 @@ fn settle(plan: &Plan, states: &[TaskState], running: bool) -> Vec<TaskState> {
                 tasks
                     .iter()
                     .position(|t| t.id == **dep)
-                    .is_some_and(|j| !matches!(settled[j], TaskState::Done(_)))
+                    .is_some_and(|j| blocks_dependents(&settled[j], running))
             });
             if let Some(blocker) = blocker {
                 settled[index] = TaskState::Blocked(blocker.to_string());
@@ -2274,6 +2274,33 @@ fn settle(plan: &Plan, states: &[TaskState], running: bool) -> Vec<TaskState> {
         }
     }
     settled
+}
+
+/// Whether a dependency in this state will keep its dependents from ever
+/// running.
+///
+/// `Blocked` means one thing to an operator — "a dependency failed, or parked
+/// and was never answered" — and that is a claim about the future, not the
+/// present. On an ended run the two coincide: anything short of `Done` is
+/// final, because nothing more is coming. On a live one they do not. A
+/// dependency that is merely pending, deferred, or in flight is a task whose
+/// turn has not come, and its dependent is *queued behind* it rather than
+/// blocked by it. Deciding this from `Done`-ness alone made `Queued`
+/// unreachable for every task with a dependency, so the entire first half of a
+/// live run read as a graph of failures.
+fn blocks_dependents(state: &TaskState, running: bool) -> bool {
+    match state {
+        TaskState::Done(_) => false,
+        // Still on the way. Only an ended run turns that into "never".
+        TaskState::Pending | TaskState::Deferred => !running,
+        // Terminal even mid-run, which is what keeps the propagation working
+        // while the engine is still going: a parked dependency really does
+        // block its dependents until somebody answers.
+        TaskState::AwaitingInput(_)
+        | TaskState::Failed { .. }
+        | TaskState::Blocked(_)
+        | TaskState::Skipped => true,
+    }
 }
 
 /// Why a task is parked or failed, for the report.
@@ -6175,6 +6202,7 @@ mod tests {
         seed(
             &repo,
             "## Implement the widget\n<!-- tactus: id=t1 kind=implement depends= -->\n\n\
+             ## Waits on the widget\n<!-- tactus: id=t2 kind=implement depends=t1 -->\n\n\
              ## Independent\n<!-- tactus: id=t3 kind=implement depends= -->\n",
             Some("[routing]\nimplement = { chain = [\"small\"], attempts_per = 1 }\n"),
         );
@@ -6193,13 +6221,14 @@ mod tests {
             .expect("an attempt");
         fs::write(paths.events(), format!("{}\n", lines[..cut].join("\n"))).expect("truncate");
 
-        // With nothing holding the run, that shape still means interrupted.
+        // With nothing holding the run, that shape still means interrupted —
+        // and `t2` really is blocked, because on an ended run a dependency that
+        // never finished never will.
         let stopped = replay_of(&repo, &report.run_id);
         assert!(stopped.interrupted_run());
-        assert!(
-            crate::status::render(&stopped).contains("skipped (run halted)"),
-            "the settled reading is unchanged"
-        );
+        let out = crate::status::render(&stopped);
+        assert!(out.contains("skipped (run halted)"), "{out}");
+        assert!(out.contains("t2: blocked by `t1`"), "{out}");
 
         // Now hold the lock the way a working engine does.
         let lock = fs::OpenOptions::new()
@@ -6217,9 +6246,18 @@ mod tests {
         );
         let out = crate::status::render(&live);
         assert!(out.contains("t1: running now"), "{out}");
+        // The one the dependency-free pair could not catch: `t2` is waiting on
+        // a task that is working, which is what `Queued` means. Reading that as
+        // `Blocked` tells the operator a dependency failed when it is running.
+        assert!(out.contains("t2: queued"), "{out}");
         assert!(out.contains("t3: queued"), "{out}");
         assert!(out.contains("run in progress"), "{out}");
-        for lie in ["small failed", "skipped (run halted)", "run complete"] {
+        for lie in [
+            "small failed",
+            "skipped (run halted)",
+            "run complete",
+            "blocked by",
+        ] {
             assert!(!out.contains(lie), "a live run reported `{lie}`:\n{out}");
         }
         let _ = lock.unlock();
