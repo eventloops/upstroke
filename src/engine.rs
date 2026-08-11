@@ -949,6 +949,10 @@ fn resume_harness_inner(
     let events_path = public.join("events.jsonl");
     let events = events::read_all(&events_path, &mut warnings)?;
     let started = events::started_of(&events, &events_path)?.clone();
+    // Usually `run_started`'s, but a log too old to carry them there may have
+    // had them established by an earlier resume instead — which is what stops
+    // the re-derivation repeating, and drifting, on every resume after that.
+    let recorded_gates = events::recorded_gates(&events).cloned();
 
     // The run knows its own plan and config; the CLI may override the config
     // but never the plan, which is frozen (§5).
@@ -990,7 +994,7 @@ fn resume_harness_inner(
         harness,
         Recorded {
             reviews: started.reviews.clone(),
-            gates: started.gate_cmds.clone(),
+            gates: recorded_gates.clone(),
         },
     )?;
     if started.reviews.is_none() {
@@ -1001,12 +1005,16 @@ fn resume_harness_inner(
                 .to_owned(),
         );
     }
-    if started.gate_cmds.is_none() {
-        // A log from before the gate record. It still recorded gate *names*,
-        // which is not enough to rebuild the gates but is enough to say
-        // something better than "anything may have changed": if the names have
-        // moved, that is proof rather than suspicion, and if they have not, the
-        // only undetectable edit left is a command behind an unchanged name.
+    if recorded_gates.is_none() {
+        // A log from before the gate record, resumed for the first time — the
+        // only case with nothing to rebuild from, since this resume writes down
+        // what it settles on and the next one is ordinary.
+        //
+        // It still recorded gate *names*, which is not enough to rebuild the
+        // gates but is enough to say something better than "anything may have
+        // changed": if the names have moved, that is proof rather than
+        // suspicion, and if they have not, the only undetectable edit left is a
+        // command behind an unchanged name.
         let names_now: Vec<String> = gates.iter().map(|gate| gate.name.clone()).collect();
         if names_now != started.gates {
             warnings.push(format!(
@@ -1266,6 +1274,10 @@ fn resume_harness_inner(
             head_sha: head,
             interrupted_attempts: u32::try_from(interrupted.len()).unwrap_or(u32::MAX),
             discarded,
+            // Only when this resume is the one that had to settle the question.
+            // Where the log already answers it, re-stating the answer would put
+            // the same fact in two places that a later change could pull apart.
+            gates: recorded_gates.is_none().then(|| gates.clone()),
         },
     })?;
     // §14 takes a capacity snapshot at pre-flight, and §15 makes a resume
@@ -7443,6 +7455,77 @@ mod tests {
         assert!(
             warning.contains("recorded [check]") && warning.contains("resolves [renamed]"),
             "and says which: {warning}"
+        );
+    }
+
+    #[test]
+    fn the_resume_that_rederives_an_old_logs_gates_records_them_for_the_next_one() {
+        // Without this, the pre-record population never gains a record: every
+        // resume re-derives, so a gate weakened between two of them is adopted
+        // silently — the exact substitution the record exists to prevent,
+        // surviving in the one population that could not carry it.
+        //
+        // Behavioural, and it takes two resumes to show: the first establishes
+        // `git --version`, the gate is then weakened to something that fails,
+        // and the second must still commit. It can only do that by running the
+        // gate the first resume wrote down.
+        let (repo, run_id) = parked_run_with_gate("oldgateestablish", "git --version");
+        strip_run_started_field(&paths_of(&repo, &run_id), "gate_cmds");
+
+        // First resume: nothing to rebuild from, so it re-derives and says so.
+        // `Effect::NoEdit` leaves the task parked, so there is a second resume
+        // to make.
+        let first = resume_answering(&repo, &run_id, Effect::NoEdit);
+        assert_eq!(first.outcome(), RunOutcome::Parked, "{first:?}");
+        assert!(
+            first
+                .warnings
+                .iter()
+                .any(|w| w.contains("predates the gate record")),
+            "the first resume re-derived: {:?}",
+            first.warnings
+        );
+
+        // It wrote down what it settled on.
+        let paths = paths_of(&repo, &run_id);
+        let mut log_warnings = Vec::new();
+        let logged = events::read_all(&paths.events(), &mut log_warnings).expect("log");
+        let established = events::recorded_gates(&logged).expect("the resume recorded its gates");
+        assert_eq!(established.len(), 1);
+        assert_eq!(established[0].cmd, "git --version");
+
+        // Now weaken the gate, exactly as an implementer editing the workspace
+        // would. Under the old behaviour the second resume re-derived and
+        // adopted this.
+        fs::write(
+            repo.join("tactus.toml"),
+            gate_config("git frobnicate-not-a-command"),
+        )
+        .expect("edit config");
+
+        let second = resume_answering(&repo, &run_id, Effect::EditFile);
+        assert_eq!(second.outcome(), RunOutcome::Complete, "{second:?}");
+        assert!(
+            committed(&second, "t1"),
+            "the established gate ran, not the weakened one: {second:?}"
+        );
+        // And it is an ordinary record-bearing resume now: it warns about the
+        // difference rather than about the log's age.
+        assert!(
+            second
+                .warnings
+                .iter()
+                .any(|w| w.contains("differ from the ones this run recorded")),
+            "{:?}",
+            second.warnings
+        );
+        assert!(
+            !second
+                .warnings
+                .iter()
+                .any(|w| w.contains("predates the gate record")),
+            "the log is no longer speechless about its gates: {:?}",
+            second.warnings
         );
     }
 

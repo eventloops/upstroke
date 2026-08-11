@@ -381,6 +381,28 @@ pub struct RunResumed {
     /// the run tomorrow can still see that work was discarded and what it was.
     #[serde(default)]
     pub discarded: Vec<String>,
+    /// The gates this resume **established**, for a run whose log had none.
+    ///
+    /// `run_started.gate_cmds` is the usual home for this, and where it exists
+    /// this is `None` — a fact belongs in one place, and re-stating an unchanged
+    /// list on every resume would give the log two authorities that could
+    /// disagree. But a log written before that field existed has no home for it,
+    /// and the first resume of one has to re-derive from today's config. Left
+    /// unrecorded, *every* later resume re-derives too, so a gate weakened
+    /// between two of them is adopted silently — the very substitution the
+    /// record exists to prevent, surviving in the one population that cannot
+    /// carry the record.
+    ///
+    /// So the resume that re-derives writes down what it settled on, and every
+    /// resume after it is an ordinary record-bearing resume. `Some(vec![])` is
+    /// meaningful and distinct from `None`: it says this run established that it
+    /// has no gates, which is what makes a gate appearing later a difference
+    /// worth warning about rather than a silent new standard.
+    ///
+    /// Folds to no state, like `capacity_snapshot`: its reader is the *next*
+    /// resume, which takes it from the log directly ([`recorded_gates`]).
+    #[serde(default)]
+    pub gates: Option<Vec<GateSummary>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1405,6 +1427,24 @@ pub struct Replay {
     pub events: Vec<Event>,
 }
 
+/// The gates this run is bound to, from wherever the log records them.
+///
+/// `run_started` for anything written since the gate record existed; otherwise
+/// the first `run_resumed` that had to establish them (see
+/// [`RunResumed::gates`]). First-in-log-order wins, which is the same rule
+/// stated two ways: `run_started` comes first, and among resumes the one that
+/// established the standard is the one the committed work was verified under.
+///
+/// `None` only for a log that predates the record and has never been resumed —
+/// the single case where nothing can be said about what verified this run.
+pub fn recorded_gates(events: &[Event]) -> Option<&Vec<GateSummary>> {
+    events.iter().find_map(|event| match &event.body {
+        EventBody::RunStarted { data } => data.gate_cmds.as_ref(),
+        EventBody::RunResumed { data } => data.gates.as_ref(),
+        _ => None,
+    })
+}
+
 /// The `run_started` a log opens with — how a run describes itself.
 pub fn started_of<'a>(events: &'a [Event], path: &Path) -> Result<&'a RunStarted, TactusError> {
     events
@@ -1645,6 +1685,7 @@ mod tests {
                     head_sha: "abc".to_owned(),
                     interrupted_attempts: 1,
                     discarded: Vec::new(),
+                    gates: None,
                 },
             },
             attempt_started("t1", 1, 0, "small"),
@@ -1987,6 +2028,7 @@ mod tests {
                     head_sha: "abc".to_owned(),
                     interrupted_attempts: 0,
                     discarded: Vec::new(),
+                    gates: None,
                 },
             }),
         ];
