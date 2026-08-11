@@ -118,3 +118,10 @@ Probed WSL-side against codex-cli 0.147.0 on a ChatGPT **Pro** plan (upgraded th
 5. **Codex pool shape is operator-declared** in `pools.toml`, with `connect` recording that it could not verify the tier rather than guessing.
 
 **Not decided here:** whether the reviewer's default effort should be high (quality) or medium (cost) — §23.2 says review is charged per attempt, so this is a real cost lever and wants a deliberate call when the profile field lands.
+
+**Implemented the same day** (commit following this record). `Effort` is a four-level abstract ladder (`low, medium, high, max`) on `WorkerProfile`, defaulting per tier (`small→low`, `mid→medium`, `frontier→high`) with a `[[pins]] effort` override validated at config load; the codex adapter states `model_reasoning_effort` on both the fresh and resumed shapes. Two decisions the build forced, recorded because neither was obvious from the probe:
+
+- **The reviewer default is `high`, not `max`.** Reviewers bind at the review tier, which defaults to frontier, so the tier default settles the question left open above. `max` stays reachable only through a pin — a deliberate purchase, not the price of routing something to the top rung.
+- **Effort is not identity.** `ReviewPlan::passes_for` decides §11.3's self-review rebind by comparing a `PassBinding` with the implementer's. Putting effort on that struct would have made the comparison always false and *silently retired the check that stops a model reviewing its own work* — a verification layer deleted by a field addition. Effort therefore travels as a parameter to the profile, not as part of the binding. The near-miss is the point: this is the failure mode §11.3 already guards against in config (an unrecognised `second_opinion` value is a hard error, "because a typo must not silently delete a verification layer"), reappearing as a type change.
+
+Also deliberately excluded from the ladder: codex's `xhigh` (an intermediate no other adapter can honour) and `ultra` ("maximum reasoning with automatic task delegation" — a change in what the agent *does*, and nothing here has audited an agent spawning subagents inside a tactus attempt).

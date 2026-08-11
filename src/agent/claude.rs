@@ -514,6 +514,9 @@ mod tests {
             model: "claude-sonnet-5".to_owned(),
             pool: "claude-max".to_owned(),
             permissions,
+            // Carried by every profile; this CLI has no effort flag to map it
+            // onto, so the adapter ignores it (§16).
+            effort: Some(crate::ir::Effort::Medium),
             max_turns: Some(30),
             extra_args: Vec::new(),
         }

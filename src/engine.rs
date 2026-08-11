@@ -43,8 +43,8 @@ use crate::interaction::{
     self, AnswerSource, InteractionMode, Notifier, QuestionRecord, RealSleeper, Sleeper,
 };
 use crate::ir::{
-    Answer, Outcome, OutcomeStatus, PermissionMode, Plan, Question, QuestionId, QuestionKind, Task,
-    TaskKind, WorkerProfile,
+    Answer, Effort, Outcome, OutcomeStatus, PermissionMode, Plan, Question, QuestionId,
+    QuestionKind, Task, TaskKind, WorkerProfile,
 };
 use crate::ladder::{self, LadderPolicy, LadderState, Next};
 use crate::review::{self, PassBinding, ReviewPass, ReviewPlan};
@@ -707,6 +707,7 @@ fn run_harness_inner(
         sleeper,
         caps,
         review_plan,
+        review_effort: analysis.config.review_effort(),
         attempt_timeout: opts.attempt_timeout,
         defer_backoff: opts.defer_backoff,
         max_defers: opts.max_defers,
@@ -1090,6 +1091,7 @@ fn resume_harness_inner(
         sleeper,
         caps,
         review_plan,
+        review_effort: analysis.config.review_effort(),
         attempt_timeout: opts.attempt_timeout,
         defer_backoff: opts.defer_backoff,
         max_defers: opts.max_defers,
@@ -1221,6 +1223,9 @@ struct Run<'a> {
     /// Who judges each task (§11.2–§11.3), resolved once at pre-flight and
     /// recorded in `run_started`.
     review_plan: ReviewPlan,
+    /// How hard every reviewer thinks — the review tier's effort, resolved once
+    /// so both passes of a second opinion judge to one standard.
+    review_effort: Effort,
     attempt_timeout: Duration,
     defer_backoff: Duration,
     max_defers: u32,
@@ -1491,6 +1496,10 @@ impl Run<'_> {
                 // Nothing routes on it.
                 pool: self.pool_name_for(&rung.binding.agent).unwrap_or_default(),
                 permissions: PermissionMode::Edit,
+                // What the rung's tier is worth on an agent with an effort
+                // axis: without this the whole chain runs at one vendor
+                // default and escalating a rung moves nothing (§10).
+                effort: Some(self.analysis.config.effort_for(rung.tier)),
                 max_turns: None,
                 extra_args: Vec::new(),
             };
@@ -1770,7 +1779,10 @@ impl Run<'_> {
             .passes_for(index, &running_on)
             .into_iter()
             .map(|pass: ReviewPass| {
-                let mut profile = pass.profile();
+                // Every pass judges at the review tier's effort, including a
+                // second opinion bound to another vendor: the standard belongs
+                // to the review, not to whichever family happens to apply it.
+                let mut profile = pass.profile(self.review_effort);
                 // A cross-vendor second opinion draws on a different
                 // subscription than the implementer (§11.3, §13), so its pool
                 // is looked up from its own agent rather than inherited.

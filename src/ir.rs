@@ -97,6 +97,71 @@ impl Tier {
     }
 }
 
+/// How hard the model should think, where the CLI exposes that axis.
+///
+/// Abstract for the same reason tiers are: the vocabularies differ per vendor
+/// and the engine should not learn one of them. Four levels, because four is
+/// what generalizes — an adapter whose CLI has no such axis ignores this, and
+/// one whose ladder is finer maps onto the nearest rung it has.
+///
+/// Codex's own ladder is `low, medium, high, xhigh, max, ultra`. Two of those
+/// are deliberately unreachable from here. `xhigh` is an intermediate no other
+/// adapter can honour, and `ultra` is documented as "maximum reasoning with
+/// automatic task delegation" — a change in what the agent *does*, not how hard
+/// it thinks, and nothing in this design has audited an agent that spawns its
+/// own subagents inside a tactus attempt.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Effort {
+    Low,
+    Medium,
+    High,
+    Max,
+}
+
+impl Effort {
+    pub fn parse(s: &str) -> Option<Self> {
+        match s.to_ascii_lowercase().as_str() {
+            "low" => Some(Self::Low),
+            "medium" => Some(Self::Medium),
+            "high" => Some(Self::High),
+            "max" => Some(Self::Max),
+            _ => None,
+        }
+    }
+
+    pub const KNOWN: &'static str = "low, medium, high, max";
+
+    /// The tier's default effort — what makes a tier mean something on a CLI
+    /// that has this axis.
+    ///
+    /// Without it, a chain that escalates `small → mid → frontier` on one
+    /// vendor's models moves nothing at all on another's: codex reads the same
+    /// slug at whatever effort the vendor defaults to, which for `gpt-5.6-sol`
+    /// is `low`. Frontier maps to `high` rather than `max` because §23.2 prices
+    /// review per attempt and a reviewer binds at the review tier; `max` is a
+    /// deliberate opt-in through a pin, not the price of routing something to
+    /// the top rung.
+    pub fn for_tier(tier: Tier) -> Self {
+        match tier {
+            Tier::Small => Self::Low,
+            Tier::Mid => Self::Medium,
+            Tier::Frontier => Self::High,
+        }
+    }
+}
+
+impl fmt::Display for Effort {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::Low => "low",
+            Self::Medium => "medium",
+            Self::High => "high",
+            Self::Max => "max",
+        })
+    }
+}
+
 impl fmt::Display for Tier {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(match self {
@@ -217,6 +282,14 @@ pub struct WorkerProfile {
     /// capacity engine lands).
     pub pool: String,
     pub permissions: PermissionMode,
+    /// Reasoning effort for adapters that have the axis (§16: codex does).
+    ///
+    /// `Some` on every profile the engine builds — the tier's default, or a
+    /// pin's override. `None` means "whatever the CLI defaults to", which is
+    /// the behaviour this field exists to end: it is reachable only from tests
+    /// that construct a profile by hand.
+    #[serde(default)]
+    pub effort: Option<Effort>,
     pub max_turns: Option<u32>,
     pub extra_args: Vec<String>,
 }

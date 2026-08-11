@@ -641,6 +641,7 @@ mod tests {
             tier: crate::ir::Tier::Frontier,
             agent: "aider".to_owned(),
             model: "qwen-3-coder".to_owned(),
+            effort: None,
         }];
         let err = check_pin_adapters(&pins, builtin_adapter, Path::new("tactus.toml"))
             .expect_err("preview must not promise a binding run would refuse");
@@ -656,6 +657,7 @@ mod tests {
             tier: crate::ir::Tier::Frontier,
             agent: "copilot".to_owned(),
             model: "gpt-5.3-codex".to_owned(),
+            effort: None,
         }];
         assert!(
             check_pin_adapters(&pins, builtin_adapter, Path::new("tactus.toml")).is_ok(),

@@ -47,7 +47,7 @@ use crate::agent::{AgentAdapter, TaskRun, proc};
 use crate::catalog::{self, Family};
 use crate::config::Config;
 use crate::error::TactusError;
-use crate::ir::{OutcomeStatus, PermissionMode, Plan, Task, Tier, Verdict, WorkerProfile};
+use crate::ir::{Effort, OutcomeStatus, PermissionMode, Plan, Task, Tier, Verdict, WorkerProfile};
 use crate::route::ResolvedChain;
 use crate::util;
 
@@ -469,23 +469,31 @@ pub struct ReviewOutcome {
 impl ReviewPass {
     /// The read-only profile this pass runs under. Named for its lens and its
     /// model, so an event log and a ledger both say which judgement is whose.
-    pub fn profile(&self) -> WorkerProfile {
+    /// Effort is a parameter rather than a field on [`PassBinding`] for a
+    /// specific reason: `passes_for` decides the §11.3 rebind by comparing a
+    /// binding with the implementer's, and a binding carrying an effort the
+    /// implementer's descriptor does not would make that comparison always
+    /// false — silently retiring the check that stops a model reviewing its own
+    /// work. The comparison is about identity; effort is not identity.
+    pub fn profile(&self, effort: Effort) -> WorkerProfile {
         profile_for(
             &self.binding.agent,
             &self.binding.model,
             &format!("{}-{}", self.lens.name(), self.binding.model),
+            effort,
         )
     }
 }
 
 /// A read-only profile bound to the same rung the reviewer is configured for.
-pub fn profile_for(agent: &str, model: &str, name: &str) -> WorkerProfile {
+pub fn profile_for(agent: &str, model: &str, name: &str, effort: Effort) -> WorkerProfile {
     WorkerProfile {
         name: name.to_owned(),
         agent: agent.to_owned(),
         model: model.to_owned(),
         pool: String::new(),
         permissions: PermissionMode::ReadOnly,
+        effort: Some(effort),
         max_turns: None,
         extra_args: Vec::new(),
     }
@@ -973,7 +981,7 @@ mod tests {
         let task = task();
         let cx = ReviewCx {
             adapter: &crate::agent::claude::ClaudeCodeAdapter,
-            profile: profile_for("claude-code", "claude-opus-5", "review"),
+            profile: profile_for("claude-code", "claude-opus-5", "review", Effort::High),
             lens: Lens::Acceptance,
             task: &task,
             diff: "+++ b/src/api.rs\n+fn encode() {}\n",
@@ -1011,7 +1019,7 @@ mod tests {
         let decisions = ["Render bare bytes when the value is not an exact multiple.".to_owned()];
         let cx = ReviewCx {
             adapter: &crate::agent::claude::ClaudeCodeAdapter,
-            profile: profile_for("claude-code", "claude-opus-5", "review"),
+            profile: profile_for("claude-code", "claude-opus-5", "review", Effort::High),
             lens: Lens::Acceptance,
             task: &task,
             diff: "+++ b/src/api.rs\n+fn encode() {}\n",
@@ -1058,7 +1066,7 @@ mod tests {
         let artifacts = [("conventions-brief".to_owned(), "Use snake_case.".to_owned())];
         let cx = ReviewCx {
             adapter: &crate::agent::claude::ClaudeCodeAdapter,
-            profile: profile_for("claude-code", "claude-opus-5", "review"),
+            profile: profile_for("claude-code", "claude-opus-5", "review", Effort::High),
             lens: Lens::Acceptance,
             task: &task,
             diff: "+++ b/src/api.rs\n+fn encode() {}\n",
@@ -1114,7 +1122,7 @@ mod tests {
         let task = task();
         let cx = ReviewCx {
             adapter: &crate::agent::claude::ClaudeCodeAdapter,
-            profile: profile_for("claude-code", "claude-opus-5", "review"),
+            profile: profile_for("claude-code", "claude-opus-5", "review", Effort::High),
             lens: Lens::Acceptance,
             task: &task,
             diff: &huge,
@@ -1150,7 +1158,7 @@ mod tests {
                     ```rust\n+fn added() {}\n ```\n";
         let cx = ReviewCx {
             adapter: &crate::agent::claude::ClaudeCodeAdapter,
-            profile: profile_for("claude-code", "claude-opus-5", "review"),
+            profile: profile_for("claude-code", "claude-opus-5", "review", Effort::High),
             lens: Lens::Acceptance,
             task: &task,
             diff,
@@ -1276,8 +1284,14 @@ mod tests {
             lens: Lens::SecondOpinion,
             binding: binding("copilot", "gpt-5.3-codex"),
         };
-        assert_eq!(pass.profile().name, "second-opinion-gpt-5.3-codex");
-        assert_eq!(pass.profile().permissions, PermissionMode::ReadOnly);
+        assert_eq!(
+            pass.profile(Effort::High).name,
+            "second-opinion-gpt-5.3-codex"
+        );
+        assert_eq!(
+            pass.profile(Effort::High).permissions,
+            PermissionMode::ReadOnly
+        );
     }
 
     // ---------------------------------------------------------------------
@@ -1534,7 +1548,12 @@ mod tests {
         let task = task();
         let cx = ReviewCx {
             adapter: &crate::agent::claude::ClaudeCodeAdapter,
-            profile: profile_for("copilot", "gpt-5.3-codex", "second-opinion-gpt-5.3-codex"),
+            profile: profile_for(
+                "copilot",
+                "gpt-5.3-codex",
+                "second-opinion-gpt-5.3-codex",
+                Effort::High,
+            ),
             lens: Lens::SecondOpinion,
             task: &task,
             diff: "+++ b/src/api.rs\n+fn encode() {}\n",
@@ -1570,7 +1589,12 @@ mod tests {
 
     #[test]
     fn reviewer_profiles_are_read_only() {
-        let profile = profile_for("claude-code", "claude-opus-5", "review-frontier");
+        let profile = profile_for(
+            "claude-code",
+            "claude-opus-5",
+            "review-frontier",
+            Effort::High,
+        );
         assert_eq!(profile.permissions, PermissionMode::ReadOnly);
         let settings = crate::agent::claude::permission_settings(&profile, &["cargo test".into()]);
         let allow = settings["permissions"]["allow"].to_string();

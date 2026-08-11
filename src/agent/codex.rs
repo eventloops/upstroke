@@ -96,7 +96,7 @@ use super::proc::{self, ProcessOutput};
 use super::{AdapterSource, AgentAdapter, AuthState, Caps, Discovery, TaskRun, looks_rate_limited};
 use crate::capacity::PoolKind;
 use crate::error::TactusError;
-use crate::ir::{Outcome, OutcomeStatus, PermissionMode, Usage, WorkerProfile};
+use crate::ir::{Effort, Outcome, OutcomeStatus, PermissionMode, Usage, WorkerProfile};
 use crate::util;
 
 pub const ADAPTER_ID: &str = "codex";
@@ -257,6 +257,23 @@ impl AgentAdapter for CodexAdapter {
     }
 }
 
+/// This CLI's name for a tier-neutral effort level.
+///
+/// One-to-one today, and a function rather than a `Display` impl because that
+/// is the adapter's job: the engine's ladder is four rungs, this vendor's is
+/// six, and the mapping belongs on this side of the seam where the next vendor
+/// can differ without the engine learning about it. Every value below is in the
+/// provider's validated enum (`low, medium, high, xhigh, max` plus `none` and
+/// `minimal`) — checked against the 400 it returns for anything else.
+fn effort_flag(effort: Effort) -> &'static str {
+    match effort {
+        Effort::Low => "low",
+        Effort::Medium => "medium",
+        Effort::High => "high",
+        Effort::Max => "max",
+    }
+}
+
 /// The sandbox this profile runs under (§20).
 ///
 /// Two modes and no third: `danger-full-access` exists on this CLI and is
@@ -352,6 +369,19 @@ pub fn build_args(run: &TaskRun) -> Vec<String> {
     // default must not silently move a resumed retry to another model.
     args.push("--model".to_owned());
     args.push(run.profile.model.clone());
+    // Effort, for exactly the reason the model is passed above — and this axis
+    // had the bug that argument was written to prevent. This CLI's default
+    // comes from the *provider's* roster, not from the flag set: `gpt-5.6-sol`
+    // carries `default_reasoning_level: low`, so every review this project ran
+    // before this line existed was judged at the lowest setting, silently, and
+    // a roster refresh could move it again without a release. Passed on the
+    // resumed shape too: `-c` is accepted there (measured — unlike `-s`, which
+    // is rejected), and a retry must not think harder or less hard than the
+    // attempt it is continuing.
+    if let Some(effort) = run.profile.effort {
+        args.push("-c".to_owned());
+        args.push(format!("model_reasoning_effort={}", effort_flag(effort)));
+    }
     if run.resume_session.is_none() {
         args.push("--sandbox".to_owned());
         args.push(sandbox_mode(&run.profile).to_owned());
@@ -598,6 +628,7 @@ mod tests {
             model: "gpt-5.6-sol".to_owned(),
             pool: String::new(),
             permissions,
+            effort: Some(Effort::Medium),
             max_turns: None,
             extra_args: Vec::new(),
         }
@@ -651,6 +682,62 @@ mod tests {
             !resumed.contains(&"--sandbox".to_owned()),
             "a resumed attempt must not re-specify the sandbox: {resumed:?}"
         );
+    }
+
+    #[test]
+    fn effort_is_stated_on_both_shapes_rather_than_left_to_the_vendor() {
+        // The bug this exists to prevent: this CLI takes its default effort
+        // from the provider's model roster, not from its flag set, and
+        // `gpt-5.6-sol` carries `default_reasoning_level: low`. Every review
+        // run before this flag existed was judged at the lowest setting with
+        // nothing in the record saying so — and a roster refresh could move it
+        // again without a release.
+        let fresh = build_args(&run(PermissionMode::Edit, None));
+        let at = fresh
+            .iter()
+            .position(|a| a == "-c")
+            .expect("effort must be passed: {fresh:?}");
+        assert_eq!(fresh[at + 1], "model_reasoning_effort=medium", "{fresh:?}");
+
+        // On the resumed shape too. `-c` is accepted there — measured against
+        // codex-cli 0.147.0, where a bogus session id fails at session lookup
+        // rather than argument parsing — unlike `-s`, which is rejected. A
+        // retry must not think harder or less hard than the attempt it
+        // continues.
+        let resumed = build_args(&run(PermissionMode::Edit, Some("019ff122-4d61")));
+        assert!(
+            resumed
+                .windows(2)
+                .any(|w| w[0] == "-c" && w[1] == "model_reasoning_effort=medium"),
+            "{resumed:?}"
+        );
+    }
+
+    #[test]
+    fn every_effort_maps_to_a_value_the_provider_accepts() {
+        // The provider validates this enum server-side and rejects anything
+        // else with a 400 *after* the turn starts, so an unmapped level would
+        // cost a whole attempt rather than failing fast. Its accepted set,
+        // read off that error: none, minimal, low, medium, high, xhigh, max.
+        const ACCEPTED: [&str; 7] = ["none", "minimal", "low", "medium", "high", "xhigh", "max"];
+        for effort in [Effort::Low, Effort::Medium, Effort::High, Effort::Max] {
+            assert!(
+                ACCEPTED.contains(&effort_flag(effort)),
+                "{effort} maps to `{}`, which the provider would reject",
+                effort_flag(effort)
+            );
+        }
+    }
+
+    #[test]
+    fn a_profile_without_an_effort_passes_none_rather_than_guessing() {
+        // Only reachable from a hand-built profile: the engine sets an effort
+        // on every profile it makes. Passing a guess here would be worse than
+        // the CLI's own default, because it would look deliberate.
+        let mut run = run(PermissionMode::Edit, None);
+        run.profile.effort = None;
+        let args = build_args(&run);
+        assert!(!args.contains(&"-c".to_owned()), "{args:?}");
     }
 
     #[test]
