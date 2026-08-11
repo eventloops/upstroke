@@ -1,8 +1,9 @@
 # Decision record — multi-model design council for tactus
 
 **Date:** 2026-08-11
-**Status:** Decided — adopted as manual practice now; machinery deferred pending the miss/catch record (v0.3 design-pane era at the earliest). All five follow-up threads approved same day (addenda A–C).
+**Status:** Decided — adopted as manual practice now; machinery deferred pending the miss/catch record (v0.3 design-pane era at the earliest).
 **Inputs:** *Tactus Multi-Model Design Council* and *Tactus Adaptive Agent Routing Engine* (GPT-5.6-sol drafts, kept outside the repo), reviewed against DESIGN.md v2.1 (§2, §5, §11.3, §21, §23.2) in a Fable 5 critique session. Decisions: project owner.
+**Siblings from the same session** (originally addenda here, split out per `README.md`): [self-hosting v0.2](2026-08-11-self-hosting-v02.md) · [resume gate config](2026-08-11-resume-gate-config.md) · [Codex reasoning effort](2026-08-11-codex-reasoning-effort.md).
 
 **The idea under decision:** run high-stakes tactus design decisions through multiple independent frontier models — independent proposals, cross-critique, synthesis, adversarial review — instead of a single designer. The sol doc proposes it as a five-phase product subsystem ("council mode").
 
@@ -66,78 +67,9 @@ Adopt the council **through the self-hosting/bootstrap lens, manual-first, zero 
 ## Related dispositions from the same review (recorded lightly)
 
 - **Adaptive routing doc, learning phases (Bayesian → bandit → learned ranking): parked indefinitely — not worth accounting for now.** Two structural reasons at personal scale: single-digit observations per (kind × tier × model) cell, and data half-life — model rosters churn quarterly, so the dataset decays about as fast as it grows. The live path remains §23.2's kill test: the predict-before-running protocol and its miss log decide whether rung/cost prediction ships as a `--dry-run` step.
-- **Salvage candidates from the routing doc** (spec changes if adopted — v0.2 `export-decisions`/event schema, justified for *interpretability of small data*, not ML): failure taxonomy on outcomes; full agent identity incl. versions per attempt; `selection_origin` (auto / user-override / pin / exploration); pre-execution difficulty/feature snapshot; marking evidence-free failures (infra) apart from capability failures. **Status: candidates — to be decided when the export-decisions plan is designed (see Addendum B: it is the first self-hosted run).**
+- **Salvage candidates from the routing doc** (spec changes if adopted — v0.2 `export-decisions`/event schema, justified for *interpretability of small data*, not ML): failure taxonomy on outcomes; full agent identity incl. versions per attempt; `selection_origin` (auto / user-override / pin / exploration); pre-execution difficulty/feature snapshot; marking evidence-free failures (infra) apart from capability failures. **Status: candidates — to be decided when the export-decisions plan is designed, which is the first self-hosted run ([self-hosting v0.2](2026-08-11-self-hosting-v02.md)).** Item #2 has since landed with a concrete shape — see [Codex reasoning effort](2026-08-11-codex-reasoning-effort.md).
 - **Process rule from the review itself:** any future sol design draft gets DESIGN.md's relevant sections in its context (at minimum §§3–5, 8, 10–13, 21, 23.2). Both docs were written without the spec and re-derived or contradicted recorded decisions — the failure mode the council doc's own context-manifest rule (§43) exists to prevent.
 
----
+## Follow-ups approved the same day
 
-## Addendum A (2026-08-11) — follow-up threads approved
-
-All five wrap-up threads approved by the owner the same day: (1) this folder created under the contract in `decisions/README.md`; (2) self-hosting v0.2 confirmed (Addendum B); (3) DESIGN.md §21's v0.3 learned-routing line reconciled with §23.2, citing this record; (4) the five telemetry fields stay candidates, decided at export-decisions plan time; (5) the gate-config hardening check performed (Addendum C).
-
-## Addendum B (2026-08-11) — self-hosting v0.2 through tactus: decided
-
-**Verdict:** v0.2 development runs through tactus wherever the v0.1 envelope allows, starting now.
-
-- **The claim is auditable, not asserted.** Engine-owned commits carry `[tactus] <task-id>` and every commit has a run ledger and event log behind it, so "N% of v0.2 was written by tactus" is a `git log --grep` result with receipts — the §23.1 "pen" pitch pointed at our own repo. Report the measured number by task count, and say plainly that difficulty-weighted share is lower.
-- **Envelope expectations, stated up front:** isolated v0.2 items flow through the engine (export-decisions, plan adapters, Aider adapter, notifiers); the scheduler rework and runner core may stay interactive or run as single-task frontier plans with heavy review. Every v0.2 defect invites "the tool wrote that" — the answer is the review record and the defect loop, not defensiveness.
-- **First run: the export-decisions schema work** — the five candidate fields above become its plan, decided at plan time. This closes today's loop (the first tactus-built v0.2 tasks implement the salvage from the review that decided to self-host) and starts filling §23.2's recorded gap: no numbers exist for the frontier-implementer regime.
-- **Operational:** runs happen WSL-side (all three CLIs work there; the Codex implementer only works there); the predict-before-running protocol applies to every run; misses land in the miss log.
-
-## Addendum C (2026-08-11) — gate-config hardening: verified, one gap found
-
-**Live runs are snapshot-safe by construction:** config is parsed at pre-flight into the analysis and gates execute from memory, so a mid-run edit to `tactus.toml` cannot change a live run's gates.
-
-**Resume has a real gap, confirmed in code:** `resume` re-resolves gates from today's config "exactly as a fresh run does" (`src/engine.rs`, resume path) — unlike the plan hash and the routing chains, which are recorded-and-refused on mismatch. `run_started` records only gate *names*, so a `[[gates]]` command edited between a run and its resume — including by an implementer agent that edited the workspace's own `tactus.toml` before an interruption — is silently adopted; a name-preserving command change (`cmd = "cargo test"` → `cmd = "true"`) is invisible even to a name comparison. The codebase already articulates the governing distinction (budgets are deliberately re-derived because they are an operator ceiling, not identity; chains are refused because they are identity) — gate commands are *verification identity* and belong on the refused side.
-
-**Fix (flagged for a separate implement session):** record gate commands (or a fingerprint) in `run_started`; resume refuses on mismatch with the chains-refusal phrasing; logs predating the record warn and re-derive, like the pre-step-9 review record; DESIGN.md §15's refusal list gains gates alongside the plan hash and chains.
-
-**Config hardening before the first self-hosted run:** blast-radius override in this repo's `tactus.toml` — `paths = ["tactus.toml"]` with `second_opinion = "different-vendor"` — so any diff touching gate definitions gets cross-family eyes. **Rejected:** hard-denying `tactus.toml` edits to implementers — self-hosting tasks legitimately touch config, and gate commands execute repository scripts anyway (§21's runner rationale); review plus refusal-on-resume is the proportionate pair.
-
-## Addendum D (2026-08-11) — reasoning effort is an unmodelled axis, and every Codex review so far ran at `low`
-
-Probed WSL-side against codex-cli 0.147.0 on a ChatGPT **Pro** plan (upgraded the same day), read-only sandbox, trivial prompts. **The headline is a defect, not the plan.**
-
-**The defect.** `~/.codex/models_cache.json` gives `gpt-5.6-sol` a `default_reasoning_level` of **`low`**, and `codex.rs::build_args` passes only `--model` and `--sandbox` — effort is never set, so it falls to that vendor default. **Every Codex review this project has run went out at the lowest reasoning setting**, including run `01KZRN48A4ZK3AEDST3RJ8HMA4`, the first §11.3 cross-family review (§21). The adapter already argues the general case against itself: it passes `--model` on resumed sessions precisely so "a future change to the CLI's default must not silently move a resumed retry to another model" — the identical argument applies to effort, which is currently left defaulted. The §11.3 cross-family claim should be re-established at a deliberate effort before it is cited again.
-
-**Measured:**
-- Effort is a first-class per-model enum. `gpt-5.6-sol`: `low, medium, high, xhigh, max, ultra` (`ultra` = "maximum reasoning with automatic task delegation"); `gpt-5.6-luna` tops out at `max`; `gpt-5.5`/`gpt-5.4` at `xhigh`. Defaults differ per model (`sol` = low, most others = medium).
-- The config key is **`model_reasoning_effort`**, set via `-c key=value`. Siblings in the same binary: `plan_mode_reasoning_effort`, `model_verbosity`, `service_tier`.
-- `xhigh`, `max` and `ultra` were all **accepted and completed** (exit 0, correct replies) under Pro. Caveat, stated because it matters: the prompts were trivial and returned `reasoning_output_tokens: 0`, so this measures *acceptance of the flag*, not that effort changed behaviour or that a Plus plan would refuse it. No Plus/Pro comparison was run.
-- **There is no pro-tier model.** Pro is a plan/quota tier; the frontier slug stays `gpt-5.6-sol`. The roster is server-driven and moves under you — it refreshed mid-probe and gained a ninth model (`gpt-5.3-codex-spark`).
-- **The plan tier is not discoverable locally.** `auth.json` carries `auth_mode`, tokens, `account_id`, `last_refresh` and no plan field; `codex login status` says only "Logged in using ChatGPT". Plus vs Pro therefore cannot be detected — for this pool §13's "pools are connected, not configured" hits a hard limit, and the plan shape must be operator-declared.
-- **No `rate_limits` anywhere in the `codex exec` JSON stream** — usage tokens only. Codex capacity estimation has no local quota signal at all, which is stronger than the adapter's recorded "usage without pricing".
-- A local model roster *does* exist (`models_cache.json`), so the adapter's probe note that "no model listing is offered" is true of the CLI surface but not of the install. It is a real discovery source for `tactus connect`, with the staleness caveat that it is a server-fetched cache.
-- Incidental confirmation: a `401 token_expired` on the websocket transport, then a successful HTTPS fallback and refresh — the rotating-refresh-token behaviour §21's runner commitment already assumed when it specified persistent credential volumes.
-
-**Design implications (no implementation here; for a separate session):**
-1. **Effort becomes explicit in the adapter** — always pass `-c model_reasoning_effort=<effort>`, by the same reasoning that already makes `--model` unconditional.
-2. **Effort belongs in `WorkerProfile`**, not `extra_args`, so the binder can reason about it and the ledger and decision record it. This is also salvage item #2 ("agent identity incl. reasoning config") arriving with a concrete shape.
-3. **The catalog's unit is model × effort**, not model: effort changes both capability and price of the same slug, which is exactly what §13's catalog ranks.
-4. **Effort-qualified rungs** (`frontier` then `frontier:max`) are the warmest possible escalation — same model, same harness, same cache, per §10's affinity gradient — and the cheapest answer to §23.2's "fewer attempts beats cheaper attempts". Decide with the per-rung `attempts_per` config change; they share a syntax.
-5. **Codex pool shape is operator-declared** in `pools.toml`, with `connect` recording that it could not verify the tier rather than guessing.
-
-**Not decided here:** whether the reviewer's default effort should be high (quality) or medium (cost) — §23.2 says review is charged per attempt, so this is a real cost lever and wants a deliberate call when the profile field lands.
-
-**Implemented the same day** (commit following this record). `Effort` is a four-level abstract ladder (`low, medium, high, max`) on `WorkerProfile`, defaulting per tier (`small→low`, `mid→medium`, `frontier→high`) with a `[[pins]] effort` override validated at config load; the codex adapter states `model_reasoning_effort` on both the fresh and resumed shapes. Two decisions the build forced, recorded because neither was obvious from the probe:
-
-- **The reviewer default is `high`, not `max`.** Reviewers bind at the review tier, which defaults to frontier, so the tier default settles the question left open above. `max` stays reachable only through a pin — a deliberate purchase, not the price of routing something to the top rung.
-- **Effort is not identity.** `ReviewPlan::passes_for` decides §11.3's self-review rebind by comparing a `PassBinding` with the implementer's. Putting effort on that struct would have made the comparison always false and *silently retired the check that stops a model reviewing its own work* — a verification layer deleted by a field addition. Effort therefore travels as a parameter to the profile, not as part of the binding. The near-miss is the point: this is the failure mode §11.3 already guards against in config (an unrecognised `second_opinion` value is a hard error, "because a typo must not silently delete a verification layer"), reappearing as a type change.
-
-Also deliberately excluded from the ladder: codex's `xhigh` (an intermediate no other adapter can honour) and `ultra` ("maximum reasoning with automatic task delegation" — a change in what the agent *does*, and nothing here has audited an agent spawning subagents inside a tactus attempt).
-
-## Addendum E (2026-08-11) — the cross-family review, re-established at a stated effort
-
-Run **`01KZS7R0V1ZD6MC290MG350QXF`**, WSL-side against a seeded scratch repo: one `implement` task bound at mid to `claude-code/claude-sonnet-5` (Anthropic), reviewed by `codex/gpt-5.6-sol` (OpenAI) pinned at frontier — so the cross-family pass is the *primary* review here, not an added second opinion. Committed on the first attempt.
-
-**What it establishes, in descending order of how hard it was to fake:**
-
-- **The effort reached the provider.** Codex's own session rollout for the review thread records `"effort":"high"`. This is the CLI's record of what it sent, not tactus's record of what it meant to send — the two had disagreed silently for the whole life of the adapter, which is the defect this run closes.
-- **The reviewer actually reasoned.** 511 of 757 output tokens were `reasoning_output_tokens`. The pre-fix probe on a trivial prompt returned 0.
-- **The families really differ.** `run_started` records `reviews.primary = codex/gpt-5.6-sol` with the alternative `claude-code/claude-opus-4-8` held in reserve, and the implementer was Anthropic. §11.3 satisfied on the substance, not the label.
-- **The verdict was a reading, not a rubber stamp.** It cited `src/clamp.rs:2` and `:3` by line, checked the "no code path can panic" criterion against the actual conversion, and reasoned explicitly that `unwrap_or` is not the prohibited panicking `unwrap` — a distinction a rubber stamp does not make.
-- **The ledger stayed honest:** `$0.1391?` — the Claude half priced, the Codex half unpriced and marked as a floor rather than presented as complete (§13).
-
-**Prediction (stated before the run, per the standing protocol): mid rung, first attempt, $0.10–0.40 reported. Actual: mid, first attempt, $0.1391. Hit** — the third consecutive hit on the routing-prediction question §23.2 says decides whether a learned router is ever worth building.
-
-**What it does not establish:** that `high` produces *better* judgement than `low`. That would need the same diff judged both ways, and §23.2's own finding — two identical configurations produced two different failure modes — says a single paired run would not settle it either. The claim here is narrower and is the one that was actually broken: tactus now decides the effort, states it, and can prove which one was used.
+All five wrap-up threads from this session were approved by the owner: (1) the `decisions/` folder created under the contract in `README.md`; (2) self-hosting v0.2 confirmed — [its own record](2026-08-11-self-hosting-v02.md); (3) DESIGN.md §21's v0.3 learned-routing line reconciled with §23.2, citing this record; (4) the five telemetry fields left as candidates, to be decided at export-decisions plan time; (5) the gate-config hardening check performed — [its own record](2026-08-11-resume-gate-config.md).
