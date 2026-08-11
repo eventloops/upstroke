@@ -6,16 +6,20 @@
 //! drive on its own: Copilot reaches OpenAI models, but through GitHub's
 //! harness and GitHub's billing.
 //!
-//! **It was built to move implementation off the Claude window and it cannot
-//! do that**, which the header says up front so nobody plans around the
-//! intention instead of the result. `codex exec` has no sandboxed write path
-//! on this platform, so [`refuse_edit_profile`] turns an implementer profile
-//! away at build time and the reasoning lives there with the evidence. What
-//! works, and works well, is the judge's seat: `read-only` is enforced exactly
-//! as §20 wants, the family is genuinely different from Anthropic's (§11.3),
-//! and a review that spends nothing on the Claude window is worth having on
-//! its own — measured end to end on run `01KZRN48A4ZK3AEDST3RJ8HMA4`, where
-//! Sonnet implemented and this adapter judged.
+//! **Implementing works where the sandbox is real, and only there.** This
+//! CLI's sandbox is an external helper, present on Linux and absent on
+//! Windows — so on Windows `exec` silently degrades to read-only and
+//! [`refuse_edit_profile`] turns an implementer away at build time rather than
+//! letting it spend attempts on empty diffs. On Linux the same flags write
+//! inside the workspace and are blocked outside it, which is what §20 asks
+//! for, so the implementer path is open. The evidence for both lives on that
+//! function.
+//!
+//! The judge's seat works everywhere: `read-only` is enforced on every
+//! platform, the family is genuinely different from Anthropic's (§11.3), and a
+//! review that spends nothing on the Claude window is worth having on its own —
+//! measured end to end on run `01KZRN48A4ZK3AEDST3RJ8HMA4`, where Sonnet
+//! implemented and this adapter judged.
 //!
 //! **Two command shapes, not one with a flag swapped.** `codex exec` and
 //! `codex exec resume` accept *different* flag sets: resume takes no `-s`, no
@@ -188,8 +192,8 @@ impl AgentAdapter for CodexAdapter {
     }
 
     fn build(&self, run: &TaskRun) -> Result<Command, TactusError> {
-        if run.profile.permissions == PermissionMode::Edit {
-            return Err(refuse_edit_profile(&run.profile));
+        if let Some(refusal) = edit_refusal(&run.profile) {
+            return Err(refusal);
         }
         let invocation = locate()?;
         let mut cmd = invocation.command(&build_args(run));
@@ -265,48 +269,65 @@ fn sandbox_mode(profile: &WorkerProfile) -> &'static str {
     }
 }
 
-/// Why this adapter will not run an implementer, and what was tried.
+/// Why an implementer is refused **on Windows only**, and what was measured.
 ///
-/// **`exec` cannot write under a sandbox that is actually enforced** — measured
-/// against codex-cli 0.147.0 on Windows with ChatGPT-plan auth, 2026-08-11, and
-/// the CLI says so in its own words:
+/// This CLI's sandbox is an external helper. `codex doctor` reports it as
+/// `linux helper: <path>` where one exists and `none` on Windows — where there
+/// is therefore nothing to enforce a boundary with. The consequence is a rule
+/// the binary states itself:
 ///
 /// > `approval_policy = "never"` cannot be used because requirements do not
 /// > allow `sandbox_mode = "danger-full-access"`; Codex would fall back to
 /// > read-only permissions with approvals disabled.
 ///
-/// `exec` is non-interactive, so it forces `approval_policy = never`; that
-/// combination degrades every sandbox to read-only. Passing
-/// `--sandbox workspace-write` is *accepted* and then silently ignored: exit 0,
-/// no warning, no diff. That silence is the dangerous part — a run spends two
-/// attempts producing empty diffs and parks asking for write access it was
-/// told it had. Overriding `-c approval_policy="on-request"` does not help;
-/// `exec` wins.
+/// `exec` is non-interactive, so it forces `never`. With no enforceable
+/// sandbox that degrades to read-only, and `--sandbox workspace-write` is
+/// *accepted and then ignored*: exit 0, no warning, no diff. The silence is the
+/// dangerous part — run `01KZRMHA28M5CM88VAXP613X9P` spent both attempts on
+/// empty diffs and parked asking for write access it had been granted.
+/// `-c approval_policy="on-request"` and `-c permission_profile="…"` were both
+/// tried; `exec` wins.
 ///
-/// The one path that does write is `--approve-for-me`, which routes approvals
-/// through an automatic reviewer instead of a human. It is refused here because
-/// it is not a sandbox: asked to write outside the repository it did so, and
-/// adding `sandbox_workspace_write.writable_roots` did not constrain it —
-/// both measured. §20 grants permission by mechanism, not by asking an
-/// LLM nicely, and §15's isolation rests on an agent having no path out of the
-/// workspace. Claude Code's deny rules and Copilot's tool flags are both
-/// mechanical; this would be strictly weaker than either.
+/// The only mode that writes there is `--approve-for-me`, which routes
+/// approvals through an automatic reviewer rather than a human — and it is not
+/// a sandbox. Asked to write outside the repository it did so, and
+/// `sandbox_workspace_write.writable_roots` did not constrain it. §20 grants
+/// permission by mechanism, not by asking an LLM nicely, and §14's rollback is
+/// `git clean -fd` *inside* the workspace: anything written outside it survives
+/// a failed attempt, which is the one thing the design rules out.
 ///
-/// So the adapter refuses at build time rather than at attempt time. §19's
-/// posture: a capability this build cannot deliver is a refusal to start, not a
-/// task that fails after spending. The reviewer path is unaffected and
-/// verified — `read-only` is enforced exactly as it should be, which is what
-/// makes this adapter worth having today.
+/// **On Linux the sandbox is real and none of this applies.** Same CLI, same
+/// flags, helper present: `--sandbox workspace-write` writes inside the
+/// workspace and is *blocked* outside it — both measured. So the refusal is
+/// scoped to the platform that cannot enforce it, and the implementer path is
+/// open everywhere else.
+///
+/// One trap worth recording for whoever containerises this: Docker's default
+/// seccomp profile blocks the syscalls the sandbox needs to initialise, and the
+/// failure is a *different* message ("the workspace sandbox failed to
+/// initialize") with the same empty-diff result. Granting
+/// `--security-opt seccomp=unconfined --cap-add SYS_ADMIN` let it initialise;
+/// which of the two is strictly required was not isolated.
+/// The platform gate, kept out of [`AgentAdapter::build`] so it is testable on
+/// a machine with no codex installed — the same reason [`build_args`] is its
+/// own function.
+fn edit_refusal(profile: &WorkerProfile) -> Option<TactusError> {
+    (cfg!(windows) && profile.permissions == PermissionMode::Edit)
+        .then(|| refuse_edit_profile(profile))
+}
+
 fn refuse_edit_profile(profile: &WorkerProfile) -> TactusError {
     TactusError::Refused {
         message: format!(
-            "codex cannot run `{}` as an implementer: `codex exec` forces `approval_policy = \
-             never`, which this CLI degrades to read-only permissions — it accepts `--sandbox \
-             workspace-write` and then writes nothing, with no error. The only writing mode it \
-             offers (`--approve-for-me`) auto-approves writes anywhere on the filesystem, \
-             including outside the repository, so §20 rules it out. Route implementation to \
-             another agent and keep codex as a reviewer, where its read-only sandbox is enforced \
-             and its different model family is the point (§11.3).",
+            "codex cannot run `{}` as an implementer on Windows: this CLI's sandbox is an \
+             external helper that does not exist here (`codex doctor` reports `linux helper: \
+             none`), so `codex exec` degrades to read-only — it accepts `--sandbox \
+             workspace-write` and then writes nothing, with no error. Its only writing mode \
+             (`--approve-for-me`) auto-approves writes anywhere on the filesystem, including \
+             outside the repository, which §14's rollback cannot undo. Run codex under Linux \
+             where its sandbox is enforced, or route implementation to another agent and keep \
+             codex as a reviewer — its read-only sandbox works everywhere, and its different \
+             model family is the point (§11.3).",
             profile.name
         ),
     }
@@ -648,30 +669,46 @@ mod tests {
         assert_eq!(CodexAdapter.stdin_payload(&run), "do the thing");
     }
 
+    #[cfg(windows)]
     #[test]
-    fn an_implementer_is_refused_rather_than_silently_given_a_read_only_workspace() {
-        // What this refusal costs is one clear error at build time. What its
-        // absence cost, measured on run 01KZRMHA28M5CM88VAXP613X9P: `exec`
-        // accepted `--sandbox workspace-write`, wrote nothing, returned 0, and
-        // the ladder burned both attempts on empty diffs before parking to ask
-        // for write access it had already been granted. A capability the build
-        // cannot deliver is a refusal to start (§19), not a task that fails
-        // after spending.
-        let err = CodexAdapter
-            .build(&run(PermissionMode::Edit, None))
-            .expect_err("an implementer profile must be refused");
+    fn an_implementer_is_refused_where_no_sandbox_can_enforce_it() {
+        // Windows has no sandbox helper (`codex doctor`: `linux helper: none`),
+        // so `exec` degrades to read-only and writes nothing while returning 0.
+        // Measured on run 01KZRMHA28M5CM88VAXP613X9P, which spent both attempts
+        // on empty diffs and then parked asking for write access it had been
+        // granted. A capability this platform cannot deliver is a refusal to
+        // start (§19), not a task that fails after spending.
+        let err = edit_refusal(&profile(PermissionMode::Edit))
+            .expect("an implementer profile must be refused on Windows");
         let text = err.to_string();
         assert!(text.contains("cannot run"), "{text}");
         assert!(
             text.contains("--approve-for-me"),
             "the refusal has to say which door was tried and why it is shut: {text}"
         );
-        // And it says where to go instead, because the reviewer path is fine.
+        // And where to go instead: Linux, or another agent.
+        assert!(text.contains("Linux"), "{text}");
         assert!(text.contains("reviewer"), "{text}");
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn an_implementer_is_allowed_where_the_sandbox_is_real() {
+        // Same CLI, same flags, helper present: `--sandbox workspace-write`
+        // wrote inside the workspace and was blocked outside it, both measured
+        // in a container. The refusal above is scoped to the platform that
+        // cannot enforce a boundary, not to the CLI.
+        assert!(
+            edit_refusal(&profile(PermissionMode::Edit)).is_none(),
+            "an implementer is fine where the sandbox is enforced"
+        );
     }
 
     #[test]
     fn a_reviewer_is_read_only_and_nothing_is_ever_given_the_machine() {
+        // Never refused anywhere: read-only is enforced on every platform, and
+        // it is the seat this adapter is most useful in.
+        assert!(edit_refusal(&profile(PermissionMode::ReadOnly)).is_none());
         let args = build_args(&run(PermissionMode::ReadOnly, None));
         assert!(args.contains(&"read-only".to_owned()), "{args:?}");
         for permissions in [PermissionMode::Edit, PermissionMode::ReadOnly] {
