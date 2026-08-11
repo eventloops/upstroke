@@ -325,14 +325,10 @@ impl RunLock {
                 path: path.clone(),
                 source,
             })?;
-        // Only *contention* may be reported as contention, and two things can
-        // fake it.
+        // Only *contention* may be reported as contention, and what fakes it
+        // is `fork`.
         //
-        // `flock` is interruptible: a signal — SIGCHLD from any of the git and
-        // agent subprocesses a run spawns — makes `try_lock` fail with
-        // `Interrupted`, having learned nothing about who holds what.
-        //
-        // And `flock` is inherited across `fork`. A subprocess spawned by
+        // `flock` is inherited across `fork`. A subprocess spawned by
         // *anything else in this process* duplicates every open descriptor,
         // this lock among them, and the child keeps holding it until it execs
         // (where close-on-exec drops it). So an uncontested lock reads as taken
@@ -340,7 +336,7 @@ impl RunLock {
         // Measured under a parallel test suite, where it made runs refuse to
         // start against a second engine that did not exist.
         //
-        // What separates the two from the real thing is duration: a genuine
+        // What separates that from the real thing is duration: a genuine
         // engine holds the lock for its whole run, a fork window for
         // microseconds. So believe `WouldBlock` only if it persists.
         match probe(|| file.try_lock(), CONTENTION_GRACE) {
@@ -378,22 +374,39 @@ enum Verdict {
 /// Both callers below face the same problem — a single `try_lock` reports
 /// contention that is not contention — and both want the same discipline
 /// applied to it, so they share one loop rather than two that have to be kept
-/// in step. `grace` is a parameter because it is the only thing they disagree
-/// about: a caller that will ask again in half a second wants the answer now.
+/// in step.
+///
+/// `grace` bounds the whole call, `EINTR` included. An interruption is not an
+/// answer, so it can never be believed the way a persistent `WouldBlock`
+/// eventually is — but it cannot be retried forever either, and unbounded is
+/// what it was: that arm neither slept nor looked at the deadline, so any
+/// sustained interruption became a spin that never returned and never refused,
+/// hanging `run`, `status`, `status --follow` and `answer` alike.
+///
+/// Whether the hazard it guards exists here at all is genuinely unclear.
+/// `flock` is interruptible by a *handled* signal, and this crate installs no
+/// handler; the subprocesses a run spawns raise SIGCHLD, which at its default
+/// disposition interrupts nothing. So the arm is defence against a dependency,
+/// a debugger, or a profiler that installs one — cheap to keep, and worth
+/// nothing at all if it can hang the process it is defending.
 fn probe(mut attempt: impl FnMut() -> Result<(), TryLockError>, grace: Duration) -> Verdict {
     let deadline = Instant::now() + grace;
     loop {
         match attempt() {
             Ok(()) => return Verdict::Free,
-            Err(TryLockError::Error(source)) if source.kind() == io::ErrorKind::Interrupted => {}
+            Err(TryLockError::Error(source)) if source.kind() == io::ErrorKind::Interrupted => {
+                if Instant::now() >= deadline {
+                    return Verdict::Unanswered(source);
+                }
+            }
             Err(TryLockError::Error(source)) => return Verdict::Unanswered(source),
             Err(TryLockError::WouldBlock) => {
                 if Instant::now() >= deadline {
                     return Verdict::Held;
                 }
-                std::thread::sleep(RETRY_PAUSE);
             }
         }
+        std::thread::sleep(RETRY_PAUSE);
     }
 }
 
@@ -658,6 +671,34 @@ mod tests {
             probe(|| Err(TryLockError::WouldBlock), Duration::ZERO),
             Verdict::Held
         ));
+    }
+
+    #[test]
+    fn a_lock_call_that_only_ever_gets_interrupted_gives_up() {
+        // `EINTR` used to be the one arm with no way out: it neither slept nor
+        // consulted the deadline, so a sustained interruption spun a core at
+        // 100% forever and every command that reads the lock hung with it.
+        let grace = Duration::from_millis(50);
+        let mut calls = 0u32;
+        let started = Instant::now();
+        let verdict = probe(
+            || {
+                calls += 1;
+                Err(TryLockError::Error(io::Error::from(
+                    io::ErrorKind::Interrupted,
+                )))
+            },
+            grace,
+        );
+
+        assert!(
+            matches!(verdict, Verdict::Unanswered(_)),
+            "an interruption never becomes a holder"
+        );
+        assert!(started.elapsed() >= grace, "it gave up before the deadline");
+        // A spin would be millions. The exact count depends on the platform's
+        // timer resolution, which is why the bound is loose rather than tight.
+        assert!(calls < 100, "{calls} calls in {grace:?} is a spin");
     }
 
     /// Any errno that is not `Interrupted`; the value itself does not matter.
