@@ -3400,7 +3400,7 @@ mod tests {
     use crate::ir::{TaskId, Usage};
     use std::path::Path;
     use std::process::Command;
-    use std::sync::Mutex;
+    use std::sync::{Mutex, OnceLock};
 
     #[derive(Clone, Copy, PartialEq)]
     enum Effect {
@@ -3900,18 +3900,28 @@ mod tests {
     /// A real, empty file rather than an absent one: an explicit `--pools` that
     /// does not exist is a hard error now, and `None` would reach for the
     /// operator's real `~/.tactus/pools.toml` — which no test may touch.
+    /// An empty pools file, created once for the whole test process.
+    ///
+    /// Every test routes through here, and this used to *rewrite* the file on
+    /// each call — one shared path truncated and rewritten while other threads
+    /// were reading it. The content is the same for every caller, so there is
+    /// nothing to rewrite: build it once and hand back the path.
     fn no_pools() -> PathBuf {
-        let dir =
-            std::env::temp_dir().join(format!("tactus-engine-nopools-{}", std::process::id()));
-        fs::create_dir_all(&dir).expect("scratch dir");
-        let path = dir.join("pools.toml");
-        fs::write(
-            &path,
-            "# no pools
+        static PATH: OnceLock<PathBuf> = OnceLock::new();
+        PATH.get_or_init(|| {
+            let dir =
+                std::env::temp_dir().join(format!("tactus-engine-nopools-{}", std::process::id()));
+            fs::create_dir_all(&dir).expect("scratch dir");
+            let path = dir.join("pools.toml");
+            fs::write(
+                &path,
+                "# no pools
 ",
-        )
-        .expect("empty pools file");
-        path
+            )
+            .expect("empty pools file");
+            path
+        })
+        .clone()
     }
 
     /// A scratch stand-in for `~/.tactus`, so tests never touch the real one.

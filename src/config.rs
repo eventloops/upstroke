@@ -1053,6 +1053,7 @@ fn discovered_pools_path() -> Option<PathBuf> {
 mod tests {
     use super::*;
     use std::env;
+    use std::sync::OnceLock;
 
     fn scratch(name: &str, content: &str) -> PathBuf {
         let dir = env::temp_dir().join(format!("tactus-config-tests-{}", std::process::id()));
@@ -1069,16 +1070,23 @@ mod tests {
     /// there is a typo), and passing `None` here would reach for the operator's
     /// real `~/.tactus/pools.toml` — which no test may touch.
     fn missing() -> PathBuf {
-        let dir = env::temp_dir().join(format!("tactus-config-nopools-{}", std::process::id()));
-        fs::create_dir_all(&dir).expect("scratch dir");
-        let path = dir.join("pools.toml");
-        fs::write(
-            &path,
-            "# no pools
+        // Created once: the file is identical for every caller, and rewriting
+        // one shared path from parallel tests means truncating it under a
+        // reader.
+        static PATH: OnceLock<PathBuf> = OnceLock::new();
+        PATH.get_or_init(|| {
+            let dir = env::temp_dir().join(format!("tactus-config-nopools-{}", std::process::id()));
+            fs::create_dir_all(&dir).expect("scratch dir");
+            let path = dir.join("pools.toml");
+            fs::write(
+                &path,
+                "# no pools
 ",
-        )
-        .expect("empty pools file");
-        path
+            )
+            .expect("empty pools file");
+            path
+        })
+        .clone()
     }
 
     /// Empty discovery root so tests never pick up a real tactus.toml.

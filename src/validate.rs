@@ -596,6 +596,7 @@ fn column_width<'a>(header: &str, values: impl Iterator<Item = &'a str>) -> usiz
 mod tests {
     use super::*;
     use std::env;
+    use std::sync::OnceLock;
 
     fn opts(plan: &str) -> ValidateOptions {
         let hermetic_root =
@@ -609,17 +610,23 @@ mod tests {
                 // A real, empty pools file: an explicit `--pools` that does not
                 // exist is a hard error, and `None` would reach for the
                 // operator's own `~/.tactus/pools.toml`.
-                let dir =
-                    env::temp_dir().join(format!("tactus-validate-nopools-{}", std::process::id()));
-                fs::create_dir_all(&dir).expect("scratch dir");
-                let path = dir.join("pools.toml");
-                fs::write(
-                    &path,
-                    "# no pools
+                // Created once: identical for every caller, and rewriting one
+                // shared path from parallel tests truncates it under a reader.
+                static PATH: OnceLock<PathBuf> = OnceLock::new();
+                PATH.get_or_init(|| {
+                    let dir = env::temp_dir()
+                        .join(format!("tactus-validate-nopools-{}", std::process::id()));
+                    fs::create_dir_all(&dir).expect("scratch dir");
+                    let path = dir.join("pools.toml");
+                    fs::write(
+                        &path,
+                        "# no pools
 ",
-                )
-                .expect("empty pools file");
-                path
+                    )
+                    .expect("empty pools file");
+                    path
+                })
+                .clone()
             }),
         }
     }

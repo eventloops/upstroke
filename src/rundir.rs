@@ -388,12 +388,30 @@ pub fn is_running(public: &Path) -> bool {
     let Ok(file) = File::open(lock_file(public)) else {
         return false;
     };
-    match file.try_lock_shared() {
-        Ok(()) => {
-            let _ = file.unlock();
-            false
+    // The same two traps `RunLock::acquire` documents, and the same answer.
+    // A signal makes the call fail having learned nothing, and a `fork`
+    // anywhere else in this process duplicates the descriptor so that an
+    // *unheld* lock refuses a shared one until that child execs. Either read
+    // as "a run is live" — which is the one thing `status` must not invent,
+    // since it is what tells an operator their run is still going.
+    let deadline = Instant::now() + CONTENTION_GRACE;
+    loop {
+        match file.try_lock_shared() {
+            Ok(()) => {
+                let _ = file.unlock();
+                return false;
+            }
+            Err(TryLockError::Error(source)) if source.kind() == io::ErrorKind::Interrupted => {}
+            // Cannot tell — and the doc above already says an unreadable lock
+            // is not a running run. `acquire` is the real guard either way.
+            Err(TryLockError::Error(_)) => return false,
+            Err(TryLockError::WouldBlock) => {
+                if Instant::now() >= deadline {
+                    return true;
+                }
+                std::thread::sleep(RETRY_PAUSE);
+            }
         }
-        Err(_) => true,
     }
 }
 

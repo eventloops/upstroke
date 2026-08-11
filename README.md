@@ -1,5 +1,9 @@
 # tactus
 
+[![CI](https://github.com/keybindings/tactus/actions/workflows/ci.yml/badge.svg)](https://github.com/keybindings/tactus/actions/workflows/ci.yml)
+[![crates.io](https://img.shields.io/crates/v/tactus.svg)](https://crates.io/crates/tactus)
+[![license](https://img.shields.io/crates/l/tactus.svg)](LICENSE)
+
 A headless orchestration engine for AI coding agents. A frontier model and you design a piece
 of work together; `tactus` then executes that plan unattended — normalizing it into a dependency
 graph of typed tasks, dispatching each to an existing coding-agent CLI with a model chosen per
