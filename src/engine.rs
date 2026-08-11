@@ -7288,7 +7288,8 @@ mod tests {
         // fail, and the task commits — which it can only do if the gate that
         // actually executed came from the log.
         //
-        // This is the self-hosting hazard from Addendum C, closed at the point
+        // This is the self-hosting hazard from the gate-config record, closed
+        // at the point
         // that matters. The workspace an implementer edits contains the very
         // tactus.toml its gates come from, so an edited gate must not become
         // the standard for what follows. Refusing would also have stopped the
