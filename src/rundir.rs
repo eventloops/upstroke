@@ -315,6 +315,13 @@ pub struct RunLock {
 impl RunLock {
     /// Take the lock on a run's public directory, or explain who has it.
     pub fn acquire(public: &Path) -> Result<Self, TactusError> {
+        Self::acquire_within(public, CONTENTION_GRACE)
+    }
+
+    /// `acquire` with the grace named, so a test can pin the *rule* — a holder
+    /// is believed only after the grace — without spending the real constant's
+    /// half-second of wall clock on every suite run.
+    fn acquire_within(public: &Path, grace: Duration) -> Result<Self, TactusError> {
         let path = lock_file(public);
         let file = File::options()
             .create(true)
@@ -339,7 +346,7 @@ impl RunLock {
         // What separates that from the real thing is duration: a genuine
         // engine holds the lock for its whole run, a fork window for
         // microseconds. So believe `WouldBlock` only if it persists.
-        match probe(|| file.try_lock(), CONTENTION_GRACE) {
+        match probe(|| file.try_lock(), grace) {
             Verdict::Free => Ok(Self { _file: file }),
             Verdict::Held => Err(TactusError::Refused {
                 message: format!(
@@ -615,26 +622,33 @@ mod tests {
         let held = RunLock::acquire(&paths.public).expect("first acquire");
         assert!(is_running(&paths.public), "status can see the run is live");
 
-        // Timed, because the refusal now waits before it believes itself: a
-        // `fork` elsewhere in the process can make an uncontested lock look
-        // taken for a moment, so `acquire` re-checks for `CONTENTION_GRACE`
-        // before reporting contention. That grace must stay short enough to
-        // read as a refusal rather than a hang — raise it much further and the
-        // operator is left watching a command that looks stuck.
+        // Timed, because the refusal waits before it believes itself: a `fork`
+        // elsewhere in the process can make an uncontested lock look taken for
+        // a moment, so `acquire` re-checks before reporting contention.
+        //
+        // The grace is named rather than taken from the constant, because what
+        // is under test is the rule and not the number. Spending the real
+        // half-second here bought no extra coverage and added it to every run
+        // of the suite.
+        let brief = Duration::from_millis(50);
         let started = Instant::now();
-        let err = RunLock::acquire(&paths.public).expect_err("second engine must be refused");
+        let err =
+            RunLock::acquire_within(&paths.public, brief).expect_err("a second engine is refused");
         let waited = started.elapsed();
         assert!(
             err.to_string().contains("already driving run"),
             "got: {err}"
         );
         assert!(
-            waited >= CONTENTION_GRACE,
+            waited >= brief,
             "a real holder is only believed after the grace: {waited:?}"
         );
+        // The constant itself has one requirement, and it is about how the
+        // refusal reads rather than about any elapsed time: raise it much
+        // further and the operator is left watching a command that looks stuck.
         assert!(
-            waited < Duration::from_secs(5),
-            "and refusing must still feel like a refusal: {waited:?}"
+            CONTENTION_GRACE < Duration::from_secs(5),
+            "a refusal, not a hang"
         );
 
         // Dropping releases it — which is also what a crash does, so resume
@@ -658,21 +672,60 @@ mod tests {
         // from a replay of its log — the invariant the event log rests on.
         // Measured at 50 false positives in 3000 probes under a parallel suite
         // spawning subprocesses.
+        //
+        // The rule itself is pinned without a clock, because the threaded
+        // version below cannot be: it used to hold for a fifth of the grace and
+        // assert that the probe outlived it, which is a 400ms scheduling margin
+        // that a loaded box — or the very parallel subprocess-spawning suite
+        // this was written for — can eat, failing for the reason it exists to
+        // rule out.
+        let mut tries = 0;
+        assert!(
+            matches!(
+                probe(
+                    || {
+                        tries += 1;
+                        if tries > 2 {
+                            Ok(())
+                        } else {
+                            Err(TryLockError::WouldBlock)
+                        }
+                    },
+                    CONTENTION_GRACE,
+                ),
+                Verdict::Free
+            ),
+            "a hold that lets go inside the grace was never a holder"
+        );
+
+        // And end to end against a real `flock`, with a grace long enough that
+        // no scheduling delay can pass for an engine. The releaser drops as
+        // soon as it is told to; the short pause only makes it near-certain the
+        // probe sees the lock held at least once, so a regression to believing
+        // the first refusal fails here rather than passing by luck.
         let root = scratch("transient");
         let paths = paths_in(&root, "RUN1");
         paths.create().expect("create");
 
         let held = RunLock::acquire(&paths.public).expect("acquire");
+        let (tx, rx) = std::sync::mpsc::channel();
         let releaser = std::thread::spawn(move || {
-            std::thread::sleep(CONTENTION_GRACE / 5);
+            rx.recv().expect("the go-ahead");
+            std::thread::sleep(RETRY_PAUSE * 5);
             drop(held);
         });
+        tx.send(()).expect("let it go");
         assert!(
-            !is_running(&paths.public),
+            !held_within(&paths.public, PATIENT_GRACE),
             "a hold that does not outlast the grace is a fork window, not an engine"
         );
         releaser.join().expect("releaser");
     }
+
+    /// Longer than any plausible scheduling delay, so the assertion above turns
+    /// on the rule rather than on how loaded the machine is. Nothing waits this
+    /// long: the probe returns the moment the lock is free.
+    const PATIENT_GRACE: Duration = Duration::from_secs(30);
 
     #[test]
     fn a_lock_call_that_never_answers_is_not_a_free_lock() {
