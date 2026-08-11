@@ -1,5 +1,10 @@
 # Result: the v0.1 acceptance run
 
+> **Re-runs since:** [`RESULT-2026-08-11.md`](RESULT-2026-08-11.md) — the same
+> criteria against the post-review engine, asking whether fourteen fixes broke
+> anything rather than whether v0.1 works. This file is the certification; each
+> re-run gets its own.
+
 - **Date:** 2026-08-10
 - **Scope:** DESIGN.md §21's definition of done — criteria (a)–(e) plus the
   kill/resume test — against `acceptance/plan.md` and `acceptance/tactus.toml`

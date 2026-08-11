@@ -9,6 +9,10 @@ operator-triggered, never launched by an agent.
 > plus the fourth that the first real-library run turned up afterwards. What
 > follows is still the run book — keep it working, because §21's criteria are
 > the regression suite for the engine's behaviour, not a one-off ceremony.
+>
+> It has been run that way since: [`RESULT-2026-08-11.md`](RESULT-2026-08-11.md)
+> is the first re-run, against the post-review engine. One file per run, so the
+> certification above stays about the run that earned it.
 
 The two files beside this one go into a *scratch* repository, not into tactus:
 
