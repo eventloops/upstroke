@@ -57,8 +57,8 @@ pub enum TactusError {
     EventLog { path: PathBuf, message: String },
 
     /// A resume precondition failed (§15). Always carries what to do about it:
-    /// refusing to continue is only useful if the operator can tell whether
-    /// the run, the plan, or the branch is the thing that moved.
+    /// refusing to continue is only useful if the operator can tell which of
+    /// the four things moved — the run, the plan, the config, or the branch.
     #[error("cannot resume run `{run_id}`: {message}")]
     Resume { run_id: String, message: String },
 

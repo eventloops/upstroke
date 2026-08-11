@@ -36,7 +36,7 @@ use crate::capacity;
 use crate::config::{self, OnTaskFailure};
 use crate::error::TactusError;
 use crate::events::{
-    self, ChainSummary, EventBody, EventLog, Feedback, Progress, RunState, TaskState,
+    self, ChainSummary, EventBody, EventLog, Feedback, GateSummary, Progress, RunState, TaskState,
 };
 use crate::gates::{self, ShellGate};
 use crate::interaction::{
@@ -441,6 +441,10 @@ struct Preflight {
     analysis: Analysis,
     caps: BTreeMap<String, Caps>,
     review_plan: ReviewPlan,
+    /// The effective gates, in the one shape everything else projects from —
+    /// the record, the permission grants, and the report all read this rather
+    /// than walking `analysis.gates` again, so they cannot drift apart.
+    gates: Vec<GateSummary>,
     gate_cmds: Vec<String>,
     warnings: Vec<String>,
     mode: InteractionMode,
@@ -450,26 +454,51 @@ struct Preflight {
     budgets: config::Budgets,
 }
 
-fn preflight(opts: &RunOptions, harness: &Harness<'_>) -> Result<Preflight, TactusError> {
-    preflight_with_reviews(opts, harness, None)
+/// What a resume takes from the run's own record instead of from today's
+/// machine (§15). Empty for a fresh run, which has no record to take from.
+#[derive(Default)]
+struct Recorded {
+    /// Who judges this run's code. `None` for a log written before step 9.
+    reviews: Option<ReviewPlan>,
+    /// What verifies it. `None` for a log written before the gate record.
+    gates: Option<Vec<GateSummary>>,
+    /// Whether those gates came from `[[gates]]` rather than the repo's shape.
+    ///
+    /// Travels with them, and read only when `gates` is `Some`: it is a label
+    /// *on the recorded list*, so leaving it to be re-derived would have the
+    /// run's own report and a later `status` disagree about the same gates —
+    /// the drift this record exists to stop, one field short of stopped.
+    gates_from_config: bool,
 }
 
-/// `recorded` is the review plan a previous process resolved for this run.
+fn preflight(opts: &RunOptions, harness: &Harness<'_>) -> Result<Preflight, TactusError> {
+    preflight_with_recorded(opts, harness, Recorded::default())
+}
+
+/// Pre-flight, with whatever a previous process already resolved for this run.
 ///
-/// `Some` on resume: §15's record is what says how this run's code was judged,
-/// and re-deriving it against today's machine would let a CLI installed (or
-/// removed) since the run started change the verification standard halfway
-/// through. `None` for a fresh run — and also for a resume of a log written
-/// before step 9, which recorded no reviewers at all. That case must re-derive
-/// rather than inherit an empty plan, because an empty plan reads as "review is
-/// switched off" and would finish the run unverified.
-fn preflight_with_reviews(
+/// Both halves of §14's verification — who reviews and what gates — are read
+/// from the record on resume rather than re-derived, for one reason stated
+/// twice: they are facts about the *run*, not about today's machine. A CLI
+/// installed or removed since the run started must not change who judges it,
+/// and a `tactus.toml` edited since — including by an implementer, in the very
+/// workspace it edits — must not change what verifies it. A live run already
+/// works this way by construction, holding one analysis in memory for its whole
+/// length; this is what makes a resume the same run rather than a new one
+/// wearing its branch.
+///
+/// `None` on either means the log predates that record and said nothing. Both
+/// re-derive in that case rather than inherit an empty value, because an empty
+/// review plan reads as "review is off" and an empty gate list reads as "there
+/// was nothing to pass" — each would finish the run less verified than it began.
+/// The caller warns; only it knows which absence it is looking at.
+fn preflight_with_recorded(
     opts: &RunOptions,
     harness: &Harness<'_>,
-    recorded: Option<ReviewPlan>,
+    recorded: Recorded,
 ) -> Result<Preflight, TactusError> {
     // §14: plan parses cycle-free, config loads, chains resolve.
-    let analysis = validate::analyze(&ValidateOptions {
+    let mut analysis = validate::analyze(&ValidateOptions {
         plan_path: opts.plan_path.clone(),
         config_path: opts.config_path.clone(),
         config_root: opts.repo_root.clone(),
@@ -477,7 +506,22 @@ fn preflight_with_reviews(
     })?;
 
     let mut warnings = analysis.warnings.clone();
-    let mut review_plan = match recorded {
+
+    // The recorded gates replace the re-derived ones *here*, before anything
+    // reads them — so the pre-flight resolution below, the `Bash(<cmd>)` grants
+    // the workers get, the prompt that names their allowed commands, and the
+    // report all describe the gates this run actually verifies against. One
+    // substitution point rather than a comparison the rest of the function
+    // could forget about.
+    if let Some(record) = &recorded.gates {
+        if let Some(difference) = gates_differ(record, &gate_summaries(&analysis)) {
+            warnings.push(difference);
+        }
+        analysis.gates = record.iter().map(ShellGate::from_record).collect();
+        analysis.gates_from_config = recorded.gates_from_config;
+    }
+
+    let mut review_plan = match recorded.reviews {
         Some(plan) => plan,
         // Resolved against the adapters *this harness* holds, not the built-in
         // registry: the harness is what can actually spawn something, and
@@ -573,13 +617,26 @@ fn preflight_with_reviews(
     }
 
     // Effective gates come from the shared analysis (single derivation point
-    // with `validate`). §14 pre-flight: the shell and every gate command must
-    // resolve before any agent tokens are spent.
+    // with `validate`), or from the record above. §14 pre-flight: the shell and
+    // every gate command must resolve before any agent tokens are spent — and
+    // on a resume that check runs against the *recorded* gates, so a machine
+    // that cannot run what this run verifies against says so plainly instead of
+    // quietly proceeding.
+    //
+    // Per gate rather than per config: a recorded gate carries the shell it ran
+    // under, and nothing requires every gate in a list to share one.
     if !analysis.gates.is_empty() {
-        gates::shell_available(analysis.config.shell)?;
+        let mut shells: Vec<crate::gates::ShellKind> =
+            analysis.gates.iter().map(|gate| gate.shell).collect();
+        shells.sort_unstable_by_key(|shell| shell.program());
+        shells.dedup();
+        for shell in shells {
+            gates::shell_available(shell)?;
+        }
         gates::resolve_programs(&analysis.gates, &opts.repo_root, &mut warnings)?;
     }
-    let gate_cmds: Vec<String> = analysis.gates.iter().map(|g| g.cmd.clone()).collect();
+    let gates = gate_summaries(&analysis);
+    let gate_cmds: Vec<String> = gates.iter().map(|gate| gate.cmd.clone()).collect();
 
     let mode = opts.interaction.unwrap_or(analysis.config.interaction_mode);
     let notifiers = interaction::notifiers_for(&analysis.config.notify, &mut warnings);
@@ -593,6 +650,7 @@ fn preflight_with_reviews(
         analysis,
         caps,
         review_plan,
+        gates,
         gate_cmds,
         warnings,
         mode,
@@ -617,6 +675,7 @@ fn run_harness_inner(
         analysis,
         caps,
         review_plan,
+        gates,
         gate_cmds,
         mut warnings,
         mode,
@@ -672,11 +731,15 @@ fn run_harness_inner(
             .map(|path| repo_relative(&opts.repo_root, path)),
         plan_hash: analysis.plan.source.hash.clone(),
         private_dir: paths.private.to_string_lossy().into_owned(),
-        gates: analysis.gates.iter().map(|g| g.name.clone()).collect(),
+        // Names for the reader, the full gates for the resume — both from the
+        // one list pre-flight resolved, so the log cannot name a gate its own
+        // record does not describe.
+        gates: gates.iter().map(|gate| gate.name.clone()).collect(),
         gates_from_config: analysis.gates_from_config,
         interaction_mode: mode.to_string(),
         chains: chain_summaries(&analysis),
         reviews: Some(review_plan.clone()),
+        gate_cmds: Some(gates),
     };
 
     let sleeper = harness.sleeper.unwrap_or(&RealSleeper);
@@ -782,6 +845,20 @@ fn chain_summaries(analysis: &Analysis) -> Vec<ChainSummary> {
         .collect()
 }
 
+/// The effective gates, in full, as they stood at this moment.
+fn gate_summaries(analysis: &Analysis) -> Vec<GateSummary> {
+    analysis
+        .gates
+        .iter()
+        .map(|gate| GateSummary {
+            name: gate.name.clone(),
+            cmd: gate.cmd.clone(),
+            timeout: gate.timeout,
+            shell: gate.shell,
+        })
+        .collect()
+}
+
 /// What to continue, and what may be overridden while continuing it.
 #[derive(Debug, Clone)]
 pub struct ResumeOptions {
@@ -799,13 +876,15 @@ pub struct ResumeOptions {
     pub wait_on_block: Option<Duration>,
     /// `--budget <usd>` (§17), overriding `[budgets] run_usd` for this resume.
     ///
-    /// Budgets are **re-derived from today's config and flags** rather than
-    /// recorded-and-refused, unlike the plan hash and the resolved chains
-    /// (§15). Those refusals protect a run's *identity*: replaying progress
-    /// against a moved plan would attribute work to the wrong task. A budget is
-    /// not identity — it is an operator's ceiling on their own spending, and
-    /// re-reading it is precisely what makes a budget stop recoverable in one
-    /// command instead of a dead run and a new branch.
+    /// Budgets are **re-derived from today's config and flags**, unlike the
+    /// three things a resume takes from the run's own record: the plan (frozen,
+    /// and refused on a hash mismatch), the resolved chains (refused, because a
+    /// recorded rung is an index into one), and the gates and reviewers (taken
+    /// and used, because they are what "this code was verified" means). Those
+    /// protect a run's *identity*. A budget is not identity — it is an
+    /// operator's ceiling on their own spending, and re-reading it is precisely
+    /// what makes a budget stop recoverable in one command instead of a dead
+    /// run and a new branch.
     pub budget_usd: Option<f64>,
 }
 
@@ -842,9 +921,15 @@ pub fn resume_with(
 /// continue — parked questions intact.
 ///
 /// Every refusal below exists because continuing would produce a *wrong*
-/// result rather than merely an awkward one, and each says which of the three
-/// things moved — the run, the plan, or the branch — because that is what
-/// decides what the operator does next.
+/// result rather than merely an awkward one, and each says which of the four
+/// things moved — the run, the plan, the config, or the branch — because that
+/// is what decides what the operator does next.
+///
+/// Note what is *not* a refusal: gates that resolve differently today. Those
+/// are taken from the record and run, so there is nothing to refuse — the
+/// difference is a warning about an edit that does not apply here. A refusal is
+/// for the cases where continuing would be wrong, and continuing under the
+/// gates this run has been using all along is exactly right.
 pub fn resume_harness(
     opts: &ResumeOptions,
     harness: &Harness<'_>,
@@ -873,6 +958,10 @@ fn resume_harness_inner(
     let events_path = public.join("events.jsonl");
     let events = events::read_all(&events_path, &mut warnings)?;
     let started = events::started_of(&events, &events_path)?.clone();
+    // Usually `run_started`'s, but a log too old to carry them there may have
+    // had them established by an earlier resume instead — which is what stops
+    // the re-derivation repeating, and drifting, on every resume after that.
+    let recorded_gates = events::recorded_gates(&events).cloned();
 
     // The run knows its own plan and config; the CLI may override the config
     // but never the plan, which is frozen (§5).
@@ -893,19 +982,31 @@ fn resume_harness_inner(
     run_opts.wait_on_block = opts.wait_on_block;
     let wait_on_block = opts.wait_on_block;
 
-    // Re-probes agents and re-resolves gates, exactly as a fresh run does —
-    // except for who reviews, which is read from the record rather than
-    // re-derived (see `preflight_with_reviews`).
+    // Re-probes agents and re-reads config, exactly as a fresh run does —
+    // except for the two things that are facts about *this run* rather than
+    // about today's machine: who reviews it and what verifies it. Both come
+    // from the record (see `preflight_with_recorded`), so a resume continues
+    // the run it is resuming rather than starting a differently-judged one on
+    // the same branch.
     let Preflight {
         analysis,
         caps,
         review_plan,
+        gates,
         gate_cmds,
         warnings: preflight_warnings,
         mode,
         notifiers,
         budgets,
-    } = preflight_with_reviews(&run_opts, harness, started.reviews.clone())?;
+    } = preflight_with_recorded(
+        &run_opts,
+        harness,
+        Recorded {
+            reviews: started.reviews.clone(),
+            gates: recorded_gates.clone(),
+            gates_from_config: started.gates_from_config,
+        },
+    )?;
     if started.reviews.is_none() {
         warnings.push(
             "this run's log predates the review record (step 9), so who reviews was re-derived \
@@ -913,6 +1014,40 @@ fn resume_harness_inner(
              judged differently"
                 .to_owned(),
         );
+    }
+    if recorded_gates.is_none() {
+        // A log from before the gate record, resumed for the first time — the
+        // only case with nothing to rebuild from, since this resume writes down
+        // what it settles on and the next one is ordinary.
+        //
+        // It still recorded gate *names*, which is not enough to rebuild the
+        // gates but is enough to say something better than "anything may have
+        // changed": if the names have moved, that is proof rather than
+        // suspicion, and if they have not, the only undetectable edit left is a
+        // command behind an unchanged name.
+        let names_now: Vec<String> = gates.iter().map(|gate| gate.name.clone()).collect();
+        if names_now != started.gates {
+            warnings.push(format!(
+                "this run's log predates the gate record, so its gates were re-derived from \
+                 today's config — and the gate names have moved, so the tasks it already \
+                 committed were verified differently: it recorded [{}], today resolves [{}]",
+                render_names(&started.gates),
+                render_names(&names_now),
+            ));
+        } else if !names_now.is_empty() {
+            warnings.push(format!(
+                "this run's log predates the gate record, so its gates were re-derived from \
+                 today's config rather than rebuilt from the run. The names still match what it \
+                 recorded ([{}]), but a log this old cannot show whether a command behind one of \
+                 them changed",
+                render_names(&names_now),
+            ));
+        }
+        // Both empty: the run recorded no gates and none resolve today, so
+        // there is nothing a command could have hidden behind. Saying "may have
+        // been verified differently" here would be a false alarm on every
+        // gateless run, and a warning that cries wolf on the harmless case is
+        // one nobody reads on the harmful one.
     }
     warnings.extend(preflight_warnings);
 
@@ -1150,6 +1285,10 @@ fn resume_harness_inner(
             head_sha: head,
             interrupted_attempts: u32::try_from(interrupted.len()).unwrap_or(u32::MAX),
             discarded,
+            // Only when this resume is the one that had to settle the question.
+            // Where the log already answers it, re-stating the answer would put
+            // the same fact in two places that a later change could pull apart.
+            gates: recorded_gates.is_none().then(|| gates.clone()),
         },
     })?;
     // §14 takes a capacity snapshot at pre-flight, and §15 makes a resume
@@ -1168,6 +1307,122 @@ fn render_tiers(chain: &ChainSummary) -> String {
         .map(ToString::to_string)
         .collect::<Vec<_>>()
         .join(" → ")
+}
+
+/// A gate name list, for a message.
+fn render_names(names: &[String]) -> String {
+    names.join(", ")
+}
+
+/// What today's config would gate with, against what the run recorded — `None`
+/// when they agree.
+///
+/// This is a **warning**, not a refusal: the run continues under the gates it
+/// recorded, and the operator's edit simply does not apply to it. Saying so is
+/// still worth a line, because an edit that silently does nothing is how
+/// somebody concludes the gate is broken.
+///
+/// Matching is by whole gate, then paired up by name, which is what makes the
+/// message survive the shapes a by-name lookup got wrong: duplicate names are
+/// legal in `[[gates]]`, so `find`-by-name silently answers for the wrong entry
+/// — reporting an edit nobody made, or finding every name present and claiming
+/// a reorder when a gate was added.
+fn gates_differ(recorded: &[GateSummary], now: &[GateSummary]) -> Option<String> {
+    if recorded == now {
+        return None;
+    }
+    // Whole-gate multiset difference: what the record has that today lacks, and
+    // the reverse. Anything appearing in both cancels, however many times.
+    let mut unmatched: Vec<&GateSummary> = now.iter().collect();
+    let mut dropped: Vec<&GateSummary> = Vec::new();
+    for gate in recorded {
+        match unmatched.iter().position(|other| *other == gate) {
+            Some(index) => {
+                unmatched.remove(index);
+            }
+            None => dropped.push(gate),
+        }
+    }
+    if dropped.is_empty() && unmatched.is_empty() {
+        // Same gates, listed in a different order. Worth a line — the record is
+        // what runs, and the order it runs in decides which failure a task sees
+        // first — but not the same claim as a changed command.
+        return Some(
+            "the gates in today's config are the ones this run recorded, in a different order; \
+             it continues in its recorded order"
+                .to_owned(),
+        );
+    }
+    // A name in exactly one dropped and one added gate is one gate edited, not
+    // one removed and an unrelated one added. Only when it is unambiguous:
+    // with duplicates, "which `check` became which" has no answer worth
+    // guessing at, so both sides are reported plainly instead.
+    let once = |gates: &[&GateSummary], name: &str| {
+        gates.iter().filter(|gate| gate.name == name).count() == 1
+    };
+    let mut items: Vec<String> = Vec::new();
+    let mut paired: Vec<&GateSummary> = Vec::new();
+    for gate in &dropped {
+        let edited = unmatched
+            .iter()
+            .find(|other| {
+                other.name == gate.name
+                    && once(&dropped, &gate.name)
+                    && once(&unmatched, &gate.name)
+            })
+            .copied();
+        match edited {
+            Some(other) => {
+                paired.push(other);
+                items.push(format!("`{}` {}", gate.name, changes_between(gate, other)));
+            }
+            None => items.push(format!(
+                "`{}` (`{}`) is in the record and not in today's config",
+                gate.name, gate.cmd
+            )),
+        }
+    }
+    for gate in unmatched {
+        if paired.iter().any(|other| std::ptr::eq(*other, gate)) {
+            continue;
+        }
+        items.push(format!(
+            "`{}` (`{}`) is in today's config and not in the record",
+            gate.name, gate.cmd
+        ));
+    }
+    Some(format!(
+        "the gates in today's config differ from the ones this run recorded, and a run keeps the \
+         gates it started with, so these edits do not apply to it: {}. Start a new run to adopt \
+         them.",
+        items.join("; ")
+    ))
+}
+
+/// How one gate's recorded form and its form in today's config differ.
+fn changes_between(recorded: &GateSummary, now: &GateSummary) -> String {
+    let mut parts: Vec<String> = Vec::new();
+    if recorded.cmd != now.cmd {
+        parts.push(format!(
+            "runs `{}` and today's config says `{}`",
+            recorded.cmd, now.cmd
+        ));
+    }
+    if recorded.shell != now.shell {
+        parts.push(format!(
+            "runs under `{}` and today's config says `{}`",
+            recorded.shell.program(),
+            now.shell.program()
+        ));
+    }
+    if recorded.timeout != now.timeout {
+        parts.push(format!(
+            "has {}s to finish and today's config allows {}s",
+            recorded.timeout.as_secs(),
+            now.timeout.as_secs()
+        ));
+    }
+    parts.join(", and ")
 }
 
 /// The sha the run's record ends at — what HEAD must still be.
@@ -4765,21 +5020,7 @@ mod tests {
 
         // Rewrite run_started as a pre-step-9 process would have written it.
         let paths = paths_of(&repo, &first.run_id);
-        let text = fs::read_to_string(paths.events()).expect("log");
-        let rewritten: Vec<String> = text
-            .lines()
-            .map(|line| {
-                let mut value: serde_json::Value =
-                    serde_json::from_str(line).expect("every line is an event");
-                if value.get("event").and_then(|e| e.as_str()) == Some("run_started")
-                    && let Some(data) = value.get_mut("data").and_then(|d| d.as_object_mut())
-                {
-                    data.remove("reviews").expect("step 9 wrote this field");
-                }
-                value.to_string()
-            })
-            .collect();
-        fs::write(paths.events(), format!("{}\n", rewritten.join("\n"))).expect("rewrite");
+        strip_run_started_field(&paths, "reviews");
 
         crate::answer::answer(
             &repo,
@@ -6925,17 +7166,29 @@ mod tests {
             .to_string()
     }
 
+    /// The base config every parked-run fixture starts from: one rung, one
+    /// attempt, no interaction — so a task that cannot pass parks immediately.
+    const PARKED_RUN_CONFIG: &str = "[interaction]\nmode = \"never\"\n\n\
+         [routing]\nimplement = { chain = [\"small\"], attempts_per = 1 }\n";
+
     /// A run that ends parked — the resumable shape every refusal test starts
     /// from, so each one isolates exactly the thing it breaks.
     fn parked_run(tag: &str) -> (PathBuf, String) {
+        parked_run_with_config(tag, PARKED_RUN_CONFIG)
+    }
+
+    /// As [`parked_run`], with the config spelled out — for the tests that need
+    /// a `[[gates]]` section in the record.
+    ///
+    /// One recipe, not two: the chains check runs before anything gate-related,
+    /// so a copy whose `[routing]` line drifted from the original would fail
+    /// these tests on "routing has changed" and point at the wrong thing.
+    fn parked_run_with_config(tag: &str, config: &str) -> (PathBuf, String) {
         let repo = temp_engine_repo(tag);
         seed(
             &repo,
             "## Doomed\n<!-- tactus: id=t1 kind=implement depends= -->\n",
-            Some(
-                "[interaction]\nmode = \"never\"\n\n\
-                 [routing]\nimplement = { chain = [\"small\"], attempts_per = 1 }\n",
-            ),
+            Some(config),
         );
         let mut opts = options(&repo);
         opts.config_path = Some(repo.join("tactus.toml"));
@@ -6997,6 +7250,345 @@ mod tests {
         let err = resume_err(&repo, &run_id);
         assert!(err.contains("routing has changed"), "got: {err}");
         assert!(err.contains("`t1` ran on [small]"), "names the task: {err}");
+    }
+
+    /// [`parked_run`], with one `[[gates]]` entry — the resumable shape for the
+    /// gate tests, which need a recorded gate to diverge from.
+    fn parked_run_with_gate(tag: &str, cmd: &str) -> (PathBuf, String) {
+        parked_run_with_config(tag, &gate_config(cmd))
+    }
+
+    /// [`PARKED_RUN_CONFIG`] plus a `check` gate running `cmd`.
+    fn gate_config(cmd: &str) -> String {
+        format!("{PARKED_RUN_CONFIG}\n[[gates]]\nname = \"check\"\ncmd = \"{cmd}\"\n")
+    }
+
+    /// Resume and answer the question the parked task is waiting on, so the
+    /// task actually runs again and its gates actually execute.
+    fn resume_answering(repo: &Path, run_id: &str, effect: Effect) -> RunReport {
+        let source = source(vec![effect], vec![ReviewBehavior::Pass]);
+        let answers = ScriptedAnswers::new(vec![Answer::Answered {
+            text: "carry on".to_owned(),
+        }]);
+        resume_harness(
+            &resume_options(repo, run_id),
+            &Harness {
+                adapters: &source,
+                answers: Some(&answers),
+                sleeper: None,
+            },
+        )
+        .expect("resume")
+    }
+
+    #[test]
+    fn resume_runs_the_gates_the_run_recorded_not_todays() {
+        // The load-bearing test for the whole gate record, and behavioural
+        // rather than textual: the recorded gate passes, today's config would
+        // fail, and the task commits — which it can only do if the gate that
+        // actually executed came from the log.
+        //
+        // This is the self-hosting hazard from Addendum C, closed at the point
+        // that matters. The workspace an implementer edits contains the very
+        // tactus.toml its gates come from, so an edited gate must not become
+        // the standard for what follows. Refusing would also have stopped the
+        // weakened gate running, but it would have stopped the *run* too, and
+        // a legitimately-committed config edit would have left it unresumable.
+        let (repo, run_id) = parked_run_with_gate("gaterecorded", "git --version");
+        // `git` still resolves at pre-flight, so nothing refuses before the
+        // gate runs — it just exits non-zero when it does.
+        fs::write(
+            repo.join("tactus.toml"),
+            gate_config("git frobnicate-not-a-command"),
+        )
+        .expect("edit config");
+
+        let resumed = resume_answering(&repo, &run_id, Effect::EditFile);
+        assert_eq!(resumed.outcome(), RunOutcome::Complete, "{resumed:?}");
+        assert!(
+            committed(&resumed, "t1"),
+            "the recorded gate ran, not the one in today's config: {resumed:?}"
+        );
+        // And the operator learns their edit did not take effect here, rather
+        // than concluding the gate is broken when it never ran.
+        let warning = resumed
+            .warnings
+            .iter()
+            .find(|w| w.contains("differ from the ones this run recorded"))
+            .unwrap_or_else(|| panic!("no gate-difference warning: {:?}", resumed.warnings));
+        assert!(
+            warning.contains(
+                "`check` runs `git --version` and today's config says `git \
+                              frobnicate-not-a-command`"
+            ),
+            "names the edit: {warning}"
+        );
+        assert!(
+            warning.contains("Start a new run to adopt them"),
+            "and what to do about it: {warning}"
+        );
+        // The report describes the gates that ran, not the ones on disk.
+        assert_eq!(resumed.gates, ["check"]);
+    }
+
+    #[test]
+    fn the_report_labels_gates_from_the_record_not_todays_config() {
+        // `gates` came from the record but `gates_from_config` did not, so the
+        // run's own report and a later `status` disagreed about the same list:
+        // `finish()` read today's analysis while `RunReport::from_state` read
+        // the record. The doc above `from_state` promises those two cannot
+        // drift, and this is the one field that still let them.
+        let (repo, run_id) = parked_run_with_gate("gatelabel", "git --version");
+        // `[[gates]]` deleted, so today's flag would be false and today's
+        // derivation empty — the temp repo has no project marker.
+        fs::write(repo.join("tactus.toml"), PARKED_RUN_CONFIG).expect("edit config");
+
+        let resumed = resume_answering(&repo, &run_id, Effect::EditFile);
+        assert_eq!(resumed.gates, ["check"], "the recorded gate ran");
+        assert!(
+            resumed.gates_from_config,
+            "and is labelled as the record has it, not as today's config would"
+        );
+        // The other half of the same promise: a reader replaying the log agrees.
+        let replayed = replay_of(&repo, &run_id).report();
+        assert_eq!(replayed.gates, resumed.gates);
+        assert_eq!(replayed.gates_from_config, resumed.gates_from_config);
+    }
+
+    #[test]
+    fn a_resume_whose_gates_did_not_move_says_nothing_about_them() {
+        // The success path, with a non-empty gate list — the direction a false
+        // positive would break. Every other gate test edits the config, so
+        // without this one an over-eager comparison (order, whitespace, a
+        // re-derived timeout) would warn on every ordinary resume unnoticed.
+        let (repo, run_id) = parked_run_with_gate("gateunmoved", "git --version");
+        let resumed = resume_answering(&repo, &run_id, Effect::EditFile);
+        assert_eq!(resumed.outcome(), RunOutcome::Complete, "{resumed:?}");
+        assert!(
+            !resumed
+                .warnings
+                .iter()
+                .any(|w| w.contains("gates") && w.contains("recorded")),
+            "an untouched config must warn about nothing: {:?}",
+            resumed.warnings
+        );
+    }
+
+    #[test]
+    fn a_gate_difference_is_described_without_inventing_edits() {
+        // `[[gates]]` does not require unique names, so the obvious by-name
+        // lookup answers for the wrong entry: it reports edits nobody made,
+        // and — worse — finds every name present and concludes "reordered"
+        // when a gate was added. Each case here produced a false sentence
+        // before the comparison paired whole gates instead of names.
+        let gate = |name: &str, cmd: &str| GateSummary {
+            name: name.to_owned(),
+            cmd: cmd.to_owned(),
+            timeout: Duration::from_secs(600),
+            shell: crate::gates::ShellKind::Sh,
+        };
+        let check = gate("check", "cargo test");
+        let only_check = std::slice::from_ref(&check);
+
+        assert_eq!(
+            gates_differ(only_check, only_check),
+            None,
+            "identical gates are not a difference"
+        );
+
+        // A duplicate name added. The record's `check` is present and unchanged,
+        // so nothing was edited and nothing reordered — one gate appeared.
+        let added = gates_differ(only_check, &[check.clone(), gate("check", "true")])
+            .expect("a difference");
+        assert!(
+            added.contains("`check` (`true`) is in today's config and not in the record"),
+            "names the added gate: {added}"
+        );
+        assert!(
+            !added.contains("different order"),
+            "and does not invent a reorder: {added}"
+        );
+
+        // One of two same-named gates removed. Pairing by name would report
+        // `check` as edited from one command to the other; both are real
+        // entries and neither changed.
+        let removed = gates_differ(&[check.clone(), gate("check", "cargo clippy")], only_check)
+            .expect("a difference");
+        assert!(
+            removed.contains("`check` (`cargo clippy`) is in the record and not in today's config"),
+            "names the removed gate: {removed}"
+        );
+
+        // An unambiguous single-name edit still reads as one edit.
+        let edited = gates_differ(only_check, &[gate("check", "true")]).expect("a difference");
+        assert!(
+            edited.contains("`check` runs `cargo test` and today's config says `true`"),
+            "{edited}"
+        );
+
+        // A rename is two facts, and saying so beats guessing which gate the
+        // operator meant to rename into which.
+        let renamed =
+            gates_differ(only_check, &[gate("verify", "cargo test")]).expect("a difference");
+        assert!(
+            renamed.contains("`check` (`cargo test`) is in the record"),
+            "{renamed}"
+        );
+        assert!(
+            renamed.contains("`verify` (`cargo test`) is in today's config"),
+            "{renamed}"
+        );
+
+        // Shell and timeout are recorded because they decide what a command
+        // means and how long it has to mean it — `true` always passes under sh
+        // and is not a program at all under cmd.
+        let reshelled = gates_differ(
+            only_check,
+            &[GateSummary {
+                shell: crate::gates::ShellKind::Bash,
+                ..check.clone()
+            }],
+        )
+        .expect("a difference");
+        assert!(
+            reshelled.contains("`check` runs under `sh` and today's config says `bash`"),
+            "{reshelled}"
+        );
+
+        // Same gates, different order: a difference worth a line, but not the
+        // same claim as a changed command.
+        let other = gate("test", "cargo test");
+        let reordered =
+            gates_differ(&[check.clone(), other.clone()], &[other, check]).expect("a difference");
+        assert!(reordered.contains("in a different order"), "{reordered}");
+        assert!(
+            !reordered.contains("not in the record"),
+            "nothing came or went: {reordered}"
+        );
+    }
+
+    #[test]
+    fn a_log_that_predates_the_gate_record_rederives_and_says_what_it_can() {
+        // A v0.1 log recorded gate names and nothing else. Refusing would
+        // strand every run written before the record over a field it could
+        // never have carried, so resume re-derives — and uses the one thing
+        // such a log *does* have. A moved name is proof the standard changed,
+        // not a suspicion, and the warning says which.
+        let (repo, run_id) = parked_run_with_gate("oldgatelog", "git --version");
+        strip_run_started_field(&paths_of(&repo, &run_id), "gate_cmds");
+        // Re-derivation must be a real re-derivation, or this test would pass
+        // against a resume that ignored today's config entirely.
+        fs::write(
+            repo.join("tactus.toml"),
+            format!(
+                "{PARKED_RUN_CONFIG}\n[[gates]]\nname = \"renamed\"\ncmd = \"git --version\"\n"
+            ),
+        )
+        .expect("edit config");
+
+        let resumed = resume_answering(&repo, &run_id, Effect::EditFile);
+        assert_eq!(resumed.outcome(), RunOutcome::Complete, "{resumed:?}");
+        let warning = resumed
+            .warnings
+            .iter()
+            .find(|w| w.contains("predates the gate record"))
+            .unwrap_or_else(|| panic!("no warning: {:?}", resumed.warnings));
+        assert!(
+            warning.contains("the gate names have moved"),
+            "an old log still knows this much: {warning}"
+        );
+        assert!(
+            warning.contains("recorded [check]") && warning.contains("resolves [renamed]"),
+            "and says which: {warning}"
+        );
+    }
+
+    #[test]
+    fn the_resume_that_rederives_an_old_logs_gates_records_them_for_the_next_one() {
+        // Without this, the pre-record population never gains a record: every
+        // resume re-derives, so a gate weakened between two of them is adopted
+        // silently — the exact substitution the record exists to prevent,
+        // surviving in the one population that could not carry it.
+        //
+        // Behavioural, and it takes two resumes to show: the first establishes
+        // `git --version`, the gate is then weakened to something that fails,
+        // and the second must still commit. It can only do that by running the
+        // gate the first resume wrote down.
+        let (repo, run_id) = parked_run_with_gate("oldgateestablish", "git --version");
+        strip_run_started_field(&paths_of(&repo, &run_id), "gate_cmds");
+
+        // First resume: nothing to rebuild from, so it re-derives and says so.
+        // `Effect::NoEdit` leaves the task parked, so there is a second resume
+        // to make.
+        let first = resume_answering(&repo, &run_id, Effect::NoEdit);
+        assert_eq!(first.outcome(), RunOutcome::Parked, "{first:?}");
+        assert!(
+            first
+                .warnings
+                .iter()
+                .any(|w| w.contains("predates the gate record")),
+            "the first resume re-derived: {:?}",
+            first.warnings
+        );
+
+        // It wrote down what it settled on.
+        let paths = paths_of(&repo, &run_id);
+        let mut log_warnings = Vec::new();
+        let logged = events::read_all(&paths.events(), &mut log_warnings).expect("log");
+        let established = events::recorded_gates(&logged).expect("the resume recorded its gates");
+        assert_eq!(established.len(), 1);
+        assert_eq!(established[0].cmd, "git --version");
+
+        // Now weaken the gate, exactly as an implementer editing the workspace
+        // would. Under the old behaviour the second resume re-derived and
+        // adopted this.
+        fs::write(
+            repo.join("tactus.toml"),
+            gate_config("git frobnicate-not-a-command"),
+        )
+        .expect("edit config");
+
+        let second = resume_answering(&repo, &run_id, Effect::EditFile);
+        assert_eq!(second.outcome(), RunOutcome::Complete, "{second:?}");
+        assert!(
+            committed(&second, "t1"),
+            "the established gate ran, not the weakened one: {second:?}"
+        );
+        // And it is an ordinary record-bearing resume now: it warns about the
+        // difference rather than about the log's age.
+        assert!(
+            second
+                .warnings
+                .iter()
+                .any(|w| w.contains("differ from the ones this run recorded")),
+            "{:?}",
+            second.warnings
+        );
+        assert!(
+            !second
+                .warnings
+                .iter()
+                .any(|w| w.contains("predates the gate record")),
+            "the log is no longer speechless about its gates: {:?}",
+            second.warnings
+        );
+    }
+
+    #[test]
+    fn an_old_gateless_log_is_not_warned_at_about_nothing() {
+        // The run recorded no gates and none resolve today, so no command can
+        // have hidden behind an unchanged name. A warning here would fire on
+        // every gateless pre-record run, and one that cries wolf on the
+        // harmless case is not read on the harmful one.
+        let (repo, run_id) = parked_run("oldgatelessslog");
+        strip_run_started_field(&paths_of(&repo, &run_id), "gate_cmds");
+
+        let resumed = resume_answering(&repo, &run_id, Effect::EditFile);
+        assert!(
+            !resumed.warnings.iter().any(|w| w.contains("gate")),
+            "nothing to say: {:?}",
+            resumed.warnings
+        );
     }
 
     #[test]
@@ -7209,6 +7801,37 @@ mod tests {
     }
 
     // ---- step 8.1: the seams either side of the log ------------------------
+
+    /// Drop a field from a log's `run_started` — the shape a log written before
+    /// that field existed has.
+    ///
+    /// Selects the event by its tag rather than by line number: `run_started`
+    /// is first today, and a helper that hard-codes that would silently rewrite
+    /// an unrelated event the day something precedes it.
+    fn strip_run_started_field(paths: &RunPaths, field: &str) {
+        let text = fs::read_to_string(paths.events()).expect("log");
+        let mut stripped = false;
+        let rewritten: Vec<String> = text
+            .lines()
+            .map(|line| {
+                let mut value: serde_json::Value =
+                    serde_json::from_str(line).expect("every line is an event");
+                if value.get("event").and_then(|e| e.as_str()) == Some("run_started")
+                    && let Some(data) = value.get_mut("data").and_then(|d| d.as_object_mut())
+                {
+                    data.remove(field)
+                        .unwrap_or_else(|| panic!("the run recorded no `{field}`"));
+                    stripped = true;
+                }
+                value.to_string()
+            })
+            .collect();
+        assert!(
+            stripped,
+            "the log has no run_started to strip `{field}` from"
+        );
+        fs::write(paths.events(), format!("{}\n", rewritten.join("\n"))).expect("rewrite");
+    }
 
     /// Rewind a log to just before the named event — the shape a process
     /// killed at that instant leaves behind.
