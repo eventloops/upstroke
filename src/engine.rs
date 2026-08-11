@@ -2366,14 +2366,24 @@ fn task_report(task: &Task, state: &TaskState, progress: &Progress, running: boo
             // settled away, so both mean the run stopped before this task got
             // its turn. On a live one `settle` leaves them alone, and the
             // attempt record says which of the two it is.
+            //
+            // Every arm here is about a run that is still going, which is why
+            // both are guarded. `Running` says of itself that only a live
+            // `status` produces it, and a dangling `in_flight` on an ended run
+            // is not a counter-example — it is an attempt whose engine died
+            // between `attempt_started` and `attempt_finished`, which any error
+            // out of `run_attempt` leaves behind. `finish` then wrote it into
+            // `report.json` as `t1: running now — attempt 2 on mid` beside a
+            // top-level `"running": false`: a stored document contradicting
+            // itself, outliving the process that wrote it.
             TaskState::Deferred | TaskState::Pending => match &progress.in_flight {
-                Some(flight) => TaskRunStatus::Running {
+                Some(flight) if running => TaskRunStatus::Running {
                     attempt: flight.attempt,
                     tier: flight.tier.clone(),
                     model: flight.model.clone(),
                 },
                 None if running => TaskRunStatus::Queued,
-                None => TaskRunStatus::Skipped,
+                _ => TaskRunStatus::Skipped,
             },
             TaskState::Skipped => TaskRunStatus::Skipped,
         },
@@ -8142,6 +8152,65 @@ mod tests {
             "nothing should have been left for the resume to discard: {:?}",
             resumed.warnings
         );
+    }
+
+    #[test]
+    fn a_report_for_a_dead_run_never_says_a_task_is_running() {
+        // `Running` says of itself that only a live `status` produces it, and
+        // the arm that built it consulted `in_flight` alone — while the arm
+        // directly below, for `Queued`, guards on `running`. What actually held
+        // the promise was a guarantee made one function away: `settle` turns
+        // every `Pending` into `Skipped` before `task_report` sees it when the
+        // run has ended, so the only way in is `Deferred`, which is recorded
+        // after an attempt finishes and therefore never has anything in flight.
+        //
+        // Unreachable is not the same as impossible, and the distance between
+        // the promise and the code keeping it is the whole hazard: a dangling
+        // `in_flight` is what any error out of `run_attempt` leaves behind, and
+        // `drain_and_report` writes a partial `report.json` on exactly that
+        // path. One reordering away, that file reads `t1: running now — attempt
+        // 2 on mid` beside a top-level `"running": false`, and outlives the
+        // process that wrote it. So the invariant is stated where it is relied
+        // upon.
+        let task = Task {
+            id: TaskId::from("t1"),
+            kind: TaskKind::Implement,
+            title: "One".to_owned(),
+            body: String::new(),
+            depends_on: Vec::new(),
+            acceptance: Vec::new(),
+            path_hints: Vec::new(),
+            suggested_tier: None,
+            min_tier: None,
+            artifacts_in: Vec::new(),
+            artifacts_out: Vec::new(),
+        };
+        let mid_attempt = Progress {
+            in_flight: Some(events::InFlight {
+                attempt: 2,
+                rung: 1,
+                tier: "mid".to_owned(),
+                model: "claude-sonnet-5".to_owned(),
+                profile: "mid-claude-sonnet-5".to_owned(),
+                pool: None,
+            }),
+            ..Progress::default()
+        };
+
+        for state in [TaskState::Pending, TaskState::Deferred] {
+            let dead = task_report(&task, &state, &mid_attempt, false);
+            assert!(
+                matches!(dead.status, TaskRunStatus::Skipped),
+                "a report for an ended run claimed a live attempt from {state:?}: {:?}",
+                dead.status
+            );
+            let live = task_report(&task, &state, &mid_attempt, true);
+            assert!(
+                matches!(live.status, TaskRunStatus::Running { .. }),
+                "and a live one still reports it: {:?}",
+                live.status
+            );
+        }
     }
 
     #[test]
