@@ -93,3 +93,28 @@ All five wrap-up threads approved by the owner the same day: (1) this folder cre
 **Fix (flagged for a separate implement session):** record gate commands (or a fingerprint) in `run_started`; resume refuses on mismatch with the chains-refusal phrasing; logs predating the record warn and re-derive, like the pre-step-9 review record; DESIGN.md §15's refusal list gains gates alongside the plan hash and chains.
 
 **Config hardening before the first self-hosted run:** blast-radius override in this repo's `tactus.toml` — `paths = ["tactus.toml"]` with `second_opinion = "different-vendor"` — so any diff touching gate definitions gets cross-family eyes. **Rejected:** hard-denying `tactus.toml` edits to implementers — self-hosting tasks legitimately touch config, and gate commands execute repository scripts anyway (§21's runner rationale); review plus refusal-on-resume is the proportionate pair.
+
+## Addendum D (2026-08-11) — reasoning effort is an unmodelled axis, and every Codex review so far ran at `low`
+
+Probed WSL-side against codex-cli 0.147.0 on a ChatGPT **Pro** plan (upgraded the same day), read-only sandbox, trivial prompts. **The headline is a defect, not the plan.**
+
+**The defect.** `~/.codex/models_cache.json` gives `gpt-5.6-sol` a `default_reasoning_level` of **`low`**, and `codex.rs::build_args` passes only `--model` and `--sandbox` — effort is never set, so it falls to that vendor default. **Every Codex review this project has run went out at the lowest reasoning setting**, including run `01KZRN48A4ZK3AEDST3RJ8HMA4`, the first §11.3 cross-family review (§21). The adapter already argues the general case against itself: it passes `--model` on resumed sessions precisely so "a future change to the CLI's default must not silently move a resumed retry to another model" — the identical argument applies to effort, which is currently left defaulted. The §11.3 cross-family claim should be re-established at a deliberate effort before it is cited again.
+
+**Measured:**
+- Effort is a first-class per-model enum. `gpt-5.6-sol`: `low, medium, high, xhigh, max, ultra` (`ultra` = "maximum reasoning with automatic task delegation"); `gpt-5.6-luna` tops out at `max`; `gpt-5.5`/`gpt-5.4` at `xhigh`. Defaults differ per model (`sol` = low, most others = medium).
+- The config key is **`model_reasoning_effort`**, set via `-c key=value`. Siblings in the same binary: `plan_mode_reasoning_effort`, `model_verbosity`, `service_tier`.
+- `xhigh`, `max` and `ultra` were all **accepted and completed** (exit 0, correct replies) under Pro. Caveat, stated because it matters: the prompts were trivial and returned `reasoning_output_tokens: 0`, so this measures *acceptance of the flag*, not that effort changed behaviour or that a Plus plan would refuse it. No Plus/Pro comparison was run.
+- **There is no pro-tier model.** Pro is a plan/quota tier; the frontier slug stays `gpt-5.6-sol`. The roster is server-driven and moves under you — it refreshed mid-probe and gained a ninth model (`gpt-5.3-codex-spark`).
+- **The plan tier is not discoverable locally.** `auth.json` carries `auth_mode`, tokens, `account_id`, `last_refresh` and no plan field; `codex login status` says only "Logged in using ChatGPT". Plus vs Pro therefore cannot be detected — for this pool §13's "pools are connected, not configured" hits a hard limit, and the plan shape must be operator-declared.
+- **No `rate_limits` anywhere in the `codex exec` JSON stream** — usage tokens only. Codex capacity estimation has no local quota signal at all, which is stronger than the adapter's recorded "usage without pricing".
+- A local model roster *does* exist (`models_cache.json`), so the adapter's probe note that "no model listing is offered" is true of the CLI surface but not of the install. It is a real discovery source for `tactus connect`, with the staleness caveat that it is a server-fetched cache.
+- Incidental confirmation: a `401 token_expired` on the websocket transport, then a successful HTTPS fallback and refresh — the rotating-refresh-token behaviour §21's runner commitment already assumed when it specified persistent credential volumes.
+
+**Design implications (no implementation here; for a separate session):**
+1. **Effort becomes explicit in the adapter** — always pass `-c model_reasoning_effort=<effort>`, by the same reasoning that already makes `--model` unconditional.
+2. **Effort belongs in `WorkerProfile`**, not `extra_args`, so the binder can reason about it and the ledger and decision record it. This is also salvage item #2 ("agent identity incl. reasoning config") arriving with a concrete shape.
+3. **The catalog's unit is model × effort**, not model: effort changes both capability and price of the same slug, which is exactly what §13's catalog ranks.
+4. **Effort-qualified rungs** (`frontier` then `frontier:max`) are the warmest possible escalation — same model, same harness, same cache, per §10's affinity gradient — and the cheapest answer to §23.2's "fewer attempts beats cheaper attempts". Decide with the per-rung `attempts_per` config change; they share a syntax.
+5. **Codex pool shape is operator-declared** in `pools.toml`, with `connect` recording that it could not verify the tier rather than guessing.
+
+**Not decided here:** whether the reviewer's default effort should be high (quality) or medium (cost) — §23.2 says review is charged per attempt, so this is a real cost lever and wants a deliberate call when the profile field lands.
