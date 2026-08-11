@@ -268,7 +268,7 @@ Assignment resolves in layers:
 
 **The affinity gradient** (context-switch cost, warmest → coldest): resume the *same session* (whole conversation cached) → new session, *same model*, within the provider's cache window (prefix hits on the system-and-repo preamble — the mechanism behind the ~97% cache-read rates heavy Claude Code users see) → same vendor, different model (cache-cold, harness-warm) → different vendor (cold everything: full context re-ingestion plus a different harness reading the conventions brief fresh). Copilot adds a useful middle rung: a cross-*vendor model* switch without a harness switch. v0.1 implements affinity as a tie-break plus streak batching; the full switch-cost model waits for real decision-log data — guessing reload costs is worse than measuring them.
 
-Every routing decision and outcome is logged with the task's features. `tactus export-decisions` (v0.2) emits the dataset a learned router would train on.
+Every routing decision and outcome is logged with the task's features. `tactus export-decisions` (v0.2) is a local, read-only, versioned projection of the frozen plan and attempt log: one attempt-start-ordered row per worker attempt, JSONL by default or the same rectangular data as CSV on stdout. It refuses a live run rather than export a moving partial record. Its purpose is human interpretation and the prediction-calibration record (§23.2); learned routing is parked indefinitely (§21), not the live consumer. The schema and provenance rules are recorded in `decisions/2026-08-11-export-decisions-schema.md`.
 
 ## 11. Verification ladder (P4)
 
@@ -470,8 +470,10 @@ tactus resume <run-id>
 tactus status [<run-id>] [--follow]
 tactus answer <question-id> [--option N | --text "..."]
 tactus capacity                    # all pools: remaining, resets, active strategy effect
-tactus export-decisions <run-id>   # v0.2: routing dataset (JSONL/CSV)
+tactus export-decisions <run-id> [--format jsonl|csv] # v0.2: local versioned attempt projection to stdout
 ```
+
+The export reads only the named, non-live run's event log and `plan.normalized.json`: it makes no HTTP request, branch switch, lock acquisition, or write. JSONL is the default; CSV has the same logical rows, with nested review passes and path hints represented as quoted JSON cells. See `decisions/2026-08-11-export-decisions-schema.md` for schema 1, legacy unknowns, and the measured/derived boundary.
 
 `--dry-run` executes everything except agents: parse, route, and print task → kind → chain (with source of each decision: config/annotation/override) → gates → pool + strategy effect, at zero spend. It exists from day one; it is both the config-iteration loop and the sales demo.
 

@@ -36,3 +36,5 @@ artifacts (§15); records promoted here are the durable subset.
   resume re-derives gates it should take from the record. Remedy under revision.
 - [2026-08-11 — Codex reasoning effort](2026-08-11-codex-reasoning-effort.md):
   every Codex review had run at `low`; effort is now a routing axis, verified live.
+- [2026-08-11 — decision export schema](2026-08-11-export-decisions-schema.md):
+  local schema-1 JSONL/CSV projection, one row per recorded worker attempt.
