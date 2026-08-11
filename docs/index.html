@@ -53,7 +53,7 @@ letter-spacing:.03em;margin:0 0 7px}
 <h1>Watch it fail safely</h1>
 <p class="sub">An agent wrote code that compiled clean and passed all 722 tests. It was still wrong.</p>
 
-<p class="lede">This is a record of tactus running unattended against <em>FluentRoslyn</em> — a real, published .NET library — fixing two open findings from its own code-review log. Everything below is captured output. Nothing is reconstructed.</p>
+<p class="lede">This is captured output from two real runs, and it is worth being precise about which is which. The <strong>verdict</strong>, the <strong>dry run</strong> and the <strong>branch</strong> below come from a run against <em>FluentRoslyn</em>, a published .NET library, fixing two open findings from its own code-review log. The <strong>interactive replay</strong> and the <strong>ledger</strong> come from the acceptance run that proved the engine, against a scratch repository. Nothing here is reconstructed, but nothing here is one continuous run either.</p>
 
 <p>The claim worth testing is narrow and falsifiable: <strong>gates are not enough, and a reviewer from a different model family catches things no gate can.</strong> What follows is one case where that happened, with the receipt.</p>
 
@@ -81,7 +81,7 @@ dry run: no agents executed, nothing spent</code></pre>
 
 <h2>The run, as the log recorded it</h2>
 
-<p>The engine holds its own terminal, so this is the view from the second one. Scrub through a real 45-minute run — five tasks, one dependency chain, one independent task. Every state below is derived from the run's append-only event log, which is exactly how the dashboard would work.</p>
+<p>The engine holds its own terminal, so this is the view from the second one. Scrub through a real 45-minute run — five tasks, one dependency chain, one independent task. This one is the <em>acceptance</em> run, against a scratch repository rather than FluentRoslyn: it is the run with a dependency graph worth showing, and with the parked question below. Every state is derived from its append-only event log, which is exactly how the dashboard would work.</p>
 
 <div class="panel">
   <p class="src"><b>replaying</b> .tactus/runs/01KZNG12FJA9DSJEYSK46NVBSC/events.jsonl — 45 events, 45 minutes</p>
@@ -110,7 +110,7 @@ dry run: no agents executed, nothing spent</code></pre>
 
 <h2>The catch</h2>
 
-<p>On a different task, the first attempt produced a fix that built cleanly and passed all 722 tests. The reviewer — a different model from the one that wrote it — rejected it anyway:</p>
+<p>Back to FluentRoslyn, and to the moment that makes the case. Its first attempt produced a fix that built cleanly and passed all 722 tests. The reviewer — a different model from the one that wrote it — rejected it anyway:</p>
 
 <blockquote>
 <p>Negative zero is emitted as <code>System.BitConverter.Int64BitsToDouble(...)</code>, which is not a compile-time constant. <code>FieldBuilder.WithInitializer</code> is reachable with <code>Const()</code>, so a const float/double field initialized from <code>-0.0</code> now fails in the consumer with <strong>CS0133</strong>. That case compiled before this change.</p>
@@ -123,7 +123,7 @@ dry run: no agents executed, nothing spent</code></pre>
 
 <h2>What it cost, and on what</h2>
 
-<p>The whole ledger is seventeen lines. Per task: how many attempts, which rungs it climbed, what the implementer spent, and what the reviewer spent — kept in separate columns, because folding them together makes a cheap rung look expensive.</p>
+<p>This is the acceptance run's ledger, matching the replay above — seventeen lines. Per task: how many attempts, which rungs it climbed, what the implementer spent, and what the reviewer spent, kept in separate columns because folding them together makes a cheap rung look expensive. FluentRoslyn's own bill is in the closing section.</p>
 
 <p class="src"><b>$</b> tactus status 01KZNG12FJA9DSJEYSK46NVBSC</p>
 <pre class="scroll"><code>  task           attempts  trail                  worker   review   total
