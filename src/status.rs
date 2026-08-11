@@ -54,6 +54,7 @@ impl RunStatus {
             &self.state,
             self.warnings.clone(),
             self.running,
+            self.interrupted_run(),
         )
     }
 
@@ -461,6 +462,7 @@ mod tests {
             questions: Vec::new(),
             budget_stop: None,
             running: false,
+            interrupted: false,
             total_cost_usd: 0.06,
             pool_drain: vec![crate::engine::PoolDrainRow {
                 pool: "claude-max".to_owned(),
@@ -508,6 +510,7 @@ mod tests {
             questions: Vec::new(),
             budget_stop: None,
             running: false,
+            interrupted: false,
             total_cost_usd: 0.0,
             pool_drain: Vec::new(),
         };

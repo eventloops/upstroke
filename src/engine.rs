@@ -323,6 +323,18 @@ pub struct RunReport {
     /// the tasks queued behind it have not been skipped.
     #[serde(default)]
     pub running: bool,
+    /// Whether this run stopped without ever recording that it finished — the
+    /// signature of a kill, a power loss, or an aborting error.
+    ///
+    /// A run in that state has no outcome, and `outcome()` cannot tell: a
+    /// killed run has nothing halted, no budget stop and nothing parked, which
+    /// is indistinguishable from a clean finish. So the flag has to be carried
+    /// rather than derived, exactly as `running` is.
+    ///
+    /// Not to be confused with `RunStatus::interrupted`, which is a `u32`
+    /// counting the attempts that were cut off mid-flight. This is the yes/no.
+    #[serde(default)]
+    pub interrupted: bool,
 }
 
 /// One pool's line in the ledger: what this run drew from which subscription.
@@ -345,6 +357,15 @@ impl RunReport {
             .filter(|t| matches!(t.status, TaskRunStatus::Parked { .. }))
             .map(|t| t.id.as_str())
             .collect()
+    }
+
+    /// How much of the plan actually landed — the one figure every ending
+    /// wants, whether the run finished, is still going, or was cut off.
+    fn committed_count(&self) -> usize {
+        self.tasks
+            .iter()
+            .filter(|t| matches!(t.status, TaskRunStatus::Committed { .. }))
+            .count()
     }
 
     /// Precedence: a halt outranks a budget stop, which outranks parked work.
@@ -2155,6 +2176,10 @@ impl Run<'_> {
                 warnings: self.warnings.clone(),
                 // The engine only reports on itself once it has stopped.
                 running: false,
+                // A `finish` that runs is by definition not an interruption:
+                // the shape this flag describes is the one left behind when
+                // this function never got the chance.
+                interrupted: false,
             },
             &self.analysis.plan,
             &self.state,
@@ -2174,6 +2199,7 @@ impl RunReport {
         state: &RunState,
         warnings: Vec<String>,
         running: bool,
+        interrupted: bool,
     ) -> Self {
         build_report(
             ReportHeader {
@@ -2183,6 +2209,7 @@ impl RunReport {
                 gates_from_config: started.gates_from_config,
                 warnings,
                 running,
+                interrupted,
             },
             plan,
             state,
@@ -2200,6 +2227,8 @@ struct ReportHeader<'a> {
     warnings: Vec<String>,
     /// Whether an engine is driving this run right now.
     running: bool,
+    /// Whether this run stopped without ever recording that it finished.
+    interrupted: bool,
 }
 
 fn build_report(header: ReportHeader<'_>, plan: &Plan, state: &RunState) -> RunReport {
@@ -2210,6 +2239,7 @@ fn build_report(header: ReportHeader<'_>, plan: &Plan, state: &RunState) -> RunR
         gates_from_config,
         warnings,
         running,
+        interrupted,
     } = header;
     let settled = settle(plan, &state.states, running);
     let tasks: Vec<TaskReport> = state
@@ -2254,6 +2284,7 @@ fn build_report(header: ReportHeader<'_>, plan: &Plan, state: &RunState) -> RunR
         total_cost_usd,
         pool_drain,
         running,
+        interrupted,
     }
 }
 
@@ -3218,7 +3249,16 @@ impl RunReport {
                     let _ = writeln!(out, "  {}: blocked by `{by}`", task.id);
                 }
                 TaskRunStatus::Skipped => {
-                    let _ = writeln!(out, "  {}: skipped (run halted)", task.id);
+                    // Why it never got its turn, since the two endings are not
+                    // the same thing to an operator: a halt is a decision the
+                    // run reached, an interruption is one that happened to it
+                    // and that `resume` undoes.
+                    let ending = if self.interrupted {
+                        "run interrupted"
+                    } else {
+                        "run halted"
+                    };
+                    let _ = writeln!(out, "  {}: skipped ({ending})", task.id);
                 }
                 TaskRunStatus::Running {
                     attempt,
@@ -3280,14 +3320,30 @@ impl RunReport {
         // A live run has no outcome yet, and every arm below claims one. Say
         // what is true instead: how far it has got.
         if self.running {
-            let committed = self
-                .tasks
-                .iter()
-                .filter(|t| matches!(t.status, TaskRunStatus::Committed { .. }))
-                .count();
             let _ = writeln!(
                 out,
-                "run in progress: {committed} task(s) committed so far on {}",
+                "run in progress: {} task(s) committed so far on {}",
+                self.committed_count(),
+                self.branch
+            );
+            return out;
+        }
+        // Neither has a run that stopped without recording a finish, and for
+        // the same reason: there is no outcome to report yet. `outcome()`
+        // cannot see that — a killed run has nothing halted, no budget stop and
+        // nothing parked, which reads as `Complete` — so it used to print `run
+        // complete: N task(s) committed` about a run that died mid-attempt,
+        // one line above `status`'s own `state: interrupted`.
+        //
+        // "So far" is the live line's word on purpose: more may yet come, once
+        // somebody resumes. Which is also why the resume command is not
+        // repeated here — the `state:` line in `status` already carries it, and
+        // saying it twice invites the two copies to drift.
+        if self.interrupted {
+            let _ = writeln!(
+                out,
+                "run interrupted: {} task(s) committed so far on {}",
+                self.committed_count(),
                 self.branch
             );
             return out;
@@ -3333,11 +3389,7 @@ impl RunReport {
                 );
             }
             RunOutcome::Complete => {
-                let committed = self
-                    .tasks
-                    .iter()
-                    .filter(|t| matches!(t.status, TaskRunStatus::Committed { .. }))
-                    .count();
+                let committed = self.committed_count();
                 let _ = writeln!(
                     out,
                     "run complete: {committed} task(s) committed on {}",
@@ -6276,7 +6328,7 @@ mod tests {
         let stopped = replay_of(&repo, &report.run_id);
         assert!(stopped.interrupted_run());
         let out = crate::status::render(&stopped);
-        assert!(out.contains("skipped (run halted)"), "{out}");
+        assert!(out.contains("skipped (run interrupted)"), "{out}");
         assert!(out.contains("t2: blocked by `t1`"), "{out}");
 
         // Now hold the lock the way a working engine does — through the same
@@ -6302,7 +6354,9 @@ mod tests {
         for lie in [
             "small failed",
             "skipped (run halted)",
+            "skipped (run interrupted)",
             "run complete",
+            "run interrupted",
             "blocked by",
         ] {
             assert!(!out.contains(lie), "a live run reported `{lie}`:\n{out}");
@@ -6459,6 +6513,25 @@ mod tests {
             !rundir::is_running(&paths.public),
             "the OS released the lock"
         );
+
+        // And the summary line says what happened rather than claiming an
+        // outcome. A killed run replays into `Complete` — nothing halted it, no
+        // budget stopped it, nothing is parked — so the ledger used to be
+        // followed by `run complete: 1 task(s) committed` and then, one line
+        // later, `state: interrupted`. Two adjacent lines contradicting each
+        // other about a run that died mid-attempt with work left undone.
+        let rendered = crate::status::render(&before);
+        assert!(
+            rendered.contains("run interrupted: 1 task(s) committed so far"),
+            "{rendered}"
+        );
+        assert!(
+            !rendered.contains("run complete"),
+            "a killed run claimed it completed:\n{rendered}"
+        );
+        // Its unreached tasks were not skipped because the run *halted* — that
+        // is a different ending, and one an operator acts on differently.
+        assert!(rendered.contains("skipped (run interrupted)"), "{rendered}");
 
         let source = fake(Effect::EditFile);
         let (resumed, state) = resume_harness_inner(
