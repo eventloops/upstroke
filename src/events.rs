@@ -1049,8 +1049,28 @@ impl RunState {
             // prompt under `feedback_section`'s human framing — "an instruction
             // from a person, and it takes precedence over your earlier
             // assumptions" — handing a coding agent a billing decision as task
-            // guidance. Every other kind's answer really is guidance.
-            if kind != crate::ir::QuestionKind::ApproveSpend {
+            // guidance.
+            //
+            // The same objection applies to any canned option, whatever the
+            // kind, and for a reason the first version of this missed: the
+            // options are the engine's instructions *to the operator*, not the
+            // operator's instructions to anyone. `tactus answer <id> --option
+            // 1` on an unblock question resolves to "retry this task with
+            // guidance you type below" — a sentence about where to type, which
+            // then reached the implementer as binding guidance and, since §12's
+            // decisions were routed to the judge, reached the reviewer as "a
+            // decision from a person… a change that departs from it is a defect
+            // however well argued". A judge grading a diff against meta-UI text
+            // can only reject it, every attempt, until the ladder runs out.
+            //
+            // An operator's own words are guidance. A label they picked off a
+            // list is the un-park, and nothing more.
+            let canned = self.questions[position]
+                .question
+                .options
+                .iter()
+                .any(|option| option == text);
+            if kind != crate::ir::QuestionKind::ApproveSpend && !canned {
                 progress.feedback.push(Feedback {
                     attempt: progress.attempts,
                     tier: String::new(),

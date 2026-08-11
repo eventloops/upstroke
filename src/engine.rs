@@ -7983,6 +7983,75 @@ mod tests {
     }
 
     #[test]
+    fn picking_an_option_is_an_un_park_and_not_a_decision() {
+        // The options a question carries are the engine's instructions to the
+        // operator: "retry this task with guidance you type below", "answer in
+        // your own words". `tactus answer <id> --option 1` resolved to that
+        // sentence and pushed it as human feedback — so it reached the
+        // implementer framed as "an instruction from a person", and once §12's
+        // decisions were routed to the judge as well, it reached the reviewer
+        // as "a decision from a person… a change that departs from it is a
+        // defect however well argued". There is no diff that satisfies a
+        // sentence about where to type, so an honest judge rejects every
+        // attempt until the ladder is spent.
+        let repo = temp_engine_repo("cannedoption");
+        seed(
+            &repo,
+            "## One\n<!-- tactus: id=t1 kind=implement depends= -->\n",
+            Some("[routing]\nimplement = { chain = [\"small\"], attempts_per = 1 }\n"),
+        );
+        let mut opts = options(&repo);
+        opts.config_path = Some(repo.join("tactus.toml"));
+        // Ask, then answer by picking the first option verbatim — what
+        // `--option 1` writes.
+        let source = source(
+            vec![Effect::AskQuestion, Effect::EditFile],
+            vec![ReviewBehavior::Pass],
+        );
+        let scripted = ScriptedAnswers::new(vec![Answer::Answered {
+            text: question_options(QuestionKind::Clarify)[0].clone(),
+        }]);
+        let report = run_harness(
+            &opts,
+            &Harness {
+                adapters: &source,
+                answers: Some(&scripted),
+                sleeper: None,
+            },
+        )
+        .expect("run");
+        assert_eq!(report.outcome(), RunOutcome::Complete, "{report:?}");
+
+        // The retry happened — the answer still un-parks the task.
+        let runs = source.adapter.runs();
+        let retry = &runs
+            .iter()
+            .filter(|r| !r.prompt.contains("DATA UNDER REVIEW"))
+            .nth(1)
+            .expect("a second implementer attempt")
+            .prompt;
+        assert!(
+            !retry.contains("answer in your own words"),
+            "the option label reached the implementer as guidance:\n{retry}"
+        );
+        assert!(
+            !retry.contains("instruction from a person"),
+            "and with no human-instruction framing at all:\n{retry}"
+        );
+        // And nothing reached the judge as an operator decision either.
+        for review in runs
+            .iter()
+            .filter(|r| r.prompt.contains("DATA UNDER REVIEW"))
+        {
+            assert!(
+                !review.prompt.contains("answer in your own words"),
+                "the option label reached the reviewer as a decision:\n{}",
+                review.prompt
+            );
+        }
+    }
+
+    #[test]
     fn one_outage_records_one_signal_however_many_deferrals_it_causes() {
         let repo = temp_engine_repo("onesignal");
         seed(
