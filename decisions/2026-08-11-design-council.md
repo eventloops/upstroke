@@ -125,3 +125,19 @@ Probed WSL-side against codex-cli 0.147.0 on a ChatGPT **Pro** plan (upgraded th
 - **Effort is not identity.** `ReviewPlan::passes_for` decides §11.3's self-review rebind by comparing a `PassBinding` with the implementer's. Putting effort on that struct would have made the comparison always false and *silently retired the check that stops a model reviewing its own work* — a verification layer deleted by a field addition. Effort therefore travels as a parameter to the profile, not as part of the binding. The near-miss is the point: this is the failure mode §11.3 already guards against in config (an unrecognised `second_opinion` value is a hard error, "because a typo must not silently delete a verification layer"), reappearing as a type change.
 
 Also deliberately excluded from the ladder: codex's `xhigh` (an intermediate no other adapter can honour) and `ultra` ("maximum reasoning with automatic task delegation" — a change in what the agent *does*, and nothing here has audited an agent spawning subagents inside a tactus attempt).
+
+## Addendum E (2026-08-11) — the cross-family review, re-established at a stated effort
+
+Run **`01KZS7R0V1ZD6MC290MG350QXF`**, WSL-side against a seeded scratch repo: one `implement` task bound at mid to `claude-code/claude-sonnet-5` (Anthropic), reviewed by `codex/gpt-5.6-sol` (OpenAI) pinned at frontier — so the cross-family pass is the *primary* review here, not an added second opinion. Committed on the first attempt.
+
+**What it establishes, in descending order of how hard it was to fake:**
+
+- **The effort reached the provider.** Codex's own session rollout for the review thread records `"effort":"high"`. This is the CLI's record of what it sent, not tactus's record of what it meant to send — the two had disagreed silently for the whole life of the adapter, which is the defect this run closes.
+- **The reviewer actually reasoned.** 511 of 757 output tokens were `reasoning_output_tokens`. The pre-fix probe on a trivial prompt returned 0.
+- **The families really differ.** `run_started` records `reviews.primary = codex/gpt-5.6-sol` with the alternative `claude-code/claude-opus-4-8` held in reserve, and the implementer was Anthropic. §11.3 satisfied on the substance, not the label.
+- **The verdict was a reading, not a rubber stamp.** It cited `src/clamp.rs:2` and `:3` by line, checked the "no code path can panic" criterion against the actual conversion, and reasoned explicitly that `unwrap_or` is not the prohibited panicking `unwrap` — a distinction a rubber stamp does not make.
+- **The ledger stayed honest:** `$0.1391?` — the Claude half priced, the Codex half unpriced and marked as a floor rather than presented as complete (§13).
+
+**Prediction (stated before the run, per the standing protocol): mid rung, first attempt, $0.10–0.40 reported. Actual: mid, first attempt, $0.1391. Hit** — the third consecutive hit on the routing-prediction question §23.2 says decides whether a learned router is ever worth building.
+
+**What it does not establish:** that `high` produces *better* judgement than `low`. That would need the same diff judged both ways, and §23.2's own finding — two identical configurations produced two different failure modes — says a single paired run would not settle it either. The claim here is narrower and is the one that was actually broken: tactus now decides the effort, states it, and can prove which one was used.
