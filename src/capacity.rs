@@ -1036,6 +1036,7 @@ mod tests {
                     cost_usd: None,
                     reviews: Vec::new(),
                     session_id: None,
+                    usage: None,
                     failure: failure.map(|kind| crate::events::FailureRecord {
                         kind,
                         origin: FailureOrigin::Worker,

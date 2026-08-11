@@ -5,6 +5,7 @@
 
 pub mod bin;
 pub mod claude;
+pub mod codex;
 pub mod copilot;
 pub mod proc;
 
@@ -207,7 +208,11 @@ impl AdapterSource for BuiltinAdapters {
 }
 
 /// Registry in routing order; ids match `WorkerProfile.agent`.
-pub static ADAPTERS: &[&dyn AgentAdapter] = &[&claude::ClaudeCodeAdapter, &copilot::CopilotAdapter];
+pub static ADAPTERS: &[&dyn AgentAdapter] = &[
+    &claude::ClaudeCodeAdapter,
+    &copilot::CopilotAdapter,
+    &codex::CodexAdapter,
+];
 
 pub fn by_id(id: &str) -> Option<&'static dyn AgentAdapter> {
     ADAPTERS.iter().copied().find(|a| a.id() == id)
@@ -248,9 +253,10 @@ mod tests {
     use super::*;
 
     #[test]
-    fn registry_resolves_both_v0_1_adapters() {
+    fn registry_resolves_every_shipped_adapter() {
         assert!(by_id("claude-code").is_some());
         assert!(by_id("copilot").is_some());
+        assert!(by_id("codex").is_some());
         assert!(by_id("aider").is_none(), "aider arrives in v0.2");
     }
 

@@ -239,6 +239,13 @@ pub struct Usage {
     pub cache_creation_input_tokens: Option<u64>,
     pub cache_read_input_tokens: Option<u64>,
     pub num_turns: Option<u32>,
+    /// Output tokens spent thinking rather than answering, where a CLI
+    /// separates the two. Vendor-neutral in name because the concept is:
+    /// Codex reports `reasoning_output_tokens`, and it is a *subset* of
+    /// `output_tokens` rather than an addition to it, so summing the two would
+    /// double-count.
+    #[serde(default)]
+    pub reasoning_output_tokens: Option<u64>,
 }
 
 /// §7 `Outcome` — what one agent attempt produced. The adapter fills status,

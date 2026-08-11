@@ -469,6 +469,10 @@ fn parse_usage(payload: &Value) -> Option<Usage> {
             .get("num_turns")
             .and_then(Value::as_u64)
             .and_then(|n| u32::try_from(n).ok()),
+        // This CLI reports its own api-equivalent dollars and does not break
+        // output tokens down further, so the field stays empty here rather
+        // than being invented from a subtraction.
+        reasoning_output_tokens: None,
     })
 }
 

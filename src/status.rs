@@ -455,6 +455,7 @@ mod tests {
                     cost_usd: Some(0.01),
                     reviews: Vec::new(),
                     session_id: None,
+                    usage: None,
                     failure: None,
                 }],
             }],

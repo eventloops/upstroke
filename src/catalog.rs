@@ -126,6 +126,13 @@ pub const CATALOG: &[CatalogEntry] = &[
         Tier::Frontier,
         Family::Anthropic,
     ),
+    // Read from a live session's own rollout on 2026-08-11 rather than from a
+    // docs page — the highest confidence any entry in this table has, since it
+    // is the string the CLI recorded for a turn it actually ran. Frontier
+    // because that is what it is and what it is for: the whole point of this
+    // pool is implementing at the top rung without the reviewer's window
+    // paying for it (§23.2, as scoped there).
+    entry("codex", "gpt-5.6-sol", Tier::Frontier, Family::OpenAI),
 ];
 
 pub fn lookup(agent: &str, model: &str) -> Option<CatalogEntry> {

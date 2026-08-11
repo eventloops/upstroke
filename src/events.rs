@@ -378,6 +378,31 @@ pub struct AttemptRecord {
     #[serde(default)]
     pub reviews: Vec<ReviewRecord>,
     pub session_id: Option<String>,
+    /// Token accounting as the CLI reported it, where it reports any.
+    ///
+    /// Kept beside `cost_usd` rather than folded into it, because dollars and
+    /// tokens are different claims and only the vendor gets to make the first
+    /// one. Claude Code computes its own api-equivalent cost and tactus records
+    /// it; Codex reports usage and no price. Pricing those tokens here would
+    /// mean shipping a rate table inside a published binary, where it goes
+    /// stale silently and — on subscription auth, where the marginal dollar is
+    /// zero and the real currency is the rate-limit window — produces a number
+    /// that is notional twice over. §13's rule holds: an estimate that flatters
+    /// is worse than none.
+    ///
+    /// So the ledger keeps saying `?` for a route that reports no dollars, and
+    /// the evidence survives anyway. That matters more than it sounds: a run
+    /// that did not record its usage can never be re-measured, and §23.2's
+    /// conclusions about where spend goes were drawn entirely from
+    /// cheap-implementer runs. Adapters have been parsing this into
+    /// [`Outcome::usage`](crate::ir::Outcome) since step 3 and the engine threw
+    /// it away.
+    ///
+    /// Pure addition, like `pool` above: `#[serde(default)]` means a log
+    /// written before this folds to exactly the state it always did, so
+    /// `SCHEMA_VERSION` does not move.
+    #[serde(default)]
+    pub usage: Option<crate::ir::Usage>,
     /// `None` when the attempt passed.
     pub failure: Option<FailureRecord>,
 }
@@ -698,6 +723,10 @@ impl InterruptedAttempt {
                 // reviewer.
                 reviews: Vec::new(),
                 session_id: None,
+                // Same reason as `cost_usd` above: the process died before the
+                // CLI reported anything, so the tokens it spent are as unknown
+                // as the dollars.
+                usage: None,
                 failure: Some(FailureRecord {
                     kind: FailureKind::Interrupted,
                     origin: FailureOrigin::Worker,
@@ -1496,6 +1525,7 @@ mod tests {
                 cost_usd: Some(0.01),
                 reviews: Vec::new(),
                 session_id: Some("s0".to_owned()),
+                usage: None,
                 failure: None,
             }),
         }

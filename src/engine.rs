@@ -1549,6 +1549,7 @@ impl Run<'_> {
                     cost_usd: result.outcome.cost_usd,
                     reviews: result.reviews.clone(),
                     session_id: result.outcome.session_id.clone(),
+                    usage: result.outcome.usage.clone(),
                     failure: result.failure.as_ref().map(|f| FailureRecord {
                         kind: f.kind,
                         origin: f.origin,
@@ -5807,6 +5808,7 @@ mod tests {
             cost_usd: None,
             reviews: Vec::new(),
             session_id: None,
+            usage: None,
             failure: failed.then(|| FailureRecord {
                 kind: FailureKind::GateFailed,
                 origin: FailureOrigin::Worker,
