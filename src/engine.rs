@@ -204,6 +204,18 @@ pub enum TaskRunStatus {
     /// Its turn has not come yet, and the run is still going — distinct from
     /// `Skipped`, which means the run ended before this task got a turn.
     Queued,
+    /// A status this build does not know, from a `report.json` a newer tactus
+    /// wrote. Never produced by this crate.
+    ///
+    /// `report.json` is a projection for whoever reads the run afterwards, and
+    /// this enum is `pub` and `Deserialize` because that reader may be someone
+    /// else's program. Without a fallback, every variant added here is a hard
+    /// `unknown variant` error in every consumer built against an older
+    /// version — which is what `running`, `Queued` and this one did to anything
+    /// compiled against 0.0.1, and that break is already published. Adding it
+    /// now cannot undo that; it stops the next one.
+    #[serde(other)]
+    Unknown,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -3221,6 +3233,16 @@ impl RunReport {
                 }
                 TaskRunStatus::Queued => {
                     let _ = writeln!(out, "  {}: queued", task.id);
+                }
+                // Only reachable from a `report.json` written by a newer
+                // tactus. Say that, rather than picking a familiar-looking
+                // status and being confidently wrong about someone's run.
+                TaskRunStatus::Unknown => {
+                    let _ = writeln!(
+                        out,
+                        "  {}: status not recognised by this version of tactus",
+                        task.id
+                    );
                 }
             }
         }
@@ -8152,6 +8174,47 @@ mod tests {
             "nothing should have been left for the resume to discard: {:?}",
             resumed.warnings
         );
+    }
+
+    #[test]
+    fn a_status_from_a_newer_tactus_does_not_fail_the_whole_report() {
+        // `report.json` is a projection for whoever reads the run afterwards,
+        // and `TaskRunStatus` is `pub` and `Deserialize` because that reader
+        // may be someone else's program. Every variant added to a serde-tagged
+        // enum with no fallback is a hard `unknown variant` error in every
+        // consumer built against an older version — one unreadable status makes
+        // the entire report unreadable.
+        //
+        // `running`, `Queued` and `Running` did that to anything compiled
+        // against 0.0.1, and that break is published and cannot be taken back.
+        // This is so the next variant is not another one.
+        let text = r#"{
+          "run_id": "01RUN", "branch": "b", "gates": [], "gates_from_config": false,
+          "warnings": [], "halted_at": null, "questions": [], "total_cost_usd": 0.0,
+          "tasks": [
+            {"id": "t1", "title": "One", "model": "m",
+             "status": {"status": "teleported", "destination": "elsewhere"},
+             "duration": {"secs": 0, "nanos": 0}, "cost_usd": null,
+             "review_models": [], "review_cost_usd": null,
+             "review_cost_incomplete": false, "session_id": null, "attempts": []},
+            {"id": "t2", "title": "Two", "model": "m",
+             "status": {"status": "committed", "sha": "abc123"},
+             "duration": {"secs": 0, "nanos": 0}, "cost_usd": null,
+             "review_models": [], "review_cost_usd": null,
+             "review_cost_incomplete": false, "session_id": null, "attempts": []}
+          ]
+        }"#;
+
+        let report: RunReport =
+            serde_json::from_str(text).expect("one unknown status must not sink the report");
+        assert!(matches!(task(&report, "t1").status, TaskRunStatus::Unknown));
+        // And everything the reader *can* understand still arrives intact.
+        assert!(
+            matches!(&task(&report, "t2").status, TaskRunStatus::Committed { sha } if sha == "abc123")
+        );
+        let rendered = report.render();
+        assert!(rendered.contains("t1: status not recognised"), "{rendered}");
+        assert!(rendered.contains("t2: committed abc123"), "{rendered}");
     }
 
     #[test]
