@@ -64,3 +64,13 @@ What it establishes, in descending order of how hard it was to fake:
 > **Correction (made during the split).** The original Addendum E called this "the third consecutive hit". That was wrong and is exactly the kind of flattery a prediction log exists to prevent: the standing tally is **four prior misses, all overestimates of roughly 2×, and this is the first hit** — earned by estimating attempt-count first rather than scaling off a previous run's total.
 
 **What it does not establish:** that `high` produces *better* judgement than `low`. That would need the same diff judged both ways, and §23.2's own finding — two identical configurations produced two different failure modes — says a single paired run would not settle it either. The claim here is narrower and is the one that was actually broken: tactus now decides the effort, states it, and can prove which one was used.
+
+## Follow-on observation (2026-08-11) — the reviewer contradicted itself on the same construct
+
+Later the same day, a different run gave the same reviewer — `codex/gpt-5.6-sol`, same `high` effort, same task text — the identical idiom to judge, and it went the other way.
+
+On run `01KZS7R0V1ZD6MC290MG350QXF` it **passed** `u8::try_from(value).unwrap_or(100)`, reasoning that "`unwrap_or` is not the prohibited panicking `unwrap`; the conversion is explicit and total." On run `01KZSCRGGJYEF5TBG6YND8YD2X` it **rejected** the same construct: "still an unwrap-family shortcut instead of explicit total handling", exhausting a one-attempt chain and parking the task on an `Unblock` question.
+
+Both readings are defensible against a criterion that said "no `unwrap`" — which is the point. §23.2 already records that two runs of one configuration produced two different failure modes; this is the sharper form, since the disagreement is one judge with itself on one line of code rather than two runs diverging somewhere.
+
+Two things follow. **Any A/B of review quality is hopeless at this sample size** — the noise floor spans pass and fail on identical input, so the "does `high` judge better than `low`" question cannot be answered by running it twice, and the caveat above understates the problem rather than overstating it. And **acceptance criteria that name a forbidden idiom rather than a forbidden behaviour are a nondeterminism source of their own**: "no `unwrap`" invites a judgement call about what counts as one, where "must not panic on any input" is checkable. That is a lesson for the plans this project writes, not a defect in the reviewer.

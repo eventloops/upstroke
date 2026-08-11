@@ -45,6 +45,18 @@
 
 **The hardening half of the original verdict, now landed:** the blast-radius override this record prescribed did not exist, because the repo had no `tactus.toml` at all — so a diff touching gate definitions would have gone to ordinary same-family review. Added in the same change, with gates matching CI. The "proportionate pair" now reads: cross-family review of config diffs, plus the record governing what a resume verifies against.
 
+## Verified live (2026-08-11, after merge)
+
+Run **`01KZSCV96PPHVNR8ATPF3C80A2`**, WSL-side: two tasks, the engine killed with `SIGKILL` mid-attempt on the second, the `check` gate then weakened from `cargo check --all-targets` to `false`, then resumed.
+
+- **The recorded gate ran, not the weakened one.** The task committed, which `false` makes impossible, and the gate log for that attempt carries cargo's own output. The resume said so in the same breath: *"`check` runs `cargo check --all-targets` and today's config says `false`. Start a new run to adopt them."*
+- **The interruption was settled as §15 promises.** `attempt_interrupted` for `bytes` attempt 1 with `cost_usd: null` and `usage: null` — recorded with unknown spend, and the run continued rather than counting it against the rung.
+- **The one-home rule held.** `run_resumed.gates` is `null`, because `run_started.gate_cmds` already answered the question; only a pre-record log's first resume writes that field.
+- **The record carries all four fields**, `shell: "sh"` and `timeout_ms` included, so the gate is reproducible rather than merely named.
+- **The residue discard behaved exactly as the review predicted**: the uncommitted weakening was reported and destroyed — `discarded: [" M tactus.toml"]` — which is why an uncommitted config edit could never have been the way to change a run's gates anyway.
+
+Both tasks committed; `$0.2258` reported with the Codex review halves unpriced.
+
 ## Deferred candidate — adopting new gates mid-run
 
 Once the record governs a resume, an operator cannot change what verifies a run without starting a new one. **That is the design working, not a gap** — a review finding claiming otherwise was withdrawn, because the example did not survive being taken apart: a typo that always *fails* commits nothing, so a new run costs almost nothing, and a typo that always *passes* commits work that a new run is the correct answer to.
