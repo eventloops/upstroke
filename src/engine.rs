@@ -3224,15 +3224,23 @@ impl RunReport {
                         // say who judged it rather than imply it was free.
                         (models, None) => format!(" + review {} $?", models.join(", ")),
                     };
+                    // Same rule as the reviewer half beside it, which has said
+                    // `$?` since step 9: a route that reports no spend has not
+                    // reported zero. `unwrap_or(0.0)` printed `$0.0000` for a
+                    // codex-implemented task while the ledger three lines below
+                    // correctly showed `—`, so one run said both.
+                    let worker = match task.cost_usd {
+                        Some(cost) => format!("${cost:.4}"),
+                        None => "$?".to_owned(),
+                    };
                     let _ = writeln!(
                         out,
-                        "  {}: committed {sha} — {} [{}] ({:.1}s, {} ${:.4}{review})",
+                        "  {}: committed {sha} — {} [{}] ({:.1}s, {} {worker}{review})",
                         task.id,
                         task.title,
                         task.trail(),
                         task.duration.as_secs_f64(),
                         task.model,
-                        task.cost_usd.unwrap_or(0.0),
                     );
                 }
                 TaskRunStatus::Failed { reason, .. } => {
@@ -8247,6 +8255,59 @@ mod tests {
             "nothing should have been left for the resume to discard: {:?}",
             resumed.warnings
         );
+    }
+
+    #[test]
+    fn an_unpriced_worker_reads_as_unreported_rather_than_free() {
+        // §13's rule, on the line an operator actually reads. The ledger has
+        // always shown `—` for a route that reports no dollars, and the review
+        // half of this line has said `$?` since step 9 — but the worker half
+        // used `unwrap_or(0.0)`, so a codex-implemented task printed
+        // `gpt-5.6-sol $0.0000` above a ledger row reading `—`. One run, two
+        // answers, and the wrong one is the one that looks precise.
+        let mut task = task_report_costing(None, None);
+        task.id = "t1".to_owned();
+        task.model = "gpt-5.6-sol".to_owned();
+        task.status = TaskRunStatus::Committed {
+            sha: "abc123".to_owned(),
+        };
+        let report = RunReport {
+            run_id: "01RUN".to_owned(),
+            branch: "b".to_owned(),
+            gates: Vec::new(),
+            gates_from_config: false,
+            warnings: Vec::new(),
+            tasks: vec![task],
+            halted_at: None,
+            questions: Vec::new(),
+            budget_stop: None,
+            total_cost_usd: 0.0,
+            pool_drain: Vec::new(),
+            running: false,
+            interrupted: false,
+        };
+
+        let rendered = report.render();
+        assert!(rendered.contains("gpt-5.6-sol $?"), "{rendered}");
+        let task_line = rendered
+            .lines()
+            .find(|l| l.contains("t1: committed"))
+            .expect("the task line");
+        assert!(
+            !task_line.contains("$0.0000"),
+            "unreported spend rendered as free: {task_line}"
+        );
+        // NOTE: `total:` below still prints `$0.0000` for this run, because
+        // `RunReport::total_cost_usd` is an `f64` that cannot distinguish a
+        // zero sum from an unreported one, and only `review_cost_incomplete`
+        // currently marks a total as a floor. A worker that reports nothing
+        // sets no such flag. Same §13 rule, one level up, and a wider change —
+        // recorded here rather than silently widened into this fix.
+
+        // And a route that does report keeps its figure.
+        let mut priced = report;
+        priced.tasks[0].cost_usd = Some(0.2020);
+        assert!(priced.render().contains("$0.2020"), "{}", priced.render());
     }
 
     #[test]
