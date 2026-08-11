@@ -28,3 +28,11 @@
 An implementation of the refusal remedy above ([PR #4](https://github.com/keybindings/tactus/pull/4)) was reviewed at max effort and the refusal design was found unsound — the severe defects were consequences of comparing configs at all, not edge cases in the comparison. The revised direction is that **resume rebuilds its gates from `run_started` and runs those**, with a warning naming any difference rather than a refusal, on the argument that it is strictly stronger: a weakened gate never governs anything instead of being detected after the fact, and it matches what the codebase already does for the review plan and `private_dir`.
 
 Recorded here as *in flight, not decided*: that work is unmerged at the time of writing. When it lands, its own record supersedes this one's remedy — the finding above is unaffected either way.
+
+## Deferred candidate — adopting new gates mid-run
+
+Once the record governs a resume, an operator cannot change what verifies a run without starting a new one. **That is the design working, not a gap** — a review finding claiming otherwise was withdrawn, because the example did not survive being taken apart: a typo that always *fails* commits nothing, so a new run costs almost nothing, and a typo that always *passes* commits work that a new run is the correct answer to.
+
+What remains is narrower: a gate that was legitimately fine and needs *adjusting* after real commits — plausibly a `timeout_secs` too tight for a slower attempt — where the operator must redo honest work to widen a limit. An opt-in `tactus resume --adopt-gates`, recording the switch as an event so the ledger can say which tasks were verified against which standard, is the obvious shape.
+
+**Deliberately not built**, under this project's own evidence rule: the scenario has not occurred here, the shape above is a guess rather than a measured requirement, and the first real occurrence will say more about what it should be than any amount of reasoning now. Revisit when it bites.
