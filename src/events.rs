@@ -293,20 +293,28 @@ pub struct RunStarted {
     /// that config moved: `Progress.rung` is an index into this chain, and
     /// re-resolving a different one would silently point it at another tier.
     pub chains: Vec<ChainSummary>,
-    /// The effective gates, command and name both, as the run resolved them.
-    /// `gates` above names them for the reader; this is what resume verifies.
-    /// Names alone cannot: a `[[gates]]` edit that keeps a name and changes its
-    /// command (`cmd = "cargo test"` → `cmd = "true"`) reads identically — and
-    /// the workspace an implementer edits contains the very `tactus.toml` the
-    /// gates are read from, so a resume that re-derived them would adopt a
-    /// standard the run never promised. Gate commands are verification
-    /// identity, recorded-and-refused like the plan hash and the chains;
-    /// budgets stay deliberately re-derived
-    /// ([`ResumeOptions::budget_usd`](crate::engine::ResumeOptions)).
+    /// The effective gates in full, as the run resolved them at pre-flight —
+    /// **the gates a resume runs**, not merely a fingerprint it compares.
+    /// `gates` above names them for the reader; this is the executable record.
+    ///
+    /// A live run is snapshot-safe by construction: config is parsed once into
+    /// the analysis and gates execute from memory, so a mid-run edit to
+    /// `tactus.toml` cannot change what a running task is verified against.
+    /// Resume honours the same snapshot by rebuilding these gates and running
+    /// them, which is what makes every `task_committed` in one log mean the
+    /// same thing. Re-deriving from today's config instead would let the
+    /// workspace an implementer edits — which contains the very `tactus.toml`
+    /// the gates come from — set the standard for the tasks that follow.
+    ///
+    /// This is the `reviews` contract below, applied to the other half of §14's
+    /// verification: recorded because it is a fact about the run, not about
+    /// today's machine. Budgets stay deliberately re-derived
+    /// ([`ResumeOptions::budget_usd`](crate::engine::ResumeOptions)) because a
+    /// ceiling on one's own spending is not identity.
     ///
     /// `None` means the log predates this record and says nothing about the
-    /// commands — not that there were none. Absent means re-derive and warn,
-    /// exactly the `reviews` contract below. Pure addition otherwise:
+    /// gates — not that there were none. Absent means re-derive and warn,
+    /// exactly as an absent `reviews` does. Pure addition otherwise:
     /// `#[serde(default)]` folds an old log to the state it always had, so
     /// `SCHEMA_VERSION` does not move.
     #[serde(default)]
@@ -337,18 +345,28 @@ pub struct ChainSummary {
     pub attempts_per: u32,
 }
 
-/// One effective gate as it stood when the run started: the name the ledger
-/// and the log tail call it, and the command that is that gate's whole meaning.
+/// One effective gate as it stood when the run started — everything needed to
+/// run it again, because a resume does exactly that.
 ///
-/// Deliberately not `timeout` or `shell`: those say how long a gate may take
-/// and how it is spawned — operational settings a resume is free to re-read,
-/// like a budget, and pinning `shell` would refuse a record §15 wants portable
-/// (a run started on Windows, resumed under WSL). Name and command are what
-/// decide *what passing meant*.
+/// All four fields, not just name and command. An earlier draft recorded the
+/// pair alone on the theory that `timeout` and `shell` are operational settings
+/// a resume may re-read; that is wrong about `shell`, which is half of what a
+/// command *means* (see [`ShellKind`](crate::gates::ShellKind)) — the same
+/// `cmd = "true"` passes always under `sh` and fails always under `cmd.exe`.
+/// And it is wrong about `timeout` in the same direction, one step weaker: a
+/// gate that was given twenty minutes and is given one verifies less.
+///
+/// The portability this costs is smaller than it looks. Resuming a run on a
+/// machine whose shell it never had is already impossible for an unrelated
+/// reason — `run_started.private_dir` records an absolute host path — so the
+/// case the pair-only record was protecting does not exist.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct GateSummary {
     pub name: String,
     pub cmd: String,
+    #[serde(rename = "timeout_ms", with = "crate::util::duration_millis")]
+    pub timeout: Duration,
+    pub shell: crate::gates::ShellKind,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1524,6 +1542,8 @@ mod tests {
                 gate_cmds: Some(vec![GateSummary {
                     name: "check".to_owned(),
                     cmd: "cargo check".to_owned(),
+                    timeout: Duration::from_secs(600),
+                    shell: crate::gates::ShellKind::Sh,
                 }]),
             }),
         }
@@ -1825,10 +1845,11 @@ mod tests {
 
     #[test]
     fn a_run_started_without_gate_commands_reads_as_unrecorded() {
-        // The shape every log written before the gate-command record has.
-        // `None`, not an empty list: "said nothing about the commands" and
-        // "said there were none" must stay distinguishable — the same rule
-        // `reviews` follows for logs that predate step 9.
+        // The shape every log written before the gate record has. `None`, not
+        // an empty list: "said nothing about the gates" and "said there were
+        // none" must stay distinguishable — the same rule `reviews` follows for
+        // logs that predate step 9, and the difference between re-deriving with
+        // a warning and running a run with verification switched off.
         let EventBody::RunStarted { data } = started() else {
             panic!("started() builds a run_started");
         };
@@ -1840,13 +1861,44 @@ mod tests {
                 .expect("data")
                 .remove("gate_cmds")
                 .is_some(),
-            "a fresh run records its gate commands"
+            "a fresh run records its gates"
         );
         let event: Event = serde_json::from_value(json).expect("an old log still parses");
         let EventBody::RunStarted { data } = event.body else {
             panic!("still a run_started");
         };
         assert_eq!(data.gate_cmds, None);
+    }
+
+    #[test]
+    fn a_recorded_gate_survives_the_wire_intact_enough_to_run_again() {
+        // Resume rebuilds its gates from this record and executes them, so a
+        // field that does not round-trip is a gate that runs differently the
+        // second time. `shell` in particular: the same `cmd` is an always-pass
+        // builtin under one and not a program at all under another.
+        let EventBody::RunStarted { data } = started() else {
+            panic!("started() builds a run_started");
+        };
+        let recorded_gates = data.gate_cmds.clone();
+        let line =
+            serde_json::to_string(&Event::now(EventBody::RunStarted { data })).expect("serialize");
+        let json: serde_json::Value = serde_json::from_str(&line).expect("valid json");
+        // Readable in the raw log, like every other duration in it.
+        assert_eq!(json["data"]["gate_cmds"][0]["timeout_ms"], 600_000);
+        assert_eq!(json["data"]["gate_cmds"][0]["shell"], "sh");
+
+        let event: Event = serde_json::from_str(&line).expect("round trip");
+        let EventBody::RunStarted { data: read_back } = event.body else {
+            panic!("still a run_started");
+        };
+        assert_eq!(read_back.gate_cmds, recorded_gates);
+        // And the shell spells the same way in the log as in `tactus.toml`, so
+        // an operator comparing the two is comparing like with like.
+        let recorded = read_back.gate_cmds.expect("gates");
+        assert_eq!(
+            crate::gates::ShellKind::parse("sh"),
+            Some(recorded[0].shell)
+        );
     }
 
     #[test]

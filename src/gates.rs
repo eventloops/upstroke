@@ -14,6 +14,8 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::Duration;
 
+use serde::{Deserialize, Serialize};
+
 use crate::agent::proc;
 use crate::error::TactusError;
 use crate::util;
@@ -21,7 +23,16 @@ use crate::workspace::Workspace;
 
 /// §17 `[engine].shell` — the shell gate commands run under. Default is the
 /// platform-native one.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+///
+/// Serialized into the run record (§15) because it is half of what a gate
+/// command *means*: `command` below hands the same string to a different
+/// interpreter per variant, and `cmd = "true"` is an always-pass builtin under
+/// `sh` while being neither a `cmd.exe` builtin nor a PATH program. A record
+/// carrying the command without the shell would describe a gate nobody can
+/// reproduce. The wire form matches [`parse`](ShellKind::parse), so config and
+/// log spell a shell the same way.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
 pub enum ShellKind {
     Cmd,
     Sh,
@@ -135,6 +146,23 @@ pub struct ShellGate {
     pub cmd: String,
     pub timeout: Duration,
     pub shell: ShellKind,
+}
+
+impl ShellGate {
+    /// Rebuild a gate from the run record (§15), so a resume verifies against
+    /// what the run verified against rather than against today's config.
+    ///
+    /// Total, and deliberately so: the record carries every field a gate needs,
+    /// which is why it can be rebuilt at all. Whether the shell is *installed*
+    /// on this machine is pre-flight's question, not this one's.
+    pub fn from_record(record: &crate::events::GateSummary) -> Self {
+        Self {
+            name: record.name.clone(),
+            cmd: record.cmd.clone(),
+            timeout: record.timeout,
+            shell: record.shell,
+        }
+    }
 }
 
 impl Gate for ShellGate {

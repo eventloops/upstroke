@@ -94,6 +94,28 @@ All five wrap-up threads approved by the owner the same day: (1) this folder cre
 
 **Config hardening before the first self-hosted run:** blast-radius override in this repo's `tactus.toml` — `paths = ["tactus.toml"]` with `second_opinion = "different-vendor"` — so any diff touching gate definitions gets cross-family eyes. **Rejected:** hard-denying `tactus.toml` edits to implementers — self-hosting tasks legitimately touch config, and gate commands execute repository scripts anyway (§21's runner rationale); review plus refusal-on-resume is the proportionate pair.
 
-## Addendum D (2026-08-11) — Addendum C's resume gap: closed
+## Addendum D (2026-08-11) — Addendum C's resume gap: first implementation
 
-Implemented as flagged: `run_started` now records each gate's name **and command** (`gate_cmds`), and resume refuses on mismatch with the chains-refusal shape ("Restore the config it ran with, or start a new run."). Logs predating the record warn and re-derive, like the pre-step-9 review record. DESIGN.md §15's refusal list gains gates alongside the plan hash and chains; `timeout`/`shell` stay deliberately re-derived (operational settings, and pinning `shell` would refuse the Windows-started/WSL-resumed record §15 wants portable).
+Implemented as flagged: `run_started` records each gate's name **and command** (`gate_cmds`), and resume refuses on mismatch with the chains-refusal shape. Logs predating the record warn and re-derive, like the pre-step-9 review record. `timeout`/`shell` left re-derived as operational settings.
+
+**Superseded the same day by Addendum E** — a multi-model review of the implementation found the refusal design unsound. Recorded rather than edited away, per this folder's contract; the reasoning is in E.
+
+## Addendum E (2026-08-11) — gates are taken from the record, not refused over
+
+**Verdict: resume rebuilds its gates from `run_started` and runs those.** A config that differs today produces a warning naming the difference, not a refusal. This reverses Addendum C's prescription ("resume refuses on mismatch") and D's implementation of it.
+
+**What changed our mind.** A max-effort review of the D implementation (10 finder angles, adversarial verification with executed probes) returned ~20 confirmed defects, and the severe ones were not edge cases in the comparison — they were consequences of comparing at all:
+
+- **The self-hosting case it was built for became unresumable.** A gate edit committed by the run's own gate-passed, cross-family-reviewed task refuses, and both remedies the message offered are self-defeating: restoring the config uncommitted passes the check and is then destroyed by §14's own residue discard (reported back to the operator as "uncommitted path(s) left by the interrupted run"), while committing the restore trips the HEAD check. Verified by probe.
+- **The verdict depended on which branch the operator was standing on**, since config is read at pre-flight, before the branch switch. The same run, same instant, refused from `main` and resumed cleanly from the run branch.
+- **It refused over crash residue that resume itself discards** eleven lines later, failing identically on every retry until someone ran `git checkout -- tactus.toml` by hand.
+- **It broke §15's orphan-commit adoption promise**, refusing before the adoption block could run.
+- Plus: derived gates (no `[[gates]]`) treated as config identity, so a committed `Cargo.toml` refused the run forever with the remedy "restore the config" naming a config that never existed; refusal ahead of the already-completed check; refusal with zero tasks committed, breaking the one-command budget-stop recovery; and a message that reported edits nobody made whenever gate names repeated, which `[[gates]]` permits.
+
+**Why taking the record is better, not merely different.** It is *stronger*: refusing detects a weakened gate and stops the run; taking the record means the weakened gate never governs anything, and the run continues. It also matches what the codebase already does twice — the review plan and `private_dir` are read from the record for the same stated reason, "a fact about the run, not about today's machine" — and what a live run does by construction (Addendum C's own opening observation: config is parsed once into the analysis, so a mid-run edit cannot change a live run's gates). Honouring that snapshot across an interruption is what makes a resume the same run rather than a new one wearing its branch.
+
+**What it costs, stated plainly.** An operator who genuinely needs different gates — a typo'd command, a gate that cannot pass — must start a new run rather than resume; the warning says so. That is the same constraint a live run has, and it is now honest instead of silently re-derived.
+
+**Also revised:** `shell` and `timeout` are recorded after all. D excused omitting `shell` on portability grounds; the review found the rationale unsupported (DESIGN.md §15 claims no such portability, §21 recommends running the whole conductor under WSL, and `private_dir` records an absolute host path, so a Windows-started/WSL-resumed run is already impossible). Shell is half of what a command means: `cmd = "true"` — D's own example of a weakened gate — always passes under `sh` and is not a program at all under `cmd.exe`.
+
+**Addendum C's other half, now landed:** the blast-radius override C decided on did not exist, because this repo had no `tactus.toml` at all — so a diff touching gate definitions would have gone to ordinary same-family review, not the cross-family eyes C required. Added in this change, along with explicit gates matching CI. C's "review plus refusal-on-resume is the proportionate pair" now reads: review plus *the record governing the resume*.

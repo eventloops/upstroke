@@ -1,0 +1,38 @@
+# tactus, run through tactus (decisions/2026-08-11-design-council.md, Addendum B).
+#
+# Repo-level overrides only; subscriptions live in ~/.tactus/pools.toml, which
+# travels with the person rather than the repository (§17).
+
+# The gates CI runs, spelled the same way, so a task that passes here passes
+# there. Local green is not CI green when the two lists disagree — and these are
+# what `run_started` records and a resume runs, so they are also the definition
+# of what "verified" meant for every commit this repo's own runs produce.
+[[gates]]
+name = "fmt"
+cmd = "cargo fmt --check"
+timeout_secs = 120
+
+[[gates]]
+name = "clippy"
+cmd = "cargo clippy --all-targets -- -D warnings"
+timeout_secs = 900
+
+[[gates]]
+name = "test"
+cmd = "cargo test --all-targets"
+timeout_secs = 1800
+
+# Blast radius (§11.3), decided in Addendum C and landed in Addendum E: a diff
+# that edits this file edits the gate definitions that verify every other diff,
+# so it gets a second reviewer from a different model family before it can be
+# committed.
+#
+# Hard-denying config edits to implementers was considered and rejected there:
+# self-hosting tasks legitimately touch config, and a gate command executes
+# repository code anyway (§21), so a deny rule buys less than it looks like it
+# does. Cross-family review is the proportionate control — paired with the run
+# record governing what a resume verifies against, so an edit that lands here
+# applies to the next run rather than retroactively to this one.
+[[routing.overrides]]
+paths = ["tactus.toml", "DESIGN.md"]
+second_opinion = "different-vendor"
