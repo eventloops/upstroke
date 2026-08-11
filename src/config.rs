@@ -18,7 +18,7 @@ use crate::catalog;
 use crate::error::TactusError;
 use crate::gates::ShellKind;
 use crate::interaction::InteractionMode;
-use crate::ir::{TaskKind, Tier};
+use crate::ir::{Effort, TaskKind, Tier};
 use crate::util;
 
 #[derive(Debug, Default, Deserialize)]
@@ -117,6 +117,10 @@ struct RawPin {
     tier: Tier,
     agent: String,
     model: String,
+    /// Optional override of the tier's default reasoning effort (§10). A pin is
+    /// already where determinism is bought, so it is where a deliberate `max`
+    /// belongs.
+    effort: Option<String>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -258,6 +262,7 @@ pub struct Pin {
     pub tier: Tier,
     pub agent: String,
     pub model: String,
+    pub effort: Option<Effort>,
 }
 
 /// One `[[gates]]` entry (§17). `None` for the whole list means the section
@@ -353,6 +358,23 @@ impl Config {
                 attempts_per: DEFAULT_ATTEMPTS_PER,
                 from_config: false,
             })
+    }
+
+    /// The effort a profile bound at this tier runs under: a pin's override,
+    /// else the tier's default (§10). One rule for implementers and reviewers
+    /// alike, resolved the same way the binding itself is.
+    pub fn effort_for(&self, tier: Tier) -> Effort {
+        self.pins
+            .iter()
+            .find(|pin| pin.tier == tier)
+            .and_then(|pin| pin.effort)
+            .unwrap_or_else(|| Effort::for_tier(tier))
+    }
+
+    /// Effort every reviewer judges at — the review tier's, with §11.2's
+    /// frontier default when the config is silent about it.
+    pub fn review_effort(&self) -> Effort {
+        self.effort_for(self.review_tier.unwrap_or(Tier::Frontier))
     }
 }
 
@@ -582,10 +604,30 @@ pub fn load_with(
             ));
             continue;
         }
+        // Validated here rather than discovered at spend time: the provider
+        // rejects an unknown effort with a 400 *after* the turn has started
+        // (measured 2026-08-11), so a typo costs a whole attempt instead of a
+        // config error. Same posture as the pinned-model check above.
+        let effort = match pin.effort.as_deref().map(Effort::parse) {
+            Some(None) => {
+                return Err(TactusError::Config {
+                    path: repo_path.clone(),
+                    message: format!(
+                        "pin for tier `{}` sets effort `{}`, which is not one of: {}",
+                        pin.tier,
+                        pin.effort.unwrap_or_default(),
+                        Effort::KNOWN
+                    ),
+                });
+            }
+            Some(effort) => effort,
+            None => None,
+        };
         pins.push(Pin {
             tier: pin.tier,
             agent: pin.agent,
             model: pin.model,
+            effort,
         });
     }
 
@@ -1264,6 +1306,45 @@ model = "claude-opus-4-8"
             msg.contains("claude-opus-4-8"),
             "should list known models: {msg}"
         );
+    }
+
+    #[test]
+    fn effort_defaults_by_tier_and_a_pin_overrides_it() {
+        // What makes a tier mean something to an agent with an effort axis: a
+        // chain that escalates has to move this too, or every rung thinks
+        // exactly as hard as the last one.
+        let path = scratch(
+            "effortpin.toml",
+            "[[pins]]\ntier = \"frontier\"\nagent = \"claude-code\"\nmodel = \"claude-opus-5\"\n\
+             effort = \"max\"\n",
+        );
+        let mut warnings = Vec::new();
+        let cfg = load(Some(&path), &hermetic(), Some(&missing()), &mut warnings).expect("load");
+        assert_eq!(cfg.effort_for(Tier::Small), Effort::Low);
+        assert_eq!(cfg.effort_for(Tier::Mid), Effort::Medium);
+        // The pin wins over the tier's `high` default — that is what a pin is
+        // for, and `max` is deliberately only reachable this way.
+        assert_eq!(cfg.effort_for(Tier::Frontier), Effort::Max);
+        // Reviewers judge at the review tier, which defaults to frontier.
+        assert_eq!(cfg.review_effort(), Effort::Max);
+    }
+
+    #[test]
+    fn a_misspelled_effort_is_a_config_error_not_a_burned_attempt() {
+        // The provider rejects an unknown effort with a 400 after the turn has
+        // started (measured), so a typo would otherwise cost an attempt and
+        // report as an agent failure. Same posture as the pinned-model check.
+        let path = scratch(
+            "badeffort.toml",
+            "[[pins]]\ntier = \"mid\"\nagent = \"claude-code\"\nmodel = \"claude-sonnet-5\"\n\
+             effort = \"maximum\"\n",
+        );
+        let mut warnings = Vec::new();
+        let err = load(Some(&path), &hermetic(), Some(&missing()), &mut warnings)
+            .expect_err("an unknown effort must error");
+        let msg = err.to_string();
+        assert!(msg.contains("maximum"), "names what was written: {msg}");
+        assert!(msg.contains("low, medium, high, max"), "lists valid: {msg}");
     }
 
     #[test]

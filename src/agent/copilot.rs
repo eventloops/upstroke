@@ -423,6 +423,9 @@ mod tests {
             model: "gpt-5.3-codex".to_owned(),
             pool: "copilot".to_owned(),
             permissions,
+            // As with the Claude adapter: no effort flag on this CLI, so the
+            // field rides along unused rather than being faked into `--model`.
+            effort: Some(crate::ir::Effort::Medium),
             max_turns: Some(30),
             extra_args: Vec::new(),
         }

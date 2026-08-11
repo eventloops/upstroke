@@ -1,8 +1,9 @@
 # Decision record — multi-model design council for tactus
 
 **Date:** 2026-08-11
-**Status:** Decided — adopted as manual practice now; machinery deferred pending the miss/catch record (v0.3 design-pane era at the earliest). All five follow-up threads approved same day (addenda A–C).
+**Status:** Decided — adopted as manual practice now; machinery deferred pending the miss/catch record (v0.3 design-pane era at the earliest).
 **Inputs:** *Tactus Multi-Model Design Council* and *Tactus Adaptive Agent Routing Engine* (GPT-5.6-sol drafts, kept outside the repo), reviewed against DESIGN.md v2.1 (§2, §5, §11.3, §21, §23.2) in a Fable 5 critique session. Decisions: project owner.
+**Siblings from the same session** (originally addenda here, split out per `README.md`): [self-hosting v0.2](2026-08-11-self-hosting-v02.md) · [resume gate config](2026-08-11-resume-gate-config.md) · [Codex reasoning effort](2026-08-11-codex-reasoning-effort.md).
 
 **The idea under decision:** run high-stakes tactus design decisions through multiple independent frontier models — independent proposals, cross-critique, synthesis, adversarial review — instead of a single designer. The sol doc proposes it as a five-phase product subsystem ("council mode").
 
@@ -66,58 +67,9 @@ Adopt the council **through the self-hosting/bootstrap lens, manual-first, zero 
 ## Related dispositions from the same review (recorded lightly)
 
 - **Adaptive routing doc, learning phases (Bayesian → bandit → learned ranking): parked indefinitely — not worth accounting for now.** Two structural reasons at personal scale: single-digit observations per (kind × tier × model) cell, and data half-life — model rosters churn quarterly, so the dataset decays about as fast as it grows. The live path remains §23.2's kill test: the predict-before-running protocol and its miss log decide whether rung/cost prediction ships as a `--dry-run` step.
-- **Salvage candidates from the routing doc** (spec changes if adopted — v0.2 `export-decisions`/event schema, justified for *interpretability of small data*, not ML): failure taxonomy on outcomes; full agent identity incl. versions per attempt; `selection_origin` (auto / user-override / pin / exploration); pre-execution difficulty/feature snapshot; marking evidence-free failures (infra) apart from capability failures. **Status: candidates — to be decided when the export-decisions plan is designed (see Addendum B: it is the first self-hosted run).**
+- **Salvage candidates from the routing doc** (spec changes if adopted — v0.2 `export-decisions`/event schema, justified for *interpretability of small data*, not ML): failure taxonomy on outcomes; full agent identity incl. versions per attempt; `selection_origin` (auto / user-override / pin / exploration); pre-execution difficulty/feature snapshot; marking evidence-free failures (infra) apart from capability failures. **Status: candidates — to be decided when the export-decisions plan is designed, which is the first self-hosted run ([self-hosting v0.2](2026-08-11-self-hosting-v02.md)).** Item #2 has since landed with a concrete shape — see [Codex reasoning effort](2026-08-11-codex-reasoning-effort.md).
 - **Process rule from the review itself:** any future sol design draft gets DESIGN.md's relevant sections in its context (at minimum §§3–5, 8, 10–13, 21, 23.2). Both docs were written without the spec and re-derived or contradicted recorded decisions — the failure mode the council doc's own context-manifest rule (§43) exists to prevent.
 
----
+## Follow-ups approved the same day
 
-## Addendum A (2026-08-11) — follow-up threads approved
-
-All five wrap-up threads approved by the owner the same day: (1) this folder created under the contract in `decisions/README.md`; (2) self-hosting v0.2 confirmed (Addendum B); (3) DESIGN.md §21's v0.3 learned-routing line reconciled with §23.2, citing this record; (4) the five telemetry fields stay candidates, decided at export-decisions plan time; (5) the gate-config hardening check performed (Addendum C).
-
-## Addendum B (2026-08-11) — self-hosting v0.2 through tactus: decided
-
-**Verdict:** v0.2 development runs through tactus wherever the v0.1 envelope allows, starting now.
-
-- **The claim is auditable, not asserted.** Engine-owned commits carry `[tactus] <task-id>` and every commit has a run ledger and event log behind it, so "N% of v0.2 was written by tactus" is a `git log --grep` result with receipts — the §23.1 "pen" pitch pointed at our own repo. Report the measured number by task count, and say plainly that difficulty-weighted share is lower.
-- **Envelope expectations, stated up front:** isolated v0.2 items flow through the engine (export-decisions, plan adapters, Aider adapter, notifiers); the scheduler rework and runner core may stay interactive or run as single-task frontier plans with heavy review. Every v0.2 defect invites "the tool wrote that" — the answer is the review record and the defect loop, not defensiveness.
-- **First run: the export-decisions schema work** — the five candidate fields above become its plan, decided at plan time. This closes today's loop (the first tactus-built v0.2 tasks implement the salvage from the review that decided to self-host) and starts filling §23.2's recorded gap: no numbers exist for the frontier-implementer regime.
-- **Operational:** runs happen WSL-side (all three CLIs work there; the Codex implementer only works there); the predict-before-running protocol applies to every run; misses land in the miss log.
-
-## Addendum C (2026-08-11) — gate-config hardening: verified, one gap found
-
-**Live runs are snapshot-safe by construction:** config is parsed at pre-flight into the analysis and gates execute from memory, so a mid-run edit to `tactus.toml` cannot change a live run's gates.
-
-**Resume has a real gap, confirmed in code:** `resume` re-resolves gates from today's config "exactly as a fresh run does" (`src/engine.rs`, resume path) — unlike the plan hash and the routing chains, which are recorded-and-refused on mismatch. `run_started` records only gate *names*, so a `[[gates]]` command edited between a run and its resume — including by an implementer agent that edited the workspace's own `tactus.toml` before an interruption — is silently adopted; a name-preserving command change (`cmd = "cargo test"` → `cmd = "true"`) is invisible even to a name comparison. The codebase already articulates the governing distinction (budgets are deliberately re-derived because they are an operator ceiling, not identity; chains are refused because they are identity) — gate commands are *verification identity* and belong on the refused side.
-
-**Fix (flagged for a separate implement session):** record gate commands (or a fingerprint) in `run_started`; resume refuses on mismatch with the chains-refusal phrasing; logs predating the record warn and re-derive, like the pre-step-9 review record; DESIGN.md §15's refusal list gains gates alongside the plan hash and chains.
-
-**Config hardening before the first self-hosted run:** blast-radius override in this repo's `tactus.toml` — `paths = ["tactus.toml"]` with `second_opinion = "different-vendor"` — so any diff touching gate definitions gets cross-family eyes. **Rejected:** hard-denying `tactus.toml` edits to implementers — self-hosting tasks legitimately touch config, and gate commands execute repository scripts anyway (§21's runner rationale); review plus refusal-on-resume is the proportionate pair.
-
-## Addendum D (2026-08-11) — Addendum C's resume gap: first implementation
-
-Implemented as flagged: `run_started` records each gate's name **and command** (`gate_cmds`), and resume refuses on mismatch with the chains-refusal shape. Logs predating the record warn and re-derive, like the pre-step-9 review record. `timeout`/`shell` left re-derived as operational settings.
-
-**Superseded the same day by Addendum E** — a multi-model review of the implementation found the refusal design unsound. Recorded rather than edited away, per this folder's contract; the reasoning is in E.
-
-## Addendum E (2026-08-11) — gates are taken from the record, not refused over
-
-**Verdict: resume rebuilds its gates from `run_started` and runs those.** A config that differs today produces a warning naming the difference, not a refusal. This reverses Addendum C's prescription ("resume refuses on mismatch") and D's implementation of it.
-
-**What changed our mind.** A max-effort review of the D implementation (10 finder angles, adversarial verification with executed probes) returned ~20 confirmed defects, and the severe ones were not edge cases in the comparison — they were consequences of comparing at all:
-
-- **The self-hosting case it was built for became unresumable.** A gate edit committed by the run's own gate-passed, cross-family-reviewed task refuses, and both remedies the message offered are self-defeating: restoring the config uncommitted passes the check and is then destroyed by §14's own residue discard (reported back to the operator as "uncommitted path(s) left by the interrupted run"), while committing the restore trips the HEAD check. Verified by probe.
-- **The verdict depended on which branch the operator was standing on**, since config is read at pre-flight, before the branch switch. The same run, same instant, refused from `main` and resumed cleanly from the run branch.
-- **It refused over crash residue that resume itself discards** eleven lines later, failing identically on every retry until someone ran `git checkout -- tactus.toml` by hand.
-- **It broke §15's orphan-commit adoption promise**, refusing before the adoption block could run.
-- Plus: derived gates (no `[[gates]]`) treated as config identity, so a committed `Cargo.toml` refused the run forever with the remedy "restore the config" naming a config that never existed; refusal ahead of the already-completed check; refusal with zero tasks committed, breaking the one-command budget-stop recovery; and a message that reported edits nobody made whenever gate names repeated, which `[[gates]]` permits.
-
-**Why taking the record is better, not merely different.** It is *stronger*: refusing detects a weakened gate and stops the run; taking the record means the weakened gate never governs anything, and the run continues. It also matches what the codebase already does twice — the review plan and `private_dir` are read from the record for the same stated reason, "a fact about the run, not about today's machine" — and what a live run does by construction (Addendum C's own opening observation: config is parsed once into the analysis, so a mid-run edit cannot change a live run's gates). Honouring that snapshot across an interruption is what makes a resume the same run rather than a new one wearing its branch.
-
-**What it costs, stated plainly.** An operator who genuinely needs different gates — a typo'd command, a gate that cannot pass — must start a new run rather than resume; the warning says so. That is the same constraint a live run has, and it is now honest instead of silently re-derived.
-
-**Also revised:** `shell` and `timeout` are recorded after all. D excused omitting `shell` on portability grounds; the review found the rationale unsupported (DESIGN.md §15 claims no such portability, §21 recommends running the whole conductor under WSL, and `private_dir` records an absolute host path, so a Windows-started/WSL-resumed run is already impossible). Shell is half of what a command means: `cmd = "true"` — D's own example of a weakened gate — always passes under `sh` and is not a program at all under `cmd.exe`.
-
-**The pre-record population is closed too.** A log written before `gate_cmds` existed has nowhere to carry the record, so its first resume must re-derive — and if that resume records nothing, so must every resume after it, leaving a gate weakened between two of them silently adopted. The resume that re-derives now writes what it settled on into its own `run_resumed`, and every resume after it is an ordinary record-bearing one. Only that resume writes it: where the log already answers the question, re-stating the answer would give one fact two homes that a later change could pull apart.
-
-**Addendum C's other half, now landed:** the blast-radius override C decided on did not exist, because this repo had no `tactus.toml` at all — so a diff touching gate definitions would have gone to ordinary same-family review, not the cross-family eyes C required. Added in this change, along with explicit gates matching CI. C's "review plus refusal-on-resume is the proportionate pair" now reads: review plus *the record governing the resume*.
+All five wrap-up threads from this session were approved by the owner: (1) the `decisions/` folder created under the contract in `README.md`; (2) self-hosting v0.2 confirmed — [its own record](2026-08-11-self-hosting-v02.md); (3) DESIGN.md §21's v0.3 learned-routing line reconciled with §23.2, citing this record; (4) the five telemetry fields left as candidates, to be decided at export-decisions plan time; (5) the gate-config hardening check performed — [its own record](2026-08-11-resume-gate-config.md).
