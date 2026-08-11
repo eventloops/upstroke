@@ -462,6 +462,13 @@ struct Recorded {
     reviews: Option<ReviewPlan>,
     /// What verifies it. `None` for a log written before the gate record.
     gates: Option<Vec<GateSummary>>,
+    /// Whether those gates came from `[[gates]]` rather than the repo's shape.
+    ///
+    /// Travels with them, and read only when `gates` is `Some`: it is a label
+    /// *on the recorded list*, so leaving it to be re-derived would have the
+    /// run's own report and a later `status` disagree about the same gates —
+    /// the drift this record exists to stop, one field short of stopped.
+    gates_from_config: bool,
 }
 
 fn preflight(opts: &RunOptions, harness: &Harness<'_>) -> Result<Preflight, TactusError> {
@@ -511,6 +518,7 @@ fn preflight_with_recorded(
             warnings.push(difference);
         }
         analysis.gates = record.iter().map(ShellGate::from_record).collect();
+        analysis.gates_from_config = recorded.gates_from_config;
     }
 
     let mut review_plan = match recorded.reviews {
@@ -996,6 +1004,7 @@ fn resume_harness_inner(
         Recorded {
             reviews: started.reviews.clone(),
             gates: recorded_gates.clone(),
+            gates_from_config: started.gates_from_config,
         },
     )?;
     if started.reviews.is_none() {
@@ -7320,6 +7329,30 @@ mod tests {
         );
         // The report describes the gates that ran, not the ones on disk.
         assert_eq!(resumed.gates, ["check"]);
+    }
+
+    #[test]
+    fn the_report_labels_gates_from_the_record_not_todays_config() {
+        // `gates` came from the record but `gates_from_config` did not, so the
+        // run's own report and a later `status` disagreed about the same list:
+        // `finish()` read today's analysis while `RunReport::from_state` read
+        // the record. The doc above `from_state` promises those two cannot
+        // drift, and this is the one field that still let them.
+        let (repo, run_id) = parked_run_with_gate("gatelabel", "git --version");
+        // `[[gates]]` deleted, so today's flag would be false and today's
+        // derivation empty — the temp repo has no project marker.
+        fs::write(repo.join("tactus.toml"), PARKED_RUN_CONFIG).expect("edit config");
+
+        let resumed = resume_answering(&repo, &run_id, Effect::EditFile);
+        assert_eq!(resumed.gates, ["check"], "the recorded gate ran");
+        assert!(
+            resumed.gates_from_config,
+            "and is labelled as the record has it, not as today's config would"
+        );
+        // The other half of the same promise: a reader replaying the log agrees.
+        let replayed = replay_of(&repo, &run_id).report();
+        assert_eq!(replayed.gates, resumed.gates);
+        assert_eq!(replayed.gates_from_config, resumed.gates_from_config);
     }
 
     #[test]
