@@ -30,7 +30,7 @@ Passing review evidence URL:
 - [ ] The independent frontier review used `max` effort on the exact current head
 - [ ] Every actionable finding is fixed; follow-ups contain only non-blocking suggestions or feature ideas
 - [ ] The evidence comment contains only `TACTUS_FRONTIER_REVIEW: 1`, `VERDICT: PASS`, and `REVIEWED_SHA: <full SHA>`
-- [ ] The `frontier-reviewed` deployment succeeded on the current head
+- [ ] The App-owned `tactus-frontier-review` check succeeded on the current head
 - [ ] Every review conversation is resolved
 
 ## Risk and rollback
