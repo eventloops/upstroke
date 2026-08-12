@@ -4,6 +4,14 @@ Contributions are welcome. Please open an issue before starting anything substan
 order in `DESIGN.md` §21 is deliberate, and it's worth checking that a change fits where the
 project currently is.
 
+Every change enters `master` through the same path: open a draft pull request early, wait for the
+deterministic CI and PR-policy gates, then obtain an independent frontier-model review of the exact
+green head before merge. The default-branch attestation workflow reruns the mechanical gates on
+that exact SHA and records the required `frontier-reviewed` deployment; a new push invalidates all
+of it and restarts the sequence. See [`MAINTAINING.md`](MAINTAINING.md) for the full lifecycle,
+attestation step, and emergency policy. Contributions from external forks remain provisional until
+the separately owned fork canary described there has passed.
+
 ## Before you send a PR
 
 The project holds itself to these; CI enforces all three:
@@ -13,6 +21,10 @@ cargo fmt --check
 cargo clippy --all-targets -- -D warnings
 cargo test --all-targets
 ```
+
+Use the pull-request template to record the exact commands, implementation provenance, reviewed
+SHA, review model and effort, evidence link, risk, and rollback. Resolve every review conversation;
+merge commits are the only accepted merge method.
 
 Conventions worth knowing: edition 2024, no panicking `.unwrap()` or `.expect()` calls outside
 tests, `anyhow` only at the binary edge (libraries return `thiserror` types), and all paths through
