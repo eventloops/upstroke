@@ -1383,21 +1383,24 @@ impl EventLog {
 
 /// Read a whole log.
 ///
-/// An unparseable **final** line is a torn tail — the shape a kill leaves — and
-/// is dropped with a warning. An unparseable line anywhere **else** is
-/// corruption: something rewrote history, and deriving state from the
+/// An unterminated **final** record is a torn tail — the shape a kill leaves —
+/// and is dropped with a warning. A newline is the commit marker written after
+/// every event, so any invalid newline-terminated record is corruption even
+/// when it is last: something rewrote history, and deriving state from the
 /// survivors would produce a confident wrong answer. That errors.
 pub fn read_all(path: &Path, warnings: &mut Vec<String>) -> Result<Vec<Event>, TactusError> {
-    let text = read_text(path)?;
-    parse_lines(path, &text, warnings)
+    let bytes = read_bytes(path)?;
+    let parsed = parse_bytes(path, &bytes)?;
+    warnings.extend(parsed.torn_tail_warning);
+    Ok(parsed.events)
 }
 
 /// Read the exact bytes a whole-log consumer will parse. Kept separate so a
 /// consumer that needs a stable snapshot can compare two reads before trusting
 /// the first one.
-pub(crate) fn read_text(path: &Path) -> Result<String, TactusError> {
-    match std::fs::read_to_string(path) {
-        Ok(text) => Ok(text),
+pub(crate) fn read_bytes(path: &Path) -> Result<Vec<u8>, TactusError> {
+    match std::fs::read(path) {
+        Ok(bytes) => Ok(bytes),
         Err(source) if source.kind() == std::io::ErrorKind::NotFound => {
             Err(TactusError::EventLog {
                 path: path.to_path_buf(),
@@ -1413,41 +1416,67 @@ pub(crate) fn read_text(path: &Path) -> Result<String, TactusError> {
     }
 }
 
-pub(crate) fn parse_lines(
-    path: &Path,
-    text: &str,
-    warnings: &mut Vec<String>,
-) -> Result<Vec<Event>, TactusError> {
-    let lines: Vec<&str> = text
-        .lines()
-        .filter(|line| !line.trim().is_empty())
-        .collect();
-    let mut events = Vec::with_capacity(lines.len());
-    let last = lines.len().saturating_sub(1);
-    for (position, line) in lines.iter().enumerate() {
-        match serde_json::from_str::<Event>(line) {
-            Ok(event) => events.push(event),
-            Err(error) if position == last => {
-                warnings.push(format!(
-                    "{}: dropped an incomplete final line ({error}) — the shape an interrupted \
-                     write leaves behind",
-                    path.display()
-                ));
-            }
-            Err(error) => {
-                return Err(TactusError::EventLog {
-                    path: path.to_path_buf(),
-                    message: format!(
-                        "line {} is not a valid event ({error}). This is not a torn tail — the \
-                         log has been rewritten, and state derived from what is left would be \
-                         confidently wrong.",
-                        position + 1
-                    ),
-                });
-            }
+/// A parsed whole-log snapshot. The only recoverable parse condition is typed
+/// separately from the events so callers never have to infer its meaning from
+/// human-readable warning text.
+pub(crate) struct ParsedLines {
+    pub events: Vec<Event>,
+    pub torn_tail_warning: Option<String>,
+}
+
+pub(crate) fn parse_bytes(path: &Path, bytes: &[u8]) -> Result<ParsedLines, TactusError> {
+    // EventLog::append writes the newline after the JSON bytes. EventLog::open
+    // likewise discards everything after the last newline before resuming, so
+    // whole-log readers must use the same boundary: even syntactically complete
+    // JSON without its terminating newline was never a committed event.
+    let committed_end = bytes
+        .iter()
+        .rposition(|byte| *byte == b'\n')
+        .map_or(0, |position| position + 1);
+    let (committed_bytes, trailing) = bytes.split_at(committed_end);
+    let torn_tail_warning = (!trailing.is_empty()).then(|| {
+        format!(
+            "{}: dropped an incomplete final line ({} trailing byte(s)) — the shape an \
+             interrupted write leaves behind",
+            path.display(),
+            trailing.len()
+        )
+    });
+    let committed = std::str::from_utf8(committed_bytes).map_err(|error| {
+        let line = committed_bytes[..error.valid_up_to()]
+            .iter()
+            .filter(|byte| **byte == b'\n')
+            .count()
+            + 1;
+        TactusError::EventLog {
+            path: path.to_path_buf(),
+            message: format!(
+                "line {line} contains invalid UTF-8 in a committed event ({error}). This is not a \
+                 torn tail — the log has been rewritten, and state derived from what is left \
+                 would be confidently wrong."
+            ),
         }
+    })?;
+
+    let mut events = Vec::with_capacity(committed.lines().count());
+    for (position, line) in committed.lines().enumerate() {
+        if line.trim().is_empty() {
+            continue;
+        }
+        let event = serde_json::from_str::<Event>(line).map_err(|error| TactusError::EventLog {
+            path: path.to_path_buf(),
+            message: format!(
+                "line {} is not a valid event ({error}). This is not a torn tail — the log has \
+                 been rewritten, and state derived from what is left would be confidently wrong.",
+                position + 1
+            ),
+        })?;
+        events.push(event);
     }
-    Ok(events)
+    Ok(ParsedLines {
+        events,
+        torn_tail_warning,
+    })
 }
 
 /// The result of folding a log: the state, plus the run metadata a reader
@@ -1591,14 +1620,16 @@ impl LogTail {
             }
         }
         file.seek(SeekFrom::Start(self.offset)).map_err(io)?;
-        let mut buffer = String::new();
-        file.read_to_string(&mut buffer).map_err(io)?;
-        let Some(end) = buffer.rfind('\n') else {
+        let mut buffer = Vec::new();
+        file.read_to_end(&mut buffer).map_err(io)?;
+        let Some(end) = buffer.iter().rposition(|byte| *byte == b'\n') else {
             return Ok(Vec::new());
         };
         let complete = &buffer[..=end];
         self.offset += complete.len() as u64;
-        parse_lines(&self.path, complete, warnings)
+        let parsed = parse_bytes(&self.path, complete)?;
+        warnings.extend(parsed.torn_tail_warning);
+        Ok(parsed.events)
     }
 }
 
@@ -1852,7 +1883,7 @@ mod tests {
     }
 
     #[test]
-    fn a_torn_final_line_is_dropped_but_a_rewritten_middle_is_an_error() {
+    fn a_torn_final_line_is_dropped_but_committed_invalid_events_are_errors() {
         let dir = scratch("torn");
         let path = dir.join("events.jsonl");
         let good = serde_json::to_string(&Event::now(started())).expect("serialize");
@@ -1870,6 +1901,18 @@ mod tests {
             "warnings: {warnings:?}"
         );
 
+        // `serde_json` may write Unicode from a recorded reason or path. A kill
+        // can split that code point, but bytes after the commit newline are no
+        // less recoverable merely because they are not yet valid UTF-8.
+        let mut invalid_utf8_tail = format!("{good}\n").into_bytes();
+        invalid_utf8_tail.extend_from_slice(&[0xf0, 0x9f]);
+        std::fs::write(&path, invalid_utf8_tail).expect("write split UTF-8 tail");
+        let mut warnings = Vec::new();
+        let events = read_all(&path, &mut warnings).expect("split UTF-8 tail is recoverable");
+        assert_eq!(events.len(), 1);
+        assert_eq!(warnings.len(), 1);
+        assert!(warnings[0].contains("2 trailing byte(s)"));
+
         // Damage anywhere else means the file was rewritten, not interrupted.
         let corrupt = format!("{good}\nnot json at all\n{also_good}\n");
         std::fs::write(&path, corrupt).expect("write");
@@ -1877,6 +1920,36 @@ mod tests {
         let err = read_all(&path, &mut warnings).expect_err("must not fold a rewritten log");
         assert!(err.to_string().contains("line 2"), "got: {err}");
         assert!(err.to_string().contains("confidently wrong"), "got: {err}");
+
+        // Being last is not enough to make an event recoverable. This record is
+        // complete JSON and newline-terminated, but its domain value is invalid.
+        let mut invalid: serde_json::Value =
+            serde_json::from_str(&also_good).expect("attempt-start JSON");
+        invalid["data"]["selection_origin"] = serde_json::json!("unknown");
+        let invalid = serde_json::to_string(&invalid).expect("invalid event JSON");
+        std::fs::write(&path, format!("{good}\n{invalid}\n")).expect("write invalid tail");
+        let mut warnings = Vec::new();
+        let err = read_all(&path, &mut warnings).expect_err("semantic errors are not torn tails");
+        assert!(err.to_string().contains("line 2"), "got: {err}");
+        assert!(err.to_string().contains("unknown variant"), "got: {err}");
+        assert!(warnings.is_empty(), "corruption is an error, not a warning");
+    }
+
+    #[test]
+    fn a_valid_json_event_without_its_commit_newline_is_a_torn_tail() {
+        let dir = scratch("uncommitted-valid-tail");
+        let path = dir.join("events.jsonl");
+        let good = serde_json::to_string(&Event::now(started())).expect("serialize");
+        let uncommitted = serde_json::to_string(&Event::now(attempt_started("t1", 1, 0, "small")))
+            .expect("serialize");
+        std::fs::write(&path, format!("{good}\n{uncommitted}")).expect("write uncommitted tail");
+
+        let mut warnings = Vec::new();
+        let events = read_all(&path, &mut warnings).expect("uncommitted tail is recoverable");
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].body.kind(), "run_started");
+        assert_eq!(warnings.len(), 1);
+        assert!(warnings[0].contains("incomplete final line"));
     }
 
     #[test]

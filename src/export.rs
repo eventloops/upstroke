@@ -132,20 +132,17 @@ pub fn load(repo_root: &Path, wanted: &str) -> Result<Loaded, TactusError> {
     let run_id = rundir::resolve_run_id(repo_root, wanted)?;
     let public = rundir::public_dir(repo_root, &run_id);
     let events_path = public.join("events.jsonl");
-    let snapshot_text = begin_snapshot(&public, &run_id, &events_path)?;
+    let snapshot_bytes = begin_snapshot(&public, &run_id, &events_path)?;
 
     // Always perform the closing stability check before returning a projection
     // error. Otherwise a racing resume could make a transient moving view look
     // like permanently invalid input.
     let projected = (|| {
-        let mut warnings = Vec::new();
-        let log = events::parse_lines(&events_path, &snapshot_text, &mut warnings)?;
-        if let Some(warning) = warnings
-            .iter()
-            .find(|warning| !is_torn_tail_warning(warning))
-        {
-            return invalid(&events_path, warning.clone());
-        }
+        let events::ParsedLines {
+            events: log,
+            torn_tail_warning,
+        } = events::parse_bytes(&events_path, &snapshot_bytes)?;
+        let warnings = torn_tail_warning.into_iter().collect();
         let mut run_starts = log
             .iter()
             .filter(|event| matches!(event.body, EventBody::RunStarted { .. }));
@@ -278,7 +275,7 @@ pub fn load(repo_root: &Path, wanted: &str) -> Result<Loaded, TactusError> {
         Ok(Loaded { rows, warnings })
     })();
 
-    finish_snapshot(&public, &run_id, &events_path, &snapshot_text)?;
+    finish_snapshot(&public, &run_id, &events_path, &snapshot_bytes)?;
     projected
 }
 
@@ -713,16 +710,25 @@ fn validate_cost(path: &Path, label: &str, cost: Option<f64>) -> Result<(), Tact
 }
 
 fn validate_timestamp(path: &Path, label: &str, value: &str) -> Result<(), TactusError> {
-    if !is_rfc3339(value) {
+    if !is_supported_rfc3339(value) {
         return Err(TactusError::EventLog {
             path: path.to_owned(),
-            message: format!("{label} timestamp `{value}` is not RFC 3339"),
+            message: format!(
+                "{label} timestamp `{value}` is not RFC 3339 in tactus's supported \
+                 no-leap-second profile"
+            ),
         });
     }
     Ok(())
 }
 
-fn is_rfc3339(value: &str) -> bool {
+/// Validate the RFC 3339 subset Tactus can record.
+///
+/// Event timestamps come from `SystemTime` as ordinary Unix seconds, so the
+/// writer can never emit `:60`. Rejecting leap-second notation avoids accepting
+/// it on arbitrary dates (which requires an external announcement table) while
+/// retaining every timestamp an authentic Tactus writer can produce.
+fn is_supported_rfc3339(value: &str) -> bool {
     let bytes = value.as_bytes();
     if bytes.len() < 20
         || bytes.get(4) != Some(&b'-')
@@ -759,7 +765,7 @@ fn is_rfc3339(value: &str) -> bool {
         2 => 28,
         _ => return false,
     };
-    if day == 0 || day > days || hour > 23 || minute > 59 || second > 60 {
+    if day == 0 || day > days || hour > 23 || minute > 59 || second > 59 {
         return false;
     }
 
@@ -793,19 +799,19 @@ fn decimal(bytes: &[u8], start: usize, len: usize) -> Option<u32> {
     })
 }
 
-fn begin_snapshot(public: &Path, run_id: &str, path: &Path) -> Result<String, TactusError> {
+fn begin_snapshot(public: &Path, run_id: &str, path: &Path) -> Result<Vec<u8>, TactusError> {
     begin_snapshot_with(
         run_id,
         || rundir::is_running(public),
-        || events::read_text(path),
+        || events::read_bytes(path),
     )
 }
 
 fn begin_snapshot_with(
     run_id: &str,
     mut is_running: impl FnMut() -> bool,
-    mut read: impl FnMut() -> Result<String, TactusError>,
-) -> Result<String, TactusError> {
+    mut read: impl FnMut() -> Result<Vec<u8>, TactusError>,
+) -> Result<Vec<u8>, TactusError> {
     if is_running() {
         return Err(live_refusal(run_id));
     }
@@ -820,21 +826,21 @@ fn finish_snapshot(
     public: &Path,
     run_id: &str,
     path: &Path,
-    original: &str,
+    original: &[u8],
 ) -> Result<(), TactusError> {
     finish_snapshot_with(
         run_id,
         original,
         || rundir::is_running(public),
-        || events::read_text(path),
+        || events::read_bytes(path),
     )
 }
 
 fn finish_snapshot_with(
     run_id: &str,
-    original: &str,
+    original: &[u8],
     mut is_running: impl FnMut() -> bool,
-    mut read: impl FnMut() -> Result<String, TactusError>,
+    mut read: impl FnMut() -> Result<Vec<u8>, TactusError>,
 ) -> Result<(), TactusError> {
     let current = read()?;
     if is_running() {
@@ -856,10 +862,6 @@ fn live_refusal(run_id: &str) -> TactusError {
             "run `{run_id}` is live and its decision dataset is still moving; wait for it to finish or stop it before exporting"
         ),
     }
-}
-
-fn is_torn_tail_warning(warning: &str) -> bool {
-    warning.contains(": dropped an incomplete final line (")
 }
 
 pub fn write(rows: &[Row], format: Format, out: &mut impl Write) -> anyhow::Result<()> {
@@ -1237,26 +1239,33 @@ mod tests {
     }
 
     #[test]
-    fn exported_timestamps_are_validated_as_rfc3339() {
+    fn exported_timestamps_use_the_supported_rfc3339_profile() {
         for valid in [
             "1970-01-01T00:00:00Z",
-            "2024-02-29T23:59:60.123Z",
+            "2024-02-29T23:59:59.123Z",
             "2026-08-01t12:34:56+05:30",
             "2026-08-01T12:34:56.000-00:00",
         ] {
-            assert!(is_rfc3339(valid), "valid RFC 3339 timestamp: {valid}");
+            assert!(
+                is_supported_rfc3339(valid),
+                "supported RFC 3339 timestamp: {valid}"
+            );
         }
-        for invalid in [
+        for rejected in [
             "2026-02-29T00:00:00Z",
             "2026-13-01T00:00:00Z",
             "2026-08-01 00:00:00Z",
             "2026-08-01T24:00:00Z",
             "2026-08-01T00:00:00",
             "2026-08-01T00:00:00.Z",
+            // `:60` is not accepted blindly on a leap-year date, and even a
+            // historical leap second is outside the writer's supported subset.
+            "2024-02-29T23:59:60.123Z",
+            "2016-12-31T23:59:60Z",
         ] {
             assert!(
-                !is_rfc3339(invalid),
-                "invalid RFC 3339 timestamp: {invalid}"
+                !is_supported_rfc3339(rejected),
+                "unsupported timestamp: {rejected}"
             );
         }
 
@@ -1554,26 +1563,26 @@ mod tests {
         let error = begin_snapshot_with(
             RUN_ID,
             || probes.next().expect("pre and post probes"),
-            || Ok("stable-so-far".to_owned()),
+            || Ok(b"stable-so-far".to_vec()),
         )
         .expect_err("a run that resumes during the first read is live");
         assert!(error.to_string().contains("is live"));
 
         let error = finish_snapshot_with(
             RUN_ID,
-            "before",
+            b"before",
             || false,
-            || Ok("before\nnew attempt_started".to_owned()),
+            || Ok(b"before\nnew attempt_started".to_vec()),
         )
         .expect_err("an append after the post-read probe moves the snapshot");
         assert!(error.to_string().contains("changed while"));
 
         assert_eq!(
-            begin_snapshot_with(RUN_ID, || false, || Ok("stable".to_owned()))
+            begin_snapshot_with(RUN_ID, || false, || Ok(b"stable".to_vec()))
                 .expect("stable first read"),
-            "stable"
+            b"stable"
         );
-        finish_snapshot_with(RUN_ID, "stable", || false, || Ok("stable".to_owned()))
+        finish_snapshot_with(RUN_ID, b"stable", || false, || Ok(b"stable".to_vec()))
             .expect("unchanged closing read");
     }
 
@@ -1588,8 +1597,9 @@ mod tests {
             vec![task("task", "task")],
         );
         let path = fixture.public.join("events.jsonl");
-        let mut log = fs::read_to_string(&path).expect("read fixture log");
-        log.push_str("{\"ts\":\"2026-08-01T00:00");
+        let mut log = fs::read(&path).expect("read fixture log");
+        log.extend_from_slice(b"{\"ts\":\"2026-08-01T00:00");
+        log.extend_from_slice(&[0xf0, 0x9f]);
         fs::write(&path, log).expect("write torn tail");
 
         let loaded = fixture.loaded();
@@ -1597,6 +1607,27 @@ mod tests {
         assert_eq!(loaded.rows[0].outcome, "interrupted");
         assert_eq!(loaded.warnings.len(), 1);
         assert!(loaded.warnings[0].contains("incomplete final line"));
+    }
+
+    #[test]
+    fn a_complete_semantically_invalid_final_event_is_rejected() {
+        let mut invalid_start = attempt_started("task", 1, "2026-08-01T00:00:01.000Z", false);
+        invalid_start["data"]["selection_origin"] = json!("unknown");
+        let fixture = Fixture::new(
+            "semantic-tail",
+            vec![run_started(&["task"]), invalid_start],
+            vec![task("task", "task")],
+        );
+
+        let error = load_error(&fixture);
+        assert!(
+            error.contains("line 2"),
+            "invalid final record is committed: {error}"
+        );
+        assert!(
+            error.contains("unknown variant"),
+            "domain error is preserved: {error}"
+        );
     }
 
     #[test]
@@ -1765,6 +1796,45 @@ mod tests {
             );
             assert!(load_error(&fixture).contains("mismatched settlement identity"));
         }
+    }
+
+    #[test]
+    fn duplicate_and_orphan_attempt_events_are_refused() {
+        let start = attempt_started("task", 1, "2026-08-01T00:00:01.000Z", false);
+        let duplicate_start = Fixture::new(
+            "duplicate-start",
+            vec![run_started(&["task"]), start.clone(), start],
+            vec![task("task", "task")],
+        );
+        assert!(
+            load_error(&duplicate_start).contains("duplicate attempt start"),
+            "a repeated key is ambiguous rather than a second logical attempt"
+        );
+
+        let start = attempt_started("task", 1, "2026-08-01T00:00:01.000Z", false);
+        let finish = attempt_finished("task", 1, "2026-08-01T00:00:02.000Z", None, false);
+        let duplicate_settlement = Fixture::new(
+            "duplicate-settlement",
+            vec![run_started(&["task"]), start, finish.clone(), finish],
+            vec![task("task", "task")],
+        );
+        assert!(
+            load_error(&duplicate_settlement).contains("duplicate settlement"),
+            "one start cannot have two authorities for its outcome"
+        );
+
+        let orphan = Fixture::new(
+            "orphan-settlement",
+            vec![
+                run_started(&["task"]),
+                attempt_finished("task", 1, "2026-08-01T00:00:02.000Z", None, false),
+            ],
+            vec![task("task", "task")],
+        );
+        assert!(
+            load_error(&orphan).contains("settlement without a start"),
+            "a finish-only record has no pre-spawn routing authority"
+        );
     }
 
     #[test]
