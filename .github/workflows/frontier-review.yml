@@ -1,0 +1,91 @@
+name: Record frontier review attestation
+
+on:
+  workflow_dispatch:
+    inputs:
+      pull_request:
+        description: Pull request number
+        required: true
+        type: string
+      reviewed_sha:
+        description: Full head SHA reviewed by the frontier model
+        required: true
+        type: string
+      review_url:
+        description: Link to the passing review evidence on the pull request
+        required: true
+        type: string
+
+permissions:
+  checks: read
+  contents: read
+  pull-requests: read
+  statuses: write
+
+jobs:
+  attest:
+    name: attest frontier review
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    env:
+      GH_TOKEN: ${{ github.token }}
+      PR_NUMBER: ${{ inputs.pull_request }}
+      REVIEWED_SHA: ${{ inputs.reviewed_sha }}
+      REVIEW_URL: ${{ inputs.review_url }}
+    steps:
+      - name: Verify review preconditions and attest exact head
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if [[ ! "$PR_NUMBER" =~ ^[1-9][0-9]*$ ]]; then
+            echo "pull_request must be a positive integer" >&2
+            exit 1
+          fi
+          if [[ ! "$REVIEWED_SHA" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "reviewed_sha must be a full lowercase commit SHA" >&2
+            exit 1
+          fi
+          review_prefix="https://github.com/$GITHUB_REPOSITORY/pull/$PR_NUMBER"
+          if [[ "$REVIEW_URL" != "$review_prefix#"* && "$REVIEW_URL" != "$review_prefix/files#"* ]]; then
+            echo "review_url must point to anchored evidence on this pull request" >&2
+            exit 1
+          fi
+
+          pr="$(gh api "repos/$GITHUB_REPOSITORY/pulls/$PR_NUMBER")"
+          state="$(jq -r '.state' <<< "$pr")"
+          head_sha="$(jq -r '.head.sha' <<< "$pr")"
+          base_sha="$(jq -r '.base.sha' <<< "$pr")"
+
+          if [[ "$state" != "open" ]]; then
+            echo "pull request #$PR_NUMBER is not open" >&2
+            exit 1
+          fi
+          if [[ "$head_sha" != "$REVIEWED_SHA" ]]; then
+            echo "reviewed SHA $REVIEWED_SHA is not current head $head_sha" >&2
+            exit 1
+          fi
+
+          behind_by="$(gh api "repos/$GITHUB_REPOSITORY/compare/$base_sha...$head_sha" --jq '.behind_by')"
+          if [[ "$behind_by" != "0" ]]; then
+            echo "pull request head is $behind_by commit(s) behind its base" >&2
+            exit 1
+          fi
+
+          checks="$(gh api -H 'Accept: application/vnd.github+json' \
+            "repos/$GITHUB_REPOSITORY/commits/$head_sha/check-runs?per_page=100")"
+          for required_check in tactus-ci tactus-pr-policy; do
+            passed="$(jq --arg name "$required_check" \
+              '[.check_runs[] | select(.name == $name and .conclusion == "success")] | length' \
+              <<< "$checks")"
+            if [[ "$passed" == "0" ]]; then
+              echo "$required_check has not passed on $head_sha" >&2
+              exit 1
+            fi
+          done
+
+          gh api --method POST "repos/$GITHUB_REPOSITORY/statuses/$head_sha" \
+            -f state=success \
+            -f context=frontier-review \
+            -f description="Frontier review passed for this exact head" \
+            -f target_url="$REVIEW_URL"

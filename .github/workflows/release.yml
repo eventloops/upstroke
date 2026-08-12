@@ -1,24 +1,47 @@
 name: Release
 
-# Tag-driven, like a NuGet release: `git tag v0.1.0 && git push --tags`.
+# Tag-driven, like a NuGet release: `git tag v0.1.0 && git push origin v0.1.0`.
 # Nothing publishes on an ordinary push.
 on:
   push:
     tags: ["v*"]
 
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
 env:
   CARGO_TERM_COLOR: always
+  RUSTFLAGS: -D warnings
 
 jobs:
   # Refuse early if the tag and Cargo.toml disagree — a crates.io version
   # number can never be reused, so publishing the wrong one is unrecoverable.
   verify:
+    name: Release / verify
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     outputs:
       version: ${{ steps.check.outputs.version }}
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Require a commit from protected mainline
+        shell: bash
+        run: |
+          git fetch --no-tags origin master:refs/remotes/origin/master
+          if ! git merge-base --is-ancestor "$GITHUB_SHA" origin/master; then
+            echo "release tag must point to a commit reachable from master" >&2
+            exit 1
+          fi
+
       - id: check
+        name: Match tag to manifest version
         shell: bash
         run: |
           tag="${GITHUB_REF_NAME#v}"
@@ -29,10 +52,19 @@ jobs:
           fi
           echo "version=$tag" >> "$GITHUB_OUTPUT"
 
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo fmt --check
+      - run: cargo clippy --all-targets -- -D warnings
+
   # Never ship a tag that does not pass its own gates.
   test:
+    name: Release / test (${{ matrix.os }})
     needs: verify
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
     strategy:
       matrix:
         os: [windows-latest, ubuntu-latest, macos-latest]
@@ -46,9 +78,10 @@ jobs:
       - run: cargo test --all-targets
 
   binaries:
-    name: binary (${{ matrix.target }})
+    name: Release / binary (${{ matrix.target }})
     needs: test
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
     strategy:
       matrix:
         include:
@@ -84,8 +117,10 @@ jobs:
           path: ${{ matrix.archive }}
 
   github-release:
+    name: Release / GitHub
     needs: binaries
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     permissions:
       contents: write
     steps:
@@ -98,12 +133,15 @@ jobs:
           generate_release_notes: true
 
   crates-io:
+    name: Release / crates.io
     needs: test
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     # Required by crates.io Trusted Publishing: the job mints a short-lived
     # OIDC token instead of holding a long-lived API key. Configure the repo
     # and workflow as a trusted publisher in the crates.io settings first.
     permissions:
+      contents: read
       id-token: write
     environment: crates-io
     steps:
