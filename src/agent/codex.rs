@@ -53,7 +53,7 @@
 //! notional twice over on subscription auth where the marginal dollar is zero.
 //! §13 already has the words: an estimate that flatters is worse than none.
 //!
-//! **Two of this CLI's own features are deliberately unused.**
+//! **Two of this CLI's own features are deliberately unused for model turns.**
 //!
 //! `codex review` runs a code review non-interactively, and adopting it would
 //! swap the standard. §11.3's second opinion is *the same standard, a
@@ -73,7 +73,10 @@
 //! two different contracts, and push the reviewer's prose into escaped strings
 //! where humans read it. The existing re-ask-on-unparseable path already covers
 //! the failure it would prevent, and nothing has yet measured that failure
-//! happening. Revisit if real runs show it firing more than rarely.
+//! happening. Revisit if real runs show it firing more than rarely. Pre-flight
+//! does pass a deliberately missing schema path to the CLI's local parser; that
+//! is a zero-spend guard proving the exact reasoning key before any model turn,
+//! not an output contract for a turn.
 //!
 //! **Never passed:** `--dangerously-bypass-approvals-and-sandbox`,
 //! `--dangerously-bypass-hook-trust`, `-s danger-full-access`. §20 grants the
@@ -89,12 +92,14 @@ use std::process::Command;
 use std::sync::OnceLock;
 use std::time::Duration;
 
+use serde::Deserialize;
 use serde_json::{Value, json};
 
 use super::bin::{self, Invocation};
 use super::proc::{self, ProcessOutput};
 use super::{AdapterSource, AgentAdapter, AuthState, Caps, Discovery, TaskRun, looks_rate_limited};
 use crate::capacity::PoolKind;
+use crate::catalog;
 use crate::error::TactusError;
 use crate::ir::{Effort, Outcome, OutcomeStatus, PermissionMode, Usage, WorkerProfile};
 use crate::util;
@@ -106,13 +111,38 @@ pub const ADAPTER_ID: &str = "codex";
 /// here loses a whole run rather than one attempt. Paid once per run.
 const PROBE_TIMEOUT: Duration = Duration::from_secs(60);
 
+/// The strict-config control must be rejected before the missing-schema guard.
+/// If it is not, a CLI has stopped enforcing the parser contract this probe
+/// relies on and an apparently successful effort-key check would mean nothing.
+const CONFIG_PROBE_UNKNOWN_KEY: &str = "tactus_probe_deliberately_unknown";
+const CONFIG_PROBE_SCHEMA_FILE: &str = "tactus-output-schema-must-not-exist.json";
+const CONFIG_PROBE_RESUME_ID: &str = "00000000-0000-0000-0000-000000000000";
+
 /// Flags `exec` must still advertise, checked at pre-flight.
 ///
 /// Every one is load-bearing rather than decorative: without `--json` there is
 /// no session id and no usage, and without `--sandbox` a reviewer could edit
 /// the code it is judging. A CLI that has dropped one of these must refuse the
 /// run up front, not fail attempts once it is already spending (§19).
-const REQUIRED_EXEC_FLAGS: [&str; 3] = ["--json", "--sandbox", "--model"];
+const REQUIRED_EXEC_FLAGS: [&str; 5] = ["--json", "--sandbox", "--model", "-c", "--config"];
+const REQUIRED_RESUME_FLAGS: [&str; 4] = ["--json", "--model", "-c", "--config"];
+
+#[derive(Debug, Deserialize)]
+struct DebugModels {
+    models: Vec<DebugModel>,
+}
+
+#[derive(Debug, Deserialize)]
+struct DebugModel {
+    slug: String,
+    #[serde(default)]
+    supported_reasoning_levels: Vec<DebugReasoningLevel>,
+}
+
+#[derive(Debug, Deserialize)]
+struct DebugReasoningLevel {
+    effort: String,
+}
 
 pub struct CodexAdapter;
 
@@ -145,31 +175,36 @@ impl AgentAdapter for CodexAdapter {
         }
         let version = bin::extract_version(&out.stdout);
 
-        // `exec --help`, not `--help`: every flag this adapter passes lives on
-        // the subcommand, and the top-level help does not list them.
-        let help = proc::run_with_timeout(
+        // Fresh and resumed attempts are different CLI surfaces. Both carry
+        // the reasoning override, so both must prove `--config` before spend;
+        // only fresh attempts carry the sandbox.
+        let fresh_help = proc::run_with_timeout(
             invocation.command(&["exec".to_owned(), "--help".to_owned()]),
             "",
             PROBE_TIMEOUT,
         )?;
-        let help_text = format!("{}{}", help.stdout, help.stderr);
-        let readable = help.code == Some(0) && !help_text.trim().is_empty();
-        if readable {
-            let missing: Vec<&str> = REQUIRED_EXEC_FLAGS
-                .into_iter()
-                .filter(|flag| !help_text.contains(flag))
-                .collect();
-            if !missing.is_empty() {
-                return Err(TactusError::Agent {
-                    message: format!(
-                        "codex {version} does not advertise required `exec` flag(s): {}. This \
-                         adapter pins known-good behavior per version — upgrade tactus or pin an \
-                         older codex.",
-                        missing.join(", ")
-                    ),
-                });
-            }
-        }
+        let fresh_help = checked_help(&invocation.display(), "exec", &fresh_help)?;
+        let resume_help = proc::run_with_timeout(
+            invocation.command(&["exec".to_owned(), "resume".to_owned(), "--help".to_owned()]),
+            "",
+            PROBE_TIMEOUT,
+        )?;
+        let resume_help = checked_help(&invocation.display(), "exec resume", &resume_help)?;
+        validate_probe_contract(&version, &fresh_help, &resume_help)?;
+        validate_effort_config_key(&invocation, &version)?;
+
+        // The strict local parser above proves the exact key and the two role
+        // policy values. The CLI's local catalog is separate zero-spend
+        // evidence for each model × effort pair, so require every known Codex
+        // model to expose every shared effort level before a run can start.
+        let models = proc::run_with_timeout(
+            invocation.command(&["debug".to_owned(), "models".to_owned()]),
+            "",
+            PROBE_TIMEOUT,
+        )?;
+        let models = checked_model_catalog(&invocation.display(), &models)?;
+        let parsed = parse_debug_models(&models)?;
+        validate_model_efforts(&version, &parsed)?;
 
         Ok(Caps {
             version,
@@ -178,16 +213,17 @@ impl AgentAdapter for CodexAdapter {
             json_output: true,
             // `codex exec resume <id>` — proven to round-trip: the resumed turn
             // returned the same `thread_id` and recalled the prior exchange.
-            session_resume: readable && help_text.contains("resume"),
+            session_resume: true,
             // Tokens, not dollars. See the module header — this is a decision
             // about what tactus is willing to claim, not a missing feature.
             cost_reporting: false,
-            read_only_mode: readable && help_text.contains("--sandbox"),
+            read_only_mode: true,
             // The CLI has `mcp-server` and `app-server`, neither of which is
             // ACP, and this adapter spawns a process per attempt either way.
             acp: false,
-            // No enumeration subcommand, so the roster is the shipped catalog.
-            model_list: false,
+            // `debug models` is a local catalog rather than a network query;
+            // probe validated it above and discovery exposes its slugs.
+            model_list: true,
         })
     }
 
@@ -224,9 +260,21 @@ impl AgentAdapter for CodexAdapter {
             "",
             PROBE_TIMEOUT,
         )?;
-        Ok(parse_login_status(&out).with_note(
-            "no model listing is offered, so the roster for this agent is the catalog shipped \
-             with tactus, not something confirmed here",
+        let mut discovery = parse_login_status(&out);
+        let models = proc::run_with_timeout(
+            invocation.command(&["debug".to_owned(), "models".to_owned()]),
+            "",
+            PROBE_TIMEOUT,
+        )?;
+        let models = checked_model_catalog(&invocation.display(), &models)?;
+        discovery.models = parse_debug_models(&models)?
+            .models
+            .into_iter()
+            .map(|model| model.slug)
+            .collect();
+        Ok(discovery.with_note(
+            "model slugs and reasoning levels were confirmed against this CLI's local `debug \
+             models` catalog",
         ))
     }
 
@@ -255,6 +303,305 @@ impl AgentAdapter for CodexAdapter {
         )?;
         Ok(None)
     }
+}
+
+fn checked_help(
+    program: &str,
+    surface: &str,
+    output: &ProcessOutput,
+) -> Result<String, TactusError> {
+    if output.timed_out {
+        return Err(TactusError::Agent {
+            message: format!(
+                "`{program} {surface} --help` timed out; reasoning configuration support could \
+                 not be verified"
+            ),
+        });
+    }
+    if output.code != Some(0) {
+        return Err(TactusError::Agent {
+            message: format!(
+                "`{program} {surface} --help` exited with {:?}: {}",
+                output.code,
+                output.stderr.trim()
+            ),
+        });
+    }
+    let text = format!("{}\n{}", output.stdout, output.stderr);
+    if text.trim().is_empty() {
+        return Err(TactusError::Agent {
+            message: format!(
+                "`{program} {surface} --help` returned no output; reasoning configuration \
+                 support could not be verified"
+            ),
+        });
+    }
+    Ok(text)
+}
+
+fn validate_probe_contract(
+    version: &str,
+    fresh_help: &str,
+    resume_help: &str,
+) -> Result<(), TactusError> {
+    for (surface, help, required) in [
+        ("exec", fresh_help, REQUIRED_EXEC_FLAGS.as_slice()),
+        ("exec resume", resume_help, REQUIRED_RESUME_FLAGS.as_slice()),
+    ] {
+        let missing: Vec<&str> = required
+            .iter()
+            .copied()
+            .filter(|flag| !super::advertises_flag(help, flag))
+            .collect();
+        if !missing.is_empty() {
+            return Err(TactusError::Agent {
+                message: format!(
+                    "codex {version} does not advertise required `{surface}` flag(s): {}. The \
+                     reasoning override must work on both fresh and resumed attempts — upgrade \
+                     tactus or pin an older codex.",
+                    missing.join(", ")
+                ),
+            });
+        }
+    }
+    Ok(())
+}
+
+#[derive(Clone, Copy, Debug)]
+enum ConfigProbeSurface {
+    Fresh,
+    Resume,
+}
+
+impl ConfigProbeSurface {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Fresh => "exec",
+            Self::Resume => "exec resume",
+        }
+    }
+}
+
+/// A unique empty directory whose child path is guaranteed not to exist.
+/// Codex validates `--output-schema` locally before starting a turn, making
+/// that absent child a deterministic, zero-spend stopping point.
+struct MissingOutputSchema {
+    dir: PathBuf,
+    path: PathBuf,
+}
+
+impl MissingOutputSchema {
+    fn create() -> Result<Self, TactusError> {
+        let dir =
+            std::env::temp_dir().join(format!("tactus-codex-config-probe-{}", crate::ulid::ulid()));
+        std::fs::create_dir(&dir).map_err(|source| TactusError::Agent {
+            message: format!(
+                "could not create Codex configuration probe directory `{}`: {source}",
+                dir.display()
+            ),
+        })?;
+        let path = dir.join(CONFIG_PROBE_SCHEMA_FILE);
+        Ok(Self { dir, path })
+    }
+}
+
+impl Drop for MissingOutputSchema {
+    fn drop(&mut self) {
+        // The child is intentionally never created. Avoid recursive cleanup:
+        // if a surprising CLI did write anything, preserving it is safer than
+        // deleting an unexpected artifact.
+        let _ = std::fs::remove_dir(&self.dir);
+    }
+}
+
+fn validate_effort_config_key(invocation: &Invocation, version: &str) -> Result<(), TactusError> {
+    let schema = MissingOutputSchema::create()?;
+    for surface in [ConfigProbeSurface::Fresh, ConfigProbeSurface::Resume] {
+        let control = run_config_parser_probe(
+            invocation,
+            surface,
+            &format!("{CONFIG_PROBE_UNKNOWN_KEY}=true"),
+            &schema.path,
+        )?;
+        validate_unknown_config_control(version, surface, &control)?;
+
+        // These are the two policy values Tactus promises for the roles this
+        // feature introduced. Model catalogs validate the remaining shared
+        // values separately; accepting either assignment here proves the exact
+        // key, while checking both catches a provider-side enum regression.
+        for effort in [Effort::XHigh, Effort::Max] {
+            let assignment = format!("model_reasoning_effort={}", effort_flag(effort));
+            let output = run_config_parser_probe(invocation, surface, &assignment, &schema.path)?;
+            validate_effort_config_probe(version, surface, effort, &output)?;
+        }
+    }
+    Ok(())
+}
+
+fn run_config_parser_probe(
+    invocation: &Invocation,
+    surface: ConfigProbeSurface,
+    assignment: &str,
+    schema_path: &std::path::Path,
+) -> Result<ProcessOutput, TactusError> {
+    proc::run_with_timeout(
+        invocation.command(&config_probe_args(surface, assignment, schema_path)),
+        "",
+        PROBE_TIMEOUT,
+    )
+}
+
+fn config_probe_args(
+    surface: ConfigProbeSurface,
+    assignment: &str,
+    schema_path: &std::path::Path,
+) -> Vec<String> {
+    let mut args = vec!["exec".to_owned()];
+    if matches!(surface, ConfigProbeSurface::Resume) {
+        args.extend(["resume".to_owned(), CONFIG_PROBE_RESUME_ID.to_owned()]);
+    }
+    args.extend([
+        "--ignore-user-config".to_owned(),
+        "--strict-config".to_owned(),
+        "-c".to_owned(),
+        assignment.to_owned(),
+        "--output-schema".to_owned(),
+        schema_path.to_string_lossy().into_owned(),
+        "tactus-config-parser-probe".to_owned(),
+    ]);
+    args
+}
+
+fn validate_unknown_config_control(
+    version: &str,
+    surface: ConfigProbeSurface,
+    output: &ProcessOutput,
+) -> Result<(), TactusError> {
+    let text = config_probe_text(output);
+    let lower = text.to_ascii_lowercase();
+    if !output.timed_out
+        && output.code.is_some_and(|code| code != 0)
+        && text.contains(CONFIG_PROBE_UNKNOWN_KEY)
+        && (lower.contains("unknown") || lower.contains("unrecognized"))
+        && !text.contains(CONFIG_PROBE_SCHEMA_FILE)
+    {
+        return Ok(());
+    }
+    Err(TactusError::Agent {
+        message: format!(
+            "codex {version} `{}` did not reject the strict-config control before the local \
+             missing-schema guard; exact reasoning-key support cannot be proven without spend \
+             (exit {:?}, timeout {}, output: {})",
+            surface.label(),
+            output.code,
+            output.timed_out,
+            util::head(&text, 400)
+        ),
+    })
+}
+
+fn validate_effort_config_probe(
+    version: &str,
+    surface: ConfigProbeSurface,
+    effort: Effort,
+    output: &ProcessOutput,
+) -> Result<(), TactusError> {
+    let text = config_probe_text(output);
+    if !output.timed_out
+        && output.code.is_some_and(|code| code != 0)
+        && text.contains(CONFIG_PROBE_SCHEMA_FILE)
+        && text.to_ascii_lowercase().contains("schema")
+    {
+        return Ok(());
+    }
+    Err(TactusError::Agent {
+        message: format!(
+            "codex {version} `{}` did not accept exact local override \
+             `model_reasoning_effort={}` before the zero-spend missing-schema guard (exit {:?}, \
+             timeout {}, output: {})",
+            surface.label(),
+            effort_flag(effort),
+            output.code,
+            output.timed_out,
+            util::head(&text, 400)
+        ),
+    })
+}
+
+fn config_probe_text(output: &ProcessOutput) -> String {
+    format!("{}\n{}", output.stdout, output.stderr)
+}
+
+fn checked_model_catalog(program: &str, output: &ProcessOutput) -> Result<String, TactusError> {
+    if output.timed_out {
+        return Err(TactusError::Agent {
+            message: format!(
+                "`{program} debug models` timed out; model effort support could not be verified"
+            ),
+        });
+    }
+    if output.code != Some(0) {
+        return Err(TactusError::Agent {
+            message: format!(
+                "`{program} debug models` exited with {:?}: {}",
+                output.code,
+                output.stderr.trim()
+            ),
+        });
+    }
+    if output.stdout.trim().is_empty() {
+        return Err(TactusError::Agent {
+            message: format!(
+                "`{program} debug models` returned no catalog; model effort support could not be \
+                 verified"
+            ),
+        });
+    }
+    Ok(output.stdout.clone())
+}
+
+fn parse_debug_models(text: &str) -> Result<DebugModels, TactusError> {
+    serde_json::from_str(text).map_err(|error| TactusError::Agent {
+        message: format!("`codex debug models` returned an unreadable catalog: {error}"),
+    })
+}
+
+fn validate_model_efforts(version: &str, models: &DebugModels) -> Result<(), TactusError> {
+    for slug in catalog::known_models(ADAPTER_ID) {
+        let model = models
+            .models
+            .iter()
+            .find(|model| model.slug == slug)
+            .ok_or_else(|| TactusError::Agent {
+                message: format!(
+                    "codex {version}'s local model catalog does not contain known model `{slug}`; \
+                     refusing before a configured `--model` fails at runtime"
+                ),
+            })?;
+        let supported: Vec<Effort> = model
+            .supported_reasoning_levels
+            .iter()
+            .filter_map(|level| Effort::parse(&level.effort))
+            .collect();
+        let missing: Vec<Effort> = Effort::ALL
+            .into_iter()
+            .filter(|effort| !supported.contains(effort))
+            .collect();
+        if !missing.is_empty() {
+            return Err(TactusError::Agent {
+                message: format!(
+                    "codex {version} model `{slug}` does not advertise required reasoning \
+                     level(s): {}. Refusing before `model_reasoning_effort` can fail an attempt.",
+                    missing
+                        .iter()
+                        .map(ToString::to_string)
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ),
+            });
+        }
+    }
+    Ok(())
 }
 
 /// This CLI's name for a tier-neutral effort level.
@@ -590,13 +937,29 @@ fn candidate_names() -> &'static [&'static str] {
 static RESOLVED: OnceLock<Option<Invocation>> = OnceLock::new();
 
 fn locate() -> Result<Invocation, TactusError> {
-    bin::locate(candidate_names(), &RESOLVED, |tried| {
-        format!(
-            "codex binary not found on PATH (looked for {}); install the OpenAI Codex CLI \
-             (`npm install -g @openai/codex`) or adjust PATH",
-            tried.join(", ")
-        )
-    })
+    bin::locate_with(
+        candidate_names(),
+        &RESOLVED,
+        |candidate| {
+            // Windows Store can put a package payload on PATH that is visible
+            // to filesystem lookup but returns access denied when spawned.
+            // Test each candidate before caching it so a later npm shim in the
+            // real PATH order can still win.
+            proc::run_with_timeout(
+                candidate.command(&["--version".to_owned()]),
+                "",
+                PROBE_TIMEOUT,
+            )
+            .is_ok_and(|output| !output.timed_out && output.code == Some(0))
+        },
+        |tried| {
+            format!(
+                "no usable codex binary found on PATH (looked for {}); install the OpenAI Codex \
+                 CLI (`npm install -g @openai/codex`) or adjust PATH",
+                tried.join(", ")
+            )
+        },
+    )
 }
 
 /// Registry entry, so `by_id("codex")` resolves without this module being
@@ -655,6 +1018,242 @@ mod tests {
         }
     }
 
+    fn debug_models_json(levels: &[&str]) -> String {
+        json!({
+            "models": [{
+                "slug": "gpt-5.6-sol",
+                "supported_reasoning_levels": levels
+                    .iter()
+                    .map(|effort| json!({ "effort": effort }))
+                    .collect::<Vec<_>>(),
+            }]
+        })
+        .to_string()
+    }
+
+    #[test]
+    fn probe_contract_requires_reasoning_config_on_fresh_and_resume() {
+        let fresh = "--json --sandbox --model -c, --config";
+        let resumed = "--json --model -c, --config";
+        validate_probe_contract("0.147.0", fresh, resumed).expect("complete surfaces");
+
+        let error = validate_probe_contract(
+            "0.147.0",
+            "--json --sandbox --model --configuration",
+            resumed,
+        )
+        .expect_err("fresh must carry reasoning config")
+        .to_string();
+        assert!(error.contains("`exec`"), "{error}");
+        assert!(error.contains("--config"), "{error}");
+        assert!(error.contains("-c"), "{error}");
+
+        let error = validate_probe_contract("0.147.0", fresh, "--json --model --configuration")
+            .expect_err("resume must carry reasoning config")
+            .to_string();
+        assert!(error.contains("`exec resume`"), "{error}");
+        assert!(error.contains("--config"), "{error}");
+        assert!(error.contains("-c"), "{error}");
+    }
+
+    #[test]
+    fn exact_key_probe_uses_strict_local_guards_on_both_cli_surfaces() {
+        let schema = std::path::Path::new(r"C:\missing\tactus-output-schema-must-not-exist.json");
+        for surface in [ConfigProbeSurface::Fresh, ConfigProbeSurface::Resume] {
+            let args = config_probe_args(surface, "model_reasoning_effort=xhigh", schema);
+            assert!(
+                args.contains(&"--ignore-user-config".to_owned()),
+                "{args:?}"
+            );
+            assert!(args.contains(&"--strict-config".to_owned()), "{args:?}");
+            assert!(args.contains(&"--output-schema".to_owned()), "{args:?}");
+            assert!(
+                args.windows(2).any(|pair| {
+                    pair == ["-c".to_owned(), "model_reasoning_effort=xhigh".to_owned()]
+                }),
+                "the exact provider key must reach argv: {args:?}"
+            );
+            assert!(
+                !args.contains(&"--help".to_owned()),
+                "help skips config parsing"
+            );
+            match surface {
+                ConfigProbeSurface::Fresh => {
+                    assert_eq!(args.first().map(String::as_str), Some("exec"));
+                    assert!(!args.contains(&"resume".to_owned()), "{args:?}");
+                }
+                ConfigProbeSurface::Resume => assert_eq!(
+                    &args[..3],
+                    ["exec", "resume", CONFIG_PROBE_RESUME_ID],
+                    "the resumed surface must be exercised independently"
+                ),
+            }
+        }
+    }
+
+    #[test]
+    fn strict_config_control_must_fail_before_the_missing_schema_guard() {
+        let rejected = output(
+            1,
+            "",
+            "error: unknown configuration key `tactus_probe_deliberately_unknown`",
+        );
+        validate_unknown_config_control("0.147.0", ConfigProbeSurface::Fresh, &rejected)
+            .expect("strict parsing is active");
+
+        let skipped = output(
+            1,
+            "",
+            "failed to read output schema tactus-output-schema-must-not-exist.json",
+        );
+        let error =
+            validate_unknown_config_control("0.147.0", ConfigProbeSurface::Resume, &skipped)
+                .expect_err("an ignored unknown key proves nothing")
+                .to_string();
+        assert!(error.contains("strict-config control"), "{error}");
+    }
+
+    #[test]
+    fn exact_effort_key_must_reach_the_zero_spend_schema_guard() {
+        let accepted = output(
+            1,
+            "",
+            "error reading output schema C:\\missing\\tactus-output-schema-must-not-exist.json",
+        );
+        for surface in [ConfigProbeSurface::Fresh, ConfigProbeSurface::Resume] {
+            for effort in [Effort::XHigh, Effort::Max] {
+                validate_effort_config_probe("0.147.0", surface, effort, &accepted)
+                    .expect("the exact key and value passed strict local parsing");
+            }
+        }
+
+        let unknown = output(
+            1,
+            "",
+            "error: unknown configuration key `model_reasoning_effort`",
+        );
+        let error = validate_effort_config_probe(
+            "0.147.0",
+            ConfigProbeSurface::Fresh,
+            Effort::XHigh,
+            &unknown,
+        )
+        .expect_err("a renamed key must refuse before spend")
+        .to_string();
+        assert!(error.contains("model_reasoning_effort=xhigh"), "{error}");
+
+        let mut timed_out = accepted;
+        timed_out.timed_out = true;
+        assert!(
+            validate_effort_config_probe(
+                "0.147.0",
+                ConfigProbeSurface::Resume,
+                Effort::Max,
+                &timed_out,
+            )
+            .is_err(),
+            "a timeout cannot be mistaken for parser evidence"
+        );
+    }
+
+    #[test]
+    fn unreadable_fresh_or_resume_help_is_a_preflight_refusal() {
+        let mut timed_out = output(0, "full help", "");
+        timed_out.timed_out = true;
+        let error = checked_help("codex", "exec", &timed_out)
+            .expect_err("fresh timeout")
+            .to_string();
+        assert!(error.contains("exec --help"), "{error}");
+        assert!(error.contains("could not be verified"), "{error}");
+
+        let failed = output(2, "", "resume help failed");
+        let error = checked_help("codex", "exec resume", &failed)
+            .expect_err("resume nonzero")
+            .to_string();
+        assert!(error.contains("exec resume --help"), "{error}");
+        assert!(error.contains("resume help failed"), "{error}");
+
+        let empty = output(0, "", "");
+        assert!(
+            checked_help("codex", "exec resume", &empty)
+                .expect_err("empty")
+                .to_string()
+                .contains("no output")
+        );
+    }
+
+    #[test]
+    fn model_catalog_requires_every_effort_for_each_known_codex_model() {
+        let complete = debug_models_json(&["low", "medium", "high", "xhigh", "max", "ultra"]);
+        let parsed = parse_debug_models(&complete).expect("realistic catalog");
+        validate_model_efforts("0.147.0", &parsed).expect("all Tactus levels are present");
+
+        for (missing, levels) in [
+            ("xhigh", ["low", "medium", "high", "max"]),
+            ("max", ["low", "medium", "high", "xhigh"]),
+        ] {
+            let parsed = parse_debug_models(&debug_models_json(&levels)).expect("catalog");
+            let error = validate_model_efforts("0.147.0", &parsed)
+                .expect_err("a missing shared level must refuse")
+                .to_string();
+            assert!(error.contains("gpt-5.6-sol"), "{error}");
+            assert!(error.contains(missing), "{error}");
+        }
+
+        let unrelated = serde_json::to_string(&json!({
+            "models": [{
+                "slug": "not-the-configured-model",
+                "supported_reasoning_levels": [
+                    { "effort": "low" },
+                    { "effort": "medium" },
+                    { "effort": "high" },
+                    { "effort": "xhigh" },
+                    { "effort": "max" },
+                ],
+            }]
+        }))
+        .expect("json");
+        let parsed = parse_debug_models(&unrelated).expect("catalog");
+        let error = validate_model_efforts("0.147.0", &parsed)
+            .expect_err("another slug cannot satisfy the configured model")
+            .to_string();
+        assert!(error.contains("gpt-5.6-sol"), "{error}");
+    }
+
+    #[test]
+    fn unreadable_model_catalog_is_a_preflight_refusal() {
+        let mut timed_out = output(0, "{}", "");
+        timed_out.timed_out = true;
+        assert!(
+            checked_model_catalog("codex", &timed_out)
+                .expect_err("timeout")
+                .to_string()
+                .contains("could not be verified")
+        );
+
+        let failed = output(2, "", "not available");
+        assert!(
+            checked_model_catalog("codex", &failed)
+                .expect_err("nonzero")
+                .to_string()
+                .contains("not available")
+        );
+
+        let empty = output(0, "", "");
+        assert!(
+            checked_model_catalog("codex", &empty)
+                .expect_err("empty")
+                .to_string()
+                .contains("no catalog")
+        );
+
+        let malformed = checked_model_catalog("codex", &output(0, "not-json", ""))
+            .and_then(|text| parse_debug_models(&text))
+            .expect_err("malformed catalog")
+            .to_string();
+        assert!(malformed.contains("unreadable catalog"), "{malformed}");
+    }
+
     #[test]
     fn a_fresh_attempt_sets_its_sandbox_and_a_resumed_one_must_not() {
         // The CLI's two shapes, which are not one shape with a flag swapped.
@@ -685,47 +1284,28 @@ mod tests {
     }
 
     #[test]
-    fn effort_is_stated_on_both_shapes_rather_than_left_to_the_vendor() {
-        // The bug this exists to prevent: this CLI takes its default effort
-        // from the provider's model roster, not from its flag set, and
-        // `gpt-5.6-sol` carries `default_reasoning_level: low`. Every review
-        // run before this flag existed was judged at the lowest setting with
-        // nothing in the record saying so — and a roster refresh could move it
-        // again without a release.
-        let fresh = build_args(&run(PermissionMode::Edit, None));
-        let at = fresh
-            .iter()
-            .position(|a| a == "-c")
-            .expect("effort must be passed: {fresh:?}");
-        assert_eq!(fresh[at + 1], "model_reasoning_effort=medium", "{fresh:?}");
-
-        // On the resumed shape too. `-c` is accepted there — measured against
-        // codex-cli 0.147.0, where a bogus session id fails at session lookup
-        // rather than argument parsing — unlike `-s`, which is rejected. A
-        // retry must not think harder or less hard than the attempt it
-        // continues.
-        let resumed = build_args(&run(PermissionMode::Edit, Some("019ff122-4d61")));
-        assert!(
-            resumed
-                .windows(2)
-                .any(|w| w[0] == "-c" && w[1] == "model_reasoning_effort=medium"),
-            "{resumed:?}"
-        );
-    }
-
-    #[test]
-    fn every_effort_maps_to_a_value_the_provider_accepts() {
-        // The provider validates this enum server-side and rejects anything
-        // else with a 400 *after* the turn starts, so an unmapped level would
-        // cost a whole attempt rather than failing fast. Its accepted set,
-        // read off that error: none, minimal, low, medium, high, xhigh, max.
-        const ACCEPTED: [&str; 7] = ["none", "minimal", "low", "medium", "high", "xhigh", "max"];
-        for effort in Effort::ALL {
-            assert!(
-                ACCEPTED.contains(&effort_flag(effort)),
-                "{effort} maps to `{}`, which the provider would reject",
-                effort_flag(effort)
-            );
+    fn every_effort_has_the_exact_config_spelling_on_fresh_and_resumed_attempts() {
+        let expected = [
+            (Effort::Low, "low"),
+            (Effort::Medium, "medium"),
+            (Effort::High, "high"),
+            (Effort::XHigh, "xhigh"),
+            (Effort::Max, "max"),
+        ];
+        for (effort, spelling) in expected {
+            assert_eq!(effort_flag(effort), spelling);
+            for resume in [None, Some("019ff122-4d61")] {
+                let mut task = run(PermissionMode::Edit, resume);
+                task.profile.effort = Some(effort);
+                let args = build_args(&task);
+                let expected = format!("model_reasoning_effort={spelling}");
+                assert!(
+                    args.windows(2)
+                        .any(|window| window[0] == "-c" && window[1] == expected),
+                    "{effort} must reach {:?} argv exactly: {args:?}",
+                    resume
+                );
+            }
         }
     }
 
@@ -925,5 +1505,20 @@ mod tests {
         let odd = parse_login_status(&output(0, "something new entirely\n", ""));
         assert_eq!(odd.auth, AuthState::Unknown);
         assert!(!odd.notes.is_empty());
+    }
+
+    // Runs only where the real CLI exists; deterministic contract fixtures do
+    // the compatibility proof, while this catches local help/catalog drift.
+    #[test]
+    fn probe_against_real_binary_when_present() {
+        if locate().is_err() {
+            eprintln!("codex not on PATH; skipping live probe");
+            return;
+        }
+        let caps = CodexAdapter.probe().expect("probe should succeed");
+        assert!(caps.json_output);
+        assert!(caps.session_resume);
+        assert!(caps.model_list);
+        assert!(!caps.version.is_empty());
     }
 }

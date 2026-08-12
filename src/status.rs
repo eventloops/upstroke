@@ -193,6 +193,9 @@ pub fn describe(event: &Event) -> String {
             short(&data.head_sha),
             data.interrupted_attempts
         ),
+        EventBody::RunSchemaUpgraded { data } => {
+            format!("event schema upgraded from {} to {}", data.from, data.to)
+        }
         EventBody::AttemptStarted {
             task,
             attempt,
@@ -377,7 +380,7 @@ mod tests {
                     adapter: None,
                     preflight_cli_version: None,
                     effort: None,
-                    selection_origin: crate::events::SelectionOrigin::Unknown,
+                    selection_origin: None,
                     tier: "small".to_owned(),
                     agent: "claude-code".to_owned(),
                     model: "claude-haiku-4-5".to_owned(),

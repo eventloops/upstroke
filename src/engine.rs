@@ -36,15 +36,16 @@ use crate::capacity;
 use crate::config::{self, OnTaskFailure};
 use crate::error::TactusError;
 use crate::events::{
-    self, ChainSummary, EventBody, EventLog, Feedback, GateSummary, Progress, RunState, TaskState,
+    self, BindingSummary, ChainSummary, EventBody, EventLog, Feedback, GateSummary, Progress,
+    RunState, TaskState,
 };
 use crate::gates::{self, ShellGate};
 use crate::interaction::{
     self, AnswerSource, InteractionMode, Notifier, QuestionRecord, RealSleeper, Sleeper,
 };
 use crate::ir::{
-    Answer, Effort, Outcome, OutcomeStatus, PermissionMode, Plan, Question, QuestionId,
-    QuestionKind, Task, TaskKind, WorkerProfile,
+    Answer, Outcome, OutcomeStatus, PermissionMode, Plan, Question, QuestionId, QuestionKind,
+    ResolvedEffortPolicy, Task, TaskKind, WorkerProfile,
 };
 use crate::ladder::{self, LadderPolicy, LadderState, Next};
 use crate::review::{self, PassBinding, ReviewPass, ReviewPlan};
@@ -469,6 +470,15 @@ struct Recorded {
     /// run's own report and a later `status` disagree about the same gates —
     /// the drift this record exists to stop, one field short of stopped.
     gates_from_config: bool,
+    /// The run's routing structure plus the first snapshot that names every
+    /// resolved rung binding. Present only on resume.
+    routing: Option<RecordedRouting>,
+}
+
+struct RecordedRouting {
+    run_id: String,
+    structure: Vec<ChainSummary>,
+    bindings: Option<Vec<ChainSummary>>,
 }
 
 fn preflight(opts: &RunOptions, harness: &Harness<'_>) -> Result<Preflight, TactusError> {
@@ -506,6 +516,14 @@ fn preflight_with_recorded(
     })?;
 
     let mut warnings = analysis.warnings.clone();
+
+    // Bindings are execution identity just like reviewers and gates. Restore
+    // them before resolving reviewers or probing agents: probing today's pin
+    // and only swapping later would let a harmless config edit refuse a resume
+    // on an agent this run was never going to use.
+    if let Some(routing) = recorded.routing.as_ref() {
+        restore_recorded_routing(&mut analysis, routing, &mut warnings)?;
+    }
 
     // The recorded gates replace the re-derived ones *here*, before anything
     // reads them — so the pre-flight resolution below, the `Bash(<cmd>)` grants
@@ -718,6 +736,7 @@ fn run_harness_inner(
         return Err(error);
     }
 
+    let effort_policy = analysis.config.resolved_effort_policy();
     let started = events::RunStarted {
         schema: events::SCHEMA_VERSION,
         tactus_version: env!("CARGO_PKG_VERSION").to_owned(),
@@ -738,6 +757,7 @@ fn run_harness_inner(
         gates_from_config: analysis.gates_from_config,
         interaction_mode: mode.to_string(),
         chains: chain_summaries(&analysis),
+        effort_policy: Some(effort_policy),
         reviews: Some(review_plan.clone()),
         gate_cmds: Some(gates),
     };
@@ -770,7 +790,7 @@ fn run_harness_inner(
         sleeper,
         caps,
         review_plan,
-        review_effort: analysis.config.review_effort(),
+        effort_policy,
         attempt_timeout: opts.attempt_timeout,
         defer_backoff: opts.defer_backoff,
         max_defers: opts.max_defers,
@@ -841,8 +861,164 @@ fn chain_summaries(analysis: &Analysis) -> Vec<ChainSummary> {
             task: task.id.to_string(),
             tiers: chain.rungs.iter().map(|rung| rung.tier).collect(),
             attempts_per: chain.attempts_per,
+            bindings: Some(
+                chain
+                    .rungs
+                    .iter()
+                    .map(|rung| BindingSummary {
+                        tier: rung.tier,
+                        agent: rung.binding.agent.clone(),
+                        model: rung.binding.model.clone(),
+                        pinned: rung.binding.pinned,
+                    })
+                    .collect(),
+            ),
         })
         .collect()
+}
+
+/// Validate the rung index space and restore the exact bindings the run began
+/// with. Structural changes still refuse: an existing `Progress.rung` cannot be
+/// interpreted against a different tier list. Binding-only changes warn and
+/// continue with the snapshot, matching gates and effort.
+fn restore_recorded_routing(
+    analysis: &mut Analysis,
+    recorded: &RecordedRouting,
+    warnings: &mut Vec<String>,
+) -> Result<(), TactusError> {
+    let current = chain_summaries(analysis);
+    let same_structure = current.len() == recorded.structure.len()
+        && current.iter().zip(&recorded.structure).all(|(now, then)| {
+            now.task == then.task
+                && now.tiers == then.tiers
+                && now.attempts_per == then.attempts_per
+        });
+    if !same_structure {
+        let moved: Vec<String> = current
+            .iter()
+            .zip(&recorded.structure)
+            .filter(|(now, then)| {
+                now.task != then.task
+                    || now.tiers != then.tiers
+                    || now.attempts_per != then.attempts_per
+            })
+            .map(|(now, then)| {
+                format!(
+                    "`{}` ran on [{}] with {} attempt(s) per rung and would now run on [{}] with {}",
+                    then.task,
+                    render_tiers(then),
+                    then.attempts_per,
+                    render_tiers(now),
+                    now.attempts_per,
+                )
+            })
+            .collect();
+        let detail = if moved.is_empty() {
+            format!(
+                "the run recorded {} task chain(s), while today's plan resolves {}",
+                recorded.structure.len(),
+                current.len()
+            )
+        } else {
+            moved.join("; ")
+        };
+        return Err(TactusError::Resume {
+            run_id: recorded.run_id.clone(),
+            message: format!(
+                "routing has changed since this run started, so a recorded rung would now mean a \
+                 different tier or allowance: {detail}. Restore the config it ran with, or start \
+                 a new run."
+            ),
+        });
+    }
+
+    let Some(snapshot) = recorded.bindings.as_ref() else {
+        warnings.push(
+            "this run's log predates the resolved-binding record, so worker agent/model bindings \
+             were re-derived from today's config rather than read from the run — earlier attempts \
+             may have used different bindings"
+                .to_owned(),
+        );
+        return Ok(());
+    };
+    if snapshot.len() != analysis.chains.len() {
+        return Err(TactusError::Resume {
+            run_id: recorded.run_id.clone(),
+            message: "the recorded binding snapshot does not align with the run's task chains; \
+                      the event log cannot safely identify which model belongs to which task"
+                .to_owned(),
+        });
+    }
+
+    let mut changed = Vec::new();
+    for ((chain, now), then) in analysis.chains.iter_mut().zip(&current).zip(snapshot) {
+        if then.task != now.task || then.tiers != now.tiers || then.attempts_per != now.attempts_per
+        {
+            return Err(TactusError::Resume {
+                run_id: recorded.run_id.clone(),
+                message: format!(
+                    "the recorded binding snapshot for `{}` does not match its frozen chain",
+                    then.task
+                ),
+            });
+        }
+        let Some(bindings) = then.bindings.as_ref() else {
+            return Err(TactusError::Resume {
+                run_id: recorded.run_id.clone(),
+                message: format!(
+                    "the recorded binding snapshot for `{}` is missing its bindings",
+                    then.task
+                ),
+            });
+        };
+        if bindings.len() != chain.rungs.len() {
+            return Err(TactusError::Resume {
+                run_id: recorded.run_id.clone(),
+                message: format!(
+                    "the recorded binding snapshot for `{}` has {} binding(s) for {} rung(s)",
+                    then.task,
+                    bindings.len(),
+                    chain.rungs.len()
+                ),
+            });
+        }
+        for (rung, binding) in chain.rungs.iter_mut().zip(bindings) {
+            if binding.tier != rung.tier {
+                return Err(TactusError::Resume {
+                    run_id: recorded.run_id.clone(),
+                    message: format!(
+                        "the recorded binding snapshot for `{}` assigns tier `{}` to a `{}` rung",
+                        then.task, binding.tier, rung.tier
+                    ),
+                });
+            }
+            if rung.binding.agent != binding.agent
+                || rung.binding.model != binding.model
+                || rung.binding.pinned != binding.pinned
+            {
+                changed.push(format!(
+                    "`{}` {}: recorded {}/{}, today {}/{}",
+                    then.task,
+                    rung.tier,
+                    binding.agent,
+                    binding.model,
+                    rung.binding.agent,
+                    rung.binding.model
+                ));
+            }
+            rung.binding.agent = binding.agent.clone();
+            rung.binding.model = binding.model.clone();
+            rung.binding.pinned = binding.pinned;
+        }
+    }
+    if !changed.is_empty() {
+        warnings.push(format!(
+            "today's worker bindings differ from the ones this run recorded ({}). This resume \
+             keeps the recorded bindings. Start a new run to adopt today's routing.",
+            changed.join("; ")
+        ));
+    }
+    Ok(())
 }
 
 /// The effective gates, in full, as they stood at this moment.
@@ -958,10 +1134,13 @@ fn resume_harness_inner(
     let events_path = public.join("events.jsonl");
     let events = events::read_all(&events_path, &mut warnings)?;
     let started = events::started_of(&events, &events_path)?.clone();
+    let effective_schema = events::ensure_supported_schema(&started, &events, &events_path)?;
     // Usually `run_started`'s, but a log too old to carry them there may have
     // had them established by an earlier resume instead — which is what stops
     // the re-derivation repeating, and drifting, on every resume after that.
     let recorded_gates = events::recorded_gates(&events).cloned();
+    let recorded_effort_policy = events::recorded_effort_policy(&events);
+    let recorded_chains = events::recorded_chains(&events).cloned();
 
     // The run knows its own plan and config; the CLI may override the config
     // but never the plan, which is frozen (§5).
@@ -1005,6 +1184,11 @@ fn resume_harness_inner(
             reviews: started.reviews.clone(),
             gates: recorded_gates.clone(),
             gates_from_config: started.gates_from_config,
+            routing: Some(RecordedRouting {
+                run_id: run_id.clone(),
+                structure: started.chains.clone(),
+                bindings: recorded_chains.clone(),
+            }),
         },
     )?;
     if started.reviews.is_none() {
@@ -1049,6 +1233,24 @@ fn resume_harness_inner(
         // gateless run, and a warning that cries wolf on the harmless case is
         // one nobody reads on the harmful one.
     }
+    let current_effort_policy = analysis.config.resolved_effort_policy();
+    let effort_policy = recorded_effort_policy.unwrap_or(current_effort_policy);
+    match recorded_effort_policy {
+        None => warnings.push(
+            "this run's log predates the effort-policy record, so implementation and review \
+             effort were re-derived from today's config rather than read from the run — earlier \
+             attempts may have used a different effort standard"
+                .to_owned(),
+        ),
+        Some(recorded) if recorded != current_effort_policy => warnings.push(format!(
+            "today's effort policy ({}) differs from the one this run recorded ({}). This \
+             resume keeps the recorded policy so one run has one execution and review standard. \
+             Start a new run to adopt today's policy.",
+            render_effort_policy(current_effort_policy),
+            render_effort_policy(recorded),
+        )),
+        Some(_) => {}
+    }
     warnings.extend(preflight_warnings);
 
     // The plan is frozen. A different hash means the file moved under the run,
@@ -1062,31 +1264,6 @@ fn resume_harness_inner(
             run_opts.plan_path.display(),
             started.plan_hash,
             analysis.plan.source.hash
-        )));
-    }
-
-    // Chains moved means config moved. `Progress.rung` is an index into the
-    // chain, so re-resolving a different one silently points a task at a
-    // different tier than the one it actually reached.
-    let chains = chain_summaries(&analysis);
-    if chains != started.chains {
-        let moved: Vec<String> = chains
-            .iter()
-            .zip(&started.chains)
-            .filter(|(now, then)| now != then)
-            .map(|(now, then)| {
-                format!(
-                    "`{}` ran on [{}] and would now run on [{}]",
-                    now.task,
-                    render_tiers(then),
-                    render_tiers(now)
-                )
-            })
-            .collect();
-        return Err(refuse(format!(
-            "routing has changed since this run started, so a recorded rung would now mean a \
-             different tier: {}. Restore the config it ran with, or start a new run.",
-            moved.join("; ")
         )));
     }
 
@@ -1226,7 +1403,7 @@ fn resume_harness_inner(
         sleeper,
         caps,
         review_plan,
-        review_effort: analysis.config.review_effort(),
+        effort_policy,
         attempt_timeout: opts.attempt_timeout,
         defer_backoff: opts.defer_backoff,
         max_defers: opts.max_defers,
@@ -1244,6 +1421,18 @@ fn resume_harness_inner(
         // previous process recorded nor swallows a fresh one.
         exhausted_pools: prior_signals.keys().cloned().collect(),
     };
+    // A legacy run cannot have its opening event rewritten without violating
+    // append-only history. This no-op event is therefore the schema-2 boundary:
+    // schema-1 binaries do not know its tag and refuse before ignoring the new
+    // effort/binding snapshots that follow.
+    if effective_schema < events::SCHEMA_VERSION {
+        run.emit(EventBody::RunSchemaUpgraded {
+            data: events::RunSchemaUpgraded {
+                from: effective_schema,
+                to: events::SCHEMA_VERSION,
+            },
+        })?;
+    }
     // The `task_committed` the dead process never got to, now that the commit
     // has been checked against the record. First of everything this resume
     // writes, because it is the thing that happened first.
@@ -1289,6 +1478,10 @@ fn resume_harness_inner(
             // Where the log already answers it, re-stating the answer would put
             // the same fact in two places that a later change could pull apart.
             gates: recorded_gates.is_none().then(|| gates.clone()),
+            effort_policy: recorded_effort_policy.is_none().then_some(effort_policy),
+            chains: recorded_chains
+                .is_none()
+                .then(|| chain_summaries(&analysis)),
         },
     })?;
     // §14 takes a capacity snapshot at pre-flight, and §15 makes a resume
@@ -1312,6 +1505,13 @@ fn render_tiers(chain: &ChainSummary) -> String {
 /// A gate name list, for a message.
 fn render_names(names: &[String]) -> String {
     names.join(", ")
+}
+
+fn render_effort_policy(policy: ResolvedEffortPolicy) -> String {
+    format!(
+        "implementation small={}, mid={}, frontier={}; review={}",
+        policy.small, policy.mid, policy.frontier, policy.review
+    )
 }
 
 /// What today's config would gate with, against what the run recorded — `None`
@@ -1478,9 +1678,9 @@ struct Run<'a> {
     /// Who judges each task (§11.2–§11.3), resolved once at pre-flight and
     /// recorded in `run_started`.
     review_plan: ReviewPlan,
-    /// How hard every reviewer thinks — the review tier's effort, resolved once
-    /// so both passes of a second opinion judge to one standard.
-    review_effort: Effort,
+    /// The run's recorded effort standard. Both worker attempts and all review
+    /// passes read this snapshot, including after a resume under changed config.
+    effort_policy: ResolvedEffortPolicy,
     attempt_timeout: Duration,
     defer_backoff: Duration,
     max_defers: u32,
@@ -1754,7 +1954,7 @@ impl Run<'_> {
                 // What the rung's tier is worth on an agent with an effort
                 // axis: without this the whole chain runs at one vendor
                 // default and escalating a rung moves nothing (§10).
-                effort: Some(self.analysis.config.implementation_effort(rung.tier)),
+                effort: Some(self.effort_policy.implementation_for(rung.tier)),
                 max_turns: None,
                 extra_args: Vec::new(),
             };
@@ -1791,11 +1991,11 @@ impl Run<'_> {
                         .get(&profile.agent)
                         .map(|caps| caps.version.clone()),
                     effort: profile.effort,
-                    selection_origin: if rung.binding.pinned {
+                    selection_origin: Some(if rung.binding.pinned {
                         events::SelectionOrigin::Pin
                     } else {
                         events::SelectionOrigin::Auto
-                    },
+                    }),
                     pool: pool_option(&profile.pool),
                     resume_session: resume.clone(),
                 },
@@ -2048,7 +2248,7 @@ impl Run<'_> {
                 // Every pass judges at the review tier's effort, including a
                 // second opinion bound to another vendor: the standard belongs
                 // to the review, not to whichever family happens to apply it.
-                let mut profile = pass.profile(self.review_effort);
+                let mut profile = pass.profile(self.effort_policy.review);
                 // A cross-vendor second opinion draws on a different
                 // subscription than the implementer (§11.3, §13), so its pool
                 // is looked up from its own agent rather than inherited.
@@ -3866,7 +4066,7 @@ impl RunReport {
 mod tests {
     use super::*;
     use crate::agent::{Caps, ProcessOutput};
-    use crate::ir::{TaskId, Usage};
+    use crate::ir::{Effort, TaskId, Usage};
     use std::path::Path;
     use std::process::Command;
     use std::sync::{Mutex, OnceLock};
@@ -5016,6 +5216,233 @@ mod tests {
             later.copilot().reviews_run(),
             0,
             "a CLI installed since the run began must not become its judge"
+        );
+    }
+
+    #[test]
+    fn resume_runs_with_the_effort_policy_the_run_recorded_not_todays_config() {
+        let original = "[interaction]\nmode = \"never\"\n\n\
+                        [routing]\nimplement = { chain = [\"small\"], attempts_per = 1 }\n\n\
+                        [routing.effort]\nimplementation = \"xhigh\"\nreview = \"max\"\n";
+        let (repo, run_id) = parked_run_with_config("resumeeffort", original);
+        fs::write(
+            repo.join("tactus.toml"),
+            "[interaction]\nmode = \"never\"\n\n\
+             [routing]\nimplement = { chain = [\"small\"], attempts_per = 1 }\n\n\
+             [routing.effort]\nimplementation = \"low\"\nreview = \"high\"\n",
+        )
+        .expect("edit effort only");
+
+        let resumed = resume_answering(&repo, &run_id, Effect::EditFile);
+        assert_eq!(resumed.outcome(), RunOutcome::Complete, "{resumed:?}");
+        let logged = events_of(&repo, &run_id);
+        let resumed_worker = logged
+            .iter()
+            .filter_map(|event| match &event.body {
+                EventBody::AttemptStarted { data, .. } => Some(data),
+                _ => None,
+            })
+            .next_back()
+            .expect("resumed worker start");
+        assert_eq!(resumed_worker.effort, Some(Effort::XHigh));
+        let resumed_reviews = logged
+            .iter()
+            .filter_map(|event| match &event.body {
+                EventBody::AttemptFinished { data, .. } if !data.reviews.is_empty() => {
+                    Some(&data.reviews)
+                }
+                _ => None,
+            })
+            .next_back()
+            .expect("resumed review records");
+        assert!(
+            resumed_reviews
+                .iter()
+                .all(|review| review.effort == Some(Effort::Max)),
+            "every review pass keeps max: {resumed_reviews:?}"
+        );
+        let warning = resumed
+            .warnings
+            .iter()
+            .find(|warning| warning.contains("today's effort policy"))
+            .unwrap_or_else(|| panic!("no effort difference warning: {:?}", resumed.warnings));
+        assert!(warning.contains("implementation small=low"), "{warning}");
+        assert!(warning.contains("implementation small=xhigh"), "{warning}");
+        assert!(warning.contains("review=max"), "{warning}");
+        assert!(warning.contains("Start a new run"), "{warning}");
+    }
+
+    #[test]
+    fn resume_restores_the_recorded_worker_binding_before_preflight() {
+        let original = "[interaction]\nmode = \"never\"\n\n\
+                        [routing]\nimplement = { chain = [\"small\"], attempts_per = 1 }\n";
+        let (repo, run_id) = parked_run_with_config("resumebinding", original);
+        fs::write(
+            repo.join("tactus.toml"),
+            "[interaction]\nmode = \"never\"\n\n\
+             [routing]\nimplement = { chain = [\"small\"], attempts_per = 1 }\n\n\
+             [[pins]]\ntier = \"small\"\nagent = \"copilot\"\nmodel = \"gpt-5-mini\"\n",
+        )
+        .expect("edit only the binding");
+
+        // `resume_answering` exposes only the Claude fake. If pre-flight probes
+        // today's Copilot pin before restoring the record, this refuses before
+        // the behavioral assertions below can run.
+        let resumed = resume_answering(&repo, &run_id, Effect::EditFile);
+        assert_eq!(resumed.outcome(), RunOutcome::Complete, "{resumed:?}");
+        let logged = events_of(&repo, &run_id);
+        let worker = logged
+            .iter()
+            .filter_map(|event| match &event.body {
+                EventBody::AttemptStarted { data, .. } => Some(data),
+                _ => None,
+            })
+            .next_back()
+            .expect("resumed worker");
+        assert_eq!(worker.agent, "claude-code");
+        assert_eq!(worker.model, "claude-haiku-4-5");
+        assert_eq!(
+            worker.selection_origin,
+            Some(events::SelectionOrigin::Auto),
+            "the recorded absence of a pin is part of the snapshot too"
+        );
+        assert!(
+            resumed
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("today's worker bindings")
+                    && warning.contains("gpt-5-mini")
+                    && warning.contains("claude-haiku-4-5")),
+            "binding difference warning: {:?}",
+            resumed.warnings
+        );
+    }
+
+    #[test]
+    fn the_resume_that_rederives_an_old_logs_effort_records_it_for_the_next_one() {
+        let original = "[interaction]\nmode = \"never\"\n\n\
+                        [routing]\nimplement = { chain = [\"small\"], attempts_per = 1 }\n\n\
+                        [routing.effort]\nimplementation = \"xhigh\"\nreview = \"max\"\n";
+        let (repo, run_id) = parked_run_with_config("oldlogeffort", original);
+        let paths = paths_of(&repo, &run_id);
+        rewrite_run_started_as_schema_one(&paths, &["effort_policy"]);
+
+        fs::write(
+            repo.join("tactus.toml"),
+            "[interaction]\nmode = \"never\"\n\n\
+             [routing]\nimplement = { chain = [\"small\"], attempts_per = 1 }\n\n\
+             [routing.effort]\nimplementation = \"high\"\nreview = \"xhigh\"\n",
+        )
+        .expect("first derived policy");
+        let first = resume_answering(&repo, &run_id, Effect::NoEdit);
+        assert_eq!(first.outcome(), RunOutcome::Parked, "{first:?}");
+        assert!(
+            first
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("predates the effort-policy record")),
+            "legacy warning: {:?}",
+            first.warnings
+        );
+        let established = ResolvedEffortPolicy {
+            small: Effort::High,
+            mid: Effort::High,
+            frontier: Effort::High,
+            review: Effort::XHigh,
+        };
+        assert_eq!(
+            events::recorded_effort_policy(&events_of(&repo, &run_id)),
+            Some(established),
+            "the first resume writes down what it derived"
+        );
+        let after_first = events_of(&repo, &run_id);
+        assert!(events::recorded_chains(&after_first).is_some());
+        assert_eq!(
+            after_first
+                .iter()
+                .filter(|event| matches!(event.body, EventBody::RunSchemaUpgraded { .. }))
+                .count(),
+            1,
+            "the first schema-2 resume appends one downgrade barrier"
+        );
+
+        fs::write(
+            repo.join("tactus.toml"),
+            "[interaction]\nmode = \"never\"\n\n\
+             [routing]\nimplement = { chain = [\"small\"], attempts_per = 1 }\n\n\
+             [routing.effort]\nimplementation = \"low\"\nreview = \"medium\"\n",
+        )
+        .expect("later policy");
+        let second = resume_answering(&repo, &run_id, Effect::EditFile);
+        assert_eq!(second.outcome(), RunOutcome::Complete, "{second:?}");
+        let logged = events_of(&repo, &run_id);
+        let worker = logged
+            .iter()
+            .filter_map(|event| match &event.body {
+                EventBody::AttemptStarted { data, .. } => Some(data),
+                _ => None,
+            })
+            .next_back()
+            .expect("second resumed worker");
+        assert_eq!(worker.effort, Some(Effort::High));
+        let reviews = logged
+            .iter()
+            .filter_map(|event| match &event.body {
+                EventBody::AttemptFinished { data, .. } if !data.reviews.is_empty() => {
+                    Some(&data.reviews)
+                }
+                _ => None,
+            })
+            .next_back()
+            .expect("second resumed reviews");
+        assert!(
+            reviews
+                .iter()
+                .all(|review| review.effort == Some(Effort::XHigh)),
+            "reviews retain the established legacy policy: {reviews:?}"
+        );
+        assert!(
+            second
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("today's effort policy")),
+            "the later edit is reported: {:?}",
+            second.warnings
+        );
+        assert!(
+            !second
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("predates the effort-policy record")),
+            "the legacy absence was established once: {:?}",
+            second.warnings
+        );
+        assert_eq!(
+            events_of(&repo, &run_id)
+                .iter()
+                .filter(|event| matches!(event.body, EventBody::RunSchemaUpgraded { .. }))
+                .count(),
+            1,
+            "later resumes must not append duplicate schema transitions"
+        );
+    }
+
+    #[test]
+    fn a_resume_whose_effort_policy_did_not_move_says_nothing_about_it() {
+        let config = "[interaction]\nmode = \"never\"\n\n\
+                      [routing]\nimplement = { chain = [\"small\"], attempts_per = 1 }\n\n\
+                      [routing.effort]\nimplementation = \"xhigh\"\nreview = \"max\"\n";
+        let (repo, run_id) = parked_run_with_config("effortunmoved", config);
+        let resumed = resume_answering(&repo, &run_id, Effect::EditFile);
+        assert_eq!(resumed.outcome(), RunOutcome::Complete, "{resumed:?}");
+        assert!(
+            !resumed
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("effort policy")
+                    || warning.contains("effort-policy")),
+            "an unchanged policy must be silent: {:?}",
+            resumed.warnings
         );
     }
 
@@ -7853,6 +8280,47 @@ mod tests {
         fs::write(paths.events(), format!("{}\n", rewritten.join("\n"))).expect("rewrite");
     }
 
+    /// Rewrite the opening event into the exact compatibility shape a
+    /// schema-1 binary wrote: selected top-level fields absent and no per-chain
+    /// binding snapshot. Used only by downgrade/resume regressions.
+    fn rewrite_run_started_as_schema_one(paths: &RunPaths, absent: &[&str]) {
+        let text = fs::read_to_string(paths.events()).expect("log");
+        let mut rewritten_start = false;
+        let rewritten: Vec<String> = text
+            .lines()
+            .map(|line| {
+                let mut value: serde_json::Value =
+                    serde_json::from_str(line).expect("every line is an event");
+                if value.get("event").and_then(|event| event.as_str()) == Some("run_started") {
+                    let data = value
+                        .get_mut("data")
+                        .and_then(serde_json::Value::as_object_mut)
+                        .expect("run_started data");
+                    data.insert("schema".to_owned(), serde_json::Value::from(1));
+                    for field in absent {
+                        data.remove(*field)
+                            .unwrap_or_else(|| panic!("the run recorded no `{field}`"));
+                    }
+                    for chain in data
+                        .get_mut("chains")
+                        .and_then(serde_json::Value::as_array_mut)
+                        .expect("run_started chains")
+                    {
+                        chain
+                            .as_object_mut()
+                            .expect("chain object")
+                            .remove("bindings")
+                            .expect("a schema-2 run records chain bindings");
+                    }
+                    rewritten_start = true;
+                }
+                value.to_string()
+            })
+            .collect();
+        assert!(rewritten_start, "the log has no run_started event");
+        fs::write(paths.events(), format!("{}\n", rewritten.join("\n"))).expect("rewrite");
+    }
+
     /// Rewind a log to just before the named event — the shape a process
     /// killed at that instant leaves behind.
     fn truncate_log_before(paths: &RunPaths, event: &str) {
@@ -8656,7 +9124,10 @@ mod tests {
         assert_eq!(started.adapter.as_deref(), Some("claude-code"));
         assert_eq!(started.preflight_cli_version.as_deref(), Some("0.0.0-fake"));
         assert_eq!(started.effort, Some(Effort::XHigh));
-        assert_eq!(started.selection_origin, events::SelectionOrigin::Auto);
+        assert_eq!(
+            started.selection_origin,
+            Some(events::SelectionOrigin::Auto)
+        );
 
         let review = events
             .iter()
@@ -8706,7 +9177,7 @@ mod tests {
                 _ => None,
             })
             .expect("worker start was emitted");
-        assert_eq!(started.selection_origin, events::SelectionOrigin::Pin);
+        assert_eq!(started.selection_origin, Some(events::SelectionOrigin::Pin));
         assert_eq!(started.effort, Some(Effort::Max));
     }
 

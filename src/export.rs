@@ -8,7 +8,7 @@ use serde::Serialize;
 
 use crate::error::TactusError;
 use crate::events::{self, AttemptRecord, Event, EventBody, ReviewPassOutcome, SelectionOrigin};
-use crate::ir::{Effort, Plan, Task, Usage};
+use crate::ir::{Effort, Plan, Task, TaskKind, Tier, Usage};
 use crate::ladder::{FailureKind, FailureOrigin};
 use crate::rundir;
 
@@ -39,15 +39,15 @@ pub struct Row {
     adapter_id: String,
     adapter_cli_version: Option<String>,
     model: String,
-    effort: Option<Effort>,
+    effort: Option<&'static str>,
     pool: Option<String>,
     session_resumed: bool,
     duration_ms: Option<u64>,
     cost_usd: Option<f64>,
-    usage: Option<Usage>,
+    usage: Option<ExportUsage>,
     outcome: &'static str,
-    failure_kind: Option<FailureKind>,
-    failure_origin: Option<FailureOrigin>,
+    failure_kind: Option<&'static str>,
+    failure_origin: Option<&'static str>,
     failure_category: Option<&'static str>,
     work_evidence: Option<&'static str>,
     failure_reason: Option<String>,
@@ -78,167 +78,205 @@ struct Review {
     adapter_id: String,
     adapter_cli_version: Option<String>,
     model: String,
-    effort: Option<Effort>,
+    effort: Option<&'static str>,
     pool: Option<String>,
     cost_usd: Option<f64>,
-    outcome: ReviewPassOutcome,
+    outcome: &'static str,
+}
+
+/// A successful load plus recoverable residue the caller must surface on a
+/// separate channel from the machine-readable export.
+pub struct Loaded {
+    pub rows: Vec<Row>,
+    pub warnings: Vec<String>,
+}
+
+/// Export-schema-1 usage. This intentionally is not the engine's `Usage`:
+/// adding an internal field must not silently add a public JSON key.
+#[derive(Serialize)]
+struct ExportUsage {
+    input_tokens: Option<u64>,
+    output_tokens: Option<u64>,
+    cache_creation_input_tokens: Option<u64>,
+    cache_read_input_tokens: Option<u64>,
+    num_turns: Option<u32>,
+    reasoning_output_tokens: Option<u64>,
 }
 
 type AttemptKey = (String, u32, u32);
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SettlementKind {
+    Finished,
+    Interrupted,
+}
+
 struct Settlement<'a> {
+    index: usize,
+    kind: SettlementKind,
     ts: &'a str,
     profile: &'a str,
     record: &'a AttemptRecord,
 }
 
+struct RunContext<'a> {
+    events_path: &'a Path,
+    run_id: &'a str,
+    tactus_version: &'a str,
+    started_at: &'a str,
+}
+
 /// Load and validate one stable run snapshot. No config, source plan, adapter,
 /// or report is consulted.
-pub fn load(repo_root: &Path, wanted: &str) -> Result<Vec<Row>, TactusError> {
+pub fn load(repo_root: &Path, wanted: &str) -> Result<Loaded, TactusError> {
     let run_id = rundir::resolve_run_id(repo_root, wanted)?;
     let public = rundir::public_dir(repo_root, &run_id);
-    if rundir::is_running(&public) {
-        return Err(TactusError::Refused {
-            message: format!(
-                "run `{run_id}` is live and its decision dataset is still moving; wait for it to finish or stop it before exporting"
-            ),
-        });
-    }
     let events_path = public.join("events.jsonl");
-    let mut warnings = Vec::new();
-    let log = events::read_all(&events_path, &mut warnings)?;
-    if !warnings.is_empty() {
-        return invalid(&events_path, warnings.join("; "));
-    }
-    let mut run_starts = log
-        .iter()
-        .filter(|event| matches!(event.body, EventBody::RunStarted { .. }));
-    let started_event = run_starts.next().ok_or_else(|| TactusError::EventLog {
-        path: events_path.clone(),
-        message: "no run_started event".to_owned(),
-    })?;
-    if run_starts.next().is_some() {
-        return invalid(&events_path, "duplicate run_started event".to_owned());
-    }
-    let EventBody::RunStarted { data: started } = &started_event.body else {
-        unreachable!()
-    };
-    if started.run_id != run_id {
-        return invalid(
-            &events_path,
-            format!(
-                "run_started id `{}` does not match directory `{run_id}`",
-                started.run_id
-            ),
-        );
-    }
+    let snapshot_bytes = begin_snapshot(&public, &run_id, &events_path)?;
 
-    let plan_path = public.join("plan.normalized.json");
-    let plan_text = std::fs::read_to_string(&plan_path).map_err(|source| TactusError::Io {
-        path: plan_path.clone(),
-        source,
-    })?;
-    let plan: Plan = serde_json::from_str(&plan_text).map_err(|error| TactusError::Parse {
-        message: format!("{}: {error}", plan_path.display()),
-    })?;
-    if plan.source.hash != started.plan_hash {
-        return invalid(
-            &plan_path,
-            format!(
-                "frozen plan hash `{}` does not match run-start hash `{}`",
-                plan.source.hash, started.plan_hash
-            ),
-        );
-    }
-    let tasks = unique_tasks(&plan, &events_path)?;
-    let chains = unique_chains(&started.chains, &events_path)?;
-    let settlements = settlements(&log, &events_path)?;
-    let mut seen_starts = BTreeSet::new();
-    let mut rows = Vec::new();
-
-    for event in &log {
-        let EventBody::AttemptStarted {
-            task,
-            attempt,
-            rung,
-            profile,
-            data,
-        } = &event.body
-        else {
-            continue;
+    // Always perform the closing stability check before returning a projection
+    // error. Otherwise a racing resume could make a transient moving view look
+    // like permanently invalid input.
+    let projected = (|| {
+        let events::ParsedLines {
+            events: log,
+            torn_tail_warning,
+        } = events::parse_bytes(&events_path, &snapshot_bytes)?;
+        let warnings = torn_tail_warning.into_iter().collect();
+        let mut run_starts = log
+            .iter()
+            .filter(|event| matches!(event.body, EventBody::RunStarted { .. }));
+        let started_event = run_starts.next().ok_or_else(|| TactusError::EventLog {
+            path: events_path.clone(),
+            message: "no run_started event".to_owned(),
+        })?;
+        if run_starts.next().is_some() {
+            return invalid(&events_path, "duplicate run_started event".to_owned());
+        }
+        let EventBody::RunStarted { data: started } = &started_event.body else {
+            unreachable!()
         };
-        let key = (task.clone(), *attempt, *rung);
-        if *attempt == 0 {
-            return invalid(
-                &events_path,
-                format!("attempt number must be positive for {}", key_text(&key)),
-            );
-        }
-        if !seen_starts.insert(key.clone()) {
-            return invalid(
-                &events_path,
-                format!("duplicate attempt start {}", key_text(&key)),
-            );
-        }
-        let task_plan = tasks
-            .get(task)
-            .ok_or_else(|| bad_join(&events_path, task, "frozen plan"))?;
-        let chain = chains
-            .get(task)
-            .ok_or_else(|| bad_join(&events_path, task, "run-start chains"))?;
-        if chain.tiers.is_empty() || chain.attempts_per == 0 {
-            return invalid(
-                &events_path,
-                format!("invalid recorded chain for attempted task `{task}`"),
-            );
-        }
-        let expected_tier = usize::try_from(*rung)
-            .ok()
-            .and_then(|index| chain.tiers.get(index))
-            .ok_or_else(|| TactusError::EventLog {
-                path: events_path.clone(),
-                message: format!("rung is outside the recorded chain for {}", key_text(&key)),
-            })?;
-        if expected_tier.to_string() != data.tier {
+        events::ensure_supported_schema(started, &log, &events_path)?;
+        if started.run_id != run_id {
             return invalid(
                 &events_path,
                 format!(
-                    "start tier `{}` does not match recorded rung tier `{expected_tier}` for {}",
-                    data.tier,
-                    key_text(&key)
+                    "run_started id `{}` does not match directory `{run_id}`",
+                    started.run_id
                 ),
             );
         }
-        let settlement = settlements.get(&key);
-        if let Some(done) = settlement
-            && (done.profile != profile
-                || done.record.attempt != *attempt
-                || done.record.tier != data.tier)
-        {
-            return invalid(
-                &events_path,
-                format!("mismatched settlement for {}", key_text(&key)),
-            );
-        }
-        rows.push(build_row(
-            &run_id,
-            &started.tactus_version,
+        validate_timestamp(
+            &events_path,
+            &format!("run `{run_id}` run_started"),
             &started_event.ts,
-            event,
-            task_plan,
-            chain,
-            settlement,
-        )?);
-    }
-    for key in settlements.keys() {
-        if !seen_starts.contains(key) {
+        )?;
+
+        let plan_path = public.join("plan.normalized.json");
+        let plan_text = std::fs::read_to_string(&plan_path).map_err(|source| TactusError::Io {
+            path: plan_path.clone(),
+            source,
+        })?;
+        let plan: Plan = serde_json::from_str(&plan_text).map_err(|error| TactusError::Parse {
+            message: format!("{}: {error}", plan_path.display()),
+        })?;
+        if plan.source.hash != started.plan_hash {
             return invalid(
-                &events_path,
-                format!("settlement without a start for {}", key_text(key)),
+                &plan_path,
+                format!(
+                    "frozen plan hash `{}` does not match run-start hash `{}`",
+                    plan.source.hash, started.plan_hash
+                ),
             );
         }
-    }
-    Ok(rows)
+        let tasks = unique_tasks(&plan, &events_path)?;
+        let chains = unique_chains(&started.chains, &tasks, &events_path)?;
+        let settlements = settlements(&log, &events_path)?;
+        let mut seen_starts = BTreeSet::new();
+        let mut rows = Vec::new();
+        let context = RunContext {
+            events_path: &events_path,
+            run_id: &run_id,
+            tactus_version: &started.tactus_version,
+            started_at: &started_event.ts,
+        };
+
+        for (start_index, event) in log.iter().enumerate() {
+            let EventBody::AttemptStarted {
+                task,
+                attempt,
+                rung,
+                profile,
+                data,
+            } = &event.body
+            else {
+                continue;
+            };
+            let key = (task.clone(), *attempt, *rung);
+            if *attempt == 0 {
+                return invalid(
+                    &events_path,
+                    format!("attempt number must be positive for {}", key_text(&key)),
+                );
+            }
+            validate_timestamp(
+                &events_path,
+                &format!("run `{run_id}`, {} start", key_text(&key)),
+                &event.ts,
+            )?;
+            if !seen_starts.insert(key.clone()) {
+                return invalid(
+                    &events_path,
+                    format!("duplicate attempt start {}", key_text(&key)),
+                );
+            }
+            let task_plan = tasks
+                .get(task)
+                .ok_or_else(|| bad_join(&events_path, task, "frozen plan"))?;
+            let chain = chains
+                .get(task)
+                .ok_or_else(|| bad_join(&events_path, task, "run-start chains"))?;
+            let expected_tier = usize::try_from(*rung)
+                .ok()
+                .and_then(|index| chain.tiers.get(index))
+                .ok_or_else(|| TactusError::EventLog {
+                    path: events_path.clone(),
+                    message: format!("rung is outside the recorded chain for {}", key_text(&key)),
+                })?;
+            if tier(*expected_tier) != data.tier {
+                return invalid(
+                    &events_path,
+                    format!(
+                        "start tier `{}` does not match recorded rung tier `{expected_tier}` for {}",
+                        data.tier,
+                        key_text(&key)
+                    ),
+                );
+            }
+            let settlement = settlements.get(&key);
+            if let Some(done) = settlement {
+                validate_settlement(&events_path, &key, start_index, profile, data, done)?;
+                validate_timestamp(
+                    &events_path,
+                    &format!("run `{run_id}`, {} settlement", key_text(&key)),
+                    done.ts,
+                )?;
+            }
+            rows.push(build_row(&context, event, task_plan, chain, settlement)?);
+        }
+        for key in settlements.keys() {
+            if !seen_starts.contains(key) {
+                return invalid(
+                    &events_path,
+                    format!("settlement without a start for {}", key_text(key)),
+                );
+            }
+        }
+        Ok(Loaded { rows, warnings })
+    })();
+
+    finish_snapshot(&public, &run_id, &events_path, &snapshot_bytes)?;
+    projected
 }
 
 fn unique_tasks<'a>(
@@ -256,14 +294,47 @@ fn unique_tasks<'a>(
 
 fn unique_chains<'a>(
     chains: &'a [events::ChainSummary],
+    tasks: &BTreeMap<String, &'_ Task>,
     path: &Path,
 ) -> Result<BTreeMap<String, &'a events::ChainSummary>, TactusError> {
     let mut out = BTreeMap::new();
     for chain in chains {
+        if !tasks.contains_key(&chain.task) {
+            return invalid(
+                path,
+                format!(
+                    "run-start chain task `{}` is absent from the frozen plan",
+                    chain.task
+                ),
+            );
+        }
+        if chain.tiers.is_empty() {
+            return invalid(
+                path,
+                format!("recorded chain for task `{}` has no tiers", chain.task),
+            );
+        }
+        if chain.attempts_per == 0 {
+            return invalid(
+                path,
+                format!(
+                    "recorded chain for task `{}` has attempts_per 0",
+                    chain.task
+                ),
+            );
+        }
         if out.insert(chain.task.clone(), chain).is_some() {
             return invalid(
                 path,
                 format!("duplicate recorded chain for task `{}`", chain.task),
+            );
+        }
+    }
+    for task in tasks.keys() {
+        if !out.contains_key(task) {
+            return invalid(
+                path,
+                format!("frozen-plan task `{task}` has no run-start chain"),
             );
         }
     }
@@ -275,22 +346,36 @@ fn settlements<'a>(
     path: &Path,
 ) -> Result<BTreeMap<AttemptKey, Settlement<'a>>, TactusError> {
     let mut out = BTreeMap::new();
-    for event in log {
-        let (task, attempt, rung, profile, record) = match &event.body {
+    for (index, event) in log.iter().enumerate() {
+        let (kind, task, attempt, rung, profile, record) = match &event.body {
             EventBody::AttemptFinished {
                 task,
                 attempt,
                 rung,
                 profile,
                 data,
-            }
-            | EventBody::AttemptInterrupted {
+            } => (
+                SettlementKind::Finished,
+                task,
+                attempt,
+                rung,
+                profile,
+                &**data,
+            ),
+            EventBody::AttemptInterrupted {
                 task,
                 attempt,
                 rung,
                 profile,
                 data,
-            } => (task, attempt, rung, profile, &**data),
+            } => (
+                SettlementKind::Interrupted,
+                task,
+                attempt,
+                rung,
+                profile,
+                &**data,
+            ),
             _ => continue,
         };
         let key = (task.clone(), *attempt, *rung);
@@ -298,6 +383,8 @@ fn settlements<'a>(
             .insert(
                 key.clone(),
                 Settlement {
+                    index,
+                    kind,
                     ts: &event.ts,
                     profile,
                     record,
@@ -311,10 +398,74 @@ fn settlements<'a>(
     Ok(out)
 }
 
+fn validate_settlement(
+    path: &Path,
+    key: &AttemptKey,
+    start_index: usize,
+    start_profile: &str,
+    start: &events::AttemptStarted,
+    settlement: &Settlement<'_>,
+) -> Result<(), TactusError> {
+    if settlement.index <= start_index {
+        return invalid(
+            path,
+            format!("settlement appears before its start for {}", key_text(key)),
+        );
+    }
+    if settlement.profile != start_profile
+        || settlement.record.attempt != key.1
+        || settlement.record.tier != start.tier
+        || settlement.record.model != start.model
+        || settlement.record.pool != start.pool
+    {
+        return invalid(
+            path,
+            format!("mismatched settlement identity for {}", key_text(key)),
+        );
+    }
+
+    let failure_kind = settlement
+        .record
+        .failure
+        .as_ref()
+        .map(|failure| failure.kind);
+    match settlement.kind {
+        SettlementKind::Finished if failure_kind == Some(FailureKind::Interrupted) => invalid(
+            path,
+            format!(
+                "attempt_finished carries interruption semantics for {}",
+                key_text(key)
+            ),
+        ),
+        SettlementKind::Interrupted if failure_kind != Some(FailureKind::Interrupted) => invalid(
+            path,
+            format!(
+                "attempt_interrupted lacks an interrupted failure for {}",
+                key_text(key)
+            ),
+        ),
+        SettlementKind::Interrupted
+            if settlement
+                .record
+                .failure
+                .as_ref()
+                .map(|failure| failure.origin)
+                != Some(FailureOrigin::Worker) =>
+        {
+            invalid(
+                path,
+                format!(
+                    "attempt_interrupted is not attributed to the worker for {}",
+                    key_text(key)
+                ),
+            )
+        }
+        SettlementKind::Finished | SettlementKind::Interrupted => Ok(()),
+    }
+}
+
 fn build_row(
-    run_id: &str,
-    version: &str,
-    run_started_at: &str,
+    context: &RunContext<'_>,
     start_event: &Event,
     task: &Task,
     chain: &events::ChainSummary,
@@ -337,20 +488,37 @@ fn build_row(
         .map(|f| f.origin)
         .or_else(|| settlement.is_none().then_some(FailureOrigin::Worker));
     let (category, evidence) = kind.map(failure_projection).unzip();
-    let interrupted = kind == Some(FailureKind::Interrupted);
+    let interrupted = settlement
+        .map(|done| done.kind == SettlementKind::Interrupted)
+        .unwrap_or(true);
     let record = settlement.map(|done| done.record);
-    let duration_ms = record.map(|r| duration_ms(r.duration)).transpose()?;
-    validate_cost("attempt", record.and_then(|r| r.cost_usd))?;
+    let identity = format!(
+        "run `{}`, {}",
+        context.run_id,
+        key_text(&(task.id.to_string(), *attempt, *rung))
+    );
+    let duration_ms = record
+        .map(|record| duration_ms(context.events_path, &identity, record.duration))
+        .transpose()?;
+    validate_cost(
+        context.events_path,
+        &format!("{identity}, worker"),
+        record.and_then(|record| record.cost_usd),
+    )?;
     if let Some(record) = record {
         for (index, review) in record.reviews.iter().enumerate() {
-            validate_cost(&format!("review pass {index}"), review.cost_usd)?;
+            validate_cost(
+                context.events_path,
+                &format!("{identity}, review pass {index}"),
+                review.cost_usd,
+            )?;
         }
     }
     Ok(Row {
         schema_version: EXPORT_SCHEMA_VERSION,
-        run_id: run_id.to_owned(),
-        tactus_version: version.to_owned(),
-        run_started_at: run_started_at.to_owned(),
+        run_id: context.run_id.to_owned(),
+        tactus_version: context.tactus_version.to_owned(),
+        run_started_at: context.started_at.to_owned(),
         attempt_started_at: start_event.ts.clone(),
         attempt_finished_at: settlement.map(|done| done.ts.to_owned()),
         task_id: task.id.to_string(),
@@ -358,9 +526,9 @@ fn build_row(
         attempt: *attempt,
         rung: *rung,
         task_features: TaskFeatures {
-            kind: task.kind.to_string(),
-            suggested_tier: task.suggested_tier.map(|v| v.to_string()),
-            minimum_tier: task.min_tier.map(|v| v.to_string()),
+            kind: task_kind(task.kind).to_owned(),
+            suggested_tier: task.suggested_tier.map(|value| tier(value).to_owned()),
+            minimum_tier: task.min_tier.map(|value| tier(value).to_owned()),
             dependency_count: task.depends_on.len(),
             acceptance_count: task.acceptance.len(),
             path_hints: task.path_hints.clone(),
@@ -368,7 +536,11 @@ fn build_row(
             artifact_output_count: task.artifacts_out.len(),
         },
         chain: Chain {
-            tiers: chain.tiers.iter().map(ToString::to_string).collect(),
+            tiers: chain
+                .tiers
+                .iter()
+                .map(|value| tier(*value).to_owned())
+                .collect(),
             attempts_per: chain.attempts_per,
         },
         selected_tier: data.tier.clone(),
@@ -376,12 +548,14 @@ fn build_row(
         adapter_id: data.adapter.clone().unwrap_or_else(|| data.agent.clone()),
         adapter_cli_version: data.preflight_cli_version.clone(),
         model: data.model.clone(),
-        effort: data.effort,
+        effort: data.effort.map(effort),
         pool: data.pool.clone(),
         session_resumed: data.resume_session.is_some(),
         duration_ms,
         cost_usd: record.and_then(|r| r.cost_usd),
-        usage: record.and_then(|r| r.usage.clone()),
+        usage: record
+            .and_then(|record| record.usage.as_ref())
+            .map(export_usage),
         outcome: if interrupted {
             "interrupted"
         } else if kind.is_some() {
@@ -389,8 +563,8 @@ fn build_row(
         } else {
             "passed"
         },
-        failure_kind: kind,
-        failure_origin: origin,
+        failure_kind: kind.map(failure_kind),
+        failure_origin: origin.map(failure_origin),
         failure_category: category,
         work_evidence: evidence,
         failure_reason: failure.map(|f| f.reason.clone()),
@@ -406,20 +580,93 @@ fn review(value: &events::ReviewRecord) -> Review {
         adapter_id: value.adapter.clone().unwrap_or_else(|| value.agent.clone()),
         adapter_cli_version: value.preflight_cli_version.clone(),
         model: value.model.clone(),
-        effort: value.effort,
+        effort: value.effort.map(effort),
         pool: value.pool.clone(),
         cost_usd: value.cost_usd,
-        outcome: value.outcome,
+        outcome: review_outcome(value.outcome),
     }
 }
 
-fn selection_origin(value: SelectionOrigin) -> &'static str {
+fn selection_origin(value: Option<SelectionOrigin>) -> &'static str {
     match value {
-        SelectionOrigin::Unknown => "unknown",
-        SelectionOrigin::Auto => "auto",
-        SelectionOrigin::Pin => "pin",
-        SelectionOrigin::UserOverride => "user_override",
-        SelectionOrigin::Exploration => "exploration",
+        None => "unknown",
+        Some(SelectionOrigin::Auto) => "auto",
+        Some(SelectionOrigin::Pin) => "pin",
+        Some(SelectionOrigin::UserOverride) => "user_override",
+        Some(SelectionOrigin::Exploration) => "exploration",
+    }
+}
+
+fn effort(value: Effort) -> &'static str {
+    match value {
+        Effort::Low => "low",
+        Effort::Medium => "medium",
+        Effort::High => "high",
+        Effort::XHigh => "xhigh",
+        Effort::Max => "max",
+    }
+}
+
+fn task_kind(value: TaskKind) -> &'static str {
+    match value {
+        TaskKind::Design => "design",
+        TaskKind::Implement => "implement",
+        TaskKind::Fix => "fix",
+        TaskKind::Refactor => "refactor",
+        TaskKind::Test => "test",
+        TaskKind::Docs => "docs",
+        TaskKind::Chore => "chore",
+    }
+}
+
+fn tier(value: Tier) -> &'static str {
+    match value {
+        Tier::Small => "small",
+        Tier::Mid => "mid",
+        Tier::Frontier => "frontier",
+    }
+}
+
+fn review_outcome(value: ReviewPassOutcome) -> &'static str {
+    match value {
+        ReviewPassOutcome::Passed => "passed",
+        ReviewPassOutcome::Failed => "failed",
+        ReviewPassOutcome::Unavailable => "unavailable",
+    }
+}
+
+fn failure_kind(value: FailureKind) -> &'static str {
+    match value {
+        FailureKind::NoChain => "no_chain",
+        FailureKind::EmptyDiff => "empty_diff",
+        FailureKind::AgentError => "agent_error",
+        FailureKind::Timeout => "timeout",
+        FailureKind::RateLimited => "rate_limited",
+        FailureKind::GateFailed => "gate_failed",
+        FailureKind::TestProvenance => "test_provenance",
+        FailureKind::ReviewFailed => "review_failed",
+        FailureKind::ReviewUnavailable => "review_unavailable",
+        FailureKind::NeedsHuman => "needs_human",
+        FailureKind::Declined => "declined",
+        FailureKind::Interrupted => "interrupted",
+    }
+}
+
+fn failure_origin(value: FailureOrigin) -> &'static str {
+    match value {
+        FailureOrigin::Worker => "worker",
+        FailureOrigin::Reviewer => "reviewer",
+    }
+}
+
+fn export_usage(value: &Usage) -> ExportUsage {
+    ExportUsage {
+        input_tokens: value.input_tokens,
+        output_tokens: value.output_tokens,
+        cache_creation_input_tokens: value.cache_creation_input_tokens,
+        cache_read_input_tokens: value.cache_read_input_tokens,
+        num_turns: value.num_turns,
+        reasoning_output_tokens: value.reasoning_output_tokens,
     }
 }
 
@@ -439,21 +686,182 @@ fn failure_projection(kind: FailureKind) -> (&'static str, &'static str) {
     }
 }
 
-fn duration_ms(value: std::time::Duration) -> Result<u64, TactusError> {
-    u64::try_from(value.as_millis()).map_err(|_| TactusError::Refused {
-        message: "attempt duration exceeds export schema range".to_owned(),
+fn duration_ms(
+    path: &Path,
+    identity: &str,
+    value: std::time::Duration,
+) -> Result<u64, TactusError> {
+    u64::try_from(value.as_millis()).map_err(|_| TactusError::EventLog {
+        path: path.to_owned(),
+        message: format!("attempt duration exceeds export schema range for {identity}"),
     })
 }
 
-fn validate_cost(label: &str, cost: Option<f64>) -> Result<(), TactusError> {
+fn validate_cost(path: &Path, label: &str, cost: Option<f64>) -> Result<(), TactusError> {
     if let Some(cost) = cost
         && (!cost.is_finite() || cost < 0.0)
     {
-        return Err(TactusError::Refused {
+        return Err(TactusError::EventLog {
+            path: path.to_owned(),
             message: format!("{label} cost must be finite and non-negative, got {cost}"),
         });
     }
     Ok(())
+}
+
+fn validate_timestamp(path: &Path, label: &str, value: &str) -> Result<(), TactusError> {
+    if !is_supported_rfc3339(value) {
+        return Err(TactusError::EventLog {
+            path: path.to_owned(),
+            message: format!(
+                "{label} timestamp `{value}` is not RFC 3339 in tactus's supported \
+                 no-leap-second profile"
+            ),
+        });
+    }
+    Ok(())
+}
+
+/// Validate the RFC 3339 subset Tactus can record.
+///
+/// Event timestamps come from `SystemTime` as ordinary Unix seconds, so the
+/// writer can never emit `:60`. Rejecting leap-second notation avoids accepting
+/// it on arbitrary dates (which requires an external announcement table) while
+/// retaining every timestamp an authentic Tactus writer can produce.
+fn is_supported_rfc3339(value: &str) -> bool {
+    let bytes = value.as_bytes();
+    if bytes.len() < 20
+        || bytes.get(4) != Some(&b'-')
+        || bytes.get(7) != Some(&b'-')
+        || !matches!(bytes.get(10), Some(b'T' | b't'))
+        || bytes.get(13) != Some(&b':')
+        || bytes.get(16) != Some(&b':')
+    {
+        return false;
+    }
+    let Some(year) = decimal(bytes, 0, 4) else {
+        return false;
+    };
+    let Some(month) = decimal(bytes, 5, 2) else {
+        return false;
+    };
+    let Some(day) = decimal(bytes, 8, 2) else {
+        return false;
+    };
+    let Some(hour) = decimal(bytes, 11, 2) else {
+        return false;
+    };
+    let Some(minute) = decimal(bytes, 14, 2) else {
+        return false;
+    };
+    let Some(second) = decimal(bytes, 17, 2) else {
+        return false;
+    };
+    let leap_year = year % 4 == 0 && (year % 100 != 0 || year % 400 == 0);
+    let days = match month {
+        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+        4 | 6 | 9 | 11 => 30,
+        2 if leap_year => 29,
+        2 => 28,
+        _ => return false,
+    };
+    if day == 0 || day > days || hour > 23 || minute > 59 || second > 59 {
+        return false;
+    }
+
+    let mut zone = 19;
+    if bytes.get(zone) == Some(&b'.') {
+        zone += 1;
+        let fraction_start = zone;
+        while bytes.get(zone).is_some_and(u8::is_ascii_digit) {
+            zone += 1;
+        }
+        if zone == fraction_start {
+            return false;
+        }
+    }
+    match bytes.get(zone..) {
+        Some([b'Z' | b'z']) => true,
+        Some([b'+' | b'-', _, _, b':', _, _]) => {
+            decimal(bytes, zone + 1, 2).is_some_and(|value| value <= 23)
+                && decimal(bytes, zone + 4, 2).is_some_and(|value| value <= 59)
+        }
+        _ => false,
+    }
+}
+
+fn decimal(bytes: &[u8], start: usize, len: usize) -> Option<u32> {
+    let digits = bytes.get(start..start.checked_add(len)?)?;
+    digits.iter().try_fold(0_u32, |value, digit| {
+        digit
+            .is_ascii_digit()
+            .then(|| value * 10 + u32::from(*digit - b'0'))
+    })
+}
+
+fn begin_snapshot(public: &Path, run_id: &str, path: &Path) -> Result<Vec<u8>, TactusError> {
+    begin_snapshot_with(
+        run_id,
+        || rundir::is_running(public),
+        || events::read_bytes(path),
+    )
+}
+
+fn begin_snapshot_with(
+    run_id: &str,
+    mut is_running: impl FnMut() -> bool,
+    mut read: impl FnMut() -> Result<Vec<u8>, TactusError>,
+) -> Result<Vec<u8>, TactusError> {
+    if is_running() {
+        return Err(live_refusal(run_id));
+    }
+    let text = read()?;
+    if is_running() {
+        return Err(live_refusal(run_id));
+    }
+    Ok(text)
+}
+
+fn finish_snapshot(
+    public: &Path,
+    run_id: &str,
+    path: &Path,
+    original: &[u8],
+) -> Result<(), TactusError> {
+    finish_snapshot_with(
+        run_id,
+        original,
+        || rundir::is_running(public),
+        || events::read_bytes(path),
+    )
+}
+
+fn finish_snapshot_with(
+    run_id: &str,
+    original: &[u8],
+    mut is_running: impl FnMut() -> bool,
+    mut read: impl FnMut() -> Result<Vec<u8>, TactusError>,
+) -> Result<(), TactusError> {
+    let current = read()?;
+    if is_running() {
+        return Err(live_refusal(run_id));
+    }
+    if current != original {
+        return Err(TactusError::Refused {
+            message: format!(
+                "run `{run_id}` changed while its decision snapshot was being read; retry once the run is settled"
+            ),
+        });
+    }
+    Ok(())
+}
+
+fn live_refusal(run_id: &str) -> TactusError {
+    TactusError::Refused {
+        message: format!(
+            "run `{run_id}` is live and its decision dataset is still moving; wait for it to finish or stop it before exporting"
+        ),
+    }
 }
 
 pub fn write(rows: &[Row], format: Format, out: &mut impl Write) -> anyhow::Result<()> {
@@ -501,7 +909,7 @@ fn write_csv(rows: &[Row], out: &mut impl Write) -> anyhow::Result<()> {
             row.adapter_id.clone(),
             opt(&row.adapter_cli_version),
             row.model.clone(),
-            row.effort.map(|v| v.to_string()).unwrap_or_default(),
+            row.effort.unwrap_or_default().to_owned(),
             opt(&row.pool),
             row.session_resumed.to_string(),
             scalar(row.duration_ms),
@@ -513,8 +921,8 @@ fn write_csv(rows: &[Row], out: &mut impl Write) -> anyhow::Result<()> {
             scalar(usage.and_then(|u| u.num_turns)),
             scalar(usage.and_then(|u| u.reasoning_output_tokens)),
             row.outcome.to_owned(),
-            json_enum(row.failure_kind)?,
-            json_enum(row.failure_origin)?,
+            row.failure_kind.unwrap_or_default().to_owned(),
+            row.failure_origin.unwrap_or_default().to_owned(),
             row.failure_category.unwrap_or_default().to_owned(),
             row.work_evidence.unwrap_or_default().to_owned(),
             opt(&row.failure_reason),
@@ -546,12 +954,6 @@ fn opt(value: &Option<String>) -> String {
 }
 fn scalar<T: ToString>(value: Option<T>) -> String {
     value.map(|v| v.to_string()).unwrap_or_default()
-}
-fn json_enum<T: Serialize>(value: Option<T>) -> anyhow::Result<String> {
-    Ok(value
-        .map(|v| serde_json::to_string(&v).map(|s| s.trim_matches('"').to_owned()))
-        .transpose()?
-        .unwrap_or_default())
 }
 fn key_text(key: &AttemptKey) -> String {
     format!("task `{}`, attempt {}, rung {}", key.0, key.1, key.2)
@@ -615,8 +1017,12 @@ mod tests {
             Self { root, public }
         }
 
-        fn rows(&self) -> Vec<Row> {
+        fn loaded(&self) -> Loaded {
             load(&self.root, "01EXPORT").expect("prefix resolves and export loads")
+        }
+
+        fn rows(&self) -> Vec<Row> {
+            self.loaded().rows
         }
     }
 
@@ -745,6 +1151,42 @@ mod tests {
         })
     }
 
+    fn attempt_interrupted(task: &str, attempt: u32, ts: &str) -> Value {
+        let mut event = attempt_finished(task, attempt, ts, Some(FailureKind::Interrupted), false);
+        event["event"] = json!("attempt_interrupted");
+        event["data"]["duration_ms"] = json!(0);
+        event["data"]["cost_usd"] = Value::Null;
+        event["data"]["usage"] = Value::Null;
+        event
+    }
+
+    fn csv_records(text: &str) -> Vec<Vec<String>> {
+        let mut records = Vec::new();
+        let mut record = Vec::new();
+        let mut field = String::new();
+        let mut chars = text.chars().peekable();
+        let mut quoted = false;
+        while let Some(ch) = chars.next() {
+            match ch {
+                '"' if quoted && chars.peek() == Some(&'"') => {
+                    chars.next();
+                    field.push('"');
+                }
+                '"' => quoted = !quoted,
+                ',' if !quoted => record.push(std::mem::take(&mut field)),
+                '\r' if !quoted && chars.peek() == Some(&'\n') => {
+                    chars.next();
+                    record.push(std::mem::take(&mut field));
+                    records.push(std::mem::take(&mut record));
+                }
+                other => field.push(other),
+            }
+        }
+        assert!(!quoted, "unterminated quoted CSV field");
+        assert!(field.is_empty() && record.is_empty(), "missing final CRLF");
+        records
+    }
+
     fn snapshot(path: &Path) -> BTreeMap<PathBuf, (u64, std::time::SystemTime)> {
         fn visit(
             root: &Path,
@@ -794,6 +1236,51 @@ mod tests {
             write_csv_field(input, &mut output).expect("write");
             assert_eq!(String::from_utf8(output).expect("utf8"), expected);
         }
+    }
+
+    #[test]
+    fn exported_timestamps_use_the_supported_rfc3339_profile() {
+        for valid in [
+            "1970-01-01T00:00:00Z",
+            "2024-02-29T23:59:59.123Z",
+            "2026-08-01t12:34:56+05:30",
+            "2026-08-01T12:34:56.000-00:00",
+        ] {
+            assert!(
+                is_supported_rfc3339(valid),
+                "supported RFC 3339 timestamp: {valid}"
+            );
+        }
+        for rejected in [
+            "2026-02-29T00:00:00Z",
+            "2026-13-01T00:00:00Z",
+            "2026-08-01 00:00:00Z",
+            "2026-08-01T24:00:00Z",
+            "2026-08-01T00:00:00",
+            "2026-08-01T00:00:00.Z",
+            // `:60` is not accepted blindly on a leap-year date, and even a
+            // historical leap second is outside the writer's supported subset.
+            "2024-02-29T23:59:60.123Z",
+            "2016-12-31T23:59:60Z",
+        ] {
+            assert!(
+                !is_supported_rfc3339(rejected),
+                "unsupported timestamp: {rejected}"
+            );
+        }
+
+        let fixture = Fixture::new(
+            "bad-timestamp",
+            vec![
+                run_started(&["task"]),
+                attempt_started("task", 1, "not-a-timestamp", false),
+            ],
+            vec![task("task", "task")],
+        );
+        let error = load_error(&fixture);
+        assert!(error.contains(RUN_ID), "run identity: {error}");
+        assert!(error.contains("task `task`, attempt 1, rung 0"), "{error}");
+        assert!(error.contains("not RFC 3339"), "{error}");
     }
 
     #[test]
@@ -869,12 +1356,127 @@ mod tests {
         assert!(values[0].get("diff_size").is_none());
         assert!(values[0]["task_features"].get("diff_size").is_none());
         assert!(!values[0].to_string().contains("WRONG"));
+        let top_level_keys = values[0]
+            .as_object()
+            .expect("row object")
+            .keys()
+            .map(String::as_str)
+            .collect::<BTreeSet<_>>();
+        assert_eq!(
+            top_level_keys,
+            [
+                "adapter_cli_version",
+                "adapter_id",
+                "attempt",
+                "attempt_finished_at",
+                "attempt_started_at",
+                "chain",
+                "cost_usd",
+                "duration_ms",
+                "effort",
+                "failure_category",
+                "failure_kind",
+                "failure_origin",
+                "failure_reason",
+                "model",
+                "outcome",
+                "pool",
+                "reviews",
+                "run_id",
+                "run_started_at",
+                "rung",
+                "schema_version",
+                "selected_tier",
+                "selection_origin",
+                "session_resumed",
+                "tactus_version",
+                "task_features",
+                "task_id",
+                "task_title",
+                "usage",
+                "work_evidence",
+            ]
+            .into_iter()
+            .collect()
+        );
+        assert_eq!(
+            values[0]["usage"]
+                .as_object()
+                .expect("usage object")
+                .keys()
+                .map(String::as_str)
+                .collect::<BTreeSet<_>>(),
+            [
+                "cache_creation_input_tokens",
+                "cache_read_input_tokens",
+                "input_tokens",
+                "num_turns",
+                "output_tokens",
+                "reasoning_output_tokens",
+            ]
+            .into_iter()
+            .collect()
+        );
+        assert_eq!(
+            values[0]["task_features"]
+                .as_object()
+                .expect("task-features object")
+                .keys()
+                .map(String::as_str)
+                .collect::<BTreeSet<_>>(),
+            [
+                "acceptance_count",
+                "artifact_input_count",
+                "artifact_output_count",
+                "dependency_count",
+                "kind",
+                "minimum_tier",
+                "path_hints",
+                "suggested_tier",
+            ]
+            .into_iter()
+            .collect()
+        );
+        assert_eq!(
+            values[0]["chain"]
+                .as_object()
+                .expect("chain object")
+                .keys()
+                .map(String::as_str)
+                .collect::<BTreeSet<_>>(),
+            ["attempts_per", "tiers"].into_iter().collect()
+        );
+        assert_eq!(
+            values[0]["reviews"][0]
+                .as_object()
+                .expect("review object")
+                .keys()
+                .map(String::as_str)
+                .collect::<BTreeSet<_>>(),
+            [
+                "adapter_cli_version",
+                "adapter_id",
+                "cost_usd",
+                "effort",
+                "model",
+                "outcome",
+                "pass",
+                "pool",
+            ]
+            .into_iter()
+            .collect()
+        );
 
         let mut csv = Vec::new();
         write(&rows, Format::Csv, &mut csv).expect("csv");
         let csv = String::from_utf8(csv).expect("utf8 csv");
         assert!(csv.starts_with(CSV_HEADER));
-        assert_eq!(csv.matches("\r\n").count(), 3, "header plus two rows");
+        let records = csv_records(&csv);
+        assert_eq!(records.len(), 3, "header plus two rows");
+        assert!(
+            records.iter().all(|record| record.len() == 43),
+            "schema 1 CSV records must retain exactly 43 columns: {records:?}"
+        );
         assert!(csv.contains("\"first, \"\"quoted\"\"\""));
         assert!(csv.contains("src/exact,a.rs"));
         assert!(csv.contains("quoted"));
@@ -956,6 +1558,89 @@ mod tests {
     }
 
     #[test]
+    fn snapshot_protocol_catches_a_resume_and_a_changed_event_file() {
+        let mut probes = [false, true].into_iter();
+        let error = begin_snapshot_with(
+            RUN_ID,
+            || probes.next().expect("pre and post probes"),
+            || Ok(b"stable-so-far".to_vec()),
+        )
+        .expect_err("a run that resumes during the first read is live");
+        assert!(error.to_string().contains("is live"));
+
+        let error = finish_snapshot_with(
+            RUN_ID,
+            b"before",
+            || false,
+            || Ok(b"before\nnew attempt_started".to_vec()),
+        )
+        .expect_err("an append after the post-read probe moves the snapshot");
+        assert!(error.to_string().contains("changed while"));
+
+        assert_eq!(
+            begin_snapshot_with(RUN_ID, || false, || Ok(b"stable".to_vec()))
+                .expect("stable first read"),
+            b"stable"
+        );
+        finish_snapshot_with(RUN_ID, b"stable", || false, || Ok(b"stable".to_vec()))
+            .expect("unchanged closing read");
+    }
+
+    #[test]
+    fn a_torn_tail_is_exported_with_a_separate_warning() {
+        let fixture = Fixture::new(
+            "torn-tail",
+            vec![
+                run_started(&["task"]),
+                attempt_started("task", 1, "2026-08-01T00:00:01.000Z", false),
+            ],
+            vec![task("task", "task")],
+        );
+        let path = fixture.public.join("events.jsonl");
+        let mut log = fs::read(&path).expect("read fixture log");
+        log.extend_from_slice(b"{\"ts\":\"2026-08-01T00:00");
+        log.extend_from_slice(&[0xf0, 0x9f]);
+        fs::write(&path, log).expect("write torn tail");
+
+        let loaded = fixture.loaded();
+        assert_eq!(loaded.rows.len(), 1);
+        assert_eq!(loaded.rows[0].outcome, "interrupted");
+        assert_eq!(loaded.warnings.len(), 1);
+        assert!(loaded.warnings[0].contains("incomplete final line"));
+    }
+
+    #[test]
+    fn a_complete_semantically_invalid_final_event_is_rejected() {
+        let mut invalid_start = attempt_started("task", 1, "2026-08-01T00:00:01.000Z", false);
+        invalid_start["data"]["selection_origin"] = json!("unknown");
+        let fixture = Fixture::new(
+            "semantic-tail",
+            vec![run_started(&["task"]), invalid_start],
+            vec![task("task", "task")],
+        );
+
+        let error = load_error(&fixture);
+        assert!(
+            error.contains("line 2"),
+            "invalid final record is committed: {error}"
+        );
+        assert!(
+            error.contains("unknown variant"),
+            "domain error is preserved: {error}"
+        );
+    }
+
+    #[test]
+    fn a_future_event_schema_is_rejected_before_projection() {
+        let mut started = run_started(&["task"]);
+        started["data"]["schema"] = json!(events::SCHEMA_VERSION + 1);
+        let fixture = Fixture::new("future-schema", vec![started], vec![task("task", "task")]);
+        let error = load_error(&fixture);
+        assert!(error.contains("written by a newer tactus"), "{error}");
+        assert!(error.contains("Upgrade rather than"), "{error}");
+    }
+
+    #[test]
     fn invalid_recorded_invariants_are_refused() {
         let hash = Fixture::new(
             "bad-hash",
@@ -1010,6 +1695,146 @@ mod tests {
             vec![task("task", "task")],
         );
         assert!(load_error(&cost).contains("review pass 0 cost"));
+
+        let mut missing_chain_start = run_started(&["attempted", "idle"]);
+        missing_chain_start["data"]["chains"]
+            .as_array_mut()
+            .expect("chains")
+            .pop();
+        let missing_chain = Fixture::new(
+            "missing-idle-chain",
+            vec![
+                missing_chain_start,
+                attempt_started("attempted", 1, "2026-08-01T00:00:01.000Z", false),
+            ],
+            vec![task("attempted", "attempted"), task("idle", "idle")],
+        );
+        assert!(load_error(&missing_chain).contains("`idle` has no run-start chain"));
+
+        let mut orphan_start = run_started(&["task"]);
+        orphan_start["data"]["chains"]
+            .as_array_mut()
+            .expect("chains")
+            .push(json!({ "task": "ghost", "tiers": ["small"], "attempts_per": 1 }));
+        let orphan = Fixture::new(
+            "orphan-chain",
+            vec![orphan_start],
+            vec![task("task", "task")],
+        );
+        assert!(load_error(&orphan).contains("`ghost` is absent from the frozen plan"));
+
+        for (tag, field, value, expected) in [
+            ("empty-chain", "tiers", json!([]), "has no tiers"),
+            ("zero-chain", "attempts_per", json!(0), "has attempts_per 0"),
+        ] {
+            let mut start = run_started(&["task"]);
+            start["data"]["chains"][0][field] = value;
+            let fixture = Fixture::new(tag, vec![start], vec![task("task", "task")]);
+            assert!(load_error(&fixture).contains(expected));
+        }
+    }
+
+    #[test]
+    fn settlement_order_kind_and_duplicated_identity_are_validated() {
+        let finish = attempt_finished("task", 1, "2026-08-01T00:00:01.000Z", None, false);
+        let before = Fixture::new(
+            "settlement-before-start",
+            vec![
+                run_started(&["task"]),
+                finish,
+                attempt_started("task", 1, "2026-08-01T00:00:02.000Z", false),
+            ],
+            vec![task("task", "task")],
+        );
+        assert!(load_error(&before).contains("appears before its start"));
+
+        let mut fake_interruption =
+            attempt_finished("task", 1, "2026-08-01T00:00:02.000Z", None, false);
+        fake_interruption["event"] = json!("attempt_interrupted");
+        let missing_kind = Fixture::new(
+            "interrupted-without-kind",
+            vec![
+                run_started(&["task"]),
+                attempt_started("task", 1, "2026-08-01T00:00:01.000Z", false),
+                fake_interruption,
+            ],
+            vec![task("task", "task")],
+        );
+        assert!(load_error(&missing_kind).contains("lacks an interrupted failure"));
+
+        let wrong_event = Fixture::new(
+            "finished-as-interrupted",
+            vec![
+                run_started(&["task"]),
+                attempt_started("task", 1, "2026-08-01T00:00:01.000Z", false),
+                attempt_finished(
+                    "task",
+                    1,
+                    "2026-08-01T00:00:02.000Z",
+                    Some(FailureKind::Interrupted),
+                    false,
+                ),
+            ],
+            vec![task("task", "task")],
+        );
+        assert!(load_error(&wrong_event).contains("carries interruption semantics"));
+
+        for (tag, field, value) in [
+            ("settlement-model", "model", json!("different/model")),
+            ("settlement-pool", "pool", json!("different-pool")),
+        ] {
+            let mut finish = attempt_finished("task", 1, "2026-08-01T00:00:02.000Z", None, false);
+            finish["data"][field] = value;
+            let fixture = Fixture::new(
+                tag,
+                vec![
+                    run_started(&["task"]),
+                    attempt_started("task", 1, "2026-08-01T00:00:01.000Z", false),
+                    finish,
+                ],
+                vec![task("task", "task")],
+            );
+            assert!(load_error(&fixture).contains("mismatched settlement identity"));
+        }
+    }
+
+    #[test]
+    fn duplicate_and_orphan_attempt_events_are_refused() {
+        let start = attempt_started("task", 1, "2026-08-01T00:00:01.000Z", false);
+        let duplicate_start = Fixture::new(
+            "duplicate-start",
+            vec![run_started(&["task"]), start.clone(), start],
+            vec![task("task", "task")],
+        );
+        assert!(
+            load_error(&duplicate_start).contains("duplicate attempt start"),
+            "a repeated key is ambiguous rather than a second logical attempt"
+        );
+
+        let start = attempt_started("task", 1, "2026-08-01T00:00:01.000Z", false);
+        let finish = attempt_finished("task", 1, "2026-08-01T00:00:02.000Z", None, false);
+        let duplicate_settlement = Fixture::new(
+            "duplicate-settlement",
+            vec![run_started(&["task"]), start, finish.clone(), finish],
+            vec![task("task", "task")],
+        );
+        assert!(
+            load_error(&duplicate_settlement).contains("duplicate settlement"),
+            "one start cannot have two authorities for its outcome"
+        );
+
+        let orphan = Fixture::new(
+            "orphan-settlement",
+            vec![
+                run_started(&["task"]),
+                attempt_finished("task", 1, "2026-08-01T00:00:02.000Z", None, false),
+            ],
+            vec![task("task", "task")],
+        );
+        assert!(
+            load_error(&orphan).contains("settlement without a start"),
+            "a finish-only record has no pre-spawn routing authority"
+        );
     }
 
     #[test]
@@ -1044,13 +1869,12 @@ mod tests {
                 &format!("2026-08-01T00:01:{index:02}.000Z"),
                 false,
             ));
-            events.push(attempt_finished(
-                id,
-                1,
-                &format!("2026-08-01T00:02:{index:02}.000Z"),
-                Some(*kind),
-                false,
-            ));
+            let ts = format!("2026-08-01T00:02:{index:02}.000Z");
+            events.push(if *kind == FailureKind::Interrupted {
+                attempt_interrupted(id, 1, &ts)
+            } else {
+                attempt_finished(id, 1, &ts, Some(*kind), false)
+            });
         }
         let fixture = Fixture::new(
             "failures",

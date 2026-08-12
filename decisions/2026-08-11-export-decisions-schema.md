@@ -10,6 +10,8 @@
 
 The command is local and read-only. It resolves an exact run id or unambiguous prefix by the existing run-directory rules, reads that run's event log and frozen `plan.normalized.json`, and uses the existing read-only liveness probe. It makes no HTTP request, switches no branch, acquires no run lock, and writes neither repository nor run record. It refuses a currently live run with an actionable error: a moving partial dataset is not a decision record.
 
+The liveness probe brackets the first event-log read. Before returning, the exporter reads the event file again, probes again, and requires the exact text to be unchanged. This establishes one stable snapshot without taking the writer lock; a resume observed anywhere across that window is a refusal, not an interrupted row manufactured from a live attempt. A recoverable incomplete final line from a dead process remains exportable and is reported on stderr while stdout stays exclusively JSONL or CSV.
+
 This is an interpretation and calibration surface, not a learned-router feed. It supports people examining routing decisions and the prediction-calibration record in DESIGN.md §23.2. Learned routing remains parked indefinitely under §21. The export adds no upload, cross-repository aggregation, learned scoring, task ranking, model call, or live-tail mode.
 
 ## Row construction and authority
@@ -18,7 +20,7 @@ Read raw events rather than building from `AttemptRecord` alone or from replay s
 
 A non-live, finished run may still contain a dangling start. It emits one row whose outcome is `interrupted`, finish timestamp is null, spend and usage are unknown, and detailed failure is derived as `{kind: "interrupted", origin: "worker", reason: null}`. The synthetic kind and origin are derived, not measured. `session_resumed` still comes only from that start's `resume_session.is_some()`; a settlement, especially a synthetic one, may not invent it.
 
-`AttemptStarted` is the pre-spawn authority for adapter id, the CLI version observed at pre-flight, full configured model slug, effort, pool, resumed-session identity, and selection origin. The additive event change therefore places `adapter_cli_version`, `effort`, and `selection_origin` there alongside the existing identity fields. It also adds `adapter_cli_version` and `effort` to each `ReviewRecord`. A run-level version map or finish-only copy is not an acceptable substitute: either loses the identity of an interrupted attempt or falsely makes a later fact pre-execution authority. The CLI version is labelled as the pre-flight observation, not claimed to be a per-invocation probe, and no extra probe is run.
+`AttemptStarted` is the pre-spawn authority for adapter id, the CLI version observed at pre-flight, full configured model slug, effort, pool, resumed-session identity, and selection origin. The additive event change therefore places `preflight_cli_version`, `effort`, and `selection_origin` there alongside the existing identity fields; the exporter projects that source field as `adapter_cli_version`. It also adds `preflight_cli_version` and `effort` to each `ReviewRecord`, again exporting the former as `adapter_cli_version`. A run-level version map or finish-only copy is not an acceptable substitute: either loses the identity of an interrupted attempt or falsely makes a later fact pre-execution authority. The CLI version is labelled as the pre-flight observation, not claimed to be a per-invocation probe, and no extra probe is run.
 
 `SelectionOrigin` written to events has exactly `auto`, `user_override`, `pin`, and `exploration`. Current execution produces `auto` or `pin`; the other two are reserved for the v0.2 binder paths that will create them. `unknown` is not an event value. It is an exporter-derived sentinel used only when a legacy start predates the field; such an absence must never be rewritten as `auto`.
 
@@ -108,7 +110,7 @@ The four provenance classes are intentionally disjoint:
 
 Assumptions are not fallback permission. The exporter must validate every join and invariant it relies on and fail loudly with the run and offending identity when one is violated. It must never fill a gap from today's source plan, config, model catalog, pricing table, run-level guess, or provider call.
 
-The export schema version is independent of the event schema. Adding the new optional event fields retains event schema 1: serde defaults preserve old absence as absence, and the exporter represents that honestly as null or, for origin alone, derived `unknown`. A change to one schema does not imply a change to the other.
+The export schema version is independent of the event schema. The optional exporter-input fields described here retained event schema 1 at the time: serde defaults preserved old absence as absence, and the exporter represented that honestly as null or, for origin alone, derived `unknown`. Event schema later moved to 2 for run-identity semantics (frozen effort and complete rung bindings), without changing export schema 1. A change to one schema does not imply a change to the other.
 
 ## Rejected alternatives
 

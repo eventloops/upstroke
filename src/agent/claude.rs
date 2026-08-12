@@ -38,6 +38,16 @@ pub const ADAPTER_ID: &str = "claude-code";
 /// minute before refusing beats refusing a working machine in fifteen seconds.
 const PROBE_TIMEOUT: Duration = Duration::from_secs(60);
 
+const REQUIRED_FLAGS: [&str; 6] = [
+    "--output-format",
+    "--model",
+    "--effort",
+    "--settings",
+    "--setting-sources",
+    "--permission-mode",
+];
+const REQUIRED_SHORT_FLAGS: [&str; 1] = ["-p"];
+
 pub struct ClaudeCodeAdapter;
 
 impl AgentAdapter for ClaudeCodeAdapter {
@@ -78,45 +88,18 @@ impl AgentAdapter for ClaudeCodeAdapter {
             "",
             PROBE_TIMEOUT,
         )?;
-        let help_text = format!("{}{}", help.stdout, help.stderr);
-        // An unreadable --help is not fatal; fall back to assuming the flags
-        // this adapter needs are present and let build/parse report reality.
-        let has = |flag: &str| !help.stdout.is_empty() && help_text.contains(flag);
-        let readable = help.code == Some(0) && !help_text.trim().is_empty();
-        if readable {
-            let required = [
-                "-p",
-                "--output-format",
-                "--model",
-                "--effort",
-                "--settings",
-                "--setting-sources",
-                "--permission-mode",
-            ];
-            let missing: Vec<&str> = required
-                .into_iter()
-                .filter(|flag| !help_text.contains(flag))
-                .collect();
-            if !missing.is_empty() {
-                return Err(TactusError::Agent {
-                    message: format!(
-                        "claude {version} does not advertise required flag(s): {}. This adapter \
-                         pins known-good behavior per version — upgrade tactus or pin an older \
-                         claude.",
-                        missing.join(", ")
-                    ),
-                });
-            }
-        }
+        let help_text = checked_help(&invocation.display(), &help)?;
+        validate_help(&version, &help_text)?;
+        let has = |flag: &str| super::advertises_flag(&help_text, flag);
         Ok(Caps {
             version,
-            json_output: !readable || has("--output-format"),
-            session_resume: !readable || has("--resume"),
+            json_output: has("--output-format"),
+            session_resume: has("--resume"),
             cost_reporting: true,
             // No single flag; achieved through the permission settings.
             read_only_mode: true,
-            acp: readable && has("--acp"),
-            model_list: readable && has("--list-models"),
+            acp: has("--acp"),
+            model_list: has("--list-models"),
         })
     }
 
@@ -164,6 +147,68 @@ impl AgentAdapter for ClaudeCodeAdapter {
         util::write_json(&path, &permission_settings(profile, gate_cmds))?;
         Ok(Some(path))
     }
+}
+
+fn checked_help(program: &str, output: &ProcessOutput) -> Result<String, TactusError> {
+    if output.timed_out {
+        return Err(TactusError::Agent {
+            message: format!("`{program}` --help timed out; effort support could not be verified"),
+        });
+    }
+    if output.code != Some(0) {
+        return Err(TactusError::Agent {
+            message: format!(
+                "`{program}` --help exited with {:?}: {}",
+                output.code,
+                output.stderr.trim()
+            ),
+        });
+    }
+    let text = format!("{}\n{}", output.stdout, output.stderr);
+    if text.trim().is_empty() {
+        return Err(TactusError::Agent {
+            message: format!(
+                "`{program}` --help returned no output; effort support could not be verified"
+            ),
+        });
+    }
+    Ok(text)
+}
+
+fn validate_help(version: &str, help: &str) -> Result<(), TactusError> {
+    let missing_flags: Vec<&str> = REQUIRED_FLAGS
+        .into_iter()
+        .filter(|flag| !super::advertises_flag(help, flag))
+        .chain(
+            REQUIRED_SHORT_FLAGS
+                .into_iter()
+                .filter(|flag| !super::advertises_flag(help, flag)),
+        )
+        .collect();
+    if !missing_flags.is_empty() {
+        return Err(TactusError::Agent {
+            message: format!(
+                "claude {version} does not advertise required flag(s): {}. This adapter pins \
+                 known-good behavior per version — upgrade tactus or pin an older claude.",
+                missing_flags.join(", ")
+            ),
+        });
+    }
+    let missing_efforts = super::missing_effort_levels(help);
+    if !missing_efforts.is_empty() {
+        return Err(TactusError::Agent {
+            message: format!(
+                "claude {version} advertises `--effort` but not required level(s): {}. Refusing \
+                 before spend because this run may request any shared effort level.",
+                missing_efforts
+                    .iter()
+                    .map(ToString::to_string)
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
+        });
+    }
+    Ok(())
 }
 
 /// Argument list, kept separate from binary resolution so it is testable on
@@ -568,15 +613,81 @@ mod tests {
     }
 
     #[test]
-    fn every_effort_maps_to_a_value_the_cli_advertises() {
-        const ACCEPTED: [&str; 5] = ["low", "medium", "high", "xhigh", "max"];
-        for effort in Effort::ALL {
-            assert!(
-                ACCEPTED.contains(&effort_flag(effort)),
-                "{effort} maps to `{}`",
-                effort_flag(effort)
-            );
+    fn every_effort_has_the_exact_cli_spelling_in_build_args() {
+        let expected = [
+            (Effort::Low, "low"),
+            (Effort::Medium, "medium"),
+            (Effort::High, "high"),
+            (Effort::XHigh, "xhigh"),
+            (Effort::Max, "max"),
+        ];
+        for (effort, spelling) in expected {
+            assert_eq!(effort_flag(effort), spelling);
+            let mut run = task_run();
+            run.profile.effort = Some(effort);
+            let args = build_args(&run);
+            let at = args
+                .iter()
+                .position(|arg| arg == "--effort")
+                .expect("effort flag");
+            assert_eq!(args.get(at + 1).map(String::as_str), Some(spelling));
         }
+    }
+
+    #[test]
+    fn help_validation_requires_every_shared_effort_level() {
+        let help = "-p --output-format --model --settings --setting-sources \
+                    --permission-mode\n  --effort <level> (low, medium, high, xhigh, max)\n";
+        validate_help("2.1.226", help).expect("full shared vocabulary");
+
+        let no_print = "--output-format --model --settings --setting-sources \
+                        --permission-mode\n  --effort <level> (low, medium, high, xhigh, max)\n";
+        let error = validate_help("2.1.226", no_print)
+            .expect_err("--permission-mode must not masquerade as -p")
+            .to_string();
+        assert!(error.contains("-p"), "{error}");
+
+        for (missing, narrowed) in [
+            ("xhigh", "low, medium, high, max"),
+            ("max", "low, medium, high, xhigh"),
+        ] {
+            let help = format!(
+                "-p --output-format --model --settings --setting-sources --permission-mode\n  \
+                 --effort <level> ({narrowed})\n"
+            );
+            let error = validate_help("2.1.226", &help).expect_err("narrow enum must refuse");
+            let message = error.to_string();
+            assert!(message.contains(missing), "{message}");
+            assert!(message.contains("2.1.226"), "{message}");
+        }
+    }
+
+    #[test]
+    fn unreadable_help_is_a_preflight_refusal() {
+        let mut timed_out = output(Some(0), "full help", "");
+        timed_out.timed_out = true;
+        assert!(
+            checked_help("claude", &timed_out)
+                .expect_err("timeout")
+                .to_string()
+                .contains("could not be verified")
+        );
+
+        let failed = output(Some(2), "", "bad option");
+        assert!(
+            checked_help("claude", &failed)
+                .expect_err("nonzero")
+                .to_string()
+                .contains("bad option")
+        );
+
+        let empty = output(Some(0), "", "");
+        assert!(
+            checked_help("claude", &empty)
+                .expect_err("empty")
+                .to_string()
+                .contains("no output")
+        );
     }
 
     #[test]

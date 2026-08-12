@@ -67,19 +67,45 @@ pub fn locate(
     cache: &OnceLock<Option<Invocation>>,
     missing: impl FnOnce(&[&str]) -> String,
 ) -> Result<Invocation, TactusError> {
+    locate_with(names, cache, |_| true, missing)
+}
+
+/// Resolve the first usable candidate in shell PATH order and cache it.
+///
+/// Some platforms expose aliases that look like files but cannot be spawned.
+/// The predicate lets an adapter reject one of those and continue through the
+/// remaining PATH entries. Rejection happens before the cache is populated, so
+/// a bad alias cannot poison every later probe and attempt in this process.
+pub fn locate_with(
+    names: &[&str],
+    cache: &OnceLock<Option<Invocation>>,
+    usable: impl FnMut(&Invocation) -> bool,
+    missing: impl FnOnce(&[&str]) -> String,
+) -> Result<Invocation, TactusError> {
+    let mut usable = usable;
     cache
         .get_or_init(|| {
-            names.iter().find_map(|name| {
-                // util::find_program skips empty PATH segments, which would
-                // otherwise resolve a bare name against the current directory
-                // — i.e. run a binary out of the repo being worked on.
-                util::find_program(name).map(|path| Invocation { path })
-            })
+            // util::find_program_candidates skips empty PATH segments, which
+            // would otherwise resolve a bare name against the current
+            // directory — i.e. run a binary out of the repo being worked on.
+            first_usable(
+                util::find_program_candidates(names)
+                    .into_iter()
+                    .map(|path| Invocation { path }),
+                &mut usable,
+            )
         })
         .clone()
         .ok_or_else(|| TactusError::Agent {
             message: missing(names),
         })
+}
+
+fn first_usable(
+    candidates: impl IntoIterator<Item = Invocation>,
+    usable: &mut impl FnMut(&Invocation) -> bool,
+) -> Option<Invocation> {
+    candidates.into_iter().find(|candidate| usable(candidate))
 }
 
 /// First `digits.digits.digits` token wins; otherwise the trimmed first line
@@ -178,6 +204,22 @@ mod tests {
                 .contains("tactus-definitely-not-a-real-binary"),
             "got: {error}"
         );
+    }
+
+    #[test]
+    fn an_unusable_candidate_is_skipped_before_the_answer_is_cached() {
+        let first = invocation(r"C:\WindowsApps\codex.exe");
+        let second = invocation(r"C:\Users\me\npm\codex.cmd");
+        let mut inspected = Vec::new();
+
+        let selected = first_usable([first, second.clone()], &mut |candidate| {
+            inspected.push(candidate.display());
+            candidate.display() == second.display()
+        })
+        .expect("the later usable installation wins");
+
+        assert_eq!(selected.display(), second.display());
+        assert_eq!(inspected.len(), 2, "the bad alias was actually tested");
     }
 
     /// A `.cmd` shim really does execute, and an argument really does arrive.

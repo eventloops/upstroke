@@ -29,7 +29,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::error::TactusError;
 use crate::interaction::QuestionRecord;
-use crate::ir::{Answer, Effort, Question, QuestionId, Tier};
+use crate::ir::{Answer, Effort, Question, QuestionId, ResolvedEffortPolicy, Tier};
 use crate::ladder::{FailureKind, FailureOrigin};
 use crate::util;
 
@@ -38,14 +38,14 @@ use crate::util;
 /// deriving the wrong state from a log we half-understand is the one failure
 /// mode an event-sourced design must not have.
 ///
-/// Misread is the operative word, and it is why step 10 did not bump it despite
-/// adding three event kinds and three fields. Every added field carries
-/// `#[serde(default)]`, so an old log folds to exactly the state it always did;
-/// and an *old binary* meeting a new event kind gets serde's unknown-variant
-/// error naming the log — a refusal, not a wrong answer. The one visible
-/// consequence, recorded rather than glossed: a budget-stopped run's log cannot
-/// be read by a pre-step-10 binary at all.
-pub const SCHEMA_VERSION: u32 = 1;
+/// Misread is the operative word. Step 10's additive reporting fields stayed in
+/// schema 1 because ignoring them did not change execution. Schema 2 is the
+/// first bump: effort and resolved worker bindings are execution identity, so a
+/// schema-1 binary ignoring those fields could continue the same branch under a
+/// different standard. Fresh runs say `2` in `run_started`; when this binary
+/// first resumes a schema-1 run it appends `run_schema_upgraded`, an event old
+/// binaries do not know and therefore refuse loudly rather than misread.
+pub const SCHEMA_VERSION: u32 = 2;
 
 // ---------------------------------------------------------------------------
 // Envelope
@@ -100,6 +100,12 @@ pub enum EventBody {
     },
     RunResumed {
         data: RunResumed,
+    },
+    /// Append-only downgrade barrier for a run whose `run_started` cannot be
+    /// rewritten from an older schema. A schema-1 binary fails on this unknown
+    /// event before it can ignore schema-2 execution identity fields.
+    RunSchemaUpgraded {
+        data: RunSchemaUpgraded,
     },
     AttemptStarted {
         task: String,
@@ -227,6 +233,7 @@ impl EventBody {
             | Self::QuestionRaised { task, .. } => Some(task),
             Self::RunStarted { .. }
             | Self::RunResumed { .. }
+            | Self::RunSchemaUpgraded { .. }
             | Self::DeferWaitElapsed { .. }
             | Self::QuestionAnswered { .. }
             | Self::DesignDefect { .. }
@@ -241,6 +248,7 @@ impl EventBody {
         match self {
             Self::RunStarted { .. } => "run_started",
             Self::RunResumed { .. } => "run_resumed",
+            Self::RunSchemaUpgraded { .. } => "run_schema_upgraded",
             Self::AttemptStarted { .. } => "attempt_started",
             Self::AttemptFinished { .. } => "attempt_finished",
             Self::AttemptInterrupted { .. } => "attempt_interrupted",
@@ -293,6 +301,15 @@ pub struct RunStarted {
     /// that config moved: `Progress.rung` is an index into this chain, and
     /// re-resolving a different one would silently point it at another tier.
     pub chains: Vec<ChainSummary>,
+    /// The concrete effort standard this run resolved at pre-flight.
+    ///
+    /// Like gates and reviewers, effort is part of the run's verification and
+    /// execution identity: changing today's config must not make the back half
+    /// of a resumed run think harder or less hard than the front half. `None`
+    /// means a legacy log predating this record; its first resume re-derives,
+    /// warns, and establishes the value in [`RunResumed::effort_policy`].
+    #[serde(default)]
+    pub effort_policy: Option<ResolvedEffortPolicy>,
     /// The effective gates in full, as the run resolved them at pre-flight —
     /// **the gates a resume runs**, not merely a fingerprint it compares.
     /// `gates` above names them for the reader; this is the executable record.
@@ -343,6 +360,22 @@ pub struct ChainSummary {
     pub task: String,
     pub tiers: Vec<Tier>,
     pub attempts_per: u32,
+    /// The exact binding each rung resolved to at pre-flight, aligned with
+    /// `tiers`. `None` means a schema-1 log predating this snapshot; its first
+    /// schema-2 resume re-derives once, warns, and records the result on
+    /// [`RunResumed::chains`]. `Some([])` is a real empty chain list.
+    #[serde(default)]
+    pub bindings: Option<Vec<BindingSummary>>,
+}
+
+/// One rung's execution identity. `pinned` remains explicit so the event log
+/// preserves why the binding was fixed as well as which adapter/model ran it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BindingSummary {
+    pub tier: Tier,
+    pub agent: String,
+    pub model: String,
+    pub pinned: bool,
 }
 
 /// One effective gate as it stood when the run started — everything needed to
@@ -403,6 +436,25 @@ pub struct RunResumed {
     /// resume, which takes it from the log directly ([`recorded_gates`]).
     #[serde(default)]
     pub gates: Option<Vec<GateSummary>>,
+    /// The effort policy established by the first resume of a legacy log.
+    ///
+    /// Current runs record this on `run_started`, so ordinary resumes leave it
+    /// `None`. Once an old log establishes a value here, later resumes use the
+    /// first recorded value and never re-derive it again.
+    #[serde(default)]
+    pub effort_policy: Option<ResolvedEffortPolicy>,
+    /// The resolved chain bindings established by the first schema-2 resume of
+    /// a schema-1 log. Current runs carry them on `run_started`; later resumes
+    /// use the first recorded snapshot and leave this `None`.
+    #[serde(default)]
+    pub chains: Option<Vec<ChainSummary>>,
+}
+
+/// A schema transition appended to an old run without rewriting its beginning.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RunSchemaUpgraded {
+    pub from: u32,
+    pub to: u32,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -419,9 +471,10 @@ pub struct AttemptStarted {
     /// Resolved effort passed to the adapter.
     #[serde(default)]
     pub effort: Option<Effort>,
-    /// Why this binding was selected. Old logs did not record this fact.
+    /// Why this binding was selected. `None` means an old log did not record
+    /// this fact; `unknown` deliberately is not a value writers can emit.
     #[serde(default)]
-    pub selection_origin: SelectionOrigin,
+    pub selection_origin: Option<SelectionOrigin>,
     /// The capacity pool this attempt draws on (§13), recorded before the
     /// spawn so an attempt the engine died inside can still be attributed: it
     /// really ran and really drained a subscription, and the settlement record
@@ -549,11 +602,9 @@ pub struct ReviewRecord {
 
 /// Where the worker binding came from. The latter two variants are reserved
 /// for future selectors and deliberately have no producer yet.
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SelectionOrigin {
-    #[default]
-    Unknown,
     Auto,
     Pin,
     UserOverride,
@@ -941,6 +992,7 @@ impl RunState {
             // consequence of the same rate limit rides on `task_deferred`,
             // which is where the scheduler already looks.
             EventBody::RunStarted { .. }
+            | EventBody::RunSchemaUpgraded { .. }
             | EventBody::DesignDefect { .. }
             | EventBody::CapacitySnapshot { .. }
             | EventBody::PoolExhausted { .. } => {}
@@ -1384,66 +1436,100 @@ impl EventLog {
 
 /// Read a whole log.
 ///
-/// An unparseable **final** line is a torn tail — the shape a kill leaves — and
-/// is dropped with a warning. An unparseable line anywhere **else** is
-/// corruption: something rewrote history, and deriving state from the
+/// An unterminated **final** record is a torn tail — the shape a kill leaves —
+/// and is dropped with a warning. A newline is the commit marker written after
+/// every event, so any invalid newline-terminated record is corruption even
+/// when it is last: something rewrote history, and deriving state from the
 /// survivors would produce a confident wrong answer. That errors.
 pub fn read_all(path: &Path, warnings: &mut Vec<String>) -> Result<Vec<Event>, TactusError> {
-    let text = match std::fs::read_to_string(path) {
-        Ok(text) => text,
+    let bytes = read_bytes(path)?;
+    let parsed = parse_bytes(path, &bytes)?;
+    warnings.extend(parsed.torn_tail_warning);
+    Ok(parsed.events)
+}
+
+/// Read the exact bytes a whole-log consumer will parse. Kept separate so a
+/// consumer that needs a stable snapshot can compare two reads before trusting
+/// the first one.
+pub(crate) fn read_bytes(path: &Path) -> Result<Vec<u8>, TactusError> {
+    match std::fs::read(path) {
+        Ok(bytes) => Ok(bytes),
         Err(source) if source.kind() == std::io::ErrorKind::NotFound => {
-            return Err(TactusError::EventLog {
+            Err(TactusError::EventLog {
                 path: path.to_path_buf(),
                 message: "no event log here — this run never started, or its directory was \
                           removed"
                     .to_owned(),
-            });
+            })
         }
-        Err(source) => {
-            return Err(TactusError::Io {
-                path: path.to_path_buf(),
-                source,
-            });
-        }
-    };
-    parse_lines(path, &text, warnings)
+        Err(source) => Err(TactusError::Io {
+            path: path.to_path_buf(),
+            source,
+        }),
+    }
 }
 
-fn parse_lines(
-    path: &Path,
-    text: &str,
-    warnings: &mut Vec<String>,
-) -> Result<Vec<Event>, TactusError> {
-    let lines: Vec<&str> = text
-        .lines()
-        .filter(|line| !line.trim().is_empty())
-        .collect();
-    let mut events = Vec::with_capacity(lines.len());
-    let last = lines.len().saturating_sub(1);
-    for (position, line) in lines.iter().enumerate() {
-        match serde_json::from_str::<Event>(line) {
-            Ok(event) => events.push(event),
-            Err(error) if position == last => {
-                warnings.push(format!(
-                    "{}: dropped an incomplete final line ({error}) — the shape an interrupted \
-                     write leaves behind",
-                    path.display()
-                ));
-            }
-            Err(error) => {
-                return Err(TactusError::EventLog {
-                    path: path.to_path_buf(),
-                    message: format!(
-                        "line {} is not a valid event ({error}). This is not a torn tail — the \
-                         log has been rewritten, and state derived from what is left would be \
-                         confidently wrong.",
-                        position + 1
-                    ),
-                });
-            }
+/// A parsed whole-log snapshot. The only recoverable parse condition is typed
+/// separately from the events so callers never have to infer its meaning from
+/// human-readable warning text.
+pub(crate) struct ParsedLines {
+    pub events: Vec<Event>,
+    pub torn_tail_warning: Option<String>,
+}
+
+pub(crate) fn parse_bytes(path: &Path, bytes: &[u8]) -> Result<ParsedLines, TactusError> {
+    // EventLog::append writes the newline after the JSON bytes. EventLog::open
+    // likewise discards everything after the last newline before resuming, so
+    // whole-log readers must use the same boundary: even syntactically complete
+    // JSON without its terminating newline was never a committed event.
+    let committed_end = bytes
+        .iter()
+        .rposition(|byte| *byte == b'\n')
+        .map_or(0, |position| position + 1);
+    let (committed_bytes, trailing) = bytes.split_at(committed_end);
+    let torn_tail_warning = (!trailing.is_empty()).then(|| {
+        format!(
+            "{}: dropped an incomplete final line ({} trailing byte(s)) — the shape an \
+             interrupted write leaves behind",
+            path.display(),
+            trailing.len()
+        )
+    });
+    let committed = std::str::from_utf8(committed_bytes).map_err(|error| {
+        let line = committed_bytes[..error.valid_up_to()]
+            .iter()
+            .filter(|byte| **byte == b'\n')
+            .count()
+            + 1;
+        TactusError::EventLog {
+            path: path.to_path_buf(),
+            message: format!(
+                "line {line} contains invalid UTF-8 in a committed event ({error}). This is not a \
+                 torn tail — the log has been rewritten, and state derived from what is left \
+                 would be confidently wrong."
+            ),
         }
+    })?;
+
+    let mut events = Vec::with_capacity(committed.lines().count());
+    for (position, line) in committed.lines().enumerate() {
+        if line.trim().is_empty() {
+            continue;
+        }
+        let event = serde_json::from_str::<Event>(line).map_err(|error| TactusError::EventLog {
+            path: path.to_path_buf(),
+            message: format!(
+                "line {} is not a valid event ({error}). This is not a torn tail — the log has \
+                 been rewritten, and state derived from what is left would be confidently wrong.",
+                position + 1
+            ),
+        })?;
+        events.push(event);
     }
-    Ok(events)
+    Ok(ParsedLines {
+        events,
+        torn_tail_warning,
+    })
 }
 
 /// The result of folding a log: the state, plus the run metadata a reader
@@ -1479,6 +1565,34 @@ pub fn recorded_gates(events: &[Event]) -> Option<&Vec<GateSummary>> {
     })
 }
 
+/// The effort standard this run is bound to, wherever the log first records it.
+///
+/// A current `run_started` wins. For a legacy start, the first resume that had
+/// to establish the missing value wins; a later conflicting entry cannot
+/// rewrite the run's execution standard.
+pub fn recorded_effort_policy(events: &[Event]) -> Option<ResolvedEffortPolicy> {
+    events.iter().find_map(|event| match &event.body {
+        EventBody::RunStarted { data } => data.effort_policy,
+        EventBody::RunResumed { data } => data.effort_policy,
+        _ => None,
+    })
+}
+
+/// The resolved worker bindings this run is bound to, wherever they first
+/// become available. Schema-2 runs carry them in `run_started`; a schema-1 run
+/// gains them on the first schema-2 `run_resumed` event.
+pub fn recorded_chains(events: &[Event]) -> Option<&Vec<ChainSummary>> {
+    events.iter().find_map(|event| match &event.body {
+        EventBody::RunStarted { data }
+            if data.chains.iter().all(|chain| chain.bindings.is_some()) =>
+        {
+            Some(&data.chains)
+        }
+        EventBody::RunResumed { data } => data.chains.as_ref(),
+        _ => None,
+    })
+}
+
 /// The `run_started` a log opens with — how a run describes itself.
 pub fn started_of<'a>(events: &'a [Event], path: &Path) -> Result<&'a RunStarted, TactusError> {
     events
@@ -1506,17 +1620,7 @@ pub fn replay(
     path: &Path,
 ) -> Result<Replay, TactusError> {
     let started = started_of(&events, path)?.clone();
-    if started.schema > SCHEMA_VERSION {
-        return Err(TactusError::EventLog {
-            path: path.to_path_buf(),
-            message: format!(
-                "written by a newer tactus (event schema {}, this binary understands {}). \
-                 Upgrade rather than replay it — folding a log we only half understand would \
-                 derive the wrong state silently.",
-                started.schema, SCHEMA_VERSION
-            ),
-        });
-    }
+    ensure_supported_schema(&started, &events, path)?;
 
     let mut state = RunState::new(task_ids);
     let mut resumes = 0;
@@ -1532,6 +1636,44 @@ pub fn replay(
         resumes,
         events,
     })
+}
+
+/// Apply the event-schema compatibility boundary shared by every whole-log
+/// interpretation. Additive fields are safe inside the current schema; a
+/// future schema is not something an older binary may silently project.
+pub(crate) fn ensure_supported_schema(
+    started: &RunStarted,
+    events: &[Event],
+    path: &Path,
+) -> Result<u32, TactusError> {
+    let mut effective = started.schema;
+    for event in events {
+        let EventBody::RunSchemaUpgraded { data } = &event.body else {
+            continue;
+        };
+        if data.from != effective || data.to <= data.from {
+            return Err(TactusError::EventLog {
+                path: path.to_path_buf(),
+                message: format!(
+                    "invalid schema transition {} -> {} while the log was at schema {}",
+                    data.from, data.to, effective
+                ),
+            });
+        }
+        effective = data.to;
+    }
+    if effective > SCHEMA_VERSION {
+        return Err(TactusError::EventLog {
+            path: path.to_path_buf(),
+            message: format!(
+                "written by a newer tactus (event schema {}, this binary understands {}). \
+                 Upgrade rather than interpret it — reading a log we only half understand would \
+                 derive the wrong state silently.",
+                effective, SCHEMA_VERSION
+            ),
+        });
+    }
+    Ok(effective)
 }
 
 /// Incremental reader for `status --follow`.
@@ -1576,14 +1718,16 @@ impl LogTail {
             }
         }
         file.seek(SeekFrom::Start(self.offset)).map_err(io)?;
-        let mut buffer = String::new();
-        file.read_to_string(&mut buffer).map_err(io)?;
-        let Some(end) = buffer.rfind('\n') else {
+        let mut buffer = Vec::new();
+        file.read_to_end(&mut buffer).map_err(io)?;
+        let Some(end) = buffer.iter().rposition(|byte| *byte == b'\n') else {
             return Ok(Vec::new());
         };
         let complete = &buffer[..=end];
         self.offset += complete.len() as u64;
-        parse_lines(&self.path, complete, warnings)
+        let parsed = parse_bytes(&self.path, complete)?;
+        warnings.extend(parsed.torn_tail_warning);
+        Ok(parsed.events)
     }
 }
 
@@ -1591,6 +1735,15 @@ impl LogTail {
 mod tests {
     use super::*;
     use crate::ir::{QuestionKind, TaskId};
+
+    fn effort_policy() -> ResolvedEffortPolicy {
+        ResolvedEffortPolicy {
+            small: Effort::Low,
+            mid: Effort::Medium,
+            frontier: Effort::XHigh,
+            review: Effort::Max,
+        }
+    }
 
     fn started() -> EventBody {
         EventBody::RunStarted {
@@ -1612,7 +1765,22 @@ mod tests {
                     task: "t1".to_owned(),
                     tiers: vec![Tier::Small, Tier::Mid],
                     attempts_per: 2,
+                    bindings: Some(vec![
+                        BindingSummary {
+                            tier: Tier::Small,
+                            agent: "claude-code".to_owned(),
+                            model: "claude-haiku-4-5".to_owned(),
+                            pinned: false,
+                        },
+                        BindingSummary {
+                            tier: Tier::Mid,
+                            agent: "claude-code".to_owned(),
+                            model: "claude-sonnet-5".to_owned(),
+                            pinned: false,
+                        },
+                    ]),
                 }],
+                effort_policy: Some(effort_policy()),
                 gate_cmds: Some(vec![GateSummary {
                     name: "check".to_owned(),
                     cmd: "cargo check".to_owned(),
@@ -1633,7 +1801,7 @@ mod tests {
                 adapter: None,
                 preflight_cli_version: None,
                 effort: None,
-                selection_origin: SelectionOrigin::Unknown,
+                selection_origin: None,
                 tier: tier.to_owned(),
                 agent: "claude-code".to_owned(),
                 model: "model".to_owned(),
@@ -1724,7 +1892,12 @@ mod tests {
                     interrupted_attempts: 1,
                     discarded: Vec::new(),
                     gates: None,
+                    effort_policy: None,
+                    chains: None,
                 },
+            },
+            EventBody::RunSchemaUpgraded {
+                data: RunSchemaUpgraded { from: 1, to: 2 },
             },
             attempt_started("t1", 1, 0, "small"),
             attempt_finished("t1", 1, 0, "small"),
@@ -1837,7 +2010,7 @@ mod tests {
     }
 
     #[test]
-    fn a_torn_final_line_is_dropped_but_a_rewritten_middle_is_an_error() {
+    fn a_torn_final_line_is_dropped_but_committed_invalid_events_are_errors() {
         let dir = scratch("torn");
         let path = dir.join("events.jsonl");
         let good = serde_json::to_string(&Event::now(started())).expect("serialize");
@@ -1855,6 +2028,18 @@ mod tests {
             "warnings: {warnings:?}"
         );
 
+        // `serde_json` may write Unicode from a recorded reason or path. A kill
+        // can split that code point, but bytes after the commit newline are no
+        // less recoverable merely because they are not yet valid UTF-8.
+        let mut invalid_utf8_tail = format!("{good}\n").into_bytes();
+        invalid_utf8_tail.extend_from_slice(&[0xf0, 0x9f]);
+        std::fs::write(&path, invalid_utf8_tail).expect("write split UTF-8 tail");
+        let mut warnings = Vec::new();
+        let events = read_all(&path, &mut warnings).expect("split UTF-8 tail is recoverable");
+        assert_eq!(events.len(), 1);
+        assert_eq!(warnings.len(), 1);
+        assert!(warnings[0].contains("2 trailing byte(s)"));
+
         // Damage anywhere else means the file was rewritten, not interrupted.
         let corrupt = format!("{good}\nnot json at all\n{also_good}\n");
         std::fs::write(&path, corrupt).expect("write");
@@ -1862,6 +2047,36 @@ mod tests {
         let err = read_all(&path, &mut warnings).expect_err("must not fold a rewritten log");
         assert!(err.to_string().contains("line 2"), "got: {err}");
         assert!(err.to_string().contains("confidently wrong"), "got: {err}");
+
+        // Being last is not enough to make an event recoverable. This record is
+        // complete JSON and newline-terminated, but its domain value is invalid.
+        let mut invalid: serde_json::Value =
+            serde_json::from_str(&also_good).expect("attempt-start JSON");
+        invalid["data"]["selection_origin"] = serde_json::json!("unknown");
+        let invalid = serde_json::to_string(&invalid).expect("invalid event JSON");
+        std::fs::write(&path, format!("{good}\n{invalid}\n")).expect("write invalid tail");
+        let mut warnings = Vec::new();
+        let err = read_all(&path, &mut warnings).expect_err("semantic errors are not torn tails");
+        assert!(err.to_string().contains("line 2"), "got: {err}");
+        assert!(err.to_string().contains("unknown variant"), "got: {err}");
+        assert!(warnings.is_empty(), "corruption is an error, not a warning");
+    }
+
+    #[test]
+    fn a_valid_json_event_without_its_commit_newline_is_a_torn_tail() {
+        let dir = scratch("uncommitted-valid-tail");
+        let path = dir.join("events.jsonl");
+        let good = serde_json::to_string(&Event::now(started())).expect("serialize");
+        let uncommitted = serde_json::to_string(&Event::now(attempt_started("t1", 1, 0, "small")))
+            .expect("serialize");
+        std::fs::write(&path, format!("{good}\n{uncommitted}")).expect("write uncommitted tail");
+
+        let mut warnings = Vec::new();
+        let events = read_all(&path, &mut warnings).expect("uncommitted tail is recoverable");
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].body.kind(), "run_started");
+        assert_eq!(warnings.len(), 1);
+        assert!(warnings[0].contains("incomplete final line"));
     }
 
     #[test]
@@ -1923,15 +2138,74 @@ mod tests {
     }
 
     #[test]
+    fn a_schema_upgrade_event_is_a_real_downgrade_barrier() {
+        #[derive(Debug, serde::Deserialize)]
+        struct SchemaOneEvent {
+            #[allow(dead_code)]
+            ts: String,
+            #[serde(flatten)]
+            #[allow(dead_code)]
+            body: SchemaOneBody,
+        }
+        #[derive(Debug, serde::Deserialize)]
+        #[serde(tag = "event", rename_all = "snake_case")]
+        #[allow(dead_code)]
+        enum SchemaOneBody {
+            RunStarted { data: serde_json::Value },
+            RunResumed { data: serde_json::Value },
+        }
+
+        let marker = Event::now(EventBody::RunSchemaUpgraded {
+            data: RunSchemaUpgraded { from: 1, to: 2 },
+        });
+        let line = serde_json::to_string(&marker).expect("serialize marker");
+        let error = serde_json::from_str::<SchemaOneEvent>(&line)
+            .expect_err("a schema-1 reader must refuse the new event");
+        assert!(error.to_string().contains("run_schema_upgraded"), "{error}");
+
+        let EventBody::RunStarted { mut data } = started() else {
+            panic!("started() builds a run_started");
+        };
+        data.schema = 1;
+        for chain in &mut data.chains {
+            chain.bindings = None;
+        }
+        let events = vec![Event::now(EventBody::RunStarted { data }), marker];
+        let replayed = replay(events, vec!["t1".to_owned()], Path::new("events.jsonl"))
+            .expect("the current binary follows the valid 1 -> 2 transition");
+        assert_eq!(replayed.started.schema, 1);
+    }
+
+    #[test]
+    fn a_future_appended_schema_transition_is_refused() {
+        let events = vec![
+            Event::now(started()),
+            Event::now(EventBody::RunSchemaUpgraded {
+                data: RunSchemaUpgraded {
+                    from: SCHEMA_VERSION,
+                    to: SCHEMA_VERSION + 1,
+                },
+            }),
+        ];
+        let error = replay(events, vec!["t1".to_owned()], Path::new("events.jsonl"))
+            .expect_err("the opening schema is not the only compatibility boundary");
+        assert!(error.to_string().contains("Upgrade"), "{error}");
+    }
+
+    #[test]
     fn a_run_started_without_gate_commands_reads_as_unrecorded() {
         // The shape every log written before the gate record has. `None`, not
         // an empty list: "said nothing about the gates" and "said there were
         // none" must stay distinguishable — the same rule `reviews` follows for
         // logs that predate step 9, and the difference between re-deriving with
         // a warning and running a run with verification switched off.
-        let EventBody::RunStarted { data } = started() else {
+        let EventBody::RunStarted { mut data } = started() else {
             panic!("started() builds a run_started");
         };
+        data.schema = 1;
+        for chain in &mut data.chains {
+            chain.bindings = None;
+        }
         let mut json =
             serde_json::to_value(Event::now(EventBody::RunStarted { data })).expect("serialize");
         assert!(
@@ -1947,6 +2221,146 @@ mod tests {
             panic!("still a run_started");
         };
         assert_eq!(data.gate_cmds, None);
+    }
+
+    #[test]
+    fn a_run_started_without_an_effort_policy_reads_as_unrecorded() {
+        let EventBody::RunStarted { mut data } = started() else {
+            panic!("started() builds a run_started");
+        };
+        data.schema = 1;
+        for chain in &mut data.chains {
+            chain.bindings = None;
+        }
+        let mut json =
+            serde_json::to_value(Event::now(EventBody::RunStarted { data })).expect("serialize");
+        assert!(
+            json["data"]
+                .as_object_mut()
+                .expect("data")
+                .remove("effort_policy")
+                .is_some(),
+            "a fresh run records its effort policy"
+        );
+        let event: Event = serde_json::from_value(json).expect("a legacy log still parses");
+        let EventBody::RunStarted { data } = &event.body else {
+            panic!("still a run_started");
+        };
+        assert_eq!(data.schema, 1, "the legacy opening remains schema 1");
+        assert_eq!(data.effort_policy, None);
+        assert_eq!(recorded_effort_policy(&[event]), None);
+    }
+
+    #[test]
+    fn a_recorded_effort_policy_round_trips_every_role_and_tier_exactly() {
+        let EventBody::RunStarted { data } = started() else {
+            panic!("started() builds a run_started");
+        };
+        let event = Event::now(EventBody::RunStarted { data });
+        let line = serde_json::to_string(&event).expect("serialize");
+        let json: serde_json::Value = serde_json::from_str(&line).expect("valid json");
+        assert_eq!(json["data"]["effort_policy"]["small"], "low");
+        assert_eq!(json["data"]["effort_policy"]["mid"], "medium");
+        assert_eq!(json["data"]["effort_policy"]["frontier"], "xhigh");
+        assert_eq!(json["data"]["effort_policy"]["review"], "max");
+
+        let read_back: Event = serde_json::from_str(&line).expect("round trip");
+        assert_eq!(recorded_effort_policy(&[read_back]), Some(effort_policy()));
+    }
+
+    #[test]
+    fn the_first_recorded_effort_policy_is_the_run_authority() {
+        let original = effort_policy();
+        let later = ResolvedEffortPolicy {
+            small: Effort::High,
+            mid: Effort::High,
+            frontier: Effort::High,
+            review: Effort::High,
+        };
+        let resumed = |policy| {
+            Event::now(EventBody::RunResumed {
+                data: RunResumed {
+                    head_sha: "abc".to_owned(),
+                    interrupted_attempts: 0,
+                    discarded: Vec::new(),
+                    gates: None,
+                    effort_policy: Some(policy),
+                    chains: None,
+                },
+            })
+        };
+
+        let EventBody::RunStarted { data } = started() else {
+            panic!("started() builds a run_started");
+        };
+        let current = vec![Event::now(EventBody::RunStarted { data }), resumed(later)];
+        assert_eq!(recorded_effort_policy(&current), Some(original));
+
+        let EventBody::RunStarted { mut data } = started() else {
+            panic!("started() builds a run_started");
+        };
+        data.effort_policy = None;
+        let legacy = vec![
+            Event::now(EventBody::RunStarted { data }),
+            resumed(original),
+            resumed(later),
+        ];
+        assert_eq!(
+            recorded_effort_policy(&legacy),
+            Some(original),
+            "the first establishing resume wins"
+        );
+    }
+
+    #[test]
+    fn the_first_complete_binding_snapshot_is_the_run_authority() {
+        let EventBody::RunStarted { data } = started() else {
+            panic!("started() builds a run_started");
+        };
+        let original = data.chains.clone();
+        let current = vec![Event::now(EventBody::RunStarted { data })];
+        assert_eq!(recorded_chains(&current), Some(&original));
+
+        let EventBody::RunStarted { mut data } = started() else {
+            panic!("started() builds a run_started");
+        };
+        for chain in &mut data.chains {
+            chain.bindings = None;
+        }
+        let later = original
+            .iter()
+            .cloned()
+            .map(|mut chain| {
+                for binding in chain.bindings.iter_mut().flatten() {
+                    binding.model = "later-model-must-not-win".to_owned();
+                }
+                chain
+            })
+            .collect();
+        let legacy = vec![
+            Event::now(EventBody::RunStarted { data }),
+            Event::now(EventBody::RunResumed {
+                data: RunResumed {
+                    head_sha: "abc".to_owned(),
+                    interrupted_attempts: 0,
+                    discarded: Vec::new(),
+                    gates: None,
+                    effort_policy: None,
+                    chains: Some(original.clone()),
+                },
+            }),
+            Event::now(EventBody::RunResumed {
+                data: RunResumed {
+                    head_sha: "def".to_owned(),
+                    interrupted_attempts: 0,
+                    discarded: Vec::new(),
+                    gates: None,
+                    effort_policy: None,
+                    chains: Some(later),
+                },
+            }),
+        ];
+        assert_eq!(recorded_chains(&legacy), Some(&original));
     }
 
     #[test]
@@ -1981,7 +2395,7 @@ mod tests {
     }
 
     #[test]
-    fn selection_origins_round_trip_and_old_starts_stay_unknown() {
+    fn selection_origins_round_trip_and_old_starts_stay_absent() {
         for origin in [
             SelectionOrigin::Auto,
             SelectionOrigin::Pin,
@@ -2009,7 +2423,11 @@ mod tests {
         assert_eq!(data.adapter, None);
         assert_eq!(data.preflight_cli_version, None);
         assert_eq!(data.effort, None);
-        assert_eq!(data.selection_origin, SelectionOrigin::Unknown);
+        assert_eq!(data.selection_origin, None);
+        assert!(
+            serde_json::from_str::<SelectionOrigin>("\"unknown\"").is_err(),
+            "unknown is an export-only sentinel"
+        );
 
         let review = ReviewRecord {
             pass: "review".to_owned(),
@@ -2031,7 +2449,7 @@ mod tests {
         assert_eq!(review.adapter, None);
         assert_eq!(review.preflight_cli_version, None);
         assert_eq!(review.effort, None);
-        assert_eq!(SCHEMA_VERSION, 1);
+        assert_eq!(SCHEMA_VERSION, 2);
     }
 
     #[test]
@@ -2121,6 +2539,8 @@ mod tests {
                     interrupted_attempts: 0,
                     discarded: Vec::new(),
                     gates: None,
+                    effort_policy: None,
+                    chains: None,
                 },
             }),
         ];

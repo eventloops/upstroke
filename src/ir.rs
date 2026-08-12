@@ -165,6 +165,30 @@ impl fmt::Display for Effort {
     }
 }
 
+/// The concrete effort standard one run resolved before it spent anything.
+///
+/// The three tier fields apply to implementation attempts; `review` applies to
+/// every review pass. Keeping the values explicit rather than positional makes
+/// the event record readable and prevents a future tier-order change from
+/// silently reinterpreting an old run.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ResolvedEffortPolicy {
+    pub small: Effort,
+    pub mid: Effort,
+    pub frontier: Effort,
+    pub review: Effort,
+}
+
+impl ResolvedEffortPolicy {
+    pub fn implementation_for(self, tier: Tier) -> Effort {
+        match tier {
+            Tier::Small => self.small,
+            Tier::Mid => self.mid,
+            Tier::Frontier => self.frontier,
+        }
+    }
+}
+
 impl fmt::Display for Tier {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(match self {

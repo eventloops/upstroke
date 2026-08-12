@@ -18,7 +18,7 @@ use crate::catalog;
 use crate::error::TactusError;
 use crate::gates::ShellKind;
 use crate::interaction::InteractionMode;
-use crate::ir::{Effort, TaskKind, Tier};
+use crate::ir::{Effort, ResolvedEffortPolicy, TaskKind, Tier};
 use crate::util;
 
 #[derive(Debug, Default, Deserialize)]
@@ -397,6 +397,16 @@ impl Config {
     pub fn review_effort(&self) -> Effort {
         self.review_effort_override
             .unwrap_or_else(|| self.effort_for(self.review_tier.unwrap_or(Tier::Frontier)))
+    }
+
+    /// Resolve the full role policy once so a run can record and retain it.
+    pub fn resolved_effort_policy(&self) -> ResolvedEffortPolicy {
+        ResolvedEffortPolicy {
+            small: self.implementation_effort(Tier::Small),
+            mid: self.implementation_effort(Tier::Mid),
+            frontier: self.implementation_effort(Tier::Frontier),
+            review: self.review_effort(),
+        }
     }
 }
 
@@ -1430,6 +1440,51 @@ effort = "low"
             cfg.review_effort(),
             Effort::Max,
             "review policy outranks its small tier and low pin"
+        );
+        assert!(warnings.is_empty(), "warnings: {warnings:?}");
+    }
+
+    #[test]
+    fn the_repository_self_host_policy_is_frontier_only_with_fixed_role_effort() {
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        let path = root.join("tactus.toml");
+        let mut warnings = Vec::new();
+        let cfg = load(Some(&path), &root, Some(&missing()), &mut warnings)
+            .expect("the checked-in self-host config loads");
+
+        for kind in TaskKind::ALL {
+            let chain = cfg.chain_for(kind);
+            assert_eq!(
+                chain.chain,
+                [Tier::Frontier],
+                "{kind} must not fall back to a cheaper implementation model"
+            );
+            assert!(
+                chain.from_config,
+                "{kind} must be explicit repository policy"
+            );
+        }
+        assert_eq!(cfg.review_tier, Some(Tier::Frontier));
+        assert!(cfg.review_enabled);
+        let effort = cfg.resolved_effort_policy();
+        assert_eq!(
+            [effort.small, effort.mid, effort.frontier],
+            [Effort::XHigh; 3]
+        );
+        assert_eq!(effort.review, Effort::Max);
+
+        let pin = cfg
+            .pins
+            .iter()
+            .find(|pin| pin.tier == Tier::Frontier)
+            .expect("frontier identity is pinned for reproducible self-hosting");
+        assert_eq!(
+            (pin.agent.as_str(), pin.model.as_str()),
+            ("codex", "gpt-5.6-sol")
+        );
+        assert_eq!(
+            catalog::lookup(&pin.agent, &pin.model).map(|entry| entry.tier),
+            Some(Tier::Frontier)
         );
         assert!(warnings.is_empty(), "warnings: {warnings:?}");
     }
