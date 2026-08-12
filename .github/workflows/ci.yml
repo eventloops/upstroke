@@ -65,6 +65,7 @@ jobs:
       - run: cargo fmt --check
       - run: cargo clippy --all-targets -- -D warnings
       - run: bash .github/scripts/test-frontier-evidence.sh
+      - run: bash .github/scripts/test-frontier-check.sh
       - run: bash .github/scripts/test-release-record.sh
 
   # Branch protection requires this one deliberately stable context. Keeping
