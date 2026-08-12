@@ -100,22 +100,21 @@ impl Tier {
 /// How hard the model should think, where the CLI exposes that axis.
 ///
 /// Abstract for the same reason tiers are: the vocabularies differ per vendor
-/// and the engine should not learn one of them. Four levels, because four is
-/// what generalizes — an adapter whose CLI has no such axis ignores this, and
-/// one whose ladder is finer maps onto the nearest rung it has.
+/// and the engine should not learn one of them. The five built-in adapter CLIs
+/// now share these levels, so each adapter maps them explicitly rather than
+/// inheriting a vendor default.
 ///
-/// Codex's own ladder is `low, medium, high, xhigh, max, ultra`. Two of those
-/// are deliberately unreachable from here. `xhigh` is an intermediate no other
-/// adapter can honour, and `ultra` is documented as "maximum reasoning with
-/// automatic task delegation" — a change in what the agent *does*, not how hard
-/// it thinks, and nothing in this design has audited an agent that spawns its
-/// own subagents inside a tactus attempt.
+/// Codex also exposes `ultra`, documented as "maximum reasoning with automatic
+/// task delegation". That remains deliberately unreachable: it changes what
+/// the agent *does*, not only how hard it thinks, and nothing in this design has
+/// audited an agent spawning its own subagents inside a tactus attempt.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Effort {
     Low,
     Medium,
     High,
+    XHigh,
     Max,
 }
 
@@ -125,12 +124,15 @@ impl Effort {
             "low" => Some(Self::Low),
             "medium" => Some(Self::Medium),
             "high" => Some(Self::High),
+            "xhigh" => Some(Self::XHigh),
             "max" => Some(Self::Max),
             _ => None,
         }
     }
 
-    pub const KNOWN: &'static str = "low, medium, high, max";
+    pub const ALL: [Self; 5] = [Self::Low, Self::Medium, Self::High, Self::XHigh, Self::Max];
+
+    pub const KNOWN: &'static str = "low, medium, high, xhigh, max";
 
     /// The tier's default effort — what makes a tier mean something on a CLI
     /// that has this axis.
@@ -157,6 +159,7 @@ impl fmt::Display for Effort {
             Self::Low => "low",
             Self::Medium => "medium",
             Self::High => "high",
+            Self::XHigh => "xhigh",
             Self::Max => "max",
         })
     }

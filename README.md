@@ -153,6 +153,10 @@ repo runs with zero config.
 fix = { chain = ["small", "mid", "frontier"], attempts_per = 2 }
 review = { tier = "frontier" }        # or { enabled = false }
 
+[routing.effort]
+implementation = "xhigh"              # every worker attempt, regardless of tier
+review = "max"                         # every review pass
+
 [[routing.overrides]]
 paths = ["src/auth/**", "migrations/**"]
 start_at = "frontier"                  # blast radius beats nominal difficulty

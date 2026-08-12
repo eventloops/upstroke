@@ -47,6 +47,12 @@ Two decisions the build forced, recorded because neither was obvious from the pr
 - **Exposing `ultra`** — "maximum reasoning with automatic task delegation" is a change in what the agent *does*, and nothing in this design has audited an agent spawning subagents inside a tactus attempt.
 - **Discovering the effort value at spend time** rather than validating at config load — the provider's 400 arrives mid-turn, so a typo would burn an attempt and report as an agent failure.
 
+## Addendum (2026-08-12) — role policy and the fifth shared level
+
+The rejection of `xhigh` depended on it being Codex-only. That premise expired: the locally probed CLIs now all advertise the same useful five-level set. Codex 0.147.0 accepts `model_reasoning_effort`; Claude Code 2.1.226 on Windows and 2.1.227 under the self-hosting WSL environment advertise `--effort <low|medium|high|xhigh|max>`; and Copilot CLI 1.0.78 advertises `--effort/--reasoning-effort` with those five levels (plus its lower `none` and `minimal`). Tactus now maps all five explicitly in every built-in adapter and makes `--effort` a probed, required flag for Claude Code and Copilot, so an older incompatible CLI refuses at pre-flight rather than silently ignoring the policy.
+
+`[routing.effort]` sets independent `implementation` and `review` values. A role value outranks a pin's effort and the tier default: that precedence is what makes “always xhigh for implementation, always max for review” true across every rung and review pass. With no role value, the original pin-then-tier behavior is unchanged. Values are validated while loading config, and each effective value remains recorded on the attempt or review event. `ultra` remains excluded because its automatic delegation changes the orchestration boundary.
+
 ## Verification — the cross-family review, re-established at a stated effort
 
 Run **`01KZS7R0V1ZD6MC290MG350QXF`**, WSL-side against a seeded scratch repo: one `implement` task bound at mid to `claude-code/claude-sonnet-5` (Anthropic), reviewed by `codex/gpt-5.6-sol` (OpenAI) pinned at frontier — so the cross-family pass is the *primary* review here, not an added second opinion. Committed on the first attempt.

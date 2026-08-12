@@ -1754,7 +1754,7 @@ impl Run<'_> {
                 // What the rung's tier is worth on an agent with an effort
                 // axis: without this the whole chain runs at one vendor
                 // default and escalating a rung moves nothing (§10).
-                effort: Some(self.analysis.config.effort_for(rung.tier)),
+                effort: Some(self.analysis.config.implementation_effort(rung.tier)),
                 max_turns: None,
                 extra_args: Vec::new(),
             };
@@ -8612,7 +8612,10 @@ mod tests {
         seed(
             &repo,
             "## One\n<!-- tactus: id=t1 kind=implement depends= -->\n",
-            Some("[routing]\nimplement = { chain = [\"small\"], attempts_per = 1 }\n"),
+            Some(
+                "[routing]\nimplement = { chain = [\"small\"], attempts_per = 1 }\n\n\
+                 [routing.effort]\nimplementation = \"xhigh\"\nreview = \"max\"\n",
+            ),
         );
         let mut opts = options(&repo);
         opts.config_path = Some(repo.join("tactus.toml"));
@@ -8652,7 +8655,7 @@ mod tests {
             .expect("worker start was emitted");
         assert_eq!(started.adapter.as_deref(), Some("claude-code"));
         assert_eq!(started.preflight_cli_version.as_deref(), Some("0.0.0-fake"));
-        assert_eq!(started.effort, Some(Effort::Low));
+        assert_eq!(started.effort, Some(Effort::XHigh));
         assert_eq!(started.selection_origin, events::SelectionOrigin::Auto);
 
         let review = events
@@ -8664,7 +8667,7 @@ mod tests {
             .expect("review pass actually ran");
         assert_eq!(review.adapter.as_deref(), Some("claude-code"));
         assert_eq!(review.preflight_cli_version.as_deref(), Some("0.0.0-fake"));
-        assert_eq!(review.effort, Some(Effort::High));
+        assert_eq!(review.effort, Some(Effort::Max));
         let snapshots: Vec<&events::CapacitySnapshot> = events
             .iter()
             .filter_map(|e| match &e.body {

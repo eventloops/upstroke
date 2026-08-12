@@ -3,6 +3,13 @@
 # Repo-level overrides only; subscriptions live in ~/.tactus/pools.toml, which
 # travels with the person rather than the repository (§17).
 
+# Self-hosted runs spend their agent budget deliberately: every worker gets
+# xhigh, while every independent judgement gets max. Role policy outranks tier
+# defaults and pin effort.
+[routing.effort]
+implementation = "xhigh"
+review = "max"
+
 # The gates CI runs, spelled the same way, so a task that passes here passes
 # there. Local green is not CI green when the two lists disagree — and these are
 # what `run_started` records and a resume runs, so they are also the definition

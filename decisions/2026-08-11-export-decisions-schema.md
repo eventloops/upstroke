@@ -44,7 +44,7 @@ JSON types below are normative. A “measured” field is a stored fact copied f
 | `adapter_id` | string | never | measured start adapter/agent id |
 | `adapter_cli_version` | string | yes | measured pre-flight CLI version on the start; null for legacy absence |
 | `model` | string | never | measured full configured model slug; no invented provider revision |
-| `effort` | `low`, `medium`, `high`, or `max` | yes | measured start effort; null for legacy absence |
+| `effort` | `low`, `medium`, `high`, `xhigh`, or `max` | yes | measured start effort; null for legacy absence |
 | `pool` | string | yes | measured start pool; null for legacy absence |
 | `session_resumed` | boolean | never | derived solely as start `resume_session.is_some()` |
 | `duration_ms` | non-negative integer | yes | measured settlement duration; null for a dangling start |
@@ -64,7 +64,7 @@ JSON types below are normative. A “measured” field is a stored fact copied f
 
 `usage`, when present, has nullable non-negative integers `input_tokens`, `output_tokens`, `cache_creation_input_tokens`, `cache_read_input_tokens`, `num_turns`, and `reasoning_output_tokens`. Preserve each reported absence; do not price tokens or calculate missing totals.
 
-Each `reviews` element has: `pass` (string lens id), `adapter_id` (string), `adapter_cli_version` (string or null for legacy absence), `model` (full configured slug string), `effort` (`low`, `medium`, `high`, or `max`, or null for legacy absence), `pool` (string or null), `cost_usd` (finite non-negative number or null when unreported), and `outcome` (`passed`, `failed`, or `unavailable`). Version and effort are the values recorded for that pass; neither is borrowed from the worker or today's config.
+Each `reviews` element has: `pass` (string lens id), `adapter_id` (string), `adapter_cli_version` (string or null for legacy absence), `model` (full configured slug string), `effort` (`low`, `medium`, `high`, `xhigh`, or `max`, or null for legacy absence), `pool` (string or null), `cost_usd` (finite non-negative number or null when unreported), and `outcome` (`passed`, `failed`, or `unavailable`). Version and effort are the values recorded for that pass; neither is borrowed from the worker or today's config.
 
 ## Exhaustive failure projection
 

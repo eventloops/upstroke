@@ -90,10 +90,21 @@ impl AskBefore {
 struct RawRouting {
     strategy: Option<RawStrategy>,
     overrides: Option<Vec<RawOverride>>,
+    /// `[routing.effort]` is parsed as a raw value so shape and spelling
+    /// mistakes can name the two accepted roles rather than failing in serde's
+    /// outer config message.
+    effort: Option<toml::Value>,
     /// Per-kind chain entries (`fix = { chain = [...] }`) plus anything the
     /// config author got wrong — unknown keys warn rather than error.
     #[serde(flatten)]
     kinds: BTreeMap<String, toml::Value>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawRoleEffort {
+    implementation: Option<String>,
+    review: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -117,9 +128,9 @@ struct RawPin {
     tier: Tier,
     agent: String,
     model: String,
-    /// Optional override of the tier's default reasoning effort (§10). A pin is
-    /// already where determinism is bought, so it is where a deliberate `max`
-    /// belongs.
+    /// Optional override of the tier's default reasoning effort (§10), used
+    /// when no explicit role policy applies. A pin is the narrower way to buy
+    /// a deliberate effort for one tier.
     effort: Option<String>,
 }
 
@@ -320,6 +331,10 @@ pub struct Config {
     pub review_tier: Option<Tier>,
     /// `[routing] review = { enabled = false }` opts out of review entirely.
     pub review_enabled: bool,
+    /// Explicit role policy. A role setting outranks pin and tier defaults so
+    /// `implementation = "xhigh"` really does mean every worker attempt.
+    implementation_effort_override: Option<Effort>,
+    review_effort_override: Option<Effort>,
     /// `[engine] on_task_failure` (§17); default `Halt`.
     pub on_task_failure: OnTaskFailure,
     /// `[interaction] mode` (§12); default `on_block`.
@@ -360,9 +375,8 @@ impl Config {
             })
     }
 
-    /// The effort a profile bound at this tier runs under: a pin's override,
-    /// else the tier's default (§10). One rule for implementers and reviewers
-    /// alike, resolved the same way the binding itself is.
+    /// The tier-bound effort before a role policy is applied: a pin's override,
+    /// else the tier's default (§10).
     pub fn effort_for(&self, tier: Tier) -> Effort {
         self.pins
             .iter()
@@ -371,10 +385,18 @@ impl Config {
             .unwrap_or_else(|| Effort::for_tier(tier))
     }
 
-    /// Effort every reviewer judges at — the review tier's, with §11.2's
-    /// frontier default when the config is silent about it.
+    /// Effort every implementation attempt uses. An explicit role policy is
+    /// global across task kinds and tiers; otherwise the tier/pin rule applies.
+    pub fn implementation_effort(&self, tier: Tier) -> Effort {
+        self.implementation_effort_override
+            .unwrap_or_else(|| self.effort_for(tier))
+    }
+
+    /// Effort every reviewer judges at. The role policy wins when present;
+    /// otherwise use the review tier, with §11.2's frontier default.
     pub fn review_effort(&self) -> Effort {
-        self.effort_for(self.review_tier.unwrap_or(Tier::Frontier))
+        self.review_effort_override
+            .unwrap_or_else(|| self.effort_for(self.review_tier.unwrap_or(Tier::Frontier)))
     }
 }
 
@@ -448,6 +470,8 @@ pub fn load_with(
     let mut overrides = Vec::new();
     let mut review_tier: Option<Tier> = None;
     let mut review_enabled = true;
+    let mut implementation_effort_override = None;
+    let mut review_effort_override = None;
     let mut strategy = Strategy {
         mode: "conserve".to_owned(),
         spend_down_after: None,
@@ -455,6 +479,22 @@ pub fn load_with(
     };
 
     if let Some(routing) = raw.routing {
+        if let Some(value) = routing.effort {
+            let policy: RawRoleEffort =
+                value.try_into().map_err(|e| TactusError::Config {
+                    path: repo_path.clone(),
+                    message: format!(
+                        "[routing.effort]: {e} (expected optional `implementation` and `review` effort strings)"
+                    ),
+                })?;
+            implementation_effort_override = parse_role_effort(
+                policy.implementation.as_deref(),
+                "implementation",
+                &repo_path,
+            )?;
+            review_effort_override =
+                parse_role_effort(policy.review.as_deref(), "review", &repo_path)?;
+        }
         for (key, value) in routing.kinds {
             let Some(kind) = TaskKind::parse(&key) else {
                 // `review` is a routing ROLE, not a task kind (DESIGN §17's
@@ -650,11 +690,33 @@ pub fn load_with(
         shell,
         review_tier,
         review_enabled,
+        implementation_effort_override,
+        review_effort_override,
         on_task_failure,
         interaction_mode: interaction.mode,
         notify: interaction.notify,
         wait_on_block: interaction.wait_on_block,
     })
+}
+
+/// Parse one role's explicit effort at config load. All three providers reject
+/// an unknown value after process launch, so accepting a typo here would burn an
+/// attempt for a routing policy the operator never actually selected.
+fn parse_role_effort(
+    raw: Option<&str>,
+    role: &str,
+    repo_path: &Path,
+) -> Result<Option<Effort>, TactusError> {
+    let Some(raw) = raw else { return Ok(None) };
+    Effort::parse(raw)
+        .map(Some)
+        .ok_or_else(|| TactusError::Config {
+            path: repo_path.to_path_buf(),
+            message: format!(
+                "[routing.effort] `{role} = \"{raw}\"` is not recognized (accepted: {})",
+                Effort::KNOWN
+            ),
+        })
 }
 
 /// `[budgets]` (§17). A ceiling that is zero, negative, or not a number is a
@@ -1322,11 +1384,82 @@ model = "claude-opus-4-8"
         let cfg = load(Some(&path), &hermetic(), Some(&missing()), &mut warnings).expect("load");
         assert_eq!(cfg.effort_for(Tier::Small), Effort::Low);
         assert_eq!(cfg.effort_for(Tier::Mid), Effort::Medium);
-        // The pin wins over the tier's `high` default — that is what a pin is
-        // for, and `max` is deliberately only reachable this way.
+        // The pin wins over the tier's `high` default when no role policy is
+        // present — the original behavior remains intact.
         assert_eq!(cfg.effort_for(Tier::Frontier), Effort::Max);
+        assert_eq!(cfg.implementation_effort(Tier::Frontier), Effort::Max);
         // Reviewers judge at the review tier, which defaults to frontier.
         assert_eq!(cfg.review_effort(), Effort::Max);
+    }
+
+    #[test]
+    fn role_effort_policy_overrides_pin_and_tier_defaults_independently() {
+        let path = scratch(
+            "roleeffort.toml",
+            r#"
+[routing]
+review = { tier = "small" }
+
+[routing.effort]
+implementation = "xhigh"
+review = "max"
+
+[[pins]]
+tier = "small"
+agent = "claude-code"
+model = "claude-haiku-4-5"
+effort = "low"
+"#,
+        );
+        let mut warnings = Vec::new();
+        let cfg = load(Some(&path), &hermetic(), Some(&missing()), &mut warnings).expect("load");
+
+        assert_eq!(
+            cfg.effort_for(Tier::Small),
+            Effort::Low,
+            "pin default remains intact"
+        );
+        for tier in [Tier::Small, Tier::Mid, Tier::Frontier] {
+            assert_eq!(
+                cfg.implementation_effort(tier),
+                Effort::XHigh,
+                "the implementation role policy is global across tiers"
+            );
+        }
+        assert_eq!(
+            cfg.review_effort(),
+            Effort::Max,
+            "review policy outranks its small tier and low pin"
+        );
+        assert!(warnings.is_empty(), "warnings: {warnings:?}");
+    }
+
+    #[test]
+    fn role_effort_typos_are_config_errors_before_an_attempt_starts() {
+        let path = scratch(
+            "badroleeffort.toml",
+            "[routing.effort]\nimplementation = \"ultra\"\nreview = \"max\"\n",
+        );
+        let mut warnings = Vec::new();
+        let err = load(Some(&path), &hermetic(), Some(&missing()), &mut warnings)
+            .expect_err("an unsupported role effort must error");
+        let msg = err.to_string();
+        assert!(msg.contains("implementation"), "names the role: {msg}");
+        assert!(msg.contains("ultra"), "names what was written: {msg}");
+        assert!(msg.contains(Effort::KNOWN), "lists valid values: {msg}");
+
+        let path = scratch(
+            "badrolekey.toml",
+            "[routing.effort]\nimplementer = \"xhigh\"\n",
+        );
+        let err = load(Some(&path), &hermetic(), Some(&missing()), &mut warnings)
+            .expect_err("an unknown role key must error");
+        let msg = err.to_string();
+        assert!(msg.contains("implementer"), "names the typo: {msg}");
+        assert!(
+            msg.contains("implementation"),
+            "names the accepted role: {msg}"
+        );
     }
 
     #[test]
@@ -1344,7 +1477,7 @@ model = "claude-opus-4-8"
             .expect_err("an unknown effort must error");
         let msg = err.to_string();
         assert!(msg.contains("maximum"), "names what was written: {msg}");
-        assert!(msg.contains("low, medium, high, max"), "lists valid: {msg}");
+        assert!(msg.contains(Effort::KNOWN), "lists valid: {msg}");
     }
 
     #[test]

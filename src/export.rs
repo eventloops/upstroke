@@ -915,6 +915,30 @@ mod tests {
     }
 
     #[test]
+    fn xhigh_worker_and_max_review_effort_are_preserved_in_schema_one() {
+        let mut start = attempt_started("task", 1, "2026-08-01T00:00:01.000Z", false);
+        start["data"]["effort"] = json!("xhigh");
+        let mut finish = attempt_finished("task", 1, "2026-08-01T00:00:02.000Z", None, true);
+        finish["data"]["reviews"][0]["effort"] = json!("max");
+        let fixture = Fixture::new(
+            "role-effort",
+            vec![run_started(&["task"]), start, finish],
+            vec![task("task", "role effort")],
+        );
+
+        let rows = fixture.rows();
+        let value = serde_json::to_value(&rows[0]).expect("row value");
+        assert_eq!(value["schema_version"], 1);
+        assert_eq!(value["effort"], "xhigh");
+        assert_eq!(value["reviews"][0]["effort"], "max");
+        let mut csv = Vec::new();
+        write(&rows, Format::Csv, &mut csv).expect("csv");
+        let csv = String::from_utf8(csv).expect("utf8 csv");
+        assert!(csv.contains("xhigh"), "worker effort is represented: {csv}");
+        assert!(csv.contains("max"), "review effort is represented: {csv}");
+    }
+
+    #[test]
     fn a_live_run_is_refused_actionably() {
         let fixture = Fixture::new(
             "live",

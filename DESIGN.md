@@ -150,8 +150,8 @@ struct WorkerProfile {                // v2.1: an optional PIN — tiers bind la
     model: String,
     pool: PoolId,                     // which capacity pool this profile drains
     permissions: PermissionMode,      // Edit | ReadOnly
-    effort: Option<Effort>,           // low | medium | high | max — the tier's, unless a pin says
-                                      // otherwise; adapters whose CLI has no such axis ignore it
+    effort: Option<Effort>,           // low | medium | high | xhigh | max — role policy, then pin,
+                                      // then tier default; each built-in adapter states it explicitly
     max_turns: Option<u32>,
     extra_args: Vec<String>,
 }
@@ -264,7 +264,7 @@ Assignment resolves in layers:
 4. **User override:** the dry-run routing preview is where the user edits any assignment before spend.
 5. **Late binding (v2.1):** chains are abstract tiers; the **binder** resolves each tier to a concrete (agent × model × pool) per attempt from everything the user has connected — scoring capability fit against the model catalog, capacity headroom under the active strategy (spend-down may raise the effective start, never below `min`), and affinity (ties break toward the previous task's binding; same-profile streaks batch). Rate-limit failover is the binder rebinding the same rung to another pool. Pins force a fixed binding where determinism matters.
 
-**A tier resolves an effort as well as a binding.** Where a CLI exposes reasoning effort, the engine states it on every attempt — `small→low`, `mid→medium`, `frontier→high`, a pin overriding any of them — because a vendor default is not a routing decision. Codex made the case concretely: its default comes from the *provider's roster* rather than its flag set, `gpt-5.6-sol` carries `low`, and until step 10 every review this project ran was judged there silently (`decisions/2026-08-11-codex-reasoning-effort.md`). A chain that escalates rungs while every rung thinks equally hard has escalated nothing. Effort is deliberately abstract for the same reason tiers are — four levels the adapters map, not one vendor's six — and `max` stays opt-in through a pin, since review is charged per attempt (§23.2) and reviewers bind at the review tier. **Effort is not identity:** §11.3's rebind compares who a binding *is*, so an effort difference must never make a reviewer look like a different model from the implementer that shares its name.
+**A tier resolves an effort as well as a binding.** The engine states it on every attempt — an explicit `[routing.effort]` role policy first, then a pin, then `small→low`, `mid→medium`, `frontier→high` — because a vendor default is not a routing decision. Codex made the case concretely: its default comes from the *provider's roster* rather than its flag set, `gpt-5.6-sol` carries `low`, and until step 10 every review this project ran was judged there silently (`decisions/2026-08-11-codex-reasoning-effort.md`). A chain that escalates rungs while every rung thinks equally hard has escalated nothing. Effort remains abstract for the same reason tiers are, but the shared built-in vocabulary is now five levels (`low, medium, high, xhigh, max`): Codex, Claude Code, and Copilot all advertise them and each adapter maps them explicitly. A role policy is the deliberate opt-in for a run-wide implementation/review standard; without one, `max` remains reachable through a pin. `ultra` stays excluded because Codex couples it to automatic delegation, which changes orchestration rather than only reasoning depth. **Effort is not identity:** §11.3's rebind compares who a binding *is*, so an effort difference must never make a reviewer look like a different model from the implementer that shares its name.
 
 **The affinity gradient** (context-switch cost, warmest → coldest): resume the *same session* (whole conversation cached) → new session, *same model*, within the provider's cache window (prefix hits on the system-and-repo preamble — the mechanism behind the ~97% cache-read rates heavy Claude Code users see) → same vendor, different model (cache-cold, harness-warm) → different vendor (cold everything: full context re-ingestion plus a different harness reading the conventions brief fresh). Copilot adds a useful middle rung: a cross-*vendor model* switch without a harness switch. v0.1 implements affinity as a tie-break plus streak batching; the full switch-cost model waits for real decision-log data — guessing reload costs is worse than measuring them.
 
@@ -435,6 +435,10 @@ fix       = { chain = ["small", "mid", "frontier"], attempts_per = 2 }
 implement = { chain = ["mid", "frontier"], attempts_per = 2 }
 review    = { tier = "frontier" }   # remaining kinds keep derived defaults
 
+[routing.effort]                    # optional role-wide standard; outranks pins and tier defaults
+implementation = "xhigh"
+review = "max"
+
 [[routing.overrides]]                 # at least one of start_at / second_opinion
 paths = ["src/auth/**", "migrations/**"]
 start_at = "frontier"                 # optional — omit to add a reviewer without raising the floor
@@ -444,7 +448,8 @@ second_opinion = "different-vendor"   # binder must add a reviewer from another 
 tier  = "frontier"
 agent = "claude-code"
 model = "claude-opus-4-8"
-effort = "max"                      # optional; default is the tier's (§10). Validated at load —
+effort = "max"                      # optional; default is the tier's when no role policy applies.
+                                    # Validated at load —
                                     # the provider rejects an unknown level with a 400 mid-turn,
                                     # so a typo would otherwise cost a whole attempt.
 

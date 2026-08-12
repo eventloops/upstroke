@@ -1,7 +1,7 @@
 //! Claude Code adapter (DESIGN.md §16).
 //!
 //! `claude -p` with the prompt on stdin, `--output-format json` parsed
-//! defensively, `--model`, `--max-turns`, `--resume` for same-rung retries.
+//! defensively, `--model`, `--effort`, `--max-turns`, `--resume` for same-rung retries.
 //! Permissions are never the skip-all flag: [`permission_settings`] generates
 //! a narrow per-run settings JSON the engine materializes to a file and this
 //! adapter passes via `--settings`, keeping the workspace's own
@@ -19,7 +19,7 @@ use super::proc::{self, ProcessOutput};
 use super::{AgentAdapter, AuthState, Caps, Discovery, TaskRun, looks_rate_limited};
 use crate::capacity::PoolKind;
 use crate::error::TactusError;
-use crate::ir::{Outcome, OutcomeStatus, PermissionMode, Usage, WorkerProfile};
+use crate::ir::{Effort, Outcome, OutcomeStatus, PermissionMode, Usage, WorkerProfile};
 use crate::util;
 
 pub const ADAPTER_ID: &str = "claude-code";
@@ -88,6 +88,7 @@ impl AgentAdapter for ClaudeCodeAdapter {
                 "-p",
                 "--output-format",
                 "--model",
+                "--effort",
                 "--settings",
                 "--setting-sources",
                 "--permission-mode",
@@ -167,6 +168,16 @@ impl AgentAdapter for ClaudeCodeAdapter {
 
 /// Argument list, kept separate from binary resolution so it is testable on
 /// machines without the CLI installed.
+fn effort_flag(effort: Effort) -> &'static str {
+    match effort {
+        Effort::Low => "low",
+        Effort::Medium => "medium",
+        Effort::High => "high",
+        Effort::XHigh => "xhigh",
+        Effort::Max => "max",
+    }
+}
+
 pub fn build_args(run: &TaskRun) -> Vec<String> {
     let mut args = vec![
         "-p".to_owned(),
@@ -185,6 +196,10 @@ pub fn build_args(run: &TaskRun) -> Vec<String> {
         "--setting-sources".to_owned(),
         String::new(),
     ];
+    if let Some(effort) = run.profile.effort {
+        args.push("--effort".to_owned());
+        args.push(effort_flag(effort).to_owned());
+    }
     if let Some(turns) = run.profile.max_turns {
         args.push("--max-turns".to_owned());
         args.push(turns.to_string());
@@ -514,8 +529,6 @@ mod tests {
             model: "claude-sonnet-5".to_owned(),
             pool: "claude-max".to_owned(),
             permissions,
-            // Carried by every profile; this CLI has no effort flag to map it
-            // onto, so the adapter ignores it (§16).
             effort: Some(crate::ir::Effort::Medium),
             max_turns: Some(30),
             extra_args: Vec::new(),
@@ -548,9 +561,22 @@ mod tests {
         let args = build_args(&task_run());
         let joined = args.join(" ");
         assert!(joined.starts_with("-p --output-format json --model claude-sonnet-5"));
+        assert!(joined.contains("--effort medium"));
         assert!(joined.contains("--max-turns 30"));
         assert!(!joined.contains("--resume"));
         assert!(!joined.contains("dangerously"), "never the skip-all flag");
+    }
+
+    #[test]
+    fn every_effort_maps_to_a_value_the_cli_advertises() {
+        const ACCEPTED: [&str; 5] = ["low", "medium", "high", "xhigh", "max"];
+        for effort in Effort::ALL {
+            assert!(
+                ACCEPTED.contains(&effort_flag(effort)),
+                "{effort} maps to `{}`",
+                effort_flag(effort)
+            );
+        }
     }
 
     #[test]

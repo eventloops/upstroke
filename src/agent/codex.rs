@@ -260,16 +260,16 @@ impl AgentAdapter for CodexAdapter {
 /// This CLI's name for a tier-neutral effort level.
 ///
 /// One-to-one today, and a function rather than a `Display` impl because that
-/// is the adapter's job: the engine's ladder is four rungs, this vendor's is
-/// six, and the mapping belongs on this side of the seam where the next vendor
-/// can differ without the engine learning about it. Every value below is in the
-/// provider's validated enum (`low, medium, high, xhigh, max` plus `none` and
-/// `minimal`) — checked against the 400 it returns for anything else.
+/// is the adapter's job: the mapping belongs on this side of the seam where a
+/// vendor can differ without the engine learning about it. Every value below
+/// is in the provider's validated enum (`low, medium, high, xhigh, max` plus
+/// `none` and `minimal`) — checked against the 400 it returns for anything else.
 fn effort_flag(effort: Effort) -> &'static str {
     match effort {
         Effort::Low => "low",
         Effort::Medium => "medium",
         Effort::High => "high",
+        Effort::XHigh => "xhigh",
         Effort::Max => "max",
     }
 }
@@ -720,7 +720,7 @@ mod tests {
         // cost a whole attempt rather than failing fast. Its accepted set,
         // read off that error: none, minimal, low, medium, high, xhigh, max.
         const ACCEPTED: [&str; 7] = ["none", "minimal", "low", "medium", "high", "xhigh", "max"];
-        for effort in [Effort::Low, Effort::Medium, Effort::High, Effort::Max] {
+        for effort in Effort::ALL {
             assert!(
                 ACCEPTED.contains(&effort_flag(effort)),
                 "{effort} maps to `{}`, which the provider would reject",

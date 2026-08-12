@@ -10,7 +10,7 @@ use crate::capacity;
 use crate::config::{self, Config};
 use crate::error::{TactusError, ValidationErrors};
 use crate::gates::{self, ShellGate};
-use crate::ir::{Plan, Task, TaskId};
+use crate::ir::{Plan, Task, TaskId, Tier};
 use crate::plan::{self, Parsed};
 use crate::review::{self, PassBinding, ReviewPlan};
 use crate::route::{self, ResolvedChain};
@@ -45,6 +45,8 @@ pub struct Report {
     pub capacity: String,
     /// Who reviews, and where a second opinion applies (§11.2–§11.3).
     pub review: String,
+    /// Effective reasoning policy before any process is spawned.
+    pub effort: String,
     pub gates: Vec<String>,
     pub gates_from_config: bool,
 }
@@ -202,6 +204,7 @@ pub fn run(opts: &ValidateOptions) -> Result<Report, TactusError> {
         strategy: strategy_echo(&analysis.config),
         capacity: capacity_echo(&analysis.config, &observations, run_id.as_deref()),
         review: review_echo(&reviews),
+        effort: effort_echo(&analysis.config),
         gates: analysis.gates.iter().map(|g| g.name.clone()).collect(),
         gates_from_config: analysis.gates_from_config,
         plan: analysis.plan,
@@ -526,6 +529,25 @@ fn strategy_echo(cfg: &Config) -> String {
     line
 }
 
+fn effort_echo(cfg: &Config) -> String {
+    let tiers = [Tier::Small, Tier::Mid, Tier::Frontier];
+    let resolved = tiers.map(|tier| cfg.implementation_effort(tier));
+    let implementation = if resolved.iter().all(|effort| *effort == resolved[0]) {
+        resolved[0].to_string()
+    } else {
+        format!(
+            "by tier (small={}, mid={}, frontier={})",
+            resolved[0], resolved[1], resolved[2]
+        )
+    };
+    let review = if cfg.review_enabled {
+        cfg.review_effort().to_string()
+    } else {
+        "disabled".to_owned()
+    };
+    format!("effort: implementation={implementation}, review={review}")
+}
+
 impl Report {
     pub fn render(&self) -> String {
         let id_width = column_width("id", self.rows.iter().map(|r| r.id.as_str()));
@@ -568,6 +590,8 @@ impl Report {
             ));
         }
         out.push_str(&self.review);
+        out.push('\n');
+        out.push_str(&self.effort);
         out.push('\n');
         out.push_str(&self.strategy);
         out.push('\n');
@@ -716,6 +740,26 @@ mod tests {
             .find(|l| l.starts_with("note"))
             .expect("row");
         assert!(!note.contains("second opinion"), "{note}");
+    }
+
+    #[test]
+    fn the_preview_shows_the_effective_role_effort_before_spend() {
+        let root = env::temp_dir().join(format!("tactus-validate-effort-{}", std::process::id()));
+        fs::create_dir_all(&root).expect("root");
+        let cfg = root.join("tactus.toml");
+        fs::write(
+            &cfg,
+            "[routing.effort]\nimplementation = \"xhigh\"\nreview = \"max\"\n",
+        )
+        .expect("config");
+        let mut o = opts("fixtures/sample-plan.md");
+        o.config_path = Some(cfg);
+
+        let rendered = run(&o).expect("validate").render();
+        assert!(
+            rendered.contains("effort: implementation=xhigh, review=max"),
+            "rendered:\n{rendered}"
+        );
     }
 
     #[test]

@@ -56,7 +56,7 @@ use super::bin::{self, Invocation};
 use super::proc::{self, ProcessOutput};
 use super::{AgentAdapter, Caps, Discovery, TaskRun, looks_rate_limited};
 use crate::error::TactusError;
-use crate::ir::{Outcome, OutcomeStatus, PermissionMode, WorkerProfile};
+use crate::ir::{Effort, Outcome, OutcomeStatus, PermissionMode, WorkerProfile};
 use crate::util;
 
 pub const ADAPTER_ID: &str = "copilot";
@@ -79,7 +79,13 @@ const PROBE_TIMEOUT: Duration = Duration::from_secs(60);
 /// programmatic flags without deprecation, so a missing one must surface as a
 /// pre-flight refusal rather than as per-task failures once a run is already
 /// spending (§19).
-const REQUIRED_FLAGS: [&str; 4] = ["--model", "--allow-tool", "--deny-tool", "--no-ask-user"];
+const REQUIRED_FLAGS: [&str; 5] = [
+    "--model",
+    "--effort",
+    "--allow-tool",
+    "--deny-tool",
+    "--no-ask-user",
+];
 
 /// Short flags this adapter passes, checked separately because a substring
 /// search for them is worthless: `"-s"` occurs inside `--settings`, `--share`
@@ -263,6 +269,16 @@ impl AgentAdapter for CopilotAdapter {
 
 /// Argument list, kept separate from binary resolution so it is testable on
 /// machines without the CLI installed.
+fn effort_flag(effort: Effort) -> &'static str {
+    match effort {
+        Effort::Low => "low",
+        Effort::Medium => "medium",
+        Effort::High => "high",
+        Effort::XHigh => "xhigh",
+        Effort::Max => "max",
+    }
+}
+
 pub fn build_args(run: &TaskRun) -> Vec<String> {
     // NOTE: no `-p`. The prompt arrives on stdin, and GitHub documents that
     // piped input is ignored when `-p` is also given — passing both would send
@@ -276,6 +292,9 @@ pub fn build_args(run: &TaskRun) -> Vec<String> {
         "--no-ask-user".to_owned(),
         format!("--model={}", run.profile.model),
     ];
+    if let Some(effort) = run.profile.effort {
+        args.push(format!("--effort={}", effort_flag(effort)));
+    }
     // `profile.max_turns` has no counterpart on this CLI and is therefore
     // NOT applied — see the module header. Nothing sets it today, and it is
     // named here rather than silently skipped so that whoever first does has
@@ -423,8 +442,6 @@ mod tests {
             model: "gpt-5.3-codex".to_owned(),
             pool: "copilot".to_owned(),
             permissions,
-            // As with the Claude adapter: no effort flag on this CLI, so the
-            // field rides along unused rather than being faked into `--model`.
             effort: Some(crate::ir::Effort::Medium),
             max_turns: Some(30),
             extra_args: Vec::new(),
@@ -458,7 +475,20 @@ mod tests {
         assert!(joined.contains("-s"), "response only: {joined}");
         assert!(joined.contains("--no-ask-user"));
         assert!(joined.contains("--model=gpt-5.3-codex"));
+        assert!(joined.contains("--effort=medium"));
         assert!(!joined.contains("--resume"), "no session to resume");
+    }
+
+    #[test]
+    fn every_effort_maps_to_a_value_the_cli_advertises() {
+        const ACCEPTED: [&str; 7] = ["none", "minimal", "low", "medium", "high", "xhigh", "max"];
+        for effort in Effort::ALL {
+            assert!(
+                ACCEPTED.contains(&effort_flag(effort)),
+                "{effort} maps to `{}`",
+                effort_flag(effort)
+            );
+        }
     }
 
     #[test]
