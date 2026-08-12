@@ -112,10 +112,11 @@ Every piece of work lives in one unit (a "pane" in the eventual UI; a run direct
 | **Router** | Resolve each task to an escalation chain of abstract tiers from three sources (config defaults, designer annotations, user override), applying blast-radius floors and `min` clips. |
 | **Binder** | Resolve each tier to a concrete (agent × model × pool) at attempt time from everything connected — scoring capability fit (catalog), capacity headroom under the active strategy, and affinity; rebinds across pools on rate limits. Pins force fixed bindings. |
 | **CapacityEngine** | Track every quota pool (windows, credits, dollars, local), estimate remaining capacity, expose strategy decisions (conserve / value-max / spend-down) to the router and scheduler. |
-| **Scheduler** | Drain the DAG. Sequential in v0.1 — advancing past parked tasks to the next ready independent task. Parallel with worktrees in v0.2. |
-| **Workspace** | Git state: run branch, per-task commits; v0.2 worktree-per-task + merge queue. |
-| **AgentAdapter** | Turn a `TaskRun` into a subprocess of an official CLI, supervise it, parse the outcome. One file per agent. |
-| **Gates** | Configured shell commands (compile/test/lint) in the workspace; failure logs become retry feedback. |
+| **Scheduler** | Drain the DAG. Sequential in v0.1 — advancing past parked tasks to the next ready independent task. In v0.2 one coordinator owns events/admission while task pipelines run concurrently and one queue serializes integration. |
+| **Workspace** | Git state: v0.1 run branch + per-task commits; v0.2 detached worktree-per-task, immutable candidate refs, staging worktree, and compare-and-swap integration. |
+| **AgentAdapter** | Turn a `TaskRun` into a data-only `CommandSpec` for an official CLI and parse the outcome. One file per agent; it does not decide where the process runs. |
+| **Runner** | Execute probes, workers, gates, and reviewers on the host or in a role-scoped container; owns cwd, mounts, environment, supervision, and timeout, never agent semantics or Git. |
+| **Gates** | Configured shell commands (compile/test/lint) executed by the selected runner in the candidate workspace; failure logs become retry feedback. |
 | **Reviewer** | Ordinary read-only worker profile emitting a structured verdict; optionally a different vendor from the implementer. |
 | **Interaction** | Question/answer events, parking semantics, notifier plugins, CI degradation. |
 | **Event log** | Append-only JSONL; source of truth for state, resume, status, questions, ledger, and the future decision-export dataset. |
@@ -196,41 +197,71 @@ Pending ─► Ready ─► Running(attempt n, rung r) ─► Gating ─► Revi
                                                      └─ declined ─► Failed ─► dependents Blocked
 ```
 
-v0.2 appends `Done ─► AwaitingMerge ─► Merged | Conflicted(spawns fix task)`, and **dependency readiness is `Merged`, not `Done`** — a dependent's worktree must branch from an integration head that already contains its dependencies' code.
+v0.2 replaces the terminal edge with `Reviewing ─► AwaitingMerge(candidate) ─► Merged | AwaitingRepair(fix task)`. There is no pre-merge `Done`: **dependency readiness is `Merged`** — a dependent's worktree must branch from an integration head that already contains its dependencies' code. `Ready`, the attempt phases, and `MergeVerifying` are derived views; the durable fold stores candidates, repair lineage, and the one prepared merge transaction ([decision](decisions/2026-08-12-merge-queue-execution-topology.md)).
 
 ## 8. Trait surface
 
 ```rust
+use async_trait::async_trait;
+
 trait PlanAdapter {
     fn id(&self) -> &'static str;
     fn sniff(&self, raw: &str) -> bool;
     fn parse(&self, raw: &str) -> Result<Plan>;
 }
 
+#[async_trait]
 trait AgentAdapter {
     fn id(&self) -> &'static str;
-    fn probe(&self) -> Result<Caps>;         // ran at pre-flight: version + flag capabilities
-    fn build(&self, run: &TaskRun) -> Result<Command>;
+    async fn probe(&self, runner: &dyn Runner) -> Result<Caps>; // probes the boundary that will execute
+    fn build(&self, run: &TaskRun) -> Result<CommandSpec>;
     fn parse(&self, out: &ProcessOutput) -> Result<Outcome>;
 }
 // Caps: json_output, session_resume, cost_reporting, read_only_mode, acp, model_list
 
-trait Gate {
-    fn name(&self) -> &str;
-    async fn check(&self, ws: &Workspace) -> GateResult;   // Pass | Fail { log }
+struct CommandSpec { program: String, args: Vec<String>, env: Vec<(String, String)>, stdin: Vec<u8> } // env is an overlay
+struct RunnerRequest { command: CommandSpec, workspace: PathBuf, role: ExecutionRole, timeout: Duration, agent: Option<AgentId> }
+enum ExecutionRole { Probe, Implement, Gate, Review }
+
+#[async_trait]
+trait Runner {
+    async fn run(&self, request: &RunnerRequest) -> Result<ProcessOutput>;
 }
 
+#[async_trait]
+trait Gate {
+    fn name(&self) -> &str;
+    async fn check(&self, runner: &dyn Runner, ws: &Workspace) -> GateResult; // Pass | Fail { log }
+}
+
+#[async_trait]
 trait Notifier {
     fn id(&self) -> &'static str;                          // cli | desktop | telegram | slack
     async fn ask(&self, q: &Question) -> Result<()>;       // delivery only; answers arrive as events
     async fn info(&self, msg: &RunEvent) -> Result<()>;    // milestones, completion, budget alerts
 }
 
+#[async_trait]
 trait CapacitySource {
     fn pool(&self) -> PoolId;
     async fn estimate(&self) -> Result<CapacityEstimate>;  // remaining, window ends, confidence
 }
 ```
+
+The attributes above are a contract, not decorative pseudocode: every async
+trait used behind `dyn` returns a boxed `Send` future (whether generated by
+`async-trait` or written explicitly), so the final Tokio surface is object-safe.
+The pre-Tokio runner steps use the same request/output contract through a
+synchronous `run`; step 5 changes that call shape to the boxed-future surface
+while parity tests hold process and parsing semantics fixed.
+
+`CommandSpec.env` overlays a runner-owned base rather than replacing it. The
+host runner starts from the Tactus environment and the container runner from the
+image environment; each supplies role-scoped `HOME`, `PATH`, and credential
+locations. Adapter overrides may select profiles or CLI behavior but may not
+conflict with runner-reserved keys. Probe and execution compose the same base,
+mounts, reserved values, and overlay, so pre-flight certifies the environment
+that will actually spend.
 
 Deliberate omissions: no `Router` trait (config-evaluating struct until a second policy exists) and no `Executor` trait beyond `AgentAdapter` (a native agentic loop remains explicitly out of scope; the seam exists if that ever changes).
 
@@ -262,7 +293,7 @@ Assignment resolves in layers:
 2. **Blast-radius floors:** path-glob overrides truncate the chain start (`src/auth/**` starts at frontier). Blast radius beats nominal difficulty.
 3. **Designer annotations:** `tier=` is advisory (becomes the chain start if it outranks the baseline), `min=` is binding (clips anything below it).
 4. **User override:** the dry-run routing preview is where the user edits any assignment before spend.
-5. **Late binding (v2.1):** chains are abstract tiers; the **binder** resolves each tier to a concrete (agent × model × pool) per attempt from everything the user has connected — scoring capability fit against the model catalog, capacity headroom under the active strategy (spend-down may raise the effective start, never below `min`), and affinity (ties break toward the previous task's binding; same-profile streaks batch). Rate-limit failover is the binder rebinding the same rung to another pool. Pins force a fixed binding where determinism matters.
+5. **Late binding (v2.1):** chains are abstract tiers; the **binder** resolves each tier to a concrete (agent × model × pool) per attempt from everything the user has connected — scoring capability fit against the model catalog, capacity headroom under the active strategy (spend-down may raise the effective start, never below `min`), and affinity (ties break toward the previous task's binding; same-profile streaks batch). Rate-limit failover is the binder rebinding the same rung to another pool. Pins force a fixed binding where determinism matters. Floors, including a merge repair's `min_tier = mid`, are intersected with the run's frozen hard pins and ceilings; an empty intersection parks at the human rung instead of silently overriding policy.
 
 **A tier resolves an effort as well as a binding.** The engine states it on every attempt — an explicit `[routing.effort]` role policy first, then a pin, then `small→low`, `mid→medium`, `frontier→high` — because a vendor default is not a routing decision. Codex made the case concretely: its default comes from the *provider's roster* rather than its flag set, `gpt-5.6-sol` carries `low`, and until step 10 every review this project ran was judged there silently (`decisions/2026-08-11-codex-reasoning-effort.md`). A chain that escalates rungs while every rung thinks equally hard has escalated nothing. Effort remains abstract for the same reason tiers are, but the shared built-in vocabulary is now five levels (`low, medium, high, xhigh, max`): Codex, Claude Code, and Copilot all advertise them and each adapter maps them explicitly. A role policy is the deliberate opt-in for a run-wide implementation/review standard; without one, `max` remains reachable through a pin. `ultra` stays excluded because Codex couples it to automatic delegation, which changes orchestration rather than only reasoning depth. **Effort is not identity:** §11.3's rebind compares who a binding *is*, so an effort difference must never make a reviewer look like a different model from the implementer that shares its name.
 
@@ -320,7 +351,9 @@ The ledger accounts every attempt in both currencies: API-equivalent dollars (ho
 
 **Sequencing:** v0.1 ships the capacity engine **read-only** — the dry-run preview and `tactus capacity` show each pool's estimated remaining capacity, resets, and what each strategy *would* do. v0.2 wires it into live routing. This de-risks estimator fragility before any routing depends on it, and the preview alone is the demo that sells the product.
 
-## 14. Execution engine — v0.1 (sequential)
+## 14. Execution engine
+
+### v0.1 — sequential
 
 - **Pre-flight:** clean working tree required; every gate command resolves; every referenced agent binary probed (`probe()` logs version + capabilities — Copilot's CLI auto-updates and has shipped breaking flag removals, so capability probing is not optional); effort support is proven rather than inferred from a flag name (Claude Code and Copilot must advertise all five shared levels, while Codex must pass the exact `model_reasoning_effort=xhigh|max` assignments through `--strict-config` on fresh and resume until a deliberately missing local output-schema file stops the command before any model turn, then expose every level for each known model in its local `debug models` catalog); plan parses cycle-free; capacity snapshot taken. Unreadable capability output is not evidence and refuses before spend.
 - **Run branch:** `tactus/run-<ulid>` from HEAD; the user's branch is never dirtied.
@@ -329,9 +362,17 @@ The ledger accounts every attempt in both currencies: API-equivalent dollars (ho
 - **Rollback on failed attempt:** `git checkout . && git clean -fd` back to the last commit — unless the retry resumes the same session, in which case the tree stays and the *cumulative* diff is re-gated.
 - **Timeouts:** per-attempt wall clock (default 30 min, per-profile override); timeout = attempt failure with partial transcript as feedback.
 
+### v0.2 — isolated candidates, serialized integration
+
+- **Dispatch:** leave the user's checkout untouched. A task becomes runnable only when every dependency is `Merged`, then receives a detached linked worktree at the current integration SHA. One generation names one worktree/base lineage, not one attempt: an immediate same-rung session-resume retry keeps it so the cumulative diff survives, while every fresh retry, unpark, or defer recovery branches from the then-current head under a new generation. `path_hints` provide conservative dispatch leases (no hints means repo-wide); parking or deferring releases the predicted lease and active-pipeline permit. Actual changed paths replace the prediction once a candidate exists. Independent tasks may start from different integration snapshots.
+- **Candidate:** the existing capture → gates → review pipeline fixes an exact tree, which the engine commits under an immutable internal candidate ref. `candidate_prepared` is the sole successful-attempt settlement for that path and contributes its embedded attempt record exactly once to replay, status, budgets, ledger, and export. Success means `AwaitingMerge`, not dependency-ready. The active-pipeline permit is released while queued, while the candidate's actual-path lease remains until integration or repair. The coordinator is the only event/ref writer; task pipelines return typed results to it.
+- **Integration:** one FIFO queue (candidate-created event order, with skip-ahead past repair-path leases) fast-forwards an exact-base candidate or cherry-picks a stale one into a detached staging worktree. A stale proposal reruns every recorded gate and review pass on the exact combined tree. `merge_prepared` is both the successful terminal verification record and the durable authorization for compare-and-swap advancement of `tactus/run-<ulid>`; a code failure instead terminates atomically in `merge_rejected`, so no separate finished event creates a crash gap before either outcome. `task_merged` alone releases dependents. A stale patch already wholly present is reverified and records `expected_head == proposed_sha`, making publication a validation-only no-op before it settles explicitly at the unchanged head. The live run ref must not be checked out in any worktree.
+- **Repair:** a conflict or code-attributed integration gate/review rejection publishes nothing. One `merge_rejected` append embeds the complete frozen Fix-task payload — task text, resolved ladder/binding constraints and review passes, candidate/base lineage, evidence, and `min_tier = mid` — and atomically moves the rejected task to `AwaitingRepair` while registering that repair as `Pending` or `AwaitingInput`. The rejecting head remains evidence; actual dispatch materializes the candidate against the then-current integration head so a queued or human-gated repair is not stale by construction. Later auto-binding may use only agents this run already probed; hard pins and ceilings still win over the repair floor. `run_started` freezes `max_merge_repairs` (default 2) for the whole lineage, so a new synthetic task cannot reset the autonomous budget; an over-limit or policy-blocked repair is registered with a complete frozen human question and cannot spend until an answer activates it. Provider, rate-limit, process-spawn, and runner failures retain their defer/rebind/halt semantics and never become prompts to edit product code. The repair's actual-path lease prevents known overlapping candidates overtaking it while disjoint work can continue.
+- **Sequencing:** build worktrees, runner, events, and this queue under `max_parallel = 1` first; prove crash recovery; only then replace the drain loop with Tokio task pipelines, global/per-agent permits, and the same single queue. The protocol and fault matrix are fixed in [the 2026-08-12 decision](decisions/2026-08-12-merge-queue-execution-topology.md).
+
 ## 15. Event log, resume, run layout (P6)
 
-The run directory is **split in two**, by who is allowed to read each half:
+The durable run artifacts are **split in two**, by who is allowed to read each half. v0.2 adds a third, disposable execution root that contains code but no authority:
 
 ```
 <repo>/.tactus/runs/<run-id>/     # run-id = ULID — the ops surface
@@ -347,10 +388,15 @@ The run directory is **split in two**, by who is allowed to read each half:
     reviews/<task>-<attempt>-review.json
     settings/<task>-<attempt>.json    # the per-attempt permission surface
     gates/<task>-<attempt>-<gate>.log
+~/.tactus/workspaces/<repo-key>/<run-id>/  # v0.2; exact path recorded on run_started
+    tasks/<task>-<generation>/          # detached linked worktrees
+    merge/                              # detached integration staging worktree
 tactus.toml                       # repo-root config, checked in
 ```
 
 The split is enforcement, not tidiness. A reviewer is a read-only agent pointed at the workspace, so *anything in the workspace is reachable* — including the implementer's transcript, which invariant 3 says is exactly not the evidence a reviewer should judge on. Deny rules cannot close that on their own: gates execute repository code the implementer just wrote, and that code reads any workspace path no permission rule ever sees. So the agent-authored half lives where there is no path to it, and the deny rules on `.tactus/**` become defence in depth rather than the mechanism. Writes there are denied outright — with the log load-bearing, an agent that could append to it could forge a `task_committed`.
+
+The v0.2 execution root is deliberately non-authoritative. A container receives only its role's one worktree mount; it never receives the public log, sibling worktrees, or private artifacts. On the host runner the agent permission surface remains the boundary and gate code is not OS-confined — the reason the container runner exists. Worktree disappearance is recoverable from events and internal refs, and cleanup follows a terminal event rather than creating one.
 
 Every transition is an event `{ts, event, task?, attempt?, rung?, profile?, data}` — including `question_raised`, `question_answered`, `design_defect`, `capacity_snapshot`, `pool_exhausted`, and `spend_down_engaged`. `status`, the ledger, and the capacity view are pure folds over this file.
 
@@ -358,11 +404,21 @@ Every transition is an event `{ts, event, task?, attempt?, rung?, profile?, data
 
 `tactus resume <run-id>` replays, verifies the run branch HEAD matches the last committed event (mismatch = refuse with an explanation), re-probes agents, re-snapshots capacity, and continues — parked questions intact. That HEAD check has one deliberate exception, because git and the log cannot be written atomically: §14 commits, reads the sha back, scrubs the tree, and only then appends `task_committed`, so a process that dies inside those three git calls leaves the branch one commit past its own record. Where that commit sits directly on the recorded head *and* carries the message this engine would have written for the task whose last attempt passed, resume adopts it rather than refusing — the alternative is telling the operator to reset away work that already passed its gates and its review, and to spend the attempt again. Anything short of the whole shape is still foreign history, and still refused. It also refuses when the frozen plan's hash moved, when the recorded chain structure no longer matches (a rung is an index into that chain), when the branch is gone, and when another process holds the run.
 
+v0.2 generalizes that exception into two explicit transactions. After fixing the verified tree, the engine creates and temporarily pins an immutable commit object; `candidate_prepared` is the sole successful settlement for that candidate-producing attempt and records exactly one complete attempt/base/commit/tree identity before the authoritative candidate ref moves, so resume adopts only that exact shape. Recovery then appends the missing `task_candidate_created`, whose append position establishes FIFO order. `merge_rejected` similarly embeds the complete frozen repair-task payload and admission state so rejection, task registration, key assignment, `AwaitingRepair`, and either runnable or human-gated repair state are one append rather than a rejection/spawn/question crash window. A human-gated admission's embedded question is itself authoritative for status, notification, and `tactus answer`; it is not followed by a duplicate `question_raised`. Each `merge_verification_started` has exactly one terminal record: successful evidence lives inside `merge_prepared`, code failure inside `merge_rejected`, and infrastructure/crash outcomes inside unavailable/interrupted events. There is no standalone successful or failed finish event before the state-changing append. `merge_prepared` records disposition, expected integration SHA, proposed SHA, candidate, verification evidence, and repair lineage before `git update-ref` advances the run ref by compare-and-swap. On resume, expected-old means retry that same transition and append `task_merged`, proposed means append the missing `task_merged`, and any third SHA means refuse; `already_present` uses equal expected/proposed SHAs, so the same rule becomes a checked no-op. A proposed commit with no prepared/rejected terminal event is residue and is reverified; a dangling merge-review process is settled as interrupted with unknown spend first. The event schema moves rather than teaching `task_committed` a second meaning. The complete protocol and fault table live in [the merge-queue decision](decisions/2026-08-12-merge-queue-execution-topology.md).
+
 **Gates are taken from the record, not re-derived — and not refused over.** `run_started` records each effective gate in full (name, command, shell, timeout) and a resume rebuilds and runs *those*, exactly as it reads the review plan from the record rather than re-resolving who judges. This is the property a live run already has for free: config is parsed once at pre-flight and gates execute from memory, so a mid-run edit to `tactus.toml` cannot change what a running task is verified against. Honouring the same snapshot across an interruption is what makes every `task_committed` in one log mean the same thing — and it matters concretely once runs self-host, because the workspace an implementer edits *contains the `tactus.toml` its own gates come from*. Refusing on a mismatch was the first design and was worse in both directions: it left the weakened-gate case detected but the run dead, and it made a gate edit that the run's own reviewed task legitimately committed permanently unresumable. A config that differs today is a warning naming the difference, not an error; the edit simply applies to the next run. Logs predating the record re-derive and warn, saying whether the recorded gate *names* still match — which is proof rather than suspicion when they do not — and that resume writes what it settled on into its own `run_resumed`, so the next one is an ordinary record-bearing resume rather than a second re-derivation that could land somewhere else. `shell` is recorded because it is half of what a command means (`cmd = "true"` always passes under `sh` and is not a program at all under `cmd.exe`); the portability that argued against pinning it does not exist anyway, since `private_dir` already records an absolute host path. The finding, the refusal remedy that was withdrawn, and why, are in `decisions/2026-08-11-resume-gate-config.md`. An attempt the log ends mid-flight is settled as `attempt_interrupted`: recorded in the ledger with unknown spend, but not counted against the rung's allowance, because nothing judged the code — the same rule §19 applies to an outage.
 
 **Effort and worker bindings are taken from the same run snapshot.** `run_started.effort_policy` records the resolved implementation value at small, mid, and frontier plus the review value, while every chain records each rung's exact agent and model plus whether it was pinned. Every worker and every review pass reads those snapshots, so editing `[routing.effort]`, adding a pin, or installing another CLI between processes cannot change one run's execution identity or standard. A mismatch warns and continues with the record; a changed chain shape refuses because recorded rung indices would no longer mean the same thing. Start a new run to adopt current routing.
 
 Those identity fields require event schema 2. A schema-1 log remains readable by a current binary: its first resume re-derives the missing policy and bindings once with explicit warnings, then records them on `run_resumed`. Before it appends any event whose meaning depends on the new identity, it appends `run_schema_upgraded { from: 1, to: 2 }`. Current replay validates that transition; an old binary does not know the marker and therefore refuses instead of silently continuing a run whose new fields it would ignore. Later resumes are record-bound and do not append a second marker.
+
+The v0.2 execution topology begins at event schema 3 because its task states and
+transactions change execution meaning. Fresh v0.2-topology runs write schema 3
+in `run_started`; older binaries reject them before folding. Existing schema-1
+or schema-2 runs finish through the v0.1 sequential path (including the existing
+1 → 2 identity upgrade when needed). No in-flight run appends a 2 → 3 upgrade:
+starting a new run is the compatibility boundary for adopting worktrees,
+candidates, and the merge queue.
 
 ## 16. Agent adapters (P2)
 
@@ -414,6 +470,7 @@ Repo-level `tactus.toml` — overrides only; everything below has a derived defa
 [engine]
 on_task_failure = "halt"            # halt | continue
 max_parallel    = 1                 # >1 requires v0.2
+max_merge_repairs = 2               # autonomous generations per original task; then HUMAN
 shell           = "powershell"      # gate shell; default = platform native
 
 [interaction]
@@ -502,7 +559,7 @@ The export reads only the named, non-live run's event log and `plan.normalized.j
 | Question parked, frontier non-empty | scheduler | continue independent tasks |
 | Runnable frontier empty | scheduler | hard block (interactive) / end run reporting parked tasks (CI) |
 | Budget or pool budget exceeded | ledger | stop scheduling; run ends `BudgetExceeded` |
-| Merge conflict (v0.2) | merge queue | auto-spawn Fix task on `mid` in a rebased worktree |
+| Merge conflict or code-attributed stale integration rejection (v0.2) | merge queue | publish nothing; atomically append rejection plus its replayable frozen Fix task, respecting hard pins/ceilings and the lineage-wide `max_merge_repairs`; infrastructure keeps its ordinary policy |
 | Engine crash / power loss | — | `tactus resume` replays the event log |
 
 ## 20. Safety and permissions
@@ -522,7 +579,7 @@ Build order (each step leaves a runnable binary): 1 IR + config + validate → 2
 
 **v0.1 was met on 2026-08-10.** A five-task plan ran unattended against a scratch repository through all five criteria and the kill/resume test, and the engine was then used on a real published library. `acceptance/RESULT.md` records both, with the evidence for each criterion and the engine defects found: **three from the acceptance run and a fourth from the real-library run that followed** — all fixed. (The count is stated per-run wherever it appears, because "three" and "four" are both true of different things and the difference is which run is being talked about.) The definition of done above said "on a real repo" until after the run, and was tightened afterwards to say which part of "real" it meant — that is a clarification made with hindsight, and the ambiguity it removes is the one that had the README calling a scratch repository real. Released as `0.1.0`; `0.0.1` was a name reservation only.
 
-**v0.2 — parallel + capacity-driven.** Worktree-per-task; **execution runner — container-per-attempt as an optional layer, decided 2026-08-11, rationale below**; tokio DAG scheduler with per-agent semaphores; readiness = Merged; overlap serialization from path hints; merge queue + conflict→fix-task; capacity-driven routing live (conserve / value-max / spend-down, reserve floors, rate-limit adaptation); affinity assignment (streak batching + measured switch costs from decision logs); Telegram/Slack notifiers; **OpenAI Codex adapter (landed 2026-08-11, ahead of the rest of v0.2)**; Aider adapter + local pool; task-master/JSON/checklist plan adapters; `export-decisions`.
+**v0.2 — parallel + capacity-driven.** Detached worktree-per-task with immutable verified candidates; **execution runner — container-per-attempt as an optional layer, decided 2026-08-11 and concretized with the worktree boundary below**; Tokio coordinator with global/per-agent semaphores and one event/ref writer; readiness = Merged; conservative path-hint admission plus actual-path repair leases; one compare-and-swap merge queue with exact-tree re-verification for stale candidates and conflict or code-attributed gate/review rejection → recorded Fix task ([protocol decided 2026-08-12](decisions/2026-08-12-merge-queue-execution-topology.md)); capacity-driven routing live (conserve / value-max / spend-down, reserve floors, rate-limit adaptation); affinity assignment (streak batching + measured switch costs from decision logs); Telegram/Slack notifiers; **OpenAI Codex adapter (landed 2026-08-11, ahead of the rest of v0.2)**; Aider adapter + local pool; task-master/JSON/checklist plan adapters; `export-decisions`.
 
 **Why the Codex adapter came first, and what it turned out to be.** Copilot was promoted into v0.1 because it bought cross-vendor models and a second pool in one move; this one buys the second pool *directly*, and that turned out to be the binding constraint rather than a convenience. §13's capacity engine assumes several subscriptions with independent windows, and v0.1 shipped able to drive exactly one — so a week of real work exhausts a single vendor's quota and the engine stops, with the design's whole answer to that sitting unreachable. Everything else in v0.2 is throughput; this is capacity, and capacity is what ran out first.
 
@@ -532,9 +589,9 @@ Build order (each step leaves a runnable binary): 1 IR + config + validate → 2
 
 **The runner layer (v0.2): the container is the floor, not the ceiling.** The Codex findings raised the obvious question — with agent sandboxes this uneven (Codex has none on Windows; Copilot's deny-by-default is admitted unverifiable in its own adapter), why not run every agent in an OS-level container and stop caring about their surfaces? The answer that survived scrutiny is a *layer*, not a replacement; the premise is about 60% true, and the design is knowing which 60%. What a container uniquely buys, in order: it is the first mechanism in this design that confines **gate-executed repository code** — gates run the diff's own build scripts with the tactus process's full authority, which no agent permission surface can ever bound and which is why §15 moved transcripts out of the workspace rather than trying; a `:ro` mount makes the reviewer's read-only *mechanically* perfect instead of flag-deep, ending the reviewer-edits-what-it-judges class outright; and an image with version-pinned CLIs makes the mid-run self-update that killed acceptance run 1 structurally impossible. What it cannot replace: **the network**. An agent's entire function is a network conversation with its vendor, so the container cannot close the channel, and selective egress — allow the vendor API, deny everything else — is a proxy project, not a docker flag. Until one exists, §20's no-URL-grant agent policy remains the only control on the largest exfiltration channel, which alone kills "we don't need to care about the agents." Adapters also keep every duty that is not filesystem confinement — prompt delivery, output parsing, resume semantics, rate-limit phrasing, each CLI's suppress-prompts flag; the permission surface is roughly a fifth of each adapter, and the runner touches only that fifth.
 
-**Runner design commitments, recorded now so the build inherits them.** (1) A runner is orthogonal to an adapter: `[runner]` config selects `host` or `container` (image, mounts), the adapter builds the command, the runner decides where it executes — adapters never learn about containers, and the runner learns nothing about agents beyond which per-agent credential volume to mount (persistent volumes, not ephemeral copies: some CLIs rotate refresh tokens on use, and a discarded rotation forces re-login). This is the same seam §23's runner-fleet model and v0.3's GitHub Action plug into, so the layer is on the roadmap's path regardless. (2) Defence in depth stays the default: agent surfaces remain ON inside the container wherever they work; the container catches what they miss. (3) Codex under a runner uses its `external-sandbox` mode — measured 2026-08-11: its own sandbox needs `seccomp=unconfined` plus `SYS_ADMIN` to initialise under Docker's defaults, and granting the container more so the inner layer can grant less is the wrong trade; one standard-strength boundary beats two weakened ones. §20's ban on the skip-sandbox class gains exactly that one scoped exception, stated there. (4) Sequenced with worktree-per-task because both redesign where an attempt executes; building them separately is building it twice. On Windows the honest cost is named now: container-per-attempt means the repository living WSL-side for filesystem performance — an operator-environment migration, not a footnote. Until the runner exists, the zero-code path stands: run the conductor itself on Linux or WSL, where all three CLIs work, the engine is best-tested since the lock rework, and the Windows-only Codex implementer refusal opens by construction. That path, not the reviewer seat, is where the quota relief lives — in the frontier-implementer regime the implementation half dominates spend (§23.2 as scoped), so relief means moving the *worker* off the Claude window; a free cross-family reviewer is worth having for §11.3's own sake, not as the savings.
+**Runner design commitments, recorded now so the build inherits them.** (1) A runner is orthogonal to an adapter: `[runner]` config selects `host` or `container` (image, mounts), the adapter builds a data-only `CommandSpec`, and the runner decides where it executes — adapters never learn about containers, and the runner learns nothing about agent semantics beyond which per-agent credential volume to mount (persistent volumes, not ephemeral copies: some CLIs rotate refresh tokens on use, and a discarded rotation forces re-login). Probes run through that same runner, or pre-flight could certify a host CLI/version different from the one the attempt executes. Workers, **repository-controlled gates**, and reviewers all cross the boundary; authoritative Git and the event log never do. Because a linked worktree's `.git` points back into the real repository, the container overlays a disposable role-scoped Git view — exact detached HEAD/index, no engine refs, read-only objects — so Git-dependent tools work without exposing or mutating the coordinator's refs. This is the same seam §23's runner-fleet model and v0.3's GitHub Action plug into, so the layer is on the roadmap's path regardless. (2) Defence in depth stays the default: agent surfaces remain ON inside the container wherever they work; the container catches what they miss. (3) Codex under a runner uses its `external-sandbox` mode — measured 2026-08-11: its own sandbox needs `seccomp=unconfined` plus `SYS_ADMIN` to initialise under Docker's defaults, and granting the container more so the inner layer can grant less is the wrong trade; one standard-strength boundary beats two weakened ones. §20's ban on the skip-sandbox class gains exactly that one scoped exception, stated there. (4) Sequenced with worktree-per-task because both redesign where an attempt executes; first make the host and container runners exercise the same detached-worktree protocol at `max_parallel = 1`, then add concurrency without changing it. On Windows the honest cost is named now: container-per-attempt means the repository living WSL-side for filesystem performance — an operator-environment migration, not a footnote. Until the runner exists, the zero-code path stands: run the conductor itself on Linux or WSL, where all three CLIs work, the engine is best-tested since the lock rework, and the Windows-only Codex implementer refusal opens by construction. That path, not the reviewer seat, is where the quota relief lives — in the frontier-implementer regime the implementation half dominates spend (§23.2 as scoped), so relief means moving the *worker* off the Claude window; a free cross-family reviewer is worth having for §11.3's own sake, not as the savings.
 
-**v0.2 definition of done:** a plan with two independent branches runs at `max_parallel = 3`, visibly interleaves in `status --follow`; one deliberate merge conflict is auto-resolved by a spawned fix task; one question is answered from a phone while the run keeps moving; and near a window reset with surplus capacity, spend-down mode observably biases assignments up-tier — with the ledger proving what each pool paid.
+**v0.2 definition of done:** a plan with two independent branches runs at `max_parallel = 3`, visibly interleaves in `status --follow`, and a dependent starts only from a head containing both; the user's checkout stays untouched; a stale clean candidate is re-gated and re-reviewed before compare-and-swap integration; one deliberate merge conflict is auto-resolved by an atomically recorded replayable Fix task, while repeated rejections stop at the frozen repair limit; kill tests at every candidate/merge/rejection transaction boundary neither duplicate nor lose a commit or attempt settlement; schema-2 resume stays sequential and a schema-2 binary refuses schema 3; the host/container runner parity tests prove object-safe execution, identical environment composition, read-only review, and confinement of gate writes; one question is answered from a phone while the run keeps moving after releasing its pipeline permit and dispatch lease; and near a window reset with surplus capacity, spend-down mode observably biases assignments up-tier — with the ledger proving worker, candidate re-verification, reviewer, and pool spend exactly once.
 
 **v0.3 — direction.** The design pane (interactive Phase-1 product) and a web dashboard, both as thin clients over the event log; a GitHub Action wrapping `tactus run`; the design-defect feedback loop surfacing into the designer prompt; and routing *prediction* — a frontier model predicting rung and cost at `--dry-run`, shipped only if §23.2's calibration test passes. Learned routing from exported decisions is parked indefinitely at personal scale — single-digit samples per routing cell, and quarterly model churn decays the dataset about as fast as it grows (`decisions/2026-08-11-design-council.md`); the telemetry keeps landing because it is what makes small data interpretable, not because it will train anything.
 
