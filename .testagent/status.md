@@ -2,9 +2,8 @@
 
 ## Result
 
-All six review requirements are implemented. The Windows baseline is green and
-the focused regression suite has been mutation-checked. WSL/Linux verification
-is the remaining release gate before handoff.
+All six review requirements are implemented. Windows and WSL/Linux are green,
+and the focused regression suite has been mutation-checked.
 
 ## Focused evidence
 
@@ -63,4 +62,14 @@ cargo test --all-targets
 # 437 passed; 0 failed; 2 ignored
 ```
 
-WSL/Linux: pending final synchronization and the same three commands.
+WSL/Linux completed:
+
+```text
+cargo fmt --check
+cargo clippy --all-targets -- -D warnings
+cargo test --all-targets
+# 438 passed; 0 failed; 2 ignored
+```
+
+The one additional Linux test is the platform-specific assertion that Codex
+implementation is allowed where its sandbox is real.
