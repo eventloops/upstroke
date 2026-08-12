@@ -79,8 +79,9 @@ tactus resume <run-id> --budget 30
 
 Continues a run that was interrupted, ended with tasks parked on questions, or stopped at its
 budget. Budgets are re-read at resume, so raising the ceiling and continuing is one command.
-Gates, reviewers, and the resolved implementation/review effort policy come from the run record;
-editing them applies to a new run rather than changing the standard halfway through this one.
+Gates, reviewers, resolved worker bindings, and the implementation/review effort policy come from
+the run record; editing them applies to a new run rather than changing the standard halfway
+through this one.
 
 ```bash
 tactus export-decisions <run-id>

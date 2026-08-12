@@ -156,7 +156,7 @@ pub fn load(repo_root: &Path, wanted: &str) -> Result<Loaded, TactusError> {
         let EventBody::RunStarted { data: started } = &started_event.body else {
             unreachable!()
         };
-        events::ensure_supported_schema(started, &events_path)?;
+        events::ensure_supported_schema(started, &log, &events_path)?;
         if started.run_id != run_id {
             return invalid(
                 &events_path,

@@ -36,7 +36,8 @@ use crate::capacity;
 use crate::config::{self, OnTaskFailure};
 use crate::error::TactusError;
 use crate::events::{
-    self, ChainSummary, EventBody, EventLog, Feedback, GateSummary, Progress, RunState, TaskState,
+    self, BindingSummary, ChainSummary, EventBody, EventLog, Feedback, GateSummary, Progress,
+    RunState, TaskState,
 };
 use crate::gates::{self, ShellGate};
 use crate::interaction::{
@@ -469,6 +470,15 @@ struct Recorded {
     /// run's own report and a later `status` disagree about the same gates —
     /// the drift this record exists to stop, one field short of stopped.
     gates_from_config: bool,
+    /// The run's routing structure plus the first snapshot that names every
+    /// resolved rung binding. Present only on resume.
+    routing: Option<RecordedRouting>,
+}
+
+struct RecordedRouting {
+    run_id: String,
+    structure: Vec<ChainSummary>,
+    bindings: Option<Vec<ChainSummary>>,
 }
 
 fn preflight(opts: &RunOptions, harness: &Harness<'_>) -> Result<Preflight, TactusError> {
@@ -506,6 +516,14 @@ fn preflight_with_recorded(
     })?;
 
     let mut warnings = analysis.warnings.clone();
+
+    // Bindings are execution identity just like reviewers and gates. Restore
+    // them before resolving reviewers or probing agents: probing today's pin
+    // and only swapping later would let a harmless config edit refuse a resume
+    // on an agent this run was never going to use.
+    if let Some(routing) = recorded.routing.as_ref() {
+        restore_recorded_routing(&mut analysis, routing, &mut warnings)?;
+    }
 
     // The recorded gates replace the re-derived ones *here*, before anything
     // reads them — so the pre-flight resolution below, the `Bash(<cmd>)` grants
@@ -843,8 +861,164 @@ fn chain_summaries(analysis: &Analysis) -> Vec<ChainSummary> {
             task: task.id.to_string(),
             tiers: chain.rungs.iter().map(|rung| rung.tier).collect(),
             attempts_per: chain.attempts_per,
+            bindings: Some(
+                chain
+                    .rungs
+                    .iter()
+                    .map(|rung| BindingSummary {
+                        tier: rung.tier,
+                        agent: rung.binding.agent.clone(),
+                        model: rung.binding.model.clone(),
+                        pinned: rung.binding.pinned,
+                    })
+                    .collect(),
+            ),
         })
         .collect()
+}
+
+/// Validate the rung index space and restore the exact bindings the run began
+/// with. Structural changes still refuse: an existing `Progress.rung` cannot be
+/// interpreted against a different tier list. Binding-only changes warn and
+/// continue with the snapshot, matching gates and effort.
+fn restore_recorded_routing(
+    analysis: &mut Analysis,
+    recorded: &RecordedRouting,
+    warnings: &mut Vec<String>,
+) -> Result<(), TactusError> {
+    let current = chain_summaries(analysis);
+    let same_structure = current.len() == recorded.structure.len()
+        && current.iter().zip(&recorded.structure).all(|(now, then)| {
+            now.task == then.task
+                && now.tiers == then.tiers
+                && now.attempts_per == then.attempts_per
+        });
+    if !same_structure {
+        let moved: Vec<String> = current
+            .iter()
+            .zip(&recorded.structure)
+            .filter(|(now, then)| {
+                now.task != then.task
+                    || now.tiers != then.tiers
+                    || now.attempts_per != then.attempts_per
+            })
+            .map(|(now, then)| {
+                format!(
+                    "`{}` ran on [{}] with {} attempt(s) per rung and would now run on [{}] with {}",
+                    then.task,
+                    render_tiers(then),
+                    then.attempts_per,
+                    render_tiers(now),
+                    now.attempts_per,
+                )
+            })
+            .collect();
+        let detail = if moved.is_empty() {
+            format!(
+                "the run recorded {} task chain(s), while today's plan resolves {}",
+                recorded.structure.len(),
+                current.len()
+            )
+        } else {
+            moved.join("; ")
+        };
+        return Err(TactusError::Resume {
+            run_id: recorded.run_id.clone(),
+            message: format!(
+                "routing has changed since this run started, so a recorded rung would now mean a \
+                 different tier or allowance: {detail}. Restore the config it ran with, or start \
+                 a new run."
+            ),
+        });
+    }
+
+    let Some(snapshot) = recorded.bindings.as_ref() else {
+        warnings.push(
+            "this run's log predates the resolved-binding record, so worker agent/model bindings \
+             were re-derived from today's config rather than read from the run — earlier attempts \
+             may have used different bindings"
+                .to_owned(),
+        );
+        return Ok(());
+    };
+    if snapshot.len() != analysis.chains.len() {
+        return Err(TactusError::Resume {
+            run_id: recorded.run_id.clone(),
+            message: "the recorded binding snapshot does not align with the run's task chains; \
+                      the event log cannot safely identify which model belongs to which task"
+                .to_owned(),
+        });
+    }
+
+    let mut changed = Vec::new();
+    for ((chain, now), then) in analysis.chains.iter_mut().zip(&current).zip(snapshot) {
+        if then.task != now.task || then.tiers != now.tiers || then.attempts_per != now.attempts_per
+        {
+            return Err(TactusError::Resume {
+                run_id: recorded.run_id.clone(),
+                message: format!(
+                    "the recorded binding snapshot for `{}` does not match its frozen chain",
+                    then.task
+                ),
+            });
+        }
+        let Some(bindings) = then.bindings.as_ref() else {
+            return Err(TactusError::Resume {
+                run_id: recorded.run_id.clone(),
+                message: format!(
+                    "the recorded binding snapshot for `{}` is missing its bindings",
+                    then.task
+                ),
+            });
+        };
+        if bindings.len() != chain.rungs.len() {
+            return Err(TactusError::Resume {
+                run_id: recorded.run_id.clone(),
+                message: format!(
+                    "the recorded binding snapshot for `{}` has {} binding(s) for {} rung(s)",
+                    then.task,
+                    bindings.len(),
+                    chain.rungs.len()
+                ),
+            });
+        }
+        for (rung, binding) in chain.rungs.iter_mut().zip(bindings) {
+            if binding.tier != rung.tier {
+                return Err(TactusError::Resume {
+                    run_id: recorded.run_id.clone(),
+                    message: format!(
+                        "the recorded binding snapshot for `{}` assigns tier `{}` to a `{}` rung",
+                        then.task, binding.tier, rung.tier
+                    ),
+                });
+            }
+            if rung.binding.agent != binding.agent
+                || rung.binding.model != binding.model
+                || rung.binding.pinned != binding.pinned
+            {
+                changed.push(format!(
+                    "`{}` {}: recorded {}/{}, today {}/{}",
+                    then.task,
+                    rung.tier,
+                    binding.agent,
+                    binding.model,
+                    rung.binding.agent,
+                    rung.binding.model
+                ));
+            }
+            rung.binding.agent = binding.agent.clone();
+            rung.binding.model = binding.model.clone();
+            rung.binding.pinned = binding.pinned;
+        }
+    }
+    if !changed.is_empty() {
+        warnings.push(format!(
+            "today's worker bindings differ from the ones this run recorded ({}). This resume \
+             keeps the recorded bindings. Start a new run to adopt today's routing.",
+            changed.join("; ")
+        ));
+    }
+    Ok(())
 }
 
 /// The effective gates, in full, as they stood at this moment.
@@ -960,11 +1134,13 @@ fn resume_harness_inner(
     let events_path = public.join("events.jsonl");
     let events = events::read_all(&events_path, &mut warnings)?;
     let started = events::started_of(&events, &events_path)?.clone();
+    let effective_schema = events::ensure_supported_schema(&started, &events, &events_path)?;
     // Usually `run_started`'s, but a log too old to carry them there may have
     // had them established by an earlier resume instead — which is what stops
     // the re-derivation repeating, and drifting, on every resume after that.
     let recorded_gates = events::recorded_gates(&events).cloned();
     let recorded_effort_policy = events::recorded_effort_policy(&events);
+    let recorded_chains = events::recorded_chains(&events).cloned();
 
     // The run knows its own plan and config; the CLI may override the config
     // but never the plan, which is frozen (§5).
@@ -1008,6 +1184,11 @@ fn resume_harness_inner(
             reviews: started.reviews.clone(),
             gates: recorded_gates.clone(),
             gates_from_config: started.gates_from_config,
+            routing: Some(RecordedRouting {
+                run_id: run_id.clone(),
+                structure: started.chains.clone(),
+                bindings: recorded_chains.clone(),
+            }),
         },
     )?;
     if started.reviews.is_none() {
@@ -1083,31 +1264,6 @@ fn resume_harness_inner(
             run_opts.plan_path.display(),
             started.plan_hash,
             analysis.plan.source.hash
-        )));
-    }
-
-    // Chains moved means config moved. `Progress.rung` is an index into the
-    // chain, so re-resolving a different one silently points a task at a
-    // different tier than the one it actually reached.
-    let chains = chain_summaries(&analysis);
-    if chains != started.chains {
-        let moved: Vec<String> = chains
-            .iter()
-            .zip(&started.chains)
-            .filter(|(now, then)| now != then)
-            .map(|(now, then)| {
-                format!(
-                    "`{}` ran on [{}] and would now run on [{}]",
-                    now.task,
-                    render_tiers(then),
-                    render_tiers(now)
-                )
-            })
-            .collect();
-        return Err(refuse(format!(
-            "routing has changed since this run started, so a recorded rung would now mean a \
-             different tier: {}. Restore the config it ran with, or start a new run.",
-            moved.join("; ")
         )));
     }
 
@@ -1265,6 +1421,18 @@ fn resume_harness_inner(
         // previous process recorded nor swallows a fresh one.
         exhausted_pools: prior_signals.keys().cloned().collect(),
     };
+    // A legacy run cannot have its opening event rewritten without violating
+    // append-only history. This no-op event is therefore the schema-2 boundary:
+    // schema-1 binaries do not know its tag and refuse before ignoring the new
+    // effort/binding snapshots that follow.
+    if effective_schema < events::SCHEMA_VERSION {
+        run.emit(EventBody::RunSchemaUpgraded {
+            data: events::RunSchemaUpgraded {
+                from: effective_schema,
+                to: events::SCHEMA_VERSION,
+            },
+        })?;
+    }
     // The `task_committed` the dead process never got to, now that the commit
     // has been checked against the record. First of everything this resume
     // writes, because it is the thing that happened first.
@@ -1311,6 +1479,9 @@ fn resume_harness_inner(
             // the same fact in two places that a later change could pull apart.
             gates: recorded_gates.is_none().then(|| gates.clone()),
             effort_policy: recorded_effort_policy.is_none().then_some(effort_policy),
+            chains: recorded_chains
+                .is_none()
+                .then(|| chain_summaries(&analysis)),
         },
     })?;
     // §14 takes a capacity snapshot at pre-flight, and §15 makes a resume
@@ -5102,13 +5273,59 @@ mod tests {
     }
 
     #[test]
+    fn resume_restores_the_recorded_worker_binding_before_preflight() {
+        let original = "[interaction]\nmode = \"never\"\n\n\
+                        [routing]\nimplement = { chain = [\"small\"], attempts_per = 1 }\n";
+        let (repo, run_id) = parked_run_with_config("resumebinding", original);
+        fs::write(
+            repo.join("tactus.toml"),
+            "[interaction]\nmode = \"never\"\n\n\
+             [routing]\nimplement = { chain = [\"small\"], attempts_per = 1 }\n\n\
+             [[pins]]\ntier = \"small\"\nagent = \"copilot\"\nmodel = \"gpt-5-mini\"\n",
+        )
+        .expect("edit only the binding");
+
+        // `resume_answering` exposes only the Claude fake. If pre-flight probes
+        // today's Copilot pin before restoring the record, this refuses before
+        // the behavioral assertions below can run.
+        let resumed = resume_answering(&repo, &run_id, Effect::EditFile);
+        assert_eq!(resumed.outcome(), RunOutcome::Complete, "{resumed:?}");
+        let logged = events_of(&repo, &run_id);
+        let worker = logged
+            .iter()
+            .filter_map(|event| match &event.body {
+                EventBody::AttemptStarted { data, .. } => Some(data),
+                _ => None,
+            })
+            .next_back()
+            .expect("resumed worker");
+        assert_eq!(worker.agent, "claude-code");
+        assert_eq!(worker.model, "claude-haiku-4-5");
+        assert_eq!(
+            worker.selection_origin,
+            Some(events::SelectionOrigin::Auto),
+            "the recorded absence of a pin is part of the snapshot too"
+        );
+        assert!(
+            resumed
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("today's worker bindings")
+                    && warning.contains("gpt-5-mini")
+                    && warning.contains("claude-haiku-4-5")),
+            "binding difference warning: {:?}",
+            resumed.warnings
+        );
+    }
+
+    #[test]
     fn the_resume_that_rederives_an_old_logs_effort_records_it_for_the_next_one() {
         let original = "[interaction]\nmode = \"never\"\n\n\
                         [routing]\nimplement = { chain = [\"small\"], attempts_per = 1 }\n\n\
                         [routing.effort]\nimplementation = \"xhigh\"\nreview = \"max\"\n";
         let (repo, run_id) = parked_run_with_config("oldlogeffort", original);
         let paths = paths_of(&repo, &run_id);
-        strip_run_started_field(&paths, "effort_policy");
+        rewrite_run_started_as_schema_one(&paths, &["effort_policy"]);
 
         fs::write(
             repo.join("tactus.toml"),
@@ -5137,6 +5354,16 @@ mod tests {
             events::recorded_effort_policy(&events_of(&repo, &run_id)),
             Some(established),
             "the first resume writes down what it derived"
+        );
+        let after_first = events_of(&repo, &run_id);
+        assert!(events::recorded_chains(&after_first).is_some());
+        assert_eq!(
+            after_first
+                .iter()
+                .filter(|event| matches!(event.body, EventBody::RunSchemaUpgraded { .. }))
+                .count(),
+            1,
+            "the first schema-2 resume appends one downgrade barrier"
         );
 
         fs::write(
@@ -5189,6 +5416,14 @@ mod tests {
                 .any(|warning| warning.contains("predates the effort-policy record")),
             "the legacy absence was established once: {:?}",
             second.warnings
+        );
+        assert_eq!(
+            events_of(&repo, &run_id)
+                .iter()
+                .filter(|event| matches!(event.body, EventBody::RunSchemaUpgraded { .. }))
+                .count(),
+            1,
+            "later resumes must not append duplicate schema transitions"
         );
     }
 
@@ -8042,6 +8277,47 @@ mod tests {
             stripped,
             "the log has no run_started to strip `{field}` from"
         );
+        fs::write(paths.events(), format!("{}\n", rewritten.join("\n"))).expect("rewrite");
+    }
+
+    /// Rewrite the opening event into the exact compatibility shape a
+    /// schema-1 binary wrote: selected top-level fields absent and no per-chain
+    /// binding snapshot. Used only by downgrade/resume regressions.
+    fn rewrite_run_started_as_schema_one(paths: &RunPaths, absent: &[&str]) {
+        let text = fs::read_to_string(paths.events()).expect("log");
+        let mut rewritten_start = false;
+        let rewritten: Vec<String> = text
+            .lines()
+            .map(|line| {
+                let mut value: serde_json::Value =
+                    serde_json::from_str(line).expect("every line is an event");
+                if value.get("event").and_then(|event| event.as_str()) == Some("run_started") {
+                    let data = value
+                        .get_mut("data")
+                        .and_then(serde_json::Value::as_object_mut)
+                        .expect("run_started data");
+                    data.insert("schema".to_owned(), serde_json::Value::from(1));
+                    for field in absent {
+                        data.remove(*field)
+                            .unwrap_or_else(|| panic!("the run recorded no `{field}`"));
+                    }
+                    for chain in data
+                        .get_mut("chains")
+                        .and_then(serde_json::Value::as_array_mut)
+                        .expect("run_started chains")
+                    {
+                        chain
+                            .as_object_mut()
+                            .expect("chain object")
+                            .remove("bindings")
+                            .expect("a schema-2 run records chain bindings");
+                    }
+                    rewritten_start = true;
+                }
+                value.to_string()
+            })
+            .collect();
+        assert!(rewritten_start, "the log has no run_started event");
         fs::write(paths.events(), format!("{}\n", rewritten.join("\n"))).expect("rewrite");
     }
 

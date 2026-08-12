@@ -38,14 +38,14 @@ use crate::util;
 /// deriving the wrong state from a log we half-understand is the one failure
 /// mode an event-sourced design must not have.
 ///
-/// Misread is the operative word, and it is why step 10 did not bump it despite
-/// adding three event kinds and three fields. Every added field carries
-/// `#[serde(default)]`, so an old log folds to exactly the state it always did;
-/// and an *old binary* meeting a new event kind gets serde's unknown-variant
-/// error naming the log — a refusal, not a wrong answer. The one visible
-/// consequence, recorded rather than glossed: a budget-stopped run's log cannot
-/// be read by a pre-step-10 binary at all.
-pub const SCHEMA_VERSION: u32 = 1;
+/// Misread is the operative word. Step 10's additive reporting fields stayed in
+/// schema 1 because ignoring them did not change execution. Schema 2 is the
+/// first bump: effort and resolved worker bindings are execution identity, so a
+/// schema-1 binary ignoring those fields could continue the same branch under a
+/// different standard. Fresh runs say `2` in `run_started`; when this binary
+/// first resumes a schema-1 run it appends `run_schema_upgraded`, an event old
+/// binaries do not know and therefore refuse loudly rather than misread.
+pub const SCHEMA_VERSION: u32 = 2;
 
 // ---------------------------------------------------------------------------
 // Envelope
@@ -100,6 +100,12 @@ pub enum EventBody {
     },
     RunResumed {
         data: RunResumed,
+    },
+    /// Append-only downgrade barrier for a run whose `run_started` cannot be
+    /// rewritten from an older schema. A schema-1 binary fails on this unknown
+    /// event before it can ignore schema-2 execution identity fields.
+    RunSchemaUpgraded {
+        data: RunSchemaUpgraded,
     },
     AttemptStarted {
         task: String,
@@ -227,6 +233,7 @@ impl EventBody {
             | Self::QuestionRaised { task, .. } => Some(task),
             Self::RunStarted { .. }
             | Self::RunResumed { .. }
+            | Self::RunSchemaUpgraded { .. }
             | Self::DeferWaitElapsed { .. }
             | Self::QuestionAnswered { .. }
             | Self::DesignDefect { .. }
@@ -241,6 +248,7 @@ impl EventBody {
         match self {
             Self::RunStarted { .. } => "run_started",
             Self::RunResumed { .. } => "run_resumed",
+            Self::RunSchemaUpgraded { .. } => "run_schema_upgraded",
             Self::AttemptStarted { .. } => "attempt_started",
             Self::AttemptFinished { .. } => "attempt_finished",
             Self::AttemptInterrupted { .. } => "attempt_interrupted",
@@ -352,6 +360,22 @@ pub struct ChainSummary {
     pub task: String,
     pub tiers: Vec<Tier>,
     pub attempts_per: u32,
+    /// The exact binding each rung resolved to at pre-flight, aligned with
+    /// `tiers`. `None` means a schema-1 log predating this snapshot; its first
+    /// schema-2 resume re-derives once, warns, and records the result on
+    /// [`RunResumed::chains`]. `Some([])` is a real empty chain list.
+    #[serde(default)]
+    pub bindings: Option<Vec<BindingSummary>>,
+}
+
+/// One rung's execution identity. `pinned` remains explicit so the event log
+/// preserves why the binding was fixed as well as which adapter/model ran it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BindingSummary {
+    pub tier: Tier,
+    pub agent: String,
+    pub model: String,
+    pub pinned: bool,
 }
 
 /// One effective gate as it stood when the run started — everything needed to
@@ -419,6 +443,18 @@ pub struct RunResumed {
     /// first recorded value and never re-derive it again.
     #[serde(default)]
     pub effort_policy: Option<ResolvedEffortPolicy>,
+    /// The resolved chain bindings established by the first schema-2 resume of
+    /// a schema-1 log. Current runs carry them on `run_started`; later resumes
+    /// use the first recorded snapshot and leave this `None`.
+    #[serde(default)]
+    pub chains: Option<Vec<ChainSummary>>,
+}
+
+/// A schema transition appended to an old run without rewriting its beginning.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RunSchemaUpgraded {
+    pub from: u32,
+    pub to: u32,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -956,6 +992,7 @@ impl RunState {
             // consequence of the same rate limit rides on `task_deferred`,
             // which is where the scheduler already looks.
             EventBody::RunStarted { .. }
+            | EventBody::RunSchemaUpgraded { .. }
             | EventBody::DesignDefect { .. }
             | EventBody::CapacitySnapshot { .. }
             | EventBody::PoolExhausted { .. } => {}
@@ -1541,6 +1578,21 @@ pub fn recorded_effort_policy(events: &[Event]) -> Option<ResolvedEffortPolicy> 
     })
 }
 
+/// The resolved worker bindings this run is bound to, wherever they first
+/// become available. Schema-2 runs carry them in `run_started`; a schema-1 run
+/// gains them on the first schema-2 `run_resumed` event.
+pub fn recorded_chains(events: &[Event]) -> Option<&Vec<ChainSummary>> {
+    events.iter().find_map(|event| match &event.body {
+        EventBody::RunStarted { data }
+            if data.chains.iter().all(|chain| chain.bindings.is_some()) =>
+        {
+            Some(&data.chains)
+        }
+        EventBody::RunResumed { data } => data.chains.as_ref(),
+        _ => None,
+    })
+}
+
 /// The `run_started` a log opens with — how a run describes itself.
 pub fn started_of<'a>(events: &'a [Event], path: &Path) -> Result<&'a RunStarted, TactusError> {
     events
@@ -1568,7 +1620,7 @@ pub fn replay(
     path: &Path,
 ) -> Result<Replay, TactusError> {
     let started = started_of(&events, path)?.clone();
-    ensure_supported_schema(&started, path)?;
+    ensure_supported_schema(&started, &events, path)?;
 
     let mut state = RunState::new(task_ids);
     let mut resumes = 0;
@@ -1591,20 +1643,37 @@ pub fn replay(
 /// future schema is not something an older binary may silently project.
 pub(crate) fn ensure_supported_schema(
     started: &RunStarted,
+    events: &[Event],
     path: &Path,
-) -> Result<(), TactusError> {
-    if started.schema > SCHEMA_VERSION {
+) -> Result<u32, TactusError> {
+    let mut effective = started.schema;
+    for event in events {
+        let EventBody::RunSchemaUpgraded { data } = &event.body else {
+            continue;
+        };
+        if data.from != effective || data.to <= data.from {
+            return Err(TactusError::EventLog {
+                path: path.to_path_buf(),
+                message: format!(
+                    "invalid schema transition {} -> {} while the log was at schema {}",
+                    data.from, data.to, effective
+                ),
+            });
+        }
+        effective = data.to;
+    }
+    if effective > SCHEMA_VERSION {
         return Err(TactusError::EventLog {
             path: path.to_path_buf(),
             message: format!(
                 "written by a newer tactus (event schema {}, this binary understands {}). \
                  Upgrade rather than interpret it — reading a log we only half understand would \
                  derive the wrong state silently.",
-                started.schema, SCHEMA_VERSION
+                effective, SCHEMA_VERSION
             ),
         });
     }
-    Ok(())
+    Ok(effective)
 }
 
 /// Incremental reader for `status --follow`.
@@ -1696,6 +1765,20 @@ mod tests {
                     task: "t1".to_owned(),
                     tiers: vec![Tier::Small, Tier::Mid],
                     attempts_per: 2,
+                    bindings: Some(vec![
+                        BindingSummary {
+                            tier: Tier::Small,
+                            agent: "claude-code".to_owned(),
+                            model: "claude-haiku-4-5".to_owned(),
+                            pinned: false,
+                        },
+                        BindingSummary {
+                            tier: Tier::Mid,
+                            agent: "claude-code".to_owned(),
+                            model: "claude-sonnet-5".to_owned(),
+                            pinned: false,
+                        },
+                    ]),
                 }],
                 effort_policy: Some(effort_policy()),
                 gate_cmds: Some(vec![GateSummary {
@@ -1810,7 +1893,11 @@ mod tests {
                     discarded: Vec::new(),
                     gates: None,
                     effort_policy: None,
+                    chains: None,
                 },
+            },
+            EventBody::RunSchemaUpgraded {
+                data: RunSchemaUpgraded { from: 1, to: 2 },
             },
             attempt_started("t1", 1, 0, "small"),
             attempt_finished("t1", 1, 0, "small"),
@@ -2051,15 +2138,74 @@ mod tests {
     }
 
     #[test]
+    fn a_schema_upgrade_event_is_a_real_downgrade_barrier() {
+        #[derive(Debug, serde::Deserialize)]
+        struct SchemaOneEvent {
+            #[allow(dead_code)]
+            ts: String,
+            #[serde(flatten)]
+            #[allow(dead_code)]
+            body: SchemaOneBody,
+        }
+        #[derive(Debug, serde::Deserialize)]
+        #[serde(tag = "event", rename_all = "snake_case")]
+        #[allow(dead_code)]
+        enum SchemaOneBody {
+            RunStarted { data: serde_json::Value },
+            RunResumed { data: serde_json::Value },
+        }
+
+        let marker = Event::now(EventBody::RunSchemaUpgraded {
+            data: RunSchemaUpgraded { from: 1, to: 2 },
+        });
+        let line = serde_json::to_string(&marker).expect("serialize marker");
+        let error = serde_json::from_str::<SchemaOneEvent>(&line)
+            .expect_err("a schema-1 reader must refuse the new event");
+        assert!(error.to_string().contains("run_schema_upgraded"), "{error}");
+
+        let EventBody::RunStarted { mut data } = started() else {
+            panic!("started() builds a run_started");
+        };
+        data.schema = 1;
+        for chain in &mut data.chains {
+            chain.bindings = None;
+        }
+        let events = vec![Event::now(EventBody::RunStarted { data }), marker];
+        let replayed = replay(events, vec!["t1".to_owned()], Path::new("events.jsonl"))
+            .expect("the current binary follows the valid 1 -> 2 transition");
+        assert_eq!(replayed.started.schema, 1);
+    }
+
+    #[test]
+    fn a_future_appended_schema_transition_is_refused() {
+        let events = vec![
+            Event::now(started()),
+            Event::now(EventBody::RunSchemaUpgraded {
+                data: RunSchemaUpgraded {
+                    from: SCHEMA_VERSION,
+                    to: SCHEMA_VERSION + 1,
+                },
+            }),
+        ];
+        let error = replay(events, vec!["t1".to_owned()], Path::new("events.jsonl"))
+            .expect_err("the opening schema is not the only compatibility boundary");
+        assert!(error.to_string().contains("Upgrade"), "{error}");
+    }
+
+    #[test]
     fn a_run_started_without_gate_commands_reads_as_unrecorded() {
         // The shape every log written before the gate record has. `None`, not
         // an empty list: "said nothing about the gates" and "said there were
         // none" must stay distinguishable — the same rule `reviews` follows for
         // logs that predate step 9, and the difference between re-deriving with
         // a warning and running a run with verification switched off.
-        let EventBody::RunStarted { data } = started() else {
+        let EventBody::RunStarted { mut data } = started() else {
             panic!("started() builds a run_started");
         };
+        data.schema = 1;
+        for chain in &mut data.chains {
+            chain.bindings = None;
+        }
         let mut json =
             serde_json::to_value(Event::now(EventBody::RunStarted { data })).expect("serialize");
         assert!(
@@ -2079,9 +2225,13 @@ mod tests {
 
     #[test]
     fn a_run_started_without_an_effort_policy_reads_as_unrecorded() {
-        let EventBody::RunStarted { data } = started() else {
+        let EventBody::RunStarted { mut data } = started() else {
             panic!("started() builds a run_started");
         };
+        data.schema = 1;
+        for chain in &mut data.chains {
+            chain.bindings = None;
+        }
         let mut json =
             serde_json::to_value(Event::now(EventBody::RunStarted { data })).expect("serialize");
         assert!(
@@ -2096,10 +2246,7 @@ mod tests {
         let EventBody::RunStarted { data } = &event.body else {
             panic!("still a run_started");
         };
-        assert_eq!(
-            data.schema, SCHEMA_VERSION,
-            "the additive field stays schema 1"
-        );
+        assert_eq!(data.schema, 1, "the legacy opening remains schema 1");
         assert_eq!(data.effort_policy, None);
         assert_eq!(recorded_effort_policy(&[event]), None);
     }
@@ -2138,6 +2285,7 @@ mod tests {
                     discarded: Vec::new(),
                     gates: None,
                     effort_policy: Some(policy),
+                    chains: None,
                 },
             })
         };
@@ -2162,6 +2310,57 @@ mod tests {
             Some(original),
             "the first establishing resume wins"
         );
+    }
+
+    #[test]
+    fn the_first_complete_binding_snapshot_is_the_run_authority() {
+        let EventBody::RunStarted { data } = started() else {
+            panic!("started() builds a run_started");
+        };
+        let original = data.chains.clone();
+        let current = vec![Event::now(EventBody::RunStarted { data })];
+        assert_eq!(recorded_chains(&current), Some(&original));
+
+        let EventBody::RunStarted { mut data } = started() else {
+            panic!("started() builds a run_started");
+        };
+        for chain in &mut data.chains {
+            chain.bindings = None;
+        }
+        let later = original
+            .iter()
+            .cloned()
+            .map(|mut chain| {
+                for binding in chain.bindings.iter_mut().flatten() {
+                    binding.model = "later-model-must-not-win".to_owned();
+                }
+                chain
+            })
+            .collect();
+        let legacy = vec![
+            Event::now(EventBody::RunStarted { data }),
+            Event::now(EventBody::RunResumed {
+                data: RunResumed {
+                    head_sha: "abc".to_owned(),
+                    interrupted_attempts: 0,
+                    discarded: Vec::new(),
+                    gates: None,
+                    effort_policy: None,
+                    chains: Some(original.clone()),
+                },
+            }),
+            Event::now(EventBody::RunResumed {
+                data: RunResumed {
+                    head_sha: "def".to_owned(),
+                    interrupted_attempts: 0,
+                    discarded: Vec::new(),
+                    gates: None,
+                    effort_policy: None,
+                    chains: Some(later),
+                },
+            }),
+        ];
+        assert_eq!(recorded_chains(&legacy), Some(&original));
     }
 
     #[test]
@@ -2250,7 +2449,7 @@ mod tests {
         assert_eq!(review.adapter, None);
         assert_eq!(review.preflight_cli_version, None);
         assert_eq!(review.effort, None);
-        assert_eq!(SCHEMA_VERSION, 1);
+        assert_eq!(SCHEMA_VERSION, 2);
     }
 
     #[test]
@@ -2341,6 +2540,7 @@ mod tests {
                     discarded: Vec::new(),
                     gates: None,
                     effort_policy: None,
+                    chains: None,
                 },
             }),
         ];

@@ -53,7 +53,7 @@
 //! notional twice over on subscription auth where the marginal dollar is zero.
 //! §13 already has the words: an estimate that flatters is worse than none.
 //!
-//! **Two of this CLI's own features are deliberately unused.**
+//! **Two of this CLI's own features are deliberately unused for model turns.**
 //!
 //! `codex review` runs a code review non-interactively, and adopting it would
 //! swap the standard. §11.3's second opinion is *the same standard, a
@@ -73,7 +73,10 @@
 //! two different contracts, and push the reviewer's prose into escaped strings
 //! where humans read it. The existing re-ask-on-unparseable path already covers
 //! the failure it would prevent, and nothing has yet measured that failure
-//! happening. Revisit if real runs show it firing more than rarely.
+//! happening. Revisit if real runs show it firing more than rarely. Pre-flight
+//! does pass a deliberately missing schema path to the CLI's local parser; that
+//! is a zero-spend guard proving the exact reasoning key before any model turn,
+//! not an output contract for a turn.
 //!
 //! **Never passed:** `--dangerously-bypass-approvals-and-sandbox`,
 //! `--dangerously-bypass-hook-trust`, `-s danger-full-access`. §20 grants the
@@ -107,6 +110,13 @@ pub const ADAPTER_ID: &str = "codex";
 /// makes a probe failure a refusal to START, so a slow machine that times out
 /// here loses a whole run rather than one attempt. Paid once per run.
 const PROBE_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// The strict-config control must be rejected before the missing-schema guard.
+/// If it is not, a CLI has stopped enforcing the parser contract this probe
+/// relies on and an apparently successful effort-key check would mean nothing.
+const CONFIG_PROBE_UNKNOWN_KEY: &str = "tactus_probe_deliberately_unknown";
+const CONFIG_PROBE_SCHEMA_FILE: &str = "tactus-output-schema-must-not-exist.json";
+const CONFIG_PROBE_RESUME_ID: &str = "00000000-0000-0000-0000-000000000000";
 
 /// Flags `exec` must still advertise, checked at pre-flight.
 ///
@@ -181,11 +191,12 @@ impl AgentAdapter for CodexAdapter {
         )?;
         let resume_help = checked_help(&invocation.display(), "exec resume", &resume_help)?;
         validate_probe_contract(&version, &fresh_help, &resume_help)?;
+        validate_effort_config_key(&invocation, &version)?;
 
-        // `--config` existing does not prove that this model accepts the value
-        // Tactus will send. The CLI's local catalog is zero-spend evidence for
-        // the model × effort pair, so require every known Codex model to expose
-        // every shared effort level before a run can start.
+        // The strict local parser above proves the exact key and the two role
+        // policy values. The CLI's local catalog is separate zero-spend
+        // evidence for each model × effort pair, so require every known Codex
+        // model to expose every shared effort level before a run can start.
         let models = proc::run_with_timeout(
             invocation.command(&["debug".to_owned(), "models".to_owned()]),
             "",
@@ -354,6 +365,171 @@ fn validate_probe_contract(
         }
     }
     Ok(())
+}
+
+#[derive(Clone, Copy, Debug)]
+enum ConfigProbeSurface {
+    Fresh,
+    Resume,
+}
+
+impl ConfigProbeSurface {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Fresh => "exec",
+            Self::Resume => "exec resume",
+        }
+    }
+}
+
+/// A unique empty directory whose child path is guaranteed not to exist.
+/// Codex validates `--output-schema` locally before starting a turn, making
+/// that absent child a deterministic, zero-spend stopping point.
+struct MissingOutputSchema {
+    dir: PathBuf,
+    path: PathBuf,
+}
+
+impl MissingOutputSchema {
+    fn create() -> Result<Self, TactusError> {
+        let dir =
+            std::env::temp_dir().join(format!("tactus-codex-config-probe-{}", crate::ulid::ulid()));
+        std::fs::create_dir(&dir).map_err(|source| TactusError::Agent {
+            message: format!(
+                "could not create Codex configuration probe directory `{}`: {source}",
+                dir.display()
+            ),
+        })?;
+        let path = dir.join(CONFIG_PROBE_SCHEMA_FILE);
+        Ok(Self { dir, path })
+    }
+}
+
+impl Drop for MissingOutputSchema {
+    fn drop(&mut self) {
+        // The child is intentionally never created. Avoid recursive cleanup:
+        // if a surprising CLI did write anything, preserving it is safer than
+        // deleting an unexpected artifact.
+        let _ = std::fs::remove_dir(&self.dir);
+    }
+}
+
+fn validate_effort_config_key(invocation: &Invocation, version: &str) -> Result<(), TactusError> {
+    let schema = MissingOutputSchema::create()?;
+    for surface in [ConfigProbeSurface::Fresh, ConfigProbeSurface::Resume] {
+        let control = run_config_parser_probe(
+            invocation,
+            surface,
+            &format!("{CONFIG_PROBE_UNKNOWN_KEY}=true"),
+            &schema.path,
+        )?;
+        validate_unknown_config_control(version, surface, &control)?;
+
+        // These are the two policy values Tactus promises for the roles this
+        // feature introduced. Model catalogs validate the remaining shared
+        // values separately; accepting either assignment here proves the exact
+        // key, while checking both catches a provider-side enum regression.
+        for effort in [Effort::XHigh, Effort::Max] {
+            let assignment = format!("model_reasoning_effort={}", effort_flag(effort));
+            let output = run_config_parser_probe(invocation, surface, &assignment, &schema.path)?;
+            validate_effort_config_probe(version, surface, effort, &output)?;
+        }
+    }
+    Ok(())
+}
+
+fn run_config_parser_probe(
+    invocation: &Invocation,
+    surface: ConfigProbeSurface,
+    assignment: &str,
+    schema_path: &std::path::Path,
+) -> Result<ProcessOutput, TactusError> {
+    proc::run_with_timeout(
+        invocation.command(&config_probe_args(surface, assignment, schema_path)),
+        "",
+        PROBE_TIMEOUT,
+    )
+}
+
+fn config_probe_args(
+    surface: ConfigProbeSurface,
+    assignment: &str,
+    schema_path: &std::path::Path,
+) -> Vec<String> {
+    let mut args = vec!["exec".to_owned()];
+    if matches!(surface, ConfigProbeSurface::Resume) {
+        args.extend(["resume".to_owned(), CONFIG_PROBE_RESUME_ID.to_owned()]);
+    }
+    args.extend([
+        "--ignore-user-config".to_owned(),
+        "--strict-config".to_owned(),
+        "-c".to_owned(),
+        assignment.to_owned(),
+        "--output-schema".to_owned(),
+        schema_path.to_string_lossy().into_owned(),
+        "tactus-config-parser-probe".to_owned(),
+    ]);
+    args
+}
+
+fn validate_unknown_config_control(
+    version: &str,
+    surface: ConfigProbeSurface,
+    output: &ProcessOutput,
+) -> Result<(), TactusError> {
+    let text = config_probe_text(output);
+    let lower = text.to_ascii_lowercase();
+    if !output.timed_out
+        && output.code.is_some_and(|code| code != 0)
+        && text.contains(CONFIG_PROBE_UNKNOWN_KEY)
+        && (lower.contains("unknown") || lower.contains("unrecognized"))
+        && !text.contains(CONFIG_PROBE_SCHEMA_FILE)
+    {
+        return Ok(());
+    }
+    Err(TactusError::Agent {
+        message: format!(
+            "codex {version} `{}` did not reject the strict-config control before the local \
+             missing-schema guard; exact reasoning-key support cannot be proven without spend \
+             (exit {:?}, timeout {}, output: {})",
+            surface.label(),
+            output.code,
+            output.timed_out,
+            util::head(&text, 400)
+        ),
+    })
+}
+
+fn validate_effort_config_probe(
+    version: &str,
+    surface: ConfigProbeSurface,
+    effort: Effort,
+    output: &ProcessOutput,
+) -> Result<(), TactusError> {
+    let text = config_probe_text(output);
+    if !output.timed_out
+        && output.code.is_some_and(|code| code != 0)
+        && text.contains(CONFIG_PROBE_SCHEMA_FILE)
+        && text.to_ascii_lowercase().contains("schema")
+    {
+        return Ok(());
+    }
+    Err(TactusError::Agent {
+        message: format!(
+            "codex {version} `{}` did not accept exact local override \
+             `model_reasoning_effort={}` before the zero-spend missing-schema guard (exit {:?}, \
+             timeout {}, output: {})",
+            surface.label(),
+            effort_flag(effort),
+            output.code,
+            output.timed_out,
+            util::head(&text, 400)
+        ),
+    })
+}
+
+fn config_probe_text(output: &ProcessOutput) -> String {
+    format!("{}\n{}", output.stdout, output.stderr)
 }
 
 fn checked_model_catalog(program: &str, output: &ProcessOutput) -> Result<String, TactusError> {
@@ -752,11 +928,7 @@ fn parse_login_status(out: &ProcessOutput) -> Discovery {
 
 fn candidate_names() -> &'static [&'static str] {
     if cfg!(windows) {
-        // Prefer the npm shim. A Windows Store installation can put a locked
-        // package payload named `codex.exe` on PATH; resolving it succeeds but
-        // spawning it directly returns OS error 5, while the supported shim in
-        // the user's npm bin directory is executable.
-        &["codex.cmd", "codex.exe", "codex.bat"]
+        &["codex.exe", "codex.cmd", "codex.bat"]
     } else {
         &["codex"]
     }
@@ -765,13 +937,29 @@ fn candidate_names() -> &'static [&'static str] {
 static RESOLVED: OnceLock<Option<Invocation>> = OnceLock::new();
 
 fn locate() -> Result<Invocation, TactusError> {
-    bin::locate(candidate_names(), &RESOLVED, |tried| {
-        format!(
-            "codex binary not found on PATH (looked for {}); install the OpenAI Codex CLI \
-             (`npm install -g @openai/codex`) or adjust PATH",
-            tried.join(", ")
-        )
-    })
+    bin::locate_with(
+        candidate_names(),
+        &RESOLVED,
+        |candidate| {
+            // Windows Store can put a package payload on PATH that is visible
+            // to filesystem lookup but returns access denied when spawned.
+            // Test each candidate before caching it so a later npm shim in the
+            // real PATH order can still win.
+            proc::run_with_timeout(
+                candidate.command(&["--version".to_owned()]),
+                "",
+                PROBE_TIMEOUT,
+            )
+            .is_ok_and(|output| !output.timed_out && output.code == Some(0))
+        },
+        |tried| {
+            format!(
+                "no usable codex binary found on PATH (looked for {}); install the OpenAI Codex \
+                 CLI (`npm install -g @openai/codex`) or adjust PATH",
+                tried.join(", ")
+            )
+        },
+    )
 }
 
 /// Registry entry, so `by_id("codex")` resolves without this module being
@@ -866,6 +1054,106 @@ mod tests {
         assert!(error.contains("`exec resume`"), "{error}");
         assert!(error.contains("--config"), "{error}");
         assert!(error.contains("-c"), "{error}");
+    }
+
+    #[test]
+    fn exact_key_probe_uses_strict_local_guards_on_both_cli_surfaces() {
+        let schema = std::path::Path::new(r"C:\missing\tactus-output-schema-must-not-exist.json");
+        for surface in [ConfigProbeSurface::Fresh, ConfigProbeSurface::Resume] {
+            let args = config_probe_args(surface, "model_reasoning_effort=xhigh", schema);
+            assert!(
+                args.contains(&"--ignore-user-config".to_owned()),
+                "{args:?}"
+            );
+            assert!(args.contains(&"--strict-config".to_owned()), "{args:?}");
+            assert!(args.contains(&"--output-schema".to_owned()), "{args:?}");
+            assert!(
+                args.windows(2).any(|pair| {
+                    pair == ["-c".to_owned(), "model_reasoning_effort=xhigh".to_owned()]
+                }),
+                "the exact provider key must reach argv: {args:?}"
+            );
+            assert!(
+                !args.contains(&"--help".to_owned()),
+                "help skips config parsing"
+            );
+            match surface {
+                ConfigProbeSurface::Fresh => {
+                    assert_eq!(args.first().map(String::as_str), Some("exec"));
+                    assert!(!args.contains(&"resume".to_owned()), "{args:?}");
+                }
+                ConfigProbeSurface::Resume => assert_eq!(
+                    &args[..3],
+                    ["exec", "resume", CONFIG_PROBE_RESUME_ID],
+                    "the resumed surface must be exercised independently"
+                ),
+            }
+        }
+    }
+
+    #[test]
+    fn strict_config_control_must_fail_before_the_missing_schema_guard() {
+        let rejected = output(
+            1,
+            "",
+            "error: unknown configuration key `tactus_probe_deliberately_unknown`",
+        );
+        validate_unknown_config_control("0.147.0", ConfigProbeSurface::Fresh, &rejected)
+            .expect("strict parsing is active");
+
+        let skipped = output(
+            1,
+            "",
+            "failed to read output schema tactus-output-schema-must-not-exist.json",
+        );
+        let error =
+            validate_unknown_config_control("0.147.0", ConfigProbeSurface::Resume, &skipped)
+                .expect_err("an ignored unknown key proves nothing")
+                .to_string();
+        assert!(error.contains("strict-config control"), "{error}");
+    }
+
+    #[test]
+    fn exact_effort_key_must_reach_the_zero_spend_schema_guard() {
+        let accepted = output(
+            1,
+            "",
+            "error reading output schema C:\\missing\\tactus-output-schema-must-not-exist.json",
+        );
+        for surface in [ConfigProbeSurface::Fresh, ConfigProbeSurface::Resume] {
+            for effort in [Effort::XHigh, Effort::Max] {
+                validate_effort_config_probe("0.147.0", surface, effort, &accepted)
+                    .expect("the exact key and value passed strict local parsing");
+            }
+        }
+
+        let unknown = output(
+            1,
+            "",
+            "error: unknown configuration key `model_reasoning_effort`",
+        );
+        let error = validate_effort_config_probe(
+            "0.147.0",
+            ConfigProbeSurface::Fresh,
+            Effort::XHigh,
+            &unknown,
+        )
+        .expect_err("a renamed key must refuse before spend")
+        .to_string();
+        assert!(error.contains("model_reasoning_effort=xhigh"), "{error}");
+
+        let mut timed_out = accepted;
+        timed_out.timed_out = true;
+        assert!(
+            validate_effort_config_probe(
+                "0.147.0",
+                ConfigProbeSurface::Resume,
+                Effort::Max,
+                &timed_out,
+            )
+            .is_err(),
+            "a timeout cannot be mistaken for parser evidence"
+        );
     }
 
     #[test]

@@ -193,6 +193,9 @@ pub fn describe(event: &Event) -> String {
             short(&data.head_sha),
             data.interrupted_attempts
         ),
+        EventBody::RunSchemaUpgraded { data } => {
+            format!("event schema upgraded from {} to {}", data.from, data.to)
+        }
         EventBody::AttemptStarted {
             task,
             attempt,

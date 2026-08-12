@@ -110,7 +110,7 @@ The four provenance classes are intentionally disjoint:
 
 Assumptions are not fallback permission. The exporter must validate every join and invariant it relies on and fail loudly with the run and offending identity when one is violated. It must never fill a gap from today's source plan, config, model catalog, pricing table, run-level guess, or provider call.
 
-The export schema version is independent of the event schema. Adding the new optional event fields retains event schema 1: serde defaults preserve old absence as absence, and the exporter represents that honestly as null or, for origin alone, derived `unknown`. A change to one schema does not imply a change to the other.
+The export schema version is independent of the event schema. The optional exporter-input fields described here retained event schema 1 at the time: serde defaults preserved old absence as absence, and the exporter represented that honestly as null or, for origin alone, derived `unknown`. Event schema later moved to 2 for run-identity semantics (frozen effort and complete rung bindings), without changing export schema 1. A change to one schema does not imply a change to the other.
 
 ## Rejected alternatives
 

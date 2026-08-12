@@ -21,7 +21,14 @@ categories = ["command-line-utilities", "development-tools"]
 # Internal working documents: useful in the repo, noise in the published
 # crate. Fixtures stay — the parser tests are fixture-driven. `docs/` is the
 # GitHub Pages source, so it is a website rather than part of the library.
-exclude = ["reviews/", ".github/", ".tactus/", "acceptance/", "docs/"]
+exclude = [
+    "reviews/",
+    ".github/",
+    ".tactus/",
+    ".testagent/",
+    "acceptance/",
+    "docs/",
+]
 
 [dependencies]
 anyhow = "1"
