@@ -93,17 +93,6 @@ const REQUIRED_FLAGS: [&str; 5] = [
 /// refusal is most of what probing actually buys.
 const REQUIRED_SHORT_FLAGS: [&str; 1] = ["-s"];
 
-/// Whether `help` advertises `flag` as a flag rather than as a fragment of a
-/// longer one. Help layouts vary, so this tokenizes on whitespace and the comma
-/// that separates a short form from its long one, then compares whole tokens.
-fn advertises(help: &str, flag: &str) -> bool {
-    help.split(|c: char| c.is_whitespace() || c == ',')
-        // `-s=VALUE` and `-s:VALUE` both advertise `-s`; the separator is where
-        // the flag stops and its argument starts.
-        .map(|token| token.split(['=', ':']).next().unwrap_or(token))
-        .any(|name| name == flag)
-}
-
 pub struct CopilotAdapter;
 
 impl AgentAdapter for CopilotAdapter {
@@ -140,30 +129,9 @@ impl AgentAdapter for CopilotAdapter {
             "",
             PROBE_TIMEOUT,
         )?;
-        let help_text = format!("{}{}", help.stdout, help.stderr);
-        let readable = help.code == Some(0) && !help_text.trim().is_empty();
-        let has = |flag: &str| readable && help_text.contains(flag);
-        if readable {
-            let missing: Vec<&str> = REQUIRED_FLAGS
-                .into_iter()
-                .filter(|flag| !help_text.contains(flag))
-                .chain(
-                    REQUIRED_SHORT_FLAGS
-                        .into_iter()
-                        .filter(|flag| !advertises(&help_text, flag)),
-                )
-                .collect();
-            if !missing.is_empty() {
-                return Err(TactusError::Agent {
-                    message: format!(
-                        "copilot {version} does not advertise required flag(s): {}. This adapter \
-                         pins known-good behavior per version — upgrade tactus or pin an older \
-                         copilot.",
-                        missing.join(", ")
-                    ),
-                });
-            }
-        }
+        let help_text = checked_help(&invocation.display(), &help)?;
+        validate_help(&version, &help_text)?;
+        let has = |flag: &str| super::advertises_flag(&help_text, flag);
         Ok(Caps {
             version,
             // False even if a JSON flag exists: `Caps` describes what this
@@ -171,14 +139,9 @@ impl AgentAdapter for CopilotAdapter {
             // parses it. Reporting the flag would promise a structured envelope
             // no caller could read.
             json_output: false,
-            // The probed axes are deliberately PESSIMISTIC where the Claude
-            // adapter is optimistic. Its flags are long-standing, so an
-            // unreadable --help there is safely assumed benign. Here, claiming a
-            // capability this CLI turns out not to have is not a degraded run
-            // but a broken one: every same-rung retry would pass `--resume` to a
-            // binary that rejects it, failing attempts for a reason that has
-            // nothing to do with the code. Under-claiming costs only the
-            // conversation cache.
+            // Optional capabilities stay pessimistic. Required surfaces were
+            // proven above; an unreadable help is a refusal, not permission to
+            // assume support.
             session_resume: has("--resume"),
             // No JSON envelope on this route, so nothing reports spend. The
             // ledger says so rather than recording zero (§13).
@@ -265,6 +228,68 @@ impl AgentAdapter for CopilotAdapter {
         )?;
         Ok(None)
     }
+}
+
+fn checked_help(program: &str, output: &ProcessOutput) -> Result<String, TactusError> {
+    if output.timed_out {
+        return Err(TactusError::Agent {
+            message: format!("`{program}` --help timed out; effort support could not be verified"),
+        });
+    }
+    if output.code != Some(0) {
+        return Err(TactusError::Agent {
+            message: format!(
+                "`{program}` --help exited with {:?}: {}",
+                output.code,
+                output.stderr.trim()
+            ),
+        });
+    }
+    let text = format!("{}\n{}", output.stdout, output.stderr);
+    if text.trim().is_empty() {
+        return Err(TactusError::Agent {
+            message: format!(
+                "`{program}` --help returned no output; effort support could not be verified"
+            ),
+        });
+    }
+    Ok(text)
+}
+
+fn validate_help(version: &str, help: &str) -> Result<(), TactusError> {
+    let missing_flags: Vec<&str> = REQUIRED_FLAGS
+        .into_iter()
+        .filter(|flag| !super::advertises_flag(help, flag))
+        .chain(
+            REQUIRED_SHORT_FLAGS
+                .into_iter()
+                .filter(|flag| !super::advertises_flag(help, flag)),
+        )
+        .collect();
+    if !missing_flags.is_empty() {
+        return Err(TactusError::Agent {
+            message: format!(
+                "copilot {version} does not advertise required flag(s): {}. This adapter pins \
+                 known-good behavior per version — upgrade tactus or pin an older copilot.",
+                missing_flags.join(", ")
+            ),
+        });
+    }
+    let missing_efforts = super::missing_effort_levels(help);
+    if !missing_efforts.is_empty() {
+        return Err(TactusError::Agent {
+            message: format!(
+                "copilot {version} advertises `--effort` but not required level(s): {}. Refusing \
+                 before spend because this run may request any shared effort level.",
+                missing_efforts
+                    .iter()
+                    .map(ToString::to_string)
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
+        });
+    }
+    Ok(())
 }
 
 /// Argument list, kept separate from binary resolution so it is testable on
@@ -480,15 +505,75 @@ mod tests {
     }
 
     #[test]
-    fn every_effort_maps_to_a_value_the_cli_advertises() {
-        const ACCEPTED: [&str; 7] = ["none", "minimal", "low", "medium", "high", "xhigh", "max"];
-        for effort in Effort::ALL {
+    fn every_effort_has_the_exact_cli_spelling_in_build_args() {
+        let expected = [
+            (Effort::Low, "low"),
+            (Effort::Medium, "medium"),
+            (Effort::High, "high"),
+            (Effort::XHigh, "xhigh"),
+            (Effort::Max, "max"),
+        ];
+        for (effort, spelling) in expected {
+            assert_eq!(effort_flag(effort), spelling);
+            let mut run = task_run();
+            run.profile.effort = Some(effort);
             assert!(
-                ACCEPTED.contains(&effort_flag(effort)),
-                "{effort} maps to `{}`",
-                effort_flag(effort)
+                build_args(&run)
+                    .iter()
+                    .any(|arg| arg == &format!("--effort={spelling}")),
+                "{effort} must reach argv as {spelling}"
             );
         }
+    }
+
+    #[test]
+    fn help_validation_requires_every_shared_effort_level() {
+        let help = "-s --model --allow-tool --deny-tool --no-ask-user\n  \
+                    --effort, --reasoning-effort <level> (choices: \"none\", \"minimal\", \
+                    \"low\", \"medium\", \"high\", \"xhigh\", \"max\")\n";
+        validate_help("1.0.78", help).expect("full shared vocabulary");
+
+        for (missing, narrowed) in [
+            ("xhigh", "none, minimal, low, medium, high, max"),
+            ("max", "none, minimal, low, medium, high, xhigh"),
+        ] {
+            let help = format!(
+                "-s --model --allow-tool --deny-tool --no-ask-user\n  --effort <level> \
+                 (choices: {narrowed})\n"
+            );
+            let error = validate_help("1.0.78", &help).expect_err("narrow enum must refuse");
+            let message = error.to_string();
+            assert!(message.contains(missing), "{message}");
+            assert!(message.contains("1.0.78"), "{message}");
+        }
+    }
+
+    #[test]
+    fn unreadable_help_is_a_preflight_refusal() {
+        let mut timed_out = output(Some(0), "full help", "");
+        timed_out.timed_out = true;
+        assert!(
+            checked_help("copilot", &timed_out)
+                .expect_err("timeout")
+                .to_string()
+                .contains("could not be verified")
+        );
+
+        let failed = output(Some(2), "", "bad option");
+        assert!(
+            checked_help("copilot", &failed)
+                .expect_err("nonzero")
+                .to_string()
+                .contains("bad option")
+        );
+
+        let empty = output(Some(0), "", "");
+        assert!(
+            checked_help("copilot", &empty)
+                .expect_err("empty")
+                .to_string()
+                .contains("no output")
+        );
     }
 
     #[test]
@@ -564,14 +649,23 @@ mod tests {
         // so probing would pass on a build that had dropped `-s` — and every
         // attempt would then fail at runtime, which is the failure §16 says
         // probing exists to catch.
-        assert!(!advertises(
+        assert!(!crate::agent::advertises_flag(
             "--settings <path>  --share <path>  --stdio",
             "-s"
         ));
-        assert!(advertises("  -s, --silent    Suppress stats", "-s"));
-        assert!(advertises("  -s  Suppress stats and decoration", "-s"));
-        assert!(advertises("-s=VALUE", "-s"), "trailing = is a value marker");
-        assert!(!advertises("", "-s"));
+        assert!(crate::agent::advertises_flag(
+            "  -s, --silent    Suppress stats",
+            "-s"
+        ));
+        assert!(crate::agent::advertises_flag(
+            "  -s  Suppress stats and decoration",
+            "-s"
+        ));
+        assert!(
+            crate::agent::advertises_flag("-s=VALUE", "-s"),
+            "trailing = is a value marker"
+        );
+        assert!(!crate::agent::advertises_flag("", "-s"));
     }
 
     #[test]

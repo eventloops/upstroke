@@ -3,12 +3,32 @@
 # Repo-level overrides only; subscriptions live in ~/.tactus/pools.toml, which
 # travels with the person rather than the repository (§17).
 
-# Self-hosted runs spend their agent budget deliberately: every worker gets
-# xhigh, while every independent judgement gets max. Role policy outranks tier
-# defaults and pin effort.
+# Self-hosted runs use frontier workers for every task kind. The Codex pin is
+# intentional: self-hosting runs execute in WSL, where its workspace sandbox is
+# enforced; the same implementer profile is refused on Windows before spend.
+# A task written by the pinned OpenAI model is reviewed by the frontier
+# different-family binding, and blast-radius paths keep the explicit second
+# opinion below.
+[routing]
+design = { chain = ["frontier"], attempts_per = 2 }
+implement = { chain = ["frontier"], attempts_per = 2 }
+fix = { chain = ["frontier"], attempts_per = 2 }
+refactor = { chain = ["frontier"], attempts_per = 2 }
+test = { chain = ["frontier"], attempts_per = 2 }
+docs = { chain = ["frontier"], attempts_per = 2 }
+chore = { chain = ["frontier"], attempts_per = 2 }
+review = { tier = "frontier" }
+
+# Every worker gets xhigh, while every independent judgement gets max. Role
+# policy outranks tier defaults and pin effort.
 [routing.effort]
 implementation = "xhigh"
 review = "max"
+
+[[pins]]
+tier = "frontier"
+agent = "codex"
+model = "gpt-5.6-sol"
 
 # The gates CI runs, spelled the same way, so a task that passes here passes
 # there. Local green is not CI green when the two lists disagree — and these are

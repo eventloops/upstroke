@@ -89,7 +89,8 @@ const EXAMPLE_FRONTIER: CatalogEntry = entry(
 /// and were replaced (see the entries). Slugs churn faster than releases do, so
 /// treat every name here as point-in-time: `tactus connect` cross-checks the
 /// roster against what the installed CLI advertises wherever that CLI can
-/// actually enumerate models, and says so when it cannot (today, neither can).
+/// actually enumerate models. Claude Code and Copilot cannot today; Codex's
+/// local `debug models` catalog is validated during its probe.
 pub const CATALOG: &[CatalogEntry] = &[
     EXAMPLE_SMALL,
     entry(

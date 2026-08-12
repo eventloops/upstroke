@@ -29,7 +29,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::error::TactusError;
 use crate::interaction::QuestionRecord;
-use crate::ir::{Answer, Effort, Question, QuestionId, Tier};
+use crate::ir::{Answer, Effort, Question, QuestionId, ResolvedEffortPolicy, Tier};
 use crate::ladder::{FailureKind, FailureOrigin};
 use crate::util;
 
@@ -293,6 +293,15 @@ pub struct RunStarted {
     /// that config moved: `Progress.rung` is an index into this chain, and
     /// re-resolving a different one would silently point it at another tier.
     pub chains: Vec<ChainSummary>,
+    /// The concrete effort standard this run resolved at pre-flight.
+    ///
+    /// Like gates and reviewers, effort is part of the run's verification and
+    /// execution identity: changing today's config must not make the back half
+    /// of a resumed run think harder or less hard than the front half. `None`
+    /// means a legacy log predating this record; its first resume re-derives,
+    /// warns, and establishes the value in [`RunResumed::effort_policy`].
+    #[serde(default)]
+    pub effort_policy: Option<ResolvedEffortPolicy>,
     /// The effective gates in full, as the run resolved them at pre-flight —
     /// **the gates a resume runs**, not merely a fingerprint it compares.
     /// `gates` above names them for the reader; this is the executable record.
@@ -403,6 +412,13 @@ pub struct RunResumed {
     /// resume, which takes it from the log directly ([`recorded_gates`]).
     #[serde(default)]
     pub gates: Option<Vec<GateSummary>>,
+    /// The effort policy established by the first resume of a legacy log.
+    ///
+    /// Current runs record this on `run_started`, so ordinary resumes leave it
+    /// `None`. Once an old log establishes a value here, later resumes use the
+    /// first recorded value and never re-derive it again.
+    #[serde(default)]
+    pub effort_policy: Option<ResolvedEffortPolicy>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1512,6 +1528,19 @@ pub fn recorded_gates(events: &[Event]) -> Option<&Vec<GateSummary>> {
     })
 }
 
+/// The effort standard this run is bound to, wherever the log first records it.
+///
+/// A current `run_started` wins. For a legacy start, the first resume that had
+/// to establish the missing value wins; a later conflicting entry cannot
+/// rewrite the run's execution standard.
+pub fn recorded_effort_policy(events: &[Event]) -> Option<ResolvedEffortPolicy> {
+    events.iter().find_map(|event| match &event.body {
+        EventBody::RunStarted { data } => data.effort_policy,
+        EventBody::RunResumed { data } => data.effort_policy,
+        _ => None,
+    })
+}
+
 /// The `run_started` a log opens with — how a run describes itself.
 pub fn started_of<'a>(events: &'a [Event], path: &Path) -> Result<&'a RunStarted, TactusError> {
     events
@@ -1638,6 +1667,15 @@ mod tests {
     use super::*;
     use crate::ir::{QuestionKind, TaskId};
 
+    fn effort_policy() -> ResolvedEffortPolicy {
+        ResolvedEffortPolicy {
+            small: Effort::Low,
+            mid: Effort::Medium,
+            frontier: Effort::XHigh,
+            review: Effort::Max,
+        }
+    }
+
     fn started() -> EventBody {
         EventBody::RunStarted {
             data: Box::new(RunStarted {
@@ -1659,6 +1697,7 @@ mod tests {
                     tiers: vec![Tier::Small, Tier::Mid],
                     attempts_per: 2,
                 }],
+                effort_policy: Some(effort_policy()),
                 gate_cmds: Some(vec![GateSummary {
                     name: "check".to_owned(),
                     cmd: "cargo check".to_owned(),
@@ -1770,6 +1809,7 @@ mod tests {
                     interrupted_attempts: 1,
                     discarded: Vec::new(),
                     gates: None,
+                    effort_policy: None,
                 },
             },
             attempt_started("t1", 1, 0, "small"),
@@ -2038,6 +2078,93 @@ mod tests {
     }
 
     #[test]
+    fn a_run_started_without_an_effort_policy_reads_as_unrecorded() {
+        let EventBody::RunStarted { data } = started() else {
+            panic!("started() builds a run_started");
+        };
+        let mut json =
+            serde_json::to_value(Event::now(EventBody::RunStarted { data })).expect("serialize");
+        assert!(
+            json["data"]
+                .as_object_mut()
+                .expect("data")
+                .remove("effort_policy")
+                .is_some(),
+            "a fresh run records its effort policy"
+        );
+        let event: Event = serde_json::from_value(json).expect("a legacy log still parses");
+        let EventBody::RunStarted { data } = &event.body else {
+            panic!("still a run_started");
+        };
+        assert_eq!(
+            data.schema, SCHEMA_VERSION,
+            "the additive field stays schema 1"
+        );
+        assert_eq!(data.effort_policy, None);
+        assert_eq!(recorded_effort_policy(&[event]), None);
+    }
+
+    #[test]
+    fn a_recorded_effort_policy_round_trips_every_role_and_tier_exactly() {
+        let EventBody::RunStarted { data } = started() else {
+            panic!("started() builds a run_started");
+        };
+        let event = Event::now(EventBody::RunStarted { data });
+        let line = serde_json::to_string(&event).expect("serialize");
+        let json: serde_json::Value = serde_json::from_str(&line).expect("valid json");
+        assert_eq!(json["data"]["effort_policy"]["small"], "low");
+        assert_eq!(json["data"]["effort_policy"]["mid"], "medium");
+        assert_eq!(json["data"]["effort_policy"]["frontier"], "xhigh");
+        assert_eq!(json["data"]["effort_policy"]["review"], "max");
+
+        let read_back: Event = serde_json::from_str(&line).expect("round trip");
+        assert_eq!(recorded_effort_policy(&[read_back]), Some(effort_policy()));
+    }
+
+    #[test]
+    fn the_first_recorded_effort_policy_is_the_run_authority() {
+        let original = effort_policy();
+        let later = ResolvedEffortPolicy {
+            small: Effort::High,
+            mid: Effort::High,
+            frontier: Effort::High,
+            review: Effort::High,
+        };
+        let resumed = |policy| {
+            Event::now(EventBody::RunResumed {
+                data: RunResumed {
+                    head_sha: "abc".to_owned(),
+                    interrupted_attempts: 0,
+                    discarded: Vec::new(),
+                    gates: None,
+                    effort_policy: Some(policy),
+                },
+            })
+        };
+
+        let EventBody::RunStarted { data } = started() else {
+            panic!("started() builds a run_started");
+        };
+        let current = vec![Event::now(EventBody::RunStarted { data }), resumed(later)];
+        assert_eq!(recorded_effort_policy(&current), Some(original));
+
+        let EventBody::RunStarted { mut data } = started() else {
+            panic!("started() builds a run_started");
+        };
+        data.effort_policy = None;
+        let legacy = vec![
+            Event::now(EventBody::RunStarted { data }),
+            resumed(original),
+            resumed(later),
+        ];
+        assert_eq!(
+            recorded_effort_policy(&legacy),
+            Some(original),
+            "the first establishing resume wins"
+        );
+    }
+
+    #[test]
     fn a_recorded_gate_survives_the_wire_intact_enough_to_run_again() {
         // Resume rebuilds its gates from this record and executes them, so a
         // field that does not round-trip is a gate that runs differently the
@@ -2213,6 +2340,7 @@ mod tests {
                     interrupted_attempts: 0,
                     discarded: Vec::new(),
                     gates: None,
+                    effort_policy: None,
                 },
             }),
         ];

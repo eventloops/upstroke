@@ -43,8 +43,8 @@ use crate::interaction::{
     self, AnswerSource, InteractionMode, Notifier, QuestionRecord, RealSleeper, Sleeper,
 };
 use crate::ir::{
-    Answer, Effort, Outcome, OutcomeStatus, PermissionMode, Plan, Question, QuestionId,
-    QuestionKind, Task, TaskKind, WorkerProfile,
+    Answer, Outcome, OutcomeStatus, PermissionMode, Plan, Question, QuestionId, QuestionKind,
+    ResolvedEffortPolicy, Task, TaskKind, WorkerProfile,
 };
 use crate::ladder::{self, LadderPolicy, LadderState, Next};
 use crate::review::{self, PassBinding, ReviewPass, ReviewPlan};
@@ -718,6 +718,7 @@ fn run_harness_inner(
         return Err(error);
     }
 
+    let effort_policy = analysis.config.resolved_effort_policy();
     let started = events::RunStarted {
         schema: events::SCHEMA_VERSION,
         tactus_version: env!("CARGO_PKG_VERSION").to_owned(),
@@ -738,6 +739,7 @@ fn run_harness_inner(
         gates_from_config: analysis.gates_from_config,
         interaction_mode: mode.to_string(),
         chains: chain_summaries(&analysis),
+        effort_policy: Some(effort_policy),
         reviews: Some(review_plan.clone()),
         gate_cmds: Some(gates),
     };
@@ -770,7 +772,7 @@ fn run_harness_inner(
         sleeper,
         caps,
         review_plan,
-        review_effort: analysis.config.review_effort(),
+        effort_policy,
         attempt_timeout: opts.attempt_timeout,
         defer_backoff: opts.defer_backoff,
         max_defers: opts.max_defers,
@@ -962,6 +964,7 @@ fn resume_harness_inner(
     // had them established by an earlier resume instead — which is what stops
     // the re-derivation repeating, and drifting, on every resume after that.
     let recorded_gates = events::recorded_gates(&events).cloned();
+    let recorded_effort_policy = events::recorded_effort_policy(&events);
 
     // The run knows its own plan and config; the CLI may override the config
     // but never the plan, which is frozen (§5).
@@ -1048,6 +1051,24 @@ fn resume_harness_inner(
         // been verified differently" here would be a false alarm on every
         // gateless run, and a warning that cries wolf on the harmless case is
         // one nobody reads on the harmful one.
+    }
+    let current_effort_policy = analysis.config.resolved_effort_policy();
+    let effort_policy = recorded_effort_policy.unwrap_or(current_effort_policy);
+    match recorded_effort_policy {
+        None => warnings.push(
+            "this run's log predates the effort-policy record, so implementation and review \
+             effort were re-derived from today's config rather than read from the run — earlier \
+             attempts may have used a different effort standard"
+                .to_owned(),
+        ),
+        Some(recorded) if recorded != current_effort_policy => warnings.push(format!(
+            "today's effort policy ({}) differs from the one this run recorded ({}). This \
+             resume keeps the recorded policy so one run has one execution and review standard. \
+             Start a new run to adopt today's policy.",
+            render_effort_policy(current_effort_policy),
+            render_effort_policy(recorded),
+        )),
+        Some(_) => {}
     }
     warnings.extend(preflight_warnings);
 
@@ -1226,7 +1247,7 @@ fn resume_harness_inner(
         sleeper,
         caps,
         review_plan,
-        review_effort: analysis.config.review_effort(),
+        effort_policy,
         attempt_timeout: opts.attempt_timeout,
         defer_backoff: opts.defer_backoff,
         max_defers: opts.max_defers,
@@ -1289,6 +1310,7 @@ fn resume_harness_inner(
             // Where the log already answers it, re-stating the answer would put
             // the same fact in two places that a later change could pull apart.
             gates: recorded_gates.is_none().then(|| gates.clone()),
+            effort_policy: recorded_effort_policy.is_none().then_some(effort_policy),
         },
     })?;
     // §14 takes a capacity snapshot at pre-flight, and §15 makes a resume
@@ -1312,6 +1334,13 @@ fn render_tiers(chain: &ChainSummary) -> String {
 /// A gate name list, for a message.
 fn render_names(names: &[String]) -> String {
     names.join(", ")
+}
+
+fn render_effort_policy(policy: ResolvedEffortPolicy) -> String {
+    format!(
+        "implementation small={}, mid={}, frontier={}; review={}",
+        policy.small, policy.mid, policy.frontier, policy.review
+    )
 }
 
 /// What today's config would gate with, against what the run recorded — `None`
@@ -1478,9 +1507,9 @@ struct Run<'a> {
     /// Who judges each task (§11.2–§11.3), resolved once at pre-flight and
     /// recorded in `run_started`.
     review_plan: ReviewPlan,
-    /// How hard every reviewer thinks — the review tier's effort, resolved once
-    /// so both passes of a second opinion judge to one standard.
-    review_effort: Effort,
+    /// The run's recorded effort standard. Both worker attempts and all review
+    /// passes read this snapshot, including after a resume under changed config.
+    effort_policy: ResolvedEffortPolicy,
     attempt_timeout: Duration,
     defer_backoff: Duration,
     max_defers: u32,
@@ -1754,7 +1783,7 @@ impl Run<'_> {
                 // What the rung's tier is worth on an agent with an effort
                 // axis: without this the whole chain runs at one vendor
                 // default and escalating a rung moves nothing (§10).
-                effort: Some(self.analysis.config.implementation_effort(rung.tier)),
+                effort: Some(self.effort_policy.implementation_for(rung.tier)),
                 max_turns: None,
                 extra_args: Vec::new(),
             };
@@ -2048,7 +2077,7 @@ impl Run<'_> {
                 // Every pass judges at the review tier's effort, including a
                 // second opinion bound to another vendor: the standard belongs
                 // to the review, not to whichever family happens to apply it.
-                let mut profile = pass.profile(self.review_effort);
+                let mut profile = pass.profile(self.effort_policy.review);
                 // A cross-vendor second opinion draws on a different
                 // subscription than the implementer (§11.3, §13), so its pool
                 // is looked up from its own agent rather than inherited.
@@ -3866,7 +3895,7 @@ impl RunReport {
 mod tests {
     use super::*;
     use crate::agent::{Caps, ProcessOutput};
-    use crate::ir::{TaskId, Usage};
+    use crate::ir::{Effort, TaskId, Usage};
     use std::path::Path;
     use std::process::Command;
     use std::sync::{Mutex, OnceLock};
@@ -5016,6 +5045,169 @@ mod tests {
             later.copilot().reviews_run(),
             0,
             "a CLI installed since the run began must not become its judge"
+        );
+    }
+
+    #[test]
+    fn resume_runs_with_the_effort_policy_the_run_recorded_not_todays_config() {
+        let original = "[interaction]\nmode = \"never\"\n\n\
+                        [routing]\nimplement = { chain = [\"small\"], attempts_per = 1 }\n\n\
+                        [routing.effort]\nimplementation = \"xhigh\"\nreview = \"max\"\n";
+        let (repo, run_id) = parked_run_with_config("resumeeffort", original);
+        fs::write(
+            repo.join("tactus.toml"),
+            "[interaction]\nmode = \"never\"\n\n\
+             [routing]\nimplement = { chain = [\"small\"], attempts_per = 1 }\n\n\
+             [routing.effort]\nimplementation = \"low\"\nreview = \"high\"\n",
+        )
+        .expect("edit effort only");
+
+        let resumed = resume_answering(&repo, &run_id, Effect::EditFile);
+        assert_eq!(resumed.outcome(), RunOutcome::Complete, "{resumed:?}");
+        let logged = events_of(&repo, &run_id);
+        let resumed_worker = logged
+            .iter()
+            .filter_map(|event| match &event.body {
+                EventBody::AttemptStarted { data, .. } => Some(data),
+                _ => None,
+            })
+            .next_back()
+            .expect("resumed worker start");
+        assert_eq!(resumed_worker.effort, Some(Effort::XHigh));
+        let resumed_reviews = logged
+            .iter()
+            .filter_map(|event| match &event.body {
+                EventBody::AttemptFinished { data, .. } if !data.reviews.is_empty() => {
+                    Some(&data.reviews)
+                }
+                _ => None,
+            })
+            .next_back()
+            .expect("resumed review records");
+        assert!(
+            resumed_reviews
+                .iter()
+                .all(|review| review.effort == Some(Effort::Max)),
+            "every review pass keeps max: {resumed_reviews:?}"
+        );
+        let warning = resumed
+            .warnings
+            .iter()
+            .find(|warning| warning.contains("today's effort policy"))
+            .unwrap_or_else(|| panic!("no effort difference warning: {:?}", resumed.warnings));
+        assert!(warning.contains("implementation small=low"), "{warning}");
+        assert!(warning.contains("implementation small=xhigh"), "{warning}");
+        assert!(warning.contains("review=max"), "{warning}");
+        assert!(warning.contains("Start a new run"), "{warning}");
+    }
+
+    #[test]
+    fn the_resume_that_rederives_an_old_logs_effort_records_it_for_the_next_one() {
+        let original = "[interaction]\nmode = \"never\"\n\n\
+                        [routing]\nimplement = { chain = [\"small\"], attempts_per = 1 }\n\n\
+                        [routing.effort]\nimplementation = \"xhigh\"\nreview = \"max\"\n";
+        let (repo, run_id) = parked_run_with_config("oldlogeffort", original);
+        let paths = paths_of(&repo, &run_id);
+        strip_run_started_field(&paths, "effort_policy");
+
+        fs::write(
+            repo.join("tactus.toml"),
+            "[interaction]\nmode = \"never\"\n\n\
+             [routing]\nimplement = { chain = [\"small\"], attempts_per = 1 }\n\n\
+             [routing.effort]\nimplementation = \"high\"\nreview = \"xhigh\"\n",
+        )
+        .expect("first derived policy");
+        let first = resume_answering(&repo, &run_id, Effect::NoEdit);
+        assert_eq!(first.outcome(), RunOutcome::Parked, "{first:?}");
+        assert!(
+            first
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("predates the effort-policy record")),
+            "legacy warning: {:?}",
+            first.warnings
+        );
+        let established = ResolvedEffortPolicy {
+            small: Effort::High,
+            mid: Effort::High,
+            frontier: Effort::High,
+            review: Effort::XHigh,
+        };
+        assert_eq!(
+            events::recorded_effort_policy(&events_of(&repo, &run_id)),
+            Some(established),
+            "the first resume writes down what it derived"
+        );
+
+        fs::write(
+            repo.join("tactus.toml"),
+            "[interaction]\nmode = \"never\"\n\n\
+             [routing]\nimplement = { chain = [\"small\"], attempts_per = 1 }\n\n\
+             [routing.effort]\nimplementation = \"low\"\nreview = \"medium\"\n",
+        )
+        .expect("later policy");
+        let second = resume_answering(&repo, &run_id, Effect::EditFile);
+        assert_eq!(second.outcome(), RunOutcome::Complete, "{second:?}");
+        let logged = events_of(&repo, &run_id);
+        let worker = logged
+            .iter()
+            .filter_map(|event| match &event.body {
+                EventBody::AttemptStarted { data, .. } => Some(data),
+                _ => None,
+            })
+            .next_back()
+            .expect("second resumed worker");
+        assert_eq!(worker.effort, Some(Effort::High));
+        let reviews = logged
+            .iter()
+            .filter_map(|event| match &event.body {
+                EventBody::AttemptFinished { data, .. } if !data.reviews.is_empty() => {
+                    Some(&data.reviews)
+                }
+                _ => None,
+            })
+            .next_back()
+            .expect("second resumed reviews");
+        assert!(
+            reviews
+                .iter()
+                .all(|review| review.effort == Some(Effort::XHigh)),
+            "reviews retain the established legacy policy: {reviews:?}"
+        );
+        assert!(
+            second
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("today's effort policy")),
+            "the later edit is reported: {:?}",
+            second.warnings
+        );
+        assert!(
+            !second
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("predates the effort-policy record")),
+            "the legacy absence was established once: {:?}",
+            second.warnings
+        );
+    }
+
+    #[test]
+    fn a_resume_whose_effort_policy_did_not_move_says_nothing_about_it() {
+        let config = "[interaction]\nmode = \"never\"\n\n\
+                      [routing]\nimplement = { chain = [\"small\"], attempts_per = 1 }\n\n\
+                      [routing.effort]\nimplementation = \"xhigh\"\nreview = \"max\"\n";
+        let (repo, run_id) = parked_run_with_config("effortunmoved", config);
+        let resumed = resume_answering(&repo, &run_id, Effect::EditFile);
+        assert_eq!(resumed.outcome(), RunOutcome::Complete, "{resumed:?}");
+        assert!(
+            !resumed
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("effort policy")
+                    || warning.contains("effort-policy")),
+            "an unchanged policy must be silent: {:?}",
+            resumed.warnings
         );
     }
 

@@ -134,10 +134,10 @@ pub fn run_with<'a>(
         match discovered {
             Ok(discovery) => {
                 // D1's cross-check, at the moment the roster's provenance is
-                // being written into the file. Today `models` is empty on both
-                // adapters and this never fires — the header says as much —
-                // but the day a CLI grows enumeration, `connect` is where a
-                // stale catalog entry should first be caught.
+                // being written into the file. Claude Code and Copilot report
+                // no roster today; Codex reports its local `debug models`
+                // catalog. Any real listing is where a stale shipped entry
+                // should first be caught.
                 let missing = crate::catalog::missing_from(id, &discovery.models);
                 if !missing.is_empty() {
                     warnings.push(format!(

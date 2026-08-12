@@ -10,7 +10,7 @@ use crate::capacity;
 use crate::config::{self, Config};
 use crate::error::{TactusError, ValidationErrors};
 use crate::gates::{self, ShellGate};
-use crate::ir::{Plan, Task, TaskId, Tier};
+use crate::ir::{Plan, Task, TaskId};
 use crate::plan::{self, Parsed};
 use crate::review::{self, PassBinding, ReviewPlan};
 use crate::route::{self, ResolvedChain};
@@ -530,8 +530,8 @@ fn strategy_echo(cfg: &Config) -> String {
 }
 
 fn effort_echo(cfg: &Config) -> String {
-    let tiers = [Tier::Small, Tier::Mid, Tier::Frontier];
-    let resolved = tiers.map(|tier| cfg.implementation_effort(tier));
+    let policy = cfg.resolved_effort_policy();
+    let resolved = [policy.small, policy.mid, policy.frontier];
     let implementation = if resolved.iter().all(|effort| *effort == resolved[0]) {
         resolved[0].to_string()
     } else {
@@ -541,7 +541,7 @@ fn effort_echo(cfg: &Config) -> String {
         )
     };
     let review = if cfg.review_enabled {
-        cfg.review_effort().to_string()
+        policy.review.to_string()
     } else {
         "disabled".to_owned()
     };
@@ -743,23 +743,51 @@ mod tests {
     }
 
     #[test]
-    fn the_preview_shows_the_effective_role_effort_before_spend() {
+    fn the_preview_echoes_resolved_role_tier_pin_and_disabled_review_effort() {
         let root = env::temp_dir().join(format!("tactus-validate-effort-{}", std::process::id()));
         fs::create_dir_all(&root).expect("root");
-        let cfg = root.join("tactus.toml");
-        fs::write(
-            &cfg,
-            "[routing.effort]\nimplementation = \"xhigh\"\nreview = \"max\"\n",
-        )
-        .expect("config");
-        let mut o = opts("fixtures/sample-plan.md");
-        o.config_path = Some(cfg);
+        let cases = [
+            (
+                "defaults",
+                "",
+                "effort: implementation=by tier (small=low, mid=medium, frontier=high), review=high",
+            ),
+            (
+                "pin-fallback",
+                "[routing]\nreview = { tier = \"small\" }\n\n\
+                 [[pins]]\ntier = \"small\"\nagent = \"claude-code\"\n\
+                 model = \"claude-haiku-4-5\"\neffort = \"max\"\n",
+                "effort: implementation=by tier (small=max, mid=medium, frontier=high), review=max",
+            ),
+            (
+                "other-role-values",
+                "[routing.effort]\nimplementation = \"low\"\nreview = \"xhigh\"\n",
+                "effort: implementation=low, review=xhigh",
+            ),
+            (
+                "configured-role-values",
+                "[routing.effort]\nimplementation = \"xhigh\"\nreview = \"max\"\n",
+                "effort: implementation=xhigh, review=max",
+            ),
+            (
+                "review-disabled",
+                "[routing]\nreview = { enabled = false }\n",
+                "effort: implementation=by tier (small=low, mid=medium, frontier=high), review=disabled",
+            ),
+        ];
 
-        let rendered = run(&o).expect("validate").render();
-        assert!(
-            rendered.contains("effort: implementation=xhigh, review=max"),
-            "rendered:\n{rendered}"
-        );
+        for (name, config, expected) in cases {
+            let cfg = root.join(format!("{name}.toml"));
+            fs::write(&cfg, config).expect("config");
+            let mut o = opts("fixtures/sample-plan.md");
+            o.config_path = Some(cfg);
+            let rendered = run(&o).expect("validate").render();
+            let actual = rendered
+                .lines()
+                .find(|line| line.starts_with("effort:"))
+                .expect("effort line");
+            assert_eq!(actual, expected, "case {name}:\n{rendered}");
+        }
     }
 
     #[test]

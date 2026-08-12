@@ -79,6 +79,8 @@ tactus resume <run-id> --budget 30
 
 Continues a run that was interrupted, ended with tasks parked on questions, or stopped at its
 budget. Budgets are re-read at resume, so raising the ceiling and continuing is one command.
+Gates, reviewers, and the resolved implementation/review effort policy come from the run record;
+editing them applies to a new run rather than changing the standard halfway through this one.
 
 ```bash
 tactus export-decisions <run-id>
@@ -157,6 +159,8 @@ review = { tier = "frontier" }        # or { enabled = false }
 [routing.effort]
 implementation = "xhigh"              # every worker attempt, regardless of tier
 review = "max"                         # every review pass
+# Effort controls reasoning depth, not model tier. To require frontier models
+# for all workers, set every task kind's chain to ["frontier"] explicitly.
 
 [[routing.overrides]]
 paths = ["src/auth/**", "migrations/**"]

@@ -16,7 +16,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::capacity::PoolKind;
 use crate::error::TactusError;
-use crate::ir::{Outcome, WorkerProfile};
+use crate::ir::{Effort, Outcome, WorkerProfile};
 
 pub use proc::ProcessOutput;
 
@@ -61,12 +61,12 @@ pub struct Discovery {
     pub auth: AuthState,
     /// The models the CLI itself advertises.
     ///
-    /// **Empty on both adapters today**, and that is a fact about the CLIs
-    /// rather than a gap here: as of Aug 2026 neither Claude Code nor Copilot
-    /// offers non-interactive model enumeration (checked against `--help` and
-    /// GitHub's programmatic reference respectively). The seam exists so the
-    /// version that does gets cross-checked against the catalog instead of
-    /// silently disagreeing with it; [`Caps::model_list`] is the gate.
+    /// Empty on Claude Code and Copilot today: as of Aug 2026 neither offers
+    /// non-interactive model enumeration. Codex exposes its local roster via
+    /// `debug models`; its adapter validates model × effort support at probe
+    /// and reports the slugs here. The seam lets every real listing be
+    /// cross-checked against the shipped catalog; [`Caps::model_list`] is the
+    /// gate.
     pub models: Vec<String>,
     /// §13's pool-kind hint, read from whatever the CLI says about the account
     /// it is signed into. `None` means it said nothing conclusive, and the
@@ -218,6 +218,54 @@ pub fn by_id(id: &str) -> Option<&'static dyn AgentAdapter> {
     ADAPTERS.iter().copied().find(|a| a.id() == id)
 }
 
+/// Shared effort levels the help entry for `--effort` actually advertises.
+///
+/// Looking only for the flag proves too little: several CLI versions exposed
+/// `--effort` with a narrower enum. The option's own wrapped help block is
+/// parsed so unrelated words elsewhere in `--help` cannot masquerade as a
+/// supported value.
+pub(crate) fn missing_effort_levels(help: &str) -> Vec<Effort> {
+    let mut block = String::new();
+    let mut collecting = false;
+    for line in help.lines() {
+        if !collecting {
+            if line.contains("--effort") {
+                collecting = true;
+                block.push_str(line);
+                block.push('\n');
+            }
+            continue;
+        }
+        if line.trim_start().starts_with('-') {
+            break;
+        }
+        block.push_str(line);
+        block.push('\n');
+    }
+    if !collecting {
+        return Effort::ALL.to_vec();
+    }
+
+    let advertised: Vec<Effort> = block
+        .split(|character: char| !character.is_ascii_alphanumeric())
+        .filter_map(Effort::parse)
+        .collect();
+    Effort::ALL
+        .into_iter()
+        .filter(|effort| !advertised.contains(effort))
+        .collect()
+}
+
+/// Whether help advertises `flag` as a whole option token.
+///
+/// Short flags need this instead of substring search: `-p` occurs inside
+/// `--permission-mode`, and `-s` inside several unrelated long options.
+pub(crate) fn advertises_flag(help: &str, flag: &str) -> bool {
+    help.split(|character: char| character.is_whitespace() || character == ',')
+        .map(|token| token.split(['=', ':']).next().unwrap_or(token))
+        .any(|name| name == flag)
+}
+
 /// Rate-limit signals are ground truth for the capacity engine (§13), so both
 /// adapters read from one vocabulary rather than two that drift apart.
 ///
@@ -273,5 +321,34 @@ mod tests {
             assert!(looks_rate_limited(phrase), "should signal: {phrase}");
         }
         assert!(!looks_rate_limited("wrote the pagination cursor encoder"));
+    }
+
+    #[test]
+    fn effort_help_is_scoped_to_the_effort_option_and_requires_every_level() {
+        let claude = "  --effort <level>  Effort level (low, medium, high, xhigh, max)\n\
+                      --model <model>   Model to use\n";
+        assert_eq!(missing_effort_levels(claude), []);
+
+        let copilot = "  --effort, --reasoning-effort <level>  Reasoning effort \
+                       (choices: \"none\", \"minimal\", \"low\", \"medium\", \"high\", \
+                       \"xhigh\", \"max\")\n  --model <model>  Model\n";
+        assert_eq!(missing_effort_levels(copilot), []);
+
+        let narrower = "  --effort <level>  Effort level (low, medium, high)\n\
+                         --other <value>  xhigh and max appear outside the option\n";
+        assert_eq!(
+            missing_effort_levels(narrower),
+            [Effort::XHigh, Effort::Max],
+            "another option cannot supply missing effort choices"
+        );
+    }
+
+    #[test]
+    fn short_flags_are_not_inferred_from_longer_names() {
+        assert!(advertises_flag("-p, --print", "-p"));
+        assert!(!advertises_flag("--permission-mode", "-p"));
+        assert!(!advertises_flag("--settings --share --stdio", "-s"));
+        assert!(advertises_flag("-c, --config <key=value>", "--config"));
+        assert!(!advertises_flag("--configuration <path>", "--config"));
     }
 }
