@@ -21,9 +21,6 @@ jobs:
     timeout-minutes: 5
     permissions:
       contents: read
-      # Transitional only: keep the old required deployment satisfiable until
-      # the additive App-check canary passes and the ruleset is migrated.
-      deployments: write
       issues: read
       pull-requests: read
     outputs:
@@ -205,6 +202,9 @@ jobs:
     environment: frontier-check-signer
     permissions:
       contents: read
+      # Transitional only: keep the old required deployment satisfiable until
+      # the additive App-check canary passes and the ruleset is migrated.
+      deployments: write
       issues: read
       pull-requests: read
     env:

@@ -49,20 +49,32 @@ That deployment must not remain the semantic gate.
 
 Migrate without opening an unprotected interval:
 
-1. Install the private `Tactus Frontier Review Gate` App only on `keybindings/tactus`, with metadata
-   read and checks write permissions and no webhook or event subscriptions.
+1. Install the private `Tactus Frontier Review Gate` App only on `keybindings/tactus`, initially
+   with metadata read and checks write permissions and no webhook or event subscriptions. GitHub
+   also requires installation-level commit-statuses write before the App can be selected as the
+   expected source of a required check, but add that only after step 4 secures the key inventory.
+   The workflow token remains down-scoped to checks write throughout.
 2. Put its client id, numeric App id, and private key in the `frontier-check-signer` environment.
-   Restrict that environment to protected branches so a pull-request-authored job cannot receive
-   the key.
+   Give that environment one custom branch policy matching only `master` so a
+   pull-request-authored job cannot receive the key. Do not rely on "protected branches only":
+   GitHub's documentation describes classic branch protection while its branch API also reports a
+   ruleset-protected branch as protected. The exact custom policy avoids that platform ambiguity.
 3. Land the default-branch attestation workflow and fixtures while the existing rules remain in
    force. During migration the workflow publishes the App check first, then the old deployment as a
    compatibility gate; an App failure therefore cannot mint the currently required deployment.
-4. On a new canary PR, obtain an exact-head frontier review and observe a successful
+4. Before expanding the App installation permission, generate and store one usable replacement
+   private key, verify the environment secret exists, and revoke every generated key whose PEM is
+   not in the credential inventory. Then add commit-statuses write to the App and approve the
+   installation update.
+5. On a new canary PR, obtain an exact-head frontier review and observe a successful
    `tactus-frontier-review` check whose `.app.id` is `4574301`.
-5. Add that App-bound check to the ruleset while retaining every existing requirement. Push a new
-   canary head and prove that the stale check does not unblock it; then review and attest the new
-   head.
-6. Only after the canary passes, remove the `frontier-reviewed` deployment requirement and retire
+6. Add `tactus-frontier-review` to the ruleset as an any-source required check while retaining every
+   existing requirement; read the ruleset back. In a second complete ruleset update, bind that
+   already-required context to App id `4574301` and read it back again. GitHub requires both a
+   recent App check and a pre-existing required context before source binding.
+7. Push a new canary head and prove that the stale check does not unblock it; then review and attest
+   the new head.
+8. Only after the canary passes, remove the `frontier-reviewed` deployment requirement and retire
    the old deployment writer and its `deployments: write` permission in a cleanup PR. Never remove
    the deterministic checks during this sequence.
 
@@ -110,10 +122,12 @@ then requests a repository-scoped installation token for the dedicated App. The 
 the final exact-SHA check. The ruleset's App binding, rather than the check name alone, is the
 security boundary.
 
-The App is private, installed only on `keybindings/tactus`, and has only metadata read and checks
-write. Its private key is an environment secret, never a repository secret. Only the final trusted
-`repository_dispatch` job declares `frontier-check-signer`; that environment accepts protected
-branches only. The short-lived installation token explicitly requests only `checks: write` and is
+The App is private, installed only on `keybindings/tactus`, and has metadata read plus checks and
+commit-statuses write. GitHub requires the latter at installation level to make the App eligible as
+an expected required-check source; the workflow never requests it in its token. The private key is
+an environment secret, never a repository secret. Only the final trusted `repository_dispatch` job
+declares `frontier-check-signer`; that environment's sole custom branch policy is the exact
+`master` branch. The short-lived installation token explicitly requests only `checks: write` and is
 revoked by the token action at job completion. The same job temporarily retains
 `deployments: write` solely for the old compatibility rule and invokes it only after App check
 creation succeeds; remove that permission with the compatibility writer after the canary. Keep
@@ -126,8 +140,11 @@ so it is never written into a command line, log, tracked file, or pull-request w
 ```bash
 gh api --method PUT repos/keybindings/tactus/environments/frontier-check-signer \
   -F wait_timer=0 \
-  -F 'deployment_branch_policy[protected_branches]=true' \
-  -F 'deployment_branch_policy[custom_branch_policies]=false'
+  -F 'deployment_branch_policy[protected_branches]=false' \
+  -F 'deployment_branch_policy[custom_branch_policies]=true'
+gh api --method POST \
+  repos/keybindings/tactus/environments/frontier-check-signer/deployment-branch-policies \
+  -f name=master -f type=branch
 
 gh variable set TACTUS_FRONTIER_APP_ID --env frontier-check-signer \
   --repo keybindings/tactus --body 4574301
@@ -148,6 +165,8 @@ gh variable set TACTUS_IMMUTABLE_RELEASES_REQUIRED \
   --repo keybindings/tactus --body true
 
 gh api repos/keybindings/tactus/environments/frontier-check-signer
+gh api \
+  repos/keybindings/tactus/environments/frontier-check-signer/deployment-branch-policies
 gh variable list --env frontier-check-signer --repo keybindings/tactus
 gh secret list --env frontier-check-signer --repo keybindings/tactus
 gh api repos/keybindings/tactus/actions/permissions/fork-pr-contributor-approval \
@@ -157,6 +176,15 @@ gh api repos/keybindings/tactus/immutable-releases \
 gh variable get TACTUS_IMMUTABLE_RELEASES_REQUIRED \
   --repo keybindings/tactus
 ```
+
+After `gh secret list` confirms the signing-secret name, revoke every active App key whose PEM is
+not in the maintained inventory. Only then add Commit statuses read/write to the App registration
+and approve the updated installation. Changing App permissions affects every active private key,
+so granting it first would broaden an unaccounted credential. Keep the workflow's generated token
+down-scoped to `permission-checks: write`; it must not request `permission-statuses`.
+
+Never commit, paste, or print the PEM. Delete the downloaded copy only after the environment secret
+has been stored and independently exercised successfully.
 
 The rules prevent accidental direct merges and stale-SHA evidence, and prevent same-name fork-check
 spoofing from satisfying the semantic gate. They do not defend against compromise or dishonesty of
