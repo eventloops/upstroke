@@ -38,3 +38,7 @@ artifacts (§15); records promoted here are the durable subset.
   every Codex review had run at `low`; effort is now a routing axis, verified live.
 - [2026-08-11 — decision export schema](2026-08-11-export-decisions-schema.md):
   local schema-1 JSONL/CSV projection, one row per recorded worker attempt.
+- [2026-08-12 — v0.2 merge queue and execution topology](2026-08-12-merge-queue-execution-topology.md):
+  schema-3 immutable candidates, exact-tree verification, crash-safe CAS
+  integration, bounded human-gated repair tasks, and the shared worktree/runner
+  boundary.
