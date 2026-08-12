@@ -110,13 +110,16 @@ pub fn load(repo_root: &Path, wanted: &str) -> Result<Vec<Row>, TactusError> {
     if !warnings.is_empty() {
         return invalid(&events_path, warnings.join("; "));
     }
-    let started_event = log
+    let mut run_starts = log
         .iter()
-        .find(|event| matches!(event.body, EventBody::RunStarted { .. }))
-        .ok_or_else(|| TactusError::EventLog {
-            path: events_path.clone(),
-            message: "no run_started event".to_owned(),
-        })?;
+        .filter(|event| matches!(event.body, EventBody::RunStarted { .. }));
+    let started_event = run_starts.next().ok_or_else(|| TactusError::EventLog {
+        path: events_path.clone(),
+        message: "no run_started event".to_owned(),
+    })?;
+    if run_starts.next().is_some() {
+        return invalid(&events_path, "duplicate run_started event".to_owned());
+    }
     let EventBody::RunStarted { data: started } = &started_event.body else {
         unreachable!()
     };
@@ -138,6 +141,15 @@ pub fn load(repo_root: &Path, wanted: &str) -> Result<Vec<Row>, TactusError> {
     let plan: Plan = serde_json::from_str(&plan_text).map_err(|error| TactusError::Parse {
         message: format!("{}: {error}", plan_path.display()),
     })?;
+    if plan.source.hash != started.plan_hash {
+        return invalid(
+            &plan_path,
+            format!(
+                "frozen plan hash `{}` does not match run-start hash `{}`",
+                plan.source.hash, started.plan_hash
+            ),
+        );
+    }
     let tasks = unique_tasks(&plan, &events_path)?;
     let chains = unique_chains(&started.chains, &events_path)?;
     let settlements = settlements(&log, &events_path)?;
@@ -156,6 +168,12 @@ pub fn load(repo_root: &Path, wanted: &str) -> Result<Vec<Row>, TactusError> {
             continue;
         };
         let key = (task.clone(), *attempt, *rung);
+        if *attempt == 0 {
+            return invalid(
+                &events_path,
+                format!("attempt number must be positive for {}", key_text(&key)),
+            );
+        }
         if !seen_starts.insert(key.clone()) {
             return invalid(
                 &events_path,
@@ -172,6 +190,23 @@ pub fn load(repo_root: &Path, wanted: &str) -> Result<Vec<Row>, TactusError> {
             return invalid(
                 &events_path,
                 format!("invalid recorded chain for attempted task `{task}`"),
+            );
+        }
+        let expected_tier = usize::try_from(*rung)
+            .ok()
+            .and_then(|index| chain.tiers.get(index))
+            .ok_or_else(|| TactusError::EventLog {
+                path: events_path.clone(),
+                message: format!("rung is outside the recorded chain for {}", key_text(&key)),
+            })?;
+        if expected_tier.to_string() != data.tier {
+            return invalid(
+                &events_path,
+                format!(
+                    "start tier `{}` does not match recorded rung tier `{expected_tier}` for {}",
+                    data.tier,
+                    key_text(&key)
+                ),
             );
         }
         let settlement = settlements.get(&key);
@@ -305,12 +340,11 @@ fn build_row(
     let interrupted = kind == Some(FailureKind::Interrupted);
     let record = settlement.map(|done| done.record);
     let duration_ms = record.map(|r| duration_ms(r.duration)).transpose()?;
-    if let Some(cost) = record.and_then(|r| r.cost_usd)
-        && (!cost.is_finite() || cost < 0.0)
-    {
-        return Err(TactusError::Refused {
-            message: format!("attempt cost must be finite and non-negative, got {cost}"),
-        });
+    validate_cost("attempt", record.and_then(|r| r.cost_usd))?;
+    if let Some(record) = record {
+        for (index, review) in record.reviews.iter().enumerate() {
+            validate_cost(&format!("review pass {index}"), review.cost_usd)?;
+        }
     }
     Ok(Row {
         schema_version: EXPORT_SCHEMA_VERSION,
@@ -409,6 +443,17 @@ fn duration_ms(value: std::time::Duration) -> Result<u64, TactusError> {
     u64::try_from(value.as_millis()).map_err(|_| TactusError::Refused {
         message: "attempt duration exceeds export schema range".to_owned(),
     })
+}
+
+fn validate_cost(label: &str, cost: Option<f64>) -> Result<(), TactusError> {
+    if let Some(cost) = cost
+        && (!cost.is_finite() || cost < 0.0)
+    {
+        return Err(TactusError::Refused {
+            message: format!("{label} cost must be finite and non-negative, got {cost}"),
+        });
+    }
+    Ok(())
 }
 
 pub fn write(rows: &[Row], format: Format, out: &mut impl Write) -> anyhow::Result<()> {
@@ -728,6 +773,13 @@ mod tests {
         out
     }
 
+    fn load_error(fixture: &Fixture) -> String {
+        match load(&fixture.root, RUN_ID) {
+            Ok(_) => panic!("invalid fixture exported successfully"),
+            Err(error) => error.to_string(),
+        }
+    }
+
     #[test]
     fn csv_quotes_rfc_4180_special_characters() {
         for (input, expected) in [
@@ -735,6 +787,8 @@ mod tests {
             ("a,b", "\"a,b\""),
             ("a\"b", "\"a\"\"b\""),
             ("a\nb", "\"a\nb\""),
+            ("a\rb", "\"a\rb\""),
+            ("a\r\nb", "\"a\r\nb\""),
         ] {
             let mut output = Vec::new();
             write_csv_field(input, &mut output).expect("write");
@@ -875,6 +929,63 @@ mod tests {
         let message = error.to_string();
         assert!(message.contains("is live"));
         assert!(message.contains("wait for it to finish or stop it"));
+    }
+
+    #[test]
+    fn invalid_recorded_invariants_are_refused() {
+        let hash = Fixture::new(
+            "bad-hash",
+            vec![run_started(&["task"])],
+            vec![task("task", "task")],
+        );
+        let plan_path = hash.public.join("plan.normalized.json");
+        let mut plan: Value =
+            serde_json::from_slice(&fs::read(&plan_path).expect("read plan")).expect("plan json");
+        plan["source"]["hash"] = json!("tampered");
+        fs::write(&plan_path, serde_json::to_vec(&plan).expect("plan json"))
+            .expect("write tampered plan");
+        assert!(load_error(&hash).contains("frozen plan hash"));
+
+        let zero = Fixture::new(
+            "zero-attempt",
+            vec![
+                run_started(&["task"]),
+                attempt_started("task", 0, "2026-08-01T00:00:01.000Z", false),
+            ],
+            vec![task("task", "task")],
+        );
+        assert!(load_error(&zero).contains("must be positive"));
+
+        let mut wrong_tier = attempt_started("task", 1, "2026-08-01T00:00:01.000Z", false);
+        wrong_tier["data"]["tier"] = json!("mid");
+        let tier = Fixture::new(
+            "wrong-tier",
+            vec![run_started(&["task"]), wrong_tier],
+            vec![task("task", "task")],
+        );
+        assert!(load_error(&tier).contains("does not match recorded rung tier"));
+
+        let mut out_of_range = attempt_started("task", 1, "2026-08-01T00:00:01.000Z", false);
+        out_of_range["rung"] = json!(9);
+        let rung = Fixture::new(
+            "bad-rung",
+            vec![run_started(&["task"]), out_of_range],
+            vec![task("task", "task")],
+        );
+        assert!(load_error(&rung).contains("outside the recorded chain"));
+
+        let mut bad_review = attempt_finished("task", 1, "2026-08-01T00:00:02.000Z", None, true);
+        bad_review["data"]["reviews"][0]["cost_usd"] = json!(-0.25);
+        let cost = Fixture::new(
+            "bad-review-cost",
+            vec![
+                run_started(&["task"]),
+                attempt_started("task", 1, "2026-08-01T00:00:01.000Z", false),
+                bad_review,
+            ],
+            vec![task("task", "task")],
+        );
+        assert!(load_error(&cost).contains("review pass 0 cost"));
     }
 
     #[test]
