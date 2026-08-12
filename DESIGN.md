@@ -3,7 +3,7 @@
 > **Name:** `tactus` — the Renaissance term for the shared steady pulse every performer synchronizes to. Verified free on crates.io and npm (2026-08-08, live API check). Known adjacent collision: AnthusAI/Tactus, an alpha Lua DSL for agent orchestration (~3★) — assessed as tolerable, but the decision is deliberate: we differentiate hard rather than share ground by accident. **Action on repo creation: publish a placeholder crate immediately.**
 
 **Status:** v2 — consolidates the original architecture, the two-phase lifecycle, the interaction model, the capacity engine, and two rounds of competitive research (companion reports: *Prior-Art & Competitive Landscape*, *Round-2 Competitive Intelligence*), plus the v2.1 late-binding refinement: connect your plans; tiers bind to concrete models and pools at attempt time.
-**Language:** Rust · **License:** MIT OR Apache-2.0 · **Form factor:** single static binary, Windows first-class
+**Language:** Rust · **License:** AGPL-3.0-only · **Form factor:** single static binary, Windows first-class
 
 ---
 
