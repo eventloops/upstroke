@@ -6,8 +6,11 @@ project currently is.
 
 Every change enters `master` through the same path: open a draft pull request early, wait for the
 deterministic CI and PR-policy gates, then obtain an independent frontier-model review of the exact
-green head before merge. A new push invalidates that review and restarts the gate sequence. See
-[`MAINTAINING.md`](MAINTAINING.md) for the full lifecycle, attestation step, and emergency policy.
+green head before merge. The default-branch attestation workflow reruns the mechanical gates on
+that exact SHA and records the required `frontier-reviewed` deployment; a new push invalidates all
+of it and restarts the sequence. See [`MAINTAINING.md`](MAINTAINING.md) for the full lifecycle,
+attestation step, and emergency policy. Contributions from external forks remain provisional until
+the separately owned fork canary described there has passed.
 
 ## Before you send a PR
 
