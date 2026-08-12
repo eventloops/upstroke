@@ -27,6 +27,7 @@ jobs:
       head_repository: ${{ steps.validate.outputs.head_repository }}
       head_sha: ${{ steps.validate.outputs.head_sha }}
       review_url: ${{ steps.validate.outputs.review_url }}
+      evidence_digest: ${{ steps.validate.outputs.evidence_digest }}
     env:
       GH_TOKEN: ${{ github.token }}
       DISPATCH_ACTOR: ${{ github.actor }}
@@ -34,6 +35,12 @@ jobs:
       REVIEWED_SHA: ${{ github.event.client_payload.reviewed_sha }}
       REVIEW_URL: ${{ github.event.client_payload.review_url }}
     steps:
+      # repository_dispatch fixes github.sha to the trusted default-branch
+      # commit whose workflow is running. Never check out the PR head here.
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
       - name: Validate owner, pull request, evidence, and exact head
         id: validate
         shell: bash
@@ -128,15 +135,14 @@ jobs:
             echo "review evidence must be recorded by repository owner $repository_owner" >&2
             exit 1
           fi
-          if ! grep -Fqx "VERDICT: PASS" <<< "$comment_body" || ! grep -Fq "$REVIEWED_SHA" <<< "$comment_body"; then
-            echo "review evidence must contain VERDICT: PASS and the exact reviewed SHA" >&2
-            exit 1
-          fi
+          printf '%s' "$comment_body" | bash .github/scripts/validate-frontier-evidence.sh "$REVIEWED_SHA"
+          evidence_digest="$(printf '%s' "$comment_body" | sha256sum | awk '{print $1}')"
 
           {
             echo "head_repository=$head_repository"
             echo "head_sha=$head_sha"
             echo "review_url=$REVIEW_URL"
+            echo "evidence_digest=$evidence_digest"
           } >> "$GITHUB_OUTPUT"
 
   lint:
@@ -158,6 +164,8 @@ jobs:
           components: rustfmt, clippy
       - run: cargo fmt --check
       - run: cargo clippy --all-targets -- -D warnings
+      - run: bash .github/scripts/test-frontier-evidence.sh
+      - run: bash .github/scripts/test-release-record.sh
 
   test:
     name: trusted test rerun (${{ matrix.os }})
@@ -200,6 +208,7 @@ jobs:
       PR_NUMBER: ${{ github.event.client_payload.pull_request }}
       REVIEWED_SHA: ${{ needs.validate.outputs.head_sha }}
       REVIEW_URL: ${{ needs.validate.outputs.review_url }}
+      EVIDENCE_DIGEST: ${{ needs.validate.outputs.evidence_digest }}
       REVIEW_ENVIRONMENT: frontier-reviewed
     steps:
       - name: Record successful deployment for exact reviewed head
@@ -267,8 +276,11 @@ jobs:
             echo "review evidence no longer matches this owner and pull request" >&2
             exit 1
           fi
-          if ! grep -Fqx "VERDICT: PASS" <<< "$comment_body" || ! grep -Fq "$REVIEWED_SHA" <<< "$comment_body"; then
-            echo "review evidence no longer records a passing verdict for the exact SHA" >&2
+          evidence_digest="$(printf '%s' "$comment_body" | sha256sum | awk '{print $1}')"
+          # EVIDENCE_DIGEST is a validated output passed through the job env.
+          # shellcheck disable=SC2153
+          if [[ "$evidence_digest" != "$EVIDENCE_DIGEST" ]]; then
+            echo "the strictly validated review-evidence record changed while tests were running" >&2
             exit 1
           fi
 

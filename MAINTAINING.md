@@ -24,11 +24,13 @@ contract itself.
 6. Fix every finding. Any code push creates a new head SHA, so return to step 3 and review the new
    head. Feature ideas discovered during review belong in the design or a follow-up unless they are
    required for the current change to be correct.
-7. Once a review passes, post its evidence on the PR and send the `frontier-review` repository
-   dispatch with the PR number, full reviewed head SHA, and evidence URL. The default-branch
-   workflow refuses stale or behind evidence, validates the PR metadata and evidence comment,
-   reruns formatting, Clippy, and all three platform test jobs from its trusted default-branch
-   definition, then records a successful `frontier-reviewed` deployment on the exact head.
+7. Once a review passes, post a dedicated evidence comment containing exactly
+   `TACTUS_FRONTIER_REVIEW: 1`, `VERDICT: PASS`, and `REVIEWED_SHA: <full SHA>` on separate lines,
+   with no other text. Send the `frontier-review` repository dispatch with the PR number, full
+   reviewed head SHA, and evidence URL. The default-branch workflow refuses stale, ambiguous, or
+   behind evidence, validates the PR metadata and evidence comment, reruns formatting, Clippy, and
+   all three platform test jobs from its trusted default-branch definition, then records a
+   successful `frontier-reviewed` deployment on the exact head.
 8. Resolve every conversation, mark the PR ready, and merge with a merge commit. Do not push or
    force-push directly to `master`. Delete the source branch after merge.
 
@@ -42,23 +44,29 @@ review. Dispatching without a real passing review is a policy violation.
 The process cannot require an attestation whose workflow is not on `master` yet. This one bootstrap
 PR is therefore merged only after its deterministic gates and a manually recorded independent
 frontier review pass. After merge, first configure the `frontier-reviewed` environment and
-all-external-contributor workflow approval, then use the licence-correction PR as the same-repo
-canary. Run its gates and review, dispatch the attestation, verify the reviewed deployment, create
-the branch ruleset disabled and inspect it, then activate it before merging the canary. Create and
-activate the immutable release-tag ruleset before any release. This exception ends once those
-rules are active; it is not a reusable bypass.
+all-external-contributor workflow approval and enable repository release immutability, then read
+all three settings back. Use the licence-correction PR as the same-repo canary. Run its gates and
+review, dispatch the attestation, verify the reviewed deployment, create the branch ruleset
+disabled and inspect it, then activate it before merging the canary. Create and activate the
+immutable release-tag ruleset before any release. This exception ends once those rules are active;
+it is not a reusable bypass.
 
 Example dispatch after a passing review:
 
 ```bash
 pr=123
 reviewed_sha="$(gh pr view "$pr" --json headRefOid --jq .headRefOid)"
-# Give this exact full SHA and its diff to the reviewer. After it passes:
+# Give this exact full SHA and its diff to the reviewer. After it passes, post
+# one machine record as the entire evidence comment (put prose in another comment):
+evidence_body="$(printf 'TACTUS_FRONTIER_REVIEW: 1\nVERDICT: PASS\nREVIEWED_SHA: %s' \
+  "$reviewed_sha")"
+review_url="$(gh api --method POST "repos/keybindings/tactus/issues/$pr/comments" \
+  -f "body=$evidence_body" --jq .html_url)"
 gh api --method POST repos/keybindings/tactus/dispatches \
   -f event_type=frontier-review \
   -F "client_payload[pull_request]=$pr" \
   -f "client_payload[reviewed_sha]=$reviewed_sha" \
-  -f "client_payload[review_url]=https://github.com/keybindings/tactus/pull/$pr#issuecomment-0000000000"
+  -f "client_payload[review_url]=$review_url"
 ```
 
 ## Enforced repository rules
@@ -109,10 +117,20 @@ gh api --method PUT \
   -H 'X-GitHub-Api-Version: 2026-03-10' \
   -f approval_policy=all_external_contributors
 
+gh api --method PUT repos/keybindings/tactus/immutable-releases \
+  -H 'X-GitHub-Api-Version: 2026-03-10'
+
+gh variable set TACTUS_IMMUTABLE_RELEASES_REQUIRED \
+  --repo keybindings/tactus --body true
+
 gh api repos/keybindings/tactus/environments/frontier-reviewed \
   -H 'X-GitHub-Api-Version: 2026-03-10'
 gh api repos/keybindings/tactus/actions/permissions/fork-pr-contributor-approval \
   -H 'X-GitHub-Api-Version: 2026-03-10'
+gh api repos/keybindings/tactus/immutable-releases \
+  -H 'X-GitHub-Api-Version: 2026-03-10'
+gh variable get TACTUS_IMMUTABLE_RELEASES_REQUIRED \
+  --repo keybindings/tactus
 ```
 
 The rules prevent accidental direct merges and stale-SHA evidence, and prevent same-name fork-check
@@ -152,11 +170,32 @@ later PR.
 
 ## Release contract
 
-Release tags use `v*` and are made immutable by the tag ruleset. The release workflow independently
-verifies that the tagged commit is reachable from `origin/master`, that the tag matches
-`Cargo.toml`, and that the release gates and platform builds pass before publishing. The GitHub
-release is created before the irreversible crates.io publish. Create releases from an already
-merged mainline commit; branch protection does not make arbitrary tags safe by itself.
+Release tags use `v*` and are made immutable by the tag ruleset. Repository release immutability is
+a separate mandatory setting: tag protection fixes the commit identity, while release immutability
+prevents published binaries from being replaced under that tag. GitHub applies the setting only to
+future releases, so enable and read it back before creating another tag. The release job's token
+cannot read that administration-scoped setting, so `TACTUS_IMMUTABLE_RELEASES_REQUIRED=true`
+records the completed owner readback and makes an incomplete bootstrap fail closed. It is not proof
+against a dishonest owner changing both values; the post-publication signed immutable-release and
+asset checks remain authoritative. Re-read the live setting before every release and in the
+periodic governance drift audit.
+
+The release workflow independently verifies that the tagged commit is reachable from
+`origin/master`, that the tag matches `Cargo.toml`, and that the release gates and platform builds
+pass before publishing. It refuses an existing mutable or incomplete release, discards only an
+unpublished same-tag draft created by `github-actions[bot]` after a failed attempt, refuses to
+delete any other same-tag draft, and skips rather than overwrites a complete immutable release. New
+uploads must contain the exact three expected assets; the workflow verifies GitHub's signed release
+attestation and each local archive against its attested digest. The GitHub release is created before
+the irreversible crates.io publish. Create releases from an already merged mainline commit; branch
+protection does not make arbitrary tags safe by itself.
+
+Release `v0.1.0` predates repository release immutability and remains the sole legacy exception. Do
+not rerun, replace, or delete its assets. Its preserved GitHub asset digests are:
+
+- `tactus-aarch64-apple-darwin.tar.gz`: `sha256:552302e348273143665d2604130e6c1487647a90b496a8d8f789d30839175289`
+- `tactus-x86_64-pc-windows-msvc.zip`: `sha256:e88206643c07ac5cee418ed27ddbbb7e6bcffc1835e727a68bbd716f876c8871`
+- `tactus-x86_64-unknown-linux-gnu.tar.gz`: `sha256:94447cfd56d0d8ba5eae1ec391c2564a7ddba2fceb15cee35ce537a0ba00d798`
 
 ## High-blast-radius changes
 
