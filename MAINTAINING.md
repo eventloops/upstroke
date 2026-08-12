@@ -29,27 +29,54 @@ contract itself.
    with no other text. Send the `frontier-review` repository dispatch with the PR number, full
    reviewed head SHA, and evidence URL. The default-branch workflow refuses stale, ambiguous, or
    behind evidence, validates the PR metadata and evidence comment, reruns formatting, Clippy, and
-   all three platform test jobs from its trusted default-branch definition, then records a
-   successful `frontier-reviewed` deployment on the exact head.
+   all three platform test jobs from its trusted default-branch definition, then uses the dedicated
+   `Tactus Frontier Review Gate` GitHub App to publish a successful `tactus-frontier-review` check
+   on the exact head.
 8. Resolve every conversation, mark the PR ready, and merge with a merge commit. Do not push or
    force-push directly to `master`. Delete the source branch after merge.
 
-The attestation workflow records a review; it does not perform one. The successful deployment is
-the hard merge gate: unlike an Actions check name, an untrusted fork cannot mint it with a
-read-only token. The repository owner remains responsible for the truth of the linked semantic
-review. Dispatching without a real passing review is a policy violation.
+The attestation workflow records a review; it does not perform one. The App-owned check is the hard
+merge gate. The ruleset binds the check name to App id `4574301`, while the App credential is kept
+out of every pull-request workflow. A same-named GitHub Actions check therefore cannot satisfy the
+rule. The repository owner remains responsible for the truth of the linked semantic review;
+dispatching without a real passing review is a policy violation.
 
-### Bootstrap exception
+### App-gate migration
 
-The process cannot require an attestation whose workflow is not on `master` yet. This one bootstrap
-PR is therefore merged only after its deterministic gates and a manually recorded independent
-frontier review pass. After merge, first configure the `frontier-reviewed` environment and
-all-external-contributor workflow approval and enable repository release immutability, then read
-all three settings back. Use the licence-correction PR as the same-repo canary. Run its gates and
-review, dispatch the attestation, verify the reviewed deployment, create the branch ruleset
-disabled and inspect it, then activate it before merging the canary. Create and activate the
-immutable release-tag ruleset before any release. This exception ends once those rules are active;
-it is not a reusable bypass.
+The original required-deployment gate failed its stale-SHA canary: GitHub reported a pull request
+mergeable after its head changed even though `frontier-reviewed` existed only on the previous SHA.
+That deployment must not remain the semantic gate.
+
+Migrate without opening an unprotected interval:
+
+1. Install the private `Tactus Frontier Review Gate` App only on `keybindings/tactus`, initially
+   with metadata read and checks write permissions and no webhook or event subscriptions. GitHub
+   also requires installation-level commit-statuses write before the App can be selected as the
+   expected source of a required check, but add that only after step 4 secures the key inventory.
+   The workflow token remains down-scoped to checks write throughout.
+2. Put its client id, numeric App id, and private key in the `frontier-check-signer` environment.
+   Give that environment one custom branch policy matching only `master` so a
+   pull-request-authored job cannot receive the key. Do not rely on "protected branches only":
+   GitHub's documentation describes classic branch protection while its branch API also reports a
+   ruleset-protected branch as protected. The exact custom policy avoids that platform ambiguity.
+3. Land the default-branch attestation workflow and fixtures while the existing rules remain in
+   force. During migration the workflow publishes the App check first, then the old deployment as a
+   compatibility gate; an App failure therefore cannot mint the currently required deployment.
+4. Before expanding the App installation permission, generate and store one usable replacement
+   private key, verify the environment secret exists, and revoke every generated key whose PEM is
+   not in the credential inventory. Then add commit-statuses write to the App and approve the
+   installation update.
+5. On a new canary PR, obtain an exact-head frontier review and observe a successful
+   `tactus-frontier-review` check whose `.app.id` is `4574301`.
+6. Add `tactus-frontier-review` to the ruleset as an any-source required check while retaining every
+   existing requirement; read the ruleset back. In a second complete ruleset update, bind that
+   already-required context to App id `4574301` and read it back again. GitHub requires both a
+   recent App check and a pre-existing required context before source binding.
+7. Push a new canary head and prove that the stale check does not unblock it; then review and attest
+   the new head.
+8. Only after the canary passes, remove the `frontier-reviewed` deployment requirement and retire
+   the old deployment writer and its `deployments: write` permission in a cleanup PR. Never remove
+   the deterministic checks during this sequence.
 
 Example dispatch after a passing review:
 
@@ -75,7 +102,7 @@ The default-branch ruleset must:
 
 - require a pull request and an up-to-date branch;
 - require `tactus-ci` and `tactus-pr-policy` on the current head;
-- require a successful deployment to the `frontier-reviewed` environment on that head;
+- require `tactus-frontier-review` on the current head, bound to GitHub App id `4574301`;
 - require all review conversations to be resolved;
 - allow merge commits only;
 - block branch deletion and non-fast-forward updates; and
@@ -91,26 +118,40 @@ workflow using `GITHUB_TOKEN` as the same GitHub Actions app. A fork can therefo
 jobs named `tactus-ci`, `tactus-pr-policy`, or anything else without receiving a write token. Those
 fast checks are required for feedback but are not the security boundary. The default-branch
 attestation workflow independently reruns their substance with no PR-controlled workflow code,
-then uses its `deployments: write` token to record the exact reviewed SHA. Fork tokens are
-read-only; jobs that reference the protected environment directly require owner approval.
+then requests a repository-scoped installation token for the dedicated App. The App publishes only
+the final exact-SHA check. The ruleset's App binding, rather than the check name alone, is the
+security boundary.
 
-Configure the `frontier-reviewed` environment with `keybindings` (user id `38257252`) as its
-required reviewer and `prevent_self_review = false`. Also require approval for workflow runs from
-**all** external contributors. The environment review gates PR-authored jobs that declare this
-environment; it does not mediate Deployments API calls or substitute for inspecting fork workflow
-changes. The legitimate attestation calls the Deployments API directly from the trusted
-default-branch workflow, so it does **not** create an environment approval request. Normally deny
-any `frontier-reviewed` approval request shown by Actions: it came from a job that declared the
-environment, not from the attestation path. These two settings are part of the gate and must not be
-weakened independently of a reviewed repository change.
+The App is private, installed only on `keybindings/tactus`, and has metadata read plus checks and
+commit-statuses write. GitHub requires the latter at installation level to make the App eligible as
+an expected required-check source; the workflow never requests it in its token. The private key is
+an environment secret, never a repository secret. Only the final trusted `repository_dispatch` job
+declares `frontier-check-signer`; that environment's sole custom branch policy is the exact
+`master` branch. The short-lived installation token explicitly requests only `checks: write` and is
+revoked by the token action at job completion. The same job temporarily retains
+`deployments: write` solely for the old compatibility rule and invokes it only after App check
+creation succeeds; remove that permission with the compatibility writer after the canary. Keep
+approval for workflow runs from **all** external contributors as a second, independent fork
+safeguard.
 
-Bootstrap those settings through the versioned API, then read them back before opening the canary:
+Bootstrap and audit the external configuration through the API. Supply the downloaded PEM on stdin
+so it is never written into a command line, log, tracked file, or pull-request workflow:
 
 ```bash
-gh api --method PUT repos/keybindings/tactus/environments/frontier-reviewed \
-  -H 'X-GitHub-Api-Version: 2026-03-10' --input - <<'JSON'
-{"prevent_self_review":false,"reviewers":[{"type":"User","id":38257252}],"deployment_branch_policy":null}
-JSON
+gh api --method PUT repos/keybindings/tactus/environments/frontier-check-signer \
+  -F wait_timer=0 \
+  -F 'deployment_branch_policy[protected_branches]=false' \
+  -F 'deployment_branch_policy[custom_branch_policies]=true'
+gh api --method POST \
+  repos/keybindings/tactus/environments/frontier-check-signer/deployment-branch-policies \
+  -f name=master -f type=branch
+
+gh variable set TACTUS_FRONTIER_APP_ID --env frontier-check-signer \
+  --repo keybindings/tactus --body 4574301
+gh variable set TACTUS_FRONTIER_APP_CLIENT_ID --env frontier-check-signer \
+  --repo keybindings/tactus --body Iv23liSwpgxIDc8SN4ED
+gh secret set TACTUS_FRONTIER_APP_PRIVATE_KEY --env frontier-check-signer \
+  --repo keybindings/tactus < tactus-frontier-review-gate.private-key.pem
 
 gh api --method PUT \
   repos/keybindings/tactus/actions/permissions/fork-pr-contributor-approval \
@@ -123,8 +164,11 @@ gh api --method PUT repos/keybindings/tactus/immutable-releases \
 gh variable set TACTUS_IMMUTABLE_RELEASES_REQUIRED \
   --repo keybindings/tactus --body true
 
-gh api repos/keybindings/tactus/environments/frontier-reviewed \
-  -H 'X-GitHub-Api-Version: 2026-03-10'
+gh api repos/keybindings/tactus/environments/frontier-check-signer
+gh api \
+  repos/keybindings/tactus/environments/frontier-check-signer/deployment-branch-policies
+gh variable list --env frontier-check-signer --repo keybindings/tactus
+gh secret list --env frontier-check-signer --repo keybindings/tactus
 gh api repos/keybindings/tactus/actions/permissions/fork-pr-contributor-approval \
   -H 'X-GitHub-Api-Version: 2026-03-10'
 gh api repos/keybindings/tactus/immutable-releases \
@@ -133,36 +177,42 @@ gh variable get TACTUS_IMMUTABLE_RELEASES_REQUIRED \
   --repo keybindings/tactus
 ```
 
+After `gh secret list` confirms the signing-secret name, revoke every active App key whose PEM is
+not in the maintained inventory. Only then add Commit statuses read/write to the App registration
+and approve the updated installation. Changing App permissions affects every active private key,
+so granting it first would broaden an unaccounted credential. Keep the workflow's generated token
+down-scoped to `permission-checks: write`; it must not request `permission-statuses`.
+
+Never commit, paste, or print the PEM. Delete the downloaded copy only after the environment secret
+has been stored and independently exercised successfully.
+
 The rules prevent accidental direct merges and stale-SHA evidence, and prevent same-name fork-check
-spoofing from satisfying the overall merge gate. They do not defend against compromise or
-dishonesty of the owner account. Any same-repository workflow, fine-grained token, or GitHub App
-with deployment-write authority can mint the gate, so keep an explicit inventory: the trusted
-`frontier-review.yml` job is the only workflow granted `deployments: write`; the owner is the only
-same-repository writer; and no token or installed App may have deployment-write authority for this
-repository without a reviewed trust-model change. The evidence link also remains an owner
-attestation rather than something GitHub can semantically judge.
+spoofing from satisfying the semantic gate. They do not defend against compromise or dishonesty of
+the owner account or theft of the App private key. Keep an explicit inventory: the owner is the only
+same-repository writer; App id `4574301` is the sole integration trusted for the semantic check; and
+no other secret, token, or App may mint that check without a reviewed trust-model change. The
+evidence link also remains an owner attestation rather than something GitHub can semantically judge.
 
 External-fork support is provisional until a canary from a separately owned fork proves GitHub's
-required-deployment behavior. The canary must verify that the trusted workflow can check out the
-fork commit, that the created deployment records the fork's exact head SHA, that the deployment
-unblocks only that SHA, and that pushing a new head invalidates it. Do not merge or advertise
-external-fork contributions before that canary passes. If GitHub does not associate the deployment
-with a fork-only SHA as required, keep external forks unsupported and move the semantic gate to the
-dedicated GitHub App design below.
+check-run behavior. The canary must verify that the trusted workflow can check out the fork commit,
+that the App can publish its check on the fork-only head SHA, that the App-bound rule accepts only
+that SHA, and that pushing a new head invalidates it. Do not merge or advertise external-fork
+contributions before that canary passes. If GitHub cannot attach the check to a fork-only SHA, keep
+external forks unsupported rather than weakening the App binding.
 
-Do not grant another account same-repository write access under this model. Before doing so, move
-the semantic gate to a dedicated GitHub App whose credential is unavailable to PR workflows and
-bind its required check to that App's integration ID. Canary same-repository and fork behavior
-before replacing the required deployment.
+Do not grant another account same-repository write access without a focused review of this trust
+model. The dedicated App prevents another writer's ordinary Actions workflow from impersonating
+the semantic gate, but that writer could still propose changes to the trusted default-branch
+workflow and external configuration.
 
 Because this is currently a solo-maintainer repository, required approving reviews remain zero:
 GitHub does not allow a PR author to approve their own PR. The independent frontier model performs
-the semantic review, and the `frontier-reviewed` deployment is its enforced owner attestation.
+the semantic review, and the App-owned check is its enforced owner attestation.
 
-The maintainer has a **pull-request-only** emergency bypass. It is for an Actions outage or a broken
-repository rule that prevents the repair PR from satisfying its own gate. It never permits a direct
-push. Explain the bypass and recovery in the PR before merging; ordinary urgency is not a reason to
-use it.
+The current rulesets have no bypass actor. If a future reviewed change adds an emergency bypass, it
+must be **pull-request-only** and limited to an Actions outage or a broken rule that prevents its own
+repair PR. It must never permit a direct push. Explain the bypass and recovery in the PR before
+merging; ordinary urgency is not a reason to use it.
 
 Required-check and required-environment names are API contracts. To rename one, first land the
 replacement, observe it on a PR, update the ruleset, and only then remove the old requirement in a
@@ -202,4 +252,5 @@ not rerun, replace, or delete its assets. Its preserved GitHub asset digests are
 Changes to event or replay schemas, Git/ref handling, agent permissions, `tactus.toml`, `DESIGN.md`,
 CI, release, rules, or frontier-review attestation deserve an especially narrow PR and a focused
 fresh-context review. A PR can edit ordinary Actions workflows, so the independent review is the
-trust boundary for changes to the gates themselves.
+human trust boundary for changes to the gates themselves; the dedicated App remains the machine
+identity that enforces the resulting exact-SHA verdict.
