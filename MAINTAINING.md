@@ -41,42 +41,16 @@ out of every pull-request workflow. A same-named GitHub Actions check therefore 
 rule. The repository owner remains responsible for the truth of the linked semantic review;
 dispatching without a real passing review is a policy violation.
 
-### App-gate migration
+### App-gate migration record
 
-The original required-deployment gate failed its stale-SHA canary: GitHub reported a pull request
-mergeable after its head changed even though `frontier-reviewed` existed only on the previous SHA.
-That deployment must not remain the semantic gate.
-
-Migrate without opening an unprotected interval:
-
-1. Install the private `Tactus Frontier Review Gate` App only on `keybindings/tactus`, initially
-   with metadata read and checks write permissions and no webhook or event subscriptions. GitHub
-   also requires installation-level commit-statuses write before the App can be selected as the
-   expected source of a required check, but add that only after step 4 secures the key inventory.
-   The workflow token remains down-scoped to checks write throughout.
-2. Put its client id, numeric App id, and private key in the `frontier-check-signer` environment.
-   Give that environment one custom branch policy matching only `master` so a
-   pull-request-authored job cannot receive the key. Do not rely on "protected branches only":
-   GitHub's documentation describes classic branch protection while its branch API also reports a
-   ruleset-protected branch as protected. The exact custom policy avoids that platform ambiguity.
-3. Land the default-branch attestation workflow and fixtures while the existing rules remain in
-   force. During migration the workflow publishes the App check first, then the old deployment as a
-   compatibility gate; an App failure therefore cannot mint the currently required deployment.
-4. Before expanding the App installation permission, generate and store one usable replacement
-   private key, verify the environment secret exists, and revoke every generated key whose PEM is
-   not in the credential inventory. Then add commit-statuses write to the App and approve the
-   installation update.
-5. On a new canary PR, obtain an exact-head frontier review and observe a successful
-   `tactus-frontier-review` check whose `.app.id` is `4574301`.
-6. Add `tactus-frontier-review` to the ruleset as an any-source required check while retaining every
-   existing requirement; read the ruleset back. In a second complete ruleset update, bind that
-   already-required context to App id `4574301` and read it back again. GitHub requires both a
-   recent App check and a pre-existing required context before source binding.
-7. Push a new canary head and prove that the stale check does not unblock it; then review and attest
-   the new head.
-8. Only after the canary passes, remove the `frontier-reviewed` deployment requirement and retire
-   the old deployment writer and its `deployments: write` permission in a cleanup PR. Never remove
-   the deterministic checks during this sequence.
+The original `frontier-reviewed` deployment gate failed its stale-SHA canary: GitHub reported a
+pull request mergeable after its head changed even though the deployment existed only on the
+previous SHA. The replacement was introduced without an unprotected interval: the dedicated App
+first emitted `tactus-frontier-review` alongside the old gate, the ruleset then required that check
+and bound it to App id `4574301`, and a no-tree-change canary proved that the old App check did not
+follow a new commit identity. Only after that proof were the deployment requirement, writer, and
+`deployments: write` permission retired. The App-owned exact-head check is now the sole semantic
+merge gate; do not reintroduce the deployment as an attestation mechanism.
 
 Example dispatch after a passing review:
 
@@ -128,11 +102,9 @@ an expected required-check source; the workflow never requests it in its token. 
 an environment secret, never a repository secret. Only the final trusted `repository_dispatch` job
 declares `frontier-check-signer`; that environment's sole custom branch policy is the exact
 `master` branch. The short-lived installation token explicitly requests only `checks: write` and is
-revoked by the token action at job completion. The same job temporarily retains
-`deployments: write` solely for the old compatibility rule and invokes it only after App check
-creation succeeds; remove that permission with the compatibility writer after the canary. Keep
-approval for workflow runs from **all** external contributors as a second, independent fork
-safeguard.
+revoked by the token action at job completion. The signer job has no deployment-write authority;
+the App-owned check is its only merge-gate output. Keep approval for workflow runs from **all**
+external contributors as a second, independent fork safeguard.
 
 Bootstrap and audit the external configuration through the API. Supply the downloaded PEM on stdin
 so it is never written into a command line, log, tracked file, or pull-request workflow:
