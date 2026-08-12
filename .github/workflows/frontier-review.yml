@@ -92,6 +92,8 @@ jobs:
           # A check run, rather than a legacy status, lets the ruleset bind the
           # required context to the GitHub Actions app. A maintainer PAT cannot
           # forge that app identity by posting a same-named status directly.
+          # All repository workflows share that app identity, however; the
+          # documented solo-owner trust model is therefore still authoritative.
           gh api --method POST "repos/$GITHUB_REPOSITORY/check-runs" \
             -H 'Accept: application/vnd.github+json' \
             -f name=frontier-review \

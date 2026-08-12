@@ -22,11 +22,13 @@ Reviewed head SHA:
 
 Frontier reviewer model and effort:
 
+Review transport and per-pass wall-clock limit:
+
 Passing review evidence URL:
 
 - [ ] `tactus-ci` and `tactus-pr-policy` passed before frontier review began
 - [ ] The independent frontier review used `max` effort on the exact current head
-- [ ] Every finding is fixed or captured as an explicitly approved follow-up
+- [ ] Every actionable finding is fixed; follow-ups contain only non-blocking suggestions or feature ideas
 - [ ] Every review conversation is resolved
 
 ## Risk and rollback

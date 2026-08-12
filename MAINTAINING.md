@@ -18,7 +18,9 @@ contract itself.
 5. Only after both gates are green, give the exact current diff and head SHA to an independent
    frontier-class reviewer at `max` effort. AI-assisted implementation should use a frontier-class
    implementation model at `xhigh` effort or higher. Record the implementation and review model,
-   effort, head SHA, and durable review link in the PR.
+   effort, head SHA, transport, wall-clock limit, and durable review link in the PR. Until Tactus
+   owns this supervision natively, allow at least 90 minutes **per frontier review pass** and use
+   the review CLI's streaming output. A timeout, transport failure, or missing verdict never passes.
 6. Fix every finding. Any code push creates a new head SHA, so return to step 3 and review the new
    head. Feature ideas discovered during review belong in the design or a follow-up unless they are
    required for the current change to be correct.
@@ -33,6 +35,15 @@ The attestation workflow records a review; it does not perform one. The ruleset 
 exact SHA, current mechanical checks, and GitHub Actions identity, but the repository owner remains
 responsible for the truth of the linked semantic review. Dispatching without a real passing review
 is a policy violation.
+
+### Bootstrap exception
+
+The process cannot require a check whose workflow is not on `master` yet. This one bootstrap PR is
+therefore merged only after its deterministic gates and a manually recorded independent frontier
+review pass. After merge, use the licence-correction PR as the canary: run and attest all three
+checks, create the branch ruleset disabled and inspect it, then activate it before merging the
+canary. Create and activate the immutable release-tag ruleset before any release. This exception
+ends once those rules are active; it is not a reusable bypass.
 
 Example dispatch after a passing review:
 
@@ -60,6 +71,20 @@ The default-branch ruleset must:
 
 A separate tag ruleset targeting `refs/tags/v*` must block both updates and deletions with no
 bypass. This makes the release tags described below genuinely immutable.
+
+### Trust boundary
+
+The current repository has one trusted same-repository writer: its owner. GitHub identifies every
+workflow using `GITHUB_TOKEN` as the same GitHub Actions app, so an intentionally malicious
+same-repository workflow could mint a same-named check. The rules prevent accidental direct merges,
+stale-SHA review evidence, PAT-created status spoofing, and unreviewed fork contributions; they do
+not defend against compromise or dishonesty of the owner account itself. The evidence link also
+remains an owner attestation rather than something GitHub can semantically judge.
+
+Do not grant another account same-repository write access under this model. Before doing so, move
+`frontier-review` issuance to a dedicated GitHub App whose credential is unavailable to PR
+workflows, bind the required check to that app's integration ID, and canary fork behavior. The CI
+and PR-policy contexts must be bound explicitly to the GitHub Actions app.
 
 Because this is currently a solo-maintainer repository, required approving reviews remain zero:
 GitHub does not allow a PR author to approve their own PR. The frontier-review check run is the
