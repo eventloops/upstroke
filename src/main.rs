@@ -284,8 +284,11 @@ fn run() -> anyhow::Result<ExitCode> {
         }
         Command::ExportDecisions { run_id, format } => {
             let repo_root = std::env::current_dir().context("resolving current directory")?;
-            let rows = export::load(&repo_root, &run_id)?;
-            export::write(&rows, format, &mut std::io::stdout())?;
+            let loaded = export::load(&repo_root, &run_id)?;
+            for warning in loaded.warnings {
+                eprintln!("warning: {warning}");
+            }
+            export::write(&loaded.rows, format, &mut std::io::stdout())?;
             Ok(ExitCode::SUCCESS)
         }
         Command::Answer {

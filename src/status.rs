@@ -377,7 +377,7 @@ mod tests {
                     adapter: None,
                     preflight_cli_version: None,
                     effort: None,
-                    selection_origin: crate::events::SelectionOrigin::Unknown,
+                    selection_origin: None,
                     tier: "small".to_owned(),
                     agent: "claude-code".to_owned(),
                     model: "claude-haiku-4-5".to_owned(),

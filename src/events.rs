@@ -419,9 +419,10 @@ pub struct AttemptStarted {
     /// Resolved effort passed to the adapter.
     #[serde(default)]
     pub effort: Option<Effort>,
-    /// Why this binding was selected. Old logs did not record this fact.
+    /// Why this binding was selected. `None` means an old log did not record
+    /// this fact; `unknown` deliberately is not a value writers can emit.
     #[serde(default)]
-    pub selection_origin: SelectionOrigin,
+    pub selection_origin: Option<SelectionOrigin>,
     /// The capacity pool this attempt draws on (§13), recorded before the
     /// spawn so an attempt the engine died inside can still be attributed: it
     /// really ran and really drained a subscription, and the settlement record
@@ -549,11 +550,9 @@ pub struct ReviewRecord {
 
 /// Where the worker binding came from. The latter two variants are reserved
 /// for future selectors and deliberately have no producer yet.
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SelectionOrigin {
-    #[default]
-    Unknown,
     Auto,
     Pin,
     UserOverride,
@@ -1389,27 +1388,32 @@ impl EventLog {
 /// corruption: something rewrote history, and deriving state from the
 /// survivors would produce a confident wrong answer. That errors.
 pub fn read_all(path: &Path, warnings: &mut Vec<String>) -> Result<Vec<Event>, TactusError> {
-    let text = match std::fs::read_to_string(path) {
-        Ok(text) => text,
+    let text = read_text(path)?;
+    parse_lines(path, &text, warnings)
+}
+
+/// Read the exact bytes a whole-log consumer will parse. Kept separate so a
+/// consumer that needs a stable snapshot can compare two reads before trusting
+/// the first one.
+pub(crate) fn read_text(path: &Path) -> Result<String, TactusError> {
+    match std::fs::read_to_string(path) {
+        Ok(text) => Ok(text),
         Err(source) if source.kind() == std::io::ErrorKind::NotFound => {
-            return Err(TactusError::EventLog {
+            Err(TactusError::EventLog {
                 path: path.to_path_buf(),
                 message: "no event log here — this run never started, or its directory was \
                           removed"
                     .to_owned(),
-            });
+            })
         }
-        Err(source) => {
-            return Err(TactusError::Io {
-                path: path.to_path_buf(),
-                source,
-            });
-        }
-    };
-    parse_lines(path, &text, warnings)
+        Err(source) => Err(TactusError::Io {
+            path: path.to_path_buf(),
+            source,
+        }),
+    }
 }
 
-fn parse_lines(
+pub(crate) fn parse_lines(
     path: &Path,
     text: &str,
     warnings: &mut Vec<String>,
@@ -1506,17 +1510,7 @@ pub fn replay(
     path: &Path,
 ) -> Result<Replay, TactusError> {
     let started = started_of(&events, path)?.clone();
-    if started.schema > SCHEMA_VERSION {
-        return Err(TactusError::EventLog {
-            path: path.to_path_buf(),
-            message: format!(
-                "written by a newer tactus (event schema {}, this binary understands {}). \
-                 Upgrade rather than replay it — folding a log we only half understand would \
-                 derive the wrong state silently.",
-                started.schema, SCHEMA_VERSION
-            ),
-        });
-    }
+    ensure_supported_schema(&started, path)?;
 
     let mut state = RunState::new(task_ids);
     let mut resumes = 0;
@@ -1532,6 +1526,27 @@ pub fn replay(
         resumes,
         events,
     })
+}
+
+/// Apply the event-schema compatibility boundary shared by every whole-log
+/// interpretation. Additive fields are safe inside the current schema; a
+/// future schema is not something an older binary may silently project.
+pub(crate) fn ensure_supported_schema(
+    started: &RunStarted,
+    path: &Path,
+) -> Result<(), TactusError> {
+    if started.schema > SCHEMA_VERSION {
+        return Err(TactusError::EventLog {
+            path: path.to_path_buf(),
+            message: format!(
+                "written by a newer tactus (event schema {}, this binary understands {}). \
+                 Upgrade rather than interpret it — reading a log we only half understand would \
+                 derive the wrong state silently.",
+                started.schema, SCHEMA_VERSION
+            ),
+        });
+    }
+    Ok(())
 }
 
 /// Incremental reader for `status --follow`.
@@ -1633,7 +1648,7 @@ mod tests {
                 adapter: None,
                 preflight_cli_version: None,
                 effort: None,
-                selection_origin: SelectionOrigin::Unknown,
+                selection_origin: None,
                 tier: tier.to_owned(),
                 agent: "claude-code".to_owned(),
                 model: "model".to_owned(),
@@ -1981,7 +1996,7 @@ mod tests {
     }
 
     #[test]
-    fn selection_origins_round_trip_and_old_starts_stay_unknown() {
+    fn selection_origins_round_trip_and_old_starts_stay_absent() {
         for origin in [
             SelectionOrigin::Auto,
             SelectionOrigin::Pin,
@@ -2009,7 +2024,11 @@ mod tests {
         assert_eq!(data.adapter, None);
         assert_eq!(data.preflight_cli_version, None);
         assert_eq!(data.effort, None);
-        assert_eq!(data.selection_origin, SelectionOrigin::Unknown);
+        assert_eq!(data.selection_origin, None);
+        assert!(
+            serde_json::from_str::<SelectionOrigin>("\"unknown\"").is_err(),
+            "unknown is an export-only sentinel"
+        );
 
         let review = ReviewRecord {
             pass: "review".to_owned(),

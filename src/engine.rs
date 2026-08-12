@@ -1791,11 +1791,11 @@ impl Run<'_> {
                         .get(&profile.agent)
                         .map(|caps| caps.version.clone()),
                     effort: profile.effort,
-                    selection_origin: if rung.binding.pinned {
+                    selection_origin: Some(if rung.binding.pinned {
                         events::SelectionOrigin::Pin
                     } else {
                         events::SelectionOrigin::Auto
-                    },
+                    }),
                     pool: pool_option(&profile.pool),
                     resume_session: resume.clone(),
                 },
@@ -8656,7 +8656,10 @@ mod tests {
         assert_eq!(started.adapter.as_deref(), Some("claude-code"));
         assert_eq!(started.preflight_cli_version.as_deref(), Some("0.0.0-fake"));
         assert_eq!(started.effort, Some(Effort::XHigh));
-        assert_eq!(started.selection_origin, events::SelectionOrigin::Auto);
+        assert_eq!(
+            started.selection_origin,
+            Some(events::SelectionOrigin::Auto)
+        );
 
         let review = events
             .iter()
@@ -8706,7 +8709,7 @@ mod tests {
                 _ => None,
             })
             .expect("worker start was emitted");
-        assert_eq!(started.selection_origin, events::SelectionOrigin::Pin);
+        assert_eq!(started.selection_origin, Some(events::SelectionOrigin::Pin));
         assert_eq!(started.effort, Some(Effort::Max));
     }
 
