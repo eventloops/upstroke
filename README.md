@@ -80,6 +80,18 @@ tactus resume <run-id> --budget 30
 Continues a run that was interrupted, ended with tasks parked on questions, or stopped at its
 budget. Budgets are re-read at resume, so raising the ceiling and continuing is one command.
 
+```bash
+tactus export-decisions <run-id>
+tactus export-decisions <run-id> --format csv
+```
+
+Exports one completed run's local routing decisions to stdout, as JSONL by default or RFC
+4180-style CSV. It reads only that run's event log and frozen normalized plan, makes no network
+request, and writes nothing; redirect stdout if you want to keep a file. A run id may be an
+unambiguous prefix. Live runs are refused because their dataset is still moving. Null JSON values,
+empty CSV cells, and `selection_origin: "unknown"` mean an older run did not record that fact—not
+that tactus inferred it from today's plan or configuration.
+
 ### Exit codes
 
 | Code | Meaning |

@@ -34,6 +34,7 @@ pub mod connect;
 pub mod engine;
 pub mod error;
 pub mod events;
+pub mod export;
 pub mod gates;
 pub mod interaction;
 pub mod ir;

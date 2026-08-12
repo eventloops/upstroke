@@ -14,6 +14,7 @@ use tactus::answer::{self, Reply};
 use tactus::capacity;
 use tactus::connect;
 use tactus::engine::{self, RunOutcome};
+use tactus::export::{self, Format as ExportFormat};
 use tactus::interaction::{InteractionMode, RealSleeper};
 use tactus::status;
 use tactus::validate::{self, ValidateOptions};
@@ -109,6 +110,14 @@ enum Command {
         /// Stream events as they are appended, ending when the run finishes
         #[arg(long)]
         follow: bool,
+    },
+    /// Export one settled run's local routing decisions to stdout
+    ExportDecisions {
+        /// Run id, or any unambiguous prefix of one
+        run_id: String,
+        /// Output encoding (default: jsonl)
+        #[arg(long, value_enum, default_value_t = ExportFormat::Jsonl)]
+        format: ExportFormat,
     },
     /// Answer a question a run is parked on (§12)
     Answer {
@@ -271,6 +280,12 @@ fn run() -> anyhow::Result<ExitCode> {
             } else {
                 print!("{}", status::render(&run));
             }
+            Ok(ExitCode::SUCCESS)
+        }
+        Command::ExportDecisions { run_id, format } => {
+            let repo_root = std::env::current_dir().context("resolving current directory")?;
+            let rows = export::load(&repo_root, &run_id)?;
+            export::write(&rows, format, &mut std::io::stdout())?;
             Ok(ExitCode::SUCCESS)
         }
         Command::Answer {
