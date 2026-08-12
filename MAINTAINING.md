@@ -55,14 +55,16 @@ Migrate without opening an unprotected interval:
    Restrict that environment to protected branches so a pull-request-authored job cannot receive
    the key.
 3. Land the default-branch attestation workflow and fixtures while the existing rules remain in
-   force.
+   force. During migration the workflow publishes the App check first, then the old deployment as a
+   compatibility gate; an App failure therefore cannot mint the currently required deployment.
 4. On a new canary PR, obtain an exact-head frontier review and observe a successful
    `tactus-frontier-review` check whose `.app.id` is `4574301`.
 5. Add that App-bound check to the ruleset while retaining every existing requirement. Push a new
    canary head and prove that the stale check does not unblock it; then review and attest the new
    head.
 6. Only after the canary passes, remove the `frontier-reviewed` deployment requirement and retire
-   the old deployment writer. Never remove the deterministic checks during this sequence.
+   the old deployment writer and its `deployments: write` permission in a cleanup PR. Never remove
+   the deterministic checks during this sequence.
 
 Example dispatch after a passing review:
 
@@ -112,8 +114,11 @@ The App is private, installed only on `keybindings/tactus`, and has only metadat
 write. Its private key is an environment secret, never a repository secret. Only the final trusted
 `repository_dispatch` job declares `frontier-check-signer`; that environment accepts protected
 branches only. The short-lived installation token explicitly requests only `checks: write` and is
-revoked by the token action at job completion. Keep approval for workflow runs from **all** external
-contributors as a second, independent fork safeguard.
+revoked by the token action at job completion. The same job temporarily retains
+`deployments: write` solely for the old compatibility rule and invokes it only after App check
+creation succeeds; remove that permission with the compatibility writer after the canary. Keep
+approval for workflow runs from **all** external contributors as a second, independent fork
+safeguard.
 
 Bootstrap and audit the external configuration through the API. Supply the downloaded PEM on stdin
 so it is never written into a command line, log, tracked file, or pull-request workflow:
