@@ -1,26 +1,16 @@
 name: Record frontier review attestation
 
 on:
-  workflow_dispatch:
-    inputs:
-      pull_request:
-        description: Pull request number
-        required: true
-        type: string
-      reviewed_sha:
-        description: Full head SHA reviewed by the frontier model
-        required: true
-        type: string
-      review_url:
-        description: Link to the passing review evidence on the pull request
-        required: true
-        type: string
+  # Unlike workflow_dispatch, repository_dispatch cannot select a feature-branch
+  # copy of this privileged workflow. GitHub always executes the version on the
+  # default branch.
+  repository_dispatch:
+    types: [frontier-review]
 
 permissions:
-  checks: read
+  checks: write
   contents: read
   pull-requests: read
-  statuses: write
 
 jobs:
   attest:
@@ -29,9 +19,10 @@ jobs:
     timeout-minutes: 5
     env:
       GH_TOKEN: ${{ github.token }}
-      PR_NUMBER: ${{ inputs.pull_request }}
-      REVIEWED_SHA: ${{ inputs.reviewed_sha }}
-      REVIEW_URL: ${{ inputs.review_url }}
+      DISPATCH_ACTOR: ${{ github.actor }}
+      PR_NUMBER: ${{ github.event.client_payload.pull_request }}
+      REVIEWED_SHA: ${{ github.event.client_payload.reviewed_sha }}
+      REVIEW_URL: ${{ github.event.client_payload.review_url }}
     steps:
       - name: Verify review preconditions and attest exact head
         shell: bash
@@ -52,10 +43,18 @@ jobs:
             exit 1
           fi
 
+          repository="$(gh api "repos/$GITHUB_REPOSITORY")"
+          repository_owner="$(jq -r '.owner.login' <<< "$repository")"
+          default_branch="$(jq -r '.default_branch' <<< "$repository")"
+          if [[ "${DISPATCH_ACTOR,,}" != "${repository_owner,,}" ]]; then
+            echo "only repository owner $repository_owner may attest a frontier review" >&2
+            exit 1
+          fi
+
           pr="$(gh api "repos/$GITHUB_REPOSITORY/pulls/$PR_NUMBER")"
           state="$(jq -r '.state' <<< "$pr")"
           head_sha="$(jq -r '.head.sha' <<< "$pr")"
-          base_sha="$(jq -r '.base.sha' <<< "$pr")"
+          base_ref="$(jq -r '.base.ref' <<< "$pr")"
 
           if [[ "$state" != "open" ]]; then
             echo "pull request #$PR_NUMBER is not open" >&2
@@ -65,27 +64,40 @@ jobs:
             echo "reviewed SHA $REVIEWED_SHA is not current head $head_sha" >&2
             exit 1
           fi
+          if [[ "$base_ref" != "$default_branch" ]]; then
+            echo "pull request targets $base_ref, not default branch $default_branch" >&2
+            exit 1
+          fi
 
-          behind_by="$(gh api "repos/$GITHUB_REPOSITORY/compare/$base_sha...$head_sha" --jq '.behind_by')"
+          behind_by="$(gh api \
+            "repos/$GITHUB_REPOSITORY/compare/$default_branch...$head_sha" \
+            --jq '.behind_by')"
           if [[ "$behind_by" != "0" ]]; then
             echo "pull request head is $behind_by commit(s) behind its base" >&2
             exit 1
           fi
 
-          checks="$(gh api -H 'Accept: application/vnd.github+json' \
-            "repos/$GITHUB_REPOSITORY/commits/$head_sha/check-runs?per_page=100")"
           for required_check in tactus-ci tactus-pr-policy; do
-            passed="$(jq --arg name "$required_check" \
-              '[.check_runs[] | select(.name == $name and .conclusion == "success")] | length' \
+            checks="$(gh api -H 'Accept: application/vnd.github+json' \
+              "repos/$GITHUB_REPOSITORY/commits/$head_sha/check-runs?check_name=$required_check&filter=latest&per_page=100")"
+            conclusion="$(jq -r --arg name "$required_check" \
+              '[.check_runs[] | select(.name == $name and .app.id == 15368)] | max_by(.id) | .conclusion // "missing"' \
               <<< "$checks")"
-            if [[ "$passed" == "0" ]]; then
-              echo "$required_check has not passed on $head_sha" >&2
+            if [[ "$conclusion" != "success" ]]; then
+              echo "latest GitHub Actions $required_check conclusion is $conclusion on $head_sha" >&2
               exit 1
             fi
           done
 
-          gh api --method POST "repos/$GITHUB_REPOSITORY/statuses/$head_sha" \
-            -f state=success \
-            -f context=frontier-review \
-            -f description="Frontier review passed for this exact head" \
-            -f target_url="$REVIEW_URL"
+          # A check run, rather than a legacy status, lets the ruleset bind the
+          # required context to the GitHub Actions app. A maintainer PAT cannot
+          # forge that app identity by posting a same-named status directly.
+          gh api --method POST "repos/$GITHUB_REPOSITORY/check-runs" \
+            -H 'Accept: application/vnd.github+json' \
+            -f name=frontier-review \
+            -f head_sha="$head_sha" \
+            -f status=completed \
+            -f conclusion=success \
+            -f details_url="$REVIEW_URL" \
+            -f 'output[title]=Independent frontier review passed' \
+            -f "output[summary]=Reviewed exact head $head_sha after current mechanical gates passed. Evidence: $REVIEW_URL"
