@@ -223,7 +223,11 @@ fn review_echo(plan: &ReviewPlan) -> String {
     let Some(primary) = &plan.primary else {
         return "review: disabled ([routing] review = { enabled = false })".to_owned();
     };
-    let mut line = format!("review: {}", primary.describe());
+    let mut line = format!(
+        "review: {} ({}s independent timeout per pass)",
+        primary.describe(),
+        plan.pass_timeout_secs
+    );
     match &plan.alternative {
         Some(alt) => line.push_str(&format!(
             " (tasks it implements itself would be reviewed by {} instead, if installed)",

@@ -155,7 +155,9 @@ repo runs with zero config.
 ```toml
 [routing]
 fix = { chain = ["small", "mid", "frontier"], attempts_per = 2 }
-review = { tier = "frontier" }        # or { enabled = false }
+review = { tier = "frontier", timeout_secs = 5400 }
+                                        # timeout is per pass and includes one format re-ask;
+                                        # or use { enabled = false }
 
 [routing.effort]
 implementation = "xhigh"              # every worker attempt, regardless of tier

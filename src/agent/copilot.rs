@@ -580,7 +580,7 @@ mod tests {
     fn the_prompt_travels_on_stdin_and_never_as_an_argument() {
         // GitHub documents that piped input is ignored when `-p` is given, so
         // passing both would send an empty task. Stdin is also the only
-        // delivery a 60 KB review prompt survives through a Windows cmd shim.
+        // delivery a complete review prompt survives through a Windows cmd shim.
         let args = build_args(&task_run());
         assert!(
             !args.iter().any(|a| a == "-p" || a.starts_with("--prompt")),

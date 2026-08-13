@@ -49,6 +49,15 @@ pub fn run_with_timeout(
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
 
+    // A supervised Unix invocation owns a fresh process group. Vendor CLIs
+    // routinely launch native children; killing only the shell/Node parent
+    // leaves those children consuming quota and holding our pipe handles.
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        command.process_group(0);
+    }
+
     let started = Instant::now();
     let mut child = command.spawn().map_err(|e| TactusError::Agent {
         message: format!(
@@ -85,6 +94,7 @@ pub fn run_with_timeout(
                 thread::sleep(Duration::from_millis(50));
             }
             Err(e) => {
+                kill_tree(&mut child);
                 return Err(TactusError::Agent {
                     message: format!("waiting on agent process: {e}"),
                 });
@@ -131,6 +141,12 @@ fn kill_tree(child: &mut Child) {
         let _ = Command::new("taskkill")
             .args(["/F", "/T", "/PID", &pid])
             .output();
+    }
+    #[cfg(unix)]
+    if let Ok(pid) = i32::try_from(child.id()) {
+        // SAFETY: `run_with_timeout` put this child in a new process group
+        // whose id is the child's pid. A negative pid targets that group only.
+        let _ = unsafe { libc::kill(-pid, libc::SIGKILL) };
     }
     let _ = child.kill();
     let _ = child.wait();
@@ -240,6 +256,30 @@ mod tests {
             started.elapsed() < Duration::from_secs(10),
             "supervisor returned promptly, no orphan stall: {:?}",
             started.elapsed()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn timeout_kills_a_background_grandchild_before_it_can_escape() {
+        let marker = std::env::temp_dir().join(format!(
+            "tactus-proc-tree-{}-{}.marker",
+            std::process::id(),
+            std::thread::current().name().unwrap_or("unnamed")
+        ));
+        let _ = std::fs::remove_file(&marker);
+
+        let mut command = shell("(sleep 1; printf leaked > \"$TACTUS_MARKER\") & wait");
+        command.env("TACTUS_MARKER", &marker);
+        let out = run_with_timeout(command, "", Duration::from_millis(200)).expect("spawn shell");
+        assert!(out.timed_out);
+
+        thread::sleep(Duration::from_millis(1300));
+        let leaked = marker.exists();
+        let _ = std::fs::remove_file(&marker);
+        assert!(
+            !leaked,
+            "the timed-out process group's background grandchild survived"
         );
     }
 

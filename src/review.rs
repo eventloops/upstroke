@@ -38,7 +38,7 @@
 
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -51,11 +51,10 @@ use crate::ir::{Effort, OutcomeStatus, PermissionMode, Plan, Task, Tier, Verdict
 use crate::route::ResolvedChain;
 use crate::util;
 
-/// Diff bytes shown to the reviewer. `git diff` orders files by path, so an
-/// oversized diff keeps its tail — the alphabetically later paths — and the
-/// reviewer is told what happened. A task changing more than this is beyond
-/// what one review can meaningfully judge anyway.
-pub const MAX_DIFF_BYTES: usize = 60 * 1024;
+/// Largest complete diff one review pass accepts. Silently omitting files is
+/// never a review: work above this bound is refused before model spend and must
+/// be split into a smaller task.
+pub const MAX_DIFF_BYTES: usize = 1024 * 1024;
 
 /// What one review pass is looking for, and how its artifacts are named.
 ///
@@ -151,9 +150,15 @@ pub struct ReviewPass {
 /// task id, which is safe for the same reason `Progress` is: a resume refuses
 /// outright when the plan hash or the resolved chains moved, so the task list
 /// this was built against and the one it is read back against are the same list.
-#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct ReviewPlan {
+    /// Independent wall-clock budget for each pass, including its one
+    /// verdict-format re-ask. Seconds keep the event record plain and stable.
+    /// This is additive within event schema 2: an older binary falls back to
+    /// its shorter legacy timeout and can only defer/park fail-closed; it can
+    /// never accept work without a completed verdict.
+    pub pass_timeout_secs: u64,
     /// `None` ⟺ `[routing] review = { enabled = false }`. Anything else that
     /// fails to resolve is an error, never an empty plan.
     pub primary: Option<PassBinding>,
@@ -166,7 +171,29 @@ pub struct ReviewPlan {
     pub second_opinion: Vec<Option<PassBinding>>,
 }
 
+impl Default for ReviewPlan {
+    fn default() -> Self {
+        Self {
+            pass_timeout_secs: crate::config::DEFAULT_REVIEW_PASS_TIMEOUT.as_secs(),
+            primary: None,
+            alternative: None,
+            second_opinion: Vec::new(),
+        }
+    }
+}
+
 impl ReviewPlan {
+    /// Validate and materialize the timeout recorded for this run. A corrupt
+    /// zero must fail closed on resume rather than disabling supervision.
+    pub fn pass_timeout(&self) -> Result<Duration, TactusError> {
+        if self.pass_timeout_secs == 0 {
+            return Err(TactusError::Refused {
+                message: "the recorded review plan has pass_timeout_secs = 0; a review pass must have a positive wall-clock budget".to_owned(),
+            });
+        }
+        Ok(Duration::from_secs(self.pass_timeout_secs))
+    }
+
     /// Every agent that could be asked to judge something — the set pre-flight
     /// must probe, deduped and stable.
     pub fn agents(&self) -> Vec<&str> {
@@ -400,6 +427,7 @@ pub fn plan_for(
     }
 
     let resolved = ReviewPlan {
+        pass_timeout_secs: cfg.review_pass_timeout.as_secs(),
         primary: Some(primary),
         alternative,
         second_opinion,
@@ -500,6 +528,11 @@ pub fn profile_for(agent: &str, model: &str, name: &str, effort: Effort) -> Work
 }
 
 pub fn run_review(cx: &ReviewCx<'_>) -> Result<ReviewOutcome, TactusError> {
+    // Validate the complete evidence before permission files are written or an
+    // adapter can build/spawn a model command. An incomplete review is no
+    // review, so large tasks fail closed rather than losing early paths.
+    let full_prompt = materialize_prompt(cx)?;
+    let started = Instant::now();
     // Reviewers run nothing: no gate commands, no edit tools (§20).
     let suffix = cx.lens.file_suffix();
     let settings_path = cx.adapter.materialize_permissions(
@@ -521,9 +554,9 @@ pub fn run_review(cx: &ReviewCx<'_>) -> Result<ReviewOutcome, TactusError> {
         // verdict from an agent that read nothing is worthless — so re-send
         // the whole prompt rather than asking it to invent an answer.
         let prompt = match (invocation, &resume) {
-            (1, _) => materialize_prompt(cx),
+            (1, _) => full_prompt.clone(),
             (_, Some(_)) => REASK_PROMPT.to_owned(),
-            (_, None) => format!("{}\n{REASK_PROMPT}", materialize_prompt(cx)),
+            (_, None) => format!("{full_prompt}\n{REASK_PROMPT}"),
         };
         let task_run = TaskRun {
             prompt,
@@ -537,8 +570,23 @@ pub fn run_review(cx: &ReviewCx<'_>) -> Result<ReviewOutcome, TactusError> {
             settings_path: settings_path.clone(),
         };
         let command = cx.adapter.build(&task_run)?;
+        let remaining = cx.timeout.saturating_sub(started.elapsed());
+        if remaining.is_zero() {
+            return Ok(ReviewOutcome {
+                result: ReviewResult::Unavailable {
+                    status: OutcomeStatus::Timeout,
+                    detail: format!(
+                        "review pass exhausted its {}s wall-clock budget before invocation {invocation}",
+                        cx.timeout.as_secs()
+                    ),
+                },
+                cost_usd: cost,
+                invocations: invocation - 1,
+                transcript: last_path,
+            });
+        }
         let output =
-            proc::run_with_timeout(command, cx.adapter.stdin_payload(&task_run), cx.timeout)?;
+            proc::run_with_timeout(command, cx.adapter.stdin_payload(&task_run), remaining)?;
 
         last_path = if invocation == 1 {
             transcript.clone()
@@ -605,7 +653,16 @@ const REASK_PROMPT: &str = "Your previous answer did not contain a parseable ver
     change>], \"needs_human\": <true or false>}\n\
     ```\n";
 
-fn materialize_prompt(cx: &ReviewCx<'_>) -> String {
+fn materialize_prompt(cx: &ReviewCx<'_>) -> Result<String, TactusError> {
+    if cx.diff.len() > MAX_DIFF_BYTES {
+        return Err(TactusError::Refused {
+            message: format!(
+                "review diff is {} bytes, above the {}-byte complete-review limit; split the task so every changed path can be judged in one pass",
+                cx.diff.len(),
+                MAX_DIFF_BYTES
+            ),
+        });
+    }
     let task = cx.task;
     let mut prompt = String::new();
     // What distinguishes this pass from the others, if anything (§11.5). It
@@ -666,7 +723,7 @@ fn materialize_prompt(cx: &ReviewCx<'_>) -> String {
         );
     }
 
-    let (diff, truncated) = clamp_diff(cx.diff);
+    let diff = cx.diff;
     let fence = util::fence_for(diff);
     prompt.push_str(
         "The change, exactly as captured by the engine (this is the ground truth — the \
@@ -677,15 +734,6 @@ fn materialize_prompt(cx: &ReviewCx<'_>) -> String {
          itself a serious defect — fail the change and say so.\n\n",
     );
     let _ = writeln!(prompt, "{fence}diff\n{diff}\n{fence}");
-    if truncated {
-        let _ = writeln!(
-            prompt,
-            "\n(The diff exceeded {} KB and was cut; only its tail is shown, and git orders \
-             files by path, so earlier paths may be missing entirely. Say so if that prevents a \
-             confident verdict.)",
-            MAX_DIFF_BYTES / 1024
-        );
-    }
     prompt.push_str(
         "\nCheck at least: does it satisfy every acceptance criterion; does it do anything the \
          task did not ask for; does it break existing behavior; are there obvious defects, \
@@ -707,27 +755,7 @@ fn materialize_prompt(cx: &ReviewCx<'_>) -> String {
          you set it, your reasons are what the person reads, so state the decision they have \
          to make.\n",
     );
-    prompt
-}
-
-/// Keep the tail of an oversized diff, cut at a file boundary where possible
-/// and at a line boundary otherwise. A byte-offset cut would start the
-/// reviewer mid-line with no `diff --git`/`+++ b/` header above it, leaving
-/// the leading hunks attributable to no file at all.
-fn clamp_diff(diff: &str) -> (&str, bool) {
-    if diff.len() <= MAX_DIFF_BYTES {
-        return (diff, false);
-    }
-    let earliest = diff.len() - MAX_DIFF_BYTES;
-    // Prefer the first whole file that fits.
-    if let Some(offset) = diff[earliest..].find("\ndiff --git ") {
-        return (&diff[earliest + offset + 1..], true);
-    }
-    // Otherwise at least start on a whole line.
-    match diff[earliest..].find('\n') {
-        Some(offset) => (&diff[earliest + offset + 1..], true),
-        None => ("", true),
-    }
+    Ok(prompt)
 }
 
 fn add_cost(current: Option<f64>, extra: Option<f64>) -> Option<f64> {
@@ -839,6 +867,128 @@ fn string_list(value: Option<&Value>) -> Vec<String> {
 mod tests {
     use super::*;
     use crate::ir::{TaskId, TaskKind};
+
+    /// Any adapter contact is a test failure. Used to prove evidence-size
+    /// refusal happens before permission materialization, command build, or
+    /// model spend.
+    struct NeverInvokedAdapter;
+
+    impl AgentAdapter for NeverInvokedAdapter {
+        fn id(&self) -> &'static str {
+            "never-invoked"
+        }
+
+        fn probe(&self) -> Result<crate::agent::Caps, TactusError> {
+            panic!("oversized review must refuse before probing")
+        }
+
+        fn build(&self, _run: &TaskRun) -> Result<std::process::Command, TactusError> {
+            panic!("oversized review must refuse before command build")
+        }
+
+        fn parse(
+            &self,
+            _out: &crate::agent::ProcessOutput,
+        ) -> Result<crate::ir::Outcome, TactusError> {
+            panic!("oversized review must refuse before parse")
+        }
+
+        fn materialize_permissions(
+            &self,
+            _profile: &WorkerProfile,
+            _gate_cmds: &[String],
+            _dir: &Path,
+            _stem: &str,
+        ) -> Result<Option<PathBuf>, TactusError> {
+            panic!("oversized review must refuse before permission materialization")
+        }
+    }
+
+    struct DeadlineAdapter {
+        builds: std::sync::atomic::AtomicUsize,
+    }
+
+    impl DeadlineAdapter {
+        fn new() -> Self {
+            Self {
+                builds: std::sync::atomic::AtomicUsize::new(0),
+            }
+        }
+    }
+
+    impl AgentAdapter for DeadlineAdapter {
+        fn id(&self) -> &'static str {
+            "deadline-test"
+        }
+
+        fn probe(&self) -> Result<crate::agent::Caps, TactusError> {
+            panic!("direct review test does not probe")
+        }
+
+        fn build(&self, _run: &TaskRun) -> Result<std::process::Command, TactusError> {
+            use std::sync::atomic::Ordering;
+
+            let invocation = self.builds.fetch_add(1, Ordering::SeqCst);
+            let (marker, delay_ms) = if invocation == 0 {
+                ("first-unparseable", "400")
+            } else {
+                ("second-valid", "750")
+            };
+            let mut command = std::process::Command::new(
+                std::env::current_exe().expect("current test executable"),
+            );
+            command.args([
+                "--exact",
+                "review::tests::review_deadline_helper",
+                "--nocapture",
+            ]);
+            command.env("TACTUS_REVIEW_DEADLINE_HELPER", marker);
+            command.env("TACTUS_REVIEW_DEADLINE_MS", delay_ms);
+            Ok(command)
+        }
+
+        fn parse(
+            &self,
+            out: &crate::agent::ProcessOutput,
+        ) -> Result<crate::ir::Outcome, TactusError> {
+            let (status, detail) = if out.timed_out {
+                (OutcomeStatus::Timeout, Some("deadline expired".to_owned()))
+            } else if out.stdout.contains("first-unparseable") {
+                (OutcomeStatus::Completed, Some("no verdict here".to_owned()))
+            } else {
+                (
+                    OutcomeStatus::Completed,
+                    Some(
+                        "```json\n{\"pass\": true, \"reasons\": [], \"required_changes\": []}\n```"
+                            .to_owned(),
+                    ),
+                )
+            };
+            Ok(crate::ir::Outcome {
+                status,
+                diff: String::new(),
+                detail,
+                session_id: Some("deadline-test-session".to_owned()),
+                usage: None,
+                cost_usd: None,
+                transcript_path: PathBuf::new(),
+                duration: out.duration,
+            })
+        }
+    }
+
+    #[test]
+    fn review_deadline_helper() {
+        let Ok(marker) = std::env::var("TACTUS_REVIEW_DEADLINE_HELPER") else {
+            return;
+        };
+        let delay_ms = std::env::var("TACTUS_REVIEW_DEADLINE_MS")
+            .expect("helper delay")
+            .parse::<u64>()
+            .expect("numeric helper delay");
+        std::thread::sleep(Duration::from_millis(delay_ms));
+        println!("{marker}");
+    }
 
     fn task() -> Task {
         Task {
@@ -993,7 +1143,7 @@ mod tests {
             stem: "00-t1-1".to_owned(),
             timeout: Duration::from_secs(60),
         };
-        let prompt = materialize_prompt(&cx);
+        let prompt = materialize_prompt(&cx).expect("prompt");
         assert!(prompt.contains("\"needs_human\""), "in the schema");
         assert!(prompt.contains("not an escape hatch"));
         assert!(
@@ -1031,7 +1181,7 @@ mod tests {
             stem: "00-t1-1".to_owned(),
             timeout: Duration::from_secs(60),
         };
-        let prompt = materialize_prompt(&cx);
+        let prompt = materialize_prompt(&cx).expect("prompt");
         assert!(
             prompt.contains(&decisions[0]),
             "the answer itself: {prompt}"
@@ -1048,7 +1198,7 @@ mod tests {
         // text near it: with nothing settled, none of it appears.
         let mut bare = cx;
         bare.decisions = &[];
-        let plain = materialize_prompt(&bare);
+        let plain = materialize_prompt(&bare).expect("prompt");
         assert!(!plain.contains("decision from a person"), "{plain}");
     }
 
@@ -1078,7 +1228,7 @@ mod tests {
             stem: "00-t1".to_owned(),
             timeout: Duration::from_secs(60),
         };
-        let prompt = materialize_prompt(&cx);
+        let prompt = materialize_prompt(&cx).expect("prompt");
         assert!(prompt.contains("READ-ONLY"));
         assert!(prompt.contains("find reasons this change should NOT be accepted"));
         assert!(prompt.contains("Cursors round-trip"), "acceptance included");
@@ -1092,36 +1242,44 @@ mod tests {
     }
 
     #[test]
-    fn oversized_diffs_keep_the_tail_and_cut_on_a_file_boundary() {
-        // Distinguishable lines, so the test can tell WHICH end survived —
-        // identical filler would pass whichever half the code kept.
-        let mut huge = String::new();
-        for file in 0..400 {
-            let _ = writeln!(huge, "diff --git a/f{file}.rs b/f{file}.rs");
-            let _ = writeln!(huge, "+++ b/f{file}.rs");
-            for line in 0..12 {
-                let _ = writeln!(huge, "+let marker_{file}_{line} = {line};");
-            }
-        }
-        assert!(huge.len() > MAX_DIFF_BYTES);
-
-        let (clamped, truncated) = clamp_diff(&huge);
-        assert!(truncated);
-        assert!(clamped.len() <= MAX_DIFF_BYTES, "actually within the cap");
-        assert!(
-            clamped.starts_with("diff --git "),
-            "cut on a file boundary so every hunk has its header: {:?}",
-            &clamped[..60.min(clamped.len())]
+    fn broad_diffs_keep_every_file_in_the_review_prompt() {
+        // This is larger than the old 60 KiB truncation threshold but safely
+        // below the complete-review limit. Both ends must survive.
+        let filler = "+let unchanged_context = 1;\n".repeat(2_500);
+        let broad = format!(
+            "diff --git a/first.rs b/first.rs\n+++ b/first.rs\n+FIRST_FILE_MARKER\n\
+             {filler}\
+             diff --git a/last.rs b/last.rs\n+++ b/last.rs\n+LAST_FILE_MARKER\n"
         );
-        assert!(clamped.contains("marker_399_11"), "the tail survives");
-        assert!(
-            !clamped.contains("marker_0_0"),
-            "the head is what was dropped"
-        );
-
+        assert!(broad.len() > 60 * 1024, "exercise the old defect");
+        assert!(broad.len() < MAX_DIFF_BYTES);
         let task = task();
         let cx = ReviewCx {
             adapter: &crate::agent::claude::ClaudeCodeAdapter,
+            profile: profile_for("claude-code", "claude-opus-5", "review", Effort::High),
+            lens: Lens::Acceptance,
+            task: &task,
+            diff: &broad,
+            artifacts: &[],
+            decisions: &[],
+            workspace: Path::new("."),
+            settings_dir: Path::new("."),
+            reviews_dir: Path::new("."),
+            stem: "00-t1-1".to_owned(),
+            timeout: Duration::from_secs(60),
+        };
+        let prompt = materialize_prompt(&cx).expect("prompt");
+        assert!(prompt.contains("FIRST_FILE_MARKER"));
+        assert!(prompt.contains("LAST_FILE_MARKER"));
+        assert!(!prompt.contains("was cut"));
+    }
+
+    #[test]
+    fn an_over_limit_diff_is_refused_instead_of_partially_reviewed() {
+        let task = task();
+        let huge = "x".repeat(MAX_DIFF_BYTES + 1);
+        let cx = ReviewCx {
+            adapter: &NeverInvokedAdapter,
             profile: profile_for("claude-code", "claude-opus-5", "review", Effort::High),
             lens: Lens::Acceptance,
             task: &task,
@@ -1134,19 +1292,47 @@ mod tests {
             stem: "00-t1-1".to_owned(),
             timeout: Duration::from_secs(60),
         };
-        let prompt = materialize_prompt(&cx);
-        assert!(prompt.contains("was cut"), "truncation disclosed");
-        assert!(
-            prompt.contains("orders files by path"),
-            "and why it matters"
-        );
-        assert!(prompt.len() < huge.len(), "prompt actually smaller");
+        let error = run_review(&cx).expect_err("oversized review must fail closed");
+        let message = error.to_string();
+        assert!(message.contains("complete-review limit"), "{message}");
+        assert!(message.contains("split the task"), "{message}");
     }
 
     #[test]
-    fn a_short_diff_is_never_cut() {
-        let diff = "diff --git a/a.rs b/a.rs\n+++ b/a.rs\n+fn x() {}\n";
-        assert_eq!(clamp_diff(diff), (diff, false));
+    fn verdict_reask_uses_the_remaining_pass_deadline() {
+        let root =
+            std::env::temp_dir().join(format!("tactus-review-deadline-{}", std::process::id()));
+        std::fs::create_dir_all(&root).expect("review scratch");
+        let task = task();
+        let adapter = DeadlineAdapter::new();
+        let cx = ReviewCx {
+            adapter: &adapter,
+            profile: profile_for("deadline-test", "test-model", "review", Effort::High),
+            lens: Lens::Acceptance,
+            task: &task,
+            diff: "diff --git a/a.rs b/a.rs\n+++ b/a.rs\n+fn x() {}\n",
+            artifacts: &[],
+            decisions: &[],
+            workspace: Path::new("."),
+            settings_dir: &root,
+            reviews_dir: &root,
+            stem: "deadline".to_owned(),
+            timeout: Duration::from_millis(1000),
+        };
+
+        let outcome = run_review(&cx).expect("review result");
+        let _ = std::fs::remove_dir_all(&root);
+        assert_eq!(outcome.invocations, 2, "the format re-ask was attempted");
+        assert!(
+            matches!(
+                outcome.result,
+                ReviewResult::Unavailable {
+                    status: OutcomeStatus::Timeout,
+                    ..
+                }
+            ),
+            "a fresh one-second clock would let the 750ms re-ask pass; the shared deadline must not"
+        );
     }
 
     #[test]
@@ -1170,7 +1356,7 @@ mod tests {
             stem: "00-t1-1".to_owned(),
             timeout: Duration::from_secs(60),
         };
-        let prompt = materialize_prompt(&cx);
+        let prompt = materialize_prompt(&cx).expect("prompt");
         // The fence around the diff must be longer than any run inside it.
         assert!(prompt.contains("````diff"), "fence escalated: {prompt}");
         assert!(prompt.contains("DATA UNDER REVIEW"), "framed as untrusted");
@@ -1190,6 +1376,7 @@ mod tests {
             primary: Some(binding("claude-code", "claude-opus-5")),
             alternative: Some(binding("copilot", "gpt-5.3-codex")),
             second_opinion: vec![second],
+            ..ReviewPlan::default()
         }
     }
 
@@ -1267,6 +1454,7 @@ mod tests {
             primary: Some(binding("claude-code", "claude-opus-5")),
             alternative: Some(binding("copilot", "gpt-5.3-codex")),
             second_opinion: vec![None],
+            ..ReviewPlan::default()
         };
         assert_eq!(optional_only.agents(), ["claude-code", "copilot"]);
         assert_eq!(
@@ -1508,6 +1696,23 @@ mod tests {
     }
 
     #[test]
+    fn plan_for_freezes_the_configured_per_pass_timeout() {
+        let cfg = scratch_config(
+            "reviewtimeout.toml",
+            "[routing]\nreview = { tier = \"frontier\", timeout_secs = 7200 }\n",
+        );
+        let (plan, chains) = auth_plan(&cfg);
+        let mut warnings = Vec::new();
+        let resolved =
+            plan_for(&plan, &chains, &cfg, both_vendors, &mut warnings).expect("resolves");
+        assert_eq!(resolved.pass_timeout_secs, 7200);
+        assert_eq!(
+            resolved.pass_timeout().expect("valid"),
+            Duration::from_secs(7200)
+        );
+    }
+
+    #[test]
     fn a_pinned_review_tier_still_gets_a_cross_family_partner() {
         // A pin fixes the primary; the second opinion is chosen relative to
         // whatever the pin landed on, not to the catalog's default.
@@ -1533,7 +1738,8 @@ mod tests {
     fn the_recorded_plan_survives_the_wire() {
         // It rides on `run_started`, so a resume reads back exactly what the
         // run resolved (§15).
-        let plan = plan_with(Some(binding("copilot", "gpt-5.3-codex")));
+        let mut plan = plan_with(Some(binding("copilot", "gpt-5.3-codex")));
+        plan.pass_timeout_secs = 7200;
         let json = serde_json::to_string(&plan).expect("serialize");
         let back: ReviewPlan = serde_json::from_str(&json).expect("deserialize");
         assert_eq!(back, plan);
@@ -1541,6 +1747,20 @@ mod tests {
         // A log written before step 9 has no such field at all.
         let empty: ReviewPlan = serde_json::from_str("{}").expect("absent field defaults");
         assert_eq!(empty, ReviewPlan::default());
+        assert_eq!(
+            empty.pass_timeout_secs,
+            crate::config::DEFAULT_REVIEW_PASS_TIMEOUT.as_secs(),
+            "legacy plans adopt the safe default rather than a zero-duration pass"
+        );
+
+        let corrupt = ReviewPlan {
+            pass_timeout_secs: 0,
+            ..ReviewPlan::default()
+        };
+        assert!(
+            corrupt.pass_timeout().is_err(),
+            "a corrupt recorded zero fails closed on resume"
+        );
     }
 
     #[test]
@@ -1565,7 +1785,7 @@ mod tests {
             stem: "00-t1-1".to_owned(),
             timeout: Duration::from_secs(60),
         };
-        let prompt = materialize_prompt(&cx);
+        let prompt = materialize_prompt(&cx).expect("prompt");
         assert!(prompt.contains("two independent reviewers"));
         assert!(
             prompt.contains("not told its verdict"),
@@ -1582,7 +1802,7 @@ mod tests {
         // And the acceptance pass is unchanged by any of it.
         let mut plain = cx;
         plain.lens = Lens::Acceptance;
-        let baseline = materialize_prompt(&plain);
+        let baseline = materialize_prompt(&plain).expect("prompt");
         assert!(!baseline.contains("two independent reviewers"));
         assert!(baseline.starts_with("You are reviewing one task's changes"));
     }

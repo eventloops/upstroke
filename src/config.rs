@@ -139,6 +139,10 @@ struct RawKindRouting {
     chain: Option<Vec<Tier>>,
     tier: Option<Tier>,
     attempts_per: Option<u32>,
+    /// `[routing] review = { timeout_secs = 5400 }`. Kept on this raw shape
+    /// because `review` shares the routing table with task kinds; rejected on
+    /// task-kind entries below so a misplaced timeout is never ignored.
+    timeout_secs: Option<u64>,
     /// `[routing] review = { enabled = false }` — the explicit opt-out of
     /// §11.2 review, for plans where a frontier judgement per task costs more
     /// than the work it is judging.
@@ -331,6 +335,10 @@ pub struct Config {
     pub review_tier: Option<Tier>,
     /// `[routing] review = { enabled = false }` opts out of review entirely.
     pub review_enabled: bool,
+    /// Independent wall-clock allowance for each review pass. Unlike a worker
+    /// attempt timeout this is frozen into [`crate::review::ReviewPlan`], so a
+    /// resume cannot silently adopt a different verification budget.
+    pub review_pass_timeout: Duration,
     /// Explicit role policy. A role setting outranks pin and tier defaults so
     /// `implementation = "xhigh"` really does mean every worker attempt.
     implementation_effort_override: Option<Effort>,
@@ -412,6 +420,10 @@ impl Config {
 
 pub const DEFAULT_ATTEMPTS_PER: u32 = 2;
 
+/// Frontier reviews can legitimately spend tens of minutes reading a broad
+/// diff. This is per pass, including its one verdict-format re-ask.
+pub const DEFAULT_REVIEW_PASS_TIMEOUT: Duration = Duration::from_secs(90 * 60);
+
 /// Derived default escalation chain per kind (DESIGN.md §10.1), used when the
 /// repo config is absent or silent for that kind.
 pub fn default_chain(kind: TaskKind) -> Vec<Tier> {
@@ -480,6 +492,7 @@ pub fn load_with(
     let mut overrides = Vec::new();
     let mut review_tier: Option<Tier> = None;
     let mut review_enabled = true;
+    let mut review_pass_timeout = DEFAULT_REVIEW_PASS_TIMEOUT;
     let mut implementation_effort_override = None;
     let mut review_effort_override = None;
     let mut strategy = Strategy {
@@ -515,7 +528,7 @@ pub fn load_with(
                     let rr: RawKindRouting = value.try_into().map_err(|e| TactusError::Config {
                         path: repo_path.clone(),
                         message: format!(
-                            "routing entry `review`: {e} (expected `tier`, or \
+                            "routing entry `review`: {e} (expected `tier`, `timeout_secs`, or \
                              `enabled = false` to run without review)"
                         ),
                     })?;
@@ -523,6 +536,16 @@ pub fn load_with(
                     review_tier = rr
                         .tier
                         .or_else(|| rr.chain.and_then(|c| c.first().copied()));
+                    if rr.timeout_secs == Some(0) {
+                        return Err(TactusError::Config {
+                            path: repo_path.clone(),
+                            message: "[routing] `review`: timeout_secs must be at least 1; omit it for the default of 5400 seconds".to_owned(),
+                        });
+                    }
+                    review_pass_timeout = rr
+                        .timeout_secs
+                        .map(Duration::from_secs)
+                        .unwrap_or(DEFAULT_REVIEW_PASS_TIMEOUT);
                     continue;
                 }
                 warnings.push(format!(
@@ -541,6 +564,14 @@ pub fn load_with(
                     message: format!(
                         "[routing] `{key}`: attempts_per must be at least 1 — omit it for the \
                          default of {DEFAULT_ATTEMPTS_PER}"
+                    ),
+                });
+            }
+            if kr.timeout_secs.is_some() {
+                return Err(TactusError::Config {
+                    path: repo_path.clone(),
+                    message: format!(
+                        "[routing] `{key}`: timeout_secs applies only to the `review` role"
                     ),
                 });
             }
@@ -700,6 +731,7 @@ pub fn load_with(
         shell,
         review_tier,
         review_enabled,
+        review_pass_timeout,
         implementation_effort_override,
         review_effort_override,
         on_task_failure,
@@ -1225,6 +1257,7 @@ mod tests {
         assert!(cfg.overrides.is_empty());
         assert!(cfg.pins.is_empty());
         assert!(cfg.pools.is_empty());
+        assert_eq!(cfg.review_pass_timeout, DEFAULT_REVIEW_PASS_TIMEOUT);
     }
 
     #[test]
@@ -1250,7 +1283,7 @@ spend_down_after = 0.7
 [routing]
 fix = { chain = ["small", "mid", "frontier"], attempts_per = 3 }
 implement = { tier = "frontier" }
-review = { tier = "frontier" }
+review = { tier = "frontier", timeout_secs = 7200 }
 
 [[routing.overrides]]
 paths = ["src/auth/**", "migrations/**"]
@@ -1289,6 +1322,7 @@ model = "claude-opus-4-8"
         // `review` is a routing role, not a task kind: parsed, echoed, and
         // never warned about (DESIGN §17 configures it in its own example).
         assert_eq!(cfg.review_tier, Some(Tier::Frontier));
+        assert_eq!(cfg.review_pass_timeout, Duration::from_secs(7200));
         assert!(warnings.is_empty(), "warnings: {warnings:?}");
     }
 
@@ -1361,6 +1395,34 @@ model = "claude-opus-4-8"
         let err = load(Some(&path), &hermetic(), Some(&missing()), &mut warnings)
             .expect_err("zero attempts must error");
         assert!(err.to_string().contains("at least 1"), "got: {err}");
+    }
+
+    #[test]
+    fn review_timeout_must_be_positive_and_is_review_only() {
+        let zero = scratch(
+            "zeroreviewtimeout.toml",
+            "[routing]\nreview = { tier = \"frontier\", timeout_secs = 0 }\n",
+        );
+        let mut warnings = Vec::new();
+        let err = load(Some(&zero), &hermetic(), Some(&missing()), &mut warnings)
+            .expect_err("zero review timeout must error");
+        assert!(err.to_string().contains("timeout_secs must be at least 1"));
+
+        let misplaced = scratch(
+            "workerreviewtimeout.toml",
+            "[routing]\nfix = { chain = [\"small\"], timeout_secs = 5400 }\n",
+        );
+        let err = load(
+            Some(&misplaced),
+            &hermetic(),
+            Some(&missing()),
+            &mut warnings,
+        )
+        .expect_err("review timeout on a task kind must error");
+        assert!(
+            err.to_string()
+                .contains("applies only to the `review` role")
+        );
     }
 
     #[test]
@@ -1466,6 +1528,11 @@ effort = "low"
         }
         assert_eq!(cfg.review_tier, Some(Tier::Frontier));
         assert!(cfg.review_enabled);
+        assert_eq!(
+            cfg.review_pass_timeout,
+            Duration::from_secs(5400),
+            "self-hosted max reviews get a full independent 90-minute pass"
+        );
         let effort = cfg.resolved_effort_policy();
         assert_eq!(
             [effort.small, effort.mid, effort.frontier],

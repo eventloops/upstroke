@@ -86,22 +86,6 @@ const MAX_FEEDBACK_ENTRIES: usize = 6;
 /// teaches this marker; nothing else in the engine parses agent prose.
 const QUESTION_MARKER: &str = "TACTUS-QUESTION:";
 
-/// What each review pass gets of the attempt's wall clock.
-///
-/// A reviewer reads a diff and answers — it has no shell and no edit tools, so
-/// it does not need the implementer's budget. Step-6 finding #13 was that
-/// giving it the full one let a single task consume several multiples of the
-/// attempt timeout, and the fix was a quarter.
-///
-/// That quarter is the budget for *review*, not for one reviewer, so it splits
-/// across the passes (§11.3). Otherwise configuring a second opinion would
-/// silently double a bound that was set deliberately. The 60s floor is per
-/// pass, because a budget too small to answer in is not a budget.
-fn review_timeout(attempt_timeout: Duration, passes: usize) -> Duration {
-    let share = attempt_timeout / 4 / u32::try_from(passes.max(1)).unwrap_or(u32::MAX);
-    share.max(Duration::from_secs(60))
-}
-
 #[derive(Debug, Clone)]
 pub struct RunOptions {
     pub plan_path: PathBuf,
@@ -442,6 +426,9 @@ struct Preflight {
     analysis: Analysis,
     caps: BTreeMap<String, Caps>,
     review_plan: ReviewPlan,
+    /// Each pass gets this independent frozen allowance. It comes from the
+    /// review plan rather than today's config on resume.
+    review_pass_timeout: Duration,
     /// The effective gates, in the one shape everything else projects from —
     /// the record, the permission grants, and the report all read this rather
     /// than walking `analysis.gates` again, so they cannot drift apart.
@@ -540,7 +527,18 @@ fn preflight_with_recorded(
     }
 
     let mut review_plan = match recorded.reviews {
-        Some(plan) => plan,
+        Some(plan) => {
+            let configured = analysis.config.review_pass_timeout.as_secs();
+            if plan.pass_timeout_secs != configured {
+                warnings.push(format!(
+                    "today's review pass timeout ({configured}s) differs from the one this run \
+                     recorded ({}s). This resume keeps the recorded timeout so one run has one \
+                     verification standard. Start a new run to adopt today's timeout.",
+                    plan.pass_timeout_secs
+                ));
+            }
+            plan
+        }
         // Resolved against the adapters *this harness* holds, not the built-in
         // registry: the harness is what can actually spawn something, and
         // asking the wrong one would let a preview's answer stand in for a
@@ -553,6 +551,7 @@ fn preflight_with_recorded(
             &mut warnings,
         )?,
     };
+    let review_pass_timeout = review_plan.pass_timeout()?;
 
     // Probe every agent the chains reference; a missing binary is a refusal
     // to start, not a task failure (§19). The capabilities are kept, not
@@ -668,6 +667,7 @@ fn preflight_with_recorded(
         analysis,
         caps,
         review_plan,
+        review_pass_timeout,
         gates,
         gate_cmds,
         warnings,
@@ -693,6 +693,7 @@ fn run_harness_inner(
         analysis,
         caps,
         review_plan,
+        review_pass_timeout,
         gates,
         gate_cmds,
         mut warnings,
@@ -792,6 +793,7 @@ fn run_harness_inner(
         review_plan,
         effort_policy,
         attempt_timeout: opts.attempt_timeout,
+        review_pass_timeout,
         defer_backoff: opts.defer_backoff,
         max_defers: opts.max_defers,
         on_task_failure: analysis.config.on_task_failure,
@@ -1171,6 +1173,7 @@ fn resume_harness_inner(
         analysis,
         caps,
         review_plan,
+        review_pass_timeout,
         gates,
         gate_cmds,
         warnings: preflight_warnings,
@@ -1405,6 +1408,7 @@ fn resume_harness_inner(
         review_plan,
         effort_policy,
         attempt_timeout: opts.attempt_timeout,
+        review_pass_timeout,
         defer_backoff: opts.defer_backoff,
         max_defers: opts.max_defers,
         on_task_failure: analysis.config.on_task_failure,
@@ -1682,6 +1686,9 @@ struct Run<'a> {
     /// passes read this snapshot, including after a resume under changed config.
     effort_policy: ResolvedEffortPolicy,
     attempt_timeout: Duration,
+    /// Independent wall clock for each configured review pass. Frozen in
+    /// `review_plan`, materialized once by pre-flight.
+    review_pass_timeout: Duration,
     defer_backoff: Duration,
     max_defers: u32,
     on_task_failure: OnTaskFailure,
@@ -2022,6 +2029,7 @@ impl Run<'_> {
                     gate_cmds: &self.gate_cmds,
                     reviewers: self.reviewers(index, &profile)?,
                     timeout: self.attempt_timeout,
+                    review_pass_timeout: self.review_pass_timeout,
                     retry,
                     // The same entries the worker prompt quotes as operator
                     // instruction, routed to the judge as well (§12).
@@ -3129,6 +3137,9 @@ struct AttemptCx<'a> {
     /// is switched off explicitly.
     reviewers: Vec<Reviewer<'a>>,
     timeout: Duration,
+    /// Independent allowance for every reviewer in `reviewers`; one pass may
+    /// use it across its initial verdict and one format-only re-ask.
+    review_pass_timeout: Duration,
     /// `None` on the first attempt.
     retry: Option<RetryBrief>,
     /// Answers the operator has given about this task (§12), in the order they
@@ -3253,7 +3264,6 @@ fn run_attempt(
     let mut reviews = Vec::new();
     if failure.is_none() && !cx.reviewers.is_empty() {
         let artifacts = load_artifacts(&cx.paths.artifacts(), cx.task);
-        let budget = review_timeout(cx.timeout, cx.reviewers.len());
         for reviewer in &cx.reviewers {
             let review = review::run_review(&review::ReviewCx {
                 adapter: reviewer.adapter,
@@ -3267,7 +3277,7 @@ fn run_attempt(
                 settings_dir: &cx.paths.settings(),
                 reviews_dir: &cx.paths.reviews(),
                 stem: format!("{}-{}", cx.stem, cx.attempt),
-                timeout: budget,
+                timeout: cx.review_pass_timeout,
             })?;
             let cost_usd = review.cost_usd;
             // Read before the result is consumed: a judge that never ran is not
@@ -5130,21 +5140,6 @@ mod tests {
     }
 
     #[test]
-    fn the_review_budget_is_shared_between_passes_not_doubled_by_them() {
-        // Step-6 finding #13 capped review at a quarter of the attempt. That
-        // cap is for review, not per reviewer — otherwise configuring a second
-        // opinion silently doubles a bound that was chosen deliberately.
-        let attempt = Duration::from_secs(40 * 60);
-        assert_eq!(review_timeout(attempt, 1), Duration::from_secs(10 * 60));
-        assert_eq!(review_timeout(attempt, 2), Duration::from_secs(5 * 60));
-        // The floor is per pass: a budget too small to answer in is not one.
-        assert_eq!(
-            review_timeout(Duration::from_secs(60), 2),
-            Duration::from_secs(60)
-        );
-    }
-
-    #[test]
     fn a_resume_keeps_the_reviewers_the_run_started_with() {
         // Who judged this run is a fact about the run, not about today's
         // machine — step-8 finding #8's lesson on `private_dir`. Re-deriving it
@@ -5188,6 +5183,15 @@ mod tests {
             recorded.alternative, None,
             "there was nothing to rebind to when this run started"
         );
+        assert_eq!(recorded.pass_timeout_secs, 5400);
+
+        fs::write(
+            repo.join("tactus.toml"),
+            "[interaction]\nmode = \"never\"\n\n\
+             [routing]\nimplement = { chain = [\"frontier\"], attempts_per = 1 }\n\
+             review = { timeout_secs = 60 }\n",
+        )
+        .expect("edit only the future review timeout");
 
         crate::answer::answer(
             &repo,
@@ -5217,6 +5221,14 @@ mod tests {
             0,
             "a CLI installed since the run began must not become its judge"
         );
+        let warning = resumed
+            .warnings
+            .iter()
+            .find(|warning| warning.contains("review pass timeout"))
+            .unwrap_or_else(|| panic!("no timeout-difference warning: {:?}", resumed.warnings));
+        assert!(warning.contains("60s"), "{warning}");
+        assert!(warning.contains("5400s"), "{warning}");
+        assert!(warning.contains("Start a new run"), "{warning}");
     }
 
     #[test]

@@ -17,7 +17,7 @@ refactor = { chain = ["frontier"], attempts_per = 2 }
 test = { chain = ["frontier"], attempts_per = 2 }
 docs = { chain = ["frontier"], attempts_per = 2 }
 chore = { chain = ["frontier"], attempts_per = 2 }
-review = { tier = "frontier" }
+review = { tier = "frontier", timeout_secs = 5400 }
 
 # Every worker gets xhigh, while every independent judgement gets max. Role
 # policy outranks tier defaults and pin effort.
