@@ -36,6 +36,10 @@ The contract that keeps this folder safe:
 
 ## Index
 
+- [2026-08-13 — v0.2 — machine-readable Tactus commit provenance](2026-08-13-v0.2-tactus-commit-provenance.md):
+  replace the overloaded `[tactus]` subject marker with run/task/role Git
+  trailers, while keeping a predictable `tactus` display identity and avoiding
+  per-commit Git tags.
 - [2026-08-13 — v0.5 — portfolio coordination and cross-story scheduling](2026-08-13-v0.5-portfolio-coordination.md):
   coordinate multiple active stories as one portfolio — shared work, hidden
   dependencies, contention, parallelism.
