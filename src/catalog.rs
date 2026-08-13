@@ -100,13 +100,18 @@ pub const CATALOG: &[CatalogEntry] = &[
         Family::Anthropic,
     ),
     EXAMPLE_MID,
+    // Keep the current frontier model ahead of retained older slugs: this
+    // order is the binding preference used by `different_family_at`, not just
+    // display order. Exact model names keep frozen runs reproducible; the
+    // moving `opus` alias must not decide which model a run meant after the
+    // fact.
+    EXAMPLE_FRONTIER,
     entry(
         "claude-code",
         "claude-opus-4-8",
         Tier::Frontier,
         Family::Anthropic,
     ),
-    EXAMPLE_FRONTIER,
     entry("copilot", "gpt-5-mini", Tier::Small, Family::OpenAI),
     // Slug pattern-derived, not verbatim: GitHub's reference lists the model as
     // "Gemini 3.1 Pro" and writes dots inside versions elsewhere
@@ -297,6 +302,11 @@ mod tests {
         let picked = different_family_at(Tier::Frontier, Family::OpenAI, everything)
             .expect("an anthropic frontier model exists");
         assert_eq!(picked.family, Family::Anthropic);
+        assert_eq!(
+            (picked.agent, picked.model),
+            ("claude-code", "claude-opus-5"),
+            "the current Opus model must remain ahead of retained legacy slugs"
+        );
     }
 
     #[test]
