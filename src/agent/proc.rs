@@ -586,6 +586,16 @@ mod tests {
         if std::env::var_os("TACTUS_SIGNAL_HELPER").is_none() {
             return;
         }
+        // SIGQUIT normally requests a core dump. Disable it in this disposable
+        // helper so the regression observes supervision semantics without
+        // invoking a host crash reporter (notably ReportCrash on macOS).
+        let no_core = libc::rlimit {
+            rlim_cur: 0,
+            rlim_max: 0,
+        };
+        // SAFETY: this changes only the current disposable helper before it
+        // launches either the signal monitor or the supervised command.
+        assert_eq!(unsafe { libc::setrlimit(libc::RLIMIT_CORE, &no_core) }, 0);
         let mut command = shell(
             "printf ready > \"$TACTUS_READY\"; \
              (sleep 1; printf leaked > \"$TACTUS_MARKER\") & wait",
@@ -613,6 +623,8 @@ mod tests {
         expect_return: bool,
         ignore_sighup: bool,
     ) -> (Child, std::path::PathBuf, std::path::PathBuf) {
+        use std::os::unix::process::CommandExt;
+
         let scratch = std::env::temp_dir().join(format!(
             "tactus-proc-{tag}-{}-{}",
             std::process::id(),
@@ -629,13 +641,16 @@ mod tests {
             .env("TACTUS_SIGNAL_HELPER", "1")
             .env("TACTUS_READY", &ready)
             .env("TACTUS_MARKER", &marker)
+            // Keep a broken child-group setup inside the disposable helper's
+            // group. A regression must fail the test, never suspend the test
+            // runner that is responsible for reporting and cleaning it up.
+            .process_group(0)
             .stdout(Stdio::null())
             .stderr(Stdio::null());
         if expect_return {
             helper.env("TACTUS_SIGNAL_HELPER_EXPECT_RETURN", "1");
         }
         if ignore_sighup {
-            use std::os::unix::process::CommandExt;
             // SAFETY: `pre_exec` performs only the async-signal-safe `signal`
             // call. SIG_IGN is deliberately inherited across exec by POSIX.
             unsafe {
