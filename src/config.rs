@@ -135,6 +135,7 @@ struct RawPin {
 }
 
 #[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct RawKindRouting {
     chain: Option<Vec<Tier>>,
     tier: Option<Tier>,
@@ -1422,6 +1423,24 @@ model = "claude-opus-4-8"
         assert!(
             err.to_string()
                 .contains("applies only to the `review` role")
+        );
+
+        let misspelled = scratch(
+            "misspelledreviewtimeout.toml",
+            "[routing]\nreview = { tier = \"frontier\", timeout_sec = 60 }\n",
+        );
+        let err = load(
+            Some(&misspelled),
+            &hermetic(),
+            Some(&missing()),
+            &mut warnings,
+        )
+        .expect_err("an unknown review-routing key must not fall back to 5400 seconds");
+        let message = err.to_string();
+        assert!(message.contains("timeout_sec"), "names the typo: {message}");
+        assert!(
+            message.contains("timeout_secs"),
+            "names the accepted key: {message}"
         );
     }
 

@@ -1426,9 +1426,9 @@ fn resume_harness_inner(
         exhausted_pools: prior_signals.keys().cloned().collect(),
     };
     // A legacy run cannot have its opening event rewritten without violating
-    // append-only history. This no-op event is therefore the schema-2 boundary:
-    // schema-1 binaries do not know its tag and refuse before ignoring the new
-    // effort/binding snapshots that follow.
+    // append-only history. This no-op event is the current downgrade boundary:
+    // schema-1 binaries do not know its tag, while schema-2 binaries reject a
+    // transition to schema 3 before applying their old partial-review contract.
     if effective_schema < events::SCHEMA_VERSION {
         run.emit(EventBody::RunSchemaUpgraded {
             data: events::RunSchemaUpgraded {
@@ -5375,7 +5375,7 @@ mod tests {
                 .filter(|event| matches!(event.body, EventBody::RunSchemaUpgraded { .. }))
                 .count(),
             1,
-            "the first schema-2 resume appends one downgrade barrier"
+            "the first current-binary resume appends one downgrade barrier"
         );
 
         fs::write(
@@ -5436,6 +5436,39 @@ mod tests {
                 .count(),
             1,
             "later resumes must not append duplicate schema transitions"
+        );
+    }
+
+    #[test]
+    fn a_schema_two_resume_records_the_complete_review_barrier_before_work() {
+        let (repo, run_id) = parked_run("schema2reviewbarrier");
+        let paths = paths_of(&repo, &run_id);
+        rewrite_run_started_as_schema_two(&paths);
+
+        let resumed = resume_answering(&repo, &run_id, Effect::EditFile);
+        assert_eq!(resumed.outcome(), RunOutcome::Complete, "{resumed:?}");
+
+        let logged = events_of(&repo, &run_id);
+        let barrier = logged
+            .iter()
+            .position(|event| {
+                matches!(
+                    &event.body,
+                    EventBody::RunSchemaUpgraded { data }
+                        if data.from == 2 && data.to == events::SCHEMA_VERSION
+                )
+            })
+            .expect("schema 2 -> 3 downgrade barrier");
+        let resumed_attempt = logged
+            .iter()
+            .enumerate()
+            .skip(barrier + 1)
+            .find(|(_, event)| matches!(event.body, EventBody::AttemptStarted { .. }))
+            .map(|(index, _)| index)
+            .expect("resumed attempt after the barrier");
+        assert!(
+            barrier < resumed_attempt,
+            "the old verification contract must be fenced off before work starts"
         );
     }
 
@@ -8324,6 +8357,36 @@ mod tests {
                             .remove("bindings")
                             .expect("a schema-2 run records chain bindings");
                     }
+                    rewritten_start = true;
+                }
+                value.to_string()
+            })
+            .collect();
+        assert!(rewritten_start, "the log has no run_started event");
+        fs::write(paths.events(), format!("{}\n", rewritten.join("\n"))).expect("rewrite");
+    }
+
+    /// Rewrite a current start into the shape written immediately before the
+    /// complete-review contract: schema 2 and no per-pass timeout field.
+    fn rewrite_run_started_as_schema_two(paths: &RunPaths) {
+        let text = fs::read_to_string(paths.events()).expect("log");
+        let mut rewritten_start = false;
+        let rewritten: Vec<String> = text
+            .lines()
+            .map(|line| {
+                let mut value: serde_json::Value =
+                    serde_json::from_str(line).expect("every line is an event");
+                if value.get("event").and_then(|event| event.as_str()) == Some("run_started") {
+                    let data = value
+                        .get_mut("data")
+                        .and_then(serde_json::Value::as_object_mut)
+                        .expect("run_started data");
+                    data.insert("schema".to_owned(), serde_json::Value::from(2));
+                    data.get_mut("reviews")
+                        .and_then(serde_json::Value::as_object_mut)
+                        .expect("recorded review plan")
+                        .remove("pass_timeout_secs")
+                        .expect("current review plan records its timeout");
                     rewritten_start = true;
                 }
                 value.to_string()

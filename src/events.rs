@@ -39,13 +39,15 @@ use crate::util;
 /// mode an event-sourced design must not have.
 ///
 /// Misread is the operative word. Step 10's additive reporting fields stayed in
-/// schema 1 because ignoring them did not change execution. Schema 2 is the
-/// first bump: effort and resolved worker bindings are execution identity, so a
-/// schema-1 binary ignoring those fields could continue the same branch under a
-/// different standard. Fresh runs say `2` in `run_started`; when this binary
-/// first resumes a schema-1 run it appends `run_schema_upgraded`, an event old
-/// binaries do not know and therefore refuse loudly rather than misread.
-pub const SCHEMA_VERSION: u32 = 2;
+/// schema 1 because ignoring them did not change execution. Schema 2 froze
+/// effort and resolved worker bindings because they are execution identity.
+/// Schema 3 freezes the complete-review contract: a schema-2 binary would
+/// ignore the per-pass timeout and still truncate review prompts at 60 KiB,
+/// which could let it accept work whose earlier paths were never judged.
+/// Fresh runs therefore say `3` in `run_started`; when this binary resumes an
+/// older run it appends `run_schema_upgraded` before another attempt, so older
+/// binaries refuse the changed verification standard rather than misread it.
+pub const SCHEMA_VERSION: u32 = 3;
 
 // ---------------------------------------------------------------------------
 // Envelope
@@ -102,8 +104,9 @@ pub enum EventBody {
         data: RunResumed,
     },
     /// Append-only downgrade barrier for a run whose `run_started` cannot be
-    /// rewritten from an older schema. A schema-1 binary fails on this unknown
-    /// event before it can ignore schema-2 execution identity fields.
+    /// rewritten from an older schema. Schema-1 binaries fail on the unknown
+    /// event tag; schema-2 binaries understand the tag but reject a transition
+    /// to schema 3 before they can apply the old partial-review contract.
     RunSchemaUpgraded {
         data: RunSchemaUpgraded,
     },
@@ -2449,7 +2452,10 @@ mod tests {
         assert_eq!(review.adapter, None);
         assert_eq!(review.preflight_cli_version, None);
         assert_eq!(review.effort, None);
-        assert_eq!(SCHEMA_VERSION, 2);
+        assert_eq!(
+            SCHEMA_VERSION, 3,
+            "the complete-review contract must remain behind a schema boundary"
+        );
     }
 
     #[test]

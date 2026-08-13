@@ -155,9 +155,10 @@ pub struct ReviewPass {
 pub struct ReviewPlan {
     /// Independent wall-clock budget for each pass, including its one
     /// verdict-format re-ask. Seconds keep the event record plain and stable.
-    /// This is additive within event schema 2: an older binary falls back to
-    /// its shorter legacy timeout and can only defer/park fail-closed; it can
-    /// never accept work without a completed verdict.
+    /// This complete-review contract begins at event schema 3. A schema-2
+    /// binary would ignore this field *and* still truncate the prompt at 60
+    /// KiB, so allowing it to resume could accept a partial review. The schema
+    /// boundary makes that downgrade a refusal instead.
     pub pass_timeout_secs: u64,
     /// `None` ⟺ `[routing] review = { enabled = false }`. Anything else that
     /// fails to resolve is an error, never an empty plan.
