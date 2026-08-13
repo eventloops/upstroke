@@ -644,6 +644,7 @@ fn failure_kind(value: FailureKind) -> &'static str {
         FailureKind::RateLimited => "rate_limited",
         FailureKind::GateFailed => "gate_failed",
         FailureKind::TestProvenance => "test_provenance",
+        FailureKind::ReviewInputTooLarge => "review_input_too_large",
         FailureKind::ReviewFailed => "review_failed",
         FailureKind::ReviewUnavailable => "review_unavailable",
         FailureKind::NeedsHuman => "needs_human",
@@ -683,6 +684,7 @@ fn failure_projection(kind: FailureKind) -> (&'static str, &'static str) {
             ("policy", "none")
         }
         FailureKind::EmptyDiff | FailureKind::TestProvenance => ("policy", "engine"),
+        FailureKind::ReviewInputTooLarge => ("policy", "review"),
     }
 }
 

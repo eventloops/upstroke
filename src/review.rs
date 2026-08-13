@@ -150,7 +150,7 @@ pub struct ReviewPass {
 /// task id, which is safe for the same reason `Progress` is: a resume refuses
 /// outright when the plan hash or the resolved chains moved, so the task list
 /// this was built against and the one it is read back against are the same list.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct ReviewPlan {
     /// Independent wall-clock budget for each pass, including its one
@@ -655,14 +655,8 @@ const REASK_PROMPT: &str = "Your previous answer did not contain a parseable ver
     ```\n";
 
 fn materialize_prompt(cx: &ReviewCx<'_>) -> Result<String, TactusError> {
-    if cx.diff.len() > MAX_DIFF_BYTES {
-        return Err(TactusError::Refused {
-            message: format!(
-                "review diff is {} bytes, above the {}-byte complete-review limit; split the task so every changed path can be judged in one pass",
-                cx.diff.len(),
-                MAX_DIFF_BYTES
-            ),
-        });
+    if let Some(message) = complete_diff_error(cx.diff) {
+        return Err(TactusError::Refused { message });
     }
     let task = cx.task;
     let mut prompt = String::new();
@@ -757,6 +751,23 @@ fn materialize_prompt(cx: &ReviewCx<'_>) -> Result<String, TactusError> {
          to make.\n",
     );
     Ok(prompt)
+}
+
+/// Explain why a diff cannot receive a complete review, if it exceeds the
+/// fail-closed input limit.
+///
+/// The engine checks this before dispatch and turns it into a settled policy
+/// failure. `materialize_prompt` repeats the check as a last line of defence
+/// for direct callers, which still receive a refusal rather than a truncated
+/// review.
+pub(crate) fn complete_diff_error(diff: &str) -> Option<String> {
+    (diff.len() > MAX_DIFF_BYTES).then(|| {
+        format!(
+            "review diff is {} bytes, above the {}-byte complete-review limit; split the task so every changed path can be judged in one pass",
+            diff.len(),
+            MAX_DIFF_BYTES
+        )
+    })
 }
 
 fn add_cost(current: Option<f64>, extra: Option<f64>) -> Option<f64> {

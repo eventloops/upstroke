@@ -32,6 +32,11 @@ pub enum FailureKind {
     RateLimited,
     GateFailed,
     TestProvenance,
+    /// The worker produced more evidence than one complete review may accept.
+    /// Retrying the same task cannot change that policy boundary, so this
+    /// parks for a human to split or otherwise rescope the task after the
+    /// attempt's real spend has been settled.
+    ReviewInputTooLarge,
     ReviewFailed,
     /// The reviewer could not run — an environment failure, not a judgement
     /// on the change.
@@ -159,6 +164,13 @@ pub fn next_step(failure: &AttemptFailure, state: &LadderState, policy: &LadderP
         return Next::AskHuman(QuestionKind::Clarify);
     }
 
+    // The worker ran, so the attempt is spent and must stay in the ledger, but
+    // no amount of automatic retrying can make the same complete diff fit the
+    // review contract. Ask for a scope decision instead of paying again.
+    if failure.kind == FailureKind::ReviewInputTooLarge {
+        return Next::AskHuman(QuestionKind::Unblock);
+    }
+
     // Outages defer. Escalating here would move the task to a pricier rung
     // because a *pool* was busy, and retrying would burn attempts on a run
     // that never got a verdict.
@@ -261,6 +273,18 @@ mod tests {
             next_step(&failure(FailureKind::GateFailed), &state(2, 2), &policy),
             Next::AskHuman(QuestionKind::Unblock),
             "the human is the top rung (§11.4)"
+        );
+    }
+
+    #[test]
+    fn an_oversized_complete_review_parks_without_paying_for_a_retry() {
+        assert_eq!(
+            next_step(
+                &failure(FailureKind::ReviewInputTooLarge),
+                &state(0, 1),
+                &policy()
+            ),
+            Next::AskHuman(QuestionKind::Unblock)
         );
     }
 

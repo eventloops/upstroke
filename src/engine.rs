@@ -1142,6 +1142,7 @@ fn resume_harness_inner(
     // the re-derivation repeating, and drifting, on every resume after that.
     let recorded_gates = events::recorded_gates(&events).cloned();
     let recorded_effort_policy = events::recorded_effort_policy(&events);
+    let recorded_reviews = events::recorded_reviews(&events).cloned();
     let recorded_chains = events::recorded_chains(&events).cloned();
 
     // The run knows its own plan and config; the CLI may override the config
@@ -1184,7 +1185,7 @@ fn resume_harness_inner(
         &run_opts,
         harness,
         Recorded {
-            reviews: started.reviews.clone(),
+            reviews: recorded_reviews.clone(),
             gates: recorded_gates.clone(),
             gates_from_config: started.gates_from_config,
             routing: Some(RecordedRouting {
@@ -1194,7 +1195,7 @@ fn resume_harness_inner(
             }),
         },
     )?;
-    if started.reviews.is_none() {
+    if recorded_reviews.is_none() {
         warnings.push(
             "this run's log predates the review record (step 9), so who reviews was re-derived \
              from today's config rather than read from the run — earlier tasks may have been \
@@ -1393,6 +1394,7 @@ fn resume_harness_inner(
     // about the pools, which a resumed run's snapshot must not forget.
     let prior_signals = capacity::observe(&replayed.events).exhausted;
     let log = EventLog::open(&paths.events(), &mut warnings)?;
+    let established_reviews = recorded_reviews.is_none().then(|| review_plan.clone());
     let mut run = Run {
         state: replayed.state,
         analysis: &analysis,
@@ -1483,6 +1485,7 @@ fn resume_harness_inner(
             // the same fact in two places that a later change could pull apart.
             gates: recorded_gates.is_none().then(|| gates.clone()),
             effort_policy: recorded_effort_policy.is_none().then_some(effort_policy),
+            reviews: established_reviews,
             chains: recorded_chains
                 .is_none()
                 .then(|| chain_summaries(&analysis)),
@@ -3263,44 +3266,54 @@ fn run_attempt(
     // and costs another frontier invocation to learn it.
     let mut reviews = Vec::new();
     if failure.is_none() && !cx.reviewers.is_empty() {
-        let artifacts = load_artifacts(&cx.paths.artifacts(), cx.task);
-        for reviewer in &cx.reviewers {
-            let review = review::run_review(&review::ReviewCx {
-                adapter: reviewer.adapter,
-                profile: reviewer.profile.clone(),
-                lens: reviewer.lens,
-                task: cx.task,
-                diff: &outcome.diff,
-                artifacts: &artifacts,
-                decisions: &cx.decisions,
-                workspace: workspace.root(),
-                settings_dir: &cx.paths.settings(),
-                reviews_dir: &cx.paths.reviews(),
-                stem: format!("{}-{}", cx.stem, cx.attempt),
-                timeout: cx.review_pass_timeout,
-            })?;
-            let cost_usd = review.cost_usd;
-            // Read before the result is consumed: a judge that never ran is not
-            // a judge that said no, and the ledger has to show which happened.
-            let unavailable = matches!(review.result, review::ReviewResult::Unavailable { .. });
-            failure = review_failure(review.result);
-            reviews.push(events::ReviewRecord {
-                pass: reviewer.lens.name().to_owned(),
-                agent: reviewer.profile.agent.clone(),
-                model: reviewer.profile.model.clone(),
-                adapter: Some(reviewer.adapter.id().to_owned()),
-                preflight_cli_version: reviewer.preflight_cli_version.clone(),
-                effort: reviewer.profile.effort,
-                pool: pool_option(&reviewer.profile.pool),
-                cost_usd,
-                outcome: match (unavailable, failure.is_none()) {
-                    (true, _) => events::ReviewPassOutcome::Unavailable,
-                    (false, true) => events::ReviewPassOutcome::Passed,
-                    (false, false) => events::ReviewPassOutcome::Failed,
-                },
-            });
-            if failure.is_some() {
-                break;
+        if let Some(reason) = review::complete_diff_error(&outcome.diff) {
+            // This happens after the worker and cheap gates have run. Return a
+            // normal attempt result so the caller writes `attempt_finished`
+            // with the worker's duration, usage, session, and cost before the
+            // ladder parks. Propagating the prompt-construction error would
+            // leave a dangling attempt that replay mislabels as interrupted.
+            failure =
+                Some(AttemptFailure::new(FailureKind::ReviewInputTooLarge, reason).from_reviewer());
+        } else {
+            let artifacts = load_artifacts(&cx.paths.artifacts(), cx.task);
+            for reviewer in &cx.reviewers {
+                let review = review::run_review(&review::ReviewCx {
+                    adapter: reviewer.adapter,
+                    profile: reviewer.profile.clone(),
+                    lens: reviewer.lens,
+                    task: cx.task,
+                    diff: &outcome.diff,
+                    artifacts: &artifacts,
+                    decisions: &cx.decisions,
+                    workspace: workspace.root(),
+                    settings_dir: &cx.paths.settings(),
+                    reviews_dir: &cx.paths.reviews(),
+                    stem: format!("{}-{}", cx.stem, cx.attempt),
+                    timeout: cx.review_pass_timeout,
+                })?;
+                let cost_usd = review.cost_usd;
+                // Read before the result is consumed: a judge that never ran is not
+                // a judge that said no, and the ledger has to show which happened.
+                let unavailable = matches!(review.result, review::ReviewResult::Unavailable { .. });
+                failure = review_failure(review.result);
+                reviews.push(events::ReviewRecord {
+                    pass: reviewer.lens.name().to_owned(),
+                    agent: reviewer.profile.agent.clone(),
+                    model: reviewer.profile.model.clone(),
+                    adapter: Some(reviewer.adapter.id().to_owned()),
+                    preflight_cli_version: reviewer.preflight_cli_version.clone(),
+                    effort: reviewer.profile.effort,
+                    pool: pool_option(&reviewer.profile.pool),
+                    cost_usd,
+                    outcome: match (unavailable, failure.is_none()) {
+                        (true, _) => events::ReviewPassOutcome::Unavailable,
+                        (false, true) => events::ReviewPassOutcome::Passed,
+                        (false, false) => events::ReviewPassOutcome::Failed,
+                    },
+                });
+                if failure.is_some() {
+                    break;
+                }
             }
         }
     }
@@ -4087,6 +4100,8 @@ mod tests {
         EditFile,
         /// Simulates an agent that writes real test code.
         EditTest,
+        /// Produces a complete diff larger than the review input boundary.
+        LargeEdit,
         /// Simulates a lying agent: success report, no changes.
         NoEdit,
         /// Simulates an agent-side failure.
@@ -4308,6 +4323,10 @@ mod tests {
                         "widget_test.rs",
                         "#[test]\nfn widget_works() {\n    assert!(true);\n}\n".to_owned(),
                     )),
+                    Effect::LargeEdit => Some((
+                        "large-agent-output.txt",
+                        "x".repeat(review::MAX_DIFF_BYTES + 1),
+                    )),
                     Effect::NoEdit | Effect::Error | Effect::RateLimited => None,
                 };
             if let Some((name, content)) = edit {
@@ -4392,6 +4411,7 @@ mod tests {
                 // `Exit` never reaches here — `build` ends the process.
                 Effect::EditFile
                 | Effect::EditTest
+                | Effect::LargeEdit
                 | Effect::NoEdit
                 | Effect::AskQuestion
                 | Effect::Exit => OutcomeStatus::Completed,
@@ -4691,6 +4711,56 @@ mod tests {
         assert!(
             repo.join(".tactus").join("runs").exists(),
             "run dir written"
+        );
+    }
+
+    #[test]
+    fn an_oversized_review_diff_is_settled_once_before_the_task_parks() {
+        let repo = temp_engine_repo("oversizedreviewsettlement");
+        seed(
+            &repo,
+            "## Generate the large fixture\n<!-- tactus: id=t1 kind=implement depends= -->\n",
+            Some(
+                "[interaction]\nmode = \"never\"\n\n\
+                 [routing]\nimplement = { chain = [\"small\"], attempts_per = 3 }\n",
+            ),
+        );
+        let mut opts = options(&repo);
+        opts.config_path = Some(repo.join("tactus.toml"));
+        let source = fake(Effect::LargeEdit);
+        let report = run_with(&opts, &source).expect("policy failure is a settled run outcome");
+
+        assert_eq!(report.outcome(), RunOutcome::Parked, "{report:?}");
+        let task = task(&report, "t1");
+        assert_eq!(task.attempts.len(), 1, "the policy boundary is not retried");
+        let attempt = &task.attempts[0];
+        let failure = attempt.failure.as_ref().expect("settled policy failure");
+        assert_eq!(failure.kind, FailureKind::ReviewInputTooLarge);
+        assert_eq!(failure.origin, FailureOrigin::Reviewer);
+        assert_eq!(attempt.cost_usd, Some(0.01), "worker spend is retained");
+        assert_eq!(attempt.session_id.as_deref(), Some("s0"));
+        assert!(attempt.usage.is_some(), "worker usage is retained");
+        assert!(attempt.reviews.is_empty(), "no reviewer was dispatched");
+        assert_eq!(source.adapter.reviews_run(), 0);
+
+        let logged = events_of(&repo, &report.run_id);
+        assert_eq!(
+            logged
+                .iter()
+                .filter(|event| matches!(event.body, EventBody::AttemptFinished { .. }))
+                .count(),
+            1,
+            "the attempt has a terminal ledger event"
+        );
+        assert!(
+            !logged
+                .iter()
+                .any(|event| matches!(event.body, EventBody::AttemptInterrupted { .. })),
+            "replay must never invent an interruption for the settled refusal"
+        );
+        assert!(
+            git_in(&repo, &["status", "--porcelain"]).trim().is_empty(),
+            "parking cleans the unreviewed oversized diff"
         );
     }
 
@@ -5436,6 +5506,69 @@ mod tests {
                 .count(),
             1,
             "later resumes must not append duplicate schema transitions"
+        );
+    }
+
+    #[test]
+    fn the_resume_that_rederives_an_old_review_plan_records_it_for_the_next_one() {
+        let original = "[interaction]\nmode = \"never\"\n\n\
+                        [routing]\nimplement = { chain = [\"small\"], attempts_per = 1 }\n";
+        let (repo, run_id) = parked_run_with_config("oldlogreviews", original);
+        let paths = paths_of(&repo, &run_id);
+        strip_run_started_field(&paths, "reviews");
+
+        fs::write(
+            repo.join("tactus.toml"),
+            "[interaction]\nmode = \"never\"\n\n\
+             [routing]\nimplement = { chain = [\"small\"], attempts_per = 1 }\n\
+             review = { timeout_secs = 60 }\n",
+        )
+        .expect("first derived review plan");
+        let first = resume_answering(&repo, &run_id, Effect::NoEdit);
+        assert_eq!(first.outcome(), RunOutcome::Parked, "{first:?}");
+        assert!(
+            first
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("predates the review record")),
+            "legacy warning: {:?}",
+            first.warnings
+        );
+        let established = events::recorded_reviews(&events_of(&repo, &run_id))
+            .cloned()
+            .expect("the first resume writes down what it derived");
+        assert_eq!(established.pass_timeout_secs, 60);
+
+        fs::write(
+            repo.join("tactus.toml"),
+            "[interaction]\nmode = \"never\"\n\n\
+             [routing]\nimplement = { chain = [\"small\"], attempts_per = 1 }\n\
+             review = { timeout_secs = 120 }\n",
+        )
+        .expect("later review plan");
+        let second = resume_answering(&repo, &run_id, Effect::EditFile);
+        assert_eq!(second.outcome(), RunOutcome::Complete, "{second:?}");
+        assert_eq!(
+            events::recorded_reviews(&events_of(&repo, &run_id))
+                .expect("record survives")
+                .pass_timeout_secs,
+            60,
+            "a later config edit cannot replace the established plan"
+        );
+        let warning = second
+            .warnings
+            .iter()
+            .find(|warning| warning.contains("today's review pass timeout"))
+            .unwrap_or_else(|| panic!("no timeout drift warning: {:?}", second.warnings));
+        assert!(warning.contains("120s"), "{warning}");
+        assert!(warning.contains("60s"), "{warning}");
+        assert!(
+            !second
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("predates the review record")),
+            "the legacy absence is established exactly once: {:?}",
+            second.warnings
         );
     }
 

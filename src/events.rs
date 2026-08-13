@@ -446,6 +446,16 @@ pub struct RunResumed {
     /// first recorded value and never re-derive it again.
     #[serde(default)]
     pub effort_policy: Option<ResolvedEffortPolicy>,
+    /// The review plan established by the first current-binary resume of a
+    /// legacy log.
+    ///
+    /// Current runs record this on `run_started`. An older run has to derive
+    /// the missing plan once, but leaving that derivation only in memory lets
+    /// every later resume silently adopt a different reviewer or timeout.
+    /// The first resume therefore appends the plan it established; later
+    /// resumes read the first recorded value and leave this `None`.
+    #[serde(default)]
+    pub reviews: Option<crate::review::ReviewPlan>,
     /// The resolved chain bindings established by the first schema-2 resume of
     /// a schema-1 log. Current runs carry them on `run_started`; later resumes
     /// use the first recorded snapshot and leave this `None`.
@@ -1581,6 +1591,19 @@ pub fn recorded_effort_policy(events: &[Event]) -> Option<ResolvedEffortPolicy> 
     })
 }
 
+/// The review plan this run is bound to, wherever the log first records it.
+///
+/// A current run carries the plan in `run_started`. A legacy run gains it on
+/// the first current-binary `run_resumed`, so subsequent resumes cannot
+/// re-derive a different reviewer, model, effort, or pass timeout.
+pub fn recorded_reviews(events: &[Event]) -> Option<&crate::review::ReviewPlan> {
+    events.iter().find_map(|event| match &event.body {
+        EventBody::RunStarted { data } => data.reviews.as_ref(),
+        EventBody::RunResumed { data } => data.reviews.as_ref(),
+        _ => None,
+    })
+}
+
 /// The resolved worker bindings this run is bound to, wherever they first
 /// become available. Schema-2 runs carry them in `run_started`; a schema-1 run
 /// gains them on the first schema-2 `run_resumed` event.
@@ -1896,6 +1919,7 @@ mod tests {
                     discarded: Vec::new(),
                     gates: None,
                     effort_policy: None,
+                    reviews: None,
                     chains: None,
                 },
             },
@@ -2288,6 +2312,7 @@ mod tests {
                     discarded: Vec::new(),
                     gates: None,
                     effort_policy: Some(policy),
+                    reviews: None,
                     chains: None,
                 },
             })
@@ -2349,6 +2374,7 @@ mod tests {
                     discarded: Vec::new(),
                     gates: None,
                     effort_policy: None,
+                    reviews: None,
                     chains: Some(original.clone()),
                 },
             }),
@@ -2359,6 +2385,7 @@ mod tests {
                     discarded: Vec::new(),
                     gates: None,
                     effort_policy: None,
+                    reviews: None,
                     chains: Some(later),
                 },
             }),
@@ -2546,6 +2573,7 @@ mod tests {
                     discarded: Vec::new(),
                     gates: None,
                     effort_policy: None,
+                    reviews: None,
                     chains: None,
                 },
             }),
