@@ -36,6 +36,10 @@ The contract that keeps this folder safe:
 
 ## Index
 
+- [2026-08-13 — v0.2 — engine-owned implementation checkpoints and selective rewind](2026-08-13-v0.2-implementation-checkpoints.md):
+  preserve bounded private A/B/C checkpoints during one implementation so a
+  bad D can rewind to C, while final verification still judges the complete
+  task-base-to-result change.
 - [2026-08-13 — v0.2 — machine-readable Tactus commit provenance](2026-08-13-v0.2-tactus-commit-provenance.md):
   retain `[tactus]` as the human-visible subject marker and augment it with
   run/task/work/revision Git trailers, a predictable `tactus` display identity,
