@@ -12,10 +12,13 @@
 //! Unix subtleties are the mirror image: each invocation gets an isolated
 //! process group so a timeout can kill every descendant, but that isolation
 //! also stops terminal interrupts reaching the child automatically. A tiny
-//! process-wide signal monitor below records SIGINT/SIGTERM/SIGHUP, waits out
-//! any spawn-registration race, kills every active process group, and only
-//! then re-raises the signal in Tactus. The run lock can therefore never be
-//! released while an isolated agent is still running.
+//! process-wide signal monitor below preserves inherited ignored signals,
+//! coordinates SIGINT/SIGTERM/SIGHUP/SIGQUIT termination, and proxies terminal
+//! suspension/continuation. It waits out any spawn-registration race, kills
+//! every active process group before re-raising a terminating signal in
+//! Tactus, and stops every active group whenever Tactus stops. The run lock can
+//! therefore never be released -- or appear suspended -- while an isolated
+//! agent is still running.
 
 use std::io::{Read, Write};
 use std::process::{Child, Command, Stdio};
@@ -176,20 +179,23 @@ fn kill_tree(child: &mut Child) {
 ///
 /// A signal handler may only perform async-signal-safe work. It therefore
 /// stores the first terminating signal in an atomic and returns. A detached
-/// monitor thread owns the locks and process-group kills, then restores the
-/// default disposition and re-raises the original signal. `spawning` closes
-/// the otherwise unavoidable race between `Command::spawn` and pid
-/// registration; the monitor cannot terminate the parent while it is nonzero.
+/// monitor thread owns the locks, termination, and job-control forwarding,
+/// then restores the default disposition and re-raises a terminating signal.
+/// `spawning` closes the otherwise unavoidable race between `Command::spawn`
+/// and pid registration; the monitor cannot terminate or suspend the parent
+/// while it is nonzero.
 #[cfg(unix)]
 mod termination {
-    use std::sync::atomic::{AtomicI32, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
     use std::sync::{Arc, Mutex, OnceLock};
     use std::thread;
     use std::time::Duration;
 
     use crate::error::TactusError;
 
-    static PENDING_SIGNAL: AtomicI32 = AtomicI32::new(0);
+    static PENDING_TERMINATION: AtomicI32 = AtomicI32::new(0);
+    static SUSPEND_REQUESTED: AtomicBool = AtomicBool::new(false);
+    static CONTINUE_REQUESTED: AtomicBool = AtomicBool::new(false);
     static STATE: OnceLock<Result<Arc<Mutex<State>>, String>> = OnceLock::new();
 
     #[derive(Default)]
@@ -218,7 +224,7 @@ mod termination {
             let mut locked = state
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
-            if locked.terminating || PENDING_SIGNAL.load(Ordering::SeqCst) != 0 {
+            if locked.terminating || PENDING_TERMINATION.load(Ordering::SeqCst) != 0 {
                 return Err(TactusError::Agent {
                     message: "process launch interrupted by a termination signal".to_owned(),
                 });
@@ -284,63 +290,157 @@ mod termination {
             .spawn(move || monitor(monitored))
             .map_err(|error| format!("starting Unix signal monitor: {error}"))?;
 
-        for signal in [libc::SIGINT, libc::SIGTERM, libc::SIGHUP] {
-            // SAFETY: `record_signal` has the C ABI and only performs one
-            // lock-free atomic compare-exchange. The monitor restores the
-            // default disposition before re-raising the recorded signal.
-            let previous =
-                unsafe { libc::signal(signal, record_signal as *const () as libc::sighandler_t) };
-            if previous == libc::SIG_ERR {
+        for signal in [libc::SIGINT, libc::SIGTERM, libc::SIGHUP, libc::SIGQUIT] {
+            // POSIX preserves SIG_IGN across exec. `nohup` relies on that for
+            // SIGHUP, and replacing it would make Tactus less durable merely
+            // because it supervised a command. Explicitly ignored terminating
+            // signals retain the disposition the launcher chose.
+            if !is_ignored(signal)? {
+                install_handler(signal)?;
+            }
+        }
+
+        // Job-control proxying is useful only as a pair: if a launcher
+        // explicitly ignored either half, preserve that policy rather than
+        // stopping children we cannot reliably continue (or vice versa).
+        if !is_ignored(libc::SIGTSTP)? && !is_ignored(libc::SIGCONT)? {
+            install_handler(libc::SIGTSTP)?;
+            install_handler(libc::SIGCONT)?;
+        }
+        Ok(state)
+    }
+
+    fn is_ignored(signal: libc::c_int) -> Result<bool, String> {
+        // SAFETY: a null `act` queries the current disposition without
+        // changing it; `previous` is initialized by a successful call.
+        unsafe {
+            let mut previous: libc::sigaction = std::mem::zeroed();
+            if libc::sigaction(signal, std::ptr::null(), &mut previous) != 0 {
+                return Err(format!(
+                    "reading Unix signal disposition for signal {signal}: {}",
+                    std::io::Error::last_os_error()
+                ));
+            }
+            Ok(previous.sa_sigaction == libc::SIG_IGN)
+        }
+    }
+
+    fn install_handler(signal: libc::c_int) -> Result<(), String> {
+        // SAFETY: `record_signal` has the C ABI and performs only lock-free
+        // atomic operations. The empty mask and SA_RESTART keep unrelated
+        // syscalls from being exposed to the implementation detail that a
+        // monitor thread, rather than the handler, owns process-group work.
+        unsafe {
+            let mut action: libc::sigaction = std::mem::zeroed();
+            action.sa_sigaction = record_signal as *const () as libc::sighandler_t;
+            action.sa_flags = libc::SA_RESTART;
+            libc::sigemptyset(&mut action.sa_mask);
+            if libc::sigaction(signal, &action, std::ptr::null_mut()) != 0 {
                 return Err(format!(
                     "installing Unix signal forwarding for signal {signal}: {}",
                     std::io::Error::last_os_error()
                 ));
             }
         }
-        Ok(state)
+        Ok(())
     }
 
     extern "C" fn record_signal(signal: libc::c_int) {
-        let _ = PENDING_SIGNAL.compare_exchange(0, signal, Ordering::SeqCst, Ordering::SeqCst);
+        match signal {
+            libc::SIGTSTP => SUSPEND_REQUESTED.store(true, Ordering::SeqCst),
+            libc::SIGCONT => CONTINUE_REQUESTED.store(true, Ordering::SeqCst),
+            _ => {
+                let _ = PENDING_TERMINATION.compare_exchange(
+                    0,
+                    signal,
+                    Ordering::SeqCst,
+                    Ordering::SeqCst,
+                );
+            }
+        }
     }
 
     fn monitor(state: Arc<Mutex<State>>) -> ! {
         loop {
-            let signal = PENDING_SIGNAL.load(Ordering::SeqCst);
-            if signal == 0 {
-                thread::sleep(Duration::from_millis(10));
+            let terminating = PENDING_TERMINATION.load(Ordering::SeqCst);
+            if terminating != 0 {
+                let Some(groups) = groups_when_registered(&state, true) else {
+                    thread::sleep(Duration::from_millis(1));
+                    continue;
+                };
+                signal_groups(&groups, libc::SIGKILL);
+
+                // SAFETY: all isolated children have been synchronously sent
+                // SIGKILL. Restore the ordinary terminal semantics and
+                // terminate Tactus with the original signal; `_exit` is a
+                // defensive fallback if a platform returns from `raise`.
+                unsafe {
+                    libc::signal(terminating, libc::SIG_DFL);
+                    libc::raise(terminating);
+                    libc::_exit(128 + terminating);
+                }
+            }
+
+            if SUSPEND_REQUESTED.swap(false, Ordering::SeqCst) {
+                let Some(groups) = groups_when_registered(&state, false) else {
+                    SUSPEND_REQUESTED.store(true, Ordering::SeqCst);
+                    thread::sleep(Duration::from_millis(1));
+                    continue;
+                };
+                // SIGSTOP cannot be caught or ignored, so a vendor process
+                // cannot keep spending while its visibly foreground Tactus
+                // parent is suspended. SIGCONT below releases the same groups.
+                signal_groups(&groups, libc::SIGSTOP);
+
+                // A terminating signal wins over suspension. Do not stop the
+                // parent after its monitor has already been asked to tear down.
+                if PENDING_TERMINATION.load(Ordering::SeqCst) != 0 {
+                    continue;
+                }
+                if CONTINUE_REQUESTED.swap(false, Ordering::SeqCst) {
+                    signal_groups(&groups, libc::SIGCONT);
+                    continue;
+                }
+
+                // SAFETY: SIGSTOP suspends the whole process without changing
+                // any installed disposition. Delivery of SIGCONT resumes it;
+                // our SIGCONT handler then asks this monitor to resume every
+                // isolated child group as well.
+                let _ = unsafe { libc::kill(libc::getpid(), libc::SIGSTOP) };
                 continue;
             }
 
-            let groups = {
-                let mut locked = state
-                    .lock()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner());
-                if locked.spawning != 0 {
-                    drop(locked);
-                    thread::sleep(Duration::from_millis(1));
-                    continue;
+            if CONTINUE_REQUESTED.swap(false, Ordering::SeqCst) {
+                if let Some(groups) = groups_when_registered(&state, false) {
+                    signal_groups(&groups, libc::SIGCONT);
+                } else {
+                    CONTINUE_REQUESTED.store(true, Ordering::SeqCst);
                 }
-                locked.terminating = true;
-                locked.groups.clone()
-            };
-
-            for pgid in groups {
-                // SAFETY: every registered child was created with
-                // `process_group(0)`, so its pid is its private group id. A
-                // negative id targets that group and never Tactus's group.
-                let _ = unsafe { libc::kill(-pgid, libc::SIGKILL) };
             }
 
-            // SAFETY: all isolated children have been synchronously sent
-            // SIGKILL. Restore the ordinary terminal semantics and terminate
-            // Tactus with the original signal; `_exit` is a defensive fallback
-            // if a platform unexpectedly returns from `raise`.
-            unsafe {
-                libc::signal(signal, libc::SIG_DFL);
-                libc::raise(signal);
-                libc::_exit(128 + signal);
-            }
+            thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    fn groups_when_registered(state: &Arc<Mutex<State>>, terminating: bool) -> Option<Vec<i32>> {
+        let mut locked = state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if locked.spawning != 0 {
+            return None;
+        }
+        if terminating {
+            locked.terminating = true;
+        }
+        Some(locked.groups.clone())
+    }
+
+    fn signal_groups(groups: &[i32], signal: libc::c_int) {
+        for pgid in groups {
+            // SAFETY: every registered child was created with
+            // `process_group(0)`, so its pid is its private group id. A
+            // negative id targets that group and never Tactus's group.
+            let _ = unsafe { libc::kill(-*pgid, signal) };
         }
     }
 }
@@ -476,7 +576,7 @@ mod tests {
         );
     }
 
-    /// Subprocess entry point for `terminal_interrupt_kills_the_isolated_tree`.
+    /// Subprocess entry point for the Unix signal-supervision tests below.
     /// Ignored in ordinary test discovery; the parent test invokes only this
     /// case in a fresh process because the expected outcome is SIGINT.
     #[cfg(unix)]
@@ -498,18 +598,27 @@ mod tests {
             "TACTUS_MARKER",
             std::env::var_os("TACTUS_MARKER").expect("marker path"),
         );
-        let _ = run_with_timeout(command, "", Duration::from_secs(30));
+        let output =
+            run_with_timeout(command, "", Duration::from_secs(30)).expect("signal helper command");
+        if std::env::var_os("TACTUS_SIGNAL_HELPER_EXPECT_RETURN").is_some() {
+            assert_eq!(output.code, Some(0));
+            return;
+        }
         panic!("the helper should terminate with the forwarded signal");
     }
 
     #[cfg(unix)]
-    #[test]
-    fn terminal_interrupt_kills_the_isolated_tree() {
+    fn spawn_signal_helper(
+        tag: &str,
+        expect_return: bool,
+        ignore_sighup: bool,
+    ) -> (Child, std::path::PathBuf, std::path::PathBuf) {
         let scratch = std::env::temp_dir().join(format!(
-            "tactus-proc-interrupt-{}-{}",
+            "tactus-proc-{tag}-{}-{}",
             std::process::id(),
             std::thread::current().name().unwrap_or("unnamed")
         ));
+        let _ = std::fs::remove_dir_all(&scratch);
         std::fs::create_dir_all(&scratch).expect("scratch dir");
         let ready = scratch.join("ready");
         let marker = scratch.join("leaked");
@@ -522,6 +631,23 @@ mod tests {
             .env("TACTUS_MARKER", &marker)
             .stdout(Stdio::null())
             .stderr(Stdio::null());
+        if expect_return {
+            helper.env("TACTUS_SIGNAL_HELPER_EXPECT_RETURN", "1");
+        }
+        if ignore_sighup {
+            use std::os::unix::process::CommandExt;
+            // SAFETY: `pre_exec` performs only the async-signal-safe `signal`
+            // call. SIG_IGN is deliberately inherited across exec by POSIX.
+            unsafe {
+                helper.pre_exec(|| {
+                    if libc::signal(libc::SIGHUP, libc::SIG_IGN) == libc::SIG_ERR {
+                        Err(std::io::Error::last_os_error())
+                    } else {
+                        Ok(())
+                    }
+                });
+            }
+        }
         let mut helper = helper.spawn().expect("spawn signal helper");
 
         let ready_deadline = Instant::now() + Duration::from_secs(10);
@@ -532,23 +658,33 @@ mod tests {
             thread::sleep(Duration::from_millis(20));
         }
         assert!(ready.exists(), "signal helper never spawned its child");
+        (helper, scratch, marker)
+    }
 
-        let pid = i32::try_from(helper.id()).expect("helper pid");
-        // SAFETY: `pid` names only the dedicated helper subprocess.
-        assert_eq!(unsafe { libc::kill(pid, libc::SIGINT) }, 0);
-        let exit_deadline = Instant::now() + Duration::from_secs(10);
-        while helper
-            .try_wait()
-            .expect("poll interrupted helper")
-            .is_none()
-            && Instant::now() < exit_deadline
-        {
+    #[cfg(unix)]
+    fn wait_for_exit(child: &mut Child, timeout: Duration) -> Option<std::process::ExitStatus> {
+        let deadline = Instant::now() + timeout;
+        loop {
+            if let Some(status) = child.try_wait().expect("poll signal helper") {
+                return Some(status);
+            }
+            if Instant::now() >= deadline {
+                return None;
+            }
             thread::sleep(Duration::from_millis(20));
         }
-        if helper.try_wait().expect("final helper poll").is_none() {
+    }
+
+    #[cfg(unix)]
+    fn assert_termination_kills_the_isolated_tree(signal: libc::c_int, tag: &str) {
+        let (mut helper, scratch, marker) = spawn_signal_helper(tag, false, false);
+        let pid = i32::try_from(helper.id()).expect("helper pid");
+        // SAFETY: `pid` names only the dedicated helper subprocess.
+        assert_eq!(unsafe { libc::kill(pid, signal) }, 0);
+        if wait_for_exit(&mut helper, Duration::from_secs(10)).is_none() {
             let _ = helper.kill();
             let _ = helper.wait();
-            panic!("interrupted supervisor did not terminate promptly");
+            panic!("signalled supervisor did not terminate promptly");
         }
 
         thread::sleep(Duration::from_millis(1300));
@@ -556,8 +692,77 @@ mod tests {
         let _ = std::fs::remove_dir_all(&scratch);
         assert!(
             !leaked,
-            "SIGINT terminated Tactus but left its isolated agent tree alive"
+            "signal {signal} terminated Tactus but left its isolated agent tree alive"
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn terminal_interrupt_kills_the_isolated_tree() {
+        assert_termination_kills_the_isolated_tree(libc::SIGINT, "interrupt");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn terminal_quit_kills_the_isolated_tree() {
+        assert_termination_kills_the_isolated_tree(libc::SIGQUIT, "quit");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_inherited_ignored_sighup_stays_ignored() {
+        let (mut helper, scratch, marker) = spawn_signal_helper("nohup", true, true);
+        let pid = i32::try_from(helper.id()).expect("helper pid");
+        // SAFETY: `pid` names only the dedicated helper subprocess.
+        assert_eq!(unsafe { libc::kill(pid, libc::SIGHUP) }, 0);
+        let status = wait_for_exit(&mut helper, Duration::from_secs(10))
+            .expect("ignored SIGHUP helper completes normally");
+        let survived = marker.exists();
+        let _ = std::fs::remove_dir_all(&scratch);
+        assert!(status.success(), "helper status: {status}");
+        assert!(survived, "nohup-style SIGHUP unexpectedly killed the agent");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn terminal_suspend_and_continue_cover_the_isolated_tree() {
+        let (mut helper, scratch, marker) = spawn_signal_helper("job-control", true, false);
+        let pid = i32::try_from(helper.id()).expect("helper pid");
+        // SAFETY: `pid` names only the dedicated helper subprocess.
+        assert_eq!(unsafe { libc::kill(pid, libc::SIGTSTP) }, 0);
+
+        let stopped_deadline = Instant::now() + Duration::from_secs(10);
+        let mut stopped = false;
+        while Instant::now() < stopped_deadline {
+            let mut status = 0;
+            // SAFETY: the helper is our unreaped child; WNOHANG avoids an
+            // unbounded test wait and WUNTRACED reports the monitor's SIGSTOP.
+            let waited =
+                unsafe { libc::waitpid(pid, &mut status, libc::WNOHANG | libc::WUNTRACED) };
+            assert!(waited >= 0, "waitpid: {}", std::io::Error::last_os_error());
+            if waited == pid && libc::WIFSTOPPED(status) {
+                stopped = true;
+                break;
+            }
+            thread::sleep(Duration::from_millis(20));
+        }
+        assert!(stopped, "Tactus did not enter a stopped job-control state");
+
+        thread::sleep(Duration::from_millis(1300));
+        assert!(
+            !marker.exists(),
+            "the isolated agent kept running while Tactus was suspended"
+        );
+
+        // SAFETY: SIGCONT resumes our helper; its installed handler forwards
+        // the same transition to the isolated process group.
+        assert_eq!(unsafe { libc::kill(pid, libc::SIGCONT) }, 0);
+        let status = wait_for_exit(&mut helper, Duration::from_secs(10))
+            .expect("continued helper completes normally");
+        let resumed = marker.exists();
+        let _ = std::fs::remove_dir_all(&scratch);
+        assert!(status.success(), "helper status: {status}");
+        assert!(resumed, "the isolated agent was not continued with Tactus");
     }
 
     #[test]

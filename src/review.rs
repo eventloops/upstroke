@@ -763,7 +763,7 @@ fn materialize_prompt(cx: &ReviewCx<'_>) -> Result<String, TactusError> {
 pub(crate) fn complete_diff_error(diff: &str) -> Option<String> {
     (diff.len() > MAX_DIFF_BYTES).then(|| {
         format!(
-            "review diff is {} bytes, above the {}-byte complete-review limit; split the task so every changed path can be judged in one pass",
+            "review diff is {} bytes, above the {}-byte complete-review limit; retry only if guidance can produce a smaller complete diff, or skip this frozen task and start a new run whose plan splits the work",
             diff.len(),
             MAX_DIFF_BYTES
         )
@@ -1307,7 +1307,8 @@ mod tests {
         let error = run_review(&cx).expect_err("oversized review must fail closed");
         let message = error.to_string();
         assert!(message.contains("complete-review limit"), "{message}");
-        assert!(message.contains("split the task"), "{message}");
+        assert!(message.contains("smaller complete diff"), "{message}");
+        assert!(message.contains("start a new run"), "{message}");
     }
 
     #[test]
