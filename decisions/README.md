@@ -18,8 +18,10 @@ The contract that keeps this folder safe:
   sections appended to *their own* record, never silent edits. A record whose
   conclusion is later overturned says so and links forward; it does not get
   rewritten to look right.
-- **Design documents do not live here.** Proposals and drafts stay outside the
-  repo; a record cites its inputs.
+- **Design documents do not live here.** Proposals live in
+  [`proposals/`](../proposals/README.md) and reach this folder only as a
+  decision record citing the proposal and its critiques as inputs. (Convention
+  since 2026-08-13; before that, drafts stayed outside the repo entirely.)
 - **Cross-link freely.** A decision that constrains another should say so in both
   directions.
 
