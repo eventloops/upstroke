@@ -1788,23 +1788,27 @@ mod termination {
             if *pid <= 0 {
                 continue;
             }
-            let mut info: libc::proc_bsdinfo = unsafe { std::mem::zeroed() };
+            let mut info: libc::proc_bsdshortinfo = unsafe { std::mem::zeroed() };
             let read = unsafe {
                 libc::proc_pidinfo(
                     *pid,
-                    libc::PROC_PIDTBSDINFO,
-                    0,
-                    (&mut info as *mut libc::proc_bsdinfo).cast(),
-                    std::mem::size_of::<libc::proc_bsdinfo>() as libc::c_int,
+                    libc::PROC_PIDT_SHORTBSDINFO,
+                    // Apple only searches the zombie table for BSD-info
+                    // flavors when this argument is non-zero. Without it an
+                    // exited group member is indistinguishable from an
+                    // incomplete snapshot and cleanup must wait forever.
+                    1,
+                    (&mut info as *mut libc::proc_bsdshortinfo).cast(),
+                    std::mem::size_of::<libc::proc_bsdshortinfo>() as libc::c_int,
                 )
             };
-            if read != std::mem::size_of::<libc::proc_bsdinfo>() as libc::c_int {
+            if read != std::mem::size_of::<libc::proc_bsdshortinfo>() as libc::c_int {
                 // As on Linux, a disappearing pid is resolved by the next
                 // complete snapshot. Never turn an incomplete observation
                 // into permission to release the cleanup lease.
                 return None;
             }
-            if info.pbi_pgid == pgid as u32 && info.pbi_status != libc::SZOMB {
+            if info.pbsi_pgid == pgid as u32 && info.pbsi_status != libc::SZOMB {
                 return Some(true);
             }
         }
