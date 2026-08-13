@@ -165,6 +165,7 @@ jobs:
       - run: cargo fmt --check
       - run: cargo clippy --all-targets -- -D warnings
       - run: bash .github/scripts/test-frontier-evidence.sh
+      - run: bash .github/scripts/test-frontier-check.sh
       - run: bash .github/scripts/test-release-record.sh
 
   test:
@@ -194,32 +195,38 @@ jobs:
       - run: cargo test --all-targets
 
   attest:
-    name: record reviewed deployment
+    name: publish App-owned exact-head check
     needs: [validate, lint, test]
     runs-on: ubuntu-latest
     timeout-minutes: 5
+    environment: frontier-check-signer
     permissions:
       contents: read
-      deployments: write
       issues: read
       pull-requests: read
     env:
-      GH_TOKEN: ${{ github.token }}
       PR_NUMBER: ${{ github.event.client_payload.pull_request }}
       REVIEWED_SHA: ${{ needs.validate.outputs.head_sha }}
       REVIEW_URL: ${{ needs.validate.outputs.review_url }}
       EVIDENCE_DIGEST: ${{ needs.validate.outputs.evidence_digest }}
-      REVIEW_ENVIRONMENT: frontier-reviewed
     steps:
-      - name: Record successful deployment for exact reviewed head
+      # Keep every script in this privileged job on the trusted default branch.
+      # The PR head was tested by the preceding jobs but is never executed here.
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - name: Revalidate exact head immediately before signing
         shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
 
-          # The trusted test reruns can take 30 minutes. Refuse to record an
-          # obsolete deployment if the PR moved, closed, or fell behind while
-          # they were running. The ruleset also binds deployments to the head,
-          # but avoiding stale attestations keeps the audit trail truthful.
+          # The trusted test reruns can take 30 minutes. Refuse to sign an
+          # obsolete review if the PR moved, closed, or fell behind meanwhile.
+          # A push racing the final API call is still safe: the App check is
+          # attached to REVIEWED_SHA, not to an abstract pull request.
           repository="$(gh api "repos/$GITHUB_REPOSITORY")"
           repository_owner="$(jq -r '.owner.login' <<< "$repository")"
           default_branch="$(jq -r '.default_branch' <<< "$repository")"
@@ -276,6 +283,7 @@ jobs:
             echo "review evidence no longer matches this owner and pull request" >&2
             exit 1
           fi
+          printf '%s' "$comment_body" | bash .github/scripts/validate-frontier-evidence.sh "$REVIEWED_SHA"
           evidence_digest="$(printf '%s' "$comment_body" | sha256sum | awk '{print $1}')"
           # EVIDENCE_DIGEST is a validated output passed through the job env.
           # shellcheck disable=SC2153
@@ -284,41 +292,50 @@ jobs:
             exit 1
           fi
 
-          # Intentionally call the Deployments API from this trusted,
-          # default-branch-only job. Environment required reviewers protect
-          # Actions jobs that declare `environment`; they do not approve this
-          # API call. Never add deployments: write to a PR-triggered workflow.
-          deployment_payload="$(jq -n \
-            --arg ref "$REVIEWED_SHA" \
-            --arg environment "$REVIEW_ENVIRONMENT" \
-            --arg review_url "$REVIEW_URL" \
-            '{
-              ref: $ref,
-              task: "frontier-review",
-              auto_merge: false,
-              required_contexts: [],
-              environment: $environment,
-              description: "Independent frontier review attestation",
-              transient_environment: false,
-              production_environment: false,
-              payload: {review_url: $review_url, reviewed_sha: $ref}
-            }')"
-          deployment_id="$(gh api --method POST "repos/$GITHUB_REPOSITORY/deployments" \
-            -H 'Accept: application/vnd.github+json' \
-            --input - --jq '.id' <<< "$deployment_payload")"
+      - name: Mint a repository-scoped review-gate token
+        id: app-token
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          client-id: ${{ vars.TACTUS_FRONTIER_APP_CLIENT_ID }}
+          private-key: ${{ secrets.TACTUS_FRONTIER_APP_PRIVATE_KEY }}
+          permission-checks: write
+      - name: Publish and verify the exact-head App check
+        shell: bash
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          EXPECTED_APP_ID: ${{ vars.TACTUS_FRONTIER_APP_ID }}
+        run: |
+          set -euo pipefail
 
-          status_payload="$(jq -n \
-            --arg environment "$REVIEW_ENVIRONMENT" \
-            --arg review_url "$REVIEW_URL" \
-            --arg sha "$REVIEWED_SHA" \
-            '{
-              state: "success",
-              environment: $environment,
-              description: ("Frontier review passed for " + $sha),
-              log_url: $review_url,
-              environment_url: $review_url,
-              auto_inactive: false
-            }')"
-          gh api --method POST "repos/$GITHUB_REPOSITORY/deployments/$deployment_id/statuses" \
+          if [[ ! "$EXPECTED_APP_ID" =~ ^[1-9][0-9]*$ ]]; then
+            echo "TACTUS_FRONTIER_APP_ID must be a positive integer" >&2
+            exit 1
+          fi
+
+          check_payload="$(bash .github/scripts/frontier-check-payload.sh \
+            "$REVIEWED_SHA" "$PR_NUMBER" "$REVIEW_URL" "$EVIDENCE_DIGEST")"
+          check_run="$(gh api --method POST "repos/$GITHUB_REPOSITORY/check-runs" \
             -H 'Accept: application/vnd.github+json' \
-            --input - <<< "$status_payload"
+            -H 'X-GitHub-Api-Version: 2026-03-10' \
+            --input - <<< "$check_payload")"
+
+          actual_name="$(jq -r '.name' <<< "$check_run")"
+          actual_sha="$(jq -r '.head_sha' <<< "$check_run")"
+          actual_status="$(jq -r '.status' <<< "$check_run")"
+          actual_conclusion="$(jq -r '.conclusion' <<< "$check_run")"
+          actual_app_id="$(jq -r '.app.id | tostring' <<< "$check_run")"
+          actual_external_id="$(jq -r '.external_id' <<< "$check_run")"
+          expected_external_id="tactus-frontier-review:pr-$PR_NUMBER:$REVIEWED_SHA:$EVIDENCE_DIGEST"
+
+          if [[ "$actual_name" != "tactus-frontier-review" ||
+                "$actual_sha" != "$REVIEWED_SHA" ||
+                "$actual_status" != "completed" ||
+                "$actual_conclusion" != "success" ||
+                "$actual_app_id" != "$EXPECTED_APP_ID" ||
+                "$actual_external_id" != "$expected_external_id" ]]; then
+            echo "GitHub returned a check run that does not match the signed review record" >&2
+            jq '{name, head_sha, status, conclusion, external_id, app_id: .app.id}' <<< "$check_run" >&2
+            exit 1
+          fi
+
+          jq '{id, name, head_sha, status, conclusion, external_id, app_id: .app.id, details_url}' <<< "$check_run"
