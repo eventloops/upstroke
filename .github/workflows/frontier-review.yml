@@ -202,9 +202,6 @@ jobs:
     environment: frontier-check-signer
     permissions:
       contents: read
-      # Transitional only: keep the old required deployment satisfiable until
-      # the additive App-check canary passes and the ruleset is migrated.
-      deployments: write
       issues: read
       pull-requests: read
     env:
@@ -342,51 +339,3 @@ jobs:
           fi
 
           jq '{id, name, head_sha, status, conclusion, external_id, app_id: .app.id, details_url}' <<< "$check_run"
-      - name: Publish transitional deployment compatibility gate
-        shell: bash
-        env:
-          GH_TOKEN: ${{ github.token }}
-          REVIEW_ENVIRONMENT: frontier-reviewed
-        run: |
-          set -euo pipefail
-
-          # This is deliberately ordered after the App check. If App signing
-          # fails, the currently required deployment remains absent and the
-          # migration fails closed. Remove this step and deployments: write in
-          # the cleanup PR only after the App-bound stale-SHA canary passes.
-          deployment_payload="$(jq -n \
-            --arg ref "$REVIEWED_SHA" \
-            --arg environment "$REVIEW_ENVIRONMENT" \
-            --arg review_url "$REVIEW_URL" \
-            '{
-              ref: $ref,
-              task: "frontier-review",
-              auto_merge: false,
-              required_contexts: [],
-              environment: $environment,
-              description: "Transitional frontier review compatibility gate",
-              transient_environment: false,
-              production_environment: false,
-              payload: {review_url: $review_url, reviewed_sha: $ref}
-            }')"
-          deployment_id="$(gh api --method POST "repos/$GITHUB_REPOSITORY/deployments" \
-            -H 'Accept: application/vnd.github+json' \
-            -H 'X-GitHub-Api-Version: 2026-03-10' \
-            --input - --jq '.id' <<< "$deployment_payload")"
-
-          status_payload="$(jq -n \
-            --arg environment "$REVIEW_ENVIRONMENT" \
-            --arg review_url "$REVIEW_URL" \
-            --arg sha "$REVIEWED_SHA" \
-            '{
-              state: "success",
-              environment: $environment,
-              description: ("Transitional review gate for " + $sha),
-              log_url: $review_url,
-              environment_url: $review_url,
-              auto_inactive: false
-            }')"
-          gh api --method POST "repos/$GITHUB_REPOSITORY/deployments/$deployment_id/statuses" \
-            -H 'Accept: application/vnd.github+json' \
-            -H 'X-GitHub-Api-Version: 2026-03-10' \
-            --input - <<< "$status_payload"
