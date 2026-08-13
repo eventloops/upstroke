@@ -12,14 +12,16 @@
 //! Unix subtleties are the mirror image: each invocation gets an isolated
 //! process group so a timeout can kill every descendant, but that isolation
 //! also stops terminal interrupts reaching the child automatically. A tiny
-//! process-wide signal monitor below preserves inherited ignored signals,
+//! process-wide signal monitor below preserves inherited ignored and custom
+//! handlers,
 //! coordinates SIGINT/SIGTERM/SIGHUP/SIGQUIT termination, and proxies terminal
 //! suspension/continuation. It waits out any spawn-registration race, blocks
 //! launches across a suspension transition, and uses a descriptor-scrubbed
-//! guard process to close the last signal-to-stop race. It kills every active
-//! process group before re-raising a terminating signal in Tactus, and stops
-//! every active group whenever Tactus stops. The run lock can therefore never
-//! be released -- or appear suspended -- while an isolated agent is running.
+//! guard process to close the last signal-to-stop race. A separate cleanup
+//! reaper survives even an uncatchable Tactus SIGKILL. Together they kill every
+//! active process group before ownership is released and stop every active
+//! group whenever Tactus stops. The run lock can therefore never be released
+//! -- or appear suspended -- while an isolated agent is running.
 
 use std::io::{Read, Write};
 use std::process::{Child, Command, Stdio};
@@ -61,21 +63,14 @@ pub fn run_with_timeout(
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
 
-    // A supervised Unix invocation owns a fresh process group. Vendor CLIs
-    // routinely launch native children; killing only the shell/Node parent
-    // leaves those children consuming quota and holding our pipe handles.
-    #[cfg(unix)]
-    {
-        use std::os::unix::process::CommandExt;
-        command.process_group(0);
-    }
-
     // Enter before `spawn`: if an interrupt arrives in the narrow interval
     // between creating the child and learning its pid, the signal monitor
     // waits for this registration rather than terminating Tactus first and
     // orphaning the new process group.
     #[cfg(unix)]
     let mut termination = termination::Supervisor::begin()?;
+    #[cfg(unix)]
+    termination.prepare(&mut command);
 
     let started = Instant::now();
     let mut child = command.spawn().map_err(|e| TactusError::Agent {
@@ -199,7 +194,7 @@ mod termination {
     static CONTINUE_REQUESTED: AtomicBool = AtomicBool::new(false);
     static SUSPEND_ARMED: AtomicBool = AtomicBool::new(false);
     static GUARD_COMMAND_FD: AtomicI32 = AtomicI32::new(-1);
-    static GUARD_SIGNAL: AtomicI32 = AtomicI32::new(0);
+    static GUARD_WAKE_FD: AtomicI32 = AtomicI32::new(-1);
     static STATE: OnceLock<Result<Arc<Mutex<State>>, String>> = OnceLock::new();
 
     const GUARD_READY: u8 = 0x91;
@@ -212,11 +207,24 @@ mod termination {
     const HANDLE_SIGTERM: u8 = 1 << 1;
     const HANDLE_SIGHUP: u8 = 1 << 2;
     const HANDLE_SIGQUIT: u8 = 1 << 3;
+    const REAPER_READY: u8 = 0x81;
+    const REAPER_REGISTER: u8 = 0x82;
+    const REAPER_UNREGISTER: u8 = 0x83;
+    const REAPER_OK: u8 = 0x84;
+    const REAPER_FAIL: u8 = 0x85;
+    const REAPER_MAX_GROUPS: usize = 1_024;
 
     #[derive(Clone, Copy)]
     struct SignalPolicy {
         termination_mask: u8,
         job_control: bool,
+    }
+
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum SignalDisposition {
+        Default,
+        Ignored,
+        Custom,
     }
 
     impl SignalPolicy {
@@ -242,7 +250,16 @@ mod termination {
         /// Set before a suspend snapshot and cleared only after continuation.
         /// New launches wait outside the lock for the complete transition.
         suspending: bool,
+        reaper: Reaper,
         guard: Guard,
+    }
+
+    #[derive(Clone, Copy)]
+    struct Reaper {
+        command_fd: libc::c_int,
+        ack_fd: libc::c_int,
+        _command_keepalive_fd: libc::c_int,
+        pid: libc::pid_t,
     }
 
     #[derive(Clone, Copy)]
@@ -263,6 +280,7 @@ mod termination {
     pub(super) struct Supervisor {
         state: Arc<Mutex<State>>,
         phase: Phase,
+        reaper: Reaper,
     }
 
     impl Supervisor {
@@ -280,16 +298,41 @@ mod termination {
                         message: "process launch interrupted by a termination signal".to_owned(),
                     });
                 }
-                if !locked.suspending {
+                if !locked.suspending && locked.spawning == 0 {
                     locked.spawning = locked.spawning.saturating_add(1);
+                    let reaper = locked.reaper;
                     drop(locked);
                     return Ok(Self {
                         state,
                         phase: Phase::Spawning,
+                        reaper,
                     });
                 }
                 drop(locked);
                 thread::sleep(Duration::from_millis(1));
+            }
+        }
+
+        pub(super) fn prepare(&self, command: &mut std::process::Command) {
+            use std::os::unix::process::CommandExt;
+
+            let reaper = self.reaper;
+            // SAFETY: the closure uses only async-signal-safe syscalls. It
+            // creates the private process group and registers it with the
+            // external reaper before exec, so even SIGKILL in the parent's
+            // post-spawn registration window cannot orphan the agent tree.
+            unsafe {
+                command.pre_exec(move || {
+                    let pid = libc::getpid();
+                    if libc::setpgid(0, 0) != 0 {
+                        return Err(std::io::Error::last_os_error());
+                    }
+                    if reaper.register_raw(pid) {
+                        Ok(())
+                    } else {
+                        Err(std::io::Error::from_raw_os_error(libc::EIO))
+                    }
+                });
             }
         }
 
@@ -310,19 +353,58 @@ mod termination {
 
     impl Drop for Supervisor {
         fn drop(&mut self) {
-            let mut locked = self
-                .state
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
             match self.phase {
-                Phase::Spawning => locked.spawning = locked.spawning.saturating_sub(1),
+                Phase::Spawning => {
+                    let mut locked = self
+                        .state
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner());
+                    locked.spawning = locked.spawning.saturating_sub(1);
+                }
                 Phase::Group(pgid) => {
-                    if let Some(index) = locked
-                        .groups
-                        .iter()
-                        .position(|candidate| *candidate == pgid)
-                    {
-                        locked.groups.swap_remove(index);
+                    // The direct child may exit while detached descendants in
+                    // its process group are still live. Do not release either
+                    // the in-process or crash-reaper registration until the
+                    // complete group has been synchronously killed.
+                    if !kill_and_wait_for_group(pgid) {
+                        let _ = PENDING_TERMINATION.compare_exchange(
+                            0,
+                            libc::SIGTERM,
+                            Ordering::SeqCst,
+                            Ordering::SeqCst,
+                        );
+                        return;
+                    }
+                    loop {
+                        let mut locked = self
+                            .state
+                            .lock()
+                            .unwrap_or_else(|poisoned| poisoned.into_inner());
+                        // Registration uses the shared acknowledgement pipe
+                        // from pre_exec. Keep unregister transactions out of
+                        // that interval; holding this mutex then prevents a
+                        // new launch from beginning until the ack is consumed.
+                        if locked.spawning != 0 {
+                            drop(locked);
+                            thread::sleep(Duration::from_millis(1));
+                            continue;
+                        }
+                        if let Some(index) = locked
+                            .groups
+                            .iter()
+                            .position(|candidate| *candidate == pgid)
+                        {
+                            locked.groups.swap_remove(index);
+                        }
+                        if !locked.reaper.unregister(pgid) {
+                            let _ = PENDING_TERMINATION.compare_exchange(
+                                0,
+                                libc::SIGTERM,
+                                Ordering::SeqCst,
+                                Ordering::SeqCst,
+                            );
+                        }
+                        break;
                     }
                 }
             }
@@ -349,18 +431,27 @@ mod termination {
             (libc::SIGHUP, HANDLE_SIGHUP),
             (libc::SIGQUIT, HANDLE_SIGQUIT),
         ] {
-            if !is_ignored(signal)? {
+            if disposition(signal)? == SignalDisposition::Default {
                 policy.termination_mask |= bit;
             }
         }
-        policy.job_control = !is_ignored(libc::SIGTSTP)? && !is_ignored(libc::SIGCONT)?;
+        policy.job_control = disposition(libc::SIGTSTP)? == SignalDisposition::Default
+            && disposition(libc::SIGCONT)? == SignalDisposition::Default;
 
-        let guard = spawn_guard(policy)?;
+        let reaper = spawn_reaper()?;
+        let guard = match spawn_guard(policy) {
+            Ok(guard) => guard,
+            Err(error) => {
+                reaper.shutdown_after_setup_failure();
+                return Err(error);
+            }
+        };
         let state = Arc::new(Mutex::new(State {
             spawning: 0,
             groups: Vec::new(),
             terminating: false,
             suspending: false,
+            reaper,
             guard,
         }));
         let monitored = Arc::clone(&state);
@@ -370,10 +461,9 @@ mod termination {
             .map_err(|error| format!("starting Unix signal monitor: {error}"))?;
 
         for signal in [libc::SIGINT, libc::SIGTERM, libc::SIGHUP, libc::SIGQUIT] {
-            // POSIX preserves SIG_IGN across exec. `nohup` relies on that for
-            // SIGHUP, and replacing it would make Tactus less durable merely
-            // because it supervised a command. Explicitly ignored terminating
-            // signals retain the disposition the launcher chose.
+            // Preserve every launcher-owned policy. POSIX carries SIG_IGN
+            // across exec (`nohup` relies on it), while an embedding host may
+            // have installed a custom in-process handler before calling us.
             if policy.handles_termination(signal) {
                 install_handler(signal)?;
             }
@@ -389,7 +479,7 @@ mod termination {
         Ok(state)
     }
 
-    fn is_ignored(signal: libc::c_int) -> Result<bool, String> {
+    fn disposition(signal: libc::c_int) -> Result<SignalDisposition, String> {
         // SAFETY: a null `act` queries the current disposition without
         // changing it; `previous` is initialized by a successful call.
         unsafe {
@@ -400,7 +490,13 @@ mod termination {
                     std::io::Error::last_os_error()
                 ));
             }
-            Ok(previous.sa_sigaction == libc::SIG_IGN)
+            Ok(if previous.sa_sigaction == libc::SIG_IGN {
+                SignalDisposition::Ignored
+            } else if previous.sa_sigaction == libc::SIG_DFL {
+                SignalDisposition::Default
+            } else {
+                SignalDisposition::Custom
+            })
         }
     }
 
@@ -444,7 +540,15 @@ mod termination {
     }
 
     extern "C" fn record_guard_signal(signal: libc::c_int) {
-        GUARD_SIGNAL.store(signal, Ordering::SeqCst);
+        let fd = GUARD_WAKE_FD.load(Ordering::SeqCst);
+        if fd < 0 {
+            return;
+        }
+        let byte = u8::try_from(signal).unwrap_or(u8::MAX);
+        // SAFETY: the wake descriptor is nonblocking and dedicated to the
+        // guard's self-pipe. A full pipe is already readable, so dropping that
+        // byte cannot lose the wakeup.
+        let _ = unsafe { libc::write(fd, (&byte as *const u8).cast(), 1) };
     }
 
     fn notify_guard(signal: libc::c_int) {
@@ -617,6 +721,288 @@ mod termination {
         locked.groups.clone()
     }
 
+    impl Reaper {
+        /// Register from `Command::pre_exec`, where allocation and Rust locks
+        /// are forbidden. Launches are serialized, so the shared one-byte
+        /// acknowledgement belongs to this registration frame.
+        fn register_raw(self, pgid: libc::pid_t) -> bool {
+            self.transact_raw(REAPER_REGISTER, pgid) == Some(REAPER_OK)
+        }
+
+        fn unregister(self, pgid: libc::pid_t) -> bool {
+            self.transact_raw(REAPER_UNREGISTER, pgid) == Some(REAPER_OK)
+        }
+
+        fn transact_raw(self, operation: u8, pgid: libc::pid_t) -> Option<u8> {
+            let mut frame = [0_u8; 5];
+            frame[0] = operation;
+            frame[1..].copy_from_slice(&pgid.to_ne_bytes());
+            if !write_raw(self.command_fd, &frame) {
+                return None;
+            }
+            read_raw_byte(self.ack_fd)
+        }
+
+        fn shutdown_after_setup_failure(self) {
+            close_fd(self.command_fd);
+            close_fd(self.ack_fd);
+            close_fd(self._command_keepalive_fd);
+            let deadline = std::time::Instant::now() + Duration::from_secs(2);
+            loop {
+                let waited =
+                    unsafe { libc::waitpid(self.pid, std::ptr::null_mut(), libc::WNOHANG) };
+                if waited == self.pid || waited < 0 {
+                    return;
+                }
+                if std::time::Instant::now() >= deadline {
+                    unsafe {
+                        let _ = libc::kill(self.pid, libc::SIGKILL);
+                        let _ = libc::waitpid(self.pid, std::ptr::null_mut(), 0);
+                    }
+                    return;
+                }
+                thread::sleep(Duration::from_millis(10));
+            }
+        }
+    }
+
+    fn spawn_reaper() -> Result<Reaper, String> {
+        let mut command = [-1; 2];
+        let mut ack = [-1; 2];
+        let open_max = unsafe { libc::sysconf(libc::_SC_OPEN_MAX) };
+        if open_max <= 0 {
+            return Err("reading the Unix open-file descriptor ceiling".to_owned());
+        }
+        let open_max = libc::c_int::try_from(open_max)
+            .map_err(|_| "Unix open-file descriptor ceiling exceeds c_int".to_owned())?;
+        if unsafe { libc::pipe(command.as_mut_ptr()) } != 0 {
+            return Err(format!(
+                "creating Unix cleanup-reaper command pipe: {}",
+                std::io::Error::last_os_error()
+            ));
+        }
+        if unsafe { libc::pipe(ack.as_mut_ptr()) } != 0 {
+            close_fd(command[0]);
+            close_fd(command[1]);
+            return Err(format!(
+                "creating Unix cleanup-reaper acknowledgement pipe: {}",
+                std::io::Error::last_os_error()
+            ));
+        }
+
+        // SAFETY: the child immediately enters a fixed-storage syscall-only
+        // loop. It never returns to the multithreaded Rust runtime.
+        let pid = unsafe { libc::fork() };
+        if pid < 0 {
+            for fd in [command[0], command[1], ack[0], ack[1]] {
+                close_fd(fd);
+            }
+            return Err(format!(
+                "starting Unix cleanup reaper: {}",
+                std::io::Error::last_os_error()
+            ));
+        }
+        if pid == 0 {
+            close_fd(command[1]);
+            close_fd(ack[0]);
+            // A separate process group is the crucial boundary: an
+            // uncatchable kill of Tactus's foreground job must not also kill
+            // the process that owns its final agent cleanup.
+            if unsafe { libc::setpgid(0, 0) } != 0 {
+                unsafe { libc::_exit(1) };
+            }
+            install_reaper_dispositions();
+            close_inherited_fds(&[command[0], ack[1]], open_max);
+            reaper_loop(command[0], ack[1]);
+        }
+
+        // Close the parent's race with the child-side setpgid. Either call may
+        // win; both establish the same private group before any agent exists.
+        if unsafe { libc::setpgid(pid, pid) } != 0 {
+            let error = last_errno();
+            if error != libc::EACCES && error != libc::EPERM {
+                for fd in [command[0], command[1], ack[0], ack[1]] {
+                    close_fd(fd);
+                }
+                unsafe {
+                    let _ = libc::kill(pid, libc::SIGKILL);
+                    let _ = libc::waitpid(pid, std::ptr::null_mut(), 0);
+                }
+                return Err(format!(
+                    "isolating Unix cleanup reaper: {}",
+                    std::io::Error::from_raw_os_error(error)
+                ));
+            }
+        }
+        close_fd(ack[1]);
+        if !set_close_on_exec(command[0])
+            || !set_close_on_exec(command[1])
+            || !set_close_on_exec(ack[0])
+        {
+            for fd in [command[0], command[1], ack[0]] {
+                close_fd(fd);
+            }
+            unsafe {
+                let _ = libc::kill(pid, libc::SIGKILL);
+                let _ = libc::waitpid(pid, std::ptr::null_mut(), 0);
+            }
+            return Err("configuring Unix cleanup-reaper descriptors".to_owned());
+        }
+        let reaper = Reaper {
+            command_fd: command[1],
+            ack_fd: ack[0],
+            _command_keepalive_fd: command[0],
+            pid,
+        };
+        if read_guard_ack(ack[0], Duration::from_secs(2)) != Some(REAPER_READY) {
+            reaper.shutdown_after_setup_failure();
+            return Err("Unix cleanup reaper did not initialize".to_owned());
+        }
+        Ok(reaper)
+    }
+
+    fn install_reaper_dispositions() {
+        unsafe {
+            for signal in [
+                libc::SIGINT,
+                libc::SIGTERM,
+                libc::SIGHUP,
+                libc::SIGQUIT,
+                libc::SIGTSTP,
+                libc::SIGCONT,
+                libc::SIGPIPE,
+            ] {
+                libc::signal(signal, libc::SIG_IGN);
+            }
+            let mut empty: libc::sigset_t = std::mem::zeroed();
+            libc::sigemptyset(&mut empty);
+            libc::sigprocmask(libc::SIG_SETMASK, &empty, std::ptr::null_mut());
+        }
+    }
+
+    fn reaper_loop(command_fd: libc::c_int, ack_fd: libc::c_int) -> ! {
+        let mut groups = [0_i32; REAPER_MAX_GROUPS];
+        let mut group_count = 0_usize;
+        if !write_raw(ack_fd, &[REAPER_READY]) {
+            unsafe { libc::_exit(1) };
+        }
+        loop {
+            let mut polled = libc::pollfd {
+                fd: command_fd,
+                events: libc::POLLIN | libc::POLLHUP,
+                revents: 0,
+            };
+            let result = unsafe { libc::poll(&mut polled, 1, 1_000) };
+            if result < 0 {
+                if last_errno_is_interrupted() {
+                    continue;
+                }
+                reap_registered_groups(&groups[..group_count]);
+            }
+            prune_reaper_groups(&mut groups, &mut group_count);
+            if result == 0 {
+                continue;
+            }
+            if polled.revents & (libc::POLLIN | libc::POLLHUP | libc::POLLERR) == 0 {
+                continue;
+            }
+            let mut frame = [0_u8; 5];
+            if !read_raw_exact(command_fd, &mut frame) {
+                reap_registered_groups(&groups[..group_count]);
+            }
+            let pgid = i32::from_ne_bytes([frame[1], frame[2], frame[3], frame[4]]);
+            let accepted = match frame[0] {
+                REAPER_REGISTER => {
+                    let duplicate = groups[..group_count].contains(&pgid);
+                    if pgid <= 0 || duplicate || group_count == REAPER_MAX_GROUPS {
+                        false
+                    } else {
+                        groups[group_count] = pgid;
+                        group_count += 1;
+                        true
+                    }
+                }
+                REAPER_UNREGISTER => {
+                    if let Some(index) = groups[..group_count]
+                        .iter()
+                        .position(|candidate| *candidate == pgid)
+                    {
+                        group_count -= 1;
+                        groups[index] = groups[group_count];
+                    }
+                    true
+                }
+                _ => false,
+            };
+            if !write_raw(ack_fd, &[if accepted { REAPER_OK } else { REAPER_FAIL }]) {
+                reap_registered_groups(&groups[..group_count]);
+            }
+        }
+    }
+
+    fn prune_reaper_groups(groups: &mut [i32; REAPER_MAX_GROUPS], count: &mut usize) {
+        let mut index = 0;
+        while index < *count {
+            if process_group_exists_raw(groups[index]) {
+                index += 1;
+            } else {
+                *count -= 1;
+                groups[index] = groups[*count];
+            }
+        }
+    }
+
+    fn reap_registered_groups(groups: &[i32]) -> ! {
+        for pgid in groups {
+            unsafe {
+                let _ = libc::kill(-*pgid, libc::SIGKILL);
+            }
+        }
+        unsafe { libc::_exit(0) };
+    }
+
+    fn write_raw(fd: libc::c_int, bytes: &[u8]) -> bool {
+        let mut offset = 0;
+        while offset < bytes.len() {
+            let written =
+                unsafe { libc::write(fd, bytes.as_ptr().add(offset).cast(), bytes.len() - offset) };
+            if written > 0 {
+                offset += written as usize;
+            } else if written < 0 && last_errno_is_interrupted() {
+                continue;
+            } else {
+                return false;
+            }
+        }
+        true
+    }
+
+    fn read_raw_exact(fd: libc::c_int, bytes: &mut [u8]) -> bool {
+        let mut offset = 0;
+        while offset < bytes.len() {
+            let read = unsafe {
+                libc::read(
+                    fd,
+                    bytes.as_mut_ptr().add(offset).cast(),
+                    bytes.len() - offset,
+                )
+            };
+            if read > 0 {
+                offset += read as usize;
+            } else if read < 0 && last_errno_is_interrupted() {
+                continue;
+            } else {
+                return false;
+            }
+        }
+        true
+    }
+
+    fn read_raw_byte(fd: libc::c_int) -> Option<u8> {
+        let mut byte = 0_u8;
+        read_raw_exact(fd, std::slice::from_mut(&mut byte)).then_some(byte)
+    }
+
     impl Guard {
         fn arm(self) -> bool {
             write_byte(self.command_fd, GUARD_ARM) && self.read_ack() == Some(GUARD_ARM)
@@ -725,6 +1111,7 @@ mod termination {
     fn spawn_guard(policy: SignalPolicy) -> Result<Guard, String> {
         let mut command = [-1; 2];
         let mut ack = [-1; 2];
+        let mut wake = [-1; 2];
         // Resolve the descriptor ceiling before fork: sysconf may take libc
         // locks, whereas the multithreaded child may call only async-safe
         // primitives until it enters the guard loop.
@@ -750,13 +1137,27 @@ mod termination {
                 std::io::Error::last_os_error()
             ));
         }
+        if unsafe { libc::pipe(wake.as_mut_ptr()) } != 0
+            || !set_nonblocking(wake[0])
+            || !set_nonblocking(wake[1])
+        {
+            for fd in [command[0], command[1], ack[0], ack[1], wake[0], wake[1]] {
+                close_fd(fd);
+            }
+            return Err(format!(
+                "creating Unix job-control wake pipe: {}",
+                std::io::Error::last_os_error()
+            ));
+        }
+        GUARD_WAKE_FD.store(wake[1], Ordering::SeqCst);
 
         // SAFETY: the child enters `guard_loop` immediately, which uses only
         // libc syscalls and lock-free atomics after fork. It closes every
         // inherited descriptor except its two pipes before doing any work.
         let pid = unsafe { libc::fork() };
         if pid < 0 {
-            for fd in [command[0], command[1], ack[0], ack[1]] {
+            GUARD_WAKE_FD.store(-1, Ordering::SeqCst);
+            for fd in [command[0], command[1], ack[0], ack[1], wake[0], wake[1]] {
                 close_fd(fd);
             }
             return Err(format!(
@@ -767,11 +1168,20 @@ mod termination {
         if pid == 0 {
             close_fd(command[1]);
             close_fd(ack[0]);
-            close_inherited_fds(command[0], ack[1], open_max);
-            guard_loop(unsafe { libc::getppid() }, command[0], ack[1], policy);
+            close_inherited_fds(&[command[0], ack[1], wake[0], wake[1]], open_max);
+            guard_loop(
+                unsafe { libc::getppid() },
+                command[0],
+                ack[1],
+                wake[0],
+                policy,
+            );
         }
 
+        GUARD_WAKE_FD.store(-1, Ordering::SeqCst);
         close_fd(ack[1]);
+        close_fd(wake[0]);
+        close_fd(wake[1]);
         if !set_close_on_exec(command[0])
             || !set_close_on_exec(command[1])
             || !set_close_on_exec(ack[0])
@@ -811,6 +1221,7 @@ mod termination {
         parent: libc::pid_t,
         command_fd: libc::c_int,
         ack_fd: libc::c_int,
+        wake_fd: libc::c_int,
         policy: SignalPolicy,
     ) -> ! {
         install_guard_dispositions(policy);
@@ -822,19 +1233,25 @@ mod termination {
         let mut wake = false;
         let mut buffer = [0_u8; 64];
         loop {
-            let mut poll_fd = libc::pollfd {
-                fd: command_fd,
-                events: libc::POLLIN | libc::POLLHUP,
-                revents: 0,
-            };
-            // SAFETY: `poll_fd` is valid for one entry. A foreground-group
-            // signal interrupts the poll and is observed through GUARD_SIGNAL;
-            // parent-PID signals arrive over the ordered command pipe.
-            let polled = unsafe { libc::poll(&mut poll_fd, 1, -1) };
+            let mut poll_fds = [
+                libc::pollfd {
+                    fd: command_fd,
+                    events: libc::POLLIN | libc::POLLHUP,
+                    revents: 0,
+                },
+                libc::pollfd {
+                    fd: wake_fd,
+                    events: libc::POLLIN | libc::POLLHUP,
+                    revents: 0,
+                },
+            ];
+            // Both parent relays and guard-directed foreground signals make a
+            // descriptor readable, so there is no atomic-check-to-poll window.
+            let polled = unsafe { libc::poll(poll_fds.as_mut_ptr(), 2, -1) };
             if polled < 0 && !last_errno_is_interrupted() {
                 unsafe { libc::_exit(1) };
             }
-            if polled > 0 && poll_fd.revents & (libc::POLLIN | libc::POLLHUP) != 0 {
+            if polled > 0 && poll_fds[0].revents & (libc::POLLIN | libc::POLLHUP) != 0 {
                 // SAFETY: `buffer` is valid writable storage and command_fd is
                 // the guard's private read end.
                 let count =
@@ -850,10 +1267,10 @@ mod termination {
                             // atomics and checked after this acknowledgement;
                             // retaining them would spuriously continue a later
                             // stop. A signal racing after this clear is caught
-                            // by its ordered pipe record or GUARD_SIGNAL.
+                            // by its ordered command or wake-pipe record.
                             wake = false;
                             stopping = false;
-                            GUARD_SIGNAL.store(0, Ordering::SeqCst);
+                            drain_pipe(wake_fd);
                             armed = true;
                             let _ =
                                 unsafe { libc::write(ack_fd, (&GUARD_ARM as *const u8).cast(), 1) };
@@ -885,13 +1302,14 @@ mod termination {
                             armed = false;
                             stopping = false;
                             wake = false;
-                            GUARD_SIGNAL.store(0, Ordering::SeqCst);
+                            drain_pipe(wake_fd);
                         }
                         _ => wake = true,
                     }
                 }
             }
-            if GUARD_SIGNAL.swap(0, Ordering::SeqCst) != 0 {
+            if polled > 0 && poll_fds[1].revents & (libc::POLLIN | libc::POLLHUP) != 0 {
+                drain_pipe(wake_fd);
                 wake = true;
             }
             if armed && stopping && wake {
@@ -940,64 +1358,45 @@ mod termination {
         }
     }
 
-    fn close_inherited_fds(keep_a: libc::c_int, keep_b: libc::c_int, open_max: libc::c_int) {
+    fn drain_pipe(fd: libc::c_int) {
+        let mut buffer = [0_u8; 64];
+        loop {
+            // SAFETY: `buffer` is writable for its complete length and `fd` is
+            // the nonblocking read side of the guard's private wake pipe.
+            if unsafe { libc::read(fd, buffer.as_mut_ptr().cast(), buffer.len()) } <= 0 {
+                return;
+            }
+        }
+    }
+
+    fn close_inherited_fds(keep: &[libc::c_int], open_max: libc::c_int) {
         // The fork must not retain the run lock, event file, pipes, or secrets.
         // Closing descriptors is async-signal-safe and the child never returns
         // to Rust runtime code after this point.
-        #[cfg(target_os = "linux")]
-        if close_linux_ranges_except(keep_a, keep_b) {
-            return;
-        }
         for fd in 0..open_max {
-            if fd != keep_a && fd != keep_b {
+            if !keep.contains(&fd) {
                 close_fd(fd);
             }
         }
     }
 
     fn last_errno_is_interrupted() -> bool {
+        last_errno() == libc::EINTR
+    }
+
+    fn last_errno() -> libc::c_int {
         #[cfg(target_os = "linux")]
         unsafe {
-            *libc::__errno_location() == libc::EINTR
+            *libc::__errno_location()
         }
         #[cfg(target_os = "macos")]
         unsafe {
-            *libc::__error() == libc::EINTR
+            *libc::__error()
         }
         #[cfg(not(any(target_os = "linux", target_os = "macos")))]
         {
-            std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted
+            std::io::Error::last_os_error().raw_os_error().unwrap_or(0)
         }
-    }
-
-    #[cfg(target_os = "linux")]
-    fn close_linux_ranges_except(keep_a: libc::c_int, keep_b: libc::c_int) -> bool {
-        let low = keep_a.min(keep_b) as libc::c_uint;
-        let high = keep_a.max(keep_b) as libc::c_uint;
-        let ranges = [
-            (0, low.saturating_sub(1), low > 0),
-            (
-                low.saturating_add(1),
-                high.saturating_sub(1),
-                high > low + 1,
-            ),
-            (
-                high.saturating_add(1),
-                libc::c_uint::MAX,
-                high < libc::c_uint::MAX,
-            ),
-        ];
-        for (first, last, present) in ranges {
-            if !present {
-                continue;
-            }
-            // SAFETY: close_range is invoked through the raw syscall so older
-            // kernels can return ENOSYS without imposing a newer glibc symbol.
-            if unsafe { libc::syscall(libc::SYS_close_range, first, last, 0_u32) } != 0 {
-                return false;
-            }
-        }
-        true
     }
 
     fn set_close_on_exec(fd: libc::c_int) -> bool {
@@ -1042,6 +1441,28 @@ mod termination {
         }
     }
 
+    fn process_group_exists_raw(pgid: i32) -> bool {
+        if pgid <= 0 {
+            return false;
+        }
+        let result = unsafe { libc::kill(-pgid, 0) };
+        result == 0 || last_errno() != libc::ESRCH
+    }
+
+    fn kill_and_wait_for_group(pgid: i32) -> bool {
+        unsafe {
+            let _ = libc::kill(-pgid, libc::SIGKILL);
+        }
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while process_group_exists_raw(pgid) {
+            if std::time::Instant::now() >= deadline {
+                return false;
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+        true
+    }
+
     fn stop_groups(groups: &[i32]) -> bool {
         signal_groups(groups, libc::SIGSTOP);
         let deadline = std::time::Instant::now() + Duration::from_secs(2);
@@ -1059,14 +1480,71 @@ mod termination {
         }
     }
 
+    #[cfg(target_os = "linux")]
     fn groups_are_quiescent(groups: &[i32]) -> bool {
         if groups.is_empty() {
             return true;
         }
-        // `/bin/ps` is a fixed system interface on the supported Unix targets;
-        // no repository-controlled PATH entry can substitute for it. Unlike
-        // waitid, this observes every descendant in the process group, not
-        // only Tactus's direct child.
+        // `/proc/<pid>/stat` is a kernel interface and remains available on
+        // distributions such as NixOS that intentionally have no `/bin/ps`.
+        // It observes every descendant in the process group, not only the
+        // direct child that Tactus can wait on.
+        let entries = match std::fs::read_dir("/proc") {
+            Ok(entries) => entries,
+            Err(_) => return false,
+        };
+        let mut observed = vec![false; groups.len()];
+        for entry in entries {
+            let Ok(entry) = entry else {
+                return false;
+            };
+            if entry
+                .file_name()
+                .to_str()
+                .and_then(|name| name.parse::<u32>().ok())
+                .is_none()
+            {
+                continue;
+            }
+            let Ok(stat) = std::fs::read_to_string(entry.path().join("stat")) else {
+                // Processes can disappear between directory enumeration and
+                // the read. A still-live target group is caught by either
+                // another member or the kill(0) completeness check below.
+                continue;
+            };
+            let Some((pgid, state)) = parse_linux_process_stat(&stat) else {
+                return false;
+            };
+            let Some(index) = groups.iter().position(|candidate| *candidate == pgid) else {
+                continue;
+            };
+            observed[index] = true;
+            if !matches!(state, b'T' | b't' | b'Z' | b'X' | b'x') {
+                return false;
+            }
+        }
+        quiescent_snapshot_is_complete(groups, &observed)
+    }
+
+    #[cfg(target_os = "linux")]
+    fn parse_linux_process_stat(stat: &str) -> Option<(i32, u8)> {
+        // The parenthesized command may itself contain spaces and `)` bytes;
+        // the final close parenthesis is the only reliable field boundary.
+        let tail = stat.get(stat.rfind(')')? + 1..)?.trim_start();
+        let mut fields = tail.split_whitespace();
+        let state = *fields.next()?.as_bytes().first()?;
+        let _parent_pid = fields.next()?.parse::<i32>().ok()?;
+        let process_group = fields.next()?.parse::<i32>().ok()?;
+        Some((process_group, state))
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    fn groups_are_quiescent(groups: &[i32]) -> bool {
+        if groups.is_empty() {
+            return true;
+        }
+        // `/bin/ps` is a fixed base-system interface on macOS; no
+        // repository-controlled PATH entry can substitute for it.
         let output = match std::process::Command::new("/bin/ps")
             .args(["-axo", "pgid=,stat="])
             .env("LC_ALL", "C")
@@ -1089,10 +1567,14 @@ mod termination {
             let Some(state) = fields.next().and_then(|field| field.as_bytes().first()) else {
                 return false;
             };
-            if !matches!(*state, b'T' | b'Z') {
+            if !matches!(*state, b'T' | b'Z' | b'X') {
                 return false;
             }
         }
+        quiescent_snapshot_is_complete(groups, &observed)
+    }
+
+    fn quiescent_snapshot_is_complete(groups: &[i32], observed: &[bool]) -> bool {
         for (index, pgid) in groups.iter().enumerate() {
             if observed[index] {
                 continue;
@@ -1120,6 +1602,12 @@ mod termination {
                 groups: vec![41],
                 terminating: false,
                 suspending: false,
+                reaper: Reaper {
+                    command_fd: -1,
+                    ack_fd: -1,
+                    _command_keepalive_fd: -1,
+                    pid: -1,
+                },
                 guard: Guard {
                     command_fd: -1,
                     ack_fd: -1,
@@ -1151,6 +1639,14 @@ mod termination {
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
             assert_eq!(locked.spawning, 0);
+        }
+
+        #[cfg(target_os = "linux")]
+        #[test]
+        fn linux_stat_parser_handles_spaces_and_closing_parentheses_in_comm() {
+            let stat = "123 (reviewer ) helper) T 7 123 123 0 -1 0";
+            assert_eq!(parse_linux_process_stat(stat), Some((123, b'T')));
+            assert_eq!(parse_linux_process_stat("malformed"), None);
         }
     }
 }
@@ -1288,6 +1784,35 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn successful_direct_exit_still_kills_detached_group_members() {
+        let marker = std::env::temp_dir().join(format!(
+            "tactus-proc-detached-{}-{}.marker",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock after epoch")
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_file(&marker);
+        let mut command = shell(
+            "(sleep 1; printf leaked > \"$TACTUS_MARKER\") \
+             </dev/null >/dev/null 2>&1 & exit 0",
+        );
+        command.env("TACTUS_MARKER", &marker);
+        let output = run_with_timeout(command, "", Duration::from_secs(10)).expect("spawn shell");
+        assert_eq!(output.code, Some(0));
+
+        thread::sleep(Duration::from_millis(1300));
+        let leaked = marker.exists();
+        let _ = std::fs::remove_file(&marker);
+        assert!(
+            !leaked,
+            "a detached descendant outlived the successful command"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
     #[ignore = "subprocess helper"]
     fn terminal_progress_worker_helper() {
         if std::env::var_os("TACTUS_SIGNAL_WORKER").is_none() {
@@ -1327,6 +1852,19 @@ mod tests {
         // SAFETY: this changes only the current disposable helper before it
         // launches either the signal monitor or the supervised command.
         assert_eq!(unsafe { libc::setrlimit(libc::RLIMIT_CORE, &no_core) }, 0);
+        let custom_handler = std::env::var_os("TACTUS_CUSTOM_SIGNAL_HANDLER").is_some();
+        if custom_handler {
+            CUSTOM_SIGNAL_SEEN.store(false, std::sync::atomic::Ordering::SeqCst);
+            assert_ne!(
+                unsafe {
+                    libc::signal(
+                        libc::SIGTERM,
+                        record_custom_signal as *const () as libc::sighandler_t,
+                    )
+                },
+                libc::SIG_ERR
+            );
+        }
         let progress_loop = std::env::var_os("TACTUS_SIGNAL_PROGRESS_LOOP").is_some();
         let mut command = if progress_loop {
             let mut command = Command::new(std::env::current_exe().expect("test executable"));
@@ -1360,9 +1898,25 @@ mod tests {
             run_with_timeout(command, "", Duration::from_secs(30)).expect("signal helper command");
         if std::env::var_os("TACTUS_SIGNAL_HELPER_EXPECT_RETURN").is_some() {
             assert_eq!(output.code, Some(0));
+            if custom_handler {
+                assert_eq!(unsafe { libc::raise(libc::SIGTERM) }, 0);
+                assert!(
+                    CUSTOM_SIGNAL_SEEN.load(std::sync::atomic::Ordering::SeqCst),
+                    "Tactus replaced the embedding host's custom SIGTERM handler"
+                );
+            }
             return;
         }
         panic!("the helper should terminate with the forwarded signal");
+    }
+
+    #[cfg(unix)]
+    static CUSTOM_SIGNAL_SEEN: std::sync::atomic::AtomicBool =
+        std::sync::atomic::AtomicBool::new(false);
+
+    #[cfg(unix)]
+    extern "C" fn record_custom_signal(_: libc::c_int) {
+        CUSTOM_SIGNAL_SEEN.store(true, std::sync::atomic::Ordering::SeqCst);
     }
 
     #[cfg(unix)]
@@ -1456,6 +2010,9 @@ mod tests {
                     }
                 });
             }
+        }
+        if tag == "custom-handler" {
+            helper.env("TACTUS_CUSTOM_SIGNAL_HANDLER", "1");
         }
         let child = helper.spawn().expect("spawn signal helper");
         let mut helper = SignalHelper {
@@ -1567,6 +2124,45 @@ mod tests {
         helper.complete();
         assert!(status.success(), "helper status: {status}");
         assert!(survived, "nohup-style SIGHUP unexpectedly killed the agent");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_inherited_custom_signal_handler_is_preserved() {
+        let mut helper = spawn_signal_helper("custom-handler", true, false);
+        let status = wait_for_exit(&mut helper.child, Duration::from_secs(10))
+            .expect("custom-handler helper completes normally");
+        helper.complete();
+        assert!(status.success(), "helper status: {status}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn sigkill_of_tactus_job_still_reaps_the_isolated_agent_group() {
+        let mut helper = spawn_signal_helper("job-control", true, false);
+        let helper_pgid = helper.pid();
+        let agent_pgid = helper.supervised_pgid.expect("supervised group");
+        assert_eq!(unsafe { libc::kill(-helper_pgid, libc::SIGKILL) }, 0);
+        wait_for_exit(&mut helper.child, Duration::from_secs(10))
+            .expect("SIGKILLed helper exits promptly");
+
+        // From here onward the test harness must not kill the agent on drop:
+        // only the helper's external reaper is allowed to make progress stop.
+        helper.active = false;
+        thread::sleep(Duration::from_millis(1300));
+        let before = std::fs::read_to_string(&helper.marker).ok();
+        thread::sleep(Duration::from_millis(350));
+        let after = std::fs::read_to_string(&helper.marker).ok();
+        let stopped = before == after;
+
+        // Clean up only after recording the result, so a regression cannot be
+        // hidden while still avoiding a leaked worker after a failed test.
+        let _ = unsafe { libc::kill(-agent_pgid, libc::SIGKILL) };
+        helper.complete();
+        assert!(
+            stopped,
+            "the isolated agent kept running after an uncatchable Tactus SIGKILL"
+        );
     }
 
     #[cfg(unix)]
