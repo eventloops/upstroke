@@ -12,7 +12,7 @@ use crate::ir::{Effort, Plan, Task, TaskKind, Tier, Usage};
 use crate::ladder::{FailureKind, FailureOrigin};
 use crate::rundir;
 
-const EXPORT_SCHEMA_VERSION: u32 = 1;
+const EXPORT_SCHEMA_VERSION: u32 = 2;
 
 #[derive(Debug, Clone, Copy, clap::ValueEnum)]
 pub enum Format {
@@ -1293,6 +1293,7 @@ mod tests {
             (FailureKind::AgentError, "provider", "none"),
             (FailureKind::RateLimited, "provider", "none"),
             (FailureKind::ReviewUnavailable, "provider", "none"),
+            (FailureKind::ReviewInputTooLarge, "policy", "review"),
             (FailureKind::Timeout, "infrastructure", "none"),
             (FailureKind::Interrupted, "infrastructure", "none"),
             (FailureKind::NoChain, "policy", "none"),
@@ -1477,7 +1478,7 @@ mod tests {
         assert_eq!(records.len(), 3, "header plus two rows");
         assert!(
             records.iter().all(|record| record.len() == 43),
-            "schema 1 CSV records must retain exactly 43 columns: {records:?}"
+            "schema 2 CSV records must retain exactly 43 columns: {records:?}"
         );
         assert!(csv.contains("\"first, \"\"quoted\"\"\""));
         assert!(csv.contains("src/exact,a.rs"));
@@ -1519,7 +1520,7 @@ mod tests {
     }
 
     #[test]
-    fn xhigh_worker_and_max_review_effort_are_preserved_in_schema_one() {
+    fn xhigh_worker_and_max_review_effort_are_preserved_in_schema_two() {
         let mut start = attempt_started("task", 1, "2026-08-01T00:00:01.000Z", false);
         start["data"]["effort"] = json!("xhigh");
         let mut finish = attempt_finished("task", 1, "2026-08-01T00:00:02.000Z", None, true);
@@ -1532,7 +1533,7 @@ mod tests {
 
         let rows = fixture.rows();
         let value = serde_json::to_value(&rows[0]).expect("row value");
-        assert_eq!(value["schema_version"], 1);
+        assert_eq!(value["schema_version"], 2);
         assert_eq!(value["effort"], "xhigh");
         assert_eq!(value["reviews"][0]["effort"], "max");
         let mut csv = Vec::new();

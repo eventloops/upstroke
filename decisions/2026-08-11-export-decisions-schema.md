@@ -6,7 +6,7 @@
 
 ## Verdict
 
-`tactus export-decisions <run-id> [--format jsonl|csv]` emits export schema 1: one logical row per recorded worker attempt, in raw `AttemptStarted` encounter order. JSONL is the default. CSV carries the same facts as a stable rectangular column set. Both go to stdout, leaving persistence and location to the caller.
+`tactus export-decisions <run-id> [--format jsonl|csv]` emits export schema 2: one logical row per recorded worker attempt, in raw `AttemptStarted` encounter order. JSONL is the default. CSV carries the same facts as a stable rectangular column set. Both go to stdout, leaving persistence and location to the caller. Schema 2 retains schema 1's columns and JSON shape but extends the exhaustive `failure_kind` domain with `review_input_too_large`; consumers must select behavior from `schema_version`, not assume an open enum.
 
 The command is local and read-only. It resolves an exact run id or unambiguous prefix by the existing run-directory rules, reads that run's event log and frozen `plan.normalized.json`, and uses the existing read-only liveness probe. It makes no HTTP request, switches no branch, acquires no run lock, and writes neither repository nor run record. It refuses a currently live run with an actionable error: a moving partial dataset is not a decision record.
 
@@ -24,13 +24,13 @@ A non-live, finished run may still contain a dangling start. It emits one row wh
 
 `SelectionOrigin` written to events has exactly `auto`, `user_override`, `pin`, and `exploration`. Current execution produces `auto` or `pin`; the other two are reserved for the v0.2 binder paths that will create them. `unknown` is not an event value. It is an exporter-derived sentinel used only when a legacy start predates the field; such an absence must never be rewritten as `auto`.
 
-## Export schema 1
+## Export schema 2
 
 JSON types below are normative. A “measured” field is a stored fact copied from the event log or frozen plan. “Derived” means a deterministic projection of those facts. `schema_version` is exporter-supplied metadata, not a measurement.
 
 | JSON field | Type and domain | Nullability | Provenance and authority |
 |---|---|---|---|
-| `schema_version` | integer, always `1` | never | exporter-supplied schema metadata |
+| `schema_version` | integer, always `2` | never | exporter-supplied schema metadata |
 | `run_id` | string | never | measured, `RunStarted` |
 | `tactus_version` | string | never | measured, `RunStarted` |
 | `run_started_at` | RFC 3339 string | never | measured, `RunStarted` event timestamp |
@@ -79,6 +79,7 @@ The exporter must use an exhaustive, non-wildcard match over `FailureKind`, so a
 | `agent_error` | `provider` | `none` |
 | `rate_limited` | `provider` | `none` |
 | `review_unavailable` | `provider` | `none` |
+| `review_input_too_large` | `policy` | `review` |
 | `timeout` | `infrastructure` | `none` |
 | `interrupted` | `infrastructure` | `none` |
 | `no_chain` | `policy` | `none` |
@@ -103,14 +104,14 @@ Null scalar values are empty cells. Booleans are `true` or `false`; numbers use 
 
 The four provenance classes are intentionally disjoint:
 
-1. **Exporter-supplied schema metadata:** only `schema_version = 1`.
+1. **Exporter-supplied schema metadata:** only `schema_version = 2`.
 2. **Measured stored facts:** values copied from raw events, `RunStarted`, attempt starts/settlements/reviews, and the run's frozen normalized plan. Newly recorded selection origins are measured. “Measured” means stored, not necessarily independently verified by the exporter.
 3. **Deterministic derived values:** session-resumed boolean, outcome, failure category, work evidence, legacy `selection_origin = unknown`, counts of frozen-plan arrays, and the dangling-start interruption fields.
 4. **Assumptions about valid input:** the event log's append order defines attempt-start order; event timestamps and identities are well formed; run id agrees with its `RunStarted`; every attempt task and every run-start chain joins exactly once to a task in the frozen plan; attempt/settlement identities pair uniquely; chain tiers are non-empty and `attempts_per` is positive; numeric values satisfy the types above; and the frozen plan is the plan named by the run's recorded hash.
 
 Assumptions are not fallback permission. The exporter must validate every join and invariant it relies on and fail loudly with the run and offending identity when one is violated. It must never fill a gap from today's source plan, config, model catalog, pricing table, run-level guess, or provider call.
 
-The export schema version is independent of the event schema. The optional exporter-input fields described here retained event schema 1 at the time: serde defaults preserved old absence as absence, and the exporter represented that honestly as null or, for origin alone, derived `unknown`. Event schema later moved to 2 for run-identity semantics (frozen effort and complete rung bindings), without changing export schema 1. A change to one schema does not imply a change to the other.
+The export schema version is independent of the event schema. The optional exporter-input fields described here retained event schema 1 at the time: serde defaults preserved old absence as absence, and the exporter represented that honestly as null or, for origin alone, derived `unknown`. Event schema later moved independently for run-identity and review-supervision semantics. Export schema 2 was required when the public exhaustive failure domain gained `review_input_too_large`; a change to one schema still does not imply a change to the other.
 
 ## Rejected alternatives
 
@@ -125,6 +126,6 @@ The export schema version is independent of the event schema. The optional expor
 - **Treat missing legacy origin as `auto`.** Absence predates the fact and says nothing about how selection happened; only `unknown` preserves that boundary.
 - **Collapse failure category and evidence.** A provider outage and a gate rejection answer different questions. Separate fields prevent an infrastructure event from becoming false evidence about model capability.
 - **Use post-execution features such as diff size.** They leak the result into a pre-execution decision snapshot and cannot explain what the router knew when it chose.
-- **Bump the event schema for additive optional fields or couple it to export schema 1.** Defaults read old logs honestly without changing their meaning; the two schemas serve different consumers and evolve independently.
+- **Bump the event schema for additive optional fields or couple it to the export schema.** Defaults read old logs honestly without changing their meaning; the two schemas serve different consumers and evolve independently. Public export enum growth, unlike an optional event input, does require an export-schema bump.
 - **Flatten or drop reviewer/path data in CSV.** That would make CSV a poorer logical export than JSONL. JSON text cells retain nested data in a rectangular file.
 - **Add a CSV dependency for this encoder.** The surface is small and RFC 4180 escaping is readily covered with comma, quote, CR, and LF tests; a new dependency costs more maintenance than it removes here.
