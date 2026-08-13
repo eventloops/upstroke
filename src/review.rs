@@ -1524,8 +1524,8 @@ mod tests {
         assert_eq!(resolved.primary, Some(binding("copilot", "gpt-5.3-codex")));
         assert_eq!(
             resolved.second_opinion[0],
-            Some(binding("claude-code", "claude-opus-4-8")),
-            "the partner crosses back to the other family"
+            Some(binding("claude-code", "claude-opus-5")),
+            "the partner crosses back to the other family using its preferred frontier model"
         );
     }
 
