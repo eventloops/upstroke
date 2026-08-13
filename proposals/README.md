@@ -38,8 +38,9 @@ The contract that keeps this folder safe:
 
 - [2026-08-13 — v0.2 — machine-readable Tactus commit provenance](2026-08-13-v0.2-tactus-commit-provenance.md):
   retain `[tactus]` as the human-visible subject marker and augment it with
-  run/task/role Git trailers, a predictable `tactus` display identity, and
-  optional namespaced annotated tags for selected authoritative commits.
+  run/task/work/revision Git trailers, a predictable `tactus` display identity,
+  and optional annotated tags that expose accepted `Initial work → Fix N`
+  lineages without tagging rejected attempts.
 - [2026-08-13 — v0.5 — portfolio coordination and cross-story scheduling](2026-08-13-v0.5-portfolio-coordination.md):
   coordinate multiple active stories as one portfolio — shared work, hidden
   dependencies, contention, parallelism.
