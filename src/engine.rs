@@ -721,6 +721,7 @@ fn run_harness_inner(
     // Held for the whole run, released by the OS if this process dies — so a
     // crash leaves nothing for `resume` to clear by hand.
     let _lock = RunLock::acquire(&paths.public)?;
+    let _cleanup_scope = _lock.enter_cleanup_scope();
 
     // Nothing is on the record until the first event lands, so a failure in
     // this window would leave a run directory with no `events.jsonl` in it —
@@ -731,6 +732,7 @@ fn run_harness_inner(
     let opened = util::write_json(&paths.plan_json(), &analysis.plan)
         .and_then(|()| workspace.create_branch(&branch));
     if let Err(error) = opened {
+        drop(_cleanup_scope);
         drop(_lock);
         let _ = fs::remove_dir_all(&paths.public);
         let _ = fs::remove_dir_all(&paths.private);
@@ -1131,6 +1133,7 @@ fn resume_harness_inner(
     // only half of the run directory known this early: where the private half
     // went is recorded in `run_started`, and that has not been read yet.
     let _lock = RunLock::acquire(&public)?;
+    let _cleanup_scope = _lock.enter_cleanup_scope();
 
     let mut warnings = Vec::new();
     let events_path = public.join("events.jsonl");

@@ -300,19 +300,28 @@ pub fn lock_file(public: &Path) -> PathBuf {
     public.join("run.lock")
 }
 
+/// A second, Unix-only lock used as a crash-cleanup lease. Each external agent
+/// reaper opens its own shared hold; `resume` needs the exclusive side, so a
+/// hard-killed conductor cannot hand over the run before cleanup is complete.
+#[cfg(unix)]
+fn cleanup_lock_file(public: &Path) -> PathBuf {
+    public.join("cleanup.lock")
+}
+
 /// An exclusive hold on one run, released when this value drops.
 ///
 /// Two engines on one run directory would interleave events into the log and
 /// fight over the same git branch and working tree. An advisory OS lock is the
-/// right shape for that because the operating system releases it when the
-/// holder dies: a crashed run — the case `resume` exists for — leaves no stale
-/// marker to clear by hand, which is exactly what a lock *file* would have
-/// forced on the common path.
+/// right shape for that because the operating system releases the primary
+/// hold when the conductor dies. On Unix, live crash reapers retain only the
+/// shared cleanup lease until their agent groups are quiescent. Neither hold
+/// leaves a stale marker to clear by hand.
 ///
 /// Which OS lock, though, is not a detail. See [`imp`].
 #[derive(Debug)]
 pub struct RunLock {
     _file: File,
+    _cleanup: cleanup::CleanupLease,
     /// The run this claimed in [`claims`], given back on drop.
     claim: PathBuf,
 }
@@ -359,12 +368,31 @@ impl RunLock {
                 }),
             });
         match taken {
-            Ok(file) => Ok(Self { _file: file, claim }),
+            Ok(file) => match cleanup::take(public) {
+                Ok(cleanup) => Ok(Self {
+                    _file: file,
+                    _cleanup: cleanup,
+                    claim,
+                }),
+                Err(error) => {
+                    claims().remove(&claim);
+                    Err(error)
+                }
+            },
             Err(error) => {
                 claims().remove(&claim);
                 Err(error)
             }
         }
+    }
+
+    /// Bind subprocess cleanup started on this thread to this run.
+    ///
+    /// The lock itself remains `Send`; callers enter the scope only while
+    /// synchronously driving the run, so a future executor can move ownership
+    /// first and establish the context on its actual worker thread.
+    pub(crate) fn enter_cleanup_scope(&self) -> cleanup::CleanupScope<'_> {
+        cleanup::enter(&self._cleanup)
     }
 }
 
@@ -447,21 +475,26 @@ fn claim_key(public: &Path) -> PathBuf {
 
 /// Whether a run is being driven right now, without disturbing the holder.
 ///
-/// Read-only, and on Unix genuinely read-only: `F_GETLK` asks who holds the
-/// lock without taking one, so there is nothing to give back and nothing to
-/// race. A file that cannot be opened at all is not a running run — the lock is
-/// only ever created by a run that started.
+/// Read-only with respect to the run record. On Unix, `F_GETLK` asks who holds
+/// the primary lock without taking one. Only when that lock is free does the
+/// probe momentarily try the exclusive side of the cleanup lease; it never
+/// creates or changes either file. A primary file that does not exist means
+/// the run never started.
 pub fn is_running(public: &Path) -> bool {
     // Asked and answered without touching the file. On Unix this is the branch
     // that keeps `fcntl`'s release-on-any-close from applying to us at all.
     if claims().contains(&claim_key(public)) {
         return true;
     }
-    let Ok(file) = File::open(lock_file(public)) else {
-        return false;
+    let file = match File::open(lock_file(public)) {
+        Ok(file) => file,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return false,
+        // An existing run whose lock cannot be inspected is not safe to call
+        // dead. `acquire` will report the concrete IO error if a resume tries.
+        Err(_) => return true,
     };
     match imp::holder(&file) {
-        Holder::Nobody => false,
+        Holder::Nobody => cleanup::is_held(public),
         Holder::Someone { .. } => true,
         // The opened-fine-but-cannot-be-locked case, which is not the same as
         // the unopenable file above and does not get the same answer. Locking
@@ -480,6 +513,164 @@ pub fn is_running(public: &Path) -> bool {
         // way, and it reports this case as the IO error it is.
         Holder::Unknown(_) => true,
     }
+}
+
+#[cfg(unix)]
+mod cleanup {
+    use super::{cleanup_lock_file, refused};
+    use crate::error::TactusError;
+    use std::cell::RefCell;
+    use std::collections::BTreeMap;
+    use std::fs::File;
+    use std::marker::PhantomData;
+    use std::os::fd::AsRawFd;
+    use std::path::{Path, PathBuf};
+    use std::rc::Rc;
+
+    thread_local! {
+        // v0.1 drives a run synchronously inside an explicit scope. Thread-
+        // local registration gives concurrent library/test runs the exact
+        // cleanup path for their own reapers instead of conservatively leasing
+        // every run active in the process.
+        static ACTIVE: RefCell<BTreeMap<PathBuf, usize>> = const { RefCell::new(BTreeMap::new()) };
+    }
+
+    #[derive(Debug)]
+    pub(super) struct CleanupLease {
+        path: PathBuf,
+    }
+
+    #[derive(Debug)]
+    pub(crate) struct CleanupScope<'a> {
+        path: PathBuf,
+        _lifetime_and_thread: PhantomData<(&'a CleanupLease, Rc<()>)>,
+    }
+
+    impl Drop for CleanupScope<'_> {
+        fn drop(&mut self) {
+            ACTIVE.with(|active| {
+                let mut active = active.borrow_mut();
+                let remove = if let Some(count) = active.get_mut(&self.path) {
+                    *count = count.saturating_sub(1);
+                    *count == 0
+                } else {
+                    false
+                };
+                if remove {
+                    active.remove(&self.path);
+                }
+            });
+        }
+    }
+
+    pub(super) fn enter(lease: &CleanupLease) -> CleanupScope<'_> {
+        ACTIVE.with(|active| {
+            let mut active = active.borrow_mut();
+            *active.entry(lease.path.clone()).or_default() += 1;
+        });
+        CleanupScope {
+            path: lease.path.clone(),
+            _lifetime_and_thread: PhantomData,
+        }
+    }
+
+    pub(super) fn take(public: &Path) -> Result<CleanupLease, TactusError> {
+        let path = cleanup_lock_file(public);
+        let file = File::options()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(&path)
+            .map_err(|source| TactusError::Io {
+                path: path.clone(),
+                source,
+            })?;
+        let result = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+        if result != 0 {
+            let source = std::io::Error::last_os_error();
+            if matches!(
+                source.raw_os_error(),
+                Some(code) if code == libc::EWOULDBLOCK || code == libc::EAGAIN
+            ) {
+                return Err(refused(public, &path, None));
+            }
+            return Err(TactusError::Io { path, source });
+        }
+        // This probe proves no prior crash reaper remains. Do not retain the
+        // lock in the conductor: arbitrary forked children would inherit its
+        // open file description and recreate the false-liveness window the
+        // primary fcntl lock deliberately avoids. Each cleanup reaper instead
+        // reopens `path` and owns an independent shared hold.
+        if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_UN) } != 0 {
+            return Err(TactusError::Io {
+                path,
+                source: std::io::Error::last_os_error(),
+            });
+        }
+        Ok(CleanupLease { path })
+    }
+
+    pub(super) fn is_held(public: &Path) -> bool {
+        let path = cleanup_lock_file(public);
+        let file = match File::options().read(true).write(true).open(&path) {
+            Ok(file) => file,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return false,
+            // An existing lease file that cannot be inspected is not evidence
+            // that cleanup finished. Keep liveness fail-closed just as the
+            // primary lock does for an unreportable holder.
+            Err(_) => return true,
+        };
+        if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
+            let _ = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_UN) };
+            false
+        } else {
+            true
+        }
+    }
+
+    pub(crate) fn active_paths() -> Vec<PathBuf> {
+        ACTIVE.with(|active| active.borrow().keys().cloned().collect())
+    }
+}
+
+#[cfg(not(unix))]
+mod cleanup {
+    use crate::error::TactusError;
+    use std::marker::PhantomData;
+    use std::path::Path;
+    use std::rc::Rc;
+
+    #[derive(Debug)]
+    pub(super) struct CleanupLease;
+
+    #[derive(Debug)]
+    pub(crate) struct CleanupScope<'a> {
+        _lifetime_and_thread: PhantomData<(&'a CleanupLease, Rc<()>)>,
+    }
+
+    impl Drop for CleanupScope<'_> {
+        fn drop(&mut self) {}
+    }
+
+    pub(super) fn take(_: &Path) -> Result<CleanupLease, TactusError> {
+        Ok(CleanupLease)
+    }
+
+    pub(super) fn is_held(_: &Path) -> bool {
+        false
+    }
+
+    pub(super) fn enter(_lease: &CleanupLease) -> CleanupScope<'_> {
+        CleanupScope {
+            _lifetime_and_thread: PhantomData,
+        }
+    }
+}
+
+#[cfg(unix)]
+pub(crate) fn active_cleanup_lease_paths() -> Vec<PathBuf> {
+    cleanup::active_paths()
 }
 
 /// The lock primitive, and why it is not `std`'s.
@@ -787,6 +978,12 @@ mod tests {
         drop(held);
         assert!(!is_running(&paths.public));
         RunLock::acquire(&paths.public).expect("re-acquire after release");
+    }
+
+    #[test]
+    fn a_run_lock_remains_send_even_though_its_cleanup_scope_is_thread_local() {
+        fn assert_send<T: Send>() {}
+        assert_send::<RunLock>();
     }
 
     #[test]
