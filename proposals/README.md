@@ -43,3 +43,6 @@ The contract that keeps this folder safe:
 - [2026-08-13 — v0.3 — public run viewer](2026-08-13-v0.3-public-run-viewer.md):
   a read-only public projection of the event log — tactus building tactus,
   with receipts.
+- [2026-08-13 — v0.2 — structured review-finding telemetry](2026-08-13-v0.2-review-finding-telemetry.md):
+  extend the verdict contract with a `findings` array; additive event fields,
+  export schema 2; telemetry never changes a verification outcome.
