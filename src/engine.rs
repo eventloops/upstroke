@@ -4396,6 +4396,9 @@ mod tests {
         Unparseable,
         /// The judge itself could not run.
         RateLimited,
+        /// Command construction succeeds, but the reviewer executable cannot
+        /// be spawned.
+        SpawnError,
         /// §12: the reviewer declines to judge and asks for a person.
         NeedsHuman,
     }
@@ -4427,6 +4430,7 @@ mod tests {
     struct Calls {
         worker: usize,
         review: usize,
+        review_spawn_failures: usize,
         runs: Vec<RecordedRun>,
     }
 
@@ -4488,6 +4492,13 @@ mod tests {
         /// How many review invocations this adapter was asked for.
         fn reviews_run(&self) -> usize {
             self.calls.lock().map(|c| c.review).unwrap_or_default()
+        }
+
+        fn review_spawn_failures(&self) -> usize {
+            self.calls
+                .lock()
+                .map(|c| c.review_spawn_failures)
+                .unwrap_or_default()
         }
     }
 
@@ -4561,6 +4572,22 @@ mod tests {
                         )
                     })
                     .unwrap_or(Effect::EditFile);
+                let behavior = {
+                    let mut calls = self.calls.lock().map_err(|_| TactusError::Agent {
+                        message: "fake adapter lock poisoned".to_owned(),
+                    })?;
+                    let index = calls.review + calls.review_spawn_failures;
+                    let behavior = scripted(&self.reviews, index, ReviewBehavior::Pass);
+                    if behavior == ReviewBehavior::SpawnError {
+                        calls.review_spawn_failures += 1;
+                    }
+                    behavior
+                };
+                if behavior == ReviewBehavior::SpawnError {
+                    let mut cmd = Command::new(run.workspace.join("missing-reviewer-executable"));
+                    cmd.current_dir(&run.workspace);
+                    return Ok(cmd);
+                }
                 if effect == Effect::JamCleanupAfterReview {
                     let common = Command::new("git")
                         .arg("-C")
@@ -4696,7 +4723,7 @@ mod tests {
                     let mut calls = self.calls.lock().map_err(|_| TactusError::Agent {
                         message: "fake adapter lock poisoned".to_owned(),
                     })?;
-                    let index = calls.review;
+                    let index = calls.review + calls.review_spawn_failures;
                     calls.review += 1;
                     index
                 };
@@ -4727,6 +4754,7 @@ mod tests {
                     }
                     ReviewBehavior::Unparseable => "Looks fine to me, ship it.",
                     ReviewBehavior::RateLimited => unreachable!("handled above"),
+                    ReviewBehavior::SpawnError => unreachable!("handled during command build"),
                 };
                 return Ok(fake_outcome(
                     OutcomeStatus::Completed,
@@ -6401,6 +6429,61 @@ mod tests {
         );
         // And the ladder treated it as an outage: deferred, then committed.
         assert!(committed(&report, "t1"), "{report:?}");
+    }
+
+    #[test]
+    fn second_reviewer_spawn_failure_settles_worker_and_first_review_evidence() {
+        let repo = temp_engine_repo("secondreviewerspawnsettlement");
+        seed(&repo, FRONTIER_AUTH_PLAN, Some(SECOND_OPINION_CONFIG));
+        let source = cross_vendor(
+            vec![Effect::EditFile],
+            vec![ReviewBehavior::Pass],
+            vec![ReviewBehavior::SpawnError, ReviewBehavior::Pass],
+        );
+        let report = run_with(&cross_vendor_opts(&repo), &source).expect("settled run");
+
+        assert!(
+            committed(&report, "t1"),
+            "the deferred retry recovers: {report:?}"
+        );
+        let task = task(&report, "t1");
+        assert_eq!(task.attempts.len(), 2, "one settled outage, one recovery");
+        let first = &task.attempts[0];
+        let failure = first.failure.as_ref().expect("spawn failure is recorded");
+        assert_eq!(failure.kind, FailureKind::ReviewUnavailable);
+        assert_eq!(failure.origin, FailureOrigin::Reviewer);
+        assert_eq!(first.cost_usd, Some(0.01), "worker spend survives");
+        assert_eq!(first.session_id.as_deref(), Some("s0"));
+        assert!(first.usage.is_some(), "worker usage survives");
+        assert_eq!(
+            first.reviews.iter().map(|r| r.outcome).collect::<Vec<_>>(),
+            [
+                events::ReviewPassOutcome::Passed,
+                events::ReviewPassOutcome::Unavailable
+            ],
+            "the completed first verdict is not discarded"
+        );
+        assert_eq!(first.reviews[0].cost_usd, Some(0.05));
+        assert_eq!(first.reviews[1].cost_usd, None);
+        assert_eq!(source.copilot().review_spawn_failures(), 1);
+
+        let logged = events_of(&repo, &report.run_id);
+        assert!(logged.iter().any(|event| matches!(
+            &event.body,
+            EventBody::AttemptFinished {
+                task,
+                attempt: 1,
+                ..
+            } if task == "t1"
+        )));
+        assert!(!logged.iter().any(|event| matches!(
+            &event.body,
+            EventBody::AttemptInterrupted {
+                task,
+                attempt: 1,
+                ..
+            } if task == "t1"
+        )));
     }
 
     #[test]
