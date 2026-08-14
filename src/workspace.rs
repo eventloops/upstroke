@@ -2158,9 +2158,9 @@ mod tests {
         assert!(!hooks_path.exists());
     }
 
-    #[cfg(unix)]
+    #[cfg(target_os = "linux")]
     #[test]
-    fn gate_snapshot_accepts_non_utf8_tmpdir_on_unix() {
+    fn gate_snapshot_accepts_non_utf8_tmpdir_on_linux() {
         use std::os::unix::ffi::OsStringExt;
 
         let repo = temp_repo("non-utf8-snapshot-root");
