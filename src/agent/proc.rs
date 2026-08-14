@@ -292,6 +292,12 @@ mod termination {
     const REAPER_CLEANUP: u8 = 0x83;
     const REAPER_OK: u8 = 0x84;
     const REAPER_FAIL: u8 = 0x85;
+    // The job-control guard briefly continues only Tactus every 250 ms while
+    // probing for a PID-directed termination. The cleanup reaper must not
+    // mistake that internal pulse for an operator resume and continue agents.
+    // Genuine SIGCONT is forwarded immediately by the monitor; this bounded
+    // fallback exists for host-owned signal policies the monitor preserves.
+    const REAPER_RESUME_STABLE_POLLS: u8 = 50;
 
     #[derive(Clone, Copy)]
     struct SignalPolicy {
@@ -1229,6 +1235,7 @@ mod termination {
         let mut pgid = 0_i32;
         let mut anchor = 0_i32;
         let mut mirrored_parent_stop = false;
+        let mut parent_running_polls = 0_u8;
         if !write_raw(ack_fd, &[REAPER_READY]) {
             unsafe { libc::_exit(1) };
         }
@@ -1299,15 +1306,30 @@ mod termination {
                 match process_is_stopped(parent) {
                     Some(true) if !mirrored_parent_stop => {
                         mirrored_parent_stop = unsafe { libc::kill(-pgid, libc::SIGSTOP) } == 0;
+                        parent_running_polls = 0;
                     }
-                    Some(false) if mirrored_parent_stop => {
-                        let _ = unsafe { libc::kill(-pgid, libc::SIGCONT) };
-                        mirrored_parent_stop = false;
+                    Some(true) => parent_running_polls = 0,
+                    state @ Some(false) if mirrored_parent_stop => {
+                        if parent_has_stably_resumed(state, &mut parent_running_polls) {
+                            let _ = unsafe { libc::kill(-pgid, libc::SIGCONT) };
+                            mirrored_parent_stop = false;
+                            parent_running_polls = 0;
+                        }
                     }
-                    _ => {}
+                    Some(false) => parent_running_polls = 0,
+                    None => parent_running_polls = 0,
                 }
             }
         }
+    }
+
+    fn parent_has_stably_resumed(stopped: Option<bool>, running_polls: &mut u8) -> bool {
+        if stopped != Some(false) {
+            *running_polls = 0;
+            return false;
+        }
+        *running_polls = running_polls.saturating_add(1);
+        *running_polls >= REAPER_RESUME_STABLE_POLLS
     }
 
     fn spawn_group_anchor(pgid: i32, open_max: libc::c_int) -> libc::pid_t {
@@ -2516,6 +2538,23 @@ mod termination {
         use std::time::Instant;
 
         static REAPED_CHILD_STOP: AtomicBool = AtomicBool::new(false);
+
+        #[test]
+        fn reaper_distinguishes_a_probe_pulse_from_a_stable_parent_resume() {
+            let mut running_polls = 0;
+            for _ in 1..REAPER_RESUME_STABLE_POLLS {
+                assert!(!parent_has_stably_resumed(Some(false), &mut running_polls));
+            }
+            assert!(!parent_has_stably_resumed(Some(true), &mut running_polls));
+            assert_eq!(running_polls, 0);
+
+            for _ in 1..REAPER_RESUME_STABLE_POLLS {
+                assert!(!parent_has_stably_resumed(Some(false), &mut running_polls));
+            }
+            assert!(parent_has_stably_resumed(Some(false), &mut running_polls));
+            assert!(!parent_has_stably_resumed(None, &mut running_polls));
+            assert_eq!(running_polls, 0);
+        }
 
         extern "C" fn reap_child_transitions(_: libc::c_int) {
             if REAPED_CHILD_STOP.swap(true, Ordering::SeqCst) {
