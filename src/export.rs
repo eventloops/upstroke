@@ -158,7 +158,7 @@ pub fn load(repo_root: &Path, wanted: &str) -> Result<Loaded, TactusError> {
         let EventBody::RunStarted { data: started } = &started_event.body else {
             unreachable!()
         };
-        events::ensure_supported_schema(started, &log, &events_path)?;
+        let effective_schema = events::ensure_supported_schema(started, &log, &events_path)?;
         if started.run_id != run_id {
             return invalid(
                 &events_path,
@@ -175,13 +175,32 @@ pub fn load(repo_root: &Path, wanted: &str) -> Result<Loaded, TactusError> {
         )?;
 
         let plan_path = public.join("plan.normalized.json");
-        let plan_text = std::fs::read_to_string(&plan_path).map_err(|source| TactusError::Io {
+        let plan_bytes = std::fs::read(&plan_path).map_err(|source| TactusError::Io {
             path: plan_path.clone(),
             source,
         })?;
-        let plan: Plan = serde_json::from_str(&plan_text).map_err(|error| TactusError::Parse {
-            message: format!("{}: {error}", plan_path.display()),
-        })?;
+        if effective_schema >= 3 {
+            let recorded = events::recorded_normalized_plan_digest(&log).ok_or_else(|| {
+                TactusError::EventLog {
+                    path: events_path.clone(),
+                    message: "event schema 3 does not record the normalized-plan SHA-256 digest"
+                        .to_owned(),
+                }
+            })?;
+            let actual = events::normalized_plan_digest(&plan_bytes);
+            if actual != recorded {
+                return invalid(
+                    &plan_path,
+                    format!(
+                        "normalized plan digest `{actual}` does not match recorded digest `{recorded}`"
+                    ),
+                );
+            }
+        }
+        let plan: Plan =
+            serde_json::from_slice(&plan_bytes).map_err(|error| TactusError::Parse {
+                message: format!("{}: {error}", plan_path.display()),
+            })?;
         if plan.source.hash != started.plan_hash {
             return invalid(
                 &plan_path,
@@ -358,6 +377,7 @@ fn settlements<'a>(
                 data,
                 parking,
                 transition,
+                ..
             } => (
                 SettlementKind::Finished,
                 task,

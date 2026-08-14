@@ -86,6 +86,10 @@ const MAX_FEEDBACK_ENTRIES: usize = 6;
 /// teaches this marker; nothing else in the engine parses agent prose.
 const QUESTION_MARKER: &str = "TACTUS-QUESTION:";
 
+#[cfg(test)]
+type AfterCandidateCapture =
+    fn(&Workspace, &crate::workspace::CapturedCandidate) -> Result<(), TactusError>;
+
 #[derive(Debug, Clone)]
 pub struct RunOptions {
     pub plan_path: PathBuf,
@@ -109,6 +113,10 @@ pub struct RunOptions {
     pub wait_on_block: Option<Duration>,
     /// `--budget <usd>`, overriding `[budgets] run_usd` (§17).
     pub budget_usd: Option<f64>,
+    /// Deterministic test seam for changing the mutable index immediately
+    /// after the engine has frozen its candidate object identities.
+    #[cfg(test)]
+    after_candidate_capture: Option<AfterCandidateCapture>,
 }
 
 impl RunOptions {
@@ -126,6 +134,8 @@ impl RunOptions {
             private_root: None,
             wait_on_block: None,
             budget_usd: None,
+            #[cfg(test)]
+            after_candidate_capture: None,
         }
     }
 
@@ -758,8 +768,29 @@ fn run_harness_inner(
     // "no event log here" for a run that never began, shadowing the real
     // latest one until someone deletes it by hand. Best-effort: failing to
     // tidy up must not mask the error that actually stopped the run.
-    let opened = util::write_json(&paths.plan_json(), &analysis.plan)
-        .and_then(|()| workspace.create_branch(&branch));
+    let plan_path = paths.plan_json();
+    let normalized_plan = normalized_plan_bytes(&analysis.plan, &plan_path)?;
+    let normalized_plan_digest = events::normalized_plan_digest(&normalized_plan);
+    let opened = fs::write(&plan_path, &normalized_plan)
+        .map_err(|source| TactusError::Io {
+            path: plan_path.clone(),
+            source,
+        })
+        .and_then(|()| {
+            let read_back = fs::read(&plan_path).map_err(|source| TactusError::Io {
+                path: plan_path.clone(),
+                source,
+            })?;
+            if read_back != normalized_plan {
+                return Err(TactusError::Refused {
+                    message: format!(
+                        "{} changed while tactus was freezing it; refusing to record a digest for bytes it did not write",
+                        plan_path.display()
+                    ),
+                });
+            }
+            workspace.create_branch(&branch)
+        });
     if let Err(error) = opened {
         drop(_cleanup_scope);
         drop(_lock);
@@ -781,6 +812,7 @@ fn run_harness_inner(
             .as_ref()
             .map(|path| repo_relative(&opts.repo_root, path)),
         plan_hash: analysis.plan.source.hash.clone(),
+        normalized_plan_digest: Some(normalized_plan_digest),
         private_dir: paths.private.to_string_lossy().into_owned(),
         // Names for the reader, the full gates for the resume — both from the
         // one list pre-flight resolved, so the log cannot name a gate its own
@@ -835,6 +867,8 @@ fn run_harness_inner(
         warnings,
         unanswerable: Vec::new(),
         exhausted_pools: std::collections::BTreeSet::new(),
+        #[cfg(test)]
+        after_candidate_capture: opts.after_candidate_capture,
     };
     run.emit(EventBody::RunStarted {
         data: Box::new(started),
@@ -1169,10 +1203,34 @@ fn resume_harness_inner(
     let events = events::read_all(&events_path, &mut warnings)?;
     let started = events::started_of(&events, &events_path)?.clone();
     let effective_schema = events::ensure_supported_schema(&started, &events, &events_path)?;
-    if let Some(failure) = events::legacy_unsettled_failure(started.schema, &events) {
+    let recorded_normalized_plan_digest =
+        events::recorded_normalized_plan_digest(&events).map(str::to_owned);
+    let frozen_plan_path = public.join("plan.normalized.json");
+    let frozen_plan_bytes = fs::read(&frozen_plan_path).map_err(|source| TactusError::Io {
+        path: frozen_plan_path.clone(),
+        source,
+    })?;
+    let frozen_plan_digest = events::normalized_plan_digest(&frozen_plan_bytes);
+    if let Some(recorded) = recorded_normalized_plan_digest.as_deref()
+        && frozen_plan_digest != recorded
+    {
         return Err(refuse(format!(
-            "legacy event schema {} records failed attempt {} for `{}` on rung {} without its durable ladder or parking decision. The old writer may have stopped between two appends, so resuming could repeat paid work or choose the wrong rung. Preserve this log for recovery and start a new run rather than guessing.",
-            started.schema, failure.attempt, failure.task, failure.rung
+            "the exact bytes at {} no longer match this run's recorded normalized-plan digest ({recorded}, now {frozen_plan_digest}). Restore the frozen snapshot or start a new run.",
+            frozen_plan_path.display()
+        )));
+    }
+    if let Some(failure) = events::legacy_unsettled_failure(started.schema, &events) {
+        let detail = match failure.kind {
+            events::LegacyUnsettledFailureKind::MissingDecision => {
+                "without its durable ladder or parking decision"
+            }
+            events::LegacyUnsettledFailureKind::MissingSpendParking => {
+                "after raising an ApproveSpend question but before durably parking the task"
+            }
+        };
+        return Err(refuse(format!(
+            "legacy event schema {} records failed attempt {} for `{}` on rung {} {detail}. The old writer may have stopped between two appends, so resuming could repeat paid work, choose the wrong rung, or bypass required spend approval. Preserve this log for recovery and start a new run rather than guessing.",
+            started.schema, failure.attempt, failure.task, failure.rung,
         )));
     }
     // Usually `run_started`'s, but a log too old to carry them there may have
@@ -1312,6 +1370,26 @@ fn resume_harness_inner(
             analysis.plan.source.hash
         )));
     }
+    let canonical_plan_bytes = normalized_plan_bytes(&analysis.plan, &frozen_plan_path)?;
+    let canonical_plan_digest = events::normalized_plan_digest(&canonical_plan_bytes);
+    let established_normalized_plan_digest = if let Some(recorded) =
+        recorded_normalized_plan_digest.as_deref()
+    {
+        if canonical_plan_digest != recorded {
+            return Err(refuse(format!(
+                "the validated source plan now normalizes to digest {canonical_plan_digest}, but this run recorded {recorded}. Restore the source plan semantics or start a new run."
+            )));
+        }
+        None
+    } else {
+        if canonical_plan_bytes != frozen_plan_bytes {
+            return Err(refuse(format!(
+                "legacy frozen plan {} does not exactly match the canonical serialization of the validated source plan. Refusing to bless a mutable legacy snapshot during the schema-3 upgrade; restore it or start a new run.",
+                frozen_plan_path.display()
+            )));
+        }
+        Some(frozen_plan_digest.clone())
+    };
 
     let task_ids: Vec<String> = analysis
         .plan
@@ -1446,27 +1524,76 @@ fn resume_harness_inner(
     // §15's check, before anything is discarded: if HEAD moved, refusing has
     // to leave the operator's tree exactly as they left it.
     let recorded_head = last_committed_sha(&replayed.events).unwrap_or(started.base_sha.clone());
-    let head = workspace.head_sha_full()?;
+    let mut head = workspace.head_sha_full()?;
 
-    // One commit past the record can be this run's own work rather than
-    // foreign history. §14 commits, reads the sha back, scrubs the tree, and
-    // only then appends `task_committed` — a process that dies inside those
-    // three git calls leaves exactly this shape. Refusing it would tell the
-    // operator to throw away a commit that already passed its gates and its
-    // review, and to spend the attempt again. So the engine adopts its own
-    // commit, but only when every part of the shape agrees: the other reading
-    // of an unexpected commit is that somebody else made it.
+    // A schema-3 successful settlement durably names the exact commit object
+    // that passed review. Recovery may publish that object from its pin, or
+    // finish recording it when HEAD already advanced. Subject/parent matching
+    // is intentionally insufficient: another commit can share both while
+    // containing arbitrary bytes.
     let mut adopted = None;
-    if head != recorded_head
-        && let Some((task, message)) = unrecorded_commit(&replayed, &analysis.plan)
-        && workspace.parent_sha(&head)?.as_deref() == Some(recorded_head.as_str())
-        && workspace.commit_subject(&head)? == message
-    {
-        warnings.push(format!(
-            "adopted commit {head} as `{task}`: the run committed it and stopped before \
-             recording it, which left the branch one commit ahead of its own log"
-        ));
-        adopted = Some((task, message));
+    if let Some((task, message, prepared)) = unrecorded_commit(&replayed, &analysis.plan) {
+        let Some(prepared) = prepared else {
+            if head != recorded_head {
+                return Err(refuse(format!(
+                    "`{}` is at {head}, but the successful legacy settlement for `{task}` did \
+                     not record an exact prepared commit. Refusing to adopt a commit by subject \
+                     alone; move the branch back to {recorded_head}, or start a new run.",
+                    started.branch
+                )));
+            }
+            return Err(refuse(format!(
+                "the successful legacy settlement for `{task}` has no exact prepared commit. \
+                 It cannot be replayed safely; preserve this log for recovery and start a new run."
+            )));
+        };
+        if prepared.parent_sha != recorded_head
+            || prepared.message != message
+            || !workspace.prepared_commit_matches(&prepared)?
+        {
+            return Err(refuse(format!(
+                "the recorded prepared commit for `{task}` does not match its task, parent, or \
+                 Git object. Refusing to publish or adopt it; preserve the log for recovery."
+            )));
+        }
+
+        if head == prepared.parent_sha {
+            if workspace.prepared_pin_target(&prepared.pin_ref)?.as_deref()
+                != Some(prepared.commit_sha.as_str())
+            {
+                return Err(refuse(format!(
+                    "the recorded prepared commit for `{task}` is not pinned by `{}`. Refusing \
+                     to publish an unprotected or substituted object; preserve the log for recovery.",
+                    prepared.pin_ref
+                )));
+            }
+            workspace.advance_prepared_commit(&prepared)?;
+            head = prepared.commit_sha.clone();
+            warnings.push(format!(
+                "published prepared commit {head} for `{task}` after the run stopped between \
+                 settlement and the branch update"
+            ));
+            adopted = Some((task, message));
+        } else if head == prepared.commit_sha {
+            match workspace.prepared_pin_target(&prepared.pin_ref)? {
+                Some(target) if target == prepared.commit_sha => {
+                    workspace.remove_prepared_pin(&prepared)?;
+                }
+                Some(target) => {
+                    return Err(refuse(format!(
+                        "prepared ref `{}` points at {target}, not the recorded commit {}; \
+                         refusing to delete or adopt a substituted object.",
+                        prepared.pin_ref, prepared.commit_sha
+                    )));
+                }
+                None => {}
+            }
+            warnings.push(format!(
+                "adopted commit {head} as `{task}` from its exact prepared identity after the \
+                 run stopped before recording it"
+            ));
+            adopted = Some((task, message));
+        }
     }
 
     if adopted.is_none() && head != recorded_head {
@@ -1477,6 +1604,24 @@ fn resume_harness_inner(
              back to {recorded_head}, or start a new run.",
             started.branch
         )));
+    }
+
+    // A pin with no successful settlement is from a crash between preparing
+    // the object and appending AttemptFinished. It has no authority to move
+    // HEAD and is removed with an expected-old-value CAS before retrying.
+    for interrupted in replayed.state.interrupted_attempts() {
+        let task_index = replayed
+            .state
+            .index_of(&interrupted.task)
+            .expect("an interrupted task belongs to the replayed plan");
+        let pin_ref = prepared_pin_ref(&run_id, task_index, interrupted.flight.attempt);
+        if workspace.prepared_pin_target(&pin_ref)?.is_some() {
+            workspace.remove_orphan_prepared_pin(&pin_ref)?;
+            warnings.push(format!(
+                "removed orphan prepared commit pin `{pin_ref}` for interrupted attempt {}",
+                interrupted.flight.attempt
+            ));
+        }
     }
 
     // Crash residue: a dead agent's half-written edits. §14 rolls a failed
@@ -1550,7 +1695,22 @@ fn resume_harness_inner(
         // Seeded from the log so a resume neither re-announces an outage the
         // previous process recorded nor swallows a fresh one.
         exhausted_pools: prior_signals.keys().cloned().collect(),
+        #[cfg(test)]
+        after_candidate_capture: None,
     };
+    // The `task_committed` the dead process never got to must be the first
+    // append after its successful settlement. Schema 3 treats that adjacency
+    // as part of the exact prepared-commit binding, so unrelated legacy answer
+    // repairs cannot interpose and poison the log.
+    if let Some((task, message)) = adopted {
+        run.emit(EventBody::TaskCommitted {
+            task,
+            data: events::TaskCommitted {
+                sha: head.clone(),
+                message,
+            },
+        })?;
+    }
     // A legacy run cannot have its opening event rewritten without violating
     // append-only history. This no-op event is the current downgrade boundary:
     // schema-1 binaries do not know its tag, while schema-2 binaries reject a
@@ -1588,19 +1748,6 @@ fn resume_harness_inner(
             run.fail_task_with_policy(index, FailureKind::Declined, reason, halts_run)?;
         }
     }
-    // The `task_committed` the dead process never got to, now that the commit
-    // has been checked against the record. First of everything this resume
-    // writes, because it is the thing that happened first.
-    if let Some((task, message)) = adopted {
-        run.emit(EventBody::TaskCommitted {
-            task,
-            data: events::TaskCommitted {
-                sha: head.clone(),
-                message,
-            },
-        })?;
-    }
-
     // A crash between `question_answered` and the payload rewrite leaves a
     // file that still reads as open, which `tactus answer` would accept a
     // second answer against — one no engine can ever ingest, because the
@@ -1638,6 +1785,7 @@ fn resume_harness_inner(
             chains: recorded_chains
                 .is_none()
                 .then(|| chain_summaries(&analysis)),
+            normalized_plan_digest: established_normalized_plan_digest,
         },
     })?;
     // §14 takes a capacity snapshot at pre-flight, and §15 makes a resume
@@ -1797,8 +1945,17 @@ fn last_committed_sha(events: &[events::Event]) -> Option<String> {
 /// the process that died. Returns the task and the message the engine would
 /// have used, so the caller can confirm the commit really is the one it is
 /// about to adopt rather than trusting the log's shape alone.
-fn unrecorded_commit(replayed: &events::Replay, plan: &Plan) -> Option<(String, String)> {
-    let EventBody::AttemptFinished { task, data, .. } = &replayed.events.last()?.body else {
+fn unrecorded_commit(
+    replayed: &events::Replay,
+    plan: &Plan,
+) -> Option<(String, String, Option<events::PreparedCommit>)> {
+    let EventBody::AttemptFinished {
+        task,
+        data,
+        prepared_commit,
+        ..
+    } = &replayed.events.last()?.body
+    else {
         return None;
     };
     if data.failure.is_some() {
@@ -1812,7 +1969,12 @@ fn unrecorded_commit(replayed: &events::Replay, plan: &Plan) -> Option<(String, 
     Some((
         task.id.to_string(),
         format!("[tactus] {}: {}", task.id, task.title),
+        prepared_commit.as_deref().cloned(),
     ))
+}
+
+fn prepared_pin_ref(run_id: &str, task_index: usize, attempt: u32) -> String {
+    format!("refs/tactus/prepared/{run_id}/{task_index}-{attempt}")
 }
 
 struct Run<'a> {
@@ -1874,6 +2036,8 @@ struct Run<'a> {
     /// resume from the log's own signals, so a resumed run neither re-announces
     /// an outage the previous process recorded nor misses a fresh one.
     exhausted_pools: std::collections::BTreeSet<String>,
+    #[cfg(test)]
+    after_candidate_capture: Option<AfterCandidateCapture>,
 }
 
 impl Run<'_> {
@@ -2191,6 +2355,8 @@ impl Run<'_> {
                         .filter(|entry| entry.human)
                         .filter_map(|entry| entry.detail.clone())
                         .collect(),
+                    #[cfg(test)]
+                    after_candidate_capture: self.after_candidate_capture,
                 };
 
                 // Any error between the agent editing files and the verdict
@@ -2311,6 +2477,30 @@ impl Run<'_> {
                 }
             }
 
+            // A passing attempt is turned into an immutable commit object and
+            // pinned before its settlement becomes durable. The event, HEAD
+            // CAS, and pin deletion can therefore be recovered at every crash
+            // prefix without re-running paid work or trusting the mutable
+            // index.
+            let prepared_commit = if result.failure.is_none() {
+                let message = format!("[tactus] {}: {}", task.id, task.title);
+                let pin_ref = prepared_pin_ref(&self.run_id, index, attempt);
+                match self.workspace.prepare_commit_from_candidate(
+                    &result.candidate_parent,
+                    &result.candidate_tree,
+                    &message,
+                    &pin_ref,
+                ) {
+                    Ok(prepared) => Some(prepared),
+                    Err(error) => {
+                        let _ = self.workspace.discard_uncommitted();
+                        return Err(error);
+                    }
+                }
+            } else {
+                None
+            };
+
             let settlement = self.emit(EventBody::AttemptFinished {
                 task: task_id.clone(),
                 attempt,
@@ -2318,6 +2508,7 @@ impl Run<'_> {
                 profile: profile.name.clone(),
                 parking,
                 transition,
+                prepared_commit: prepared_commit.clone().map(Box::new),
                 data: Box::new(AttemptRecord {
                     attempt,
                     tier: rung.tier.to_string(),
@@ -2337,9 +2528,12 @@ impl Run<'_> {
                 }),
             });
             if let Err(error) = settlement {
-                // The log may be unavailable too, so durability is not always
-                // possible. Workspace hygiene still is: never return with an
-                // unreviewed staged diff just because settlement failed.
+                // A write/flush/sync error cannot prove whether the newline-
+                // committed event reached disk. Deliberately retain a prepared
+                // pin: resume removes it as an orphan if no settlement landed,
+                // or publishes it if the complete settlement is readable.
+                // Deleting it here would turn an ambiguous sync error into a
+                // schema-3 settlement whose exact object is no longer durable.
                 if let Err(cleanup) = self.workspace.discard_uncommitted() {
                     return Err(TactusError::Git {
                         message: format!(
@@ -2367,12 +2561,9 @@ impl Run<'_> {
             }
 
             let Some(failure) = result.failure else {
-                let message = format!("[tactus] {}: {}", task.id, task.title);
-                self.workspace.commit(&message)?;
-                // The full sha, not `commit`'s abbreviated one: `resume`
-                // compares this against HEAD, and abbreviation length varies
-                // with `core.abbrev` and the repo's object count.
-                let full_sha = self.workspace.head_sha_full()?;
+                let prepared = prepared_commit
+                    .expect("a successful schema-3 settlement has a prepared commit");
+                self.workspace.advance_prepared_commit(&prepared)?;
                 // Scrub gate side-effects (build artifacts, lockfile churn) so
                 // they cannot leak into the next task's captured diff; the
                 // commit recorded exactly the verified staged set.
@@ -2380,8 +2571,8 @@ impl Run<'_> {
                 self.emit(EventBody::TaskCommitted {
                     task: task_id.clone(),
                     data: events::TaskCommitted {
-                        sha: full_sha,
-                        message,
+                        sha: prepared.commit_sha,
+                        message: prepared.message,
                     },
                 })?;
                 return Ok(false);
@@ -3388,6 +3579,8 @@ struct AttemptCx<'a> {
     /// Answers the operator has given about this task (§12), in the order they
     /// arrived. The worker gets these as instructions; so must the judge.
     decisions: Vec<String>,
+    #[cfg(test)]
+    after_candidate_capture: Option<AfterCandidateCapture>,
 }
 
 /// What the retry prompt needs to know (§11.4).
@@ -3412,6 +3605,10 @@ struct Reviewer<'a> {
 struct AttemptResult {
     outcome: Outcome,
     failure: Option<AttemptFailure>,
+    /// Immutable git identities captured with the diff before any gate or
+    /// reviewer ran. A successful commit is prepared from these exact objects.
+    candidate_parent: String,
+    candidate_tree: String,
     /// The passes that actually ran, in order — empty when the cheap checks
     /// failed first and no review happened. Derived from the reviews having
     /// happened rather than from passes being configured, so the ledger never
@@ -3460,7 +3657,12 @@ fn run_attempt(
     }
 
     let mut outcome: Outcome = cx.adapter.parse(&output)?;
-    outcome.diff = workspace.capture_diff()?;
+    let candidate = workspace.capture_candidate()?;
+    #[cfg(test)]
+    if let Some(after_capture) = cx.after_candidate_capture {
+        after_capture(workspace, &candidate)?;
+    }
+    outcome.diff = candidate.diff;
     outcome.transcript_path = transcript_path;
 
     // Verification ladder (§11): outcome sanity → cheap static provenance →
@@ -3491,13 +3693,14 @@ fn run_attempt(
         );
     }
     if failure.is_none()
-        && let Some(problem) = workspace.review_input_problem()?
+        && let Some(problem) = workspace.review_input_problem_for_tree(&candidate.tree_oid)?
     {
         failure =
             Some(AttemptFailure::new(FailureKind::ReviewInputOpaque, problem).from_reviewer());
     }
     if failure.is_none() && !cx.gates.is_empty() {
-        let gate_workspace = workspace.gate_snapshot()?;
+        let gate_workspace =
+            workspace.gate_snapshot_for_candidate(&candidate.parent_oid, &candidate.tree_oid)?;
         if let Some(gate_failure) = gates::run_all(
             cx.gates,
             gate_workspace.workspace(),
@@ -3532,7 +3735,8 @@ fn run_attempt(
         // Like gates, reviewers may inspect repository context beyond the
         // supplied diff. Give them the exact staged candidate, never ignored
         // worker inputs or residue from the authoritative workspace.
-        let review_workspace = workspace.gate_snapshot()?;
+        let review_workspace =
+            workspace.gate_snapshot_for_candidate(&candidate.parent_oid, &candidate.tree_oid)?;
         for reviewer in &cx.reviewers {
             let review = review::run_review(&review::ReviewCx {
                 adapter: reviewer.adapter,
@@ -3577,8 +3781,18 @@ fn run_attempt(
     Ok(AttemptResult {
         outcome,
         failure,
+        candidate_parent: candidate.parent_oid,
+        candidate_tree: candidate.tree_oid,
         reviews,
     })
+}
+
+fn normalized_plan_bytes(plan: &Plan, path: &Path) -> Result<Vec<u8>, TactusError> {
+    let mut bytes = serde_json::to_vec_pretty(plan).map_err(|error| TactusError::Parse {
+        message: format!("serializing {}: {error}", path.display()),
+    })?;
+    bytes.push(b'\n');
+    Ok(bytes)
 }
 
 /// Turn a review result into an attempt failure, or `None` if it passed.
@@ -4364,6 +4578,9 @@ mod tests {
         /// Adds an ignored, uncommitted input that a gate could observe in the
         /// worker tree but that is absent from the staged review candidate.
         IgnoredGateInput,
+        /// Lets the test mutate the authoritative index after capture and
+        /// records which immutable tree the reviewer actually received.
+        FrozenCandidate,
         /// After the reviewer workspace exists, plants a stale lock in the
         /// common git directory so the later authoritative cleanup fails.
         JamCleanupAfterReview,
@@ -4432,6 +4649,7 @@ mod tests {
         review: usize,
         review_spawn_failures: usize,
         runs: Vec<RecordedRun>,
+        review_snapshots: Vec<(String, String)>,
     }
 
     #[derive(Clone)]
@@ -4498,6 +4716,13 @@ mod tests {
             self.calls
                 .lock()
                 .map(|c| c.review_spawn_failures)
+                .unwrap_or_default()
+        }
+
+        fn review_snapshots(&self) -> Vec<(String, String)> {
+            self.calls
+                .lock()
+                .map(|calls| calls.review_snapshots.clone())
                 .unwrap_or_default()
         }
     }
@@ -4588,6 +4813,38 @@ mod tests {
                     cmd.current_dir(&run.workspace);
                     return Ok(cmd);
                 }
+                if effect == Effect::FrozenCandidate {
+                    let tree = Command::new("git")
+                        .arg("-C")
+                        .arg(&run.workspace)
+                        .args(["rev-parse", "HEAD^{tree}"])
+                        .output()
+                        .map_err(|e| TactusError::Agent {
+                            message: format!("fake could not inspect reviewer tree: {e}"),
+                        })?;
+                    if !tree.status.success() {
+                        return Err(TactusError::Agent {
+                            message: format!(
+                                "fake could not inspect reviewer tree: {}",
+                                String::from_utf8_lossy(&tree.stderr).trim()
+                            ),
+                        });
+                    }
+                    let contents = fs::read_to_string(run.workspace.join("agent-output.txt"))
+                        .map_err(|e| TactusError::Agent {
+                            message: format!("fake could not inspect reviewer candidate: {e}"),
+                        })?;
+                    self.calls
+                        .lock()
+                        .map_err(|_| TactusError::Agent {
+                            message: "fake adapter lock poisoned".to_owned(),
+                        })?
+                        .review_snapshots
+                        .push((
+                            String::from_utf8_lossy(&tree.stdout).trim().to_owned(),
+                            contents,
+                        ));
+                }
                 if effect == Effect::JamCleanupAfterReview {
                     let common = Command::new("git")
                         .arg("-C")
@@ -4649,7 +4906,10 @@ mod tests {
                         );
                         std::process::exit(CRASH_EXIT_CODE);
                     }
-                    Effect::EditFile | Effect::AskQuestion | Effect::JamCleanupAfterReview => {
+                    Effect::EditFile
+                    | Effect::AskQuestion
+                    | Effect::JamCleanupAfterReview
+                    | Effect::FrozenCandidate => {
                         let marker = run.workspace.join("agent-output.txt");
                         let previous = fs::read_to_string(&marker).unwrap_or_default();
                         Some(("agent-output.txt", format!("{previous}edited: {index}\n")))
@@ -4780,6 +5040,7 @@ mod tests {
                 | Effect::LargeEdit
                 | Effect::OpaqueEdit
                 | Effect::IgnoredGateInput
+                | Effect::FrozenCandidate
                 | Effect::JamCleanupAfterReview
                 | Effect::LargeEditQuestionWriteFailure
                 | Effect::NoEdit
@@ -4919,6 +5180,77 @@ mod tests {
             String::from_utf8_lossy(&out.stderr)
         );
         String::from_utf8_lossy(&out.stdout).into_owned()
+    }
+
+    fn candidate_mutation_marker(repo: &Path) -> PathBuf {
+        let name = repo
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "repo".to_owned());
+        repo.with_file_name(format!("{name}-candidate-mutation.txt"))
+    }
+
+    fn mutate_index_after_candidate_capture(
+        workspace: &Workspace,
+        candidate: &crate::workspace::CapturedCandidate,
+    ) -> Result<(), TactusError> {
+        fs::write(
+            workspace.root().join("agent-output.txt"),
+            "tampered after capture\n",
+        )
+        .map_err(|error| TactusError::Git {
+            message: format!("test could not mutate the captured worktree: {error}"),
+        })?;
+        let add = Command::new("git")
+            .arg("-C")
+            .arg(workspace.root())
+            .args(["add", "-A"])
+            .output()
+            .map_err(|error| TactusError::Git {
+                message: format!("test could not stage its post-capture mutation: {error}"),
+            })?;
+        if !add.status.success() {
+            return Err(TactusError::Git {
+                message: format!(
+                    "test could not stage its post-capture mutation: {}",
+                    String::from_utf8_lossy(&add.stderr).trim()
+                ),
+            });
+        }
+        let tampered_tree = Command::new("git")
+            .arg("-C")
+            .arg(workspace.root())
+            .arg("write-tree")
+            .output()
+            .map_err(|error| TactusError::Git {
+                message: format!("test could not inspect its post-capture tree: {error}"),
+            })?;
+        if !tampered_tree.status.success() {
+            return Err(TactusError::Git {
+                message: format!(
+                    "test could not inspect its post-capture tree: {}",
+                    String::from_utf8_lossy(&tampered_tree.stderr).trim()
+                ),
+            });
+        }
+        let tampered_tree = String::from_utf8_lossy(&tampered_tree.stdout)
+            .trim()
+            .to_owned();
+        if tampered_tree == candidate.tree_oid {
+            return Err(TactusError::Git {
+                message: "test post-capture mutation did not change the staged tree".to_owned(),
+            });
+        }
+        fs::write(
+            candidate_mutation_marker(workspace.root()),
+            format!(
+                "{}\n{}\n{tampered_tree}\n",
+                candidate.parent_oid, candidate.tree_oid
+            ),
+        )
+        .map_err(|error| TactusError::Git {
+            message: format!("test could not record its capture identities: {error}"),
+        })
     }
 
     fn temp_engine_repo(tag: &str) -> PathBuf {
@@ -5081,6 +5413,86 @@ mod tests {
         assert!(
             repo.join(".tactus").join("runs").exists(),
             "run dir written"
+        );
+    }
+
+    #[test]
+    fn gates_review_and_commit_use_one_frozen_candidate_tree() {
+        let repo = temp_engine_repo("one-frozen-candidate");
+        seed(
+            &repo,
+            "## Implement the widget\n<!-- tactus: id=t1 depends= -->\n",
+            Some(
+                "[interaction]\nmode = \"never\"\n\n\
+                 [[gates]]\nname = \"frozen-candidate\"\n\
+                 cmd = 'git grep -q \"edited: 0\" -- agent-output.txt'\n",
+            ),
+        );
+        let base = git_in(&repo, &["rev-parse", "HEAD"]).trim().to_owned();
+        let marker = candidate_mutation_marker(&repo);
+        let _ = fs::remove_file(&marker);
+        let mut opts = options(&repo);
+        opts.config_path = Some(repo.join("tactus.toml"));
+        opts.after_candidate_capture = Some(mutate_index_after_candidate_capture);
+        let source = fake(Effect::FrozenCandidate);
+
+        let report = run_with(&opts, &source).expect("the frozen candidate remains authoritative");
+        assert_eq!(report.outcome(), RunOutcome::Complete, "{report:?}");
+        assert_eq!(report.gates, ["frozen-candidate"]);
+
+        let capture: Vec<_> = fs::read_to_string(&marker)
+            .expect("the post-capture mutation hook ran")
+            .lines()
+            .map(str::to_owned)
+            .collect();
+        assert_eq!(capture.len(), 3, "capture marker: {capture:?}");
+        assert_eq!(capture[0], base, "captured parent is the attempt parent");
+        assert_ne!(
+            capture[1], capture[2],
+            "the mutable index really changed after capture"
+        );
+
+        let logged = events_of(&repo, &report.run_id);
+        let prepared = logged
+            .iter()
+            .find_map(|event| match &event.body {
+                EventBody::AttemptFinished {
+                    prepared_commit, ..
+                } => prepared_commit.as_deref().cloned(),
+                _ => None,
+            })
+            .expect("successful settlement records its prepared object");
+        assert_eq!(prepared.parent_sha, capture[0]);
+        assert_eq!(prepared.tree_sha, capture[1]);
+        assert_ne!(prepared.tree_sha, capture[2]);
+
+        let review_snapshots = source.adapter.review_snapshots();
+        assert_eq!(review_snapshots.len(), 1, "one reviewer snapshot");
+        assert_eq!(review_snapshots[0].0, prepared.tree_sha);
+        assert_eq!(
+            review_snapshots[0].1.replace("\r\n", "\n"),
+            "edited: 0\n",
+            "review sees the captured tree, not the later staged mutation"
+        );
+
+        let committed = logged
+            .iter()
+            .find_map(|event| match &event.body {
+                EventBody::TaskCommitted { data, .. } => Some(data),
+                _ => None,
+            })
+            .expect("task_committed follows the prepared settlement");
+        let head = git_in(&repo, &["rev-parse", "HEAD"]).trim().to_owned();
+        let head_tree = git_in(&repo, &["rev-parse", "HEAD^{tree}"])
+            .trim()
+            .to_owned();
+        assert_eq!(head, prepared.commit_sha);
+        assert_eq!(committed.sha, prepared.commit_sha);
+        assert_eq!(head_tree, prepared.tree_sha);
+        assert_eq!(
+            git_in(&repo, &["show", "HEAD:agent-output.txt"]),
+            "edited: 0\n",
+            "the staged post-capture mutation is never published"
         );
     }
 
@@ -8796,11 +9208,103 @@ mod tests {
     }
 
     #[test]
-    fn status_refuses_mismatched_frozen_plan_hash() {
-        let (repo, run_id) = parked_run("statusplanhash");
+    fn status_export_and_resume_refuse_mutated_normalized_plan_bytes() {
+        let (repo, run_id) = parked_run("normalized-plan-tamper");
         let plan_path = paths_of(&repo, &run_id).plan_json();
         let mut plan: serde_json::Value =
             serde_json::from_str(&fs::read_to_string(&plan_path).expect("frozen plan"))
+                .expect("valid frozen plan");
+        plan["tasks"][0]["title"] =
+            serde_json::Value::String("tampered but self-hash unchanged".to_owned());
+        fs::write(
+            &plan_path,
+            format!(
+                "{}\n",
+                serde_json::to_string_pretty(&plan).expect("serialize plan")
+            ),
+        )
+        .expect("replace frozen plan");
+
+        let status_error = match crate::status::load(&repo, Some(&run_id)) {
+            Ok(_) => panic!("status must authenticate the exact normalized bytes"),
+            Err(error) => error.to_string(),
+        };
+        assert!(
+            status_error.contains("normalized plan digest"),
+            "{status_error}"
+        );
+
+        let export_error = match crate::export::load(&repo, &run_id) {
+            Ok(_) => panic!("export must authenticate the exact normalized bytes"),
+            Err(error) => error.to_string(),
+        };
+        assert!(
+            export_error.contains("normalized plan digest"),
+            "{export_error}"
+        );
+
+        let resume_error = resume_err(&repo, &run_id);
+        assert!(
+            resume_error.contains("exact bytes") && resume_error.contains("normalized-plan digest"),
+            "{resume_error}"
+        );
+    }
+
+    #[test]
+    fn resume_refuses_schema_two_spend_question_without_task_parked() {
+        let (repo, run_id) = parked_run("legacyspendprefix");
+        let paths = paths_of(&repo, &run_id);
+        rewrite_run_started_as_schema_two(&paths);
+        strip_event_field(&paths, "attempt_finished", "parking");
+        truncate_log_after(&paths, "attempt_finished");
+        let mut warnings = Vec::new();
+        let mut log = EventLog::open(&paths.events(), &mut warnings).expect("legacy log");
+        log.append(EventBody::LadderEscalated {
+            task: "t1".to_owned(),
+            attempt: 1,
+            rung: 0,
+            data: events::LadderEscalated {
+                to_rung: 1,
+                tier: "small".to_owned(),
+                summary: "escalate".to_owned(),
+                detail: None,
+            },
+        })
+        .expect("legacy escalation");
+        log.append(EventBody::QuestionRaised {
+            task: "t1".to_owned(),
+            data: Box::new(events::QuestionRaised {
+                question: Question {
+                    id: QuestionId::from("q-spend-prefix"),
+                    kind: QuestionKind::ApproveSpend,
+                    affected_tasks: vec![TaskId::from("t1")],
+                    context: "approve spend".to_owned(),
+                    options: Vec::new(),
+                },
+            }),
+        })
+        .expect("legacy question");
+        drop(log);
+        let before = fs::read(paths.events()).expect("ambiguous prefix");
+
+        let error = resume_err(&repo, &run_id);
+        assert!(error.contains("ApproveSpend"), "{error}");
+        assert!(error.contains("before durably parking the task"), "{error}");
+        assert_eq!(
+            fs::read(paths.events()).expect("refused log"),
+            before,
+            "refusal never upgrades the spend-approval gap"
+        );
+    }
+
+    #[test]
+    fn legacy_status_still_refuses_a_mismatched_self_reported_plan_hash() {
+        let (repo, run_id) = parked_run("legacy-status-plan-hash");
+        let paths = paths_of(&repo, &run_id);
+        rewrite_run_started_as_schema_two(&paths);
+        let plan_path = paths.plan_json();
+        let mut plan: serde_json::Value =
+            serde_json::from_slice(&fs::read(&plan_path).expect("frozen plan"))
                 .expect("valid frozen plan");
         plan["source"]["hash"] = serde_json::Value::String("different-plan".to_owned());
         fs::write(
@@ -8813,11 +9317,71 @@ mod tests {
         .expect("replace frozen plan");
 
         let error = match crate::status::load(&repo, Some(&run_id)) {
-            Ok(_) => panic!("status must not fold events against a different frozen plan"),
+            Ok(_) => panic!("legacy status retains its source-hash boundary"),
             Err(error) => error.to_string(),
         };
         assert!(error.contains("frozen plan hash"), "{error}");
         assert!(error.contains("different-plan"), "{error}");
+    }
+
+    #[test]
+    fn legacy_upgrade_never_blesses_a_modified_normalized_snapshot() {
+        let (repo, run_id) = parked_run("legacy-plan-upgrade-tamper");
+        let paths = paths_of(&repo, &run_id);
+        rewrite_run_started_as_schema_two(&paths);
+        let plan_path = paths.plan_json();
+        let mut plan: serde_json::Value =
+            serde_json::from_slice(&fs::read(&plan_path).expect("frozen plan"))
+                .expect("valid frozen plan");
+        plan["tasks"][0]["title"] = serde_json::Value::String("modified snapshot".to_owned());
+        fs::write(
+            &plan_path,
+            format!(
+                "{}\n",
+                serde_json::to_string_pretty(&plan).expect("serialize plan")
+            ),
+        )
+        .expect("tamper legacy snapshot");
+        let before = fs::read(paths.events()).expect("legacy log");
+
+        let error = resume_err(&repo, &run_id);
+        assert!(error.contains("Refusing to bless"), "{error}");
+        assert_eq!(
+            fs::read(paths.events()).expect("refused log"),
+            before,
+            "refusal happens before the schema upgrade append"
+        );
+    }
+
+    #[test]
+    fn resume_compares_canonical_source_semantics_to_the_recorded_plan_digest() {
+        let (repo, run_id) = parked_run("source-semantics-digest");
+        fs::write(
+            repo.join("plan.md"),
+            "## Changed semantics\n<!-- tactus: id=t1 kind=implement depends= -->\nDifferent body.\n",
+        )
+        .expect("change source plan");
+        let new_hash = crate::ir::content_hash(&fs::read(repo.join("plan.md")).expect("plan"));
+        let paths = paths_of(&repo, &run_id);
+        let text = fs::read_to_string(paths.events()).expect("log");
+        let rewritten = text
+            .lines()
+            .map(|line| {
+                let mut value: serde_json::Value = serde_json::from_str(line).expect("event");
+                if value["event"] == "run_started" {
+                    value["data"]["plan_hash"] = serde_json::Value::String(new_hash.clone());
+                }
+                value.to_string()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        fs::write(paths.events(), format!("{rewritten}\n")).expect("force legacy hash guard equal");
+
+        let error = resume_err(&repo, &run_id);
+        assert!(
+            error.contains("validated source plan now normalizes to digest"),
+            "{error}"
+        );
     }
 
     #[test]
@@ -9358,6 +9922,7 @@ mod tests {
                 effort_policy: None,
                 reviews: None,
                 chains: None,
+                normalized_plan_digest: None,
             },
         })
         .expect("resume marker");
@@ -9411,6 +9976,7 @@ mod tests {
                         effort_policy: None,
                         reviews: None,
                         chains: None,
+                        normalized_plan_digest: None,
                     },
                 })
                 .expect("resume marker");
@@ -9540,6 +10106,7 @@ mod tests {
                         .and_then(serde_json::Value::as_object_mut)
                         .expect("run_started data");
                     data.insert("schema".to_owned(), serde_json::Value::from(1));
+                    data.remove("normalized_plan_digest");
                     for field in absent {
                         data.remove(*field)
                             .unwrap_or_else(|| panic!("the run recorded no `{field}`"));
@@ -9587,6 +10154,7 @@ mod tests {
                         .and_then(serde_json::Value::as_object_mut)
                         .expect("run_started data");
                     data.insert("schema".to_owned(), serde_json::Value::from(2));
+                    data.remove("normalized_plan_digest");
                     let reviews = data
                         .get_mut("reviews")
                         .and_then(serde_json::Value::as_object_mut)
@@ -9667,6 +10235,26 @@ mod tests {
         fs::write(paths.events(), format!("{}\n", lines[..cut].join("\n"))).expect("truncate");
     }
 
+    fn prepared_commit_of(paths: &RunPaths) -> events::PreparedCommit {
+        let mut warnings = Vec::new();
+        events::read_all(&paths.events(), &mut warnings)
+            .expect("read prepared settlement")
+            .into_iter()
+            .find_map(|event| match event.body {
+                EventBody::AttemptFinished {
+                    prepared_commit: Some(prepared),
+                    ..
+                } => Some(*prepared),
+                _ => None,
+            })
+            .expect("successful settlement records its prepared commit")
+    }
+
+    fn recreate_prepared_pin(repo: &Path, prepared: &events::PreparedCommit, target: &str) {
+        let zero = "0".repeat(target.len());
+        git_in(repo, &["update-ref", &prepared.pin_ref, target, &zero]);
+    }
+
     #[test]
     fn resume_adopts_the_commit_it_made_but_never_recorded() {
         // §14 commits, reads the sha back, scrubs the tree, and only then
@@ -9731,10 +10319,250 @@ mod tests {
     }
 
     #[test]
-    fn resume_refuses_a_commit_it_would_not_have_written() {
-        // The adoption above is deliberately narrow: one commit past the
-        // record, carrying the message this engine would have used for the
-        // task whose attempt just passed. Anything else is someone's history.
+    fn resume_recovers_every_prepared_commit_ref_crash_prefix() {
+        for (tag, reset_to_parent, recreate_pin) in [
+            ("prepared-same-head", true, true),
+            ("prepared-head-with-pin", false, true),
+            ("prepared-head-no-pin", false, false),
+        ] {
+            let repo = temp_engine_repo(tag);
+            seed(
+                &repo,
+                "## Implement the widget\n<!-- tactus: id=t1 kind=implement depends= -->\n",
+                Some("[routing]\nimplement = { chain = [\"small\"], attempts_per = 1 }\n"),
+            );
+            let mut opts = options(&repo);
+            opts.config_path = Some(repo.join("tactus.toml"));
+            let report = run_with(&opts, &fake(Effect::EditFile)).expect("run");
+            let paths = paths_of(&repo, &report.run_id);
+            let prepared = prepared_commit_of(&paths);
+            truncate_log_before(&paths, "task_committed");
+            if reset_to_parent {
+                git_in(&repo, &["reset", "-q", "--soft", &prepared.parent_sha]);
+            }
+            if recreate_pin {
+                let target = prepared.commit_sha.clone();
+                recreate_prepared_pin(&repo, &prepared, &target);
+            }
+
+            let source = fake(Effect::EditFile);
+            let resumed = resume_harness(
+                &resume_options(&repo, &report.run_id),
+                &Harness {
+                    adapters: &source,
+                    answers: None,
+                    sleeper: None,
+                },
+            )
+            .expect("recover exact prepared object");
+            assert_eq!(
+                resumed.outcome(),
+                RunOutcome::Complete,
+                "{tag}: {resumed:?}"
+            );
+            assert_eq!(
+                git_in(&repo, &["rev-parse", "HEAD"]).trim(),
+                prepared.commit_sha,
+                "{tag}: the exact reviewed object is published"
+            );
+            assert_eq!(task(&resumed, "t1").attempts.len(), 1, "{tag}");
+            let workspace = Workspace::open(&repo).expect("workspace");
+            assert_eq!(
+                workspace
+                    .prepared_pin_target(&prepared.pin_ref)
+                    .expect("pin lookup"),
+                None,
+                "{tag}: recovery cleans the private pin"
+            );
+        }
+    }
+
+    #[test]
+    fn resume_removes_a_pin_whose_successful_settlement_never_landed() {
+        let repo = temp_engine_repo("prepared-orphan");
+        seed(
+            &repo,
+            "## Implement the widget\n<!-- tactus: id=t1 kind=implement depends= -->\n",
+            Some("[routing]\nimplement = { chain = [\"small\"], attempts_per = 2 }\n"),
+        );
+        let mut opts = options(&repo);
+        opts.config_path = Some(repo.join("tactus.toml"));
+        let report = run_with(&opts, &fake(Effect::EditFile)).expect("run");
+        let paths = paths_of(&repo, &report.run_id);
+        let prepared = prepared_commit_of(&paths);
+        truncate_log_before(&paths, "attempt_finished");
+        git_in(&repo, &["reset", "-q", "--soft", &prepared.parent_sha]);
+        let target = prepared.commit_sha.clone();
+        recreate_prepared_pin(&repo, &prepared, &target);
+
+        let source = fake(Effect::EditFile);
+        let resumed = resume_harness(
+            &resume_options(&repo, &report.run_id),
+            &Harness {
+                adapters: &source,
+                answers: None,
+                sleeper: None,
+            },
+        )
+        .expect("orphan pin is not a settlement");
+        assert_eq!(resumed.outcome(), RunOutcome::Complete, "{resumed:?}");
+        assert_eq!(task(&resumed, "t1").attempts.len(), 2);
+        assert!(
+            resumed
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("removed orphan prepared commit pin")),
+            "{:?}",
+            resumed.warnings
+        );
+        assert_eq!(
+            Workspace::open(&repo)
+                .expect("workspace")
+                .prepared_pin_target(&prepared.pin_ref)
+                .expect("pin lookup"),
+            None
+        );
+    }
+
+    #[test]
+    fn resume_refuses_a_substituted_prepared_pin_without_deleting_it() {
+        let repo = temp_engine_repo("prepared-pin-mismatch");
+        seed(
+            &repo,
+            "## Implement the widget\n<!-- tactus: id=t1 kind=implement depends= -->\n",
+            Some("[routing]\nimplement = { chain = [\"small\"], attempts_per = 1 }\n"),
+        );
+        let mut opts = options(&repo);
+        opts.config_path = Some(repo.join("tactus.toml"));
+        let report = run_with(&opts, &fake(Effect::EditFile)).expect("run");
+        let paths = paths_of(&repo, &report.run_id);
+        let prepared = prepared_commit_of(&paths);
+        truncate_log_before(&paths, "task_committed");
+        git_in(&repo, &["reset", "-q", "--soft", &prepared.parent_sha]);
+        recreate_prepared_pin(&repo, &prepared, &prepared.parent_sha);
+
+        let err = resume_err(&repo, &report.run_id);
+        assert!(err.contains("not pinned"), "{err}");
+        assert_eq!(
+            Workspace::open(&repo)
+                .expect("workspace")
+                .prepared_pin_target(&prepared.pin_ref)
+                .expect("pin lookup")
+                .as_deref(),
+            Some(prepared.parent_sha.as_str()),
+            "refusal never deletes the substituted target"
+        );
+        assert_eq!(
+            git_in(&repo, &["rev-parse", "HEAD"]).trim(),
+            prepared.parent_sha,
+            "HEAD remains at the recorded parent"
+        );
+    }
+
+    #[test]
+    fn recovered_prepared_commit_precedes_unrelated_answer_defect_repair() {
+        let repo = temp_engine_repo("prepared-before-repair");
+        seed(
+            &repo,
+            "## Implement the widget\n<!-- tactus: id=t1 kind=implement depends= -->\n",
+            Some("[routing]\nimplement = { chain = [\"small\"], attempts_per = 1 }\n"),
+        );
+        let mut opts = options(&repo);
+        opts.config_path = Some(repo.join("tactus.toml"));
+        let report = run_with(&opts, &fake(Effect::EditFile)).expect("run");
+        let paths = paths_of(&repo, &report.run_id);
+        truncate_log_before(&paths, "task_committed");
+
+        // Model an earlier answered question whose DesignDefect append was
+        // interrupted. It is unrelated to the later successful settlement,
+        // but resume still owes the repair after closing that settlement.
+        let question_id = QuestionId::from("q-before-success");
+        let question = Question {
+            id: question_id.clone(),
+            kind: QuestionKind::Unblock,
+            affected_tasks: vec![TaskId::from("t1")],
+            context: "an earlier question".to_owned(),
+            options: Vec::new(),
+        };
+        let inserted = [
+            events::Event::now(EventBody::QuestionRaised {
+                task: "t1".to_owned(),
+                data: Box::new(events::QuestionRaised {
+                    question: question.clone(),
+                }),
+            }),
+            events::Event::now(EventBody::TaskParked {
+                task: "t1".to_owned(),
+                data: events::TaskParked {
+                    question: question_id.to_string(),
+                    refund_attempt: false,
+                },
+            }),
+            events::Event::now(EventBody::QuestionAnswered {
+                data: events::QuestionAnswered {
+                    question: question_id,
+                    answer: Answer::Answered {
+                        text: "continue".to_owned(),
+                    },
+                    decline_halts_run: None,
+                    via: "answer-file".to_owned(),
+                },
+            }),
+        ];
+        let mut lines: Vec<String> = fs::read_to_string(paths.events())
+            .expect("log")
+            .lines()
+            .map(str::to_owned)
+            .collect();
+        let before_attempt = lines
+            .iter()
+            .position(|line| line.contains("\"attempt_started\""))
+            .expect("attempt start");
+        lines.splice(
+            before_attempt..before_attempt,
+            inserted
+                .iter()
+                .map(|event| serde_json::to_string(event).expect("event json")),
+        );
+        fs::write(paths.events(), format!("{}\n", lines.join("\n"))).expect("insert prefix");
+
+        let source = fake(Effect::EditFile);
+        let resumed = resume_harness(
+            &resume_options(&repo, &report.run_id),
+            &Harness {
+                adapters: &source,
+                answers: None,
+                sleeper: None,
+            },
+        )
+        .expect("resume closes settlement before repairing older metadata");
+        assert_eq!(resumed.outcome(), RunOutcome::Complete, "{resumed:?}");
+        let logged = events_of(&repo, &report.run_id);
+        let settlement = logged
+            .iter()
+            .rposition(|event| matches!(event.body, EventBody::AttemptFinished { .. }))
+            .expect("settlement");
+        assert!(
+            matches!(
+                logged.get(settlement + 1).map(|event| &event.body),
+                Some(EventBody::TaskCommitted { task, .. }) if task == "t1"
+            ),
+            "task_committed must immediately close the prepared settlement"
+        );
+        assert!(
+            logged
+                .iter()
+                .skip(settlement + 2)
+                .any(|event| matches!(event.body, EventBody::DesignDefect { .. })),
+            "the older answer repair still lands after the commit"
+        );
+        events::replay(logged, vec!["t1".to_owned()], &paths.events())
+            .expect("the repaired log remains replayable");
+    }
+
+    #[test]
+    fn resume_refuses_an_arbitrary_tree_with_the_same_parent_and_subject() {
+        // Exact object identity, not a plausible subject, is the authority.
         let repo = temp_engine_repo("adoptforeign");
         seed(
             &repo,
@@ -9745,14 +10573,43 @@ mod tests {
         opts.config_path = Some(repo.join("tactus.toml"));
         let report = run_with(&opts, &fake(Effect::EditFile)).expect("run");
         truncate_log_before(&paths_of(&repo, &report.run_id), "task_committed");
-        // Same place on the branch, different hand.
-        git_in(
-            &repo,
-            &["commit", "-q", "--amend", "-m", "not the engine's"],
+        let subject = git_in(&repo, &["show", "-s", "--format=%s", "HEAD"]);
+        fs::write(repo.join("foreign.txt"), "not reviewed\n").expect("foreign tree");
+        git_in(&repo, &["add", "foreign.txt"]);
+        git_in(&repo, &["commit", "-q", "--amend", "--no-edit"]);
+        assert_eq!(
+            git_in(&repo, &["show", "-s", "--format=%s", "HEAD"]),
+            subject,
+            "the substituted commit deliberately has the expected subject"
         );
 
         let err = resume_err(&repo, &report.run_id);
         assert!(err.contains("record ends at"), "got: {err}");
+    }
+
+    #[test]
+    fn legacy_success_without_prepared_identity_is_never_adopted_by_subject() {
+        let repo = temp_engine_repo("legacy-subject");
+        seed(
+            &repo,
+            "## Implement the widget\n<!-- tactus: id=t1 kind=implement depends= -->\n",
+            Some("[routing]\nimplement = { chain = [\"small\"], attempts_per = 1 }\n"),
+        );
+        let mut opts = options(&repo);
+        opts.config_path = Some(repo.join("tactus.toml"));
+        let report = run_with(&opts, &fake(Effect::EditFile)).expect("run");
+        let paths = paths_of(&repo, &report.run_id);
+        truncate_log_before(&paths, "task_committed");
+        rewrite_run_started_as_schema_two(&paths);
+        strip_event_field(&paths, "attempt_finished", "prepared_commit");
+
+        let err = resume_err(&repo, &report.run_id);
+        assert!(err.contains("subject alone"), "{err}");
+        assert_eq!(
+            git_in(&repo, &["rev-list", "--count", "main..HEAD"]).trim(),
+            "1",
+            "refusal preserves the plausible legacy commit"
+        );
     }
 
     #[test]
@@ -9772,7 +10629,10 @@ mod tests {
         let report = run_with(&opts, &fake(Effect::EditFile)).expect("run");
         let run_id = report.run_id.clone();
         let recorded = paths_of(&repo, &run_id);
-        truncate_log_before(&recorded, "task_committed");
+        // Stop before the successful settlement, so this is a genuinely
+        // interrupted attempt rather than a settled prepared commit whose pin
+        // a real process would still retain.
+        truncate_log_before(&recorded, "attempt_finished");
         git_in(&repo, &["reset", "-q", "--hard", "HEAD~1"]);
 
         // No override, so the resume has to read the location off the record.

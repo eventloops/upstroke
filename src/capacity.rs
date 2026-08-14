@@ -1046,6 +1046,7 @@ mod tests {
                 profile: "p".to_owned(),
                 parking: None,
                 transition: None,
+                prepared_commit: None,
                 data: Box::new(AttemptRecord {
                     attempt: 1,
                     tier: "small".to_owned(),
@@ -1108,6 +1109,7 @@ mod tests {
             profile: "p".to_owned(),
             parking: None,
             transition: None,
+            prepared_commit: None,
             data: Box::new(AttemptRecord {
                 attempt: 2,
                 tier: "small".to_owned(),

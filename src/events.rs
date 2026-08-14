@@ -26,6 +26,7 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 
 use crate::error::TactusError;
 use crate::interaction::QuestionRecord;
@@ -135,6 +136,12 @@ pub enum EventBody {
         /// replay a known failure as pending work on its old rung.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         transition: Option<Box<AttemptTransition>>,
+        /// The exact commit object prepared from the reviewed index for a
+        /// successful attempt. Creating the object does not move a ref; the
+        /// event is therefore durable before the branch advances, and resume
+        /// can finish either side of that CAS without re-running paid work.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        prepared_commit: Option<Box<PreparedCommit>>,
     },
     /// The `attempt_finished` a dead process never got to write.
     ///
@@ -307,6 +314,15 @@ pub struct RunStarted {
     /// Content hash of the plan text (`ir::content_hash`). A run is bound to
     /// the plan it froze; a different hash means the task graph moved under it.
     pub plan_hash: String,
+    /// Digest of the exact bytes written to `plan.normalized.json`.
+    ///
+    /// `plan_hash` above belongs to the source document and is also serialized
+    /// inside the normalized plan. It cannot authenticate that file against
+    /// itself. Fresh schema-3 runs record this independent byte digest; legacy
+    /// runs establish it on their first schema-3 resume after comparing the
+    /// old snapshot with a canonical serialization of the validated source.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub normalized_plan_digest: Option<String>,
     /// Where the agent-authored half of this run lives (§15 split).
     pub private_dir: String,
     pub gates: Vec<String>,
@@ -473,6 +489,11 @@ pub struct RunResumed {
     /// use the first recorded snapshot and leave this `None`.
     #[serde(default)]
     pub chains: Option<Vec<ChainSummary>>,
+    /// Exact normalized-plan byte digest established by the first schema-3
+    /// resume of a legacy run. Current runs carry it in `run_started`, and
+    /// subsequent resumes leave this absent so the first authority wins.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub normalized_plan_digest: Option<String>,
 }
 
 /// A schema transition appended to an old run without rewriting its beginning.
@@ -567,6 +588,20 @@ pub struct AttemptRecord {
     pub usage: Option<crate::ir::Usage>,
     /// `None` when the attempt passed.
     pub failure: Option<FailureRecord>,
+}
+
+/// A hook-free commit object prepared from the exact staged tree that gates
+/// and reviewers accepted. The event log records all four identities because
+/// a subject and parent alone do not distinguish an amended, unreviewed tree.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PreparedCommit {
+    pub parent_sha: String,
+    pub tree_sha: String,
+    pub commit_sha: String,
+    pub message: String,
+    /// Private ref that keeps the prepared object reachable until HEAD has
+    /// advanced. Its target is CAS-created and CAS-deleted.
+    pub pin_ref: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1660,6 +1695,45 @@ pub struct Replay {
     pub events: Vec<Event>,
 }
 
+/// Stable digest for the exact bytes of `plan.normalized.json`.
+///
+/// This deliberately differs from [`crate::ir::content_hash`]: the source-plan
+/// identity normalizes CRLF, while this value authenticates the snapshot bytes
+/// themselves. The algorithm is named in the value so a future schema can add
+/// a different digest without silently changing what an existing record means.
+pub(crate) fn normalized_plan_digest(bytes: &[u8]) -> String {
+    format!("sha256:{:x}", Sha256::digest(bytes))
+}
+
+/// The first exact normalized-plan digest this run established.
+///
+/// A fresh schema-3 run carries it in `run_started`; a legacy run gains it on
+/// the first schema-3 `run_resumed`. First-in-log-order wins, matching the gate,
+/// review, effort, and chain identity records above.
+pub(crate) fn recorded_normalized_plan_digest(events: &[Event]) -> Option<&str> {
+    let mut schema = 0;
+    for event in events {
+        match &event.body {
+            EventBody::RunStarted { data } => {
+                schema = data.schema;
+                if schema >= 3
+                    && let Some(digest) = data.normalized_plan_digest.as_deref()
+                {
+                    return Some(digest);
+                }
+            }
+            EventBody::RunSchemaUpgraded { data } => schema = data.to,
+            EventBody::RunResumed { data } if schema >= 3 => {
+                if let Some(digest) = data.normalized_plan_digest.as_deref() {
+                    return Some(digest);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
 /// The gates this run is bound to, from wherever the log records them.
 ///
 /// `run_started` for anything written since the gate record existed; otherwise
@@ -1837,6 +1911,7 @@ pub(crate) fn ensure_supported_schema(
         });
     }
     let mut event_schema = started.schema;
+    let mut pending_prepared: Option<(String, PreparedCommit)> = None;
     for event in events {
         if let EventBody::RunSchemaUpgraded { data } = &event.body {
             event_schema = data.to;
@@ -1845,21 +1920,102 @@ pub(crate) fn ensure_supported_schema(
         if event_schema < 3 {
             continue;
         }
+        if let Some((task, prepared)) = pending_prepared.as_ref() {
+            match &event.body {
+                EventBody::TaskCommitted {
+                    task: committed_task,
+                    data,
+                } if committed_task == task
+                    && data.sha == prepared.commit_sha
+                    && data.message == prepared.message =>
+                {
+                    pending_prepared = None;
+                    continue;
+                }
+                _ => {
+                    return Err(TactusError::EventLog {
+                        path: path.to_path_buf(),
+                        message: format!(
+                            "event schema 3 requires the successful settlement for `{task}` to \
+                             be followed by task_committed for its exact prepared commit"
+                        ),
+                    });
+                }
+            }
+        }
         match &event.body {
             EventBody::AttemptFinished {
                 task,
+                attempt,
                 data,
                 parking,
                 transition,
+                prepared_commit,
                 ..
             } => {
                 let failed = data.failure.is_some();
+                if data.attempt != *attempt {
+                    return Err(TactusError::EventLog {
+                        path: path.to_path_buf(),
+                        message: "event schema 3 attempt_finished envelope and record disagree on the attempt number".to_owned(),
+                    });
+                }
                 let decided = parking.is_some() || transition.is_some();
                 if failed != decided {
                     return Err(TactusError::EventLog {
                         path: path.to_path_buf(),
                         message: "event schema 3 requires every failed attempt_finished to carry its ladder/parking decision, and forbids one on a successful attempt".to_owned(),
                     });
+                }
+                match (failed, prepared_commit.as_deref()) {
+                    (true, Some(_)) => {
+                        return Err(TactusError::EventLog {
+                            path: path.to_path_buf(),
+                            message: "event schema 3 forbids a failed attempt_finished from carrying a prepared commit".to_owned(),
+                        });
+                    }
+                    (false, None) => {
+                        return Err(TactusError::EventLog {
+                            path: path.to_path_buf(),
+                            message: "event schema 3 requires every successful attempt_finished to bind the exact prepared commit".to_owned(),
+                        });
+                    }
+                    (false, Some(prepared)) if !valid_prepared_commit_shape(prepared) => {
+                        return Err(TactusError::EventLog {
+                            path: path.to_path_buf(),
+                            message: "event schema 3 successful attempt_finished carries an invalid prepared commit identity".to_owned(),
+                        });
+                    }
+                    (false, Some(prepared)) => {
+                        let Some(task_index) =
+                            started.chains.iter().position(|chain| chain.task == *task)
+                        else {
+                            return Err(TactusError::EventLog {
+                                path: path.to_path_buf(),
+                                message: format!(
+                                    "event schema 3 successful settlement names unknown task `{task}`"
+                                ),
+                            });
+                        };
+                        let expected_pin = format!(
+                            "refs/tactus/prepared/{}/{task_index}-{}",
+                            started.run_id, attempt
+                        );
+                        let expected_prefix = format!("[tactus] {task}: ");
+                        if prepared.pin_ref != expected_pin
+                            || !prepared.message.starts_with(&expected_prefix)
+                        {
+                            return Err(TactusError::EventLog {
+                                path: path.to_path_buf(),
+                                message: format!(
+                                    "event schema 3 successful settlement for `{task}` carries a \
+                                     prepared ref or message that is not deterministic for this run"
+                                ),
+                            });
+                        }
+                        pending_prepared = Some((task.clone(), prepared.clone()));
+                    }
+                    _ => {}
                 }
                 if failed
                     && !valid_attempt_decision(
@@ -1883,10 +2039,29 @@ pub(crate) fn ensure_supported_schema(
                     message: "event schema 3 requires a declined question_answered to record its contemporaneous halt policy".to_owned(),
                 });
             }
+            EventBody::TaskCommitted { task, .. } => {
+                return Err(TactusError::EventLog {
+                    path: path.to_path_buf(),
+                    message: format!(
+                        "event schema 3 task_committed for `{task}` has no immediately preceding \
+                         successful settlement with an exact prepared commit"
+                    ),
+                });
+            }
             _ => {}
         }
     }
     if started.schema >= 3 {
+        if !started
+            .normalized_plan_digest
+            .as_deref()
+            .is_some_and(valid_normalized_plan_digest)
+        {
+            return Err(TactusError::EventLog {
+                path: path.to_path_buf(),
+                message: "event schema 3 requires run_started.normalized_plan_digest to bind the exact frozen plan bytes".to_owned(),
+            });
+        }
         let plan = started.reviews.as_ref().ok_or_else(|| TactusError::EventLog {
             path: path.to_path_buf(),
             message: "event schema 3 requires run_started.reviews; refusing to re-derive a missing verification identity".to_owned(),
@@ -1914,6 +2089,16 @@ pub(crate) fn ensure_supported_schema(
             match &event.body {
                 EventBody::RunSchemaUpgraded { data } => schema = data.to,
                 EventBody::RunResumed { data } if schema >= 3 => {
+                    if !data
+                        .normalized_plan_digest
+                        .as_deref()
+                        .is_some_and(valid_normalized_plan_digest)
+                    {
+                        return Err(TactusError::EventLog {
+                            path: path.to_path_buf(),
+                            message: "the first schema-3 run_resumed must record the exact normalized-plan byte digest".to_owned(),
+                        });
+                    }
                     let plan = data.reviews.as_ref().ok_or_else(|| TactusError::EventLog {
                         path: path.to_path_buf(),
                         message: "the first schema-3 run_resumed must record the complete review identity".to_owned(),
@@ -1940,6 +2125,33 @@ pub(crate) fn ensure_supported_schema(
     Ok(effective)
 }
 
+fn valid_normalized_plan_digest(digest: &str) -> bool {
+    digest
+        .strip_prefix("sha256:")
+        .is_some_and(|hex| hex.len() == 64 && hex.bytes().all(|byte| byte.is_ascii_hexdigit()))
+}
+
+fn valid_prepared_commit_shape(prepared: &PreparedCommit) -> bool {
+    let valid_oid = |oid: &str| {
+        matches!(oid.len(), 40 | 64) && oid.bytes().all(|byte| byte.is_ascii_hexdigit())
+    };
+    valid_oid(&prepared.parent_sha)
+        && valid_oid(&prepared.tree_sha)
+        && valid_oid(&prepared.commit_sha)
+        && prepared.parent_sha.len() == prepared.tree_sha.len()
+        && prepared.parent_sha.len() == prepared.commit_sha.len()
+        && prepared.parent_sha != prepared.commit_sha
+        && !prepared.message.trim().is_empty()
+        && !prepared.message.contains('\r')
+        && !prepared.message.contains('\n')
+        && prepared.pin_ref.starts_with("refs/tactus/prepared/")
+        && !prepared.pin_ref.contains("..")
+        && prepared
+            .pin_ref
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'/' | b'-' | b'_'))
+}
+
 /// A failed attempt written before schema 3 was settled in two appends: first
 /// `attempt_finished`, then its ladder/parking decision. A process can die
 /// between them. Upgrading that prefix would make the known failed task
@@ -1951,6 +2163,13 @@ pub(crate) struct LegacyUnsettledFailure {
     pub task: String,
     pub attempt: u32,
     pub rung: u32,
+    pub kind: LegacyUnsettledFailureKind,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum LegacyUnsettledFailureKind {
+    MissingDecision,
+    MissingSpendParking,
 }
 
 pub(crate) fn legacy_unsettled_failure(
@@ -1959,6 +2178,8 @@ pub(crate) fn legacy_unsettled_failure(
 ) -> Option<LegacyUnsettledFailure> {
     let mut schema = started_schema;
     let mut pending = Vec::<LegacyUnsettledFailure>::new();
+    let mut latest_escalations = Vec::<LegacyUnsettledFailure>::new();
+    let mut pending_spend_parks = Vec::<LegacyUnsettledFailure>::new();
 
     for event in events {
         match &event.body {
@@ -1980,6 +2201,7 @@ pub(crate) fn legacy_unsettled_failure(
                     task: task.clone(),
                     attempt: *attempt,
                     rung: *rung,
+                    kind: LegacyUnsettledFailureKind::MissingDecision,
                 });
             }
             EventBody::LadderRetry {
@@ -1987,25 +2209,62 @@ pub(crate) fn legacy_unsettled_failure(
                 attempt,
                 rung,
                 ..
-            }
-            | EventBody::LadderEscalated {
+            } => pending.retain(|failure| {
+                failure.task != *task || failure.attempt != *attempt || failure.rung != *rung
+            }),
+            EventBody::LadderEscalated {
                 task,
                 attempt,
                 rung,
                 ..
-            } => pending.retain(|failure| {
-                failure.task != *task || failure.attempt != *attempt || failure.rung != *rung
-            }),
-            EventBody::TaskDeferred { task, .. }
-            | EventBody::TaskParked { task, .. }
-            | EventBody::TaskFailed { task, .. } => {
+            } => {
+                pending.retain(|failure| {
+                    failure.task != *task || failure.attempt != *attempt || failure.rung != *rung
+                });
+                latest_escalations.retain(|failure| failure.task != *task);
+                latest_escalations.push(LegacyUnsettledFailure {
+                    task: task.clone(),
+                    attempt: *attempt,
+                    rung: *rung,
+                    kind: LegacyUnsettledFailureKind::MissingSpendParking,
+                });
+            }
+            EventBody::QuestionRaised { task, data }
+                if data.question.kind == crate::ir::QuestionKind::ApproveSpend =>
+            {
+                if let Some(escalation) = latest_escalations
+                    .iter()
+                    .rev()
+                    .find(|failure| failure.task == *task)
+                    .cloned()
+                {
+                    pending_spend_parks.retain(|failure| failure.task != *task);
+                    pending_spend_parks.push(escalation);
+                }
+            }
+            EventBody::TaskDeferred { task, .. } | EventBody::TaskFailed { task, .. } => {
                 pending.retain(|failure| failure.task != *task);
+                latest_escalations.retain(|failure| failure.task != *task);
+            }
+            EventBody::TaskParked { task, .. } => {
+                pending.retain(|failure| failure.task != *task);
+                latest_escalations.retain(|failure| failure.task != *task);
+                pending_spend_parks.retain(|failure| failure.task != *task);
+            }
+            EventBody::AttemptStarted { task, .. } => {
+                // A next attempt proves an escalation with no approval question
+                // was complete. It does not excuse a question raised without
+                // the TaskParked append that made the approval binding.
+                latest_escalations.retain(|failure| failure.task != *task);
             }
             _ => {}
         }
     }
 
-    pending.into_iter().next()
+    pending_spend_parks
+        .into_iter()
+        .next()
+        .or_else(|| pending.into_iter().next())
 }
 
 pub(crate) fn validate_review_identity(
@@ -2061,51 +2320,71 @@ fn valid_attempt_decision(
     transition: Option<&AttemptTransition>,
     parking: Option<&AttemptParking>,
 ) -> bool {
+    let associated = |parking: &AttemptParking| {
+        parking.question.affected_tasks.len() == 1
+            && parking.question.affected_tasks[0].as_str() == task
+    };
     let outage = matches!(
         (failure.kind, failure.origin),
         (FailureKind::RateLimited | FailureKind::ReviewUnavailable, _)
             | (FailureKind::Timeout, FailureOrigin::Reviewer)
     );
-    let transition_valid = match transition {
-        None => true,
-        Some(AttemptTransition::Retry(_) | AttemptTransition::Escalate(_)) => true,
-        Some(AttemptTransition::Defer(_)) => outage,
-        Some(AttemptTransition::Fail(data)) => data.kind == failure.kind,
-    };
-    let Some(parking) = parking else {
-        return transition_valid;
-    };
-    if parking.question.affected_tasks.len() != 1
-        || parking.question.affected_tasks[0].as_str() != task
-    {
+
+    // These categories have policy-independent semantics. Accepting a generic
+    // retry/escalation here would turn a request for a person, an outage, or an
+    // unreviewable diff into spend the ladder explicitly forbids.
+    if failure.kind == FailureKind::NeedsHuman {
+        return transition.is_none()
+            && parking.is_some_and(|parking| {
+                associated(parking)
+                    && parking.question.kind == crate::ir::QuestionKind::Clarify
+                    && parking.refund_attempt
+            });
+    }
+    if matches!(
+        failure.kind,
+        FailureKind::ReviewInputTooLarge | FailureKind::ReviewInputOpaque
+    ) {
+        return failure.origin == FailureOrigin::Reviewer
+            && transition.is_none()
+            && parking.is_some_and(|parking| {
+                associated(parking)
+                    && parking.question.kind == crate::ir::QuestionKind::Unblock
+                    && !parking.refund_attempt
+            });
+    }
+    if outage {
+        return matches!(
+            (transition, parking),
+            (Some(AttemptTransition::Defer(_)), None)
+        ) || matches!((transition, parking), (None, Some(parking))
+                if associated(parking)
+                    && parking.question.kind == crate::ir::QuestionKind::Unblock
+                    && parking.refund_attempt);
+    }
+    if matches!(
+        failure.kind,
+        FailureKind::Declined | FailureKind::Interrupted
+    ) {
         return false;
     }
-    let parking_valid = match parking.question.kind {
-        crate::ir::QuestionKind::Clarify => {
-            failure.kind == FailureKind::NeedsHuman
-                && transition.is_none()
-                && parking.refund_attempt
-        }
-        crate::ir::QuestionKind::ApproveSpend => {
-            matches!(transition, Some(AttemptTransition::Escalate(_))) && !parking.refund_attempt
-        }
-        crate::ir::QuestionKind::Unblock
-            if matches!(
-                failure.kind,
-                FailureKind::ReviewInputTooLarge | FailureKind::ReviewInputOpaque
-            ) =>
-        {
-            failure.origin == FailureOrigin::Reviewer
-                && transition.is_none()
+
+    match (transition, parking) {
+        (Some(AttemptTransition::Retry(_)), None)
+        | (Some(AttemptTransition::Escalate(_)), None) => true,
+        (Some(AttemptTransition::Escalate(_)), Some(parking)) => {
+            associated(parking)
+                && parking.question.kind == crate::ir::QuestionKind::ApproveSpend
                 && !parking.refund_attempt
         }
-        crate::ir::QuestionKind::Unblock if outage => {
-            transition.is_none() && parking.refund_attempt
+        (Some(AttemptTransition::Fail(data)), None) => data.kind == failure.kind,
+        (None, Some(parking)) => {
+            associated(parking)
+                && parking.question.kind == crate::ir::QuestionKind::Unblock
+                && !parking.refund_attempt
         }
-        crate::ir::QuestionKind::Unblock => transition.is_none() && !parking.refund_attempt,
-        crate::ir::QuestionKind::Continue => false,
-    };
-    transition_valid && parking_valid
+        _ => false,
+    }
 }
 
 /// Incremental reader for `status --follow`.
@@ -2188,6 +2467,7 @@ mod tests {
                 plan_path: "plan.md".to_owned(),
                 config_path: None,
                 plan_hash: "deadbeef".to_owned(),
+                normalized_plan_digest: Some(format!("sha256:{}", "0".repeat(64))),
                 private_dir: "/home/x/.tactus/runs/01RUN".to_owned(),
                 gates: vec!["check".to_owned()],
                 gates_from_config: true,
@@ -2223,6 +2503,16 @@ mod tests {
         }
     }
 
+    fn legacy_started() -> EventBody {
+        let mut body = started();
+        let EventBody::RunStarted { data } = &mut body else {
+            unreachable!();
+        };
+        data.schema = 2;
+        data.normalized_plan_digest = None;
+        body
+    }
+
     fn attempt_started(task: &str, attempt: u32, rung: u32, tier: &str) -> EventBody {
         EventBody::AttemptStarted {
             task: task.to_owned(),
@@ -2251,6 +2541,13 @@ mod tests {
             profile: format!("{tier}-model"),
             parking: None,
             transition: None,
+            prepared_commit: Some(Box::new(PreparedCommit {
+                parent_sha: "1".repeat(40),
+                tree_sha: "2".repeat(40),
+                commit_sha: "3".repeat(40),
+                message: "[tactus] t1: task".to_owned(),
+                pin_ref: format!("refs/tactus/prepared/01RUN/0-{attempt}"),
+            })),
             data: Box::new(AttemptRecord {
                 attempt,
                 tier: tier.to_owned(),
@@ -2329,6 +2626,7 @@ mod tests {
                     effort_policy: None,
                     reviews: None,
                     chains: None,
+                    normalized_plan_digest: None,
                 },
             },
             EventBody::RunSchemaUpgraded {
@@ -2650,6 +2948,7 @@ mod tests {
                 effort_policy: None,
                 reviews: None,
                 chains: None,
+                normalized_plan_digest: None,
             },
         }));
         assert_eq!(state.finished, None);
@@ -2749,6 +3048,268 @@ mod tests {
     }
 
     #[test]
+    fn schema_three_rejects_human_outage_and_review_input_decision_contradictions() {
+        let retry = || {
+            Some(Box::new(AttemptTransition::Retry(LadderRetry {
+                resume: false,
+                tier: "small".to_owned(),
+                summary: "retry".to_owned(),
+                detail: None,
+            })))
+        };
+        let escalate = || {
+            Some(Box::new(AttemptTransition::Escalate(LadderEscalated {
+                to_rung: 1,
+                tier: "small".to_owned(),
+                summary: "escalate".to_owned(),
+                detail: None,
+            })))
+        };
+        let park = |kind, refund_attempt| {
+            let mut question = question("q-special", "t1");
+            question.kind = kind;
+            Some(Box::new(AttemptParking {
+                question,
+                refund_attempt,
+            }))
+        };
+        let cases = vec![
+            (
+                FailureKind::NeedsHuman,
+                FailureOrigin::Worker,
+                retry(),
+                None,
+            ),
+            (
+                FailureKind::NeedsHuman,
+                FailureOrigin::Reviewer,
+                None,
+                park(QuestionKind::Unblock, true),
+            ),
+            (
+                FailureKind::RateLimited,
+                FailureOrigin::Worker,
+                retry(),
+                None,
+            ),
+            (
+                FailureKind::Timeout,
+                FailureOrigin::Reviewer,
+                escalate(),
+                None,
+            ),
+            (
+                FailureKind::ReviewUnavailable,
+                FailureOrigin::Reviewer,
+                None,
+                park(QuestionKind::Unblock, false),
+            ),
+            (
+                FailureKind::ReviewInputTooLarge,
+                FailureOrigin::Reviewer,
+                retry(),
+                None,
+            ),
+            (
+                FailureKind::ReviewInputOpaque,
+                FailureOrigin::Worker,
+                None,
+                park(QuestionKind::Unblock, false),
+            ),
+        ];
+
+        for (kind, origin, transition, parking) in cases {
+            let mut finished = attempt_finished("t1", 1, 0, "small");
+            let EventBody::AttemptFinished {
+                data,
+                transition: recorded_transition,
+                parking: recorded_parking,
+                prepared_commit,
+                ..
+            } = &mut finished
+            else {
+                unreachable!();
+            };
+            data.failure = Some(FailureRecord {
+                kind,
+                origin,
+                reason: "special failure".to_owned(),
+            });
+            *recorded_transition = transition;
+            *recorded_parking = parking;
+            *prepared_commit = None;
+            let error = replay(
+                vec![
+                    Event::now(started()),
+                    Event::now(attempt_started("t1", 1, 0, "small")),
+                    Event::now(finished),
+                ],
+                vec!["t1".to_owned()],
+                Path::new("events.jsonl"),
+            )
+            .expect_err("schema 3 must reject a policy-contradictory settlement");
+            assert!(
+                error.to_string().contains("inconsistent with its failure"),
+                "{kind:?}/{origin:?}: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn legacy_schema_two_spend_question_without_task_parked_is_unsettled() {
+        let mut failed = attempt_finished("t1", 1, 0, "small");
+        let EventBody::AttemptFinished {
+            data,
+            prepared_commit,
+            ..
+        } = &mut failed
+        else {
+            unreachable!();
+        };
+        data.failure = Some(FailureRecord {
+            kind: FailureKind::GateFailed,
+            origin: FailureOrigin::Worker,
+            reason: "failed".to_owned(),
+        });
+        *prepared_commit = None;
+        let mut approval = question("q-spend", "t1");
+        approval.kind = QuestionKind::ApproveSpend;
+        let mut log = vec![
+            Event::now(legacy_started()),
+            Event::now(attempt_started("t1", 1, 0, "small")),
+            Event::now(failed),
+            Event::now(EventBody::LadderEscalated {
+                task: "t1".to_owned(),
+                attempt: 1,
+                rung: 0,
+                data: LadderEscalated {
+                    to_rung: 1,
+                    tier: "small".to_owned(),
+                    summary: "escalate".to_owned(),
+                    detail: None,
+                },
+            }),
+            Event::now(EventBody::QuestionRaised {
+                task: "t1".to_owned(),
+                data: Box::new(QuestionRaised { question: approval }),
+            }),
+        ];
+        let unsettled = legacy_unsettled_failure(2, &log).expect("parking append is missing");
+        assert_eq!(
+            unsettled.kind,
+            LegacyUnsettledFailureKind::MissingSpendParking
+        );
+
+        log.push(Event::now(EventBody::TaskParked {
+            task: "t1".to_owned(),
+            data: TaskParked {
+                question: "q-spend".to_owned(),
+                refund_attempt: false,
+            },
+        }));
+        assert_eq!(legacy_unsettled_failure(2, &log), None);
+    }
+
+    #[test]
+    fn schema_three_binds_task_committed_to_the_immediately_prepared_object() {
+        let success = attempt_finished("t1", 1, 0, "small");
+        let EventBody::AttemptFinished {
+            prepared_commit: Some(prepared),
+            ..
+        } = &success
+        else {
+            unreachable!();
+        };
+        let prepared = (**prepared).clone();
+        let committed = EventBody::TaskCommitted {
+            task: "t1".to_owned(),
+            data: TaskCommitted {
+                sha: prepared.commit_sha.clone(),
+                message: prepared.message.clone(),
+            },
+        };
+        replay(
+            vec![
+                Event::now(started()),
+                Event::now(attempt_started("t1", 1, 0, "small")),
+                Event::now(success.clone()),
+                Event::now(committed),
+            ],
+            vec!["t1".to_owned()],
+            Path::new("events.jsonl"),
+        )
+        .expect("the exact prepared identity closes the settlement");
+
+        let error = replay(
+            vec![
+                Event::now(started()),
+                Event::now(attempt_started("t1", 1, 0, "small")),
+                Event::now(success),
+                Event::now(EventBody::TaskCommitted {
+                    task: "t1".to_owned(),
+                    data: TaskCommitted {
+                        sha: "4".repeat(40),
+                        message: prepared.message.clone(),
+                    },
+                }),
+            ],
+            vec!["t1".to_owned()],
+            Path::new("events.jsonl"),
+        )
+        .expect_err("same subject cannot substitute another commit tree");
+        assert!(
+            error.to_string().contains("exact prepared commit"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn pre_upgrade_digest_fields_cannot_bless_a_legacy_snapshot() {
+        let spoofed = format!("sha256:{}", "1".repeat(64));
+        let authoritative = format!("sha256:{}", "2".repeat(64));
+        let resumed = |digest| {
+            Event::now(EventBody::RunResumed {
+                data: RunResumed {
+                    head_sha: "abc".to_owned(),
+                    interrupted_attempts: 0,
+                    discarded: Vec::new(),
+                    gates: None,
+                    effort_policy: None,
+                    reviews: None,
+                    chains: None,
+                    normalized_plan_digest: Some(digest),
+                },
+            })
+        };
+        let mut start = legacy_started();
+        let EventBody::RunStarted { data } = &mut start else {
+            unreachable!();
+        };
+        data.normalized_plan_digest = Some(spoofed.clone());
+
+        let before_upgrade = vec![Event::now(start.clone()), resumed(spoofed.clone())];
+        assert_eq!(
+            recorded_normalized_plan_digest(&before_upgrade),
+            None,
+            "schema-1/2 additive fields are not an authority"
+        );
+
+        let after_upgrade = vec![
+            Event::now(start),
+            resumed(spoofed),
+            Event::now(EventBody::RunSchemaUpgraded {
+                data: RunSchemaUpgraded { from: 2, to: 3 },
+            }),
+            resumed(authoritative.clone()),
+        ];
+        assert_eq!(
+            recorded_normalized_plan_digest(&after_upgrade),
+            Some(authoritative.as_str()),
+            "only the first schema-3 resume can establish a legacy digest"
+        );
+    }
+
+    #[test]
     fn a_run_started_without_gate_commands_reads_as_unrecorded() {
         // The shape every log written before the gate record has. `None`, not
         // an empty list: "said nothing about the gates" and "said there were
@@ -2843,6 +3404,7 @@ mod tests {
                     effort_policy: Some(policy),
                     reviews: None,
                     chains: None,
+                    normalized_plan_digest: None,
                 },
             })
         };
@@ -2905,6 +3467,7 @@ mod tests {
                     effort_policy: None,
                     reviews: None,
                     chains: Some(original.clone()),
+                    normalized_plan_digest: None,
                 },
             }),
             Event::now(EventBody::RunResumed {
@@ -2916,6 +3479,7 @@ mod tests {
                     effort_policy: None,
                     reviews: None,
                     chains: Some(later),
+                    normalized_plan_digest: None,
                 },
             }),
         ];
@@ -3111,6 +3675,7 @@ mod tests {
             let EventBody::AttemptFinished {
                 data,
                 transition: recorded,
+                prepared_commit,
                 ..
             } = &mut finished
             else {
@@ -3125,6 +3690,7 @@ mod tests {
                 origin: FailureOrigin::Worker,
                 reason: "settled".to_owned(),
             });
+            *prepared_commit = None;
             *recorded = Some(Box::new(transition.clone()));
             let replayed = replay(
                 vec![
@@ -3171,7 +3737,10 @@ mod tests {
 
         let mut second = attempt_finished("t1", 2, 0, "small");
         let EventBody::AttemptFinished {
-            data, transition, ..
+            data,
+            transition,
+            prepared_commit,
+            ..
         } = &mut second
         else {
             unreachable!();
@@ -3182,6 +3751,7 @@ mod tests {
             origin: FailureOrigin::Worker,
             reason: "failed without a session".to_owned(),
         });
+        *prepared_commit = None;
         *transition = Some(Box::new(AttemptTransition::Retry(LadderRetry {
             resume: false,
             tier: "small".to_owned(),
@@ -3191,7 +3761,7 @@ mod tests {
 
         let replayed = replay(
             vec![
-                Event::now(started()),
+                Event::now(legacy_started()),
                 Event::now(attempt_started("t1", 1, 0, "small")),
                 Event::now(first),
                 Event::now(EventBody::TaskDeferred {
@@ -3215,7 +3785,13 @@ mod tests {
     #[test]
     fn atomic_attempt_parking_discards_the_finished_sessions_tree_identity() {
         let mut finished = attempt_finished("t1", 1, 0, "small");
-        let EventBody::AttemptFinished { data, parking, .. } = &mut finished else {
+        let EventBody::AttemptFinished {
+            data,
+            parking,
+            prepared_commit,
+            ..
+        } = &mut finished
+        else {
             unreachable!("the helper always returns an attempt settlement");
         };
         data.failure = Some(FailureRecord {
@@ -3223,6 +3799,7 @@ mod tests {
             origin: FailureOrigin::Reviewer,
             reason: "too large".to_owned(),
         });
+        *prepared_commit = None;
         *parking = Some(Box::new(AttemptParking {
             question: question("q-parked", "t1"),
             refund_attempt: false,
@@ -3253,7 +3830,7 @@ mod tests {
         // §14's pairing: tree retention and session resume travel together, so
         // a resume that discards the tree must also drop the session.
         let events = vec![
-            Event::now(started()),
+            Event::now(legacy_started()),
             Event::now(attempt_started("t1", 1, 0, "small")),
             Event::now(attempt_finished("t1", 1, 0, "small")),
             Event::now(EventBody::TaskDeferred {
@@ -3272,6 +3849,7 @@ mod tests {
                     effort_policy: None,
                     reviews: None,
                     chains: None,
+                    normalized_plan_digest: None,
                 },
             }),
         ];
@@ -3290,7 +3868,7 @@ mod tests {
     #[test]
     fn answering_unparks_the_task_and_carries_the_operators_words() {
         let events = vec![
-            Event::now(started()),
+            Event::now(legacy_started()),
             Event::now(attempt_started("t1", 1, 0, "small")),
             Event::now(attempt_finished("t1", 1, 0, "small")),
             Event::now(EventBody::QuestionRaised {

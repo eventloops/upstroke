@@ -89,6 +89,7 @@ pub fn load(repo_root: &Path, run_id: Option<&str>) -> Result<RunStatus, TactusE
     warnings.extend(parsed.torn_tail_warning);
     let events = parsed.events;
     let started = events::started_of(&events, &events_path)?.clone();
+    let effective_schema = events::ensure_supported_schema(&started, &events, &events_path)?;
     if started.run_id != run_id {
         return Err(TactusError::EventLog {
             path: events_path.clone(),
@@ -101,16 +102,34 @@ pub fn load(repo_root: &Path, run_id: Option<&str>) -> Result<RunStatus, TactusE
     let paths = RunPaths::from_parts(public.clone(), PathBuf::from(&started.private_dir));
 
     let plan_path = paths.plan_json();
-    let plan_text = std::fs::read_to_string(&plan_path).map_err(|source| TactusError::Io {
+    let plan_bytes = std::fs::read(&plan_path).map_err(|source| TactusError::Io {
         path: plan_path.clone(),
         source,
     })?;
-    let plan: Plan = serde_json::from_str(&plan_text).map_err(|e| TactusError::Parse {
+    if effective_schema >= 3 {
+        let recorded = events::recorded_normalized_plan_digest(&events).ok_or_else(|| {
+            TactusError::EventLog {
+                path: events_path.clone(),
+                message: "event schema 3 does not record the normalized-plan SHA-256 digest"
+                    .to_owned(),
+            }
+        })?;
+        let actual = events::normalized_plan_digest(&plan_bytes);
+        if actual != recorded {
+            return Err(TactusError::EventLog {
+                path: plan_path.clone(),
+                message: format!(
+                    "normalized plan digest `{actual}` does not match recorded digest `{recorded}`"
+                ),
+            });
+        }
+    }
+    let plan: Plan = serde_json::from_slice(&plan_bytes).map_err(|e| TactusError::Parse {
         message: format!("{}: {e}", plan_path.display()),
     })?;
     if plan.source.hash != started.plan_hash {
         return Err(TactusError::EventLog {
-            path: plan_path,
+            path: plan_path.clone(),
             message: format!(
                 "frozen plan hash `{}` does not match run-start hash `{}`",
                 plan.source.hash, started.plan_hash
@@ -244,14 +263,24 @@ pub fn describe(event: &Event) -> String {
             ..
         } => {
             if let Some(parking) = parking {
-                format!(
-                    "{task}: attempt {attempt} failed and parked on question {} — {}",
-                    parking.question.id,
-                    data.failure
-                        .as_ref()
-                        .map(|failure| failure.reason.as_str())
-                        .unwrap_or("policy refusal")
-                )
+                let reason = data
+                    .failure
+                    .as_ref()
+                    .map(|failure| failure.reason.as_str())
+                    .unwrap_or("policy refusal");
+                if let Some(events::AttemptTransition::Escalate(escalation)) = transition.as_deref()
+                {
+                    format!(
+                        "{task}: attempt {attempt} failed — {reason}; escalating past {} to rung \
+                         {} and parked on question {}",
+                        escalation.tier, escalation.to_rung, parking.question.id
+                    )
+                } else {
+                    format!(
+                        "{task}: attempt {attempt} failed and parked on question {} — {reason}",
+                        parking.question.id
+                    )
+                }
             } else {
                 match &data.failure {
                     Some(failure) => match transition.as_deref() {
@@ -634,9 +663,57 @@ mod tests {
                 }),
                 parking: None,
                 transition: Some(Box::new(transition)),
+                prepared_commit: None,
             }));
             assert!(line.contains(expected), "{line}");
         }
+    }
+
+    #[test]
+    fn describe_composes_escalation_with_spend_approval_parking() {
+        let line = describe(&event(EventBody::AttemptFinished {
+            task: "t1".to_owned(),
+            attempt: 1,
+            rung: 0,
+            profile: "implement".to_owned(),
+            data: Box::new(AttemptRecord {
+                attempt: 1,
+                tier: "small".to_owned(),
+                model: "model".to_owned(),
+                pool: None,
+                resumed: false,
+                duration: Duration::from_secs(1),
+                cost_usd: None,
+                reviews: Vec::new(),
+                session_id: None,
+                usage: None,
+                failure: Some(events::FailureRecord {
+                    kind: FailureKind::GateFailed,
+                    origin: FailureOrigin::Worker,
+                    reason: "the attempt failed".to_owned(),
+                }),
+            }),
+            parking: Some(Box::new(events::AttemptParking {
+                question: Question {
+                    id: QuestionId::from("q-spend"),
+                    kind: QuestionKind::ApproveSpend,
+                    affected_tasks: vec![TaskId::from("t1")],
+                    context: "approve the next rung".to_owned(),
+                    options: Vec::new(),
+                },
+                refund_attempt: false,
+            })),
+            transition: Some(Box::new(AttemptTransition::Escalate(LadderEscalated {
+                to_rung: 1,
+                tier: "small".to_owned(),
+                summary: "escalate".to_owned(),
+                detail: None,
+            }))),
+            prepared_commit: None,
+        }));
+        assert!(line.contains("escalating past small to rung 1"), "{line}");
+        assert!(line.contains("parked on question q-spend"), "{line}");
+        assert_eq!(line.lines().count(), 1, "{line:?}");
     }
 
     #[test]

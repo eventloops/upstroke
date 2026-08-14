@@ -9,11 +9,15 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 
 use crate::error::TactusError;
+use crate::events::PreparedCommit;
 
 pub struct Workspace {
     root: PathBuf,
 }
 
+/// The immutable candidate captured immediately after staging. Every gate,
+/// review, prepared commit, and CAS uses these object identities rather than
+/// consulting a mutable index again.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CapturedCandidate {
     pub parent_oid: String,
@@ -170,6 +174,58 @@ impl Workspace {
             message: format!("writing paths to git {}: {e}", args.join(" ")),
         })?;
         Ok(output.stdout)
+    }
+
+    fn prepared_update_ref(&self, args: &[&str]) -> Result<(), TactusError> {
+        let output = self.run_git_with_private_hooks(args)?;
+        if !output.status.success() {
+            return Err(TactusError::Git {
+                message: format!(
+                    "git {} failed: {}",
+                    args.join(" "),
+                    String::from_utf8_lossy(&output.stderr).trim()
+                ),
+            });
+        }
+        Ok(())
+    }
+
+    fn commit_tree_with_tactus_identity(
+        &self,
+        tree_oid: &str,
+        parent_oid: &str,
+        message: &str,
+    ) -> Result<String, TactusError> {
+        let args = ["commit-tree", tree_oid, "-p", parent_oid, "-m", message];
+        let output = Command::new("git")
+            .arg("-C")
+            .arg(&self.root)
+            .args(args)
+            // Environment identity overrides repository/global config and any
+            // inherited GIT_AUTHOR_* or GIT_COMMITTER_* values.
+            .env("GIT_AUTHOR_NAME", "tactus")
+            .env("GIT_AUTHOR_EMAIL", "tactus@tactus.local")
+            .env("GIT_COMMITTER_NAME", "tactus")
+            .env("GIT_COMMITTER_EMAIL", "tactus@tactus.local")
+            .output()
+            .map_err(|e| TactusError::Git {
+                message: format!("failed to run git: {e}"),
+            })?;
+        if !output.status.success() {
+            return Err(TactusError::Git {
+                message: format!(
+                    "git {} failed: {}",
+                    args.join(" "),
+                    String::from_utf8_lossy(&output.stderr).trim()
+                ),
+            });
+        }
+        String::from_utf8(output.stdout).map_err(|error| TactusError::Git {
+            message: format!(
+                "git {} returned output that is not valid UTF-8: {error}",
+                args.join(" ")
+            ),
+        })
     }
 
     /// §14 pre-flight: the engine refuses dirty trees.
@@ -719,12 +775,193 @@ impl Workspace {
         Ok(())
     }
 
+    /// Prepare and pin a commit from the exact candidate identities already
+    /// used by gates and review. This never rereads the mutable index.
+    pub fn prepare_commit_from_candidate(
+        &self,
+        parent_oid: &str,
+        tree_oid: &str,
+        message: &str,
+        pin_ref: &str,
+    ) -> Result<PreparedCommit, TactusError> {
+        self.validate_commit_oid(parent_oid)?;
+        self.validate_tree_oid(tree_oid)?;
+        if self.head_sha_full()? != parent_oid {
+            return Err(TactusError::Git {
+                message: format!(
+                    "HEAD moved after tactus captured candidate parent {parent_oid}; refusing to prepare it"
+                ),
+            });
+        }
+        if message.trim().is_empty() || message.contains('\r') || message.contains('\n') {
+            return Err(TactusError::Git {
+                message: "refusing to prepare a commit with an empty or multi-line subject"
+                    .to_owned(),
+            });
+        }
+        self.validate_prepared_ref(pin_ref)?;
+        let commit_sha = self
+            .commit_tree_with_tactus_identity(tree_oid, parent_oid, message)?
+            .trim()
+            .to_owned();
+        let prepared = PreparedCommit {
+            parent_sha: parent_oid.to_owned(),
+            tree_sha: tree_oid.to_owned(),
+            commit_sha,
+            message: message.to_owned(),
+            pin_ref: pin_ref.to_owned(),
+        };
+        if !self.prepared_commit_matches(&prepared)? {
+            return Err(TactusError::Git {
+                message: "git created a commit object that does not match the prepared identity"
+                    .to_owned(),
+            });
+        }
+        let zero = "0".repeat(parent_oid.len());
+        self.prepared_update_ref(&[
+            "update-ref",
+            "-m",
+            "tactus: pin prepared task",
+            pin_ref,
+            &prepared.commit_sha,
+            &zero,
+        ])?;
+        Ok(prepared)
+    }
+
     /// Commit whatever `capture_diff` staged. §14: commit-per-task,
     /// `[tactus] <task-id>: <title>`.
     pub fn commit(&self, message: &str) -> Result<String, TactusError> {
         self.refuse_worktree_filters_before("git commit")?;
         self.git_with_private_hooks(&["commit", "-q", "-m", message])?;
         self.head_sha()
+    }
+
+    pub fn prepared_commit_matches(&self, prepared: &PreparedCommit) -> Result<bool, TactusError> {
+        if !valid_object_id(&prepared.parent_sha)
+            || !valid_object_id(&prepared.tree_sha)
+            || !valid_object_id(&prepared.commit_sha)
+        {
+            return Ok(false);
+        }
+        if self.validate_prepared_ref(&prepared.pin_ref).is_err() {
+            return Ok(false);
+        }
+        let output = Command::new("git")
+            .arg("-C")
+            .arg(&self.root)
+            .args(["cat-file", "commit", &prepared.commit_sha])
+            .output()
+            .map_err(|e| TactusError::Git {
+                message: format!("failed to run git: {e}"),
+            })?;
+        if !output.status.success() {
+            return Ok(false);
+        }
+        let object = String::from_utf8(output.stdout).map_err(|error| TactusError::Git {
+            message: format!("prepared commit object is not valid UTF-8: {error}"),
+        })?;
+        let Some((headers, body)) = object.split_once("\n\n") else {
+            return Ok(false);
+        };
+        let tree = headers.lines().find_map(|line| line.strip_prefix("tree "));
+        let parents: Vec<&str> = headers
+            .lines()
+            .filter_map(|line| line.strip_prefix("parent "))
+            .collect();
+        let author = headers
+            .lines()
+            .find_map(|line| line.strip_prefix("author "));
+        let committer = headers
+            .lines()
+            .find_map(|line| line.strip_prefix("committer "));
+        Ok(tree == Some(prepared.tree_sha.as_str())
+            && parents == [prepared.parent_sha.as_str()]
+            && author.is_some_and(|value| value.starts_with("tactus <tactus@tactus.local> "))
+            && committer.is_some_and(|value| value.starts_with("tactus <tactus@tactus.local> "))
+            && body.trim_end_matches('\n') == prepared.message)
+    }
+
+    fn validate_prepared_ref(&self, pin_ref: &str) -> Result<(), TactusError> {
+        if !pin_ref.starts_with("refs/tactus/prepared/") {
+            return Err(TactusError::Git {
+                message: format!("prepared ref `{pin_ref}` is outside tactus's private namespace"),
+            });
+        }
+        self.git(&["check-ref-format", pin_ref]).map(|_| ())
+    }
+
+    pub fn prepared_pin_target(&self, pin_ref: &str) -> Result<Option<String>, TactusError> {
+        self.validate_prepared_ref(pin_ref)?;
+        let output = Command::new("git")
+            .arg("-C")
+            .arg(&self.root)
+            .args(["rev-parse", "--verify", "--quiet", pin_ref])
+            .output()
+            .map_err(|e| TactusError::Git {
+                message: format!("failed to run git: {e}"),
+            })?;
+        if !output.status.success() {
+            return Ok(None);
+        }
+        Ok(Some(
+            String::from_utf8_lossy(&output.stdout).trim().to_owned(),
+        ))
+    }
+
+    pub fn remove_prepared_pin(&self, prepared: &PreparedCommit) -> Result<(), TactusError> {
+        match self.prepared_pin_target(&prepared.pin_ref)? {
+            None => Ok(()),
+            Some(target) if target == prepared.commit_sha => self.prepared_update_ref(&[
+                "update-ref",
+                "-d",
+                &prepared.pin_ref,
+                &prepared.commit_sha,
+            ]),
+            Some(target) => Err(TactusError::Git {
+                message: format!(
+                    "prepared ref `{}` points at {target}, not the recorded commit {}; refusing to delete another object",
+                    prepared.pin_ref, prepared.commit_sha
+                ),
+            }),
+        }
+    }
+
+    /// Remove a private pin for an attempt that never durably recorded a
+    /// successful settlement. The target is read then supplied as the expected
+    /// old value, so even cleanup is compare-and-swap.
+    pub fn remove_orphan_prepared_pin(&self, pin_ref: &str) -> Result<(), TactusError> {
+        if let Some(target) = self.prepared_pin_target(pin_ref)? {
+            self.prepared_update_ref(&["update-ref", "-d", pin_ref, &target])?;
+        }
+        Ok(())
+    }
+
+    pub fn advance_prepared_commit(&self, prepared: &PreparedCommit) -> Result<(), TactusError> {
+        if !self.prepared_commit_matches(prepared)? {
+            return Err(TactusError::Git {
+                message: "refusing to advance HEAD to a commit that does not match its durable prepared identity".to_owned(),
+            });
+        }
+        if self.prepared_pin_target(&prepared.pin_ref)?.as_deref()
+            != Some(prepared.commit_sha.as_str())
+        {
+            return Err(TactusError::Git {
+                message: format!(
+                    "prepared ref `{}` does not pin {}; refusing to advance HEAD",
+                    prepared.pin_ref, prepared.commit_sha
+                ),
+            });
+        }
+        self.prepared_update_ref(&[
+            "update-ref",
+            "-m",
+            "tactus: publish reviewed task",
+            "HEAD",
+            &prepared.commit_sha,
+            &prepared.parent_sha,
+        ])?;
+        self.remove_prepared_pin(prepared)
     }
 
     /// Discard everything since the last commit: staged, unstaged, and
@@ -824,7 +1061,6 @@ impl Drop for PendingGateWorkspace {
         }
     }
 }
-
 fn create_private_dir(path: &Path) -> std::io::Result<()> {
     #[cfg(unix)]
     {
@@ -861,6 +1097,10 @@ fn cleanup_gate_workspace(source_root: &Path, path: &Path, hooks_path: &Path) {
     // cleanup if a partially failed `worktree add` left either one behind.
     let _ = fs::remove_dir_all(path);
     let _ = fs::remove_dir_all(hooks_path);
+}
+
+fn valid_object_id(oid: &str) -> bool {
+    matches!(oid.len(), 40 | 64) && oid.bytes().all(|byte| byte.is_ascii_hexdigit())
 }
 
 pub struct GateWorkspace {
@@ -1052,6 +1292,80 @@ mod tests {
             Err(error) => error.to_string(),
         };
         assert!(error.contains("not a tree"), "{error}");
+    }
+
+    #[test]
+    fn prepared_commit_uses_frozen_objects_identity_and_hook_free_ref_transactions() {
+        let repo = temp_repo("prepared");
+        let ws = Workspace::open(&repo).expect("open");
+        let hook_marker = repo.join("hook-ran");
+        ws.git(&["config", "core.hooksPath", ".githooks"])
+            .expect("candidate-controlled hooks path");
+        fs::create_dir_all(repo.join(".githooks")).expect("hooks directory");
+        let hook = repo.join(".githooks").join("reference-transaction");
+        fs::write(
+            &hook,
+            format!(
+                "#!/bin/sh\nprintf ran > '{}'\nexit 1\n",
+                hook_marker.display()
+            ),
+        )
+        .expect("hook");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&hook, fs::Permissions::from_mode(0o755)).expect("executable hook");
+        }
+
+        fs::write(repo.join("README.md"), "reviewed candidate\n").expect("candidate");
+        let candidate = ws.capture_candidate().expect("freeze candidate");
+        fs::write(repo.join("README.md"), "later unreviewed index\n").expect("later edit");
+        ws.capture_diff().expect("move index past candidate");
+
+        let pin_ref = "refs/tactus/prepared/01RUN/0-1";
+        let prepared = ws
+            .prepare_commit_from_candidate(
+                &candidate.parent_oid,
+                &candidate.tree_oid,
+                "[tactus] t1: task",
+                pin_ref,
+            )
+            .expect("commit-tree and pin creation ignore candidate hooks");
+        assert_eq!(ws.head_sha_full().expect("head"), candidate.parent_oid);
+        assert_eq!(
+            ws.prepared_pin_target(pin_ref).expect("pin").as_deref(),
+            Some(prepared.commit_sha.as_str()),
+            "the object is reachable before settlement"
+        );
+        let object = ws
+            .git(&["cat-file", "commit", &prepared.commit_sha])
+            .expect("prepared object");
+        assert!(
+            object.contains("author tactus <tactus@tactus.local> "),
+            "{object}"
+        );
+        assert!(
+            object.contains("committer tactus <tactus@tactus.local> "),
+            "{object}"
+        );
+        assert_eq!(
+            ws.git(&["show", &format!("{}:README.md", prepared.commit_sha)])
+                .expect("frozen blob"),
+            "reviewed candidate\n",
+            "preparation never rereads the later index"
+        );
+        assert!(!hook_marker.exists(), "pin creation never ran the ref hook");
+
+        ws.advance_prepared_commit(&prepared).expect("HEAD CAS");
+        assert_eq!(
+            ws.head_sha_full().expect("advanced head"),
+            prepared.commit_sha
+        );
+        assert_eq!(ws.prepared_pin_target(pin_ref).expect("deleted pin"), None);
+        assert!(
+            !hook_marker.exists(),
+            "neither HEAD publication nor pin deletion ran the ref hook"
+        );
     }
 
     #[test]
