@@ -26,6 +26,7 @@ use std::sync::Mutex;
 
 use crate::error::TactusError;
 use crate::util;
+use crate::workspace::Workspace;
 
 /// Created beside the repo: the run's own record and the human/UI surface.
 const PUBLIC_DIRS: [&str; 3] = ["artifacts", "questions", "answers"];
@@ -313,8 +314,8 @@ pub fn lock_file(public: &Path) -> PathBuf {
     public.join("run.lock")
 }
 
-fn worktree_lock_file(repo_root: &Path) -> PathBuf {
-    repo_root.join(".tactus").join("worktree.lock")
+fn worktree_lock_file(worktree_git_dir: &Path) -> PathBuf {
+    worktree_git_dir.join("tactus-worktree.lock")
 }
 
 /// An exclusive lease on the physical worktree shared by every run directory.
@@ -335,14 +336,22 @@ impl Drop for WorktreeLock {
 }
 
 impl WorktreeLock {
+    /// Acquire the lease for `repo_root` without placing coordination state in
+    /// the working tree. Kept as the public convenience API for existing
+    /// callers; the engine already has the resolved [`Workspace`] and uses
+    /// [`Self::acquire_in`] to avoid opening it twice.
     pub fn acquire(repo_root: &Path) -> Result<Self, TactusError> {
-        let lock_dir = repo_root.join(".tactus");
-        fs::create_dir_all(&lock_dir).map_err(|source| TactusError::Io {
-            path: lock_dir.clone(),
-            source,
-        })?;
-        let path = worktree_lock_file(repo_root);
-        let claim = claim_key(&lock_dir).join("worktree.lock");
+        let workspace = Workspace::open(repo_root)?;
+        let worktree_git_dir = workspace.worktree_git_dir()?;
+        Self::acquire_in(workspace.root(), &worktree_git_dir)
+    }
+
+    pub(crate) fn acquire_in(
+        repo_root: &Path,
+        worktree_git_dir: &Path,
+    ) -> Result<Self, TactusError> {
+        let path = worktree_lock_file(worktree_git_dir);
+        let claim = claim_key(worktree_git_dir).join("tactus-worktree.lock");
         if !claims().insert(claim.clone()) {
             return Err(worktree_refused(repo_root, &path, Some(std::process::id())));
         }
@@ -1312,8 +1321,11 @@ mod tests {
     #[ignore = "spawned as a subprocess by two_run_ids_cannot_drive_one_worktree_concurrently"]
     fn worktree_lock_child_holds_run_a() {
         let repo = PathBuf::from(std::env::var("TACTUS_TEST_WORKTREE_DIR").expect("repo"));
+        let git_dir =
+            PathBuf::from(std::env::var("TACTUS_TEST_WORKTREE_GIT_DIR").expect("git dir"));
         let public = PathBuf::from(std::env::var("TACTUS_TEST_LOCK_DIR").expect("run dir"));
-        let _worktree = WorktreeLock::acquire(&repo).expect("child takes worktree lease");
+        let _worktree =
+            WorktreeLock::acquire_in(&repo, &git_dir).expect("child takes worktree lease");
         let _run = RunLock::acquire(&public).expect("child takes run A lock");
         println!("held");
         std::io::Write::flush(&mut std::io::stdout()).expect("flush");
@@ -1324,6 +1336,8 @@ mod tests {
     fn two_run_ids_cannot_drive_one_worktree_concurrently() {
         let root = scratch("two-runs-one-worktree");
         let repo = root.join("repo");
+        let git_dir = root.join("git-dir");
+        fs::create_dir_all(&git_dir).expect("worktree git dir");
         let run_a = paths_in(&repo, "RUNA");
         let run_b = paths_in(&repo, "RUNB");
         run_a.create().expect("run A dirs");
@@ -1338,6 +1352,7 @@ mod tests {
                 "--nocapture",
             ])
             .env("TACTUS_TEST_WORKTREE_DIR", &repo)
+            .env("TACTUS_TEST_WORKTREE_GIT_DIR", &git_dir)
             .env("TACTUS_TEST_LOCK_DIR", &run_a.public)
             .stdout(std::process::Stdio::piped())
             .spawn()
@@ -1363,7 +1378,8 @@ mod tests {
         // differ. The outer lease is what owns shared HEAD/index/worktree state.
         let run_b_only = RunLock::acquire(&run_b.public).expect("run B lock is independent");
         drop(run_b_only);
-        let error = WorktreeLock::acquire(&repo).expect_err("run B must lose the worktree lease");
+        let error = WorktreeLock::acquire_in(&repo, &git_dir)
+            .expect_err("run B must lose the worktree lease");
         assert!(
             error.to_string().contains("already driving worktree"),
             "{error}"

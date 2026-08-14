@@ -44,19 +44,80 @@ impl Workspace {
                 message: format!("{} is not a git worktree", root.display()),
             });
         }
-        let toplevel = probe.git(&["rev-parse", "--show-toplevel"])?;
-        let toplevel = toplevel.trim();
+        let toplevel = probe.git_path(&["rev-parse", "--show-toplevel"])?;
         Ok(Self {
-            root: if toplevel.is_empty() {
+            root: if toplevel.as_os_str().is_empty() {
                 probe.root
             } else {
-                PathBuf::from(toplevel)
+                toplevel
             },
         })
     }
 
     pub fn root(&self) -> &Path {
         &self.root
+    }
+
+    /// The administrative directory private to this physical worktree.
+    ///
+    /// A linked worktree's `.git` is a pointer into the common repository, so
+    /// joining the visible `.git` path would either fail or collapse distinct
+    /// worktrees onto one lease. Git resolves the exact per-worktree directory
+    /// for us without changing tracked or working-tree state.
+    pub(crate) fn worktree_git_dir(&self) -> Result<PathBuf, TactusError> {
+        let git_dir = self.git_path(&["rev-parse", "--absolute-git-dir"])?;
+        if !git_dir.is_absolute() {
+            return Err(TactusError::Git {
+                message: format!(
+                    "git rev-parse --absolute-git-dir returned a relative path: {}",
+                    git_dir.display()
+                ),
+            });
+        }
+        Ok(git_dir)
+    }
+
+    /// Decode one path printed by Git without requiring Unix path bytes to be
+    /// UTF-8. Git appends a platform line ending; remove only that delimiter,
+    /// never legal leading or trailing path bytes.
+    fn git_path(&self, args: &[&str]) -> Result<PathBuf, TactusError> {
+        let mut output = self.git_output(args)?;
+        #[cfg(windows)]
+        {
+            if output.ends_with(b"\r\n") {
+                output.truncate(output.len() - 2);
+            } else if output.ends_with(b"\n") {
+                output.pop();
+            }
+            let path = String::from_utf8(output).map_err(|error| TactusError::Git {
+                message: format!(
+                    "git {} returned a path that is not valid UTF-8: {error}",
+                    args.join(" ")
+                ),
+            })?;
+            Ok(PathBuf::from(path))
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::ffi::OsStringExt;
+            if output.ends_with(b"\n") {
+                output.pop();
+            }
+            Ok(PathBuf::from(OsString::from_vec(output)))
+        }
+        #[cfg(not(any(unix, windows)))]
+        {
+            if output.ends_with(b"\n") {
+                output.pop();
+            }
+            let path = String::from_utf8(output).map_err(|error| TactusError::Git {
+                message: format!(
+                    "git {} returned a path that is not valid UTF-8: {error}",
+                    args.join(" ")
+                ),
+            })?;
+            Ok(PathBuf::from(path))
+        }
     }
 
     fn git(&self, args: &[&str]) -> Result<String, TactusError> {
@@ -2110,6 +2171,14 @@ mod tests {
         );
 
         let ws = Workspace::open(&linked).expect("open linked worktree");
+        let main_ws = Workspace::open(&repo).expect("open main worktree");
+        assert_ne!(
+            fs::canonicalize(ws.worktree_git_dir().expect("linked private git dir"))
+                .expect("canonical linked git dir"),
+            fs::canonicalize(main_ws.worktree_git_dir().expect("main private git dir"))
+                .expect("canonical main git dir"),
+            "each physical worktree needs an independent lease directory"
+        );
         ws.ensure_run_exclusions().expect("exclude");
         fs::create_dir_all(linked.join(".tactus").join("runs")).expect("run dir");
         fs::write(linked.join(".tactus").join("runs").join("t.json"), "{}").expect("artifact");
@@ -2132,6 +2201,40 @@ mod tests {
             actual, expected,
             "root normalized to the worktree top level"
         );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn worktree_git_dir_preserves_non_utf8_repo_path() {
+        use std::os::unix::ffi::OsStringExt;
+
+        let mut name = format!("tactus-ws-non-utf8-git-dir-{}-", std::process::id()).into_bytes();
+        name.push(0xff);
+        let repo = env::temp_dir().join(OsString::from_vec(name));
+        let _ = fs::remove_dir_all(&repo);
+        fs::create_dir(&repo).expect("create non-UTF-8 repo");
+        run_git(&repo, &["init", "-q", "-b", "main"]);
+        run_git(&repo, &["config", "user.email", "test@tactus.local"]);
+        run_git(&repo, &["config", "user.name", "tactus tests"]);
+        fs::write(repo.join("README.md"), "seed\n").expect("seed file");
+        run_git(&repo, &["add", "-A"]);
+        run_git(&repo, &["commit", "-q", "-m", "seed"]);
+
+        let workspace = Workspace::open(&repo).expect("open non-UTF-8 worktree");
+        assert_eq!(
+            fs::canonicalize(workspace.root()).expect("canonical workspace root"),
+            fs::canonicalize(&repo).expect("canonical expected root")
+        );
+        assert_eq!(
+            fs::canonicalize(
+                workspace
+                    .worktree_git_dir()
+                    .expect("resolve non-UTF-8 git dir")
+            )
+            .expect("canonical resolved git dir"),
+            fs::canonicalize(repo.join(".git")).expect("canonical expected git dir")
+        );
+        fs::remove_dir_all(repo).expect("remove non-UTF-8 repo");
     }
 
     #[test]

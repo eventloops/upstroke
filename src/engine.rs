@@ -732,7 +732,8 @@ fn run_harness_inner(
     // Preflight reads the source plan, config, and gate programs from this
     // physical worktree. Own it before taking that snapshot so another run
     // cannot leave us with an analysis of its transient edits.
-    let _worktree_lock = WorktreeLock::acquire(workspace.root())?;
+    let worktree_git_dir = workspace.worktree_git_dir()?;
+    let _worktree_lock = WorktreeLock::acquire_in(workspace.root(), &worktree_git_dir)?;
     let Preflight {
         analysis,
         caps,
@@ -1196,7 +1197,8 @@ fn resume_harness_inner(
         message,
     };
     let workspace = Workspace::open(&opts.repo_root)?;
-    let _worktree_lock = WorktreeLock::acquire(workspace.root())?;
+    let worktree_git_dir = workspace.worktree_git_dir()?;
+    let _worktree_lock = WorktreeLock::acquire_in(workspace.root(), &worktree_git_dir)?;
 
     // Claimed before anything is read, so two resumes cannot race each other
     // into the same branch. The lock sits beside the ops surface, which is the
@@ -5785,7 +5787,7 @@ mod tests {
     }
 
     #[test]
-    fn sparse_checkout_is_refused_before_worker_spend() {
+    fn sparse_checkout_preflight_refusal_leaves_worktree_clean() {
         let repo = temp_engine_repo("sparse-worker-preflight");
         git_in(&repo, &["update-index", "--skip-worktree", "README.md"]);
         let source = fake(Effect::EditFile);
@@ -5804,6 +5806,24 @@ mod tests {
             "preflight refusal must not create or switch a run branch"
         );
         git_in(&repo, &["update-index", "--no-skip-worktree", "README.md"]);
+        let worktree_git_dir = Workspace::open(&repo)
+            .expect("open worktree")
+            .worktree_git_dir()
+            .expect("resolve private git dir");
+        assert!(
+            worktree_git_dir.join("tactus-worktree.lock").exists(),
+            "the regression must exercise acquisition of the private worktree lease"
+        );
+        assert!(
+            !repo.join(".tactus").exists(),
+            "a refused preflight must not create working-tree coordinator state"
+        );
+        assert!(
+            git_in(&repo, &["status", "--porcelain", "--untracked-files=all"])
+                .trim()
+                .is_empty(),
+            "a refused preflight left coordinator state visible to Git"
+        );
     }
 
     #[test]
