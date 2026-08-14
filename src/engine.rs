@@ -742,6 +742,7 @@ fn run_harness_inner(
     } = preflight(opts, harness)?;
 
     let workspace = Workspace::open(&opts.repo_root)?;
+    workspace.ensure_execution_prerequisites()?;
     workspace.ensure_run_exclusions()?;
     if !workspace.is_clean()? {
         return Err(TactusError::Git {
@@ -1211,13 +1212,13 @@ fn resume_harness_inner(
         source,
     })?;
     let frozen_plan_digest = events::normalized_plan_digest(&frozen_plan_bytes);
-    if let Some(recorded) = recorded_normalized_plan_digest.as_deref()
-        && frozen_plan_digest != recorded
-    {
-        return Err(refuse(format!(
-            "the exact bytes at {} no longer match this run's recorded normalized-plan digest ({recorded}, now {frozen_plan_digest}). Restore the frozen snapshot or start a new run.",
-            frozen_plan_path.display()
-        )));
+    if let Some(recorded) = recorded_normalized_plan_digest.as_deref() {
+        if frozen_plan_digest != recorded {
+            return Err(refuse(format!(
+                "the exact bytes at {} no longer match this run's recorded normalized-plan digest ({recorded}, now {frozen_plan_digest}). Restore the frozen snapshot or start a new run.",
+                frozen_plan_path.display()
+            )));
+        }
     }
     if let Some(failure) = events::legacy_unsettled_failure(started.schema, &events) {
         let detail = match failure.kind {
@@ -1500,7 +1501,22 @@ fn resume_harness_inner(
         declined_questions.push((record.question.id.clone(), affected, halts_run));
     }
 
+    // Resolve the recorded private root before touching the worktree so a
+    // killed engine's durable snapshot registrations are reclaimed first.
+    let paths = match &opts.private_root {
+        Some(root) => RunPaths::with_private_root(&opts.repo_root, &run_id, root),
+        None => RunPaths::from_parts(public.clone(), PathBuf::from(&started.private_dir)),
+    };
+    paths.create()?;
+
     let workspace = Workspace::open(&opts.repo_root)?;
+    let reclaimed = workspace.reclaim_gate_workspaces(&paths.gate_worktrees())?;
+    if reclaimed > 0 {
+        warnings.push(format!(
+            "reclaimed {reclaimed} gate/review snapshot worktree(s) left by the interrupted run"
+        ));
+    }
+    workspace.ensure_execution_prerequisites()?;
     workspace.ensure_run_exclusions()?;
     if !workspace.branch_exists(&started.branch)? {
         return Err(refuse(format!(
@@ -1644,11 +1660,6 @@ fn resume_harness_inner(
     // this run's transcripts into a second private root while `status` went on
     // pointing at the first. An explicit override still wins, for a private
     // root that has genuinely moved.
-    let paths = match &opts.private_root {
-        Some(root) => RunPaths::with_private_root(&opts.repo_root, &run_id, root),
-        None => RunPaths::from_parts(public.clone(), PathBuf::from(&started.private_dir)),
-    };
-    paths.create()?;
     let sleeper = harness.sleeper.unwrap_or(&RealSleeper);
     let default_answers = interaction::answers_for(
         mode,
@@ -2428,20 +2439,20 @@ impl Run<'_> {
                                 detail: failure.feedback.clone(),
                             },
                         )));
-                        if let Some(onto) = chain.rungs.get(rung_index + 1).map(|next| next.tier)
-                            && self.should_approve_spend(rung.tier, onto, pending_spend)
-                        {
-                            let question = self.build_spend_approval(
-                                index,
-                                onto,
-                                pending_spend,
-                                pending_unpriced,
-                            );
-                            parking = Some(Box::new(events::AttemptParking {
-                                question: question.clone(),
-                                refund_attempt: false,
-                            }));
-                            parking_question = Some(question);
+                        if let Some(onto) = chain.rungs.get(rung_index + 1).map(|next| next.tier) {
+                            if self.should_approve_spend(rung.tier, onto, pending_spend) {
+                                let question = self.build_spend_approval(
+                                    index,
+                                    onto,
+                                    pending_spend,
+                                    pending_unpriced,
+                                );
+                                parking = Some(Box::new(events::AttemptParking {
+                                    question: question.clone(),
+                                    refund_attempt: false,
+                                }));
+                                parking_question = Some(question);
+                            }
                         }
                     }
                     Next::Defer => {
@@ -2543,21 +2554,21 @@ impl Run<'_> {
                 }
                 return Err(error);
             }
-            if let Some(question) = parking_question.as_ref()
-                && let Err(error) = self.materialize_question(question)
-            {
-                // The durable settlement is authoritative and already carries
-                // the complete question. A crash or write failure here cannot
-                // expose an orphan projection; resume rematerializes the
-                // question from the event before accepting an answer.
-                if let Err(cleanup) = self.workspace.discard_uncommitted() {
-                    return Err(TactusError::Git {
-                        message: format!(
-                            "{error}; additionally failed to clean the unreviewed workspace: {cleanup}"
-                        ),
-                    });
+            if let Some(question) = parking_question.as_ref() {
+                if let Err(error) = self.materialize_question(question) {
+                    // The durable settlement is authoritative and already carries
+                    // the complete question. A crash or write failure here cannot
+                    // expose an orphan projection; resume rematerializes the
+                    // question from the event before accepting an answer.
+                    if let Err(cleanup) = self.workspace.discard_uncommitted() {
+                        return Err(TactusError::Git {
+                            message: format!(
+                                "{error}; additionally failed to clean the unreviewed workspace: {cleanup}"
+                            ),
+                        });
+                    }
+                    return Err(error);
                 }
-                return Err(error);
             }
 
             let Some(failure) = result.failure else {
@@ -2597,10 +2608,10 @@ impl Run<'_> {
                 self.exhausted_pools.remove(&profile.pool);
             }
             for review in &result.reviews {
-                if review.outcome != events::ReviewPassOutcome::Unavailable
-                    && let Some(pool) = &review.pool
-                {
-                    self.exhausted_pools.remove(pool);
+                if review.outcome != events::ReviewPassOutcome::Unavailable {
+                    if let Some(pool) = &review.pool {
+                        self.exhausted_pools.remove(pool);
+                    }
                 }
             }
             if failure.kind == FailureKind::RateLimited {
@@ -3668,15 +3679,16 @@ fn run_attempt(
     // Verification ladder (§11): outcome sanity → cheap static provenance →
     // gates → review. Cheapest and most objective first.
     let mut failure = evaluate_outcome(&outcome, &output);
-    if failure.is_none()
-        && let Some(error) = review::complete_diff_error(&outcome.diff)
-        && (matches!(error, review::CompleteDiffError::Opaque) || !cx.reviewers.is_empty())
-    {
-        let kind = match error {
-            review::CompleteDiffError::Opaque => FailureKind::ReviewInputOpaque,
-            review::CompleteDiffError::TooLarge { .. } => FailureKind::ReviewInputTooLarge,
-        };
-        failure = Some(AttemptFailure::new(kind, error.to_string()).from_reviewer());
+    if failure.is_none() {
+        if let Some(error) = review::complete_diff_error(&outcome.diff) {
+            if matches!(error, review::CompleteDiffError::Opaque) || !cx.reviewers.is_empty() {
+                let kind = match error {
+                    review::CompleteDiffError::Opaque => FailureKind::ReviewInputOpaque,
+                    review::CompleteDiffError::TooLarge { .. } => FailureKind::ReviewInputTooLarge,
+                };
+                failure = Some(AttemptFailure::new(kind, error.to_string()).from_reviewer());
+            }
+        }
     }
     if failure.is_none() && cx.task.kind == TaskKind::Test && !gates::diff_adds_tests(&outcome.diff)
     {
@@ -3692,15 +3704,18 @@ fn run_attempt(
             ),
         );
     }
-    if failure.is_none()
-        && let Some(problem) = workspace.review_input_problem_for_tree(&candidate.tree_oid)?
-    {
-        failure =
-            Some(AttemptFailure::new(FailureKind::ReviewInputOpaque, problem).from_reviewer());
+    if failure.is_none() {
+        if let Some(problem) = workspace.review_input_problem_for_tree(&candidate.tree_oid)? {
+            failure =
+                Some(AttemptFailure::new(FailureKind::ReviewInputOpaque, problem).from_reviewer());
+        }
     }
     if failure.is_none() && !cx.gates.is_empty() {
-        let gate_workspace =
-            workspace.gate_snapshot_for_candidate(&candidate.parent_oid, &candidate.tree_oid)?;
+        let gate_workspace = workspace.gate_snapshot_for_candidate_in_store(
+            &candidate.parent_oid,
+            &candidate.tree_oid,
+            &cx.paths.gate_worktrees(),
+        )?;
         if let Some(gate_failure) = gates::run_all(
             cx.gates,
             gate_workspace.workspace(),
@@ -3735,8 +3750,11 @@ fn run_attempt(
         // Like gates, reviewers may inspect repository context beyond the
         // supplied diff. Give them the exact staged candidate, never ignored
         // worker inputs or residue from the authoritative workspace.
-        let review_workspace =
-            workspace.gate_snapshot_for_candidate(&candidate.parent_oid, &candidate.tree_oid)?;
+        let review_workspace = workspace.gate_snapshot_for_candidate_in_store(
+            &candidate.parent_oid,
+            &candidate.tree_oid,
+            &cx.paths.gate_worktrees(),
+        )?;
         for reviewer in &cx.reviewers {
             let review = review::run_review(&review::ReviewCx {
                 adapter: reviewer.adapter,
@@ -4009,19 +4027,19 @@ fn materialize_prompt(
 ) -> String {
     // A resumed session already holds the task, the artifacts, and the rules;
     // re-sending them buys nothing and buries the one thing that changed.
-    if let Some(retry) = retry
-        && retry.resumed
-    {
-        let mut prompt = String::new();
-        prompt.push_str(
-            "Your previous attempt did not pass verification. Fix it in this same session — the \
-             task and its rules have not changed.\n\n",
-        );
-        prompt.push_str(&feedback_section(&retry.feedback, false));
-        prompt.push_str(
-            "\nMake the smallest change that resolves the above, then stop and summarize.\n",
-        );
-        return prompt;
+    if let Some(retry) = retry {
+        if retry.resumed {
+            let mut prompt = String::new();
+            prompt.push_str(
+                "Your previous attempt did not pass verification. Fix it in this same session — the \
+                 task and its rules have not changed.\n\n",
+            );
+            prompt.push_str(&feedback_section(&retry.feedback, false));
+            prompt.push_str(
+                "\nMake the smallest change that resolves the above, then stop and summarize.\n",
+            );
+            return prompt;
+        }
     }
 
     let mut prompt = String::new();
@@ -4147,12 +4165,13 @@ fn feedback_section(feedback: &[Feedback], all: bool) -> String {
         );
         // Only the newest failure carries its full output; older ones would
         // bury it, and the newest is the one still standing in the way.
-        if position == last
-            && let Some(detail) = &entry.detail
-            && !detail.trim().is_empty()
-        {
-            let fence = util::fence_for(detail);
-            let _ = writeln!(out, "{fence}\n{}\n{fence}", detail.trim());
+        if position == last {
+            if let Some(detail) = &entry.detail {
+                if !detail.trim().is_empty() {
+                    let fence = util::fence_for(detail);
+                    let _ = writeln!(out, "{fence}\n{}\n{fence}", detail.trim());
+                }
+            }
         }
         out.push('\n');
     }
@@ -5732,6 +5751,28 @@ mod tests {
         assert!(err.to_string().contains("not clean"), "got: {err}");
         let branch = git_in(&repo, &["rev-parse", "--abbrev-ref", "HEAD"]);
         assert_eq!(branch.trim(), "main", "no run branch created");
+    }
+
+    #[test]
+    fn sparse_checkout_is_refused_before_worker_spend() {
+        let repo = temp_engine_repo("sparse-worker-preflight");
+        git_in(&repo, &["update-index", "--skip-worktree", "README.md"]);
+        let source = fake(Effect::EditFile);
+
+        let error = run_with(&options(&repo), &source)
+            .expect_err("incomplete materialization must be refused")
+            .to_string();
+        assert!(error.contains("sparse checkout is active"), "{error}");
+        assert!(
+            source.adapter.runs().is_empty(),
+            "a worker was dispatched before sparse-checkout refusal"
+        );
+        assert_eq!(
+            git_in(&repo, &["rev-parse", "--abbrev-ref", "HEAD"]).trim(),
+            "main",
+            "preflight refusal must not create or switch a run branch"
+        );
+        git_in(&repo, &["update-index", "--no-skip-worktree", "README.md"]);
     }
 
     #[test]
@@ -10072,12 +10113,12 @@ mod tests {
             .map(|line| {
                 let mut value: serde_json::Value =
                     serde_json::from_str(line).expect("every line is an event");
-                if value.get("event").and_then(|e| e.as_str()) == Some("run_started")
-                    && let Some(data) = value.get_mut("data").and_then(|d| d.as_object_mut())
-                {
-                    data.remove(field)
-                        .unwrap_or_else(|| panic!("the run recorded no `{field}`"));
-                    stripped = true;
+                if value.get("event").and_then(|e| e.as_str()) == Some("run_started") {
+                    if let Some(data) = value.get_mut("data").and_then(|d| d.as_object_mut()) {
+                        data.remove(field)
+                            .unwrap_or_else(|| panic!("the run recorded no `{field}`"));
+                        stripped = true;
+                    }
                 }
                 value.to_string()
             })
@@ -10893,10 +10934,10 @@ mod tests {
                 return;
             };
             *waits += 1;
-            if *waits == self.release_after
-                && let Ok(mut lock) = self.lock.lock()
-            {
-                drop(lock.take());
+            if *waits == self.release_after {
+                if let Ok(mut lock) = self.lock.lock() {
+                    drop(lock.take());
+                }
             }
         }
     }

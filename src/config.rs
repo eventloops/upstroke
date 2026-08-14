@@ -937,16 +937,16 @@ fn parse_interaction(
             ),
         })?,
     };
-    if let Some(threshold) = ask_before.frontier_escalation_over_usd
-        && (!threshold.is_finite() || threshold < 0.0)
-    {
-        return Err(TactusError::Config {
-            path: repo_path.to_path_buf(),
-            message: format!(
-                "[interaction] ask_before `frontier_escalation_over_usd = {threshold}` is not a \
-                 spend threshold — omit the key to never ask, or give it a number of dollars"
-            ),
-        });
+    if let Some(threshold) = ask_before.frontier_escalation_over_usd {
+        if !threshold.is_finite() || threshold < 0.0 {
+            return Err(TactusError::Config {
+                path: repo_path.to_path_buf(),
+                message: format!(
+                    "[interaction] ask_before `frontier_escalation_over_usd = {threshold}` is not a \
+                     spend threshold — omit the key to never ask, or give it a number of dollars"
+                ),
+            });
+        }
     }
     let mode = match interaction.mode {
         None => InteractionMode::default(),
@@ -1170,13 +1170,13 @@ fn parse_pool(
             )));
         }
     };
-    if let Allowance::Units(units) = monthly_allowance
-        && (!units.is_finite() || units <= 0.0)
-    {
-        return Err(config_error(format!(
-            "[pools.{name}] `monthly_allowance = {units}` is not an allowance — write \"auto\" if \
-             you do not know its size"
-        )));
+    if let Allowance::Units(units) = monthly_allowance {
+        if !units.is_finite() || units <= 0.0 {
+            return Err(config_error(format!(
+                "[pools.{name}] `monthly_allowance = {units}` is not an allowance — write \"auto\" if \
+                 you do not know its size"
+            )));
+        }
     }
 
     for key in raw.unknown.keys() {

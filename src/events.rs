@@ -1716,10 +1716,10 @@ pub(crate) fn recorded_normalized_plan_digest(events: &[Event]) -> Option<&str> 
         match &event.body {
             EventBody::RunStarted { data } => {
                 schema = data.schema;
-                if schema >= 3
-                    && let Some(digest) = data.normalized_plan_digest.as_deref()
-                {
-                    return Some(digest);
+                if schema >= 3 {
+                    if let Some(digest) = data.normalized_plan_digest.as_deref() {
+                        return Some(digest);
+                    }
                 }
             }
             EventBody::RunSchemaUpgraded { data } => schema = data.to,

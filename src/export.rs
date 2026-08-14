@@ -798,13 +798,13 @@ fn duration_ms(
 }
 
 fn validate_cost(path: &Path, label: &str, cost: Option<f64>) -> Result<(), TactusError> {
-    if let Some(cost) = cost
-        && (!cost.is_finite() || cost < 0.0)
-    {
-        return Err(TactusError::EventLog {
-            path: path.to_owned(),
-            message: format!("{label} cost must be finite and non-negative, got {cost}"),
-        });
+    if let Some(cost) = cost {
+        if !cost.is_finite() || cost < 0.0 {
+            return Err(TactusError::EventLog {
+                path: path.to_owned(),
+                message: format!("{label} cost must be finite and non-negative, got {cost}"),
+            });
+        }
     }
     Ok(())
 }
@@ -1144,16 +1144,21 @@ mod tests {
     }
 
     #[test]
-    fn windows_crash_containment_docs_do_not_advertise_unshipped_runner() {
+    fn windows_crash_containment_docs_match_shipped_job_ownership() {
         let readme = include_str!("../README.md");
         let design = include_str!("../DESIGN.md");
-        for doc in [readme, design] {
-            assert!(doc.contains("run the conductor under WSL"), "{doc}");
-            assert!(
-                doc.contains("not a shipped") || doc.contains("not a shipped workaround"),
-                "future runner must not read as current"
-            );
-        }
+        assert!(readme.contains("kill-on-close Job Object"), "{readme}");
+        assert!(
+            readme.contains("before its primary\nthread runs"),
+            "{readme}"
+        );
+        assert!(design.contains("created suspended"), "{design}");
+        assert!(
+            design.contains("boundedly observe that job empty"),
+            "{design}"
+        );
+        assert!(!readme.contains("run the conductor under WSL"), "{readme}");
+        assert!(!design.contains("run the conductor under WSL"), "{design}");
     }
 
     struct Fixture {

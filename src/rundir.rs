@@ -31,7 +31,13 @@ use crate::util;
 const PUBLIC_DIRS: [&str; 3] = ["artifacts", "questions", "answers"];
 /// Created outside the workspace: everything an agent wrote or that describes
 /// an agent's sandbox.
-const PRIVATE_DIRS: [&str; 4] = ["transcripts", "reviews", "settings", "gates"];
+const PRIVATE_DIRS: [&str; 5] = [
+    "transcripts",
+    "reviews",
+    "settings",
+    "gates",
+    "gate-worktrees",
+];
 
 /// Where one run's files live, split by who is allowed to read them.
 #[derive(Debug, Clone)]
@@ -131,6 +137,13 @@ impl RunPaths {
 
     pub fn gates(&self) -> PathBuf {
         self.private.join("gates")
+    }
+
+    /// Durable intents and disposable directories for exact gate/review
+    /// worktrees. This lives outside the candidate workspace, so a hard-killed
+    /// engine can reclaim Git registrations before a resumed worker runs.
+    pub fn gate_worktrees(&self) -> PathBuf {
+        self.private.join("gate-worktrees")
     }
 }
 
@@ -807,29 +820,82 @@ mod imp {
     }
 }
 
-#[cfg(not(unix))]
+#[cfg(windows)]
 mod imp {
     use super::Holder;
-    use std::fs::{File, TryLockError};
+    use std::fs::File;
+    use std::io;
+    use std::os::windows::io::AsRawHandle;
+
+    use windows_sys::Win32::Foundation::{ERROR_LOCK_VIOLATION, HANDLE};
+    use windows_sys::Win32::Storage::FileSystem::{
+        LOCKFILE_EXCLUSIVE_LOCK, LOCKFILE_FAIL_IMMEDIATELY, LockFileEx, UnlockFileEx,
+    };
+    use windows_sys::Win32::System::IO::OVERLAPPED;
 
     pub(super) fn take(file: &File) -> Holder {
-        match file.try_lock() {
-            Ok(()) => Holder::Nobody,
-            // `LockFileEx` names no owner, and inventing one would be worse
-            // than the shorter sentence.
-            Err(TryLockError::WouldBlock) => Holder::Someone { pid: None },
-            Err(TryLockError::Error(source)) => Holder::Unknown(source),
-        }
+        try_lock(file, true)
     }
 
     pub(super) fn holder(file: &File) -> Holder {
-        match file.try_lock_shared() {
-            Ok(()) => {
-                let _ = file.unlock();
-                Holder::Nobody
-            }
-            Err(TryLockError::WouldBlock) => Holder::Someone { pid: None },
-            Err(TryLockError::Error(source)) => Holder::Unknown(source),
+        match try_lock(file, false) {
+            Holder::Nobody => match unlock(file) {
+                Ok(()) => Holder::Nobody,
+                Err(source) => Holder::Unknown(source),
+            },
+            other => other,
+        }
+    }
+
+    fn try_lock(file: &File, exclusive: bool) -> Holder {
+        let mut overlapped = OVERLAPPED::default();
+        let flags = LOCKFILE_FAIL_IMMEDIATELY
+            | if exclusive {
+                LOCKFILE_EXCLUSIVE_LOCK
+            } else {
+                0
+            };
+        // SAFETY: `file` owns a live Windows handle, `overlapped` describes
+        // offset zero, and the same whole-file range is used by every holder.
+        let locked = unsafe {
+            LockFileEx(
+                file.as_raw_handle() as HANDLE,
+                flags,
+                0,
+                u32::MAX,
+                u32::MAX,
+                &mut overlapped,
+            )
+        };
+        if locked != 0 {
+            return Holder::Nobody;
+        }
+        let source = io::Error::last_os_error();
+        if source.raw_os_error() == Some(ERROR_LOCK_VIOLATION as i32) {
+            // LockFileEx names no owner, and inventing one would be worse than
+            // the shorter sentence.
+            Holder::Someone { pid: None }
+        } else {
+            Holder::Unknown(source)
+        }
+    }
+
+    fn unlock(file: &File) -> io::Result<()> {
+        let mut overlapped = OVERLAPPED::default();
+        // SAFETY: this releases exactly the range acquired in `try_lock`.
+        if unsafe {
+            UnlockFileEx(
+                file.as_raw_handle() as HANDLE,
+                0,
+                u32::MAX,
+                u32::MAX,
+                &mut overlapped,
+            )
+        } != 0
+        {
+            Ok(())
+        } else {
+            Err(io::Error::last_os_error())
         }
     }
 }
@@ -865,6 +931,7 @@ mod tests {
             paths.reviews(),
             paths.settings(),
             paths.gates(),
+            paths.gate_worktrees(),
         ] {
             assert!(private.is_dir(), "{} should exist", private.display());
             assert!(

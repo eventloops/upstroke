@@ -151,10 +151,10 @@ fn split_sections(raw: &str) -> Vec<Section> {
             Event::InlineHtml(t) | Event::Html(t) => {
                 if let Some(scan) = in_heading.as_mut() {
                     for comment in comments_in(&t) {
-                        if let Some(body) = tactus_body(comment.inner)
-                            && scan.annotation.is_none()
-                        {
-                            scan.annotation = Some(body.to_owned());
+                        if let Some(body) = tactus_body(comment.inner) {
+                            if scan.annotation.is_none() {
+                                scan.annotation = Some(body.to_owned());
+                            }
                         }
                     }
                 }
@@ -447,15 +447,14 @@ fn checklist_drafts(raw: &str, warnings: &mut Vec<String>) -> Vec<Draft> {
                 }
             }
             Event::End(TagEnd::Item) => {
-                if list_depth == 1
-                    && item_depth == 1
-                    && let Some((mut draft, sink)) = current.take()
-                {
-                    draft.title = draft.title.trim().to_owned();
-                    draft.body = draft.body.trim().to_owned();
-                    draft.ann = sink.annotation;
-                    if is_task_item && !draft.title.is_empty() {
-                        drafts.push(draft);
+                if list_depth == 1 && item_depth == 1 {
+                    if let Some((mut draft, sink)) = current.take() {
+                        draft.title = draft.title.trim().to_owned();
+                        draft.body = draft.body.trim().to_owned();
+                        draft.ann = sink.annotation;
+                        if is_task_item && !draft.title.is_empty() {
+                            drafts.push(draft);
+                        }
                     }
                 }
                 item_depth = item_depth.saturating_sub(1);
@@ -773,15 +772,15 @@ fn collect_artifacts(tasks: &mut [Task], warnings: &mut Vec<String>) -> Vec<Arti
             }
         }
     }
-    if artifacts.is_empty()
-        && let Some(design) = tasks.iter_mut().find(|t| t.kind == TaskKind::Design)
-    {
-        let id = ArtifactId::from("conventions-brief");
-        design.artifacts_out.push(id.clone());
-        artifacts.push(Artifact {
-            id,
-            produced_by: Some(design.id.clone()),
-        });
+    if artifacts.is_empty() {
+        if let Some(design) = tasks.iter_mut().find(|t| t.kind == TaskKind::Design) {
+            let id = ArtifactId::from("conventions-brief");
+            design.artifacts_out.push(id.clone());
+            artifacts.push(Artifact {
+                id,
+                produced_by: Some(design.id.clone()),
+            });
+        }
     }
     for task in tasks.iter() {
         for needed in &task.artifacts_in {

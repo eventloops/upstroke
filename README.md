@@ -238,18 +238,24 @@ These are invariants, not aspirations — they're what make it safe to leave run
 
 ## Requirements
 
-Rust 1.85+ (edition 2024) and [Claude Code](https://docs.claude.com/en/docs/claude-code/overview)
-on `PATH`. The [GitHub Copilot CLI](https://docs.github.com/en/copilot/reference/copilot-cli-reference/cli-programmatic-reference)
+Rust 1.85+ (edition 2024), Git 2.40+ (the exact-tree review check requires
+`git check-attr --source`), and [Claude Code](https://docs.claude.com/en/docs/claude-code/overview)
+on `PATH`. Tactus probes that Git capability before dispatching a worker. The
+[GitHub Copilot CLI](https://docs.github.com/en/copilot/reference/copilot-cli-reference/cli-programmatic-reference)
 is optional and unlocks the cross-family second opinion. Windows, macOS and Linux are all
 first-class.
 
-One crash-containment caveat is explicit: the current Windows host runner kills a process tree
-when it observes a timeout, but cannot retain ownership if the Tactus conductor itself is killed.
-Until the planned Job Object plus external cleanup guardian lands, run the conductor under WSL
-when a hard conductor crash must not leave an ordinary agent descendant running or spending. The
-external/container runner is a v0.2 design commitment, not a shipped option. Unix and WSL host runs
-retain a cleanup lease for ordinary descendants; deliberately daemonised escape remains outside
-the current host-runner contract on every platform.
+On Windows every supervised command is assigned to a kill-on-close Job Object before its primary
+thread runs. Ordinary descendants are therefore terminated after a direct-child exit, an observed
+timeout, or abrupt conductor death. Unix and WSL host runs retain a cleanup lease for ordinary
+descendants. Deliberately daemonised Unix escape remains outside the host-runner contract.
+
+Host-run mode is for trusted repositories and plans. Repository-controlled gates execute candidate
+build/test code as the Tactus user's OS account; no shipped host sandbox prevents that code from
+finding or modifying `.tactus` run files. Adapter deny rules reduce accidental access but do not
+make the event log tamper-resistant against hostile candidate code. Isolating coordinator state
+from workers, reviewers, and gates remains a container-runner/authority-layout blocker; use a
+dedicated OS account or VM for untrusted input until that boundary ships.
 
 ## Licence
 

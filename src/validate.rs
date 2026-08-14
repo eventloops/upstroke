@@ -359,10 +359,10 @@ fn check_graph(plan: &Plan, warnings: &mut Vec<String>) -> Result<(), TactusErro
         }
     }
     // Cycle detection only makes sense on a graph whose edges all resolve.
-    if problems.is_empty()
-        && let Some(cycle) = find_cycle(plan)
-    {
-        problems.push(format!("dependency cycle: {}", cycle.join(" -> ")));
+    if problems.is_empty() {
+        if let Some(cycle) = find_cycle(plan) {
+            problems.push(format!("dependency cycle: {}", cycle.join(" -> ")));
+        }
     }
     if !problems.is_empty() {
         return Err(TactusError::Validation(ValidationErrors(problems)));
@@ -456,10 +456,10 @@ fn find_cycle(plan: &Plan) -> Option<Vec<String>> {
                 cycle.push(plan.tasks[next].id.to_string());
                 return Some(cycle);
             }
-            if color[next] == WHITE
-                && let Some(cycle) = dfs(next, plan, index, color, stack)
-            {
-                return Some(cycle);
+            if color[next] == WHITE {
+                if let Some(cycle) = dfs(next, plan, index, color, stack) {
+                    return Some(cycle);
+                }
             }
         }
         stack.pop();
@@ -470,10 +470,10 @@ fn find_cycle(plan: &Plan) -> Option<Vec<String>> {
     let mut color = vec![WHITE; plan.tasks.len()];
     let mut stack = Vec::new();
     for start in 0..plan.tasks.len() {
-        if color[start] == WHITE
-            && let Some(cycle) = dfs(start, plan, &index, &mut color, &mut stack)
-        {
-            return Some(cycle);
+        if color[start] == WHITE {
+            if let Some(cycle) = dfs(start, plan, &index, &mut color, &mut stack) {
+                return Some(cycle);
+            }
         }
     }
     None

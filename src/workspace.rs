@@ -3,7 +3,7 @@
 //! operation is a subprocess of the system `git` binary — no library binding.
 
 use std::ffi::OsString;
-use std::fs;
+use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
@@ -235,6 +235,59 @@ impl Workspace {
             .git_with_private_hooks(&["status", "--porcelain"])?
             .trim()
             .is_empty())
+    }
+
+    /// Repository prerequisites whose absence would make the captured tree
+    /// incomplete or its attribute policy unverifiable. Run this before any
+    /// worker is dispatched on both fresh and resumed runs.
+    pub fn ensure_execution_prerequisites(&self) -> Result<(), TactusError> {
+        require_check_attr_source(self.git_output_with_input(
+            &["check-attr", "--source=HEAD", "--stdin", "-z", "filter"],
+            Vec::new(),
+        ))?;
+        self.refuse_sparse_checkout()
+    }
+
+    fn refuse_sparse_checkout(&self) -> Result<(), TactusError> {
+        let configured =
+            self.run_git_with_private_hooks(&["config", "--bool", "--get", "core.sparseCheckout"])?;
+        let sparse_configured = if configured.status.success() {
+            match configured.stdout.as_slice() {
+                b"true\n" | b"true\r\n" => true,
+                b"false\n" | b"false\r\n" => false,
+                other => {
+                    return Err(TactusError::Git {
+                        message: format!(
+                            "git config returned an invalid core.sparseCheckout value `{}`",
+                            String::from_utf8_lossy(other).trim()
+                        ),
+                    });
+                }
+            }
+        } else if configured.status.code() == Some(1) {
+            false
+        } else {
+            return Err(TactusError::Git {
+                message: format!(
+                    "checking core.sparseCheckout failed: {}",
+                    String::from_utf8_lossy(&configured.stderr).trim()
+                ),
+            });
+        };
+        // `-t` reports the skip-worktree tag as an uppercase `S` even when an
+        // entry is also marked assume-unchanged. (`-v` would lowercase that
+        // tag and could let a manually sparse index evade this preflight.)
+        let index = self.git_output_with_private_hooks(&["ls-files", "-t", "-z"])?;
+        let has_skipped_entry = index
+            .split(|byte| *byte == 0)
+            .any(|entry| entry.starts_with(b"S "));
+        if sparse_configured || has_skipped_entry {
+            return Err(TactusError::Refused {
+                message: "sparse checkout is active (or the index has skip-worktree entries); tactus requires a complete worktree so workers, gates, and reviewers see every candidate path. Run `git sparse-checkout disable` and clear any manual skip-worktree bits before starting or resuming."
+                    .to_owned(),
+            });
+        }
+        Ok(())
     }
 
     pub fn current_branch(&self) -> Result<String, TactusError> {
@@ -527,7 +580,7 @@ impl Workspace {
         if fields.last().is_some_and(|field| field.is_empty()) {
             fields.pop();
         }
-        if !fields.len().is_multiple_of(3) {
+        if fields.len() % 3 != 0 {
             return Err(TactusError::Git {
                 message: "git check-attr returned malformed NUL-delimited output".to_owned(),
             });
@@ -613,7 +666,73 @@ impl Workspace {
         parent_oid: &str,
         tree_oid: &str,
     ) -> Result<GateWorkspace, TactusError> {
-        self.gate_snapshot_for_candidate_in(parent_oid, tree_oid, &std::env::temp_dir())
+        let store =
+            std::env::temp_dir().join(format!("tactus-gate-worktrees-{}", std::process::id()));
+        self.gate_snapshot_for_candidate_in(parent_oid, tree_oid, &store)
+    }
+
+    /// Materialize a candidate under a durable, caller-owned snapshot store.
+    /// The intent is synced before Git registers the worktree, allowing resume
+    /// to reclaim a snapshot whose owner was terminated without running Drop.
+    pub fn gate_snapshot_for_candidate_in_store(
+        &self,
+        parent_oid: &str,
+        tree_oid: &str,
+        store: &Path,
+    ) -> Result<GateWorkspace, TactusError> {
+        self.gate_snapshot_for_candidate_in(parent_oid, tree_oid, store)
+    }
+
+    /// Reclaim every durable gate-worktree intent in `store`. Callers must use
+    /// the same repository that created the store; intent names contain no
+    /// path supplied by the candidate and cannot escape these fixed children.
+    pub fn reclaim_gate_workspaces(&self, store: &Path) -> Result<usize, TactusError> {
+        let intents = store.join("intents");
+        let entries = match fs::read_dir(&intents) {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(0),
+            Err(source) => {
+                return Err(TactusError::Io {
+                    path: intents,
+                    source,
+                });
+            }
+        };
+        let mut reclaimed = 0;
+        for entry in entries {
+            let entry = entry.map_err(|source| TactusError::Io {
+                path: intents.clone(),
+                source,
+            })?;
+            let name = entry.file_name();
+            let name = name.to_str().ok_or_else(|| TactusError::Git {
+                message: format!(
+                    "snapshot intent {} has a non-UTF-8 name",
+                    entry.path().display()
+                ),
+            })?;
+            let Some(snapshot) = name.strip_suffix(".intent") else {
+                return Err(TactusError::Git {
+                    message: format!(
+                        "unexpected file {} in the snapshot intent directory",
+                        entry.path().display()
+                    ),
+                });
+            };
+            if !valid_snapshot_name(snapshot) {
+                return Err(TactusError::Git {
+                    message: format!("invalid snapshot intent name `{name}`"),
+                });
+            }
+            cleanup_gate_workspace(
+                &self.root,
+                &store.join("worktrees").join(snapshot),
+                &store.join("hooks").join(snapshot),
+                &entry.path(),
+            )?;
+            reclaimed += 1;
+        }
+        Ok(reclaimed)
     }
 
     fn gate_snapshot_for_candidate_in(
@@ -977,6 +1096,14 @@ impl Workspace {
     }
 }
 
+fn require_check_attr_source(probe: Result<Vec<u8>, TactusError>) -> Result<(), TactusError> {
+    probe.map(|_| ()).map_err(|error| TactusError::Refused {
+        message: format!(
+            "Git 2.40 or newer is required: tactus must bind filter-attribute checks to the exact captured tree with `git check-attr --source` before gates or review ({error})"
+        ),
+    })
+}
+
 struct PrivateHooksDir {
     path: PathBuf,
 }
@@ -1008,26 +1135,49 @@ struct PendingGateWorkspace {
     source_root: PathBuf,
     path: PathBuf,
     hooks_path: PathBuf,
+    intent_path: PathBuf,
     armed: bool,
 }
 
 impl PendingGateWorkspace {
-    fn create(source_root: &Path, temp_root: &Path) -> Result<Self, TactusError> {
+    fn create(source_root: &Path, store: &Path) -> Result<Self, TactusError> {
         let name = format!(
             "tactus-gates-{}-{}",
             std::process::id(),
             crate::ulid::ulid()
         );
-        let path = temp_root.join(&name);
-        let hooks_path = temp_root.join(format!("{name}-hooks"));
-        create_private_dir(&path).map_err(|e| TactusError::Git {
-            message: format!(
-                "creating private gate snapshot directory {}: {e}",
-                path.display()
-            ),
-        })?;
+        let intents = store.join("intents");
+        let worktrees = store.join("worktrees");
+        let hooks = store.join("hooks");
+        for directory in [
+            store,
+            intents.as_path(),
+            worktrees.as_path(),
+            hooks.as_path(),
+        ] {
+            create_private_dir_all(directory).map_err(|error| TactusError::Git {
+                message: format!(
+                    "creating private gate snapshot store {}: {error}",
+                    directory.display()
+                ),
+            })?;
+        }
+        let intent_path = intents.join(format!("{name}.intent"));
+        create_snapshot_intent(&intent_path)?;
+        let path = worktrees.join(&name);
+        let hooks_path = hooks.join(&name);
+        if let Err(error) = create_private_dir(&path) {
+            let _ = fs::remove_file(&intent_path);
+            return Err(TactusError::Git {
+                message: format!(
+                    "creating private gate snapshot directory {}: {error}",
+                    path.display()
+                ),
+            });
+        }
         if let Err(error) = create_private_dir(&hooks_path) {
             let _ = fs::remove_dir(&path);
+            let _ = fs::remove_file(&intent_path);
             return Err(TactusError::Git {
                 message: format!(
                     "creating private empty hooks directory {}: {error}",
@@ -1039,6 +1189,7 @@ impl PendingGateWorkspace {
             source_root: source_root.to_path_buf(),
             path,
             hooks_path,
+            intent_path,
             armed: true,
         })
     }
@@ -1049,6 +1200,7 @@ impl PendingGateWorkspace {
             source_root: self.source_root.clone(),
             path: self.path.clone(),
             hooks_path: self.hooks_path.clone(),
+            intent_path: self.intent_path.clone(),
             workspace,
         }
     }
@@ -1057,10 +1209,72 @@ impl PendingGateWorkspace {
 impl Drop for PendingGateWorkspace {
     fn drop(&mut self) {
         if self.armed {
-            cleanup_gate_workspace(&self.source_root, &self.path, &self.hooks_path);
+            let _ = cleanup_gate_workspace(
+                &self.source_root,
+                &self.path,
+                &self.hooks_path,
+                &self.intent_path,
+            );
         }
     }
 }
+
+fn create_snapshot_intent(path: &Path) -> Result<(), TactusError> {
+    let mut options = OpenOptions::new();
+    options.create_new(true).write(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let file = options.open(path).map_err(|source| TactusError::Io {
+        path: path.to_path_buf(),
+        source,
+    })?;
+    file.sync_all().map_err(|source| TactusError::Io {
+        path: path.to_path_buf(),
+        source,
+    })?;
+    sync_parent(path)
+}
+
+fn sync_parent(path: &Path) -> Result<(), TactusError> {
+    #[cfg(unix)]
+    {
+        let parent = path.parent().ok_or_else(|| TactusError::Git {
+            message: format!("snapshot intent {} has no parent", path.display()),
+        })?;
+        let directory = fs::File::open(parent).map_err(|source| TactusError::Io {
+            path: parent.to_path_buf(),
+            source,
+        })?;
+        directory.sync_all().map_err(|source| TactusError::Io {
+            path: parent.to_path_buf(),
+            source,
+        })?;
+    }
+    #[cfg(not(unix))]
+    let _ = path;
+    Ok(())
+}
+
+fn valid_snapshot_name(name: &str) -> bool {
+    name.starts_with("tactus-gates-")
+        && name
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+}
+
+fn create_private_dir_all(path: &Path) -> std::io::Result<()> {
+    fs::create_dir_all(path)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(path, fs::Permissions::from_mode(0o700))?;
+    }
+    Ok(())
+}
+
 fn create_private_dir(path: &Path) -> std::io::Result<()> {
     #[cfg(unix)]
     {
@@ -1075,14 +1289,19 @@ fn create_private_dir(path: &Path) -> std::io::Result<()> {
     }
 }
 
-fn cleanup_gate_workspace(source_root: &Path, path: &Path, hooks_path: &Path) {
+fn cleanup_gate_workspace(
+    source_root: &Path,
+    path: &Path,
+    hooks_path: &Path,
+    intent_path: &Path,
+) -> Result<(), TactusError> {
     let mut hooks_config = OsString::from("core.hooksPath=");
     hooks_config.push(hooks_path);
-    let _ = Command::new("git")
+    let removal = Command::new("git")
         .arg("-C")
         .arg(source_root)
         .arg("-c")
-        .arg(hooks_config)
+        .arg(&hooks_config)
         .args([
             "-c",
             "core.fsmonitor=false",
@@ -1091,12 +1310,95 @@ fn cleanup_gate_workspace(source_root: &Path, path: &Path, hooks_path: &Path) {
             "--force",
         ])
         .arg(path)
-        .output();
-    // `worktree remove` normally removes the directory too. These exact paths
-    // were atomically created by this process, so fall back to filesystem
-    // cleanup if a partially failed `worktree add` left either one behind.
+        .output()
+        .map_err(|error| TactusError::Git {
+            message: format!("failed to remove gate worktree {}: {error}", path.display()),
+        })?;
+    if worktree_is_registered(source_root, path, &hooks_config)? {
+        return Err(TactusError::Git {
+            message: format!(
+                "could not reclaim registered gate worktree {}: {}",
+                path.display(),
+                String::from_utf8_lossy(&removal.stderr).trim()
+            ),
+        });
+    }
+    // `worktree remove` normally removes the directory too. Once Git confirms
+    // no registration remains, these exact private paths are safe to remove
+    // even if a partially failed add populated only part of either one.
     let _ = fs::remove_dir_all(path);
     let _ = fs::remove_dir_all(hooks_path);
+    match fs::remove_file(intent_path) {
+        Ok(()) => sync_parent(intent_path)?,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(source) => {
+            return Err(TactusError::Io {
+                path: intent_path.to_path_buf(),
+                source,
+            });
+        }
+    }
+    for directory in [intent_path.parent(), hooks_path.parent(), path.parent()]
+        .into_iter()
+        .flatten()
+    {
+        let _ = fs::remove_dir(directory);
+    }
+    Ok(())
+}
+
+fn worktree_is_registered(
+    source_root: &Path,
+    path: &Path,
+    hooks_config: &std::ffi::OsStr,
+) -> Result<bool, TactusError> {
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(source_root)
+        .arg("-c")
+        .arg(hooks_config)
+        .args([
+            "-c",
+            "core.fsmonitor=false",
+            "worktree",
+            "list",
+            "--porcelain",
+            "-z",
+        ])
+        .output()
+        .map_err(|error| TactusError::Git {
+            message: format!("failed to verify gate-worktree reclamation: {error}"),
+        })?;
+    if !output.status.success() {
+        return Err(TactusError::Git {
+            message: format!(
+                "verifying gate-worktree reclamation failed: {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            ),
+        });
+    }
+    Ok(output
+        .stdout
+        .split(|byte| *byte == 0)
+        .filter_map(|field| field.strip_prefix(b"worktree "))
+        .any(|field| git_path_field_matches(field, path)))
+}
+
+#[cfg(unix)]
+fn git_path_field_matches(field: &[u8], path: &Path) -> bool {
+    use std::os::unix::ffi::OsStrExt;
+    field == path.as_os_str().as_bytes()
+}
+
+#[cfg(windows)]
+fn git_path_field_matches(field: &[u8], path: &Path) -> bool {
+    let rendered = String::from_utf8_lossy(field).replace('/', "\\");
+    Path::new(&rendered) == path
+}
+
+#[cfg(not(any(unix, windows)))]
+fn git_path_field_matches(field: &[u8], path: &Path) -> bool {
+    String::from_utf8_lossy(field) == path.to_string_lossy()
 }
 
 fn valid_object_id(oid: &str) -> bool {
@@ -1107,6 +1409,7 @@ pub struct GateWorkspace {
     source_root: PathBuf,
     path: PathBuf,
     hooks_path: PathBuf,
+    intent_path: PathBuf,
     workspace: Workspace,
 }
 
@@ -1118,7 +1421,12 @@ impl GateWorkspace {
 
 impl Drop for GateWorkspace {
     fn drop(&mut self) {
-        cleanup_gate_workspace(&self.source_root, &self.path, &self.hooks_path);
+        let _ = cleanup_gate_workspace(
+            &self.source_root,
+            &self.path,
+            &self.hooks_path,
+            &self.intent_path,
+        );
     }
 }
 
@@ -1188,6 +1496,42 @@ mod tests {
         let plain = env::temp_dir().join(format!("tactus-ws-plain-{}", std::process::id()));
         fs::create_dir_all(&plain).expect("plain dir");
         assert!(Workspace::open(&plain).is_err());
+    }
+
+    #[test]
+    fn sparse_checkout_is_refused_before_worker_spend() {
+        let repo = temp_repo("sparse-preflight");
+        // Set these in separate commands: update-index applies only the final
+        // mode option from one invocation. The combination guards against a
+        // detector accidentally keying off assume-unchanged's presentation.
+        run_git(&repo, &["update-index", "--skip-worktree", "README.md"]);
+        run_git(&repo, &["update-index", "--assume-unchanged", "README.md"]);
+        let workspace = Workspace::open(&repo).expect("open");
+
+        let error = workspace
+            .ensure_execution_prerequisites()
+            .expect_err("an incomplete index must fail closed")
+            .to_string();
+        assert!(error.contains("sparse checkout is active"), "{error}");
+        run_git(&repo, &["update-index", "--no-skip-worktree", "README.md"]);
+        run_git(
+            &repo,
+            &["update-index", "--no-assume-unchanged", "README.md"],
+        );
+        workspace
+            .ensure_execution_prerequisites()
+            .expect("a complete checkout is accepted");
+    }
+
+    #[test]
+    fn git_without_check_attr_source_is_refused_before_worker_spend() {
+        let error = require_check_attr_source(Err(TactusError::Git {
+            message: "error: unknown option `source=HEAD`".to_owned(),
+        }))
+        .expect_err("missing exact-tree attribute support must fail closed")
+        .to_string();
+        assert!(error.contains("Git 2.40 or newer"), "{error}");
+        assert!(error.contains("check-attr --source"), "{error}");
     }
 
     #[test]
@@ -2120,6 +2464,101 @@ mod tests {
         );
     }
 
+    #[test]
+    #[ignore = "subprocess helper"]
+    fn gate_snapshot_owner_helper() {
+        if env::var_os("TACTUS_SNAPSHOT_OWNER").is_none() {
+            return;
+        }
+        let repo = PathBuf::from(env::var_os("TACTUS_REPO").expect("repo path"));
+        let store = PathBuf::from(env::var_os("TACTUS_SNAPSHOT_STORE").expect("store path"));
+        let ready = PathBuf::from(env::var_os("TACTUS_READY").expect("ready path"));
+        let workspace = Workspace::open(&repo).expect("open helper workspace");
+        let parent = workspace.head_sha_full().expect("snapshot parent");
+        let tree = workspace.staged_tree_oid().expect("snapshot tree");
+        let snapshot = workspace
+            .gate_snapshot_for_candidate_in_store(&parent, &tree, &store)
+            .expect("create durable snapshot");
+        fs::write(
+            &ready,
+            snapshot.workspace().root().to_string_lossy().as_bytes(),
+        )
+        .expect("publish snapshot path");
+        std::thread::sleep(std::time::Duration::from_secs(30));
+        drop(snapshot);
+    }
+
+    #[test]
+    fn hard_killed_snapshot_owner_is_reclaimed_before_resume() {
+        let repo = temp_repo("snapshot-hard-kill");
+        let store = env::temp_dir().join(format!(
+            "tactus-snapshot-store-{}-{}",
+            std::process::id(),
+            crate::ulid::ulid()
+        ));
+        let ready = store.with_extension("ready");
+        let workspace = Workspace::open(&repo).expect("open");
+        let registrations_before = workspace
+            .git(&["worktree", "list", "--porcelain"])
+            .expect("registrations before");
+        let mut owner = Command::new(env::current_exe().expect("test executable"))
+            .args(["gate_snapshot_owner_helper", "--ignored", "--nocapture"])
+            .env("TACTUS_SNAPSHOT_OWNER", "1")
+            .env("TACTUS_REPO", &repo)
+            .env("TACTUS_SNAPSHOT_STORE", &store)
+            .env("TACTUS_READY", &ready)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn disposable snapshot owner");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+        while !ready.exists() && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(ready.exists(), "snapshot owner never published readiness");
+        let snapshot_path = PathBuf::from(
+            String::from_utf8(fs::read(&ready).expect("read snapshot path"))
+                .expect("test temp path is UTF-8"),
+        );
+        assert!(snapshot_path.exists(), "snapshot was not materialized");
+        assert_ne!(
+            workspace
+                .git(&["worktree", "list", "--porcelain"])
+                .expect("registrations while live"),
+            registrations_before,
+            "helper did not register a linked worktree"
+        );
+
+        owner.kill().expect("hard-kill snapshot owner");
+        owner.wait().expect("reap snapshot owner");
+        assert!(
+            snapshot_path.exists(),
+            "hard kill unexpectedly ran the snapshot destructor"
+        );
+        assert_eq!(
+            workspace
+                .reclaim_gate_workspaces(&store)
+                .expect("resume reclaims durable intents"),
+            1
+        );
+        assert!(!snapshot_path.exists(), "snapshot directory was reclaimed");
+        assert_eq!(
+            workspace
+                .git(&["worktree", "list", "--porcelain"])
+                .expect("registrations after reclaim"),
+            registrations_before,
+            "resume left a registered snapshot worktree"
+        );
+        assert_eq!(
+            workspace
+                .reclaim_gate_workspaces(&store)
+                .expect("reclamation is idempotent"),
+            0
+        );
+        let _ = fs::remove_file(ready);
+        let _ = fs::remove_dir_all(store);
+    }
+
     #[cfg(unix)]
     #[test]
     fn gate_snapshot_target_is_atomically_private() {
@@ -2130,6 +2569,7 @@ mod tests {
             .expect("atomically create private snapshot directories");
         let path = pending.path.clone();
         let hooks_path = pending.hooks_path.clone();
+        let intent_path = pending.intent_path.clone();
         assert_eq!(
             fs::metadata(&path)
                 .expect("snapshot metadata")
@@ -2153,9 +2593,19 @@ mod tests {
                 .next()
                 .is_none()
         );
+        assert_eq!(
+            fs::metadata(&intent_path)
+                .expect("intent metadata")
+                .permissions()
+                .mode()
+                & 0o777,
+            0o600,
+            "the durable intent is private before worktree registration"
+        );
         drop(pending);
         assert!(!path.exists());
         assert!(!hooks_path.exists());
+        assert!(!intent_path.exists());
     }
 
     #[cfg(target_os = "linux")]

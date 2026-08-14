@@ -1,13 +1,17 @@
 //! Subprocess supervision: run a command, feed stdin, drain both pipes
 //! concurrently (required on Windows — a full pipe buffer deadlocks a child
-//! that is still writing), and enforce a wall-clock timeout. Std-only; the
-//! tokio scheduler arrives in v0.2.
+//! that is still writing), and enforce a wall-clock timeout. The synchronous
+//! runner remains until the Tokio scheduler arrives in v0.2.
 //!
 //! Windows subtleties this module owns: `.cmd` shims (npm installs) mean the
-//! direct child is `cmd.exe`, so timeouts must kill the process *tree*
-//! (`taskkill /T`), and any orphan that inherited a pipe handle must not be
-//! able to stall the drain — readers accumulate into shared buffers that are
-//! snapshotted after a bounded grace instead of joined unconditionally.
+//! direct child is `cmd.exe`, so every invocation is placed in a private Job
+//! Object before its suspended primary thread is allowed to execute. Closing
+//! that handle kills ordinary descendants even when the direct child exits
+//! successfully or Tactus is terminated. Explicit cleanup uses the same job
+//! and a bounded wait; it never shells out to a PID-based tree walker. Any
+//! process that inherited a pipe handle must not be able to stall the drain —
+//! readers accumulate into shared buffers that are snapshotted after a bounded
+//! grace instead of joined unconditionally.
 //!
 //! Unix subtleties are the mirror image: each invocation gets an isolated
 //! process group so a timeout can kill every member, but that isolation
@@ -29,6 +33,7 @@
 //! -- or appear suspended -- while an isolated agent group is running.
 
 use std::io::{Read, Write};
+use std::ops::{Deref, DerefMut};
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -60,6 +65,56 @@ const DRAIN_GRACE_KILL: Duration = Duration::from_millis(500);
 /// Per stream. Readers continue draining after this point so the child cannot
 /// block on a full pipe while the supervisor notices and terminates its tree.
 const OUTPUT_LIMIT_BYTES: usize = 16 * 1024 * 1024;
+
+/// A direct child plus the platform primitive that owns its ordinary
+/// descendants. Keeping ownership beside `Child` prevents a successful wait
+/// from accidentally bypassing tree settlement.
+struct ProcessTree {
+    child: Child,
+    #[cfg(windows)]
+    job: windows_job::Job,
+}
+
+impl ProcessTree {
+    fn spawn(command: &mut Command) -> std::io::Result<Self> {
+        #[cfg(windows)]
+        {
+            let (child, job) = windows_job::spawn_suspended_in_job(command)?;
+            Ok(Self { child, job })
+        }
+        #[cfg(not(windows))]
+        {
+            command.spawn().map(|child| Self { child })
+        }
+    }
+
+    /// The direct child has already exited. Windows descendants remain job
+    /// members, so terminate and observe the job empty before returning its
+    /// status. Unix process-group settlement is owned by `termination`.
+    #[cfg(windows)]
+    fn finish_direct_exit(&mut self) -> Result<(), TactusError> {
+        self.job
+            .terminate_and_wait()
+            .map_err(|error| TactusError::Agent {
+                message: format!("settling the Windows agent job after direct-child exit: {error}"),
+            })?;
+        Ok(())
+    }
+}
+
+impl Deref for ProcessTree {
+    type Target = Child;
+
+    fn deref(&self) -> &Self::Target {
+        &self.child
+    }
+}
+
+impl DerefMut for ProcessTree {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.child
+    }
+}
 
 /// Run `command`, writing `stdin_data` to the child's stdin, with a hard
 /// wall-clock timeout. On timeout the child's owned process group is killed and
@@ -94,7 +149,7 @@ fn run_with_timeout_and_limit(
     termination.prepare(&mut command);
 
     let started = Instant::now();
-    let mut child = command.spawn().map_err(|e| TactusError::Agent {
+    let mut child = ProcessTree::spawn(&mut command).map_err(|e| TactusError::Agent {
         message: format!(
             "failed to spawn `{}`: {e}",
             command.get_program().to_string_lossy()
@@ -105,7 +160,7 @@ fn run_with_timeout_and_limit(
         // Drop the pre-exec reaper first: it still has an anchor pinning this
         // child's group identity and will kill every member before returning.
         drop(termination);
-        kill_tree(&mut child);
+        kill_tree(&mut child)?;
         return Err(error);
     }
 
@@ -187,21 +242,24 @@ fn run_with_timeout_and_limit(
     #[cfg(not(unix))]
     let code = loop {
         match child.try_wait() {
-            Ok(Some(status)) => break status.code(),
+            Ok(Some(status)) => {
+                child.finish_direct_exit()?;
+                break status.code();
+            }
             Ok(None) => {
                 if drain_limit_exceeded(&stdout_drain, &stderr_drain) {
                     output_limited = true;
-                    kill_tree(&mut child);
+                    kill_tree(&mut child)?;
                     break None;
                 } else if started.elapsed() >= timeout {
                     timed_out = true;
-                    kill_tree(&mut child);
+                    kill_tree(&mut child)?;
                     break None;
                 }
                 thread::sleep(Duration::from_millis(50));
             }
             Err(e) => {
-                kill_tree(&mut child);
+                kill_tree(&mut child)?;
                 return Err(TactusError::Agent {
                     message: format!("waiting on agent process: {e}"),
                 });
@@ -248,22 +306,223 @@ fn drain_limit_exceeded(stdout: &Option<Drain>, stderr: &Option<Drain>) -> bool 
 /// Kill the whole process tree. Killing only the direct child is not enough
 /// when it is a `cmd.exe` shim: the real agent process would survive, keep
 /// running, and keep the pipes open.
-fn kill_tree(child: &mut Child) {
+fn kill_tree(child: &mut ProcessTree) -> Result<(), TactusError> {
     #[cfg(windows)]
     {
-        let pid = child.id().to_string();
-        let _ = Command::new("taskkill")
-            .args(["/F", "/T", "/PID", &pid])
-            .output();
+        let cleanup = child.job.terminate_and_wait();
+        let _ = child.kill();
+        let _ = child.wait();
+        cleanup.map_err(|error| TactusError::Agent {
+            message: format!("terminating the Windows agent job: {error}"),
+        })
     }
-    #[cfg(unix)]
-    if let Ok(pid) = i32::try_from(child.id()) {
-        // SAFETY: `run_with_timeout` put this child in a new process group
-        // whose id is the child's pid. A negative pid targets that group only.
-        let _ = unsafe { libc::kill(-pid, libc::SIGKILL) };
+    #[cfg(not(windows))]
+    {
+        #[cfg(unix)]
+        if let Ok(pid) = i32::try_from(child.id()) {
+            // SAFETY: `run_with_timeout` put this child in a new process group
+            // whose id is the child's pid. A negative pid targets that group only.
+            let _ = unsafe { libc::kill(-pid, libc::SIGKILL) };
+        }
+        let _ = child.kill();
+        let _ = child.wait();
+        Ok(())
     }
-    let _ = child.kill();
-    let _ = child.wait();
+}
+
+#[cfg(windows)]
+mod windows_job {
+    use std::io;
+    use std::mem::size_of;
+    use std::os::windows::io::AsRawHandle;
+    use std::os::windows::process::CommandExt;
+    use std::process::{Child, Command};
+    use std::ptr;
+    use std::thread;
+    use std::time::{Duration, Instant};
+
+    use windows_sys::Win32::Foundation::{CloseHandle, HANDLE, INVALID_HANDLE_VALUE};
+    use windows_sys::Win32::System::Diagnostics::ToolHelp::{
+        CreateToolhelp32Snapshot, TH32CS_SNAPTHREAD, THREADENTRY32, Thread32First, Thread32Next,
+    };
+    use windows_sys::Win32::System::JobObjects::{
+        AssignProcessToJobObject, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+        JOBOBJECT_BASIC_ACCOUNTING_INFORMATION, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
+        JobObjectBasicAccountingInformation, JobObjectExtendedLimitInformation,
+        QueryInformationJobObject, SetInformationJobObject, TerminateJobObject,
+    };
+    use windows_sys::Win32::System::Threading::{
+        CREATE_SUSPENDED, OpenThread, ResumeThread, THREAD_SUSPEND_RESUME,
+    };
+
+    const CLEANUP_TIMEOUT: Duration = Duration::from_secs(2);
+
+    /// A non-inheritable Job Object configured before any supervised code can
+    /// run. The OS closes this handle on abrupt conductor death, and
+    /// KILL_ON_JOB_CLOSE then terminates every ordinary descendant.
+    pub(super) struct Job {
+        handle: HANDLE,
+    }
+
+    impl Job {
+        fn create() -> io::Result<Self> {
+            // SAFETY: null security attributes and name request an unnamed,
+            // non-inheritable job owned solely by this process.
+            let handle = unsafe {
+                windows_sys::Win32::System::JobObjects::CreateJobObjectW(ptr::null(), ptr::null())
+            };
+            if handle.is_null() {
+                return Err(io::Error::last_os_error());
+            }
+            let job = Self { handle };
+            let mut limits = JOBOBJECT_EXTENDED_LIMIT_INFORMATION::default();
+            limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+            // SAFETY: `limits` has exactly the layout and lifetime required by
+            // JobObjectExtendedLimitInformation; `job.handle` is live.
+            let configured = unsafe {
+                SetInformationJobObject(
+                    job.handle,
+                    JobObjectExtendedLimitInformation,
+                    ptr::from_ref(&limits).cast(),
+                    u32::try_from(size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>())
+                        .expect("job information structure fits in u32"),
+                )
+            };
+            if configured == 0 {
+                return Err(io::Error::last_os_error());
+            }
+            Ok(job)
+        }
+
+        pub(super) fn terminate_and_wait(&self) -> io::Result<()> {
+            // SAFETY: the handle remains live for this call and the requested
+            // exit code has no semantic meaning outside this private job.
+            if unsafe { TerminateJobObject(self.handle, 1) } == 0 {
+                return Err(io::Error::last_os_error());
+            }
+            let deadline = Instant::now() + CLEANUP_TIMEOUT;
+            loop {
+                if self.active_processes()? == 0 {
+                    return Ok(());
+                }
+                if Instant::now() >= deadline {
+                    return Err(io::Error::new(
+                        io::ErrorKind::TimedOut,
+                        "Windows agent job did not become empty within 2 seconds",
+                    ));
+                }
+                thread::sleep(Duration::from_millis(10));
+            }
+        }
+
+        fn active_processes(&self) -> io::Result<u32> {
+            let mut accounting = JOBOBJECT_BASIC_ACCOUNTING_INFORMATION::default();
+            // SAFETY: the output buffer is correctly typed and sized and the
+            // optional returned-length pointer is not needed.
+            let queried = unsafe {
+                QueryInformationJobObject(
+                    self.handle,
+                    JobObjectBasicAccountingInformation,
+                    ptr::from_mut(&mut accounting).cast(),
+                    u32::try_from(size_of::<JOBOBJECT_BASIC_ACCOUNTING_INFORMATION>())
+                        .expect("job accounting structure fits in u32"),
+                    ptr::null_mut(),
+                )
+            };
+            if queried == 0 {
+                return Err(io::Error::last_os_error());
+            }
+            Ok(accounting.ActiveProcesses)
+        }
+    }
+
+    impl Drop for Job {
+        fn drop(&mut self) {
+            // SAFETY: this object uniquely owns the non-inheritable handle.
+            // KILL_ON_JOB_CLOSE is the final fail-safe if explicit settlement
+            // returned an error or the conductor is being torn down.
+            let _ = unsafe { CloseHandle(self.handle) };
+        }
+    }
+
+    pub(super) fn spawn_suspended_in_job(command: &mut Command) -> io::Result<(Child, Job)> {
+        let job = Job::create()?;
+        command.creation_flags(CREATE_SUSPENDED);
+        let mut child = command.spawn()?;
+        // SAFETY: `Child` owns a live process handle. The primary thread is
+        // still suspended, so candidate code cannot create an escaping child
+        // between process creation and assignment to the job.
+        let assigned =
+            unsafe { AssignProcessToJobObject(job.handle, child.as_raw_handle() as HANDLE) };
+        if assigned == 0 {
+            let error = io::Error::last_os_error();
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(error);
+        }
+        if let Err(error) = resume_only_thread(child.id()) {
+            let _ = job.terminate_and_wait();
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(error);
+        }
+        Ok((child, job))
+    }
+
+    fn resume_only_thread(process_id: u32) -> io::Result<()> {
+        // CREATE_SUSPENDED prevents the process from creating another thread,
+        // so the one owned thread in this system snapshot is necessarily its
+        // primary thread.
+        // SAFETY: the snapshot call has no borrowed inputs.
+        let snapshot = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0) };
+        if snapshot == INVALID_HANDLE_VALUE {
+            return Err(io::Error::last_os_error());
+        }
+        let snapshot = Snapshot(snapshot);
+        let mut entry = THREADENTRY32 {
+            dwSize: u32::try_from(size_of::<THREADENTRY32>())
+                .expect("thread entry structure fits in u32"),
+            ..THREADENTRY32::default()
+        };
+        // SAFETY: `entry` advertises its correct size and remains writable.
+        if unsafe { Thread32First(snapshot.0, &mut entry) } == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        let thread_id = loop {
+            if entry.th32OwnerProcessID == process_id {
+                break entry.th32ThreadID;
+            }
+            // SAFETY: same valid snapshot and output entry as above.
+            if unsafe { Thread32Next(snapshot.0, &mut entry) } == 0 {
+                return Err(io::Error::new(
+                    io::ErrorKind::NotFound,
+                    "could not find the suspended agent primary thread",
+                ));
+            }
+        };
+        // SAFETY: the enumerated thread id belongs to the still-suspended
+        // child; the returned handle is non-inheritable.
+        let thread_handle = unsafe { OpenThread(THREAD_SUSPEND_RESUME, 0, thread_id) };
+        if thread_handle.is_null() {
+            return Err(io::Error::last_os_error());
+        }
+        let thread_handle = Snapshot(thread_handle);
+        // SAFETY: this handle has THREAD_SUSPEND_RESUME access and identifies
+        // the primary thread created suspended by `Command::spawn`.
+        if unsafe { ResumeThread(thread_handle.0) } == u32::MAX {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(())
+    }
+
+    struct Snapshot(HANDLE);
+
+    impl Drop for Snapshot {
+        fn drop(&mut self) {
+            // SAFETY: this wrapper uniquely owns its snapshot/thread handle.
+            let _ = unsafe { CloseHandle(self.0) };
+        }
+    }
 }
 
 #[cfg(unix)]
@@ -1276,14 +1535,14 @@ mod termination {
             return Err("Unix cleanup reaper did not initialize".to_owned());
         }
         #[cfg(test)]
-        if let Some(path) = std::env::var_os("TACTUS_TEST_REAPER_PID_PATH")
-            && let Err(error) = std::fs::write(&path, pid.to_string())
-        {
-            reaper.cancel();
-            return Err(format!(
-                "recording test cleanup-reaper pid at {}: {error}",
-                std::path::Path::new(&path).display()
-            ));
+        if let Some(path) = std::env::var_os("TACTUS_TEST_REAPER_PID_PATH") {
+            if let Err(error) = std::fs::write(&path, pid.to_string()) {
+                reaper.cancel();
+                return Err(format!(
+                    "recording test cleanup-reaper pid at {}: {error}",
+                    std::path::Path::new(&path).display()
+                ));
+            }
         }
         Ok(reaper)
     }
@@ -3178,26 +3437,32 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "subprocess helper"]
+    fn excessive_output_helper() {
+        if std::env::var_os("TACTUS_EXCESSIVE_OUTPUT_HELPER").is_none() {
+            return;
+        }
+        let chunk = [b'x'; 4096];
+        let mut stdout = std::io::stdout().lock();
+        loop {
+            stdout
+                .write_all(&chunk)
+                .expect("write deterministic excessive output");
+        }
+    }
+
+    #[test]
     fn excessive_output_is_bounded_and_terminates_the_tree() {
         const TEST_LIMIT: usize = 64 * 1024;
-        #[cfg(windows)]
-        let command = {
-            let mut command = Command::new("cmd.exe");
-            command.args([
-                "/D",
-                "/Q",
-                "/C",
-                "for /L %i in (1,1,2147483647) do @echo 0123456789abcdef",
-            ]);
-            command
-        };
-        #[cfg(not(windows))]
-        let command = shell("while :; do printf '0123456789abcdef\\n'; done");
+        let mut command = Command::new(std::env::current_exe().expect("test executable"));
+        command
+            .args(["excessive_output_helper", "--ignored", "--nocapture"])
+            .env("TACTUS_EXCESSIVE_OUTPUT_HELPER", "1");
 
         let started = Instant::now();
         let out = run_with_timeout_and_limit(command, "", Duration::from_secs(30), TEST_LIMIT)
             .expect("supervise noisy child");
-        assert!(out.output_limited);
+        assert!(out.output_limited, "supervised output: {out:?}");
         assert!(!out.timed_out);
         assert!(out.code.is_none());
         assert!(out.stdout.len() <= TEST_LIMIT);
@@ -3266,6 +3531,145 @@ mod tests {
         assert!(
             !leaked,
             "the timed-out process group's background grandchild survived"
+        );
+    }
+
+    #[cfg(windows)]
+    fn windows_descendant_command(ready: &std::path::Path, marker: &std::path::Path) -> Command {
+        let mut command = Command::new(std::env::current_exe().expect("test executable"));
+        command
+            .args(["windows_delayed_marker_helper", "--ignored", "--nocapture"])
+            .env("TACTUS_WINDOWS_DESCENDANT", "1")
+            .env("TACTUS_READY", ready)
+            .env("TACTUS_MARKER", marker)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        command
+    }
+
+    #[cfg(windows)]
+    fn windows_tree_scratch(tag: &str) -> std::path::PathBuf {
+        let scratch = std::env::temp_dir().join(format!(
+            "tactus-windows-job-{tag}-{}-{}",
+            std::process::id(),
+            crate::ulid::ulid()
+        ));
+        std::fs::create_dir_all(&scratch).expect("create Windows job scratch directory");
+        scratch
+    }
+
+    #[cfg(windows)]
+    fn wait_for_marker(path: &std::path::Path, timeout: Duration) {
+        let deadline = Instant::now() + timeout;
+        while !path.exists() && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert!(path.exists(), "{} was not created", path.display());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    #[ignore = "subprocess helper"]
+    fn windows_delayed_marker_helper() {
+        if std::env::var_os("TACTUS_WINDOWS_DESCENDANT").is_none() {
+            return;
+        }
+        let ready = std::env::var_os("TACTUS_READY").expect("ready path");
+        let marker = std::env::var_os("TACTUS_MARKER").expect("marker path");
+        std::fs::write(ready, b"ready").expect("announce descendant start");
+        thread::sleep(Duration::from_secs(1));
+        std::fs::write(marker, b"leaked").expect("write delayed marker");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    #[ignore = "subprocess helper"]
+    #[allow(clippy::zombie_processes)]
+    fn windows_direct_exit_parent_helper() {
+        if std::env::var_os("TACTUS_WINDOWS_DIRECT_PARENT").is_none() {
+            return;
+        }
+        let ready = std::path::PathBuf::from(std::env::var_os("TACTUS_READY").expect("ready path"));
+        let marker =
+            std::path::PathBuf::from(std::env::var_os("TACTUS_MARKER").expect("marker path"));
+        windows_descendant_command(&ready, &marker)
+            .spawn()
+            .expect("spawn ordinary descendant");
+        wait_for_marker(&ready, Duration::from_secs(10));
+        // Returning successfully while the child is live models a CLI shim
+        // whose real worker outlives it.
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn successful_direct_exit_kills_windows_descendants() {
+        let scratch = windows_tree_scratch("direct-exit");
+        let ready = scratch.join("ready");
+        let marker = scratch.join("marker");
+        let mut command = Command::new(std::env::current_exe().expect("test executable"));
+        command
+            .args([
+                "windows_direct_exit_parent_helper",
+                "--ignored",
+                "--nocapture",
+            ])
+            .env("TACTUS_WINDOWS_DIRECT_PARENT", "1")
+            .env("TACTUS_READY", &ready)
+            .env("TACTUS_MARKER", &marker);
+
+        let output = run_with_timeout(command, "", Duration::from_secs(20))
+            .expect("supervise direct-exit tree");
+        assert_eq!(output.code, Some(0), "supervised output: {output:?}");
+        assert!(ready.exists(), "the descendant never began executing");
+        thread::sleep(Duration::from_millis(1300));
+        let leaked = marker.exists();
+        let _ = std::fs::remove_dir_all(&scratch);
+        assert!(
+            !leaked,
+            "a Windows descendant outlived its successful parent"
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    #[ignore = "subprocess helper"]
+    fn windows_job_owner_helper() {
+        if std::env::var_os("TACTUS_WINDOWS_JOB_OWNER").is_none() {
+            return;
+        }
+        let ready = std::path::PathBuf::from(std::env::var_os("TACTUS_READY").expect("ready path"));
+        let marker =
+            std::path::PathBuf::from(std::env::var_os("TACTUS_MARKER").expect("marker path"));
+        let command = windows_descendant_command(&ready, &marker);
+        let _ = run_with_timeout(command, "", Duration::from_secs(30));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn kill_on_close_cleans_windows_descendants_after_conductor_death() {
+        let scratch = windows_tree_scratch("kill-on-close");
+        let ready = scratch.join("ready");
+        let marker = scratch.join("marker");
+        let mut owner = Command::new(std::env::current_exe().expect("test executable"))
+            .args(["windows_job_owner_helper", "--ignored", "--nocapture"])
+            .env("TACTUS_WINDOWS_JOB_OWNER", "1")
+            .env("TACTUS_READY", &ready)
+            .env("TACTUS_MARKER", &marker)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn disposable job owner");
+        wait_for_marker(&ready, Duration::from_secs(10));
+        owner.kill().expect("hard-kill disposable job owner");
+        owner.wait().expect("reap disposable job owner");
+
+        thread::sleep(Duration::from_millis(1300));
+        let leaked = marker.exists();
+        let _ = std::fs::remove_dir_all(&scratch);
+        assert!(
+            !leaked,
+            "kill-on-close did not terminate the owned descendant"
         );
     }
 

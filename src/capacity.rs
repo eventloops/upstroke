@@ -355,33 +355,35 @@ fn retire_signals(exhausted: &mut BTreeMap<String, Option<String>>, record: &Att
             && !(failure.kind == FailureKind::RateLimited
                 && failure.origin == crate::ladder::FailureOrigin::Worker)
     });
-    if worker_served && let Some(pool) = &record.pool {
-        exhausted.remove(pool);
+    if worker_served {
+        if let Some(pool) = &record.pool {
+            exhausted.remove(pool);
+        }
     }
     // A review pass that reached a verdict proves its own pool served, which on
     // a cross-vendor second opinion is a different subscription entirely.
     for review in &record.reviews {
-        if review.outcome != ReviewPassOutcome::Unavailable
-            && let Some(pool) = &review.pool
-        {
-            exhausted.remove(pool);
+        if review.outcome != ReviewPassOutcome::Unavailable {
+            if let Some(pool) = &review.pool {
+                exhausted.remove(pool);
+            }
         }
     }
     // The attempt settlement itself is the durable source of a rate-limit
     // signal. `pool_exhausted` remains useful detail, but a crash between the
     // two appends must not make replay forget which subscription refused work.
-    if let Some(failure) = &record.failure
-        && failure.kind == FailureKind::RateLimited
-    {
-        let pool = match failure.origin {
-            crate::ladder::FailureOrigin::Worker => record.pool.as_ref(),
-            crate::ladder::FailureOrigin::Reviewer => record
-                .reviews
-                .last()
-                .and_then(|review| review.pool.as_ref()),
-        };
-        if let Some(pool) = pool {
-            exhausted.insert(pool.clone(), None);
+    if let Some(failure) = &record.failure {
+        if failure.kind == FailureKind::RateLimited {
+            let pool = match failure.origin {
+                crate::ladder::FailureOrigin::Worker => record.pool.as_ref(),
+                crate::ladder::FailureOrigin::Reviewer => record
+                    .reviews
+                    .last()
+                    .and_then(|review| review.pool.as_ref()),
+            };
+            if let Some(pool) = pool {
+                exhausted.insert(pool.clone(), None);
+            }
         }
     }
 }
@@ -576,27 +578,28 @@ fn estimate_one(pool: &Pool, obs: &Observations) -> PoolEstimate {
     // draw is reported beside an Unknown remaining rather than dressed up as
     // one — §13's conservatism is about never overstating what is left, and
     // "we measured some spend" is not a measurement of the ceiling.
-    if let (Some(spend), Allowance::Units(allowance)) = (&self_spend, pool.monthly_allowance)
-        && allowance > 0.0
-        && let Some(usd) = spend.usd
-    {
-        let raw = 1.0 - (usd / allowance);
-        if take(
-            Remaining::AtMost(effective_remaining(raw, pool)),
-            Confidence::SelfMetered,
-        ) {
-            notes.push(
-                "a ceiling, not a measurement: this counts only what tactus spawned in this \
-                 repository, so earlier runs, other repositories, and your own interactive \
-                 sessions have all drawn against the same allowance unseen"
-                    .to_owned(),
-            );
-            if spend.unpriced > 0 {
-                notes.push(format!(
-                    "{} attempt(s) on this pool reported no spend, so even the draw behind that \
-                     ceiling is a floor (§13)",
-                    spend.unpriced
-                ));
+    if let (Some(spend), Allowance::Units(allowance)) = (&self_spend, pool.monthly_allowance) {
+        if allowance > 0.0 {
+            if let Some(usd) = spend.usd {
+                let raw = 1.0 - (usd / allowance);
+                if take(
+                    Remaining::AtMost(effective_remaining(raw, pool)),
+                    Confidence::SelfMetered,
+                ) {
+                    notes.push(
+                        "a ceiling, not a measurement: this counts only what tactus spawned in this \
+                         repository, so earlier runs, other repositories, and your own interactive \
+                         sessions have all drawn against the same allowance unseen"
+                            .to_owned(),
+                    );
+                    if spend.unpriced > 0 {
+                        notes.push(format!(
+                            "{} attempt(s) on this pool reported no spend, so even the draw behind that \
+                             ceiling is a floor (§13)",
+                            spend.unpriced
+                        ));
+                    }
+                }
             }
         }
     }
@@ -688,7 +691,7 @@ pub fn parse_duration(raw: &str) -> Option<Duration> {
 pub fn render_duration(duration: Duration) -> String {
     let seconds = duration.as_secs();
     for (unit, size) in [("d", 86_400u64), ("h", 3600), ("m", 60)] {
-        if seconds >= size && seconds.is_multiple_of(size) {
+        if seconds >= size && seconds % size == 0 {
             return format!("{}{unit}", seconds / size);
         }
     }

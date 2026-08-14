@@ -397,10 +397,10 @@ pub fn interpret(question: &Question, raw: &str) -> Answer {
     ) {
         return Answer::Declined;
     }
-    if let Ok(choice) = text.parse::<usize>()
-        && let Some(answer) = answer_for_option(question, choice)
-    {
-        return answer;
+    if let Ok(choice) = text.parse::<usize>() {
+        if let Some(answer) = answer_for_option(question, choice) {
+            return answer;
+        }
     }
     Answer::Answered {
         text: text.to_owned(),
