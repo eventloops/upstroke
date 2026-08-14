@@ -284,6 +284,9 @@ mod termination {
     const HANDLE_SIGTERM: u8 = 1 << 1;
     const HANDLE_SIGHUP: u8 = 1 << 2;
     const HANDLE_SIGQUIT: u8 = 1 << 3;
+    const HANDLE_SIGTSTP: u8 = 1 << 0;
+    const HANDLE_SIGTTIN: u8 = 1 << 1;
+    const HANDLE_SIGTTOU: u8 = 1 << 2;
     const REAPER_READY: u8 = 0x81;
     const REAPER_REGISTER: u8 = 0x82;
     const REAPER_CLEANUP: u8 = 0x83;
@@ -294,6 +297,7 @@ mod termination {
     struct SignalPolicy {
         termination_mask: u8,
         guard_wake_mask: u8,
+        stop_mask: u8,
         job_control: bool,
     }
 
@@ -325,6 +329,16 @@ mod termination {
                 _ => return false,
             };
             self.guard_wake_mask & bit != 0
+        }
+
+        fn handles_stop(self, signal: libc::c_int) -> bool {
+            let bit = match signal {
+                libc::SIGTSTP => HANDLE_SIGTSTP,
+                libc::SIGTTIN => HANDLE_SIGTTIN,
+                libc::SIGTTOU => HANDLE_SIGTTOU,
+                _ => return false,
+            };
+            self.stop_mask & bit != 0
         }
     }
 
@@ -522,6 +536,7 @@ mod termination {
         let mut policy = SignalPolicy {
             termination_mask: 0,
             guard_wake_mask: 0,
+            stop_mask: 0,
             job_control: false,
         };
         for (signal, bit) in [
@@ -539,8 +554,23 @@ mod termination {
                 SignalDisposition::Ignored => {}
             }
         }
-        policy.job_control = disposition(libc::SIGTSTP)? == SignalDisposition::Default
-            && disposition(libc::SIGCONT)? == SignalDisposition::Default;
+        for (signal, bit) in [
+            (libc::SIGTSTP, HANDLE_SIGTSTP),
+            (libc::SIGTTIN, HANDLE_SIGTTIN),
+            (libc::SIGTTOU, HANDLE_SIGTTOU),
+        ] {
+            if disposition(signal)? == SignalDisposition::Default {
+                policy.stop_mask |= bit;
+            }
+        }
+        let continue_disposition = disposition(libc::SIGCONT)?;
+        if policy.stop_mask != 0 && continue_disposition != SignalDisposition::Default {
+            return Err(
+                "cannot safely proxy default Unix job-control stops while the embedding host owns or ignores SIGCONT"
+                    .to_owned(),
+            );
+        }
+        policy.job_control = policy.stop_mask != 0;
         HANDLED_TERMINATION_MASK.store(policy.termination_mask, Ordering::SeqCst);
 
         let guard = spawn_guard(policy)?;
@@ -596,11 +626,15 @@ mod termination {
             }
         }
 
-        // Job-control proxying is useful only as a pair: if a launcher
-        // explicitly ignored either half, preserve that policy rather than
-        // stopping children we cannot reliably continue (or vice versa).
+        // Preserve every host-owned stop disposition. Each remaining default
+        // terminal stop is proxied, and the policy check above guarantees the
+        // matching default SIGCONT can release the isolated groups again.
         if policy.job_control {
-            install_handler(libc::SIGTSTP)?;
+            for signal in [libc::SIGTSTP, libc::SIGTTIN, libc::SIGTTOU] {
+                if policy.handles_stop(signal) {
+                    install_handler(signal)?;
+                }
+            }
             install_handler(libc::SIGCONT)?;
         }
         Ok(state)
@@ -686,7 +720,9 @@ mod termination {
 
     extern "C" fn record_signal(signal: libc::c_int) {
         match signal {
-            libc::SIGTSTP => SUSPEND_REQUESTED.store(true, Ordering::SeqCst),
+            libc::SIGTSTP | libc::SIGTTIN | libc::SIGTTOU => {
+                SUSPEND_REQUESTED.store(true, Ordering::SeqCst)
+            }
             libc::SIGCONT => {
                 CONTINUE_REQUESTED.store(true, Ordering::SeqCst);
                 notify_guard(signal);
@@ -996,6 +1032,7 @@ mod termination {
         use std::os::unix::ffi::OsStrExt;
 
         verify_group_scanner()?;
+        let parent = unsafe { libc::getpid() };
         let mut command = [-1; 2];
         let mut ack = [-1; 2];
         let cleanup_paths = crate::rundir::active_cleanup_lease_paths()
@@ -1065,7 +1102,7 @@ mod termination {
             if !lock_cleanup_paths(&cleanup_paths) {
                 unsafe { libc::_exit(1) };
             }
-            reaper_loop(command[0], ack[1], open_max, cleanup_delay_ms);
+            reaper_loop(parent, command[0], ack[1], open_max, cleanup_delay_ms);
         }
 
         // Close the parent's race with the child-side setpgid. Either call may
@@ -1183,6 +1220,7 @@ mod termination {
     }
 
     fn reaper_loop(
+        parent: libc::pid_t,
         command_fd: libc::c_int,
         ack_fd: libc::c_int,
         open_max: libc::c_int,
@@ -1190,41 +1228,84 @@ mod termination {
     ) -> ! {
         let mut pgid = 0_i32;
         let mut anchor = 0_i32;
+        let mut mirrored_parent_stop = false;
         if !write_raw(ack_fd, &[REAPER_READY]) {
             unsafe { libc::_exit(1) };
         }
         loop {
-            let mut frame = [0_u8; 5];
-            if !read_raw_exact(command_fd, &mut frame) {
+            let mut command = libc::pollfd {
+                fd: command_fd,
+                events: libc::POLLIN | libc::POLLHUP,
+                revents: 0,
+            };
+            // Before registration there is nothing to supervise, so block for
+            // the command. Afterwards, this separately isolated helper polls
+            // the parent state as well: SIGSTOP is uncatchable, and a stop of
+            // Tactus's foreground group must not leave its private agent group
+            // running until the terminal eventually continues it.
+            let timeout_ms = if pgid > 0 { 10 } else { -1 };
+            let polled = unsafe { libc::poll(&mut command, 1, timeout_ms) };
+            if polled < 0 {
+                if last_errno_is_interrupted() {
+                    continue;
+                }
                 if pgid > 0 {
                     cleanup_reaper_group(pgid, anchor, cleanup_delay_ms);
                 }
                 unsafe { libc::_exit(0) };
             }
-            let requested = i32::from_ne_bytes([frame[1], frame[2], frame[3], frame[4]]);
-            let accepted = match frame[0] {
-                REAPER_REGISTER if pgid == 0 && requested > 0 => {
-                    let created = spawn_group_anchor(requested, open_max);
-                    if created <= 0 {
-                        false
-                    } else {
-                        pgid = requested;
-                        anchor = created;
-                        true
-                    }
-                }
-                REAPER_CLEANUP if requested == pgid && pgid > 0 => {
-                    cleanup_reaper_group(pgid, anchor, cleanup_delay_ms);
-                    let _ = write_raw(ack_fd, &[REAPER_OK]);
-                    unsafe { libc::_exit(0) };
-                }
-                _ => false,
-            };
-            if !write_raw(ack_fd, &[if accepted { REAPER_OK } else { REAPER_FAIL }]) {
+            if polled > 0 && command.revents & (libc::POLLERR | libc::POLLNVAL) != 0 {
                 if pgid > 0 {
                     cleanup_reaper_group(pgid, anchor, cleanup_delay_ms);
                 }
                 unsafe { libc::_exit(0) };
+            }
+            if polled > 0 && command.revents & (libc::POLLIN | libc::POLLHUP) != 0 {
+                let mut frame = [0_u8; 5];
+                if !read_raw_exact(command_fd, &mut frame) {
+                    if pgid > 0 {
+                        cleanup_reaper_group(pgid, anchor, cleanup_delay_ms);
+                    }
+                    unsafe { libc::_exit(0) };
+                }
+                let requested = i32::from_ne_bytes([frame[1], frame[2], frame[3], frame[4]]);
+                let accepted = match frame[0] {
+                    REAPER_REGISTER if pgid == 0 && requested > 0 => {
+                        let created = spawn_group_anchor(requested, open_max);
+                        if created <= 0 {
+                            false
+                        } else {
+                            pgid = requested;
+                            anchor = created;
+                            true
+                        }
+                    }
+                    REAPER_CLEANUP if requested == pgid && pgid > 0 => {
+                        cleanup_reaper_group(pgid, anchor, cleanup_delay_ms);
+                        let _ = write_raw(ack_fd, &[REAPER_OK]);
+                        unsafe { libc::_exit(0) };
+                    }
+                    _ => false,
+                };
+                if !write_raw(ack_fd, &[if accepted { REAPER_OK } else { REAPER_FAIL }]) {
+                    if pgid > 0 {
+                        cleanup_reaper_group(pgid, anchor, cleanup_delay_ms);
+                    }
+                    unsafe { libc::_exit(0) };
+                }
+            }
+
+            if pgid > 0 && unsafe { libc::getppid() } == parent {
+                match process_is_stopped(parent) {
+                    Some(true) if !mirrored_parent_stop => {
+                        mirrored_parent_stop = unsafe { libc::kill(-pgid, libc::SIGSTOP) } == 0;
+                    }
+                    Some(false) if mirrored_parent_stop => {
+                        let _ = unsafe { libc::kill(-pgid, libc::SIGCONT) };
+                        mirrored_parent_stop = false;
+                    }
+                    _ => {}
+                }
             }
         }
     }
@@ -1960,22 +2041,45 @@ mod termination {
 
     fn verify_group_scanner() -> Result<(), String> {
         let own_group = unsafe { libc::getpgrp() };
+        let own_pid = unsafe { libc::getpid() };
         // Process enumeration can race an unrelated process exiting. Retry a
-        // few complete snapshots, but refuse before launching an agent when
-        // the platform capability is persistently absent (for example a
-        // Linux container without a mounted/readable procfs).
-        for _ in 0..5 {
-            match group_has_non_zombie_members(own_group) {
-                Some(true) => return Ok(()),
-                Some(false) => {
+        // bounded realistic interval, but refuse before launching an agent
+        // when either cleanup enumeration or parent-state observation is
+        // persistently absent (for example a Linux container without a
+        // mounted/readable procfs).
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        loop {
+            match (
+                group_has_non_zombie_members(own_group),
+                process_is_stopped(own_pid),
+            ) {
+                (Some(true), Some(false)) => return Ok(()),
+                (Some(false), _) => {
                     return Err(format!(
                         "Unix process-group scanner did not find the current group {own_group}"
                     ));
                 }
-                None => thread::sleep(Duration::from_millis(1)),
+                (Some(true), Some(true)) => {
+                    return Err(
+                        "Unix parent-state scanner reported the running Tactus process as stopped"
+                            .to_owned(),
+                    );
+                }
+                _ if std::time::Instant::now() < deadline => {
+                    thread::sleep(Duration::from_millis(1));
+                }
+                _ => break,
             }
         }
         Err("Unix process-group scanner is unavailable; refusing to launch an agent whose cleanup could not be verified".to_owned())
+    }
+
+    #[cfg(target_os = "linux")]
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum LinuxStatSnapshot {
+        Present { pgid: i32, state: u8 },
+        Vanished,
+        Invalid,
     }
 
     #[cfg(target_os = "linux")]
@@ -2029,19 +2133,18 @@ mod termination {
                     .unwrap_or(name.len());
                 if let Some(pid) = parse_decimal(&name[..name_len]) {
                     match read_linux_stat_raw(pid) {
-                        Some((candidate, state))
-                            if candidate == pgid && !matches!(state, b'Z' | b'X' | b'x') =>
-                        {
+                        LinuxStatSnapshot::Present {
+                            pgid: candidate,
+                            state,
+                        } if candidate == pgid && !matches!(state, b'Z' | b'X' | b'x') => {
                             close_fd(directory);
                             return Some(true);
                         }
-                        Some(_) => {}
-                        // A process may have disappeared between enumeration
-                        // and stat; the next scan resolves that ordinary race.
-                        // Treat every unreadable or malformed snapshot as
-                        // unknown for this pass rather than guessing it was an
-                        // unrelated/dead member and releasing cleanup early.
-                        None => {
+                        LinuxStatSnapshot::Present { .. } | LinuxStatSnapshot::Vanished => {}
+                        // Permission failures and malformed snapshots remain
+                        // fail-closed. Only a kernel-confirmed vanished PID is
+                        // safe to skip as ordinary process churn.
+                        LinuxStatSnapshot::Invalid => {
                             close_fd(directory);
                             return None;
                         }
@@ -2053,18 +2156,27 @@ mod termination {
     }
 
     #[cfg(target_os = "linux")]
-    fn read_linux_stat_raw(pid: i32) -> Option<(i32, u8)> {
+    fn read_linux_stat_raw(pid: i32) -> LinuxStatSnapshot {
         let mut path = [0_u8; 64];
         let prefix = b"/proc/";
         path[..prefix.len()].copy_from_slice(prefix);
         let mut end = prefix.len();
-        end += write_decimal(pid, &mut path[end..])?;
+        let Some(written) = write_decimal(pid, &mut path[end..]) else {
+            return LinuxStatSnapshot::Invalid;
+        };
+        end += written;
         let suffix = b"/stat\0";
-        path.get_mut(end..end + suffix.len())?
-            .copy_from_slice(suffix);
+        let Some(target) = path.get_mut(end..end + suffix.len()) else {
+            return LinuxStatSnapshot::Invalid;
+        };
+        target.copy_from_slice(suffix);
         let fd = unsafe { libc::open(path.as_ptr().cast(), libc::O_RDONLY | libc::O_CLOEXEC) };
         if fd < 0 {
-            return None;
+            return if matches!(last_errno(), libc::ENOENT | libc::ESRCH) {
+                LinuxStatSnapshot::Vanished
+            } else {
+                LinuxStatSnapshot::Invalid
+            };
         }
         let mut stat = [0_u8; 2_048];
         let count = loop {
@@ -2074,11 +2186,25 @@ mod termination {
             }
             break read;
         };
+        let read_errno = (count < 0).then(last_errno);
         close_fd(fd);
+        if matches!(read_errno, Some(libc::ENOENT | libc::ESRCH)) {
+            return LinuxStatSnapshot::Vanished;
+        }
         if count <= 0 {
-            return None;
+            return LinuxStatSnapshot::Invalid;
         }
         parse_linux_stat_bytes(&stat[..count as usize])
+            .map(|(pgid, state)| LinuxStatSnapshot::Present { pgid, state })
+            .unwrap_or(LinuxStatSnapshot::Invalid)
+    }
+
+    #[cfg(target_os = "linux")]
+    fn process_is_stopped(pid: i32) -> Option<bool> {
+        match read_linux_stat_raw(pid) {
+            LinuxStatSnapshot::Present { state, .. } => Some(matches!(state, b'T' | b't')),
+            LinuxStatSnapshot::Vanished | LinuxStatSnapshot::Invalid => None,
+        }
     }
 
     #[cfg(target_os = "linux")]
@@ -2185,7 +2311,7 @@ mod termination {
                 )
             };
             if read != std::mem::size_of::<libc::proc_bsdshortinfo>() as libc::c_int {
-                // As on Linux, a disappearing pid is resolved by the next
+                // A disappearing target-group pid is resolved by the next
                 // complete snapshot. Never turn an incomplete observation
                 // into permission to release the cleanup lease.
                 return None;
@@ -2195,6 +2321,22 @@ mod termination {
             }
         }
         Some(false)
+    }
+
+    #[cfg(target_os = "macos")]
+    fn process_is_stopped(pid: i32) -> Option<bool> {
+        let mut info: libc::proc_bsdshortinfo = unsafe { std::mem::zeroed() };
+        let read = unsafe {
+            libc::proc_pidinfo(
+                pid,
+                libc::PROC_PIDT_SHORTBSDINFO,
+                0,
+                (&mut info as *mut libc::proc_bsdshortinfo).cast(),
+                std::mem::size_of::<libc::proc_bsdshortinfo>() as libc::c_int,
+            )
+        };
+        (read == std::mem::size_of::<libc::proc_bsdshortinfo>() as libc::c_int)
+            .then_some(info.pbsi_status == libc::SSTOP)
     }
 
     fn set_close_on_exec(fd: libc::c_int) -> bool {
@@ -2563,6 +2705,12 @@ mod termination {
             assert_eq!(parse_linux_stat_bytes(stat.as_bytes()), Some((123, b'T')));
             assert_eq!(parse_linux_process_stat("malformed"), None);
             assert_eq!(parse_linux_stat_bytes(b"malformed"), None);
+        }
+
+        #[cfg(target_os = "linux")]
+        #[test]
+        fn a_vanished_linux_pid_is_not_an_incomplete_scanner_snapshot() {
+            assert_eq!(read_linux_stat_raw(i32::MAX), LinuxStatSnapshot::Vanished);
         }
 
         #[test]
@@ -2946,6 +3094,17 @@ mod tests {
                 libc::SIG_ERR
             );
         }
+        if std::env::var_os("TACTUS_CUSTOM_CONTINUE_HANDLER").is_some() {
+            assert_ne!(
+                unsafe {
+                    libc::signal(
+                        libc::SIGCONT,
+                        record_custom_continue as *const () as libc::sighandler_t,
+                    )
+                },
+                libc::SIG_ERR
+            );
+        }
         let custom_aux_signal = std::env::var_os("TACTUS_CUSTOM_AUX_SIGNAL_HANDLER").is_some();
         if custom_aux_signal {
             CUSTOM_AUX_SIGNAL_SEEN.store(false, std::sync::atomic::Ordering::SeqCst);
@@ -2992,8 +3151,18 @@ mod tests {
         if let Some(finish) = std::env::var_os("TACTUS_FINISH") {
             command.env("TACTUS_FINISH", finish);
         }
-        let output =
-            run_with_timeout(command, "", Duration::from_secs(30)).expect("signal helper command");
+        let result = run_with_timeout(command, "", Duration::from_secs(30));
+        if std::env::var_os("TACTUS_EXPECT_JOB_CONTROL_REFUSAL").is_some() {
+            let error = result.expect_err("host-owned SIGCONT must refuse default stop proxying");
+            assert!(
+                error
+                    .to_string()
+                    .contains("cannot safely proxy default Unix job-control stops"),
+                "unexpected policy error: {error}"
+            );
+            return;
+        }
+        let output = result.expect("signal helper command");
         if std::env::var_os("TACTUS_SIGNAL_HELPER_EXPECT_RETURN").is_some() {
             assert_eq!(output.code, Some(0), "supervised output: {output:?}");
             if custom_handler {
@@ -3052,6 +3221,9 @@ mod tests {
             let _ = unsafe { libc::kill(parent, libc::SIGKILL) };
         }
     }
+
+    #[cfg(unix)]
+    extern "C" fn record_custom_continue(_: libc::c_int) {}
 
     #[cfg(unix)]
     extern "C" fn record_custom_aux_signal(_: libc::c_int) {
@@ -3354,6 +3526,45 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn a_host_owned_sigcont_rejects_default_stop_proxying_before_launch() {
+        use std::os::unix::process::CommandExt;
+
+        let scratch = std::env::temp_dir().join(format!(
+            "tactus-proc-custom-cont-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock after epoch")
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&scratch).expect("custom-cont scratch");
+        let ready = scratch.join("ready");
+        let output = Command::new(std::env::current_exe().expect("test executable"))
+            .args(["terminal_interrupt_helper", "--ignored", "--nocapture"])
+            .env("TACTUS_SIGNAL_HELPER", "1")
+            .env("TACTUS_CUSTOM_CONTINUE_HANDLER", "1")
+            .env("TACTUS_EXPECT_JOB_CONTROL_REFUSAL", "1")
+            .env("TACTUS_READY", &ready)
+            .env("TACTUS_MARKER", scratch.join("marker"))
+            .env("TACTUS_FINISH", scratch.join("finish"))
+            .process_group(0)
+            .output()
+            .expect("run custom-SIGCONT policy helper");
+        assert!(
+            output.status.success(),
+            "custom-SIGCONT helper failed: {}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            !ready.exists(),
+            "an agent launched under the unsafe signal policy"
+        );
+        let _ = std::fs::remove_dir_all(&scratch);
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn arbitrary_host_callbacks_never_run_in_private_helpers() {
         let mut helper = spawn_signal_helper("custom-aux-signal", true, false);
         let parent = helper.pid();
@@ -3443,6 +3654,52 @@ mod tests {
         };
         drop(recovered);
         helper.complete();
+    }
+
+    #[cfg(unix)]
+    fn assert_stop_covers_the_isolated_tree(signal: libc::c_int, tag: &str) {
+        let mut helper = spawn_signal_helper(tag, true, false);
+        let pid = helper.pid();
+        assert_eq!(unsafe { libc::kill(-pid, signal) }, 0);
+        assert!(
+            wait_for_stop(pid, Duration::from_secs(10)),
+            "Tactus did not stop for signal {signal}"
+        );
+
+        let before = std::fs::read_to_string(&helper.marker)
+            .unwrap_or_else(|error| panic!("progress before signal {signal}: {error}"));
+        thread::sleep(Duration::from_millis(350));
+        let after = std::fs::read_to_string(&helper.marker)
+            .unwrap_or_else(|error| panic!("progress after signal {signal}: {error}"));
+        assert_eq!(
+            after, before,
+            "the isolated agent kept making progress while Tactus was stopped by signal {signal}"
+        );
+
+        std::fs::write(&helper.finish, "finish").expect("release supervised worker");
+        assert_eq!(unsafe { libc::kill(-pid, libc::SIGCONT) }, 0);
+        let status = wait_for_exit(&mut helper.child, Duration::from_secs(10))
+            .unwrap_or_else(|| panic!("signal {signal} left the supervised tree stranded"));
+        let diagnostic = helper.diagnostic();
+        helper.complete();
+        assert!(status.success(), "helper status: {status}\n{diagnostic}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn terminal_input_and_output_stops_cover_the_isolated_tree() {
+        for (signal, tag) in [
+            (libc::SIGTTIN, "job-control-ttin"),
+            (libc::SIGTTOU, "job-control-ttou"),
+        ] {
+            assert_stop_covers_the_isolated_tree(signal, tag);
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn uncatchable_sigstop_covers_the_isolated_tree() {
+        assert_stop_covers_the_isolated_tree(libc::SIGSTOP, "job-control-sigstop");
     }
 
     #[cfg(unix)]

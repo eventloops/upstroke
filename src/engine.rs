@@ -2075,11 +2075,32 @@ impl Run<'_> {
                 }
             };
 
+            let parking = if let Some(failure) = result
+                .failure
+                .as_ref()
+                .filter(|failure| failure.kind == FailureKind::ReviewInputTooLarge)
+            {
+                let context = question_context(
+                    task,
+                    QuestionKind::Unblock,
+                    failure,
+                    &self.state.progress[index],
+                );
+                Some(Box::new(events::AttemptParking {
+                    question: self.prepare_question(index, QuestionKind::Unblock, context)?,
+                    refund_attempt: false,
+                }))
+            } else {
+                None
+            };
+            let policy_parked = parking.is_some();
+
             self.emit(EventBody::AttemptFinished {
                 task: task_id.clone(),
                 attempt,
                 rung: rung_number,
                 profile: profile.name.clone(),
+                parking,
                 data: Box::new(AttemptRecord {
                     attempt,
                     tier: rung.tier.to_string(),
@@ -2164,6 +2185,11 @@ impl Run<'_> {
             // run before this one does again.
             if !matches!(next, Next::RetrySameRung { resume: true }) {
                 self.workspace.discard_uncommitted()?;
+            }
+
+            if policy_parked {
+                debug_assert_eq!(next, Next::AskHuman(QuestionKind::Unblock));
+                return Ok(false);
             }
 
             match next {
@@ -2531,6 +2557,26 @@ impl Run<'_> {
         kind: QuestionKind,
         context: String,
     ) -> Result<QuestionId, TactusError> {
+        let question = self.prepare_question(index, kind, context)?;
+        let id = question.id.clone();
+        self.emit(EventBody::QuestionRaised {
+            task: self.analysis.plan.tasks[index].id.to_string(),
+            data: Box::new(events::QuestionRaised { question }),
+        })?;
+        Ok(id)
+    }
+
+    /// Materialize and announce a question before its authoritative event.
+    ///
+    /// Most callers follow this with `question_raised`. A policy refusal can
+    /// instead embed the same question in `attempt_finished`, making the paid
+    /// settlement and its parking state one crash-atomic replay transition.
+    fn prepare_question(
+        &mut self,
+        index: usize,
+        kind: QuestionKind,
+        context: String,
+    ) -> Result<Question, TactusError> {
         let task = &self.analysis.plan.tasks[index];
         let question = Question {
             id: interaction::new_question_id(),
@@ -2553,17 +2599,14 @@ impl Run<'_> {
                 ));
             }
         }
-        // The payload lands on disk before the event, so a reader that sees
-        // `question_raised` can always open the file it names.
+        // The payload lands on disk before the authoritative event, so a
+        // reader that folds either `question_raised` or an atomically parked
+        // `attempt_finished` can always open the file it names.
         interaction::write_question(
             &self.paths.questions(),
             &QuestionRecord::open(question.clone()),
         )?;
-        self.emit(EventBody::QuestionRaised {
-            task: self.analysis.plan.tasks[index].id.to_string(),
-            data: Box::new(events::QuestionRaised { question }),
-        })?;
-        Ok(id)
+        Ok(question)
     }
 
     /// Ingest answers left by `tactus answer` in another process.
@@ -4761,9 +4804,13 @@ mod tests {
         let report = run_with(&opts, &source).expect("policy failure is a settled run outcome");
 
         assert_eq!(report.outcome(), RunOutcome::Parked, "{report:?}");
-        let task = task(&report, "t1");
-        assert_eq!(task.attempts.len(), 1, "the policy boundary is not retried");
-        let attempt = &task.attempts[0];
+        let task_report = task(&report, "t1");
+        assert_eq!(
+            task_report.attempts.len(),
+            1,
+            "the policy boundary is not retried"
+        );
+        let attempt = &task_report.attempts[0];
         let failure = attempt.failure.as_ref().expect("settled policy failure");
         assert_eq!(failure.kind, FailureKind::ReviewInputTooLarge);
         assert_eq!(failure.origin, FailureOrigin::Reviewer);
@@ -4781,6 +4828,21 @@ mod tests {
                 .count(),
             1,
             "the attempt has a terminal ledger event"
+        );
+        let parking = logged.iter().find_map(|event| match &event.body {
+            EventBody::AttemptFinished { parking, .. } => parking.as_deref(),
+            _ => None,
+        });
+        assert!(
+            parking.is_some(),
+            "the settlement atomically carries its parking question"
+        );
+        assert!(
+            !logged.iter().any(|event| matches!(
+                event.body,
+                EventBody::QuestionRaised { .. } | EventBody::TaskParked { .. }
+            )),
+            "policy parking must not reopen a crash window with follow-up events"
         );
         assert!(
             !logged
@@ -4801,6 +4863,28 @@ mod tests {
                 && !question.question.context.contains("all failed"),
             "policy parking must not pretend the escalation chain was exhausted: {}",
             question.question.context
+        );
+
+        // Rewind to the exact atomic settlement, then add dirty residue to
+        // model death before ordinary post-attempt cleanup. Replay must retain
+        // both the paid ledger line and the question, discard the residue, and
+        // never dispatch another worker for the known-oversized identity.
+        let paths = paths_of(&repo, &report.run_id);
+        truncate_log_after(&paths, "attempt_finished");
+        fs::write(repo.join("crash-residue.txt"), "unreviewed\n").expect("crash residue");
+        let retry = fake(Effect::EditFile);
+        let resumed =
+            resume_with(&resume_options(&repo, &report.run_id), &retry).expect("resume parks");
+        assert_eq!(resumed.outcome(), RunOutcome::Parked, "{resumed:?}");
+        assert!(
+            retry.adapter.runs().is_empty(),
+            "resume paid for the oversized attempt again"
+        );
+        assert_eq!(task(&resumed, "t1").attempts.len(), 1);
+        assert_eq!(resumed.questions.len(), 1);
+        assert!(
+            git_in(&repo, &["status", "--porcelain"]).trim().is_empty(),
+            "resume did not discard crash residue"
         );
     }
 
@@ -8618,6 +8702,19 @@ mod tests {
             .iter()
             .position(|line| line.contains(&format!("\"{event}\"")))
             .unwrap_or_else(|| panic!("the run recorded no {event}"));
+        fs::write(paths.events(), format!("{}\n", lines[..cut].join("\n"))).expect("truncate");
+    }
+
+    /// Rewind a log through the named event — the shape a process killed
+    /// immediately after its durable transition leaves behind.
+    fn truncate_log_after(paths: &RunPaths, event: &str) {
+        let text = fs::read_to_string(paths.events()).expect("log");
+        let lines: Vec<&str> = text.lines().collect();
+        let cut = lines
+            .iter()
+            .position(|line| line.contains(&format!("\"{event}\"")))
+            .unwrap_or_else(|| panic!("the run recorded no {event}"))
+            + 1;
         fs::write(paths.events(), format!("{}\n", lines[..cut].join("\n"))).expect("truncate");
     }
 

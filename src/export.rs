@@ -117,6 +117,7 @@ struct Settlement<'a> {
     ts: &'a str,
     profile: &'a str,
     record: &'a AttemptRecord,
+    parking: Option<&'a events::AttemptParking>,
 }
 
 struct RunContext<'a> {
@@ -347,13 +348,14 @@ fn settlements<'a>(
 ) -> Result<BTreeMap<AttemptKey, Settlement<'a>>, TactusError> {
     let mut out = BTreeMap::new();
     for (index, event) in log.iter().enumerate() {
-        let (kind, task, attempt, rung, profile, record) = match &event.body {
+        let (kind, task, attempt, rung, profile, record, parking) = match &event.body {
             EventBody::AttemptFinished {
                 task,
                 attempt,
                 rung,
                 profile,
                 data,
+                parking,
             } => (
                 SettlementKind::Finished,
                 task,
@@ -361,6 +363,7 @@ fn settlements<'a>(
                 rung,
                 profile,
                 &**data,
+                parking.as_deref(),
             ),
             EventBody::AttemptInterrupted {
                 task,
@@ -375,6 +378,7 @@ fn settlements<'a>(
                 rung,
                 profile,
                 &**data,
+                None,
             ),
             _ => continue,
         };
@@ -388,6 +392,7 @@ fn settlements<'a>(
                     ts: &event.ts,
                     profile,
                     record,
+                    parking,
                 },
             )
             .is_some()
@@ -429,6 +434,21 @@ fn validate_settlement(
         .failure
         .as_ref()
         .map(|failure| failure.kind);
+    if let Some(parking) = settlement.parking {
+        let failure = settlement.record.failure.as_ref();
+        if failure_kind != Some(FailureKind::ReviewInputTooLarge)
+            || failure.map(|failure| failure.origin) != Some(FailureOrigin::Reviewer)
+            || parking.refund_attempt
+            || parking.question.kind != crate::ir::QuestionKind::Unblock
+            || parking.question.affected_tasks.len() != 1
+            || parking.question.affected_tasks[0].as_str() != key.0
+        {
+            return invalid(
+                path,
+                format!("invalid atomic policy parking for {}", key_text(key)),
+            );
+        }
+    }
     match settlement.kind {
         SettlementKind::Finished if failure_kind == Some(FailureKind::Interrupted) => invalid(
             path,
@@ -1802,6 +1822,54 @@ mod tests {
     }
 
     #[test]
+    fn atomic_policy_parking_is_bound_to_its_review_refusal_and_task() {
+        let parked_finish = || {
+            let mut finish = attempt_finished(
+                "task",
+                1,
+                "2026-08-01T00:00:02.000Z",
+                Some(FailureKind::ReviewInputTooLarge),
+                false,
+            );
+            finish["data"]["failure"]["origin"] = json!("reviewer");
+            finish["parking"] = json!({
+                "question": {
+                    "id": "q-01ATOMIC",
+                    "kind": "unblock",
+                    "affected_tasks": ["task"],
+                    "context": "split the exact diff",
+                    "options": ["retry with a smaller diff"]
+                },
+                "refund_attempt": false
+            });
+            finish
+        };
+        let events = |finish| {
+            vec![
+                run_started(&["task"]),
+                attempt_started("task", 1, "2026-08-01T00:00:01.000Z", false),
+                finish,
+            ]
+        };
+
+        let valid = Fixture::new(
+            "valid-atomic-parking",
+            events(parked_finish()),
+            vec![task("task", "task")],
+        );
+        assert_eq!(valid.rows().len(), 1);
+
+        let mut wrong_task = parked_finish();
+        wrong_task["parking"]["question"]["affected_tasks"] = json!(["other"]);
+        let invalid = Fixture::new(
+            "wrong-atomic-parking-task",
+            events(wrong_task),
+            vec![task("task", "task")],
+        );
+        assert!(load_error(&invalid).contains("invalid atomic policy parking"));
+    }
+
+    #[test]
     fn duplicate_and_orphan_attempt_events_are_refused() {
         let start = attempt_started("task", 1, "2026-08-01T00:00:01.000Z", false);
         let duplicate_start = Fixture::new(
@@ -1848,6 +1916,7 @@ mod tests {
             (FailureKind::AgentError, "provider", "none"),
             (FailureKind::RateLimited, "provider", "none"),
             (FailureKind::ReviewUnavailable, "provider", "none"),
+            (FailureKind::ReviewInputTooLarge, "policy", "review"),
             (FailureKind::Timeout, "infrastructure", "none"),
             (FailureKind::Interrupted, "infrastructure", "none"),
             (FailureKind::NoChain, "policy", "none"),

@@ -418,7 +418,10 @@ allowing it to resume a new run could accept code whose earlier paths were never
 shown to the reviewer. Fresh runs therefore write schema 3, and a current binary
 resuming a schema-1 or schema-2 run appends a transition to 3 before another
 attempt. Older binaries refuse that opening schema or transition instead of
-silently applying the weaker verification standard.
+silently applying the weaker verification standard. When the exact diff is too
+large for that contract, `attempt_finished` embeds the unblock question and
+parks the task in the same replay transition; it is not followed by separate
+`question_raised`/`task_parked` events that a crash could strand between.
 
 The v0.2 execution topology consequently begins at event schema 4 because its
 task states and transactions change execution meaning. Fresh topology runs write

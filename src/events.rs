@@ -123,6 +123,12 @@ pub enum EventBody {
         rung: u32,
         profile: String,
         data: Box<AttemptRecord>,
+        /// A policy refusal that must finish the paid attempt and park the
+        /// task atomically. Without this, a crash between `attempt_finished`
+        /// and the separate question/parking events can replay the task as
+        /// pending and pay for the same known-unreviewable attempt again.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        parking: Option<Box<AttemptParking>>,
     },
     /// The `attempt_finished` a dead process never got to write.
     ///
@@ -555,6 +561,12 @@ pub struct AttemptRecord {
     pub usage: Option<crate::ir::Usage>,
     /// `None` when the attempt passed.
     pub failure: Option<FailureRecord>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AttemptParking {
+    pub question: Question,
+    pub refund_attempt: bool,
 }
 
 impl AttemptRecord {
@@ -1091,16 +1103,32 @@ impl RunState {
                 progress.records.push((**data).clone());
             }
 
-            EventBody::AttemptFinished { task, data, .. } => {
+            EventBody::AttemptFinished {
+                task,
+                data,
+                parking,
+                ..
+            } => {
                 let Some(index) = self.index_of(task) else {
                     return;
                 };
-                let progress = &mut self.progress[index];
-                progress.in_flight = None;
-                if let Some(session) = &data.session_id {
-                    progress.session = Some(session.clone());
+                {
+                    let progress = &mut self.progress[index];
+                    progress.in_flight = None;
+                    if let Some(session) = &data.session_id {
+                        progress.session = Some(session.clone());
+                    }
+                    progress.records.push((**data).clone());
                 }
-                progress.records.push((**data).clone());
+                if let Some(parking) = parking {
+                    if parking.refund_attempt {
+                        self.progress[index].attempts_on_rung =
+                            self.progress[index].attempts_on_rung.saturating_sub(1);
+                    }
+                    self.questions
+                        .push(QuestionRecord::open(parking.question.clone()));
+                    self.states[index] = TaskState::AwaitingInput(parking.question.id.clone());
+                }
             }
 
             EventBody::LadderRetry {
@@ -1879,6 +1907,7 @@ mod tests {
             attempt,
             rung,
             profile: format!("{tier}-model"),
+            parking: None,
             data: Box::new(AttemptRecord {
                 attempt,
                 tier: tier.to_owned(),

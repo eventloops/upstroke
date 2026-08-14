@@ -1026,6 +1026,7 @@ mod tests {
                 attempt: 1,
                 rung: 0,
                 profile: "p".to_owned(),
+                parking: None,
                 data: Box::new(AttemptRecord {
                     attempt: 1,
                     tier: "small".to_owned(),

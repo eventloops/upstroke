@@ -215,11 +215,27 @@ pub fn describe(event: &Event) -> String {
             task,
             attempt,
             data,
+            parking,
             ..
-        } => match &data.failure {
-            Some(failure) => format!("{task}: attempt {attempt} failed — {}", failure.reason),
-            None => format!("{task}: attempt {attempt} passed"),
-        },
+        } => {
+            if let Some(parking) = parking {
+                format!(
+                    "{task}: attempt {attempt} failed and parked on question {} — {}",
+                    parking.question.id,
+                    data.failure
+                        .as_ref()
+                        .map(|failure| failure.reason.as_str())
+                        .unwrap_or("policy refusal")
+                )
+            } else {
+                match &data.failure {
+                    Some(failure) => {
+                        format!("{task}: attempt {attempt} failed — {}", failure.reason)
+                    }
+                    None => format!("{task}: attempt {attempt} passed"),
+                }
+            }
+        }
         EventBody::AttemptInterrupted { task, attempt, .. } => format!(
             "{task}: attempt {attempt} was cut off mid-flight; its spend is unknown and the \
              rung's allowance is intact"
