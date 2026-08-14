@@ -308,7 +308,7 @@ impl Workspace {
         let output = Command::new("git")
             .arg("-C")
             .arg(&self.root)
-            .args(["symbolic-ref", "--quiet", "HEAD"])
+            .args(["symbolic-ref", "--quiet", "--no-recurse", "HEAD"])
             .output()
             .map_err(|e| TactusError::Git {
                 message: format!("failed to run git: {e}"),
@@ -1119,7 +1119,7 @@ impl Workspace {
         let output = Command::new("git")
             .arg("-C")
             .arg(&self.root)
-            .args(["symbolic-ref", "--quiet", refname])
+            .args(["symbolic-ref", "--quiet", "--no-recurse", refname])
             .output()
             .map_err(|e| TactusError::Git {
                 message: format!("failed to run git: {e}"),

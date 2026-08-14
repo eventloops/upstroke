@@ -1577,6 +1577,14 @@ fn resume_harness_inner(
                  Git object. Refusing to publish or adopt it; preserve the log for recovery."
             )));
         }
+        let observed_branch_ref = workspace.current_branch_ref()?;
+        if observed_branch_ref != prepared.branch_ref {
+            return Err(refuse(format!(
+                "HEAD is on `{observed_branch_ref}`, not the prepared commit's recorded branch \
+                 `{}`; refusing prepared recovery.",
+                prepared.branch_ref
+            )));
+        }
 
         if head == prepared.parent_sha {
             if workspace.prepared_pin_target(&prepared.pin_ref)?.as_deref()
@@ -10520,6 +10528,66 @@ mod tests {
             git_in(&repo, &["rev-parse", "HEAD"]).trim(),
             prepared.parent_sha,
             "HEAD remains at the recorded parent"
+        );
+    }
+
+    #[test]
+    fn resume_refuses_symbolic_run_ref_at_already_published_prepared_prefix() {
+        let repo = temp_engine_repo("prepared-symbolic-run-ref");
+        seed(
+            &repo,
+            "## Implement the widget\n<!-- tactus: id=t1 kind=implement depends= -->\n",
+            Some("[routing]\nimplement = { chain = [\"small\"], attempts_per = 1 }\n"),
+        );
+        let mut opts = options(&repo);
+        opts.config_path = Some(repo.join("tactus.toml"));
+        let report = run_with(&opts, &fake(Effect::EditFile)).expect("run");
+        let paths = paths_of(&repo, &report.run_id);
+        let prepared = prepared_commit_of(&paths);
+        truncate_log_before(&paths, "task_committed");
+        recreate_prepared_pin(&repo, &prepared, &prepared.commit_sha);
+
+        git_in(&repo, &["branch", "victim", prepared.commit_sha.as_str()]);
+        git_in(
+            &repo,
+            &[
+                "symbolic-ref",
+                prepared.branch_ref.as_str(),
+                "refs/heads/victim",
+            ],
+        );
+        let events_before = fs::read(paths.events()).expect("event bytes before refusal");
+        let victim_before = git_in(&repo, &["rev-parse", "refs/heads/victim"]);
+
+        let error = resume_err(&repo, &report.run_id);
+        assert!(error.contains("itself symbolic"), "{error}");
+        assert_eq!(
+            fs::read(paths.events()).expect("event bytes after refusal"),
+            events_before,
+            "refusal happens before task_committed or any other repair append"
+        );
+        assert_eq!(
+            Workspace::open(&repo)
+                .expect("workspace")
+                .prepared_pin_target(&prepared.pin_ref)
+                .expect("pin lookup")
+                .as_deref(),
+            Some(prepared.commit_sha.as_str()),
+            "refusal preserves the durable prepared pin"
+        );
+        assert_eq!(
+            git_in(&repo, &["rev-parse", "refs/heads/victim"]),
+            victim_before,
+            "the symbolic run ref never advances or deletes its victim"
+        );
+        assert_eq!(
+            git_in(
+                &repo,
+                &["symbolic-ref", "--no-recurse", prepared.branch_ref.as_str(),],
+            )
+            .trim(),
+            "refs/heads/victim",
+            "refusal preserves the substituted symbolic run ref for inspection"
         );
     }
 
