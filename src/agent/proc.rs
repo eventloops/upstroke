@@ -432,37 +432,19 @@ mod termination {
         }
 
         fn begin_with_state(state: Arc<Mutex<State>>) -> Result<Self, TactusError> {
-            loop {
-                let mut locked = state
-                    .lock()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner());
-                if locked.terminating || PENDING_TERMINATION.load(Ordering::SeqCst) != 0 {
-                    return Err(TactusError::Agent {
-                        message: "process launch interrupted by a termination signal".to_owned(),
-                    });
+            claim_launch(&state)?;
+            let reaper = match spawn_reaper() {
+                Ok(reaper) => reaper,
+                Err(message) => {
+                    release_launch(&state);
+                    return Err(TactusError::Agent { message });
                 }
-                if !locked.suspending && locked.spawning == 0 {
-                    locked.spawning = locked.spawning.saturating_add(1);
-                    drop(locked);
-                    let reaper = match spawn_reaper() {
-                        Ok(reaper) => reaper,
-                        Err(message) => {
-                            let mut locked = state
-                                .lock()
-                                .unwrap_or_else(|poisoned| poisoned.into_inner());
-                            locked.spawning = locked.spawning.saturating_sub(1);
-                            return Err(TactusError::Agent { message });
-                        }
-                    };
-                    return Ok(Self {
-                        state,
-                        phase: Phase::Spawning,
-                        reaper,
-                    });
-                }
-                drop(locked);
-                thread::sleep(Duration::from_millis(1));
-            }
+            };
+            Ok(Self {
+                state,
+                phase: Phase::Spawning,
+                reaper,
+            })
         }
 
         pub(super) fn prepare(&self, command: &mut std::process::Command) {
@@ -544,16 +526,38 @@ mod termination {
         }
     }
 
+    fn claim_launch(state: &Arc<Mutex<State>>) -> Result<(), TactusError> {
+        loop {
+            let mut locked = state
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if locked.terminating || PENDING_TERMINATION.load(Ordering::SeqCst) != 0 {
+                return Err(TactusError::Agent {
+                    message: "process launch interrupted by a termination signal".to_owned(),
+                });
+            }
+            if !locked.suspending && locked.spawning == 0 {
+                locked.spawning = locked.spawning.saturating_add(1);
+                return Ok(());
+            }
+            drop(locked);
+            thread::sleep(Duration::from_millis(1));
+        }
+    }
+
+    fn release_launch(state: &Arc<Mutex<State>>) {
+        let mut locked = state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        locked.spawning = locked.spawning.saturating_sub(1);
+    }
+
     impl Drop for Supervisor {
         fn drop(&mut self) {
             match self.phase {
                 Phase::Spawning => {
                     self.reaper.cancel();
-                    let mut locked = self
-                        .state
-                        .lock()
-                        .unwrap_or_else(|poisoned| poisoned.into_inner());
-                    locked.spawning = locked.spawning.saturating_sub(1);
+                    release_launch(&self.state);
                 }
                 Phase::Group(_) => {
                     // `finish` normally runs while the direct child is still
@@ -2842,10 +2846,15 @@ mod termination {
             let waiting = Arc::clone(&state);
             let (sent, received) = std::sync::mpsc::channel();
             let launch = thread::spawn(move || {
-                let supervisor =
-                    Supervisor::begin_with_state(waiting).expect("launch after resume");
+                // Exercise the production launch gate without fabricating a
+                // second independent cleanup-reaper registry. Production has
+                // one shared registry and serializes helper creation through
+                // this claim; constructing a private Supervisor here violates
+                // that invariant and makes Darwin FIFO inheritance part of a
+                // synchronization test that never intended to cover it.
+                claim_launch(&waiting).expect("launch after resume");
                 sent.send(()).expect("report launch");
-                supervisor
+                release_launch(&waiting);
             });
             assert!(
                 received.recv_timeout(Duration::from_millis(50)).is_err(),
@@ -2859,7 +2868,7 @@ mod termination {
             received
                 .recv_timeout(Duration::from_secs(2))
                 .expect("launch released after resume");
-            drop(launch.join().expect("join launch"));
+            launch.join().expect("join launch");
             let locked = state
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
