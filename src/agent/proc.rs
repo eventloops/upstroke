@@ -292,6 +292,7 @@ mod termination {
     const REAPER_CLEANUP: u8 = 0x83;
     const REAPER_OK: u8 = 0x84;
     const REAPER_FAIL: u8 = 0x85;
+    const REAPER_CANCEL: u8 = 0x86;
     // The job-control guard briefly continues only Tactus every 250 ms while
     // probing for a PID-directed termination. The cleanup reaper must not
     // mistake that internal pulse for an operator resume and continue agents.
@@ -1088,6 +1089,26 @@ mod termination {
         }
 
         fn cancel(self) {
+            let mut frame = [0_u8; 5];
+            frame[0] = REAPER_CANCEL;
+            let cancelled = write_raw(self.command_fd, &frame)
+                && read_guard_ack(self.ack_fd, Duration::from_secs(2)) == Some(REAPER_OK);
+            if !cancelled {
+                // The parent does not know whether pre_exec registered a group
+                // before spawn failed. Arm ordinary fail-closed termination;
+                // the independently polling reaper will observe reparenting
+                // and complete any registered cleanup without trusting EOF.
+                let _ = PENDING_TERMINATION.compare_exchange(
+                    0,
+                    libc::SIGTERM,
+                    Ordering::SeqCst,
+                    Ordering::SeqCst,
+                );
+                close_fd(self.command_fd);
+                close_fd(self.ack_fd);
+                close_fd(self._command_keepalive_fd);
+                return;
+            }
             self.close_and_wait();
         }
 
@@ -1297,17 +1318,21 @@ mod termination {
                 events: libc::POLLIN | libc::POLLHUP,
                 revents: 0,
             };
-            // Before registration there is nothing to supervise, so block for
-            // the command. Afterwards, this separately isolated helper polls
-            // the parent state as well: SIGSTOP is uncatchable, and a stop of
-            // Tactus's foreground group must not leave its private agent group
-            // running until the terminal eventually continues it.
-            let timeout_ms = if pgid > 0 { 10 } else { -1 };
-            let polled = unsafe { libc::poll(&mut command, 1, timeout_ms) };
+            // Poll even before registration. An exec-racing descendant may
+            // retain a FIFO writer until it exits, so EOF is not a trustworthy
+            // parent-liveness signal on Darwin. Reparenting is authoritative
+            // and lets this fork-only helper settle independently.
+            let polled = unsafe { libc::poll(&mut command, 1, 10) };
             if polled < 0 {
                 if last_errno_is_interrupted() {
                     continue;
                 }
+                if pgid > 0 {
+                    cleanup_reaper_group(pgid, anchor, cleanup_delay_ms);
+                }
+                unsafe { libc::_exit(0) };
+            }
+            if unsafe { libc::getppid() } != parent {
                 if pgid > 0 {
                     cleanup_reaper_group(pgid, anchor, cleanup_delay_ms);
                 }
@@ -1344,6 +1369,13 @@ mod termination {
                         let _ = write_raw(ack_fd, &[REAPER_OK]);
                         unsafe { libc::_exit(0) };
                     }
+                    REAPER_CANCEL if requested == 0 => {
+                        if pgid > 0 {
+                            cleanup_reaper_group(pgid, anchor, cleanup_delay_ms);
+                        }
+                        let _ = write_raw(ack_fd, &[REAPER_OK]);
+                        unsafe { libc::_exit(0) };
+                    }
                     _ => false,
                 };
                 if !write_raw(ack_fd, &[if accepted { REAPER_OK } else { REAPER_FAIL }]) {
@@ -1354,7 +1386,7 @@ mod termination {
                 }
             }
 
-            if pgid > 0 && unsafe { libc::getppid() } == parent {
+            if pgid > 0 {
                 match process_is_stopped(parent) {
                     Some(true) if !mirrored_parent_stop => {
                         mirrored_parent_stop = unsafe { libc::kill(-pgid, libc::SIGSTOP) } == 0;
