@@ -2,14 +2,23 @@
 //! engine stages, commits, branches, and rolls back (invariant 1). Every git
 //! operation is a subprocess of the system `git` binary — no library binding.
 
+use std::ffi::OsString;
 use std::fs;
+use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
 
 use crate::error::TactusError;
 
 pub struct Workspace {
     root: PathBuf,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CapturedCandidate {
+    pub parent_oid: String,
+    pub tree_oid: String,
+    pub diff: String,
 }
 
 impl Workspace {
@@ -70,6 +79,46 @@ impl Workspace {
                 ),
             });
         }
+        Ok(output.stdout)
+    }
+
+    fn git_output_with_input(&self, args: &[&str], input: Vec<u8>) -> Result<Vec<u8>, TactusError> {
+        let mut child = Command::new("git")
+            .arg("-C")
+            .arg(&self.root)
+            .args(args)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .map_err(|e| TactusError::Git {
+                message: format!("failed to run git: {e}"),
+            })?;
+        let mut stdin = child.stdin.take().ok_or_else(|| TactusError::Git {
+            message: format!("git {} did not open stdin", args.join(" ")),
+        })?;
+        // Read stdout/stderr while feeding the complete NUL-delimited path
+        // list. A large index can otherwise fill check-attr's stdout pipe and
+        // deadlock the parent while it is still writing stdin.
+        let writer = std::thread::spawn(move || stdin.write_all(&input));
+        let output = child.wait_with_output().map_err(|e| TactusError::Git {
+            message: format!("waiting for git {}: {e}", args.join(" ")),
+        })?;
+        let write_result = writer.join().map_err(|_| TactusError::Git {
+            message: format!("writing paths to git {} panicked", args.join(" ")),
+        })?;
+        if !output.status.success() {
+            return Err(TactusError::Git {
+                message: format!(
+                    "git {} failed: {}",
+                    args.join(" "),
+                    String::from_utf8_lossy(&output.stderr).trim()
+                ),
+            });
+        }
+        write_result.map_err(|e| TactusError::Git {
+            message: format!("writing paths to git {}: {e}", args.join(" ")),
+        })?;
         Ok(output.stdout)
     }
 
@@ -190,25 +239,49 @@ impl Workspace {
         })
     }
 
-    /// Stage everything and return the staged diff against HEAD — the
-    /// engine-captured ground truth (invariant 3). Includes new files.
+    /// Stage everything, freeze one parent and tree object, and return their
+    /// complete diff. The diff names those frozen objects rather than rereading
+    /// HEAD or the index, so all three values remain one candidate even if a
+    /// ref or the index changes afterward.
     ///
     /// The diff must be a plain unified diff regardless of user config: a
     /// configured `diff.external` (difftastic and friends) would replace it
     /// wholesale and `color.ui` would inject escape codes, corrupting every
     /// downstream check that reads it.
-    pub fn capture_diff(&self) -> Result<String, TactusError> {
+    pub fn capture_candidate(&self) -> Result<CapturedCandidate, TactusError> {
+        let parent_oid = self.head_sha_full()?;
         self.git(&["add", "-A"])?;
-        self.git(&[
+        let tree_oid = self.staged_tree_oid()?;
+        let diff = self.git(&[
             "-c",
             "color.ui=false",
             "diff",
-            "--cached",
             "--binary",
             "--no-ext-diff",
             "--no-textconv",
             "--no-color",
-        ])
+            &parent_oid,
+            &tree_oid,
+            "--",
+        ])?;
+        let observed_parent = self.head_sha_full()?;
+        if observed_parent != parent_oid {
+            return Err(TactusError::Git {
+                message: format!(
+                    "HEAD moved from {parent_oid} to {observed_parent} while capturing the candidate"
+                ),
+            });
+        }
+        Ok(CapturedCandidate {
+            parent_oid,
+            tree_oid,
+            diff,
+        })
+    }
+
+    /// Backward-compatible diff-only capture for existing callers.
+    pub fn capture_diff(&self) -> Result<String, TactusError> {
+        Ok(self.capture_candidate()?.diff)
     }
 
     /// Refuse staged evidence whose bytes are not the bytes a gate would see,
@@ -218,7 +291,21 @@ impl Workspace {
     /// executable inputs behind an unchanged gitlink. Neither can be reviewed
     /// completely, so both are policy failures rather than gate results.
     pub fn review_input_problem(&self) -> Result<Option<String>, TactusError> {
+        let tree_oid = self.staged_tree_oid()?;
+        self.review_input_problem_for_tree(&tree_oid)
+    }
+
+    /// Inspect live nested-worktree state, then bind every semantic input check
+    /// to one captured tree rather than to an index that may have moved since
+    /// its diff was produced.
+    pub fn review_input_problem_for_tree(
+        &self,
+        tree_oid: &str,
+    ) -> Result<Option<String>, TactusError> {
+        self.validate_tree_oid(tree_oid)?;
         let status = self.git_output(&[
+            "-c",
+            "core.fsmonitor=false",
             "status",
             "--porcelain=v1",
             "--untracked-files=no",
@@ -236,24 +323,69 @@ impl Workspace {
             }
         }
 
-        let names = self.git_output(&["diff", "--cached", "--name-only", "-z"])?;
-        for raw in names
+        self.tree_input_problem(tree_oid)
+    }
+
+    fn tree_input_problem(&self, tree_oid: &str) -> Result<Option<String>, TactusError> {
+        // A captured .gitattributes can attach a filter to an otherwise
+        // unchanged file, so changed names are insufficient. `ls-tree`
+        // enumerates every path in the exact candidate and exposes gitlinks.
+        let entries = self.git_output(&["ls-tree", "-r", "-z", "--full-tree", tree_oid])?;
+        let mut paths = Vec::new();
+        for entry in entries
             .split(|byte| *byte == 0)
-            .filter(|path| !path.is_empty())
+            .filter(|entry| !entry.is_empty())
         {
-            let path = std::str::from_utf8(raw).map_err(|_| TactusError::Git {
-                message: "a staged path is not valid UTF-8, so its attributes cannot be verified"
-                    .to_owned(),
-            })?;
-            let attr = self.git_output(&["check-attr", "--cached", "-z", "filter", "--", path])?;
-            let fields: Vec<&[u8]> = attr
-                .split(|byte| *byte == 0)
-                .filter(|field| !field.is_empty())
-                .collect();
-            let value = fields.get(2).copied().unwrap_or_default();
+            let tab = entry
+                .iter()
+                .position(|byte| *byte == b'\t')
+                .ok_or_else(|| TactusError::Git {
+                    message: "git ls-tree returned a malformed tree entry".to_owned(),
+                })?;
+            let metadata = &entry[..tab];
+            let path = &entry[tab + 1..];
+            let mode = metadata
+                .split(|byte| *byte == b' ')
+                .next()
+                .unwrap_or_default();
+            if mode == b"160000" {
+                return Ok(Some(format!(
+                    "candidate-tree path `{}` is a submodule (mode 160000); exact gate snapshots do not materialize submodules",
+                    String::from_utf8_lossy(path)
+                )));
+            }
+            paths.extend_from_slice(path);
+            paths.push(0);
+        }
+
+        let attrs = if paths.is_empty() {
+            Vec::new()
+        } else {
+            let source = format!("--source={tree_oid}");
+            self.git_output_with_input(&["check-attr", &source, "--stdin", "-z", "filter"], paths)?
+        };
+        let mut fields: Vec<&[u8]> = attrs.split(|byte| *byte == 0).collect();
+        if fields.last().is_some_and(|field| field.is_empty()) {
+            fields.pop();
+        }
+        if !fields.len().is_multiple_of(3) {
+            return Err(TactusError::Git {
+                message: "git check-attr returned malformed NUL-delimited output".to_owned(),
+            });
+        }
+        for record in fields.chunks_exact(3) {
+            let path = record[0];
+            let attribute = record[1];
+            let value = record[2];
+            if attribute != b"filter" {
+                return Err(TactusError::Git {
+                    message: "git check-attr returned an unexpected attribute".to_owned(),
+                });
+            }
             if !matches!(value, b"unspecified" | b"unset") {
                 return Ok(Some(format!(
-                    "staged path `{path}` uses clean/smudge filter `{}`; the cached diff and gate worktree can contain different bytes",
+                    "candidate-tree path `{}` uses clean/smudge filter `{}`; the captured diff and gate worktree can contain different bytes",
+                    String::from_utf8_lossy(path),
                     String::from_utf8_lossy(value)
                 )));
             }
@@ -261,57 +393,211 @@ impl Workspace {
         Ok(None)
     }
 
+    /// Read the full object ID of the index tree once. Callers that run more
+    /// than one verifier can retain this identity and materialize the same
+    /// bytes for each verifier even if the source index later changes.
+    pub fn staged_tree_oid(&self) -> Result<String, TactusError> {
+        let tree = self.git(&["write-tree"])?;
+        let tree = tree.trim().to_owned();
+        self.validate_tree_oid(&tree)?;
+        Ok(tree)
+    }
+
     /// A clean detached worktree whose HEAD tree is exactly the staged tree.
+    /// Kept for existing callers; new callers that need more than one snapshot
+    /// should retain `capture_candidate()` and use
+    /// `gate_snapshot_for_candidate()`.
+    pub fn gate_snapshot(&self) -> Result<GateWorkspace, TactusError> {
+        let parent_oid = self.head_sha_full()?;
+        let tree = self.staged_tree_oid()?;
+        let observed_parent = self.head_sha_full()?;
+        if observed_parent != parent_oid {
+            return Err(TactusError::Git {
+                message: format!(
+                    "HEAD moved from {parent_oid} to {observed_parent} while preparing the gate snapshot"
+                ),
+            });
+        }
+        self.gate_snapshot_for_candidate(&parent_oid, &tree)
+    }
+
+    /// Materialize a clean detached worktree for one exact tree object ID.
     /// Gates run here, never in the worker's workspace, so ignored files,
     /// build residue, and gate side-effects cannot influence or contaminate the
     /// commit under review.
-    pub fn gate_snapshot(&self) -> Result<GateWorkspace, TactusError> {
-        let tree = self.git(&["write-tree"])?;
+    pub fn gate_snapshot_for_tree(&self, tree_oid: &str) -> Result<GateWorkspace, TactusError> {
+        let parent_oid = self.head_sha_full()?;
+        self.gate_snapshot_for_candidate(&parent_oid, tree_oid)
+    }
+
+    /// Materialize one frozen candidate. Both object IDs are supplied so a
+    /// concurrent ref move cannot silently change the ephemeral commit's
+    /// parent after the candidate was reviewed.
+    pub fn gate_snapshot_for_candidate(
+        &self,
+        parent_oid: &str,
+        tree_oid: &str,
+    ) -> Result<GateWorkspace, TactusError> {
+        self.gate_snapshot_for_candidate_in(parent_oid, tree_oid, &std::env::temp_dir())
+    }
+
+    fn gate_snapshot_for_candidate_in(
+        &self,
+        parent_oid: &str,
+        tree_oid: &str,
+        temp_root: &Path,
+    ) -> Result<GateWorkspace, TactusError> {
+        self.gate_snapshot_for_candidate_in_with(
+            parent_oid,
+            tree_oid,
+            temp_root,
+            |path, hooks_path, commit| self.add_gate_worktree(path, hooks_path, commit),
+        )
+    }
+
+    fn gate_snapshot_for_candidate_in_with<F>(
+        &self,
+        parent_oid: &str,
+        tree_oid: &str,
+        temp_root: &Path,
+        add_worktree: F,
+    ) -> Result<GateWorkspace, TactusError>
+    where
+        F: FnOnce(&Path, &Path, &str) -> Result<(), TactusError>,
+    {
+        self.validate_commit_oid(parent_oid)?;
+        self.validate_tree_oid(tree_oid)?;
+        if let Some(problem) = self.tree_input_problem(tree_oid)? {
+            return Err(TactusError::Git { message: problem });
+        }
         let commit = self.git(&[
             "-c",
             "user.name=tactus",
             "-c",
             "user.email=tactus@tactus.local",
             "commit-tree",
-            tree.trim(),
+            tree_oid,
             "-p",
-            "HEAD",
+            parent_oid,
             "-m",
             "[tactus] ephemeral gate snapshot",
         ])?;
-        let path = std::env::temp_dir().join(format!(
-            "tactus-gates-{}-{}",
-            std::process::id(),
-            crate::ulid::ulid()
-        ));
-        let path_text = path.to_str().ok_or_else(|| TactusError::Git {
-            message: format!("gate snapshot path is not valid UTF-8: {}", path.display()),
-        })?;
-        self.git(&[
-            "worktree",
-            "add",
-            "-q",
-            "--detach",
-            "--force",
-            path_text,
-            commit.trim(),
-        ])?;
-        match Workspace::open(&path) {
-            Ok(workspace) => Ok(GateWorkspace {
-                source_root: self.root.clone(),
-                path,
-                workspace,
-            }),
-            Err(error) => {
-                let _ = Command::new("git")
-                    .arg("-C")
-                    .arg(&self.root)
-                    .args(["worktree", "remove", "--force"])
-                    .arg(&path)
-                    .output();
-                Err(error)
-            }
+        let pending = PendingGateWorkspace::create(&self.root, temp_root)?;
+        add_worktree(&pending.path, &pending.hooks_path, commit.trim())?;
+        self.verify_gate_worktree(&pending.path, &pending.hooks_path)?;
+
+        // The exact path is already known to be the new worktree's top level.
+        // Avoid round-tripping it through Git's textual path output, which is
+        // not necessarily UTF-8 on Unix.
+        let workspace = Workspace {
+            root: pending.path.clone(),
+        };
+        Ok(pending.finish(workspace))
+    }
+
+    fn validate_tree_oid(&self, tree_oid: &str) -> Result<(), TactusError> {
+        self.validate_object_oid(tree_oid, "tree")
+    }
+
+    fn validate_commit_oid(&self, commit_oid: &str) -> Result<(), TactusError> {
+        self.validate_object_oid(commit_oid, "commit")
+    }
+
+    fn validate_object_oid(&self, oid: &str, expected_kind: &str) -> Result<(), TactusError> {
+        if !matches!(oid.len(), 40 | 64) || !oid.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+            return Err(TactusError::Git {
+                message: format!("`{oid}` is not a full Git object ID"),
+            });
         }
+        let kind = self.git(&["cat-file", "-t", oid])?;
+        if kind.trim() != expected_kind {
+            return Err(TactusError::Git {
+                message: format!(
+                    "Git object {oid} is a {}, not a {expected_kind}",
+                    kind.trim()
+                ),
+            });
+        }
+        Ok(())
+    }
+
+    fn add_gate_worktree(
+        &self,
+        path: &Path,
+        hooks_path: &Path,
+        commit: &str,
+    ) -> Result<(), TactusError> {
+        let mut hooks_config = OsString::from("core.hooksPath=");
+        hooks_config.push(hooks_path);
+        let output = Command::new("git")
+            .arg("-C")
+            .arg(&self.root)
+            .arg("-c")
+            .arg(hooks_config)
+            .args([
+                "-c",
+                "core.fsmonitor=false",
+                "worktree",
+                "add",
+                "-q",
+                "--detach",
+                "--force",
+            ])
+            .arg(path)
+            .arg(commit)
+            .output()
+            .map_err(|e| TactusError::Git {
+                message: format!("failed to run git worktree add: {e}"),
+            })?;
+        if !output.status.success() {
+            return Err(TactusError::Git {
+                message: format!(
+                    "git worktree add failed: {}",
+                    String::from_utf8_lossy(&output.stderr).trim()
+                ),
+            });
+        }
+        Ok(())
+    }
+
+    fn verify_gate_worktree(&self, path: &Path, hooks_path: &Path) -> Result<(), TactusError> {
+        let mut hooks_config = OsString::from("core.hooksPath=");
+        hooks_config.push(hooks_path);
+        let output = Command::new("git")
+            .arg("-C")
+            .arg(path)
+            .arg("-c")
+            .arg(hooks_config)
+            .args([
+                "-c",
+                "core.fsmonitor=false",
+                "status",
+                "--porcelain=v1",
+                "-z",
+                "--untracked-files=all",
+                "--ignore-submodules=none",
+            ])
+            .output()
+            .map_err(|e| TactusError::Git {
+                message: format!("failed to verify gate worktree: {e}"),
+            })?;
+        if !output.status.success() {
+            return Err(TactusError::Git {
+                message: format!(
+                    "verifying gate worktree failed: {}",
+                    String::from_utf8_lossy(&output.stderr).trim()
+                ),
+            });
+        }
+        if !output.stdout.is_empty() {
+            return Err(TactusError::Git {
+                message: format!(
+                    "gate worktree materialized with unexpected tracked or untracked state: {}",
+                    String::from_utf8_lossy(&output.stdout)
+                ),
+            });
+        }
+        Ok(())
     }
 
     /// Commit whatever `capture_diff` staged. §14: commit-per-task,
@@ -332,9 +618,100 @@ impl Workspace {
     }
 }
 
+struct PendingGateWorkspace {
+    source_root: PathBuf,
+    path: PathBuf,
+    hooks_path: PathBuf,
+    armed: bool,
+}
+
+impl PendingGateWorkspace {
+    fn create(source_root: &Path, temp_root: &Path) -> Result<Self, TactusError> {
+        let name = format!(
+            "tactus-gates-{}-{}",
+            std::process::id(),
+            crate::ulid::ulid()
+        );
+        let path = temp_root.join(&name);
+        let hooks_path = temp_root.join(format!("{name}-hooks"));
+        create_private_dir(&path).map_err(|e| TactusError::Git {
+            message: format!(
+                "creating private gate snapshot directory {}: {e}",
+                path.display()
+            ),
+        })?;
+        if let Err(error) = create_private_dir(&hooks_path) {
+            let _ = fs::remove_dir(&path);
+            return Err(TactusError::Git {
+                message: format!(
+                    "creating private empty hooks directory {}: {error}",
+                    hooks_path.display()
+                ),
+            });
+        }
+        Ok(Self {
+            source_root: source_root.to_path_buf(),
+            path,
+            hooks_path,
+            armed: true,
+        })
+    }
+
+    fn finish(mut self, workspace: Workspace) -> GateWorkspace {
+        self.armed = false;
+        GateWorkspace {
+            source_root: self.source_root.clone(),
+            path: self.path.clone(),
+            hooks_path: self.hooks_path.clone(),
+            workspace,
+        }
+    }
+}
+
+impl Drop for PendingGateWorkspace {
+    fn drop(&mut self) {
+        if self.armed {
+            cleanup_gate_workspace(&self.source_root, &self.path, &self.hooks_path);
+        }
+    }
+}
+
+fn create_private_dir(path: &Path) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        let mut builder = fs::DirBuilder::new();
+        builder.mode(0o700);
+        builder.create(path)
+    }
+    #[cfg(not(unix))]
+    {
+        fs::DirBuilder::new().create(path)
+    }
+}
+
+fn cleanup_gate_workspace(source_root: &Path, path: &Path, hooks_path: &Path) {
+    let mut hooks_config = OsString::from("core.hooksPath=");
+    hooks_config.push(hooks_path);
+    let _ = Command::new("git")
+        .arg("-C")
+        .arg(source_root)
+        .arg("-c")
+        .arg(hooks_config)
+        .args(["worktree", "remove", "--force"])
+        .arg(path)
+        .output();
+    // `worktree remove` normally removes the directory too. These exact paths
+    // were atomically created by this process, so fall back to filesystem
+    // cleanup if a partially failed `worktree add` left either one behind.
+    let _ = fs::remove_dir_all(path);
+    let _ = fs::remove_dir_all(hooks_path);
+}
+
 pub struct GateWorkspace {
     source_root: PathBuf,
     path: PathBuf,
+    hooks_path: PathBuf,
     workspace: Workspace,
 }
 
@@ -346,12 +723,7 @@ impl GateWorkspace {
 
 impl Drop for GateWorkspace {
     fn drop(&mut self) {
-        let _ = Command::new("git")
-            .arg("-C")
-            .arg(&self.source_root)
-            .args(["worktree", "remove", "--force"])
-            .arg(&self.path)
-            .output();
+        cleanup_gate_workspace(&self.source_root, &self.path, &self.hooks_path);
     }
 }
 
@@ -384,6 +756,21 @@ mod tests {
         run(&["add", "-A"]);
         run(&["commit", "-q", "-m", "seed"]);
         dir
+    }
+
+    fn run_git(repo: &Path, args: &[&str]) -> Vec<u8> {
+        let output = Command::new("git")
+            .arg("-C")
+            .arg(repo)
+            .args(args)
+            .output()
+            .expect("run git");
+        assert!(
+            output.status.success(),
+            "git {args:?}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        output.stdout
     }
 
     #[test]
@@ -444,6 +831,60 @@ mod tests {
             None,
             "the seed commit is the root, and that is an answer rather than an error"
         );
+    }
+
+    #[test]
+    fn captured_candidate_keeps_one_parent_tree_and_diff() {
+        let repo = temp_repo("captured-candidate");
+        let ws = Workspace::open(&repo).expect("open");
+        let original_parent = ws.head_sha_full().expect("parent before capture");
+        fs::write(repo.join("README.md"), "first candidate\n").expect("first edit");
+
+        let candidate = ws.capture_candidate().expect("capture candidate");
+        assert_eq!(candidate.parent_oid, original_parent);
+        assert!(
+            candidate.diff.contains("first candidate"),
+            "{}",
+            candidate.diff
+        );
+        assert_eq!(
+            ws.git(&["cat-file", "-t", &candidate.tree_oid])
+                .expect("tree type")
+                .trim(),
+            "tree"
+        );
+
+        // Advance the index after capture, then prove the supplied tree still
+        // materializes the first candidate rather than rereading that index.
+        fs::write(repo.join("README.md"), "second candidate\n").expect("second edit");
+        ws.capture_diff().expect("stage second candidate");
+        let snapshot = ws
+            .gate_snapshot_for_candidate(&candidate.parent_oid, &candidate.tree_oid)
+            .expect("materialize frozen tree");
+        assert_eq!(
+            fs::read_to_string(snapshot.workspace().root().join("README.md"))
+                .expect("frozen README")
+                .replace("\r\n", "\n"),
+            "first candidate\n"
+        );
+        let snapshot_commit = snapshot
+            .workspace()
+            .head_sha_full()
+            .expect("snapshot commit");
+        assert_eq!(
+            snapshot
+                .workspace()
+                .parent_sha(&snapshot_commit)
+                .expect("snapshot parent"),
+            Some(candidate.parent_oid.clone()),
+            "the ephemeral commit must retain the captured parent, not mutable HEAD"
+        );
+
+        let error = match ws.gate_snapshot_for_tree(&candidate.parent_oid) {
+            Ok(_) => panic!("a commit object is not a supplied tree OID"),
+            Err(error) => error.to_string(),
+        };
+        assert!(error.contains("not a tree"), "{error}");
     }
 
     #[test]
@@ -619,6 +1060,233 @@ mod tests {
     }
 
     #[test]
+    fn filter_on_unchanged_tracked_path_is_refused_before_materialization() {
+        let repo = temp_repo("filter-on-unchanged-path");
+        let ws = Workspace::open(&repo).expect("open");
+        fs::write(repo.join("unchanged.txt"), "tracked baseline\n").expect("tracked file");
+        ws.capture_diff().expect("stage baseline file");
+        ws.commit("seed unchanged file")
+            .expect("commit baseline file");
+
+        // Only the attributes file changes. The filter target itself is absent
+        // from `diff --cached --name-only` but is still a gate input.
+        fs::write(
+            repo.join(".gitattributes"),
+            "unchanged.txt filter=tactus-test\n",
+        )
+        .expect("candidate attributes");
+        let candidate = ws
+            .capture_candidate()
+            .expect("capture candidate attributes");
+        fs::remove_file(repo.join(".gitattributes")).expect("move index past candidate");
+        ws.capture_diff().expect("stage later filter-free index");
+
+        let problem = ws
+            .review_input_problem_for_tree(&candidate.tree_oid)
+            .expect("inspect every path in the captured tree")
+            .expect("filter on unchanged path must fail closed");
+        assert!(problem.contains("unchanged.txt"), "{problem}");
+        assert!(problem.contains("tactus-test"), "{problem}");
+    }
+
+    #[test]
+    fn gate_snapshot_does_not_execute_post_checkout_hook() {
+        let repo = temp_repo("snapshot-checkout-hook");
+        run_git(&repo, &["config", "core.autocrlf", "false"]);
+        run_git(&repo, &["config", "core.hooksPath", ".githooks"]);
+        fs::create_dir_all(repo.join(".githooks")).expect("hooks directory");
+        fs::write(
+            repo.join(".githooks").join("post-checkout"),
+            "#!/bin/sh\nprintf 'ran\\n' > hook-ran\n",
+        )
+        .expect("candidate checkout hook");
+        let ws = Workspace::open(&repo).expect("open");
+        ws.capture_diff().expect("stage candidate hook");
+        run_git(
+            &repo,
+            &["update-index", "--chmod=+x", ".githooks/post-checkout"],
+        );
+
+        let snapshot = ws.gate_snapshot().expect("hook-suppressed snapshot");
+        assert!(
+            snapshot
+                .workspace()
+                .root()
+                .join(".githooks")
+                .join("post-checkout")
+                .exists(),
+            "the candidate hook itself remains part of the reviewed tree"
+        );
+        assert!(
+            !snapshot.workspace().root().join("hook-ran").exists(),
+            "materialization must never execute candidate-controlled checkout hooks"
+        );
+        assert!(
+            fs::read_dir(&snapshot.hooks_path)
+                .expect("private hooks directory")
+                .next()
+                .is_none(),
+            "the override must point at a private empty directory"
+        );
+    }
+
+    #[test]
+    fn failed_gate_snapshot_add_cleans_registered_worktree() {
+        let repo = temp_repo("failed-snapshot-add-cleanup");
+        let ws = Workspace::open(&repo).expect("open");
+        let parent = ws.head_sha_full().expect("parent");
+        let tree = ws.staged_tree_oid().expect("tree");
+        let registrations_before = ws
+            .git(&["worktree", "list", "--porcelain"])
+            .expect("registrations before");
+        let temp_root = env::temp_dir();
+        let mut attempted_path = None;
+        let mut attempted_hooks_path = None;
+
+        let result = ws.gate_snapshot_for_candidate_in_with(
+            &parent,
+            &tree,
+            &temp_root,
+            |path, hooks_path, commit| {
+                attempted_path = Some(path.to_path_buf());
+                attempted_hooks_path = Some(hooks_path.to_path_buf());
+                // Model the dangerous failure boundary: Git has registered and
+                // populated the worktree, then the overall add operation is
+                // reported as failed (as a failing post-checkout hook did).
+                ws.add_gate_worktree(path, hooks_path, commit)?;
+                Err(TactusError::Git {
+                    message: "synthetic late worktree-add failure".to_owned(),
+                })
+            },
+        );
+        let error = match result {
+            Ok(_) => panic!("synthetic worktree-add failure must propagate"),
+            Err(error) => error.to_string(),
+        };
+        assert!(error.contains("synthetic late"), "{error}");
+
+        let attempted_path = attempted_path.expect("attempted snapshot path");
+        let attempted_hooks_path = attempted_hooks_path.expect("attempted hooks path");
+        assert!(!attempted_path.exists(), "snapshot directory cleaned");
+        assert!(!attempted_hooks_path.exists(), "hooks directory cleaned");
+        assert_eq!(
+            ws.git(&["worktree", "list", "--porcelain"])
+                .expect("registrations after"),
+            registrations_before,
+            "a failed add must not leave a registered worktree"
+        );
+    }
+
+    #[test]
+    fn unexpected_materialization_residue_is_rejected_and_cleaned() {
+        let repo = temp_repo("snapshot-residue-cleanup");
+        let ws = Workspace::open(&repo).expect("open");
+        let parent = ws.head_sha_full().expect("parent");
+        let tree = ws.staged_tree_oid().expect("tree");
+        let registrations_before = ws
+            .git(&["worktree", "list", "--porcelain"])
+            .expect("registrations before");
+        let temp_root = env::temp_dir();
+        let mut attempted_path = None;
+
+        let result = ws.gate_snapshot_for_candidate_in_with(
+            &parent,
+            &tree,
+            &temp_root,
+            |path, hooks_path, commit| {
+                attempted_path = Some(path.to_path_buf());
+                ws.add_gate_worktree(path, hooks_path, commit)?;
+                fs::write(path.join("unexpected-residue"), "not in candidate\n").map_err(
+                    |error| TactusError::Git {
+                        message: format!("creating synthetic residue: {error}"),
+                    },
+                )?;
+                Ok(())
+            },
+        );
+        let error = match result {
+            Ok(_) => panic!("unexpected materialization residue must fail closed"),
+            Err(error) => error.to_string(),
+        };
+        assert!(
+            error.contains("unexpected tracked or untracked state"),
+            "{error}"
+        );
+        assert!(
+            !attempted_path.expect("attempted path").exists(),
+            "rejected snapshot directory cleaned"
+        );
+        assert_eq!(
+            ws.git(&["worktree", "list", "--porcelain"])
+                .expect("registrations after"),
+            registrations_before,
+            "rejected materialization must not stay registered"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn gate_snapshot_target_is_atomically_private() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let repo = temp_repo("private-snapshot-target");
+        let pending = PendingGateWorkspace::create(&repo, &env::temp_dir())
+            .expect("atomically create private snapshot directories");
+        let path = pending.path.clone();
+        let hooks_path = pending.hooks_path.clone();
+        assert_eq!(
+            fs::metadata(&path)
+                .expect("snapshot metadata")
+                .permissions()
+                .mode()
+                & 0o777,
+            0o700
+        );
+        assert_eq!(
+            fs::metadata(&hooks_path)
+                .expect("hooks metadata")
+                .permissions()
+                .mode()
+                & 0o777,
+            0o700
+        );
+        assert!(fs::read_dir(&path).expect("empty target").next().is_none());
+        assert!(
+            fs::read_dir(&hooks_path)
+                .expect("empty hooks path")
+                .next()
+                .is_none()
+        );
+        drop(pending);
+        assert!(!path.exists());
+        assert!(!hooks_path.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn gate_snapshot_accepts_non_utf8_tmpdir_on_unix() {
+        use std::os::unix::ffi::OsStringExt;
+
+        let repo = temp_repo("non-utf8-snapshot-root");
+        let ws = Workspace::open(&repo).expect("open");
+        let parent = ws.head_sha_full().expect("parent");
+        let tree = ws.staged_tree_oid().expect("tree");
+        let mut name = format!("tactus-non-utf8-tmp-{}-", std::process::id()).into_bytes();
+        name.push(0xff);
+        let temp_root = env::temp_dir().join(OsString::from_vec(name));
+        let _ = fs::remove_dir_all(&temp_root);
+        fs::create_dir(&temp_root).expect("non-UTF-8 temp root");
+
+        let snapshot = ws
+            .gate_snapshot_for_candidate_in(&parent, &tree, &temp_root)
+            .expect("Path/OsStr must reach git without UTF-8 conversion");
+        assert!(snapshot.workspace().root().starts_with(&temp_root));
+        assert!(snapshot.workspace().is_clean().expect("clean snapshot"));
+        drop(snapshot);
+        fs::remove_dir(&temp_root).expect("clean non-UTF-8 temp root");
+    }
+
+    #[test]
     fn dirty_submodule_worktree_is_refused_before_gates() {
         let child = temp_repo("dirty-submodule-child");
         let repo = temp_repo("dirty-submodule-parent");
@@ -654,5 +1322,43 @@ mod tests {
             problem.contains("absent from the reviewed commit"),
             "{problem}"
         );
+    }
+
+    #[test]
+    fn clean_unchanged_submodule_is_refused_before_gate_snapshot() {
+        let child = temp_repo("clean-submodule-child");
+        let repo = temp_repo("clean-submodule-parent");
+        let output = Command::new("git")
+            .arg("-C")
+            .arg(&repo)
+            .args(["-c", "protocol.file.allow=always", "submodule", "add", "-q"])
+            .arg(&child)
+            .arg("nested")
+            .output()
+            .expect("add submodule");
+        assert!(
+            output.status.success(),
+            "submodule add: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let ws = Workspace::open(&repo).expect("open parent");
+        ws.capture_diff().expect("stage submodule");
+        ws.commit("seed clean submodule").expect("commit submodule");
+        assert!(ws.is_clean().expect("clean parent and submodule"));
+
+        let problem = ws
+            .review_input_problem()
+            .expect("inspect complete index")
+            .expect("even a clean unchanged gitlink must fail closed");
+        assert!(problem.contains("nested"), "{problem}");
+        assert!(problem.contains("mode 160000"), "{problem}");
+
+        let tree = ws.staged_tree_oid().expect("indexed tree");
+        let error = match ws.gate_snapshot_for_tree(&tree) {
+            Ok(_) => panic!("a gitlink tree must not be materialized incompletely"),
+            Err(error) => error.to_string(),
+        };
+        assert!(error.contains("nested"), "{error}");
+        assert!(error.contains("mode 160000"), "{error}");
     }
 }

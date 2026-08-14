@@ -492,6 +492,14 @@ fn validate_unknown_config_control(
     surface: ConfigProbeSurface,
     output: &ProcessOutput,
 ) -> Result<(), TactusError> {
+    if output.output_limited {
+        return Err(TactusError::Agent {
+            message: format!(
+                "codex {version} `{}` strict-config control exceeded the output limit; truncated output cannot prove local parser behavior",
+                surface.label()
+            ),
+        });
+    }
     let text = config_probe_text(output);
     let lower = text.to_ascii_lowercase();
     if !output.timed_out
@@ -521,6 +529,15 @@ fn validate_effort_config_probe(
     effort: Effort,
     output: &ProcessOutput,
 ) -> Result<(), TactusError> {
+    if output.output_limited {
+        return Err(TactusError::Agent {
+            message: format!(
+                "codex {version} `{}` reasoning-key probe exceeded the output limit; truncated output cannot prove `model_reasoning_effort={}`",
+                surface.label(),
+                effort_flag(effort)
+            ),
+        });
+    }
     let text = config_probe_text(output);
     if !output.timed_out
         && output.code.is_some_and(|code| code != 0)
@@ -1136,6 +1153,22 @@ mod tests {
     }
 
     #[test]
+    fn strict_config_evidence_rejects_output_limited_transcript() {
+        let mut truncated = output(
+            1,
+            "",
+            "error: unknown configuration key `tactus_probe_deliberately_unknown`",
+        );
+        truncated.output_limited = true;
+        let error =
+            validate_unknown_config_control("0.147.0", ConfigProbeSurface::Fresh, &truncated)
+                .expect_err("truncated parser evidence must fail closed")
+                .to_string();
+        assert!(error.contains("output limit"), "{error}");
+        assert!(error.contains("truncated output"), "{error}");
+    }
+
+    #[test]
     fn exact_effort_key_must_reach_the_zero_spend_schema_guard() {
         let accepted = output(
             1,
@@ -1176,6 +1209,26 @@ mod tests {
             .is_err(),
             "a timeout cannot be mistaken for parser evidence"
         );
+    }
+
+    #[test]
+    fn effort_config_evidence_rejects_output_limited_transcript() {
+        let mut truncated = output(
+            1,
+            "",
+            "error reading output schema tactus-output-schema-must-not-exist.json",
+        );
+        truncated.output_limited = true;
+        let error = validate_effort_config_probe(
+            "0.147.0",
+            ConfigProbeSurface::Resume,
+            Effort::Max,
+            &truncated,
+        )
+        .expect_err("truncated reasoning-key evidence must fail closed")
+        .to_string();
+        assert!(error.contains("output limit"), "{error}");
+        assert!(error.contains("model_reasoning_effort=max"), "{error}");
     }
 
     #[test]
