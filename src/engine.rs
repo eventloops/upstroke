@@ -2075,7 +2075,7 @@ impl Run<'_> {
                 }
             };
 
-            let (parking, parking_write_error) = if let Some(failure) = result
+            let (parking, parking_question) = if let Some(failure) = result
                 .failure
                 .as_ref()
                 .filter(|failure| failure.kind == FailureKind::ReviewInputTooLarge)
@@ -2087,13 +2087,12 @@ impl Run<'_> {
                     &self.state.progress[index],
                 );
                 let question = self.build_question(index, QuestionKind::Unblock, context);
-                let write_error = self.materialize_question(&question).err();
                 (
                     Some(Box::new(events::AttemptParking {
-                        question,
+                        question: question.clone(),
                         refund_attempt: false,
                     })),
-                    write_error,
+                    Some(question),
                 )
             } else {
                 (None, None)
@@ -2137,11 +2136,13 @@ impl Run<'_> {
                 }
                 return Err(error);
             }
-            if let Some(error) = parking_write_error {
-                // `attempt_finished` already carries the complete question, so
-                // replay cannot repay or reinterpret this attempt. The missing
-                // projection is repaired from that event on resume; surface the
-                // storage failure now, after making the workspace safe.
+            if let Some(question) = parking_question
+                && let Err(error) = self.materialize_question(&question)
+            {
+                // The durable settlement is authoritative and already carries
+                // the complete question. A crash or write failure here cannot
+                // expose an orphan projection; resume rematerializes the
+                // question from the event before accepting an answer.
                 if let Err(cleanup) = self.workspace.discard_uncommitted() {
                     return Err(TactusError::Git {
                         message: format!(
@@ -2598,11 +2599,9 @@ impl Run<'_> {
         Ok(id)
     }
 
-    /// Materialize and announce a question before its authoritative event.
-    ///
-    /// Most callers follow this with `question_raised`. A policy refusal can
-    /// instead embed the same question in `attempt_finished`, making the paid
-    /// settlement and its parking state one crash-atomic replay transition.
+    /// Materialize and announce an ordinary question before its authoritative
+    /// event. Atomic policy parking uses `build_question` directly, appends its
+    /// attempt settlement first, and only then publishes the projection.
     fn prepare_question(
         &mut self,
         index: usize,
@@ -2629,8 +2628,10 @@ impl Run<'_> {
     }
 
     fn materialize_question(&mut self, question: &Question) -> Result<(), TactusError> {
-        // Materialize first: a notifier must never announce a payload that its
-        // recipient cannot open. The authoritative event follows in the caller.
+        // Materialize before notifying: a recipient must always be able to open
+        // the payload it was told about. The caller decides whether the
+        // authoritative event belongs before (atomic settlement parking) or
+        // after (ordinary question flow) this projection.
         interaction::write_question(
             &self.paths.questions(),
             &QuestionRecord::open(question.clone()),

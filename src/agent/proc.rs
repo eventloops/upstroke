@@ -18,10 +18,12 @@
 //! suspension/continuation. It waits out any spawn-registration race, blocks
 //! launches across a suspension transition, and uses a descriptor-scrubbed
 //! guard process to close the last signal-to-stop race. A separate cleanup
-//! reaper survives even an uncatchable Tactus SIGKILL. Together they kill every
-//! active process group before ownership is released and stop every active
-//! group whenever Tactus stops. Run ownership therefore cannot be handed to a
-//! resume -- or appear suspended -- while an isolated agent is running.
+//! reaper survives even an uncatchable Tactus SIGKILL. It continuously retains
+//! descendant identities independently of process group, so `setsid` or
+//! `setpgid` cannot turn a detached tool into unowned work. Together the monitor
+//! and reaper stop and clean every active tree before ownership is released.
+//! Run ownership therefore cannot be handed to a resume -- or appear suspended
+//! -- while an isolated agent is running.
 
 use std::io::{Read, Write};
 use std::process::{Child, Command, Stdio};
@@ -299,6 +301,147 @@ mod termination {
     // Genuine SIGCONT is forwarded immediately by the monitor; this bounded
     // fallback exists for host-owned signal policies the monitor preserves.
     const REAPER_RESUME_STABLE_POLLS: u8 = 50;
+    // Fixed storage keeps the post-fork reaper allocation-free. Hitting either
+    // ceiling is a scanner failure and therefore holds the cleanup lease rather
+    // than pretending an incomplete process-tree snapshot is safe.
+    const MAX_PROCESS_SNAPSHOT: usize = 16_384;
+    const MAX_TRACKED_DESCENDANTS: usize = MAX_PROCESS_SNAPSHOT;
+
+    #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+    struct ProcessIdentity {
+        pid: i32,
+        started_secs: u64,
+        started_subsec: u64,
+    }
+
+    #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+    struct ProcessSnapshot {
+        identity: ProcessIdentity,
+        parent: i32,
+        pgid: i32,
+        state: u32,
+    }
+
+    const EMPTY_PROCESS: ProcessSnapshot = ProcessSnapshot {
+        identity: ProcessIdentity {
+            pid: 0,
+            started_secs: 0,
+            started_subsec: 0,
+        },
+        parent: 0,
+        pgid: 0,
+        state: 0,
+    };
+
+    struct DescendantTracker {
+        identities: [ProcessIdentity; MAX_TRACKED_DESCENDANTS],
+        len: usize,
+    }
+
+    impl DescendantTracker {
+        fn new() -> Self {
+            Self {
+                identities: [ProcessIdentity::default(); MAX_TRACKED_DESCENDANTS],
+                len: 0,
+            }
+        }
+
+        fn refresh(&mut self, root: i32) -> bool {
+            let mut processes = [EMPTY_PROCESS; MAX_PROCESS_SNAPSHOT];
+            let Some(count) = snapshot_processes(&mut processes) else {
+                return false;
+            };
+            self.absorb(root, &processes[..count])
+        }
+
+        fn absorb(&mut self, root: i32, processes: &[ProcessSnapshot]) -> bool {
+            if self.len == 0 {
+                let Some(process) = processes
+                    .iter()
+                    .find(|process| process.identity.pid == root)
+                else {
+                    return false;
+                };
+                if !self.insert(process.identity) {
+                    return false;
+                }
+            }
+
+            // One snapshot can contain several generations. Iterate to a fixed
+            // point so a grandchild is retained even when directory order puts
+            // it before its parent. Once retained, identity survives reparenting
+            // and process-group/session changes.
+            loop {
+                let mut changed = false;
+                for process in processes {
+                    if self.contains(process.identity) {
+                        continue;
+                    }
+                    let Some(parent) = processes
+                        .iter()
+                        .find(|candidate| candidate.identity.pid == process.parent)
+                    else {
+                        continue;
+                    };
+                    if self.contains(parent.identity) {
+                        if !self.insert(process.identity) {
+                            return false;
+                        }
+                        changed = true;
+                    }
+                }
+                if !changed {
+                    return true;
+                }
+            }
+        }
+
+        fn insert(&mut self, identity: ProcessIdentity) -> bool {
+            if self.contains(identity) {
+                return true;
+            }
+            if self.len == self.identities.len() {
+                return false;
+            }
+            self.identities[self.len] = identity;
+            self.len += 1;
+            true
+        }
+
+        fn contains(&self, identity: ProcessIdentity) -> bool {
+            self.identities[..self.len].contains(&identity)
+        }
+
+        fn signal_live(&self, processes: &[ProcessSnapshot], signal: libc::c_int) {
+            for identity in &self.identities[..self.len] {
+                if processes
+                    .iter()
+                    .any(|process| process.identity == *identity && !snapshot_is_zombie(*process))
+                {
+                    let _ = unsafe { libc::kill(identity.pid, signal) };
+                }
+            }
+        }
+
+        fn all_live_stopped(&self, processes: &[ProcessSnapshot]) -> bool {
+            self.identities[..self.len].iter().all(|identity| {
+                processes
+                    .iter()
+                    .find(|process| process.identity == *identity)
+                    .is_none_or(|process| {
+                        snapshot_is_zombie(*process) || snapshot_is_stopped(*process)
+                    })
+            })
+        }
+
+        fn any_live(&self, processes: &[ProcessSnapshot]) -> bool {
+            self.identities[..self.len].iter().any(|identity| {
+                processes
+                    .iter()
+                    .any(|process| process.identity == *identity && !snapshot_is_zombie(*process))
+            })
+        }
+    }
 
     #[derive(Clone, Copy)]
     struct SignalPolicy {
@@ -1307,6 +1450,7 @@ mod termination {
     ) -> ! {
         let mut pgid = 0_i32;
         let mut anchor = 0_i32;
+        let mut descendants = DescendantTracker::new();
         let mut mirrored_parent_stop = false;
         let mut parent_running_polls = 0_u8;
         if !write_raw(ack_fd, &[REAPER_READY]) {
@@ -1328,19 +1472,19 @@ mod termination {
                     continue;
                 }
                 if pgid > 0 {
-                    cleanup_reaper_group(pgid, anchor, cleanup_delay_ms);
+                    cleanup_reaper_tree(pgid, anchor, &mut descendants, cleanup_delay_ms);
                 }
                 unsafe { libc::_exit(0) };
             }
             if unsafe { libc::getppid() } != parent {
                 if pgid > 0 {
-                    cleanup_reaper_group(pgid, anchor, cleanup_delay_ms);
+                    cleanup_reaper_tree(pgid, anchor, &mut descendants, cleanup_delay_ms);
                 }
                 unsafe { libc::_exit(0) };
             }
             if polled > 0 && command.revents & (libc::POLLERR | libc::POLLNVAL) != 0 {
                 if pgid > 0 {
-                    cleanup_reaper_group(pgid, anchor, cleanup_delay_ms);
+                    cleanup_reaper_tree(pgid, anchor, &mut descendants, cleanup_delay_ms);
                 }
                 unsafe { libc::_exit(0) };
             }
@@ -1348,7 +1492,7 @@ mod termination {
                 let mut frame = [0_u8; 5];
                 if !read_raw_exact(command_fd, &mut frame) {
                     if pgid > 0 {
-                        cleanup_reaper_group(pgid, anchor, cleanup_delay_ms);
+                        cleanup_reaper_tree(pgid, anchor, &mut descendants, cleanup_delay_ms);
                     }
                     unsafe { libc::_exit(0) };
                 }
@@ -1358,6 +1502,14 @@ mod termination {
                         let created = spawn_group_anchor(requested, open_max);
                         if created <= 0 {
                             false
+                        } else if !descendants.refresh(requested) {
+                            cleanup_reaper_tree(
+                                requested,
+                                created,
+                                &mut descendants,
+                                cleanup_delay_ms,
+                            );
+                            false
                         } else {
                             pgid = requested;
                             anchor = created;
@@ -1365,13 +1517,13 @@ mod termination {
                         }
                     }
                     REAPER_CLEANUP if requested == pgid && pgid > 0 => {
-                        cleanup_reaper_group(pgid, anchor, cleanup_delay_ms);
+                        cleanup_reaper_tree(pgid, anchor, &mut descendants, cleanup_delay_ms);
                         let _ = write_raw(ack_fd, &[REAPER_OK]);
                         unsafe { libc::_exit(0) };
                     }
                     REAPER_CANCEL if requested == 0 => {
                         if pgid > 0 {
-                            cleanup_reaper_group(pgid, anchor, cleanup_delay_ms);
+                            cleanup_reaper_tree(pgid, anchor, &mut descendants, cleanup_delay_ms);
                         }
                         let _ = write_raw(ack_fd, &[REAPER_OK]);
                         unsafe { libc::_exit(0) };
@@ -1380,22 +1532,27 @@ mod termination {
                 };
                 if !write_raw(ack_fd, &[if accepted { REAPER_OK } else { REAPER_FAIL }]) {
                     if pgid > 0 {
-                        cleanup_reaper_group(pgid, anchor, cleanup_delay_ms);
+                        cleanup_reaper_tree(pgid, anchor, &mut descendants, cleanup_delay_ms);
                     }
                     unsafe { libc::_exit(0) };
                 }
             }
 
             if pgid > 0 {
+                if !descendants.refresh(pgid) {
+                    cleanup_reaper_tree(pgid, anchor, &mut descendants, cleanup_delay_ms);
+                    unsafe { libc::_exit(0) };
+                }
                 match process_is_stopped(parent) {
                     Some(true) if !mirrored_parent_stop => {
-                        mirrored_parent_stop = unsafe { libc::kill(-pgid, libc::SIGSTOP) } == 0;
+                        mirrored_parent_stop =
+                            signal_reaper_tree(pgid, &mut descendants, libc::SIGSTOP);
                         parent_running_polls = 0;
                     }
                     Some(true) => parent_running_polls = 0,
                     state @ Some(false) if mirrored_parent_stop => {
                         if parent_has_stably_resumed(state, &mut parent_running_polls) {
-                            let _ = unsafe { libc::kill(-pgid, libc::SIGCONT) };
+                            let _ = signal_reaper_tree(pgid, &mut descendants, libc::SIGCONT);
                             mirrored_parent_stop = false;
                             parent_running_polls = 0;
                         }
@@ -1448,10 +1605,60 @@ mod termination {
         }
     }
 
-    fn cleanup_reaper_group(pgid: i32, anchor: libc::pid_t, cleanup_delay_ms: u64) {
-        unsafe {
-            let _ = libc::kill(-pgid, libc::SIGKILL);
+    fn signal_reaper_tree(
+        pgid: i32,
+        descendants: &mut DescendantTracker,
+        signal: libc::c_int,
+    ) -> bool {
+        let mut processes = [EMPTY_PROCESS; MAX_PROCESS_SNAPSHOT];
+        let Some(count) = snapshot_processes(&mut processes) else {
+            return false;
+        };
+        if !descendants.absorb(pgid, &processes[..count]) {
+            return false;
         }
+        let group_signalled =
+            unsafe { libc::kill(-pgid, signal) } == 0 || last_errno() == libc::ESRCH;
+        descendants.signal_live(&processes[..count], signal);
+        group_signalled
+    }
+
+    fn cleanup_reaper_tree(
+        pgid: i32,
+        anchor: libc::pid_t,
+        descendants: &mut DescendantTracker,
+        cleanup_delay_ms: u64,
+    ) {
+        let mut processes = [EMPTY_PROCESS; MAX_PROCESS_SNAPSHOT];
+
+        // Freeze the complete retained ancestry before killing any parent. A
+        // process may have left the original group with setsid/setpgid, but it
+        // cannot fork after its stable identity is stopped. Re-snapshot to a
+        // fixed point so a child created immediately before SIGSTOP is retained
+        // while its parent still pins the ancestry edge.
+        loop {
+            let Some(count) = snapshot_processes(&mut processes) else {
+                raw_sleep_10ms();
+                continue;
+            };
+            if !descendants.absorb(pgid, &processes[..count]) {
+                raw_sleep_10ms();
+                continue;
+            }
+            let _ = unsafe { libc::kill(-pgid, libc::SIGSTOP) };
+            descendants.signal_live(&processes[..count], libc::SIGSTOP);
+            raw_sleep_10ms();
+
+            let Some(count) = snapshot_processes(&mut processes) else {
+                continue;
+            };
+            if descendants.absorb(pgid, &processes[..count])
+                && descendants.all_live_stopped(&processes[..count])
+            {
+                break;
+            }
+        }
+
         // Test subprocesses can widen the otherwise tiny post-crash window so
         // the reaper-owned cleanup lease is asserted deterministically.
         // Release builds always pass zero and pay no delay.
@@ -1461,12 +1668,27 @@ mod termination {
             delay_left = delay_left.saturating_sub(10);
         }
         // The stopped anchor pins the PGID until it becomes our unreaped
-        // zombie. Only release the reaper-owned run-cleanup lease once every
-        // member of that exact group is either gone or a non-running zombie.
-        while group_has_non_zombie_members(pgid) != Some(false) {
+        // zombie. Retained start-time identities independently pin descendants
+        // that changed group or session; PID reuse can never redirect a signal
+        // at an unrelated process.
+        loop {
+            let Some(count) = snapshot_processes(&mut processes) else {
+                raw_sleep_10ms();
+                continue;
+            };
+            if !descendants.absorb(pgid, &processes[..count]) {
+                raw_sleep_10ms();
+                continue;
+            }
             raw_sleep_10ms();
             unsafe {
                 let _ = libc::kill(-pgid, libc::SIGKILL);
+            }
+            descendants.signal_live(&processes[..count], libc::SIGKILL);
+            if !descendants.any_live(&processes[..count])
+                && group_has_non_zombie_members(pgid) == Some(false)
+            {
+                break;
             }
         }
         if anchor > 0 {
@@ -2186,9 +2408,91 @@ mod termination {
     #[cfg(target_os = "linux")]
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
     enum LinuxStatSnapshot {
-        Present { pgid: i32, state: u8 },
+        Present(ProcessSnapshot),
         Vanished,
         Invalid,
+    }
+
+    #[cfg(target_os = "linux")]
+    fn snapshot_processes(output: &mut [ProcessSnapshot]) -> Option<usize> {
+        let directory = unsafe {
+            libc::open(
+                c"/proc".as_ptr(),
+                libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC,
+            )
+        };
+        if directory < 0 {
+            return None;
+        }
+        let mut entries = [0_u8; 16_384];
+        let mut output_len = 0_usize;
+        loop {
+            let count = unsafe {
+                libc::syscall(
+                    libc::SYS_getdents64,
+                    directory,
+                    entries.as_mut_ptr(),
+                    entries.len(),
+                )
+            };
+            if count == 0 {
+                close_fd(directory);
+                return Some(output_len);
+            }
+            if count < 0 {
+                if last_errno_is_interrupted() {
+                    continue;
+                }
+                close_fd(directory);
+                return None;
+            }
+            let mut offset = 0_usize;
+            while offset < count as usize {
+                if offset + 19 > count as usize {
+                    close_fd(directory);
+                    return None;
+                }
+                let record_len =
+                    u16::from_ne_bytes([entries[offset + 16], entries[offset + 17]]) as usize;
+                if record_len < 20 || offset + record_len > count as usize {
+                    close_fd(directory);
+                    return None;
+                }
+                let name = &entries[offset + 19..offset + record_len];
+                let name_len = name
+                    .iter()
+                    .position(|byte| *byte == 0)
+                    .unwrap_or(name.len());
+                if let Some(pid) = parse_decimal(&name[..name_len]) {
+                    match read_linux_stat_raw(pid) {
+                        LinuxStatSnapshot::Present(process) => {
+                            let Some(slot) = output.get_mut(output_len) else {
+                                close_fd(directory);
+                                return None;
+                            };
+                            *slot = process;
+                            output_len += 1;
+                        }
+                        // Kernel-owned or deliberately hidden unrelated
+                        // processes can be unreadable. The supervised root is
+                        // required below before registration succeeds, and its
+                        // same-credential descendants remain observable.
+                        LinuxStatSnapshot::Vanished | LinuxStatSnapshot::Invalid => {}
+                    }
+                }
+                offset += record_len;
+            }
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn snapshot_is_zombie(process: ProcessSnapshot) -> bool {
+        matches!(process.state as u8, b'Z' | b'X' | b'x')
+    }
+
+    #[cfg(target_os = "linux")]
+    fn snapshot_is_stopped(process: ProcessSnapshot) -> bool {
+        matches!(process.state as u8, b'T' | b't')
     }
 
     #[cfg(target_os = "linux")]
@@ -2242,14 +2546,13 @@ mod termination {
                     .unwrap_or(name.len());
                 if let Some(pid) = parse_decimal(&name[..name_len]) {
                     match read_linux_stat_raw(pid) {
-                        LinuxStatSnapshot::Present {
-                            pgid: candidate,
-                            state,
-                        } if candidate == pgid && !matches!(state, b'Z' | b'X' | b'x') => {
+                        LinuxStatSnapshot::Present(process)
+                            if process.pgid == pgid && !snapshot_is_zombie(process) =>
+                        {
                             close_fd(directory);
                             return Some(true);
                         }
-                        LinuxStatSnapshot::Present { .. } | LinuxStatSnapshot::Vanished => {}
+                        LinuxStatSnapshot::Present(_) | LinuxStatSnapshot::Vanished => {}
                         // Permission failures and malformed snapshots remain
                         // fail-closed. Only a kernel-confirmed vanished PID is
                         // safe to skip as ordinary process churn.
@@ -2303,30 +2606,46 @@ mod termination {
         if count <= 0 {
             return LinuxStatSnapshot::Invalid;
         }
-        parse_linux_stat_bytes(&stat[..count as usize])
-            .map(|(pgid, state)| LinuxStatSnapshot::Present { pgid, state })
+        parse_linux_stat_bytes(pid, &stat[..count as usize])
+            .map(LinuxStatSnapshot::Present)
             .unwrap_or(LinuxStatSnapshot::Invalid)
     }
 
     #[cfg(target_os = "linux")]
     fn process_is_stopped(pid: i32) -> Option<bool> {
         match read_linux_stat_raw(pid) {
-            LinuxStatSnapshot::Present { state, .. } => Some(matches!(state, b'T' | b't')),
+            LinuxStatSnapshot::Present(process) => Some(snapshot_is_stopped(process)),
             LinuxStatSnapshot::Vanished | LinuxStatSnapshot::Invalid => None,
         }
     }
 
     #[cfg(target_os = "linux")]
-    fn parse_linux_stat_bytes(stat: &[u8]) -> Option<(i32, u8)> {
+    fn parse_linux_stat_bytes(pid: i32, stat: &[u8]) -> Option<ProcessSnapshot> {
         let close = stat.iter().rposition(|byte| *byte == b')')?;
         let mut fields = stat.get(close + 1..)?;
         fields = trim_ascii_start(fields);
-        let state = *fields.first()?;
-        fields = next_ascii_field(fields)?.1;
-        let (parent, tail) = next_ascii_field(fields)?;
-        parse_decimal(parent)?;
-        let (group, _) = next_ascii_field(tail)?;
-        Some((parse_decimal(group)?, state))
+        let (state, tail) = next_ascii_field(fields)?;
+        let state = u32::from(*state.first()?);
+        let (parent, tail) = next_ascii_field(tail)?;
+        let parent = parse_decimal(parent)?;
+        let (group, mut tail) = next_ascii_field(tail)?;
+        let group = parse_decimal(group)?;
+        // Fields 6..=21 sit between pgrp (5) and starttime (22).
+        for _ in 0..16 {
+            tail = next_ascii_field(tail)?.1;
+        }
+        let (started, _) = next_ascii_field(tail)?;
+        let started = parse_u64_decimal(started)?;
+        Some(ProcessSnapshot {
+            identity: ProcessIdentity {
+                pid,
+                started_secs: started,
+                started_subsec: 0,
+            },
+            parent,
+            pgid: group,
+            state,
+        })
     }
 
     #[cfg(target_os = "linux")]
@@ -2363,6 +2682,21 @@ mod termination {
     }
 
     #[cfg(target_os = "linux")]
+    fn parse_u64_decimal(bytes: &[u8]) -> Option<u64> {
+        if bytes.is_empty() {
+            return None;
+        }
+        let mut value = 0_u64;
+        for byte in bytes {
+            if !byte.is_ascii_digit() {
+                return None;
+            }
+            value = value.checked_mul(10)?.checked_add(u64::from(byte - b'0'))?;
+        }
+        Some(value)
+    }
+
+    #[cfg(target_os = "linux")]
     fn write_decimal(value: i32, output: &mut [u8]) -> Option<usize> {
         if value <= 0 {
             return None;
@@ -2382,6 +2716,66 @@ mod termination {
             output[index] = reversed[count - index - 1];
         }
         Some(count)
+    }
+
+    #[cfg(target_os = "macos")]
+    fn snapshot_processes(output: &mut [ProcessSnapshot]) -> Option<usize> {
+        let mut pids = [0_i32; MAX_PROCESS_SNAPSHOT];
+        let count = unsafe {
+            libc::proc_listallpids(
+                pids.as_mut_ptr().cast(),
+                std::mem::size_of_val(&pids) as libc::c_int,
+            )
+        };
+        if count < 0 || count as usize >= pids.len() {
+            return None;
+        }
+        let mut output_len = 0_usize;
+        for pid in &pids[..count as usize] {
+            if *pid <= 0 {
+                continue;
+            }
+            let mut info: libc::proc_bsdinfo = unsafe { std::mem::zeroed() };
+            let read = unsafe {
+                libc::proc_pidinfo(
+                    *pid,
+                    libc::PROC_PIDTBSDINFO,
+                    1,
+                    (&mut info as *mut libc::proc_bsdinfo).cast(),
+                    std::mem::size_of::<libc::proc_bsdinfo>() as libc::c_int,
+                )
+            };
+            if read != std::mem::size_of::<libc::proc_bsdinfo>() as libc::c_int {
+                // System processes can be intentionally opaque. A supervised
+                // descendant has the caller's credentials and remains
+                // observable; the root-presence check makes that assumption
+                // fail closed at registration.
+                continue;
+            }
+            let slot = output.get_mut(output_len)?;
+            *slot = ProcessSnapshot {
+                identity: ProcessIdentity {
+                    pid: *pid,
+                    started_secs: info.pbi_start_tvsec,
+                    started_subsec: info.pbi_start_tvusec,
+                },
+                parent: i32::try_from(info.pbi_ppid).ok()?,
+                pgid: i32::try_from(info.pbi_pgid).ok()?,
+                state: info.pbi_status,
+            };
+            output_len += 1;
+        }
+        Some(output_len)
+    }
+
+    #[cfg(target_os = "macos")]
+    fn snapshot_is_zombie(process: ProcessSnapshot) -> bool {
+        process.state == libc::SZOMB
+    }
+
+    #[cfg(target_os = "macos")]
+    fn snapshot_is_stopped(process: ProcessSnapshot) -> bool {
+        process.state == libc::SSTOP
     }
 
     #[cfg(target_os = "macos")]
@@ -2716,6 +3110,61 @@ mod termination {
             assert_eq!(running_polls, 0);
         }
 
+        #[test]
+        fn descendant_tracking_survives_reparenting_and_group_changes() {
+            let root = ProcessSnapshot {
+                identity: ProcessIdentity {
+                    pid: 10,
+                    started_secs: 1,
+                    started_subsec: 0,
+                },
+                parent: 1,
+                pgid: 10,
+                state: u32::from(b'R'),
+            };
+            let child = ProcessSnapshot {
+                identity: ProcessIdentity {
+                    pid: 11,
+                    started_secs: 2,
+                    started_subsec: 0,
+                },
+                parent: 10,
+                pgid: 11,
+                state: u32::from(b'R'),
+            };
+            let grandchild = ProcessSnapshot {
+                identity: ProcessIdentity {
+                    pid: 12,
+                    started_secs: 3,
+                    started_subsec: 0,
+                },
+                parent: 11,
+                pgid: 12,
+                state: u32::from(b'R'),
+            };
+            let mut tracker = DescendantTracker::new();
+            assert!(tracker.absorb(10, &[grandchild, child, root]));
+            assert_eq!(
+                tracker.len, 3,
+                "one snapshot reaches an ancestry fixed point"
+            );
+
+            let reparented = ProcessSnapshot {
+                parent: 1,
+                ..grandchild
+            };
+            assert!(tracker.absorb(10, &[reparented]));
+            assert!(tracker.contains(grandchild.identity));
+            assert!(
+                !tracker.contains(ProcessIdentity {
+                    pid: 12,
+                    started_secs: 4,
+                    started_subsec: 0,
+                }),
+                "PID reuse is not descendant identity"
+            );
+        }
+
         extern "C" fn reap_child_transitions(_: libc::c_int) {
             if REAPED_CHILD_STOP.swap(true, Ordering::SeqCst) {
                 return;
@@ -2961,17 +3410,42 @@ mod termination {
         #[cfg(target_os = "linux")]
         #[test]
         fn linux_stat_parser_handles_spaces_and_closing_parentheses_in_comm() {
-            let stat = "123 (reviewer ) helper) T 7 123 123 0 -1 0";
+            let stat = "123 (reviewer ) helper) T 7 123 123 0 -1 0 0 0 0 0 0 0 0 0 0 0 1 0 4242";
             assert_eq!(parse_linux_process_stat(stat), Some((123, b'T')));
-            assert_eq!(parse_linux_stat_bytes(stat.as_bytes()), Some((123, b'T')));
+            assert_eq!(
+                parse_linux_stat_bytes(123, stat.as_bytes()),
+                Some(ProcessSnapshot {
+                    identity: ProcessIdentity {
+                        pid: 123,
+                        started_secs: 4242,
+                        started_subsec: 0,
+                    },
+                    parent: 7,
+                    pgid: 123,
+                    state: u32::from(b'T'),
+                })
+            );
             assert_eq!(parse_linux_process_stat("malformed"), None);
-            assert_eq!(parse_linux_stat_bytes(b"malformed"), None);
+            assert_eq!(parse_linux_stat_bytes(123, b"malformed"), None);
         }
 
         #[cfg(target_os = "linux")]
         #[test]
         fn a_vanished_linux_pid_is_not_an_incomplete_scanner_snapshot() {
             assert_eq!(read_linux_stat_raw(i32::MAX), LinuxStatSnapshot::Vanished);
+        }
+
+        #[cfg(target_os = "linux")]
+        #[test]
+        fn linux_snapshot_records_a_stable_identity_for_the_current_process() {
+            let LinuxStatSnapshot::Present(process) =
+                read_linux_stat_raw(unsafe { libc::getpid() })
+            else {
+                panic!("current process was not readable through procfs");
+            };
+            assert!(process.identity.started_secs > 0);
+            assert!(process.parent > 0);
+            assert!(process.pgid > 0);
         }
 
         #[test]
@@ -3189,6 +3663,73 @@ mod tests {
             !leaked,
             "a detached descendant outlived the successful command"
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[ignore = "subprocess helper"]
+    fn escaped_session_launcher_helper() {
+        let Some(marker) = std::env::var_os("TACTUS_ESCAPE_MARKER") else {
+            return;
+        };
+        use std::os::unix::ffi::OsStrExt;
+        let marker = std::ffi::CString::new(std::path::Path::new(&marker).as_os_str().as_bytes())
+            .expect("marker path has no null byte");
+        let child = unsafe { libc::fork() };
+        assert!(child >= 0, "fork escaped descendant");
+        if child == 0 {
+            unsafe {
+                if libc::setsid() < 0 {
+                    libc::_exit(2);
+                }
+                libc::usleep(1_000_000);
+                let fd = libc::open(
+                    marker.as_ptr(),
+                    libc::O_WRONLY | libc::O_CREAT | libc::O_TRUNC,
+                    0o600,
+                );
+                if fd >= 0 {
+                    let bytes = b"leaked";
+                    let _ = libc::write(fd, bytes.as_ptr().cast(), bytes.len());
+                    let _ = libc::close(fd);
+                }
+                libc::_exit(0);
+            }
+        }
+        // Give the independent reaper several observations while the ancestry
+        // edge still exists, then let this supervised leader exit normally.
+        thread::sleep(Duration::from_millis(200));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn successful_exit_kills_a_descendant_that_created_a_new_session() {
+        let marker = std::env::temp_dir().join(format!(
+            "tactus-proc-escaped-session-{}-{}.marker",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock after epoch")
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_file(&marker);
+        let mut command = Command::new(std::env::current_exe().expect("test executable"));
+        command
+            .args([
+                "agent::proc::tests::escaped_session_launcher_helper",
+                "--ignored",
+                "--exact",
+                "--nocapture",
+            ])
+            .env("TACTUS_ESCAPE_MARKER", &marker);
+        let output = run_with_timeout(command, "", Duration::from_secs(10))
+            .expect("spawn escaped-session helper");
+        assert_eq!(output.code, Some(0), "helper output: {output:?}");
+
+        thread::sleep(Duration::from_millis(1200));
+        let leaked = marker.exists();
+        let _ = std::fs::remove_file(&marker);
+        assert!(!leaked, "a setsid descendant escaped the cleanup reaper");
     }
 
     #[cfg(unix)]

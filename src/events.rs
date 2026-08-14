@@ -1121,6 +1121,11 @@ impl RunState {
                     progress.records.push((**data).clone());
                 }
                 if let Some(parking) = parking {
+                    // Parking discards the attempt's working tree. Its model
+                    // session therefore describes edits that no longer exist
+                    // and must not survive as a candidate for a later retry.
+                    self.progress[index].session = None;
+                    self.progress[index].resume_next = false;
                     if parking.refund_attempt {
                         self.progress[index].attempts_on_rung =
                             self.progress[index].attempts_on_rung.saturating_sub(1);
@@ -1200,6 +1205,8 @@ impl RunState {
                 let Some(index) = self.index_of(task) else {
                     return;
                 };
+                self.progress[index].session = None;
+                self.progress[index].resume_next = false;
                 if data.refund_attempt {
                     let progress = &mut self.progress[index];
                     progress.attempts_on_rung = progress.attempts_on_rung.saturating_sub(1);
@@ -2617,6 +2624,37 @@ mod tests {
     }
 
     #[test]
+    fn atomic_attempt_parking_discards_the_finished_sessions_tree_identity() {
+        let mut finished = attempt_finished("t1", 1, 0, "small");
+        let EventBody::AttemptFinished { parking, .. } = &mut finished else {
+            unreachable!("the helper always returns an attempt settlement");
+        };
+        *parking = Some(Box::new(AttemptParking {
+            question: question("q-parked", "t1"),
+            refund_attempt: false,
+        }));
+        let events = vec![
+            Event::now(started()),
+            Event::now(attempt_started("t1", 1, 0, "small")),
+            Event::now(finished),
+        ];
+        let replayed =
+            replay(events, vec!["t1".to_owned()], Path::new("events.jsonl")).expect("replay");
+
+        let progress = &replayed.state.progress[0];
+        assert!(
+            progress.session.is_none(),
+            "parking discarded the tree, so its session cannot be resumed"
+        );
+        assert!(!progress.resume_next);
+        assert_eq!(
+            replayed.state.states[0],
+            TaskState::AwaitingInput(QuestionId::from("q-parked"))
+        );
+        assert_eq!(replayed.state.open_questions().len(), 1);
+    }
+
+    #[test]
     fn resuming_drops_the_session_and_wakes_deferred_work() {
         // §14's pairing: tree retention and session resume travel together, so
         // a resume that discards the tree must also drop the session.
@@ -2692,6 +2730,10 @@ mod tests {
         assert_eq!(
             progress.attempts_on_rung, 0,
             "an Unblock answer buys a fresh allowance on the same rung"
+        );
+        assert!(
+            progress.session.is_none(),
+            "a parked tree has no live session"
         );
         assert!(!progress.resume_next, "never resume out of a park (§14)");
         let last = progress.feedback.last().expect("the answer is feedback");
