@@ -152,6 +152,16 @@ pub struct ReviewPass {
 /// this was built against and the one it is read back against are the same list.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ReviewPlan {
+    /// Whether verification was deliberately enabled when this plan was
+    /// frozen. `Option` is intentional: schema-3 replay must distinguish an
+    /// old/malformed record that omitted the field from an explicit `false`.
+    #[serde(default)]
+    pub enabled: Option<bool>,
+    /// Whether the frozen plan deliberately retained an anti-self-review
+    /// alternative. Absence of the binding is legitimate, but absence of this
+    /// marker is not: otherwise a truncated record silently weakens review.
+    #[serde(default)]
+    pub alternative_available: Option<bool>,
     /// Independent wall-clock budget for each pass, including its one
     /// verdict-format re-ask. Seconds keep the event record plain and stable.
     /// This complete-review contract begins at event schema 3. A schema-2
@@ -178,6 +188,8 @@ pub struct ReviewPlan {
 impl Default for ReviewPlan {
     fn default() -> Self {
         Self {
+            enabled: Some(false),
+            alternative_available: Some(false),
             pass_timeout_secs: Some(crate::config::DEFAULT_REVIEW_PASS_TIMEOUT.as_secs()),
             primary: None,
             alternative: None,
@@ -235,6 +247,7 @@ impl ReviewPlan {
     /// probe. Reviews still happen; some may be same-model.
     pub fn drop_alternative(&mut self) {
         self.alternative = None;
+        self.alternative_available = Some(false);
     }
 
     /// Which tasks will be judged by the model that wrote them, and why nothing
@@ -434,6 +447,8 @@ pub fn plan_for(
     }
 
     let resolved = ReviewPlan {
+        enabled: Some(true),
+        alternative_available: Some(alternative.is_some()),
         pass_timeout_secs: Some(cfg.review_pass_timeout.as_secs()),
         primary: Some(primary),
         alternative,
@@ -661,8 +676,10 @@ const REASK_PROMPT: &str = "Your previous answer did not contain a parseable ver
     ```\n";
 
 fn materialize_prompt(cx: &ReviewCx<'_>) -> Result<String, TactusError> {
-    if let Some(message) = complete_diff_error(cx.diff) {
-        return Err(TactusError::Refused { message });
+    if let Some(error) = complete_diff_error(cx.diff) {
+        return Err(TactusError::Refused {
+            message: error.to_string(),
+        });
     }
     let task = cx.task;
     let mut prompt = String::new();
@@ -766,24 +783,50 @@ fn materialize_prompt(cx: &ReviewCx<'_>) -> Result<String, TactusError> {
 /// failure. `materialize_prompt` repeats the check as a last line of defence
 /// for direct callers, which still receive a refusal rather than a truncated
 /// review.
-pub(crate) fn complete_diff_error(diff: &str) -> Option<String> {
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum CompleteDiffError {
+    Opaque,
+    TooLarge { actual: usize, limit: usize },
+}
+
+impl std::fmt::Display for CompleteDiffError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Opaque => write!(
+                f,
+                "review diff contains an opaque binary, attribute-suppressed path, or gitlink; \
+                 the reviewer cannot inspect its changed bytes. Move generated/binary artifacts \
+                 outside this task, replace them with reviewable textual source, and vendor any \
+                 submodule change as reviewable content"
+            ),
+            Self::TooLarge { actual, limit } => write!(
+                f,
+                "review diff is {actual} bytes, above the {limit}-byte complete-review limit; \
+                 retry only if guidance can produce a smaller complete diff, or skip this frozen \
+                 task and start a new run whose plan splits the work"
+            ),
+        }
+    }
+}
+
+pub(crate) fn complete_diff_error(diff: &str) -> Option<CompleteDiffError> {
     if diff.lines().any(|line| {
         line == "GIT binary patch"
             || (line.starts_with("Binary files ") && line.ends_with(" differ"))
+            || matches!(
+                line,
+                "new file mode 160000"
+                    | "deleted file mode 160000"
+                    | "old mode 160000"
+                    | "new mode 160000"
+            )
+            || (line.starts_with("index ") && line.ends_with(" 160000"))
     }) {
-        return Some(
-            "review diff contains an opaque binary or attribute-suppressed path; the reviewer \
-             cannot inspect its changed bytes. Move generated/binary artifacts outside this task \
-             or replace them with a reviewable textual source representation"
-                .to_owned(),
-        );
+        return Some(CompleteDiffError::Opaque);
     }
-    (diff.len() > MAX_DIFF_BYTES).then(|| {
-        format!(
-            "review diff is {} bytes, above the {}-byte complete-review limit; retry only if guidance can produce a smaller complete diff, or skip this frozen task and start a new run whose plan splits the work",
-            diff.len(),
-            MAX_DIFF_BYTES
-        )
+    (diff.len() > MAX_DIFF_BYTES).then_some(CompleteDiffError::TooLarge {
+        actual: diff.len(),
+        limit: MAX_DIFF_BYTES,
     })
 }
 
@@ -1352,6 +1395,30 @@ mod tests {
     }
 
     #[test]
+    fn gitlink_diff_is_refused_before_reviewer_invocation() {
+        let task = task();
+        let gitlink = "diff --git a/vendor/lib b/vendor/lib\nnew file mode 160000\n\
+                       index 0000000..0123456\n--- /dev/null\n+++ b/vendor/lib\n\
+                       @@ -0,0 +1 @@\n+Subproject commit 0123456789abcdef\n";
+        let cx = ReviewCx {
+            adapter: &NeverInvokedAdapter,
+            profile: profile_for("claude-code", "claude-opus-5", "review", Effort::High),
+            lens: Lens::Acceptance,
+            task: &task,
+            diff: gitlink,
+            artifacts: &[],
+            decisions: &[],
+            workspace: Path::new("."),
+            settings_dir: Path::new("."),
+            reviews_dir: Path::new("."),
+            stem: "00-t1-gitlink".to_owned(),
+            timeout: Duration::from_secs(60),
+        };
+        let error = run_review(&cx).expect_err("a gitlink hash is not reviewable content");
+        assert!(error.to_string().contains("gitlink"), "{error}");
+    }
+
+    #[test]
     fn verdict_reask_uses_the_remaining_pass_deadline() {
         let root =
             std::env::temp_dir().join(format!("tactus-review-deadline-{}", std::process::id()));
@@ -1426,6 +1493,8 @@ mod tests {
     /// Primary at frontier, a reachable OpenAI alternative, one task.
     fn plan_with(second: Option<PassBinding>) -> ReviewPlan {
         ReviewPlan {
+            enabled: Some(true),
+            alternative_available: Some(true),
             primary: Some(binding("claude-code", "claude-opus-5")),
             alternative: Some(binding("copilot", "gpt-5.3-codex")),
             second_opinion: vec![second],
@@ -1504,6 +1573,8 @@ mod tests {
         assert_eq!(plan.required_agents(), ["claude-code", "copilot"]);
 
         let optional_only = ReviewPlan {
+            enabled: Some(true),
+            alternative_available: Some(true),
             primary: Some(binding("claude-code", "claude-opus-5")),
             alternative: Some(binding("copilot", "gpt-5.3-codex")),
             second_opinion: vec![None],
@@ -1800,6 +1871,8 @@ mod tests {
         // A log written before step 9 has no such field at all.
         let empty: ReviewPlan = serde_json::from_str("{}").expect("absent field defaults");
         assert_eq!(empty.pass_timeout_secs, None);
+        assert_eq!(empty.enabled, None);
+        assert_eq!(empty.alternative_available, None);
         assert_eq!(empty.primary, None);
         assert_eq!(empty.alternative, None);
         assert!(empty.second_opinion.is_empty());

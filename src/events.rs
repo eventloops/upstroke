@@ -41,9 +41,10 @@ use crate::util;
 /// Misread is the operative word. Step 10's additive reporting fields stayed in
 /// schema 1 because ignoring them did not change execution. Schema 2 froze
 /// effort and resolved worker bindings because they are execution identity.
-/// Schema 3 freezes the complete-review contract: a schema-2 binary would
-/// ignore the per-pass timeout and still truncate review prompts at 60 KiB,
-/// which could let it accept work whose earlier paths were never judged.
+/// Schema 3 freezes the complete-review and atomic-attempt contracts: a
+/// schema-2 binary would ignore the per-pass timeout and still truncate review
+/// prompts at 60 KiB, and would ignore an embedded ladder transition and
+/// repeat a settled failure after a crash.
 /// Fresh runs therefore say `3` in `run_started`; when this binary resumes an
 /// older run it appends `run_schema_upgraded` before another attempt, so older
 /// binaries refuse the changed verification standard rather than misread it.
@@ -129,6 +130,11 @@ pub enum EventBody {
         /// pending and pay for the same known-unreviewable attempt again.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         parking: Option<Box<AttemptParking>>,
+        /// The ladder decision caused by this failed attempt. It is part of
+        /// the same durable append as the attempt record: a crash must not
+        /// replay a known failure as pending work on its old rung.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        transition: Option<Box<AttemptTransition>>,
     },
     /// The `attempt_finished` a dead process never got to write.
     ///
@@ -569,6 +575,21 @@ pub struct AttemptParking {
     pub refund_attempt: bool,
 }
 
+/// The non-parking state transition settled by one failed attempt.
+///
+/// Parking remains beside this on `attempt_finished` because escalation can
+/// both move to the next rung and ask for spend approval atomically. Legacy
+/// standalone ladder events remain readable, but new attempts record their
+/// decision with the attempt they settle.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "action", content = "data", rename_all = "snake_case")]
+pub enum AttemptTransition {
+    Retry(LadderRetry),
+    Escalate(LadderEscalated),
+    Defer(TaskDeferred),
+    Fail(TaskFailed),
+}
+
 impl AttemptRecord {
     /// Total review spend for this attempt, or `None` when nothing reported any
     /// — which is not the same as nothing costing anything (§13: the Copilot
@@ -737,6 +758,10 @@ pub struct QuestionRaised {
 pub struct QuestionAnswered {
     pub question: QuestionId,
     pub answer: Answer,
+    /// The halt policy frozen when a decline became durable. `None` is a
+    /// legacy answer whose older writer did not record the policy.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub decline_halts_run: Option<bool>,
     /// Which channel produced it — a terminal, an out-of-band `tactus answer`,
     /// or a resume picking up an answer written while the run was dead.
     pub via: String,
@@ -1082,6 +1107,11 @@ impl RunState {
                     profile: profile.clone(),
                     pool: data.pool.clone(),
                 });
+                // A fresh attempt has no conversation paired with its fresh
+                // tree. Replace, rather than preserve, the previous identity;
+                // otherwise a sessionless failure can resurrect a discarded
+                // session on the following retry.
+                progress.session = data.resume_session.clone();
             }
 
             // The attempt nobody was alive to finish. Recorded — it really ran
@@ -1109,8 +1139,10 @@ impl RunState {
 
             EventBody::AttemptFinished {
                 task,
+                attempt,
                 data,
                 parking,
+                transition,
                 ..
             } => {
                 let Some(index) = self.index_of(task) else {
@@ -1123,6 +1155,9 @@ impl RunState {
                         progress.session = Some(session.clone());
                     }
                     progress.records.push((**data).clone());
+                }
+                if let Some(transition) = transition {
+                    self.apply_attempt_transition(task, *attempt, transition);
                 }
                 if let Some(parking) = parking {
                     // Parking discards the attempt's working tree. Its model
@@ -1145,57 +1180,16 @@ impl RunState {
                 attempt,
                 data,
                 ..
-            } => {
-                let Some(index) = self.index_of(task) else {
-                    return;
-                };
-                let progress = &mut self.progress[index];
-                progress.feedback.push(Feedback {
-                    attempt: *attempt,
-                    tier: data.tier.clone(),
-                    summary: data.summary.clone(),
-                    detail: data.detail.clone(),
-                    human: false,
-                });
-                progress.resume_next = data.resume;
-            }
+            } => self.apply_ladder_retry(task, *attempt, data),
 
             EventBody::LadderEscalated {
                 task,
                 attempt,
                 data,
                 ..
-            } => {
-                let Some(index) = self.index_of(task) else {
-                    return;
-                };
-                let progress = &mut self.progress[index];
-                progress.feedback.push(Feedback {
-                    attempt: *attempt,
-                    tier: data.tier.clone(),
-                    summary: data.summary.clone(),
-                    detail: data.detail.clone(),
-                    human: false,
-                });
-                progress.rung = data.to_rung as usize;
-                progress.attempts_on_rung = 0;
-                // §11.4: a different model cannot inherit another's
-                // conversation; the accumulated feedback carries the history.
-                progress.session = None;
-                progress.resume_next = false;
-            }
+            } => self.apply_ladder_escalated(task, *attempt, data),
 
-            EventBody::TaskDeferred { task, data } => {
-                let Some(index) = self.index_of(task) else {
-                    return;
-                };
-                let progress = &mut self.progress[index];
-                // No attempt was spent on the work itself (§19).
-                progress.attempts_on_rung = progress.attempts_on_rung.saturating_sub(1);
-                progress.defers = data.defers;
-                progress.resume_next = false;
-                self.states[index] = TaskState::Deferred;
-            }
+            EventBody::TaskDeferred { task, data } => self.apply_task_deferred(task, data),
 
             EventBody::DeferWaitElapsed { .. } => {
                 for state in &mut self.states {
@@ -1225,20 +1219,7 @@ impl RunState {
                 self.states[index] = TaskState::Done(data.sha.clone());
             }
 
-            EventBody::TaskFailed { task, data } => {
-                let Some(index) = self.index_of(task) else {
-                    return;
-                };
-                self.states[index] = TaskState::Failed {
-                    kind: data.kind,
-                    reason: data.reason.clone(),
-                };
-                if data.halts_run {
-                    // First failure wins: `halted_at` is what the report and
-                    // the CLI name as the cause.
-                    self.halted_at.get_or_insert_with(|| task.clone());
-                }
-            }
+            EventBody::TaskFailed { task, data } => self.apply_task_failed(task, data),
 
             EventBody::QuestionRaised { data, .. } => {
                 self.questions
@@ -1248,6 +1229,86 @@ impl RunState {
             EventBody::QuestionAnswered { data } => self.answer_question(data),
 
             EventBody::RunFinished { data } => self.finished = Some(data.clone()),
+        }
+    }
+
+    fn apply_attempt_transition(
+        &mut self,
+        task: &str,
+        attempt: u32,
+        transition: &AttemptTransition,
+    ) {
+        match transition {
+            AttemptTransition::Retry(data) => self.apply_ladder_retry(task, attempt, data),
+            AttemptTransition::Escalate(data) => {
+                self.apply_ladder_escalated(task, attempt, data);
+            }
+            AttemptTransition::Defer(data) => self.apply_task_deferred(task, data),
+            AttemptTransition::Fail(data) => self.apply_task_failed(task, data),
+        }
+    }
+
+    fn apply_ladder_retry(&mut self, task: &str, attempt: u32, data: &LadderRetry) {
+        let Some(index) = self.index_of(task) else {
+            return;
+        };
+        let progress = &mut self.progress[index];
+        progress.feedback.push(Feedback {
+            attempt,
+            tier: data.tier.clone(),
+            summary: data.summary.clone(),
+            detail: data.detail.clone(),
+            human: false,
+        });
+        progress.resume_next = data.resume;
+    }
+
+    fn apply_ladder_escalated(&mut self, task: &str, attempt: u32, data: &LadderEscalated) {
+        let Some(index) = self.index_of(task) else {
+            return;
+        };
+        let progress = &mut self.progress[index];
+        progress.feedback.push(Feedback {
+            attempt,
+            tier: data.tier.clone(),
+            summary: data.summary.clone(),
+            detail: data.detail.clone(),
+            human: false,
+        });
+        progress.rung = data.to_rung as usize;
+        progress.attempts_on_rung = 0;
+        // §11.4: a different model cannot inherit another's conversation; the
+        // accumulated feedback carries the history.
+        progress.session = None;
+        progress.resume_next = false;
+    }
+
+    fn apply_task_deferred(&mut self, task: &str, data: &TaskDeferred) {
+        let Some(index) = self.index_of(task) else {
+            return;
+        };
+        let progress = &mut self.progress[index];
+        // No attempt was spent on the work itself (§19), and the discarded tree
+        // makes every session that described it invalid.
+        progress.attempts_on_rung = progress.attempts_on_rung.saturating_sub(1);
+        progress.defers = data.defers;
+        progress.session = None;
+        progress.resume_next = false;
+        self.states[index] = TaskState::Deferred;
+    }
+
+    fn apply_task_failed(&mut self, task: &str, data: &TaskFailed) {
+        let Some(index) = self.index_of(task) else {
+            return;
+        };
+        self.states[index] = TaskState::Failed {
+            kind: data.kind,
+            reason: data.reason.clone(),
+        };
+        if data.halts_run {
+            // First failure wins: `halted_at` is what the report and CLI name
+            // as the cause.
+            self.halted_at.get_or_insert_with(|| task.to_owned());
         }
     }
 
@@ -1775,6 +1836,56 @@ pub(crate) fn ensure_supported_schema(
             ),
         });
     }
+    let mut event_schema = started.schema;
+    for event in events {
+        if let EventBody::RunSchemaUpgraded { data } = &event.body {
+            event_schema = data.to;
+            continue;
+        }
+        if event_schema < 3 {
+            continue;
+        }
+        match &event.body {
+            EventBody::AttemptFinished {
+                task,
+                data,
+                parking,
+                transition,
+                ..
+            } => {
+                let failed = data.failure.is_some();
+                let decided = parking.is_some() || transition.is_some();
+                if failed != decided {
+                    return Err(TactusError::EventLog {
+                        path: path.to_path_buf(),
+                        message: "event schema 3 requires every failed attempt_finished to carry its ladder/parking decision, and forbids one on a successful attempt".to_owned(),
+                    });
+                }
+                if failed
+                    && !valid_attempt_decision(
+                        task,
+                        data.failure.as_ref().expect("checked failed"),
+                        transition.as_deref(),
+                        parking.as_deref(),
+                    )
+                {
+                    return Err(TactusError::EventLog {
+                        path: path.to_path_buf(),
+                        message: "event schema 3 attempt_finished carries a ladder/parking decision inconsistent with its failure".to_owned(),
+                    });
+                }
+            }
+            EventBody::QuestionAnswered { data }
+                if data.answer == Answer::Declined && data.decline_halts_run.is_none() =>
+            {
+                return Err(TactusError::EventLog {
+                    path: path.to_path_buf(),
+                    message: "event schema 3 requires a declined question_answered to record its contemporaneous halt policy".to_owned(),
+                });
+            }
+            _ => {}
+        }
+    }
     if started.schema >= 3 {
         let plan = started.reviews.as_ref().ok_or_else(|| TactusError::EventLog {
             path: path.to_path_buf(),
@@ -1795,8 +1906,138 @@ pub(crate) fn ensure_supported_schema(
                 });
             }
         }
+        validate_review_identity(plan, started.chains.len(), path)?;
+    } else if effective >= 3 {
+        let mut schema = started.schema;
+        let mut complete = false;
+        for event in events {
+            match &event.body {
+                EventBody::RunSchemaUpgraded { data } => schema = data.to,
+                EventBody::RunResumed { data } if schema >= 3 => {
+                    let plan = data.reviews.as_ref().ok_or_else(|| TactusError::EventLog {
+                        path: path.to_path_buf(),
+                        message: "the first schema-3 run_resumed must record the complete review identity".to_owned(),
+                    })?;
+                    match plan.pass_timeout_secs {
+                        Some(seconds) if seconds > 0 => {}
+                        _ => {
+                            return Err(TactusError::EventLog {
+                                path: path.to_path_buf(),
+                                message: "the first schema-3 run_resumed requires a positive recorded review timeout".to_owned(),
+                            });
+                        }
+                    }
+                    validate_review_identity(plan, started.chains.len(), path)?;
+                    complete = true;
+                }
+                _ => {}
+            }
+            if complete {
+                break;
+            }
+        }
     }
     Ok(effective)
+}
+
+fn validate_review_identity(
+    plan: &crate::review::ReviewPlan,
+    task_count: usize,
+    path: &Path,
+) -> Result<(), TactusError> {
+    let enabled = plan.enabled.ok_or_else(|| TactusError::EventLog {
+        path: path.to_path_buf(),
+        message: "event schema 3 requires reviews.enabled; refusing to infer whether verification was intentionally disabled".to_owned(),
+    })?;
+    if enabled != plan.primary.is_some() {
+        return Err(TactusError::EventLog {
+            path: path.to_path_buf(),
+            message: "event schema 3 reviews.enabled does not match the recorded primary reviewer"
+                .to_owned(),
+        });
+    }
+    let alternative_available =
+        plan.alternative_available
+            .ok_or_else(|| TactusError::EventLog {
+                path: path.to_path_buf(),
+                message: "event schema 3 requires reviews.alternative_available; refusing to infer a missing reviewer binding".to_owned(),
+            })?;
+    if alternative_available != plan.alternative.is_some() {
+        return Err(TactusError::EventLog {
+            path: path.to_path_buf(),
+            message: "event schema 3 reviews.alternative_available does not match the recorded alternative reviewer".to_owned(),
+        });
+    }
+    if enabled && plan.second_opinion.len() != task_count {
+        return Err(TactusError::EventLog {
+            path: path.to_path_buf(),
+            message: format!(
+                "event schema 3 records {task_count} task chains but {} second-opinion slots; refusing a misaligned review identity",
+                plan.second_opinion.len()
+            ),
+        });
+    }
+    if !enabled && (plan.alternative.is_some() || plan.second_opinion.iter().any(Option::is_some)) {
+        return Err(TactusError::EventLog {
+            path: path.to_path_buf(),
+            message: "event schema 3 disables review but still records review-pass bindings"
+                .to_owned(),
+        });
+    }
+    Ok(())
+}
+
+fn valid_attempt_decision(
+    task: &str,
+    failure: &FailureRecord,
+    transition: Option<&AttemptTransition>,
+    parking: Option<&AttemptParking>,
+) -> bool {
+    let outage = matches!(
+        (failure.kind, failure.origin),
+        (FailureKind::RateLimited | FailureKind::ReviewUnavailable, _)
+            | (FailureKind::Timeout, FailureOrigin::Reviewer)
+    );
+    let transition_valid = match transition {
+        None => true,
+        Some(AttemptTransition::Retry(_) | AttemptTransition::Escalate(_)) => true,
+        Some(AttemptTransition::Defer(_)) => outage,
+        Some(AttemptTransition::Fail(data)) => data.kind == failure.kind,
+    };
+    let Some(parking) = parking else {
+        return transition_valid;
+    };
+    if parking.question.affected_tasks.len() != 1
+        || parking.question.affected_tasks[0].as_str() != task
+    {
+        return false;
+    }
+    let parking_valid = match parking.question.kind {
+        crate::ir::QuestionKind::Clarify => {
+            failure.kind == FailureKind::NeedsHuman
+                && transition.is_none()
+                && parking.refund_attempt
+        }
+        crate::ir::QuestionKind::ApproveSpend => {
+            matches!(transition, Some(AttemptTransition::Escalate(_))) && !parking.refund_attempt
+        }
+        crate::ir::QuestionKind::Unblock
+            if matches!(
+                failure.kind,
+                FailureKind::ReviewInputTooLarge | FailureKind::ReviewInputOpaque
+            ) =>
+        {
+            failure.origin == FailureOrigin::Reviewer
+                && transition.is_none()
+                && !parking.refund_attempt
+        }
+        crate::ir::QuestionKind::Unblock if outage => {
+            transition.is_none() && parking.refund_attempt
+        }
+        crate::ir::QuestionKind::Unblock => transition.is_none() && !parking.refund_attempt,
+        crate::ir::QuestionKind::Continue => false,
+    };
+    transition_valid && parking_valid
 }
 
 /// Incremental reader for `status --follow`.
@@ -1941,6 +2182,7 @@ mod tests {
             rung,
             profile: format!("{tier}-model"),
             parking: None,
+            transition: None,
             data: Box::new(AttemptRecord {
                 attempt,
                 tier: tier.to_owned(),
@@ -2095,6 +2337,7 @@ mod tests {
                     answer: Answer::Answered {
                         text: "use base64".to_owned(),
                     },
+                    decline_halts_run: None,
                     via: "terminal".to_owned(),
                 },
             },
@@ -2372,6 +2615,69 @@ mod tests {
         )
         .expect_err("schema 3 cannot inherit a timeout from this binary");
         assert!(error.to_string().contains("pass_timeout_secs"), "{error}");
+
+        let complete = || {
+            let EventBody::RunStarted { mut data } = started() else {
+                unreachable!();
+            };
+            let plan = data.reviews.as_mut().expect("review plan");
+            plan.enabled = Some(true);
+            plan.alternative_available = Some(false);
+            plan.primary = Some(crate::review::PassBinding::new("codex", "gpt-5.6-sol"));
+            plan.second_opinion = vec![None];
+            Event::now(EventBody::RunStarted { data })
+        };
+
+        for missing in ["enabled", "alternative_available", "primary"] {
+            let mut json = serde_json::to_value(complete()).expect("serialize");
+            json["data"]["reviews"]
+                .as_object_mut()
+                .expect("review object")
+                .remove(missing);
+            let event: Event = serde_json::from_value(json).expect("additive field parses");
+            let error = replay(
+                vec![event],
+                vec!["t1".to_owned()],
+                Path::new("events.jsonl"),
+            )
+            .expect_err("schema 3 cannot default away a reviewer identity field");
+            assert!(error.to_string().contains("review"), "{missing}: {error}");
+        }
+
+        let mut json = serde_json::to_value(complete()).expect("serialize");
+        json["data"]["reviews"]["second_opinion"] = serde_json::json!([]);
+        let event: Event = serde_json::from_value(json).expect("short vector parses");
+        let error = replay(
+            vec![event],
+            vec!["t1".to_owned()],
+            Path::new("events.jsonl"),
+        )
+        .expect_err("a short pass vector silently removes required task reviews");
+        assert!(error.to_string().contains("misaligned"), "{error}");
+
+        let mut undecided = attempt_finished("t1", 1, 0, "small");
+        let EventBody::AttemptFinished { data, .. } = &mut undecided else {
+            unreachable!();
+        };
+        data.failure = Some(FailureRecord {
+            kind: FailureKind::GateFailed,
+            origin: FailureOrigin::Worker,
+            reason: "failed".to_owned(),
+        });
+        let error = replay(
+            vec![
+                Event::now(started()),
+                Event::now(attempt_started("t1", 1, 0, "small")),
+                Event::now(undecided),
+            ],
+            vec!["t1".to_owned()],
+            Path::new("events.jsonl"),
+        )
+        .expect_err("schema 3 cannot replay a failed attempt without its decision");
+        assert!(
+            error.to_string().contains("ladder/parking decision"),
+            "{error}"
+        );
     }
 
     #[test]
@@ -2707,11 +3013,148 @@ mod tests {
     }
 
     #[test]
+    fn resume_repairs_each_attempt_settlement_transition_prefix() {
+        let cases = [
+            AttemptTransition::Retry(LadderRetry {
+                resume: true,
+                tier: "small".to_owned(),
+                summary: "retry".to_owned(),
+                detail: Some("fix it".to_owned()),
+            }),
+            AttemptTransition::Escalate(LadderEscalated {
+                to_rung: 1,
+                tier: "small".to_owned(),
+                summary: "escalate".to_owned(),
+                detail: None,
+            }),
+            AttemptTransition::Defer(TaskDeferred {
+                reason: "outage".to_owned(),
+                defers: 1,
+            }),
+            AttemptTransition::Fail(TaskFailed {
+                kind: FailureKind::NoChain,
+                reason: "no chain".to_owned(),
+                halts_run: true,
+            }),
+        ];
+
+        for transition in cases {
+            let mut finished = attempt_finished("t1", 1, 0, "small");
+            let EventBody::AttemptFinished {
+                data,
+                transition: recorded,
+                ..
+            } = &mut finished
+            else {
+                unreachable!();
+            };
+            data.failure = Some(FailureRecord {
+                kind: match &transition {
+                    AttemptTransition::Defer(_) => FailureKind::RateLimited,
+                    AttemptTransition::Fail(data) => data.kind,
+                    _ => FailureKind::GateFailed,
+                },
+                origin: FailureOrigin::Worker,
+                reason: "settled".to_owned(),
+            });
+            *recorded = Some(Box::new(transition.clone()));
+            let replayed = replay(
+                vec![
+                    Event::now(started()),
+                    Event::now(attempt_started("t1", 1, 0, "small")),
+                    Event::now(finished),
+                ],
+                vec!["t1".to_owned()],
+                Path::new("events.jsonl"),
+            )
+            .expect("the settlement prefix is complete on its own");
+            let progress = &replayed.state.progress[0];
+            match transition {
+                AttemptTransition::Retry(_) => {
+                    assert_eq!(replayed.state.states[0], TaskState::Pending);
+                    assert!(progress.resume_next);
+                    assert_eq!(progress.feedback.len(), 1);
+                }
+                AttemptTransition::Escalate(_) => {
+                    assert_eq!(progress.rung, 1);
+                    assert_eq!(progress.attempts_on_rung, 0);
+                    assert!(progress.session.is_none());
+                }
+                AttemptTransition::Defer(_) => {
+                    assert_eq!(replayed.state.states[0], TaskState::Deferred);
+                    assert_eq!(progress.attempts_on_rung, 0);
+                    assert_eq!(progress.defers, 1);
+                }
+                AttemptTransition::Fail(_) => {
+                    assert!(matches!(replayed.state.states[0], TaskState::Failed { .. }));
+                    assert_eq!(replayed.state.halted_at.as_deref(), Some("t1"));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn defer_then_sessionless_fresh_attempt_never_resumes_stale_session() {
+        let mut first = attempt_finished("t1", 1, 0, "small");
+        let EventBody::AttemptFinished { data, .. } = &mut first else {
+            unreachable!();
+        };
+        data.session_id = Some("stale-session".to_owned());
+
+        let mut second = attempt_finished("t1", 2, 0, "small");
+        let EventBody::AttemptFinished {
+            data, transition, ..
+        } = &mut second
+        else {
+            unreachable!();
+        };
+        data.session_id = None;
+        data.failure = Some(FailureRecord {
+            kind: FailureKind::GateFailed,
+            origin: FailureOrigin::Worker,
+            reason: "failed without a session".to_owned(),
+        });
+        *transition = Some(Box::new(AttemptTransition::Retry(LadderRetry {
+            resume: false,
+            tier: "small".to_owned(),
+            summary: "retry fresh".to_owned(),
+            detail: None,
+        })));
+
+        let replayed = replay(
+            vec![
+                Event::now(started()),
+                Event::now(attempt_started("t1", 1, 0, "small")),
+                Event::now(first),
+                Event::now(EventBody::TaskDeferred {
+                    task: "t1".to_owned(),
+                    data: TaskDeferred {
+                        reason: "review outage".to_owned(),
+                        defers: 1,
+                    },
+                }),
+                Event::now(attempt_started("t1", 2, 0, "small")),
+                Event::now(second),
+            ],
+            vec!["t1".to_owned()],
+            Path::new("events.jsonl"),
+        )
+        .expect("replay");
+        assert!(replayed.state.progress[0].session.is_none());
+        assert!(!replayed.state.progress[0].resume_next);
+    }
+
+    #[test]
     fn atomic_attempt_parking_discards_the_finished_sessions_tree_identity() {
         let mut finished = attempt_finished("t1", 1, 0, "small");
-        let EventBody::AttemptFinished { parking, .. } = &mut finished else {
+        let EventBody::AttemptFinished { data, parking, .. } = &mut finished else {
             unreachable!("the helper always returns an attempt settlement");
         };
+        data.failure = Some(FailureRecord {
+            kind: FailureKind::ReviewInputTooLarge,
+            origin: FailureOrigin::Reviewer,
+            reason: "too large".to_owned(),
+        });
         *parking = Some(Box::new(AttemptParking {
             question: question("q-parked", "t1"),
             refund_attempt: false,
@@ -2801,6 +3244,7 @@ mod tests {
                     answer: Answer::Answered {
                         text: "write it in src/widget.rs".to_owned(),
                     },
+                    decline_halts_run: None,
                     via: "answer-file".to_owned(),
                 },
             }),
@@ -2849,6 +3293,7 @@ mod tests {
                 answer: Answer::Answered {
                     text: "once".to_owned(),
                 },
+                decline_halts_run: None,
                 via: "terminal".to_owned(),
             },
         });
@@ -2878,6 +3323,7 @@ mod tests {
             data: QuestionAnswered {
                 question: QuestionId::from("q-1"),
                 answer: Answer::Declined,
+                decline_halts_run: Some(true),
                 via: "terminal".to_owned(),
             },
         }));

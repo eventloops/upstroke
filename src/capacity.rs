@@ -350,11 +350,12 @@ pub fn observe(events: &[Event]) -> Observations {
 /// opposite. An interrupted one proves nothing at all: the engine died without
 /// ever learning whether a reply was coming.
 fn retire_signals(exhausted: &mut BTreeMap<String, Option<String>>, record: &AttemptRecord) {
-    let served = record
-        .failure
-        .as_ref()
-        .is_none_or(|f| !matches!(f.kind, FailureKind::RateLimited | FailureKind::Interrupted));
-    if served && let Some(pool) = &record.pool {
+    let worker_served = record.failure.as_ref().is_none_or(|failure| {
+        failure.kind != FailureKind::Interrupted
+            && !(failure.kind == FailureKind::RateLimited
+                && failure.origin == crate::ladder::FailureOrigin::Worker)
+    });
+    if worker_served && let Some(pool) = &record.pool {
         exhausted.remove(pool);
     }
     // A review pass that reached a verdict proves its own pool served, which on
@@ -364,6 +365,23 @@ fn retire_signals(exhausted: &mut BTreeMap<String, Option<String>>, record: &Att
             && let Some(pool) = &review.pool
         {
             exhausted.remove(pool);
+        }
+    }
+    // The attempt settlement itself is the durable source of a rate-limit
+    // signal. `pool_exhausted` remains useful detail, but a crash between the
+    // two appends must not make replay forget which subscription refused work.
+    if let Some(failure) = &record.failure
+        && failure.kind == FailureKind::RateLimited
+    {
+        let pool = match failure.origin {
+            crate::ladder::FailureOrigin::Worker => record.pool.as_ref(),
+            crate::ladder::FailureOrigin::Reviewer => record
+                .reviews
+                .last()
+                .and_then(|review| review.pool.as_ref()),
+        };
+        if let Some(pool) = pool {
+            exhausted.insert(pool.clone(), None);
         }
     }
 }
@@ -1027,6 +1045,7 @@ mod tests {
                 rung: 0,
                 profile: "p".to_owned(),
                 parking: None,
+                transition: None,
                 data: Box::new(AttemptRecord {
                     attempt: 1,
                     tier: "small".to_owned(),
@@ -1079,6 +1098,78 @@ mod tests {
         // And order is respected: recovery then a fresh outage stays down.
         let obs = observe(&[signal.clone(), record(None), signal]);
         assert!(obs.exhausted.contains_key("claude-max"));
+
+        // A reviewer-side limit is attached to the failed review pool, while
+        // the same settlement proves the worker and earlier reviewers served.
+        let reviewer_limited = Event::now(EventBody::AttemptFinished {
+            task: "t1".to_owned(),
+            attempt: 2,
+            rung: 0,
+            profile: "p".to_owned(),
+            parking: None,
+            transition: None,
+            data: Box::new(AttemptRecord {
+                attempt: 2,
+                tier: "small".to_owned(),
+                model: "worker".to_owned(),
+                pool: Some("worker-pool".to_owned()),
+                resumed: false,
+                duration: Duration::ZERO,
+                cost_usd: None,
+                reviews: vec![
+                    crate::events::ReviewRecord {
+                        pass: "review".to_owned(),
+                        agent: "codex".to_owned(),
+                        model: "sol".to_owned(),
+                        adapter: None,
+                        preflight_cli_version: None,
+                        effort: None,
+                        pool: Some("recovered-reviewer".to_owned()),
+                        cost_usd: None,
+                        outcome: crate::events::ReviewPassOutcome::Passed,
+                    },
+                    crate::events::ReviewRecord {
+                        pass: "second-opinion".to_owned(),
+                        agent: "claude-code".to_owned(),
+                        model: "opus".to_owned(),
+                        adapter: None,
+                        preflight_cli_version: None,
+                        effort: None,
+                        pool: Some("limited-reviewer".to_owned()),
+                        cost_usd: None,
+                        outcome: crate::events::ReviewPassOutcome::Unavailable,
+                    },
+                ],
+                session_id: None,
+                usage: None,
+                failure: Some(crate::events::FailureRecord {
+                    kind: FailureKind::RateLimited,
+                    origin: FailureOrigin::Reviewer,
+                    reason: "review pool limited".to_owned(),
+                }),
+            }),
+        });
+        let mut prior = Observations::default();
+        for pool in ["worker-pool", "recovered-reviewer", "limited-reviewer"] {
+            prior.exhausted.insert(pool.to_owned(), None);
+        }
+        let mut events = Vec::new();
+        for pool in prior.exhausted.keys() {
+            events.push(Event::now(EventBody::PoolExhausted {
+                task: "t1".to_owned(),
+                data: PoolExhausted {
+                    pool: pool.clone(),
+                    agent: "agent".to_owned(),
+                    reset_at: None,
+                    detail: "old signal".to_owned(),
+                },
+            }));
+        }
+        events.push(reviewer_limited);
+        let obs = observe(&events);
+        assert!(!obs.exhausted.contains_key("worker-pool"), "{obs:?}");
+        assert!(!obs.exhausted.contains_key("recovered-reviewer"), "{obs:?}");
+        assert!(obs.exhausted.contains_key("limited-reviewer"), "{obs:?}");
     }
 
     #[test]

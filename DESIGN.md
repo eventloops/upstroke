@@ -398,7 +398,7 @@ The split is enforcement, not tidiness. A reviewer is a read-only agent pointed 
 
 The v0.2 execution root is deliberately non-authoritative. A container receives only its role's one worktree mount; it never receives the public log, sibling worktrees, or private artifacts. On the host runner the agent permission surface remains the boundary and gate code is not OS-confined — the reason the container runner exists. Worktree disappearance is recoverable from events and internal refs, and cleanup follows a terminal event rather than creating one.
 
-Current host-process crash containment is deliberately platform-specific. On Unix, ordinary descendants remain in an isolated process group and a separate cleanup reaper retains the run's cleanup lease if the conductor is killed; code that deliberately daemonises out of that group remains outside the host-runner contract. On Windows, `taskkill /T` handles an observed timeout, but an abrupt conductor death has no surviving owner: until the runner uses a kill-on-close Job Object assigned before the child can execute, plus an external guardian/cleanup lease, an agent tree may outlive Tactus and a resume may overlap its spend. Windows runs that require crash containment must therefore use the external/container runner (or run the conductor under WSL); PID scanning or a later `taskkill` is not accepted as a substitute because PID reuse makes it racy.
+Current host-process crash containment is deliberately platform-specific. On Unix, ordinary descendants remain in an isolated process group and a separate cleanup reaper retains the run's cleanup lease if the conductor is killed; code that deliberately daemonises out of that group remains outside the host-runner contract. On Windows, `taskkill /T` handles an observed timeout, but an abrupt conductor death has no surviving owner: until the runner uses a kill-on-close Job Object assigned before the child can execute, plus an external guardian/cleanup lease, an agent tree may outlive Tactus and a resume may overlap its spend. Windows runs that require current crash containment for ordinary descendants must therefore run the conductor under WSL. The external/container runner is a v0.2 design commitment, not a shipped workaround; PID scanning or a later `taskkill` is not accepted as a substitute because PID reuse makes it racy.
 
 Every transition is an event `{ts, event, task?, attempt?, rung?, profile?, data}` — including `question_raised`, `question_answered`, `design_defect`, `capacity_snapshot`, `pool_exhausted`, and `spend_down_engaged`. `status`, the ledger, and the capacity view are pure folds over this file.
 
@@ -414,16 +414,21 @@ v0.2 generalizes that exception into two explicit transactions. After fixing the
 
 Those identity fields require event schema 2. A schema-1 log remains readable by a current binary: its first resume re-derives the missing policy and bindings once with explicit warnings, then records them on `run_resumed`. Before it appends any event whose meaning depends on the new identity, it appends `run_schema_upgraded { from: 1, to: 2 }`. Current replay validates that transition; an old binary does not know the marker and therefore refuses instead of silently continuing a run whose new fields it would ignore. Later resumes are record-bound and do not append a second marker.
 
-The complete-review contract begins at event schema 3. A schema-2 binary ignores
-the recorded per-pass timeout and retains its 60 KiB prompt truncation, so
-allowing it to resume a new run could accept code whose earlier paths were never
-shown to the reviewer. Fresh runs therefore write schema 3, and a current binary
+The complete-review and atomic sequential-settlement contracts begin at event
+schema 3. A schema-2 binary ignores the recorded per-pass timeout and retains
+its 60 KiB prompt truncation; it would also ignore the ladder transition now
+embedded in a failed `attempt_finished` and could spend the same known failure
+again after a crash. Fresh runs therefore write schema 3, and a current binary
 resuming a schema-1 or schema-2 run appends a transition to 3 before another
 attempt. Older binaries refuse that opening schema or transition instead of
-silently applying the weaker verification standard. When the exact diff is too
-large for that contract, `attempt_finished` embeds the unblock question and
-parks the task in the same replay transition; it is not followed by separate
-`question_raised`/`task_parked` events that a crash could strand between.
+silently applying weaker verification or replay semantics. Every failed
+sequential attempt embeds its retry, escalation, deferral, terminal failure, or
+parking decision in the same durable settlement. A parking settlement carries
+the authoritative question too; it is not followed by separate ladder,
+`question_raised`, or `task_parked` events that a crash could strand between.
+A declined `question_answered` likewise freezes the contemporaneous
+`on_task_failure` decision, so resume can append a missing task settlement
+without reinterpreting the human's already-durable answer through edited config.
 
 The v0.2 execution topology consequently begins at event schema 4 because its
 task states and transactions change execution meaning. Fresh topology runs write

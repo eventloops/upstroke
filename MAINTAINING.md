@@ -48,8 +48,8 @@ finding a stable id and retain one ledger row in the pull request with:
 
 - severity, exact reviewed SHA and file/line, plus a concrete failure sequence;
 - provenance: `pre_existing`, `introduced_by_feature`, `fix_regression`, or `undetermined`;
-- category: `correctness`, `crash_consistency`, `security_trust`, `portability`, `liveness`,
-  `performance`, `compatibility`, or `docs_contract`;
+- category: `correctness`, `crash-consistency`, `security-trust`, `portability`, `liveness`,
+  `performance`, `compatibility`, or `docs-contract`;
 - first-bad commit where history can establish it, and any earlier finding id when it recurs; and
 - disposition plus prevention: the named regression test, or an explicit explanation of why a
   deterministic test is infeasible and the documented guard/pitfall that prevents false claims.

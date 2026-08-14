@@ -535,6 +535,8 @@ fn preflight_with_recorded(
             let configured = analysis.config.review_pass_timeout.as_secs();
             if recorded.legacy_review_timeout_missing {
                 plan.pass_timeout_secs = Some(configured);
+                plan.enabled = Some(plan.primary.is_some());
+                plan.alternative_available = Some(plan.alternative.is_some());
                 warnings.push(format!(
                     "this run's recorded review plan predates schema 3's per-pass timeout; this \
                      resume establishes today's configured {configured}s timeout in the \
@@ -1351,6 +1353,16 @@ fn resume_harness_inner(
             })
         })
         .collect();
+    let decline_halt_policies: BTreeMap<_, _> = replayed
+        .events
+        .iter()
+        .filter_map(|event| match &event.body {
+            EventBody::QuestionAnswered { data } if data.answer == Answer::Declined => {
+                Some((data.question.clone(), data.decline_halts_run))
+            }
+            _ => None,
+        })
+        .collect();
     let declined_questions: Vec<_> = replayed
         .state
         .questions
@@ -1360,6 +1372,11 @@ fn resume_harness_inner(
             (
                 record.question.id.clone(),
                 record.question.affected_tasks.clone(),
+                decline_halt_policies
+                    .get(&record.question.id)
+                    .copied()
+                    .flatten()
+                    .unwrap_or(analysis.config.on_task_failure == OnTaskFailure::Halt),
             )
         })
         .collect();
@@ -1514,7 +1531,7 @@ fn resume_harness_inner(
             },
         })?;
     }
-    for (question, affected) in declined_questions {
+    for (question, affected, halts_run) in declined_questions {
         for task_id in affected {
             let Some(index) = run.state.index_of(task_id.as_str()) else {
                 continue;
@@ -1527,7 +1544,7 @@ fn resume_harness_inner(
                 "declined at the human rung: {}",
                 last_reason(&run.state.progress[index])
             );
-            run.fail_task(index, FailureKind::Declined, reason)?;
+            run.fail_task_with_policy(index, FailureKind::Declined, reason, halts_run)?;
         }
     }
     // The `task_committed` the dead process never got to, now that the commit
@@ -2147,29 +2164,111 @@ impl Run<'_> {
                 }
             };
 
-            let (parking, parking_question) = if let Some(failure) = result
-                .failure
-                .as_ref()
-                .filter(|failure| failure.kind == FailureKind::ReviewInputTooLarge)
-            {
-                let context = question_context(
-                    task,
-                    QuestionKind::Unblock,
+            // Decide the ladder transition before writing the settlement, then
+            // carry both in one event. A failure record without its decision is
+            // not a safe crash prefix: replay would otherwise buy another
+            // attempt on the old rung or lose an outage refund.
+            let next = result.failure.as_ref().map(|failure| {
+                let settlement_session = result.outcome.session_id.as_ref().or(resume.as_ref());
+                let resumable = settlement_session.is_some()
+                    && self
+                        .caps
+                        .get(&profile.agent)
+                        .is_some_and(|c| c.session_resume);
+                ladder::next_step(
                     failure,
-                    &self.state.progress[index],
-                );
-                let question = self.build_question(index, QuestionKind::Unblock, context);
-                (
-                    Some(Box::new(events::AttemptParking {
-                        question: question.clone(),
-                        refund_attempt: false,
-                    })),
-                    Some(question),
+                    &LadderState {
+                        rung: self.state.progress[index].rung,
+                        attempts_on_rung: self.state.progress[index].attempts_on_rung,
+                        defers: self.state.progress[index].defers,
+                        resumable,
+                    },
+                    &policy,
                 )
-            } else {
-                (None, None)
-            };
-            let policy_parked = parking.is_some();
+            });
+            let mut transition = None;
+            let mut parking = None;
+            let mut parking_question = None;
+            let pending_spend = result.outcome.cost_usd.unwrap_or(0.0)
+                + result
+                    .reviews
+                    .iter()
+                    .map(|review| review.cost_usd.unwrap_or(0.0))
+                    .sum::<f64>();
+            let pending_unpriced = result.outcome.cost_usd.is_none()
+                || result
+                    .reviews
+                    .iter()
+                    .any(|review| review.cost_usd.is_none());
+            if let (Some(failure), Some(next)) = (result.failure.as_ref(), next) {
+                match next {
+                    Next::RetrySameRung { resume } => {
+                        transition = Some(Box::new(events::AttemptTransition::Retry(
+                            events::LadderRetry {
+                                resume,
+                                tier: rung.tier.to_string(),
+                                summary: failure.reason.clone(),
+                                detail: failure.feedback.clone(),
+                            },
+                        )));
+                    }
+                    Next::Escalate => {
+                        transition = Some(Box::new(events::AttemptTransition::Escalate(
+                            events::LadderEscalated {
+                                to_rung: rung_number.saturating_add(1),
+                                tier: rung.tier.to_string(),
+                                summary: failure.reason.clone(),
+                                detail: failure.feedback.clone(),
+                            },
+                        )));
+                        if let Some(onto) = chain.rungs.get(rung_index + 1).map(|next| next.tier)
+                            && self.should_approve_spend(rung.tier, onto, pending_spend)
+                        {
+                            let question = self.build_spend_approval(
+                                index,
+                                onto,
+                                pending_spend,
+                                pending_unpriced,
+                            );
+                            parking = Some(Box::new(events::AttemptParking {
+                                question: question.clone(),
+                                refund_attempt: false,
+                            }));
+                            parking_question = Some(question);
+                        }
+                    }
+                    Next::Defer => {
+                        transition = Some(Box::new(events::AttemptTransition::Defer(
+                            events::TaskDeferred {
+                                reason: failure.reason.clone(),
+                                defers: self.state.progress[index].defers.saturating_add(1),
+                            },
+                        )));
+                    }
+                    Next::AskHuman(kind) => {
+                        let context =
+                            question_context(task, kind, failure, &self.state.progress[index]);
+                        let question = self.build_question(index, kind, context);
+                        parking = Some(Box::new(events::AttemptParking {
+                            question: question.clone(),
+                            // An outage or clarification never received a code
+                            // verdict, so its allowance is returned even when
+                            // the outage ceiling sends it to a human.
+                            refund_attempt: kind == QuestionKind::Clarify || failure.is_outage(),
+                        }));
+                        parking_question = Some(question);
+                    }
+                    Next::Fail => {
+                        transition = Some(Box::new(events::AttemptTransition::Fail(
+                            events::TaskFailed {
+                                kind: failure.kind,
+                                reason: failure.reason.clone(),
+                                halts_run: self.on_task_failure == OnTaskFailure::Halt,
+                            },
+                        )));
+                    }
+                }
+            }
 
             let settlement = self.emit(EventBody::AttemptFinished {
                 task: task_id.clone(),
@@ -2177,6 +2276,7 @@ impl Run<'_> {
                 rung: rung_number,
                 profile: profile.name.clone(),
                 parking,
+                transition,
                 data: Box::new(AttemptRecord {
                     attempt,
                     tier: rung.tier.to_string(),
@@ -2208,8 +2308,8 @@ impl Run<'_> {
                 }
                 return Err(error);
             }
-            if let Some(question) = parking_question
-                && let Err(error) = self.materialize_question(&question)
+            if let Some(question) = parking_question.as_ref()
+                && let Err(error) = self.materialize_question(question)
             {
                 // The durable settlement is authoritative and already carries
                 // the complete question. A crash or write failure here cannot
@@ -2252,9 +2352,10 @@ impl Run<'_> {
             // because they are facts with different lifetimes — the deferral is
             // about this task's next move, this is about a subscription, and a
             // later run's estimator reads it back out of the log.
-            if failure.kind == FailureKind::RateLimited {
-                self.record_pool_exhausted(&task_id, &profile, &result.reviews, &failure)?;
-            } else {
+            if failure.kind != FailureKind::Interrupted
+                && !(failure.kind == FailureKind::RateLimited
+                    && failure.origin == FailureOrigin::Worker)
+            {
                 // This attempt reached a model and got an answer, whatever the
                 // verdict on its code, so any pool it drew on is serving again.
                 // Same rule as `capacity::observe`'s, applied to the engine's
@@ -2262,27 +2363,19 @@ impl Run<'_> {
                 // recovered — without it, the *next* outage on the same pool
                 // would go unrecorded because the set still held it.
                 self.exhausted_pools.remove(&profile.pool);
-                for review in &result.reviews {
-                    if review.outcome != events::ReviewPassOutcome::Unavailable
-                        && let Some(pool) = &review.pool
-                    {
-                        self.exhausted_pools.remove(pool);
-                    }
+            }
+            for review in &result.reviews {
+                if review.outcome != events::ReviewPassOutcome::Unavailable
+                    && let Some(pool) = &review.pool
+                {
+                    self.exhausted_pools.remove(pool);
                 }
             }
+            if failure.kind == FailureKind::RateLimited {
+                self.record_pool_exhausted(&task_id, &profile, &result.reviews, &failure)?;
+            }
 
-            let resumable = self.state.progress[index].session.is_some()
-                && self
-                    .caps
-                    .get(&profile.agent)
-                    .is_some_and(|c| c.session_resume);
-            let state = LadderState {
-                rung: self.state.progress[index].rung,
-                attempts_on_rung: self.state.progress[index].attempts_on_rung,
-                defers: self.state.progress[index].defers,
-                resumable,
-            };
-            let next = ladder::next_step(&failure, &state, &policy);
+            let next = next.expect("a failed attempt has a ladder decision");
 
             // §14: the tree survives only for a resumed retry, where the
             // *cumulative* diff is what gets re-gated. Every other branch
@@ -2292,94 +2385,15 @@ impl Run<'_> {
                 self.workspace.discard_uncommitted()?;
             }
 
-            if policy_parked {
-                debug_assert_eq!(next, Next::AskHuman(QuestionKind::Unblock));
-                return Ok(false);
-            }
-
             match next {
-                Next::RetrySameRung { resume } => {
-                    self.emit(EventBody::LadderRetry {
-                        task: task_id.clone(),
-                        attempt,
-                        rung: rung_number,
-                        data: events::LadderRetry {
-                            resume,
-                            tier: rung.tier.to_string(),
-                            summary: failure.reason.clone(),
-                            detail: failure.feedback.clone(),
-                        },
-                    })?;
-                }
+                Next::RetrySameRung { .. } => {}
                 Next::Escalate => {
-                    let onto = chain.rungs.get(rung_index + 1).map(|next| next.tier);
-                    // Escalate FIRST, then ask. The order is what makes the
-                    // approval path need no special case anywhere else: the
-                    // escalation's own fold moves the rung and resets
-                    // `attempts_on_rung`, so an approved task un-parks already
-                    // standing on the frontier rung with a fresh allowance —
-                    // rather than re-running the rung it had just exhausted, or
-                    // arriving back here and asking the same question again.
-                    self.emit(EventBody::LadderEscalated {
-                        task: task_id.clone(),
-                        attempt,
-                        rung: rung_number,
-                        data: events::LadderEscalated {
-                            to_rung: rung_number.saturating_add(1),
-                            tier: rung.tier.to_string(),
-                            summary: failure.reason.clone(),
-                            detail: failure.feedback.clone(),
-                        },
-                    })?;
-                    if let Some(onto) = onto
-                        && self.should_approve_spend(rung.tier, onto)
-                    {
-                        let question = self.raise_spend_approval(index, onto)?;
-                        self.emit(EventBody::TaskParked {
-                            task: task_id.clone(),
-                            data: events::TaskParked {
-                                question: question.to_string(),
-                                // The attempt that caused this escalation was
-                                // genuinely judged and genuinely failed, so its
-                                // allowance stays spent (§12's refund is for
-                                // work nobody judged).
-                                refund_attempt: false,
-                            },
-                        })?;
+                    if parking_question.is_some() {
                         return Ok(false);
                     }
                 }
-                Next::Defer => {
-                    // No attempt was spent on the work itself, so the event's
-                    // fold gives the rung its allowance back (§19).
-                    self.emit(EventBody::TaskDeferred {
-                        task: task_id.clone(),
-                        data: events::TaskDeferred {
-                            reason: failure.reason.clone(),
-                            defers: self.state.progress[index].defers.saturating_add(1),
-                        },
-                    })?;
-                    return Ok(true);
-                }
-                Next::AskHuman(kind) => {
-                    let context =
-                        question_context(task, kind, &failure, &self.state.progress[index]);
-                    let question = self.raise_question(index, kind, context)?;
-                    self.emit(EventBody::TaskParked {
-                        task: task_id.clone(),
-                        data: events::TaskParked {
-                            question: question.to_string(),
-                            // Nobody judged the code, so the attempt is not
-                            // spent (§12).
-                            refund_attempt: kind == QuestionKind::Clarify,
-                        },
-                    })?;
-                    return Ok(false);
-                }
-                Next::Fail => {
-                    self.fail_task(index, failure.kind, failure.reason.clone())?;
-                    return Ok(false);
-                }
+                Next::Defer => return Ok(true),
+                Next::AskHuman(_) | Next::Fail => return Ok(false),
             }
         }
     }
@@ -2549,13 +2563,18 @@ impl Run<'_> {
     /// the task in config or in an annotation, and §12's concern is silent
     /// escalation — asking permission for a decision the operator already made
     /// in writing would train them to answer without reading.
-    fn should_approve_spend(&self, from: crate::ir::Tier, onto: crate::ir::Tier) -> bool {
+    fn should_approve_spend(
+        &self,
+        from: crate::ir::Tier,
+        onto: crate::ir::Tier,
+        pending_spend: f64,
+    ) -> bool {
         let Some(threshold) = self.ask_before.frontier_escalation_over_usd else {
             return false;
         };
         onto == crate::ir::Tier::Frontier
             && from != crate::ir::Tier::Frontier
-            && self.reported_spend(None) >= threshold
+            && self.reported_spend(None) + pending_spend >= threshold
     }
 
     /// §13 source 1, recorded: attribute a rate limit to the pool that hit it.
@@ -2608,11 +2627,21 @@ impl Run<'_> {
         kind: FailureKind,
         reason: String,
     ) -> Result<(), TactusError> {
-        let task = self.analysis.plan.tasks[index].id.to_string();
         // The halt policy is resolved here and recorded, not re-derived on
         // replay: a `tactus.toml` edited between a run and its resume must not
         // rewrite which task the report blames for stopping.
         let halts_run = self.on_task_failure == OnTaskFailure::Halt;
+        self.fail_task_with_policy(index, kind, reason, halts_run)
+    }
+
+    fn fail_task_with_policy(
+        &mut self,
+        index: usize,
+        kind: FailureKind,
+        reason: String,
+        halts_run: bool,
+    ) -> Result<(), TactusError> {
+        let task = self.analysis.plan.tasks[index].id.to_string();
         self.emit(EventBody::TaskFailed {
             task,
             data: events::TaskFailed {
@@ -2628,19 +2657,21 @@ impl Run<'_> {
     /// §12's `ask_before` question: this task is about to escalate onto a
     /// frontier rung, and the run has already reported enough spend that the
     /// operator asked to be consulted first.
-    fn raise_spend_approval(
-        &mut self,
+    fn build_spend_approval(
+        &self,
         index: usize,
         onto: crate::ir::Tier,
-    ) -> Result<QuestionId, TactusError> {
+        pending_spend: f64,
+        pending_unpriced: bool,
+    ) -> Question {
         let context = spend_question_context(
             &self.analysis.plan.tasks[index],
             onto,
-            self.reported_spend(None),
+            self.reported_spend(None) + pending_spend,
             self.ask_before.frontier_escalation_over_usd.unwrap_or(0.0),
-            self.unpriced_attempts() > 0,
+            self.unpriced_attempts() > 0 || pending_unpriced,
         );
-        self.raise_question(index, QuestionKind::ApproveSpend, context)
+        self.build_question(index, QuestionKind::ApproveSpend, context)
     }
 
     /// Attempts whose route reported no spend at all (§13), so the figures this
@@ -2654,35 +2685,6 @@ impl Run<'_> {
             .filter(|record| record.cost_usd.is_none() || record.review_cost_incomplete())
             .count();
         u32::try_from(unpriced).unwrap_or(u32::MAX)
-    }
-
-    fn raise_question(
-        &mut self,
-        index: usize,
-        kind: QuestionKind,
-        context: String,
-    ) -> Result<QuestionId, TactusError> {
-        let question = self.prepare_question(index, kind, context)?;
-        let id = question.id.clone();
-        self.emit(EventBody::QuestionRaised {
-            task: self.analysis.plan.tasks[index].id.to_string(),
-            data: Box::new(events::QuestionRaised { question }),
-        })?;
-        Ok(id)
-    }
-
-    /// Materialize and announce an ordinary question before its authoritative
-    /// event. Atomic policy parking uses `build_question` directly, appends its
-    /// attempt settlement first, and only then publishes the projection.
-    fn prepare_question(
-        &mut self,
-        index: usize,
-        kind: QuestionKind,
-        context: String,
-    ) -> Result<Question, TactusError> {
-        let question = self.build_question(index, kind, context);
-        self.materialize_question(&question)?;
-        Ok(question)
     }
 
     fn build_question(&self, index: usize, kind: QuestionKind, context: String) -> Question {
@@ -2788,6 +2790,8 @@ impl Run<'_> {
             data: events::QuestionAnswered {
                 question: id.clone(),
                 answer: answer.clone(),
+                decline_halts_run: (answer == Answer::Declined)
+                    .then_some(self.on_task_failure == OnTaskFailure::Halt),
                 via: via.to_owned(),
             },
         })?;
@@ -3197,14 +3201,23 @@ fn question_context(
         FailureOrigin::Reviewer => "the reviewer",
         FailureOrigin::Worker => "the implementing agent",
     };
-    if failure.kind == FailureKind::ReviewInputTooLarge {
+    if matches!(
+        failure.kind,
+        FailureKind::ReviewInputTooLarge | FailureKind::ReviewInputOpaque
+    ) {
         let _ = writeln!(
             context,
-            "This attempt ran and is settled, but its exact diff is too large for one complete \
-             review. Tactus parked it instead of paying for an identical automatic retry. Retry \
-             only with guidance that produces a smaller diff; because the plan is frozen for \
-             this run, splitting the task requires skipping it and starting a new run from a \
-             revised plan. The policy failure was:"
+            "This attempt ran and is settled, but its exact diff cannot receive one complete \
+             review. Tactus parked it instead of paying for an identical automatic retry. {} \
+             The policy failure was:",
+            if failure.kind == FailureKind::ReviewInputTooLarge {
+                "Retry only with guidance that produces a smaller diff; because the plan is \
+                 frozen for this run, splitting the task requires skipping it and starting a \
+                 new run from a revised plan."
+            } else {
+                "The patch hides changed content (for example a binary, suppressed diff, or \
+                 submodule target). Make every changed byte reviewable before retrying."
+            }
         );
     } else {
         match kind {
@@ -3452,14 +3465,17 @@ fn run_attempt(
     // and costs another frontier invocation to learn it.
     let mut reviews = Vec::new();
     if failure.is_none() && !cx.reviewers.is_empty() {
-        if let Some(reason) = review::complete_diff_error(&outcome.diff) {
+        if let Some(error) = review::complete_diff_error(&outcome.diff) {
             // This happens after the worker and cheap gates have run. Return a
             // normal attempt result so the caller writes `attempt_finished`
             // with the worker's duration, usage, session, and cost before the
             // ladder parks. Propagating the prompt-construction error would
             // leave a dangling attempt that replay mislabels as interrupted.
-            failure =
-                Some(AttemptFailure::new(FailureKind::ReviewInputTooLarge, reason).from_reviewer());
+            let kind = match error {
+                review::CompleteDiffError::Opaque => FailureKind::ReviewInputOpaque,
+                review::CompleteDiffError::TooLarge { .. } => FailureKind::ReviewInputTooLarge,
+            };
+            failure = Some(AttemptFailure::new(kind, error.to_string()).from_reviewer());
         } else {
             let artifacts = load_artifacts(&cx.paths.artifacts(), cx.task);
             for reviewer in &cx.reviewers {
@@ -4288,6 +4304,9 @@ mod tests {
         EditTest,
         /// Produces a complete diff larger than the review input boundary.
         LargeEdit,
+        /// Produces a binary patch whose changed bytes cannot be semantically
+        /// reviewed from the unified diff.
+        OpaqueEdit,
         /// Produces the same oversized diff, then makes the question payload
         /// directory unwritable so parking preparation fails deterministically.
         LargeEditQuestionWriteFailure,
@@ -4516,6 +4535,9 @@ mod tests {
                         "large-agent-output.txt",
                         "x".repeat(review::MAX_DIFF_BYTES + 1),
                     )),
+                    Effect::OpaqueEdit => {
+                        Some(("opaque-agent-output.bin", "\0hidden bytes".to_owned()))
+                    }
                     Effect::NoEdit | Effect::Error | Effect::RateLimited => None,
                 };
             if let Some((name, content)) = edit {
@@ -4616,6 +4638,7 @@ mod tests {
                 Effect::EditFile
                 | Effect::EditTest
                 | Effect::LargeEdit
+                | Effect::OpaqueEdit
                 | Effect::LargeEditQuestionWriteFailure
                 | Effect::NoEdit
                 | Effect::AskQuestion
@@ -5018,6 +5041,34 @@ mod tests {
             git_in(&repo, &["status", "--porcelain"]).trim().is_empty(),
             "resume did not discard crash residue"
         );
+    }
+
+    #[test]
+    fn opaque_review_input_has_distinct_failure_and_remediation() {
+        let repo = temp_engine_repo("opaquereviewsettlement");
+        seed(
+            &repo,
+            "## Generate an opaque artifact\n<!-- tactus: id=t1 kind=implement depends= -->\n",
+            Some(
+                "[interaction]\nmode = \"never\"\n\n\
+                 [routing]\nimplement = { chain = [\"small\"], attempts_per = 3 }\n",
+            ),
+        );
+        let mut opts = options(&repo);
+        opts.config_path = Some(repo.join("tactus.toml"));
+        let source = fake(Effect::OpaqueEdit);
+        let report = run_with(&opts, &source).expect("opaque evidence parks fail-closed");
+
+        assert_eq!(report.outcome(), RunOutcome::Parked, "{report:?}");
+        let attempt = &task(&report, "t1").attempts[0];
+        assert_eq!(
+            attempt.failure.as_ref().map(|failure| failure.kind),
+            Some(FailureKind::ReviewInputOpaque)
+        );
+        assert_eq!(source.adapter.reviews_run(), 0);
+        let context = &report.questions[0].question.context;
+        assert!(context.contains("hides changed content"), "{context}");
+        assert!(!context.contains("smaller diff"), "{context}");
     }
 
     #[test]
@@ -5929,13 +5980,15 @@ mod tests {
             barrier < resumed_attempt,
             "the old verification contract must be fenced off before work starts"
         );
+        let upgraded_reviews = events::recorded_complete_reviews(&logged)
+            .expect("schema-3 resume records a complete review plan");
+        assert_eq!(upgraded_reviews.pass_timeout_secs, Some(47));
+        assert_eq!(upgraded_reviews.enabled, Some(true));
         assert_eq!(
-            events::recorded_complete_reviews(&logged)
-                .expect("schema-3 resume records a complete review plan")
-                .pass_timeout_secs,
-            Some(47),
-            "the absent legacy field is explicitly serialized, not left to serde defaults"
+            upgraded_reviews.alternative_available,
+            Some(upgraded_reviews.alternative.is_some())
         );
+        assert_eq!(upgraded_reviews.second_opinion.len(), 1);
 
         fs::write(
             repo.join("tactus.toml"),
@@ -6614,11 +6667,21 @@ mod tests {
             .expect("build a complete decline sequence");
             let paths = paths_of(&repo, &report.run_id);
             truncate_log_after(&paths, last_durable_event);
+            fs::write(
+                repo.join("tactus.toml"),
+                "[engine]\non_task_failure = \"continue\"\n\n\
+                 [routing]\nimplement = { chain = [\"small\"], attempts_per = 1 }\n",
+            )
+            .expect("change today's policy after the decline was durable");
 
             let resumed_source = fake(Effect::EditFile);
             let resumed = resume_with(&resume_options(&repo, &report.run_id), &resumed_source)
                 .expect("resume repairs the incomplete settlement");
-            assert_eq!(resumed.outcome(), RunOutcome::Halted, "prefix {tag}");
+            assert_eq!(
+                resumed.outcome(),
+                RunOutcome::Halted,
+                "prefix {tag}: repair must use the policy recorded with the answer"
+            );
             assert!(
                 matches!(
                     task(&resumed, "t1").status,
@@ -8852,6 +8915,66 @@ mod tests {
     }
 
     #[test]
+    fn follow_waits_at_held_historical_terminal_until_resume_marker() {
+        struct ResumeOnSleep {
+            events: PathBuf,
+            lock: Mutex<Option<RunLock>>,
+        }
+
+        impl Sleeper for ResumeOnSleep {
+            fn sleep(&self, _: Duration) {
+                let Ok(mut lock) = self.lock.lock() else {
+                    return;
+                };
+                if lock.is_none() {
+                    return;
+                }
+                let mut warnings = Vec::new();
+                let mut log = events::EventLog::open(&self.events, &mut warnings).expect("log");
+                log.append(EventBody::RunResumed {
+                    data: events::RunResumed {
+                        head_sha: "resumed-head".to_owned(),
+                        interrupted_attempts: 0,
+                        discarded: Vec::new(),
+                        gates: None,
+                        effort_policy: None,
+                        reviews: None,
+                        chains: None,
+                    },
+                })
+                .expect("resume marker");
+                log.append(EventBody::RunFinished {
+                    data: events::RunFinished {
+                        outcome: events::RunOutcome::Complete,
+                        halted_at: None,
+                        committed: 1,
+                        parked: 0,
+                    },
+                })
+                .expect("new terminal");
+                drop(log);
+                drop(lock.take());
+            }
+        }
+
+        let repo = temp_engine_repo("followheldterminal");
+        let report = run_with(&options(&repo), &fake(Effect::EditFile)).expect("run");
+        let paths = paths_of(&repo, &report.run_id);
+        let loaded = replay_of(&repo, &report.run_id);
+        let sleeper = ResumeOnSleep {
+            events: paths.events(),
+            lock: Mutex::new(Some(
+                RunLock::acquire(&paths.public).expect("resume owns lock before marker"),
+            )),
+        };
+        let mut out = Vec::new();
+        crate::status::follow(&loaded, &sleeper, Duration::ZERO, 1, &mut out).expect("follow");
+        let text = String::from_utf8(out).expect("utf8");
+        assert!(text.contains("resumed at resumed-he"), "{text}");
+        assert_eq!(text.matches("run finished").count(), 2, "{text}");
+    }
+
+    #[test]
     fn transcripts_live_outside_the_workspace_and_survive_a_rollback() {
         // The §15 split, and the reason the private root cannot be inside the
         // repo: §14's rollback is `git clean -fd`, which would delete it.
@@ -9929,6 +10052,45 @@ mod tests {
             capacity::Remaining::Exhausted,
             "{}",
             settled[0].describe()
+        );
+    }
+
+    #[test]
+    fn reviewer_rate_limit_retires_recovered_implementer_pool_live() {
+        let repo = temp_engine_repo("reviewerlimitretiresworker");
+        seed(&repo, FRONTIER_AUTH_PLAN, Some(SECOND_OPINION_CONFIG));
+        let pools = pools_file(
+            &repo,
+            "[pools.claude-max]\nkind = \"subscription-window\"\nagent = \"claude-code\"\n\
+             sources = [\"signals\"]\n\n[pools.copilot-window]\nkind = \"subscription-window\"\n\
+             agent = \"copilot\"\nsources = [\"signals\"]\n",
+        );
+        let mut opts = cross_vendor_opts(&repo);
+        opts.pools_path = Some(pools);
+        let source = cross_vendor(
+            vec![
+                Effect::RateLimited,
+                Effect::EditFile,
+                Effect::RateLimited,
+                Effect::EditFile,
+            ],
+            vec![ReviewBehavior::Pass],
+            vec![ReviewBehavior::RateLimited, ReviewBehavior::Pass],
+        );
+        let report = run_with(&opts, &source).expect("outages eventually recover");
+        assert_eq!(report.outcome(), RunOutcome::Complete, "{report:?}");
+
+        let signals: Vec<String> = events_of(&repo, &report.run_id)
+            .iter()
+            .filter_map(|event| match &event.body {
+                EventBody::PoolExhausted { data, .. } => Some(data.pool.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            signals,
+            ["claude-max", "copilot-window", "claude-max"],
+            "the reviewer outage must not leave the successfully serving worker pool retired forever"
         );
     }
 

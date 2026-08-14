@@ -118,6 +118,7 @@ struct Settlement<'a> {
     profile: &'a str,
     record: &'a AttemptRecord,
     parking: Option<&'a events::AttemptParking>,
+    transition: Option<&'a events::AttemptTransition>,
 }
 
 struct RunContext<'a> {
@@ -348,7 +349,7 @@ fn settlements<'a>(
 ) -> Result<BTreeMap<AttemptKey, Settlement<'a>>, TactusError> {
     let mut out = BTreeMap::new();
     for (index, event) in log.iter().enumerate() {
-        let (kind, task, attempt, rung, profile, record, parking) = match &event.body {
+        let (kind, task, attempt, rung, profile, record, parking, transition) = match &event.body {
             EventBody::AttemptFinished {
                 task,
                 attempt,
@@ -356,6 +357,7 @@ fn settlements<'a>(
                 profile,
                 data,
                 parking,
+                transition,
             } => (
                 SettlementKind::Finished,
                 task,
@@ -364,6 +366,7 @@ fn settlements<'a>(
                 profile,
                 &**data,
                 parking.as_deref(),
+                transition.as_deref(),
             ),
             EventBody::AttemptInterrupted {
                 task,
@@ -379,6 +382,7 @@ fn settlements<'a>(
                 profile,
                 &**data,
                 None,
+                None,
             ),
             _ => continue,
         };
@@ -393,6 +397,7 @@ fn settlements<'a>(
                     profile,
                     record,
                     parking,
+                    transition,
                 },
             )
             .is_some()
@@ -434,15 +439,67 @@ fn validate_settlement(
         .failure
         .as_ref()
         .map(|failure| failure.kind);
+    let failure_origin = settlement
+        .record
+        .failure
+        .as_ref()
+        .map(|failure| failure.origin);
+    let outage = matches!(
+        (failure_kind, failure_origin),
+        (
+            Some(FailureKind::RateLimited | FailureKind::ReviewUnavailable),
+            _
+        ) | (Some(FailureKind::Timeout), Some(FailureOrigin::Reviewer))
+    );
+    if let Some(transition) = settlement.transition {
+        let valid = match transition {
+            events::AttemptTransition::Retry(_) | events::AttemptTransition::Escalate(_) => {
+                failure_kind.is_some()
+            }
+            events::AttemptTransition::Defer(_) => outage,
+            events::AttemptTransition::Fail(data) => failure_kind == Some(data.kind),
+        };
+        if !valid {
+            return invalid(
+                path,
+                format!("invalid atomic attempt transition for {}", key_text(key)),
+            );
+        }
+    }
     if let Some(parking) = settlement.parking {
-        let failure = settlement.record.failure.as_ref();
-        if failure_kind != Some(FailureKind::ReviewInputTooLarge)
-            || failure.map(|failure| failure.origin) != Some(FailureOrigin::Reviewer)
-            || parking.refund_attempt
-            || parking.question.kind != crate::ir::QuestionKind::Unblock
-            || parking.question.affected_tasks.len() != 1
-            || parking.question.affected_tasks[0].as_str() != key.0
-        {
+        let associated = parking.question.affected_tasks.len() == 1
+            && parking.question.affected_tasks[0].as_str() == key.0;
+        let semantics = match parking.question.kind {
+            crate::ir::QuestionKind::Clarify => {
+                failure_kind == Some(FailureKind::NeedsHuman)
+                    && settlement.transition.is_none()
+                    && parking.refund_attempt
+            }
+            crate::ir::QuestionKind::ApproveSpend => {
+                matches!(
+                    settlement.transition,
+                    Some(events::AttemptTransition::Escalate(_))
+                ) && !parking.refund_attempt
+            }
+            crate::ir::QuestionKind::Unblock
+                if matches!(
+                    failure_kind,
+                    Some(FailureKind::ReviewInputTooLarge | FailureKind::ReviewInputOpaque)
+                ) =>
+            {
+                failure_origin == Some(FailureOrigin::Reviewer)
+                    && settlement.transition.is_none()
+                    && !parking.refund_attempt
+            }
+            crate::ir::QuestionKind::Unblock if outage => {
+                settlement.transition.is_none() && parking.refund_attempt
+            }
+            crate::ir::QuestionKind::Unblock => {
+                failure_kind.is_some() && settlement.transition.is_none() && !parking.refund_attempt
+            }
+            crate::ir::QuestionKind::Continue => false,
+        };
+        if !associated || !semantics {
             return invalid(
                 path,
                 format!("invalid atomic policy parking for {}", key_text(key)),
@@ -665,6 +722,7 @@ fn failure_kind(value: FailureKind) -> &'static str {
         FailureKind::GateFailed => "gate_failed",
         FailureKind::TestProvenance => "test_provenance",
         FailureKind::ReviewInputTooLarge => "review_input_too_large",
+        FailureKind::ReviewInputOpaque => "review_input_opaque",
         FailureKind::ReviewFailed => "review_failed",
         FailureKind::ReviewUnavailable => "review_unavailable",
         FailureKind::NeedsHuman => "needs_human",
@@ -704,7 +762,7 @@ fn failure_projection(kind: FailureKind) -> (&'static str, &'static str) {
             ("policy", "none")
         }
         FailureKind::EmptyDiff | FailureKind::TestProvenance => ("policy", "engine"),
-        FailureKind::ReviewInputTooLarge => ("policy", "review"),
+        FailureKind::ReviewInputTooLarge | FailureKind::ReviewInputOpaque => ("policy", "review"),
     }
 }
 
@@ -1012,6 +1070,33 @@ mod tests {
             index.contains(&expected),
             "decision index must track the public exporter constant: expected `{expected}`"
         );
+    }
+
+    #[test]
+    fn review_finding_ledger_uses_canonical_category_tokens() {
+        let maintaining = include_str!("../MAINTAINING.md");
+        for token in ["crash-consistency", "security-trust", "docs-contract"] {
+            assert!(
+                maintaining.contains(&format!("`{token}`")),
+                "missing {token}"
+            );
+        }
+        for stale in ["crash_consistency", "security_trust", "docs_contract"] {
+            assert!(!maintaining.contains(stale), "stale category {stale}");
+        }
+    }
+
+    #[test]
+    fn windows_crash_containment_docs_do_not_advertise_unshipped_runner() {
+        let readme = include_str!("../README.md");
+        let design = include_str!("../DESIGN.md");
+        for doc in [readme, design] {
+            assert!(doc.contains("run the conductor under WSL"), "{doc}");
+            assert!(
+                doc.contains("not a shipped") || doc.contains("not a shipped workaround"),
+                "future runner must not read as current"
+            );
+        }
     }
 
     struct Fixture {
@@ -1324,6 +1409,7 @@ mod tests {
             (FailureKind::RateLimited, "provider", "none"),
             (FailureKind::ReviewUnavailable, "provider", "none"),
             (FailureKind::ReviewInputTooLarge, "policy", "review"),
+            (FailureKind::ReviewInputOpaque, "policy", "review"),
             (FailureKind::Timeout, "infrastructure", "none"),
             (FailureKind::Interrupted, "infrastructure", "none"),
             (FailureKind::NoChain, "policy", "none"),
@@ -1880,6 +1966,57 @@ mod tests {
     }
 
     #[test]
+    fn atomic_attempt_transitions_are_bound_to_their_failure() {
+        let events = |finish| {
+            vec![
+                run_started(&["task"]),
+                attempt_started("task", 1, "2026-08-01T00:00:01.000Z", false),
+                finish,
+            ]
+        };
+        let mut retry = attempt_finished(
+            "task",
+            1,
+            "2026-08-01T00:00:02.000Z",
+            Some(FailureKind::GateFailed),
+            false,
+        );
+        retry["transition"] = json!({
+            "action": "retry",
+            "data": {
+                "resume": false,
+                "tier": "small",
+                "summary": "gate failed",
+                "detail": null
+            }
+        });
+        let valid = Fixture::new(
+            "valid-atomic-transition",
+            events(retry),
+            vec![task("task", "task")],
+        );
+        assert_eq!(valid.rows().len(), 1);
+
+        let mut invalid = attempt_finished(
+            "task",
+            1,
+            "2026-08-01T00:00:02.000Z",
+            Some(FailureKind::GateFailed),
+            false,
+        );
+        invalid["transition"] = json!({
+            "action": "defer",
+            "data": { "reason": "not an outage", "defers": 1 }
+        });
+        let invalid = Fixture::new(
+            "invalid-atomic-transition",
+            events(invalid),
+            vec![task("task", "task")],
+        );
+        assert!(load_error(&invalid).contains("invalid atomic attempt transition"));
+    }
+
+    #[test]
     fn duplicate_and_orphan_attempt_events_are_refused() {
         let start = attempt_started("task", 1, "2026-08-01T00:00:01.000Z", false);
         let duplicate_start = Fixture::new(
@@ -1927,6 +2064,7 @@ mod tests {
             (FailureKind::RateLimited, "provider", "none"),
             (FailureKind::ReviewUnavailable, "provider", "none"),
             (FailureKind::ReviewInputTooLarge, "policy", "review"),
+            (FailureKind::ReviewInputOpaque, "policy", "review"),
             (FailureKind::Timeout, "infrastructure", "none"),
             (FailureKind::Interrupted, "infrastructure", "none"),
             (FailureKind::NoChain, "policy", "none"),

@@ -60,7 +60,12 @@ impl Workspace {
                 ),
             });
         }
-        Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+        String::from_utf8(output.stdout).map_err(|error| TactusError::Git {
+            message: format!(
+                "git {} returned output that is not valid UTF-8: {error}",
+                args.join(" ")
+            ),
+        })
     }
 
     /// §14 pre-flight: the engine refuses dirty trees.
@@ -414,6 +419,18 @@ mod tests {
         );
         let refusal = crate::review::complete_diff_error(&diff)
             .expect("an opaque patch cannot receive a semantic review");
-        assert!(refusal.contains("opaque binary"), "{refusal}");
+        assert!(refusal.to_string().contains("opaque binary"), "{refusal}");
+    }
+
+    #[test]
+    fn non_utf8_text_diff_is_refused_before_review() {
+        let repo = temp_repo("non-utf8-diff");
+        let ws = Workspace::open(&repo).expect("open");
+        fs::write(repo.join("invalid.rs"), b"fn changed() { // \xff\n}\n").expect("invalid text");
+
+        let error = ws
+            .capture_diff()
+            .expect_err("lossy conversion would change the evidence the reviewer sees");
+        assert!(error.to_string().contains("not valid UTF-8"), "{error}");
     }
 }

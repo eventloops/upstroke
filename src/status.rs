@@ -344,9 +344,6 @@ pub fn follow(
     loop {
         let events = tail.poll(&mut warnings)?;
         if events.is_empty() {
-            if terminal {
-                return Ok(());
-            }
             // The idle budget is not a timeout on silence. A whole attempt —
             // the agent's thinking, its tool calls, the gates, the review —
             // folds into a single `attempt_finished`, so a healthy run says
@@ -360,7 +357,11 @@ pub fn follow(
             // grace every time the answer was yes — which on a healthy run is
             // every poll. The lock now answers exactly, so there is no cheaper
             // question to ask.
-            if rundir::is_running(&status.paths.public) {
+            let running = rundir::is_running(&status.paths.public);
+            if terminal && !running {
+                return Ok(());
+            }
+            if running {
                 idle = 0;
             } else {
                 idle += 1;
@@ -380,7 +381,11 @@ pub fn follow(
                 _ => {}
             }
         }
-        if terminal {
+        // A resume owns the lock before it can append RunResumed. A follower
+        // that sees the previous epoch's RunFinished in that window must wait
+        // for the marker rather than treating historical terminal state as the
+        // current process's result.
+        if terminal && !rundir::is_running(&status.paths.public) {
             return Ok(());
         }
     }
@@ -629,6 +634,7 @@ mod tests {
                 answer: Answer::Answered {
                     text: "\u{1b}[31mnot a control sequence\u{1b}[0m".to_owned(),
                 },
+                decline_halts_run: None,
                 via: "answer-file".to_owned(),
             },
         }));

@@ -242,10 +242,11 @@ first-class.
 
 One crash-containment caveat is explicit: the current Windows host runner kills a process tree
 when it observes a timeout, but cannot retain ownership if the Tactus conductor itself is killed.
-Until the planned Job Object plus external cleanup guardian lands, use WSL or the external/container
-runner when a hard conductor crash must not leave an agent running or spending. Unix host runs
-retain a cleanup lease for ordinary descendants; deliberately daemonised processes require the
-external/container boundary on every platform.
+Until the planned Job Object plus external cleanup guardian lands, run the conductor under WSL
+when a hard conductor crash must not leave an ordinary agent descendant running or spending. The
+external/container runner is a v0.2 design commitment, not a shipped option. Unix and WSL host runs
+retain a cleanup lease for ordinary descendants; deliberately daemonised escape remains outside
+the current host-runner contract on every platform.
 
 ## Licence
 

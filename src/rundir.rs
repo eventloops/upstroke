@@ -338,9 +338,7 @@ impl RunLock {
     /// acquired the same inode would release *all* of this process's locks on
     /// that inode, silently stripping the new owner's exclusion.
     fn release_file_then(&mut self, after_close: impl FnOnce()) {
-        drop(self._file.take());
-        after_close();
-        claims().remove(&self.claim);
+        release_claim_after_file(self._file.take(), &self.claim, after_close);
     }
 
     /// Take the lock on a run's public directory, or explain who has it.
@@ -383,7 +381,7 @@ impl RunLock {
                     claim,
                 }),
                 Err(error) => {
-                    claims().remove(&claim);
+                    release_claim_after_file(Some(file), &claim, || {});
                     Err(error)
                 }
             },
@@ -402,6 +400,15 @@ impl RunLock {
     pub(crate) fn enter_cleanup_scope(&self) -> cleanup::CleanupScope<'_> {
         cleanup::enter(&self._cleanup)
     }
+}
+
+/// Release a process-scoped POSIX lock before another thread can observe the
+/// in-process claim as free. This ordering is shared by ordinary `Drop` and by
+/// rollback after the primary lock succeeded but the cleanup lease did not.
+fn release_claim_after_file(file: Option<File>, claim: &Path, after_close: impl FnOnce()) {
+    drop(file);
+    after_close();
+    claims().remove(claim);
 }
 
 fn refused(public: &Path, path: &Path, pid: Option<u32>) -> TactusError {
@@ -1009,6 +1016,31 @@ mod tests {
 
         let replacement = RunLock::acquire(&paths.public).expect("handoff after ordered release");
         drop(replacement);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cleanup_lease_failure_closes_primary_before_releasing_claim() {
+        let root = scratch("cleanupfailurehandoff");
+        let paths = paths_in(&root, "RUN1");
+        paths.create().expect("create");
+        let mut held = RunLock::acquire(&paths.public).expect("primary acquired");
+        let file = held._file.take();
+        let claim = held.claim.clone();
+
+        // This is the exact rollback primitive used when cleanup::take fails.
+        // The callback is a deterministic observation point between closing
+        // the POSIX descriptor and publishing the same-process claim as free.
+        release_claim_after_file(file, &claim, || {
+            let file = File::open(lock_file(&paths.public)).expect("inspect primary lock");
+            assert!(matches!(imp::holder(&file), Holder::Nobody));
+            RunLock::acquire(&paths.public)
+                .expect_err("claim cannot be reused until the old descriptor is closed");
+        });
+
+        let replacement = RunLock::acquire(&paths.public).expect("clean rollback handoff");
+        drop(replacement);
+        drop(held);
     }
 
     #[test]

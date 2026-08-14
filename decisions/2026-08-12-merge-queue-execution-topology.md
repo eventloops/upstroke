@@ -193,9 +193,10 @@ Schema 3 records at least:
 
 These are execution-semantic events, so fresh v0.2-topology runs start at event
 schema 4. The topology originally reserved schema 3, but the complete-review
-contract used that boundary first: a schema-2 binary can ignore the recorded
-timeout and truncate a prompt, so schema 3 must remain the downgrade barrier for
-that verification change. Older binaries must reject schema 4 before folding
+and atomic sequential-attempt settlement contracts used that boundary first: a
+schema-2 binary can ignore the recorded timeout and truncate a prompt, or ignore
+an embedded ladder decision and repeat a settled failure, so schema 3 must
+remain their downgrade barrier. Older binaries must reject schema 4 before folding
 topology events; this is not an additive field smuggled into an earlier schema.
 An existing schema-1, schema-2, or schema-3 run stays on the sequential execution
 path until it finishes. It may perform the review-contract upgrade to schema 3,
