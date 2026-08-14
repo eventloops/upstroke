@@ -2075,7 +2075,7 @@ impl Run<'_> {
                 }
             };
 
-            let parking = if let Some(failure) = result
+            let (parking, parking_write_error) = if let Some(failure) = result
                 .failure
                 .as_ref()
                 .filter(|failure| failure.kind == FailureKind::ReviewInputTooLarge)
@@ -2086,16 +2086,21 @@ impl Run<'_> {
                     failure,
                     &self.state.progress[index],
                 );
-                Some(Box::new(events::AttemptParking {
-                    question: self.prepare_question(index, QuestionKind::Unblock, context)?,
-                    refund_attempt: false,
-                }))
+                let question = self.build_question(index, QuestionKind::Unblock, context);
+                let write_error = self.materialize_question(&question).err();
+                (
+                    Some(Box::new(events::AttemptParking {
+                        question,
+                        refund_attempt: false,
+                    })),
+                    write_error,
+                )
             } else {
-                None
+                (None, None)
             };
             let policy_parked = parking.is_some();
 
-            self.emit(EventBody::AttemptFinished {
+            let settlement = self.emit(EventBody::AttemptFinished {
                 task: task_id.clone(),
                 attempt,
                 rung: rung_number,
@@ -2118,7 +2123,34 @@ impl Run<'_> {
                         reason: f.reason.clone(),
                     }),
                 }),
-            })?;
+            });
+            if let Err(error) = settlement {
+                // The log may be unavailable too, so durability is not always
+                // possible. Workspace hygiene still is: never return with an
+                // unreviewed staged diff just because settlement failed.
+                if let Err(cleanup) = self.workspace.discard_uncommitted() {
+                    return Err(TactusError::Git {
+                        message: format!(
+                            "{error}; additionally failed to clean the unreviewed workspace: {cleanup}"
+                        ),
+                    });
+                }
+                return Err(error);
+            }
+            if let Some(error) = parking_write_error {
+                // `attempt_finished` already carries the complete question, so
+                // replay cannot repay or reinterpret this attempt. The missing
+                // projection is repaired from that event on resume; surface the
+                // storage failure now, after making the workspace safe.
+                if let Err(cleanup) = self.workspace.discard_uncommitted() {
+                    return Err(TactusError::Git {
+                        message: format!(
+                            "{error}; additionally failed to clean the unreviewed workspace: {cleanup}"
+                        ),
+                    });
+                }
+                return Err(error);
+            }
 
             let Some(failure) = result.failure else {
                 let message = format!("[tactus] {}: {}", task.id, task.title);
@@ -2577,8 +2609,14 @@ impl Run<'_> {
         kind: QuestionKind,
         context: String,
     ) -> Result<Question, TactusError> {
+        let question = self.build_question(index, kind, context);
+        self.materialize_question(&question)?;
+        Ok(question)
+    }
+
+    fn build_question(&self, index: usize, kind: QuestionKind, context: String) -> Question {
         let task = &self.analysis.plan.tasks[index];
-        let question = Question {
+        Question {
             id: interaction::new_question_id(),
             kind,
             // v0.1 parks only the task that raised it. Dependents are held by
@@ -2587,26 +2625,28 @@ impl Run<'_> {
             affected_tasks: vec![task.id.clone()],
             context,
             options: question_options(kind),
-        };
+        }
+    }
+
+    fn materialize_question(&mut self, question: &Question) -> Result<(), TactusError> {
+        // Materialize first: a notifier must never announce a payload that its
+        // recipient cannot open. The authoritative event follows in the caller.
+        interaction::write_question(
+            &self.paths.questions(),
+            &QuestionRecord::open(question.clone()),
+        )?;
         let id = question.id.clone();
         for notifier in &self.notifiers {
-            // A notifier that cannot deliver must not take the run with it:
-            // the question is on disk either way (§12).
-            if let Err(error) = notifier.ask(&question) {
+            // A notifier that cannot deliver must not take the run with it: the
+            // question is already on disk either way (§12).
+            if let Err(error) = notifier.ask(question) {
                 self.warnings.push(format!(
                     "notifier `{}` could not deliver question {id}: {error}",
                     notifier.id()
                 ));
             }
         }
-        // The payload lands on disk before the authoritative event, so a
-        // reader that folds either `question_raised` or an atomically parked
-        // `attempt_finished` can always open the file it names.
-        interaction::write_question(
-            &self.paths.questions(),
-            &QuestionRecord::open(question.clone()),
-        )?;
-        Ok(question)
+        Ok(())
     }
 
     /// Ingest answers left by `tactus answer` in another process.
@@ -4175,6 +4215,9 @@ mod tests {
         EditTest,
         /// Produces a complete diff larger than the review input boundary.
         LargeEdit,
+        /// Produces the same oversized diff, then makes the question payload
+        /// directory unwritable so parking preparation fails deterministically.
+        LargeEditQuestionWriteFailure,
         /// Simulates a lying agent: success report, no changes.
         NoEdit,
         /// Simulates an agent-side failure.
@@ -4396,7 +4439,7 @@ mod tests {
                         "widget_test.rs",
                         "#[test]\nfn widget_works() {\n    assert!(true);\n}\n".to_owned(),
                     )),
-                    Effect::LargeEdit => Some((
+                    Effect::LargeEdit | Effect::LargeEditQuestionWriteFailure => Some((
                         "large-agent-output.txt",
                         "x".repeat(review::MAX_DIFF_BYTES + 1),
                     )),
@@ -4405,6 +4448,21 @@ mod tests {
             if let Some((name, content)) = edit {
                 fs::write(run.workspace.join(name), content).map_err(|e| TactusError::Agent {
                     message: format!("fake edit failed: {e}"),
+                })?;
+            }
+            if scripted(&self.effects, index, Effect::EditFile)
+                == Effect::LargeEditQuestionWriteFailure
+            {
+                let run_id =
+                    rundir::latest_run(&run.workspace).ok_or_else(|| TactusError::Agent {
+                        message: "fake could not find the active run".to_owned(),
+                    })?;
+                let questions = rundir::public_dir(&run.workspace, &run_id).join("questions");
+                fs::remove_dir(&questions).map_err(|e| TactusError::Agent {
+                    message: format!("fake could not remove questions directory: {e}"),
+                })?;
+                fs::write(&questions, "not a directory\n").map_err(|e| TactusError::Agent {
+                    message: format!("fake could not block question writes: {e}"),
                 })?;
             }
             let mut cmd = shell_command("exit 0");
@@ -4485,6 +4543,7 @@ mod tests {
                 Effect::EditFile
                 | Effect::EditTest
                 | Effect::LargeEdit
+                | Effect::LargeEditQuestionWriteFailure
                 | Effect::NoEdit
                 | Effect::AskQuestion
                 | Effect::Exit => OutcomeStatus::Completed,
@@ -4885,6 +4944,68 @@ mod tests {
         assert!(
             git_in(&repo, &["status", "--porcelain"]).trim().is_empty(),
             "resume did not discard crash residue"
+        );
+    }
+
+    #[test]
+    fn failed_parking_payload_still_settles_and_cleans_the_attempt() {
+        let repo = temp_engine_repo("oversizedreviewquestionwrite");
+        seed(
+            &repo,
+            "## Generate the large fixture\n<!-- tactus: id=t1 kind=implement depends= -->\n",
+            Some(
+                "[interaction]\nmode = \"never\"\n\n\
+                 [routing]\nimplement = { chain = [\"small\"], attempts_per = 3 }\n",
+            ),
+        );
+        let mut opts = options(&repo);
+        opts.config_path = Some(repo.join("tactus.toml"));
+        let source = fake(Effect::LargeEditQuestionWriteFailure);
+        let error = run_with(&opts, &source).expect_err("question projection must fail");
+        assert!(
+            error.to_string().contains("questions"),
+            "wrong failure surfaced: {error}"
+        );
+
+        let run_id = rundir::latest_run(&repo).expect("failed run remains resumable");
+        let logged = events_of(&repo, &run_id);
+        let parking = logged.iter().find_map(|event| match &event.body {
+            EventBody::AttemptFinished { parking, .. } => parking.as_deref(),
+            _ => None,
+        });
+        assert!(
+            parking.is_some(),
+            "the event must retain parking even when its JSON projection fails"
+        );
+        assert_eq!(
+            logged
+                .iter()
+                .filter(|event| matches!(event.body, EventBody::AttemptFinished { .. }))
+                .count(),
+            1,
+            "the paid attempt must settle exactly once"
+        );
+        assert!(
+            git_in(&repo, &["status", "--porcelain"]).trim().is_empty(),
+            "a failed question write leaked the oversized unreviewed diff"
+        );
+
+        let paths = paths_of(&repo, &run_id);
+        fs::remove_file(paths.questions()).expect("remove injected blocker");
+        fs::create_dir(paths.questions()).expect("restore questions directory");
+        let retry = fake(Effect::EditFile);
+        let resumed = resume_with(&resume_options(&repo, &run_id), &retry)
+            .expect("resume repairs the projection and remains parked");
+        assert_eq!(resumed.outcome(), RunOutcome::Parked, "{resumed:?}");
+        assert!(
+            retry.adapter.runs().is_empty(),
+            "resume paid for an already-settled attempt"
+        );
+        assert_eq!(task(&resumed, "t1").attempts.len(), 1);
+        let question = resumed.questions.first().expect("restored question");
+        assert!(
+            interaction::answer_path(&paths.questions(), &question.question.id).exists(),
+            "resume did not rematerialize the authoritative question"
         );
     }
 

@@ -351,14 +351,48 @@ mod termination {
     struct State {
         /// Supervisors that entered before spawn but have not registered a pid.
         spawning: usize,
-        /// Active isolated process-group ids.
-        groups: Vec<i32>,
+        /// Active isolated process groups. A signal lease pins the numeric
+        /// identity until the monitor has delivered its snapshot's signal, so
+        /// `finish` cannot reap the leader and expose that id for reuse first.
+        groups: Vec<RegisteredGroup>,
         /// Set by the monitor before it kills groups. No later spawn may begin.
         terminating: bool,
         /// Set before a suspend snapshot and cleared only after continuation.
         /// New launches wait outside the lock for the complete transition.
         suspending: bool,
         guard: Guard,
+    }
+
+    struct RegisteredGroup {
+        pgid: i32,
+        signal_leases: usize,
+    }
+
+    struct GroupSnapshot {
+        state: Arc<Mutex<State>>,
+        pgids: Vec<i32>,
+    }
+
+    impl std::ops::Deref for GroupSnapshot {
+        type Target = [i32];
+
+        fn deref(&self) -> &Self::Target {
+            &self.pgids
+        }
+    }
+
+    impl Drop for GroupSnapshot {
+        fn drop(&mut self) {
+            let mut locked = self
+                .state
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            for pgid in &self.pgids {
+                if let Some(group) = locked.groups.iter_mut().find(|group| group.pgid == *pgid) {
+                    group.signal_leases = group.signal_leases.saturating_sub(1);
+                }
+            }
+        }
     }
 
     #[derive(Clone, Copy)]
@@ -463,7 +497,10 @@ mod termination {
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
             locked.spawning = locked.spawning.saturating_sub(1);
-            locked.groups.push(pgid);
+            locked.groups.push(RegisteredGroup {
+                pgid,
+                signal_leases: 0,
+            });
             self.phase = Phase::Group(pgid);
             Ok(())
         }
@@ -490,18 +527,20 @@ mod termination {
                     ),
                 });
             }
-            let mut locked = self
-                .state
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
-            if let Some(index) = locked
-                .groups
-                .iter()
-                .position(|candidate| *candidate == pgid)
-            {
-                locked.groups.swap_remove(index);
+            loop {
+                let mut locked = self
+                    .state
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                if !locked.groups.iter().any(|group| group.pgid == pgid) {
+                    return Ok(());
+                }
+                if remove_unpinned_group(&mut locked, pgid) {
+                    return Ok(());
+                }
+                drop(locked);
+                thread::sleep(Duration::from_millis(1));
             }
-            Ok(())
         }
     }
 
@@ -961,7 +1000,10 @@ mod termination {
         }
     }
 
-    fn groups_when_registered(state: &Arc<Mutex<State>>, terminating: bool) -> Option<Vec<i32>> {
+    fn groups_when_registered(
+        state: &Arc<Mutex<State>>,
+        terminating: bool,
+    ) -> Option<GroupSnapshot> {
         let mut locked = state
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
@@ -971,10 +1013,10 @@ mod termination {
         if terminating {
             locked.terminating = true;
         }
-        Some(locked.groups.clone())
+        Some(snapshot_groups(state, &mut locked))
     }
 
-    fn begin_suspend(state: &Arc<Mutex<State>>) -> Option<(Vec<i32>, Guard)> {
+    fn begin_suspend(state: &Arc<Mutex<State>>) -> Option<(GroupSnapshot, Guard)> {
         let mut locked = state
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
@@ -982,15 +1024,39 @@ mod termination {
             return None;
         }
         locked.suspending = true;
-        Some((locked.groups.clone(), locked.guard))
+        let guard = locked.guard;
+        Some((snapshot_groups(state, &mut locked), guard))
     }
 
-    fn end_suspend(state: &Arc<Mutex<State>>) -> Vec<i32> {
+    fn end_suspend(state: &Arc<Mutex<State>>) -> GroupSnapshot {
         let mut locked = state
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         locked.suspending = false;
-        locked.groups.clone()
+        snapshot_groups(state, &mut locked)
+    }
+
+    fn snapshot_groups(state: &Arc<Mutex<State>>, locked: &mut State) -> GroupSnapshot {
+        let mut pgids = Vec::with_capacity(locked.groups.len());
+        for group in &mut locked.groups {
+            group.signal_leases = group.signal_leases.saturating_add(1);
+            pgids.push(group.pgid);
+        }
+        GroupSnapshot {
+            state: Arc::clone(state),
+            pgids,
+        }
+    }
+
+    fn remove_unpinned_group(state: &mut State, pgid: i32) -> bool {
+        let Some(index) = state.groups.iter().position(|group| group.pgid == pgid) else {
+            return true;
+        };
+        if state.groups[index].signal_leases != 0 {
+            return false;
+        }
+        state.groups.swap_remove(index);
+        true
     }
 
     impl Reaper {
@@ -1039,8 +1105,6 @@ mod termination {
 
         verify_group_scanner()?;
         let parent = unsafe { libc::getpid() };
-        let mut command = [-1; 2];
-        let mut ack = [-1; 2];
         let cleanup_paths = crate::rundir::active_cleanup_lease_paths()
             .into_iter()
             .map(|path| {
@@ -1065,21 +1129,18 @@ mod termination {
         }
         let open_max = libc::c_int::try_from(open_max)
             .map_err(|_| "Unix open-file descriptor ceiling exceeds c_int".to_owned())?;
-        if unsafe { libc::pipe(command.as_mut_ptr()) } != 0 {
-            return Err(format!(
-                "creating Unix cleanup-reaper command pipe: {}",
-                std::io::Error::last_os_error()
-            ));
-        }
-        if unsafe { libc::pipe(ack.as_mut_ptr()) } != 0 {
-            close_fd(command[0]);
-            close_fd(command[1]);
-            return Err(format!(
-                "creating Unix cleanup-reaper acknowledgement pipe: {}",
-                std::io::Error::last_os_error()
-            ));
-        }
-
+        let command = create_cloexec_pipe()
+            .map_err(|error| format!("creating Unix cleanup-reaper command pipe: {error}"))?;
+        let ack = match create_cloexec_pipe() {
+            Ok(pipe) => pipe,
+            Err(error) => {
+                close_fd(command[0]);
+                close_fd(command[1]);
+                return Err(format!(
+                    "creating Unix cleanup-reaper acknowledgement pipe: {error}"
+                ));
+            }
+        };
         // SAFETY: the child immediately enters a fixed-storage syscall-only
         // loop. It never returns to the multithreaded Rust runtime.
         let pid = unsafe { libc::fork() };
@@ -1130,19 +1191,6 @@ mod termination {
             }
         }
         close_fd(ack[1]);
-        if !set_close_on_exec(command[0])
-            || !set_close_on_exec(command[1])
-            || !set_close_on_exec(ack[0])
-        {
-            for fd in [command[0], command[1], ack[0]] {
-                close_fd(fd);
-            }
-            unsafe {
-                let _ = libc::kill(pid, libc::SIGKILL);
-                let _ = libc::waitpid(pid, std::ptr::null_mut(), 0);
-            }
-            return Err("configuring Unix cleanup-reaper descriptors".to_owned());
-        }
         let reaper = Reaper {
             command_fd: command[1],
             ack_fd: ack[0],
@@ -1569,10 +1617,6 @@ mod termination {
     }
 
     fn spawn_guard(policy: SignalPolicy) -> Result<Guard, String> {
-        let mut command = [-1; 2];
-        let mut ack = [-1; 2];
-        let mut wake = [-1; 2];
-        let mut probe = [-1; 2];
         // Resolve the descriptor ceiling before fork: sysconf may take libc
         // locks, whereas the multithreaded child may call only async-safe
         // primitives until it enters the guard loop.
@@ -1582,27 +1626,38 @@ mod termination {
         }
         let open_max = libc::c_int::try_from(open_max)
             .map_err(|_| "Unix open-file descriptor ceiling exceeds c_int".to_owned())?;
-        // SAFETY: both arrays provide the two writable descriptors required by
-        // `pipe`; every error path below closes descriptors already created.
-        if unsafe { libc::pipe(command.as_mut_ptr()) } != 0 {
-            return Err(format!(
-                "creating Unix job-control command pipe: {}",
-                std::io::Error::last_os_error()
-            ));
-        }
-        if unsafe { libc::pipe(ack.as_mut_ptr()) } != 0 {
-            close_fd(command[0]);
-            close_fd(command[1]);
-            return Err(format!(
-                "creating Unix job-control acknowledgement pipe: {}",
-                std::io::Error::last_os_error()
-            ));
-        }
-        if unsafe { libc::pipe(wake.as_mut_ptr()) } != 0
-            || !set_nonblocking(wake[0])
-            || !set_nonblocking(wake[1])
-            || unsafe { libc::pipe(probe.as_mut_ptr()) } != 0
-        {
+        let command = create_cloexec_pipe()
+            .map_err(|error| format!("creating Unix job-control command pipe: {error}"))?;
+        let ack = match create_cloexec_pipe() {
+            Ok(pipe) => pipe,
+            Err(error) => {
+                for fd in command {
+                    close_fd(fd);
+                }
+                return Err(format!(
+                    "creating Unix job-control acknowledgement pipe: {error}"
+                ));
+            }
+        };
+        let wake = match create_cloexec_pipe() {
+            Ok(pipe) => pipe,
+            Err(error) => {
+                for fd in [command[0], command[1], ack[0], ack[1]] {
+                    close_fd(fd);
+                }
+                return Err(format!("creating Unix job-control wake pipe: {error}"));
+            }
+        };
+        let probe = match create_cloexec_pipe() {
+            Ok(pipe) => pipe,
+            Err(error) => {
+                for fd in [command[0], command[1], ack[0], ack[1], wake[0], wake[1]] {
+                    close_fd(fd);
+                }
+                return Err(format!("creating Unix job-control probe pipe: {error}"));
+            }
+        };
+        if !set_nonblocking(wake[0]) || !set_nonblocking(wake[1]) {
             for fd in [
                 command[0], command[1], ack[0], ack[1], wake[0], wake[1], probe[0], probe[1],
             ] {
@@ -1665,11 +1720,7 @@ mod termination {
         close_fd(wake[1]);
         close_fd(probe[0]);
         close_fd(probe[1]);
-        if !set_close_on_exec(command[0])
-            || !set_close_on_exec(command[1])
-            || !set_close_on_exec(ack[0])
-            || !set_nonblocking(command[1])
-        {
+        if !set_nonblocking(command[1]) {
             for fd in [command[0], command[1], ack[0]] {
                 close_fd(fd);
             }
@@ -2361,17 +2412,90 @@ mod termination {
             .then_some(info.pbsi_status == libc::SSTOP)
     }
 
-    fn set_close_on_exec(fd: libc::c_int) -> bool {
-        // SAFETY: fcntl only updates the supplied live descriptor. The caller
-        // treats failure as fatal because agent descendants must never retain
-        // the guard's control pipes across exec.
-        unsafe {
-            let flags = libc::fcntl(fd, libc::F_GETFD);
-            if flags >= 0 {
-                return libc::fcntl(fd, libc::F_SETFD, flags | libc::FD_CLOEXEC) == 0;
-            }
+    #[cfg(target_os = "linux")]
+    fn create_cloexec_pipe() -> Result<[libc::c_int; 2], std::io::Error> {
+        let mut pipe = [-1; 2];
+        // SAFETY: `pipe` exposes storage for exactly two descriptors. `pipe2`
+        // applies CLOEXEC in the same kernel operation that publishes them, so
+        // a concurrent spawn can never inherit an intermediate descriptor.
+        if unsafe { libc::pipe2(pipe.as_mut_ptr(), libc::O_CLOEXEC) } == 0 {
+            Ok(pipe)
+        } else {
+            Err(std::io::Error::last_os_error())
         }
-        false
+    }
+
+    #[cfg(target_os = "macos")]
+    fn create_cloexec_pipe() -> Result<[libc::c_int; 2], std::io::Error> {
+        use std::os::unix::ffi::OsStrExt;
+
+        // Darwin has no pipe2. Build the anonymous-equivalent channel from a
+        // FIFO inside an atomic, private mkdtemp directory: each endpoint is
+        // opened with O_CLOEXEC in the syscall that creates its descriptor,
+        // then the name and directory are removed before this function returns.
+        let template =
+            std::env::temp_dir().join(format!(".tactus-pipe-{}-XXXXXX", unsafe { libc::getpid() }));
+        let mut template = std::ffi::CString::new(template.as_os_str().as_bytes())
+            .map_err(|_| std::io::Error::from_raw_os_error(libc::EINVAL))?
+            .into_bytes_with_nul();
+        if unsafe { libc::mkdtemp(template.as_mut_ptr().cast()) }.is_null() {
+            return Err(std::io::Error::last_os_error());
+        }
+
+        let directory_len = template.len().saturating_sub(1);
+        let mut fifo = Vec::with_capacity(directory_len + b"/channel\0".len());
+        fifo.extend_from_slice(&template[..directory_len]);
+        fifo.extend_from_slice(b"/channel\0");
+        let cleanup = || unsafe {
+            let _ = libc::unlink(fifo.as_ptr().cast());
+            let _ = libc::rmdir(template.as_ptr().cast());
+        };
+        if unsafe { libc::mkfifo(fifo.as_ptr().cast(), 0o600) } != 0 {
+            let error = std::io::Error::last_os_error();
+            cleanup();
+            return Err(error);
+        }
+
+        let read_fd = unsafe {
+            libc::open(
+                fifo.as_ptr().cast(),
+                libc::O_RDONLY | libc::O_NONBLOCK | libc::O_CLOEXEC,
+            )
+        };
+        if read_fd < 0 {
+            let error = std::io::Error::last_os_error();
+            cleanup();
+            return Err(error);
+        }
+        let write_fd = unsafe {
+            libc::open(
+                fifo.as_ptr().cast(),
+                libc::O_WRONLY | libc::O_NONBLOCK | libc::O_CLOEXEC,
+            )
+        };
+        if write_fd < 0 {
+            let error = std::io::Error::last_os_error();
+            close_fd(read_fd);
+            cleanup();
+            return Err(error);
+        }
+        let unlinked = unsafe { libc::unlink(fifo.as_ptr().cast()) } == 0;
+        let removed = unsafe { libc::rmdir(template.as_ptr().cast()) } == 0;
+        if !unlinked || !removed || !clear_nonblocking(read_fd) || !clear_nonblocking(write_fd) {
+            let error = std::io::Error::last_os_error();
+            close_fd(read_fd);
+            close_fd(write_fd);
+            return Err(error);
+        }
+        Ok([read_fd, write_fd])
+    }
+
+    #[cfg(target_os = "macos")]
+    fn clear_nonblocking(fd: libc::c_int) -> bool {
+        unsafe {
+            let flags = libc::fcntl(fd, libc::F_GETFL);
+            flags >= 0 && libc::fcntl(fd, libc::F_SETFL, flags & !libc::O_NONBLOCK) == 0
+        }
     }
 
     fn set_nonblocking(fd: libc::c_int) -> bool {
@@ -2699,7 +2823,10 @@ mod termination {
         fn a_launch_cannot_enter_after_the_suspend_snapshot() {
             let state = Arc::new(Mutex::new(State {
                 spawning: 0,
-                groups: vec![41],
+                groups: vec![RegisteredGroup {
+                    pgid: 41,
+                    signal_leases: 0,
+                }],
                 terminating: false,
                 suspending: false,
                 guard: Guard {
@@ -2710,7 +2837,7 @@ mod termination {
                 },
             }));
             let (groups, _) = begin_suspend(&state).expect("begin suspend transition");
-            assert_eq!(groups, vec![41]);
+            assert_eq!(&*groups, &[41]);
 
             let waiting = Arc::clone(&state);
             let (sent, received) = std::sync::mpsc::channel();
@@ -2725,7 +2852,10 @@ mod termination {
                 "a launch entered while the frozen process-group snapshot was active"
             );
 
-            assert_eq!(end_suspend(&state), vec![41]);
+            let resumed = end_suspend(&state);
+            assert_eq!(&*resumed, &[41]);
+            drop(resumed);
+            drop(groups);
             received
                 .recv_timeout(Duration::from_secs(2))
                 .expect("launch released after resume");
@@ -2734,6 +2864,57 @@ mod termination {
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
             assert_eq!(locked.spawning, 0);
+        }
+
+        #[test]
+        fn signal_snapshot_pins_a_group_until_delivery_finishes() {
+            let state = Arc::new(Mutex::new(State {
+                spawning: 0,
+                groups: vec![RegisteredGroup {
+                    pgid: 41,
+                    signal_leases: 0,
+                }],
+                terminating: false,
+                suspending: false,
+                guard: Guard {
+                    command_fd: -1,
+                    ack_fd: -1,
+                    _command_keepalive_fd: -1,
+                    pid: -1,
+                },
+            }));
+            let snapshot = groups_when_registered(&state, false).expect("group snapshot");
+            {
+                let mut locked = state
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                assert_eq!(locked.groups[0].signal_leases, 1);
+                assert!(
+                    !remove_unpinned_group(&mut locked, 41),
+                    "finish exposed the group id while a signal snapshot held it"
+                );
+            }
+            drop(snapshot);
+            let mut locked = state
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            assert!(remove_unpinned_group(&mut locked, 41));
+            assert!(locked.groups.is_empty());
+        }
+
+        #[test]
+        fn helper_pipe_descriptors_are_close_on_exec() {
+            let pipe = create_cloexec_pipe().expect("atomic close-on-exec pipe");
+            for fd in pipe {
+                let flags = unsafe { libc::fcntl(fd, libc::F_GETFD) };
+                assert!(flags >= 0, "read descriptor flags");
+                assert_ne!(
+                    flags & libc::FD_CLOEXEC,
+                    0,
+                    "helper descriptor was visible without close-on-exec"
+                );
+                close_fd(fd);
+            }
         }
 
         #[cfg(target_os = "linux")]
