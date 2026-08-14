@@ -256,7 +256,7 @@ fn child_exited_unreaped(child: &Child) -> std::io::Result<bool> {
 /// while it is nonzero.
 #[cfg(unix)]
 mod termination {
-    use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU8, Ordering};
     use std::sync::{Arc, Mutex, OnceLock};
     use std::thread;
     use std::time::Duration;
@@ -269,6 +269,8 @@ mod termination {
     static SUSPEND_ARMED: AtomicBool = AtomicBool::new(false);
     static GUARD_COMMAND_FD: AtomicI32 = AtomicI32::new(-1);
     static GUARD_WAKE_FD: AtomicI32 = AtomicI32::new(-1);
+    static PROBE_PID: AtomicI32 = AtomicI32::new(-1);
+    static HANDLED_TERMINATION_MASK: AtomicU8 = AtomicU8::new(0);
     static STATE: OnceLock<Result<Arc<Mutex<State>>, String>> = OnceLock::new();
 
     const GUARD_READY: u8 = 0x91;
@@ -277,6 +279,7 @@ mod termination {
     const GUARD_STOPPED: u8 = 0xb2;
     const GUARD_CANCELLED: u8 = 0xc1;
     const GUARD_DISARM: u8 = 0xd1;
+    const GUARD_PROBE: u8 = 0xe1;
     const HANDLE_SIGINT: u8 = 1 << 0;
     const HANDLE_SIGTERM: u8 = 1 << 1;
     const HANDLE_SIGHUP: u8 = 1 << 2;
@@ -537,6 +540,7 @@ mod termination {
         }
         policy.job_control = disposition(libc::SIGTSTP)? == SignalDisposition::Default
             && disposition(libc::SIGCONT)? == SignalDisposition::Default;
+        HANDLED_TERMINATION_MASK.store(policy.termination_mask, Ordering::SeqCst);
 
         let guard = spawn_guard(policy)?;
         let state = Arc::new(Mutex::new(State {
@@ -599,8 +603,13 @@ mod termination {
         // monitor thread, rather than the handler, owns process-group work.
         unsafe {
             let mut action: libc::sigaction = std::mem::zeroed();
-            action.sa_sigaction = record_signal as *const () as libc::sighandler_t;
-            action.sa_flags = libc::SA_RESTART;
+            if signal == libc::SIGCONT {
+                action.sa_sigaction = record_signal_info as *const () as libc::sighandler_t;
+                action.sa_flags = libc::SA_RESTART | libc::SA_SIGINFO;
+            } else {
+                action.sa_sigaction = record_signal as *const () as libc::sighandler_t;
+                action.sa_flags = libc::SA_RESTART;
+            }
             libc::sigemptyset(&mut action.sa_mask);
             if libc::sigaction(signal, &action, std::ptr::null_mut()) != 0 {
                 return Err(format!(
@@ -629,6 +638,72 @@ mod termination {
                 notify_guard(signal);
             }
         }
+    }
+
+    extern "C" fn record_signal_info(
+        signal: libc::c_int,
+        info: *mut libc::siginfo_t,
+        _: *mut libc::c_void,
+    ) {
+        let is_guard_probe = signal == libc::SIGCONT
+            && !info.is_null()
+            && unsafe { (*info).si_pid() } == PROBE_PID.load(Ordering::SeqCst);
+        if !is_guard_probe {
+            record_signal(signal);
+            return;
+        }
+
+        // A stopped process cannot execute a caught termination handler. The
+        // external guard periodically resumes only Tactus so this handler can
+        // inspect/deliver a PID-directed pending signal; supervised agent
+        // groups remain stopped. With no such signal, stop again from inside
+        // the handler before returning to ordinary parent code.
+        let already_recorded = PENDING_TERMINATION.load(Ordering::SeqCst);
+        if already_recorded != 0 {
+            notify_guard(already_recorded);
+            return;
+        }
+        let pending = pending_termination_signal();
+        if pending != 0 {
+            let _ = PENDING_TERMINATION.compare_exchange(
+                0,
+                pending,
+                Ordering::SeqCst,
+                Ordering::SeqCst,
+            );
+            notify_guard(pending);
+            return;
+        }
+        if unsafe { libc::kill(libc::getpid(), libc::SIGSTOP) } != 0 {
+            let _ = PENDING_TERMINATION.compare_exchange(
+                0,
+                libc::SIGTERM,
+                Ordering::SeqCst,
+                Ordering::SeqCst,
+            );
+            notify_guard(libc::SIGTERM);
+        }
+    }
+
+    fn pending_termination_signal() -> libc::c_int {
+        unsafe {
+            let mut pending: libc::sigset_t = std::mem::zeroed();
+            if libc::sigpending(&mut pending) != 0 {
+                return libc::SIGTERM;
+            }
+            let mask = HANDLED_TERMINATION_MASK.load(Ordering::SeqCst);
+            for (signal, bit) in [
+                (libc::SIGINT, HANDLE_SIGINT),
+                (libc::SIGTERM, HANDLE_SIGTERM),
+                (libc::SIGHUP, HANDLE_SIGHUP),
+                (libc::SIGQUIT, HANDLE_SIGQUIT),
+            ] {
+                if mask & bit != 0 && libc::sigismember(&pending, signal) == 1 {
+                    return signal;
+                }
+            }
+        }
+        0
     }
 
     extern "C" fn record_guard_signal(signal: libc::c_int) {
@@ -972,11 +1047,28 @@ mod termination {
             reaper.cancel();
             return Err("Unix cleanup reaper did not initialize".to_owned());
         }
+        #[cfg(test)]
+        if let Some(path) = std::env::var_os("TACTUS_TEST_REAPER_PID_PATH")
+            && let Err(error) = std::fs::write(&path, pid.to_string())
+        {
+            reaper.cancel();
+            return Err(format!(
+                "recording test cleanup-reaper pid at {}: {error}",
+                std::path::Path::new(&path).display()
+            ));
+        }
         Ok(reaper)
     }
 
     fn install_reaper_dispositions() -> bool {
         unsafe {
+            // This child never executes embedding-host code. Remove every
+            // inherited callback before clearing its signal mask; SIGCHLD is
+            // restored to default immediately below because the reaper owns
+            // the stopped anchor's wait lifecycle.
+            if !scrub_private_helper_dispositions() {
+                return false;
+            }
             // A library host may own SIGCHLD and reap children from its
             // handler. The private reaper must not inherit that callback (or
             // SA_NOCLDWAIT): either can consume the stopped anchor before the
@@ -1288,6 +1380,7 @@ mod termination {
         let mut command = [-1; 2];
         let mut ack = [-1; 2];
         let mut wake = [-1; 2];
+        let mut probe = [-1; 2];
         // Resolve the descriptor ceiling before fork: sysconf may take libc
         // locks, whereas the multithreaded child may call only async-safe
         // primitives until it enters the guard loop.
@@ -1316,12 +1409,15 @@ mod termination {
         if unsafe { libc::pipe(wake.as_mut_ptr()) } != 0
             || !set_nonblocking(wake[0])
             || !set_nonblocking(wake[1])
+            || unsafe { libc::pipe(probe.as_mut_ptr()) } != 0
         {
-            for fd in [command[0], command[1], ack[0], ack[1], wake[0], wake[1]] {
+            for fd in [
+                command[0], command[1], ack[0], ack[1], wake[0], wake[1], probe[0], probe[1],
+            ] {
                 close_fd(fd);
             }
             return Err(format!(
-                "creating Unix job-control wake pipe: {}",
+                "creating Unix job-control wake/probe pipe: {}",
                 std::io::Error::last_os_error()
             ));
         }
@@ -1333,7 +1429,9 @@ mod termination {
         let pid = unsafe { libc::fork() };
         if pid < 0 {
             GUARD_WAKE_FD.store(-1, Ordering::SeqCst);
-            for fd in [command[0], command[1], ack[0], ack[1], wake[0], wake[1]] {
+            for fd in [
+                command[0], command[1], ack[0], ack[1], wake[0], wake[1], probe[0], probe[1],
+            ] {
                 close_fd(fd);
             }
             return Err(format!(
@@ -1349,16 +1447,32 @@ mod termination {
             if !install_guard_dispositions(policy) {
                 unsafe { libc::_exit(1) };
             }
+            let parent = unsafe { libc::getppid() };
+            let probe_pid = unsafe { libc::fork() };
+            if probe_pid < 0 {
+                unsafe { libc::_exit(1) };
+            }
+            if probe_pid == 0 {
+                if !install_probe_dispositions() {
+                    unsafe { libc::_exit(1) };
+                }
+                close_fd(probe[1]);
+                close_inherited_fds(&[probe[0]], open_max);
+                probe_loop(parent, probe[0]);
+            }
             close_fd(command[1]);
             close_fd(ack[0]);
-            close_inherited_fds(&[command[0], ack[1], wake[0], wake[1]], open_max);
-            guard_loop(unsafe { libc::getppid() }, command[0], ack[1], wake[0]);
+            close_fd(probe[0]);
+            close_inherited_fds(&[command[0], ack[1], wake[0], wake[1], probe[1]], open_max);
+            guard_loop(parent, command[0], ack[1], wake[0], probe[1], probe_pid);
         }
 
         GUARD_WAKE_FD.store(-1, Ordering::SeqCst);
         close_fd(ack[1]);
         close_fd(wake[0]);
         close_fd(wake[1]);
+        close_fd(probe[0]);
+        close_fd(probe[1]);
         if !set_close_on_exec(command[0])
             || !set_close_on_exec(command[1])
             || !set_close_on_exec(ack[0])
@@ -1378,7 +1492,11 @@ mod termination {
             ack_fd: ack[0],
             _command_keepalive_fd: command[0],
         };
-        if guard.read_ack() != Some(GUARD_READY) {
+        let mut probe_pid_bytes = [0_u8; 4];
+        if guard.read_ack() != Some(GUARD_READY)
+            || !read_raw_exact(ack[0], &mut probe_pid_bytes)
+            || i32::from_ne_bytes(probe_pid_bytes) <= 0
+        {
             for fd in [command[0], command[1], ack[0]] {
                 close_fd(fd);
             }
@@ -1390,6 +1508,7 @@ mod termination {
             }
             return Err("Unix job-control guard did not initialize".to_owned());
         }
+        PROBE_PID.store(i32::from_ne_bytes(probe_pid_bytes), Ordering::SeqCst);
         GUARD_COMMAND_FD.store(command[1], Ordering::SeqCst);
         Ok(guard)
     }
@@ -1399,8 +1518,13 @@ mod termination {
         command_fd: libc::c_int,
         ack_fd: libc::c_int,
         wake_fd: libc::c_int,
+        probe_fd: libc::c_int,
+        probe_pid: libc::pid_t,
     ) -> ! {
-        if !write_byte(ack_fd, GUARD_READY) {
+        let mut ready = [0_u8; 5];
+        ready[0] = GUARD_READY;
+        ready[1..].copy_from_slice(&probe_pid.to_ne_bytes());
+        if !write_raw(ack_fd, &ready) {
             unsafe { libc::_exit(1) };
         }
         let mut armed = false;
@@ -1422,9 +1546,21 @@ mod termination {
             ];
             // Both parent relays and guard-directed foreground signals make a
             // descriptor readable, so there is no atomic-check-to-poll window.
-            let polled = unsafe { libc::poll(poll_fds.as_mut_ptr(), 2, -1) };
+            // While the parent is SIGSTOPped, a signal sent only to its PID
+            // cannot run a caught handler. Periodically resume only the parent;
+            // its SA_SIGINFO SIGCONT handler recognizes this guard as sender,
+            // delivers any pending Tactus-owned termination, or immediately
+            // re-stops. Agent groups remain stopped throughout.
+            let timeout_ms = if armed && stopping { 250 } else { -1 };
+            let polled = unsafe { libc::poll(poll_fds.as_mut_ptr(), 2, timeout_ms) };
             if polled < 0 && !last_errno_is_interrupted() {
                 unsafe { libc::_exit(1) };
+            }
+            if polled == 0 && armed && stopping {
+                if unsafe { libc::getppid() } != parent || !write_byte(probe_fd, GUARD_PROBE) {
+                    unsafe { libc::_exit(0) };
+                }
+                continue;
             }
             if polled > 0 && poll_fds[0].revents & (libc::POLLIN | libc::POLLHUP) != 0 {
                 // SAFETY: `buffer` is valid writable storage and command_fd is
@@ -1509,12 +1645,94 @@ mod termination {
         }
     }
 
+    /// Remove every embedding-host callback from a fork-only helper.
+    ///
+    /// Signal numbers are sparse and platform-specific. `sigaction` reports
+    /// EINVAL for holes, uncatchable signals, and values above the platform's
+    /// range, so a fixed upper bound avoids non-portable NSIG APIs while still
+    /// covering Linux real-time and BSD/macOS signals. Asynchronous signals
+    /// are ignored so a broadcast cannot disable cleanup; synchronous faults
+    /// retain their ordinary fatal behavior.
+    fn scrub_private_helper_dispositions() -> bool {
+        for signal in 1..=128 {
+            if signal == libc::SIGKILL || signal == libc::SIGSTOP {
+                continue;
+            }
+            let synchronous = matches!(
+                signal,
+                libc::SIGILL
+                    | libc::SIGABRT
+                    | libc::SIGFPE
+                    | libc::SIGSEGV
+                    | libc::SIGBUS
+                    | libc::SIGTRAP
+                    | libc::SIGSYS
+            );
+            let disposition = if synchronous {
+                libc::SIG_DFL
+            } else {
+                libc::SIG_IGN
+            };
+            if !set_signal_disposition(signal, disposition) {
+                return false;
+            }
+        }
+        true
+    }
+
+    fn set_signal_disposition(signal: libc::c_int, disposition: libc::sighandler_t) -> bool {
+        unsafe {
+            let mut action: libc::sigaction = std::mem::zeroed();
+            action.sa_sigaction = disposition;
+            action.sa_flags = 0;
+            if libc::sigemptyset(&mut action.sa_mask) != 0 {
+                return false;
+            }
+            if libc::sigaction(signal, &action, std::ptr::null_mut()) == 0 {
+                true
+            } else {
+                last_errno() == libc::EINVAL
+            }
+        }
+    }
+
+    fn install_probe_dispositions() -> bool {
+        unsafe {
+            if !scrub_private_helper_dispositions() {
+                return false;
+            }
+            let mut empty: libc::sigset_t = std::mem::zeroed();
+            libc::sigemptyset(&mut empty) == 0
+                && libc::sigprocmask(libc::SIG_SETMASK, &empty, std::ptr::null_mut()) == 0
+        }
+    }
+
+    fn probe_loop(parent: libc::pid_t, command_fd: libc::c_int) -> ! {
+        loop {
+            let mut command = 0_u8;
+            let read = unsafe { libc::read(command_fd, (&mut command as *mut u8).cast(), 1) };
+            if read == 1 && command == GUARD_PROBE {
+                if unsafe { libc::kill(parent, libc::SIGCONT) } == 0 {
+                    continue;
+                }
+            } else if read < 0 && last_errno_is_interrupted() {
+                continue;
+            }
+            unsafe { libc::_exit(0) };
+        }
+    }
+
     fn install_guard_dispositions(policy: SignalPolicy) -> bool {
         // The guard stays in the foreground process group but cannot join the
         // stop: it ignores SIGTSTP and records every transition that must wake
         // a parent already stopped by the guard. SIGSTOP itself targets only
         // the parent pid.
         unsafe {
+            // Scrub before deliberately clearing the inherited mask. Only this
+            // guard's narrow supervision surface is installed below.
+            if !scrub_private_helper_dispositions() {
+                return false;
+            }
             // A library host may have blocked these signals on the thread
             // that first invoked Tactus. The guard is an isolated relay, not
             // host code: clear its inherited mask so it can always wake a
@@ -2554,6 +2772,23 @@ mod tests {
                 libc::SIG_ERR
             );
         }
+        let custom_aux_signal = std::env::var_os("TACTUS_CUSTOM_AUX_SIGNAL_HANDLER").is_some();
+        if custom_aux_signal {
+            CUSTOM_AUX_SIGNAL_SEEN.store(false, std::sync::atomic::Ordering::SeqCst);
+            CUSTOM_PARENT_PID.store(
+                unsafe { libc::getpid() },
+                std::sync::atomic::Ordering::SeqCst,
+            );
+            assert_ne!(
+                unsafe {
+                    libc::signal(
+                        libc::SIGUSR1,
+                        record_custom_aux_signal as *const () as libc::sighandler_t,
+                    )
+                },
+                libc::SIG_ERR
+            );
+        }
         let progress_loop = std::env::var_os("TACTUS_SIGNAL_PROGRESS_LOOP").is_some();
         let mut command = if progress_loop {
             let mut command = Command::new(std::env::current_exe().expect("test executable"));
@@ -2600,6 +2835,12 @@ mod tests {
                     "Tactus replaced the embedding host's custom SIGTSTP handler"
                 );
             }
+            if custom_aux_signal {
+                assert!(
+                    CUSTOM_AUX_SIGNAL_SEEN.load(std::sync::atomic::Ordering::SeqCst),
+                    "the embedding host did not receive its own SIGUSR1"
+                );
+            }
             return;
         }
         panic!("the helper should terminate with the forwarded signal");
@@ -2611,6 +2852,10 @@ mod tests {
 
     #[cfg(unix)]
     static CUSTOM_JOB_CONTROL_SEEN: std::sync::atomic::AtomicBool =
+        std::sync::atomic::AtomicBool::new(false);
+
+    #[cfg(unix)]
+    static CUSTOM_AUX_SIGNAL_SEEN: std::sync::atomic::AtomicBool =
         std::sync::atomic::AtomicBool::new(false);
 
     #[cfg(unix)]
@@ -2635,12 +2880,26 @@ mod tests {
     }
 
     #[cfg(unix)]
+    extern "C" fn record_custom_aux_signal(_: libc::c_int) {
+        let parent = CUSTOM_PARENT_PID.load(std::sync::atomic::Ordering::SeqCst);
+        if unsafe { libc::getpid() } == parent {
+            CUSTOM_AUX_SIGNAL_SEEN.store(true, std::sync::atomic::Ordering::SeqCst);
+        } else if parent > 0 {
+            // Any forked helper that retained this callback turns a harmless
+            // auxiliary signal into an observable failure in the disposable
+            // parent instead of mutating only its private atomic copy.
+            let _ = unsafe { libc::kill(parent, libc::SIGKILL) };
+        }
+    }
+
+    #[cfg(unix)]
     struct SignalHelper {
         child: Child,
         scratch: std::path::PathBuf,
         marker: std::path::PathBuf,
         finish: std::path::PathBuf,
         diagnostic: std::path::PathBuf,
+        reaper_pid_path: std::path::PathBuf,
         supervised_pgid: Option<i32>,
         active: bool,
     }
@@ -2700,6 +2959,7 @@ mod tests {
         let marker = scratch.join("leaked");
         let finish = scratch.join("finish");
         let diagnostic = scratch.join("helper.log");
+        let reaper_pid_path = scratch.join("reaper.pid");
         let diagnostic_stdout = std::fs::File::create(&diagnostic).expect("helper diagnostic");
         let diagnostic_stderr = diagnostic_stdout
             .try_clone()
@@ -2712,6 +2972,7 @@ mod tests {
             .env("TACTUS_READY", &ready)
             .env("TACTUS_MARKER", &marker)
             .env("TACTUS_FINISH", &finish)
+            .env("TACTUS_TEST_REAPER_PID_PATH", &reaper_pid_path)
             // Keep a broken child-group setup inside the disposable helper's
             // group. A regression must fail the test, never suspend the test
             // runner that is responsible for reporting and cleaning it up.
@@ -2742,6 +3003,9 @@ mod tests {
         }
         if tag == "custom-job-control" {
             helper.env("TACTUS_CUSTOM_JOB_CONTROL_HANDLER", "1");
+        }
+        if tag == "custom-aux-signal" {
+            helper.env("TACTUS_CUSTOM_AUX_SIGNAL_HANDLER", "1");
         }
         if tag.contains("blocked") {
             helper.env("TACTUS_BLOCK_SIGNAL", "1");
@@ -2775,6 +3039,7 @@ mod tests {
             marker,
             finish,
             diagnostic,
+            reaper_pid_path,
             supervised_pgid: None,
             active: true,
         };
@@ -2901,6 +3166,34 @@ mod tests {
         assert_eq!(unsafe { libc::kill(-pid, libc::SIGTSTP) }, 0);
         let status = wait_for_exit(&mut helper.child, Duration::from_secs(10))
             .expect("custom job-control helper completes normally");
+        let diagnostic = helper.diagnostic();
+        helper.complete();
+        assert!(status.success(), "helper status: {status}\n{diagnostic}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn arbitrary_host_callbacks_never_run_in_private_helpers() {
+        let mut helper = spawn_signal_helper("custom-aux-signal", true, false);
+        let parent = helper.pid();
+        let reaper: i32 = std::fs::read_to_string(&helper.reaper_pid_path)
+            .expect("recorded private reaper pid")
+            .trim()
+            .parse()
+            .expect("numeric private reaper pid");
+
+        // The helper parent deliberately retains and observes its host-owned
+        // callback. The guard shares this group but must have scrubbed the
+        // fork-copied callback before unblocking signals.
+        assert_eq!(unsafe { libc::kill(-parent, libc::SIGUSR1) }, 0);
+        // The private cleanup reaper is in its own group; target it directly so
+        // both fork-only helper types prove the same callback boundary.
+        assert_eq!(unsafe { libc::kill(reaper, libc::SIGUSR1) }, 0);
+        thread::sleep(Duration::from_millis(50));
+        std::fs::write(&helper.finish, "finish").expect("release supervised worker");
+
+        let status = wait_for_exit(&mut helper.child, Duration::from_secs(10))
+            .expect("host-callback helper completes normally");
         let diagnostic = helper.diagnostic();
         helper.complete();
         assert!(status.success(), "helper status: {status}\n{diagnostic}");
@@ -3112,6 +3405,33 @@ mod tests {
         let leaked = helper.marker.exists();
         helper.complete();
         assert!(!leaked, "the suspended agent tree survived termination");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn pid_directed_termination_kills_a_suspended_tree_without_continue() {
+        let mut helper = spawn_signal_helper("pid-suspend-termination", false, false);
+        let pid = helper.pid();
+        assert_eq!(unsafe { libc::kill(-pid, libc::SIGTSTP) }, 0);
+        assert!(
+            wait_for_stop(pid, Duration::from_secs(10)),
+            "Tactus did not enter a stopped job-control state"
+        );
+
+        // Target only Tactus, not its foreground group and therefore not the
+        // external guard. No external SIGCONT follows: the guard's bounded
+        // probe must expose the pending signal to Tactus's handler, then let
+        // the ordinary monitor/reaper path settle the whole tree.
+        assert_eq!(unsafe { libc::kill(pid, libc::SIGTERM) }, 0);
+        wait_for_exit(&mut helper.child, Duration::from_secs(10))
+            .expect("PID-directed termination did not release the stopped Tactus process");
+        thread::sleep(Duration::from_millis(1300));
+        let leaked = helper.marker.exists();
+        helper.complete();
+        assert!(
+            !leaked,
+            "the isolated agent tree survived PID-directed termination"
+        );
     }
 
     #[test]

@@ -450,6 +450,10 @@ struct Recorded {
     reviews: Option<ReviewPlan>,
     /// What verifies it. `None` for a log written before the gate record.
     gates: Option<Vec<GateSummary>>,
+    /// The legacy record identifies the reviewers but predates schema 3's
+    /// explicit per-pass timeout. Its first complete-review resume must choose
+    /// and serialize that missing part of the verification identity.
+    legacy_review_timeout_missing: bool,
     /// Whether those gates came from `[[gates]]` rather than the repo's shape.
     ///
     /// Travels with them, and read only when `gates` is `Some`: it is a label
@@ -527,9 +531,16 @@ fn preflight_with_recorded(
     }
 
     let mut review_plan = match recorded.reviews {
-        Some(plan) => {
+        Some(mut plan) => {
             let configured = analysis.config.review_pass_timeout.as_secs();
-            if plan.pass_timeout_secs != configured {
+            if recorded.legacy_review_timeout_missing {
+                plan.pass_timeout_secs = configured;
+                warnings.push(format!(
+                    "this run's recorded review plan predates schema 3's per-pass timeout; this \
+                     resume establishes today's configured {configured}s timeout in the \
+                     append-only log before any more work starts"
+                ));
+            } else if plan.pass_timeout_secs != configured {
                 warnings.push(format!(
                     "today's review pass timeout ({configured}s) differs from the one this run \
                      recorded ({}s). This resume keeps the recorded timeout so one run has one \
@@ -1145,6 +1156,7 @@ fn resume_harness_inner(
     // the re-derivation repeating, and drifting, on every resume after that.
     let recorded_gates = events::recorded_gates(&events).cloned();
     let recorded_effort_policy = events::recorded_effort_policy(&events);
+    let recorded_complete_reviews = events::recorded_complete_reviews(&events).cloned();
     let recorded_reviews = events::recorded_reviews(&events).cloned();
     let recorded_chains = events::recorded_chains(&events).cloned();
 
@@ -1190,6 +1202,8 @@ fn resume_harness_inner(
         Recorded {
             reviews: recorded_reviews.clone(),
             gates: recorded_gates.clone(),
+            legacy_review_timeout_missing: recorded_reviews.is_some()
+                && recorded_complete_reviews.is_none(),
             gates_from_config: started.gates_from_config,
             routing: Some(RecordedRouting {
                 run_id: run_id.clone(),
@@ -1397,7 +1411,9 @@ fn resume_harness_inner(
     // about the pools, which a resumed run's snapshot must not forget.
     let prior_signals = capacity::observe(&replayed.events).exhausted;
     let log = EventLog::open(&paths.events(), &mut warnings)?;
-    let established_reviews = recorded_reviews.is_none().then(|| review_plan.clone());
+    let established_reviews = recorded_complete_reviews
+        .is_none()
+        .then(|| review_plan.clone());
     let mut run = Run {
         state: replayed.state,
         analysis: &analysis,
@@ -5601,9 +5617,16 @@ mod tests {
         let (repo, run_id) = parked_run("schema2reviewbarrier");
         let paths = paths_of(&repo, &run_id);
         rewrite_run_started_as_schema_two(&paths);
+        fs::write(
+            repo.join("tactus.toml"),
+            "[interaction]\nmode = \"never\"\n\n\
+             [routing]\nimplement = { chain = [\"small\"], attempts_per = 1 }\n\
+             review = { timeout_secs = 47 }\n",
+        )
+        .expect("first explicit complete-review timeout");
 
-        let resumed = resume_answering(&repo, &run_id, Effect::EditFile);
-        assert_eq!(resumed.outcome(), RunOutcome::Complete, "{resumed:?}");
+        let resumed = resume_answering(&repo, &run_id, Effect::NoEdit);
+        assert_eq!(resumed.outcome(), RunOutcome::Parked, "{resumed:?}");
 
         let logged = events_of(&repo, &run_id);
         let barrier = logged
@@ -5626,6 +5649,39 @@ mod tests {
         assert!(
             barrier < resumed_attempt,
             "the old verification contract must be fenced off before work starts"
+        );
+        assert_eq!(
+            events::recorded_complete_reviews(&logged)
+                .expect("schema-3 resume records a complete review plan")
+                .pass_timeout_secs,
+            47,
+            "the absent legacy field is explicitly serialized, not left to serde defaults"
+        );
+
+        fs::write(
+            repo.join("tactus.toml"),
+            "[interaction]\nmode = \"never\"\n\n\
+             [routing]\nimplement = { chain = [\"small\"], attempts_per = 1 }\n\
+             review = { timeout_secs = 83 }\n",
+        )
+        .expect("later configured timeout");
+        let second = resume_answering(&repo, &run_id, Effect::EditFile);
+        assert_eq!(second.outcome(), RunOutcome::Complete, "{second:?}");
+        assert_eq!(
+            events::recorded_reviews(&events_of(&repo, &run_id))
+                .expect("upgraded review plan survives")
+                .pass_timeout_secs,
+            47,
+            "a later binary/config default cannot reinterpret the upgraded timeout"
+        );
+        assert!(
+            second.warnings.iter().any(|warning| {
+                warning.contains("today's review pass timeout")
+                    && warning.contains("83s")
+                    && warning.contains("47s")
+            }),
+            "timeout drift warning: {:?}",
+            second.warnings
         );
     }
 

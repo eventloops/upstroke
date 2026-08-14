@@ -1597,9 +1597,45 @@ pub fn recorded_effort_policy(events: &[Event]) -> Option<ResolvedEffortPolicy> 
 /// the first current-binary `run_resumed`, so subsequent resumes cannot
 /// re-derive a different reviewer, model, effort, or pass timeout.
 pub fn recorded_reviews(events: &[Event]) -> Option<&crate::review::ReviewPlan> {
+    recorded_complete_reviews(events).or_else(|| {
+        events.iter().find_map(|event| match &event.body {
+            EventBody::RunStarted { data } => data.reviews.as_ref(),
+            EventBody::RunResumed { data } => data.reviews.as_ref(),
+            _ => None,
+        })
+    })
+}
+
+/// The first review plan recorded while the complete-review contract was in
+/// force.
+///
+/// Schema 1 and 2 plans deserialize an absent `pass_timeout_secs` through the
+/// current binary's serde default. That makes them usable as a legacy identity
+/// snapshot, but not authoritative for the timeout: a later binary could have
+/// a different default. A current start is complete in place. A legacy start
+/// becomes complete only when a schema-3 resume explicitly serializes the
+/// upgraded plan after the downgrade barrier.
+pub fn recorded_complete_reviews(events: &[Event]) -> Option<&crate::review::ReviewPlan> {
+    let started = events.iter().find_map(|event| match &event.body {
+        EventBody::RunStarted { data } => Some(&**data),
+        _ => None,
+    })?;
+    if started.schema >= 3 {
+        return started.reviews.as_ref().or_else(|| {
+            events.iter().find_map(|event| match &event.body {
+                EventBody::RunResumed { data } => data.reviews.as_ref(),
+                _ => None,
+            })
+        });
+    }
+
+    let mut schema = started.schema;
     events.iter().find_map(|event| match &event.body {
-        EventBody::RunStarted { data } => data.reviews.as_ref(),
-        EventBody::RunResumed { data } => data.reviews.as_ref(),
+        EventBody::RunSchemaUpgraded { data } if data.from == schema && data.to > schema => {
+            schema = data.to;
+            None
+        }
+        EventBody::RunResumed { data } if schema >= 3 => data.reviews.as_ref(),
         _ => None,
     })
 }
