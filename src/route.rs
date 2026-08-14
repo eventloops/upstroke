@@ -66,14 +66,15 @@ pub fn resolve(task: &Task, cfg: &Config) -> ResolvedChain {
     // `second_opinion` has no floor to apply and is handled by the reviewer
     // (§11.3), not here.
     for ov in &cfg.overrides {
-        if let Some(start_at) = ov.start_at
-            && task.path_hints.iter().any(|h| ov.globs.is_match(h))
-            && raise_start(&mut tiers, start_at, ChainSource::Override)
-        {
-            notes.push(format!(
-                "override paths [{}] raised start to {start_at}",
-                ov.raw_paths.join(", "),
-            ));
+        if let Some(start_at) = ov.start_at {
+            if task.path_hints.iter().any(|h| ov.globs.is_match(h))
+                && raise_start(&mut tiers, start_at, ChainSource::Override)
+            {
+                notes.push(format!(
+                    "override paths [{}] raised start to {start_at}",
+                    ov.raw_paths.join(", "),
+                ));
+            }
         }
     }
 
@@ -86,20 +87,20 @@ pub fn resolve(task: &Task, cfg: &Config) -> ResolvedChain {
         // Agreeing with a silent default still counts as the designer's
         // decision; agreeing with an override does not — the override is what
         // holds the start up, and removing the annotation would not lower it.
-        if !raised
-            && let Some(first) = tiers.first_mut()
-            && first.0 == tier
-            && first.1 == ChainSource::Default
-        {
-            first.1 = ChainSource::Annotation;
+        if !raised {
+            if let Some(first) = tiers.first_mut() {
+                if first.0 == tier && first.1 == ChainSource::Default {
+                    first.1 = ChainSource::Annotation;
+                }
+            }
         }
     }
 
     // `min=` is binding: clip everything below it.
-    if let Some(min) = task.min_tier
-        && raise_start(&mut tiers, min, ChainSource::Annotation)
-    {
-        notes.push(format!("min={min} clipped the chain start"));
+    if let Some(min) = task.min_tier {
+        if raise_start(&mut tiers, min, ChainSource::Annotation) {
+            notes.push(format!("min={min} clipped the chain start"));
+        }
     }
 
     if !task.path_hints.is_empty() {
@@ -132,8 +133,10 @@ fn raise_start(tiers: &mut Vec<(Tier, ChainSource)>, floor: Tier, source: ChainS
         return true;
     }
     let changed = tiers.len() != before;
-    if changed && let Some(first) = tiers.first_mut() {
-        first.1 = source;
+    if changed {
+        if let Some(first) = tiers.first_mut() {
+            first.1 = source;
+        }
     }
     changed
 }

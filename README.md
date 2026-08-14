@@ -155,7 +155,9 @@ repo runs with zero config.
 ```toml
 [routing]
 fix = { chain = ["small", "mid", "frontier"], attempts_per = 2 }
-review = { tier = "frontier" }        # or { enabled = false }
+review = { tier = "frontier", timeout_secs = 5400 }
+                                        # timeout is per pass and includes one format re-ask;
+                                        # or use { enabled = false }
 
 [routing.effort]
 implementation = "xhigh"              # every worker attempt, regardless of tier
@@ -221,9 +223,12 @@ These are invariants, not aspirations — they're what make it safe to leave run
   engine captured, never the agent's own account of what it did.
 - **Narrow permissions.** Unattended agents get file tools plus exactly the configured gate
   commands — never a skip-all-permissions flag. Reviewers are read-only.
-- **Nothing reviews its own work.** Where a task runs on the model that would have reviewed it,
-  the reviewer rebinds to a different model family; on blast-radius paths a second reviewer from
-  another family judges the same diff independently, and both must pass.
+- **Independent review is preferred and its fallback is explicit.** Where a task runs on the exact
+  model that would have reviewed it, Tactus opportunistically rebinds to another model family. If
+  that alternative cannot be probed, the run warns with the affected tasks and falls back to the
+  frozen same-model reviewer instead of silently claiming independence. A configured blast-radius
+  second opinion is stricter: another model family must be available, both reviewers judge the same
+  diff independently, and both must pass.
 - **An empty diff can never pass.** "Done" claims require changed code.
 - **Estimates are never optimistic.** A capacity pool nothing has measured reads as *unknown*,
   not as full; a figure derived from what tactus alone has spent is shown as a ceiling (`≤`)
@@ -233,10 +238,24 @@ These are invariants, not aspirations — they're what make it safe to leave run
 
 ## Requirements
 
-Rust 1.85+ (edition 2024) and [Claude Code](https://docs.claude.com/en/docs/claude-code/overview)
-on `PATH`. The [GitHub Copilot CLI](https://docs.github.com/en/copilot/reference/copilot-cli-reference/cli-programmatic-reference)
+Rust 1.85+ (edition 2024), Git 2.40+ (the exact-tree review check requires
+`git check-attr --source`), and [Claude Code](https://docs.claude.com/en/docs/claude-code/overview)
+on `PATH`. Tactus probes that Git capability before dispatching a worker. The
+[GitHub Copilot CLI](https://docs.github.com/en/copilot/reference/copilot-cli-reference/cli-programmatic-reference)
 is optional and unlocks the cross-family second opinion. Windows, macOS and Linux are all
 first-class.
+
+On Windows every supervised command is assigned to a kill-on-close Job Object before its primary
+thread runs. Ordinary descendants are therefore terminated after a direct-child exit, an observed
+timeout, or abrupt conductor death. Unix and WSL host runs retain a cleanup lease for ordinary
+descendants. Deliberately daemonised Unix escape remains outside the host-runner contract.
+
+Host-run mode is for trusted repositories and plans. Repository-controlled gates execute candidate
+build/test code as the Tactus user's OS account; no shipped host sandbox prevents that code from
+finding or modifying `.tactus` run files. Adapter deny rules reduce accidental access but do not
+make the event log tamper-resistant against hostile candidate code. Isolating coordinator state
+from workers, reviewers, and gates remains a container-runner/authority-layout blocker; use a
+dedicated OS account or VM for untrusted input until that boundary ships.
 
 ## Licence
 

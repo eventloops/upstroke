@@ -79,19 +79,63 @@ pub fn load(repo_root: &Path, run_id: Option<&str>) -> Result<RunStatus, TactusE
     let public = rundir::public_dir(repo_root, &run_id);
     let events_path = public.join("events.jsonl");
 
+    let (bytes, held) = stable_event_bytes_with(
+        &events_path,
+        || events::read_bytes(&events_path),
+        || rundir::is_running(&public),
+    )?;
+    let parsed = events::parse_bytes(&events_path, &bytes)?;
     let mut warnings = Vec::new();
-    let events = events::read_all(&events_path, &mut warnings)?;
+    warnings.extend(parsed.torn_tail_warning);
+    let events = parsed.events;
     let started = events::started_of(&events, &events_path)?.clone();
+    let effective_schema = events::ensure_supported_schema(&started, &events, &events_path)?;
+    if started.run_id != run_id {
+        return Err(TactusError::EventLog {
+            path: events_path.clone(),
+            message: format!(
+                "run_started id `{}` does not match directory `{run_id}`",
+                started.run_id
+            ),
+        });
+    }
     let paths = RunPaths::from_parts(public.clone(), PathBuf::from(&started.private_dir));
 
     let plan_path = paths.plan_json();
-    let plan_text = std::fs::read_to_string(&plan_path).map_err(|source| TactusError::Io {
+    let plan_bytes = std::fs::read(&plan_path).map_err(|source| TactusError::Io {
         path: plan_path.clone(),
         source,
     })?;
-    let plan: Plan = serde_json::from_str(&plan_text).map_err(|e| TactusError::Parse {
+    if effective_schema >= 3 {
+        let recorded = events::recorded_normalized_plan_digest(&events).ok_or_else(|| {
+            TactusError::EventLog {
+                path: events_path.clone(),
+                message: "event schema 3 does not record the normalized-plan SHA-256 digest"
+                    .to_owned(),
+            }
+        })?;
+        let actual = events::normalized_plan_digest(&plan_bytes);
+        if actual != recorded {
+            return Err(TactusError::EventLog {
+                path: plan_path.clone(),
+                message: format!(
+                    "normalized plan digest `{actual}` does not match recorded digest `{recorded}`"
+                ),
+            });
+        }
+    }
+    let plan: Plan = serde_json::from_slice(&plan_bytes).map_err(|e| TactusError::Parse {
         message: format!("{}: {e}", plan_path.display()),
     })?;
+    if plan.source.hash != started.plan_hash {
+        return Err(TactusError::EventLog {
+            path: plan_path.clone(),
+            message: format!(
+                "frozen plan hash `{}` does not match run-start hash `{}`",
+                plan.source.hash, started.plan_hash
+            ),
+        });
+    }
 
     let task_ids = plan.tasks.iter().map(|task| task.id.to_string()).collect();
     let mut replayed = events::replay(events, task_ids, &events_path)?;
@@ -103,7 +147,6 @@ pub fn load(repo_root: &Path, run_id: Option<&str>) -> Result<RunStatus, TactusE
     // alone made those seconds render as `run in progress`, dropping the stop
     // reason, the parked list, and the `resume --budget` line the operator is
     // there to find.
-    let held = rundir::is_running(&paths.public);
     let running = held && replayed.state.finished.is_none();
     // Settled in memory only: status is a pure read and must not write to a
     // run it is merely looking at. A resume records the same settlement as
@@ -215,11 +258,60 @@ pub fn describe(event: &Event) -> String {
             task,
             attempt,
             data,
+            parking,
+            transition,
             ..
-        } => match &data.failure {
-            Some(failure) => format!("{task}: attempt {attempt} failed — {}", failure.reason),
-            None => format!("{task}: attempt {attempt} passed"),
-        },
+        } => {
+            if let Some(parking) = parking {
+                let reason = data
+                    .failure
+                    .as_ref()
+                    .map(|failure| failure.reason.as_str())
+                    .unwrap_or("policy refusal");
+                if let Some(events::AttemptTransition::Escalate(escalation)) = transition.as_deref()
+                {
+                    format!(
+                        "{task}: attempt {attempt} failed — {reason}; escalating past {} to rung \
+                         {} and parked on question {}",
+                        escalation.tier, escalation.to_rung, parking.question.id
+                    )
+                } else {
+                    format!(
+                        "{task}: attempt {attempt} failed and parked on question {} — {reason}",
+                        parking.question.id
+                    )
+                }
+            } else {
+                match &data.failure {
+                    Some(failure) => match transition.as_deref() {
+                        Some(events::AttemptTransition::Retry(data)) => format!(
+                            "{task}: attempt {attempt} failed — {}; retrying on {}{}",
+                            failure.reason,
+                            data.tier,
+                            if data.resume {
+                                " in the same session"
+                            } else {
+                                ""
+                            }
+                        ),
+                        Some(events::AttemptTransition::Escalate(data)) => format!(
+                            "{task}: attempt {attempt} failed — {}; escalating past {} to rung {}",
+                            failure.reason, data.tier, data.to_rung
+                        ),
+                        Some(events::AttemptTransition::Defer(data)) => format!(
+                            "{task}: attempt {attempt} failed — {}; deferred ({}) — {}",
+                            failure.reason, data.defers, data.reason
+                        ),
+                        Some(events::AttemptTransition::Fail(data)) => format!(
+                            "{task}: attempt {attempt} failed — {}; task failed ({:?})",
+                            failure.reason, data.kind
+                        ),
+                        None => format!("{task}: attempt {attempt} failed — {}", failure.reason),
+                    },
+                    None => format!("{task}: attempt {attempt} passed"),
+                }
+            }
+        }
         EventBody::AttemptInterrupted { task, attempt, .. } => format!(
             "{task}: attempt {attempt} was cut off mid-flight; its spend is unknown and the \
              rung's allowance is intact"
@@ -318,6 +410,7 @@ pub fn follow(
     let mut tail = LogTail::new(status.paths.events());
     let mut warnings = Vec::new();
     let mut idle = 0;
+    let mut terminal = false;
     loop {
         let events = tail.poll(&mut warnings)?;
         if events.is_empty() {
@@ -334,7 +427,11 @@ pub fn follow(
             // grace every time the answer was yes — which on a healthy run is
             // every poll. The lock now answers exactly, so there is no cheaper
             // question to ask.
-            if rundir::is_running(&status.paths.public) {
+            let running = rundir::is_running(&status.paths.public);
+            if terminal && !running {
+                return Ok(());
+            }
+            if running {
                 idle = 0;
             } else {
                 idle += 1;
@@ -348,24 +445,96 @@ pub fn follow(
         idle = 0;
         for event in &events {
             let _ = writeln!(out, "{}", describe(event));
-            if matches!(event.body, EventBody::RunFinished { .. }) {
-                return Ok(());
+            match &event.body {
+                EventBody::RunFinished { .. } => terminal = true,
+                EventBody::RunResumed { .. } => terminal = false,
+                _ => {}
             }
         }
+        // A resume owns the lock before it can append RunResumed. A follower
+        // that sees the previous epoch's RunFinished in that window must wait
+        // for the marker rather than treating historical terminal state as the
+        // current process's result.
+        if terminal && !rundir::is_running(&status.paths.public) {
+            return Ok(());
+        }
     }
+}
+
+/// Pair event bytes with a stable liveness observation. A dead snapshot is
+/// trusted only after an identical second read and a second dead probe; this
+/// prevents status from reading `attempt_started`, observing the conductor
+/// release its lock after writing the settlement, and then inventing an
+/// interrupted attempt from the stale prefix.
+fn stable_event_bytes_with(
+    path: &Path,
+    mut read: impl FnMut() -> Result<Vec<u8>, TactusError>,
+    mut held: impl FnMut() -> bool,
+) -> Result<(Vec<u8>, bool), TactusError> {
+    const MAX_SNAPSHOT_ATTEMPTS: usize = 8;
+    for _ in 0..MAX_SNAPSHOT_ATTEMPTS {
+        let held_before = held();
+        let first = read()?;
+        let held_after = held();
+        if held_before != held_after {
+            continue;
+        }
+        if held_after {
+            return Ok((first, true));
+        }
+
+        let second = read()?;
+        let held_final = held();
+        if !held_final && first == second {
+            return Ok((second, false));
+        }
+    }
+    Err(TactusError::Refused {
+        message: format!(
+            "{} kept changing while status checked whether its engine was live; retry status once the transition settles",
+            path.display()
+        ),
+    })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::events::{AttemptRecord, AttemptStarted, RunFinished, RunOutcome, TaskCommitted};
+    use crate::events::{
+        AttemptRecord, AttemptStarted, AttemptTransition, LadderEscalated, LadderRetry,
+        RunFinished, RunOutcome, TaskCommitted, TaskDeferred, TaskFailed,
+    };
     use crate::ir::{Answer, Question, QuestionId, QuestionKind, TaskId};
+    use crate::ladder::{FailureKind, FailureOrigin};
 
     fn event(body: EventBody) -> Event {
         Event {
             ts: "2026-08-09T14:03:07Z".to_owned(),
             body,
         }
+    }
+
+    #[test]
+    fn a_live_to_dead_transition_retries_instead_of_settling_a_stale_prefix() {
+        use std::collections::VecDeque;
+
+        let mut reads = VecDeque::from([
+            b"attempt-started\n".to_vec(),
+            b"attempt-started\nattempt-finished\n".to_vec(),
+            b"attempt-started\nattempt-finished\n".to_vec(),
+        ]);
+        let mut probes = VecDeque::from([true, false, false, false, false]);
+        let (bytes, held) = stable_event_bytes_with(
+            Path::new("events.jsonl"),
+            || Ok(reads.pop_front().expect("bounded read sequence")),
+            || probes.pop_front().expect("bounded probe sequence"),
+        )
+        .expect("the second snapshot is stable");
+
+        assert!(!held);
+        assert_eq!(bytes, b"attempt-started\nattempt-finished\n");
+        assert!(reads.is_empty());
+        assert!(probes.is_empty());
     }
 
     #[test]
@@ -429,6 +598,122 @@ mod tests {
             }),
         }));
         assert!(line.contains("tactus answer q-01ABC"), "{line}");
+    }
+
+    #[test]
+    fn describe_atomic_attempt_transitions() {
+        let cases = [
+            (
+                AttemptTransition::Retry(LadderRetry {
+                    resume: true,
+                    tier: "mid".to_owned(),
+                    summary: "try again".to_owned(),
+                    detail: None,
+                }),
+                "retrying on mid in the same session",
+            ),
+            (
+                AttemptTransition::Escalate(LadderEscalated {
+                    to_rung: 2,
+                    tier: "frontier".to_owned(),
+                    summary: "go higher".to_owned(),
+                    detail: None,
+                }),
+                "escalating past frontier to rung 2",
+            ),
+            (
+                AttemptTransition::Defer(TaskDeferred {
+                    reason: "pool unavailable".to_owned(),
+                    defers: 3,
+                }),
+                "deferred (3) — pool unavailable",
+            ),
+            (
+                AttemptTransition::Fail(TaskFailed {
+                    kind: FailureKind::GateFailed,
+                    reason: "gates exhausted".to_owned(),
+                    halts_run: true,
+                }),
+                "task failed (GateFailed)",
+            ),
+        ];
+
+        for (transition, expected) in cases {
+            let line = describe(&event(EventBody::AttemptFinished {
+                task: "t1".to_owned(),
+                attempt: 1,
+                rung: 0,
+                profile: "implement".to_owned(),
+                data: Box::new(AttemptRecord {
+                    attempt: 1,
+                    tier: "small".to_owned(),
+                    model: "model".to_owned(),
+                    pool: None,
+                    resumed: false,
+                    duration: Duration::from_secs(1),
+                    cost_usd: None,
+                    reviews: Vec::new(),
+                    session_id: None,
+                    usage: None,
+                    failure: Some(events::FailureRecord {
+                        kind: FailureKind::GateFailed,
+                        origin: FailureOrigin::Worker,
+                        reason: "the attempt failed".to_owned(),
+                    }),
+                }),
+                parking: None,
+                transition: Some(Box::new(transition)),
+                prepared_commit: None,
+            }));
+            assert!(line.contains(expected), "{line}");
+        }
+    }
+
+    #[test]
+    fn describe_composes_escalation_with_spend_approval_parking() {
+        let line = describe(&event(EventBody::AttemptFinished {
+            task: "t1".to_owned(),
+            attempt: 1,
+            rung: 0,
+            profile: "implement".to_owned(),
+            data: Box::new(AttemptRecord {
+                attempt: 1,
+                tier: "small".to_owned(),
+                model: "model".to_owned(),
+                pool: None,
+                resumed: false,
+                duration: Duration::from_secs(1),
+                cost_usd: None,
+                reviews: Vec::new(),
+                session_id: None,
+                usage: None,
+                failure: Some(events::FailureRecord {
+                    kind: FailureKind::GateFailed,
+                    origin: FailureOrigin::Worker,
+                    reason: "the attempt failed".to_owned(),
+                }),
+            }),
+            parking: Some(Box::new(events::AttemptParking {
+                question: Question {
+                    id: QuestionId::from("q-spend"),
+                    kind: QuestionKind::ApproveSpend,
+                    affected_tasks: vec![TaskId::from("t1")],
+                    context: "approve the next rung".to_owned(),
+                    options: Vec::new(),
+                },
+                refund_attempt: false,
+            })),
+            transition: Some(Box::new(AttemptTransition::Escalate(LadderEscalated {
+                to_rung: 1,
+                tier: "small".to_owned(),
+                summary: "escalate".to_owned(),
+                detail: None,
+            }))),
+            prepared_commit: None,
+        }));
+        assert!(line.contains("escalating past small to rung 1"), "{line}");
+        assert!(line.contains("parked on question q-spend"), "{line}");
+        assert_eq!(line.lines().count(), 1, "{line:?}");
     }
 
     #[test]
@@ -539,6 +824,7 @@ mod tests {
                 answer: Answer::Answered {
                     text: "\u{1b}[31mnot a control sequence\u{1b}[0m".to_owned(),
                 },
+                decline_halts_run: None,
                 via: "answer-file".to_owned(),
             },
         }));

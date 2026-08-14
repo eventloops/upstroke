@@ -186,6 +186,13 @@ impl Gate for ShellGate {
             }
             log.push_str(&out.stderr);
         }
+        if out.output_limited {
+            log.push_str(&format!(
+                "\ngate `{}` exceeded the stdout/stderr output limit",
+                self.name
+            ));
+            return Ok(GateResult::Fail { log });
+        }
         if out.timed_out {
             log.push_str(&format!(
                 "\ngate `{}` timed out after {}s",
@@ -430,17 +437,20 @@ pub fn derive(root: &Path, shell: ShellKind) -> Vec<ShellGate> {
             gate("test", "go test ./...", 1200),
         ];
     }
-    if let Ok(text) = fs::read_to_string(root.join("package.json"))
-        && let Ok(pkg) = serde_json::from_str::<serde_json::Value>(&text)
-        && let Some(script) = pkg
-            .get("scripts")
-            .and_then(|s| s.get("test"))
-            .and_then(|t| t.as_str())
-        // npm init's placeholder always exits 1 — deriving it would make
-        // every zero-config run fail.
-        && !script.contains("no test specified")
-    {
-        return vec![gate("test", "npm test", 1200)];
+    if let Ok(text) = fs::read_to_string(root.join("package.json")) {
+        if let Ok(pkg) = serde_json::from_str::<serde_json::Value>(&text) {
+            if let Some(script) = pkg
+                .get("scripts")
+                .and_then(|s| s.get("test"))
+                .and_then(|t| t.as_str())
+            {
+                // npm init's placeholder always exits 1 — deriving it would
+                // make every zero-config run fail.
+                if !script.contains("no test specified") {
+                    return vec![gate("test", "npm test", 1200)];
+                }
+            }
+        }
     }
     Vec::new()
 }

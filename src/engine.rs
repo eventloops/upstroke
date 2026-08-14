@@ -23,7 +23,7 @@
 //! along. `report.json` is written from that state as a projection for humans;
 //! nothing ever reads it back.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -49,7 +49,7 @@ use crate::ir::{
 };
 use crate::ladder::{self, LadderPolicy, LadderState, Next};
 use crate::review::{self, PassBinding, ReviewPass, ReviewPlan};
-use crate::rundir::{self, RunLock, RunPaths};
+use crate::rundir::{self, RunLock, RunPaths, WorktreeLock};
 use crate::ulid;
 use crate::util;
 use crate::validate::{self, Analysis, ValidateOptions};
@@ -86,21 +86,9 @@ const MAX_FEEDBACK_ENTRIES: usize = 6;
 /// teaches this marker; nothing else in the engine parses agent prose.
 const QUESTION_MARKER: &str = "TACTUS-QUESTION:";
 
-/// What each review pass gets of the attempt's wall clock.
-///
-/// A reviewer reads a diff and answers — it has no shell and no edit tools, so
-/// it does not need the implementer's budget. Step-6 finding #13 was that
-/// giving it the full one let a single task consume several multiples of the
-/// attempt timeout, and the fix was a quarter.
-///
-/// That quarter is the budget for *review*, not for one reviewer, so it splits
-/// across the passes (§11.3). Otherwise configuring a second opinion would
-/// silently double a bound that was set deliberately. The 60s floor is per
-/// pass, because a budget too small to answer in is not a budget.
-fn review_timeout(attempt_timeout: Duration, passes: usize) -> Duration {
-    let share = attempt_timeout / 4 / u32::try_from(passes.max(1)).unwrap_or(u32::MAX);
-    share.max(Duration::from_secs(60))
-}
+#[cfg(test)]
+type AfterCandidateCapture =
+    fn(&Workspace, &crate::workspace::CapturedCandidate) -> Result<(), TactusError>;
 
 #[derive(Debug, Clone)]
 pub struct RunOptions {
@@ -125,6 +113,10 @@ pub struct RunOptions {
     pub wait_on_block: Option<Duration>,
     /// `--budget <usd>`, overriding `[budgets] run_usd` (§17).
     pub budget_usd: Option<f64>,
+    /// Deterministic test seam for changing the mutable index immediately
+    /// after the engine has frozen its candidate object identities.
+    #[cfg(test)]
+    after_candidate_capture: Option<AfterCandidateCapture>,
 }
 
 impl RunOptions {
@@ -142,6 +134,8 @@ impl RunOptions {
             private_root: None,
             wait_on_block: None,
             budget_usd: None,
+            #[cfg(test)]
+            after_candidate_capture: None,
         }
     }
 
@@ -442,6 +436,9 @@ struct Preflight {
     analysis: Analysis,
     caps: BTreeMap<String, Caps>,
     review_plan: ReviewPlan,
+    /// Each pass gets this independent frozen allowance. It comes from the
+    /// review plan rather than today's config on resume.
+    review_pass_timeout: Duration,
     /// The effective gates, in the one shape everything else projects from —
     /// the record, the permission grants, and the report all read this rather
     /// than walking `analysis.gates` again, so they cannot drift apart.
@@ -463,6 +460,10 @@ struct Recorded {
     reviews: Option<ReviewPlan>,
     /// What verifies it. `None` for a log written before the gate record.
     gates: Option<Vec<GateSummary>>,
+    /// The legacy record identifies the reviewers but predates schema 3's
+    /// explicit per-pass timeout. Its first complete-review resume must choose
+    /// and serialize that missing part of the verification identity.
+    legacy_review_timeout_missing: bool,
     /// Whether those gates came from `[[gates]]` rather than the repo's shape.
     ///
     /// Travels with them, and read only when `gates` is `Some`: it is a label
@@ -540,7 +541,37 @@ fn preflight_with_recorded(
     }
 
     let mut review_plan = match recorded.reviews {
-        Some(plan) => plan,
+        Some(mut plan) => {
+            let configured = analysis.config.review_pass_timeout.as_secs();
+            if recorded.legacy_review_timeout_missing {
+                plan.pass_timeout_secs = Some(configured);
+                warnings.push(format!(
+                    "this run's recorded review plan predates schema 3's per-pass timeout; this \
+                     resume establishes today's configured {configured}s timeout in the \
+                     append-only log before any more work starts"
+                ));
+            } else if plan.pass_timeout_secs != Some(configured) {
+                let recorded = plan
+                    .pass_timeout_secs
+                    .expect("a non-legacy recorded review plan has an explicit timeout");
+                warnings.push(format!(
+                    "today's review pass timeout ({configured}s) differs from the one this run \
+                     recorded ({}s). This resume keeps the recorded timeout so one run has one \
+                     verification standard. Start a new run to adopt today's timeout.",
+                    recorded
+                ));
+            }
+            if plan.enabled.is_none() || plan.alternative_available.is_none() {
+                plan.enabled.get_or_insert(plan.primary.is_some());
+                plan.alternative_available
+                    .get_or_insert(plan.alternative.is_some());
+                warnings.push(
+                    "this run's recorded review plan predates schema 3's explicit reviewer-identity markers; this resume records them before any more work starts"
+                        .to_owned(),
+                );
+            }
+            plan
+        }
         // Resolved against the adapters *this harness* holds, not the built-in
         // registry: the harness is what can actually spawn something, and
         // asking the wrong one would let a preview's answer stand in for a
@@ -553,6 +584,13 @@ fn preflight_with_recorded(
             &mut warnings,
         )?,
     };
+    // A legacy record is not trustworthy merely because its missing marker
+    // fields can be filled. Validate the complete inherited identity before
+    // probing an adapter or dispatching any paid work; otherwise a malformed
+    // schema-2 pass list can run once and only be rejected after it has been
+    // appended as schema 3.
+    events::validate_review_identity(&review_plan, analysis.plan.tasks.len(), &opts.plan_path)?;
+    let review_pass_timeout = review_plan.pass_timeout()?;
 
     // Probe every agent the chains reference; a missing binary is a refusal
     // to start, not a task failure (§19). The capabilities are kept, not
@@ -668,6 +706,7 @@ fn preflight_with_recorded(
         analysis,
         caps,
         review_plan,
+        review_pass_timeout,
         gates,
         gate_cmds,
         warnings,
@@ -689,10 +728,17 @@ fn run_harness_inner(
     opts: &RunOptions,
     harness: &Harness<'_>,
 ) -> Result<(RunReport, RunState), TactusError> {
+    let workspace = Workspace::open(&opts.repo_root)?;
+    // Preflight reads the source plan, config, and gate programs from this
+    // physical worktree. Own it before taking that snapshot so another run
+    // cannot leave us with an analysis of its transient edits.
+    let worktree_git_dir = workspace.worktree_git_dir()?;
+    let _worktree_lock = WorktreeLock::acquire_in(workspace.root(), &worktree_git_dir)?;
     let Preflight {
         analysis,
         caps,
         review_plan,
+        review_pass_timeout,
         gates,
         gate_cmds,
         mut warnings,
@@ -701,7 +747,7 @@ fn run_harness_inner(
         budgets,
     } = preflight(opts, harness)?;
 
-    let workspace = Workspace::open(&opts.repo_root)?;
+    workspace.ensure_execution_prerequisites()?;
     workspace.ensure_run_exclusions()?;
     if !workspace.is_clean()? {
         return Err(TactusError::Git {
@@ -720,6 +766,7 @@ fn run_harness_inner(
     // Held for the whole run, released by the OS if this process dies — so a
     // crash leaves nothing for `resume` to clear by hand.
     let _lock = RunLock::acquire(&paths.public)?;
+    let _cleanup_scope = _lock.enter_cleanup_scope();
 
     // Nothing is on the record until the first event lands, so a failure in
     // this window would leave a run directory with no `events.jsonl` in it —
@@ -727,9 +774,31 @@ fn run_harness_inner(
     // "no event log here" for a run that never began, shadowing the real
     // latest one until someone deletes it by hand. Best-effort: failing to
     // tidy up must not mask the error that actually stopped the run.
-    let opened = util::write_json(&paths.plan_json(), &analysis.plan)
-        .and_then(|()| workspace.create_branch(&branch));
+    let plan_path = paths.plan_json();
+    let normalized_plan = normalized_plan_bytes(&analysis.plan, &plan_path)?;
+    let normalized_plan_digest = events::normalized_plan_digest(&normalized_plan);
+    let opened = fs::write(&plan_path, &normalized_plan)
+        .map_err(|source| TactusError::Io {
+            path: plan_path.clone(),
+            source,
+        })
+        .and_then(|()| {
+            let read_back = fs::read(&plan_path).map_err(|source| TactusError::Io {
+                path: plan_path.clone(),
+                source,
+            })?;
+            if read_back != normalized_plan {
+                return Err(TactusError::Refused {
+                    message: format!(
+                        "{} changed while tactus was freezing it; refusing to record a digest for bytes it did not write",
+                        plan_path.display()
+                    ),
+                });
+            }
+            workspace.create_branch(&branch)
+        });
     if let Err(error) = opened {
+        drop(_cleanup_scope);
         drop(_lock);
         let _ = fs::remove_dir_all(&paths.public);
         let _ = fs::remove_dir_all(&paths.private);
@@ -749,6 +818,7 @@ fn run_harness_inner(
             .as_ref()
             .map(|path| repo_relative(&opts.repo_root, path)),
         plan_hash: analysis.plan.source.hash.clone(),
+        normalized_plan_digest: Some(normalized_plan_digest),
         private_dir: paths.private.to_string_lossy().into_owned(),
         // Names for the reader, the full gates for the resume — both from the
         // one list pre-flight resolved, so the log cannot name a gate its own
@@ -792,6 +862,7 @@ fn run_harness_inner(
         review_plan,
         effort_policy,
         attempt_timeout: opts.attempt_timeout,
+        review_pass_timeout,
         defer_backoff: opts.defer_backoff,
         max_defers: opts.max_defers,
         on_task_failure: analysis.config.on_task_failure,
@@ -802,6 +873,8 @@ fn run_harness_inner(
         warnings,
         unanswerable: Vec::new(),
         exhausted_pools: std::collections::BTreeSet::new(),
+        #[cfg(test)]
+        after_candidate_capture: opts.after_candidate_capture,
     };
     run.emit(EventBody::RunStarted {
         data: Box::new(started),
@@ -1123,23 +1196,59 @@ fn resume_harness_inner(
         run_id: run_id.clone(),
         message,
     };
+    let workspace = Workspace::open(&opts.repo_root)?;
+    let worktree_git_dir = workspace.worktree_git_dir()?;
+    let _worktree_lock = WorktreeLock::acquire_in(workspace.root(), &worktree_git_dir)?;
 
     // Claimed before anything is read, so two resumes cannot race each other
     // into the same branch. The lock sits beside the ops surface, which is the
     // only half of the run directory known this early: where the private half
     // went is recorded in `run_started`, and that has not been read yet.
     let _lock = RunLock::acquire(&public)?;
+    let _cleanup_scope = _lock.enter_cleanup_scope();
 
     let mut warnings = Vec::new();
     let events_path = public.join("events.jsonl");
     let events = events::read_all(&events_path, &mut warnings)?;
     let started = events::started_of(&events, &events_path)?.clone();
     let effective_schema = events::ensure_supported_schema(&started, &events, &events_path)?;
+    let recorded_normalized_plan_digest =
+        events::recorded_normalized_plan_digest(&events).map(str::to_owned);
+    let frozen_plan_path = public.join("plan.normalized.json");
+    let frozen_plan_bytes = fs::read(&frozen_plan_path).map_err(|source| TactusError::Io {
+        path: frozen_plan_path.clone(),
+        source,
+    })?;
+    let frozen_plan_digest = events::normalized_plan_digest(&frozen_plan_bytes);
+    if let Some(recorded) = recorded_normalized_plan_digest.as_deref() {
+        if frozen_plan_digest != recorded {
+            return Err(refuse(format!(
+                "the exact bytes at {} no longer match this run's recorded normalized-plan digest ({recorded}, now {frozen_plan_digest}). Restore the frozen snapshot or start a new run.",
+                frozen_plan_path.display()
+            )));
+        }
+    }
+    if let Some(failure) = events::legacy_unsettled_failure(started.schema, &events) {
+        let detail = match failure.kind {
+            events::LegacyUnsettledFailureKind::MissingDecision => {
+                "without its durable ladder or parking decision"
+            }
+            events::LegacyUnsettledFailureKind::MissingSpendParking => {
+                "after raising an ApproveSpend question but before durably parking the task"
+            }
+        };
+        return Err(refuse(format!(
+            "legacy event schema {} records failed attempt {} for `{}` on rung {} {detail}. The old writer may have stopped between two appends, so resuming could repeat paid work, choose the wrong rung, or bypass required spend approval. Preserve this log for recovery and start a new run rather than guessing.",
+            started.schema, failure.attempt, failure.task, failure.rung,
+        )));
+    }
     // Usually `run_started`'s, but a log too old to carry them there may have
     // had them established by an earlier resume instead — which is what stops
     // the re-derivation repeating, and drifting, on every resume after that.
     let recorded_gates = events::recorded_gates(&events).cloned();
     let recorded_effort_policy = events::recorded_effort_policy(&events);
+    let recorded_complete_reviews = events::recorded_complete_reviews(&events).cloned();
+    let recorded_reviews = events::recorded_reviews(&events).cloned();
     let recorded_chains = events::recorded_chains(&events).cloned();
 
     // The run knows its own plan and config; the CLI may override the config
@@ -1171,6 +1280,7 @@ fn resume_harness_inner(
         analysis,
         caps,
         review_plan,
+        review_pass_timeout,
         gates,
         gate_cmds,
         warnings: preflight_warnings,
@@ -1181,8 +1291,11 @@ fn resume_harness_inner(
         &run_opts,
         harness,
         Recorded {
-            reviews: started.reviews.clone(),
+            reviews: recorded_reviews.clone(),
             gates: recorded_gates.clone(),
+            legacy_review_timeout_missing: recorded_reviews
+                .as_ref()
+                .is_some_and(|plan| plan.pass_timeout_secs.is_none()),
             gates_from_config: started.gates_from_config,
             routing: Some(RecordedRouting {
                 run_id: run_id.clone(),
@@ -1191,7 +1304,7 @@ fn resume_harness_inner(
             }),
         },
     )?;
-    if started.reviews.is_none() {
+    if recorded_reviews.is_none() {
         warnings.push(
             "this run's log predates the review record (step 9), so who reviews was re-derived \
              from today's config rather than read from the run — earlier tasks may have been \
@@ -1266,6 +1379,26 @@ fn resume_harness_inner(
             analysis.plan.source.hash
         )));
     }
+    let canonical_plan_bytes = normalized_plan_bytes(&analysis.plan, &frozen_plan_path)?;
+    let canonical_plan_digest = events::normalized_plan_digest(&canonical_plan_bytes);
+    let established_normalized_plan_digest = if let Some(recorded) =
+        recorded_normalized_plan_digest.as_deref()
+    {
+        if canonical_plan_digest != recorded {
+            return Err(refuse(format!(
+                "the validated source plan now normalizes to digest {canonical_plan_digest}, but this run recorded {recorded}. Restore the source plan semantics or start a new run."
+            )));
+        }
+        None
+    } else {
+        if canonical_plan_bytes != frozen_plan_bytes {
+            return Err(refuse(format!(
+                "legacy frozen plan {} does not exactly match the canonical serialization of the validated source plan. Refusing to bless a mutable legacy snapshot during the schema-3 upgrade; restore it or start a new run.",
+                frozen_plan_path.display()
+            )));
+        }
+        Some(frozen_plan_digest.clone())
+    };
 
     let task_ids: Vec<String> = analysis
         .plan
@@ -1296,7 +1429,101 @@ fn resume_harness_inner(
         Some(events::RunOutcome::Parked | events::RunOutcome::BudgetExceeded) | None => {}
     }
 
-    let workspace = Workspace::open(&opts.repo_root)?;
+    // `question_answered`, its design-defect record, and a declined task's
+    // failure predate atomic parking and are three durable appends. Preserve
+    // every crash prefix so a closed question can never strand its task in
+    // AwaitingInput with no legal way to answer it again.
+    let defect_questions: BTreeSet<QuestionId> = replayed
+        .events
+        .iter()
+        .filter_map(|event| match &event.body {
+            EventBody::DesignDefect { data } => Some(data.question.clone()),
+            _ => None,
+        })
+        .collect();
+    let missing_answer_defects: Vec<_> = replayed
+        .state
+        .questions
+        .iter()
+        .filter_map(|record| {
+            let answer = record.answer.as_ref()?;
+            (!defect_questions.contains(&record.question.id)).then(|| {
+                (
+                    record.question.id.clone(),
+                    util::head(record.question.context.trim(), 600),
+                    match answer {
+                        Answer::Answered { text } => text.clone(),
+                        _ => "declined".to_owned(),
+                    },
+                )
+            })
+        })
+        .collect();
+    let decline_halt_policies: BTreeMap<_, _> = replayed
+        .events
+        .iter()
+        .filter_map(|event| match &event.body {
+            EventBody::QuestionAnswered { data } if data.answer == Answer::Declined => {
+                Some((data.question.clone(), data.decline_halts_run))
+            }
+            _ => None,
+        })
+        .collect();
+    let mut declined_questions = Vec::new();
+    for record in replayed
+        .state
+        .questions
+        .iter()
+        .filter(|record| record.answer.as_ref() == Some(&Answer::Declined))
+    {
+        let affected: Vec<_> = record
+            .question
+            .affected_tasks
+            .iter()
+            .filter(|task_id| {
+                replayed
+                    .state
+                    .index_of(task_id.as_str())
+                    .is_some_and(|index| {
+                        matches!(
+                            &replayed.state.states[index],
+                            TaskState::AwaitingInput(open) if open == &record.question.id
+                        )
+                    })
+            })
+            .cloned()
+            .collect();
+        if affected.is_empty() {
+            continue;
+        }
+        let Some(halts_run) = decline_halt_policies
+            .get(&record.question.id)
+            .copied()
+            .flatten()
+        else {
+            return Err(refuse(format!(
+                "legacy declined answer {} stopped before settling its affected task, but the log does not record the contemporaneous on_task_failure policy. Today's config cannot safely decide an old answer; preserve this log for recovery and start a new run.",
+                record.question.id
+            )));
+        };
+        declined_questions.push((record.question.id.clone(), affected, halts_run));
+    }
+
+    // Resolve the recorded private root before touching the worktree so a
+    // killed engine's durable snapshot registrations are reclaimed first.
+    let paths = match &opts.private_root {
+        Some(root) => RunPaths::with_private_root(&opts.repo_root, &run_id, root),
+        None => RunPaths::from_parts(public.clone(), PathBuf::from(&started.private_dir)),
+    };
+    paths.create()?;
+
+    let reclaimed = workspace.reclaim_gate_workspaces(&paths.gate_worktrees())?;
+    if reclaimed > 0 {
+        warnings.push(format!(
+            "reclaimed {reclaimed} gate/review snapshot worktree(s) left by the interrupted run"
+        ));
+    }
+    workspace.ensure_execution_prerequisites()?;
     workspace.ensure_run_exclusions()?;
     if !workspace.branch_exists(&started.branch)? {
         return Err(refuse(format!(
@@ -1320,27 +1547,84 @@ fn resume_harness_inner(
     // §15's check, before anything is discarded: if HEAD moved, refusing has
     // to leave the operator's tree exactly as they left it.
     let recorded_head = last_committed_sha(&replayed.events).unwrap_or(started.base_sha.clone());
-    let head = workspace.head_sha_full()?;
+    let mut head = workspace.head_sha_full()?;
 
-    // One commit past the record can be this run's own work rather than
-    // foreign history. §14 commits, reads the sha back, scrubs the tree, and
-    // only then appends `task_committed` — a process that dies inside those
-    // three git calls leaves exactly this shape. Refusing it would tell the
-    // operator to throw away a commit that already passed its gates and its
-    // review, and to spend the attempt again. So the engine adopts its own
-    // commit, but only when every part of the shape agrees: the other reading
-    // of an unexpected commit is that somebody else made it.
+    // A schema-3 successful settlement durably names the exact commit object
+    // that passed review. Recovery may publish that object from its pin, or
+    // finish recording it when HEAD already advanced. Subject/parent matching
+    // is intentionally insufficient: another commit can share both while
+    // containing arbitrary bytes.
     let mut adopted = None;
-    if head != recorded_head
-        && let Some((task, message)) = unrecorded_commit(&replayed, &analysis.plan)
-        && workspace.parent_sha(&head)?.as_deref() == Some(recorded_head.as_str())
-        && workspace.commit_subject(&head)? == message
-    {
-        warnings.push(format!(
-            "adopted commit {head} as `{task}`: the run committed it and stopped before \
-             recording it, which left the branch one commit ahead of its own log"
-        ));
-        adopted = Some((task, message));
+    if let Some((task, message, prepared)) = unrecorded_commit(&replayed, &analysis.plan) {
+        let Some(prepared) = prepared else {
+            if head != recorded_head {
+                return Err(refuse(format!(
+                    "`{}` is at {head}, but the successful legacy settlement for `{task}` did \
+                     not record an exact prepared commit. Refusing to adopt a commit by subject \
+                     alone; move the branch back to {recorded_head}, or start a new run.",
+                    started.branch
+                )));
+            }
+            return Err(refuse(format!(
+                "the successful legacy settlement for `{task}` has no exact prepared commit. \
+                 It cannot be replayed safely; preserve this log for recovery and start a new run."
+            )));
+        };
+        if prepared.parent_sha != recorded_head
+            || prepared.message != message
+            || !workspace.prepared_commit_matches(&prepared)?
+        {
+            return Err(refuse(format!(
+                "the recorded prepared commit for `{task}` does not match its task, parent, or \
+                 Git object. Refusing to publish or adopt it; preserve the log for recovery."
+            )));
+        }
+        let observed_branch_ref = workspace.current_branch_ref()?;
+        if observed_branch_ref != prepared.branch_ref {
+            return Err(refuse(format!(
+                "HEAD is on `{observed_branch_ref}`, not the prepared commit's recorded branch \
+                 `{}`; refusing prepared recovery.",
+                prepared.branch_ref
+            )));
+        }
+
+        if head == prepared.parent_sha {
+            if workspace.prepared_pin_target(&prepared.pin_ref)?.as_deref()
+                != Some(prepared.commit_sha.as_str())
+            {
+                return Err(refuse(format!(
+                    "the recorded prepared commit for `{task}` is not pinned by `{}`. Refusing \
+                     to publish an unprotected or substituted object; preserve the log for recovery.",
+                    prepared.pin_ref
+                )));
+            }
+            workspace.advance_prepared_commit(&prepared.branch_ref, &prepared)?;
+            head = prepared.commit_sha.clone();
+            warnings.push(format!(
+                "published prepared commit {head} for `{task}` after the run stopped between \
+                 settlement and the branch update"
+            ));
+            adopted = Some((task, message));
+        } else if head == prepared.commit_sha {
+            match workspace.prepared_pin_target(&prepared.pin_ref)? {
+                Some(target) if target == prepared.commit_sha => {
+                    workspace.remove_prepared_pin(&prepared)?;
+                }
+                Some(target) => {
+                    return Err(refuse(format!(
+                        "prepared ref `{}` points at {target}, not the recorded commit {}; \
+                         refusing to delete or adopt a substituted object.",
+                        prepared.pin_ref, prepared.commit_sha
+                    )));
+                }
+                None => {}
+            }
+            warnings.push(format!(
+                "adopted commit {head} as `{task}` from its exact prepared identity after the \
+                 run stopped before recording it"
+            ));
+            adopted = Some((task, message));
+        }
     }
 
     if adopted.is_none() && head != recorded_head {
@@ -1351,6 +1635,24 @@ fn resume_harness_inner(
              back to {recorded_head}, or start a new run.",
             started.branch
         )));
+    }
+
+    // A pin with no successful settlement is from a crash between preparing
+    // the object and appending AttemptFinished. It has no authority to move
+    // HEAD and is removed with an expected-old-value CAS before retrying.
+    for interrupted in replayed.state.interrupted_attempts() {
+        let task_index = replayed
+            .state
+            .index_of(&interrupted.task)
+            .expect("an interrupted task belongs to the replayed plan");
+        let pin_ref = prepared_pin_ref(&run_id, task_index, interrupted.flight.attempt);
+        if workspace.prepared_pin_target(&pin_ref)?.is_some() {
+            workspace.remove_orphan_prepared_pin(&pin_ref)?;
+            warnings.push(format!(
+                "removed orphan prepared commit pin `{pin_ref}` for interrupted attempt {}",
+                interrupted.flight.attempt
+            ));
+        }
     }
 
     // Crash residue: a dead agent's half-written edits. §14 rolls a failed
@@ -1373,11 +1675,6 @@ fn resume_harness_inner(
     // this run's transcripts into a second private root while `status` went on
     // pointing at the first. An explicit override still wins, for a private
     // root that has genuinely moved.
-    let paths = match &opts.private_root {
-        Some(root) => RunPaths::with_private_root(&opts.repo_root, &run_id, root),
-        None => RunPaths::from_parts(public.clone(), PathBuf::from(&started.private_dir)),
-    };
-    paths.create()?;
     let sleeper = harness.sleeper.unwrap_or(&RealSleeper);
     let default_answers = interaction::answers_for(
         mode,
@@ -1390,6 +1687,9 @@ fn resume_harness_inner(
     // about the pools, which a resumed run's snapshot must not forget.
     let prior_signals = capacity::observe(&replayed.events).exhausted;
     let log = EventLog::open(&paths.events(), &mut warnings)?;
+    let established_reviews = recorded_complete_reviews
+        .is_none()
+        .then(|| review_plan.clone());
     let mut run = Run {
         state: replayed.state,
         analysis: &analysis,
@@ -1405,6 +1705,7 @@ fn resume_harness_inner(
         review_plan,
         effort_policy,
         attempt_timeout: opts.attempt_timeout,
+        review_pass_timeout,
         defer_backoff: opts.defer_backoff,
         max_defers: opts.max_defers,
         on_task_failure: analysis.config.on_task_failure,
@@ -1420,22 +1721,13 @@ fn resume_harness_inner(
         // Seeded from the log so a resume neither re-announces an outage the
         // previous process recorded nor swallows a fresh one.
         exhausted_pools: prior_signals.keys().cloned().collect(),
+        #[cfg(test)]
+        after_candidate_capture: None,
     };
-    // A legacy run cannot have its opening event rewritten without violating
-    // append-only history. This no-op event is therefore the schema-2 boundary:
-    // schema-1 binaries do not know its tag and refuse before ignoring the new
-    // effort/binding snapshots that follow.
-    if effective_schema < events::SCHEMA_VERSION {
-        run.emit(EventBody::RunSchemaUpgraded {
-            data: events::RunSchemaUpgraded {
-                from: effective_schema,
-                to: events::SCHEMA_VERSION,
-            },
-        })?;
-    }
-    // The `task_committed` the dead process never got to, now that the commit
-    // has been checked against the record. First of everything this resume
-    // writes, because it is the thing that happened first.
+    // The `task_committed` the dead process never got to must be the first
+    // append after its successful settlement. Schema 3 treats that adjacency
+    // as part of the exact prepared-commit binding, so unrelated legacy answer
+    // repairs cannot interpose and poison the log.
     if let Some((task, message)) = adopted {
         run.emit(EventBody::TaskCommitted {
             task,
@@ -1445,7 +1737,43 @@ fn resume_harness_inner(
             },
         })?;
     }
-
+    // A legacy run cannot have its opening event rewritten without violating
+    // append-only history. This no-op event is the current downgrade boundary:
+    // schema-1 binaries do not know its tag, while schema-2 binaries reject a
+    // transition to schema 3 before applying their old partial-review contract.
+    if effective_schema < events::SCHEMA_VERSION {
+        run.emit(EventBody::RunSchemaUpgraded {
+            data: events::RunSchemaUpgraded {
+                from: effective_schema,
+                to: events::SCHEMA_VERSION,
+            },
+        })?;
+    }
+    for (question, context, answer) in missing_answer_defects {
+        run.emit(EventBody::DesignDefect {
+            data: events::DesignDefect {
+                question,
+                context,
+                answer,
+            },
+        })?;
+    }
+    for (question, affected, halts_run) in declined_questions {
+        for task_id in affected {
+            let Some(index) = run.state.index_of(task_id.as_str()) else {
+                continue;
+            };
+            if !matches!(&run.state.states[index], TaskState::AwaitingInput(open) if open == &question)
+            {
+                continue;
+            }
+            let reason = format!(
+                "declined at the human rung: {}",
+                last_reason(&run.state.progress[index])
+            );
+            run.fail_task_with_policy(index, FailureKind::Declined, reason, halts_run)?;
+        }
+    }
     // A crash between `question_answered` and the payload rewrite leaves a
     // file that still reads as open, which `tactus answer` would accept a
     // second answer against — one no engine can ever ingest, because the
@@ -1479,9 +1807,11 @@ fn resume_harness_inner(
             // the same fact in two places that a later change could pull apart.
             gates: recorded_gates.is_none().then(|| gates.clone()),
             effort_policy: recorded_effort_policy.is_none().then_some(effort_policy),
+            reviews: established_reviews,
             chains: recorded_chains
                 .is_none()
                 .then(|| chain_summaries(&analysis)),
+            normalized_plan_digest: established_normalized_plan_digest,
         },
     })?;
     // §14 takes a capacity snapshot at pre-flight, and §15 makes a resume
@@ -1641,8 +1971,17 @@ fn last_committed_sha(events: &[events::Event]) -> Option<String> {
 /// the process that died. Returns the task and the message the engine would
 /// have used, so the caller can confirm the commit really is the one it is
 /// about to adopt rather than trusting the log's shape alone.
-fn unrecorded_commit(replayed: &events::Replay, plan: &Plan) -> Option<(String, String)> {
-    let EventBody::AttemptFinished { task, data, .. } = &replayed.events.last()?.body else {
+fn unrecorded_commit(
+    replayed: &events::Replay,
+    plan: &Plan,
+) -> Option<(String, String, Option<events::PreparedCommit>)> {
+    let EventBody::AttemptFinished {
+        task,
+        data,
+        prepared_commit,
+        ..
+    } = &replayed.events.last()?.body
+    else {
         return None;
     };
     if data.failure.is_some() {
@@ -1656,7 +1995,12 @@ fn unrecorded_commit(replayed: &events::Replay, plan: &Plan) -> Option<(String, 
     Some((
         task.id.to_string(),
         format!("[tactus] {}: {}", task.id, task.title),
+        prepared_commit.as_deref().cloned(),
     ))
+}
+
+fn prepared_pin_ref(run_id: &str, task_index: usize, attempt: u32) -> String {
+    format!("refs/tactus/prepared/{run_id}/{task_index}-{attempt}")
 }
 
 struct Run<'a> {
@@ -1682,6 +2026,9 @@ struct Run<'a> {
     /// passes read this snapshot, including after a resume under changed config.
     effort_policy: ResolvedEffortPolicy,
     attempt_timeout: Duration,
+    /// Independent wall clock for each configured review pass. Frozen in
+    /// `review_plan`, materialized once by pre-flight.
+    review_pass_timeout: Duration,
     defer_backoff: Duration,
     max_defers: u32,
     on_task_failure: OnTaskFailure,
@@ -1715,6 +2062,8 @@ struct Run<'a> {
     /// resume from the log's own signals, so a resumed run neither re-announces
     /// an outage the previous process recorded nor misses a fresh one.
     exhausted_pools: std::collections::BTreeSet<String>,
+    #[cfg(test)]
+    after_candidate_capture: Option<AfterCandidateCapture>,
 }
 
 impl Run<'_> {
@@ -2022,6 +2371,7 @@ impl Run<'_> {
                     gate_cmds: &self.gate_cmds,
                     reviewers: self.reviewers(index, &profile)?,
                     timeout: self.attempt_timeout,
+                    review_pass_timeout: self.review_pass_timeout,
                     retry,
                     // The same entries the worker prompt quotes as operator
                     // instruction, routed to the judge as well (§12).
@@ -2031,6 +2381,8 @@ impl Run<'_> {
                         .filter(|entry| entry.human)
                         .filter_map(|entry| entry.detail.clone())
                         .collect(),
+                    #[cfg(test)]
+                    after_candidate_capture: self.after_candidate_capture,
                 };
 
                 // Any error between the agent editing files and the verdict
@@ -2045,11 +2397,155 @@ impl Run<'_> {
                 }
             };
 
-            self.emit(EventBody::AttemptFinished {
+            // Decide the ladder transition before writing the settlement, then
+            // carry both in one event. A failure record without its decision is
+            // not a safe crash prefix: replay would otherwise buy another
+            // attempt on the old rung or lose an outage refund.
+            let next = result.failure.as_ref().map(|failure| {
+                let settlement_session = result.outcome.session_id.as_ref().or(resume.as_ref());
+                let resumable = settlement_session.is_some()
+                    && self
+                        .caps
+                        .get(&profile.agent)
+                        .is_some_and(|c| c.session_resume);
+                ladder::next_step(
+                    failure,
+                    &LadderState {
+                        rung: self.state.progress[index].rung,
+                        attempts_on_rung: self.state.progress[index].attempts_on_rung,
+                        defers: self.state.progress[index].defers,
+                        resumable,
+                    },
+                    &policy,
+                )
+            });
+            let mut transition = None;
+            let mut parking = None;
+            let mut parking_question = None;
+            let pending_spend = result.outcome.cost_usd.unwrap_or(0.0)
+                + result
+                    .reviews
+                    .iter()
+                    .map(|review| review.cost_usd.unwrap_or(0.0))
+                    .sum::<f64>();
+            let pending_unpriced = result.outcome.cost_usd.is_none()
+                || result
+                    .reviews
+                    .iter()
+                    .any(|review| review.cost_usd.is_none());
+            if let (Some(failure), Some(next)) = (result.failure.as_ref(), next) {
+                match next {
+                    Next::RetrySameRung { resume } => {
+                        transition = Some(Box::new(events::AttemptTransition::Retry(
+                            events::LadderRetry {
+                                resume,
+                                tier: rung.tier.to_string(),
+                                summary: failure.reason.clone(),
+                                detail: failure.feedback.clone(),
+                            },
+                        )));
+                    }
+                    Next::Escalate => {
+                        transition = Some(Box::new(events::AttemptTransition::Escalate(
+                            events::LadderEscalated {
+                                to_rung: rung_number.saturating_add(1),
+                                tier: rung.tier.to_string(),
+                                summary: failure.reason.clone(),
+                                detail: failure.feedback.clone(),
+                            },
+                        )));
+                        if let Some(onto) = chain.rungs.get(rung_index + 1).map(|next| next.tier) {
+                            if self.should_approve_spend(rung.tier, onto, pending_spend) {
+                                let question = self.build_spend_approval(
+                                    index,
+                                    onto,
+                                    pending_spend,
+                                    pending_unpriced,
+                                );
+                                parking = Some(Box::new(events::AttemptParking {
+                                    question: question.clone(),
+                                    refund_attempt: false,
+                                }));
+                                parking_question = Some(question);
+                            }
+                        }
+                    }
+                    Next::Defer => {
+                        transition = Some(Box::new(events::AttemptTransition::Defer(
+                            events::TaskDeferred {
+                                reason: failure.reason.clone(),
+                                defers: self.state.progress[index].defers.saturating_add(1),
+                            },
+                        )));
+                    }
+                    Next::AskHuman(kind) => {
+                        let context =
+                            question_context(task, kind, failure, &self.state.progress[index]);
+                        let question = self.build_question(index, kind, context);
+                        parking = Some(Box::new(events::AttemptParking {
+                            question: question.clone(),
+                            // An outage or clarification never received a code
+                            // verdict, so its allowance is returned even when
+                            // the outage ceiling sends it to a human.
+                            refund_attempt: kind == QuestionKind::Clarify || failure.is_outage(),
+                        }));
+                        parking_question = Some(question);
+                    }
+                    Next::Fail => {
+                        transition = Some(Box::new(events::AttemptTransition::Fail(
+                            events::TaskFailed {
+                                kind: failure.kind,
+                                reason: failure.reason.clone(),
+                                halts_run: self.on_task_failure == OnTaskFailure::Halt,
+                            },
+                        )));
+                    }
+                }
+            }
+
+            // A passing attempt is turned into an immutable commit object and
+            // pinned before its settlement becomes durable. The event, HEAD
+            // CAS, and pin deletion can therefore be recovered at every crash
+            // prefix without re-running paid work or trusting the mutable
+            // index.
+            let prepared_commit = if result.failure.is_none() {
+                let message = format!("[tactus] {}: {}", task.id, task.title);
+                let pin_ref = prepared_pin_ref(&self.run_id, index, attempt);
+                let recorded_branch_ref = format!("refs/heads/{}", self.branch);
+                if result.candidate_branch_ref != recorded_branch_ref {
+                    let _ = self.workspace.discard_uncommitted();
+                    return Err(TactusError::Git {
+                        message: format!(
+                            "candidate was captured from `{}`, not recorded run branch `{recorded_branch_ref}`; refusing publication",
+                            result.candidate_branch_ref
+                        ),
+                    });
+                }
+                match self.workspace.prepare_commit_from_candidate(
+                    &result.candidate_branch_ref,
+                    &result.candidate_parent,
+                    &result.candidate_tree,
+                    &message,
+                    &pin_ref,
+                ) {
+                    Ok(prepared) => Some(prepared),
+                    Err(error) => {
+                        let _ = self.workspace.discard_uncommitted();
+                        return Err(error);
+                    }
+                }
+            } else {
+                None
+            };
+
+            let settlement = self.emit(EventBody::AttemptFinished {
                 task: task_id.clone(),
                 attempt,
                 rung: rung_number,
                 profile: profile.name.clone(),
+                parking,
+                transition,
+                prepared_commit: prepared_commit.clone().map(Box::new),
                 data: Box::new(AttemptRecord {
                     attempt,
                     tier: rung.tier.to_string(),
@@ -2067,15 +2563,45 @@ impl Run<'_> {
                         reason: f.reason.clone(),
                     }),
                 }),
-            })?;
+            });
+            if let Err(error) = settlement {
+                // A write/flush/sync error cannot prove whether the newline-
+                // committed event reached disk. Deliberately retain a prepared
+                // pin: resume removes it as an orphan if no settlement landed,
+                // or publishes it if the complete settlement is readable.
+                // Deleting it here would turn an ambiguous sync error into a
+                // schema-3 settlement whose exact object is no longer durable.
+                if let Err(cleanup) = self.workspace.discard_uncommitted() {
+                    return Err(TactusError::Git {
+                        message: format!(
+                            "{error}; additionally failed to clean the unreviewed workspace: {cleanup}"
+                        ),
+                    });
+                }
+                return Err(error);
+            }
+            if let Some(question) = parking_question.as_ref() {
+                if let Err(error) = self.materialize_question(question) {
+                    // The durable settlement is authoritative and already carries
+                    // the complete question. A crash or write failure here cannot
+                    // expose an orphan projection; resume rematerializes the
+                    // question from the event before accepting an answer.
+                    if let Err(cleanup) = self.workspace.discard_uncommitted() {
+                        return Err(TactusError::Git {
+                            message: format!(
+                                "{error}; additionally failed to clean the unreviewed workspace: {cleanup}"
+                            ),
+                        });
+                    }
+                    return Err(error);
+                }
+            }
 
             let Some(failure) = result.failure else {
-                let message = format!("[tactus] {}: {}", task.id, task.title);
-                self.workspace.commit(&message)?;
-                // The full sha, not `commit`'s abbreviated one: `resume`
-                // compares this against HEAD, and abbreviation length varies
-                // with `core.abbrev` and the repo's object count.
-                let full_sha = self.workspace.head_sha_full()?;
+                let prepared = prepared_commit
+                    .expect("a successful schema-3 settlement has a prepared commit");
+                self.workspace
+                    .advance_prepared_commit(&result.candidate_branch_ref, &prepared)?;
                 // Scrub gate side-effects (build artifacts, lockfile churn) so
                 // they cannot leak into the next task's captured diff; the
                 // commit recorded exactly the verified staged set.
@@ -2083,8 +2609,8 @@ impl Run<'_> {
                 self.emit(EventBody::TaskCommitted {
                     task: task_id.clone(),
                     data: events::TaskCommitted {
-                        sha: full_sha,
-                        message,
+                        sha: prepared.commit_sha,
+                        message: prepared.message,
                     },
                 })?;
                 return Ok(false);
@@ -2096,9 +2622,10 @@ impl Run<'_> {
             // because they are facts with different lifetimes — the deferral is
             // about this task's next move, this is about a subscription, and a
             // later run's estimator reads it back out of the log.
-            if failure.kind == FailureKind::RateLimited {
-                self.record_pool_exhausted(&task_id, &profile, &result.reviews, &failure)?;
-            } else {
+            if failure.kind != FailureKind::Interrupted
+                && !(failure.kind == FailureKind::RateLimited
+                    && failure.origin == FailureOrigin::Worker)
+            {
                 // This attempt reached a model and got an answer, whatever the
                 // verdict on its code, so any pool it drew on is serving again.
                 // Same rule as `capacity::observe`'s, applied to the engine's
@@ -2106,27 +2633,19 @@ impl Run<'_> {
                 // recovered — without it, the *next* outage on the same pool
                 // would go unrecorded because the set still held it.
                 self.exhausted_pools.remove(&profile.pool);
-                for review in &result.reviews {
-                    if review.outcome != events::ReviewPassOutcome::Unavailable
-                        && let Some(pool) = &review.pool
-                    {
+            }
+            for review in &result.reviews {
+                if review.outcome != events::ReviewPassOutcome::Unavailable {
+                    if let Some(pool) = &review.pool {
                         self.exhausted_pools.remove(pool);
                     }
                 }
             }
+            if failure.kind == FailureKind::RateLimited {
+                self.record_pool_exhausted(&task_id, &profile, &result.reviews, &failure)?;
+            }
 
-            let resumable = self.state.progress[index].session.is_some()
-                && self
-                    .caps
-                    .get(&profile.agent)
-                    .is_some_and(|c| c.session_resume);
-            let state = LadderState {
-                rung: self.state.progress[index].rung,
-                attempts_on_rung: self.state.progress[index].attempts_on_rung,
-                defers: self.state.progress[index].defers,
-                resumable,
-            };
-            let next = ladder::next_step(&failure, &state, &policy);
+            let next = next.expect("a failed attempt has a ladder decision");
 
             // §14: the tree survives only for a resumed retry, where the
             // *cumulative* diff is what gets re-gated. Every other branch
@@ -2137,88 +2656,14 @@ impl Run<'_> {
             }
 
             match next {
-                Next::RetrySameRung { resume } => {
-                    self.emit(EventBody::LadderRetry {
-                        task: task_id.clone(),
-                        attempt,
-                        rung: rung_number,
-                        data: events::LadderRetry {
-                            resume,
-                            tier: rung.tier.to_string(),
-                            summary: failure.reason.clone(),
-                            detail: failure.feedback.clone(),
-                        },
-                    })?;
-                }
+                Next::RetrySameRung { .. } => {}
                 Next::Escalate => {
-                    let onto = chain.rungs.get(rung_index + 1).map(|next| next.tier);
-                    // Escalate FIRST, then ask. The order is what makes the
-                    // approval path need no special case anywhere else: the
-                    // escalation's own fold moves the rung and resets
-                    // `attempts_on_rung`, so an approved task un-parks already
-                    // standing on the frontier rung with a fresh allowance —
-                    // rather than re-running the rung it had just exhausted, or
-                    // arriving back here and asking the same question again.
-                    self.emit(EventBody::LadderEscalated {
-                        task: task_id.clone(),
-                        attempt,
-                        rung: rung_number,
-                        data: events::LadderEscalated {
-                            to_rung: rung_number.saturating_add(1),
-                            tier: rung.tier.to_string(),
-                            summary: failure.reason.clone(),
-                            detail: failure.feedback.clone(),
-                        },
-                    })?;
-                    if let Some(onto) = onto
-                        && self.should_approve_spend(rung.tier, onto)
-                    {
-                        let question = self.raise_spend_approval(index, onto)?;
-                        self.emit(EventBody::TaskParked {
-                            task: task_id.clone(),
-                            data: events::TaskParked {
-                                question: question.to_string(),
-                                // The attempt that caused this escalation was
-                                // genuinely judged and genuinely failed, so its
-                                // allowance stays spent (§12's refund is for
-                                // work nobody judged).
-                                refund_attempt: false,
-                            },
-                        })?;
+                    if parking_question.is_some() {
                         return Ok(false);
                     }
                 }
-                Next::Defer => {
-                    // No attempt was spent on the work itself, so the event's
-                    // fold gives the rung its allowance back (§19).
-                    self.emit(EventBody::TaskDeferred {
-                        task: task_id.clone(),
-                        data: events::TaskDeferred {
-                            reason: failure.reason.clone(),
-                            defers: self.state.progress[index].defers.saturating_add(1),
-                        },
-                    })?;
-                    return Ok(true);
-                }
-                Next::AskHuman(kind) => {
-                    let context =
-                        question_context(task, kind, &failure, &self.state.progress[index]);
-                    let question = self.raise_question(index, kind, context)?;
-                    self.emit(EventBody::TaskParked {
-                        task: task_id.clone(),
-                        data: events::TaskParked {
-                            question: question.to_string(),
-                            // Nobody judged the code, so the attempt is not
-                            // spent (§12).
-                            refund_attempt: kind == QuestionKind::Clarify,
-                        },
-                    })?;
-                    return Ok(false);
-                }
-                Next::Fail => {
-                    self.fail_task(index, failure.kind, failure.reason.clone())?;
-                    return Ok(false);
-                }
+                Next::Defer => return Ok(true),
+                Next::AskHuman(_) | Next::Fail => return Ok(false),
             }
         }
     }
@@ -2388,13 +2833,18 @@ impl Run<'_> {
     /// the task in config or in an annotation, and §12's concern is silent
     /// escalation — asking permission for a decision the operator already made
     /// in writing would train them to answer without reading.
-    fn should_approve_spend(&self, from: crate::ir::Tier, onto: crate::ir::Tier) -> bool {
+    fn should_approve_spend(
+        &self,
+        from: crate::ir::Tier,
+        onto: crate::ir::Tier,
+        pending_spend: f64,
+    ) -> bool {
         let Some(threshold) = self.ask_before.frontier_escalation_over_usd else {
             return false;
         };
         onto == crate::ir::Tier::Frontier
             && from != crate::ir::Tier::Frontier
-            && self.reported_spend(None) >= threshold
+            && self.reported_spend(None) + pending_spend >= threshold
     }
 
     /// §13 source 1, recorded: attribute a rate limit to the pool that hit it.
@@ -2447,11 +2897,21 @@ impl Run<'_> {
         kind: FailureKind,
         reason: String,
     ) -> Result<(), TactusError> {
-        let task = self.analysis.plan.tasks[index].id.to_string();
         // The halt policy is resolved here and recorded, not re-derived on
         // replay: a `tactus.toml` edited between a run and its resume must not
         // rewrite which task the report blames for stopping.
         let halts_run = self.on_task_failure == OnTaskFailure::Halt;
+        self.fail_task_with_policy(index, kind, reason, halts_run)
+    }
+
+    fn fail_task_with_policy(
+        &mut self,
+        index: usize,
+        kind: FailureKind,
+        reason: String,
+        halts_run: bool,
+    ) -> Result<(), TactusError> {
+        let task = self.analysis.plan.tasks[index].id.to_string();
         self.emit(EventBody::TaskFailed {
             task,
             data: events::TaskFailed {
@@ -2467,19 +2927,21 @@ impl Run<'_> {
     /// §12's `ask_before` question: this task is about to escalate onto a
     /// frontier rung, and the run has already reported enough spend that the
     /// operator asked to be consulted first.
-    fn raise_spend_approval(
-        &mut self,
+    fn build_spend_approval(
+        &self,
         index: usize,
         onto: crate::ir::Tier,
-    ) -> Result<QuestionId, TactusError> {
+        pending_spend: f64,
+        pending_unpriced: bool,
+    ) -> Question {
         let context = spend_question_context(
             &self.analysis.plan.tasks[index],
             onto,
-            self.reported_spend(None),
+            self.reported_spend(None) + pending_spend,
             self.ask_before.frontier_escalation_over_usd.unwrap_or(0.0),
-            self.unpriced_attempts() > 0,
+            self.unpriced_attempts() > 0 || pending_unpriced,
         );
-        self.raise_question(index, QuestionKind::ApproveSpend, context)
+        self.build_question(index, QuestionKind::ApproveSpend, context)
     }
 
     /// Attempts whose route reported no spend at all (§13), so the figures this
@@ -2495,14 +2957,9 @@ impl Run<'_> {
         u32::try_from(unpriced).unwrap_or(u32::MAX)
     }
 
-    fn raise_question(
-        &mut self,
-        index: usize,
-        kind: QuestionKind,
-        context: String,
-    ) -> Result<QuestionId, TactusError> {
+    fn build_question(&self, index: usize, kind: QuestionKind, context: String) -> Question {
         let task = &self.analysis.plan.tasks[index];
-        let question = Question {
+        Question {
             id: interaction::new_question_id(),
             kind,
             // v0.1 parks only the task that raised it. Dependents are held by
@@ -2511,29 +2968,30 @@ impl Run<'_> {
             affected_tasks: vec![task.id.clone()],
             context,
             options: question_options(kind),
-        };
+        }
+    }
+
+    fn materialize_question(&mut self, question: &Question) -> Result<(), TactusError> {
+        // Materialize before notifying: a recipient must always be able to open
+        // the payload it was told about. The caller decides whether the
+        // authoritative event belongs before (atomic settlement parking) or
+        // after (ordinary question flow) this projection.
+        interaction::write_question(
+            &self.paths.questions(),
+            &QuestionRecord::open(question.clone()),
+        )?;
         let id = question.id.clone();
         for notifier in &self.notifiers {
-            // A notifier that cannot deliver must not take the run with it:
-            // the question is on disk either way (§12).
-            if let Err(error) = notifier.ask(&question) {
+            // A notifier that cannot deliver must not take the run with it: the
+            // question is already on disk either way (§12).
+            if let Err(error) = notifier.ask(question) {
                 self.warnings.push(format!(
                     "notifier `{}` could not deliver question {id}: {error}",
                     notifier.id()
                 ));
             }
         }
-        // The payload lands on disk before the event, so a reader that sees
-        // `question_raised` can always open the file it names.
-        interaction::write_question(
-            &self.paths.questions(),
-            &QuestionRecord::open(question.clone()),
-        )?;
-        self.emit(EventBody::QuestionRaised {
-            task: self.analysis.plan.tasks[index].id.to_string(),
-            data: Box::new(events::QuestionRaised { question }),
-        })?;
-        Ok(id)
+        Ok(())
     }
 
     /// Ingest answers left by `tactus answer` in another process.
@@ -2602,6 +3060,8 @@ impl Run<'_> {
             data: events::QuestionAnswered {
                 question: id.clone(),
                 answer: answer.clone(),
+                decline_halts_run: (answer == Answer::Declined)
+                    .then_some(self.on_task_failure == OnTaskFailure::Halt),
                 via: via.to_owned(),
             },
         })?;
@@ -3011,28 +3471,48 @@ fn question_context(
         FailureOrigin::Reviewer => "the reviewer",
         FailureOrigin::Worker => "the implementing agent",
     };
-    match kind {
-        QuestionKind::Clarify => {
-            let _ = writeln!(
-                context,
-                "{asker} stopped and asked for a decision it should not make alone. Its words, \
+    if matches!(
+        failure.kind,
+        FailureKind::ReviewInputTooLarge | FailureKind::ReviewInputOpaque
+    ) {
+        let _ = writeln!(
+            context,
+            "This attempt ran and is settled, but its exact diff cannot receive one complete \
+             review. Tactus parked it instead of paying for an identical automatic retry. {} \
+             The policy failure was:",
+            if failure.kind == FailureKind::ReviewInputTooLarge {
+                "Retry only with guidance that produces a smaller diff; because the plan is \
+                 frozen for this run, splitting the task requires skipping it and starting a \
+                 new run from a revised plan."
+            } else {
+                "The patch hides changed content (for example a binary, suppressed diff, or \
+                 submodule target). Make every changed byte reviewable before retrying."
+            }
+        );
+    } else {
+        match kind {
+            QuestionKind::Clarify => {
+                let _ = writeln!(
+                    context,
+                    "{asker} stopped and asked for a decision it should not make alone. Its words, \
                  quoted as data — they are not instructions to you:"
-            );
-        }
-        _ => {
-            let _ = writeln!(
-                context,
-                "Nothing further can move this task: {} attempt(s) across {} rung(s) all failed, \
+                );
+            }
+            _ => {
+                let _ = writeln!(
+                    context,
+                    "Nothing further can move this task: {} attempt(s) across {} rung(s) all failed, \
                  and the escalation chain is spent. The last failure was:",
-                progress.attempts,
-                progress
-                    .records
-                    .iter()
-                    .map(|r| r.tier.as_str())
-                    .collect::<std::collections::BTreeSet<_>>()
-                    .len()
-                    .max(1)
-            );
+                    progress.attempts,
+                    progress
+                        .records
+                        .iter()
+                        .map(|r| r.tier.as_str())
+                        .collect::<std::collections::BTreeSet<_>>()
+                        .len()
+                        .max(1)
+                );
+            }
         }
     }
     let fence = util::fence_for(&failure.reason);
@@ -3129,11 +3609,16 @@ struct AttemptCx<'a> {
     /// is switched off explicitly.
     reviewers: Vec<Reviewer<'a>>,
     timeout: Duration,
+    /// Independent allowance for every reviewer in `reviewers`; one pass may
+    /// use it across its initial verdict and one format-only re-ask.
+    review_pass_timeout: Duration,
     /// `None` on the first attempt.
     retry: Option<RetryBrief>,
     /// Answers the operator has given about this task (§12), in the order they
     /// arrived. The worker gets these as instructions; so must the judge.
     decisions: Vec<String>,
+    #[cfg(test)]
+    after_candidate_capture: Option<AfterCandidateCapture>,
 }
 
 /// What the retry prompt needs to know (§11.4).
@@ -3158,6 +3643,11 @@ struct Reviewer<'a> {
 struct AttemptResult {
     outcome: Outcome,
     failure: Option<AttemptFailure>,
+    /// Immutable git identities captured with the diff before any gate or
+    /// reviewer ran. A successful commit is prepared from these exact objects.
+    candidate_branch_ref: String,
+    candidate_parent: String,
+    candidate_tree: String,
     /// The passes that actually ran, in order — empty when the cheap checks
     /// failed first and no review happened. Derived from the reviews having
     /// happened rather than from passes being configured, so the ledger never
@@ -3206,12 +3696,28 @@ fn run_attempt(
     }
 
     let mut outcome: Outcome = cx.adapter.parse(&output)?;
-    outcome.diff = workspace.capture_diff()?;
+    let candidate = workspace.capture_candidate()?;
+    #[cfg(test)]
+    if let Some(after_capture) = cx.after_candidate_capture {
+        after_capture(workspace, &candidate)?;
+    }
+    outcome.diff = candidate.diff;
     outcome.transcript_path = transcript_path;
 
     // Verification ladder (§11): outcome sanity → cheap static provenance →
     // gates → review. Cheapest and most objective first.
     let mut failure = evaluate_outcome(&outcome, &output);
+    if failure.is_none() {
+        if let Some(error) = review::complete_diff_error(&outcome.diff) {
+            if matches!(error, review::CompleteDiffError::Opaque) || !cx.reviewers.is_empty() {
+                let kind = match error {
+                    review::CompleteDiffError::Opaque => FailureKind::ReviewInputOpaque,
+                    review::CompleteDiffError::TooLarge { .. } => FailureKind::ReviewInputTooLarge,
+                };
+                failure = Some(AttemptFailure::new(kind, error.to_string()).from_reviewer());
+            }
+        }
+    }
     if failure.is_none() && cx.task.kind == TaskKind::Test && !gates::diff_adds_tests(&outcome.diff)
     {
         failure = Some(
@@ -3226,20 +3732,36 @@ fn run_attempt(
             ),
         );
     }
-    if failure.is_none()
-        && let Some(gate_failure) =
-            gates::run_all(cx.gates, workspace, &cx.paths.gates(), &cx.stem, cx.attempt)?
-    {
-        failure = Some(
-            AttemptFailure::new(
-                FailureKind::GateFailed,
-                format!(
-                    "gate `{}` failed: {}",
-                    gate_failure.gate, gate_failure.summary
-                ),
-            )
-            .with_feedback(gate_failure.log_tail),
-        );
+    if failure.is_none() {
+        if let Some(problem) = workspace.review_input_problem_for_tree(&candidate.tree_oid)? {
+            failure =
+                Some(AttemptFailure::new(FailureKind::ReviewInputOpaque, problem).from_reviewer());
+        }
+    }
+    if failure.is_none() && !cx.gates.is_empty() {
+        let gate_workspace = workspace.gate_snapshot_for_candidate_in_store(
+            &candidate.parent_oid,
+            &candidate.tree_oid,
+            &cx.paths.gate_worktrees(),
+        )?;
+        if let Some(gate_failure) = gates::run_all(
+            cx.gates,
+            gate_workspace.workspace(),
+            &cx.paths.gates(),
+            &cx.stem,
+            cx.attempt,
+        )? {
+            failure = Some(
+                AttemptFailure::new(
+                    FailureKind::GateFailed,
+                    format!(
+                        "gate `{}` failed: {}",
+                        gate_failure.gate, gate_failure.summary
+                    ),
+                )
+                .with_feedback(gate_failure.log_tail),
+            );
+        }
     }
 
     // §11.2: gates are objective but shallow — a strong reviewer judges the
@@ -3253,7 +3775,14 @@ fn run_attempt(
     let mut reviews = Vec::new();
     if failure.is_none() && !cx.reviewers.is_empty() {
         let artifacts = load_artifacts(&cx.paths.artifacts(), cx.task);
-        let budget = review_timeout(cx.timeout, cx.reviewers.len());
+        // Like gates, reviewers may inspect repository context beyond the
+        // supplied diff. Give them the exact staged candidate, never ignored
+        // worker inputs or residue from the authoritative workspace.
+        let review_workspace = workspace.gate_snapshot_for_candidate_in_store(
+            &candidate.parent_oid,
+            &candidate.tree_oid,
+            &cx.paths.gate_worktrees(),
+        )?;
         for reviewer in &cx.reviewers {
             let review = review::run_review(&review::ReviewCx {
                 adapter: reviewer.adapter,
@@ -3263,11 +3792,11 @@ fn run_attempt(
                 diff: &outcome.diff,
                 artifacts: &artifacts,
                 decisions: &cx.decisions,
-                workspace: workspace.root(),
+                workspace: review_workspace.workspace().root(),
                 settings_dir: &cx.paths.settings(),
                 reviews_dir: &cx.paths.reviews(),
                 stem: format!("{}-{}", cx.stem, cx.attempt),
-                timeout: budget,
+                timeout: cx.review_pass_timeout,
             })?;
             let cost_usd = review.cost_usd;
             // Read before the result is consumed: a judge that never ran is not
@@ -3298,8 +3827,19 @@ fn run_attempt(
     Ok(AttemptResult {
         outcome,
         failure,
+        candidate_branch_ref: candidate.branch_ref,
+        candidate_parent: candidate.parent_oid,
+        candidate_tree: candidate.tree_oid,
         reviews,
     })
+}
+
+fn normalized_plan_bytes(plan: &Plan, path: &Path) -> Result<Vec<u8>, TactusError> {
+    let mut bytes = serde_json::to_vec_pretty(plan).map_err(|error| TactusError::Parse {
+        message: format!("serializing {}: {error}", path.display()),
+    })?;
+    bytes.push(b'\n');
+    Ok(bytes)
 }
 
 /// Turn a review result into an attempt failure, or `None` if it passed.
@@ -3516,19 +4056,19 @@ fn materialize_prompt(
 ) -> String {
     // A resumed session already holds the task, the artifacts, and the rules;
     // re-sending them buys nothing and buries the one thing that changed.
-    if let Some(retry) = retry
-        && retry.resumed
-    {
-        let mut prompt = String::new();
-        prompt.push_str(
-            "Your previous attempt did not pass verification. Fix it in this same session — the \
-             task and its rules have not changed.\n\n",
-        );
-        prompt.push_str(&feedback_section(&retry.feedback, false));
-        prompt.push_str(
-            "\nMake the smallest change that resolves the above, then stop and summarize.\n",
-        );
-        return prompt;
+    if let Some(retry) = retry {
+        if retry.resumed {
+            let mut prompt = String::new();
+            prompt.push_str(
+                "Your previous attempt did not pass verification. Fix it in this same session — the \
+                 task and its rules have not changed.\n\n",
+            );
+            prompt.push_str(&feedback_section(&retry.feedback, false));
+            prompt.push_str(
+                "\nMake the smallest change that resolves the above, then stop and summarize.\n",
+            );
+            return prompt;
+        }
     }
 
     let mut prompt = String::new();
@@ -3654,12 +4194,13 @@ fn feedback_section(feedback: &[Feedback], all: bool) -> String {
         );
         // Only the newest failure carries its full output; older ones would
         // bury it, and the newest is the one still standing in the way.
-        if position == last
-            && let Some(detail) = &entry.detail
-            && !detail.trim().is_empty()
-        {
-            let fence = util::fence_for(detail);
-            let _ = writeln!(out, "{fence}\n{}\n{fence}", detail.trim());
+        if position == last {
+            if let Some(detail) = &entry.detail {
+                if !detail.trim().is_empty() {
+                    let fence = util::fence_for(detail);
+                    let _ = writeln!(out, "{fence}\n{}\n{fence}", detail.trim());
+                }
+            }
         }
         out.push('\n');
     }
@@ -4077,6 +4618,23 @@ mod tests {
         EditFile,
         /// Simulates an agent that writes real test code.
         EditTest,
+        /// Produces a complete diff larger than the review input boundary.
+        LargeEdit,
+        /// Produces a binary patch whose changed bytes cannot be semantically
+        /// reviewed from the unified diff.
+        OpaqueEdit,
+        /// Adds an ignored, uncommitted input that a gate could observe in the
+        /// worker tree but that is absent from the staged review candidate.
+        IgnoredGateInput,
+        /// Lets the test mutate the authoritative index after capture and
+        /// records which immutable tree the reviewer actually received.
+        FrozenCandidate,
+        /// After the reviewer workspace exists, plants a stale lock in the
+        /// common git directory so the later authoritative cleanup fails.
+        JamCleanupAfterReview,
+        /// Produces the same oversized diff, then makes the question payload
+        /// directory unwritable so parking preparation fails deterministically.
+        LargeEditQuestionWriteFailure,
         /// Simulates a lying agent: success report, no changes.
         NoEdit,
         /// Simulates an agent-side failure.
@@ -4103,6 +4661,9 @@ mod tests {
         Unparseable,
         /// The judge itself could not run.
         RateLimited,
+        /// Command construction succeeds, but the reviewer executable cannot
+        /// be spawned.
+        SpawnError,
         /// §12: the reviewer declines to judge and asks for a person.
         NeedsHuman,
     }
@@ -4134,7 +4695,9 @@ mod tests {
     struct Calls {
         worker: usize,
         review: usize,
+        review_spawn_failures: usize,
         runs: Vec<RecordedRun>,
+        review_snapshots: Vec<(String, String)>,
     }
 
     #[derive(Clone)]
@@ -4195,6 +4758,20 @@ mod tests {
         /// How many review invocations this adapter was asked for.
         fn reviews_run(&self) -> usize {
             self.calls.lock().map(|c| c.review).unwrap_or_default()
+        }
+
+        fn review_spawn_failures(&self) -> usize {
+            self.calls
+                .lock()
+                .map(|c| c.review_spawn_failures)
+                .unwrap_or_default()
+        }
+
+        fn review_snapshots(&self) -> Vec<(String, String)> {
+            self.calls
+                .lock()
+                .map(|calls| calls.review_snapshots.clone())
+                .unwrap_or_default()
         }
     }
 
@@ -4257,6 +4834,94 @@ mod tests {
 
         fn build(&self, run: &TaskRun) -> Result<std::process::Command, TactusError> {
             if run.profile.permissions == PermissionMode::ReadOnly {
+                let effect = self
+                    .calls
+                    .lock()
+                    .map(|calls| {
+                        scripted(
+                            &self.effects,
+                            calls.worker.saturating_sub(1),
+                            Effect::EditFile,
+                        )
+                    })
+                    .unwrap_or(Effect::EditFile);
+                let behavior = {
+                    let mut calls = self.calls.lock().map_err(|_| TactusError::Agent {
+                        message: "fake adapter lock poisoned".to_owned(),
+                    })?;
+                    let index = calls.review + calls.review_spawn_failures;
+                    let behavior = scripted(&self.reviews, index, ReviewBehavior::Pass);
+                    if behavior == ReviewBehavior::SpawnError {
+                        calls.review_spawn_failures += 1;
+                    }
+                    behavior
+                };
+                if behavior == ReviewBehavior::SpawnError {
+                    let mut cmd = Command::new(run.workspace.join("missing-reviewer-executable"));
+                    cmd.current_dir(&run.workspace);
+                    return Ok(cmd);
+                }
+                if effect == Effect::FrozenCandidate {
+                    let tree = Command::new("git")
+                        .arg("-C")
+                        .arg(&run.workspace)
+                        .args(["rev-parse", "HEAD^{tree}"])
+                        .output()
+                        .map_err(|e| TactusError::Agent {
+                            message: format!("fake could not inspect reviewer tree: {e}"),
+                        })?;
+                    if !tree.status.success() {
+                        return Err(TactusError::Agent {
+                            message: format!(
+                                "fake could not inspect reviewer tree: {}",
+                                String::from_utf8_lossy(&tree.stderr).trim()
+                            ),
+                        });
+                    }
+                    let contents = fs::read_to_string(run.workspace.join("agent-output.txt"))
+                        .map_err(|e| TactusError::Agent {
+                            message: format!("fake could not inspect reviewer candidate: {e}"),
+                        })?;
+                    self.calls
+                        .lock()
+                        .map_err(|_| TactusError::Agent {
+                            message: "fake adapter lock poisoned".to_owned(),
+                        })?
+                        .review_snapshots
+                        .push((
+                            String::from_utf8_lossy(&tree.stdout).trim().to_owned(),
+                            contents,
+                        ));
+                }
+                if effect == Effect::JamCleanupAfterReview {
+                    let common = Command::new("git")
+                        .arg("-C")
+                        .arg(&run.workspace)
+                        .args(["rev-parse", "--git-common-dir"])
+                        .output()
+                        .map_err(|e| TactusError::Agent {
+                            message: format!("fake could not inspect git common dir: {e}"),
+                        })?;
+                    if !common.status.success() {
+                        return Err(TactusError::Agent {
+                            message: format!(
+                                "fake could not inspect git common dir: {}",
+                                String::from_utf8_lossy(&common.stderr).trim()
+                            ),
+                        });
+                    }
+                    let common = PathBuf::from(String::from_utf8_lossy(&common.stdout).trim());
+                    let common = if common.is_absolute() {
+                        common
+                    } else {
+                        run.workspace.join(common)
+                    };
+                    fs::write(common.join("index.lock"), "jam\n").map_err(|e| {
+                        TactusError::Agent {
+                            message: format!("fake could not jam cleanup: {e}"),
+                        }
+                    })?;
+                }
                 let mut cmd = shell_command(&format!("echo {REVIEW_MARKER}"));
                 cmd.current_dir(&run.workspace);
                 return Ok(cmd);
@@ -4289,7 +4954,10 @@ mod tests {
                         );
                         std::process::exit(CRASH_EXIT_CODE);
                     }
-                    Effect::EditFile | Effect::AskQuestion => {
+                    Effect::EditFile
+                    | Effect::AskQuestion
+                    | Effect::JamCleanupAfterReview
+                    | Effect::FrozenCandidate => {
                         let marker = run.workspace.join("agent-output.txt");
                         let previous = fs::read_to_string(&marker).unwrap_or_default();
                         Some(("agent-output.txt", format!("{previous}edited: {index}\n")))
@@ -4298,11 +4966,45 @@ mod tests {
                         "widget_test.rs",
                         "#[test]\nfn widget_works() {\n    assert!(true);\n}\n".to_owned(),
                     )),
+                    Effect::LargeEdit | Effect::LargeEditQuestionWriteFailure => Some((
+                        "large-agent-output.txt",
+                        "x".repeat(review::MAX_DIFF_BYTES + 1),
+                    )),
+                    Effect::OpaqueEdit => {
+                        Some(("opaque-agent-output.bin", "\0hidden bytes".to_owned()))
+                    }
+                    Effect::IgnoredGateInput => {
+                        fs::write(run.workspace.join(".gitignore"), "ignored.flag\n").map_err(
+                            |e| TactusError::Agent {
+                                message: format!("fake ignore rule failed: {e}"),
+                            },
+                        )?;
+                        fs::write(run.workspace.join("ignored.flag"), "gate-only input\n")
+                            .map_err(|e| TactusError::Agent {
+                                message: format!("fake ignored input failed: {e}"),
+                            })?;
+                        Some(("agent-output.txt", "reviewed edit\n".to_owned()))
+                    }
                     Effect::NoEdit | Effect::Error | Effect::RateLimited => None,
                 };
             if let Some((name, content)) = edit {
                 fs::write(run.workspace.join(name), content).map_err(|e| TactusError::Agent {
                     message: format!("fake edit failed: {e}"),
+                })?;
+            }
+            if scripted(&self.effects, index, Effect::EditFile)
+                == Effect::LargeEditQuestionWriteFailure
+            {
+                let run_id =
+                    rundir::latest_run(&run.workspace).ok_or_else(|| TactusError::Agent {
+                        message: "fake could not find the active run".to_owned(),
+                    })?;
+                let questions = rundir::public_dir(&run.workspace, &run_id).join("questions");
+                fs::remove_dir(&questions).map_err(|e| TactusError::Agent {
+                    message: format!("fake could not remove questions directory: {e}"),
+                })?;
+                fs::write(&questions, "not a directory\n").map_err(|e| TactusError::Agent {
+                    message: format!("fake could not block question writes: {e}"),
                 })?;
             }
             let mut cmd = shell_command("exit 0");
@@ -4329,7 +5031,7 @@ mod tests {
                     let mut calls = self.calls.lock().map_err(|_| TactusError::Agent {
                         message: "fake adapter lock poisoned".to_owned(),
                     })?;
-                    let index = calls.review;
+                    let index = calls.review + calls.review_spawn_failures;
                     calls.review += 1;
                     index
                 };
@@ -4345,21 +5047,21 @@ mod tests {
                 }
                 let answer = match behavior {
                     ReviewBehavior::Pass => {
-                        "Checked every criterion.\n```json\n{\"pass\": true, \"reasons\": \
-                         [\"meets the acceptance criteria\"], \"required_changes\": []}\n```"
+                        "```json\n{\"pass\": true, \"reasons\": [\"meets the acceptance \
+                         criteria\"], \"required_changes\": []}\n```"
                     }
                     ReviewBehavior::Fail => {
-                        "The diff misses a case.\n```json\n{\"pass\": false, \"reasons\": \
-                         [\"no error handling for empty input\"], \"required_changes\": \
+                        "```json\n{\"pass\": false, \"reasons\": [\"no error handling for \
+                         empty input\"], \"required_changes\": \
                          [\"handle the empty-input case\"]}\n```"
                     }
                     ReviewBehavior::NeedsHuman => {
-                        "This turns on a product decision.\n```json\n{\"pass\": false, \
-                         \"reasons\": [\"the acceptance criteria contradict the API contract\"], \
-                         \"needs_human\": true}\n```"
+                        "```json\n{\"pass\": false, \"reasons\": [\"the acceptance criteria \
+                         contradict the API contract\"], \"needs_human\": true}\n```"
                     }
                     ReviewBehavior::Unparseable => "Looks fine to me, ship it.",
                     ReviewBehavior::RateLimited => unreachable!("handled above"),
+                    ReviewBehavior::SpawnError => unreachable!("handled during command build"),
                 };
                 return Ok(fake_outcome(
                     OutcomeStatus::Completed,
@@ -4382,6 +5084,12 @@ mod tests {
                 // `Exit` never reaches here — `build` ends the process.
                 Effect::EditFile
                 | Effect::EditTest
+                | Effect::LargeEdit
+                | Effect::OpaqueEdit
+                | Effect::IgnoredGateInput
+                | Effect::FrozenCandidate
+                | Effect::JamCleanupAfterReview
+                | Effect::LargeEditQuestionWriteFailure
                 | Effect::NoEdit
                 | Effect::AskQuestion
                 | Effect::Exit => OutcomeStatus::Completed,
@@ -4519,6 +5227,77 @@ mod tests {
             String::from_utf8_lossy(&out.stderr)
         );
         String::from_utf8_lossy(&out.stdout).into_owned()
+    }
+
+    fn candidate_mutation_marker(repo: &Path) -> PathBuf {
+        let name = repo
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "repo".to_owned());
+        repo.with_file_name(format!("{name}-candidate-mutation.txt"))
+    }
+
+    fn mutate_index_after_candidate_capture(
+        workspace: &Workspace,
+        candidate: &crate::workspace::CapturedCandidate,
+    ) -> Result<(), TactusError> {
+        fs::write(
+            workspace.root().join("agent-output.txt"),
+            "tampered after capture\n",
+        )
+        .map_err(|error| TactusError::Git {
+            message: format!("test could not mutate the captured worktree: {error}"),
+        })?;
+        let add = Command::new("git")
+            .arg("-C")
+            .arg(workspace.root())
+            .args(["add", "-A"])
+            .output()
+            .map_err(|error| TactusError::Git {
+                message: format!("test could not stage its post-capture mutation: {error}"),
+            })?;
+        if !add.status.success() {
+            return Err(TactusError::Git {
+                message: format!(
+                    "test could not stage its post-capture mutation: {}",
+                    String::from_utf8_lossy(&add.stderr).trim()
+                ),
+            });
+        }
+        let tampered_tree = Command::new("git")
+            .arg("-C")
+            .arg(workspace.root())
+            .arg("write-tree")
+            .output()
+            .map_err(|error| TactusError::Git {
+                message: format!("test could not inspect its post-capture tree: {error}"),
+            })?;
+        if !tampered_tree.status.success() {
+            return Err(TactusError::Git {
+                message: format!(
+                    "test could not inspect its post-capture tree: {}",
+                    String::from_utf8_lossy(&tampered_tree.stderr).trim()
+                ),
+            });
+        }
+        let tampered_tree = String::from_utf8_lossy(&tampered_tree.stdout)
+            .trim()
+            .to_owned();
+        if tampered_tree == candidate.tree_oid {
+            return Err(TactusError::Git {
+                message: "test post-capture mutation did not change the staged tree".to_owned(),
+            });
+        }
+        fs::write(
+            candidate_mutation_marker(workspace.root()),
+            format!(
+                "{}\n{}\n{tampered_tree}\n",
+                candidate.parent_oid, candidate.tree_oid
+            ),
+        )
+        .map_err(|error| TactusError::Git {
+            message: format!("test could not record its capture identities: {error}"),
+        })
     }
 
     fn temp_engine_repo(tag: &str) -> PathBuf {
@@ -4685,6 +5464,318 @@ mod tests {
     }
 
     #[test]
+    fn gates_review_and_commit_use_one_frozen_candidate_tree() {
+        let repo = temp_engine_repo("one-frozen-candidate");
+        seed(
+            &repo,
+            "## Implement the widget\n<!-- tactus: id=t1 depends= -->\n",
+            Some(
+                "[interaction]\nmode = \"never\"\n\n\
+                 [[gates]]\nname = \"frozen-candidate\"\n\
+                 cmd = 'git grep -q \"edited: 0\" -- agent-output.txt'\n",
+            ),
+        );
+        let base = git_in(&repo, &["rev-parse", "HEAD"]).trim().to_owned();
+        let marker = candidate_mutation_marker(&repo);
+        let _ = fs::remove_file(&marker);
+        let mut opts = options(&repo);
+        opts.config_path = Some(repo.join("tactus.toml"));
+        opts.after_candidate_capture = Some(mutate_index_after_candidate_capture);
+        let source = fake(Effect::FrozenCandidate);
+
+        let report = run_with(&opts, &source).expect("the frozen candidate remains authoritative");
+        assert_eq!(report.outcome(), RunOutcome::Complete, "{report:?}");
+        assert_eq!(report.gates, ["frozen-candidate"]);
+
+        let capture: Vec<_> = fs::read_to_string(&marker)
+            .expect("the post-capture mutation hook ran")
+            .lines()
+            .map(str::to_owned)
+            .collect();
+        assert_eq!(capture.len(), 3, "capture marker: {capture:?}");
+        assert_eq!(capture[0], base, "captured parent is the attempt parent");
+        assert_ne!(
+            capture[1], capture[2],
+            "the mutable index really changed after capture"
+        );
+
+        let logged = events_of(&repo, &report.run_id);
+        let prepared = logged
+            .iter()
+            .find_map(|event| match &event.body {
+                EventBody::AttemptFinished {
+                    prepared_commit, ..
+                } => prepared_commit.as_deref().cloned(),
+                _ => None,
+            })
+            .expect("successful settlement records its prepared object");
+        assert_eq!(
+            prepared.branch_ref,
+            format!("refs/heads/{}", report.branch),
+            "the durable settlement owns the exact run ref"
+        );
+        assert_eq!(prepared.parent_sha, capture[0]);
+        assert_eq!(prepared.tree_sha, capture[1]);
+        assert_ne!(prepared.tree_sha, capture[2]);
+
+        let review_snapshots = source.adapter.review_snapshots();
+        assert_eq!(review_snapshots.len(), 1, "one reviewer snapshot");
+        assert_eq!(review_snapshots[0].0, prepared.tree_sha);
+        assert_eq!(
+            review_snapshots[0].1.replace("\r\n", "\n"),
+            "edited: 0\n",
+            "review sees the captured tree, not the later staged mutation"
+        );
+
+        let committed = logged
+            .iter()
+            .find_map(|event| match &event.body {
+                EventBody::TaskCommitted { data, .. } => Some(data),
+                _ => None,
+            })
+            .expect("task_committed follows the prepared settlement");
+        let head = git_in(&repo, &["rev-parse", "HEAD"]).trim().to_owned();
+        let head_tree = git_in(&repo, &["rev-parse", "HEAD^{tree}"])
+            .trim()
+            .to_owned();
+        assert_eq!(head, prepared.commit_sha);
+        assert_eq!(committed.sha, prepared.commit_sha);
+        assert_eq!(head_tree, prepared.tree_sha);
+        assert_eq!(
+            git_in(&repo, &["show", "HEAD:agent-output.txt"]),
+            "edited: 0\n",
+            "the staged post-capture mutation is never published"
+        );
+    }
+
+    #[test]
+    fn an_oversized_review_diff_is_settled_once_before_the_task_parks() {
+        let repo = temp_engine_repo("oversizedreviewsettlement");
+        seed(
+            &repo,
+            "## Generate the large fixture\n<!-- tactus: id=t1 kind=implement depends= -->\n",
+            Some(
+                "[interaction]\nmode = \"never\"\n\n\
+                 [routing]\nimplement = { chain = [\"small\"], attempts_per = 3 }\n",
+            ),
+        );
+        let mut opts = options(&repo);
+        opts.config_path = Some(repo.join("tactus.toml"));
+        let source = fake(Effect::LargeEdit);
+        let report = run_with(&opts, &source).expect("policy failure is a settled run outcome");
+
+        assert_eq!(report.outcome(), RunOutcome::Parked, "{report:?}");
+        let task_report = task(&report, "t1");
+        assert_eq!(
+            task_report.attempts.len(),
+            1,
+            "the policy boundary is not retried"
+        );
+        let attempt = &task_report.attempts[0];
+        let failure = attempt.failure.as_ref().expect("settled policy failure");
+        assert_eq!(failure.kind, FailureKind::ReviewInputTooLarge);
+        assert_eq!(failure.origin, FailureOrigin::Reviewer);
+        assert_eq!(attempt.cost_usd, Some(0.01), "worker spend is retained");
+        assert_eq!(attempt.session_id.as_deref(), Some("s0"));
+        assert!(attempt.usage.is_some(), "worker usage is retained");
+        assert!(attempt.reviews.is_empty(), "no reviewer was dispatched");
+        assert_eq!(source.adapter.reviews_run(), 0);
+
+        let logged = events_of(&repo, &report.run_id);
+        assert_eq!(
+            logged
+                .iter()
+                .filter(|event| matches!(event.body, EventBody::AttemptFinished { .. }))
+                .count(),
+            1,
+            "the attempt has a terminal ledger event"
+        );
+        let parking = logged.iter().find_map(|event| match &event.body {
+            EventBody::AttemptFinished { parking, .. } => parking.as_deref(),
+            _ => None,
+        });
+        assert!(
+            parking.is_some(),
+            "the settlement atomically carries its parking question"
+        );
+        assert!(
+            !logged.iter().any(|event| matches!(
+                event.body,
+                EventBody::QuestionRaised { .. } | EventBody::TaskParked { .. }
+            )),
+            "policy parking must not reopen a crash window with follow-up events"
+        );
+        assert!(
+            !logged
+                .iter()
+                .any(|event| matches!(event.body, EventBody::AttemptInterrupted { .. })),
+            "replay must never invent an interruption for the settled refusal"
+        );
+        assert!(
+            git_in(&repo, &["status", "--porcelain"]).trim().is_empty(),
+            "parking cleans the unreviewed oversized diff"
+        );
+        let question = report.questions.first().expect("scope question");
+        assert_eq!(question.question.kind, QuestionKind::Unblock);
+        assert!(question.question.context.contains("smaller diff"));
+        assert!(question.question.context.contains("starting a new run"));
+        assert!(
+            !question.question.context.contains("chain is spent")
+                && !question.question.context.contains("all failed"),
+            "policy parking must not pretend the escalation chain was exhausted: {}",
+            question.question.context
+        );
+
+        // Rewind to the exact atomic settlement, then add dirty residue to
+        // model death before ordinary post-attempt cleanup. Replay must retain
+        // both the paid ledger line and the question, discard the residue, and
+        // never dispatch another worker for the known-oversized identity.
+        let paths = paths_of(&repo, &report.run_id);
+        truncate_log_after(&paths, "attempt_finished");
+        fs::write(repo.join("crash-residue.txt"), "unreviewed\n").expect("crash residue");
+        let retry = fake(Effect::EditFile);
+        let resumed =
+            resume_with(&resume_options(&repo, &report.run_id), &retry).expect("resume parks");
+        assert_eq!(resumed.outcome(), RunOutcome::Parked, "{resumed:?}");
+        assert!(
+            retry.adapter.runs().is_empty(),
+            "resume paid for the oversized attempt again"
+        );
+        assert_eq!(task(&resumed, "t1").attempts.len(), 1);
+        assert_eq!(resumed.questions.len(), 1);
+        assert!(
+            git_in(&repo, &["status", "--porcelain"]).trim().is_empty(),
+            "resume did not discard crash residue"
+        );
+    }
+
+    #[test]
+    fn opaque_review_input_has_distinct_failure_and_remediation() {
+        let repo = temp_engine_repo("opaquereviewsettlement");
+        seed(
+            &repo,
+            "## Generate an opaque artifact\n<!-- tactus: id=t1 kind=implement depends= -->\n",
+            Some(
+                "[interaction]\nmode = \"never\"\n\n\
+                 [routing]\nimplement = { chain = [\"small\"], attempts_per = 3 }\n",
+            ),
+        );
+        let mut opts = options(&repo);
+        opts.config_path = Some(repo.join("tactus.toml"));
+        let source = fake(Effect::OpaqueEdit);
+        let report = run_with(&opts, &source).expect("opaque evidence parks fail-closed");
+
+        assert_eq!(report.outcome(), RunOutcome::Parked, "{report:?}");
+        let attempt = &task(&report, "t1").attempts[0];
+        assert_eq!(
+            attempt.failure.as_ref().map(|failure| failure.kind),
+            Some(FailureKind::ReviewInputOpaque)
+        );
+        assert_eq!(source.adapter.reviews_run(), 0);
+        let context = &report.questions[0].question.context;
+        assert!(context.contains("hides changed content"), "{context}");
+        assert!(!context.contains("smaller diff"), "{context}");
+    }
+
+    #[test]
+    fn opaque_test_task_parks_before_test_provenance_retry() {
+        let repo = temp_engine_repo("opaquetestprovenance");
+        seed(
+            &repo,
+            "## Add the regression\n<!-- tactus: id=t1 kind=test depends= -->\n",
+            Some(
+                "[interaction]\nmode = \"never\"\n\n\
+                 [routing]\ntest = { chain = [\"small\"], attempts_per = 3 }\n",
+            ),
+        );
+        let mut opts = options(&repo);
+        opts.config_path = Some(repo.join("tactus.toml"));
+        let source = fake(Effect::OpaqueEdit);
+        let report = run_with(&opts, &source).expect("opaque evidence parks fail-closed");
+
+        assert_eq!(report.outcome(), RunOutcome::Parked, "{report:?}");
+        let task = task(&report, "t1");
+        assert_eq!(task.attempts.len(), 1, "opaque evidence is not retried");
+        assert_eq!(
+            task.attempts[0]
+                .failure
+                .as_ref()
+                .map(|failure| failure.kind),
+            Some(FailureKind::ReviewInputOpaque),
+            "the intrinsic evidence failure wins over Test provenance"
+        );
+        assert_eq!(source.adapter.reviews_run(), 0);
+        assert!(
+            report.questions[0]
+                .question
+                .context
+                .contains("hides changed content")
+        );
+    }
+
+    #[test]
+    fn failed_parking_payload_still_settles_and_cleans_the_attempt() {
+        let repo = temp_engine_repo("oversizedreviewquestionwrite");
+        seed(
+            &repo,
+            "## Generate the large fixture\n<!-- tactus: id=t1 kind=implement depends= -->\n",
+            Some(
+                "[interaction]\nmode = \"never\"\n\n\
+                 [routing]\nimplement = { chain = [\"small\"], attempts_per = 3 }\n",
+            ),
+        );
+        let mut opts = options(&repo);
+        opts.config_path = Some(repo.join("tactus.toml"));
+        let source = fake(Effect::LargeEditQuestionWriteFailure);
+        let error = run_with(&opts, &source).expect_err("question projection must fail");
+        assert!(
+            error.to_string().contains("questions"),
+            "wrong failure surfaced: {error}"
+        );
+
+        let run_id = rundir::latest_run(&repo).expect("failed run remains resumable");
+        let logged = events_of(&repo, &run_id);
+        let parking = logged.iter().find_map(|event| match &event.body {
+            EventBody::AttemptFinished { parking, .. } => parking.as_deref(),
+            _ => None,
+        });
+        assert!(
+            parking.is_some(),
+            "the event must retain parking even when its JSON projection fails"
+        );
+        assert_eq!(
+            logged
+                .iter()
+                .filter(|event| matches!(event.body, EventBody::AttemptFinished { .. }))
+                .count(),
+            1,
+            "the paid attempt must settle exactly once"
+        );
+        assert!(
+            git_in(&repo, &["status", "--porcelain"]).trim().is_empty(),
+            "a failed question write leaked the oversized unreviewed diff"
+        );
+
+        let paths = paths_of(&repo, &run_id);
+        fs::remove_file(paths.questions()).expect("remove injected blocker");
+        fs::create_dir(paths.questions()).expect("restore questions directory");
+        let retry = fake(Effect::EditFile);
+        let resumed = resume_with(&resume_options(&repo, &run_id), &retry)
+            .expect("resume repairs the projection and remains parked");
+        assert_eq!(resumed.outcome(), RunOutcome::Parked, "{resumed:?}");
+        assert!(
+            retry.adapter.runs().is_empty(),
+            "resume paid for an already-settled attempt"
+        );
+        assert_eq!(task(&resumed, "t1").attempts.len(), 1);
+        let question = resumed.questions.first().expect("restored question");
+        assert!(
+            interaction::answer_path(&paths.questions(), &question.question.id).exists(),
+            "resume did not rematerialize the authoritative question"
+        );
+    }
+
+    #[test]
     fn dirty_tree_is_refused() {
         let repo = temp_engine_repo("dirty");
         fs::write(repo.join("stray.txt"), "uncommitted\n").expect("stray");
@@ -4693,6 +5784,46 @@ mod tests {
         assert!(err.to_string().contains("not clean"), "got: {err}");
         let branch = git_in(&repo, &["rev-parse", "--abbrev-ref", "HEAD"]);
         assert_eq!(branch.trim(), "main", "no run branch created");
+    }
+
+    #[test]
+    fn sparse_checkout_preflight_refusal_leaves_worktree_clean() {
+        let repo = temp_engine_repo("sparse-worker-preflight");
+        git_in(&repo, &["update-index", "--skip-worktree", "README.md"]);
+        let source = fake(Effect::EditFile);
+
+        let error = run_with(&options(&repo), &source)
+            .expect_err("incomplete materialization must be refused")
+            .to_string();
+        assert!(error.contains("sparse checkout is active"), "{error}");
+        assert!(
+            source.adapter.runs().is_empty(),
+            "a worker was dispatched before sparse-checkout refusal"
+        );
+        assert_eq!(
+            git_in(&repo, &["rev-parse", "--abbrev-ref", "HEAD"]).trim(),
+            "main",
+            "preflight refusal must not create or switch a run branch"
+        );
+        git_in(&repo, &["update-index", "--no-skip-worktree", "README.md"]);
+        let worktree_git_dir = Workspace::open(&repo)
+            .expect("open worktree")
+            .worktree_git_dir()
+            .expect("resolve private git dir");
+        assert!(
+            worktree_git_dir.join("tactus-worktree.lock").exists(),
+            "the regression must exercise acquisition of the private worktree lease"
+        );
+        assert!(
+            !repo.join(".tactus").exists(),
+            "a refused preflight must not create working-tree coordinator state"
+        );
+        assert!(
+            git_in(&repo, &["status", "--porcelain", "--untracked-files=all"])
+                .trim()
+                .is_empty(),
+            "a refused preflight left coordinator state visible to Git"
+        );
     }
 
     #[test]
@@ -4712,6 +5843,37 @@ mod tests {
         assert_eq!(report.gates, ["version"]);
         assert!(report.gates_from_config);
         assert!(report.render().contains("gates: version [from config]"));
+    }
+
+    #[test]
+    fn ignored_worker_input_cannot_make_a_gate_pass() {
+        let repo = temp_engine_repo("ignored-gate-input");
+        seed(
+            &repo,
+            "## Implement the widget\n<!-- tactus: id=t1 depends= -->\n",
+            Some(
+                "[interaction]\nmode = \"never\"\n\n\
+                 [routing]\nimplement = { chain = [\"small\"], attempts_per = 1 }\n\n\
+                 [[gates]]\nname = \"ignored-input\"\ncmd = \"git hash-object ignored.flag\"\n",
+            ),
+        );
+
+        let mut opts = options(&repo);
+        opts.config_path = Some(repo.join("tactus.toml"));
+        let source = fake(Effect::IgnoredGateInput);
+        let report = run_with(&opts, &source).expect("gate failure settles the task");
+
+        assert!(!committed(&report, "t1"), "report: {report:?}");
+        assert!(task(&report, "t1").attempts.iter().any(|attempt| {
+            attempt
+                .failure
+                .as_ref()
+                .is_some_and(|failure| failure.kind == FailureKind::GateFailed)
+        }));
+        assert!(
+            !repo.join("ignored.flag").exists(),
+            "ignored worker-only input was cleaned from the authoritative workspace"
+        );
     }
 
     #[test]
@@ -5130,21 +6292,6 @@ mod tests {
     }
 
     #[test]
-    fn the_review_budget_is_shared_between_passes_not_doubled_by_them() {
-        // Step-6 finding #13 capped review at a quarter of the attempt. That
-        // cap is for review, not per reviewer — otherwise configuring a second
-        // opinion silently doubles a bound that was chosen deliberately.
-        let attempt = Duration::from_secs(40 * 60);
-        assert_eq!(review_timeout(attempt, 1), Duration::from_secs(10 * 60));
-        assert_eq!(review_timeout(attempt, 2), Duration::from_secs(5 * 60));
-        // The floor is per pass: a budget too small to answer in is not one.
-        assert_eq!(
-            review_timeout(Duration::from_secs(60), 2),
-            Duration::from_secs(60)
-        );
-    }
-
-    #[test]
     fn a_resume_keeps_the_reviewers_the_run_started_with() {
         // Who judged this run is a fact about the run, not about today's
         // machine — step-8 finding #8's lesson on `private_dir`. Re-deriving it
@@ -5188,6 +6335,15 @@ mod tests {
             recorded.alternative, None,
             "there was nothing to rebind to when this run started"
         );
+        assert_eq!(recorded.pass_timeout_secs, Some(5400));
+
+        fs::write(
+            repo.join("tactus.toml"),
+            "[interaction]\nmode = \"never\"\n\n\
+             [routing]\nimplement = { chain = [\"frontier\"], attempts_per = 1 }\n\
+             review = { timeout_secs = 60 }\n",
+        )
+        .expect("edit only the future review timeout");
 
         crate::answer::answer(
             &repo,
@@ -5217,6 +6373,14 @@ mod tests {
             0,
             "a CLI installed since the run began must not become its judge"
         );
+        let warning = resumed
+            .warnings
+            .iter()
+            .find(|warning| warning.contains("review pass timeout"))
+            .unwrap_or_else(|| panic!("no timeout-difference warning: {:?}", resumed.warnings));
+        assert!(warning.contains("60s"), "{warning}");
+        assert!(warning.contains("5400s"), "{warning}");
+        assert!(warning.contains("Start a new run"), "{warning}");
     }
 
     #[test]
@@ -5363,7 +6527,7 @@ mod tests {
                 .filter(|event| matches!(event.body, EventBody::RunSchemaUpgraded { .. }))
                 .count(),
             1,
-            "the first schema-2 resume appends one downgrade barrier"
+            "the first current-binary resume appends one downgrade barrier"
         );
 
         fs::write(
@@ -5428,6 +6592,261 @@ mod tests {
     }
 
     #[test]
+    fn the_resume_that_rederives_an_old_review_plan_records_it_for_the_next_one() {
+        let original = "[interaction]\nmode = \"never\"\n\n\
+                        [routing]\nimplement = { chain = [\"small\"], attempts_per = 1 }\n";
+        let (repo, run_id) = parked_run_with_config("oldlogreviews", original);
+        let paths = paths_of(&repo, &run_id);
+        rewrite_run_started_as_schema_two(&paths);
+        strip_run_started_field(&paths, "reviews");
+
+        fs::write(
+            repo.join("tactus.toml"),
+            "[interaction]\nmode = \"never\"\n\n\
+             [routing]\nimplement = { chain = [\"small\"], attempts_per = 1 }\n\
+             review = { timeout_secs = 60 }\n",
+        )
+        .expect("first derived review plan");
+        let first = resume_answering(&repo, &run_id, Effect::NoEdit);
+        assert_eq!(first.outcome(), RunOutcome::Parked, "{first:?}");
+        assert!(
+            first
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("predates the review record")),
+            "legacy warning: {:?}",
+            first.warnings
+        );
+        let established = events::recorded_reviews(&events_of(&repo, &run_id))
+            .cloned()
+            .expect("the first resume writes down what it derived");
+        assert_eq!(established.pass_timeout_secs, Some(60));
+
+        fs::write(
+            repo.join("tactus.toml"),
+            "[interaction]\nmode = \"never\"\n\n\
+             [routing]\nimplement = { chain = [\"small\"], attempts_per = 1 }\n\
+             review = { timeout_secs = 120 }\n",
+        )
+        .expect("later review plan");
+        let second = resume_answering(&repo, &run_id, Effect::EditFile);
+        assert_eq!(second.outcome(), RunOutcome::Complete, "{second:?}");
+        assert_eq!(
+            events::recorded_reviews(&events_of(&repo, &run_id))
+                .expect("record survives")
+                .pass_timeout_secs,
+            Some(60),
+            "a later config edit cannot replace the established plan"
+        );
+        let warning = second
+            .warnings
+            .iter()
+            .find(|warning| warning.contains("today's review pass timeout"))
+            .unwrap_or_else(|| panic!("no timeout drift warning: {:?}", second.warnings));
+        assert!(warning.contains("120s"), "{warning}");
+        assert!(warning.contains("60s"), "{warning}");
+        assert!(
+            !second
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("predates the review record")),
+            "the legacy absence is established exactly once: {:?}",
+            second.warnings
+        );
+    }
+
+    #[test]
+    fn a_schema_two_resume_records_the_complete_review_barrier_before_work() {
+        let (repo, run_id) = parked_run("schema2reviewbarrier");
+        let paths = paths_of(&repo, &run_id);
+        rewrite_run_started_as_schema_two(&paths);
+        fs::write(
+            repo.join("tactus.toml"),
+            "[interaction]\nmode = \"never\"\n\n\
+             [routing]\nimplement = { chain = [\"small\"], attempts_per = 1 }\n\
+             review = { timeout_secs = 47 }\n",
+        )
+        .expect("first explicit complete-review timeout");
+
+        let resumed = resume_answering(&repo, &run_id, Effect::NoEdit);
+        assert_eq!(resumed.outcome(), RunOutcome::Parked, "{resumed:?}");
+
+        let logged = events_of(&repo, &run_id);
+        let barrier = logged
+            .iter()
+            .position(|event| {
+                matches!(
+                    &event.body,
+                    EventBody::RunSchemaUpgraded { data }
+                        if data.from == 2 && data.to == events::SCHEMA_VERSION
+                )
+            })
+            .expect("schema 2 -> 3 downgrade barrier");
+        let resumed_attempt = logged
+            .iter()
+            .enumerate()
+            .skip(barrier + 1)
+            .find(|(_, event)| matches!(event.body, EventBody::AttemptStarted { .. }))
+            .map(|(index, _)| index)
+            .expect("resumed attempt after the barrier");
+        assert!(
+            barrier < resumed_attempt,
+            "the old verification contract must be fenced off before work starts"
+        );
+        let upgraded_reviews = events::recorded_complete_reviews(&logged)
+            .expect("schema-3 resume records a complete review plan");
+        assert_eq!(upgraded_reviews.pass_timeout_secs, Some(47));
+        assert_eq!(upgraded_reviews.enabled, Some(true));
+        assert_eq!(
+            upgraded_reviews.alternative_available,
+            Some(upgraded_reviews.alternative.is_some())
+        );
+        assert_eq!(upgraded_reviews.second_opinion.len(), 1);
+
+        fs::write(
+            repo.join("tactus.toml"),
+            "[interaction]\nmode = \"never\"\n\n\
+             [routing]\nimplement = { chain = [\"small\"], attempts_per = 1 }\n\
+             review = { timeout_secs = 83 }\n",
+        )
+        .expect("later configured timeout");
+        let second = resume_answering(&repo, &run_id, Effect::EditFile);
+        assert_eq!(second.outcome(), RunOutcome::Complete, "{second:?}");
+        assert_eq!(
+            events::recorded_reviews(&events_of(&repo, &run_id))
+                .expect("upgraded review plan survives")
+                .pass_timeout_secs,
+            Some(47),
+            "a later binary/config default cannot reinterpret the upgraded timeout"
+        );
+        assert!(
+            second.warnings.iter().any(|warning| {
+                warning.contains("today's review pass timeout")
+                    && warning.contains("83s")
+                    && warning.contains("47s")
+            }),
+            "timeout drift warning: {:?}",
+            second.warnings
+        );
+    }
+
+    #[test]
+    fn schema_two_review_markers_upgrade_independently_of_timeout() {
+        let (repo, run_id) = parked_run("schema2reviewmarkers");
+        let paths = paths_of(&repo, &run_id);
+        let recorded_timeout = events::recorded_reviews(&events_of(&repo, &run_id))
+            .and_then(|plan| plan.pass_timeout_secs)
+            .expect("current run records a timeout");
+        rewrite_run_started_as_schema_two_missing_review_fields(
+            &paths,
+            &["enabled", "alternative_available"],
+        );
+
+        let first = resume_answering(&repo, &run_id, Effect::NoEdit);
+        assert_eq!(first.outcome(), RunOutcome::Parked, "{first:?}");
+        assert!(
+            first
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("explicit reviewer-identity markers")),
+            "marker-upgrade warning: {:?}",
+            first.warnings
+        );
+        let upgraded = events::recorded_complete_reviews(&events_of(&repo, &run_id))
+            .cloned()
+            .expect("schema-3 resume records the complete identity");
+        assert_eq!(upgraded.pass_timeout_secs, Some(recorded_timeout));
+        assert_eq!(upgraded.enabled, Some(upgraded.primary.is_some()));
+        assert_eq!(
+            upgraded.alternative_available,
+            Some(upgraded.alternative.is_some())
+        );
+
+        let second = resume_answering(&repo, &run_id, Effect::EditFile);
+        assert_eq!(second.outcome(), RunOutcome::Complete, "{second:?}");
+        assert_eq!(
+            events::recorded_complete_reviews(&events_of(&repo, &run_id)),
+            Some(&upgraded),
+            "the next replay accepts and preserves the explicit markers"
+        );
+    }
+
+    #[test]
+    fn schema_two_inconsistent_review_identity_is_refused_before_upgrade_and_spend() {
+        let (repo, run_id) = parked_run("schema2badreviewidentity");
+        let paths = paths_of(&repo, &run_id);
+        let text = fs::read_to_string(paths.events()).expect("log");
+        let mut rewritten = false;
+        let lines: Vec<String> = text
+            .lines()
+            .map(|line| {
+                let mut value: serde_json::Value = serde_json::from_str(line).expect("event json");
+                if value.get("event").and_then(serde_json::Value::as_str) == Some("run_started") {
+                    let data = value
+                        .get_mut("data")
+                        .and_then(serde_json::Value::as_object_mut)
+                        .expect("run_started data");
+                    data.insert("schema".to_owned(), serde_json::Value::from(2));
+                    let reviews = data
+                        .get_mut("reviews")
+                        .and_then(serde_json::Value::as_object_mut)
+                        .expect("review plan");
+                    reviews.insert("enabled".to_owned(), serde_json::Value::Bool(true));
+                    reviews.insert("primary".to_owned(), serde_json::Value::Null);
+                    rewritten = true;
+                }
+                value.to_string()
+            })
+            .collect();
+        assert!(rewritten);
+        fs::write(paths.events(), format!("{}\n", lines.join("\n"))).expect("rewrite");
+
+        let question = events_of(&repo, &run_id)
+            .iter()
+            .find_map(|event| match &event.body {
+                EventBody::QuestionRaised { data, .. } => Some(data.question.id.to_string()),
+                EventBody::AttemptFinished {
+                    parking: Some(parking),
+                    ..
+                } => Some(parking.question.id.to_string()),
+                _ => None,
+            })
+            .expect("parked question");
+        crate::answer::answer(
+            &repo,
+            &question,
+            crate::answer::Reply::Text("continue".to_owned()),
+        )
+        .expect("answer");
+        let source = fake(Effect::EditFile);
+        let error = resume_harness_inner(
+            &resume_options(&repo, &run_id),
+            &Harness {
+                adapters: &source,
+                answers: None,
+                sleeper: None,
+            },
+        )
+        .expect_err("an inconsistent inherited review identity must fail closed");
+        assert!(
+            error
+                .to_string()
+                .contains("reviews.enabled does not match the recorded primary reviewer"),
+            "wrong error: {error}"
+        );
+        assert!(
+            source.adapter.runs().is_empty(),
+            "no worker may run under the malformed identity"
+        );
+        assert!(
+            !events_of(&repo, &run_id)
+                .iter()
+                .any(|event| matches!(event.body, EventBody::RunSchemaUpgraded { .. })),
+            "the malformed identity must not be blessed by a schema upgrade"
+        );
+    }
+
+    #[test]
     fn a_resume_whose_effort_policy_did_not_move_says_nothing_about_it() {
         let config = "[interaction]\nmode = \"never\"\n\n\
                       [routing]\nimplement = { chain = [\"small\"], attempts_per = 1 }\n\n\
@@ -5466,6 +6885,7 @@ mod tests {
 
         // Rewrite run_started as a pre-step-9 process would have written it.
         let paths = paths_of(&repo, &first.run_id);
+        rewrite_run_started_as_schema_two(&paths);
         strip_run_started_field(&paths, "reviews");
 
         crate::answer::answer(
@@ -5513,6 +6933,61 @@ mod tests {
         );
         // And the ladder treated it as an outage: deferred, then committed.
         assert!(committed(&report, "t1"), "{report:?}");
+    }
+
+    #[test]
+    fn second_reviewer_spawn_failure_settles_worker_and_first_review_evidence() {
+        let repo = temp_engine_repo("secondreviewerspawnsettlement");
+        seed(&repo, FRONTIER_AUTH_PLAN, Some(SECOND_OPINION_CONFIG));
+        let source = cross_vendor(
+            vec![Effect::EditFile],
+            vec![ReviewBehavior::Pass],
+            vec![ReviewBehavior::SpawnError, ReviewBehavior::Pass],
+        );
+        let report = run_with(&cross_vendor_opts(&repo), &source).expect("settled run");
+
+        assert!(
+            committed(&report, "t1"),
+            "the deferred retry recovers: {report:?}"
+        );
+        let task = task(&report, "t1");
+        assert_eq!(task.attempts.len(), 2, "one settled outage, one recovery");
+        let first = &task.attempts[0];
+        let failure = first.failure.as_ref().expect("spawn failure is recorded");
+        assert_eq!(failure.kind, FailureKind::ReviewUnavailable);
+        assert_eq!(failure.origin, FailureOrigin::Reviewer);
+        assert_eq!(first.cost_usd, Some(0.01), "worker spend survives");
+        assert_eq!(first.session_id.as_deref(), Some("s0"));
+        assert!(first.usage.is_some(), "worker usage survives");
+        assert_eq!(
+            first.reviews.iter().map(|r| r.outcome).collect::<Vec<_>>(),
+            [
+                events::ReviewPassOutcome::Passed,
+                events::ReviewPassOutcome::Unavailable
+            ],
+            "the completed first verdict is not discarded"
+        );
+        assert_eq!(first.reviews[0].cost_usd, Some(0.05));
+        assert_eq!(first.reviews[1].cost_usd, None);
+        assert_eq!(source.copilot().review_spawn_failures(), 1);
+
+        let logged = events_of(&repo, &report.run_id);
+        assert!(logged.iter().any(|event| matches!(
+            &event.body,
+            EventBody::AttemptFinished {
+                task,
+                attempt: 1,
+                ..
+            } if task == "t1"
+        )));
+        assert!(!logged.iter().any(|event| matches!(
+            &event.body,
+            EventBody::AttemptInterrupted {
+                task,
+                attempt: 1,
+                ..
+            } if task == "t1"
+        )));
     }
 
     #[test]
@@ -6047,6 +7522,126 @@ mod tests {
             "§17's default on_task_failure is halt"
         );
         assert_eq!(report.outcome(), RunOutcome::Halted);
+    }
+
+    #[test]
+    fn resume_repairs_every_decline_settlement_crash_prefix() {
+        for (tag, last_durable_event) in [
+            ("answered", "question_answered"),
+            ("defect", "design_defect"),
+        ] {
+            let repo = temp_engine_repo(&format!("declineprefix-{tag}"));
+            seed(
+                &repo,
+                "## Doomed\n<!-- tactus: id=t1 kind=implement depends= -->\n",
+                Some("[routing]\nimplement = { chain = [\"small\"], attempts_per = 1 }\n"),
+            );
+            let mut opts = options(&repo);
+            opts.config_path = Some(repo.join("tactus.toml"));
+            let initial = source(vec![Effect::NoEdit], vec![ReviewBehavior::Pass]);
+            let answers = ScriptedAnswers::new(vec![Answer::Declined]);
+            let report = run_harness(
+                &opts,
+                &Harness {
+                    adapters: &initial,
+                    answers: Some(&answers),
+                    sleeper: None,
+                },
+            )
+            .expect("build a complete decline sequence");
+            let paths = paths_of(&repo, &report.run_id);
+            truncate_log_after(&paths, last_durable_event);
+            fs::write(
+                repo.join("tactus.toml"),
+                "[engine]\non_task_failure = \"continue\"\n\n\
+                 [routing]\nimplement = { chain = [\"small\"], attempts_per = 1 }\n",
+            )
+            .expect("change today's policy after the decline was durable");
+
+            let resumed_source = fake(Effect::EditFile);
+            let resumed = resume_with(&resume_options(&repo, &report.run_id), &resumed_source)
+                .expect("resume repairs the incomplete settlement");
+            assert_eq!(
+                resumed.outcome(),
+                RunOutcome::Halted,
+                "prefix {tag}: repair must use the policy recorded with the answer"
+            );
+            assert!(
+                matches!(
+                    task(&resumed, "t1").status,
+                    TaskRunStatus::Failed {
+                        kind: FailureKind::Declined,
+                        ..
+                    }
+                ),
+                "prefix {tag}: {resumed:?}"
+            );
+            assert!(
+                resumed_source.adapter.runs().is_empty(),
+                "repair must settle the decline before another paid attempt"
+            );
+
+            let logged = events_of(&repo, &report.run_id);
+            assert_eq!(
+                logged
+                    .iter()
+                    .filter(|event| matches!(event.body, EventBody::DesignDefect { .. }))
+                    .count(),
+                1,
+                "the missing prefix is appended once"
+            );
+            assert_eq!(
+                logged
+                    .iter()
+                    .filter(|event| matches!(event.body, EventBody::TaskFailed { .. }))
+                    .count(),
+                1,
+                "the declined task is settled once"
+            );
+        }
+    }
+
+    #[test]
+    fn schema_two_decline_prefix_preserves_or_refuses_unknown_halt_policy() {
+        let repo = temp_engine_repo("legacydeclinepolicy");
+        seed(
+            &repo,
+            "## Doomed\n<!-- tactus: id=t1 kind=implement depends= -->\n",
+            Some("[routing]\nimplement = { chain = [\"small\"], attempts_per = 1 }\n"),
+        );
+        let mut opts = options(&repo);
+        opts.config_path = Some(repo.join("tactus.toml"));
+        let initial = source(vec![Effect::NoEdit], vec![ReviewBehavior::Pass]);
+        let answers = ScriptedAnswers::new(vec![Answer::Declined]);
+        let report = run_harness(
+            &opts,
+            &Harness {
+                adapters: &initial,
+                answers: Some(&answers),
+                sleeper: None,
+            },
+        )
+        .expect("build a complete decline sequence");
+        let paths = paths_of(&repo, &report.run_id);
+        truncate_log_after(&paths, "question_answered");
+        rewrite_run_started_as_schema_two(&paths);
+        strip_event_data_field(&paths, "question_answered", "decline_halts_run");
+        fs::write(
+            repo.join("tactus.toml"),
+            "[engine]\non_task_failure = \"continue\"\n\n\
+             [routing]\nimplement = { chain = [\"small\"], attempts_per = 1 }\n",
+        )
+        .expect("today's policy differs");
+
+        let error = resume_err(&repo, &report.run_id);
+        assert!(
+            error.contains("contemporaneous on_task_failure policy"),
+            "{error}"
+        );
+        assert!(
+            error.contains("cannot safely decide an old answer"),
+            "{error}"
+        );
     }
 
     #[test]
@@ -6616,6 +8211,7 @@ mod tests {
             stderr: String::new(),
             code: Some(1),
             timed_out: false,
+            output_limited: false,
             duration: Duration::ZERO,
         };
         for (status, expected) in [
@@ -7645,6 +9241,28 @@ mod tests {
     }
 
     #[test]
+    fn resume_refuses_schema_two_failed_attempt_without_recorded_decision() {
+        let (repo, run_id) = parked_run("legacyfailedprefix");
+        let paths = paths_of(&repo, &run_id);
+        rewrite_run_started_as_schema_two(&paths);
+        strip_event_field(&paths, "attempt_finished", "parking");
+        truncate_log_after(&paths, "attempt_finished");
+        let before = fs::read(paths.events()).expect("legacy prefix");
+
+        let error = resume_err(&repo, &run_id);
+        assert!(error.contains("failed attempt 1"), "{error}");
+        assert!(
+            error.contains("without its durable ladder or parking decision"),
+            "{error}"
+        );
+        assert_eq!(
+            fs::read(paths.events()).expect("refused log"),
+            before,
+            "refusal must not upgrade or otherwise mutate the ambiguous prefix"
+        );
+    }
+
+    #[test]
     fn resume_refuses_when_the_branch_moved_under_it() {
         // §15's HEAD check. Something committed after the run stopped, so the
         // log no longer describes what is on the branch.
@@ -7678,6 +9296,183 @@ mod tests {
         assert!(
             err.contains("attribute work to the wrong tasks"),
             "and why it matters: {err}"
+        );
+    }
+
+    #[test]
+    fn status_export_and_resume_refuse_mutated_normalized_plan_bytes() {
+        let (repo, run_id) = parked_run("normalized-plan-tamper");
+        let plan_path = paths_of(&repo, &run_id).plan_json();
+        let mut plan: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&plan_path).expect("frozen plan"))
+                .expect("valid frozen plan");
+        plan["tasks"][0]["title"] =
+            serde_json::Value::String("tampered but self-hash unchanged".to_owned());
+        fs::write(
+            &plan_path,
+            format!(
+                "{}\n",
+                serde_json::to_string_pretty(&plan).expect("serialize plan")
+            ),
+        )
+        .expect("replace frozen plan");
+
+        let status_error = match crate::status::load(&repo, Some(&run_id)) {
+            Ok(_) => panic!("status must authenticate the exact normalized bytes"),
+            Err(error) => error.to_string(),
+        };
+        assert!(
+            status_error.contains("normalized plan digest"),
+            "{status_error}"
+        );
+
+        let export_error = match crate::export::load(&repo, &run_id) {
+            Ok(_) => panic!("export must authenticate the exact normalized bytes"),
+            Err(error) => error.to_string(),
+        };
+        assert!(
+            export_error.contains("normalized plan digest"),
+            "{export_error}"
+        );
+
+        let resume_error = resume_err(&repo, &run_id);
+        assert!(
+            resume_error.contains("exact bytes") && resume_error.contains("normalized-plan digest"),
+            "{resume_error}"
+        );
+    }
+
+    #[test]
+    fn resume_refuses_schema_two_spend_question_without_task_parked() {
+        let (repo, run_id) = parked_run("legacyspendprefix");
+        let paths = paths_of(&repo, &run_id);
+        rewrite_run_started_as_schema_two(&paths);
+        strip_event_field(&paths, "attempt_finished", "parking");
+        truncate_log_after(&paths, "attempt_finished");
+        let mut warnings = Vec::new();
+        let mut log = EventLog::open(&paths.events(), &mut warnings).expect("legacy log");
+        log.append(EventBody::LadderEscalated {
+            task: "t1".to_owned(),
+            attempt: 1,
+            rung: 0,
+            data: events::LadderEscalated {
+                to_rung: 1,
+                tier: "small".to_owned(),
+                summary: "escalate".to_owned(),
+                detail: None,
+            },
+        })
+        .expect("legacy escalation");
+        log.append(EventBody::QuestionRaised {
+            task: "t1".to_owned(),
+            data: Box::new(events::QuestionRaised {
+                question: Question {
+                    id: QuestionId::from("q-spend-prefix"),
+                    kind: QuestionKind::ApproveSpend,
+                    affected_tasks: vec![TaskId::from("t1")],
+                    context: "approve spend".to_owned(),
+                    options: Vec::new(),
+                },
+            }),
+        })
+        .expect("legacy question");
+        drop(log);
+        let before = fs::read(paths.events()).expect("ambiguous prefix");
+
+        let error = resume_err(&repo, &run_id);
+        assert!(error.contains("ApproveSpend"), "{error}");
+        assert!(error.contains("before durably parking the task"), "{error}");
+        assert_eq!(
+            fs::read(paths.events()).expect("refused log"),
+            before,
+            "refusal never upgrades the spend-approval gap"
+        );
+    }
+
+    #[test]
+    fn legacy_status_still_refuses_a_mismatched_self_reported_plan_hash() {
+        let (repo, run_id) = parked_run("legacy-status-plan-hash");
+        let paths = paths_of(&repo, &run_id);
+        rewrite_run_started_as_schema_two(&paths);
+        let plan_path = paths.plan_json();
+        let mut plan: serde_json::Value =
+            serde_json::from_slice(&fs::read(&plan_path).expect("frozen plan"))
+                .expect("valid frozen plan");
+        plan["source"]["hash"] = serde_json::Value::String("different-plan".to_owned());
+        fs::write(
+            &plan_path,
+            format!(
+                "{}\n",
+                serde_json::to_string_pretty(&plan).expect("serialize plan")
+            ),
+        )
+        .expect("replace frozen plan");
+
+        let error = match crate::status::load(&repo, Some(&run_id)) {
+            Ok(_) => panic!("legacy status retains its source-hash boundary"),
+            Err(error) => error.to_string(),
+        };
+        assert!(error.contains("frozen plan hash"), "{error}");
+        assert!(error.contains("different-plan"), "{error}");
+    }
+
+    #[test]
+    fn legacy_upgrade_never_blesses_a_modified_normalized_snapshot() {
+        let (repo, run_id) = parked_run("legacy-plan-upgrade-tamper");
+        let paths = paths_of(&repo, &run_id);
+        rewrite_run_started_as_schema_two(&paths);
+        let plan_path = paths.plan_json();
+        let mut plan: serde_json::Value =
+            serde_json::from_slice(&fs::read(&plan_path).expect("frozen plan"))
+                .expect("valid frozen plan");
+        plan["tasks"][0]["title"] = serde_json::Value::String("modified snapshot".to_owned());
+        fs::write(
+            &plan_path,
+            format!(
+                "{}\n",
+                serde_json::to_string_pretty(&plan).expect("serialize plan")
+            ),
+        )
+        .expect("tamper legacy snapshot");
+        let before = fs::read(paths.events()).expect("legacy log");
+
+        let error = resume_err(&repo, &run_id);
+        assert!(error.contains("Refusing to bless"), "{error}");
+        assert_eq!(
+            fs::read(paths.events()).expect("refused log"),
+            before,
+            "refusal happens before the schema upgrade append"
+        );
+    }
+
+    #[test]
+    fn resume_compares_canonical_source_semantics_to_the_recorded_plan_digest() {
+        let (repo, run_id) = parked_run("source-semantics-digest");
+        fs::write(
+            repo.join("plan.md"),
+            "## Changed semantics\n<!-- tactus: id=t1 kind=implement depends= -->\nDifferent body.\n",
+        )
+        .expect("change source plan");
+        let new_hash = crate::ir::content_hash(&fs::read(repo.join("plan.md")).expect("plan"));
+        let paths = paths_of(&repo, &run_id);
+        let text = fs::read_to_string(paths.events()).expect("log");
+        let rewritten = text
+            .lines()
+            .map(|line| {
+                let mut value: serde_json::Value = serde_json::from_str(line).expect("event");
+                if value["event"] == "run_started" {
+                    value["data"]["plan_hash"] = serde_json::Value::String(new_hash.clone());
+                }
+                value.to_string()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        fs::write(paths.events(), format!("{rewritten}\n")).expect("force legacy hash guard equal");
+
+        let error = resume_err(&repo, &run_id);
+        assert!(
+            error.contains("validated source plan now normalizes to digest"),
+            "{error}"
         );
     }
 
@@ -8203,6 +9998,112 @@ mod tests {
     }
 
     #[test]
+    fn follow_ignores_a_terminal_marker_superseded_by_resume() {
+        let repo = temp_engine_repo("followresume");
+        let source = fake(Effect::EditFile);
+        let report = run_with(&options(&repo), &source).expect("run");
+        let paths = paths_of(&repo, &report.run_id);
+        let mut warnings = Vec::new();
+        let mut log = events::EventLog::open(&paths.events(), &mut warnings).expect("open log");
+        log.append(EventBody::RunResumed {
+            data: events::RunResumed {
+                head_sha: "second-epoch".to_owned(),
+                interrupted_attempts: 0,
+                discarded: Vec::new(),
+                gates: None,
+                effort_policy: None,
+                reviews: None,
+                chains: None,
+                normalized_plan_digest: None,
+            },
+        })
+        .expect("resume marker");
+        log.append(EventBody::RunFinished {
+            data: events::RunFinished {
+                outcome: events::RunOutcome::Complete,
+                halted_at: None,
+                committed: 1,
+                parked: 0,
+            },
+        })
+        .expect("second finish");
+        drop(log);
+
+        let loaded = replay_of(&repo, &report.run_id);
+        let sleeper = RecordingSleeper::default();
+        let mut out = Vec::new();
+        crate::status::follow(&loaded, &sleeper, Duration::ZERO, 2, &mut out).expect("follow");
+        let text = String::from_utf8(out).expect("utf8");
+        assert!(text.contains("resumed at second-epo"), "{text}");
+        assert_eq!(
+            text.matches("run finished").count(),
+            2,
+            "the historical finish must not truncate the later epoch: {text}"
+        );
+    }
+
+    #[test]
+    fn follow_waits_at_held_historical_terminal_until_resume_marker() {
+        struct ResumeOnSleep {
+            events: PathBuf,
+            lock: Mutex<Option<RunLock>>,
+        }
+
+        impl Sleeper for ResumeOnSleep {
+            fn sleep(&self, _: Duration) {
+                let Ok(mut lock) = self.lock.lock() else {
+                    return;
+                };
+                if lock.is_none() {
+                    return;
+                }
+                let mut warnings = Vec::new();
+                let mut log = events::EventLog::open(&self.events, &mut warnings).expect("log");
+                log.append(EventBody::RunResumed {
+                    data: events::RunResumed {
+                        head_sha: "resumed-head".to_owned(),
+                        interrupted_attempts: 0,
+                        discarded: Vec::new(),
+                        gates: None,
+                        effort_policy: None,
+                        reviews: None,
+                        chains: None,
+                        normalized_plan_digest: None,
+                    },
+                })
+                .expect("resume marker");
+                log.append(EventBody::RunFinished {
+                    data: events::RunFinished {
+                        outcome: events::RunOutcome::Complete,
+                        halted_at: None,
+                        committed: 1,
+                        parked: 0,
+                    },
+                })
+                .expect("new terminal");
+                drop(log);
+                drop(lock.take());
+            }
+        }
+
+        let repo = temp_engine_repo("followheldterminal");
+        let report = run_with(&options(&repo), &fake(Effect::EditFile)).expect("run");
+        let paths = paths_of(&repo, &report.run_id);
+        let loaded = replay_of(&repo, &report.run_id);
+        let sleeper = ResumeOnSleep {
+            events: paths.events(),
+            lock: Mutex::new(Some(
+                RunLock::acquire(&paths.public).expect("resume owns lock before marker"),
+            )),
+        };
+        let mut out = Vec::new();
+        crate::status::follow(&loaded, &sleeper, Duration::ZERO, 1, &mut out).expect("follow");
+        let text = String::from_utf8(out).expect("utf8");
+        assert!(text.contains("resumed at resumed-he"), "{text}");
+        assert_eq!(text.matches("run finished").count(), 2, "{text}");
+    }
+
+    #[test]
     fn transcripts_live_outside_the_workspace_and_survive_a_rollback() {
         // The §15 split, and the reason the private root cannot be inside the
         // repo: §14's rollback is `git clean -fd`, which would delete it.
@@ -8263,12 +10164,12 @@ mod tests {
             .map(|line| {
                 let mut value: serde_json::Value =
                     serde_json::from_str(line).expect("every line is an event");
-                if value.get("event").and_then(|e| e.as_str()) == Some("run_started")
-                    && let Some(data) = value.get_mut("data").and_then(|d| d.as_object_mut())
-                {
-                    data.remove(field)
-                        .unwrap_or_else(|| panic!("the run recorded no `{field}`"));
-                    stripped = true;
+                if value.get("event").and_then(|e| e.as_str()) == Some("run_started") {
+                    if let Some(data) = value.get_mut("data").and_then(|d| d.as_object_mut()) {
+                        data.remove(field)
+                            .unwrap_or_else(|| panic!("the run recorded no `{field}`"));
+                        stripped = true;
+                    }
                 }
                 value.to_string()
             })
@@ -8297,6 +10198,7 @@ mod tests {
                         .and_then(serde_json::Value::as_object_mut)
                         .expect("run_started data");
                     data.insert("schema".to_owned(), serde_json::Value::from(1));
+                    data.remove("normalized_plan_digest");
                     for field in absent {
                         data.remove(*field)
                             .unwrap_or_else(|| panic!("the run recorded no `{field}`"));
@@ -8321,6 +10223,85 @@ mod tests {
         fs::write(paths.events(), format!("{}\n", rewritten.join("\n"))).expect("rewrite");
     }
 
+    /// Rewrite a current start into the shape written immediately before the
+    /// complete-review contract: schema 2 and no per-pass timeout field.
+    fn rewrite_run_started_as_schema_two(paths: &RunPaths) {
+        rewrite_run_started_as_schema_two_missing_review_fields(paths, &["pass_timeout_secs"]);
+    }
+
+    fn rewrite_run_started_as_schema_two_missing_review_fields(
+        paths: &RunPaths,
+        absent_review_fields: &[&str],
+    ) {
+        let text = fs::read_to_string(paths.events()).expect("log");
+        let mut rewritten_start = false;
+        let rewritten: Vec<String> = text
+            .lines()
+            .map(|line| {
+                let mut value: serde_json::Value =
+                    serde_json::from_str(line).expect("every line is an event");
+                if value.get("event").and_then(|event| event.as_str()) == Some("run_started") {
+                    let data = value
+                        .get_mut("data")
+                        .and_then(serde_json::Value::as_object_mut)
+                        .expect("run_started data");
+                    data.insert("schema".to_owned(), serde_json::Value::from(2));
+                    data.remove("normalized_plan_digest");
+                    let reviews = data
+                        .get_mut("reviews")
+                        .and_then(serde_json::Value::as_object_mut)
+                        .expect("recorded review plan");
+                    for field in absent_review_fields {
+                        reviews
+                            .remove(*field)
+                            .unwrap_or_else(|| panic!("current review plan records `{field}`"));
+                    }
+                    rewritten_start = true;
+                }
+                value.to_string()
+            })
+            .collect();
+        assert!(rewritten_start, "the log has no run_started event");
+        fs::write(paths.events(), format!("{}\n", rewritten.join("\n"))).expect("rewrite");
+    }
+
+    fn strip_event_field(paths: &RunPaths, event: &str, field: &str) {
+        rewrite_event_field(paths, event, field, false);
+    }
+
+    fn strip_event_data_field(paths: &RunPaths, event: &str, field: &str) {
+        rewrite_event_field(paths, event, field, true);
+    }
+
+    fn rewrite_event_field(paths: &RunPaths, event: &str, field: &str, nested_in_data: bool) {
+        let text = fs::read_to_string(paths.events()).expect("log");
+        let mut stripped = false;
+        let rewritten: Vec<String> = text
+            .lines()
+            .map(|line| {
+                let mut value: serde_json::Value =
+                    serde_json::from_str(line).expect("every line is an event");
+                if value.get("event").and_then(serde_json::Value::as_str) == Some(event) {
+                    let object = if nested_in_data {
+                        value
+                            .get_mut("data")
+                            .and_then(serde_json::Value::as_object_mut)
+                            .expect("event data")
+                    } else {
+                        value.as_object_mut().expect("event object")
+                    };
+                    object
+                        .remove(field)
+                        .unwrap_or_else(|| panic!("{event} records `{field}`"));
+                    stripped = true;
+                }
+                value.to_string()
+            })
+            .collect();
+        assert!(stripped, "the log has no `{event}.{field}` to strip");
+        fs::write(paths.events(), format!("{}\n", rewritten.join("\n"))).expect("rewrite");
+    }
+
     /// Rewind a log to just before the named event — the shape a process
     /// killed at that instant leaves behind.
     fn truncate_log_before(paths: &RunPaths, event: &str) {
@@ -8331,6 +10312,39 @@ mod tests {
             .position(|line| line.contains(&format!("\"{event}\"")))
             .unwrap_or_else(|| panic!("the run recorded no {event}"));
         fs::write(paths.events(), format!("{}\n", lines[..cut].join("\n"))).expect("truncate");
+    }
+
+    /// Rewind a log through the named event — the shape a process killed
+    /// immediately after its durable transition leaves behind.
+    fn truncate_log_after(paths: &RunPaths, event: &str) {
+        let text = fs::read_to_string(paths.events()).expect("log");
+        let lines: Vec<&str> = text.lines().collect();
+        let cut = lines
+            .iter()
+            .position(|line| line.contains(&format!("\"{event}\"")))
+            .unwrap_or_else(|| panic!("the run recorded no {event}"))
+            + 1;
+        fs::write(paths.events(), format!("{}\n", lines[..cut].join("\n"))).expect("truncate");
+    }
+
+    fn prepared_commit_of(paths: &RunPaths) -> events::PreparedCommit {
+        let mut warnings = Vec::new();
+        events::read_all(&paths.events(), &mut warnings)
+            .expect("read prepared settlement")
+            .into_iter()
+            .find_map(|event| match event.body {
+                EventBody::AttemptFinished {
+                    prepared_commit: Some(prepared),
+                    ..
+                } => Some(*prepared),
+                _ => None,
+            })
+            .expect("successful settlement records its prepared commit")
+    }
+
+    fn recreate_prepared_pin(repo: &Path, prepared: &events::PreparedCommit, target: &str) {
+        let zero = "0".repeat(target.len());
+        git_in(repo, &["update-ref", &prepared.pin_ref, target, &zero]);
     }
 
     #[test]
@@ -8397,10 +10411,310 @@ mod tests {
     }
 
     #[test]
-    fn resume_refuses_a_commit_it_would_not_have_written() {
-        // The adoption above is deliberately narrow: one commit past the
-        // record, carrying the message this engine would have used for the
-        // task whose attempt just passed. Anything else is someone's history.
+    fn resume_recovers_every_prepared_commit_ref_crash_prefix() {
+        for (tag, reset_to_parent, recreate_pin) in [
+            ("prepared-same-head", true, true),
+            ("prepared-head-with-pin", false, true),
+            ("prepared-head-no-pin", false, false),
+        ] {
+            let repo = temp_engine_repo(tag);
+            seed(
+                &repo,
+                "## Implement the widget\n<!-- tactus: id=t1 kind=implement depends= -->\n",
+                Some("[routing]\nimplement = { chain = [\"small\"], attempts_per = 1 }\n"),
+            );
+            let mut opts = options(&repo);
+            opts.config_path = Some(repo.join("tactus.toml"));
+            let report = run_with(&opts, &fake(Effect::EditFile)).expect("run");
+            let paths = paths_of(&repo, &report.run_id);
+            let prepared = prepared_commit_of(&paths);
+            truncate_log_before(&paths, "task_committed");
+            if reset_to_parent {
+                git_in(&repo, &["reset", "-q", "--soft", &prepared.parent_sha]);
+            }
+            if recreate_pin {
+                let target = prepared.commit_sha.clone();
+                recreate_prepared_pin(&repo, &prepared, &target);
+            }
+
+            let source = fake(Effect::EditFile);
+            let resumed = resume_harness(
+                &resume_options(&repo, &report.run_id),
+                &Harness {
+                    adapters: &source,
+                    answers: None,
+                    sleeper: None,
+                },
+            )
+            .expect("recover exact prepared object");
+            assert_eq!(
+                resumed.outcome(),
+                RunOutcome::Complete,
+                "{tag}: {resumed:?}"
+            );
+            assert_eq!(
+                git_in(&repo, &["rev-parse", "HEAD"]).trim(),
+                prepared.commit_sha,
+                "{tag}: the exact reviewed object is published"
+            );
+            assert_eq!(task(&resumed, "t1").attempts.len(), 1, "{tag}");
+            let workspace = Workspace::open(&repo).expect("workspace");
+            assert_eq!(
+                workspace
+                    .prepared_pin_target(&prepared.pin_ref)
+                    .expect("pin lookup"),
+                None,
+                "{tag}: recovery cleans the private pin"
+            );
+        }
+    }
+
+    #[test]
+    fn resume_removes_a_pin_whose_successful_settlement_never_landed() {
+        let repo = temp_engine_repo("prepared-orphan");
+        seed(
+            &repo,
+            "## Implement the widget\n<!-- tactus: id=t1 kind=implement depends= -->\n",
+            Some("[routing]\nimplement = { chain = [\"small\"], attempts_per = 2 }\n"),
+        );
+        let mut opts = options(&repo);
+        opts.config_path = Some(repo.join("tactus.toml"));
+        let report = run_with(&opts, &fake(Effect::EditFile)).expect("run");
+        let paths = paths_of(&repo, &report.run_id);
+        let prepared = prepared_commit_of(&paths);
+        truncate_log_before(&paths, "attempt_finished");
+        git_in(&repo, &["reset", "-q", "--soft", &prepared.parent_sha]);
+        let target = prepared.commit_sha.clone();
+        recreate_prepared_pin(&repo, &prepared, &target);
+
+        let source = fake(Effect::EditFile);
+        let resumed = resume_harness(
+            &resume_options(&repo, &report.run_id),
+            &Harness {
+                adapters: &source,
+                answers: None,
+                sleeper: None,
+            },
+        )
+        .expect("orphan pin is not a settlement");
+        assert_eq!(resumed.outcome(), RunOutcome::Complete, "{resumed:?}");
+        assert_eq!(task(&resumed, "t1").attempts.len(), 2);
+        assert!(
+            resumed
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("removed orphan prepared commit pin")),
+            "{:?}",
+            resumed.warnings
+        );
+        assert_eq!(
+            Workspace::open(&repo)
+                .expect("workspace")
+                .prepared_pin_target(&prepared.pin_ref)
+                .expect("pin lookup"),
+            None
+        );
+    }
+
+    #[test]
+    fn resume_refuses_a_substituted_prepared_pin_without_deleting_it() {
+        let repo = temp_engine_repo("prepared-pin-mismatch");
+        seed(
+            &repo,
+            "## Implement the widget\n<!-- tactus: id=t1 kind=implement depends= -->\n",
+            Some("[routing]\nimplement = { chain = [\"small\"], attempts_per = 1 }\n"),
+        );
+        let mut opts = options(&repo);
+        opts.config_path = Some(repo.join("tactus.toml"));
+        let report = run_with(&opts, &fake(Effect::EditFile)).expect("run");
+        let paths = paths_of(&repo, &report.run_id);
+        let prepared = prepared_commit_of(&paths);
+        truncate_log_before(&paths, "task_committed");
+        git_in(&repo, &["reset", "-q", "--soft", &prepared.parent_sha]);
+        recreate_prepared_pin(&repo, &prepared, &prepared.parent_sha);
+
+        let err = resume_err(&repo, &report.run_id);
+        assert!(err.contains("not pinned"), "{err}");
+        assert_eq!(
+            Workspace::open(&repo)
+                .expect("workspace")
+                .prepared_pin_target(&prepared.pin_ref)
+                .expect("pin lookup")
+                .as_deref(),
+            Some(prepared.parent_sha.as_str()),
+            "refusal never deletes the substituted target"
+        );
+        assert_eq!(
+            git_in(&repo, &["rev-parse", "HEAD"]).trim(),
+            prepared.parent_sha,
+            "HEAD remains at the recorded parent"
+        );
+    }
+
+    #[test]
+    fn resume_refuses_symbolic_run_ref_at_already_published_prepared_prefix() {
+        let repo = temp_engine_repo("prepared-symbolic-run-ref");
+        seed(
+            &repo,
+            "## Implement the widget\n<!-- tactus: id=t1 kind=implement depends= -->\n",
+            Some("[routing]\nimplement = { chain = [\"small\"], attempts_per = 1 }\n"),
+        );
+        let mut opts = options(&repo);
+        opts.config_path = Some(repo.join("tactus.toml"));
+        let report = run_with(&opts, &fake(Effect::EditFile)).expect("run");
+        let paths = paths_of(&repo, &report.run_id);
+        let prepared = prepared_commit_of(&paths);
+        truncate_log_before(&paths, "task_committed");
+        recreate_prepared_pin(&repo, &prepared, &prepared.commit_sha);
+
+        git_in(&repo, &["branch", "victim", prepared.commit_sha.as_str()]);
+        git_in(
+            &repo,
+            &[
+                "symbolic-ref",
+                prepared.branch_ref.as_str(),
+                "refs/heads/victim",
+            ],
+        );
+        let events_before = fs::read(paths.events()).expect("event bytes before refusal");
+        let victim_before = git_in(&repo, &["rev-parse", "refs/heads/victim"]);
+
+        let error = resume_err(&repo, &report.run_id);
+        assert!(error.contains("itself symbolic"), "{error}");
+        assert_eq!(
+            fs::read(paths.events()).expect("event bytes after refusal"),
+            events_before,
+            "refusal happens before task_committed or any other repair append"
+        );
+        assert_eq!(
+            Workspace::open(&repo)
+                .expect("workspace")
+                .prepared_pin_target(&prepared.pin_ref)
+                .expect("pin lookup")
+                .as_deref(),
+            Some(prepared.commit_sha.as_str()),
+            "refusal preserves the durable prepared pin"
+        );
+        assert_eq!(
+            git_in(&repo, &["rev-parse", "refs/heads/victim"]),
+            victim_before,
+            "the symbolic run ref never advances or deletes its victim"
+        );
+        assert_eq!(
+            git_in(
+                &repo,
+                &["symbolic-ref", "--no-recurse", prepared.branch_ref.as_str(),],
+            )
+            .trim(),
+            "refs/heads/victim",
+            "refusal preserves the substituted symbolic run ref for inspection"
+        );
+    }
+
+    #[test]
+    fn recovered_prepared_commit_precedes_unrelated_answer_defect_repair() {
+        let repo = temp_engine_repo("prepared-before-repair");
+        seed(
+            &repo,
+            "## Implement the widget\n<!-- tactus: id=t1 kind=implement depends= -->\n",
+            Some("[routing]\nimplement = { chain = [\"small\"], attempts_per = 1 }\n"),
+        );
+        let mut opts = options(&repo);
+        opts.config_path = Some(repo.join("tactus.toml"));
+        let report = run_with(&opts, &fake(Effect::EditFile)).expect("run");
+        let paths = paths_of(&repo, &report.run_id);
+        truncate_log_before(&paths, "task_committed");
+
+        // Model an earlier answered question whose DesignDefect append was
+        // interrupted. It is unrelated to the later successful settlement,
+        // but resume still owes the repair after closing that settlement.
+        let question_id = QuestionId::from("q-before-success");
+        let question = Question {
+            id: question_id.clone(),
+            kind: QuestionKind::Unblock,
+            affected_tasks: vec![TaskId::from("t1")],
+            context: "an earlier question".to_owned(),
+            options: Vec::new(),
+        };
+        let inserted = [
+            events::Event::now(EventBody::QuestionRaised {
+                task: "t1".to_owned(),
+                data: Box::new(events::QuestionRaised {
+                    question: question.clone(),
+                }),
+            }),
+            events::Event::now(EventBody::TaskParked {
+                task: "t1".to_owned(),
+                data: events::TaskParked {
+                    question: question_id.to_string(),
+                    refund_attempt: false,
+                },
+            }),
+            events::Event::now(EventBody::QuestionAnswered {
+                data: events::QuestionAnswered {
+                    question: question_id,
+                    answer: Answer::Answered {
+                        text: "continue".to_owned(),
+                    },
+                    decline_halts_run: None,
+                    via: "answer-file".to_owned(),
+                },
+            }),
+        ];
+        let mut lines: Vec<String> = fs::read_to_string(paths.events())
+            .expect("log")
+            .lines()
+            .map(str::to_owned)
+            .collect();
+        let before_attempt = lines
+            .iter()
+            .position(|line| line.contains("\"attempt_started\""))
+            .expect("attempt start");
+        lines.splice(
+            before_attempt..before_attempt,
+            inserted
+                .iter()
+                .map(|event| serde_json::to_string(event).expect("event json")),
+        );
+        fs::write(paths.events(), format!("{}\n", lines.join("\n"))).expect("insert prefix");
+
+        let source = fake(Effect::EditFile);
+        let resumed = resume_harness(
+            &resume_options(&repo, &report.run_id),
+            &Harness {
+                adapters: &source,
+                answers: None,
+                sleeper: None,
+            },
+        )
+        .expect("resume closes settlement before repairing older metadata");
+        assert_eq!(resumed.outcome(), RunOutcome::Complete, "{resumed:?}");
+        let logged = events_of(&repo, &report.run_id);
+        let settlement = logged
+            .iter()
+            .rposition(|event| matches!(event.body, EventBody::AttemptFinished { .. }))
+            .expect("settlement");
+        assert!(
+            matches!(
+                logged.get(settlement + 1).map(|event| &event.body),
+                Some(EventBody::TaskCommitted { task, .. }) if task == "t1"
+            ),
+            "task_committed must immediately close the prepared settlement"
+        );
+        assert!(
+            logged
+                .iter()
+                .skip(settlement + 2)
+                .any(|event| matches!(event.body, EventBody::DesignDefect { .. })),
+            "the older answer repair still lands after the commit"
+        );
+        events::replay(logged, vec!["t1".to_owned()], &paths.events())
+            .expect("the repaired log remains replayable");
+    }
+
+    #[test]
+    fn resume_refuses_an_arbitrary_tree_with_the_same_parent_and_subject() {
+        // Exact object identity, not a plausible subject, is the authority.
         let repo = temp_engine_repo("adoptforeign");
         seed(
             &repo,
@@ -8411,14 +10725,43 @@ mod tests {
         opts.config_path = Some(repo.join("tactus.toml"));
         let report = run_with(&opts, &fake(Effect::EditFile)).expect("run");
         truncate_log_before(&paths_of(&repo, &report.run_id), "task_committed");
-        // Same place on the branch, different hand.
-        git_in(
-            &repo,
-            &["commit", "-q", "--amend", "-m", "not the engine's"],
+        let subject = git_in(&repo, &["show", "-s", "--format=%s", "HEAD"]);
+        fs::write(repo.join("foreign.txt"), "not reviewed\n").expect("foreign tree");
+        git_in(&repo, &["add", "foreign.txt"]);
+        git_in(&repo, &["commit", "-q", "--amend", "--no-edit"]);
+        assert_eq!(
+            git_in(&repo, &["show", "-s", "--format=%s", "HEAD"]),
+            subject,
+            "the substituted commit deliberately has the expected subject"
         );
 
         let err = resume_err(&repo, &report.run_id);
         assert!(err.contains("record ends at"), "got: {err}");
+    }
+
+    #[test]
+    fn legacy_success_without_prepared_identity_is_never_adopted_by_subject() {
+        let repo = temp_engine_repo("legacy-subject");
+        seed(
+            &repo,
+            "## Implement the widget\n<!-- tactus: id=t1 kind=implement depends= -->\n",
+            Some("[routing]\nimplement = { chain = [\"small\"], attempts_per = 1 }\n"),
+        );
+        let mut opts = options(&repo);
+        opts.config_path = Some(repo.join("tactus.toml"));
+        let report = run_with(&opts, &fake(Effect::EditFile)).expect("run");
+        let paths = paths_of(&repo, &report.run_id);
+        truncate_log_before(&paths, "task_committed");
+        rewrite_run_started_as_schema_two(&paths);
+        strip_event_field(&paths, "attempt_finished", "prepared_commit");
+
+        let err = resume_err(&repo, &report.run_id);
+        assert!(err.contains("subject alone"), "{err}");
+        assert_eq!(
+            git_in(&repo, &["rev-list", "--count", "main..HEAD"]).trim(),
+            "1",
+            "refusal preserves the plausible legacy commit"
+        );
     }
 
     #[test]
@@ -8438,7 +10781,10 @@ mod tests {
         let report = run_with(&opts, &fake(Effect::EditFile)).expect("run");
         let run_id = report.run_id.clone();
         let recorded = paths_of(&repo, &run_id);
-        truncate_log_before(&recorded, "task_committed");
+        // Stop before the successful settlement, so this is a genuinely
+        // interrupted attempt rather than a settled prepared commit whose pin
+        // a real process would still retain.
+        truncate_log_before(&recorded, "attempt_finished");
         git_in(&repo, &["reset", "-q", "--hard", "HEAD~1"]);
 
         // No override, so the resume has to read the location off the record.
@@ -8699,10 +11045,10 @@ mod tests {
                 return;
             };
             *waits += 1;
-            if *waits == self.release_after
-                && let Ok(mut lock) = self.lock.lock()
-            {
-                drop(lock.take());
+            if *waits == self.release_after {
+                if let Ok(mut lock) = self.lock.lock() {
+                    drop(lock.take());
+                }
             }
         }
     }
@@ -9241,6 +11587,45 @@ mod tests {
     }
 
     #[test]
+    fn reviewer_rate_limit_retires_recovered_implementer_pool_live() {
+        let repo = temp_engine_repo("reviewerlimitretiresworker");
+        seed(&repo, FRONTIER_AUTH_PLAN, Some(SECOND_OPINION_CONFIG));
+        let pools = pools_file(
+            &repo,
+            "[pools.claude-max]\nkind = \"subscription-window\"\nagent = \"claude-code\"\n\
+             sources = [\"signals\"]\n\n[pools.copilot-window]\nkind = \"subscription-window\"\n\
+             agent = \"copilot\"\nsources = [\"signals\"]\n",
+        );
+        let mut opts = cross_vendor_opts(&repo);
+        opts.pools_path = Some(pools);
+        let source = cross_vendor(
+            vec![
+                Effect::RateLimited,
+                Effect::EditFile,
+                Effect::RateLimited,
+                Effect::EditFile,
+            ],
+            vec![ReviewBehavior::Pass],
+            vec![ReviewBehavior::RateLimited, ReviewBehavior::Pass],
+        );
+        let report = run_with(&opts, &source).expect("outages eventually recover");
+        assert_eq!(report.outcome(), RunOutcome::Complete, "{report:?}");
+
+        let signals: Vec<String> = events_of(&repo, &report.run_id)
+            .iter()
+            .filter_map(|event| match &event.body {
+                EventBody::PoolExhausted { data, .. } => Some(data.pool.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            signals,
+            ["claude-max", "copilot-window", "claude-max"],
+            "the reviewer outage must not leave the successfully serving worker pool retired forever"
+        );
+    }
+
+    #[test]
     fn the_budget_flag_is_validated_like_the_config_key() {
         // `[budgets] run_usd = 0.0` is a hard error at load. The flag that
         // overrides it must not be a way around that: zero and negative both
@@ -9767,22 +12152,22 @@ mod tests {
         // stop to get past. The tidying is a courtesy; the ceiling is the run's
         // account of why it stopped.
         //
-        // The gate plants a stale `.git/index.lock`, which is the most faithful
-        // portable version of that: every later git command that writes the
-        // index refuses, and nothing else changes.
+        // The fake reviewer plants a stale lock only after its exact candidate
+        // worktree exists. This reaches the budget-stop cleanup without using
+        // ordinary gate residue to pierce the new workspace isolation.
         let repo = temp_engine_repo("budgetjam");
         seed(
             &repo,
             "## One\n<!-- tactus: id=t1 kind=implement depends= -->\n",
-            Some(
-                "[routing]\nimplement = { chain = [\"small\"], attempts_per = 2 }\n\n\
-                 [[gates]]\nname = \"jam\"\ncmd = \"echo jam> .git/index.lock\"\n",
-            ),
+            Some("[routing]\nimplement = { chain = [\"small\"], attempts_per = 2 }\n"),
         );
         let mut opts = options(&repo);
         opts.config_path = Some(repo.join("tactus.toml"));
         opts.budget_usd = Some(0.05);
-        let rejected = source(vec![Effect::EditFile], vec![ReviewBehavior::Fail]);
+        let rejected = source(
+            vec![Effect::JamCleanupAfterReview],
+            vec![ReviewBehavior::Fail],
+        );
         let stopped = run_with(&opts, &rejected).expect("the ceiling still ends the run");
 
         assert_eq!(

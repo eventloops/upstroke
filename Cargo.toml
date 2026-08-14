@@ -12,6 +12,7 @@ name = "tactus"
 # copy stays wrong and this one is right from the next release on.
 version = "0.1.0"
 edition = "2024"
+rust-version = "1.85"
 license = "AGPL-3.0-only"
 description = "Headless orchestration engine for AI coding agents — the conductor, not an instrument"
 repository = "https://github.com/keybindings/tactus"
@@ -33,16 +34,30 @@ exclude = [
 [dependencies]
 anyhow = "1"
 clap = { version = "4", features = ["derive"] }
-globset = "0.4"
+# 0.4.20 raised its MSRV to Rust 1.88; keep the public Rust 1.85 contract.
+globset = "=0.4.19"
 pulldown-cmark = { version = "0.13", default-features = false }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+sha2 = "0.10"
 thiserror = "2"
 toml = "0.8"
 
 # `fcntl(F_SETLK)` for the run lock, which std does not expose — std's
 # `File::try_lock` is `flock`, and `flock` is inherited across `fork`. See
 # `src/rundir.rs` for why that difference decides the whole design of the lock.
-# Windows keeps `LockFileEx` through std and needs nothing here.
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
+
+# Windows uses Job Objects for process-tree ownership and calls LockFileEx
+# directly because Rust 1.85 predates std's file-locking API.
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_Storage_FileSystem",
+    "Win32_System_Diagnostics_ToolHelp",
+    "Win32_System_IO",
+    "Win32_System_JobObjects",
+    "Win32_System_Threading",
+] }

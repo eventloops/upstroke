@@ -26,12 +26,19 @@ use std::sync::Mutex;
 
 use crate::error::TactusError;
 use crate::util;
+use crate::workspace::Workspace;
 
 /// Created beside the repo: the run's own record and the human/UI surface.
 const PUBLIC_DIRS: [&str; 3] = ["artifacts", "questions", "answers"];
 /// Created outside the workspace: everything an agent wrote or that describes
 /// an agent's sandbox.
-const PRIVATE_DIRS: [&str; 4] = ["transcripts", "reviews", "settings", "gates"];
+const PRIVATE_DIRS: [&str; 5] = [
+    "transcripts",
+    "reviews",
+    "settings",
+    "gates",
+    "gate-worktrees",
+];
 
 /// Where one run's files live, split by who is allowed to read them.
 #[derive(Debug, Clone)]
@@ -131,6 +138,13 @@ impl RunPaths {
 
     pub fn gates(&self) -> PathBuf {
         self.private.join("gates")
+    }
+
+    /// Durable intents and disposable directories for exact gate/review
+    /// worktrees. This lives outside the candidate workspace, so a hard-killed
+    /// engine can reclaim Git registrations before a resumed worker runs.
+    pub fn gate_worktrees(&self) -> PathBuf {
+        self.private.join("gate-worktrees")
     }
 }
 
@@ -300,32 +314,140 @@ pub fn lock_file(public: &Path) -> PathBuf {
     public.join("run.lock")
 }
 
+fn worktree_lock_file(worktree_git_dir: &Path) -> PathBuf {
+    worktree_git_dir.join("tactus-worktree.lock")
+}
+
+/// An exclusive lease on the physical worktree shared by every run directory.
+///
+/// A per-run lock protects one log, but two distinct runs still share HEAD, the
+/// index, and every working-tree byte. The engine therefore holds this outer
+/// lease before either a fresh run or a resume can inspect or mutate Git state.
+#[derive(Debug)]
+pub struct WorktreeLock {
+    _file: Option<File>,
+    claim: PathBuf,
+}
+
+impl Drop for WorktreeLock {
+    fn drop(&mut self) {
+        release_claim_after_file(self._file.take(), &self.claim, || {});
+    }
+}
+
+impl WorktreeLock {
+    /// Acquire the lease for `repo_root` without placing coordination state in
+    /// the working tree. Kept as the public convenience API for existing
+    /// callers; the engine already has the resolved [`Workspace`] and uses
+    /// [`Self::acquire_in`] to avoid opening it twice.
+    pub fn acquire(repo_root: &Path) -> Result<Self, TactusError> {
+        let workspace = Workspace::open(repo_root)?;
+        let worktree_git_dir = workspace.worktree_git_dir()?;
+        Self::acquire_in(workspace.root(), &worktree_git_dir)
+    }
+
+    pub(crate) fn acquire_in(
+        repo_root: &Path,
+        worktree_git_dir: &Path,
+    ) -> Result<Self, TactusError> {
+        let path = worktree_lock_file(worktree_git_dir);
+        let claim = claim_key(worktree_git_dir).join("tactus-worktree.lock");
+        if !claims().insert(claim.clone()) {
+            return Err(worktree_refused(repo_root, &path, Some(std::process::id())));
+        }
+        let taken = File::options()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .read(true)
+            .open(&path)
+            .map_err(|source| TactusError::Io {
+                path: path.clone(),
+                source,
+            })
+            .and_then(|file| match imp::take(&file) {
+                Holder::Nobody => Ok(file),
+                Holder::Someone { pid } => Err(worktree_refused(repo_root, &path, pid)),
+                Holder::Unknown(source) => Err(TactusError::Io {
+                    path: path.clone(),
+                    source,
+                }),
+            });
+        match taken {
+            Ok(file) => {
+                // A killed conductor releases the primary worktree lease, but
+                // its Unix cleanup reaper deliberately retains the old run's
+                // cleanup lease until every agent process is gone. Check only
+                // after taking the primary lease, closing the race where the
+                // conductor dies between a scan and this acquisition.
+                if let Some(cleaning) = list_runs(repo_root)
+                    .into_iter()
+                    .map(|run_id| public_dir(repo_root, &run_id))
+                    .find(|public| cleanup::is_held(public))
+                {
+                    release_claim_after_file(Some(file), &claim, || {});
+                    return Err(TactusError::Refused {
+                        message: format!(
+                            "run `{}` is still cleaning agent processes in worktree {}; refusing overlapping engine ownership",
+                            cleaning.file_name().unwrap_or_default().to_string_lossy(),
+                            repo_root.display()
+                        ),
+                    });
+                }
+                Ok(Self {
+                    _file: Some(file),
+                    claim,
+                })
+            }
+            Err(error) => {
+                claims().remove(&claim);
+                Err(error)
+            }
+        }
+    }
+}
+
+/// A second, Unix-only lock used as a crash-cleanup lease. Each external agent
+/// reaper opens its own shared hold; `resume` needs the exclusive side, so a
+/// hard-killed conductor cannot hand over the run before cleanup is complete.
+#[cfg(unix)]
+fn cleanup_lock_file(public: &Path) -> PathBuf {
+    public.join("cleanup.lock")
+}
+
 /// An exclusive hold on one run, released when this value drops.
 ///
 /// Two engines on one run directory would interleave events into the log and
 /// fight over the same git branch and working tree. An advisory OS lock is the
-/// right shape for that because the operating system releases it when the
-/// holder dies: a crashed run — the case `resume` exists for — leaves no stale
-/// marker to clear by hand, which is exactly what a lock *file* would have
-/// forced on the common path.
+/// right shape for that because the operating system releases the primary
+/// hold when the conductor dies. On Unix, live crash reapers retain only the
+/// shared cleanup lease until their agent groups are quiescent. Neither hold
+/// leaves a stale marker to clear by hand.
 ///
 /// Which OS lock, though, is not a detail. See [`imp`].
 #[derive(Debug)]
 pub struct RunLock {
-    _file: File,
+    _file: Option<File>,
+    _cleanup: cleanup::CleanupLease,
     /// The run this claimed in [`claims`], given back on drop.
     claim: PathBuf,
 }
 
 impl Drop for RunLock {
     fn drop(&mut self) {
-        // Before the file closes, so no window exists where the OS has let go
-        // and this process still thinks it holds the run.
-        claims().remove(&self.claim);
+        self.release_file_then(|| {});
     }
 }
 
 impl RunLock {
+    /// Close the process-scoped OS lock before publishing this process's claim
+    /// as free. On POSIX, closing the old descriptor after another thread has
+    /// acquired the same inode would release *all* of this process's locks on
+    /// that inode, silently stripping the new owner's exclusion.
+    fn release_file_then(&mut self, after_close: impl FnOnce()) {
+        release_claim_after_file(self._file.take(), &self.claim, after_close);
+    }
+
     /// Take the lock on a run's public directory, or explain who has it.
     pub fn acquire(public: &Path) -> Result<Self, TactusError> {
         let path = lock_file(public);
@@ -359,13 +481,41 @@ impl RunLock {
                 }),
             });
         match taken {
-            Ok(file) => Ok(Self { _file: file, claim }),
+            Ok(file) => match cleanup::take(public) {
+                Ok(cleanup) => Ok(Self {
+                    _file: Some(file),
+                    _cleanup: cleanup,
+                    claim,
+                }),
+                Err(error) => {
+                    release_claim_after_file(Some(file), &claim, || {});
+                    Err(error)
+                }
+            },
             Err(error) => {
                 claims().remove(&claim);
                 Err(error)
             }
         }
     }
+
+    /// Bind subprocess cleanup started on this thread to this run.
+    ///
+    /// The lock itself remains `Send`; callers enter the scope only while
+    /// synchronously driving the run, so a future executor can move ownership
+    /// first and establish the context on its actual worker thread.
+    pub(crate) fn enter_cleanup_scope(&self) -> cleanup::CleanupScope<'_> {
+        cleanup::enter(&self._cleanup)
+    }
+}
+
+/// Release a process-scoped POSIX lock before another thread can observe the
+/// in-process claim as free. This ordering is shared by ordinary `Drop` and by
+/// rollback after the primary lock succeeded but the cleanup lease did not.
+fn release_claim_after_file(file: Option<File>, claim: &Path, after_close: impl FnOnce()) {
+    drop(file);
+    after_close();
+    claims().remove(claim);
 }
 
 fn refused(public: &Path, path: &Path, pid: Option<u32>) -> TactusError {
@@ -384,6 +534,20 @@ fn refused(public: &Path, path: &Path, pid: Option<u32>) -> TactusError {
     }
 }
 
+fn worktree_refused(repo_root: &Path, path: &Path, pid: Option<u32>) -> TactusError {
+    let who = match pid {
+        Some(pid) => format!(" (pid {pid})"),
+        None => String::new(),
+    };
+    TactusError::Refused {
+        message: format!(
+            "another tactus process{who} is already driving worktree {} (lock held on {}). Different run ids still share HEAD, the index, and working-tree bytes; wait for it to finish, or stop it first.",
+            repo_root.display(),
+            path.display()
+        ),
+    }
+}
+
 /// Who holds a run's lock.
 #[derive(Debug)]
 enum Holder {
@@ -396,8 +560,8 @@ enum Holder {
     Unknown(io::Error),
 }
 
-/// Runs this process holds, so that two `acquire`s here behave like two
-/// engines.
+/// Run and worktree locks this process holds, so that two `acquire`s here
+/// behave like two engines.
 ///
 /// It also keeps [`is_running`] away from a lock file this process already
 /// holds — which on Unix is not tidiness but a correctness requirement, because
@@ -447,21 +611,26 @@ fn claim_key(public: &Path) -> PathBuf {
 
 /// Whether a run is being driven right now, without disturbing the holder.
 ///
-/// Read-only, and on Unix genuinely read-only: `F_GETLK` asks who holds the
-/// lock without taking one, so there is nothing to give back and nothing to
-/// race. A file that cannot be opened at all is not a running run — the lock is
-/// only ever created by a run that started.
+/// Read-only with respect to the run record. On Unix, `F_GETLK` asks who holds
+/// the primary lock without taking one. Only when that lock is free does the
+/// probe momentarily try the exclusive side of the cleanup lease; it never
+/// creates or changes either file. A primary file that does not exist means
+/// the run never started.
 pub fn is_running(public: &Path) -> bool {
     // Asked and answered without touching the file. On Unix this is the branch
     // that keeps `fcntl`'s release-on-any-close from applying to us at all.
     if claims().contains(&claim_key(public)) {
         return true;
     }
-    let Ok(file) = File::open(lock_file(public)) else {
-        return false;
+    let file = match File::open(lock_file(public)) {
+        Ok(file) => file,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return false,
+        // An existing run whose lock cannot be inspected is not safe to call
+        // dead. `acquire` will report the concrete IO error if a resume tries.
+        Err(_) => return true,
     };
     match imp::holder(&file) {
-        Holder::Nobody => false,
+        Holder::Nobody => cleanup::is_held(public),
         Holder::Someone { .. } => true,
         // The opened-fine-but-cannot-be-locked case, which is not the same as
         // the unopenable file above and does not get the same answer. Locking
@@ -480,6 +649,164 @@ pub fn is_running(public: &Path) -> bool {
         // way, and it reports this case as the IO error it is.
         Holder::Unknown(_) => true,
     }
+}
+
+#[cfg(unix)]
+mod cleanup {
+    use super::{cleanup_lock_file, refused};
+    use crate::error::TactusError;
+    use std::cell::RefCell;
+    use std::collections::BTreeMap;
+    use std::fs::File;
+    use std::marker::PhantomData;
+    use std::os::fd::AsRawFd;
+    use std::path::{Path, PathBuf};
+    use std::rc::Rc;
+
+    thread_local! {
+        // v0.1 drives a run synchronously inside an explicit scope. Thread-
+        // local registration gives concurrent library/test runs the exact
+        // cleanup path for their own reapers instead of conservatively leasing
+        // every run active in the process.
+        static ACTIVE: RefCell<BTreeMap<PathBuf, usize>> = const { RefCell::new(BTreeMap::new()) };
+    }
+
+    #[derive(Debug)]
+    pub(super) struct CleanupLease {
+        path: PathBuf,
+    }
+
+    #[derive(Debug)]
+    pub(crate) struct CleanupScope<'a> {
+        path: PathBuf,
+        _lifetime_and_thread: PhantomData<(&'a CleanupLease, Rc<()>)>,
+    }
+
+    impl Drop for CleanupScope<'_> {
+        fn drop(&mut self) {
+            ACTIVE.with(|active| {
+                let mut active = active.borrow_mut();
+                let remove = if let Some(count) = active.get_mut(&self.path) {
+                    *count = count.saturating_sub(1);
+                    *count == 0
+                } else {
+                    false
+                };
+                if remove {
+                    active.remove(&self.path);
+                }
+            });
+        }
+    }
+
+    pub(super) fn enter(lease: &CleanupLease) -> CleanupScope<'_> {
+        ACTIVE.with(|active| {
+            let mut active = active.borrow_mut();
+            *active.entry(lease.path.clone()).or_default() += 1;
+        });
+        CleanupScope {
+            path: lease.path.clone(),
+            _lifetime_and_thread: PhantomData,
+        }
+    }
+
+    pub(super) fn take(public: &Path) -> Result<CleanupLease, TactusError> {
+        let path = cleanup_lock_file(public);
+        let file = File::options()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(&path)
+            .map_err(|source| TactusError::Io {
+                path: path.clone(),
+                source,
+            })?;
+        let result = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+        if result != 0 {
+            let source = std::io::Error::last_os_error();
+            if matches!(
+                source.raw_os_error(),
+                Some(code) if code == libc::EWOULDBLOCK || code == libc::EAGAIN
+            ) {
+                return Err(refused(public, &path, None));
+            }
+            return Err(TactusError::Io { path, source });
+        }
+        // This probe proves no prior crash reaper remains. Do not retain the
+        // lock in the conductor: arbitrary forked children would inherit its
+        // open file description and recreate the false-liveness window the
+        // primary fcntl lock deliberately avoids. Each cleanup reaper instead
+        // reopens `path` and owns an independent shared hold.
+        if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_UN) } != 0 {
+            return Err(TactusError::Io {
+                path,
+                source: std::io::Error::last_os_error(),
+            });
+        }
+        Ok(CleanupLease { path })
+    }
+
+    pub(super) fn is_held(public: &Path) -> bool {
+        let path = cleanup_lock_file(public);
+        let file = match File::options().read(true).write(true).open(&path) {
+            Ok(file) => file,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return false,
+            // An existing lease file that cannot be inspected is not evidence
+            // that cleanup finished. Keep liveness fail-closed just as the
+            // primary lock does for an unreportable holder.
+            Err(_) => return true,
+        };
+        if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
+            let _ = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_UN) };
+            false
+        } else {
+            true
+        }
+    }
+
+    pub(crate) fn active_paths() -> Vec<PathBuf> {
+        ACTIVE.with(|active| active.borrow().keys().cloned().collect())
+    }
+}
+
+#[cfg(not(unix))]
+mod cleanup {
+    use crate::error::TactusError;
+    use std::marker::PhantomData;
+    use std::path::Path;
+    use std::rc::Rc;
+
+    #[derive(Debug)]
+    pub(super) struct CleanupLease;
+
+    #[derive(Debug)]
+    pub(crate) struct CleanupScope<'a> {
+        _lifetime_and_thread: PhantomData<(&'a CleanupLease, Rc<()>)>,
+    }
+
+    impl Drop for CleanupScope<'_> {
+        fn drop(&mut self) {}
+    }
+
+    pub(super) fn take(_: &Path) -> Result<CleanupLease, TactusError> {
+        Ok(CleanupLease)
+    }
+
+    pub(super) fn is_held(_: &Path) -> bool {
+        false
+    }
+
+    pub(super) fn enter(_lease: &CleanupLease) -> CleanupScope<'_> {
+        CleanupScope {
+            _lifetime_and_thread: PhantomData,
+        }
+    }
+}
+
+#[cfg(unix)]
+pub(crate) fn active_cleanup_lease_paths() -> Vec<PathBuf> {
+    cleanup::active_paths()
 }
 
 /// The lock primitive, and why it is not `std`'s.
@@ -601,29 +928,82 @@ mod imp {
     }
 }
 
-#[cfg(not(unix))]
+#[cfg(windows)]
 mod imp {
     use super::Holder;
-    use std::fs::{File, TryLockError};
+    use std::fs::File;
+    use std::io;
+    use std::os::windows::io::AsRawHandle;
+
+    use windows_sys::Win32::Foundation::{ERROR_LOCK_VIOLATION, HANDLE};
+    use windows_sys::Win32::Storage::FileSystem::{
+        LOCKFILE_EXCLUSIVE_LOCK, LOCKFILE_FAIL_IMMEDIATELY, LockFileEx, UnlockFileEx,
+    };
+    use windows_sys::Win32::System::IO::OVERLAPPED;
 
     pub(super) fn take(file: &File) -> Holder {
-        match file.try_lock() {
-            Ok(()) => Holder::Nobody,
-            // `LockFileEx` names no owner, and inventing one would be worse
-            // than the shorter sentence.
-            Err(TryLockError::WouldBlock) => Holder::Someone { pid: None },
-            Err(TryLockError::Error(source)) => Holder::Unknown(source),
-        }
+        try_lock(file, true)
     }
 
     pub(super) fn holder(file: &File) -> Holder {
-        match file.try_lock_shared() {
-            Ok(()) => {
-                let _ = file.unlock();
-                Holder::Nobody
-            }
-            Err(TryLockError::WouldBlock) => Holder::Someone { pid: None },
-            Err(TryLockError::Error(source)) => Holder::Unknown(source),
+        match try_lock(file, false) {
+            Holder::Nobody => match unlock(file) {
+                Ok(()) => Holder::Nobody,
+                Err(source) => Holder::Unknown(source),
+            },
+            other => other,
+        }
+    }
+
+    fn try_lock(file: &File, exclusive: bool) -> Holder {
+        let mut overlapped = OVERLAPPED::default();
+        let flags = LOCKFILE_FAIL_IMMEDIATELY
+            | if exclusive {
+                LOCKFILE_EXCLUSIVE_LOCK
+            } else {
+                0
+            };
+        // SAFETY: `file` owns a live Windows handle, `overlapped` describes
+        // offset zero, and the same whole-file range is used by every holder.
+        let locked = unsafe {
+            LockFileEx(
+                file.as_raw_handle() as HANDLE,
+                flags,
+                0,
+                u32::MAX,
+                u32::MAX,
+                &mut overlapped,
+            )
+        };
+        if locked != 0 {
+            return Holder::Nobody;
+        }
+        let source = io::Error::last_os_error();
+        if source.raw_os_error() == Some(ERROR_LOCK_VIOLATION as i32) {
+            // LockFileEx names no owner, and inventing one would be worse than
+            // the shorter sentence.
+            Holder::Someone { pid: None }
+        } else {
+            Holder::Unknown(source)
+        }
+    }
+
+    fn unlock(file: &File) -> io::Result<()> {
+        let mut overlapped = OVERLAPPED::default();
+        // SAFETY: this releases exactly the range acquired in `try_lock`.
+        if unsafe {
+            UnlockFileEx(
+                file.as_raw_handle() as HANDLE,
+                0,
+                u32::MAX,
+                u32::MAX,
+                &mut overlapped,
+            )
+        } != 0
+        {
+            Ok(())
+        } else {
+            Err(io::Error::last_os_error())
         }
     }
 }
@@ -659,6 +1039,7 @@ mod tests {
             paths.reviews(),
             paths.settings(),
             paths.gates(),
+            paths.gate_worktrees(),
         ] {
             assert!(private.is_dir(), "{} should exist", private.display());
             assert!(
@@ -789,6 +1170,60 @@ mod tests {
         RunLock::acquire(&paths.public).expect("re-acquire after release");
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn same_process_handoff_closes_old_descriptor_before_publishing_claim_free() {
+        let root = scratch("orderedhandoff");
+        let paths = paths_in(&root, "RUN1");
+        paths.create().expect("create");
+        let mut held = RunLock::acquire(&paths.public).expect("first acquire");
+
+        held.release_file_then(|| {
+            let file = File::open(lock_file(&paths.public)).expect("inspect released lock");
+            assert!(
+                matches!(imp::holder(&file), Holder::Nobody),
+                "the old descriptor must already be closed"
+            );
+            let error = RunLock::acquire(&paths.public)
+                .expect_err("the in-process claim stays published until after close");
+            assert!(error.to_string().contains("already driving run"), "{error}");
+        });
+
+        let replacement = RunLock::acquire(&paths.public).expect("handoff after ordered release");
+        drop(replacement);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cleanup_lease_failure_closes_primary_before_releasing_claim() {
+        let root = scratch("cleanupfailurehandoff");
+        let paths = paths_in(&root, "RUN1");
+        paths.create().expect("create");
+        let mut held = RunLock::acquire(&paths.public).expect("primary acquired");
+        let file = held._file.take();
+        let claim = held.claim.clone();
+
+        // This is the exact rollback primitive used when cleanup::take fails.
+        // The callback is a deterministic observation point between closing
+        // the POSIX descriptor and publishing the same-process claim as free.
+        release_claim_after_file(file, &claim, || {
+            let file = File::open(lock_file(&paths.public)).expect("inspect primary lock");
+            assert!(matches!(imp::holder(&file), Holder::Nobody));
+            RunLock::acquire(&paths.public)
+                .expect_err("claim cannot be reused until the old descriptor is closed");
+        });
+
+        let replacement = RunLock::acquire(&paths.public).expect("clean rollback handoff");
+        drop(replacement);
+        drop(held);
+    }
+
+    #[test]
+    fn a_run_lock_remains_send_even_though_its_cleanup_scope_is_thread_local() {
+        fn assert_send<T: Send>() {}
+        assert_send::<RunLock>();
+    }
+
     #[test]
     fn the_lock_answers_at_once_rather_than_waiting_to_be_sure() {
         // There was a 500ms contention grace here, and it was paid in full
@@ -880,6 +1315,78 @@ mod tests {
         println!("held");
         std::io::Write::flush(&mut std::io::stdout()).expect("flush");
         std::thread::sleep(Duration::from_secs(30));
+    }
+
+    #[test]
+    #[ignore = "spawned as a subprocess by two_run_ids_cannot_drive_one_worktree_concurrently"]
+    fn worktree_lock_child_holds_run_a() {
+        let repo = PathBuf::from(std::env::var("TACTUS_TEST_WORKTREE_DIR").expect("repo"));
+        let git_dir =
+            PathBuf::from(std::env::var("TACTUS_TEST_WORKTREE_GIT_DIR").expect("git dir"));
+        let public = PathBuf::from(std::env::var("TACTUS_TEST_LOCK_DIR").expect("run dir"));
+        let _worktree =
+            WorktreeLock::acquire_in(&repo, &git_dir).expect("child takes worktree lease");
+        let _run = RunLock::acquire(&public).expect("child takes run A lock");
+        println!("held");
+        std::io::Write::flush(&mut std::io::stdout()).expect("flush");
+        std::thread::sleep(Duration::from_secs(30));
+    }
+
+    #[test]
+    fn two_run_ids_cannot_drive_one_worktree_concurrently() {
+        let root = scratch("two-runs-one-worktree");
+        let repo = root.join("repo");
+        let git_dir = root.join("git-dir");
+        fs::create_dir_all(&git_dir).expect("worktree git dir");
+        let run_a = paths_in(&repo, "RUNA");
+        let run_b = paths_in(&repo, "RUNB");
+        run_a.create().expect("run A dirs");
+        run_b.create().expect("run B dirs");
+
+        let exe = std::env::current_exe().expect("test binary");
+        let mut child = std::process::Command::new(exe)
+            .args([
+                "--exact",
+                "rundir::tests::worktree_lock_child_holds_run_a",
+                "--ignored",
+                "--nocapture",
+            ])
+            .env("TACTUS_TEST_WORKTREE_DIR", &repo)
+            .env("TACTUS_TEST_WORKTREE_GIT_DIR", &git_dir)
+            .env("TACTUS_TEST_LOCK_DIR", &run_a.public)
+            .stdout(std::process::Stdio::piped())
+            .spawn()
+            .expect("spawn run A engine");
+
+        let mut out = std::io::BufReader::new(child.stdout.take().expect("stdout"));
+        let mut line = String::new();
+        let deadline = Instant::now() + Duration::from_secs(30);
+        loop {
+            line.clear();
+            let read = std::io::BufRead::read_line(&mut out, &mut line).expect("read");
+            assert!(read > 0, "run A child ended before taking its leases");
+            if line.trim() == "held" {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "run A child never took its leases"
+            );
+        }
+
+        // The per-run lock alone would allow this: the identifiers and files
+        // differ. The outer lease is what owns shared HEAD/index/worktree state.
+        let run_b_only = RunLock::acquire(&run_b.public).expect("run B lock is independent");
+        drop(run_b_only);
+        let error = WorktreeLock::acquire_in(&repo, &git_dir)
+            .expect_err("run B must lose the worktree lease");
+        assert!(
+            error.to_string().contains("already driving worktree"),
+            "{error}"
+        );
+
+        let _ = child.kill();
+        let _ = child.wait();
     }
 
     #[test]

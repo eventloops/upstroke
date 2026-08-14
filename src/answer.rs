@@ -70,11 +70,8 @@ pub fn answer(repo_root: &Path, wanted: &str, reply: Reply) -> Result<Answered, 
         Reply::Decline => Answer::Declined,
         Reply::Text(text) => interaction::interpret(&record.question, &text),
         Reply::Option(choice) => {
-            let option = record
-                .question
-                .options
-                .get(choice.checked_sub(1).unwrap_or(usize::MAX))
-                .ok_or_else(|| TactusError::Refused {
+            interaction::answer_for_option(&record.question, choice).ok_or_else(|| {
+                TactusError::Refused {
                     message: format!(
                         "there is no option {choice} on this question; it offers {}",
                         if record.question.options.is_empty() {
@@ -85,10 +82,8 @@ pub fn answer(repo_root: &Path, wanted: &str, reply: Reply) -> Result<Answered, 
                             format!("1-{}", record.question.options.len())
                         }
                     ),
-                })?;
-            Answer::Answered {
-                text: option.clone(),
-            }
+                }
+            })?
         }
     };
 
@@ -199,16 +194,11 @@ mod tests {
     }
 
     #[test]
-    fn an_option_number_resolves_to_the_option_text() {
+    fn an_option_number_preserves_the_option_action() {
         let repo = scratch("option").join("repo");
         seed(&repo, "01RUN", "q-1");
         let recorded = answer(&repo, "q-1", Reply::Option(2)).expect("answer");
-        assert_eq!(
-            recorded.answer,
-            Answer::Answered {
-                text: "skip it".to_owned()
-            }
-        );
+        assert_eq!(recorded.answer, Answer::Declined);
 
         // Out of range is refused rather than silently clamped — the operator
         // meant a specific option.

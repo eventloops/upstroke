@@ -192,13 +192,17 @@ Schema 3 records at least:
   ref.
 
 These are execution-semantic events, so fresh v0.2-topology runs start at event
-schema 3. Older binaries must reject schema 3 before folding it; this is not an
-additive field smuggled into schema 2. An existing schema-1 or schema-2 run stays
-on the v0.1 sequential execution path until it finishes: schema 1 may perform
-the existing 1 -> 2 identity upgrade, but no live run ever appends a 2 -> 3
-transition. `TaskCommitted` remains the schema-2/v0.1 event and is not overloaded
-with two meanings. Starting a new run is how an operator adopts the v0.2
-topology.
+schema 4. The topology originally reserved schema 3, but the complete-review
+and atomic sequential-attempt settlement contracts used that boundary first: a
+schema-2 binary can ignore the recorded timeout and truncate a prompt, or ignore
+an embedded ladder decision and repeat a settled failure, so schema 3 must
+remain their downgrade barrier. Older binaries must reject schema 4 before folding
+topology events; this is not an additive field smuggled into an earlier schema.
+An existing schema-1, schema-2, or schema-3 run stays on the sequential execution
+path until it finishes. It may perform the review-contract upgrade to schema 3,
+but no live run ever appends a 3 -> 4 transition. `TaskCommitted` remains the
+sequential event and is not overloaded with two meanings. Starting a new run is
+how an operator adopts the v0.2 topology.
 
 Only the coordinator owns `EventLog` and Git ref mutation. Tokio workers return
 typed results over channels. This preserves the current invariant that live
@@ -420,8 +424,8 @@ The implementation is not complete until tests demonstrate:
   atomically register the next repair and question in `AwaitingInput`, and spend
   nothing further until an answer; a delayed repair dispatch uses the current
   integration head while retaining the rejecting head as lineage evidence;
-- schema-2 runs continue on the sequential topology without a 2 -> 3 upgrade,
-  while a schema-2 binary refuses a fresh schema-3 run;
+- schema-3 runs continue on the sequential topology without a 3 -> 4 upgrade,
+  while a schema-3 binary refuses a fresh schema-4 run;
 - status/replay and the live coordinator derive identical task and queue state;
 - host and container runners preserve adapter parsing, while the container
   prevents reviewer writes and gate writes outside its mounted workspace and a
