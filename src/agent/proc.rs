@@ -848,6 +848,7 @@ mod termination {
     fn spawn_reaper() -> Result<Reaper, String> {
         use std::os::unix::ffi::OsStrExt;
 
+        verify_group_scanner()?;
         let mut command = [-1; 2];
         let mut ack = [-1; 2];
         let cleanup_paths = crate::rundir::active_cleanup_lease_paths()
@@ -967,6 +968,18 @@ mod termination {
 
     fn install_reaper_dispositions() -> bool {
         unsafe {
+            // A library host may own SIGCHLD and reap children from its
+            // handler. The private reaper must not inherit that callback (or
+            // SA_NOCLDWAIT): either can consume the stopped anchor before the
+            // reaper's blocking waitpid observes it.
+            let mut child_action: libc::sigaction = std::mem::zeroed();
+            child_action.sa_sigaction = libc::SIG_DFL;
+            child_action.sa_flags = 0;
+            if libc::sigemptyset(&mut child_action.sa_mask) != 0
+                || libc::sigaction(libc::SIGCHLD, &child_action, std::ptr::null_mut()) != 0
+            {
+                return false;
+            }
             for signal in [
                 libc::SIGINT,
                 libc::SIGTERM,
@@ -1554,12 +1567,41 @@ mod termination {
 
     fn close_inherited_fds(keep: &[libc::c_int], open_max: libc::c_int) {
         // The fork must not retain the run lock, event file, pipes, or secrets.
-        // Closing descriptors is async-signal-safe and the child never returns
-        // to Rust runtime code after this point.
+        // Linux close_range keeps this bounded even when RLIMIT_NOFILE is in
+        // the millions. Older kernels and other Unix hosts retain the
+        // syscall-only per-descriptor fallback.
+        #[cfg(target_os = "linux")]
+        if close_ranges_except(keep) {
+            return;
+        }
         for fd in 0..open_max {
             if !keep.contains(&fd) {
                 close_fd(fd);
             }
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn close_ranges_except(keep: &[libc::c_int]) -> bool {
+        let mut first = 0_u32;
+        loop {
+            let next_keep = keep
+                .iter()
+                .copied()
+                .filter(|fd| *fd >= 0 && (*fd as u32) >= first)
+                .map(|fd| fd as u32)
+                .min();
+            let last = next_keep.map_or(u32::MAX, |fd| fd.saturating_sub(1));
+            if first <= last {
+                let result = unsafe { libc::syscall(libc::SYS_close_range, first, last, 0_u32) };
+                if result != 0 {
+                    return false;
+                }
+            }
+            let Some(kept) = next_keep else {
+                return true;
+            };
+            first = kept + 1;
         }
     }
 
@@ -1594,6 +1636,26 @@ mod termination {
                 return;
             }
         }
+    }
+
+    fn verify_group_scanner() -> Result<(), String> {
+        let own_group = unsafe { libc::getpgrp() };
+        // Process enumeration can race an unrelated process exiting. Retry a
+        // few complete snapshots, but refuse before launching an agent when
+        // the platform capability is persistently absent (for example a
+        // Linux container without a mounted/readable procfs).
+        for _ in 0..5 {
+            match group_has_non_zombie_members(own_group) {
+                Some(true) => return Ok(()),
+                Some(false) => {
+                    return Err(format!(
+                        "Unix process-group scanner did not find the current group {own_group}"
+                    ));
+                }
+                None => thread::sleep(Duration::from_millis(1)),
+            }
+        }
+        Err("Unix process-group scanner is unavailable; refusing to launch an agent whose cleanup could not be verified".to_owned())
     }
 
     #[cfg(target_os = "linux")]
@@ -1988,6 +2050,88 @@ mod termination {
     #[cfg(test)]
     mod tests {
         use super::*;
+        use std::process::{Command, Stdio};
+        use std::time::Instant;
+
+        static REAPED_CHILD_STOP: AtomicBool = AtomicBool::new(false);
+
+        extern "C" fn reap_child_transitions(_: libc::c_int) {
+            if REAPED_CHILD_STOP.swap(true, Ordering::SeqCst) {
+                return;
+            }
+            let mut status = 0;
+            let child = unsafe { libc::waitpid(-1, &mut status, libc::WNOHANG | libc::WUNTRACED) };
+            if child > 0 && libc::WIFSTOPPED(status) {
+                // Keep a broken implementation from leaking the consumed,
+                // permanently stopped anchor after this regression fails.
+                let _ = unsafe { libc::kill(child, libc::SIGKILL) };
+            }
+        }
+
+        #[test]
+        #[ignore = "subprocess helper"]
+        fn sigchld_reaper_host_helper() {
+            if std::env::var_os("TACTUS_SIGCHLD_REAPER_HELPER").is_none() {
+                return;
+            }
+            REAPED_CHILD_STOP.store(false, Ordering::SeqCst);
+            assert_ne!(
+                unsafe {
+                    libc::signal(
+                        libc::SIGCHLD,
+                        reap_child_transitions as *const () as libc::sighandler_t,
+                    )
+                },
+                libc::SIG_ERR
+            );
+            let target = unsafe { libc::fork() };
+            if target == 0 {
+                let _ = unsafe { libc::setpgid(0, 0) };
+                loop {
+                    unsafe { libc::pause() };
+                }
+            }
+            assert!(target > 0);
+            let result = unsafe { libc::setpgid(target, target) };
+            assert!(
+                result == 0 || matches!(last_errno(), libc::EACCES | libc::EPERM),
+                "setpgid: {}",
+                std::io::Error::last_os_error()
+            );
+
+            let reaper = spawn_reaper().expect("spawn private reaper");
+            assert!(reaper.register_raw(target), "register target group");
+            assert!(reaper.cleanup(target), "cleanup target group");
+            let _ = unsafe { libc::waitpid(target, std::ptr::null_mut(), 0) };
+        }
+
+        #[test]
+        fn a_host_sigchld_reaper_cannot_consume_the_private_anchor() {
+            use std::os::unix::process::CommandExt;
+
+            let mut command = Command::new(std::env::current_exe().expect("test executable"));
+            command
+                .args(["sigchld_reaper_host_helper", "--ignored", "--nocapture"])
+                .env("TACTUS_SIGCHLD_REAPER_HELPER", "1")
+                .process_group(0)
+                .stdout(Stdio::null())
+                .stderr(Stdio::null());
+            let mut child = command.spawn().expect("spawn SIGCHLD helper");
+            let pid = i32::try_from(child.id()).expect("helper pid");
+            let deadline = Instant::now() + Duration::from_secs(5);
+            loop {
+                if let Some(status) = child.try_wait().expect("poll SIGCHLD helper") {
+                    assert!(status.success(), "SIGCHLD helper status: {status}");
+                    break;
+                }
+                if Instant::now() >= deadline {
+                    let _ = unsafe { libc::kill(-pid, libc::SIGKILL) };
+                    let _ = child.wait();
+                    panic!("inherited SIGCHLD reaper consumed the private anchor transition");
+                }
+                thread::sleep(Duration::from_millis(10));
+            }
+        }
 
         #[test]
         fn a_launch_cannot_enter_after_the_suspend_snapshot() {
@@ -2366,7 +2510,7 @@ mod tests {
         let output =
             run_with_timeout(command, "", Duration::from_secs(30)).expect("signal helper command");
         if std::env::var_os("TACTUS_SIGNAL_HELPER_EXPECT_RETURN").is_some() {
-            assert_eq!(output.code, Some(0));
+            assert_eq!(output.code, Some(0), "supervised output: {output:?}");
             if custom_handler {
                 assert_eq!(unsafe { libc::raise(libc::SIGTERM) }, 0);
                 assert!(
@@ -2420,6 +2564,7 @@ mod tests {
         scratch: std::path::PathBuf,
         marker: std::path::PathBuf,
         finish: std::path::PathBuf,
+        diagnostic: std::path::PathBuf,
         supervised_pgid: Option<i32>,
         active: bool,
     }
@@ -2433,6 +2578,11 @@ mod tests {
         fn complete(&mut self) {
             self.active = false;
             let _ = std::fs::remove_dir_all(&self.scratch);
+        }
+
+        fn diagnostic(&self) -> String {
+            std::fs::read_to_string(&self.diagnostic)
+                .unwrap_or_else(|error| format!("<could not read helper diagnostic: {error}>"))
         }
     }
 
@@ -2473,6 +2623,11 @@ mod tests {
         let ready = scratch.join("ready");
         let marker = scratch.join("leaked");
         let finish = scratch.join("finish");
+        let diagnostic = scratch.join("helper.log");
+        let diagnostic_stdout = std::fs::File::create(&diagnostic).expect("helper diagnostic");
+        let diagnostic_stderr = diagnostic_stdout
+            .try_clone()
+            .expect("clone helper diagnostic");
 
         let mut helper = Command::new(std::env::current_exe().expect("test executable"));
         helper
@@ -2485,8 +2640,8 @@ mod tests {
             // group. A regression must fail the test, never suspend the test
             // runner that is responsible for reporting and cleaning it up.
             .process_group(0)
-            .stdout(Stdio::null())
-            .stderr(Stdio::null());
+            .stdout(Stdio::from(diagnostic_stdout))
+            .stderr(Stdio::from(diagnostic_stderr));
         if expect_return {
             helper.env("TACTUS_SIGNAL_HELPER_EXPECT_RETURN", "1");
         }
@@ -2543,6 +2698,7 @@ mod tests {
             scratch,
             marker,
             finish,
+            diagnostic,
             supervised_pgid: None,
             active: true,
         };
@@ -2644,8 +2800,9 @@ mod tests {
         let status = wait_for_exit(&mut helper.child, Duration::from_secs(10))
             .expect("ignored SIGHUP helper completes normally");
         let survived = helper.marker.exists();
+        let diagnostic = helper.diagnostic();
         helper.complete();
-        assert!(status.success(), "helper status: {status}");
+        assert!(status.success(), "helper status: {status}\n{diagnostic}");
         assert!(survived, "nohup-style SIGHUP unexpectedly killed the agent");
     }
 
@@ -2655,8 +2812,9 @@ mod tests {
         let mut helper = spawn_signal_helper("custom-handler", true, false);
         let status = wait_for_exit(&mut helper.child, Duration::from_secs(10))
             .expect("custom-handler helper completes normally");
+        let diagnostic = helper.diagnostic();
         helper.complete();
-        assert!(status.success(), "helper status: {status}");
+        assert!(status.success(), "helper status: {status}\n{diagnostic}");
     }
 
     #[cfg(unix)]
@@ -2667,8 +2825,9 @@ mod tests {
         assert_eq!(unsafe { libc::kill(-pid, libc::SIGTSTP) }, 0);
         let status = wait_for_exit(&mut helper.child, Duration::from_secs(10))
             .expect("custom job-control helper completes normally");
+        let diagnostic = helper.diagnostic();
         helper.complete();
-        assert!(status.success(), "helper status: {status}");
+        assert!(status.success(), "helper status: {status}\n{diagnostic}");
     }
 
     #[cfg(unix)]
@@ -2769,8 +2928,9 @@ mod tests {
         let status = wait_for_exit(&mut helper.child, Duration::from_secs(10))
             .expect("continued helper completes normally");
         let resumed = helper.marker.exists();
+        let diagnostic = helper.diagnostic();
         helper.complete();
-        assert!(status.success(), "helper status: {status}");
+        assert!(status.success(), "helper status: {status}\n{diagnostic}");
         assert!(resumed, "the isolated agent was not continued with Tactus");
     }
 
@@ -2789,8 +2949,9 @@ mod tests {
         std::fs::write(&helper.finish, "finish").expect("release supervised worker");
         let status = wait_for_exit(&mut helper.child, Duration::from_secs(10))
             .expect("guard with an unblocked mask wakes the suspended host");
+        let diagnostic = helper.diagnostic();
         helper.complete();
-        assert!(status.success(), "helper status: {status}");
+        assert!(status.success(), "helper status: {status}\n{diagnostic}");
     }
 
     #[cfg(unix)]
@@ -2808,8 +2969,9 @@ mod tests {
         std::fs::write(&helper.finish, "finish").expect("release supervised worker");
         let status = wait_for_exit(&mut helper.child, Duration::from_secs(10))
             .expect("guard relay wakes the custom-handler host");
+        let diagnostic = helper.diagnostic();
         helper.complete();
-        assert!(status.success(), "helper status: {status}");
+        assert!(status.success(), "helper status: {status}\n{diagnostic}");
     }
 
     #[cfg(unix)]
@@ -2833,8 +2995,9 @@ mod tests {
         assert_eq!(unsafe { libc::kill(-pid, libc::SIGCONT) }, 0);
         let status = wait_for_exit(&mut helper.child, Duration::from_secs(10))
             .expect("continued helper completes normally");
+        let diagnostic = helper.diagnostic();
         helper.complete();
-        assert!(status.success(), "helper status: {status}");
+        assert!(status.success(), "helper status: {status}\n{diagnostic}");
     }
 
     #[cfg(unix)]
@@ -2852,8 +3015,9 @@ mod tests {
             wait_for_exit(&mut helper.child, Duration::from_secs(10)).unwrap_or_else(|| {
                 panic!("a continue racing with suspend stranded Tactus or its agent tree");
             });
+        let diagnostic = helper.diagnostic();
         helper.complete();
-        assert!(status.success(), "helper status: {status}");
+        assert!(status.success(), "helper status: {status}\n{diagnostic}");
     }
 
     #[cfg(unix)]
