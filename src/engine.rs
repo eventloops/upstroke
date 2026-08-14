@@ -5037,18 +5037,17 @@ mod tests {
                 }
                 let answer = match behavior {
                     ReviewBehavior::Pass => {
-                        "Checked every criterion.\n```json\n{\"pass\": true, \"reasons\": \
-                         [\"meets the acceptance criteria\"], \"required_changes\": []}\n```"
+                        "```json\n{\"pass\": true, \"reasons\": [\"meets the acceptance \
+                         criteria\"], \"required_changes\": []}\n```"
                     }
                     ReviewBehavior::Fail => {
-                        "The diff misses a case.\n```json\n{\"pass\": false, \"reasons\": \
-                         [\"no error handling for empty input\"], \"required_changes\": \
+                        "```json\n{\"pass\": false, \"reasons\": [\"no error handling for \
+                         empty input\"], \"required_changes\": \
                          [\"handle the empty-input case\"]}\n```"
                     }
                     ReviewBehavior::NeedsHuman => {
-                        "This turns on a product decision.\n```json\n{\"pass\": false, \
-                         \"reasons\": [\"the acceptance criteria contradict the API contract\"], \
-                         \"needs_human\": true}\n```"
+                        "```json\n{\"pass\": false, \"reasons\": [\"the acceptance criteria \
+                         contradict the API contract\"], \"needs_human\": true}\n```"
                     }
                     ReviewBehavior::Unparseable => "Looks fine to me, ship it.",
                     ReviewBehavior::RateLimited => unreachable!("handled above"),

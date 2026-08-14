@@ -1,7 +1,7 @@
 //! Review (DESIGN.md §11.2–§11.3): read-only worker profiles judge the
-//! engine-captured diff against the task's acceptance criteria, each ending its
-//! answer with a fenced JSON verdict. The parser does not depend on fence
-//! placement: it reads the final balanced, string-aware JSON object.
+//! engine-captured diff against the task's acceptance criteria. A judgement is
+//! authoritative only when the complete trimmed answer is one `json`-labelled
+//! fence containing one verdict object; prose and examples cannot approve.
 //!
 //! Two things make this more than a second opinion from the same model: a
 //! reviewer sees the *diff* rather than the implementer's account of it
@@ -833,7 +833,7 @@ fn materialize_prompt(cx: &ReviewCx<'_>) -> Result<String, TactusError> {
         "\nCheck at least: does it satisfy every acceptance criterion; does it do anything the \
          task did not ask for; does it break existing behavior; are there obvious defects, \
          missing error handling, or untested edge cases.\n\n\
-         End your reply with a single fenced JSON block, and nothing after it:\n\n\
+         Reply with NOTHING except a single fenced JSON block:\n\n\
          ```json\n\
          {\"pass\": <true or false>, \"reasons\": [<why you reached this verdict>], \
          \"required_changes\": [<what must change before this can pass>], \"needs_human\": \
@@ -914,74 +914,25 @@ fn add_cost(current: Option<f64>, extra: Option<f64>) -> Option<f64> {
     }
 }
 
-/// The verdict is the LAST JSON object in the reply, which must itself be
-/// well-formed.
+/// Parse the one authoritative verdict envelope.
 ///
-/// Deliberately NOT fence-driven. Fences cannot be tracked reliably here: the
-/// reviewer is asked to cite the diff, and quoted diff content routinely
-/// contains fence lines of its own, which desynchronises any open/close
-/// pairing and silently drops the real answer. Scanning for balanced,
-/// string-aware `{...}` spans is immune to that, and accepts a reviewer who
-/// answered in substance without a fence.
-///
-/// "Last wins" is the §11.2 rule and the safe direction: models restate the
-/// requested shape before answering, so an earlier object is an example, not
-/// a verdict. Nothing here falls back to an earlier candidate when the final
-/// one is malformed — that would turn a mangled rejection into an approval.
-/// Unparseable output must earn the re-ask instead.
+/// The complete trimmed reply must be exactly one `json`-labelled Markdown
+/// fence whose body is exactly one JSON object. This deliberately rejects
+/// useful-looking prose, quoted examples, bare JSON, extra fences, and trailing
+/// commentary: none of those forms proves that the reviewer meant the object
+/// as its verdict. Unparseable output earns the one §11.2 re-ask instead.
 pub fn parse_verdict(text: &str) -> Option<Verdict> {
-    // The LAST object only — never a search backwards for one that happens to
-    // parse. Models restate the requested shape before answering, so an
-    // earlier object is an example; accepting it when the real answer is
-    // malformed converts a rejection into an approval. A botched final answer
-    // must cost a re-ask, which is what returning None buys.
-    let (objects, unclosed) = json_objects(text);
-    if unclosed {
+    // Normalise the line ending emitted by Windows CLIs, but do not otherwise
+    // rewrite the answer: the wrapper itself is part of the authority boundary.
+    let normalized = text.trim().replace("\r\n", "\n");
+    let candidate = normalized
+        .strip_prefix("```json\n")?
+        .strip_suffix("\n```")?
+        .trim();
+    if candidate.is_empty() {
         return None;
     }
-    verdict_from_json(objects.last()?)
-}
-
-/// Every balanced `{...}` span in `text`, outermost only, in document order,
-/// plus whether a later object began but never closed. Braces inside JSON
-/// strings (and their escapes) do not count.
-fn json_objects(text: &str) -> (Vec<String>, bool) {
-    let bytes = text.as_bytes();
-    let mut spans = Vec::new();
-    let mut depth = 0usize;
-    let mut start = 0usize;
-    let mut in_string = false;
-    let mut escaped = false;
-
-    for (index, byte) in bytes.iter().enumerate() {
-        if in_string {
-            if escaped {
-                escaped = false;
-            } else if *byte == b'\\' {
-                escaped = true;
-            } else if *byte == b'"' {
-                in_string = false;
-            }
-            continue;
-        }
-        match byte {
-            b'"' if depth > 0 => in_string = true,
-            b'{' => {
-                if depth == 0 {
-                    start = index;
-                }
-                depth += 1;
-            }
-            b'}' if depth > 0 => {
-                depth -= 1;
-                if depth == 0 {
-                    spans.push(text[start..=index].to_owned());
-                }
-            }
-            _ => {}
-        }
-    }
-    (spans, depth != 0)
+    verdict_from_json(candidate)
 }
 
 fn verdict_from_json(candidate: &str) -> Option<Verdict> {
@@ -1312,8 +1263,8 @@ mod tests {
 
     #[test]
     fn parses_a_fenced_verdict() {
-        let text = "Looks reasonable.\n\n```json\n{\"pass\": true, \"reasons\": [\"meets the \
-                    criteria\"], \"required_changes\": []}\n```\n";
+        let text = "```json\n{\"pass\": true, \"reasons\": [\"meets the criteria\"], \
+                    \"required_changes\": []}\n```\n";
         let verdict = parse_verdict(text).expect("verdict");
         assert!(verdict.pass);
         assert_eq!(verdict.reasons, ["meets the criteria"]);
@@ -1321,27 +1272,34 @@ mod tests {
     }
 
     #[test]
-    fn the_last_block_wins_over_an_example() {
+    fn prose_and_an_example_before_a_filled_pass_are_not_authoritative() {
         let text = "I will answer in this shape:\n```json\n{\"pass\": true, \"reasons\": \
                     [\"example\"]}\n```\nAfter reading the diff:\n```json\n{\"pass\": false, \
                     \"reasons\": [\"no tests\"], \"required_changes\": [\"add a round-trip \
                     test\"]}\n```\n";
-        let verdict = parse_verdict(text).expect("verdict");
-        assert!(!verdict.pass, "the real answer is the last block");
-        assert_eq!(verdict.required_changes, ["add a round-trip test"]);
+        assert!(
+            parse_verdict(text).is_none(),
+            "multiple candidate blocks have no unambiguous authority"
+        );
     }
 
     #[test]
-    fn tolerates_plain_fences_bare_json_and_missing_lists() {
+    fn plain_fences_and_bare_json_are_not_authoritative() {
         let plain = "```\n{\"pass\": false}\n```";
-        let verdict = parse_verdict(plain).expect("plain fence");
-        assert!(!verdict.pass);
-        assert!(verdict.reasons.is_empty());
+        assert!(parse_verdict(plain).is_none());
 
         let bare = "Verdict: {\"pass\": true, \"reasons\": \"single string\"}";
-        let verdict = parse_verdict(bare).expect("bare json");
+        assert!(parse_verdict(bare).is_none());
+    }
+
+    #[test]
+    fn authoritative_envelope_accepts_crlf_and_optional_lists() {
+        let verdict =
+            parse_verdict("```json\r\n{\"pass\": true, \"reasons\": \"single string\"}\r\n```")
+                .expect("one exact Windows-formatted verdict envelope");
         assert!(verdict.pass);
         assert_eq!(verdict.reasons, ["single string"]);
+        assert!(verdict.required_changes.is_empty());
     }
 
     #[test]
@@ -1382,38 +1340,41 @@ mod tests {
         let text = "I was unable to complete this review: the diff appears truncated. For \
                     reference the required shape is {\"pass\": true, \"reasons\": [\"why you \
                     reached this verdict\"]} but I cannot fill it in honestly.";
-        // The reply's only object IS a verdict shape, so it parses — but the
-        // prompt now ships a non-parseable schema, so a model echoing the
-        // real template cannot produce this.
         let echoed_schema = "the shape is {\"pass\": <true or false>, \"reasons\": [<why>]}";
         assert!(
             parse_verdict(echoed_schema).is_none(),
             "the prompt's schema must not itself parse as a verdict"
         );
-        // Documented residual: a model that invents a filled-in example still
-        // parses. Last-wins keeps it bounded to replies with no real verdict.
-        assert!(parse_verdict(text).is_some());
+        assert!(
+            parse_verdict(text).is_none(),
+            "a refusal cannot approve merely by quoting an invented filled example"
+        );
     }
 
     #[test]
-    fn quoted_fences_do_not_hide_the_real_verdict() {
-        // Reply citing a diff hunk that contains its own fences — the case
-        // that used to invert fence parity and drop the answer entirely.
+    fn quoted_fences_and_prose_do_not_create_an_authoritative_verdict() {
         let text = "Citing the change:\n```diff\n@@ -1,3 +1,3 @@\n ```bash\n-old\n+new\n \
                     ```\n```\nThat breaks the block.\n```json\n{\"pass\": false, \"reasons\": \
                     [\"README fence broken\"], \"required_changes\": [\"restore the fence\"]}\n\
                     ```\n";
-        let verdict = parse_verdict(text).expect("the real verdict is found");
-        assert!(!verdict.pass);
-        assert_eq!(verdict.required_changes, ["restore the fence"]);
+        assert!(parse_verdict(text).is_none());
     }
 
     #[test]
-    fn a_verdict_with_trailing_prose_in_the_fence_still_parses() {
+    fn trailing_prose_inside_the_fence_is_not_authoritative() {
         let text = "```json\n{\"pass\": false, \"reasons\": [\"no tests\"]}\nNote: please add \
                     coverage.\n```";
-        let verdict = parse_verdict(text).expect("object extracted from the block");
-        assert!(!verdict.pass);
+        assert!(parse_verdict(text).is_none());
+    }
+
+    #[test]
+    fn prose_before_a_filled_pass_object_is_not_an_authoritative_verdict() {
+        let text = "The required answer would be:\n```json\n{\"pass\": true, \"reasons\": \
+                    [\"example only\"], \"required_changes\": []}\n```";
+        assert!(
+            parse_verdict(text).is_none(),
+            "a filled example surrounded by prose cannot approve"
+        );
     }
 
     #[test]
