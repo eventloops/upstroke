@@ -1161,6 +1161,23 @@ mod tests {
         assert!(!design.contains("run the conductor under WSL"), "{design}");
     }
 
+    #[test]
+    fn design_does_not_authorize_legacy_subject_only_adoption() {
+        let design = include_str!("../DESIGN.md");
+        assert!(
+            design.contains("never** adopted from parent plus subject alone"),
+            "schema-1/2 recovery must stay fail-closed"
+        );
+        assert!(
+            design.contains("compare-and-swaps the **recorded full branch ref**"),
+            "schema-3 recovery must name the explicit-ref CAS authority"
+        );
+        assert!(
+            !design.contains("carries the message this engine would have written"),
+            "the removed subject heuristic must not return as normative design"
+        );
+    }
+
     struct Fixture {
         root: PathBuf,
         public: PathBuf,
