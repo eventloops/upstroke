@@ -1033,6 +1033,10 @@ impl RunState {
             // edits in a tree that has since been rolled back, and deferred
             // work has by definition already waited.
             EventBody::RunResumed { .. } => {
+                // `run_finished` describes the previous driver invocation, not
+                // an immutable terminal once a later resume is durable. Status,
+                // follow, and crash reporting must project the latest epoch.
+                self.finished = None;
                 for progress in &mut self.progress {
                     progress.session = None;
                     progress.resume_next = false;
@@ -1644,24 +1648,22 @@ pub fn recorded_reviews(events: &[Event]) -> Option<&crate::review::ReviewPlan> 
 /// The first review plan recorded while the complete-review contract was in
 /// force.
 ///
-/// Schema 1 and 2 plans deserialize an absent `pass_timeout_secs` through the
-/// current binary's serde default. That makes them usable as a legacy identity
-/// snapshot, but not authoritative for the timeout: a later binary could have
-/// a different default. A current start is complete in place. A legacy start
-/// becomes complete only when a schema-3 resume explicitly serializes the
-/// upgraded plan after the downgrade barrier.
+/// Schema 1 and 2 plans preserve an absent `pass_timeout_secs` as `None`. That
+/// makes their reviewer binding usable as a legacy identity snapshot, but not
+/// authoritative for the timeout: a later binary could have a different
+/// default. A current start is complete in place. A legacy start becomes
+/// complete only when a schema-3 resume explicitly serializes the upgraded
+/// plan after the downgrade barrier.
 pub fn recorded_complete_reviews(events: &[Event]) -> Option<&crate::review::ReviewPlan> {
     let started = events.iter().find_map(|event| match &event.body {
         EventBody::RunStarted { data } => Some(&**data),
         _ => None,
     })?;
     if started.schema >= 3 {
-        return started.reviews.as_ref().or_else(|| {
-            events.iter().find_map(|event| match &event.body {
-                EventBody::RunResumed { data } => data.reviews.as_ref(),
-                _ => None,
-            })
-        });
+        return started
+            .reviews
+            .as_ref()
+            .filter(|plan| plan.pass_timeout_secs.is_some());
     }
 
     let mut schema = started.schema;
@@ -1670,7 +1672,10 @@ pub fn recorded_complete_reviews(events: &[Event]) -> Option<&crate::review::Rev
             schema = data.to;
             None
         }
-        EventBody::RunResumed { data } if schema >= 3 => data.reviews.as_ref(),
+        EventBody::RunResumed { data } if schema >= 3 => data
+            .reviews
+            .as_ref()
+            .filter(|plan| plan.pass_timeout_secs.is_some()),
         _ => None,
     })
 }
@@ -1769,6 +1774,27 @@ pub(crate) fn ensure_supported_schema(
                 effective, SCHEMA_VERSION
             ),
         });
+    }
+    if started.schema >= 3 {
+        let plan = started.reviews.as_ref().ok_or_else(|| TactusError::EventLog {
+            path: path.to_path_buf(),
+            message: "event schema 3 requires run_started.reviews; refusing to re-derive a missing verification identity".to_owned(),
+        })?;
+        match plan.pass_timeout_secs {
+            Some(seconds) if seconds > 0 => {}
+            Some(_) => {
+                return Err(TactusError::EventLog {
+                    path: path.to_path_buf(),
+                    message: "event schema 3 requires run_started.reviews.pass_timeout_secs to be positive".to_owned(),
+                });
+            }
+            None => {
+                return Err(TactusError::EventLog {
+                    path: path.to_path_buf(),
+                    message: "event schema 3 requires run_started.reviews.pass_timeout_secs to be present; refusing to inherit a binary default".to_owned(),
+                });
+            }
+        }
     }
     Ok(effective)
 }
@@ -2289,6 +2315,63 @@ mod tests {
         let error = replay(events, vec!["t1".to_owned()], Path::new("events.jsonl"))
             .expect_err("the opening schema is not the only compatibility boundary");
         assert!(error.to_string().contains("Upgrade"), "{error}");
+    }
+
+    #[test]
+    fn run_resumed_clears_the_prior_terminal_marker() {
+        let mut state = RunState::new(vec!["t1".to_owned()]);
+        state.apply(&Event::now(EventBody::RunFinished {
+            data: RunFinished {
+                outcome: RunOutcome::Parked,
+                halted_at: None,
+                committed: 0,
+                parked: 1,
+            },
+        }));
+        assert!(state.finished.is_some());
+
+        state.apply(&Event::now(EventBody::RunResumed {
+            data: RunResumed {
+                head_sha: "abc".to_owned(),
+                interrupted_attempts: 0,
+                discarded: Vec::new(),
+                gates: None,
+                effort_policy: None,
+                reviews: None,
+                chains: None,
+            },
+        }));
+        assert_eq!(state.finished, None);
+    }
+
+    #[test]
+    fn schema_three_rejects_incomplete_review_identity_without_legacy_defaults() {
+        let EventBody::RunStarted { mut data } = started() else {
+            panic!("started() builds a run_started");
+        };
+        data.reviews = None;
+        let error = replay(
+            vec![Event::now(EventBody::RunStarted { data })],
+            vec!["t1".to_owned()],
+            Path::new("events.jsonl"),
+        )
+        .expect_err("schema 3 cannot re-derive a missing reviewer identity");
+        assert!(error.to_string().contains("run_started.reviews"), "{error}");
+
+        let EventBody::RunStarted { mut data } = started() else {
+            panic!("started() builds a run_started");
+        };
+        data.reviews
+            .as_mut()
+            .expect("current start records reviews")
+            .pass_timeout_secs = None;
+        let error = replay(
+            vec![Event::now(EventBody::RunStarted { data })],
+            vec!["t1".to_owned()],
+            Path::new("events.jsonl"),
+        )
+        .expect_err("schema 3 cannot inherit a timeout from this binary");
+        assert!(error.to_string().contains("pass_timeout_secs"), "{error}");
     }
 
     #[test]

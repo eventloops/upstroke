@@ -36,3 +36,9 @@ Passing review evidence URL:
 ## Risk and rollback
 
 <!-- Failure modes, compatibility impact, and the concrete revert/recovery path. -->
+
+## Review finding ledger
+
+| ID | Severity | Reviewed SHA / location | Provenance | Category | First bad / prior ID | Regression or documented guard | Disposition |
+|---|---|---|---|---|---|---|---|
+| None yet | — | — | — | — | — | — | — |

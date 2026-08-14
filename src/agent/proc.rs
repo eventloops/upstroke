@@ -3667,14 +3667,25 @@ mod tests {
         };
 
         let ready_deadline = Instant::now() + Duration::from_secs(10);
-        while !ready.exists() && Instant::now() < ready_deadline {
+        let mut last_identities = String::new();
+        let identities = loop {
             if let Some(status) = helper.child.try_wait().expect("poll helper") {
                 panic!("signal helper exited before its child was ready: {status}");
             }
+            if let Ok(current) = std::fs::read_to_string(&ready) {
+                if current.split_whitespace().count() == 4 {
+                    break current;
+                }
+                last_identities = current;
+            }
+            if Instant::now() >= ready_deadline {
+                panic!(
+                    "signal helper never published complete child identities; last payload: \
+                     {last_identities:?}"
+                );
+            }
             thread::sleep(Duration::from_millis(20));
-        }
-        assert!(ready.exists(), "signal helper never spawned its child");
-        let identities = std::fs::read_to_string(&ready).expect("signal helper identities");
+        };
         let fields = identities.split_whitespace().collect::<Vec<_>>();
         assert_eq!(fields.len(), 4, "signal helper identities: {identities}");
         assert_eq!(

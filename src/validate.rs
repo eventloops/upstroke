@@ -227,6 +227,7 @@ fn review_echo(plan: &ReviewPlan) -> String {
         "review: {} ({}s independent timeout per pass)",
         primary.describe(),
         plan.pass_timeout_secs
+            .expect("freshly resolved review plans always record their timeout")
     );
     match &plan.alternative {
         Some(alt) => line.push_str(&format!(

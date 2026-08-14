@@ -41,6 +41,28 @@ out of every pull-request workflow. A same-named GitHub Actions check therefore 
 rule. The repository owner remains responsible for the truth of the linked semantic review;
 dispatching without a real passing review is a policy violation.
 
+### Review finding ledger
+
+Do not let review findings disappear into a sequence of force-pushed fixes. Give every actionable
+finding a stable id and retain one ledger row in the pull request with:
+
+- severity, exact reviewed SHA and file/line, plus a concrete failure sequence;
+- provenance: `pre_existing`, `introduced_by_feature`, `fix_regression`, or `undetermined`;
+- category: `correctness`, `crash_consistency`, `security_trust`, `portability`, `liveness`,
+  `performance`, `compatibility`, or `docs_contract`;
+- first-bad commit where history can establish it, and any earlier finding id when it recurs; and
+- disposition plus prevention: the named regression test, or an explicit explanation of why a
+  deterministic test is infeasible and the documented guard/pitfall that prevents false claims.
+
+Provenance explains where a defect came from; it does not make a defect less real. Fix bounded
+pre-existing defects exposed by the changed path. A genuinely architectural or unrelated defect
+may move to a critical follow-up only when the current PR documents the limitation honestly and
+does not claim the missing guarantee. Every code defect fixed in the PR gets a regression test
+that fails on the first-bad shape. If the same failure is found again, link the old id and treat the
+missing or inadequate regression as a process defect too. Keep fixed and rejected rows in the
+ledger: the point is to preserve why a change was accepted, rejected, or deferred, not merely to
+list what remains open.
+
 ### App-gate migration record
 
 The original `frontier-reviewed` deployment gate failed its stale-SHA canary: GitHub reported a

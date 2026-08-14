@@ -240,6 +240,13 @@ on `PATH`. The [GitHub Copilot CLI](https://docs.github.com/en/copilot/reference
 is optional and unlocks the cross-family second opinion. Windows, macOS and Linux are all
 first-class.
 
+One crash-containment caveat is explicit: the current Windows host runner kills a process tree
+when it observes a timeout, but cannot retain ownership if the Tactus conductor itself is killed.
+Until the planned Job Object plus external cleanup guardian lands, use WSL or the external/container
+runner when a hard conductor crash must not leave an agent running or spending. Unix host runs
+retain a cleanup lease for ordinary descendants; deliberately daemonised processes require the
+external/container boundary on every platform.
+
 ## Licence
 
 **GNU AGPL v3 only** — see [LICENSE](LICENSE).

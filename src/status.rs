@@ -79,8 +79,15 @@ pub fn load(repo_root: &Path, run_id: Option<&str>) -> Result<RunStatus, TactusE
     let public = rundir::public_dir(repo_root, &run_id);
     let events_path = public.join("events.jsonl");
 
+    let (bytes, held) = stable_event_bytes_with(
+        &events_path,
+        || events::read_bytes(&events_path),
+        || rundir::is_running(&public),
+    )?;
+    let parsed = events::parse_bytes(&events_path, &bytes)?;
     let mut warnings = Vec::new();
-    let events = events::read_all(&events_path, &mut warnings)?;
+    warnings.extend(parsed.torn_tail_warning);
+    let events = parsed.events;
     let started = events::started_of(&events, &events_path)?.clone();
     let paths = RunPaths::from_parts(public.clone(), PathBuf::from(&started.private_dir));
 
@@ -103,7 +110,6 @@ pub fn load(repo_root: &Path, run_id: Option<&str>) -> Result<RunStatus, TactusE
     // alone made those seconds render as `run in progress`, dropping the stop
     // reason, the parked list, and the `resume --budget` line the operator is
     // there to find.
-    let held = rundir::is_running(&paths.public);
     let running = held && replayed.state.finished.is_none();
     // Settled in memory only: status is a pure read and must not write to a
     // run it is merely looking at. A resume records the same settlement as
@@ -334,9 +340,13 @@ pub fn follow(
     let mut tail = LogTail::new(status.paths.events());
     let mut warnings = Vec::new();
     let mut idle = 0;
+    let mut terminal = false;
     loop {
         let events = tail.poll(&mut warnings)?;
         if events.is_empty() {
+            if terminal {
+                return Ok(());
+            }
             // The idle budget is not a timeout on silence. A whole attempt —
             // the agent's thinking, its tool calls, the gates, the review —
             // folds into a single `attempt_finished`, so a healthy run says
@@ -364,11 +374,52 @@ pub fn follow(
         idle = 0;
         for event in &events {
             let _ = writeln!(out, "{}", describe(event));
-            if matches!(event.body, EventBody::RunFinished { .. }) {
-                return Ok(());
+            match &event.body {
+                EventBody::RunFinished { .. } => terminal = true,
+                EventBody::RunResumed { .. } => terminal = false,
+                _ => {}
             }
         }
+        if terminal {
+            return Ok(());
+        }
     }
+}
+
+/// Pair event bytes with a stable liveness observation. A dead snapshot is
+/// trusted only after an identical second read and a second dead probe; this
+/// prevents status from reading `attempt_started`, observing the conductor
+/// release its lock after writing the settlement, and then inventing an
+/// interrupted attempt from the stale prefix.
+fn stable_event_bytes_with(
+    path: &Path,
+    mut read: impl FnMut() -> Result<Vec<u8>, TactusError>,
+    mut held: impl FnMut() -> bool,
+) -> Result<(Vec<u8>, bool), TactusError> {
+    const MAX_SNAPSHOT_ATTEMPTS: usize = 8;
+    for _ in 0..MAX_SNAPSHOT_ATTEMPTS {
+        let held_before = held();
+        let first = read()?;
+        let held_after = held();
+        if held_before != held_after {
+            continue;
+        }
+        if held_after {
+            return Ok((first, true));
+        }
+
+        let second = read()?;
+        let held_final = held();
+        if !held_final && first == second {
+            return Ok((second, false));
+        }
+    }
+    Err(TactusError::Refused {
+        message: format!(
+            "{} kept changing while status checked whether its engine was live; retry status once the transition settles",
+            path.display()
+        ),
+    })
 }
 
 #[cfg(test)]
@@ -382,6 +433,29 @@ mod tests {
             ts: "2026-08-09T14:03:07Z".to_owned(),
             body,
         }
+    }
+
+    #[test]
+    fn a_live_to_dead_transition_retries_instead_of_settling_a_stale_prefix() {
+        use std::collections::VecDeque;
+
+        let mut reads = VecDeque::from([
+            b"attempt-started\n".to_vec(),
+            b"attempt-started\nattempt-finished\n".to_vec(),
+            b"attempt-started\nattempt-finished\n".to_vec(),
+        ]);
+        let mut probes = VecDeque::from([true, false, false, false, false]);
+        let (bytes, held) = stable_event_bytes_with(
+            Path::new("events.jsonl"),
+            || Ok(reads.pop_front().expect("bounded read sequence")),
+            || probes.pop_front().expect("bounded probe sequence"),
+        )
+        .expect("the second snapshot is stable");
+
+        assert!(!held);
+        assert_eq!(bytes, b"attempt-started\nattempt-finished\n");
+        assert!(reads.is_empty());
+        assert!(probes.is_empty());
     }
 
     #[test]

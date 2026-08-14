@@ -22,7 +22,7 @@ use std::time::Duration;
 use serde::{Deserialize, Serialize};
 
 use crate::error::TactusError;
-use crate::ir::{Answer, Question, QuestionId};
+use crate::ir::{Answer, Question, QuestionId, QuestionKind};
 use crate::ulid;
 use crate::util;
 
@@ -398,16 +398,33 @@ pub fn interpret(question: &Question, raw: &str) -> Answer {
         return Answer::Declined;
     }
     if let Ok(choice) = text.parse::<usize>()
-        && (1..=question.options.len()).contains(&choice)
-        && let Some(option) = question.options.get(choice - 1)
+        && let Some(answer) = answer_for_option(question, choice)
     {
-        return Answer::Answered {
-            text: option.clone(),
-        };
+        return answer;
     }
     Answer::Answered {
         text: text.to_owned(),
     }
+}
+
+/// Resolve one rendered, 1-indexed option without losing the action encoded by
+/// engine-authored terminal choices. `Question.options` predates typed option
+/// records, so the final option on every non-clarification question is the
+/// frozen decline action; treating its label as ordinary guidance would retry
+/// the task the operator explicitly chose to give up on.
+pub(crate) fn answer_for_option(question: &Question, choice: usize) -> Option<Answer> {
+    let index = choice.checked_sub(1)?;
+    let option = question.options.get(index)?;
+    let is_decline = question.kind != QuestionKind::Clarify
+        && question.options.len() >= 2
+        && index + 1 == question.options.len();
+    Some(if is_decline {
+        Answer::Declined
+    } else {
+        Answer::Answered {
+            text: option.clone(),
+        }
+    })
 }
 
 /// Pick the answer channel for a mode and the situation the run is actually in.
@@ -501,9 +518,8 @@ mod tests {
         );
         assert_eq!(
             interpret(&question(), "2"),
-            Answer::Answered {
-                text: "skip the task".to_owned()
-            }
+            Answer::Declined,
+            "the numbered give-up option is the same action as typing `skip`"
         );
         // Out of range is not silently clamped — it is the user's words.
         assert_eq!(

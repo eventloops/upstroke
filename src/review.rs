@@ -151,7 +151,6 @@ pub struct ReviewPass {
 /// outright when the plan hash or the resolved chains moved, so the task list
 /// this was built against and the one it is read back against are the same list.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(default)]
 pub struct ReviewPlan {
     /// Independent wall-clock budget for each pass, including its one
     /// verdict-format re-ask. Seconds keep the event record plain and stable.
@@ -159,23 +158,27 @@ pub struct ReviewPlan {
     /// binary would ignore this field *and* still truncate the prompt at 60
     /// KiB, so allowing it to resume could accept a partial review. The schema
     /// boundary makes that downgrade a refusal instead.
-    pub pass_timeout_secs: u64,
+    #[serde(default)]
+    pub pass_timeout_secs: Option<u64>,
     /// `None` ⟺ `[routing] review = { enabled = false }`. Anything else that
     /// fails to resolve is an error, never an empty plan.
+    #[serde(default)]
     pub primary: Option<PassBinding>,
     /// A different-family binding at the review tier, where this build can
     /// reach one. Used *only* to stop a task being reviewed by the model that
     /// wrote it; absent on a single-vendor install, which warns instead.
+    #[serde(default)]
     pub alternative: Option<PassBinding>,
     /// Per task, aligned with `plan.tasks`: the §11.3 second opinion this
     /// task's paths asked for.
+    #[serde(default)]
     pub second_opinion: Vec<Option<PassBinding>>,
 }
 
 impl Default for ReviewPlan {
     fn default() -> Self {
         Self {
-            pass_timeout_secs: crate::config::DEFAULT_REVIEW_PASS_TIMEOUT.as_secs(),
+            pass_timeout_secs: Some(crate::config::DEFAULT_REVIEW_PASS_TIMEOUT.as_secs()),
             primary: None,
             alternative: None,
             second_opinion: Vec::new(),
@@ -187,12 +190,15 @@ impl ReviewPlan {
     /// Validate and materialize the timeout recorded for this run. A corrupt
     /// zero must fail closed on resume rather than disabling supervision.
     pub fn pass_timeout(&self) -> Result<Duration, TactusError> {
-        if self.pass_timeout_secs == 0 {
-            return Err(TactusError::Refused {
+        match self.pass_timeout_secs {
+            Some(0) => Err(TactusError::Refused {
                 message: "the recorded review plan has pass_timeout_secs = 0; a review pass must have a positive wall-clock budget".to_owned(),
-            });
+            }),
+            Some(seconds) => Ok(Duration::from_secs(seconds)),
+            None => Err(TactusError::Refused {
+                message: "the recorded review plan has no pass_timeout_secs; event schema 3 requires the timeout to be explicit".to_owned(),
+            }),
         }
-        Ok(Duration::from_secs(self.pass_timeout_secs))
     }
 
     /// Every agent that could be asked to judge something — the set pre-flight
@@ -428,7 +434,7 @@ pub fn plan_for(
     }
 
     let resolved = ReviewPlan {
-        pass_timeout_secs: cfg.review_pass_timeout.as_secs(),
+        pass_timeout_secs: Some(cfg.review_pass_timeout.as_secs()),
         primary: Some(primary),
         alternative,
         second_opinion,
@@ -761,6 +767,17 @@ fn materialize_prompt(cx: &ReviewCx<'_>) -> Result<String, TactusError> {
 /// for direct callers, which still receive a refusal rather than a truncated
 /// review.
 pub(crate) fn complete_diff_error(diff: &str) -> Option<String> {
+    if diff.lines().any(|line| {
+        line == "GIT binary patch"
+            || (line.starts_with("Binary files ") && line.ends_with(" differ"))
+    }) {
+        return Some(
+            "review diff contains an opaque binary or attribute-suppressed path; the reviewer \
+             cannot inspect its changed bytes. Move generated/binary artifacts outside this task \
+             or replace them with a reviewable textual source representation"
+                .to_owned(),
+        );
+    }
     (diff.len() > MAX_DIFF_BYTES).then(|| {
         format!(
             "review diff is {} bytes, above the {}-byte complete-review limit; retry only if guidance can produce a smaller complete diff, or skip this frozen task and start a new run whose plan splits the work",
@@ -1312,6 +1329,29 @@ mod tests {
     }
 
     #[test]
+    fn an_opaque_diff_is_refused_before_the_reviewer_is_invoked() {
+        let task = task();
+        let opaque = "diff --git a/asset.bin b/asset.bin\nnew file mode 100644\n\
+                      GIT binary patch\nliteral 3\nKcmZQzU|?Vb0000\n";
+        let cx = ReviewCx {
+            adapter: &NeverInvokedAdapter,
+            profile: profile_for("claude-code", "claude-opus-5", "review", Effort::High),
+            lens: Lens::Acceptance,
+            task: &task,
+            diff: opaque,
+            artifacts: &[],
+            decisions: &[],
+            workspace: Path::new("."),
+            settings_dir: Path::new("."),
+            reviews_dir: Path::new("."),
+            stem: "00-t1-opaque".to_owned(),
+            timeout: Duration::from_secs(60),
+        };
+        let error = run_review(&cx).expect_err("opaque review must fail closed");
+        assert!(error.to_string().contains("opaque binary"), "{error}");
+    }
+
+    #[test]
     fn verdict_reask_uses_the_remaining_pass_deadline() {
         let root =
             std::env::temp_dir().join(format!("tactus-review-deadline-{}", std::process::id()));
@@ -1718,7 +1758,7 @@ mod tests {
         let mut warnings = Vec::new();
         let resolved =
             plan_for(&plan, &chains, &cfg, both_vendors, &mut warnings).expect("resolves");
-        assert_eq!(resolved.pass_timeout_secs, 7200);
+        assert_eq!(resolved.pass_timeout_secs, Some(7200));
         assert_eq!(
             resolved.pass_timeout().expect("valid"),
             Duration::from_secs(7200)
@@ -1752,22 +1792,24 @@ mod tests {
         // It rides on `run_started`, so a resume reads back exactly what the
         // run resolved (§15).
         let mut plan = plan_with(Some(binding("copilot", "gpt-5.3-codex")));
-        plan.pass_timeout_secs = 7200;
+        plan.pass_timeout_secs = Some(7200);
         let json = serde_json::to_string(&plan).expect("serialize");
         let back: ReviewPlan = serde_json::from_str(&json).expect("deserialize");
         assert_eq!(back, plan);
 
         // A log written before step 9 has no such field at all.
         let empty: ReviewPlan = serde_json::from_str("{}").expect("absent field defaults");
-        assert_eq!(empty, ReviewPlan::default());
-        assert_eq!(
-            empty.pass_timeout_secs,
-            crate::config::DEFAULT_REVIEW_PASS_TIMEOUT.as_secs(),
-            "legacy plans adopt the safe default rather than a zero-duration pass"
+        assert_eq!(empty.pass_timeout_secs, None);
+        assert_eq!(empty.primary, None);
+        assert_eq!(empty.alternative, None);
+        assert!(empty.second_opinion.is_empty());
+        assert!(
+            empty.pass_timeout().is_err(),
+            "wire absence must remain observable until the schema-aware resume establishes it"
         );
 
         let corrupt = ReviewPlan {
-            pass_timeout_secs: 0,
+            pass_timeout_secs: Some(0),
             ..ReviewPlan::default()
         };
         assert!(

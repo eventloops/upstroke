@@ -194,7 +194,9 @@ impl Workspace {
             "color.ui=false",
             "diff",
             "--cached",
+            "--binary",
             "--no-ext-diff",
+            "--no-textconv",
             "--no-color",
         ])
     }
@@ -391,5 +393,27 @@ mod tests {
         let diff = ws.capture_diff().expect("diff");
         assert!(diff.contains("+++ "), "plain unified diff: {diff}");
         assert!(!diff.contains('\u{1b}'), "no ANSI escapes: {diff}");
+    }
+
+    #[test]
+    fn opaque_git_diffs_are_rejected_before_review() {
+        let repo = temp_repo("opaque-diff");
+        let ws = Workspace::open(&repo).expect("open");
+
+        // A candidate controls .gitattributes. Without --binary, marking a
+        // source path -diff replaces all changed bytes with the tiny sentence
+        // "Binary files differ", which a read-only reviewer cannot recover.
+        fs::write(repo.join(".gitattributes"), "hidden.rs -diff\n").expect("attributes");
+        fs::write(repo.join("hidden.rs"), "fn hidden_change() {}\n").expect("hidden source");
+        fs::write(repo.join("asset.bin"), b"\0opaque bytes\xff").expect("binary asset");
+
+        let diff = ws.capture_diff().expect("binary-complete diff");
+        assert!(
+            diff.lines().any(|line| line == "GIT binary patch"),
+            "opaque paths must be represented explicitly: {diff}"
+        );
+        let refusal = crate::review::complete_diff_error(&diff)
+            .expect("an opaque patch cannot receive a semantic review");
+        assert!(refusal.contains("opaque binary"), "{refusal}");
     }
 }

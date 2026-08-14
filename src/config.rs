@@ -533,6 +533,14 @@ pub fn load_with(
                              `enabled = false` to run without review)"
                         ),
                     })?;
+                    if rr.attempts_per.is_some() {
+                        return Err(TactusError::Config {
+                            path: repo_path.clone(),
+                            message:
+                                "[routing] `review`: attempts_per applies only to task-kind roles"
+                                    .to_owned(),
+                        });
+                    }
                     review_enabled = rr.enabled.unwrap_or(true);
                     review_tier = rr
                         .tier
@@ -573,6 +581,14 @@ pub fn load_with(
                     path: repo_path.clone(),
                     message: format!(
                         "[routing] `{key}`: timeout_secs applies only to the `review` role"
+                    ),
+                });
+            }
+            if kr.enabled.is_some() {
+                return Err(TactusError::Config {
+                    path: repo_path.clone(),
+                    message: format!(
+                        "[routing] `{key}`: enabled applies only to the `review` role"
                     ),
                 });
             }
@@ -1441,6 +1457,36 @@ model = "claude-opus-4-8"
         assert!(
             message.contains("timeout_secs"),
             "names the accepted key: {message}"
+        );
+    }
+
+    #[test]
+    fn routing_role_fields_are_rejected_in_the_wrong_entry() {
+        let review = scratch(
+            "reviewattempts.toml",
+            "[routing]\nreview = { tier = \"frontier\", attempts_per = 2 }\n",
+        );
+        let mut warnings = Vec::new();
+        let error = load(Some(&review), &hermetic(), Some(&missing()), &mut warnings)
+            .expect_err("review must not silently ignore task retry policy");
+        assert!(
+            error
+                .to_string()
+                .contains("applies only to task-kind roles"),
+            "{error}"
+        );
+
+        let task = scratch(
+            "taskenabled.toml",
+            "[routing]\nfix = { chain = [\"small\"], enabled = false }\n",
+        );
+        let error = load(Some(&task), &hermetic(), Some(&missing()), &mut warnings)
+            .expect_err("task routing must not silently ignore review-only enablement");
+        assert!(
+            error
+                .to_string()
+                .contains("applies only to the `review` role"),
+            "{error}"
         );
     }
 

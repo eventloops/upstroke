@@ -320,7 +320,7 @@ fn cleanup_lock_file(public: &Path) -> PathBuf {
 /// Which OS lock, though, is not a detail. See [`imp`].
 #[derive(Debug)]
 pub struct RunLock {
-    _file: File,
+    _file: Option<File>,
     _cleanup: cleanup::CleanupLease,
     /// The run this claimed in [`claims`], given back on drop.
     claim: PathBuf,
@@ -328,13 +328,21 @@ pub struct RunLock {
 
 impl Drop for RunLock {
     fn drop(&mut self) {
-        // Before the file closes, so no window exists where the OS has let go
-        // and this process still thinks it holds the run.
-        claims().remove(&self.claim);
+        self.release_file_then(|| {});
     }
 }
 
 impl RunLock {
+    /// Close the process-scoped OS lock before publishing this process's claim
+    /// as free. On POSIX, closing the old descriptor after another thread has
+    /// acquired the same inode would release *all* of this process's locks on
+    /// that inode, silently stripping the new owner's exclusion.
+    fn release_file_then(&mut self, after_close: impl FnOnce()) {
+        drop(self._file.take());
+        after_close();
+        claims().remove(&self.claim);
+    }
+
     /// Take the lock on a run's public directory, or explain who has it.
     pub fn acquire(public: &Path) -> Result<Self, TactusError> {
         let path = lock_file(public);
@@ -370,7 +378,7 @@ impl RunLock {
         match taken {
             Ok(file) => match cleanup::take(public) {
                 Ok(cleanup) => Ok(Self {
-                    _file: file,
+                    _file: Some(file),
                     _cleanup: cleanup,
                     claim,
                 }),
@@ -978,6 +986,29 @@ mod tests {
         drop(held);
         assert!(!is_running(&paths.public));
         RunLock::acquire(&paths.public).expect("re-acquire after release");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn same_process_handoff_closes_old_descriptor_before_publishing_claim_free() {
+        let root = scratch("orderedhandoff");
+        let paths = paths_in(&root, "RUN1");
+        paths.create().expect("create");
+        let mut held = RunLock::acquire(&paths.public).expect("first acquire");
+
+        held.release_file_then(|| {
+            let file = File::open(lock_file(&paths.public)).expect("inspect released lock");
+            assert!(
+                matches!(imp::holder(&file), Holder::Nobody),
+                "the old descriptor must already be closed"
+            );
+            let error = RunLock::acquire(&paths.public)
+                .expect_err("the in-process claim stays published until after close");
+            assert!(error.to_string().contains("already driving run"), "{error}");
+        });
+
+        let replacement = RunLock::acquire(&paths.public).expect("handoff after ordered release");
+        drop(replacement);
     }
 
     #[test]

@@ -1004,6 +1004,16 @@ mod tests {
 
     const RUN_ID: &str = "01EXPORTTEST00000000000000";
 
+    #[test]
+    fn the_decision_index_names_the_shipped_export_schema() {
+        let index = include_str!("../decisions/README.md");
+        let expected = format!("schema-{EXPORT_SCHEMA_VERSION} JSONL/CSV projection");
+        assert!(
+            index.contains(&expected),
+            "decision index must track the public exporter constant: expected `{expected}`"
+        );
+    }
+
     struct Fixture {
         root: PathBuf,
         public: PathBuf,

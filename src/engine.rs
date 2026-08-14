@@ -23,7 +23,7 @@
 //! along. `report.json` is written from that state as a projection for humans;
 //! nothing ever reads it back.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -534,18 +534,21 @@ fn preflight_with_recorded(
         Some(mut plan) => {
             let configured = analysis.config.review_pass_timeout.as_secs();
             if recorded.legacy_review_timeout_missing {
-                plan.pass_timeout_secs = configured;
+                plan.pass_timeout_secs = Some(configured);
                 warnings.push(format!(
                     "this run's recorded review plan predates schema 3's per-pass timeout; this \
                      resume establishes today's configured {configured}s timeout in the \
                      append-only log before any more work starts"
                 ));
-            } else if plan.pass_timeout_secs != configured {
+            } else if plan.pass_timeout_secs != Some(configured) {
+                let recorded = plan
+                    .pass_timeout_secs
+                    .expect("a non-legacy recorded review plan has an explicit timeout");
                 warnings.push(format!(
                     "today's review pass timeout ({configured}s) differs from the one this run \
                      recorded ({}s). This resume keeps the recorded timeout so one run has one \
                      verification standard. Start a new run to adopt today's timeout.",
-                    plan.pass_timeout_secs
+                    recorded
                 ));
             }
             plan
@@ -1202,8 +1205,9 @@ fn resume_harness_inner(
         Recorded {
             reviews: recorded_reviews.clone(),
             gates: recorded_gates.clone(),
-            legacy_review_timeout_missing: recorded_reviews.is_some()
-                && recorded_complete_reviews.is_none(),
+            legacy_review_timeout_missing: recorded_reviews
+                .as_ref()
+                .is_some_and(|plan| plan.pass_timeout_secs.is_none()),
             gates_from_config: started.gates_from_config,
             routing: Some(RecordedRouting {
                 run_id: run_id.clone(),
@@ -1316,6 +1320,49 @@ fn resume_harness_inner(
         // command rather than a new run and a lost branch.
         Some(events::RunOutcome::Parked | events::RunOutcome::BudgetExceeded) | None => {}
     }
+
+    // `question_answered`, its design-defect record, and a declined task's
+    // failure predate atomic parking and are three durable appends. Preserve
+    // every crash prefix so a closed question can never strand its task in
+    // AwaitingInput with no legal way to answer it again.
+    let defect_questions: BTreeSet<QuestionId> = replayed
+        .events
+        .iter()
+        .filter_map(|event| match &event.body {
+            EventBody::DesignDefect { data } => Some(data.question.clone()),
+            _ => None,
+        })
+        .collect();
+    let missing_answer_defects: Vec<_> = replayed
+        .state
+        .questions
+        .iter()
+        .filter_map(|record| {
+            let answer = record.answer.as_ref()?;
+            (!defect_questions.contains(&record.question.id)).then(|| {
+                (
+                    record.question.id.clone(),
+                    util::head(record.question.context.trim(), 600),
+                    match answer {
+                        Answer::Answered { text } => text.clone(),
+                        _ => "declined".to_owned(),
+                    },
+                )
+            })
+        })
+        .collect();
+    let declined_questions: Vec<_> = replayed
+        .state
+        .questions
+        .iter()
+        .filter(|record| record.answer.as_ref() == Some(&Answer::Declined))
+        .map(|record| {
+            (
+                record.question.id.clone(),
+                record.question.affected_tasks.clone(),
+            )
+        })
+        .collect();
 
     let workspace = Workspace::open(&opts.repo_root)?;
     workspace.ensure_run_exclusions()?;
@@ -1457,6 +1504,31 @@ fn resume_harness_inner(
                 to: events::SCHEMA_VERSION,
             },
         })?;
+    }
+    for (question, context, answer) in missing_answer_defects {
+        run.emit(EventBody::DesignDefect {
+            data: events::DesignDefect {
+                question,
+                context,
+                answer,
+            },
+        })?;
+    }
+    for (question, affected) in declined_questions {
+        for task_id in affected {
+            let Some(index) = run.state.index_of(task_id.as_str()) else {
+                continue;
+            };
+            if !matches!(&run.state.states[index], TaskState::AwaitingInput(open) if open == &question)
+            {
+                continue;
+            }
+            let reason = format!(
+                "declined at the human rung: {}",
+                last_reason(&run.state.progress[index])
+            );
+            run.fail_task(index, FailureKind::Declined, reason)?;
+        }
     }
     // The `task_committed` the dead process never got to, now that the commit
     // has been checked against the record. First of everything this resume
@@ -5499,7 +5571,7 @@ mod tests {
             recorded.alternative, None,
             "there was nothing to rebind to when this run started"
         );
-        assert_eq!(recorded.pass_timeout_secs, 5400);
+        assert_eq!(recorded.pass_timeout_secs, Some(5400));
 
         fs::write(
             repo.join("tactus.toml"),
@@ -5761,6 +5833,7 @@ mod tests {
                         [routing]\nimplement = { chain = [\"small\"], attempts_per = 1 }\n";
         let (repo, run_id) = parked_run_with_config("oldlogreviews", original);
         let paths = paths_of(&repo, &run_id);
+        rewrite_run_started_as_schema_two(&paths);
         strip_run_started_field(&paths, "reviews");
 
         fs::write(
@@ -5783,7 +5856,7 @@ mod tests {
         let established = events::recorded_reviews(&events_of(&repo, &run_id))
             .cloned()
             .expect("the first resume writes down what it derived");
-        assert_eq!(established.pass_timeout_secs, 60);
+        assert_eq!(established.pass_timeout_secs, Some(60));
 
         fs::write(
             repo.join("tactus.toml"),
@@ -5798,7 +5871,7 @@ mod tests {
             events::recorded_reviews(&events_of(&repo, &run_id))
                 .expect("record survives")
                 .pass_timeout_secs,
-            60,
+            Some(60),
             "a later config edit cannot replace the established plan"
         );
         let warning = second
@@ -5860,7 +5933,7 @@ mod tests {
             events::recorded_complete_reviews(&logged)
                 .expect("schema-3 resume records a complete review plan")
                 .pass_timeout_secs,
-            47,
+            Some(47),
             "the absent legacy field is explicitly serialized, not left to serde defaults"
         );
 
@@ -5877,7 +5950,7 @@ mod tests {
             events::recorded_reviews(&events_of(&repo, &run_id))
                 .expect("upgraded review plan survives")
                 .pass_timeout_secs,
-            47,
+            Some(47),
             "a later binary/config default cannot reinterpret the upgraded timeout"
         );
         assert!(
@@ -5930,6 +6003,7 @@ mod tests {
 
         // Rewrite run_started as a pre-step-9 process would have written it.
         let paths = paths_of(&repo, &first.run_id);
+        rewrite_run_started_as_schema_two(&paths);
         strip_run_started_field(&paths, "reviews");
 
         crate::answer::answer(
@@ -6511,6 +6585,73 @@ mod tests {
             "§17's default on_task_failure is halt"
         );
         assert_eq!(report.outcome(), RunOutcome::Halted);
+    }
+
+    #[test]
+    fn resume_repairs_every_decline_settlement_crash_prefix() {
+        for (tag, last_durable_event) in [
+            ("answered", "question_answered"),
+            ("defect", "design_defect"),
+        ] {
+            let repo = temp_engine_repo(&format!("declineprefix-{tag}"));
+            seed(
+                &repo,
+                "## Doomed\n<!-- tactus: id=t1 kind=implement depends= -->\n",
+                Some("[routing]\nimplement = { chain = [\"small\"], attempts_per = 1 }\n"),
+            );
+            let mut opts = options(&repo);
+            opts.config_path = Some(repo.join("tactus.toml"));
+            let initial = source(vec![Effect::NoEdit], vec![ReviewBehavior::Pass]);
+            let answers = ScriptedAnswers::new(vec![Answer::Declined]);
+            let report = run_harness(
+                &opts,
+                &Harness {
+                    adapters: &initial,
+                    answers: Some(&answers),
+                    sleeper: None,
+                },
+            )
+            .expect("build a complete decline sequence");
+            let paths = paths_of(&repo, &report.run_id);
+            truncate_log_after(&paths, last_durable_event);
+
+            let resumed_source = fake(Effect::EditFile);
+            let resumed = resume_with(&resume_options(&repo, &report.run_id), &resumed_source)
+                .expect("resume repairs the incomplete settlement");
+            assert_eq!(resumed.outcome(), RunOutcome::Halted, "prefix {tag}");
+            assert!(
+                matches!(
+                    task(&resumed, "t1").status,
+                    TaskRunStatus::Failed {
+                        kind: FailureKind::Declined,
+                        ..
+                    }
+                ),
+                "prefix {tag}: {resumed:?}"
+            );
+            assert!(
+                resumed_source.adapter.runs().is_empty(),
+                "repair must settle the decline before another paid attempt"
+            );
+
+            let logged = events_of(&repo, &report.run_id);
+            assert_eq!(
+                logged
+                    .iter()
+                    .filter(|event| matches!(event.body, EventBody::DesignDefect { .. }))
+                    .count(),
+                1,
+                "the missing prefix is appended once"
+            );
+            assert_eq!(
+                logged
+                    .iter()
+                    .filter(|event| matches!(event.body, EventBody::TaskFailed { .. }))
+                    .count(),
+                1,
+                "the declined task is settled once"
+            );
+        }
     }
 
     #[test]
@@ -8664,6 +8805,50 @@ mod tests {
         for line in text.lines() {
             assert!(!line.is_empty());
         }
+    }
+
+    #[test]
+    fn follow_ignores_a_terminal_marker_superseded_by_resume() {
+        let repo = temp_engine_repo("followresume");
+        let source = fake(Effect::EditFile);
+        let report = run_with(&options(&repo), &source).expect("run");
+        let paths = paths_of(&repo, &report.run_id);
+        let mut warnings = Vec::new();
+        let mut log = events::EventLog::open(&paths.events(), &mut warnings).expect("open log");
+        log.append(EventBody::RunResumed {
+            data: events::RunResumed {
+                head_sha: "second-epoch".to_owned(),
+                interrupted_attempts: 0,
+                discarded: Vec::new(),
+                gates: None,
+                effort_policy: None,
+                reviews: None,
+                chains: None,
+            },
+        })
+        .expect("resume marker");
+        log.append(EventBody::RunFinished {
+            data: events::RunFinished {
+                outcome: events::RunOutcome::Complete,
+                halted_at: None,
+                committed: 1,
+                parked: 0,
+            },
+        })
+        .expect("second finish");
+        drop(log);
+
+        let loaded = replay_of(&repo, &report.run_id);
+        let sleeper = RecordingSleeper::default();
+        let mut out = Vec::new();
+        crate::status::follow(&loaded, &sleeper, Duration::ZERO, 2, &mut out).expect("follow");
+        let text = String::from_utf8(out).expect("utf8");
+        assert!(text.contains("resumed at second-epo"), "{text}");
+        assert_eq!(
+            text.matches("run finished").count(),
+            2,
+            "the historical finish must not truncate the later epoch: {text}"
+        );
     }
 
     #[test]
