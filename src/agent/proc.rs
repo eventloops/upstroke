@@ -2599,7 +2599,21 @@ mod termination {
                 thread::sleep(Duration::from_millis(1));
             }
 
-            let observed = group_has_non_zombie_members(pid);
+            // An unrelated process can disappear between `/proc` enumeration
+            // and its stat read, making one conservative scanner snapshot
+            // unknown. Cleanup retries that state; this regression must model
+            // the same contract rather than requiring an unrealistically
+            // quiescent runner on its first snapshot.
+            let scan_deadline = std::time::Instant::now() + Duration::from_secs(2);
+            let observed = loop {
+                match group_has_non_zombie_members(pid) {
+                    observed @ Some(_) => break observed,
+                    None if std::time::Instant::now() < scan_deadline => {
+                        thread::sleep(Duration::from_millis(1));
+                    }
+                    None => break None,
+                }
+            };
             unsafe {
                 let _ = libc::waitpid(pid, std::ptr::null_mut(), 0);
             }
