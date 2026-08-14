@@ -2008,7 +2008,7 @@ pub(crate) fn legacy_unsettled_failure(
     pending.into_iter().next()
 }
 
-fn validate_review_identity(
+pub(crate) fn validate_review_identity(
     plan: &crate::review::ReviewPlan,
     task_count: usize,
     path: &Path,

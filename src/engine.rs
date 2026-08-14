@@ -574,6 +574,12 @@ fn preflight_with_recorded(
             &mut warnings,
         )?,
     };
+    // A legacy record is not trustworthy merely because its missing marker
+    // fields can be filled. Validate the complete inherited identity before
+    // probing an adapter or dispatching any paid work; otherwise a malformed
+    // schema-2 pass list can run once and only be rejected after it has been
+    // appended as schema 3.
+    events::validate_review_identity(&review_plan, analysis.plan.tasks.len(), &opts.plan_path)?;
     let review_pass_timeout = review_plan.pass_timeout()?;
 
     // Probe every agent the chains reference; a missing binary is a refusal
@@ -3460,6 +3466,16 @@ fn run_attempt(
     // Verification ladder (§11): outcome sanity → cheap static provenance →
     // gates → review. Cheapest and most objective first.
     let mut failure = evaluate_outcome(&outcome, &output);
+    if failure.is_none()
+        && let Some(error) = review::complete_diff_error(&outcome.diff)
+        && (matches!(error, review::CompleteDiffError::Opaque) || !cx.reviewers.is_empty())
+    {
+        let kind = match error {
+            review::CompleteDiffError::Opaque => FailureKind::ReviewInputOpaque,
+            review::CompleteDiffError::TooLarge { .. } => FailureKind::ReviewInputTooLarge,
+        };
+        failure = Some(AttemptFailure::new(kind, error.to_string()).from_reviewer());
+    }
     if failure.is_none() && cx.task.kind == TaskKind::Test && !gates::diff_adds_tests(&outcome.diff)
     {
         failure = Some(
@@ -3473,16 +3489,6 @@ fn run_attempt(
                     .to_owned(),
             ),
         );
-    }
-    if failure.is_none()
-        && let Some(error) = review::complete_diff_error(&outcome.diff)
-        && (matches!(error, review::CompleteDiffError::Opaque) || !cx.reviewers.is_empty())
-    {
-        let kind = match error {
-            review::CompleteDiffError::Opaque => FailureKind::ReviewInputOpaque,
-            review::CompleteDiffError::TooLarge { .. } => FailureKind::ReviewInputTooLarge,
-        };
-        failure = Some(AttemptFailure::new(kind, error.to_string()).from_reviewer());
     }
     if failure.is_none()
         && let Some(problem) = workspace.review_input_problem()?
@@ -5180,6 +5186,42 @@ mod tests {
     }
 
     #[test]
+    fn opaque_test_task_parks_before_test_provenance_retry() {
+        let repo = temp_engine_repo("opaquetestprovenance");
+        seed(
+            &repo,
+            "## Add the regression\n<!-- tactus: id=t1 kind=test depends= -->\n",
+            Some(
+                "[interaction]\nmode = \"never\"\n\n\
+                 [routing]\ntest = { chain = [\"small\"], attempts_per = 3 }\n",
+            ),
+        );
+        let mut opts = options(&repo);
+        opts.config_path = Some(repo.join("tactus.toml"));
+        let source = fake(Effect::OpaqueEdit);
+        let report = run_with(&opts, &source).expect("opaque evidence parks fail-closed");
+
+        assert_eq!(report.outcome(), RunOutcome::Parked, "{report:?}");
+        let task = task(&report, "t1");
+        assert_eq!(task.attempts.len(), 1, "opaque evidence is not retried");
+        assert_eq!(
+            task.attempts[0]
+                .failure
+                .as_ref()
+                .map(|failure| failure.kind),
+            Some(FailureKind::ReviewInputOpaque),
+            "the intrinsic evidence failure wins over Test provenance"
+        );
+        assert_eq!(source.adapter.reviews_run(), 0);
+        assert!(
+            report.questions[0]
+                .question
+                .context
+                .contains("hides changed content")
+        );
+    }
+
+    #[test]
     fn failed_parking_payload_still_settles_and_cleans_the_attempt() {
         let repo = temp_engine_repo("oversizedreviewquestionwrite");
         seed(
@@ -6194,6 +6236,81 @@ mod tests {
             events::recorded_complete_reviews(&events_of(&repo, &run_id)),
             Some(&upgraded),
             "the next replay accepts and preserves the explicit markers"
+        );
+    }
+
+    #[test]
+    fn schema_two_inconsistent_review_identity_is_refused_before_upgrade_and_spend() {
+        let (repo, run_id) = parked_run("schema2badreviewidentity");
+        let paths = paths_of(&repo, &run_id);
+        let text = fs::read_to_string(paths.events()).expect("log");
+        let mut rewritten = false;
+        let lines: Vec<String> = text
+            .lines()
+            .map(|line| {
+                let mut value: serde_json::Value = serde_json::from_str(line).expect("event json");
+                if value.get("event").and_then(serde_json::Value::as_str) == Some("run_started") {
+                    let data = value
+                        .get_mut("data")
+                        .and_then(serde_json::Value::as_object_mut)
+                        .expect("run_started data");
+                    data.insert("schema".to_owned(), serde_json::Value::from(2));
+                    let reviews = data
+                        .get_mut("reviews")
+                        .and_then(serde_json::Value::as_object_mut)
+                        .expect("review plan");
+                    reviews.insert("enabled".to_owned(), serde_json::Value::Bool(true));
+                    reviews.insert("primary".to_owned(), serde_json::Value::Null);
+                    rewritten = true;
+                }
+                value.to_string()
+            })
+            .collect();
+        assert!(rewritten);
+        fs::write(paths.events(), format!("{}\n", lines.join("\n"))).expect("rewrite");
+
+        let question = events_of(&repo, &run_id)
+            .iter()
+            .find_map(|event| match &event.body {
+                EventBody::QuestionRaised { data, .. } => Some(data.question.id.to_string()),
+                EventBody::AttemptFinished {
+                    parking: Some(parking),
+                    ..
+                } => Some(parking.question.id.to_string()),
+                _ => None,
+            })
+            .expect("parked question");
+        crate::answer::answer(
+            &repo,
+            &question,
+            crate::answer::Reply::Text("continue".to_owned()),
+        )
+        .expect("answer");
+        let source = fake(Effect::EditFile);
+        let error = resume_harness_inner(
+            &resume_options(&repo, &run_id),
+            &Harness {
+                adapters: &source,
+                answers: None,
+                sleeper: None,
+            },
+        )
+        .expect_err("an inconsistent inherited review identity must fail closed");
+        assert!(
+            error
+                .to_string()
+                .contains("reviews.enabled does not match the recorded primary reviewer"),
+            "wrong error: {error}"
+        );
+        assert!(
+            source.adapter.runs().is_empty(),
+            "no worker may run under the malformed identity"
+        );
+        assert!(
+            !events_of(&repo, &run_id)
+                .iter()
+                .any(|event| matches!(event.body, EventBody::RunSchemaUpgraded { .. })),
+            "the malformed identity must not be blessed by a schema upgrade"
         );
     }
 
