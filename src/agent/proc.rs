@@ -357,6 +357,7 @@ mod termination {
         // into an acknowledgement EOF instead of delivering SIGPIPE from an
         // async signal handler that writes the command pipe.
         _command_keepalive_fd: libc::c_int,
+        pid: libc::pid_t,
     }
 
     enum Phase {
@@ -551,10 +552,40 @@ mod termination {
             guard,
         }));
         let monitored = Arc::clone(&state);
-        thread::Builder::new()
+        let (monitor_ready, monitor_started) = std::sync::mpsc::sync_channel(1);
+        let monitor = thread::Builder::new()
             .name("tactus-signal-monitor".to_owned())
-            .spawn(move || monitor(monitored))
-            .map_err(|error| format!("starting Unix signal monitor: {error}"))?;
+            .spawn(move || match prepare_monitor_signal_mask(policy) {
+                Ok(()) => {
+                    let _ = monitor_ready.send(Ok(()));
+                    monitor(monitored)
+                }
+                Err(error) => {
+                    let _ = monitor_ready.send(Err(error));
+                }
+            });
+        let monitor = match monitor {
+            Ok(monitor) => monitor,
+            Err(error) => {
+                guard.abort_setup();
+                return Err(format!("starting Unix signal monitor: {error}"));
+            }
+        };
+        match monitor_started.recv() {
+            Ok(Ok(())) => drop(monitor),
+            Ok(Err(error)) => {
+                let _ = monitor.join();
+                guard.abort_setup();
+                return Err(error);
+            }
+            Err(error) => {
+                let _ = monitor.join();
+                guard.abort_setup();
+                return Err(format!(
+                    "starting Unix signal monitor: readiness channel closed: {error}"
+                ));
+            }
+        }
 
         for signal in [libc::SIGINT, libc::SIGTERM, libc::SIGHUP, libc::SIGQUIT] {
             // Preserve every launcher-owned policy. POSIX carries SIG_IGN
@@ -594,6 +625,38 @@ mod termination {
                 SignalDisposition::Custom
             })
         }
+    }
+
+    fn prepare_monitor_signal_mask(policy: SignalPolicy) -> Result<(), String> {
+        if !policy.job_control {
+            return Ok(());
+        }
+
+        // An embedding host may have blocked SIGCONT on the thread that first
+        // called Tactus, and new threads inherit that mask. SIGCONT still wakes
+        // a stopped process when blocked, but its handler cannot run, so the
+        // isolated agent groups would remain stopped forever. Give only the
+        // private monitor thread an unblocked SIGCONT; every host thread keeps
+        // its original mask.
+        unsafe {
+            let mut signals: libc::sigset_t = std::mem::zeroed();
+            if libc::sigemptyset(&mut signals) != 0
+                || libc::sigaddset(&mut signals, libc::SIGCONT) != 0
+            {
+                return Err(format!(
+                    "building Unix signal-monitor mask: {}",
+                    std::io::Error::last_os_error()
+                ));
+            }
+            let result = libc::pthread_sigmask(libc::SIG_UNBLOCK, &signals, std::ptr::null_mut());
+            if result != 0 {
+                return Err(format!(
+                    "unblocking SIGCONT in Unix signal monitor: {}",
+                    std::io::Error::from_raw_os_error(result)
+                ));
+            }
+        }
+        Ok(())
     }
 
     fn install_handler(signal: libc::c_int) -> Result<(), String> {
@@ -1272,6 +1335,32 @@ mod termination {
     }
 
     impl Guard {
+        fn abort_setup(self) {
+            let _ = GUARD_COMMAND_FD.compare_exchange(
+                self.command_fd,
+                -1,
+                Ordering::SeqCst,
+                Ordering::SeqCst,
+            );
+            PROBE_PID.store(-1, Ordering::SeqCst);
+            for fd in [self.command_fd, self.ack_fd, self._command_keepalive_fd] {
+                close_fd(fd);
+            }
+            // SAFETY: `pid` is the unreaped child returned by `fork`. Killing
+            // the guard closes its probe pipe, so the descriptor-scrubbed
+            // grandchild exits as well.
+            unsafe {
+                let _ = libc::kill(self.pid, libc::SIGKILL);
+                loop {
+                    if libc::waitpid(self.pid, std::ptr::null_mut(), 0) >= 0
+                        || !last_errno_is_interrupted()
+                    {
+                        break;
+                    }
+                }
+            }
+        }
+
         fn arm(self) -> bool {
             write_byte(self.command_fd, GUARD_ARM) && self.read_ack() == Some(GUARD_ARM)
         }
@@ -1491,6 +1580,7 @@ mod termination {
             command_fd: command[1],
             ack_fd: ack[0],
             _command_keepalive_fd: command[0],
+            pid,
         };
         let mut probe_pid_bytes = [0_u8; 4];
         if guard.read_ack() != Some(GUARD_READY)
@@ -1818,8 +1908,11 @@ mod termination {
                 .filter(|fd| *fd >= 0 && (*fd as u32) >= first)
                 .map(|fd| fd as u32)
                 .min();
-            let last = next_keep.map_or(u32::MAX, |fd| fd.saturating_sub(1));
-            if first <= last {
+            // `first == kept` is an empty range. Saturating `kept - 1`
+            // would turn the fd-zero case into 0..=0 and close the descriptor
+            // we were explicitly asked to preserve.
+            if next_keep != Some(first) {
+                let last = next_keep.map_or(u32::MAX, |fd| fd - 1);
                 let result = unsafe { libc::syscall(libc::SYS_close_range, first, last, 0_u32) };
                 if result != 0 {
                     return false;
@@ -2360,6 +2453,67 @@ mod termination {
             }
         }
 
+        #[cfg(target_os = "linux")]
+        #[test]
+        #[ignore = "subprocess helper"]
+        fn linux_close_range_fd_zero_helper() {
+            if std::env::var_os("TACTUS_CLOSE_RANGE_FD_ZERO_HELPER").is_none() {
+                return;
+            }
+
+            // The Rust test harness may reopen a missing standard descriptor
+            // during startup, so close it at the final isolated point before
+            // the pipe that must receive fd zero.
+            let closed = unsafe { libc::close(libc::STDIN_FILENO) };
+            assert!(
+                closed == 0 || last_errno() == libc::EBADF,
+                "closing helper stdin: {}",
+                std::io::Error::last_os_error()
+            );
+            let mut pipe = [-1; 2];
+            assert_eq!(unsafe { libc::pipe(pipe.as_mut_ptr()) }, 0);
+            assert_eq!(pipe[0], 0, "closed stdin was not reused as pipe fd zero");
+            let open_max = unsafe { libc::sysconf(libc::_SC_OPEN_MAX) };
+            assert!(open_max > 0, "invalid open-file descriptor ceiling");
+            let open_max = libc::c_int::try_from(open_max).expect("descriptor ceiling fits c_int");
+
+            close_inherited_fds(
+                &[pipe[0], pipe[1], libc::STDOUT_FILENO, libc::STDERR_FILENO],
+                open_max,
+            );
+            let sent = [0x5a_u8];
+            let mut received = [0_u8];
+            assert!(write_raw(pipe[1], &sent), "write through kept pipe");
+            assert!(
+                read_raw_exact(pipe[0], &mut received),
+                "close_range closed kept fd zero"
+            );
+            assert_eq!(received, sent);
+        }
+
+        #[cfg(target_os = "linux")]
+        #[test]
+        fn linux_close_range_preserves_a_kept_fd_zero() {
+            let mut command = Command::new(std::env::current_exe().expect("test executable"));
+            command
+                .args([
+                    "linux_close_range_fd_zero_helper",
+                    "--ignored",
+                    "--nocapture",
+                ])
+                .env("TACTUS_CLOSE_RANGE_FD_ZERO_HELPER", "1")
+                .stdin(Stdio::null())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped());
+            let output = command.output().expect("run fd-zero close-range helper");
+            assert!(
+                output.status.success(),
+                "fd-zero helper failed: {}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+
         #[test]
         fn a_launch_cannot_enter_after_the_suspend_snapshot() {
             let state = Arc::new(Mutex::new(State {
@@ -2371,6 +2525,7 @@ mod termination {
                     command_fd: -1,
                     ack_fd: -1,
                     _command_keepalive_fd: -1,
+                    pid: -1,
                 },
             }));
             let (groups, _) = begin_suspend(&state).expect("begin suspend transition");
@@ -2729,13 +2884,18 @@ mod tests {
         let _cleanup_scope = _cleanup_lock
             .as_ref()
             .map(crate::rundir::RunLock::enter_cleanup_scope);
-        if std::env::var_os("TACTUS_BLOCK_SIGNAL").is_some() {
+        if let Some(blocked_signal) = std::env::var_os("TACTUS_BLOCK_SIGNAL") {
             // SAFETY: this disposable process deliberately models an embedding
-            // host that blocked SIGTERM before Tactus initialized supervision.
+            // host that blocked the selected signal before Tactus initialized
+            // supervision.
+            let blocked_signal = blocked_signal
+                .to_string_lossy()
+                .parse::<libc::c_int>()
+                .expect("numeric blocked signal");
             unsafe {
                 let mut blocked: libc::sigset_t = std::mem::zeroed();
                 assert_eq!(libc::sigemptyset(&mut blocked), 0);
-                assert_eq!(libc::sigaddset(&mut blocked, libc::SIGTERM), 0);
+                assert_eq!(libc::sigaddset(&mut blocked, blocked_signal), 0);
                 assert_eq!(
                     libc::sigprocmask(libc::SIG_BLOCK, &blocked, std::ptr::null_mut()),
                     0
@@ -3007,17 +3167,24 @@ mod tests {
         if tag == "custom-aux-signal" {
             helper.env("TACTUS_CUSTOM_AUX_SIGNAL_HANDLER", "1");
         }
-        if tag.contains("blocked") {
-            helper.env("TACTUS_BLOCK_SIGNAL", "1");
+        let blocked_signal = if tag == "job-control-cont-blocked" {
+            Some(libc::SIGCONT)
+        } else if tag.contains("blocked") {
+            Some(libc::SIGTERM)
+        } else {
+            None
+        };
+        if let Some(blocked_signal) = blocked_signal {
+            helper.env("TACTUS_BLOCK_SIGNAL", blocked_signal.to_string());
             // Block before exec so every thread subsequently created by the
             // Rust test harness inherits the host policy. Blocking only in the
             // selected test thread would leave another harness thread able to
-            // take the process-directed SIGTERM with its default disposition.
+            // receive the process-directed signal.
             unsafe {
-                helper.pre_exec(|| {
+                helper.pre_exec(move || {
                     let mut blocked: libc::sigset_t = std::mem::zeroed();
                     if libc::sigemptyset(&mut blocked) != 0
-                        || libc::sigaddset(&mut blocked, libc::SIGTERM) != 0
+                        || libc::sigaddset(&mut blocked, blocked_signal) != 0
                         || libc::sigprocmask(libc::SIG_BLOCK, &blocked, std::ptr::null_mut()) != 0
                     {
                         Err(std::io::Error::last_os_error())
@@ -3301,6 +3468,36 @@ mod tests {
         helper.complete();
         assert!(status.success(), "helper status: {status}\n{diagnostic}");
         assert!(resumed, "the isolated agent was not continued with Tactus");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_inherited_blocked_sigcont_still_releases_the_isolated_tree() {
+        let mut helper = spawn_signal_helper("job-control-cont-blocked", true, false);
+        let pid = helper.pid();
+        assert_eq!(unsafe { libc::kill(-pid, libc::SIGTSTP) }, 0);
+        assert!(
+            wait_for_stop(pid, Duration::from_secs(10)),
+            "Tactus did not enter a stopped job-control state"
+        );
+
+        let before =
+            std::fs::read_to_string(&helper.marker).expect("progress before blocked SIGCONT");
+        thread::sleep(Duration::from_millis(350));
+        let after =
+            std::fs::read_to_string(&helper.marker).expect("progress after blocked SIGCONT");
+        assert_eq!(
+            after, before,
+            "the isolated agent kept making progress while Tactus was suspended"
+        );
+
+        std::fs::write(&helper.finish, "finish").expect("release supervised worker");
+        assert_eq!(unsafe { libc::kill(-pid, libc::SIGCONT) }, 0);
+        let status = wait_for_exit(&mut helper.child, Duration::from_secs(10))
+            .expect("blocked SIGCONT stranded Tactus or its isolated agent tree");
+        let diagnostic = helper.diagnostic();
+        helper.complete();
+        assert!(status.success(), "helper status: {status}\n{diagnostic}");
     }
 
     #[cfg(unix)]
