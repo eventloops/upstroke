@@ -3182,12 +3182,12 @@ mod tests {
         const TEST_LIMIT: usize = 64 * 1024;
         #[cfg(windows)]
         let command = {
-            let mut command = Command::new("powershell");
+            let mut command = Command::new("cmd.exe");
             command.args([
-                "-NoProfile",
-                "-NonInteractive",
-                "-Command",
-                "while ($true) { [Console]::Out.WriteLine('0123456789abcdef') }",
+                "/D",
+                "/Q",
+                "/C",
+                "for /L %i in (1,1,2147483647) do @echo 0123456789abcdef",
             ]);
             command
         };
