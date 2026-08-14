@@ -5,7 +5,9 @@ export PATH="/usr/bin:/bin:$PATH"
 script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 root="$(cd "$script_dir/../.." && pwd)"
 workflow="$root/.github/workflows/frontier-review.yml"
+invalidation_workflow="$root/.github/workflows/frontier-review-invalidate.yml"
 canonical="printf '%s\\n' \"\$pr_body\" | bash .github/scripts/validate-pr-body.sh \"\$pr_title\""
+canonical_evidence="printf '%s\\n' \"\$pr_body\" | bash .github/scripts/validate-pr-ledger-evidence.sh \"\$head_sha\""
 
 validate_block="$(sed -n '/^  validate:/,/^  lint:/p' "$workflow")"
 attest_block="$(sed -n '/^  attest:/,$p' "$workflow")"
@@ -27,6 +29,11 @@ assert_trusted_validation() {
     echo "$name does not pass the fetched title/body to the canonical validator" >&2
     exit 1
   fi
+  if ! grep -Fq 'refs/pull/$PR_NUMBER/head:$ledger_ref' <<< "$block" ||
+     ! grep -Fq "$canonical_evidence" <<< "$block"; then
+    echo "$name does not resolve ledger evidence against the fetched exact PR history" >&2
+    exit 1
+  fi
 }
 
 assert_trusted_validation "validate job" "$validate_block"
@@ -41,6 +48,47 @@ validator_line="$(grep -nF "$canonical" "$workflow" | tail -n 1 | cut -d: -f1)"
 token_line="$(grep -nF 'name: Mint a repository-scoped review-gate token' "$workflow" | cut -d: -f1)"
 if [[ -z "$validator_line" || -z "$token_line" || "$validator_line" -ge "$token_line" ]]; then
   echo "the final trusted PR-policy validation must precede App-token minting" >&2
+  exit 1
+fi
+
+if ! grep -Fq 'pull_request_target:' "$invalidation_workflow" ||
+   ! grep -Fq 'types: [edited]' "$invalidation_workflow"; then
+  echo "frontier invalidation must be driven by trusted PR metadata-edit events" >&2
+  exit 1
+fi
+if ! grep -Fq 'if: github.event.changes.title != null || github.event.changes.body != null' \
+  "$invalidation_workflow"; then
+  echo "frontier invalidation is not restricted to title/body edits" >&2
+  exit 1
+fi
+if ! grep -Fq 'ref: ${{ github.sha }}' "$invalidation_workflow"; then
+  echo "frontier invalidation does not check out the trusted default-branch SHA" >&2
+  exit 1
+fi
+if grep -Fq 'ref: ${{ github.event.pull_request.head.sha }}' "$invalidation_workflow" ||
+   grep -Eq '^[[:space:]]+repository:[[:space:]]*\$\{\{[[:space:]]*github\.event\.pull_request\.head' \
+     "$invalidation_workflow"; then
+  echo "frontier invalidation must never check out candidate-controlled code" >&2
+  exit 1
+fi
+
+invalidate_token_line="$(grep -nF 'name: Mint the review-gate App token' \
+  "$invalidation_workflow" | cut -d: -f1)"
+invalidate_call_line="$(grep -nF 'bash .github/scripts/invalidate-frontier-check.sh' \
+  "$invalidation_workflow" | cut -d: -f1)"
+if [[ -z "$invalidate_token_line" || -z "$invalidate_call_line" ||
+      "$invalidate_token_line" -ge "$invalidate_call_line" ]]; then
+  echo "the metadata-edit job does not use the dedicated App to invalidate its own check" >&2
+  exit 1
+fi
+
+publish_line="$(grep -nF 'check_run="$(GH_TOKEN="$APP_TOKEN" gh api --method POST' \
+  "$workflow" | cut -d: -f1)"
+race_invalidation_line="$(grep -nF 'GH_TOKEN="$APP_TOKEN" bash .github/scripts/invalidate-frontier-check.sh' \
+  "$workflow" | cut -d: -f1)"
+if [[ -z "$publish_line" || -z "$race_invalidation_line" ||
+      "$publish_line" -ge "$race_invalidation_line" ]]; then
+  echo "the signer does not fail a just-published check when metadata races publication" >&2
   exit 1
 fi
 

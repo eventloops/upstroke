@@ -23,6 +23,9 @@ jobs:
     timeout-minutes: 5
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          fetch-depth: 0
+          persist-credentials: false
 
       - name: Validate title, evidence sections, and finding ledger
         shell: bash
@@ -31,3 +34,5 @@ jobs:
           PR_BODY: ${{ github.event.pull_request.body }}
         run: |
           printf '%s\n' "$PR_BODY" | bash .github/scripts/validate-pr-body.sh "$PR_TITLE"
+          printf '%s\n' "$PR_BODY" | bash .github/scripts/validate-pr-ledger-evidence.sh \
+            "${{ github.event.pull_request.head.sha }}"

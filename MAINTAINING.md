@@ -33,7 +33,10 @@ contract itself.
    validates the evidence comment, reruns formatting, Clippy, and
    all three platform test jobs from its trusted default-branch definition, then uses the dedicated
    `Tactus Frontier Review Gate` GitHub App to publish a successful `tactus-frontier-review` check
-   on the exact head.
+   on the exact head. Editing the PR title or body after that success causes the trusted
+   invalidator to turn the same App-owned check into a failure; repeat the frontier review and
+   attestation against the current metadata rather than treating an unchanged commit SHA as
+   unchanged review scope.
 8. Resolve every conversation, mark the PR ready, and merge with a merge commit. Do not push or
    force-push directly to `master`. Delete the source branch after merge.
 
@@ -47,6 +50,13 @@ dispatching without a real passing review is a policy violation.
 unprivileged feedback from the candidate they are editing. Its result is not trusted: the
 default-branch `repository_dispatch` workflow fetches the live title/body and runs its own canonical
 `validate-pr-body.sh` immediately after dispatch validation and again just before App-token minting.
+The separate `pull_request_target` invalidator is deliberately metadata-only: GitHub loads it from
+the default branch, it checks out only `github.sha` from that trusted base, and it never loads or
+executes the pull request. On a title/body edit it uses the dedicated App to PATCH every successful
+`tactus-frontier-review` check from that App on the unchanged head to `failure`. The signing workflow
+also re-reads metadata after publication and applies the same invalidation if an edit races the
+final API call. Do not add candidate checkout, PR-authored scripts, dependency installation, or
+any command derived from PR content to this privileged invalidator.
 
 ### Review finding ledger
 
@@ -75,6 +85,16 @@ The exact table header and canonical tokens in the pull-request template are mac
 and `file:line`, includes an explicit `A -> B -> failure` sequence, and uses one disposition:
 `fixed`, `rejected`, `deferred`, or `accepted-risk`. Update the validator and its rejection fixtures
 in the same pull request before changing this schema; aliases and free-form categories fail closed.
+
+`.github/scripts/validate-pr-ledger-evidence.sh` then resolves those claims against the exact PR
+head. A reviewed SHA must be an ancestor of that head, the named path and line must exist at the
+reviewed commit, and every backticked regression or guard identifier must occur in tracked exact-head
+content. Never cite an isolated worktree/lane commit that was later cherry-picked under another
+identity: bind the row to the first integrated PR commit and record the pre-commit lane in
+`First bad / prior ID` if it matters. When a regression is renamed or consolidated, update the live
+ledger to its current tracked name; do not preserve a stale claim by adding a no-op alias test. An
+explicit deterministic invariant may remain prose rather than a backticked identifier, but its
+wording must say what enforces it.
 
 ### App-gate migration record
 
@@ -135,11 +155,12 @@ The App is private, installed only on `keybindings/tactus`, and has metadata rea
 commit-statuses write. GitHub requires the latter at installation level to make the App eligible as
 an expected required-check source; the workflow never requests it in its token. The private key is
 an environment secret, never a repository secret. Only the final trusted `repository_dispatch` job
-declares `frontier-check-signer`; that environment's sole custom branch policy is the exact
-`master` branch. The short-lived installation token explicitly requests only `checks: write` and is
-revoked by the token action at job completion. The signer job has no deployment-write authority;
-the App-owned check is its only merge-gate output. Keep approval for workflow runs from **all**
-external contributors as a second, independent fork safeguard.
+and the metadata-only default-branch `pull_request_target` invalidator declare
+`frontier-check-signer`; that environment's sole custom branch policy is the exact `master` branch.
+Their short-lived installation tokens explicitly request only `checks: write` and are revoked by
+the token action at job completion. Neither job has deployment-write authority; the App-owned check
+is their only merge-gate output. Keep approval for workflow runs from **all** external contributors
+as a second, independent fork safeguard.
 
 Bootstrap and audit the external configuration through the API. Supply the downloaded PEM on stdin
 so it is never written into a command line, log, tracked file, or pull-request workflow:
@@ -193,8 +214,9 @@ down-scoped to `permission-checks: write`; it must not request `permission-statu
 Never commit, paste, or print the PEM. Delete the downloaded copy only after the environment secret
 has been stored and independently exercised successfully.
 
-The rules prevent accidental direct merges and stale-SHA evidence, and prevent same-name fork-check
-spoofing from satisfying the semantic gate. They do not defend against compromise or dishonesty of
+The rules prevent accidental direct merges, stale-SHA evidence, and a post-attestation title/body
+edit retaining success, and prevent same-name fork-check spoofing from satisfying the semantic
+gate. They do not defend against compromise or dishonesty of
 the owner account or theft of the App private key. Keep an explicit inventory: the owner is the only
 same-repository writer; App id `4574301` is the sole integration trusted for the semantic check; and
 no other secret, token, or App may mint that check without a reviewed trust-model change. The

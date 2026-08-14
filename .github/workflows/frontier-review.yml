@@ -106,6 +106,19 @@ jobs:
           # This checkout and validator come from the trusted default branch,
           # never from the pull request whose metadata is being attested.
           printf '%s\n' "$pr_body" | bash .github/scripts/validate-pr-body.sh "$pr_title"
+          if [[ "$(git rev-parse --is-shallow-repository)" == "true" ]]; then
+            git -c core.hooksPath=/dev/null -c core.fsmonitor=false \
+              fetch --no-tags --unshallow origin
+          fi
+          ledger_ref="refs/tactus/ledger/$head_sha"
+          git -c core.hooksPath=/dev/null -c core.fsmonitor=false \
+            fetch --no-tags --force origin \
+            "refs/pull/$PR_NUMBER/head:$ledger_ref"
+          if [[ "$(git rev-parse "$ledger_ref^{commit}")" != "$head_sha" ]]; then
+            echo "fetched pull-request ref does not match the API head" >&2
+            exit 1
+          fi
+          printf '%s\n' "$pr_body" | bash .github/scripts/validate-pr-ledger-evidence.sh "$head_sha"
 
           review_comment="$(gh api "repos/$GITHUB_REPOSITORY/issues/comments/$review_comment_id")"
           comment_url="$(jq -r '.html_url' <<< "$review_comment")"
@@ -151,8 +164,10 @@ jobs:
       - run: cargo clippy --all-targets -- -D warnings
       - run: bash .github/scripts/test-frontier-evidence.sh
       - run: bash .github/scripts/test-frontier-check.sh
+      - run: bash .github/scripts/test-frontier-invalidation.sh
       - run: bash .github/scripts/test-frontier-workflow.sh
       - run: bash .github/scripts/test-release-record.sh
+      - run: bash .github/scripts/test-pr-ledger-evidence.sh
 
   test:
     name: trusted test rerun (${{ matrix.os }})
@@ -203,6 +218,7 @@ jobs:
           ref: ${{ github.sha }}
           persist-credentials: false
       - name: Revalidate exact head immediately before signing
+        id: live-metadata
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
@@ -238,6 +254,19 @@ jobs:
           # Re-run the same trusted policy after the test matrix: title, body,
           # and ledger are mutable PR metadata and may have changed meanwhile.
           printf '%s\n' "$pr_body" | bash .github/scripts/validate-pr-body.sh "$pr_title"
+          if [[ "$(git rev-parse --is-shallow-repository)" == "true" ]]; then
+            git -c core.hooksPath=/dev/null -c core.fsmonitor=false \
+              fetch --no-tags --unshallow origin
+          fi
+          ledger_ref="refs/tactus/ledger/$head_sha"
+          git -c core.hooksPath=/dev/null -c core.fsmonitor=false \
+            fetch --no-tags --force origin \
+            "refs/pull/$PR_NUMBER/head:$ledger_ref"
+          if [[ "$(git rev-parse "$ledger_ref^{commit}")" != "$head_sha" ]]; then
+            echo "fetched pull-request ref does not match the API head" >&2
+            exit 1
+          fi
+          printf '%s\n' "$pr_body" | bash .github/scripts/validate-pr-ledger-evidence.sh "$head_sha"
 
           review_prefix="https://github.com/$GITHUB_REPOSITORY/pull/$PR_NUMBER#issuecomment-"
           review_comment_id="${REVIEW_URL#"$review_prefix"}"
@@ -262,6 +291,8 @@ jobs:
             echo "the strictly validated review-evidence record changed while tests were running" >&2
             exit 1
           fi
+          metadata_digest="$(printf '%s\0%s' "$pr_title" "$pr_body" | sha256sum | awk '{print $1}')"
+          echo "metadata_digest=$metadata_digest" >> "$GITHUB_OUTPUT"
 
       - name: Mint a repository-scoped review-gate token
         id: app-token
@@ -273,8 +304,11 @@ jobs:
       - name: Publish and verify the exact-head App check
         shell: bash
         env:
-          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          APP_TOKEN: ${{ steps.app-token.outputs.token }}
+          REPOSITORY_TOKEN: ${{ github.token }}
           EXPECTED_APP_ID: ${{ vars.TACTUS_FRONTIER_APP_ID }}
+          METADATA_DIGEST: ${{ steps.live-metadata.outputs.metadata_digest }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
         run: |
           set -euo pipefail
 
@@ -285,7 +319,7 @@ jobs:
 
           check_payload="$(bash .github/scripts/frontier-check-payload.sh \
             "$REVIEWED_SHA" "$PR_NUMBER" "$REVIEW_URL" "$EVIDENCE_DIGEST")"
-          check_run="$(gh api --method POST "repos/$GITHUB_REPOSITORY/check-runs" \
+          check_run="$(GH_TOKEN="$APP_TOKEN" gh api --method POST "repos/$GITHUB_REPOSITORY/check-runs" \
             -H 'Accept: application/vnd.github+json' \
             -H 'X-GitHub-Api-Version: 2026-03-10' \
             --input - <<< "$check_payload")"
@@ -310,3 +344,24 @@ jobs:
           fi
 
           jq '{id, name, head_sha, status, conclusion, external_id, app_id: .app.id, details_url}' <<< "$check_run"
+
+          # Close the final fetch-to-POST race. A pull_request_target event also
+          # revokes post-sign edits, but an edit which overlaps this API call
+          # must fail the check before this signer job can report success.
+          latest_pr="$(GH_TOKEN="$REPOSITORY_TOKEN" gh api \
+            "repos/$GITHUB_REPOSITORY/pulls/$PR_NUMBER")"
+          latest_state="$(jq -r '.state' <<< "$latest_pr")"
+          latest_head="$(jq -r '.head.sha' <<< "$latest_pr")"
+          latest_base="$(jq -r '.base.ref' <<< "$latest_pr")"
+          latest_title="$(jq -r '.title' <<< "$latest_pr")"
+          latest_body="$(jq -r '.body // ""' <<< "$latest_pr" | tr -d '\r')"
+          latest_metadata_digest="$(printf '%s\0%s' "$latest_title" "$latest_body" | sha256sum | awk '{print $1}')"
+          if [[ "$latest_state" != "open" ||
+                "$latest_head" != "$REVIEWED_SHA" ||
+                "$latest_base" != "$DEFAULT_BRANCH" ||
+                "$latest_metadata_digest" != "$METADATA_DIGEST" ]]; then
+            GH_TOKEN="$APP_TOKEN" bash .github/scripts/invalidate-frontier-check.sh \
+              "$REVIEWED_SHA" "$PR_NUMBER" "$EXPECTED_APP_ID"
+            echo "pull-request identity or metadata changed while the App check was being published" >&2
+            exit 1
+          fi
