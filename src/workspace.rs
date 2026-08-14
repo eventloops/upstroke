@@ -706,9 +706,7 @@ impl Workspace {
         parent_oid: &str,
         tree_oid: &str,
     ) -> Result<GateWorkspace, TactusError> {
-        let store =
-            std::env::temp_dir().join(format!("tactus-gate-worktrees-{}", std::process::id()));
-        self.gate_snapshot_for_candidate_in(parent_oid, tree_oid, &store)
+        self.gate_snapshot_for_candidate_in(parent_oid, tree_oid, &std::env::temp_dir())
     }
 
     /// Materialize a candidate under a durable, caller-owned snapshot store.
@@ -720,7 +718,13 @@ impl Workspace {
         tree_oid: &str,
         store: &Path,
     ) -> Result<GateWorkspace, TactusError> {
-        self.gate_snapshot_for_candidate_in(parent_oid, tree_oid, store)
+        self.gate_snapshot_for_candidate_in_with_mode(
+            parent_oid,
+            tree_oid,
+            store,
+            SnapshotStoreMode::ExactDurable,
+            |path, hooks_path, commit| self.add_gate_worktree(path, hooks_path, commit),
+        )
     }
 
     /// Reclaim every durable gate-worktree intent in `store`. Callers must use
@@ -799,6 +803,26 @@ impl Workspace {
     where
         F: FnOnce(&Path, &Path, &str) -> Result<(), TactusError>,
     {
+        self.gate_snapshot_for_candidate_in_with_mode(
+            parent_oid,
+            tree_oid,
+            temp_root,
+            SnapshotStoreMode::EphemeralUnderRoot,
+            add_worktree,
+        )
+    }
+
+    fn gate_snapshot_for_candidate_in_with_mode<F>(
+        &self,
+        parent_oid: &str,
+        tree_oid: &str,
+        store_or_root: &Path,
+        store_mode: SnapshotStoreMode,
+        add_worktree: F,
+    ) -> Result<GateWorkspace, TactusError>
+    where
+        F: FnOnce(&Path, &Path, &str) -> Result<(), TactusError>,
+    {
         self.validate_commit_oid(parent_oid)?;
         self.validate_tree_oid(tree_oid)?;
         if let Some(problem) = self.tree_input_problem(tree_oid)? {
@@ -816,7 +840,14 @@ impl Workspace {
             "-m",
             "[tactus] ephemeral gate snapshot",
         ])?;
-        let pending = PendingGateWorkspace::create(&self.root, temp_root)?;
+        let pending = match store_mode {
+            SnapshotStoreMode::EphemeralUnderRoot => {
+                PendingGateWorkspace::create(&self.root, store_or_root)?
+            }
+            SnapshotStoreMode::ExactDurable => {
+                PendingGateWorkspace::create_in_store(&self.root, store_or_root)?
+            }
+        };
         add_worktree(&pending.path, &pending.hooks_path, commit.trim())?;
         self.verify_gate_worktree(&pending.path, &pending.hooks_path)?;
 
@@ -1274,16 +1305,66 @@ impl Drop for PrivateHooksDir {
     }
 }
 
+#[derive(Clone, Copy)]
+enum SnapshotStoreMode {
+    /// `store_or_root` is a shared parent such as the system temp directory.
+    /// Create one atomically private child and remove it after normal cleanup.
+    EphemeralUnderRoot,
+    /// `store_or_root` is the stable per-run store whose intents resume scans.
+    ExactDurable,
+}
+
 struct PendingGateWorkspace {
     source_root: PathBuf,
     path: PathBuf,
     hooks_path: PathBuf,
     intent_path: PathBuf,
+    ephemeral_store: Option<PathBuf>,
     armed: bool,
 }
 
 impl PendingGateWorkspace {
-    fn create(source_root: &Path, store: &Path) -> Result<Self, TactusError> {
+    /// Create a uniquely named, owner-private store beneath a caller-owned
+    /// root. The root may be shared (notably `/tmp`) and is never chmodded.
+    fn create(source_root: &Path, temp_root: &Path) -> Result<Self, TactusError> {
+        let store = temp_root.join(format!(
+            "tactus-gate-worktrees-{}-{}",
+            std::process::id(),
+            crate::ulid::ulid()
+        ));
+        create_private_dir(&store).map_err(|error| TactusError::Git {
+            message: format!(
+                "creating private gate snapshot store {}: {error}",
+                store.display()
+            ),
+        })?;
+        match Self::create_in_store_inner(source_root, &store, Some(store.clone())) {
+            Ok(pending) => Ok(pending),
+            Err(error) => {
+                let _ = fs::remove_dir_all(&store);
+                Err(error)
+            }
+        }
+    }
+
+    /// Use the exact stable store whose synced intents resume will reclaim.
+    fn create_in_store(source_root: &Path, store: &Path) -> Result<Self, TactusError> {
+        if store == std::env::temp_dir() {
+            return Err(TactusError::Git {
+                message: format!(
+                    "the shared system temp root {} is not a durable snapshot store; supply an owner-private child directory",
+                    store.display()
+                ),
+            });
+        }
+        Self::create_in_store_inner(source_root, store, None)
+    }
+
+    fn create_in_store_inner(
+        source_root: &Path,
+        store: &Path,
+        ephemeral_store: Option<PathBuf>,
+    ) -> Result<Self, TactusError> {
         let name = format!(
             "tactus-gates-{}-{}",
             std::process::id(),
@@ -1333,6 +1414,7 @@ impl PendingGateWorkspace {
             path,
             hooks_path,
             intent_path,
+            ephemeral_store,
             armed: true,
         })
     }
@@ -1344,6 +1426,7 @@ impl PendingGateWorkspace {
             path: self.path.clone(),
             hooks_path: self.hooks_path.clone(),
             intent_path: self.intent_path.clone(),
+            ephemeral_store: self.ephemeral_store.clone(),
             workspace,
         }
     }
@@ -1352,12 +1435,15 @@ impl PendingGateWorkspace {
 impl Drop for PendingGateWorkspace {
     fn drop(&mut self) {
         if self.armed {
-            let _ = cleanup_gate_workspace(
+            let cleaned = cleanup_gate_workspace(
                 &self.source_root,
                 &self.path,
                 &self.hooks_path,
                 &self.intent_path,
             );
+            if cleaned.is_ok() {
+                remove_ephemeral_store(self.ephemeral_store.as_deref());
+            }
         }
     }
 }
@@ -1408,16 +1494,6 @@ fn valid_snapshot_name(name: &str) -> bool {
             .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
 }
 
-fn create_private_dir_all(path: &Path) -> std::io::Result<()> {
-    fs::create_dir_all(path)?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        fs::set_permissions(path, fs::Permissions::from_mode(0o700))?;
-    }
-    Ok(())
-}
-
 fn create_private_dir(path: &Path) -> std::io::Result<()> {
     #[cfg(unix)]
     {
@@ -1429,6 +1505,22 @@ fn create_private_dir(path: &Path) -> std::io::Result<()> {
     #[cfg(not(unix))]
     {
         fs::DirBuilder::new().create(path)
+    }
+}
+
+fn create_private_dir_all(path: &Path) -> std::io::Result<()> {
+    fs::create_dir_all(path)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(path, fs::Permissions::from_mode(0o700))?;
+    }
+    Ok(())
+}
+
+fn remove_ephemeral_store(store: Option<&Path>) {
+    if let Some(store) = store {
+        let _ = fs::remove_dir(store);
     }
 }
 
@@ -1553,6 +1645,7 @@ pub struct GateWorkspace {
     path: PathBuf,
     hooks_path: PathBuf,
     intent_path: PathBuf,
+    ephemeral_store: Option<PathBuf>,
     workspace: Workspace,
 }
 
@@ -1564,12 +1657,15 @@ impl GateWorkspace {
 
 impl Drop for GateWorkspace {
     fn drop(&mut self) {
-        let _ = cleanup_gate_workspace(
+        let cleaned = cleanup_gate_workspace(
             &self.source_root,
             &self.path,
             &self.hooks_path,
             &self.intent_path,
         );
+        if cleaned.is_ok() {
+            remove_ephemeral_store(self.ephemeral_store.as_deref());
+        }
     }
 }
 
@@ -2830,11 +2926,66 @@ mod tests {
         use std::os::unix::fs::PermissionsExt;
 
         let repo = temp_repo("private-snapshot-target");
-        let pending = PendingGateWorkspace::create(&repo, &env::temp_dir())
+        let system_temp = env::temp_dir();
+        let system_temp_mode = fs::metadata(&system_temp)
+            .expect("system temp metadata")
+            .permissions()
+            .mode()
+            & 0o7777;
+        let refusal = match PendingGateWorkspace::create_in_store(&repo, &system_temp) {
+            Ok(_) => panic!("the system temp root must not be used as an exact store"),
+            Err(error) => error.to_string(),
+        };
+        assert!(
+            refusal.contains("not a durable snapshot store"),
+            "{refusal}"
+        );
+        assert_eq!(
+            fs::metadata(&system_temp)
+                .expect("system temp metadata after refusal")
+                .permissions()
+                .mode()
+                & 0o7777,
+            system_temp_mode,
+            "snapshot setup must never chmod the system temp root"
+        );
+
+        let temp_root = env::temp_dir().join(format!(
+            "tactus-shared-temp-root-{}-{}",
+            std::process::id(),
+            crate::ulid::ulid()
+        ));
+        fs::create_dir(&temp_root).expect("create shared-like temp root");
+        fs::set_permissions(&temp_root, fs::Permissions::from_mode(0o1777))
+            .expect("make temp root shared-like");
+
+        let pending = PendingGateWorkspace::create(&repo, &temp_root)
             .expect("atomically create private snapshot directories");
         let path = pending.path.clone();
         let hooks_path = pending.hooks_path.clone();
         let intent_path = pending.intent_path.clone();
+        let store = pending
+            .ephemeral_store
+            .clone()
+            .expect("temp-root snapshots own a child store");
+        assert_eq!(store.parent(), Some(temp_root.as_path()));
+        assert_eq!(
+            fs::metadata(&temp_root)
+                .expect("shared root metadata")
+                .permissions()
+                .mode()
+                & 0o7777,
+            0o1777,
+            "snapshot setup must not chmod a pre-existing shared root"
+        );
+        assert_eq!(
+            fs::metadata(&store)
+                .expect("private store metadata")
+                .permissions()
+                .mode()
+                & 0o777,
+            0o700
+        );
         assert_eq!(
             fs::metadata(&path)
                 .expect("snapshot metadata")
@@ -2871,6 +3022,17 @@ mod tests {
         assert!(!path.exists());
         assert!(!hooks_path.exists());
         assert!(!intent_path.exists());
+        assert!(!store.exists(), "ephemeral child store was cleaned");
+        assert_eq!(
+            fs::metadata(&temp_root)
+                .expect("shared root survives cleanup")
+                .permissions()
+                .mode()
+                & 0o7777,
+            0o1777,
+            "snapshot cleanup must not chmod or remove the shared root"
+        );
+        fs::remove_dir(&temp_root).expect("remove test-owned shared root");
     }
 
     #[cfg(target_os = "linux")]
