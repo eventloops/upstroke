@@ -6,7 +6,7 @@ use std::ffi::OsString;
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::{Command, Output, Stdio};
 
 use crate::error::TactusError;
 
@@ -82,10 +82,60 @@ impl Workspace {
         Ok(output.stdout)
     }
 
+    /// Run a Git command with every repository-configured hook and fsmonitor
+    /// disabled. Keep this raw-output primitive reusable by reference updates,
+    /// whose expected compare-and-swap failures need the real exit status.
+    pub(crate) fn run_git_with_private_hooks(&self, args: &[&str]) -> Result<Output, TactusError> {
+        let hooks = PrivateHooksDir::create()?;
+        let mut hooks_config = OsString::from("core.hooksPath=");
+        hooks_config.push(&hooks.path);
+        Command::new("git")
+            .arg("-C")
+            .arg(&self.root)
+            .arg("-c")
+            .arg(hooks_config)
+            .args(["-c", "core.fsmonitor=false"])
+            .args(args)
+            .output()
+            .map_err(|e| TactusError::Git {
+                message: format!("failed to run git: {e}"),
+            })
+    }
+
+    fn git_output_with_private_hooks(&self, args: &[&str]) -> Result<Vec<u8>, TactusError> {
+        let output = self.run_git_with_private_hooks(args)?;
+        if !output.status.success() {
+            return Err(TactusError::Git {
+                message: format!(
+                    "git {} failed: {}",
+                    args.join(" "),
+                    String::from_utf8_lossy(&output.stderr).trim()
+                ),
+            });
+        }
+        Ok(output.stdout)
+    }
+
+    fn git_with_private_hooks(&self, args: &[&str]) -> Result<String, TactusError> {
+        let output = self.git_output_with_private_hooks(args)?;
+        String::from_utf8(output).map_err(|error| TactusError::Git {
+            message: format!(
+                "git {} returned output that is not valid UTF-8: {error}",
+                args.join(" ")
+            ),
+        })
+    }
+
     fn git_output_with_input(&self, args: &[&str], input: Vec<u8>) -> Result<Vec<u8>, TactusError> {
+        let hooks = PrivateHooksDir::create()?;
+        let mut hooks_config = OsString::from("core.hooksPath=");
+        hooks_config.push(&hooks.path);
         let mut child = Command::new("git")
             .arg("-C")
             .arg(&self.root)
+            .arg("-c")
+            .arg(hooks_config)
+            .args(["-c", "core.fsmonitor=false"])
             .args(args)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -124,7 +174,11 @@ impl Workspace {
 
     /// §14 pre-flight: the engine refuses dirty trees.
     pub fn is_clean(&self) -> Result<bool, TactusError> {
-        Ok(self.git(&["status", "--porcelain"])?.trim().is_empty())
+        self.refuse_worktree_filters_before("git status")?;
+        Ok(self
+            .git_with_private_hooks(&["status", "--porcelain"])?
+            .trim()
+            .is_empty())
     }
 
     pub fn current_branch(&self) -> Result<String, TactusError> {
@@ -182,13 +236,23 @@ impl Workspace {
     }
 
     pub fn create_branch(&self, name: &str) -> Result<(), TactusError> {
-        self.git(&["switch", "-q", "-c", name]).map(|_| ())
+        self.refuse_worktree_filters_before("git switch")?;
+        let tree_oid = self.git(&["rev-parse", "HEAD^{tree}"])?;
+        self.refuse_unsafe_checkout_tree(tree_oid.trim())?;
+        let create = format!("--create={name}");
+        self.git_with_private_hooks(&["switch", "-q", "--no-recurse-submodules", &create, "--"])
+            .map(|_| ())
     }
 
     /// Move to an existing branch — how `resume` gets back onto the run's own
     /// branch when the operator has wandered off it.
     pub fn switch_branch(&self, name: &str) -> Result<(), TactusError> {
-        self.git(&["switch", "-q", name]).map(|_| ())
+        self.refuse_worktree_filters_before("git switch")?;
+        let revision = format!("refs/heads/{name}^{{tree}}");
+        let tree_oid = self.git(&["rev-parse", "--verify", &revision])?;
+        self.refuse_unsafe_checkout_tree(tree_oid.trim())?;
+        self.git_with_private_hooks(&["switch", "-q", "--no-recurse-submodules", "--", name])
+            .map(|_| ())
     }
 
     /// Whether a branch exists locally.
@@ -208,8 +272,9 @@ impl Workspace {
     /// A one-line-per-path summary of everything uncommitted, for telling the
     /// operator what a resume is about to discard.
     pub fn uncommitted_summary(&self) -> Result<Vec<String>, TactusError> {
+        self.refuse_worktree_filters_before("git status")?;
         Ok(self
-            .git(&["status", "--porcelain"])?
+            .git_with_private_hooks(&["status", "--porcelain"])?
             .lines()
             .map(|line| line.trim_end().to_owned())
             .filter(|line| !line.is_empty())
@@ -250,7 +315,10 @@ impl Workspace {
     /// downstream check that reads it.
     pub fn capture_candidate(&self) -> Result<CapturedCandidate, TactusError> {
         let parent_oid = self.head_sha_full()?;
-        self.git(&["add", "-A"])?;
+        if let Some(problem) = self.worktree_filter_problem("git add")? {
+            return Err(TactusError::Git { message: problem });
+        }
+        self.git_with_private_hooks(&["add", "-A"])?;
         let tree_oid = self.staged_tree_oid()?;
         let diff = self.git(&[
             "-c",
@@ -284,6 +352,29 @@ impl Workspace {
         Ok(self.capture_candidate()?.diff)
     }
 
+    fn worktree_filter_problem(&self, operation: &str) -> Result<Option<String>, TactusError> {
+        // Commands that inspect or update worktree entries (`add`, `status`,
+        // `switch`, `commit`) can run clean/process filters before a later
+        // tree policy check. Enumerate tracked and addable untracked paths
+        // without refreshing fsmonitor, then evaluate the worktree's
+        // attributes without invoking a driver.
+        let paths = self.git_output_with_private_hooks(&[
+            "ls-files",
+            "--cached",
+            "--others",
+            "--exclude-standard",
+            "-z",
+        ])?;
+        self.filter_problem_for_paths(paths, None, operation)
+    }
+
+    fn refuse_worktree_filters_before(&self, operation: &str) -> Result<(), TactusError> {
+        if let Some(problem) = self.worktree_filter_problem(operation)? {
+            return Err(TactusError::Git { message: problem });
+        }
+        Ok(())
+    }
+
     /// Refuse staged evidence whose bytes are not the bytes a gate would see,
     /// or whose worktree still contains unstaged nested state after `git add`.
     /// A clean/smudge filter makes the cached diff describe the transformed
@@ -303,9 +394,10 @@ impl Workspace {
         tree_oid: &str,
     ) -> Result<Option<String>, TactusError> {
         self.validate_tree_oid(tree_oid)?;
-        let status = self.git_output(&[
-            "-c",
-            "core.fsmonitor=false",
+        if let Some(problem) = self.worktree_filter_problem("git status")? {
+            return Ok(Some(problem));
+        }
+        let status = self.git_output_with_private_hooks(&[
             "status",
             "--porcelain=v1",
             "--untracked-files=no",
@@ -358,11 +450,22 @@ impl Workspace {
             paths.push(0);
         }
 
+        self.filter_problem_for_paths(paths, Some(tree_oid), "")
+    }
+
+    fn filter_problem_for_paths(
+        &self,
+        paths: Vec<u8>,
+        tree_oid: Option<&str>,
+        operation: &str,
+    ) -> Result<Option<String>, TactusError> {
         let attrs = if paths.is_empty() {
             Vec::new()
-        } else {
+        } else if let Some(tree_oid) = tree_oid {
             let source = format!("--source={tree_oid}");
             self.git_output_with_input(&["check-attr", &source, "--stdin", "-z", "filter"], paths)?
+        } else {
+            self.git_output_with_input(&["check-attr", "--stdin", "-z", "filter"], paths)?
         };
         let mut fields: Vec<&[u8]> = attrs.split(|byte| *byte == 0).collect();
         if fields.last().is_some_and(|field| field.is_empty()) {
@@ -383,21 +486,37 @@ impl Workspace {
                 });
             }
             if !matches!(value, b"unspecified" | b"unset") {
-                return Ok(Some(format!(
-                    "candidate-tree path `{}` uses clean/smudge filter `{}`; the captured diff and gate worktree can contain different bytes",
-                    String::from_utf8_lossy(path),
-                    String::from_utf8_lossy(value)
-                )));
+                let path = String::from_utf8_lossy(path);
+                let value = String::from_utf8_lossy(value);
+                return Ok(Some(if tree_oid.is_some() {
+                    format!(
+                        "candidate-tree path `{path}` uses clean/smudge filter `{value}`; the captured diff and gate worktree can contain different bytes"
+                    )
+                } else {
+                    format!(
+                        "working-tree path `{path}` uses clean/smudge filter `{value}`; refusing before {operation} can execute configured filter code"
+                    )
+                }));
             }
         }
         Ok(None)
+    }
+
+    fn refuse_unsafe_checkout_tree(&self, tree_oid: &str) -> Result<(), TactusError> {
+        self.validate_tree_oid(tree_oid)?;
+        if let Some(problem) = self.tree_input_problem(tree_oid)? {
+            return Err(TactusError::Git {
+                message: format!("refusing checkout before configured code can run: {problem}"),
+            });
+        }
+        Ok(())
     }
 
     /// Read the full object ID of the index tree once. Callers that run more
     /// than one verifier can retain this identity and materialize the same
     /// bytes for each verifier even if the source index later changes.
     pub fn staged_tree_oid(&self) -> Result<String, TactusError> {
-        let tree = self.git(&["write-tree"])?;
+        let tree = self.git_with_private_hooks(&["write-tree"])?;
         let tree = tree.trim().to_owned();
         self.validate_tree_oid(&tree)?;
         Ok(tree)
@@ -603,7 +722,8 @@ impl Workspace {
     /// Commit whatever `capture_diff` staged. §14: commit-per-task,
     /// `[tactus] <task-id>: <title>`.
     pub fn commit(&self, message: &str) -> Result<String, TactusError> {
-        self.git(&["commit", "-q", "-m", message])?;
+        self.refuse_worktree_filters_before("git commit")?;
+        self.git_with_private_hooks(&["commit", "-q", "-m", message])?;
         self.head_sha()
     }
 
@@ -613,8 +733,37 @@ impl Workspace {
     /// (build artifacts, lockfile churn) from leaking into the next task's
     /// captured diff.
     pub fn discard_uncommitted(&self) -> Result<(), TactusError> {
-        self.git(&["reset", "-q", "--hard", "HEAD"])?;
-        self.git(&["clean", "-qfd"]).map(|_| ())
+        let tree_oid = self.git(&["rev-parse", "HEAD^{tree}"])?;
+        self.refuse_unsafe_checkout_tree(tree_oid.trim())?;
+        self.git_with_private_hooks(&["reset", "-q", "--hard", "HEAD"])?;
+        self.git_with_private_hooks(&["clean", "-qfd"]).map(|_| ())
+    }
+}
+
+struct PrivateHooksDir {
+    path: PathBuf,
+}
+
+impl PrivateHooksDir {
+    fn create() -> Result<Self, TactusError> {
+        let path = std::env::temp_dir().join(format!(
+            "tactus-empty-hooks-{}-{}",
+            std::process::id(),
+            crate::ulid::ulid()
+        ));
+        create_private_dir(&path).map_err(|error| TactusError::Git {
+            message: format!(
+                "creating private empty hooks directory {}: {error}",
+                path.display()
+            ),
+        })?;
+        Ok(Self { path })
+    }
+}
+
+impl Drop for PrivateHooksDir {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir(&self.path);
     }
 }
 
@@ -698,7 +847,13 @@ fn cleanup_gate_workspace(source_root: &Path, path: &Path, hooks_path: &Path) {
         .arg(source_root)
         .arg("-c")
         .arg(hooks_config)
-        .args(["worktree", "remove", "--force"])
+        .args([
+            "-c",
+            "core.fsmonitor=false",
+            "worktree",
+            "remove",
+            "--force",
+        ])
         .arg(path)
         .output();
     // `worktree remove` normally removes the directory too. These exact paths
@@ -771,6 +926,18 @@ mod tests {
             String::from_utf8_lossy(&output.stderr)
         );
         output.stdout
+    }
+
+    fn make_executable(path: &Path) {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut permissions = fs::metadata(path).expect("hook metadata").permissions();
+            permissions.set_mode(permissions.mode() | 0o111);
+            fs::set_permissions(path, permissions).expect("make hook executable");
+        }
+        #[cfg(not(unix))]
+        let _ = path;
     }
 
     #[test]
@@ -1048,10 +1215,22 @@ mod tests {
         )
         .expect("filter attribute");
         fs::write(repo.join("filtered.txt"), "semantic bytes\n").expect("filtered file");
-        ws.capture_diff().expect("stage filtered path");
+        let error = ws
+            .capture_diff()
+            .expect_err("filters must be refused before staging")
+            .to_string();
+        assert!(error.contains("before git add"), "{error}");
+        assert!(error.contains("filtered.txt"), "{error}");
+
+        // Preserve the independent post-stage guard for a caller opening an
+        // index prepared outside Workspace::capture_candidate.
+        run_git(&repo, &["add", "-A"]);
+        let filtered_tree = ws.staged_tree_oid().expect("filtered tree");
+        fs::write(repo.join(".gitattributes"), "").expect("clear live attributes");
+        run_git(&repo, &["add", ".gitattributes"]);
 
         let problem = ws
-            .review_input_problem()
+            .review_input_problem_for_tree(&filtered_tree)
             .expect("inspect attributes")
             .expect("filtered evidence must fail closed");
         assert!(problem.contains("filtered.txt"), "{problem}");
@@ -1075,18 +1254,421 @@ mod tests {
             "unchanged.txt filter=tactus-test\n",
         )
         .expect("candidate attributes");
-        let candidate = ws
+        let error = ws
             .capture_candidate()
-            .expect("capture candidate attributes");
+            .expect_err("unchanged filtered targets must fail before add")
+            .to_string();
+        assert!(error.contains("unchanged.txt"), "{error}");
+        run_git(&repo, &["add", "-A"]);
+        let tree_oid = ws.staged_tree_oid().expect("externally captured tree");
         fs::remove_file(repo.join(".gitattributes")).expect("move index past candidate");
-        ws.capture_diff().expect("stage later filter-free index");
+        run_git(&repo, &["add", "-A"]);
 
         let problem = ws
-            .review_input_problem_for_tree(&candidate.tree_oid)
+            .review_input_problem_for_tree(&tree_oid)
             .expect("inspect every path in the captured tree")
             .expect("filter on unchanged path must fail closed");
         assert!(problem.contains("unchanged.txt"), "{problem}");
         assert!(problem.contains("tactus-test"), "{problem}");
+    }
+
+    #[test]
+    fn capture_candidate_refuses_filter_before_candidate_helper_executes() {
+        let repo = temp_repo("pre-add-filter-helper");
+        fs::create_dir_all(repo.join(".githooks")).expect("helper directory");
+        fs::write(
+            repo.join(".githooks").join("filter-helper"),
+            "#!/bin/sh\ncat\n",
+        )
+        .expect("baseline helper");
+        fs::write(repo.join("payload.txt"), "baseline\n").expect("payload");
+        run_git(&repo, &["add", "-A"]);
+        run_git(&repo, &["commit", "-q", "-m", "seed filter helper"]);
+        run_git(
+            &repo,
+            &[
+                "config",
+                "filter.tactus-test.clean",
+                "sh .githooks/filter-helper",
+            ],
+        );
+        run_git(&repo, &["config", "filter.tactus-test.smudge", "cat"]);
+
+        fs::write(
+            repo.join(".githooks").join("filter-helper"),
+            "#!/bin/sh\nprintf 'ran\\n' > filter-ran\ncat\n",
+        )
+        .expect("candidate helper");
+        fs::write(
+            repo.join(".gitattributes"),
+            "payload.txt filter=tactus-test\n",
+        )
+        .expect("candidate attributes");
+        fs::write(repo.join("payload.txt"), "candidate\n").expect("candidate payload");
+        let ws = Workspace::open(&repo).expect("open");
+
+        let error = ws
+            .capture_candidate()
+            .expect_err("filter must be refused before git add")
+            .to_string();
+        assert!(error.contains("before git add"), "{error}");
+        assert!(error.contains("payload.txt"), "{error}");
+        assert!(
+            !repo.join("filter-ran").exists(),
+            "attribute inspection must not execute the candidate-edited filter helper"
+        );
+
+        // Control: the exact raw command that capture used to run executes the
+        // fixture, proving marker absence above is suppression rather than a
+        // helper that could never run on this platform.
+        run_git(&repo, &["add", "-A"]);
+        assert!(repo.join("filter-ran").exists(), "raw git add ran filter");
+    }
+
+    #[test]
+    fn status_and_switch_refuse_filter_before_candidate_helper_executes() {
+        let repo = temp_repo("status-filter-helper");
+        fs::create_dir_all(repo.join(".githooks")).expect("helper directory");
+        fs::write(
+            repo.join(".githooks").join("status-filter"),
+            "#!/bin/sh\ncat\n",
+        )
+        .expect("baseline helper");
+        fs::write(repo.join("payload.txt"), "baseline\n").expect("payload");
+        run_git(&repo, &["add", "-A"]);
+        run_git(&repo, &["commit", "-q", "-m", "seed status helper"]);
+        run_git(&repo, &["branch", "alternate"]);
+        run_git(&repo, &["config", "core.trustctime", "false"]);
+        run_git(&repo, &["config", "core.checkStat", "minimal"]);
+        run_git(
+            &repo,
+            &[
+                "config",
+                "filter.tactus-status.clean",
+                "sh .githooks/status-filter",
+            ],
+        );
+        run_git(&repo, &["config", "filter.tactus-status.smudge", "cat"]);
+
+        fs::write(
+            repo.join(".githooks").join("status-filter"),
+            "#!/bin/sh\nprintf 'ran\\n' > status-filter-ran\ncat\n",
+        )
+        .expect("candidate helper");
+        fs::write(
+            repo.join(".gitattributes"),
+            "payload.txt filter=tactus-status\n",
+        )
+        .expect("candidate attributes");
+        let payload = repo.join("payload.txt");
+        let indexed_mtime = fs::metadata(&payload)
+            .and_then(|metadata| metadata.modified())
+            .expect("indexed payload mtime");
+        fs::write(&payload, "changed!\n").expect("same-size candidate payload");
+        fs::OpenOptions::new()
+            .write(true)
+            .open(&payload)
+            .and_then(|file| file.set_times(fs::FileTimes::new().set_modified(indexed_mtime)))
+            .expect("restore indexed mtime");
+        fs::OpenOptions::new()
+            .write(true)
+            .open(repo.join(".git").join("index"))
+            .and_then(|file| file.set_times(fs::FileTimes::new().set_modified(indexed_mtime)))
+            .expect("force a deterministic racily-clean index comparison");
+        let ws = Workspace::open(&repo).expect("open");
+
+        let clean_error = ws
+            .is_clean()
+            .expect_err("status preflight must refuse the filter")
+            .to_string();
+        assert!(clean_error.contains("before git status"), "{clean_error}");
+        let summary_error = ws
+            .uncommitted_summary()
+            .expect_err("resume summary must refuse the filter")
+            .to_string();
+        assert!(
+            summary_error.contains("before git status"),
+            "{summary_error}"
+        );
+        let head_tree = ws.git(&["rev-parse", "HEAD^{tree}"]).expect("head tree");
+        let review_problem = ws
+            .review_input_problem_for_tree(head_tree.trim())
+            .expect("review preflight")
+            .expect("review status must refuse the filter");
+        assert!(
+            review_problem.contains("before git status"),
+            "{review_problem}"
+        );
+        let switch_error = ws
+            .switch_branch("alternate")
+            .expect_err("branch switch must refuse the live filter")
+            .to_string();
+        assert!(switch_error.contains("before git switch"), "{switch_error}");
+        let commit_error = ws
+            .commit("must not inspect filtered worktree")
+            .expect_err("commit must refuse the live filter")
+            .to_string();
+        assert!(commit_error.contains("before git commit"), "{commit_error}");
+        assert!(
+            !repo.join("status-filter-ran").exists(),
+            "preflight inspection must not execute the candidate-edited filter helper"
+        );
+
+        run_git(&repo, &["status", "--porcelain"]);
+        assert!(
+            repo.join("status-filter-ran").exists(),
+            "raw git status ran the candidate-edited clean filter"
+        );
+    }
+
+    #[test]
+    fn capture_candidate_disables_candidate_fsmonitor() {
+        let repo = temp_repo("capture-fsmonitor");
+        fs::create_dir_all(repo.join(".githooks")).expect("hooks directory");
+        fs::write(
+            repo.join(".githooks").join("fsmonitor"),
+            "#!/bin/sh\nprintf 'baseline-token\\0'\n",
+        )
+        .expect("baseline fsmonitor");
+        make_executable(&repo.join(".githooks").join("fsmonitor"));
+        run_git(&repo, &["add", "-A"]);
+        run_git(
+            &repo,
+            &["update-index", "--chmod=+x", ".githooks/fsmonitor"],
+        );
+        run_git(&repo, &["commit", "-q", "-m", "seed fsmonitor"]);
+        run_git(&repo, &["config", "core.fsmonitor", ".githooks/fsmonitor"]);
+        run_git(&repo, &["config", "core.fsmonitorHookVersion", "2"]);
+        run_git(&repo, &["status", "--porcelain"]);
+
+        fs::write(
+            repo.join(".githooks").join("fsmonitor"),
+            "#!/bin/sh\nprintf 'ran\\n' > fsmonitor-ran\nprintf 'candidate-token\\0'\n",
+        )
+        .expect("candidate fsmonitor");
+        fs::write(repo.join("README.md"), "candidate\n").expect("candidate edit");
+        let ws = Workspace::open(&repo).expect("open without fsmonitor execution");
+        ws.capture_candidate()
+            .expect("capture with fsmonitor explicitly disabled");
+        assert!(!repo.join("fsmonitor-ran").exists());
+        assert!(!ws.is_clean().expect("status with fsmonitor disabled"));
+        assert!(!repo.join("fsmonitor-ran").exists());
+
+        fs::write(repo.join("README.md"), "control\n").expect("control edit");
+        run_git(&repo, &["add", "-A"]);
+        assert!(
+            repo.join("fsmonitor-ran").exists(),
+            "raw git add ran the candidate-edited fsmonitor"
+        );
+    }
+
+    #[test]
+    fn capture_candidate_disables_post_index_change_hook() {
+        let repo = temp_repo("capture-post-index-change");
+        fs::create_dir_all(repo.join(".githooks")).expect("hooks directory");
+        fs::write(
+            repo.join(".githooks").join("post-index-change"),
+            "#!/bin/sh\nexit 0\n",
+        )
+        .expect("baseline hook");
+        make_executable(&repo.join(".githooks").join("post-index-change"));
+        run_git(&repo, &["add", "-A"]);
+        run_git(
+            &repo,
+            &["update-index", "--chmod=+x", ".githooks/post-index-change"],
+        );
+        run_git(&repo, &["commit", "-q", "-m", "seed index hook"]);
+        run_git(&repo, &["config", "core.hooksPath", ".githooks"]);
+
+        fs::write(
+            repo.join(".githooks").join("post-index-change"),
+            "#!/bin/sh\nprintf 'ran\\n' > post-index-ran\n",
+        )
+        .expect("candidate hook");
+        fs::write(repo.join("README.md"), "candidate\n").expect("candidate edit");
+        let ws = Workspace::open(&repo).expect("open");
+        ws.capture_candidate()
+            .expect("capture with private empty hooks path");
+        assert!(!repo.join("post-index-ran").exists());
+
+        fs::write(repo.join("README.md"), "control\n").expect("control edit");
+        run_git(&repo, &["add", "-A"]);
+        assert!(
+            repo.join("post-index-ran").exists(),
+            "raw git add ran post-index-change"
+        );
+    }
+
+    #[test]
+    fn branch_creation_and_switch_do_not_execute_post_checkout_hook() {
+        let repo = temp_repo("branch-post-checkout");
+        fs::create_dir_all(repo.join(".githooks")).expect("hooks directory");
+        fs::write(
+            repo.join(".githooks").join("post-checkout"),
+            "#!/bin/sh\nprintf 'ran\\n' > post-checkout-ran\n",
+        )
+        .expect("checkout hook");
+        make_executable(&repo.join(".githooks").join("post-checkout"));
+        run_git(&repo, &["add", "-A"]);
+        run_git(
+            &repo,
+            &["update-index", "--chmod=+x", ".githooks/post-checkout"],
+        );
+        run_git(&repo, &["commit", "-q", "-m", "seed checkout hook"]);
+        run_git(&repo, &["config", "core.hooksPath", ".githooks"]);
+        let ws = Workspace::open(&repo).expect("open");
+
+        ws.create_branch("safe-create")
+            .expect("hook-suppressed branch creation");
+        assert!(!repo.join("post-checkout-ran").exists());
+        ws.switch_branch("main")
+            .expect("hook-suppressed branch switch");
+        assert!(!repo.join("post-checkout-ran").exists());
+
+        run_git(&repo, &["switch", "-q", "safe-create"]);
+        assert!(
+            repo.join("post-checkout-ran").exists(),
+            "raw git switch ran post-checkout"
+        );
+    }
+
+    #[test]
+    fn branch_switch_refuses_filter_before_target_helper_executes() {
+        let repo = temp_repo("branch-filter-helper");
+        fs::create_dir_all(repo.join(".githooks")).expect("helper directory");
+        fs::write(
+            repo.join(".githooks").join("smudge-helper"),
+            "#!/bin/sh\nprintf 'ran\\n' > smudge-ran\ncat\n",
+        )
+        .expect("smudge helper");
+        run_git(&repo, &["add", "-A"]);
+        run_git(&repo, &["commit", "-q", "-m", "seed smudge helper"]);
+        run_git(&repo, &["switch", "-q", "-c", "filtered"]);
+        fs::write(
+            repo.join(".gitattributes"),
+            "payload.txt filter=tactus-switch\n",
+        )
+        .expect("attributes");
+        fs::write(repo.join("payload.txt"), "filtered branch\n").expect("payload");
+        run_git(&repo, &["add", "-A"]);
+        run_git(&repo, &["commit", "-q", "-m", "seed filtered branch"]);
+        run_git(&repo, &["switch", "-q", "main"]);
+        run_git(&repo, &["config", "filter.tactus-switch.clean", "cat"]);
+        run_git(
+            &repo,
+            &[
+                "config",
+                "filter.tactus-switch.smudge",
+                "sh .githooks/smudge-helper",
+            ],
+        );
+        let ws = Workspace::open(&repo).expect("open");
+
+        let error = ws
+            .switch_branch("filtered")
+            .expect_err("target filters must fail before checkout")
+            .to_string();
+        assert!(error.contains("refusing checkout"), "{error}");
+        assert!(error.contains("payload.txt"), "{error}");
+        assert!(!repo.join("smudge-ran").exists());
+        assert_eq!(ws.current_branch().expect("still on main"), "main");
+
+        run_git(&repo, &["switch", "-q", "filtered"]);
+        assert!(
+            repo.join("smudge-ran").exists(),
+            "raw git switch ran the target's configured smudge helper"
+        );
+    }
+
+    #[test]
+    fn commit_and_discard_do_not_execute_candidate_hooks() {
+        let repo = temp_repo("commit-reset-hooks");
+        fs::create_dir_all(repo.join(".githooks")).expect("hooks directory");
+        fs::write(
+            repo.join(".githooks").join("pre-commit"),
+            "#!/bin/sh\nprintf 'ran\\n' > pre-commit-ran\n",
+        )
+        .expect("commit hook");
+        fs::write(
+            repo.join(".githooks").join("post-index-change"),
+            "#!/bin/sh\nprintf 'ran\\n' > reset-index-ran\n",
+        )
+        .expect("index hook");
+        make_executable(&repo.join(".githooks").join("pre-commit"));
+        make_executable(&repo.join(".githooks").join("post-index-change"));
+        run_git(&repo, &["add", "-A"]);
+        run_git(
+            &repo,
+            &["update-index", "--chmod=+x", ".githooks/pre-commit"],
+        );
+        run_git(
+            &repo,
+            &["update-index", "--chmod=+x", ".githooks/post-index-change"],
+        );
+        run_git(&repo, &["commit", "-q", "-m", "seed hooks"]);
+        run_git(&repo, &["config", "core.hooksPath", ".githooks"]);
+        let ws = Workspace::open(&repo).expect("open");
+
+        fs::write(repo.join("README.md"), "candidate commit\n").expect("edit");
+        ws.capture_candidate().expect("capture");
+        assert!(!repo.join("reset-index-ran").exists());
+        ws.commit("candidate without hooks")
+            .expect("hook-suppressed commit");
+        assert!(!repo.join("pre-commit-ran").exists());
+
+        fs::write(repo.join("README.md"), "candidate reset\n").expect("reset edit");
+        ws.capture_candidate().expect("capture reset candidate");
+        ws.discard_uncommitted()
+            .expect("hook-suppressed reset and clean");
+        assert!(!repo.join("reset-index-ran").exists());
+
+        fs::write(repo.join("README.md"), "control\n").expect("control edit");
+        run_git(&repo, &["add", "-A"]);
+        run_git(&repo, &["commit", "-q", "-m", "control commit"]);
+        assert!(repo.join("pre-commit-ran").exists(), "raw commit ran hook");
+    }
+
+    #[test]
+    fn discard_refuses_target_filter_before_candidate_helper_executes() {
+        let repo = temp_repo("reset-filter-helper");
+        fs::write(
+            repo.join(".gitattributes"),
+            "README.md filter=tactus-reset\n",
+        )
+        .expect("target attributes");
+        fs::write(repo.join("zz-reset-helper"), "#!/bin/sh\ncat\n").expect("baseline helper");
+        run_git(&repo, &["add", "-A"]);
+        run_git(&repo, &["commit", "-q", "-m", "seed reset filter"]);
+        run_git(&repo, &["config", "filter.tactus-reset.clean", "cat"]);
+        run_git(
+            &repo,
+            &["config", "filter.tactus-reset.smudge", "sh zz-reset-helper"],
+        );
+
+        fs::write(
+            repo.join("zz-reset-helper"),
+            "#!/bin/sh\nprintf 'ran\\n' > reset-filter-ran\ncat\n",
+        )
+        .expect("candidate helper");
+        fs::write(repo.join("README.md"), "candidate\n").expect("candidate payload");
+        let ws = Workspace::open(&repo).expect("open");
+
+        let error = ws
+            .discard_uncommitted()
+            .expect_err("reset target filters must fail before checkout")
+            .to_string();
+        assert!(error.contains("refusing checkout"), "{error}");
+        assert!(error.contains("README.md"), "{error}");
+        assert!(
+            !repo.join("reset-filter-ran").exists(),
+            "tree inspection must not execute the candidate-edited smudge helper"
+        );
+
+        run_git(&repo, &["reset", "-q", "--hard", "HEAD"]);
+        assert!(
+            repo.join("reset-filter-ran").exists(),
+            "raw git reset ran the candidate-edited smudge helper"
+        );
     }
 
     #[test]
