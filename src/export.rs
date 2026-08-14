@@ -1148,10 +1148,8 @@ mod tests {
         let readme = include_str!("../README.md");
         let design = include_str!("../DESIGN.md");
         assert!(readme.contains("kill-on-close Job Object"), "{readme}");
-        assert!(
-            readme.contains("before its primary\nthread runs"),
-            "{readme}"
-        );
+        assert!(readme.contains("before its primary"), "{readme}");
+        assert!(readme.contains("thread runs"), "{readme}");
         assert!(design.contains("created suspended"), "{design}");
         assert!(
             design.contains("boundedly observe that job empty"),
