@@ -3453,6 +3453,32 @@ mod tests {
     }
 
     #[cfg(unix)]
+    fn settled_progress_after_stop(marker: &std::path::Path, context: &str) -> String {
+        // A process-group snapshot can report every member stopped while a
+        // write already accepted by the kernel is still becoming visible on
+        // disk (observed on macOS). Require more than two 50 ms worker periods
+        // with no change before measuring the sustained stop. A genuinely
+        // running worker keeps incrementing and either fails here or in the
+        // longer assertion interval at the call site.
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let mut previous = std::fs::read_to_string(marker)
+            .unwrap_or_else(|error| panic!("progress before {context}: {error}"));
+        loop {
+            thread::sleep(Duration::from_millis(125));
+            let current = std::fs::read_to_string(marker)
+                .unwrap_or_else(|error| panic!("progress while settling {context}: {error}"));
+            if current == previous {
+                return current;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "the isolated agent never became quiescent during {context}: {previous} -> {current}"
+            );
+            previous = current;
+        }
+    }
+
+    #[cfg(unix)]
     fn assert_termination_kills_the_isolated_tree(signal: libc::c_int, tag: &str) {
         let mut helper = spawn_signal_helper(tag, false, false);
         let pid = helper.pid();
@@ -3666,8 +3692,7 @@ mod tests {
             "Tactus did not stop for signal {signal}"
         );
 
-        let before = std::fs::read_to_string(&helper.marker)
-            .unwrap_or_else(|error| panic!("progress before signal {signal}: {error}"));
+        let before = settled_progress_after_stop(&helper.marker, &format!("signal {signal}"));
         thread::sleep(Duration::from_millis(350));
         let after = std::fs::read_to_string(&helper.marker)
             .unwrap_or_else(|error| panic!("progress after signal {signal}: {error}"));
@@ -3717,8 +3742,7 @@ mod tests {
             "Tactus did not enter a stopped job-control state"
         );
 
-        let before =
-            std::fs::read_to_string(&helper.marker).expect("progress before suspend interval");
+        let before = settled_progress_after_stop(&helper.marker, "suspend interval");
         thread::sleep(Duration::from_millis(350));
         let after =
             std::fs::read_to_string(&helper.marker).expect("progress after suspend interval");
@@ -3752,8 +3776,7 @@ mod tests {
             "Tactus did not enter a stopped job-control state"
         );
 
-        let before =
-            std::fs::read_to_string(&helper.marker).expect("progress before blocked SIGCONT");
+        let before = settled_progress_after_stop(&helper.marker, "blocked SIGCONT");
         thread::sleep(Duration::from_millis(350));
         let after =
             std::fs::read_to_string(&helper.marker).expect("progress after blocked SIGCONT");
@@ -3821,8 +3844,7 @@ mod tests {
             wait_for_stop(pid, Duration::from_secs(10)),
             "Tactus did not enter a stopped job-control state"
         );
-        let before =
-            std::fs::read_to_string(&helper.marker).expect("progress before ignored SIGHUP");
+        let before = settled_progress_after_stop(&helper.marker, "ignored SIGHUP");
         assert_eq!(unsafe { libc::kill(-pid, libc::SIGHUP) }, 0);
         thread::sleep(Duration::from_millis(350));
         let after = std::fs::read_to_string(&helper.marker).expect("progress after ignored SIGHUP");
