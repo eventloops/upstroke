@@ -1087,6 +1087,43 @@ mod tests {
     }
 
     #[test]
+    fn export_schema_decision_lists_every_failure_kind() {
+        let decision = include_str!("../decisions/2026-08-11-export-decisions-schema.md");
+        for kind in [
+            FailureKind::NoChain,
+            FailureKind::EmptyDiff,
+            FailureKind::AgentError,
+            FailureKind::Timeout,
+            FailureKind::RateLimited,
+            FailureKind::GateFailed,
+            FailureKind::TestProvenance,
+            FailureKind::ReviewInputTooLarge,
+            FailureKind::ReviewInputOpaque,
+            FailureKind::ReviewFailed,
+            FailureKind::ReviewUnavailable,
+            FailureKind::NeedsHuman,
+            FailureKind::Declined,
+            FailureKind::Interrupted,
+        ] {
+            let token = failure_kind(kind);
+            assert!(
+                decision.contains(&format!("| `{token}` |")),
+                "export decision omits `{token}`"
+            );
+        }
+    }
+
+    #[test]
+    fn readme_does_not_promise_unconditional_anti_self_review() {
+        let readme = include_str!("../README.md");
+        assert!(!readme.contains("Nothing reviews its own work"));
+        assert!(readme.contains("falls back to the"));
+        assert!(readme.contains("frozen same-model reviewer"));
+        assert!(readme.contains("A configured blast-radius"));
+        assert!(readme.contains("second opinion is stricter"));
+    }
+
+    #[test]
     fn windows_crash_containment_docs_do_not_advertise_unshipped_runner() {
         let readme = include_str!("../README.md");
         let design = include_str!("../DESIGN.md");

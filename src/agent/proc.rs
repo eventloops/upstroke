@@ -30,6 +30,7 @@
 
 use std::io::{Read, Write};
 use std::process::{Child, Command, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -38,14 +39,17 @@ use crate::error::TactusError;
 
 #[derive(Debug, Clone)]
 pub struct ProcessOutput {
-    /// Exit code if the process exited normally; `None` when killed (timeout)
-    /// or terminated by a signal.
+    /// Exit code if the process exited normally; `None` when killed for a
+    /// timeout/output limit or terminated by a signal.
     pub code: Option<i32>,
     pub stdout: String,
     pub stderr: String,
     /// Wall clock from spawn to process exit (not including pipe drain).
     pub duration: Duration,
     pub timed_out: bool,
+    /// The child exceeded the bounded stdout or stderr capture allowance and
+    /// its owned process tree was terminated.
+    pub output_limited: bool,
 }
 
 /// How long to keep draining pipes after the process is gone. Normally EOF is
@@ -53,15 +57,27 @@ pub struct ProcessOutput {
 /// grandchild still holding a write handle.
 const DRAIN_GRACE_EXIT: Duration = Duration::from_secs(2);
 const DRAIN_GRACE_KILL: Duration = Duration::from_millis(500);
+/// Per stream. Readers continue draining after this point so the child cannot
+/// block on a full pipe while the supervisor notices and terminates its tree.
+const OUTPUT_LIMIT_BYTES: usize = 16 * 1024 * 1024;
 
 /// Run `command`, writing `stdin_data` to the child's stdin, with a hard
 /// wall-clock timeout. On timeout the child's owned process group is killed and
 /// the partial output captured so far is returned with `timed_out = true`
 /// (§14: timeout is an attempt failure with the partial transcript as feedback).
 pub fn run_with_timeout(
+    command: Command,
+    stdin_data: &str,
+    timeout: Duration,
+) -> Result<ProcessOutput, TactusError> {
+    run_with_timeout_and_limit(command, stdin_data, timeout, OUTPUT_LIMIT_BYTES)
+}
+
+fn run_with_timeout_and_limit(
     mut command: Command,
     stdin_data: &str,
     timeout: Duration,
+    output_limit: usize,
 ) -> Result<ProcessOutput, TactusError> {
     command
         .stdin(Stdio::piped())
@@ -105,10 +121,17 @@ pub fn run_with_timeout(
         }
     });
 
-    let stdout_drain = child.stdout.take().map(Drain::start);
-    let stderr_drain = child.stderr.take().map(Drain::start);
+    let stdout_drain = child
+        .stdout
+        .take()
+        .map(|pipe| Drain::start(pipe, output_limit));
+    let stderr_drain = child
+        .stderr
+        .take()
+        .map(|pipe| Drain::start(pipe, output_limit));
 
     let mut timed_out = false;
+    let mut output_limited = false;
     #[cfg(unix)]
     let code = loop {
         match child_exited_unreaped(&child) {
@@ -127,7 +150,17 @@ pub fn run_with_timeout(
                 break status.code();
             }
             Ok(false) => {
-                if started.elapsed() >= timeout {
+                if drain_limit_exceeded(&stdout_drain, &stderr_drain) {
+                    output_limited = true;
+                    if let Err(error) = termination.finish() {
+                        let _ = child.kill();
+                        let _ = child.wait();
+                        return Err(error);
+                    }
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    break None;
+                } else if started.elapsed() >= timeout {
                     timed_out = true;
                     if let Err(error) = termination.finish() {
                         let _ = child.kill();
@@ -156,7 +189,11 @@ pub fn run_with_timeout(
         match child.try_wait() {
             Ok(Some(status)) => break status.code(),
             Ok(None) => {
-                if started.elapsed() >= timeout {
+                if drain_limit_exceeded(&stdout_drain, &stderr_drain) {
+                    output_limited = true;
+                    kill_tree(&mut child);
+                    break None;
+                } else if started.elapsed() >= timeout {
                     timed_out = true;
                     kill_tree(&mut child);
                     break None;
@@ -173,7 +210,7 @@ pub fn run_with_timeout(
     };
     let duration = started.elapsed();
 
-    let grace = if timed_out {
+    let grace = if timed_out || output_limited {
         DRAIN_GRACE_KILL
     } else {
         DRAIN_GRACE_EXIT
@@ -189,8 +226,9 @@ pub fn run_with_timeout(
     if stdin_thread.is_finished() {
         let _ = stdin_thread.join();
     }
-    let stdout = stdout_drain.map(|d| d.collect(grace)).unwrap_or_default();
-    let stderr = stderr_drain.map(|d| d.collect(grace)).unwrap_or_default();
+    let (stdout, stdout_limited) = stdout_drain.map(|d| d.collect(grace)).unwrap_or_default();
+    let (stderr, stderr_limited) = stderr_drain.map(|d| d.collect(grace)).unwrap_or_default();
+    output_limited |= stdout_limited || stderr_limited;
 
     Ok(ProcessOutput {
         code,
@@ -198,7 +236,13 @@ pub fn run_with_timeout(
         stderr,
         duration,
         timed_out,
+        output_limited,
     })
+}
+
+fn drain_limit_exceeded(stdout: &Option<Drain>, stderr: &Option<Drain>) -> bool {
+    stdout.as_ref().is_some_and(Drain::limit_exceeded)
+        || stderr.as_ref().is_some_and(Drain::limit_exceeded)
 }
 
 /// Kill the whole process tree. Killing only the direct child is not enough
@@ -3043,31 +3087,50 @@ mod termination {
 /// so an orphan holding the write end can never stall the supervisor.
 struct Drain {
     buf: Arc<Mutex<Vec<u8>>>,
+    limited: Arc<AtomicBool>,
     handle: thread::JoinHandle<()>,
 }
 
 impl Drain {
-    fn start<R: Read + Send + 'static>(mut pipe: R) -> Self {
+    fn start<R: Read + Send + 'static>(mut pipe: R, limit: usize) -> Self {
         let buf = Arc::new(Mutex::new(Vec::new()));
         let writer = Arc::clone(&buf);
+        let limited = Arc::new(AtomicBool::new(false));
+        let reader_limited = Arc::clone(&limited);
         let handle = thread::spawn(move || {
             let mut chunk = [0u8; 8192];
             loop {
                 match pipe.read(&mut chunk) {
                     Ok(0) | Err(_) => break,
-                    Ok(n) => match writer.lock() {
-                        Ok(mut guard) => guard.extend_from_slice(&chunk[..n]),
-                        Err(poisoned) => poisoned.into_inner().extend_from_slice(&chunk[..n]),
-                    },
+                    Ok(n) => {
+                        let mut guard = match writer.lock() {
+                            Ok(guard) => guard,
+                            Err(poisoned) => poisoned.into_inner(),
+                        };
+                        let remaining = limit.saturating_sub(guard.len());
+                        let retained = remaining.min(n);
+                        guard.extend_from_slice(&chunk[..retained]);
+                        if retained < n {
+                            reader_limited.store(true, Ordering::SeqCst);
+                        }
+                    }
                 }
             }
         });
-        Self { buf, handle }
+        Self {
+            buf,
+            limited,
+            handle,
+        }
+    }
+
+    fn limit_exceeded(&self) -> bool {
+        self.limited.load(Ordering::SeqCst)
     }
 
     /// Wait up to `grace` for EOF, then snapshot whatever arrived. A reader
     /// abandoned here exits on its own when the last write handle closes.
-    fn collect(self, grace: Duration) -> String {
+    fn collect(self, grace: Duration) -> (String, bool) {
         let deadline = Instant::now() + grace;
         while !self.handle.is_finished() && Instant::now() < deadline {
             thread::sleep(Duration::from_millis(20));
@@ -3079,7 +3142,10 @@ impl Drain {
             Ok(guard) => guard.clone(),
             Err(poisoned) => poisoned.into_inner().clone(),
         };
-        String::from_utf8_lossy(&snapshot).into_owned()
+        (
+            String::from_utf8_lossy(&snapshot).into_owned(),
+            self.limited.load(Ordering::SeqCst),
+        )
     }
 }
 
@@ -3108,6 +3174,39 @@ mod tests {
         assert_eq!(out.code, Some(0));
         assert!(out.stdout.contains("hello"));
         assert!(!out.timed_out);
+        assert!(!out.output_limited);
+    }
+
+    #[test]
+    fn excessive_output_is_bounded_and_terminates_the_tree() {
+        const TEST_LIMIT: usize = 64 * 1024;
+        #[cfg(windows)]
+        let command = {
+            let mut command = Command::new("powershell");
+            command.args([
+                "-NoProfile",
+                "-NonInteractive",
+                "-Command",
+                "while ($true) { [Console]::Out.WriteLine('0123456789abcdef') }",
+            ]);
+            command
+        };
+        #[cfg(not(windows))]
+        let command = shell("while :; do printf '0123456789abcdef\\n'; done");
+
+        let started = Instant::now();
+        let out = run_with_timeout_and_limit(command, "", Duration::from_secs(30), TEST_LIMIT)
+            .expect("supervise noisy child");
+        assert!(out.output_limited);
+        assert!(!out.timed_out);
+        assert!(out.code.is_none());
+        assert!(out.stdout.len() <= TEST_LIMIT);
+        assert!(out.stderr.len() <= TEST_LIMIT);
+        assert!(
+            started.elapsed() < Duration::from_secs(10),
+            "output-limited child was not terminated promptly: {:?}",
+            started.elapsed()
+        );
     }
 
     #[test]

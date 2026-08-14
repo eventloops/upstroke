@@ -114,6 +114,7 @@ struct RawStrategy {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct RawOverride {
     paths: Vec<String>,
     /// Optional since step 9: an override may raise the tier floor, ask for a
@@ -1385,6 +1386,27 @@ model = "claude-opus-4-8"
         assert!(
             msg.contains("different-vendor"),
             "lists what is accepted: {msg}"
+        );
+    }
+
+    #[test]
+    fn misspelled_second_opinion_key_is_a_hard_error_even_with_start_at() {
+        let path = scratch(
+            "bad-so-key.toml",
+            "[[routing.overrides]]\npaths = [\"src/auth/**\"]\nstart_at = \"frontier\"\n\
+             second_opinon = \"different-vendor\"\n",
+        );
+        let mut warnings = Vec::new();
+        let err = load(Some(&path), &hermetic(), Some(&missing()), &mut warnings)
+            .expect_err("an unknown override key must not silently remove a reviewer");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("second_opinon"),
+            "names the misspelled key: {msg}"
+        );
+        assert!(
+            msg.contains("second_opinion"),
+            "lists the accepted spelling: {msg}"
         );
     }
 

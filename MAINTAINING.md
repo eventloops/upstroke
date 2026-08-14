@@ -63,6 +63,12 @@ missing or inadequate regression as a process defect too. Keep fixed and rejecte
 ledger: the point is to preserve why a change was accepted, rejected, or deferred, not merely to
 list what remains open.
 
+The exact table header and canonical tokens in the pull-request template are machine-enforced by
+`.github/scripts/validate-pr-body.sh`. Every non-empty row binds the finding to a full reviewed SHA
+and `file:line`, includes an explicit `A -> B -> failure` sequence, and uses one disposition:
+`fixed`, `rejected`, `deferred`, or `accepted-risk`. Update the validator and its rejection fixtures
+in the same pull request before changing this schema; aliases and free-form categories fail closed.
+
 ### App-gate migration record
 
 The original `frontier-reviewed` deployment gate failed its stale-SHA canary: GitHub reported a

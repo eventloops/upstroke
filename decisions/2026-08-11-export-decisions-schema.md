@@ -6,7 +6,7 @@
 
 ## Verdict
 
-`tactus export-decisions <run-id> [--format jsonl|csv]` emits export schema 2: one logical row per recorded worker attempt, in raw `AttemptStarted` encounter order. JSONL is the default. CSV carries the same facts as a stable rectangular column set. Both go to stdout, leaving persistence and location to the caller. Schema 2 retains schema 1's columns and JSON shape but extends the exhaustive `failure_kind` domain with `review_input_too_large`; consumers must select behavior from `schema_version`, not assume an open enum.
+`tactus export-decisions <run-id> [--format jsonl|csv]` emits export schema 2: one logical row per recorded worker attempt, in raw `AttemptStarted` encounter order. JSONL is the default. CSV carries the same facts as a stable rectangular column set. Both go to stdout, leaving persistence and location to the caller. Schema 2 retains schema 1's columns and JSON shape but extends the exhaustive `failure_kind` domain with `review_input_too_large` and `review_input_opaque`; consumers must select behavior from `schema_version`, not assume an open enum.
 
 The command is local and read-only. It resolves an exact run id or unambiguous prefix by the existing run-directory rules, reads that run's event log and frozen `plan.normalized.json`, and uses the existing read-only liveness probe. It makes no HTTP request, switches no branch, acquires no run lock, and writes neither repository nor run record. It refuses a currently live run with an actionable error: a moving partial dataset is not a decision record.
 
@@ -80,6 +80,7 @@ The exporter must use an exhaustive, non-wildcard match over `FailureKind`, so a
 | `rate_limited` | `provider` | `none` |
 | `review_unavailable` | `provider` | `none` |
 | `review_input_too_large` | `policy` | `review` |
+| `review_input_opaque` | `policy` | `review` |
 | `timeout` | `infrastructure` | `none` |
 | `interrupted` | `infrastructure` | `none` |
 | `no_chain` | `policy` | `none` |

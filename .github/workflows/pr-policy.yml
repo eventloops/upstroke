@@ -19,32 +19,12 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
-      - name: Validate title and evidence sections
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+
+      - name: Validate title, evidence sections, and finding ledger
         shell: bash
         env:
           PR_TITLE: ${{ github.event.pull_request.title }}
           PR_BODY: ${{ github.event.pull_request.body }}
         run: |
-          title_pattern='^(feat|fix|docs|refactor|test|chore|ci|build|perf|security|release|revert)(\([a-z0-9][a-z0-9._/-]*\))?!?: .+'
-          if [[ ! "$PR_TITLE" =~ $title_pattern ]]; then
-            echo "Pull-request title must use: type(optional-scope): summary" >&2
-            echo "Allowed types: feat, fix, docs, refactor, test, chore, ci, build, perf, security, release, revert" >&2
-            exit 1
-          fi
-
-          failed=0
-          pr_body="${PR_BODY//$'\r'/}"
-          required_sections=(
-            "## Summary"
-            "## Scope"
-            "## Validation"
-            "## Review evidence"
-            "## Risk and rollback"
-          )
-          for section in "${required_sections[@]}"; do
-            if ! grep -Fqx "$section" <<< "$pr_body"; then
-              echo "Pull-request body is missing: $section" >&2
-              failed=1
-            fi
-          done
-          exit "$failed"
+          printf '%s\n' "$PR_BODY" | bash .github/scripts/validate-pr-body.sh "$PR_TITLE"

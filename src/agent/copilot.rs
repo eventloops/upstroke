@@ -107,6 +107,14 @@ impl AgentAdapter for CopilotAdapter {
             "",
             PROBE_TIMEOUT,
         )?;
+        if out.output_limited {
+            return Err(TactusError::Agent {
+                message: format!(
+                    "`{}` --version exceeded the output limit",
+                    invocation.display()
+                ),
+            });
+        }
         if out.timed_out {
             return Err(TactusError::Agent {
                 message: format!("`{}` --version timed out", invocation.display()),
@@ -231,6 +239,13 @@ impl AgentAdapter for CopilotAdapter {
 }
 
 fn checked_help(program: &str, output: &ProcessOutput) -> Result<String, TactusError> {
+    if output.output_limited {
+        return Err(TactusError::Agent {
+            message: format!(
+                "`{program}` --help exceeded the output limit; effort support could not be verified"
+            ),
+        });
+    }
     if output.timed_out {
         return Err(TactusError::Agent {
             message: format!("`{program}` --help timed out; effort support could not be verified"),
@@ -385,6 +400,12 @@ fn parse_output(out: &ProcessOutput) -> Outcome {
         duration: out.duration,
     };
 
+    if out.output_limited {
+        outcome.status = OutcomeStatus::AgentError;
+        outcome.detail = Some("agent exceeded the stdout/stderr output limit".to_owned());
+        return outcome;
+    }
+
     if out.timed_out {
         outcome.status = OutcomeStatus::Timeout;
         outcome.detail = Some("attempt exceeded its wall-clock timeout".to_owned());
@@ -491,6 +512,7 @@ mod tests {
             stderr: stderr.to_owned(),
             duration: Duration::from_secs(1),
             timed_out: false,
+            output_limited: false,
         }
     }
 

@@ -43,6 +43,16 @@ impl Workspace {
     }
 
     fn git(&self, args: &[&str]) -> Result<String, TactusError> {
+        let output = self.git_output(args)?;
+        String::from_utf8(output).map_err(|error| TactusError::Git {
+            message: format!(
+                "git {} returned output that is not valid UTF-8: {error}",
+                args.join(" ")
+            ),
+        })
+    }
+
+    fn git_output(&self, args: &[&str]) -> Result<Vec<u8>, TactusError> {
         let output = Command::new("git")
             .arg("-C")
             .arg(&self.root)
@@ -60,12 +70,7 @@ impl Workspace {
                 ),
             });
         }
-        String::from_utf8(output.stdout).map_err(|error| TactusError::Git {
-            message: format!(
-                "git {} returned output that is not valid UTF-8: {error}",
-                args.join(" ")
-            ),
-        })
+        Ok(output.stdout)
     }
 
     /// §14 pre-flight: the engine refuses dirty trees.
@@ -206,6 +211,109 @@ impl Workspace {
         ])
     }
 
+    /// Refuse staged evidence whose bytes are not the bytes a gate would see,
+    /// or whose worktree still contains unstaged nested state after `git add`.
+    /// A clean/smudge filter makes the cached diff describe the transformed
+    /// blob while gates see the smudged file. Dirty submodules similarly hide
+    /// executable inputs behind an unchanged gitlink. Neither can be reviewed
+    /// completely, so both are policy failures rather than gate results.
+    pub fn review_input_problem(&self) -> Result<Option<String>, TactusError> {
+        let status = self.git_output(&[
+            "status",
+            "--porcelain=v1",
+            "--untracked-files=no",
+            "--ignore-submodules=none",
+        ])?;
+        for line in status
+            .split(|byte| *byte == b'\n')
+            .filter(|line| !line.is_empty())
+        {
+            if line.len() < 3 || line[1] != b' ' {
+                return Ok(Some(format!(
+                    "the staged task still has unstaged or dirty nested-worktree state (`{}`); gates could observe bytes absent from the reviewed commit",
+                    String::from_utf8_lossy(line)
+                )));
+            }
+        }
+
+        let names = self.git_output(&["diff", "--cached", "--name-only", "-z"])?;
+        for raw in names
+            .split(|byte| *byte == 0)
+            .filter(|path| !path.is_empty())
+        {
+            let path = std::str::from_utf8(raw).map_err(|_| TactusError::Git {
+                message: "a staged path is not valid UTF-8, so its attributes cannot be verified"
+                    .to_owned(),
+            })?;
+            let attr = self.git_output(&["check-attr", "--cached", "-z", "filter", "--", path])?;
+            let fields: Vec<&[u8]> = attr
+                .split(|byte| *byte == 0)
+                .filter(|field| !field.is_empty())
+                .collect();
+            let value = fields.get(2).copied().unwrap_or_default();
+            if !matches!(value, b"unspecified" | b"unset") {
+                return Ok(Some(format!(
+                    "staged path `{path}` uses clean/smudge filter `{}`; the cached diff and gate worktree can contain different bytes",
+                    String::from_utf8_lossy(value)
+                )));
+            }
+        }
+        Ok(None)
+    }
+
+    /// A clean detached worktree whose HEAD tree is exactly the staged tree.
+    /// Gates run here, never in the worker's workspace, so ignored files,
+    /// build residue, and gate side-effects cannot influence or contaminate the
+    /// commit under review.
+    pub fn gate_snapshot(&self) -> Result<GateWorkspace, TactusError> {
+        let tree = self.git(&["write-tree"])?;
+        let commit = self.git(&[
+            "-c",
+            "user.name=tactus",
+            "-c",
+            "user.email=tactus@tactus.local",
+            "commit-tree",
+            tree.trim(),
+            "-p",
+            "HEAD",
+            "-m",
+            "[tactus] ephemeral gate snapshot",
+        ])?;
+        let path = std::env::temp_dir().join(format!(
+            "tactus-gates-{}-{}",
+            std::process::id(),
+            crate::ulid::ulid()
+        ));
+        let path_text = path.to_str().ok_or_else(|| TactusError::Git {
+            message: format!("gate snapshot path is not valid UTF-8: {}", path.display()),
+        })?;
+        self.git(&[
+            "worktree",
+            "add",
+            "-q",
+            "--detach",
+            "--force",
+            path_text,
+            commit.trim(),
+        ])?;
+        match Workspace::open(&path) {
+            Ok(workspace) => Ok(GateWorkspace {
+                source_root: self.root.clone(),
+                path,
+                workspace,
+            }),
+            Err(error) => {
+                let _ = Command::new("git")
+                    .arg("-C")
+                    .arg(&self.root)
+                    .args(["worktree", "remove", "--force"])
+                    .arg(&path)
+                    .output();
+                Err(error)
+            }
+        }
+    }
+
     /// Commit whatever `capture_diff` staged. §14: commit-per-task,
     /// `[tactus] <task-id>: <title>`.
     pub fn commit(&self, message: &str) -> Result<String, TactusError> {
@@ -221,6 +329,29 @@ impl Workspace {
     pub fn discard_uncommitted(&self) -> Result<(), TactusError> {
         self.git(&["reset", "-q", "--hard", "HEAD"])?;
         self.git(&["clean", "-qfd"]).map(|_| ())
+    }
+}
+
+pub struct GateWorkspace {
+    source_root: PathBuf,
+    path: PathBuf,
+    workspace: Workspace,
+}
+
+impl GateWorkspace {
+    pub fn workspace(&self) -> &Workspace {
+        &self.workspace
+    }
+}
+
+impl Drop for GateWorkspace {
+    fn drop(&mut self) {
+        let _ = Command::new("git")
+            .arg("-C")
+            .arg(&self.source_root)
+            .args(["worktree", "remove", "--force"])
+            .arg(&self.path)
+            .output();
     }
 }
 
@@ -432,5 +563,96 @@ mod tests {
             .capture_diff()
             .expect_err("lossy conversion would change the evidence the reviewer sees");
         assert!(error.to_string().contains("not valid UTF-8"), "{error}");
+    }
+
+    #[test]
+    fn ignored_worker_input_is_absent_from_gate_snapshot() {
+        let repo = temp_repo("ignored-gate-input");
+        let ws = Workspace::open(&repo).expect("open");
+        fs::write(repo.join(".gitignore"), "worker-toggle\n").expect("ignore rule");
+        ws.capture_diff().expect("stage ignore rule");
+        ws.commit("seed ignore rule").expect("commit ignore rule");
+
+        fs::write(repo.join("README.md"), "changed\n").expect("tracked edit");
+        fs::write(repo.join("worker-toggle"), "make the gate pass\n").expect("ignored input");
+        ws.capture_diff().expect("stage candidate");
+        assert!(
+            ws.review_input_problem()
+                .expect("inspect evidence")
+                .is_none(),
+            "ignored state is isolated by materialization rather than misreported as staged"
+        );
+
+        let snapshot = ws.gate_snapshot().expect("exact staged snapshot");
+        assert_eq!(
+            fs::read_to_string(snapshot.workspace().root().join("README.md"))
+                .expect("snapshot tracked file")
+                .replace("\r\n", "\n"),
+            "changed\n"
+        );
+        assert!(
+            !snapshot.workspace().root().join("worker-toggle").exists(),
+            "worker-created ignored input must not reach gates"
+        );
+        assert!(snapshot.workspace().is_clean().expect("clean snapshot"));
+    }
+
+    #[test]
+    fn filtered_paths_are_refused_before_gates_and_review() {
+        let repo = temp_repo("filtered-evidence");
+        let ws = Workspace::open(&repo).expect("open");
+        fs::write(
+            repo.join(".gitattributes"),
+            "filtered.txt filter=tactus-test\n",
+        )
+        .expect("filter attribute");
+        fs::write(repo.join("filtered.txt"), "semantic bytes\n").expect("filtered file");
+        ws.capture_diff().expect("stage filtered path");
+
+        let problem = ws
+            .review_input_problem()
+            .expect("inspect attributes")
+            .expect("filtered evidence must fail closed");
+        assert!(problem.contains("filtered.txt"), "{problem}");
+        assert!(problem.contains("tactus-test"), "{problem}");
+        assert!(problem.contains("different bytes"), "{problem}");
+    }
+
+    #[test]
+    fn dirty_submodule_worktree_is_refused_before_gates() {
+        let child = temp_repo("dirty-submodule-child");
+        let repo = temp_repo("dirty-submodule-parent");
+        let add = Command::new("git")
+            .arg("-C")
+            .arg(&repo)
+            .args(["-c", "protocol.file.allow=always", "submodule", "add", "-q"])
+            .arg(&child)
+            .arg("nested")
+            .output()
+            .expect("add submodule");
+        assert!(
+            add.status.success(),
+            "submodule add: {}",
+            String::from_utf8_lossy(&add.stderr)
+        );
+        let ws = Workspace::open(&repo).expect("open parent");
+        ws.capture_diff().expect("stage gitlink");
+        ws.commit("seed submodule").expect("commit gitlink");
+        fs::write(
+            repo.join("nested").join("README.md"),
+            "dirty nested bytes\n",
+        )
+        .expect("dirty submodule");
+        ws.capture_diff().expect("stage parent");
+
+        let problem = ws
+            .review_input_problem()
+            .expect("inspect nested state")
+            .expect("dirty submodule must fail closed");
+        assert!(problem.contains("nested"), "{problem}");
+        assert!(
+            problem.contains("absent from the reviewed commit"),
+            "{problem}"
+        );
     }
 }

@@ -186,6 +186,13 @@ impl Gate for ShellGate {
             }
             log.push_str(&out.stderr);
         }
+        if out.output_limited {
+            log.push_str(&format!(
+                "\ngate `{}` exceeded the stdout/stderr output limit",
+                self.name
+            ));
+            return Ok(GateResult::Fail { log });
+        }
         if out.timed_out {
             log.push_str(&format!(
                 "\ngate `{}` timed out after {}s",

@@ -39,6 +39,6 @@ Passing review evidence URL:
 
 ## Review finding ledger
 
-| ID | Severity | Reviewed SHA / location | Provenance | Category | First bad / prior ID | Regression or documented guard | Disposition |
-|---|---|---|---|---|---|---|---|
-| None yet | — | — | — | — | — | — | — |
+| ID | Severity | Reviewed SHA / location | Failure sequence | Provenance | Category | First bad / prior ID | Regression or documented guard | Disposition |
+|---|---|---|---|---|---|---|---|---|
+| None yet | — | — | — | — | — | — | — | — |

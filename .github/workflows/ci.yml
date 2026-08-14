@@ -67,6 +67,7 @@ jobs:
       - run: bash .github/scripts/test-frontier-evidence.sh
       - run: bash .github/scripts/test-frontier-check.sh
       - run: bash .github/scripts/test-release-record.sh
+      - run: bash .github/scripts/test-pr-policy.sh
 
   # Branch protection requires this one deliberately stable context. Keeping
   # the external rule pointed at an aggregate means adding a platform or

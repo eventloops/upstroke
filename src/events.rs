@@ -1940,6 +1940,74 @@ pub(crate) fn ensure_supported_schema(
     Ok(effective)
 }
 
+/// A failed attempt written before schema 3 was settled in two appends: first
+/// `attempt_finished`, then its ladder/parking decision. A process can die
+/// between them. Upgrading that prefix would make the known failed task
+/// runnable again, spending another attempt under a decision the log never
+/// durably recorded. New writers avoid the gap by embedding the decision; old
+/// prefixes must be refused when their second append is absent.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct LegacyUnsettledFailure {
+    pub task: String,
+    pub attempt: u32,
+    pub rung: u32,
+}
+
+pub(crate) fn legacy_unsettled_failure(
+    started_schema: u32,
+    events: &[Event],
+) -> Option<LegacyUnsettledFailure> {
+    let mut schema = started_schema;
+    let mut pending = Vec::<LegacyUnsettledFailure>::new();
+
+    for event in events {
+        match &event.body {
+            EventBody::RunSchemaUpgraded { data } => schema = data.to,
+            EventBody::AttemptFinished {
+                task,
+                attempt,
+                rung,
+                data,
+                parking,
+                transition,
+                ..
+            } if schema < 3
+                && data.failure.is_some()
+                && parking.is_none()
+                && transition.is_none() =>
+            {
+                pending.push(LegacyUnsettledFailure {
+                    task: task.clone(),
+                    attempt: *attempt,
+                    rung: *rung,
+                });
+            }
+            EventBody::LadderRetry {
+                task,
+                attempt,
+                rung,
+                ..
+            }
+            | EventBody::LadderEscalated {
+                task,
+                attempt,
+                rung,
+                ..
+            } => pending.retain(|failure| {
+                failure.task != *task || failure.attempt != *attempt || failure.rung != *rung
+            }),
+            EventBody::TaskDeferred { task, .. }
+            | EventBody::TaskParked { task, .. }
+            | EventBody::TaskFailed { task, .. } => {
+                pending.retain(|failure| failure.task != *task);
+            }
+            _ => {}
+        }
+    }
+
+    pending.into_iter().next()
+}
+
 fn validate_review_identity(
     plan: &crate::review::ReviewPlan,
     task_count: usize,

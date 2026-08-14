@@ -89,6 +89,15 @@ pub fn load(repo_root: &Path, run_id: Option<&str>) -> Result<RunStatus, TactusE
     warnings.extend(parsed.torn_tail_warning);
     let events = parsed.events;
     let started = events::started_of(&events, &events_path)?.clone();
+    if started.run_id != run_id {
+        return Err(TactusError::EventLog {
+            path: events_path.clone(),
+            message: format!(
+                "run_started id `{}` does not match directory `{run_id}`",
+                started.run_id
+            ),
+        });
+    }
     let paths = RunPaths::from_parts(public.clone(), PathBuf::from(&started.private_dir));
 
     let plan_path = paths.plan_json();
@@ -99,6 +108,15 @@ pub fn load(repo_root: &Path, run_id: Option<&str>) -> Result<RunStatus, TactusE
     let plan: Plan = serde_json::from_str(&plan_text).map_err(|e| TactusError::Parse {
         message: format!("{}: {e}", plan_path.display()),
     })?;
+    if plan.source.hash != started.plan_hash {
+        return Err(TactusError::EventLog {
+            path: plan_path,
+            message: format!(
+                "frozen plan hash `{}` does not match run-start hash `{}`",
+                plan.source.hash, started.plan_hash
+            ),
+        });
+    }
 
     let task_ids = plan.tasks.iter().map(|task| task.id.to_string()).collect();
     let mut replayed = events::replay(events, task_ids, &events_path)?;
@@ -222,6 +240,7 @@ pub fn describe(event: &Event) -> String {
             attempt,
             data,
             parking,
+            transition,
             ..
         } => {
             if let Some(parking) = parking {
@@ -235,9 +254,31 @@ pub fn describe(event: &Event) -> String {
                 )
             } else {
                 match &data.failure {
-                    Some(failure) => {
-                        format!("{task}: attempt {attempt} failed — {}", failure.reason)
-                    }
+                    Some(failure) => match transition.as_deref() {
+                        Some(events::AttemptTransition::Retry(data)) => format!(
+                            "{task}: attempt {attempt} failed — {}; retrying on {}{}",
+                            failure.reason,
+                            data.tier,
+                            if data.resume {
+                                " in the same session"
+                            } else {
+                                ""
+                            }
+                        ),
+                        Some(events::AttemptTransition::Escalate(data)) => format!(
+                            "{task}: attempt {attempt} failed — {}; escalating past {} to rung {}",
+                            failure.reason, data.tier, data.to_rung
+                        ),
+                        Some(events::AttemptTransition::Defer(data)) => format!(
+                            "{task}: attempt {attempt} failed — {}; deferred ({}) — {}",
+                            failure.reason, data.defers, data.reason
+                        ),
+                        Some(events::AttemptTransition::Fail(data)) => format!(
+                            "{task}: attempt {attempt} failed — {}; task failed ({:?})",
+                            failure.reason, data.kind
+                        ),
+                        None => format!("{task}: attempt {attempt} failed — {}", failure.reason),
+                    },
                     None => format!("{task}: attempt {attempt} passed"),
                 }
             }
@@ -430,8 +471,12 @@ fn stable_event_bytes_with(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::events::{AttemptRecord, AttemptStarted, RunFinished, RunOutcome, TaskCommitted};
+    use crate::events::{
+        AttemptRecord, AttemptStarted, AttemptTransition, LadderEscalated, LadderRetry,
+        RunFinished, RunOutcome, TaskCommitted, TaskDeferred, TaskFailed,
+    };
     use crate::ir::{Answer, Question, QuestionId, QuestionKind, TaskId};
+    use crate::ladder::{FailureKind, FailureOrigin};
 
     fn event(body: EventBody) -> Event {
         Event {
@@ -524,6 +569,74 @@ mod tests {
             }),
         }));
         assert!(line.contains("tactus answer q-01ABC"), "{line}");
+    }
+
+    #[test]
+    fn describe_atomic_attempt_transitions() {
+        let cases = [
+            (
+                AttemptTransition::Retry(LadderRetry {
+                    resume: true,
+                    tier: "mid".to_owned(),
+                    summary: "try again".to_owned(),
+                    detail: None,
+                }),
+                "retrying on mid in the same session",
+            ),
+            (
+                AttemptTransition::Escalate(LadderEscalated {
+                    to_rung: 2,
+                    tier: "frontier".to_owned(),
+                    summary: "go higher".to_owned(),
+                    detail: None,
+                }),
+                "escalating past frontier to rung 2",
+            ),
+            (
+                AttemptTransition::Defer(TaskDeferred {
+                    reason: "pool unavailable".to_owned(),
+                    defers: 3,
+                }),
+                "deferred (3) — pool unavailable",
+            ),
+            (
+                AttemptTransition::Fail(TaskFailed {
+                    kind: FailureKind::GateFailed,
+                    reason: "gates exhausted".to_owned(),
+                    halts_run: true,
+                }),
+                "task failed (GateFailed)",
+            ),
+        ];
+
+        for (transition, expected) in cases {
+            let line = describe(&event(EventBody::AttemptFinished {
+                task: "t1".to_owned(),
+                attempt: 1,
+                rung: 0,
+                profile: "implement".to_owned(),
+                data: Box::new(AttemptRecord {
+                    attempt: 1,
+                    tier: "small".to_owned(),
+                    model: "model".to_owned(),
+                    pool: None,
+                    resumed: false,
+                    duration: Duration::from_secs(1),
+                    cost_usd: None,
+                    reviews: Vec::new(),
+                    session_id: None,
+                    usage: None,
+                    failure: Some(events::FailureRecord {
+                        kind: FailureKind::GateFailed,
+                        origin: FailureOrigin::Worker,
+                        reason: "the attempt failed".to_owned(),
+                    }),
+                }),
+                parking: None,
+                transition: Some(Box::new(transition)),
+            }));
+            assert!(line.contains(expected), "{line}");
+        }
     }
 
     #[test]

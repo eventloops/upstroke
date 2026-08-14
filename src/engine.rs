@@ -535,8 +535,6 @@ fn preflight_with_recorded(
             let configured = analysis.config.review_pass_timeout.as_secs();
             if recorded.legacy_review_timeout_missing {
                 plan.pass_timeout_secs = Some(configured);
-                plan.enabled = Some(plan.primary.is_some());
-                plan.alternative_available = Some(plan.alternative.is_some());
                 warnings.push(format!(
                     "this run's recorded review plan predates schema 3's per-pass timeout; this \
                      resume establishes today's configured {configured}s timeout in the \
@@ -552,6 +550,15 @@ fn preflight_with_recorded(
                      verification standard. Start a new run to adopt today's timeout.",
                     recorded
                 ));
+            }
+            if plan.enabled.is_none() || plan.alternative_available.is_none() {
+                plan.enabled.get_or_insert(plan.primary.is_some());
+                plan.alternative_available
+                    .get_or_insert(plan.alternative.is_some());
+                warnings.push(
+                    "this run's recorded review plan predates schema 3's explicit reviewer-identity markers; this resume records them before any more work starts"
+                        .to_owned(),
+                );
             }
             plan
         }
@@ -1156,6 +1163,12 @@ fn resume_harness_inner(
     let events = events::read_all(&events_path, &mut warnings)?;
     let started = events::started_of(&events, &events_path)?.clone();
     let effective_schema = events::ensure_supported_schema(&started, &events, &events_path)?;
+    if let Some(failure) = events::legacy_unsettled_failure(started.schema, &events) {
+        return Err(refuse(format!(
+            "legacy event schema {} records failed attempt {} for `{}` on rung {} without its durable ladder or parking decision. The old writer may have stopped between two appends, so resuming could repeat paid work or choose the wrong rung. Preserve this log for recovery and start a new run rather than guessing.",
+            started.schema, failure.attempt, failure.task, failure.rung
+        )));
+    }
     // Usually `run_started`'s, but a log too old to carry them there may have
     // had them established by an earlier resume instead — which is what stops
     // the re-derivation repeating, and drifting, on every resume after that.
@@ -1363,23 +1376,45 @@ fn resume_harness_inner(
             _ => None,
         })
         .collect();
-    let declined_questions: Vec<_> = replayed
+    let mut declined_questions = Vec::new();
+    for record in replayed
         .state
         .questions
         .iter()
         .filter(|record| record.answer.as_ref() == Some(&Answer::Declined))
-        .map(|record| {
-            (
-                record.question.id.clone(),
-                record.question.affected_tasks.clone(),
-                decline_halt_policies
-                    .get(&record.question.id)
-                    .copied()
-                    .flatten()
-                    .unwrap_or(analysis.config.on_task_failure == OnTaskFailure::Halt),
-            )
-        })
-        .collect();
+    {
+        let affected: Vec<_> = record
+            .question
+            .affected_tasks
+            .iter()
+            .filter(|task_id| {
+                replayed
+                    .state
+                    .index_of(task_id.as_str())
+                    .is_some_and(|index| {
+                        matches!(
+                            &replayed.state.states[index],
+                            TaskState::AwaitingInput(open) if open == &record.question.id
+                        )
+                    })
+            })
+            .cloned()
+            .collect();
+        if affected.is_empty() {
+            continue;
+        }
+        let Some(halts_run) = decline_halt_policies
+            .get(&record.question.id)
+            .copied()
+            .flatten()
+        else {
+            return Err(refuse(format!(
+                "legacy declined answer {} stopped before settling its affected task, but the log does not record the contemporaneous on_task_failure policy. Today's config cannot safely decide an old answer; preserve this log for recovery and start a new run.",
+                record.question.id
+            )));
+        };
+        declined_questions.push((record.question.id.clone(), affected, halts_run));
+    }
 
     let workspace = Workspace::open(&opts.repo_root)?;
     workspace.ensure_run_exclusions()?;
@@ -3440,19 +3475,41 @@ fn run_attempt(
         );
     }
     if failure.is_none()
-        && let Some(gate_failure) =
-            gates::run_all(cx.gates, workspace, &cx.paths.gates(), &cx.stem, cx.attempt)?
+        && let Some(error) = review::complete_diff_error(&outcome.diff)
+        && (matches!(error, review::CompleteDiffError::Opaque) || !cx.reviewers.is_empty())
     {
-        failure = Some(
-            AttemptFailure::new(
-                FailureKind::GateFailed,
-                format!(
-                    "gate `{}` failed: {}",
-                    gate_failure.gate, gate_failure.summary
-                ),
-            )
-            .with_feedback(gate_failure.log_tail),
-        );
+        let kind = match error {
+            review::CompleteDiffError::Opaque => FailureKind::ReviewInputOpaque,
+            review::CompleteDiffError::TooLarge { .. } => FailureKind::ReviewInputTooLarge,
+        };
+        failure = Some(AttemptFailure::new(kind, error.to_string()).from_reviewer());
+    }
+    if failure.is_none()
+        && let Some(problem) = workspace.review_input_problem()?
+    {
+        failure =
+            Some(AttemptFailure::new(FailureKind::ReviewInputOpaque, problem).from_reviewer());
+    }
+    if failure.is_none() && !cx.gates.is_empty() {
+        let gate_workspace = workspace.gate_snapshot()?;
+        if let Some(gate_failure) = gates::run_all(
+            cx.gates,
+            gate_workspace.workspace(),
+            &cx.paths.gates(),
+            &cx.stem,
+            cx.attempt,
+        )? {
+            failure = Some(
+                AttemptFailure::new(
+                    FailureKind::GateFailed,
+                    format!(
+                        "gate `{}` failed: {}",
+                        gate_failure.gate, gate_failure.summary
+                    ),
+                )
+                .with_feedback(gate_failure.log_tail),
+            );
+        }
     }
 
     // §11.2: gates are objective but shallow — a strong reviewer judges the
@@ -3465,57 +3522,48 @@ fn run_attempt(
     // and costs another frontier invocation to learn it.
     let mut reviews = Vec::new();
     if failure.is_none() && !cx.reviewers.is_empty() {
-        if let Some(error) = review::complete_diff_error(&outcome.diff) {
-            // This happens after the worker and cheap gates have run. Return a
-            // normal attempt result so the caller writes `attempt_finished`
-            // with the worker's duration, usage, session, and cost before the
-            // ladder parks. Propagating the prompt-construction error would
-            // leave a dangling attempt that replay mislabels as interrupted.
-            let kind = match error {
-                review::CompleteDiffError::Opaque => FailureKind::ReviewInputOpaque,
-                review::CompleteDiffError::TooLarge { .. } => FailureKind::ReviewInputTooLarge,
-            };
-            failure = Some(AttemptFailure::new(kind, error.to_string()).from_reviewer());
-        } else {
-            let artifacts = load_artifacts(&cx.paths.artifacts(), cx.task);
-            for reviewer in &cx.reviewers {
-                let review = review::run_review(&review::ReviewCx {
-                    adapter: reviewer.adapter,
-                    profile: reviewer.profile.clone(),
-                    lens: reviewer.lens,
-                    task: cx.task,
-                    diff: &outcome.diff,
-                    artifacts: &artifacts,
-                    decisions: &cx.decisions,
-                    workspace: workspace.root(),
-                    settings_dir: &cx.paths.settings(),
-                    reviews_dir: &cx.paths.reviews(),
-                    stem: format!("{}-{}", cx.stem, cx.attempt),
-                    timeout: cx.review_pass_timeout,
-                })?;
-                let cost_usd = review.cost_usd;
-                // Read before the result is consumed: a judge that never ran is not
-                // a judge that said no, and the ledger has to show which happened.
-                let unavailable = matches!(review.result, review::ReviewResult::Unavailable { .. });
-                failure = review_failure(review.result);
-                reviews.push(events::ReviewRecord {
-                    pass: reviewer.lens.name().to_owned(),
-                    agent: reviewer.profile.agent.clone(),
-                    model: reviewer.profile.model.clone(),
-                    adapter: Some(reviewer.adapter.id().to_owned()),
-                    preflight_cli_version: reviewer.preflight_cli_version.clone(),
-                    effort: reviewer.profile.effort,
-                    pool: pool_option(&reviewer.profile.pool),
-                    cost_usd,
-                    outcome: match (unavailable, failure.is_none()) {
-                        (true, _) => events::ReviewPassOutcome::Unavailable,
-                        (false, true) => events::ReviewPassOutcome::Passed,
-                        (false, false) => events::ReviewPassOutcome::Failed,
-                    },
-                });
-                if failure.is_some() {
-                    break;
-                }
+        let artifacts = load_artifacts(&cx.paths.artifacts(), cx.task);
+        // Like gates, reviewers may inspect repository context beyond the
+        // supplied diff. Give them the exact staged candidate, never ignored
+        // worker inputs or residue from the authoritative workspace.
+        let review_workspace = workspace.gate_snapshot()?;
+        for reviewer in &cx.reviewers {
+            let review = review::run_review(&review::ReviewCx {
+                adapter: reviewer.adapter,
+                profile: reviewer.profile.clone(),
+                lens: reviewer.lens,
+                task: cx.task,
+                diff: &outcome.diff,
+                artifacts: &artifacts,
+                decisions: &cx.decisions,
+                workspace: review_workspace.workspace().root(),
+                settings_dir: &cx.paths.settings(),
+                reviews_dir: &cx.paths.reviews(),
+                stem: format!("{}-{}", cx.stem, cx.attempt),
+                timeout: cx.review_pass_timeout,
+            })?;
+            let cost_usd = review.cost_usd;
+            // Read before the result is consumed: a judge that never ran is not
+            // a judge that said no, and the ledger has to show which happened.
+            let unavailable = matches!(review.result, review::ReviewResult::Unavailable { .. });
+            failure = review_failure(review.result);
+            reviews.push(events::ReviewRecord {
+                pass: reviewer.lens.name().to_owned(),
+                agent: reviewer.profile.agent.clone(),
+                model: reviewer.profile.model.clone(),
+                adapter: Some(reviewer.adapter.id().to_owned()),
+                preflight_cli_version: reviewer.preflight_cli_version.clone(),
+                effort: reviewer.profile.effort,
+                pool: pool_option(&reviewer.profile.pool),
+                cost_usd,
+                outcome: match (unavailable, failure.is_none()) {
+                    (true, _) => events::ReviewPassOutcome::Unavailable,
+                    (false, true) => events::ReviewPassOutcome::Passed,
+                    (false, false) => events::ReviewPassOutcome::Failed,
+                },
+            });
+            if failure.is_some() {
+                break;
             }
         }
     }
@@ -4307,6 +4355,12 @@ mod tests {
         /// Produces a binary patch whose changed bytes cannot be semantically
         /// reviewed from the unified diff.
         OpaqueEdit,
+        /// Adds an ignored, uncommitted input that a gate could observe in the
+        /// worker tree but that is absent from the staged review candidate.
+        IgnoredGateInput,
+        /// After the reviewer workspace exists, plants a stale lock in the
+        /// common git directory so the later authoritative cleanup fails.
+        JamCleanupAfterReview,
         /// Produces the same oversized diff, then makes the question payload
         /// directory unwritable so parking preparation fails deterministically.
         LargeEditQuestionWriteFailure,
@@ -4490,6 +4544,46 @@ mod tests {
 
         fn build(&self, run: &TaskRun) -> Result<std::process::Command, TactusError> {
             if run.profile.permissions == PermissionMode::ReadOnly {
+                let effect = self
+                    .calls
+                    .lock()
+                    .map(|calls| {
+                        scripted(
+                            &self.effects,
+                            calls.worker.saturating_sub(1),
+                            Effect::EditFile,
+                        )
+                    })
+                    .unwrap_or(Effect::EditFile);
+                if effect == Effect::JamCleanupAfterReview {
+                    let common = Command::new("git")
+                        .arg("-C")
+                        .arg(&run.workspace)
+                        .args(["rev-parse", "--git-common-dir"])
+                        .output()
+                        .map_err(|e| TactusError::Agent {
+                            message: format!("fake could not inspect git common dir: {e}"),
+                        })?;
+                    if !common.status.success() {
+                        return Err(TactusError::Agent {
+                            message: format!(
+                                "fake could not inspect git common dir: {}",
+                                String::from_utf8_lossy(&common.stderr).trim()
+                            ),
+                        });
+                    }
+                    let common = PathBuf::from(String::from_utf8_lossy(&common.stdout).trim());
+                    let common = if common.is_absolute() {
+                        common
+                    } else {
+                        run.workspace.join(common)
+                    };
+                    fs::write(common.join("index.lock"), "jam\n").map_err(|e| {
+                        TactusError::Agent {
+                            message: format!("fake could not jam cleanup: {e}"),
+                        }
+                    })?;
+                }
                 let mut cmd = shell_command(&format!("echo {REVIEW_MARKER}"));
                 cmd.current_dir(&run.workspace);
                 return Ok(cmd);
@@ -4522,7 +4616,7 @@ mod tests {
                         );
                         std::process::exit(CRASH_EXIT_CODE);
                     }
-                    Effect::EditFile | Effect::AskQuestion => {
+                    Effect::EditFile | Effect::AskQuestion | Effect::JamCleanupAfterReview => {
                         let marker = run.workspace.join("agent-output.txt");
                         let previous = fs::read_to_string(&marker).unwrap_or_default();
                         Some(("agent-output.txt", format!("{previous}edited: {index}\n")))
@@ -4537,6 +4631,18 @@ mod tests {
                     )),
                     Effect::OpaqueEdit => {
                         Some(("opaque-agent-output.bin", "\0hidden bytes".to_owned()))
+                    }
+                    Effect::IgnoredGateInput => {
+                        fs::write(run.workspace.join(".gitignore"), "ignored.flag\n").map_err(
+                            |e| TactusError::Agent {
+                                message: format!("fake ignore rule failed: {e}"),
+                            },
+                        )?;
+                        fs::write(run.workspace.join("ignored.flag"), "gate-only input\n")
+                            .map_err(|e| TactusError::Agent {
+                                message: format!("fake ignored input failed: {e}"),
+                            })?;
+                        Some(("agent-output.txt", "reviewed edit\n".to_owned()))
                     }
                     Effect::NoEdit | Effect::Error | Effect::RateLimited => None,
                 };
@@ -4639,6 +4745,8 @@ mod tests {
                 | Effect::EditTest
                 | Effect::LargeEdit
                 | Effect::OpaqueEdit
+                | Effect::IgnoredGateInput
+                | Effect::JamCleanupAfterReview
                 | Effect::LargeEditQuestionWriteFailure
                 | Effect::NoEdit
                 | Effect::AskQuestion
@@ -5161,6 +5269,37 @@ mod tests {
         assert_eq!(report.gates, ["version"]);
         assert!(report.gates_from_config);
         assert!(report.render().contains("gates: version [from config]"));
+    }
+
+    #[test]
+    fn ignored_worker_input_cannot_make_a_gate_pass() {
+        let repo = temp_engine_repo("ignored-gate-input");
+        seed(
+            &repo,
+            "## Implement the widget\n<!-- tactus: id=t1 depends= -->\n",
+            Some(
+                "[interaction]\nmode = \"never\"\n\n\
+                 [routing]\nimplement = { chain = [\"small\"], attempts_per = 1 }\n\n\
+                 [[gates]]\nname = \"ignored-input\"\ncmd = \"git hash-object ignored.flag\"\n",
+            ),
+        );
+
+        let mut opts = options(&repo);
+        opts.config_path = Some(repo.join("tactus.toml"));
+        let source = fake(Effect::IgnoredGateInput);
+        let report = run_with(&opts, &source).expect("gate failure settles the task");
+
+        assert!(!committed(&report, "t1"), "report: {report:?}");
+        assert!(task(&report, "t1").attempts.iter().any(|attempt| {
+            attempt
+                .failure
+                .as_ref()
+                .is_some_and(|failure| failure.kind == FailureKind::GateFailed)
+        }));
+        assert!(
+            !repo.join("ignored.flag").exists(),
+            "ignored worker-only input was cleaned from the authoritative workspace"
+        );
     }
 
     #[test]
@@ -6018,6 +6157,47 @@ mod tests {
     }
 
     #[test]
+    fn schema_two_review_markers_upgrade_independently_of_timeout() {
+        let (repo, run_id) = parked_run("schema2reviewmarkers");
+        let paths = paths_of(&repo, &run_id);
+        let recorded_timeout = events::recorded_reviews(&events_of(&repo, &run_id))
+            .and_then(|plan| plan.pass_timeout_secs)
+            .expect("current run records a timeout");
+        rewrite_run_started_as_schema_two_missing_review_fields(
+            &paths,
+            &["enabled", "alternative_available"],
+        );
+
+        let first = resume_answering(&repo, &run_id, Effect::NoEdit);
+        assert_eq!(first.outcome(), RunOutcome::Parked, "{first:?}");
+        assert!(
+            first
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("explicit reviewer-identity markers")),
+            "marker-upgrade warning: {:?}",
+            first.warnings
+        );
+        let upgraded = events::recorded_complete_reviews(&events_of(&repo, &run_id))
+            .cloned()
+            .expect("schema-3 resume records the complete identity");
+        assert_eq!(upgraded.pass_timeout_secs, Some(recorded_timeout));
+        assert_eq!(upgraded.enabled, Some(upgraded.primary.is_some()));
+        assert_eq!(
+            upgraded.alternative_available,
+            Some(upgraded.alternative.is_some())
+        );
+
+        let second = resume_answering(&repo, &run_id, Effect::EditFile);
+        assert_eq!(second.outcome(), RunOutcome::Complete, "{second:?}");
+        assert_eq!(
+            events::recorded_complete_reviews(&events_of(&repo, &run_id)),
+            Some(&upgraded),
+            "the next replay accepts and preserves the explicit markers"
+        );
+    }
+
+    #[test]
     fn a_resume_whose_effort_policy_did_not_move_says_nothing_about_it() {
         let config = "[interaction]\nmode = \"never\"\n\n\
                       [routing]\nimplement = { chain = [\"small\"], attempts_per = 1 }\n\n\
@@ -6718,6 +6898,49 @@ mod tests {
     }
 
     #[test]
+    fn schema_two_decline_prefix_preserves_or_refuses_unknown_halt_policy() {
+        let repo = temp_engine_repo("legacydeclinepolicy");
+        seed(
+            &repo,
+            "## Doomed\n<!-- tactus: id=t1 kind=implement depends= -->\n",
+            Some("[routing]\nimplement = { chain = [\"small\"], attempts_per = 1 }\n"),
+        );
+        let mut opts = options(&repo);
+        opts.config_path = Some(repo.join("tactus.toml"));
+        let initial = source(vec![Effect::NoEdit], vec![ReviewBehavior::Pass]);
+        let answers = ScriptedAnswers::new(vec![Answer::Declined]);
+        let report = run_harness(
+            &opts,
+            &Harness {
+                adapters: &initial,
+                answers: Some(&answers),
+                sleeper: None,
+            },
+        )
+        .expect("build a complete decline sequence");
+        let paths = paths_of(&repo, &report.run_id);
+        truncate_log_after(&paths, "question_answered");
+        rewrite_run_started_as_schema_two(&paths);
+        strip_event_data_field(&paths, "question_answered", "decline_halts_run");
+        fs::write(
+            repo.join("tactus.toml"),
+            "[engine]\non_task_failure = \"continue\"\n\n\
+             [routing]\nimplement = { chain = [\"small\"], attempts_per = 1 }\n",
+        )
+        .expect("today's policy differs");
+
+        let error = resume_err(&repo, &report.run_id);
+        assert!(
+            error.contains("contemporaneous on_task_failure policy"),
+            "{error}"
+        );
+        assert!(
+            error.contains("cannot safely decide an old answer"),
+            "{error}"
+        );
+    }
+
+    #[test]
     fn on_task_failure_continue_keeps_independent_work_moving() {
         let repo = temp_engine_repo("continue");
         seed(
@@ -7284,6 +7507,7 @@ mod tests {
             stderr: String::new(),
             code: Some(1),
             timed_out: false,
+            output_limited: false,
             duration: Duration::ZERO,
         };
         for (status, expected) in [
@@ -8313,6 +8537,28 @@ mod tests {
     }
 
     #[test]
+    fn resume_refuses_schema_two_failed_attempt_without_recorded_decision() {
+        let (repo, run_id) = parked_run("legacyfailedprefix");
+        let paths = paths_of(&repo, &run_id);
+        rewrite_run_started_as_schema_two(&paths);
+        strip_event_field(&paths, "attempt_finished", "parking");
+        truncate_log_after(&paths, "attempt_finished");
+        let before = fs::read(paths.events()).expect("legacy prefix");
+
+        let error = resume_err(&repo, &run_id);
+        assert!(error.contains("failed attempt 1"), "{error}");
+        assert!(
+            error.contains("without its durable ladder or parking decision"),
+            "{error}"
+        );
+        assert_eq!(
+            fs::read(paths.events()).expect("refused log"),
+            before,
+            "refusal must not upgrade or otherwise mutate the ambiguous prefix"
+        );
+    }
+
+    #[test]
     fn resume_refuses_when_the_branch_moved_under_it() {
         // §15's HEAD check. Something committed after the run stopped, so the
         // log no longer describes what is on the branch.
@@ -8347,6 +8593,31 @@ mod tests {
             err.contains("attribute work to the wrong tasks"),
             "and why it matters: {err}"
         );
+    }
+
+    #[test]
+    fn status_refuses_mismatched_frozen_plan_hash() {
+        let (repo, run_id) = parked_run("statusplanhash");
+        let plan_path = paths_of(&repo, &run_id).plan_json();
+        let mut plan: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&plan_path).expect("frozen plan"))
+                .expect("valid frozen plan");
+        plan["source"]["hash"] = serde_json::Value::String("different-plan".to_owned());
+        fs::write(
+            &plan_path,
+            format!(
+                "{}\n",
+                serde_json::to_string_pretty(&plan).expect("serialize plan")
+            ),
+        )
+        .expect("replace frozen plan");
+
+        let error = match crate::status::load(&repo, Some(&run_id)) {
+            Ok(_) => panic!("status must not fold events against a different frozen plan"),
+            Err(error) => error.to_string(),
+        };
+        assert!(error.contains("frozen plan hash"), "{error}");
+        assert!(error.contains("different-plan"), "{error}");
     }
 
     #[test]
@@ -9096,6 +9367,13 @@ mod tests {
     /// Rewrite a current start into the shape written immediately before the
     /// complete-review contract: schema 2 and no per-pass timeout field.
     fn rewrite_run_started_as_schema_two(paths: &RunPaths) {
+        rewrite_run_started_as_schema_two_missing_review_fields(paths, &["pass_timeout_secs"]);
+    }
+
+    fn rewrite_run_started_as_schema_two_missing_review_fields(
+        paths: &RunPaths,
+        absent_review_fields: &[&str],
+    ) {
         let text = fs::read_to_string(paths.events()).expect("log");
         let mut rewritten_start = false;
         let rewritten: Vec<String> = text
@@ -9109,17 +9387,58 @@ mod tests {
                         .and_then(serde_json::Value::as_object_mut)
                         .expect("run_started data");
                     data.insert("schema".to_owned(), serde_json::Value::from(2));
-                    data.get_mut("reviews")
+                    let reviews = data
+                        .get_mut("reviews")
                         .and_then(serde_json::Value::as_object_mut)
-                        .expect("recorded review plan")
-                        .remove("pass_timeout_secs")
-                        .expect("current review plan records its timeout");
+                        .expect("recorded review plan");
+                    for field in absent_review_fields {
+                        reviews
+                            .remove(*field)
+                            .unwrap_or_else(|| panic!("current review plan records `{field}`"));
+                    }
                     rewritten_start = true;
                 }
                 value.to_string()
             })
             .collect();
         assert!(rewritten_start, "the log has no run_started event");
+        fs::write(paths.events(), format!("{}\n", rewritten.join("\n"))).expect("rewrite");
+    }
+
+    fn strip_event_field(paths: &RunPaths, event: &str, field: &str) {
+        rewrite_event_field(paths, event, field, false);
+    }
+
+    fn strip_event_data_field(paths: &RunPaths, event: &str, field: &str) {
+        rewrite_event_field(paths, event, field, true);
+    }
+
+    fn rewrite_event_field(paths: &RunPaths, event: &str, field: &str, nested_in_data: bool) {
+        let text = fs::read_to_string(paths.events()).expect("log");
+        let mut stripped = false;
+        let rewritten: Vec<String> = text
+            .lines()
+            .map(|line| {
+                let mut value: serde_json::Value =
+                    serde_json::from_str(line).expect("every line is an event");
+                if value.get("event").and_then(serde_json::Value::as_str) == Some(event) {
+                    let object = if nested_in_data {
+                        value
+                            .get_mut("data")
+                            .and_then(serde_json::Value::as_object_mut)
+                            .expect("event data")
+                    } else {
+                        value.as_object_mut().expect("event object")
+                    };
+                    object
+                        .remove(field)
+                        .unwrap_or_else(|| panic!("{event} records `{field}`"));
+                    stripped = true;
+                }
+                value.to_string()
+            })
+            .collect();
+        assert!(stripped, "the log has no `{event}.{field}` to strip");
         fs::write(paths.events(), format!("{}\n", rewritten.join("\n"))).expect("rewrite");
     }
 
@@ -10621,22 +10940,22 @@ mod tests {
         // stop to get past. The tidying is a courtesy; the ceiling is the run's
         // account of why it stopped.
         //
-        // The gate plants a stale `.git/index.lock`, which is the most faithful
-        // portable version of that: every later git command that writes the
-        // index refuses, and nothing else changes.
+        // The fake reviewer plants a stale lock only after its exact candidate
+        // worktree exists. This reaches the budget-stop cleanup without using
+        // ordinary gate residue to pierce the new workspace isolation.
         let repo = temp_engine_repo("budgetjam");
         seed(
             &repo,
             "## One\n<!-- tactus: id=t1 kind=implement depends= -->\n",
-            Some(
-                "[routing]\nimplement = { chain = [\"small\"], attempts_per = 2 }\n\n\
-                 [[gates]]\nname = \"jam\"\ncmd = \"echo jam> .git/index.lock\"\n",
-            ),
+            Some("[routing]\nimplement = { chain = [\"small\"], attempts_per = 2 }\n"),
         );
         let mut opts = options(&repo);
         opts.config_path = Some(repo.join("tactus.toml"));
         opts.budget_usd = Some(0.05);
-        let rejected = source(vec![Effect::EditFile], vec![ReviewBehavior::Fail]);
+        let rejected = source(
+            vec![Effect::JamCleanupAfterReview],
+            vec![ReviewBehavior::Fail],
+        );
         let stopped = run_with(&opts, &rejected).expect("the ceiling still ends the run");
 
         assert_eq!(
