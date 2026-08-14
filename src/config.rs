@@ -125,6 +125,7 @@ struct RawOverride {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct RawPin {
     tier: Tier,
     agent: String,
@@ -1526,6 +1527,24 @@ model = "claude-opus-4-8"
         assert!(
             msg.contains("claude-opus-4-8"),
             "should list known models: {msg}"
+        );
+    }
+
+    #[test]
+    fn misspelled_pin_effort_key_is_a_hard_error() {
+        let path = scratch(
+            "misspelledpineffort.toml",
+            "[[pins]]\ntier = \"frontier\"\nagent = \"claude-code\"\nmodel = \
+             \"claude-opus-5\"\neffrot = \"max\"\n",
+        );
+        let mut warnings = Vec::new();
+        let error = load(Some(&path), &hermetic(), Some(&missing()), &mut warnings)
+            .expect_err("a misspelled pin effort must not fall back to the tier default");
+        let message = error.to_string();
+        assert!(message.contains("effrot"), "names the typo: {message}");
+        assert!(
+            message.contains("effort"),
+            "names the accepted key: {message}"
         );
     }
 

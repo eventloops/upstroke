@@ -1,6 +1,9 @@
 name: Pull request policy
 
 on:
+  # This pull_request workflow and its checked-out validator are candidate
+  # controlled. It is fast feedback only; the default-branch frontier-review
+  # workflow re-runs the canonical validator before the App check is minted.
   pull_request:
     branches: [master]
     types: [opened, edited, synchronize, reopened, ready_for_review]

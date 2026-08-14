@@ -12,7 +12,8 @@ contract itself.
 2. Push the branch and open a **draft pull request early**. Use a Conventional Commit title:
    `type(optional-scope): summary`.
 3. Let the inexpensive deterministic gates finish first:
-   - `tactus-pr-policy` checks the PR title format and that the required evidence headings exist.
+   - `tactus-pr-policy` gives fast candidate-controlled feedback on the PR title and evidence ledger;
+     it is not a trusted merge boundary because a pull request can edit both workflow and validator.
    - `tactus-ci` aggregates formatting, Clippy, and the Windows, Linux, and macOS test matrix.
 4. If the branch is behind `master`, update it and wait for both gates again.
 5. Only after both gates are green, give the exact current diff and head SHA to an independent
@@ -28,7 +29,8 @@ contract itself.
    `TACTUS_FRONTIER_REVIEW: 1`, `VERDICT: PASS`, and `REVIEWED_SHA: <full SHA>` on separate lines,
    with no other text. Send the `frontier-review` repository dispatch with the PR number, full
    reviewed head SHA, and evidence URL. The default-branch workflow refuses stale, ambiguous, or
-   behind evidence, validates the PR metadata and evidence comment, reruns formatting, Clippy, and
+   behind evidence, runs the default branch's canonical PR-body validator over the live title/body,
+   validates the evidence comment, reruns formatting, Clippy, and
    all three platform test jobs from its trusted default-branch definition, then uses the dedicated
    `Tactus Frontier Review Gate` GitHub App to publish a successful `tactus-frontier-review` check
    on the exact head.
@@ -40,6 +42,11 @@ merge gate. The ruleset binds the check name to App id `4574301`, while the App 
 out of every pull-request workflow. A same-named GitHub Actions check therefore cannot satisfy the
 rule. The repository owner remains responsible for the truth of the linked semantic review;
 dispatching without a real passing review is a policy violation.
+
+`tactus-pr-policy` deliberately remains a `pull_request` workflow so contributors get immediate,
+unprivileged feedback from the candidate they are editing. Its result is not trusted: the
+default-branch `repository_dispatch` workflow fetches the live title/body and runs its own canonical
+`validate-pr-body.sh` immediately after dispatch validation and again just before App-token minting.
 
 ### Review finding ledger
 

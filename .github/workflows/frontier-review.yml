@@ -103,24 +103,9 @@ jobs:
             exit 1
           fi
 
-          title_pattern='^(feat|fix|docs|refactor|test|chore|ci|build|perf|security|release|revert)(\([a-z0-9][a-z0-9._/-]*\))?!?: .+'
-          if [[ ! "$pr_title" =~ $title_pattern ]]; then
-            echo "pull-request title does not satisfy repository policy" >&2
-            exit 1
-          fi
-          required_sections=(
-            "## Summary"
-            "## Scope"
-            "## Validation"
-            "## Review evidence"
-            "## Risk and rollback"
-          )
-          for section in "${required_sections[@]}"; do
-            if ! grep -Fqx "$section" <<< "$pr_body"; then
-              echo "pull-request body is missing: $section" >&2
-              exit 1
-            fi
-          done
+          # This checkout and validator come from the trusted default branch,
+          # never from the pull request whose metadata is being attested.
+          printf '%s\n' "$pr_body" | bash .github/scripts/validate-pr-body.sh "$pr_title"
 
           review_comment="$(gh api "repos/$GITHUB_REPOSITORY/issues/comments/$review_comment_id")"
           comment_url="$(jq -r '.html_url' <<< "$review_comment")"
@@ -166,6 +151,7 @@ jobs:
       - run: cargo clippy --all-targets -- -D warnings
       - run: bash .github/scripts/test-frontier-evidence.sh
       - run: bash .github/scripts/test-frontier-check.sh
+      - run: bash .github/scripts/test-frontier-workflow.sh
       - run: bash .github/scripts/test-release-record.sh
 
   test:
@@ -249,24 +235,9 @@ jobs:
             exit 1
           fi
 
-          title_pattern='^(feat|fix|docs|refactor|test|chore|ci|build|perf|security|release|revert)(\([a-z0-9][a-z0-9._/-]*\))?!?: .+'
-          if [[ ! "$pr_title" =~ $title_pattern ]]; then
-            echo "pull-request title no longer satisfies repository policy" >&2
-            exit 1
-          fi
-          required_sections=(
-            "## Summary"
-            "## Scope"
-            "## Validation"
-            "## Review evidence"
-            "## Risk and rollback"
-          )
-          for section in "${required_sections[@]}"; do
-            if ! grep -Fqx "$section" <<< "$pr_body"; then
-              echo "pull-request body is now missing: $section" >&2
-              exit 1
-            fi
-          done
+          # Re-run the same trusted policy after the test matrix: title, body,
+          # and ledger are mutable PR metadata and may have changed meanwhile.
+          printf '%s\n' "$pr_body" | bash .github/scripts/validate-pr-body.sh "$pr_title"
 
           review_prefix="https://github.com/$GITHUB_REPOSITORY/pull/$PR_NUMBER#issuecomment-"
           review_comment_id="${REVIEW_URL#"$review_prefix"}"

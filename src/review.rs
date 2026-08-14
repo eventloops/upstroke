@@ -1,6 +1,7 @@
 //! Review (DESIGN.md §11.2–§11.3): read-only worker profiles judge the
 //! engine-captured diff against the task's acceptance criteria, each ending its
-//! answer with a fenced JSON verdict.
+//! answer with a fenced JSON verdict. The parser does not depend on fence
+//! placement: it reads the final balanced, string-aware JSON object.
 //!
 //! Two things make this more than a second opinion from the same model: a
 //! reviewer sees the *diff* rather than the implementer's account of it
@@ -549,26 +550,55 @@ pub fn profile_for(agent: &str, model: &str, name: &str, effort: Effort) -> Work
     }
 }
 
+fn unavailable_after_error(
+    stage: &str,
+    error: TactusError,
+    cost_usd: Option<f64>,
+    invocations: u32,
+    transcript: PathBuf,
+) -> ReviewOutcome {
+    ReviewOutcome {
+        result: ReviewResult::Unavailable {
+            status: OutcomeStatus::AgentError,
+            detail: format!("{stage}: {error}"),
+        },
+        cost_usd,
+        invocations,
+        transcript,
+    }
+}
+
 pub fn run_review(cx: &ReviewCx<'_>) -> Result<ReviewOutcome, TactusError> {
     // Validate the complete evidence before permission files are written or an
     // adapter can build/spawn a model command. An incomplete review is no
     // review, so large tasks fail closed rather than losing early paths.
     let full_prompt = materialize_prompt(cx)?;
     let started = Instant::now();
-    // Reviewers run nothing: no gate commands, no edit tools (§20).
+    let reviews_dir = cx.reviews_dir;
     let suffix = cx.lens.file_suffix();
-    let settings_path = cx.adapter.materialize_permissions(
+    let transcript = reviews_dir.join(format!("{}{suffix}-review.json", cx.stem));
+    let mut last_path = transcript.clone();
+    // Reviewers run nothing: no gate commands, no edit tools (§20).
+    let settings_path = match cx.adapter.materialize_permissions(
         &cx.profile,
         &[],
         cx.settings_dir,
         &format!("{}{suffix}-review", cx.stem),
-    )?;
-    let reviews_dir = cx.reviews_dir;
-    let transcript = reviews_dir.join(format!("{}{suffix}-review.json", cx.stem));
+    ) {
+        Ok(path) => path,
+        Err(error) => {
+            return Ok(unavailable_after_error(
+                "review permission setup failed",
+                error,
+                None,
+                0,
+                last_path,
+            ));
+        }
+    };
 
     let mut cost = None;
     let mut session = None;
-    let mut last_path = transcript.clone();
     for invocation in 1..=2u32 {
         let resume = (invocation > 1).then(|| session.clone()).flatten();
         // The re-ask only gets to be terse if the reviewer's context survives.
@@ -591,7 +621,18 @@ pub fn run_review(cx: &ReviewCx<'_>) -> Result<ReviewOutcome, TactusError> {
             resume_session: resume,
             settings_path: settings_path.clone(),
         };
-        let command = cx.adapter.build(&task_run)?;
+        let command = match cx.adapter.build(&task_run) {
+            Ok(command) => command,
+            Err(error) => {
+                return Ok(unavailable_after_error(
+                    "review command setup failed",
+                    error,
+                    cost,
+                    invocation - 1,
+                    last_path,
+                ));
+            }
+        };
         let remaining = cx.timeout.saturating_sub(started.elapsed());
         if remaining.is_zero() {
             return Ok(ReviewOutcome {
@@ -608,16 +649,52 @@ pub fn run_review(cx: &ReviewCx<'_>) -> Result<ReviewOutcome, TactusError> {
             });
         }
         let output =
-            proc::run_with_timeout(command, cx.adapter.stdin_payload(&task_run), remaining)?;
+            match proc::run_with_timeout(command, cx.adapter.stdin_payload(&task_run), remaining) {
+                Ok(output) => output,
+                Err(error) => {
+                    return Ok(unavailable_after_error(
+                        "review process failed",
+                        error,
+                        cost,
+                        invocation - 1,
+                        last_path,
+                    ));
+                }
+            };
 
         last_path = if invocation == 1 {
             transcript.clone()
         } else {
             reviews_dir.join(format!("{}{suffix}-review-reask.json", cx.stem))
         };
-        util::write_text(&last_path, &output.stdout)?;
+        if let Err(error) = util::write_text(&last_path, &output.stdout) {
+            // The model may already have spent tokens. Parse only to retain
+            // any spend it reported; without a durable transcript its verdict
+            // cannot be accepted.
+            if let Ok(outcome) = cx.adapter.parse(&output) {
+                cost = add_cost(cost, outcome.cost_usd);
+            }
+            return Ok(unavailable_after_error(
+                "review transcript write failed",
+                error,
+                cost,
+                invocation,
+                last_path,
+            ));
+        }
 
-        let outcome = cx.adapter.parse(&output)?;
+        let outcome = match cx.adapter.parse(&output) {
+            Ok(outcome) => outcome,
+            Err(error) => {
+                return Ok(unavailable_after_error(
+                    "review response parsing failed",
+                    error,
+                    cost,
+                    invocation,
+                    last_path,
+                ));
+            }
+        };
         cost = add_cost(cost, outcome.cost_usd);
         session = outcome.session_id.clone().or(session);
 
@@ -858,12 +935,17 @@ pub fn parse_verdict(text: &str) -> Option<Verdict> {
     // earlier object is an example; accepting it when the real answer is
     // malformed converts a rejection into an approval. A botched final answer
     // must cost a re-ask, which is what returning None buys.
-    verdict_from_json(json_objects(text).last()?)
+    let (objects, unclosed) = json_objects(text);
+    if unclosed {
+        return None;
+    }
+    verdict_from_json(objects.last()?)
 }
 
-/// Every balanced `{...}` span in `text`, outermost only, in document order.
-/// Braces inside JSON strings (and their escapes) do not count.
-fn json_objects(text: &str) -> Vec<String> {
+/// Every balanced `{...}` span in `text`, outermost only, in document order,
+/// plus whether a later object began but never closed. Braces inside JSON
+/// strings (and their escapes) do not count.
+fn json_objects(text: &str) -> (Vec<String>, bool) {
     let bytes = text.as_bytes();
     let mut spans = Vec::new();
     let mut depth = 0usize;
@@ -899,7 +981,7 @@ fn json_objects(text: &str) -> Vec<String> {
             _ => {}
         }
     }
-    spans
+    (spans, depth != 0)
 }
 
 fn verdict_from_json(candidate: &str) -> Option<Verdict> {
@@ -1049,6 +1131,93 @@ mod tests {
         }
     }
 
+    #[derive(Clone, Copy, Debug)]
+    enum UnavailableStage {
+        Permissions,
+        Build,
+        Spawn,
+        Transcript,
+    }
+
+    struct UnavailableAdapter {
+        stage: UnavailableStage,
+    }
+
+    impl AgentAdapter for UnavailableAdapter {
+        fn id(&self) -> &'static str {
+            "unavailable-test"
+        }
+
+        fn probe(&self) -> Result<crate::agent::Caps, TactusError> {
+            panic!("direct review test does not probe")
+        }
+
+        fn build(&self, run: &TaskRun) -> Result<std::process::Command, TactusError> {
+            match self.stage {
+                UnavailableStage::Build => Err(TactusError::Agent {
+                    message: "scripted review build failure".to_owned(),
+                }),
+                UnavailableStage::Spawn => Ok(std::process::Command::new(
+                    run.workspace.join("missing-reviewer-executable"),
+                )),
+                UnavailableStage::Transcript => {
+                    let mut command = std::process::Command::new(
+                        std::env::current_exe().expect("current test executable"),
+                    );
+                    command.args([
+                        "--exact",
+                        "review::tests::review_deadline_helper",
+                        "--nocapture",
+                    ]);
+                    Ok(command)
+                }
+                UnavailableStage::Permissions => {
+                    panic!("permission failure must stop before command build")
+                }
+            }
+        }
+
+        fn parse(
+            &self,
+            out: &crate::agent::ProcessOutput,
+        ) -> Result<crate::ir::Outcome, TactusError> {
+            match self.stage {
+                UnavailableStage::Transcript => Ok(crate::ir::Outcome {
+                    status: OutcomeStatus::Completed,
+                    diff: String::new(),
+                    detail: Some("review completed before transcript storage failed".to_owned()),
+                    session_id: Some("unavailable-test-session".to_owned()),
+                    usage: None,
+                    cost_usd: Some(0.25),
+                    transcript_path: PathBuf::new(),
+                    duration: out.duration,
+                }),
+                UnavailableStage::Permissions
+                | UnavailableStage::Build
+                | UnavailableStage::Spawn => {
+                    panic!("setup and spawn failures must stop before response parsing")
+                }
+            }
+        }
+
+        fn materialize_permissions(
+            &self,
+            _profile: &WorkerProfile,
+            _gate_cmds: &[String],
+            _dir: &Path,
+            _stem: &str,
+        ) -> Result<Option<PathBuf>, TactusError> {
+            match self.stage {
+                UnavailableStage::Permissions => Err(TactusError::Agent {
+                    message: "scripted review permission failure".to_owned(),
+                }),
+                UnavailableStage::Build
+                | UnavailableStage::Spawn
+                | UnavailableStage::Transcript => Ok(None),
+            }
+        }
+    }
+
     #[test]
     fn review_deadline_helper() {
         let Ok(marker) = std::env::var("TACTUS_REVIEW_DEADLINE_HELPER") else {
@@ -1075,6 +1244,69 @@ mod tests {
             min_tier: None,
             artifacts_in: Vec::new(),
             artifacts_out: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn review_infrastructure_failures_become_unavailable_outcomes() {
+        let task = task();
+        for (stage, expected) in [
+            (
+                UnavailableStage::Permissions,
+                "review permission setup failed",
+            ),
+            (UnavailableStage::Build, "review command setup failed"),
+            (UnavailableStage::Spawn, "review process failed"),
+            (
+                UnavailableStage::Transcript,
+                "review transcript write failed",
+            ),
+        ] {
+            let root = std::env::temp_dir().join(format!(
+                "tactus-review-unavailable-{}-{stage:?}",
+                std::process::id()
+            ));
+            std::fs::create_dir_all(&root).expect("review scratch");
+            let blocked_reviews = root.join("reviews-not-a-directory");
+            let reviews_dir = if matches!(stage, UnavailableStage::Transcript) {
+                std::fs::write(&blocked_reviews, "blocks transcript writes\n")
+                    .expect("block transcript directory");
+                blocked_reviews.as_path()
+            } else {
+                root.as_path()
+            };
+            let adapter = UnavailableAdapter { stage };
+            let cx = ReviewCx {
+                adapter: &adapter,
+                profile: profile_for("unavailable-test", "test-model", "review", Effort::High),
+                lens: Lens::Acceptance,
+                task: &task,
+                diff: "diff --git a/a.rs b/a.rs\n+++ b/a.rs\n+fn x() {}\n",
+                artifacts: &[],
+                decisions: &[],
+                workspace: &root,
+                settings_dir: &root,
+                reviews_dir,
+                stem: "unavailable".to_owned(),
+                timeout: Duration::from_secs(60),
+            };
+
+            let outcome = run_review(&cx).expect("infrastructure failure is a review outcome");
+            if matches!(stage, UnavailableStage::Transcript) {
+                assert_eq!(outcome.invocations, 1, "the reviewer already completed");
+                assert_eq!(outcome.cost_usd, Some(0.25), "reported spend is retained");
+            } else {
+                assert_eq!(outcome.invocations, 0, "the reviewer never started");
+                assert_eq!(outcome.cost_usd, None);
+            }
+            match outcome.result {
+                ReviewResult::Unavailable {
+                    status: OutcomeStatus::AgentError,
+                    detail,
+                } => assert!(detail.contains(expected), "{detail}"),
+                other => panic!("unexpected review result for {stage:?}: {other:?}"),
+            }
+            let _ = std::fs::remove_dir_all(&root);
         }
     }
 
@@ -1131,6 +1363,17 @@ mod tests {
                 "must not resurrect the earlier pass for: {botched}"
             );
         }
+    }
+
+    #[test]
+    fn unclosed_final_verdict_never_falls_back_to_an_earlier_pass() {
+        let text = "I will answer in this shape:\n```json\n{\"pass\": true, \"reasons\": \
+                    [\"example\"]}\n```\nHaving read the diff:\n```json\n{\"pass\": false, \
+                    \"reasons\": [\"no tests\"]\n```\n";
+        assert!(
+            parse_verdict(text).is_none(),
+            "an incomplete final rejection must not resurrect the earlier pass"
+        );
     }
 
     #[test]
