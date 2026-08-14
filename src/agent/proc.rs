@@ -233,7 +233,16 @@ fn child_exited_unreaped(child: &Child) -> std::io::Result<bool> {
     if result != 0 {
         return Err(std::io::Error::last_os_error());
     }
-    Ok(unsafe { info.si_pid() } != 0)
+    if unsafe { info.si_pid() } == 0 {
+        return Ok(false);
+    }
+    // WEXITED should filter non-terminal transitions, but Darwin can leave a
+    // stopped/continued record observable around job-control delivery. Never
+    // turn such a record into permission for the reaper to SIGKILL the group.
+    Ok(matches!(
+        info.si_code,
+        libc::CLD_EXITED | libc::CLD_KILLED | libc::CLD_DUMPED
+    ))
 }
 
 /// Process-wide Unix termination coordination.
@@ -2405,6 +2414,73 @@ mod tests {
             std::fs::write(&marker, progress.to_string()).expect("worker progress");
             thread::sleep(Duration::from_millis(50));
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_stopped_child_is_not_mistaken_for_an_exited_child() {
+        let scratch = std::env::temp_dir().join(format!(
+            "tactus-stopped-child-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock after epoch")
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&scratch).expect("scratch dir");
+        let ready = scratch.join("ready");
+        let marker = scratch.join("marker");
+        let finish = scratch.join("finish");
+        let mut child = Command::new(std::env::current_exe().expect("test executable"))
+            .args([
+                "terminal_progress_worker_helper",
+                "--ignored",
+                "--nocapture",
+            ])
+            .env("TACTUS_SIGNAL_WORKER", "1")
+            .env("TACTUS_READY", &ready)
+            .env("TACTUS_MARKER", &marker)
+            .env("TACTUS_FINISH", &finish)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn stopped-child helper");
+        let pid = i32::try_from(child.id()).expect("child pid");
+        let ready_deadline = Instant::now() + Duration::from_secs(5);
+        while !ready.exists() && Instant::now() < ready_deadline {
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert!(ready.exists(), "stopped-child helper never became ready");
+        assert_eq!(unsafe { libc::kill(pid, libc::SIGSTOP) }, 0);
+
+        let stop_deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+            assert_eq!(
+                unsafe {
+                    libc::waitid(
+                        libc::P_PID,
+                        pid as libc::id_t,
+                        &mut info,
+                        libc::WSTOPPED | libc::WNOHANG | libc::WNOWAIT,
+                    )
+                },
+                0
+            );
+            if unsafe { info.si_pid() } == pid {
+                break;
+            }
+            assert!(Instant::now() < stop_deadline, "child never stopped");
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert!(
+            !child_exited_unreaped(&child).expect("probe stopped child"),
+            "a non-terminal child transition was mistaken for process exit"
+        );
+
+        let _ = unsafe { libc::kill(pid, libc::SIGKILL) };
+        let _ = child.wait();
+        let _ = std::fs::remove_dir_all(scratch);
     }
 
     /// Subprocess entry point for the Unix signal-supervision tests below.
