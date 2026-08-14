@@ -49,7 +49,7 @@ use crate::ir::{
 };
 use crate::ladder::{self, LadderPolicy, LadderState, Next};
 use crate::review::{self, PassBinding, ReviewPass, ReviewPlan};
-use crate::rundir::{self, RunLock, RunPaths};
+use crate::rundir::{self, RunLock, RunPaths, WorktreeLock};
 use crate::ulid;
 use crate::util;
 use crate::validate::{self, Analysis, ValidateOptions};
@@ -728,6 +728,11 @@ fn run_harness_inner(
     opts: &RunOptions,
     harness: &Harness<'_>,
 ) -> Result<(RunReport, RunState), TactusError> {
+    let workspace = Workspace::open(&opts.repo_root)?;
+    // Preflight reads the source plan, config, and gate programs from this
+    // physical worktree. Own it before taking that snapshot so another run
+    // cannot leave us with an analysis of its transient edits.
+    let _worktree_lock = WorktreeLock::acquire(workspace.root())?;
     let Preflight {
         analysis,
         caps,
@@ -741,7 +746,6 @@ fn run_harness_inner(
         budgets,
     } = preflight(opts, harness)?;
 
-    let workspace = Workspace::open(&opts.repo_root)?;
     workspace.ensure_execution_prerequisites()?;
     workspace.ensure_run_exclusions()?;
     if !workspace.is_clean()? {
@@ -1191,6 +1195,8 @@ fn resume_harness_inner(
         run_id: run_id.clone(),
         message,
     };
+    let workspace = Workspace::open(&opts.repo_root)?;
+    let _worktree_lock = WorktreeLock::acquire(workspace.root())?;
 
     // Claimed before anything is read, so two resumes cannot race each other
     // into the same branch. The lock sits beside the ops surface, which is the
@@ -1509,7 +1515,6 @@ fn resume_harness_inner(
     };
     paths.create()?;
 
-    let workspace = Workspace::open(&opts.repo_root)?;
     let reclaimed = workspace.reclaim_gate_workspaces(&paths.gate_worktrees())?;
     if reclaimed > 0 {
         warnings.push(format!(
@@ -1583,7 +1588,7 @@ fn resume_harness_inner(
                     prepared.pin_ref
                 )));
             }
-            workspace.advance_prepared_commit(&prepared)?;
+            workspace.advance_prepared_commit(&prepared.branch_ref, &prepared)?;
             head = prepared.commit_sha.clone();
             warnings.push(format!(
                 "published prepared commit {head} for `{task}` after the run stopped between \
@@ -2496,7 +2501,18 @@ impl Run<'_> {
             let prepared_commit = if result.failure.is_none() {
                 let message = format!("[tactus] {}: {}", task.id, task.title);
                 let pin_ref = prepared_pin_ref(&self.run_id, index, attempt);
+                let recorded_branch_ref = format!("refs/heads/{}", self.branch);
+                if result.candidate_branch_ref != recorded_branch_ref {
+                    let _ = self.workspace.discard_uncommitted();
+                    return Err(TactusError::Git {
+                        message: format!(
+                            "candidate was captured from `{}`, not recorded run branch `{recorded_branch_ref}`; refusing publication",
+                            result.candidate_branch_ref
+                        ),
+                    });
+                }
                 match self.workspace.prepare_commit_from_candidate(
+                    &result.candidate_branch_ref,
                     &result.candidate_parent,
                     &result.candidate_tree,
                     &message,
@@ -2574,7 +2590,8 @@ impl Run<'_> {
             let Some(failure) = result.failure else {
                 let prepared = prepared_commit
                     .expect("a successful schema-3 settlement has a prepared commit");
-                self.workspace.advance_prepared_commit(&prepared)?;
+                self.workspace
+                    .advance_prepared_commit(&result.candidate_branch_ref, &prepared)?;
                 // Scrub gate side-effects (build artifacts, lockfile churn) so
                 // they cannot leak into the next task's captured diff; the
                 // commit recorded exactly the verified staged set.
@@ -3618,6 +3635,7 @@ struct AttemptResult {
     failure: Option<AttemptFailure>,
     /// Immutable git identities captured with the diff before any gate or
     /// reviewer ran. A successful commit is prepared from these exact objects.
+    candidate_branch_ref: String,
     candidate_parent: String,
     candidate_tree: String,
     /// The passes that actually ran, in order — empty when the cheap checks
@@ -3799,6 +3817,7 @@ fn run_attempt(
     Ok(AttemptResult {
         outcome,
         failure,
+        candidate_branch_ref: candidate.branch_ref,
         candidate_parent: candidate.parent_oid,
         candidate_tree: candidate.tree_oid,
         reviews,
@@ -5481,6 +5500,11 @@ mod tests {
                 _ => None,
             })
             .expect("successful settlement records its prepared object");
+        assert_eq!(
+            prepared.branch_ref,
+            format!("refs/heads/{}", report.branch),
+            "the durable settlement owns the exact run ref"
+        );
         assert_eq!(prepared.parent_sha, capture[0]);
         assert_eq!(prepared.tree_sha, capture[1]);
         assert_ne!(prepared.tree_sha, capture[2]);

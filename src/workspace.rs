@@ -20,6 +20,10 @@ pub struct Workspace {
 /// consulting a mutable index again.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CapturedCandidate {
+    /// The exact direct branch ref that owned `parent_oid` when this candidate
+    /// was captured. An object id alone is insufficient: two branches may
+    /// legitimately point at the same commit while only one belongs to the run.
+    pub branch_ref: String,
     pub parent_oid: String,
     pub tree_oid: String,
     pub diff: String,
@@ -297,6 +301,39 @@ impl Workspace {
             .to_owned())
     }
 
+    /// The full direct branch ref currently checked out by this worktree.
+    /// Prepared publication is deliberately unavailable from detached HEAD or
+    /// through a symbolic branch alias: the run records one concrete local ref.
+    pub fn current_branch_ref(&self) -> Result<String, TactusError> {
+        let output = Command::new("git")
+            .arg("-C")
+            .arg(&self.root)
+            .args(["symbolic-ref", "--quiet", "HEAD"])
+            .output()
+            .map_err(|e| TactusError::Git {
+                message: format!("failed to run git: {e}"),
+            })?;
+        if !output.status.success() {
+            return Err(TactusError::Git {
+                message: "HEAD is detached; tactus requires the recorded run branch to own every candidate"
+                    .to_owned(),
+            });
+        }
+        let branch_ref = String::from_utf8(output.stdout).map_err(|error| TactusError::Git {
+            message: format!("git symbolic-ref returned output that is not valid UTF-8: {error}"),
+        })?;
+        let branch_ref = branch_ref.trim().to_owned();
+        self.validate_branch_ref(&branch_ref)?;
+        if self.symbolic_ref_target(&branch_ref)?.is_some() {
+            return Err(TactusError::Git {
+                message: format!(
+                    "recorded branch ref `{branch_ref}` is itself symbolic; refusing ambiguous publication"
+                ),
+            });
+        }
+        Ok(branch_ref)
+    }
+
     pub fn head_sha(&self) -> Result<String, TactusError> {
         Ok(self
             .git(&["rev-parse", "--short", "HEAD"])?
@@ -423,6 +460,7 @@ impl Workspace {
     /// wholesale and `color.ui` would inject escape codes, corrupting every
     /// downstream check that reads it.
     pub fn capture_candidate(&self) -> Result<CapturedCandidate, TactusError> {
+        let branch_ref = self.current_branch_ref()?;
         let parent_oid = self.head_sha_full()?;
         if let Some(problem) = self.worktree_filter_problem("git add")? {
             return Err(TactusError::Git { message: problem });
@@ -441,15 +479,17 @@ impl Workspace {
             &tree_oid,
             "--",
         ])?;
+        let observed_branch_ref = self.current_branch_ref()?;
         let observed_parent = self.head_sha_full()?;
-        if observed_parent != parent_oid {
+        if observed_branch_ref != branch_ref || observed_parent != parent_oid {
             return Err(TactusError::Git {
                 message: format!(
-                    "HEAD moved from {parent_oid} to {observed_parent} while capturing the candidate"
+                    "HEAD moved from {branch_ref} at {parent_oid} to {observed_branch_ref} at {observed_parent} while capturing the candidate"
                 ),
             });
         }
         Ok(CapturedCandidate {
+            branch_ref,
             parent_oid,
             tree_oid,
             diff,
@@ -898,17 +938,21 @@ impl Workspace {
     /// used by gates and review. This never rereads the mutable index.
     pub fn prepare_commit_from_candidate(
         &self,
+        branch_ref: &str,
         parent_oid: &str,
         tree_oid: &str,
         message: &str,
         pin_ref: &str,
     ) -> Result<PreparedCommit, TactusError> {
+        self.validate_branch_ref(branch_ref)?;
         self.validate_commit_oid(parent_oid)?;
         self.validate_tree_oid(tree_oid)?;
-        if self.head_sha_full()? != parent_oid {
+        let observed_branch_ref = self.current_branch_ref()?;
+        let observed_parent = self.head_sha_full()?;
+        if observed_branch_ref != branch_ref || observed_parent != parent_oid {
             return Err(TactusError::Git {
                 message: format!(
-                    "HEAD moved after tactus captured candidate parent {parent_oid}; refusing to prepare it"
+                    "HEAD moved from captured branch {branch_ref} at {parent_oid} to {observed_branch_ref} at {observed_parent}; refusing to prepare it"
                 ),
             });
         }
@@ -919,11 +963,19 @@ impl Workspace {
             });
         }
         self.validate_prepared_ref(pin_ref)?;
+        if let Some(target) = self.symbolic_ref_target(pin_ref)? {
+            return Err(TactusError::Git {
+                message: format!(
+                    "prepared ref `{pin_ref}` is symbolic to `{target}`; refusing to follow it"
+                ),
+            });
+        }
         let commit_sha = self
             .commit_tree_with_tactus_identity(tree_oid, parent_oid, message)?
             .trim()
             .to_owned();
         let prepared = PreparedCommit {
+            branch_ref: branch_ref.to_owned(),
             parent_sha: parent_oid.to_owned(),
             tree_sha: tree_oid.to_owned(),
             commit_sha,
@@ -939,12 +991,21 @@ impl Workspace {
         let zero = "0".repeat(parent_oid.len());
         self.prepared_update_ref(&[
             "update-ref",
+            "--no-deref",
             "-m",
             "tactus: pin prepared task",
             pin_ref,
             &prepared.commit_sha,
             &zero,
         ])?;
+        if self.prepared_pin_target(pin_ref)?.as_deref() != Some(prepared.commit_sha.as_str()) {
+            return Err(TactusError::Git {
+                message: format!(
+                    "prepared ref `{pin_ref}` did not become the exact direct pin for {}",
+                    prepared.commit_sha
+                ),
+            });
+        }
         Ok(prepared)
     }
 
@@ -960,6 +1021,7 @@ impl Workspace {
         if !valid_object_id(&prepared.parent_sha)
             || !valid_object_id(&prepared.tree_sha)
             || !valid_object_id(&prepared.commit_sha)
+            || self.validate_branch_ref(&prepared.branch_ref).is_err()
         {
             return Ok(false);
         }
@@ -1010,8 +1072,56 @@ impl Workspace {
         self.git(&["check-ref-format", pin_ref]).map(|_| ())
     }
 
+    fn validate_branch_ref(&self, branch_ref: &str) -> Result<(), TactusError> {
+        if !branch_ref.starts_with("refs/heads/") {
+            return Err(TactusError::Git {
+                message: format!(
+                    "refusing prepared publication outside a local branch: `{branch_ref}`"
+                ),
+            });
+        }
+        self.git(&["check-ref-format", branch_ref]).map(|_| ())
+    }
+
+    /// Return the immediate symbolic target without dereferencing it.
+    fn symbolic_ref_target(&self, refname: &str) -> Result<Option<String>, TactusError> {
+        let output = Command::new("git")
+            .arg("-C")
+            .arg(&self.root)
+            .args(["symbolic-ref", "--quiet", refname])
+            .output()
+            .map_err(|e| TactusError::Git {
+                message: format!("failed to run git: {e}"),
+            })?;
+        if output.status.success() {
+            return String::from_utf8(output.stdout)
+                .map(|target| Some(target.trim().to_owned()))
+                .map_err(|error| TactusError::Git {
+                    message: format!(
+                        "git symbolic-ref returned output that is not valid UTF-8: {error}"
+                    ),
+                });
+        }
+        if output.status.code() == Some(1) {
+            return Ok(None);
+        }
+        Err(TactusError::Git {
+            message: format!(
+                "git symbolic-ref --quiet {refname} failed: {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            ),
+        })
+    }
+
     pub fn prepared_pin_target(&self, pin_ref: &str) -> Result<Option<String>, TactusError> {
         self.validate_prepared_ref(pin_ref)?;
+        if let Some(target) = self.symbolic_ref_target(pin_ref)? {
+            return Err(TactusError::Git {
+                message: format!(
+                    "prepared ref `{pin_ref}` is symbolic to `{target}`; refusing to follow it"
+                ),
+            });
+        }
         let output = Command::new("git")
             .arg("-C")
             .arg(&self.root)
@@ -1033,6 +1143,7 @@ impl Workspace {
             None => Ok(()),
             Some(target) if target == prepared.commit_sha => self.prepared_update_ref(&[
                 "update-ref",
+                "--no-deref",
                 "-d",
                 &prepared.pin_ref,
                 &prepared.commit_sha,
@@ -1051,12 +1162,33 @@ impl Workspace {
     /// old value, so even cleanup is compare-and-swap.
     pub fn remove_orphan_prepared_pin(&self, pin_ref: &str) -> Result<(), TactusError> {
         if let Some(target) = self.prepared_pin_target(pin_ref)? {
-            self.prepared_update_ref(&["update-ref", "-d", pin_ref, &target])?;
+            self.prepared_update_ref(&["update-ref", "--no-deref", "-d", pin_ref, &target])?;
         }
         Ok(())
     }
 
-    pub fn advance_prepared_commit(&self, prepared: &PreparedCommit) -> Result<(), TactusError> {
+    pub fn advance_prepared_commit(
+        &self,
+        branch_ref: &str,
+        prepared: &PreparedCommit,
+    ) -> Result<(), TactusError> {
+        self.validate_branch_ref(branch_ref)?;
+        if prepared.branch_ref != branch_ref {
+            return Err(TactusError::Git {
+                message: format!(
+                    "prepared commit belongs to `{}`, not requested publication ref `{branch_ref}`",
+                    prepared.branch_ref
+                ),
+            });
+        }
+        let observed_branch_ref = self.current_branch_ref()?;
+        if observed_branch_ref != branch_ref {
+            return Err(TactusError::Git {
+                message: format!(
+                    "HEAD is on `{observed_branch_ref}`, not recorded run branch `{branch_ref}`; refusing publication"
+                ),
+            });
+        }
         if !self.prepared_commit_matches(prepared)? {
             return Err(TactusError::Git {
                 message: "refusing to advance HEAD to a commit that does not match its durable prepared identity".to_owned(),
@@ -1074,12 +1206,23 @@ impl Workspace {
         }
         self.prepared_update_ref(&[
             "update-ref",
+            "--no-deref",
             "-m",
             "tactus: publish reviewed task",
-            "HEAD",
+            branch_ref,
             &prepared.commit_sha,
             &prepared.parent_sha,
         ])?;
+        let published_branch_ref = self.current_branch_ref()?;
+        let published_head = self.head_sha_full()?;
+        if published_branch_ref != branch_ref || published_head != prepared.commit_sha {
+            return Err(TactusError::Git {
+                message: format!(
+                    "recorded run branch {branch_ref} advanced to {}, but worktree HEAD is now {published_branch_ref} at {published_head}; preserving the prepared pin for resume",
+                    prepared.commit_sha
+                ),
+            });
+        }
         self.remove_prepared_pin(prepared)
     }
 
@@ -1592,6 +1735,7 @@ mod tests {
         fs::write(repo.join("README.md"), "first candidate\n").expect("first edit");
 
         let candidate = ws.capture_candidate().expect("capture candidate");
+        assert_eq!(candidate.branch_ref, "refs/heads/main");
         assert_eq!(candidate.parent_oid, original_parent);
         assert!(
             candidate.diff.contains("first candidate"),
@@ -1669,6 +1813,7 @@ mod tests {
         let pin_ref = "refs/tactus/prepared/01RUN/0-1";
         let prepared = ws
             .prepare_commit_from_candidate(
+                &candidate.branch_ref,
                 &candidate.parent_oid,
                 &candidate.tree_oid,
                 "[tactus] t1: task",
@@ -1700,7 +1845,8 @@ mod tests {
         );
         assert!(!hook_marker.exists(), "pin creation never ran the ref hook");
 
-        ws.advance_prepared_commit(&prepared).expect("HEAD CAS");
+        ws.advance_prepared_commit(&candidate.branch_ref, &prepared)
+            .expect("branch CAS");
         assert_eq!(
             ws.head_sha_full().expect("advanced head"),
             prepared.commit_sha
@@ -1709,6 +1855,125 @@ mod tests {
         assert!(
             !hook_marker.exists(),
             "neither HEAD publication nor pin deletion ran the ref hook"
+        );
+    }
+
+    #[test]
+    fn prepared_pins_reject_symbolic_refs_without_touching_the_victim() {
+        let repo = temp_repo("prepared-symbolic-pin");
+        let ws = Workspace::open(&repo).expect("open");
+        let victim_before = ws.head_sha_full().expect("victim target");
+        run_git(&repo, &["branch", "victim", &victim_before]);
+
+        fs::write(repo.join("README.md"), "reviewed candidate\n").expect("candidate");
+        let candidate = ws.capture_candidate().expect("capture");
+        let pin_ref = "refs/tactus/prepared/01RUN/0-1";
+        run_git(&repo, &["symbolic-ref", pin_ref, "refs/heads/victim"]);
+
+        let prepare_error = ws
+            .prepare_commit_from_candidate(
+                &candidate.branch_ref,
+                &candidate.parent_oid,
+                &candidate.tree_oid,
+                "[tactus] t1: task",
+                pin_ref,
+            )
+            .expect_err("a private prepared pin must be direct");
+        assert!(
+            prepare_error.to_string().contains("is symbolic"),
+            "{prepare_error}"
+        );
+
+        let cleanup_error = ws
+            .remove_orphan_prepared_pin(pin_ref)
+            .expect_err("cleanup must not dereference the private symref");
+        assert!(
+            cleanup_error.to_string().contains("is symbolic"),
+            "{cleanup_error}"
+        );
+        assert_eq!(
+            String::from_utf8(run_git(&repo, &["rev-parse", "refs/heads/victim"]))
+                .expect("utf8")
+                .trim(),
+            victim_before,
+            "the victim branch survives both create and cleanup paths"
+        );
+        assert_eq!(
+            ws.symbolic_ref_target(pin_ref)
+                .expect("inspect symref")
+                .as_deref(),
+            Some("refs/heads/victim"),
+            "refusal preserves the hostile pin for explicit operator repair"
+        );
+    }
+
+    #[test]
+    fn prepared_publication_refuses_same_oid_symbolic_head_change_after_capture() {
+        let repo = temp_repo("prepared-branch-binding");
+        let ws = Workspace::open(&repo).expect("open");
+        fs::write(repo.join("README.md"), "reviewed candidate\n").expect("candidate");
+        let candidate = ws.capture_candidate().expect("capture on main");
+        assert_eq!(candidate.branch_ref, "refs/heads/main");
+
+        ws.create_branch("other").expect("same-OID branch switch");
+        assert_eq!(
+            ws.head_sha_full().expect("same parent"),
+            candidate.parent_oid
+        );
+        let before_prepare = ws
+            .prepare_commit_from_candidate(
+                &candidate.branch_ref,
+                &candidate.parent_oid,
+                &candidate.tree_oid,
+                "[tactus] t1: task",
+                "refs/tactus/prepared/01RUN/0-1",
+            )
+            .expect_err("same object on another branch is still the wrong owner");
+        assert!(
+            before_prepare.to_string().contains("HEAD moved"),
+            "{before_prepare}"
+        );
+
+        ws.switch_branch("main").expect("return to captured branch");
+        let prepared = ws
+            .prepare_commit_from_candidate(
+                &candidate.branch_ref,
+                &candidate.parent_oid,
+                &candidate.tree_oid,
+                "[tactus] t1: task",
+                "refs/tactus/prepared/01RUN/0-1",
+            )
+            .expect("prepare on captured branch");
+        ws.switch_branch("other").expect("switch after preparation");
+        let publish_error = ws
+            .advance_prepared_commit(&candidate.branch_ref, &prepared)
+            .expect_err("publication must not follow mutable HEAD");
+        assert!(
+            publish_error
+                .to_string()
+                .contains("not recorded run branch"),
+            "{publish_error}"
+        );
+        assert_eq!(
+            String::from_utf8(run_git(&repo, &["rev-parse", "refs/heads/main"]))
+                .expect("utf8")
+                .trim(),
+            candidate.parent_oid,
+            "the recorded branch is unchanged"
+        );
+        assert_eq!(
+            String::from_utf8(run_git(&repo, &["rev-parse", "refs/heads/other"]))
+                .expect("utf8")
+                .trim(),
+            candidate.parent_oid,
+            "the current unrelated branch is unchanged"
+        );
+        assert_eq!(
+            ws.prepared_pin_target(&prepared.pin_ref)
+                .expect("pin retained")
+                .as_deref(),
+            Some(prepared.commit_sha.as_str()),
+            "resume still has the exact prepared object"
         );
     }
 

@@ -591,10 +591,12 @@ pub struct AttemptRecord {
 }
 
 /// A hook-free commit object prepared from the exact staged tree that gates
-/// and reviewers accepted. The event log records all four identities because
-/// a subject and parent alone do not distinguish an amended, unreviewed tree.
+/// and reviewers accepted. The event log records the owning full branch ref as
+/// well as every object identity because a subject, parent, and mutable HEAD do
+/// not distinguish an amended tree or the ref the run is authorized to move.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PreparedCommit {
+    pub branch_ref: String,
     pub parent_sha: String,
     pub tree_sha: String,
     pub commit_sha: String,
@@ -2001,15 +2003,17 @@ pub(crate) fn ensure_supported_schema(
                             "refs/tactus/prepared/{}/{task_index}-{}",
                             started.run_id, attempt
                         );
+                        let expected_branch = format!("refs/heads/{}", started.branch);
                         let expected_prefix = format!("[tactus] {task}: ");
-                        if prepared.pin_ref != expected_pin
+                        if prepared.branch_ref != expected_branch
+                            || prepared.pin_ref != expected_pin
                             || !prepared.message.starts_with(&expected_prefix)
                         {
                             return Err(TactusError::EventLog {
                                 path: path.to_path_buf(),
                                 message: format!(
                                     "event schema 3 successful settlement for `{task}` carries a \
-                                     prepared ref or message that is not deterministic for this run"
+                                     branch, prepared ref, or message that is not deterministic for this run"
                                 ),
                             });
                         }
@@ -2135,7 +2139,9 @@ fn valid_prepared_commit_shape(prepared: &PreparedCommit) -> bool {
     let valid_oid = |oid: &str| {
         matches!(oid.len(), 40 | 64) && oid.bytes().all(|byte| byte.is_ascii_hexdigit())
     };
-    valid_oid(&prepared.parent_sha)
+    prepared.branch_ref.starts_with("refs/heads/")
+        && !prepared.branch_ref.contains("..")
+        && valid_oid(&prepared.parent_sha)
         && valid_oid(&prepared.tree_sha)
         && valid_oid(&prepared.commit_sha)
         && prepared.parent_sha.len() == prepared.tree_sha.len()
@@ -2542,6 +2548,7 @@ mod tests {
             parking: None,
             transition: None,
             prepared_commit: Some(Box::new(PreparedCommit {
+                branch_ref: "refs/heads/tactus/run-01RUN".to_owned(),
                 parent_sha: "1".repeat(40),
                 tree_sha: "2".repeat(40),
                 commit_sha: "3".repeat(40),
@@ -3239,6 +3246,30 @@ mod tests {
             Path::new("events.jsonl"),
         )
         .expect("the exact prepared identity closes the settlement");
+
+        let mut wrong_branch = success.clone();
+        let EventBody::AttemptFinished {
+            prepared_commit: Some(wrong_prepared),
+            ..
+        } = &mut wrong_branch
+        else {
+            unreachable!();
+        };
+        wrong_prepared.branch_ref = "refs/heads/unrelated".to_owned();
+        let branch_error = replay(
+            vec![
+                Event::now(started()),
+                Event::now(attempt_started("t1", 1, 0, "small")),
+                Event::now(wrong_branch),
+            ],
+            vec!["t1".to_owned()],
+            Path::new("events.jsonl"),
+        )
+        .expect_err("the prepared identity cannot substitute another branch");
+        assert!(
+            branch_error.to_string().contains("branch"),
+            "{branch_error}"
+        );
 
         let error = replay(
             vec![

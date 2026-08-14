@@ -313,6 +313,91 @@ pub fn lock_file(public: &Path) -> PathBuf {
     public.join("run.lock")
 }
 
+fn worktree_lock_file(repo_root: &Path) -> PathBuf {
+    repo_root.join(".tactus").join("worktree.lock")
+}
+
+/// An exclusive lease on the physical worktree shared by every run directory.
+///
+/// A per-run lock protects one log, but two distinct runs still share HEAD, the
+/// index, and every working-tree byte. The engine therefore holds this outer
+/// lease before either a fresh run or a resume can inspect or mutate Git state.
+#[derive(Debug)]
+pub struct WorktreeLock {
+    _file: Option<File>,
+    claim: PathBuf,
+}
+
+impl Drop for WorktreeLock {
+    fn drop(&mut self) {
+        release_claim_after_file(self._file.take(), &self.claim, || {});
+    }
+}
+
+impl WorktreeLock {
+    pub fn acquire(repo_root: &Path) -> Result<Self, TactusError> {
+        let lock_dir = repo_root.join(".tactus");
+        fs::create_dir_all(&lock_dir).map_err(|source| TactusError::Io {
+            path: lock_dir.clone(),
+            source,
+        })?;
+        let path = worktree_lock_file(repo_root);
+        let claim = claim_key(&lock_dir).join("worktree.lock");
+        if !claims().insert(claim.clone()) {
+            return Err(worktree_refused(repo_root, &path, Some(std::process::id())));
+        }
+        let taken = File::options()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .read(true)
+            .open(&path)
+            .map_err(|source| TactusError::Io {
+                path: path.clone(),
+                source,
+            })
+            .and_then(|file| match imp::take(&file) {
+                Holder::Nobody => Ok(file),
+                Holder::Someone { pid } => Err(worktree_refused(repo_root, &path, pid)),
+                Holder::Unknown(source) => Err(TactusError::Io {
+                    path: path.clone(),
+                    source,
+                }),
+            });
+        match taken {
+            Ok(file) => {
+                // A killed conductor releases the primary worktree lease, but
+                // its Unix cleanup reaper deliberately retains the old run's
+                // cleanup lease until every agent process is gone. Check only
+                // after taking the primary lease, closing the race where the
+                // conductor dies between a scan and this acquisition.
+                if let Some(cleaning) = list_runs(repo_root)
+                    .into_iter()
+                    .map(|run_id| public_dir(repo_root, &run_id))
+                    .find(|public| cleanup::is_held(public))
+                {
+                    release_claim_after_file(Some(file), &claim, || {});
+                    return Err(TactusError::Refused {
+                        message: format!(
+                            "run `{}` is still cleaning agent processes in worktree {}; refusing overlapping engine ownership",
+                            cleaning.file_name().unwrap_or_default().to_string_lossy(),
+                            repo_root.display()
+                        ),
+                    });
+                }
+                Ok(Self {
+                    _file: Some(file),
+                    claim,
+                })
+            }
+            Err(error) => {
+                claims().remove(&claim);
+                Err(error)
+            }
+        }
+    }
+}
+
 /// A second, Unix-only lock used as a crash-cleanup lease. Each external agent
 /// reaper opens its own shared hold; `resume` needs the exclusive side, so a
 /// hard-killed conductor cannot hand over the run before cleanup is complete.
@@ -440,6 +525,20 @@ fn refused(public: &Path, path: &Path, pid: Option<u32>) -> TactusError {
     }
 }
 
+fn worktree_refused(repo_root: &Path, path: &Path, pid: Option<u32>) -> TactusError {
+    let who = match pid {
+        Some(pid) => format!(" (pid {pid})"),
+        None => String::new(),
+    };
+    TactusError::Refused {
+        message: format!(
+            "another tactus process{who} is already driving worktree {} (lock held on {}). Different run ids still share HEAD, the index, and working-tree bytes; wait for it to finish, or stop it first.",
+            repo_root.display(),
+            path.display()
+        ),
+    }
+}
+
 /// Who holds a run's lock.
 #[derive(Debug)]
 enum Holder {
@@ -452,8 +551,8 @@ enum Holder {
     Unknown(io::Error),
 }
 
-/// Runs this process holds, so that two `acquire`s here behave like two
-/// engines.
+/// Run and worktree locks this process holds, so that two `acquire`s here
+/// behave like two engines.
 ///
 /// It also keeps [`is_running`] away from a lock file this process already
 /// holds — which on Unix is not tidiness but a correctness requirement, because
@@ -1207,6 +1306,71 @@ mod tests {
         println!("held");
         std::io::Write::flush(&mut std::io::stdout()).expect("flush");
         std::thread::sleep(Duration::from_secs(30));
+    }
+
+    #[test]
+    #[ignore = "spawned as a subprocess by two_run_ids_cannot_drive_one_worktree_concurrently"]
+    fn worktree_lock_child_holds_run_a() {
+        let repo = PathBuf::from(std::env::var("TACTUS_TEST_WORKTREE_DIR").expect("repo"));
+        let public = PathBuf::from(std::env::var("TACTUS_TEST_LOCK_DIR").expect("run dir"));
+        let _worktree = WorktreeLock::acquire(&repo).expect("child takes worktree lease");
+        let _run = RunLock::acquire(&public).expect("child takes run A lock");
+        println!("held");
+        std::io::Write::flush(&mut std::io::stdout()).expect("flush");
+        std::thread::sleep(Duration::from_secs(30));
+    }
+
+    #[test]
+    fn two_run_ids_cannot_drive_one_worktree_concurrently() {
+        let root = scratch("two-runs-one-worktree");
+        let repo = root.join("repo");
+        let run_a = paths_in(&repo, "RUNA");
+        let run_b = paths_in(&repo, "RUNB");
+        run_a.create().expect("run A dirs");
+        run_b.create().expect("run B dirs");
+
+        let exe = std::env::current_exe().expect("test binary");
+        let mut child = std::process::Command::new(exe)
+            .args([
+                "--exact",
+                "rundir::tests::worktree_lock_child_holds_run_a",
+                "--ignored",
+                "--nocapture",
+            ])
+            .env("TACTUS_TEST_WORKTREE_DIR", &repo)
+            .env("TACTUS_TEST_LOCK_DIR", &run_a.public)
+            .stdout(std::process::Stdio::piped())
+            .spawn()
+            .expect("spawn run A engine");
+
+        let mut out = std::io::BufReader::new(child.stdout.take().expect("stdout"));
+        let mut line = String::new();
+        let deadline = Instant::now() + Duration::from_secs(30);
+        loop {
+            line.clear();
+            let read = std::io::BufRead::read_line(&mut out, &mut line).expect("read");
+            assert!(read > 0, "run A child ended before taking its leases");
+            if line.trim() == "held" {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "run A child never took its leases"
+            );
+        }
+
+        // The per-run lock alone would allow this: the identifiers and files
+        // differ. The outer lease is what owns shared HEAD/index/worktree state.
+        let run_b_only = RunLock::acquire(&run_b.public).expect("run B lock is independent");
+        drop(run_b_only);
+        let error = WorktreeLock::acquire(&repo).expect_err("run B must lose the worktree lease");
+        assert!(
+            error.to_string().contains("already driving worktree"),
+            "{error}"
+        );
+
+        let _ = child.kill();
+        let _ = child.wait();
     }
 
     #[test]
