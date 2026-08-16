@@ -17,11 +17,11 @@
 //!
 //! Every transition here is an event (invariant 4). The engine never mutates
 //! run state directly: it appends to `events.jsonl` and folds the event back in
-//! through [`RunState::apply`], the same function `resume` and `status` use to
-//! rebuild state from the file. A live run and a replay of its own log
-//! therefore cannot disagree — there is no second path for them to disagree
-//! along. `report.json` is written from that state as a projection for humans;
-//! nothing ever reads it back.
+//! through [`crate::events::RunState::apply`], the same function `resume` and
+//! `status` use to rebuild state from the file. A live run and a replay of its
+//! own log therefore cannot disagree — there is no second path for them to
+//! disagree along. `report.json` is written from that state as a projection for
+//! humans; nothing ever reads it back.
 
 mod attempt;
 mod coordinator;

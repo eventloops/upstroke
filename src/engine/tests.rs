@@ -1,9 +1,30 @@
-use super::*;
-use crate::agent::{Caps, ProcessOutput};
-use crate::ir::{Effort, TaskId, Usage};
-use std::path::Path;
+use std::fs;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::{Mutex, OnceLock};
+use std::time::Duration;
+
+use super::attempt::{
+    QUESTION_MARKER, artifact_path, evaluate_outcome, materialize_prompt, review_failure,
+    worker_question,
+};
+use super::coordinator::{question_options, run_harness_inner};
+use super::preflight::gates_differ;
+use super::report::{sum_opt, task_report, total_of};
+use super::resume::resume_harness_inner;
+use super::*;
+use crate::agent::{AgentAdapter, Caps, ProcessOutput, TaskRun};
+use crate::capacity;
+use crate::config;
+use crate::events::{self, EventBody, EventLog, GateSummary, Progress, RunState, TaskState};
+use crate::interaction::{self, AnswerSource, QuestionRecord, Sleeper};
+use crate::ir::{
+    Answer, Effort, Outcome, OutcomeStatus, PermissionMode, Question, QuestionId, QuestionKind,
+    ResolvedEffortPolicy, Task, TaskId, TaskKind, Usage, WorkerProfile,
+};
+use crate::review;
+use crate::rundir::{self, RunLock, RunPaths};
+use crate::workspace::Workspace;
 
 #[derive(Clone, Copy, PartialEq)]
 enum Effect {
@@ -271,9 +292,11 @@ impl AgentAdapter for FakeAdapter {
                         ),
                     });
                 }
-                let contents = fs::read_to_string(run.workspace.join("agent-output.txt"))
-                    .map_err(|e| TactusError::Agent {
-                        message: format!("fake could not inspect reviewer candidate: {e}"),
+                let contents =
+                    fs::read_to_string(run.workspace.join("agent-output.txt")).map_err(|e| {
+                        TactusError::Agent {
+                            message: format!("fake could not inspect reviewer candidate: {e}"),
+                        }
                     })?;
                 self.calls
                     .lock()
@@ -309,10 +332,8 @@ impl AgentAdapter for FakeAdapter {
                 } else {
                     run.workspace.join(common)
                 };
-                fs::write(common.join("index.lock"), "jam\n").map_err(|e| {
-                    TactusError::Agent {
-                        message: format!("fake could not jam cleanup: {e}"),
-                    }
+                fs::write(common.join("index.lock"), "jam\n").map_err(|e| TactusError::Agent {
+                    message: format!("fake could not jam cleanup: {e}"),
                 })?;
             }
             let mut cmd = shell_command(&format!("echo {REVIEW_MARKER}"));
@@ -332,66 +353,62 @@ impl AgentAdapter for FakeAdapter {
             });
             index
         };
-        let edit: Option<(&str, String)> =
-            match scripted(&self.effects, index, Effect::EditFile) {
-                Effect::Exit => {
-                    // Half-finished edits first, then die without
-                    // unwinding — no destructors, no flush of anything the
-                    // engine has not already synced. That is what makes
-                    // this a faithful stand-in for a kill rather than a
-                    // tidy shutdown, and it happens at a deterministic
-                    // point instead of racing a signal.
-                    let _ = fs::write(
-                        run.workspace.join("agent-output.txt"),
-                        "half-written by an agent that never came back\n",
-                    );
-                    std::process::exit(CRASH_EXIT_CODE);
-                }
-                Effect::EditFile
-                | Effect::AskQuestion
-                | Effect::JamCleanupAfterReview
-                | Effect::FrozenCandidate => {
-                    let marker = run.workspace.join("agent-output.txt");
-                    let previous = fs::read_to_string(&marker).unwrap_or_default();
-                    Some(("agent-output.txt", format!("{previous}edited: {index}\n")))
-                }
-                Effect::EditTest => Some((
-                    "widget_test.rs",
-                    "#[test]\nfn widget_works() {\n    assert!(true);\n}\n".to_owned(),
-                )),
-                Effect::LargeEdit | Effect::LargeEditQuestionWriteFailure => Some((
-                    "large-agent-output.txt",
-                    "x".repeat(review::MAX_DIFF_BYTES + 1),
-                )),
-                Effect::OpaqueEdit => {
-                    Some(("opaque-agent-output.bin", "\0hidden bytes".to_owned()))
-                }
-                Effect::IgnoredGateInput => {
-                    fs::write(run.workspace.join(".gitignore"), "ignored.flag\n").map_err(
-                        |e| TactusError::Agent {
-                            message: format!("fake ignore rule failed: {e}"),
-                        },
-                    )?;
-                    fs::write(run.workspace.join("ignored.flag"), "gate-only input\n")
-                        .map_err(|e| TactusError::Agent {
-                            message: format!("fake ignored input failed: {e}"),
-                        })?;
-                    Some(("agent-output.txt", "reviewed edit\n".to_owned()))
-                }
-                Effect::NoEdit | Effect::Error | Effect::RateLimited => None,
-            };
+        let edit: Option<(&str, String)> = match scripted(&self.effects, index, Effect::EditFile) {
+            Effect::Exit => {
+                // Half-finished edits first, then die without
+                // unwinding — no destructors, no flush of anything the
+                // engine has not already synced. That is what makes
+                // this a faithful stand-in for a kill rather than a
+                // tidy shutdown, and it happens at a deterministic
+                // point instead of racing a signal.
+                let _ = fs::write(
+                    run.workspace.join("agent-output.txt"),
+                    "half-written by an agent that never came back\n",
+                );
+                std::process::exit(CRASH_EXIT_CODE);
+            }
+            Effect::EditFile
+            | Effect::AskQuestion
+            | Effect::JamCleanupAfterReview
+            | Effect::FrozenCandidate => {
+                let marker = run.workspace.join("agent-output.txt");
+                let previous = fs::read_to_string(&marker).unwrap_or_default();
+                Some(("agent-output.txt", format!("{previous}edited: {index}\n")))
+            }
+            Effect::EditTest => Some((
+                "widget_test.rs",
+                "#[test]\nfn widget_works() {\n    assert!(true);\n}\n".to_owned(),
+            )),
+            Effect::LargeEdit | Effect::LargeEditQuestionWriteFailure => Some((
+                "large-agent-output.txt",
+                "x".repeat(review::MAX_DIFF_BYTES + 1),
+            )),
+            Effect::OpaqueEdit => Some(("opaque-agent-output.bin", "\0hidden bytes".to_owned())),
+            Effect::IgnoredGateInput => {
+                fs::write(run.workspace.join(".gitignore"), "ignored.flag\n").map_err(|e| {
+                    TactusError::Agent {
+                        message: format!("fake ignore rule failed: {e}"),
+                    }
+                })?;
+                fs::write(run.workspace.join("ignored.flag"), "gate-only input\n").map_err(
+                    |e| TactusError::Agent {
+                        message: format!("fake ignored input failed: {e}"),
+                    },
+                )?;
+                Some(("agent-output.txt", "reviewed edit\n".to_owned()))
+            }
+            Effect::NoEdit | Effect::Error | Effect::RateLimited => None,
+        };
         if let Some((name, content)) = edit {
             fs::write(run.workspace.join(name), content).map_err(|e| TactusError::Agent {
                 message: format!("fake edit failed: {e}"),
             })?;
         }
-        if scripted(&self.effects, index, Effect::EditFile)
-            == Effect::LargeEditQuestionWriteFailure
+        if scripted(&self.effects, index, Effect::EditFile) == Effect::LargeEditQuestionWriteFailure
         {
-            let run_id =
-                rundir::latest_run(&run.workspace).ok_or_else(|| TactusError::Agent {
-                    message: "fake could not find the active run".to_owned(),
-                })?;
+            let run_id = rundir::latest_run(&run.workspace).ok_or_else(|| TactusError::Agent {
+                message: "fake could not find the active run".to_owned(),
+            })?;
             let questions = rundir::public_dir(&run.workspace, &run_id).join("questions");
             fs::remove_dir(&questions).map_err(|e| TactusError::Agent {
                 message: format!("fake could not remove questions directory: {e}"),
@@ -1638,8 +1655,8 @@ fn an_unprobeable_cross_family_reviewer_downgrades_instead_of_halting() {
         adapter: FakeAdapter::new(vec![Effect::EditFile], vec![ReviewBehavior::Pass]),
         copilot: Some(FakeAdapter::copilot(vec![ReviewBehavior::Pass]).broken("not logged in")),
     };
-    let report = run_with(&cross_vendor_opts(&repo), &source)
-        .expect("a broken upgrade is not a broken run");
+    let report =
+        run_with(&cross_vendor_opts(&repo), &source).expect("a broken upgrade is not a broken run");
 
     assert!(committed(&report, "t1"));
     assert_eq!(
@@ -2251,8 +2268,7 @@ fn a_resume_whose_effort_policy_did_not_move_says_nothing_about_it() {
         !resumed
             .warnings
             .iter()
-            .any(|warning| warning.contains("effort policy")
-                || warning.contains("effort-policy")),
+            .any(|warning| warning.contains("effort policy") || warning.contains("effort-policy")),
         "an unchanged policy must be silent: {:?}",
         resumed.warnings
     );
@@ -2642,9 +2658,7 @@ fn prompt_wires_artifacts_to_real_files() {
 
     // Missing input: say so plainly rather than pointing at nothing.
     let prompt = materialize_prompt(&task, &[], &run_dir, None);
-    assert!(
-        prompt.contains("did \n     not leave one") || prompt.contains("did not leave one")
-    );
+    assert!(prompt.contains("did \n     not leave one") || prompt.contains("did not leave one"));
     assert!(
         prompt.contains("write artifact `notes`"),
         "producer told where to write"
@@ -2815,8 +2829,7 @@ fn a_parked_question_does_not_stop_the_runnable_frontier() {
         .join("questions")
         .join(format!("{question}.json"));
     let record: QuestionRecord =
-        serde_json::from_str(&fs::read_to_string(&path).expect("question file"))
-            .expect("parses");
+        serde_json::from_str(&fs::read_to_string(&path).expect("question file")).expect("parses");
     assert_eq!(record.question.kind, QuestionKind::Unblock);
     assert_eq!(record.question.affected_tasks, [TaskId::from("t1")]);
     assert!(record.answer.is_none(), "still open");
@@ -3612,8 +3625,7 @@ fn an_outage_is_never_reclassified_as_a_question() {
         (OutcomeStatus::Timeout, FailureKind::Timeout),
         (OutcomeStatus::AgentError, FailureKind::AgentError),
     ] {
-        let outcome =
-            fake_outcome(status, Some(quoting.to_owned()), "s0", None, Duration::ZERO);
+        let outcome = fake_outcome(status, Some(quoting.to_owned()), "s0", None, Duration::ZERO);
         let failure = evaluate_outcome(&outcome, &output).expect("still a failure");
         assert_eq!(failure.kind, expected, "{status:?} must keep its own kind");
     }
@@ -5033,8 +5045,8 @@ fn a_gate_difference_is_described_without_inventing_edits() {
 
     // A duplicate name added. The record's `check` is present and unchanged,
     // so nothing was edited and nothing reordered — one gate appeared.
-    let added = gates_differ(only_check, &[check.clone(), gate("check", "true")])
-        .expect("a difference");
+    let added =
+        gates_differ(only_check, &[check.clone(), gate("check", "true")]).expect("a difference");
     assert!(
         added.contains("`check` (`true`) is in today's config and not in the record"),
         "names the added gate: {added}"
@@ -5063,8 +5075,7 @@ fn a_gate_difference_is_described_without_inventing_edits() {
 
     // A rename is two facts, and saying so beats guessing which gate the
     // operator meant to rename into which.
-    let renamed =
-        gates_differ(only_check, &[gate("verify", "cargo test")]).expect("a difference");
+    let renamed = gates_differ(only_check, &[gate("verify", "cargo test")]).expect("a difference");
     assert!(
         renamed.contains("`check` (`cargo test`) is in the record"),
         "{renamed}"
@@ -5115,9 +5126,7 @@ fn a_log_that_predates_the_gate_record_rederives_and_says_what_it_can() {
     // against a resume that ignored today's config entirely.
     fs::write(
         repo.join("tactus.toml"),
-        format!(
-            "{PARKED_RUN_CONFIG}\n[[gates]]\nname = \"renamed\"\ncmd = \"git --version\"\n"
-        ),
+        format!("{PARKED_RUN_CONFIG}\n[[gates]]\nname = \"renamed\"\ncmd = \"git --version\"\n"),
     )
     .expect("edit config");
 
