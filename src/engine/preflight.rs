@@ -69,11 +69,132 @@ pub(super) struct RecordedRouting {
     pub(super) bindings: Option<Vec<ChainSummary>>,
 }
 
+/// The pure half of pre-flight: the part that only reads files.
+///
+/// It exists because of *when* it can run rather than what it does. §14's
+/// read-only refusals — the plan parsing, the graph, the routing chains, and
+/// every `[engine]` ceiling — have to land before the first effect of a write
+/// command, which is the worktree lease. Nothing here spawns a process, takes a
+/// lock, or writes a byte, so it can run before that lease and refuse there.
+///
+/// The other half of pre-flight — probing agents, resolving gate programs —
+/// genuinely inspects the machine and stays behind the lease.
+///
+/// `analysis` is what `inputs` says, and only what `inputs` says: the capture is
+/// the source [`validate::analyze_captured`] parses, not a fingerprint taken
+/// alongside a second read. That is the whole point of the type. A snapshot
+/// beside an independent read proves nothing about what was validated — bytes
+/// that change and change back leave two equal snapshots either side of a
+/// validation performed on the value in between — so there is one read, and this
+/// is it.
+pub(super) struct Validated {
+    analysis: Analysis,
+    /// Every file the analysis came out of: the plan, the repo config, the pools
+    /// file, and the worktree files the gate derivation reads.
+    inputs: validate::CapturedInputs,
+    limits: config::EngineLimits,
+}
+
+/// Capture every input, then validate that capture.
+///
+/// Callers run this **before** the worktree lease, and again under it. See
+/// [`Validated`] and [`Validated::confirm_under_lease`].
+pub(super) fn validate_inputs(
+    opts: &RunOptions,
+    limits: config::EngineLimits,
+) -> Result<Validated, TactusError> {
+    let validate_opts = ValidateOptions {
+        plan_path: opts.plan_path.clone(),
+        config_path: opts.config_path.clone(),
+        config_root: opts.repo_root.clone(),
+        pools_path: opts.pools_path.clone(),
+        engine_limits: limits,
+    };
+    // Capture first, then parse the capture. Not "snapshot, then read": the
+    // ordering is not the point, having a single read is.
+    let inputs = validate::CapturedInputs::capture(&validate_opts);
+    // §14: plan parses cycle-free, config loads, chains resolve.
+    let analysis = validate::analyze_captured(&inputs, &validate_opts)?;
+    Ok(Validated {
+        analysis,
+        inputs,
+        limits,
+    })
+}
+
+impl Validated {
+    /// Adopt an analysis, now that the lease is held.
+    ///
+    /// The pre-lock check buys the ordering: a refusal reaches the operator
+    /// without a lock file, a run directory, or a branch behind it. What it
+    /// cannot buy is that the files did not move in the window between it and
+    /// the lease, and a run that executed inputs nothing ever checked would be a
+    /// worse defect than the ordering it fixed.
+    ///
+    /// So the lease-holder captures and validates again, and adopts *that*
+    /// analysis rather than the pre-lock one, on the condition that the two
+    /// captures agree. The re-validation is not redundant with the comparison:
+    /// it is what puts the gate derivation — the one input `analyze` reaches the
+    /// filesystem for rather than parsing out of the capture — behind the lease,
+    /// where the worktree is this run's and a read of it is a fact about it. The
+    /// comparison is what makes the pre-lock refusal mean something: it says the
+    /// question answered before the lease was asked about these bytes.
+    ///
+    /// Every retry does the whole thing — capture, validate that capture,
+    /// confirm it against the previous one — so an adopted analysis is always
+    /// one whose own bytes were seen twice with nothing in between.
+    ///
+    /// `limits` is passed again rather than remembered because a resume derives
+    /// it from a header it read before the lock; if the authoritative read
+    /// disagrees, the reading has to be redone under the one that counts.
+    ///
+    /// Bounded, because inputs being rewritten faster than they can be read
+    /// twice is a broken machine rather than a race worth waiting out, and
+    /// looping forever there would hold the lease while doing so.
+    pub(super) fn confirm_under_lease(
+        self,
+        opts: &RunOptions,
+        limits: config::EngineLimits,
+    ) -> Result<Analysis, TactusError> {
+        const ATTEMPTS: usize = 3;
+        // The pre-lock analysis is deliberately dropped rather than returned on
+        // agreement: it answered "may this start", out of a worktree that was
+        // still anybody's. What survives it is its capture, which is the thing
+        // the reading taken under the lease has to agree with.
+        let Self {
+            mut inputs,
+            limits: mut validated_for,
+            ..
+        } = self;
+        for _ in 0..ATTEMPTS {
+            let confirmed = validate_inputs(opts, limits)?;
+            if confirmed.inputs == inputs && limits == validated_for {
+                return Ok(confirmed.analysis);
+            }
+            inputs = confirmed.inputs;
+            validated_for = limits;
+        }
+        Err(TactusError::Refused {
+            message: format!(
+                "{} kept changing while tactus was reading them; refusing to run inputs it \
+                 could not check and then hold still",
+                inputs
+                    .paths()
+                    .iter()
+                    .map(|path| path.display().to_string())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
+        })
+    }
+}
+
 pub(super) fn preflight(
     opts: &RunOptions,
     harness: &Harness<'_>,
+    analysis: Analysis,
 ) -> Result<Preflight, TactusError> {
-    preflight_with_recorded(opts, harness, Recorded::default())
+    preflight_with_recorded(opts, harness, analysis, Recorded::default())
 }
 
 /// Pre-flight, with whatever a previous process already resolved for this run.
@@ -93,19 +214,16 @@ pub(super) fn preflight(
 /// review plan reads as "review is off" and an empty gate list reads as "there
 /// was nothing to pass" — each would finish the run less verified than it began.
 /// The caller warns; only it knows which absence it is looking at.
+///
+/// `analysis` arrives already validated, from [`validate_inputs`] run before
+/// the worktree lease and confirmed under it — see [`Validated`]. Everything
+/// from here on may inspect the machine.
 pub(super) fn preflight_with_recorded(
     opts: &RunOptions,
     harness: &Harness<'_>,
+    mut analysis: Analysis,
     recorded: Recorded,
 ) -> Result<Preflight, TactusError> {
-    // §14: plan parses cycle-free, config loads, chains resolve.
-    let mut analysis = validate::analyze(&ValidateOptions {
-        plan_path: opts.plan_path.clone(),
-        config_path: opts.config_path.clone(),
-        config_root: opts.repo_root.clone(),
-        pools_path: opts.pools_path.clone(),
-    })?;
-
     let mut warnings = analysis.warnings.clone();
 
     // Bindings are execution identity just like reviewers and gates. Restore

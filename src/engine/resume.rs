@@ -3,6 +3,7 @@ use std::fs;
 use std::path::PathBuf;
 
 use crate::capacity;
+use crate::config;
 use crate::error::TactusError;
 use crate::events::{self, EventBody, EventLog, RunState, TaskState};
 use crate::interaction::{self, RealSleeper};
@@ -16,7 +17,7 @@ use super::coordinator::{Run, prepared_pin_ref};
 use super::options::{Harness, ResumeOptions, RunOptions};
 use super::preflight::{
     Preflight, Recorded, RecordedRouting, chain_summaries, normalized_plan_bytes,
-    preflight_with_recorded,
+    preflight_with_recorded, validate_inputs,
 };
 use super::report::{RunReport, last_reason};
 
@@ -30,22 +31,87 @@ pub(super) fn resume_harness_inner(
         run_id: run_id.clone(),
         message,
     };
+    let events_path = public.join("events.jsonl");
+
+    // Read-only, and before either lock. §14's refusals must reach the operator
+    // without a worktree lease and without a `run.lock` file behind them, and
+    // the config is one of them — so the two things deciding *how* to read
+    // today's config have to be read first: the schema this run was recorded
+    // at, which chooses between refusing an impossible ceiling and warning
+    // about one, and where the run's config lives.
+    //
+    // Only that. The authoritative whole-log read is below, under the locks,
+    // and everything the resume actually acts on comes from there. This read
+    // decides what to refuse before taking anything.
+    let mut header_warnings = Vec::new();
+    let header_events = events::read_all(&events_path, &mut header_warnings)?;
+    let header = events::started_of(&header_events, &events_path)?.clone();
+    let header_schema = events::ensure_supported_schema(&header, &header_events, &events_path)?;
+
+    // The run knows its own plan and config; the CLI may override the config
+    // but never the plan, which is frozen (§5).
+    let mut run_opts = RunOptions::new(
+        opts.repo_root.join(&header.plan_path),
+        opts.repo_root.clone(),
+    );
+    run_opts.config_path = opts
+        .config_path
+        .clone()
+        .or_else(|| header.config_path.as_ref().map(|p| opts.repo_root.join(p)));
+    run_opts.pools_path = opts.pools_path.clone();
+    run_opts.interaction = opts.interaction;
+    run_opts.attempt_timeout = opts.attempt_timeout;
+    run_opts.defer_backoff = opts.defer_backoff;
+    run_opts.max_defers = opts.max_defers;
+    run_opts.private_root = opts.private_root.clone();
+    run_opts.wait_on_block = opts.wait_on_block;
+    let wait_on_block = opts.wait_on_block;
+
+    // This run's ceilings were fixed when it started. Today's `[engine]` keys
+    // are read for the same reason today's gates are — the file is what is
+    // here — but a value this engine cannot honour is a statement about some
+    // future run, not an instruction to this one, so it warns rather than
+    // stranding a run whose only fault is that someone edited a file it reads.
+    let limits = config::EngineLimits::for_resume(header_schema);
+    let validated = validate_inputs(&run_opts, limits)?;
+
+    // The first effect of the command.
     let workspace = Workspace::open(&opts.repo_root)?;
     let worktree_git_dir = workspace.worktree_git_dir()?;
     let _worktree_lock = WorktreeLock::acquire_in(workspace.root(), &worktree_git_dir)?;
 
-    // Claimed before anything is read, so two resumes cannot race each other
-    // into the same branch. The lock sits beside the ops surface, which is the
-    // only half of the run directory known this early: where the private half
-    // went is recorded in `run_started`, and that has not been read yet.
+    // Claimed before anything is acted on, so two resumes cannot race each
+    // other into the same branch. The lock sits beside the ops surface, which
+    // is the only half of the run directory known this early: where the private
+    // half went is recorded in `run_started`, which the authoritative read
+    // below is about to establish.
     let _lock = RunLock::acquire(&public)?;
     let _cleanup_scope = _lock.enter_cleanup_scope();
 
     let mut warnings = Vec::new();
-    let events_path = public.join("events.jsonl");
     let events = events::read_all(&events_path, &mut warnings)?;
     let started = events::started_of(&events, &events_path)?.clone();
     let effective_schema = events::ensure_supported_schema(&started, &events, &events_path)?;
+    // `run_started` is the first line of an append-only log, so the read under
+    // the lease must agree with the one before it about where this run's plan
+    // and config live. If it does not, something rewrote history while we were
+    // waiting for the lease, and the pre-lock refusals were answered about
+    // files this run never named.
+    if started.plan_path != header.plan_path || started.config_path != header.config_path {
+        return Err(refuse(
+            "this run's opening record changed while the resume was waiting for the worktree \
+             lease: it now names a different plan or config. Preserve this log for recovery and \
+             start a new run rather than continuing against a record that moved."
+                .to_owned(),
+        ));
+    }
+    // Adopted only now, and only against the schema the authoritative read
+    // settled on: a resume that raced an appended schema upgrade must not run
+    // on a reading derived from the header it saw first.
+    let analysis = validated.confirm_under_lease(
+        &run_opts,
+        config::EngineLimits::for_resume(effective_schema),
+    )?;
     let recorded_normalized_plan_digest =
         events::recorded_normalized_plan_digest(&events).map(str::to_owned);
     let frozen_plan_path = public.join("plan.normalized.json");
@@ -85,25 +151,6 @@ pub(super) fn resume_harness_inner(
     let recorded_reviews = events::recorded_reviews(&events).cloned();
     let recorded_chains = events::recorded_chains(&events).cloned();
 
-    // The run knows its own plan and config; the CLI may override the config
-    // but never the plan, which is frozen (§5).
-    let mut run_opts = RunOptions::new(
-        opts.repo_root.join(&started.plan_path),
-        opts.repo_root.clone(),
-    );
-    run_opts.config_path = opts
-        .config_path
-        .clone()
-        .or_else(|| started.config_path.as_ref().map(|p| opts.repo_root.join(p)));
-    run_opts.pools_path = opts.pools_path.clone();
-    run_opts.interaction = opts.interaction;
-    run_opts.attempt_timeout = opts.attempt_timeout;
-    run_opts.defer_backoff = opts.defer_backoff;
-    run_opts.max_defers = opts.max_defers;
-    run_opts.private_root = opts.private_root.clone();
-    run_opts.wait_on_block = opts.wait_on_block;
-    let wait_on_block = opts.wait_on_block;
-
     // Re-probes agents and re-reads config, exactly as a fresh run does —
     // except for the two things that are facts about *this run* rather than
     // about today's machine: who reviews it and what verifies it. Both come
@@ -124,6 +171,7 @@ pub(super) fn resume_harness_inner(
     } = preflight_with_recorded(
         &run_opts,
         harness,
+        analysis,
         Recorded {
             reviews: recorded_reviews.clone(),
             gates: recorded_gates.clone(),

@@ -30,7 +30,7 @@ use super::attempt::{AttemptCx, RetryBrief, Reviewer, pool_option, run_attempt};
 use super::options::AfterCandidateCapture;
 use super::options::{Harness, RunOptions};
 use super::preflight::{
-    Preflight, chain_summaries, normalized_plan_bytes, preflight, repo_relative,
+    Preflight, chain_summaries, normalized_plan_bytes, preflight, repo_relative, validate_inputs,
 };
 use super::report::{
     ReportHeader, RunOutcome, RunReport, TaskRunStatus, build_report, last_reason,
@@ -44,12 +44,23 @@ pub(super) fn run_harness_inner(
     opts: &RunOptions,
     harness: &Harness<'_>,
 ) -> Result<(RunReport, RunState), TactusError> {
+    // Every read-only refusal precedes every lock: the plan, the config, and
+    // `[engine]`'s ceilings are checked here, where nothing has been created
+    // yet, so a config this engine cannot honour cannot leave a git-dir lock
+    // file behind on its way to being refused — and cannot lose a race to a
+    // competing holder of the lease it never needed.
+    let validated = validate_inputs(opts, config::EngineLimits::Fresh)?;
     let workspace = Workspace::open(&opts.repo_root)?;
     // Preflight reads the source plan, config, and gate programs from this
     // physical worktree. Own it before taking that snapshot so another run
     // cannot leave us with an analysis of its transient edits.
     let worktree_git_dir = workspace.worktree_git_dir()?;
     let _worktree_lock = WorktreeLock::acquire_in(workspace.root(), &worktree_git_dir)?;
+    // The lease is what makes a read of this worktree a fact about it, so the
+    // analysis the run executes is captured and validated here rather than
+    // before — and adopted only once it agrees, byte for byte, with what the
+    // refusal above was decided on.
+    let analysis = validated.confirm_under_lease(opts, config::EngineLimits::Fresh)?;
     let Preflight {
         analysis,
         caps,
@@ -61,7 +72,7 @@ pub(super) fn run_harness_inner(
         mode,
         notifiers,
         budgets,
-    } = preflight(opts, harness)?;
+    } = preflight(opts, harness, analysis)?;
 
     workspace.ensure_execution_prerequisites()?;
     workspace.ensure_run_exclusions()?;

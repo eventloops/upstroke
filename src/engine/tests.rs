@@ -9,7 +9,7 @@ use super::attempt::{
     worker_question,
 };
 use super::coordinator::{question_options, run_harness_inner};
-use super::preflight::gates_differ;
+use super::preflight::{gates_differ, validate_inputs};
 use super::report::{sum_opt, task_report, total_of};
 use super::resume::resume_harness_inner;
 use super::*;
@@ -23,7 +23,7 @@ use crate::ir::{
     ResolvedEffortPolicy, Task, TaskId, TaskKind, Usage, WorkerProfile,
 };
 use crate::review;
-use crate::rundir::{self, RunLock, RunPaths};
+use crate::rundir::{self, RunLock, RunPaths, WorktreeLock};
 use crate::workspace::Workspace;
 
 #[derive(Clone, Copy, PartialEq)]
@@ -2138,6 +2138,607 @@ fn a_schema_two_resume_records_the_complete_review_barrier_before_work() {
         "timeout drift warning: {:?}",
         second.warnings
     );
+}
+
+#[test]
+fn max_parallel_above_one_refuses_before_the_run_touches_the_workspace() {
+    // The config refusal is only worth having if it lands before the run has
+    // done anything an operator must undo. Pre-flight loads the config ahead of
+    // the run id, the run directory, the run lock, and the branch — so a
+    // ceiling this engine cannot honour leaves the repository exactly as it
+    // was, rather than a husk under `.tactus/runs` that `latest_run` then
+    // reports on in place of the real one.
+    let repo = temp_engine_repo("maxparallelrefusal");
+    seed(
+        &repo,
+        "## Doomed\n<!-- tactus: id=t1 kind=implement depends= -->\n",
+        Some(
+            "[engine]\nmax_parallel = 3\n\n\
+             [routing]\nimplement = { chain = [\"small\"], attempts_per = 1 }\n",
+        ),
+    );
+    let head_before = git_in(&repo, &["rev-parse", "HEAD"]);
+    let mut opts = options(&repo);
+    opts.config_path = Some(repo.join("tactus.toml"));
+    let source = fake(Effect::EditFile);
+
+    let error = run_with(&opts, &source).expect_err("a refused ceiling must not start a run");
+    assert!(error.to_string().contains("max_parallel = 3"), "{error}");
+
+    assert!(
+        source.adapter.runs().is_empty(),
+        "nothing may be spawned, let alone paid for"
+    );
+    assert!(
+        rundir::list_runs(&repo).is_empty(),
+        "no run directory: {:?}",
+        rundir::list_runs(&repo)
+    );
+    assert_eq!(
+        git_in(&repo, &["branch", "--list", "tactus/run-*"]),
+        "",
+        "no run branch"
+    );
+    assert_eq!(git_in(&repo, &["rev-parse", "HEAD"]), head_before);
+    assert_eq!(
+        git_in(&repo, &["status", "--porcelain"]),
+        "",
+        "working tree untouched"
+    );
+}
+
+/// Where this repository's worktree lease file would be, held or not.
+fn worktree_lock_path(repo: &Path) -> PathBuf {
+    Workspace::open(repo)
+        .expect("workspace")
+        .worktree_git_dir()
+        .expect("worktree git dir")
+        .join("tactus-worktree.lock")
+}
+
+#[test]
+fn a_refused_ceiling_beats_the_lease_rather_than_racing_it() {
+    // The ordering claim itself, tested where cleanup cannot fake it.
+    //
+    // A run that took the lease, *then* read the config, then tidied up on its
+    // way out would leave a repository indistinguishable from this one — so an
+    // end-state assertion proves nothing about when the config was read. These
+    // two do:
+    //
+    //  (a) The lock file is created by acquisition and is never removed by
+    //      release, by design (a killed engine must leave nothing to clear by
+    //      hand, and the OS releases the hold; the file stays). Its absence is
+    //      therefore proof that acquisition never happened, not proof that it
+    //      was undone.
+    //
+    //  (b) With a competing holder already on the lease, an acquisition-first
+    //      order cannot produce a config error at all: the acquisition is what
+    //      fails, and the operator is told another process owns the worktree —
+    //      the wrong diagnosis for a file they can fix in five seconds. Move
+    //      `validate_inputs` back below `WorktreeLock::acquire_in` and this
+    //      half fails no matter what any cleanup does afterwards.
+    let repo = temp_engine_repo("ceilingbeforelease");
+    seed(
+        &repo,
+        "## Doomed\n<!-- tactus: id=t1 kind=implement depends= -->\n",
+        Some(
+            "[engine]\nmax_parallel = 3\n\n\
+             [routing]\nimplement = { chain = [\"small\"], attempts_per = 1 }\n",
+        ),
+    );
+    let lease = worktree_lock_path(&repo);
+    assert!(
+        !lease.exists(),
+        "the fixture has never taken the lease, so the file cannot exist yet"
+    );
+    let mut opts = options(&repo);
+    opts.config_path = Some(repo.join("tactus.toml"));
+
+    // (a) Uncontended: the refusal must not have created the lease file.
+    let source = fake(Effect::EditFile);
+    let refused = run_with(&opts, &source)
+        .expect_err("a ceiling this engine cannot honour must not start a run")
+        .to_string();
+    assert!(refused.contains("max_parallel = 3"), "{refused}");
+    assert!(
+        !lease.exists(),
+        "the worktree lock file at {} was created before the config was read",
+        lease.display()
+    );
+
+    // (b) Contended: the config error must still be the one that comes back.
+    let competitor = WorktreeLock::acquire(&repo).expect("a competing holder takes the lease");
+    assert!(
+        lease.exists(),
+        "the competing holder is what creates the file, which is how (a) means anything"
+    );
+    let contended = run_with(&opts, &source)
+        .expect_err("a refused ceiling still refuses while somebody holds the lease")
+        .to_string();
+    assert!(
+        contended.contains("max_parallel = 3"),
+        "the config error must win the race it never needed to enter: {contended}"
+    );
+    assert!(
+        !contended.contains("another tactus process"),
+        "lock contention must not be the diagnosis for a config error: {contended}"
+    );
+    drop(competitor);
+
+    assert!(
+        source.adapter.runs().is_empty(),
+        "nothing may be spawned, let alone paid for"
+    );
+    assert!(
+        rundir::list_runs(&repo).is_empty(),
+        "and no run directory: {:?}",
+        rundir::list_runs(&repo)
+    );
+}
+
+#[test]
+fn a_refused_ceiling_beats_both_locks_on_resume() {
+    // The same claim for the other write command, which takes two locks rather
+    // than one. `max_per_agent = 0` is the ceiling to test a resume's ordering
+    // with: the legacy reading below softens `max_parallel > 1` for a run that
+    // is already sequential, but a limit with no meaning at all is refused for
+    // fresh runs and resumes alike, so this refusal is genuinely about *when*.
+    let (repo, run_id) = parked_run("resumeceilingbeforelocks");
+    let paths = paths_of(&repo, &run_id);
+    rewrite_run_started_as_schema_two(&paths);
+    fs::write(
+        repo.join("tactus.toml"),
+        format!("{PARKED_RUN_CONFIG}\n[engine]\nmax_per_agent = 0\n"),
+    )
+    .expect("today's config");
+
+    // The fixture run created both lock files. Remove them, so that a file
+    // found afterwards is evidence about this resume rather than history.
+    let lease = worktree_lock_path(&repo);
+    let run_lock = rundir::lock_file(&paths.public);
+    for path in [&lease, &run_lock] {
+        fs::remove_file(path).unwrap_or_else(|error| {
+            panic!("the fixture run left {}: {error}", path.display());
+        });
+    }
+
+    let refused = resume_err(&repo, &run_id);
+    assert!(refused.contains("max_per_agent"), "{refused}");
+    assert!(
+        !lease.exists(),
+        "the worktree lease was taken before the config was read"
+    );
+    assert!(
+        !run_lock.exists(),
+        "the run lock was taken before the config was read"
+    );
+
+    // And with the lease already held, so that an acquisition-first order
+    // could only ever answer with contention.
+    let competitor = WorktreeLock::acquire(&repo).expect("a competing holder takes the lease");
+    let contended = resume_err(&repo, &run_id);
+    assert!(
+        contended.contains("max_per_agent"),
+        "the config error must win the race it never needed to enter: {contended}"
+    );
+    assert!(
+        !contended.contains("another tactus process"),
+        "lock contention must not be the diagnosis for a config error: {contended}"
+    );
+    drop(competitor);
+    assert!(
+        !run_lock.exists(),
+        "and the run lock stays untaken either way"
+    );
+}
+
+/// A config with a distinguishable, harmless ceiling in it.
+///
+/// `max_merge_repairs` is the right knob for the tests below: it is kept
+/// verbatim by every reading, it loads without refusing, and its value is
+/// visible on the `Analysis` — so "which bytes produced this analysis" has a
+/// direct answer rather than an inferred one.
+fn config_with_repairs(repairs: u32) -> String {
+    format!(
+        "[engine]\nmax_merge_repairs = {repairs}\n\n\
+         [routing]\nimplement = {{ chain = [\"small\"], attempts_per = 1 }}\n"
+    )
+}
+
+#[test]
+fn the_analysis_adopted_under_the_lease_is_the_one_its_own_bytes_were_validated_from() {
+    // The pre-lock check answers "may this start", from files the worktree did
+    // not yet belong to this run. Adopting *that* analysis afterwards would
+    // execute an answer about bytes that no longer exist, so what the lease
+    // holder adopts is an analysis it captured and validated itself — on the
+    // condition that the two captures agree about what it was reading.
+    let repo = temp_engine_repo("confirmunderlease");
+    let config = repo.join("tactus.toml");
+    let mut opts = options(&repo);
+    opts.config_path = Some(config.clone());
+
+    // (a) A change that is still there at the lease is adopted, not papered
+    //     over with the pre-lock reading. Nothing here is refused: the point is
+    //     that a stale-adopting implementation returns 5 and a re-validating
+    //     one returns 7, and only one of those is the config the run will hold.
+    fs::write(&config, config_with_repairs(5)).expect("the config before the lease");
+    let validated = validate_inputs(&opts, config::EngineLimits::Fresh).expect("pre-lock check");
+    fs::write(&config, config_with_repairs(7)).expect("the config at the lease");
+    let analysis = validated
+        .confirm_under_lease(&opts, config::EngineLimits::Fresh)
+        .expect("a valid config is still valid");
+    assert_eq!(
+        analysis.config.max_merge_repairs, 7,
+        "the adopted analysis must describe the bytes the run is holding"
+    );
+
+    // (b) And if the change is one this engine must refuse, it refuses — under
+    //     the lease rather than never. A run whose config was checked in an
+    //     earlier life and replaced since is a run executing something nothing
+    //     ever validated, which is the whole defect.
+    fs::write(&config, config_with_repairs(5)).expect("the config before the lease");
+    let validated = validate_inputs(&opts, config::EngineLimits::Fresh).expect("pre-lock check");
+    fs::write(
+        &config,
+        "[engine]\nmax_parallel = 3\n\n\
+         [routing]\nimplement = { chain = [\"small\"], attempts_per = 1 }\n",
+    )
+    .expect("a ceiling this engine cannot honour");
+    let refused = validated
+        .confirm_under_lease(&opts, config::EngineLimits::Fresh)
+        .expect_err("an unhonourable ceiling must not be adopted because an older file was fine")
+        .to_string();
+    assert!(refused.contains("max_parallel = 3"), "{refused}");
+
+    // (c) The A-to-B-to-A interleaving, end to end. The excursion is invisible
+    //     to both captures — which is precisely why the analysis may not come
+    //     from a read taken beside them. It comes from the capture itself, so
+    //     what is adopted is A whether or not B ever existed.
+    fs::write(&config, config_with_repairs(5)).expect("A");
+    let validated = validate_inputs(&opts, config::EngineLimits::Fresh).expect("pre-lock check");
+    fs::write(&config, config_with_repairs(9)).expect("B");
+    fs::write(&config, config_with_repairs(5)).expect("A again");
+    let analysis = validated
+        .confirm_under_lease(&opts, config::EngineLimits::Fresh)
+        .expect("A is what was captured and A is what is there");
+    assert_eq!(
+        analysis.config.max_merge_repairs, 5,
+        "B was adopted from an excursion neither capture can see"
+    );
+}
+
+#[test]
+fn the_gate_derivation_is_taken_under_the_lease_not_carried_over_it() {
+    // The one input `analyze` still reads from the filesystem rather than out
+    // of the capture: `gates::derive` is handed a directory. So the derivation
+    // has to happen where the worktree is this run's — which means the adopted
+    // analysis cannot be the pre-lock one, and the files it looks at have to be
+    // in the captured set so that a change to them is a change this confirmation
+    // notices.
+    let repo = temp_engine_repo("gatesunderlease");
+    let mut opts = options(&repo);
+    opts.config_path = Some(repo.join("tactus.toml"));
+    fs::write(opts.config_path.as_ref().expect("config path"), "").expect("an empty config");
+
+    let validated = validate_inputs(&opts, config::EngineLimits::Fresh).expect("pre-lock check");
+    // The repo becomes a Rust repo between the check and the lease.
+    fs::write(repo.join("Cargo.toml"), "[package]\nname = \"x\"\n").expect("a rust repo now");
+    let analysis = validated
+        .confirm_under_lease(&opts, config::EngineLimits::Fresh)
+        .expect("a shape change is not a refusal");
+    assert_eq!(
+        analysis
+            .gates
+            .iter()
+            .map(|gate| gate.name.clone())
+            .collect::<Vec<_>>(),
+        vec!["check".to_owned(), "test".to_owned()],
+        "the gates a run is held to must be derived from the worktree it holds"
+    );
+}
+
+/// What two runs of one fixture can never share: their run id, and the two
+/// absolute paths their identity is built out of.
+fn volatile_strings(repo: &Path, run_id: &str) -> Vec<String> {
+    let mut volatile = vec![run_id.to_owned()];
+    // Longest first, so a path that contains another is replaced whole.
+    for path in [private_root_for(repo), repo.to_path_buf()] {
+        let text = path.to_string_lossy().into_owned();
+        volatile.push(text.replace('\\', "/"));
+        volatile.push(text);
+    }
+    volatile
+}
+
+/// Replace every maximal run of `member` that is exactly `len` long.
+///
+/// Length-exact and maximal so that content-derived digests keep their meaning:
+/// a 16-character plan hash and a 64-character normalized-plan digest are facts
+/// two identical fixtures must agree on, and only the 40-character Git object
+/// names and the 26-character ULIDs are unshareable.
+fn replace_exact_runs(
+    text: &str,
+    len: usize,
+    token: &str,
+    member: impl Fn(char) -> bool,
+) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut run = String::new();
+    let flush = |run: &mut String, out: &mut String| {
+        if run.chars().count() == len {
+            out.push_str(token);
+        } else {
+            out.push_str(run);
+        }
+        run.clear();
+    };
+    for ch in text.chars() {
+        if member(ch) {
+            run.push(ch);
+            continue;
+        }
+        flush(&mut run, &mut out);
+        out.push(ch);
+    }
+    flush(&mut run, &mut out);
+    out
+}
+
+/// One JSON value with everything two runs of one fixture legitimately differ
+/// by replaced by a token, in place.
+fn canonicalize_json(value: &mut serde_json::Value, volatile: &[String]) {
+    match value {
+        serde_json::Value::String(text) => {
+            let mut canonical = text.clone();
+            for needle in volatile {
+                canonical = canonical.replace(needle.as_str(), "<volatile>");
+            }
+            canonical = replace_exact_runs(&canonical, 40, "<sha>", |ch| {
+                ch.is_ascii_digit() || ch.is_ascii_lowercase() && ch.is_ascii_hexdigit()
+            });
+            *text = replace_exact_runs(&canonical, 26, "<ulid>", |ch| {
+                ch.is_ascii_digit() || ch.is_ascii_uppercase()
+            });
+        }
+        serde_json::Value::Array(items) => {
+            for item in items {
+                canonicalize_json(item, volatile);
+            }
+        }
+        serde_json::Value::Object(fields) => {
+            for (key, field) in fields.iter_mut() {
+                // Wall-clock, not meaning. Everything else — cost, usage,
+                // effort, tier, model, reviewer, session, rung — is compared.
+                if matches!(key.as_str(), "ts" | "duration_ms" | "duration") {
+                    *field = serde_json::Value::String(format!("<{key}>"));
+                    continue;
+                }
+                canonicalize_json(field, volatile);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// One run's log as a semantic trace two runs of the same fixture can be
+/// compared by.
+///
+/// Whole event bodies, not kinds. A config key that changed which reviewer
+/// judged the retry, what effort it ran at, how long a review was allowed, or
+/// which rung the ladder resumed on would leave the sequence of event kinds and
+/// the run's outcome untouched — so comparing those alone would pass on exactly
+/// the reinterpretation this exists to rule out.
+fn canonical_trace(events: &[events::Event], repo: &Path, run_id: &str) -> Vec<String> {
+    let volatile = volatile_strings(repo, run_id);
+    events
+        .iter()
+        .map(|event| {
+            let mut value = serde_json::to_value(event).expect("an event serializes");
+            canonicalize_json(&mut value, &volatile);
+            value.to_string()
+        })
+        .collect()
+}
+
+/// The run's report and every task record in it, canonicalized the same way.
+///
+/// `warnings` is dropped rather than compared: saying what today's config
+/// contains is the one thing the two arms are *supposed* to differ by, and the
+/// assertions about it are separate and explicit.
+fn canonical_projection(report: &RunReport, repo: &Path, run_id: &str) -> String {
+    let volatile = volatile_strings(repo, run_id);
+    let mut value = serde_json::to_value(report).expect("a report serializes");
+    value
+        .as_object_mut()
+        .expect("a report is an object")
+        .remove("warnings")
+        .expect("a report records its warnings");
+    canonicalize_json(&mut value, &volatile);
+    value.to_string()
+}
+
+/// All four §17 ceilings, written the way an operator waiting for the parallel
+/// engine would write them — `max_parallel` included, and above 1.
+const LEGACY_RESUME_LIMITS: &str = "\n[engine]\nmax_parallel = 2\nmax_merge_repairs = 7\n\
+                                    max_per_agent = 4\nmax_per_pool = 5\n";
+
+/// What the control arm appends instead.
+///
+/// An edit rather than nothing: §14 rolls an interrupted run's uncommitted
+/// paths back, so an arm that left `tactus.toml` untouched would record no
+/// discard while the other recorded one — a difference about which fixture
+/// edited a file, not about what the ceilings did. Both arms edit it; only one
+/// says anything.
+const LEGACY_RESUME_NO_LIMITS: &str = "\n# no [engine] ceilings in this arm\n";
+
+/// Which resume shape a legacy-limits fixture exercises.
+#[derive(Clone, Copy)]
+enum LegacyFixture {
+    /// The ordinary case: a parked run answered and carried to the end.
+    Parked,
+    /// A crash prefix: the log ends inside an attempt that never settled, so
+    /// the resume has to record the interrupted settlement, refund the rung,
+    /// and retry before it can finish. This is where an unacted-on ceiling
+    /// would be most tempting to act on, because it is the only path that
+    /// re-decides how much of the ladder is left.
+    InterruptedAttempt,
+}
+
+/// One arm of a legacy-limits comparison: everything two resumes of the same
+/// fixture must agree about, plus the warnings they are allowed to differ by.
+struct LegacyArm {
+    report: RunReport,
+    /// Every event, whole, with the tokens two runs cannot share replaced.
+    trace: Vec<String>,
+    /// The report and its task records, canonicalized the same way.
+    projection: String,
+    /// The tree the run committed. Content-addressed, so it is directly
+    /// comparable across two repositories whose commits can never share a sha.
+    tree: String,
+    events: Vec<events::Event>,
+}
+
+/// Run one legacy fixture twice — once with the four ceilings in today's
+/// config, once without — and hand back what each resume did.
+fn legacy_resume_pair(tag: &str, fixture: LegacyFixture) -> Vec<LegacyArm> {
+    let mut observed = Vec::new();
+    for (arm, extra) in [
+        ("control", LEGACY_RESUME_NO_LIMITS),
+        ("limits", LEGACY_RESUME_LIMITS),
+    ] {
+        let (repo, run_id) = parked_run(&format!("legacylimits-{tag}-{arm}"));
+        let paths = paths_of(&repo, &run_id);
+        rewrite_run_started_as_schema_two(&paths);
+        if matches!(fixture, LegacyFixture::InterruptedAttempt) {
+            truncate_log_after(&paths, "attempt_started");
+        }
+        fs::write(
+            repo.join("tactus.toml"),
+            format!("{PARKED_RUN_CONFIG}{extra}"),
+        )
+        .expect("today's config");
+
+        let report = resume_answering(&repo, &run_id, Effect::EditFile);
+        let events = events_of(&repo, &run_id);
+        observed.push(LegacyArm {
+            trace: canonical_trace(&events, &repo, &run_id),
+            projection: canonical_projection(&report, &repo, &run_id),
+            tree: git_in(&repo, &["rev-parse", "HEAD^{tree}"]),
+            events,
+            report,
+        });
+    }
+    observed
+}
+
+#[test]
+fn a_legacy_resume_is_not_reinterpreted_by_the_new_engine_limits() {
+    // The keys are new; the run is not. A resume that reads all four — the one
+    // a fresh run refuses among them — must continue exactly as it would have
+    // without them, and say so rather than act on them.
+    //
+    // Proved against a control resume of the identical fixture rather than by
+    // reading the resume path: "the engine ignores these fields" is a claim
+    // about every line of that path, and only a comparison covers all of them.
+    //
+    // And compared *semantically*, not by event kinds and an outcome. A ceiling
+    // that changed which reviewer judged the retry, what effort it ran at, how
+    // long the review was allowed, which rung the ladder resumed on, or what
+    // the attempt cost would leave the sequence of event kinds and the final
+    // outcome identical — so a comparison that could not see those would pass
+    // on exactly the reinterpretation it exists to rule out. Three comparisons
+    // together close that: every event body, the report and its task records,
+    // and the tree the run actually committed.
+    for (fixture, tag) in [
+        (LegacyFixture::Parked, "parked"),
+        (LegacyFixture::InterruptedAttempt, "interrupted"),
+    ] {
+        let observed = legacy_resume_pair(tag, fixture);
+        let control = &observed[0];
+        let limits = &observed[1];
+
+        assert_eq!(
+            control.report.outcome(),
+            RunOutcome::Complete,
+            "the {tag} control resume continues to the end: {:?}",
+            control.report
+        );
+        assert_eq!(
+            limits.report.outcome(),
+            control.report.outcome(),
+            "the new keys must not change how a legacy run ends ({tag})"
+        );
+        assert_eq!(
+            limits.trace, control.trace,
+            "nor what it records, nor with what contents, nor in what order ({tag})"
+        );
+        assert_eq!(
+            limits.projection, control.projection,
+            "nor what it reports about each task ({tag})"
+        );
+        assert_eq!(
+            limits.tree, control.tree,
+            "nor the tree it committed ({tag})"
+        );
+        assert!(
+            !control.tree.is_empty(),
+            "the fixture must actually have committed something for that to mean anything"
+        );
+
+        // Sequential all the way through, stated as a property of the log
+        // rather than of the outcome: one attempt open at a time is what
+        // `max_parallel = 2` would have changed if anything acted on it.
+        let mut open = 0i32;
+        let mut peak = 0i32;
+        for event in &limits.events {
+            match &event.body {
+                EventBody::AttemptStarted { .. } => open += 1,
+                // Both settlements close one: a crashed attempt's recovery
+                // record is as much an end as a finished one.
+                EventBody::AttemptFinished { .. } | EventBody::AttemptInterrupted { .. } => {
+                    open -= 1;
+                }
+                _ => continue,
+            }
+            peak = peak.max(open);
+        }
+        assert_eq!(peak, 1, "the resume ran one attempt at a time ({tag})");
+        assert_eq!(open, 0, "and settled every one of them ({tag})");
+
+        // Every one of the four is named, and only where it was written.
+        for key in [
+            "max_parallel",
+            "max_merge_repairs",
+            "max_per_agent",
+            "max_per_pool",
+        ] {
+            assert!(
+                limits
+                    .report
+                    .warnings
+                    .iter()
+                    .any(|warning| warning.contains(key) && warning.contains("not acted on")),
+                "`{key}` must be reported as unacted-on ({tag}): {:?}",
+                limits.report.warnings
+            );
+            assert!(
+                !control
+                    .report
+                    .warnings
+                    .iter()
+                    .any(|warning| warning.contains(key)),
+                "and only when it was written ({tag}): {:?}",
+                control.report.warnings
+            );
+        }
+        assert!(
+            limits.report.warnings.iter().any(|warning| {
+                warning.contains("max_parallel = 2") && warning.contains("this resume")
+            }),
+            "and the refused-for-fresh-runs ceiling says which run it is talking about: {:?}",
+            limits.report.warnings
+        );
+    }
 }
 
 #[test]

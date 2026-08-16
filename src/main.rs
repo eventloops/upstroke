@@ -172,6 +172,9 @@ fn validate_options(plan: PathBuf, config: Option<PathBuf>) -> anyhow::Result<Va
         config_path: config,
         config_root: std::env::current_dir().context("resolving current directory")?,
         pools_path: None,
+        // Both callers are previewing a run that does not exist yet, so both
+        // want the reading a fresh run gets — including its refusals.
+        engine_limits: tactus::config::EngineLimits::Fresh,
     })
 }
 
