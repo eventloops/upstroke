@@ -488,6 +488,14 @@ export CARGO_INCREMENTAL=0
 export TACTUS_SLOTS=8
 export TACTUS_RAMTARGET=${RAMTARGET}
 
+# ~/bin holds tactus-build, tactus-preflight, tactus-watch, tactus-claude.
+# Ubuntu puts ~/bin on PATH from .profile, which ONLY LOGIN SHELLS READ. A tmux
+# pane running plain bash does not, and neither does any agent subprocess. The
+# failure is silent and expensive: cargo still works, so a build that cannot
+# find tactus-build just uses a per-invocation target dir and gets zero cache
+# reuse. Set it here, where every shell that sources the env picks it up.
+export PATH="\$HOME/bin:\$PATH"
+
 # DO NOT set CARGO_TARGET_DIR per worktree. Use \`tactus-build <cmd>\` instead.
 #
 # Measured on this box 2026-08-17 with two worktrees at an identical commit:

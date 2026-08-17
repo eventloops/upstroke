@@ -15,9 +15,22 @@
 # Idempotent: if the session already exists this does nothing, so the service
 # can be restarted and .bashrc can call it on every login without harm.
 #
-# NOTE ON WINDOW 0: claude runs wrapped so the window SURVIVES claude exiting.
-# A bare `claude` would take window 0 down with it on exit or crash, and with
-# it any scrollback explaining why -- which is the one thing you would want.
+# WINDOW 0 DOES NOT AUTO-START CLAUDE, deliberately.
+#
+# An earlier version ran `claude` here directly from the systemd unit. It
+# renders but never reads a keystroke. claude is an Ink TUI and sets up
+# raw-mode stdin at startup; this unit starts at BOOT, in a pane with no
+# attached client, so there is nothing to set up and it does not recover when a
+# client attaches later.
+#
+# Observed 2026-08-17: the first-run theme picker drew correctly but ignored
+# Enter, C-m and arrow keys indefinitely. The same pane accepted input
+# immediately once respawned as a plain shell, which is what ruled out tmux,
+# the pty and send-keys as causes.
+#
+# So the window is created as a shell and claude is started by `tactus-claude`
+# when a human is actually attached. Never auto-start an interactive TUI in a
+# pane that has no client.
 # =============================================================================
 set -uo pipefail
 
@@ -35,10 +48,9 @@ fi
 
 echo "tactus-session: creating '$SESSION'"
 
-# Window 0 -- the orchestrator. `claude; exec bash` keeps the window alive with
-# its scrollback intact if claude exits, instead of silently vanishing.
+# Window 0 -- the orchestrator. A shell, not claude. See the note above.
 tmux new-session -d -s "$SESSION" -n orchestrator -c "$REPO" \
-  "claude; echo; echo '[claude exited -- scrollback preserved; re-run: claude]'; exec bash"
+  "echo 'Run: tactus-claude   (then: read ~/ORCHESTRATOR-BRIEF.md)'; exec bash"
 
 tmux new-window -t "$SESSION:1" -n shell -c "$REPO"
 tmux new-window -t "$SESSION:2" -n watch -c "$HOME" \
