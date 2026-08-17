@@ -1,0 +1,21 @@
+#!/bin/sh
+# MOTD banner: surface a failed preflight at SSH login.
+#
+# The box has no MTA and no push channel, so a failing 6-hourly cron would
+# otherwise only reach syslog -- which nobody reads. This puts it in front of
+# you the moment you log in, which is the point: token expiry should surface
+# while you are at the keyboard, not at hour four of an unattended run.
+STATUS=/home/ubuntu/.tactus-preflight.status
+[ -f "$STATUS" ] || exit 0
+
+if head -1 "$STATUS" | grep -q '^FAIL'; then
+  printf '\n\033[1;31m'
+  printf '=========================================================\n'
+  printf ' TACTUS PREFLIGHT FAILING  -  agent CLIs cannot make calls\n'
+  printf '=========================================================\033[0m\n'
+  sed -n '2,$p' "$STATUS" | sed 's/^/  - /' | cut -c1-100
+  printf '\n  last checked: %s\n' "$(head -1 "$STATUS" | awk '{print $2}')"
+  printf '  re-run: ~/bin/tactus-preflight\n\n'
+else
+  printf '\n\033[32mtactus preflight: PASS\033[0m (%s)\n\n' "$(head -1 "$STATUS" | awk '{print $2}')"
+fi

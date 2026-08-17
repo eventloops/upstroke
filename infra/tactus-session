@@ -1,0 +1,50 @@
+#!/usr/bin/env bash
+# =============================================================================
+# tactus-session — create (idempotently) the long-lived orchestrator session.
+# =============================================================================
+#
+# One tmux session, created at boot by the tactus-session systemd USER service
+# and attached to by every ssh client. CameronPC, laptop, anywhere on the
+# tailnet: same windows, same scrollback, same running claude.
+#
+# Windows:
+#   0 orchestrator  claude, the session that drives the workflow
+#   1 shell         a plain shell in /srv/tactus, for everything else
+#   2 watch         live tail of the branch gate results
+#
+# Idempotent: if the session already exists this does nothing, so the service
+# can be restarted and .bashrc can call it on every login without harm.
+#
+# NOTE ON WINDOW 0: claude runs wrapped so the window SURVIVES claude exiting.
+# A bare `claude` would take window 0 down with it on exit or crash, and with
+# it any scrollback explaining why -- which is the one thing you would want.
+# =============================================================================
+set -uo pipefail
+
+[ -f "$HOME/.cargo/env" ]  && . "$HOME/.cargo/env"
+[ -f "$HOME/.tactus-env" ] && . "$HOME/.tactus-env"
+export PATH="$HOME/bin:$HOME/.cargo/bin:/usr/local/bin:/usr/bin:/bin"
+
+readonly SESSION="${TACTUS_SESSION:-tactus}"
+readonly REPO="${TACTUS_REPO:-/srv/tactus}"
+
+if tmux has-session -t "$SESSION" 2>/dev/null; then
+  echo "tactus-session: '$SESSION' already exists"
+  exit 0
+fi
+
+echo "tactus-session: creating '$SESSION'"
+
+# Window 0 -- the orchestrator. `claude; exec bash` keeps the window alive with
+# its scrollback intact if claude exits, instead of silently vanishing.
+tmux new-session -d -s "$SESSION" -n orchestrator -c "$REPO" \
+  "claude; echo; echo '[claude exited -- scrollback preserved; re-run: claude]'; exec bash"
+
+tmux new-window -t "$SESSION:1" -n shell -c "$REPO"
+tmux new-window -t "$SESSION:2" -n watch -c "$HOME" \
+  "echo 'branch gate results (tactus-watch):'; tail -n 20 -f ~/.tactus-watch.log; exec bash"
+
+# Land on the shell rather than dumping you straight into claude's TUI.
+tmux select-window -t "$SESSION:1"
+
+echo "tactus-session: '$SESSION' ready (windows: orchestrator, shell, watch)"

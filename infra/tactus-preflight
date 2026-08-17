@@ -1,0 +1,164 @@
+#!/usr/bin/env bash
+# =============================================================================
+# tactus-preflight — prove BOTH agent CLIs can actually make a call, right now.
+# =============================================================================
+#
+# WHY LIVE CALLS AND NOTHING ELSE
+#   File existence lies: ~/.tactus-env can hold a 92-character fragment that
+#   looks perfectly plausible and returns 401 on first use. That happened during
+#   this box's build.
+#   `exp` claims lie: refresh tokens rotate, so a token whose expiry is in the
+#   future can still be dead.
+#   Exit codes lie: `codex login status` prints "Not logged in" and exits 0.
+#     Measured on codex-cli 0.147.0, 2026-08-17.
+#
+#   So every check below is either a real round-trip to the provider, or a
+#   string match on output. Never a file test, never a bare exit code.
+#
+# EXIT
+#   0  both CLIs completed a live round-trip
+#   1  one or more failed  (cron alerts on this)
+#
+# USAGE
+#   tactus-preflight            # run all checks
+#   tactus-preflight --quiet    # only print on failure (used by cron)
+# =============================================================================
+
+set -uo pipefail
+
+# Non-interactive shells get nothing from ~/.bashrc (it returns early), so the
+# environment must be sourced explicitly. Cron is even more barren than ssh.
+[ -f "$HOME/.cargo/env" ]  && . "$HOME/.cargo/env"
+[ -f "$HOME/.tactus-env" ] && . "$HOME/.tactus-env"
+export PATH="$HOME/.cargo/bin:/usr/local/bin:/usr/bin:/bin:$PATH"
+
+readonly MARKER="PREFLIGHT_OK_7Q2X"
+readonly STATUS_FILE="$HOME/.tactus-preflight.status"
+readonly LOG_FILE="$HOME/.tactus-preflight.log"
+readonly CALL_TIMEOUT=240
+readonly QUIET="${1:-}"
+
+FAILURES=()
+START_TS="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+
+say()  { [ "$QUIET" = "--quiet" ] || printf '%s\n' "$*"; }
+ok()   { say "  [ ok ] $*"; }
+# Failures print on STDOUT, same stream as the section headers. Splitting them
+# across stdout/stderr interleaves unpredictably and makes a failure appear
+# under the wrong check, which is actively misleading when you are reading a
+# cron mail at 3am.
+bad()  { printf '  [FAIL] %s\n' "$*"; FAILURES+=("$*"); }
+
+say "tactus-preflight  $START_TS"
+say
+
+# ---------------------------------------------------------------------------
+# 1. Claude — token present at all (a precondition, NOT proof of anything)
+# ---------------------------------------------------------------------------
+say "[1/4] claude: token present"
+if [ -n "${CLAUDE_CODE_OAUTH_TOKEN:-}" ]; then
+  # Length and prefix only. The value is never printed, logged or transmitted.
+  ok "CLAUDE_CODE_OAUTH_TOKEN set (${#CLAUDE_CODE_OAUTH_TOKEN} chars, ${CLAUDE_CODE_OAUTH_TOKEN:0:13}...)"
+  if [ "${#CLAUDE_CODE_OAUTH_TOKEN}" -lt 100 ]; then
+    bad "token is suspiciously short (${#CLAUDE_CODE_OAUTH_TOKEN}); a truncated paste looks exactly like this"
+  fi
+else
+  bad "CLAUDE_CODE_OAUTH_TOKEN is empty or unset in ~/.tactus-env"
+fi
+
+# ---------------------------------------------------------------------------
+# 2. Claude — LIVE round-trip. This is the check that counts.
+# ---------------------------------------------------------------------------
+say "[2/4] claude: live round-trip"
+claude_out="$(timeout "$CALL_TIMEOUT" claude -p "Reply with exactly: ${MARKER}" 2>&1)"
+claude_rc=$?
+if [ $claude_rc -eq 124 ]; then
+  bad "claude -p timed out after ${CALL_TIMEOUT}s"
+elif printf '%s' "$claude_out" | grep -q "$MARKER"; then
+  ok "claude -p returned the marker"
+else
+  bad "claude -p did not return the marker (rc=$claude_rc): $(printf '%s' "$claude_out" | tail -2 | tr '\n' ' ')"
+fi
+
+# ---------------------------------------------------------------------------
+# 3. Codex — login status. Parse the TEXT; the exit code is worthless here.
+# ---------------------------------------------------------------------------
+say "[3/4] codex: login status"
+codex_status="$(timeout 60 codex login status 2>&1)"
+# Deliberately ignoring $? — it is 0 even when logged out.
+if printf '%s' "$codex_status" | grep -qi "not logged in"; then
+  bad "codex reports 'Not logged in' — run: codex login --device-auth"
+else
+  ok "codex login status: $(printf '%s' "$codex_status" | head -1)"
+fi
+
+# ---------------------------------------------------------------------------
+# 4. Codex — LIVE round-trip, in the same shape as the real review invocation.
+#
+#    -C points at a temp dir OUTSIDE any git repo, so --skip-git-repo-check is
+#    mandatory; without it codex exits "Not inside a trusted directory" before
+#    making any call, which would look like an auth failure and is not one.
+#    -s read-only + bubblewrap is the reviewer's containment; keep it here so
+#    the preflight exercises the same sandbox path as production.
+# ---------------------------------------------------------------------------
+say "[4/4] codex: live round-trip"
+tmp_dir="$(mktemp -d)"
+tmp_out="$(mktemp)"
+trap 'rm -rf "$tmp_dir" "$tmp_out"' EXIT
+
+codex_err="$(printf 'Reply with exactly: %s' "$MARKER" | timeout "$CALL_TIMEOUT" \
+  codex exec \
+    -m gpt-5.6-sol \
+    -c 'model_reasoning_effort="max"' \
+    --strict-config \
+    -s read-only \
+    --ephemeral \
+    --skip-git-repo-check \
+    -C "$tmp_dir" \
+    -o "$tmp_out" \
+    - 2>&1)"
+codex_rc=$?
+
+# ONLY the -o output file counts as proof.
+#
+# There was a stderr fallback here and it was WRONG: codex echoes the prompt
+# back in its error output, and the prompt contains the marker. So grepping
+# stderr passed while codex was demonstrably logged out -- a false pass, caught
+# by the negative test on 2026-08-17. Never reintroduce it. If the model did not
+# write to the file we asked it to write to, the round-trip did not happen.
+if [ $codex_rc -eq 124 ]; then
+  bad "codex exec timed out after ${CALL_TIMEOUT}s"
+elif grep -q "$MARKER" "$tmp_out" 2>/dev/null; then
+  ok "codex exec returned the marker"
+else
+  bad "codex exec did not return the marker (rc=$codex_rc): $(printf '%s' "$codex_err" | tail -2 | tr '\n' ' ')"
+fi
+
+# ---------------------------------------------------------------------------
+# Result
+# ---------------------------------------------------------------------------
+END_TS="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+say
+
+if [ ${#FAILURES[@]} -eq 0 ]; then
+  printf 'PASS %s\n' "$END_TS" > "$STATUS_FILE"
+  printf '%s PASS\n' "$END_TS" >> "$LOG_FILE"
+  say "PASS — both CLIs completed a live round-trip."
+  exit 0
+fi
+
+{
+  printf 'FAIL %s\n' "$END_TS"
+  printf '%s\n' "${FAILURES[@]}"
+} > "$STATUS_FILE"
+printf '%s FAIL (%s)\n' "$END_TS" "${FAILURES[*]}" >> "$LOG_FILE"
+
+# Alerting. No MTA and no push channel is configured on this box, so this is
+# deliberately local-only: syslog (journalctl -t tactus-preflight) plus a status
+# file that the login MOTD banner reads. If you want this on your phone, wire a
+# webhook in here -- that needs a URL only you can supply.
+logger -t tactus-preflight -p user.err "PREFLIGHT FAILED: ${FAILURES[*]}" 2>/dev/null || true
+
+printf '\nFAIL — %d check(s) failed:\n' "${#FAILURES[@]}" >&2
+printf '  - %s\n' "${FAILURES[@]}" >&2
+exit 1
