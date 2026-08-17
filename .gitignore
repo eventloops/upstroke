@@ -5,4 +5,4 @@ plan.normalized.json
 # Claude Code local overrides. settings.json (shared, project-level) is NOT
 # ignored -- only the per-machine layer and the backups /doctor writes.
 .claude/settings.local.json
-.claude/settings.local.json.*
+.claude/settings.local.json.doctor-backup
