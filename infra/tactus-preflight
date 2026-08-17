@@ -36,6 +36,7 @@ readonly MARKER="PREFLIGHT_OK_7Q2X"
 readonly STATUS_FILE="$HOME/.tactus-preflight.status"
 readonly LOG_FILE="$HOME/.tactus-preflight.log"
 readonly CALL_TIMEOUT=240
+readonly GH_REPO="${TACTUS_GH_REPO:-keybindings/tactus}"
 readonly QUIET="${1:-}"
 
 FAILURES=()
@@ -55,7 +56,7 @@ say
 # ---------------------------------------------------------------------------
 # 1. Claude — token present at all (a precondition, NOT proof of anything)
 # ---------------------------------------------------------------------------
-say "[1/4] claude: token present"
+say "[1/6] claude: token present"
 if [ -n "${CLAUDE_CODE_OAUTH_TOKEN:-}" ]; then
   # Length and prefix only. The value is never printed, logged or transmitted.
   ok "CLAUDE_CODE_OAUTH_TOKEN set (${#CLAUDE_CODE_OAUTH_TOKEN} chars, ${CLAUDE_CODE_OAUTH_TOKEN:0:13}...)"
@@ -69,7 +70,7 @@ fi
 # ---------------------------------------------------------------------------
 # 2. Claude — LIVE round-trip. This is the check that counts.
 # ---------------------------------------------------------------------------
-say "[2/4] claude: live round-trip"
+say "[2/6] claude: live round-trip"
 claude_out="$(timeout "$CALL_TIMEOUT" claude -p "Reply with exactly: ${MARKER}" 2>&1)"
 claude_rc=$?
 if [ $claude_rc -eq 124 ]; then
@@ -83,7 +84,7 @@ fi
 # ---------------------------------------------------------------------------
 # 3. Codex — login status. Parse the TEXT; the exit code is worthless here.
 # ---------------------------------------------------------------------------
-say "[3/4] codex: login status"
+say "[3/6] codex: login status"
 codex_status="$(timeout 60 codex login status 2>&1)"
 # Deliberately ignoring $? — it is 0 even when logged out.
 if printf '%s' "$codex_status" | grep -qi "not logged in"; then
@@ -101,7 +102,7 @@ fi
 #    -s read-only + bubblewrap is the reviewer's containment; keep it here so
 #    the preflight exercises the same sandbox path as production.
 # ---------------------------------------------------------------------------
-say "[4/4] codex: live round-trip"
+say "[4/6] codex: live round-trip"
 tmp_dir="$(mktemp -d)"
 tmp_out="$(mktemp)"
 trap 'rm -rf "$tmp_dir" "$tmp_out"' EXIT
@@ -132,6 +133,106 @@ elif grep -q "$MARKER" "$tmp_out" 2>/dev/null; then
   ok "codex exec returned the marker"
 else
   bad "codex exec did not return the marker (rc=$codex_rc): $(printf '%s' "$codex_err" | tail -2 | tr '\n' ' ')"
+fi
+
+# ---------------------------------------------------------------------------
+# 4b. codex FILE READ — the sandbox actually launching, not just the API.
+#
+#     Check 4 proves the model answers. It does NOT prove codex can read a file,
+#     because a text round-trip never invokes the filesystem tool path.
+#
+#     That gap was real and cost hours on 2026-08-17: Ubuntu 24.04 ships
+#     kernel.apparmor_restrict_unprivileged_userns=1, bubblewrap could not
+#     create a user namespace, and EVERY sandboxed file read failed with
+#       bwrap: loopback: Failed RTM_NEWADDR: Operation not permitted
+#     while this script reported PASS. A reviewer agent that cannot read the
+#     tree is worthless, and the failure surfaced only when one first tried --
+#     seven hours into a slice. Fixed by /etc/apparmor.d/bwrap granting userns
+#     to bwrap alone; this check is what proves the fix is still in place.
+# ---------------------------------------------------------------------------
+say "[4b/6] codex: live FILE READ (proves the bwrap sandbox launches)"
+read_dir="$(mktemp -d)"
+read_out="$(mktemp)"
+printf '%s\n' "$MARKER" > "$read_dir/marker.txt"
+
+read_err="$(timeout "$CALL_TIMEOUT" \
+  codex exec \
+    -m gpt-5.6-sol \
+    -c 'model_reasoning_effort="low"' \
+    --strict-config \
+    -s read-only \
+    --ephemeral \
+    --skip-git-repo-check \
+    -C "$read_dir" \
+    -o "$read_out" \
+    'Read the file marker.txt in the current directory and reply with its exact contents and nothing else. If you cannot read it, reply with the exact error text you received.' 2>&1)"
+read_rc=$?
+
+# Same rule as check 4: only the -o file counts. And the marker must have come
+# FROM THE FILE -- it is not in the prompt, so a model that cannot read cannot
+# guess it. That is what makes this a genuine capability test rather than a
+# politeness test.
+if [ $read_rc -eq 124 ]; then
+  bad "codex file read timed out after ${CALL_TIMEOUT}s"
+elif grep -q "$MARKER" "$read_out" 2>/dev/null; then
+  ok "codex read a file through the sandbox"
+elif grep -qi 'bwrap\|RTM_NEWADDR\|uid map\|user namespace' "$read_out" "$read_err" 2>/dev/null; then
+  bad "codex sandbox cannot launch — check /etc/apparmor.d/bwrap and kernel.apparmor_restrict_unprivileged_userns"
+else
+  bad "codex did not return the file contents (rc=$read_rc): $(printf '%s' "$read_err" | tail -2 | tr '\n' ' ')"
+fi
+rm -rf "$read_dir" "$read_out"
+
+# ---------------------------------------------------------------------------
+# 5. GitHub PAT — LIVE API round-trip.
+#
+#    The box pushes branches with a deploy key (git-only, no API) and opens PRs
+#    with this fine-grained PAT. Expiry is deliberately short (30 days), so this
+#    check is the thing that tells you it lapsed -- otherwise you find out when
+#    an agent silently fails to file a PR at hour four of a run.
+#
+#    Deliberately NOT checked: dispatch capability. This token must NOT be able
+#    to POST /dispatches, because that is what attests a frontier review, and
+#    only the repository owner may attest. Verified 2026-08-17: dispatch returns
+#    403 "Resource not accessible by personal access token". If that ever starts
+#    succeeding, the token has been over-scoped and an agent could attest its own
+#    work onto master. See check 6.
+# ---------------------------------------------------------------------------
+say "[5/6] github: live API round-trip"
+if [ -z "${GH_TOKEN:-}" ]; then
+  bad "GH_TOKEN is empty or unset in ~/.tactus-env"
+else
+  gh_out="$(timeout 60 gh api "repos/${GH_REPO}" --jq .full_name 2>&1)"
+  gh_rc=$?
+  if [ $gh_rc -eq 124 ]; then
+    bad "gh api timed out"
+  elif [ "$gh_out" = "$GH_REPO" ]; then
+    ok "gh api reached ${GH_REPO} (token ${#GH_TOKEN} chars, ${GH_TOKEN:0:11}...)"
+  else
+    bad "gh api failed (rc=$gh_rc): $(printf '%s' "$gh_out" | tail -1)"
+  fi
+fi
+
+# ---------------------------------------------------------------------------
+# 6. GitHub PAT — NEGATIVE check: it must NOT be able to dispatch.
+#
+#    event_type=noop is safe: frontier-review.yml listens only for
+#    types:[frontier-review], so nothing triggers even if this were permitted.
+#    A 403 here is the PASS condition. This is a scope regression test, not a
+#    liveness check -- it fails loudly if someone widens the token to
+#    Contents:write, which would let the box attest its own reviews and land
+#    them on master unattended.
+# ---------------------------------------------------------------------------
+say "[6/6] github: token CANNOT attest (must be denied)"
+if [ -z "${GH_TOKEN:-}" ]; then
+  say "  [skip] no GH_TOKEN"
+else
+  disp_out="$(timeout 60 gh api "repos/${GH_REPO}/dispatches" -X POST -f event_type=noop 2>&1)"
+  if printf '%s' "$disp_out" | grep -q "403\|Resource not accessible"; then
+    ok "dispatch correctly denied (403) — token cannot attest a frontier review"
+  else
+    bad "SCOPE REGRESSION: token CAN dispatch. It can attest its own reviews and land on master. Narrow it to Pull requests:write."
+  fi
 fi
 
 # ---------------------------------------------------------------------------
