@@ -15,12 +15,13 @@ provisional until the separately owned fork canary described there has passed.
 
 ## Before you send a PR
 
-The project holds itself to these; CI enforces all three:
+The project holds itself to these; CI enforces all four, verbatim:
 
 ```bash
 cargo fmt --check
-cargo clippy --all-targets -- -D warnings
-cargo test --all-targets
+cargo clippy --all-targets --all-features -- -D warnings
+cargo test --all-targets --all-features
+cargo +1.85.0 check --locked --all-targets --all-features
 ```
 
 Use the pull-request template to record the exact commands, implementation provenance, reviewed
