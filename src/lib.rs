@@ -44,6 +44,7 @@ pub mod review;
 pub mod route;
 pub mod rundir;
 pub mod status;
+pub mod topology;
 pub mod ulid;
 pub mod util;
 pub mod validate;
