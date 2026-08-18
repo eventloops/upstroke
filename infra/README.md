@@ -32,6 +32,7 @@ most of a day.
    5   claude/codex auth           (MANUAL — paste-back + device code)
    preflight  token health check + 6-hourly cron + MOTD banner
    6   sccache, tmpfs, swap
+   7   windows guest VM      (Server 2025 on KVM, fully unattended)
    10  docker
    ```
 
@@ -46,10 +47,22 @@ most of a day.
 | `tactus-preflight` | Proves both agent CLIs can make a **live call**. Cron'd 6-hourly. |
 | `tactus-watch` | Polls the watched branch; runs the full gates on each new commit. |
 | `tactus-build` | Wraps cargo with a slot-pooled `CARGO_TARGET_DIR`. **Use instead of setting it yourself.** |
+| `tactus-winguest` | Builds and operates the Windows Server 2025 guest (`up` = fetch ISOs, repack, unattended install, provision, verify). |
+| `autounattend.xml.in` + `winguest-provision.ps1` | Unattended Windows install + guest bootstrap: OpenSSH, Git, VS Build Tools (MSVC), rustup stable + 1.85.0. Password placeholder is substituted at build time, never committed. |
 | `phase9.sh` | The gate runner: 4 cargo gates, 7 bash CI gates, `bash -n` on all scripts, timed baseline. Exits non-zero on failure. |
 | `tactus-session` + `.service` | Long-lived tmux orchestrator session, started at boot via a lingering systemd user service. |
 | `99-tactus-preflight` | MOTD banner surfacing failing tokens or failing gates at login. |
 | `fix-shellenv.sh` | Standalone version of the non-interactive-shell fix (also in `setup.sh`). |
+
+## Windows test leg
+
+`ssh windowsguest 'cd /d C:\tactus && cargo test --all-targets --all-features'`
+runs the suite on a Server 2025 KVM guest — the same OS as GitHub's
+windows-latest runner — so Windows-only failures surface in minutes, not
+after a push. phase9.sh has a `win-test` gate that ships HEAD (as a git bundle) to the
+guest's clone and tests that exact sha (unpushed commits: covered;
+uncommitted changes: not). `TACTUS_NO_WINDOWS=1` skips the gate loudly;
+an unreachable guest fails it rather than skipping, on purpose.
 
 ## Findings worth keeping
 

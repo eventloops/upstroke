@@ -72,6 +72,33 @@ done
 echo "  -> $bash_pass passed, $bash_fail failed"
 echo
 
+echo "--- windows leg: cargo test on the Server 2025 guest ---"
+# Tests HEAD (the exact sha), not the dirty tree: the leg ships the host's
+# commits to the guest's clone and checks the sha out detached, so UNPUSHED
+# work is covered but UNCOMMITTED changes are not. Commit before running.
+# TACTUS_NO_WINDOWS=1 skips loudly; an unreachable guest FAILS rather than
+# skips, because a silently-missing gate is exactly how Windows breakage
+# would reach CI unseen again.
+if [ "${TACTUS_NO_WINDOWS:-0}" = "1" ]; then
+  printf '  [ SKIP ] windows  (TACTUS_NO_WINDOWS=1)\n'
+elif ! ssh -o BatchMode=yes -o ConnectTimeout=5 windowsguest exit >/dev/null 2>&1; then
+  printf '  [ FAIL ] windows  guest unreachable (debug: tactus-winguest status)\n'
+  RC[win-test]=1
+else
+  win_sha=$(git rev-parse HEAD)
+  win_dirty=$(git status --porcelain | wc -l)
+  [ "$win_dirty" -gt 0 ] && printf '  [ note ] %s dirty file(s) NOT included (HEAD only)\n' "$win_dirty"
+  # git push over Windows OpenSSH+cmd mangles the squoted path (cmd keeps the
+  # quotes; receive-pack sees the path WITH quotes and fails), so HEAD travels
+  # as a bundle instead: ~1.5 MB for this repo, and scp + fetch-from-bundle
+  # have no quoting problem and need no server-side config at all.
+  git bundle create -q /tmp/phase9-win.bundle HEAD
+  scp -q /tmp/phase9-win.bundle windowsguest:C:/phase9-win.bundle
+  gate win-test ssh windowsguest "cd /d C:\tactus && git fetch -f -q C:\phase9-win.bundle HEAD:refs/heads/phase9-under-test && git checkout -q -f $win_sha && cargo test --all-targets --all-features"
+  grep -h "test result:" /tmp/phase9_win-test.log 2>/dev/null | sed 's/^/  /'
+fi
+echo
+
 echo "--- syntax check on ALL scripts ---"
 syn=0
 for s in .github/scripts/*.sh; do bash -n "$s" || { echo "  SYNTAX FAIL: $s"; syn=1; }; done
@@ -84,7 +111,7 @@ echo
 
 echo "=========================================================="
 fail=0
-for k in fmt clippy test msrv; do [ "${RC[$k]}" -ne 0 ] && fail=1; done
+for k in fmt clippy test msrv win-test; do [ "${RC[$k]:-0}" -ne 0 ] && fail=1; done
 [ $bash_fail -ne 0 ] && fail=1
 if [ $fail -eq 0 ]; then
   echo " PHASE 9: ALL GREEN"

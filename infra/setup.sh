@@ -533,6 +533,57 @@ EOF
 }
 
 # =============================================================================
+# PHASE 7 — Windows guest VM (the Windows test leg)
+# =============================================================================
+#
+# A Server 2025 KVM guest so `ssh windowsguest 'cargo test ...'` surfaces
+# Windows-only failures in minutes instead of after a push. CI already covers
+# windows-latest; this is for SPEED, not coverage — and Server 2025 is the
+# same OS as GitHub's windows-latest image, so failures reproduce CI
+# faithfully.
+#
+# The heavy lifting is in tactus-winguest (idempotent subcommands; `up`
+# chains download → ISO repack → unattended install → provisioning → verify).
+# The guest install is fully unattended via autounattend.xml.in; the three
+# guest files (autounattend.xml.in, winguest-provision.ps1, tactus-winguest)
+# travel alongside this script, like tactus-build does.
+#
+phase_7() {
+  phase 7 "Windows guest VM (Server 2025 on KVM)"
+  [ -e /dev/kvm ] || { fail "/dev/kvm missing — KVM not available on this box"; return 1; }
+
+  sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq \
+    qemu-kvm libvirt-daemon-system libvirt-clients virtinst ovmf \
+    swtpm swtpm-tools genisoimage xorriso wimtools
+  sudo systemctl enable --now libvirtd
+  sudo usermod -aG libvirt,kvm "$USER"
+  # sudo, not the libvirt group: on a fresh rebuild the group membership
+  # above is not in this shell's token yet (needs a re-login). tactus-winguest
+  # detects the same and prefixes sudo when the group is missing.
+  sudo virsh net-start default 2>/dev/null || true
+  sudo virsh net-autostart default >/dev/null
+  ok "libvirt up, default NAT network autostarted"
+
+  # Stage the guest sources where tactus-winguest looks for them.
+  mkdir -p "$HOME/winguest" "$HOME/bin"
+  local here f
+  here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+  for f in autounattend.xml.in winguest-provision.ps1; do
+    if [ -f "$here/$f" ]; then install -m 644 "$here/$f" "$HOME/winguest/$f"; else warn "$f not found next to setup.sh"; fi
+  done
+  if [ -f "$here/tactus-winguest" ]; then install -m 755 "$here/tactus-winguest" "$HOME/bin/tactus-winguest"; fi
+
+  # The ssh alias the whole workflow keys on (phase9's windows leg, and you).
+  touch "$HOME/.ssh/config"; chmod 600 "$HOME/.ssh/config"
+  if ! grep -q '^Host windowsguest$' "$HOME/.ssh/config"; then
+    printf '\nHost windowsguest\n  HostName 192.168.122.25\n  User Administrator\n  StrictHostKeyChecking accept-new\n' >> "$HOME/.ssh/config"
+  fi
+  ok "ssh alias windowsguest -> 192.168.122.25"
+
+  "$HOME/bin/tactus-winguest" up
+}
+
+# =============================================================================
 # PHASE 10 — Docker
 # =============================================================================
 phase_10() {
@@ -561,7 +612,7 @@ phase_10() {
 # =============================================================================
 # main
 # =============================================================================
-readonly PHASES=(1a 1b 1c 2 3 4 5 preflight 6 10)
+readonly PHASES=(1a 1b 1c 2 3 4 5 preflight 6 7 10)
 
 usage() {
   printf 'usage: %s [phase ...]\n\nphases: %s\n' "$0" "${PHASES[*]}"
@@ -574,6 +625,7 @@ usage() {
   printf '  5   claude/codex auth           (MANUAL)\n'
   printf '  preflight  token health check + 6-hourly cron + MOTD banner\n'
   printf '  6   sccache, tmpfs, swap\n'
+  printf '  7   windows guest VM (Server 2025 on KVM)\n'
   printf '  10  docker\n'
 }
 
