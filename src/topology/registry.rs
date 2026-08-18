@@ -93,6 +93,7 @@ impl Origin {
 
 /// A repair's place in the lineage it belongs to. `None` on an original.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Lineage {
     /// The original task this lineage descends from.
     pub root: TaskKey,
@@ -105,6 +106,7 @@ pub struct Lineage {
 
 /// One rung's frozen execution identity, exactly as the run resolved it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct FrozenRung {
     pub tier: Tier,
     pub agent: String,
@@ -115,7 +117,7 @@ pub struct FrozenRung {
 /// Whether an entry may be dispatched, or is waiting for a human to name a
 /// binding for it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub enum Admission {
     /// The frozen ladder has rungs; the scheduler may dispatch it.
     Runnable,
@@ -141,6 +143,7 @@ impl Admission {
 
 /// The escalation ladder frozen for one entry.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct FrozenLadder {
     /// The resolved tiers, in escalation order.
     pub tiers: Vec<Tier>,
@@ -151,13 +154,16 @@ pub struct FrozenLadder {
     pub rungs: Vec<FrozenRung>,
     /// The task's binding `min=` clip, or `None` where it set no floor. This is
     /// what a repair spawned from this entry intersects its own floor with.
+    #[serde(deserialize_with = "crate::topology::events::strict::required")]
     pub floor: Option<Tier>,
     /// The highest tier this ladder reaches — the policy ceiling a repair
     /// descended from this entry may not exceed. `None` on an empty ladder.
+    #[serde(deserialize_with = "crate::topology::events::strict::required")]
     pub ceiling: Option<Tier>,
     /// The run's resolved effort standard. Carried per entry rather than
     /// referenced, because a dynamic entry is embedded whole in the event that
     /// registers it and has to be readable without the run header beside it.
+    #[serde(deserialize_with = "crate::topology::events::strict::field")]
     pub effort: ResolvedEffortPolicy,
     pub admission: Admission,
 }
@@ -165,13 +171,16 @@ pub struct FrozenLadder {
 /// Everything about a task that is not its identity, its dependencies, or how
 /// it is run — frozen at registration.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct FrozenTaskSpec {
     pub kind: TaskKind,
     pub title: String,
     pub body: String,
     pub acceptance: Vec<String>,
     pub path_hints: Vec<String>,
+    #[serde(deserialize_with = "crate::topology::events::strict::required")]
     pub suggested_tier: Option<Tier>,
+    #[serde(deserialize_with = "crate::topology::events::strict::required")]
     pub min_tier: Option<Tier>,
     pub artifacts_in: Vec<ArtifactId>,
     pub artifacts_out: Vec<ArtifactId>,
@@ -185,6 +194,7 @@ pub struct FrozenTaskSpec {
 /// attempt time. Which of them actually runs still depends on the rung the
 /// implementer bound to, so that choice stays where it was.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct FrozenReviews {
     /// Whether verification was deliberately enabled when the run froze.
     pub enabled: bool,
@@ -192,14 +202,18 @@ pub struct FrozenReviews {
     pub alternative_available: bool,
     /// The independent per-pass wall-clock allowance.
     pub pass_timeout_secs: u64,
+    #[serde(deserialize_with = "crate::topology::events::strict::optional")]
     pub primary: Option<PassBinding>,
+    #[serde(deserialize_with = "crate::topology::events::strict::optional")]
     pub alternative: Option<PassBinding>,
     /// This task's §11.3 second opinion, where its paths asked for one.
+    #[serde(deserialize_with = "crate::topology::events::strict::optional")]
     pub second_opinion: Option<PassBinding>,
 }
 
 /// One registered task.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct TaskEntry {
     pub key: TaskKey,
     /// The id a plan wrote or the merge queue generated. Display only: it is
@@ -215,6 +229,17 @@ pub struct TaskEntry {
     pub display_deps: Vec<TaskId>,
     pub ladder: FrozenLadder,
     pub reviews: FrozenReviews,
+    /// The agents this run's pre-flight actually probed — the allow-list every
+    /// binding on this entry is drawn from, including one a human names for a
+    /// repair whose ladder clipped to nothing.
+    ///
+    /// Recorded per entry rather than referenced from the run header for the
+    /// same reason the effort policy is: a dynamic entry is embedded whole in
+    /// the event that registers it and has to be readable without the header
+    /// beside it. Kept in the order `run_started` recorded, because that record
+    /// is frozen and this value is part of what the digest authenticates.
+    pub allowed_agents: Vec<String>,
+    #[serde(deserialize_with = "crate::topology::events::strict::required")]
     pub lineage: Option<Lineage>,
 }
 
@@ -248,6 +273,12 @@ impl TaskEntry {
 pub struct TaskRegistry {
     entries: Vec<TaskEntry>,
     by_display: BTreeMap<String, TaskKey>,
+    /// How many leading entries came from the frozen plan.
+    ///
+    /// The boundary [`Self::digest`] is defined over. Everything after it was
+    /// registered by an event, which carries it complete and is its own
+    /// authority.
+    originals: usize,
 }
 
 /// Why a registry could not be derived, or could not be trusted.
@@ -362,11 +393,41 @@ impl TaskRegistry {
     /// Derive the original entries: the frozen plan's tasks, in plan order,
     /// against the chains, review plan, and effort policy the run recorded.
     ///
+    /// Derive the original entries from a run record that names no probed
+    /// agents, giving every entry an empty allow-list.
+    ///
+    /// A legacy [`RunStarted`] has no probed-agent record — the field is
+    /// schema 4's — so this is the whole of what such a record supports. **A
+    /// schema-4 derivation must use [`Self::originals_with_agents`]**: the
+    /// allow-list is a digest input, so originals rebuilt through this
+    /// constructor authenticate against a schema-4 log only if that log probed
+    /// nothing, which no run does.
+    ///
+    /// # Errors
+    ///
+    /// Every [`RegistryError`] [`Self::originals_with_agents`] produces.
+    pub fn originals(plan: &Plan, started: &RunStarted) -> Result<Self, RegistryError> {
+        Self::originals_with_agents(plan, started, &[])
+    }
+
+    /// Derive the original entries: the frozen plan's tasks, in plan order,
+    /// against the chains, review plan, and effort policy the run recorded,
+    /// with the agents its pre-flight probed.
+    ///
     /// Every refusal here is a statement that the two inputs do not describe
     /// the same run. That matters more than it looks: this is the construction
     /// a reader repeats to check [`Self::digest`], so an input pair it accepted
     /// loosely would authenticate a registry nothing else agrees with.
-    pub fn originals(plan: &Plan, started: &RunStarted) -> Result<Self, RegistryError> {
+    ///
+    /// # Errors
+    ///
+    /// A [`RegistryError`] naming the first way the plan and the run record
+    /// disagree about the run they describe.
+    pub fn originals_with_agents(
+        plan: &Plan,
+        started: &RunStarted,
+        probed_agents: &[String],
+    ) -> Result<Self, RegistryError> {
         let effort = started
             .effort_policy
             .ok_or(RegistryError::IncompleteRunRecord {
@@ -451,14 +512,32 @@ impl TaskRegistry {
                     alternative: reviews.alternative.clone(),
                     second_opinion: reviews.second_opinion.get(index).cloned().flatten(),
                 },
+                allowed_agents: probed_agents.to_vec(),
                 lineage: None,
             });
         }
 
         Ok(Self {
+            originals: entries.len(),
             entries,
             by_display,
         })
+    }
+
+    /// Add an entry a schema-4 event registered.
+    ///
+    /// Infallible on purpose: whether this key is the next dense index, whether
+    /// its display id is free, and whether its ladder is one an attempt could
+    /// climb are all decided by the checked fold *before* it applies the event
+    /// that registers the entry. Repeating those checks here would put a second
+    /// authority on the same question, and the one place a dynamic entry can be
+    /// refused is the transition that introduces it.
+    ///
+    /// Does not move [`Self::digest`]: see that method for why.
+    pub fn register(&mut self, entry: TaskEntry) {
+        self.by_display
+            .insert(entry.display_id.to_string(), entry.key);
+        self.entries.push(entry);
     }
 
     pub fn len(&self) -> usize {
@@ -493,12 +572,33 @@ impl TaskRegistry {
         self.entries.iter().map(TaskEntry::legacy_task).collect()
     }
 
-    /// The authentication value over this registry's entries.
+    /// How many entries came from the frozen plan.
+    pub fn originals_len(&self) -> usize {
+        self.originals
+    }
+
+    /// The authentication value over this registry's **original** entries.
     ///
-    /// `sha256:<hex>` of [`Self::canonical_bytes`], matching the normalized
-    /// plan's digest so a log carries one shape of digest rather than two.
+    /// `sha256:<hex>` of the canonical encoding over the originals alone, in
+    /// the `sha256:<hex>` shape the normalized plan's digest uses so a log
+    /// carries one shape of digest rather than two.
+    ///
+    /// Deliberately not a digest of everything registered. A reader
+    /// authenticates a registry by rebuilding the originals from
+    /// `plan.normalized.json` and `run_started` and comparing; a dynamic entry
+    /// has no frozen input behind it to rebuild *from*, and is authenticated
+    /// instead by arriving complete inside the event that registers it. A
+    /// digest that widened as repairs were registered would be a value no
+    /// reader could ever recompute, and it would do so silently.
+    ///
+    /// This is the half of the pair that is *narrow* on purpose.
+    /// [`Self::canonical_bytes`] is the whole registry; the two are the same
+    /// bytes exactly when nothing dynamic has been registered.
     pub fn digest(&self) -> String {
-        format!("sha256:{:x}", Sha256::digest(self.canonical_bytes()))
+        format!(
+            "sha256:{:x}",
+            Sha256::digest(self.encode(self.originals.min(self.entries.len())))
+        )
     }
 
     /// Refuse a registry that does not match a recorded digest.
@@ -520,6 +620,15 @@ impl TaskRegistry {
     /// ever recorded. A new field goes in at the end behind a new version tag,
     /// never in the middle.
     ///
+    /// `allowed_agents` is the one field that arrived after the encoding was
+    /// written and did *not* take a new tag. It is not an extension: it is part
+    /// of what an entry has always been (`decisions.task_registry.task_entry`),
+    /// deferred by one slice on the explicit ruling that no digest is recorded
+    /// in between. Nothing has ever written a `tactus.registry.v1` value
+    /// without it, so there is no reader for which the two versions differ, and
+    /// a second tag would claim a compatibility history this format does not
+    /// have. The next field to arrive will be a real extension and takes v2.
+    ///
     /// Every value is written length-prefixed as `<byte length>:<bytes>;`, so
     /// the encoding is injective — two registries that differ anywhere produce
     /// different bytes, and no arrangement of one entry's text can imitate
@@ -527,10 +636,26 @@ impl TaskRegistry {
     /// locale-dependent rendering, which is what makes the value identical in
     /// another process on another platform.
     pub fn canonical_bytes(&self) -> Vec<u8> {
+        self.encode(self.entries.len())
+    }
+
+    /// The canonical encoding of this registry's first `entries` entries.
+    ///
+    /// One encoder, two readers: [`Self::digest`] takes the originals and
+    /// [`Self::canonical_bytes`] takes everything. Writing it once is what
+    /// makes "the digest is the whole-registry encoding when nothing dynamic
+    /// exists" a fact about the code rather than a coincidence between two
+    /// copies of a format — and a dynamic entry that no encoder ever visited
+    /// would be a value nothing downstream could compare.
+    ///
+    /// The count is part of the encoding, so a prefix of a longer registry is
+    /// never the encoding of a shorter one.
+    fn encode(&self, entries: usize) -> Vec<u8> {
+        let entries = &self.entries[..entries.min(self.entries.len())];
         let mut out = Vec::new();
         field(&mut out, "tactus.registry.v1");
-        count(&mut out, self.entries.len());
-        for entry in &self.entries {
+        count(&mut out, entries.len());
+        for entry in entries {
             encode_entry(&mut out, entry);
         }
         out
@@ -763,6 +888,11 @@ fn encode_entry(out: &mut Vec<u8>, entry: &TaskEntry) {
     optional_binding(out, reviews.primary.as_ref());
     optional_binding(out, reviews.alternative.as_ref());
     optional_binding(out, reviews.second_opinion.as_ref());
+
+    // In the order `run_started` recorded, not sorted: the record is frozen,
+    // and two runs that probed the same agents in different orders resolved
+    // their bindings against different lists.
+    strings(out, entry.allowed_agents.iter());
 }
 
 #[cfg(test)]
@@ -785,7 +915,11 @@ mod tests {
     type BreakRecord = fn(&mut RunStarted);
 
     /// One way to move a single digest input, for the coverage table.
-    type MoveInput = fn(&mut Plan, &mut RunStarted);
+    ///
+    /// The probed agents are a third input rather than a field of the run
+    /// record: a legacy [`RunStarted`] has no place to record them, and they
+    /// are a digest input all the same.
+    type MoveInput = fn(&mut Plan, &mut RunStarted, &mut Vec<String>);
 
     /// One way to move a single field of one already-built entry.
     type MoveField = fn(&mut TaskEntry);
@@ -1102,8 +1236,38 @@ mod tests {
         plan
     }
 
+    /// The agents the sample run's pre-flight probed.
+    ///
+    /// Not the agents the chains bind, and not a sorted list. A real run's
+    /// probe finds every configured CLI, of which the ladder binds some; a
+    /// fixture whose allow-list happened to be the set of bound agents would be
+    /// reproduced exactly by an encoder that derived the allow-list from the
+    /// rungs instead of reading the record. `copilot` is here and is bound by
+    /// nothing; `claude-code` is bound and is here; the padded, multi-byte and
+    /// over-length entries are here and are bound by nothing.
+    ///
+    /// The order is the record's: neither ascending nor descending by bytes
+    /// (`"  Codex-CLI  "` sorts first, the `a`-run second, `claude-code` third,
+    /// `copilot` fourth, `ÜBER…` last), so an encoder that sorted or reversed
+    /// the list writes bytes this fixture does not contain.
+    fn sample_agents() -> Vec<String> {
+        vec![
+            "ÜBER-agent-Ωmega".to_owned(),
+            "claude-code".to_owned(),
+            "  Codex-CLI  ".to_owned(),
+            "a".repeat(300),
+            "copilot".to_owned(),
+        ]
+    }
+
+    /// The derivation every fixture here goes through, with the sample run's
+    /// probed agents.
+    fn originals_of(plan: &Plan, started: &RunStarted) -> Result<TaskRegistry, RegistryError> {
+        TaskRegistry::originals_with_agents(plan, started, &sample_agents())
+    }
+
     fn registry_of(plan: &Plan) -> TaskRegistry {
-        TaskRegistry::originals(plan, &started_for(plan)).expect("the sample record is complete")
+        originals_of(plan, &started_for(plan)).expect("the sample record is complete")
     }
 
     // -----------------------------------------------------------------------
@@ -1179,7 +1343,7 @@ mod tests {
         // each representation on its own rather than of the pair moving
         // together.
         let plan = dependency_order_plan();
-        let registry = TaskRegistry::originals(&plan, &started_for(&plan))
+        let registry = originals_of(&plan, &started_for(&plan))
             .expect("the dependency-order record is complete");
         let omega = registry
             .get(registry.key_of("omega").expect("omega is registered"))
@@ -1253,7 +1417,7 @@ mod tests {
         // artifact on each side, so a registry that sorted either list is
         // indistinguishable from one that copied it.
         let plan = artifact_order_plan();
-        let registry = TaskRegistry::originals(&plan, &started_for(&plan))
+        let registry = originals_of(&plan, &started_for(&plan))
             .expect("the artifact-order record is complete");
         let omega = registry
             .get(registry.key_of("omega").expect("omega is registered"))
@@ -1312,7 +1476,7 @@ mod tests {
         for (what, permute) in permutations {
             let mut moved = artifact_order_plan();
             permute(moved.tasks.last_mut().expect("omega is the last task"));
-            let rebuilt = TaskRegistry::originals(&moved, &started_for(&moved))
+            let rebuilt = originals_of(&moved, &started_for(&moved))
                 .expect("a permuted artifact list still builds");
             assert_ne!(
                 rebuilt.canonical_bytes(),
@@ -1384,8 +1548,7 @@ mod tests {
         // wrong ladder for at least one task.
         let plan = varied_plan();
         let started = varied_started_for(&plan);
-        let registry =
-            TaskRegistry::originals(&plan, &started).expect("the varied record is complete");
+        let registry = originals_of(&plan, &started).expect("the varied record is complete");
 
         // The fixture has to discriminate before anything below means
         // something: two equal ladders would satisfy any lookup at all.
@@ -1457,8 +1620,7 @@ mod tests {
         let plan = plan_of(vec![task("alpha", &[])]);
         let mut started = started_for(&plan);
         started.chains = vec![unordered_chain("alpha")];
-        let registry =
-            TaskRegistry::originals(&plan, &started).expect("the unordered record is complete");
+        let registry = originals_of(&plan, &started).expect("the unordered record is complete");
         let entry = &registry.entries()[0];
 
         // The fixture has to be able to see the difference before the assertion
@@ -1543,8 +1705,8 @@ mod tests {
         // hard-coded to that literal produced the expected answer, and the
         // slot's own recorded agent was never consulted by anything.
         let plan = varied_plan();
-        let registry = TaskRegistry::originals(&plan, &varied_started_for(&plan))
-            .expect("the varied record is complete");
+        let registry =
+            originals_of(&plan, &varied_started_for(&plan)).expect("the varied record is complete");
         let named: Vec<(&str, Option<(&str, &str)>)> = registry
             .entries()
             .iter()
@@ -1750,7 +1912,7 @@ mod tests {
         {
             let mut started = started_for(&plan);
             mutate(&mut started);
-            let moved = TaskRegistry::originals(&plan, &started)
+            let moved = originals_of(&plan, &started)
                 .unwrap_or_else(|error| panic!("the {label} case must still build: {error}"));
             assert_eq!(moved.len(), baseline.len(), "{label}");
 
@@ -1915,8 +2077,8 @@ mod tests {
         ];
 
         let plan = varied_plan();
-        let baseline = TaskRegistry::originals(&plan, &varied_started_for(&plan))
-            .expect("the varied record is complete");
+        let baseline =
+            originals_of(&plan, &varied_started_for(&plan)).expect("the varied record is complete");
         for SlotCase {
             label,
             slot,
@@ -1926,7 +2088,7 @@ mod tests {
         {
             let mut started = varied_started_for(&plan);
             mutate(&mut started);
-            let moved = TaskRegistry::originals(&plan, &started)
+            let moved = originals_of(&plan, &started)
                 .unwrap_or_else(|error| panic!("the {label} case must still build: {error}"));
             assert_eq!(moved.len(), baseline.len(), "{label}");
 
@@ -2180,7 +2342,7 @@ mod tests {
         const RESERVED: &str = "merge-fix-0001-alpha";
 
         let plan = plan_of(vec![task("alpha", &[]), task(RESERVED, &[])]);
-        let refusal = TaskRegistry::originals(&plan, &started_for(&plan))
+        let refusal = originals_of(&plan, &started_for(&plan))
             .expect_err("the reserved namespace belongs to the merge queue");
         assert_eq!(
             refusal,
@@ -2195,7 +2357,7 @@ mod tests {
     fn a_duplicate_display_id_is_refused() {
         let plan = plan_of(vec![task("alpha", &[]), task("alpha", &[])]);
         assert_eq!(
-            TaskRegistry::originals(&plan, &started_for(&plan)),
+            originals_of(&plan, &started_for(&plan)),
             Err(RegistryError::DuplicateDisplayId {
                 id: "alpha".to_owned()
             })
@@ -2206,7 +2368,7 @@ mod tests {
     fn an_unknown_dependency_is_refused() {
         let plan = plan_of(vec![task("alpha", &["ghost"])]);
         assert_eq!(
-            TaskRegistry::originals(&plan, &started_for(&plan)),
+            originals_of(&plan, &started_for(&plan)),
             Err(RegistryError::UnknownDependency {
                 task: "alpha".to_owned(),
                 dep: "ghost".to_owned(),
@@ -2245,7 +2407,7 @@ mod tests {
             let mut started = started_for(&plan);
             break_it(&mut started);
             assert_eq!(
-                TaskRegistry::originals(&plan, &started),
+                originals_of(&plan, &started),
                 Err(RegistryError::IncompleteRunRecord { field }),
                 "a record missing its {field} must refuse rather than default"
             );
@@ -2305,7 +2467,7 @@ mod tests {
             let plan = sample_plan();
             let mut started = started_for(&plan);
             break_it(&mut started);
-            assert_eq!(TaskRegistry::originals(&plan, &started), Err(expected));
+            assert_eq!(originals_of(&plan, &started), Err(expected));
         }
 
         // A binding recorded against the wrong tier: same count, wrong meaning.
@@ -2313,7 +2475,7 @@ mod tests {
         let mut started = started_for(&plan);
         started.chains[0].bindings.as_mut().expect("bindings")[0].tier = Tier::Frontier;
         assert_eq!(
-            TaskRegistry::originals(&plan, &started),
+            originals_of(&plan, &started),
             Err(RegistryError::BindingTier {
                 task: "zeta".to_owned(),
                 tier: Tier::Small,
@@ -2332,7 +2494,7 @@ mod tests {
             .second_opinion
             .pop();
         assert_eq!(
-            TaskRegistry::originals(&plan, &started),
+            originals_of(&plan, &started),
             Err(RegistryError::ReviewAlignment {
                 recorded: 2,
                 tasks: 3
@@ -2350,7 +2512,15 @@ mod tests {
     /// implementation of the documented encoding rather than copied out of this
     /// one, so it pins the format and not merely today's output.
     const SAMPLE_DIGEST: &str =
-        "sha256:b3ca7771a2f338ed2bc165c33395c7ef2ae0de8d1dbbd540888021181d84db3f";
+        "sha256:02b5b9f120fb1b0499698e98849d5da3f7cadc35ba69da6f11e3f89464d3845d";
+
+    /// The length of the exact bytes [`SAMPLE_DIGEST`] is taken over.
+    ///
+    /// Pinned beside the digest because the two fail differently: a hash
+    /// mismatch says something moved, and the byte count says whether the
+    /// encoding grew, shrank, or merely rearranged. Re-derived from the
+    /// documented framing at the same time as the digest.
+    const SAMPLE_CANONICAL_BYTES: usize = 2520;
 
     #[test]
     fn the_registry_digest_is_its_frozen_vector() {
@@ -2361,10 +2531,46 @@ mod tests {
             SAMPLE_DIGEST,
             "the canonical serialization is frozen; a recorded digest outlives this binary"
         );
+        assert_eq!(
+            registry.canonical_bytes().len(),
+            SAMPLE_CANONICAL_BYTES,
+            "the digest is taken over a different number of bytes than the frozen encoding"
+        );
         // Built again from scratch: no interior iteration order, no address,
         // no clock.
         assert_eq!(registry_of(&sample_plan()).digest(), SAMPLE_DIGEST);
         assert_eq!(registry.digest().len(), "sha256:".len() + 64);
+    }
+
+    #[test]
+    fn a_record_that_names_no_probed_agents_derives_an_empty_allow_list() {
+        // The two-argument derivation is the legacy one: a schema-1..3
+        // `RunStarted` has nowhere to record what pre-flight probed, so every
+        // entry's allow-list is empty — and that is a different registry, with
+        // a different digest, from the one the same plan derives under a run
+        // that probed anything at all. Asserted rather than assumed because the
+        // difference is exactly what stops a schema-4 log from authenticating
+        // against originals rebuilt through the wrong constructor.
+        let plan = sample_plan();
+        let started = started_for(&plan);
+        let legacy =
+            TaskRegistry::originals(&plan, &started).expect("the sample record is complete");
+
+        for entry in legacy.entries() {
+            assert!(
+                entry.allowed_agents.is_empty(),
+                "`{}` took an allow-list from a record that has no place to record one",
+                entry.display_id
+            );
+        }
+        assert_eq!(
+            legacy,
+            TaskRegistry::originals_with_agents(&plan, &started, &[])
+                .expect("the sample record is complete"),
+            "the two-argument derivation must be the no-agents case of the three-argument one, \
+             not a second derivation that could drift from it"
+        );
+        assert_ne!(legacy.digest(), SAMPLE_DIGEST);
     }
 
     #[test]
@@ -2393,75 +2599,75 @@ mod tests {
         // may move it to the same place: a field left out of the canonical
         // serialization shows up as a digest that did not move, and a field
         // written without its own length prefix shows up as a collision.
-        let cases: [(&str, MoveInput); 26] = [
-            ("display id", |plan, started| {
+        let cases: [(&str, MoveInput); 30] = [
+            ("display id", |plan, started, _| {
                 plan.tasks[0].id = TaskId::from("zeta-renamed");
                 plan.tasks[2].depends_on[1] = TaskId::from("zeta-renamed");
                 started.chains[0].task = "zeta-renamed".to_owned();
             }),
-            ("kind", |plan, _| plan.tasks[0].kind = TaskKind::Docs),
-            ("title", |plan, _| plan.tasks[0].title.push('!')),
-            ("body", |plan, _| plan.tasks[0].body.push('!')),
-            ("acceptance", |plan, _| {
+            ("kind", |plan, _, _| plan.tasks[0].kind = TaskKind::Docs),
+            ("title", |plan, _, _| plan.tasks[0].title.push('!')),
+            ("body", |plan, _, _| plan.tasks[0].body.push('!')),
+            ("acceptance", |plan, _, _| {
                 plan.tasks[0].acceptance.push("more".to_owned());
             }),
-            ("path hints", |plan, _| {
+            ("path hints", |plan, _, _| {
                 plan.tasks[0].path_hints.push("src/extra.rs".to_owned());
             }),
-            ("suggested tier", |plan, _| {
+            ("suggested tier", |plan, _, _| {
                 plan.tasks[0].suggested_tier = Some(Tier::Frontier);
             }),
-            ("suggested tier absent", |plan, _| {
+            ("suggested tier absent", |plan, _, _| {
                 plan.tasks[0].suggested_tier = None;
             }),
-            ("min tier", |plan, _| {
+            ("min tier", |plan, _, _| {
                 plan.tasks[0].min_tier = Some(Tier::Mid);
             }),
-            ("artifacts in", |plan, _| {
+            ("artifacts in", |plan, _, _| {
                 plan.tasks[0].artifacts_in.push(ArtifactId::from("extra"));
             }),
-            ("artifacts out", |plan, _| {
+            ("artifacts out", |plan, _, _| {
                 plan.tasks[0].artifacts_out.push(ArtifactId::from("extra"));
             }),
-            ("dependencies", |plan, _| {
+            ("dependencies", |plan, _, _| {
                 plan.tasks[0].depends_on.clear();
             }),
-            ("dependency order", |plan, _| {
+            ("dependency order", |plan, _, _| {
                 plan.tasks[2].depends_on.swap(0, 1);
             }),
-            ("plan order", |plan, started| {
+            ("plan order", |plan, started, _| {
                 plan.tasks.swap(0, 1);
                 started.chains.swap(0, 1);
             }),
-            ("chain tiers", |_, started| {
+            ("chain tiers", |_, started, _| {
                 started.chains[0].tiers[1] = Tier::Frontier;
                 started.chains[0].bindings.as_mut().expect("bindings")[1].tier = Tier::Frontier;
             }),
-            ("attempts per rung", |_, started| {
+            ("attempts per rung", |_, started, _| {
                 started.chains[0].attempts_per = 3;
             }),
-            ("rung agent", |_, started| {
+            ("rung agent", |_, started, _| {
                 started.chains[0].bindings.as_mut().expect("bindings")[0].agent =
                     "copilot".to_owned();
             }),
-            ("rung model", |_, started| {
+            ("rung model", |_, started, _| {
                 started.chains[0].bindings.as_mut().expect("bindings")[0].model =
                     "claude-sonnet-5".to_owned();
             }),
-            ("rung pin", |_, started| {
+            ("rung pin", |_, started, _| {
                 started.chains[0].bindings.as_mut().expect("bindings")[0].pinned = true;
             }),
-            ("effort policy", |_, started| {
+            ("effort policy", |_, started, _| {
                 started
                     .effort_policy
                     .as_mut()
                     .expect("effort policy")
                     .frontier = Effort::Max;
             }),
-            ("review pass timeout", |_, started| {
+            ("review pass timeout", |_, started, _| {
                 started.reviews.as_mut().expect("reviews").pass_timeout_secs = Some(60);
             }),
-            ("primary reviewer", |_, started| {
+            ("primary reviewer", |_, started, _| {
                 started.reviews.as_mut().expect("reviews").primary =
                     Some(PassBinding::new("copilot", "gpt-5.6"));
             }),
@@ -2470,10 +2676,10 @@ mod tests {
             // Moved as a pair they are one case, and a serialization that wrote
             // only one of them is authenticated by the other; apart, each has
             // to reach the digest on its own.
-            ("alternative reviewer", |_, started| {
+            ("alternative reviewer", |_, started, _| {
                 started.reviews.as_mut().expect("reviews").alternative = None;
             }),
-            ("alternative available marker", |_, started| {
+            ("alternative available marker", |_, started, _| {
                 started
                     .reviews
                     .as_mut()
@@ -2483,12 +2689,23 @@ mod tests {
             // The sample record enables verification, and nothing else here
             // moves that marker off its default, so an encoding that dropped it
             // would be authenticated by every other case in this table.
-            ("reviews enabled marker", |_, started| {
+            ("reviews enabled marker", |_, started, _| {
                 started.reviews.as_mut().expect("reviews").enabled = Some(false);
             }),
-            ("second opinion slot", |_, started| {
+            ("second opinion slot", |_, started, _| {
                 started.reviews.as_mut().expect("reviews").second_opinion[1] = None;
             }),
+            // The allow-list, moved four ways. It is the same value on every
+            // entry, which is exactly why a single "the agents changed" case
+            // would be weak evidence: an encoder that wrote it once for the
+            // whole registry rather than once per entry, or that wrote only
+            // its length, or that sorted it, passes that case and fails these.
+            ("probed agent value", |_, _, agents| agents[1].push('!')),
+            ("probed agent count", |_, _, agents| {
+                agents.push("gemini".to_owned());
+            }),
+            ("probed agent order", |_, _, agents| agents.swap(0, 1)),
+            ("probed agents absent", |_, _, agents| agents.clear()),
         ];
 
         // Against the baseline computed here, not against the frozen vector: a
@@ -2501,8 +2718,9 @@ mod tests {
         for (label, mutate) in cases {
             let mut plan = sample_plan();
             let mut started = started_for(&plan);
-            mutate(&mut plan, &mut started);
-            let digest = TaskRegistry::originals(&plan, &started)
+            let mut agents = sample_agents();
+            mutate(&mut plan, &mut started, &mut agents);
+            let digest = TaskRegistry::originals_with_agents(&plan, &started, &agents)
                 .unwrap_or_else(|error| panic!("the {label} case must still build: {error}"))
                 .digest();
             assert_ne!(
@@ -2541,7 +2759,7 @@ mod tests {
         // encoder that sorted one is invisible while the other supplies the
         // difference.
         const MOVED: usize = 2;
-        let cases: [(&str, MoveField); 60] = [
+        let cases: [(&str, MoveField); 64] = [
             ("key", |entry| entry.key = TaskKey(7)),
             ("display id", |entry| {
                 entry.display_id = TaskId::from("zeta-renamed");
@@ -2714,6 +2932,25 @@ mod tests {
             }),
             ("second opinion model", |entry| {
                 entry.reviews.second_opinion = Some(PassBinding::new("copilot", "claude-opus-5"));
+            }),
+            // The allow-list is the one entry field every entry holds the same
+            // value of, so it is the field an encoder is most likely to write
+            // once for the whole registry — or to leave out, since no
+            // plan-level mutation moves it alone. Moved here on one entry only,
+            // with the entries either side of it asserted unchanged, all four
+            // shortcuts are visible: a registry-level write leaves these bytes
+            // where they were, and so does no write at all.
+            ("allowed agent value", |entry| {
+                entry.allowed_agents[1].push('!');
+            }),
+            ("allowed agent count", |entry| {
+                entry.allowed_agents.push("gemini".to_owned());
+            }),
+            ("allowed agent order", |entry| {
+                entry.allowed_agents.swap(0, 1);
+            }),
+            ("allowed agents absent", |entry| {
+                entry.allowed_agents.clear();
             }),
         ];
 

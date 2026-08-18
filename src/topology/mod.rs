@@ -7,7 +7,17 @@
 //! addresses tasks by.
 //!
 //! Nothing here is wired into a production path yet. [`registry`] is pure
-//! construction over inputs a run already froze, so a run's status, report, and
-//! export are byte-for-byte what they were before this module existed.
+//! construction over inputs a run already froze, [`schema`] and [`events`]
+//! describe a log no production writer produces, and [`paths`] is the
+//! vocabulary they record regions in — so a run's status, report, and export
+//! are byte-for-byte what they were before this module existed.
 
+pub mod census;
+pub mod effects;
+pub mod events;
+pub mod fold;
+pub mod leases;
+pub mod paths;
+pub mod queue;
 pub mod registry;
+pub mod schema;
