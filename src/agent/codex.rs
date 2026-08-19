@@ -88,7 +88,6 @@
 //! `codex exec resume --help` at 0.147.0, and verified by running it.
 
 use std::path::PathBuf;
-use std::process::Command;
 use std::sync::OnceLock;
 use std::time::Duration;
 
@@ -96,12 +95,16 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 
 use super::bin::{self, Invocation};
-use super::proc::{self, ProcessOutput};
-use super::{AdapterSource, AgentAdapter, AuthState, Caps, Discovery, TaskRun, looks_rate_limited};
+use super::proc::ProcessOutput;
+use super::{
+    AdapterSource, AgentAdapter, AuthState, Caps, Discovery, TaskRun, looks_rate_limited,
+    probe_request,
+};
 use crate::capacity::PoolKind;
 use crate::catalog;
 use crate::error::TactusError;
 use crate::ir::{Effort, Outcome, OutcomeStatus, PermissionMode, Usage, WorkerProfile};
+use crate::runner::{CommandSpec, Runner};
 use crate::util;
 
 pub const ADAPTER_ID: &str = "codex";
@@ -127,6 +130,56 @@ const CONFIG_PROBE_RESUME_ID: &str = "00000000-0000-0000-0000-000000000000";
 const REQUIRED_EXEC_FLAGS: [&str; 5] = ["--json", "--sandbox", "--model", "-c", "--config"];
 const REQUIRED_RESUME_FLAGS: [&str; 4] = ["--json", "--model", "-c", "--config"];
 
+/// Which of this adapter's pre-flight processes each identity is.
+///
+/// Named rather than counted, for the reason [`super::probe_request`] gives —
+/// and this is the adapter that makes the reason concrete. Binary resolution
+/// here *spawns*, once per PATH candidate, and it caches: the second
+/// `probe()` in one process performs none of those spawns. A counter would
+/// therefore renumber every capability step on the second call, and two
+/// pre-flights of one machine would mint different identities for the same
+/// work.
+///
+/// Two blocks, which is what keeps a variable-length step from colliding with
+/// a fixed one:
+///
+/// * `0 .. RESOLUTION_BASE` — the capability probe and discovery, one named
+///   ordinal per step, in the order they run.
+/// * `RESOLUTION_BASE ..` — one per PATH candidate tested for usability, in
+///   PATH order. Unbounded in principle (one candidate per PATH entry per
+///   name), which is exactly why it may not share a block with the fixed
+///   steps.
+mod probe_ordinal {
+    pub const VERSION: u32 = 0;
+    pub const EXEC_HELP: u32 = 1;
+    pub const RESUME_HELP: u32 = 2;
+    /// The six strict-config parser probes: two surfaces x
+    /// {unknown-key control, xhigh, max}. `CONFIG_BASE + surface * 3 + step`.
+    pub const CONFIG_BASE: u32 = 3;
+    pub const CONFIG_PER_SURFACE: u32 = 3;
+    pub const PROBE_MODELS: u32 = 9;
+    pub const LOGIN_STATUS: u32 = 10;
+    pub const DISCOVER_MODELS: u32 = 11;
+    /// Where the per-PATH-candidate block starts.
+    pub const RESOLUTION_BASE: u32 = 1_000;
+    /// Every fixed ordinal above, for the uniqueness assertion.
+    #[cfg(test)]
+    pub const ALL: [u32; 12] = [
+        VERSION,
+        EXEC_HELP,
+        RESUME_HELP,
+        CONFIG_BASE,
+        CONFIG_BASE + 1,
+        CONFIG_BASE + 2,
+        CONFIG_BASE + CONFIG_PER_SURFACE,
+        CONFIG_BASE + CONFIG_PER_SURFACE + 1,
+        CONFIG_BASE + CONFIG_PER_SURFACE + 2,
+        PROBE_MODELS,
+        LOGIN_STATUS,
+        DISCOVER_MODELS,
+    ];
+}
+
 #[derive(Debug, Deserialize)]
 struct DebugModels {
     models: Vec<DebugModel>,
@@ -151,13 +204,14 @@ impl AgentAdapter for CodexAdapter {
         ADAPTER_ID
     }
 
-    fn probe(&self) -> Result<Caps, TactusError> {
-        let invocation = locate()?;
-        let out = proc::run_with_timeout(
-            invocation.command(&["--version".to_owned()]),
-            "",
+    fn probe(&self, runner: &dyn Runner) -> Result<Caps, TactusError> {
+        let invocation = locate(runner)?;
+        let out = runner.run(&probe_request(
+            ADAPTER_ID,
+            invocation.spec(&["--version".to_owned()])?,
+            probe_ordinal::VERSION,
             PROBE_TIMEOUT,
-        )?;
+        )?)?;
         if out.output_limited {
             return Err(TactusError::Agent {
                 message: format!(
@@ -186,30 +240,33 @@ impl AgentAdapter for CodexAdapter {
         // Fresh and resumed attempts are different CLI surfaces. Both carry
         // the reasoning override, so both must prove `--config` before spend;
         // only fresh attempts carry the sandbox.
-        let fresh_help = proc::run_with_timeout(
-            invocation.command(&["exec".to_owned(), "--help".to_owned()]),
-            "",
+        let fresh_help = runner.run(&probe_request(
+            ADAPTER_ID,
+            invocation.spec(&["exec".to_owned(), "--help".to_owned()])?,
+            probe_ordinal::EXEC_HELP,
             PROBE_TIMEOUT,
-        )?;
+        )?)?;
         let fresh_help = checked_help(&invocation.display(), "exec", &fresh_help)?;
-        let resume_help = proc::run_with_timeout(
-            invocation.command(&["exec".to_owned(), "resume".to_owned(), "--help".to_owned()]),
-            "",
+        let resume_help = runner.run(&probe_request(
+            ADAPTER_ID,
+            invocation.spec(&["exec".to_owned(), "resume".to_owned(), "--help".to_owned()])?,
+            probe_ordinal::RESUME_HELP,
             PROBE_TIMEOUT,
-        )?;
+        )?)?;
         let resume_help = checked_help(&invocation.display(), "exec resume", &resume_help)?;
         validate_probe_contract(&version, &fresh_help, &resume_help)?;
-        validate_effort_config_key(&invocation, &version)?;
+        validate_effort_config_key(runner, &invocation, &version)?;
 
         // The strict local parser above proves the exact key and the two role
         // policy values. The CLI's local catalog is separate zero-spend
         // evidence for each model × effort pair, so require every known Codex
         // model to expose every shared effort level before a run can start.
-        let models = proc::run_with_timeout(
-            invocation.command(&["debug".to_owned(), "models".to_owned()]),
-            "",
+        let models = runner.run(&probe_request(
+            ADAPTER_ID,
+            invocation.spec(&["debug".to_owned(), "models".to_owned()])?,
+            probe_ordinal::PROBE_MODELS,
             PROBE_TIMEOUT,
-        )?;
+        )?)?;
         let models = checked_model_catalog(&invocation.display(), &models)?;
         let parsed = parse_debug_models(&models)?;
         validate_model_efforts(&version, &parsed)?;
@@ -235,17 +292,19 @@ impl AgentAdapter for CodexAdapter {
         })
     }
 
-    fn build(&self, run: &TaskRun) -> Result<Command, TactusError> {
+    fn build(&self, run: &TaskRun) -> Result<CommandSpec, TactusError> {
         if let Some(refusal) = edit_refusal(&run.profile) {
             return Err(refusal);
         }
-        let invocation = locate()?;
-        let mut cmd = invocation.command(&build_args(run));
         // The working root comes from the process, not from `-C`: `exec resume`
         // has no `-C`, and one mechanism that works for both shapes beats two
-        // that have to agree.
-        cmd.current_dir(&run.workspace);
-        Ok(cmd)
+        // that have to agree. It is now the *runner's* cwd
+        // (`RunnerRequest.workspace`) rather than one this adapter set, which
+        // is DESIGN.md:118's split and changes nothing about the mechanism.
+        //
+        // `resolved()` rather than `locate()`: `build` is data-only and may
+        // not spawn, so it never runs the PATH-candidate usability probe.
+        resolved()?.spec(&build_args(run))
     }
 
     fn parse(&self, out: &ProcessOutput) -> Result<Outcome, TactusError> {
@@ -261,19 +320,21 @@ impl AgentAdapter for CodexAdapter {
     /// documents no such query; here the honest answer is a real one, so
     /// `tactus connect` writes a pool an operator can trust rather than a
     /// shrug.
-    fn discover(&self, _caps: &Caps) -> Result<Discovery, TactusError> {
-        let invocation = locate()?;
-        let out = proc::run_with_timeout(
-            invocation.command(&["login".to_owned(), "status".to_owned()]),
-            "",
+    fn discover(&self, runner: &dyn Runner, _caps: &Caps) -> Result<Discovery, TactusError> {
+        let invocation = locate(runner)?;
+        let out = runner.run(&probe_request(
+            ADAPTER_ID,
+            invocation.spec(&["login".to_owned(), "status".to_owned()])?,
+            probe_ordinal::LOGIN_STATUS,
             PROBE_TIMEOUT,
-        )?;
+        )?)?;
         let mut discovery = parse_login_status(&out);
-        let models = proc::run_with_timeout(
-            invocation.command(&["debug".to_owned(), "models".to_owned()]),
-            "",
+        let models = runner.run(&probe_request(
+            ADAPTER_ID,
+            invocation.spec(&["debug".to_owned(), "models".to_owned()])?,
+            probe_ordinal::DISCOVER_MODELS,
             PROBE_TIMEOUT,
-        )?;
+        )?)?;
         let models = checked_model_catalog(&invocation.display(), &models)?;
         discovery.models = parse_debug_models(&models)?
             .models
@@ -395,6 +456,15 @@ impl ConfigProbeSurface {
             Self::Resume => "exec resume",
         }
     }
+
+    /// Which surface this is, so its three parser probes get their own block
+    /// of invocation ordinals.
+    const fn index(self) -> u32 {
+        match self {
+            Self::Fresh => 0,
+            Self::Resume => 1,
+        }
+    }
 }
 
 /// A unique empty directory whose child path is guaranteed not to exist.
@@ -429,14 +499,21 @@ impl Drop for MissingOutputSchema {
     }
 }
 
-fn validate_effort_config_key(invocation: &Invocation, version: &str) -> Result<(), TactusError> {
+fn validate_effort_config_key(
+    runner: &dyn Runner,
+    invocation: &Invocation,
+    version: &str,
+) -> Result<(), TactusError> {
     let schema = MissingOutputSchema::create()?;
     for surface in [ConfigProbeSurface::Fresh, ConfigProbeSurface::Resume] {
+        let base = probe_ordinal::CONFIG_BASE + surface.index() * probe_ordinal::CONFIG_PER_SURFACE;
         let control = run_config_parser_probe(
+            runner,
             invocation,
             surface,
             &format!("{CONFIG_PROBE_UNKNOWN_KEY}=true"),
             &schema.path,
+            base,
         )?;
         validate_unknown_config_control(version, surface, &control)?;
 
@@ -444,9 +521,16 @@ fn validate_effort_config_key(invocation: &Invocation, version: &str) -> Result<
         // feature introduced. Model catalogs validate the remaining shared
         // values separately; accepting either assignment here proves the exact
         // key, while checking both catches a provider-side enum regression.
-        for effort in [Effort::XHigh, Effort::Max] {
+        for (step, effort) in [Effort::XHigh, Effort::Max].into_iter().enumerate() {
             let assignment = format!("model_reasoning_effort={}", effort_flag(effort));
-            let output = run_config_parser_probe(invocation, surface, &assignment, &schema.path)?;
+            let output = run_config_parser_probe(
+                runner,
+                invocation,
+                surface,
+                &assignment,
+                &schema.path,
+                base + 1 + u32::try_from(step).unwrap_or(u32::MAX),
+            )?;
             validate_effort_config_probe(version, surface, effort, &output)?;
         }
     }
@@ -454,16 +538,19 @@ fn validate_effort_config_key(invocation: &Invocation, version: &str) -> Result<
 }
 
 fn run_config_parser_probe(
+    runner: &dyn Runner,
     invocation: &Invocation,
     surface: ConfigProbeSurface,
     assignment: &str,
     schema_path: &std::path::Path,
+    ordinal: u32,
 ) -> Result<ProcessOutput, TactusError> {
-    proc::run_with_timeout(
-        invocation.command(&config_probe_args(surface, assignment, schema_path)),
-        "",
+    runner.run(&probe_request(
+        ADAPTER_ID,
+        invocation.spec(&config_probe_args(surface, assignment, schema_path))?,
+        ordinal,
         PROBE_TIMEOUT,
-    )
+    )?)
 }
 
 fn config_probe_args(
@@ -974,29 +1061,56 @@ fn candidate_names() -> &'static [&'static str] {
 
 static RESOLVED: OnceLock<Option<Invocation>> = OnceLock::new();
 
-fn locate() -> Result<Invocation, TactusError> {
+/// Resolve the binary, spawning through `runner` to test each candidate.
+///
+/// The pre-flight path. Windows Store can put a package payload on PATH that
+/// is visible to filesystem lookup but returns access denied when spawned, so
+/// each candidate is tested before the answer is cached and a later npm shim
+/// in the real PATH order can still win. That test is an agent CLI process
+/// like any other, so it goes through the Runner too — one identity per
+/// candidate, from `probe_ordinal::RESOLUTION_BASE` in PATH order.
+fn locate(runner: &dyn Runner) -> Result<Invocation, TactusError> {
+    let mut candidate_index = 0u32;
     bin::locate_with(
         candidate_names(),
         &RESOLVED,
         |candidate| {
-            // Windows Store can put a package payload on PATH that is visible
-            // to filesystem lookup but returns access denied when spawned.
-            // Test each candidate before caching it so a later npm shim in the
-            // real PATH order can still win.
-            proc::run_with_timeout(
-                candidate.command(&["--version".to_owned()]),
-                "",
-                PROBE_TIMEOUT,
-            )
-            .is_ok_and(|output| !output.timed_out && output.code == Some(0))
+            let ordinal = probe_ordinal::RESOLUTION_BASE + candidate_index;
+            candidate_index += 1;
+            // A candidate whose path cannot be carried in a `CommandSpec` is
+            // simply not usable, and PATH order continues past it: this is the
+            // one place where refusing the whole run would be wrong, because
+            // the next entry may hold a perfectly ordinary installation.
+            candidate
+                .spec(&["--version".to_owned()])
+                .and_then(|spec| probe_request(ADAPTER_ID, spec, ordinal, PROBE_TIMEOUT))
+                .and_then(|request| runner.run(&request))
+                .is_ok_and(|output| !output.timed_out && output.code == Some(0))
         },
-        |tried| {
-            format!(
-                "no usable codex binary found on PATH (looked for {}); install the OpenAI Codex \
-                 CLI (`npm install -g @openai/codex`) or adjust PATH",
-                tried.join(", ")
-            )
-        },
+        missing_codex,
+    )
+}
+
+/// Resolve the binary **without spawning anything**.
+///
+/// What `build` uses, because `build` is data-only (DESIGN.md:117) and a
+/// `build` that spawned would be carrying a process decision past the Runner —
+/// the precise hole `CommandSpec` closes. It shares [`RESOLVED`] with
+/// [`locate`], so once pre-flight has resolved and cached a usable binary this
+/// returns exactly that one; the engine always probes before it builds
+/// (`preflight::prepare` runs before any attempt), which
+/// `engine::tests::the_legacy_engine_routes_every_process_through_the_runner`
+/// witnesses by ordering. Resolving first here — only reachable outside a
+/// run — takes the first PATH candidate without testing it.
+fn resolved() -> Result<Invocation, TactusError> {
+    bin::locate(candidate_names(), &RESOLVED, missing_codex)
+}
+
+fn missing_codex(tried: &[&str]) -> String {
+    format!(
+        "no usable codex binary found on PATH (looked for {}); install the OpenAI Codex CLI \
+         (`npm install -g @openai/codex`) or adjust PATH",
+        tried.join(", ")
     )
 }
 
@@ -1582,15 +1696,67 @@ mod tests {
         assert!(!odd.notes.is_empty());
     }
 
+    /// Every pre-flight process of this adapter carries its own identity.
+    ///
+    /// `decisions.admission_and_leases.permits.invocation_identity` says
+    /// "unique **per process**", and this adapter runs 12 of them, so the
+    /// ordinals it fixes must be 12 distinct values. The expected count is
+    /// written here from the steps the adapter performs, not read from the
+    /// table under test — a table that lost an entry would otherwise agree
+    /// with itself.
+    #[test]
+    fn every_preflight_process_has_its_own_ordinal() {
+        use std::collections::BTreeSet;
+
+        let ordinals: BTreeSet<u32> = probe_ordinal::ALL.into_iter().collect();
+        assert_eq!(
+            ordinals.len(),
+            12,
+            "`--version`, two `--help` surfaces, six strict-config parser probes, `debug models`, `login status`, and discovery's `debug models` — 12 processes, 12 identities"
+        );
+        assert_eq!(probe_ordinal::ALL.len(), 12);
+
+        // And they really do render as 12 distinct identities of the packet's
+        // third form, which is the property the ordinals exist for.
+        let ids: BTreeSet<String> = probe_ordinal::ALL
+            .into_iter()
+            .map(|ordinal| {
+                crate::runner::InvocationId::probe(
+                    crate::runner::ProbeTarget::Agent(crate::runner::AgentId::new(ADAPTER_ID)),
+                    ordinal,
+                )
+                .expect("the adapter id survives an invocation identity")
+                .render()
+            })
+            .collect();
+        assert_eq!(ids.len(), 12);
+        assert!(
+            ids.iter().all(|id| id.starts_with("p.agent-codex.o")),
+            "the probe form, naming this agent: {ids:?}"
+        );
+
+        // The fixed block and the per-candidate block cannot meet: binary
+        // resolution here spawns once per PATH candidate and PATH is
+        // unbounded, so the two are separated by construction rather than by
+        // counting.
+        assert!(
+            probe_ordinal::ALL
+                .into_iter()
+                .all(|ordinal| ordinal < probe_ordinal::RESOLUTION_BASE),
+            "a fixed step reached the per-candidate block"
+        );
+    }
     // Runs only where the real CLI exists; deterministic contract fixtures do
     // the compatibility proof, while this catches local help/catalog drift.
     #[test]
     fn probe_against_real_binary_when_present() {
-        if locate().is_err() {
+        if resolved().is_err() {
             eprintln!("codex not on PATH; skipping live probe");
             return;
         }
-        let caps = CodexAdapter.probe().expect("probe should succeed");
+        let caps = CodexAdapter
+            .probe(&crate::runner::host::HostRunner::new())
+            .expect("probe should succeed");
         assert!(caps.json_output);
         assert!(caps.session_resume);
         assert!(caps.model_list);

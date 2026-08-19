@@ -11,6 +11,10 @@ use crate::ir::{Outcome, OutcomeStatus, Task, TaskKind, WorkerProfile};
 use crate::ladder::{AttemptFailure, FailureKind};
 use crate::review;
 use crate::rundir::RunPaths;
+use crate::runner::invocation::{AttemptRole, InvocationId};
+use crate::runner::{AgentId, Runner};
+use crate::topology::events::AttemptNumber;
+use crate::topology::registry::TaskKey;
 use crate::util;
 use crate::workspace::Workspace;
 
@@ -38,6 +42,12 @@ pub(super) struct AttemptCx<'a> {
     pub(super) task: &'a Task,
     pub(super) profile: WorkerProfile,
     pub(super) adapter: &'a dyn AgentAdapter,
+    /// Where every process of this attempt executes (DESIGN.md:118). The host
+    /// runner today; PR6 swaps in the container one behind the same `dyn`.
+    pub(super) runner: &'a dyn Runner,
+    /// This task's position in the plan, which is the legacy engine's own
+    /// scope for [`InvocationId`]. See [`AttemptCx::invocation`].
+    pub(super) task_index: u32,
     pub(super) attempt: u32,
     /// Collision-free file stem for this task's run artifacts.
     pub(super) stem: String,
@@ -58,6 +68,39 @@ pub(super) struct AttemptCx<'a> {
     pub(super) decisions: Vec<String>,
     #[cfg(test)]
     pub(super) after_candidate_capture: Option<AfterCandidateCapture>,
+}
+
+impl AttemptCx<'_> {
+    /// The identity of one process of this attempt.
+    ///
+    /// The contract's `invariants_introduced[1]`: "legacy engine assigns
+    /// **legacy-scoped** values". The scope is
+    /// [`crate::runner::invocation::LEGACY_GENERATION`] — generation 0, which
+    /// [`InvocationId::legacy_attempt`] supplies — because the legacy engine
+    /// has no generations: it never re-dispatches a task from a fresh worktree,
+    /// so there is no second generation for a value to sit in. A legacy run is
+    /// schema-1..3 and a generation-bearing run is schema-4, and INV-23 forbids
+    /// a run changing schema between epochs, so the two sets never share a
+    /// ledger and generation 0 is a scope rather than a coincidence.
+    ///
+    /// The key is the task's **position in the plan**, not a topology
+    /// `TaskKey`: the legacy engine has no task registry to draw one from, and
+    /// what the identity has to be is unique per process, which a dense
+    /// position is. `(position, attempt, role, ordinal)` is unique because a
+    /// position names one task, `attempt` increments per attempt of it
+    /// (INV-20's "changes with every attempt"), `role` distinguishes the
+    /// worker from gate `n` and review pass `n`, and nothing inside one
+    /// attempt runs a given role twice — so every ordinal here is 0, and a
+    /// re-dispatch that did run one twice would need a second ordinal rather
+    /// than a reused identity.
+    fn invocation(&self, role: AttemptRole) -> InvocationId {
+        InvocationId::legacy_attempt(
+            TaskKey(self.task_index),
+            AttemptNumber(self.attempt),
+            role,
+            0,
+        )
+    }
 }
 
 /// What the retry prompt needs to know (§11.4).
@@ -121,8 +164,21 @@ pub(super) fn run_attempt(
         resume_session,
         settings_path,
     };
-    let command = cx.adapter.build(&task_run)?;
-    let output = proc::run_with_timeout(command, cx.adapter.stdin_payload(&task_run), cx.timeout)?;
+    // The adapter says what to run; the runner says where. `ExecutionRole::
+    // Implement` with the bound agent is what makes this process slotted
+    // (R3) and what tells `host-v1` to supply that agent's credential
+    // location — both properties of the role, not of this call site.
+    let command = cx
+        .adapter
+        .build(&task_run)?
+        .stdin(cx.adapter.stdin_payload(&task_run).as_bytes().to_vec());
+    let output = cx.runner.run(&crate::runner::worker_request(
+        command,
+        task_run.workspace.clone(),
+        AgentId::new(cx.adapter.id()),
+        cx.timeout,
+        cx.invocation(AttemptRole::Worker),
+    ))?;
 
     let transcripts = cx.paths.transcripts();
     let transcript_path = transcripts.join(format!("{}-{}.json", cx.stem, cx.attempt));
@@ -185,6 +241,8 @@ pub(super) fn run_attempt(
         )?;
         if let Some(gate_failure) = gates::run_all(
             cx.gates,
+            cx.runner,
+            &|index| cx.invocation(AttemptRole::Gate(index)),
             gate_workspace.workspace(),
             &cx.paths.gates(),
             &cx.stem,
@@ -222,21 +280,32 @@ pub(super) fn run_attempt(
             &candidate.tree_oid,
             &cx.paths.gate_worktrees(),
         )?;
-        for reviewer in &cx.reviewers {
-            let review = review::run_review(&review::ReviewCx {
-                adapter: reviewer.adapter,
-                profile: reviewer.profile.clone(),
-                lens: reviewer.lens,
-                task: cx.task,
-                diff: &outcome.diff,
-                artifacts: &artifacts,
-                decisions: &cx.decisions,
-                workspace: review_workspace.workspace().root(),
-                settings_dir: &cx.paths.settings(),
-                reviews_dir: &cx.paths.reviews(),
-                stem: format!("{}-{}", cx.stem, cx.attempt),
-                timeout: cx.review_pass_timeout,
-            })?;
+        for (pass, reviewer) in cx.reviewers.iter().enumerate() {
+            let pass = u32::try_from(pass).unwrap_or(u32::MAX);
+            let review = review::run_review(
+                &review::ReviewCx {
+                    adapter: reviewer.adapter,
+                    profile: reviewer.profile.clone(),
+                    lens: reviewer.lens,
+                    task: cx.task,
+                    diff: &outcome.diff,
+                    artifacts: &artifacts,
+                    decisions: &cx.decisions,
+                    workspace: review_workspace.workspace().root(),
+                    settings_dir: &cx.paths.settings(),
+                    reviews_dir: &cx.paths.reviews(),
+                    stem: format!("{}-{}", cx.stem, cx.attempt),
+                    timeout: cx.review_pass_timeout,
+                },
+                cx.runner,
+                // `pass` is which reviewer in this attempt's ordered list, so
+                // the two members the packet gives a review — `review_pass(n)`
+                // and `review_reask(n)` — index the same `n`.
+                &review::ReviewInvocations {
+                    pass: cx.invocation(AttemptRole::ReviewPass(pass)),
+                    reask: cx.invocation(AttemptRole::ReviewReask(pass)),
+                },
+            )?;
             let cost_usd = review.cost_usd;
             // Read before the result is consumed: a judge that never ran is not
             // a judge that said no, and the ledger has to show which happened.

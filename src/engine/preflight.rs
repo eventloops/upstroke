@@ -10,6 +10,7 @@ use crate::gates::{self, ShellGate};
 use crate::interaction::{self, InteractionMode, Notifier};
 use crate::ir::Plan;
 use crate::review::{self, PassBinding, ReviewPlan};
+use crate::runner::Runner;
 use crate::validate::{self, Analysis, ValidateOptions};
 
 use super::options::{Harness, RunOptions};
@@ -192,9 +193,10 @@ impl Validated {
 pub(super) fn preflight(
     opts: &RunOptions,
     harness: &Harness<'_>,
+    runner: &dyn Runner,
     analysis: Analysis,
 ) -> Result<Preflight, TactusError> {
-    preflight_with_recorded(opts, harness, analysis, Recorded::default())
+    preflight_with_recorded(opts, harness, runner, analysis, Recorded::default())
 }
 
 /// Pre-flight, with whatever a previous process already resolved for this run.
@@ -221,6 +223,7 @@ pub(super) fn preflight(
 pub(super) fn preflight_with_recorded(
     opts: &RunOptions,
     harness: &Harness<'_>,
+    runner: &dyn Runner,
     mut analysis: Analysis,
     recorded: Recorded,
 ) -> Result<Preflight, TactusError> {
@@ -335,7 +338,7 @@ pub(super) fn preflight_with_recorded(
         let adapter = harness.adapters.get(id).ok_or_else(|| TactusError::Agent {
             message: format!("no adapter registered for agent `{id}`"),
         })?;
-        caps.insert(id.to_owned(), adapter.probe()?);
+        caps.insert(id.to_owned(), adapter.probe(runner)?);
     }
     for id in optional {
         if caps.contains_key(&id) {
@@ -347,7 +350,7 @@ pub(super) fn preflight_with_recorded(
             .ok_or_else(|| TactusError::Agent {
                 message: format!("no adapter registered for agent `{id}`"),
             })
-            .and_then(|adapter| adapter.probe());
+            .and_then(|adapter| adapter.probe(runner));
         match probed {
             Ok(caps_for_id) => {
                 caps.insert(id, caps_for_id);

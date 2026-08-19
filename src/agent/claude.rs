@@ -8,18 +8,18 @@
 //! `.claude/settings.json` untouched.
 
 use std::path::PathBuf;
-use std::process::Command;
 use std::sync::OnceLock;
 use std::time::Duration;
 
 use serde_json::{Value, json};
 
 use super::bin::{self, Invocation};
-use super::proc::{self, ProcessOutput};
-use super::{AgentAdapter, AuthState, Caps, Discovery, TaskRun, looks_rate_limited};
+use super::proc::ProcessOutput;
+use super::{AgentAdapter, AuthState, Caps, Discovery, TaskRun, looks_rate_limited, probe_request};
 use crate::capacity::PoolKind;
 use crate::error::TactusError;
 use crate::ir::{Effort, Outcome, OutcomeStatus, PermissionMode, Usage, WorkerProfile};
+use crate::runner::{CommandSpec, Runner};
 use crate::util;
 
 pub const ADAPTER_ID: &str = "claude-code";
@@ -48,6 +48,22 @@ const REQUIRED_FLAGS: [&str; 6] = [
 ];
 const REQUIRED_SHORT_FLAGS: [&str; 1] = ["-p"];
 
+/// Which of this adapter's pre-flight processes each identity is.
+///
+/// A named table rather than a counter, for the reason
+/// [`super::probe_request`] gives: an ordinal is a property of the *step*, so
+/// two pre-flights of one machine mint the same identities whether or not an
+/// earlier step was skipped. Dense from 0, and pairwise distinct — asserted by
+/// `every_preflight_process_has_its_own_ordinal`.
+mod probe_ordinal {
+    pub const VERSION: u32 = 0;
+    pub const HELP: u32 = 1;
+    pub const AUTH_STATUS: u32 = 2;
+    /// Every ordinal above, for the uniqueness assertion.
+    #[cfg(test)]
+    pub const ALL: [u32; 3] = [VERSION, HELP, AUTH_STATUS];
+}
+
 pub struct ClaudeCodeAdapter;
 
 impl AgentAdapter for ClaudeCodeAdapter {
@@ -55,13 +71,14 @@ impl AgentAdapter for ClaudeCodeAdapter {
         ADAPTER_ID
     }
 
-    fn probe(&self) -> Result<Caps, TactusError> {
+    fn probe(&self, runner: &dyn Runner) -> Result<Caps, TactusError> {
         let invocation = locate()?;
-        let out = proc::run_with_timeout(
-            invocation.command(&["--version".to_owned()]),
-            "",
+        let out = runner.run(&probe_request(
+            ADAPTER_ID,
+            invocation.spec(&["--version".to_owned()])?,
+            probe_ordinal::VERSION,
             PROBE_TIMEOUT,
-        )?;
+        )?)?;
         if out.output_limited {
             return Err(TactusError::Agent {
                 message: format!(
@@ -91,11 +108,12 @@ impl AgentAdapter for ClaudeCodeAdapter {
         // removed and hidden flags between releases, and a missing flag must
         // surface as a pre-flight refusal rather than as per-task failures
         // once a run is already spending (§16, §19).
-        let help = proc::run_with_timeout(
-            invocation.command(&["--help".to_owned()]),
-            "",
+        let help = runner.run(&probe_request(
+            ADAPTER_ID,
+            invocation.spec(&["--help".to_owned()])?,
+            probe_ordinal::HELP,
             PROBE_TIMEOUT,
-        )?;
+        )?)?;
         let help_text = checked_help(&invocation.display(), &help)?;
         validate_help(&version, &help_text)?;
         let has = |flag: &str| super::advertises_flag(&help_text, flag);
@@ -111,11 +129,10 @@ impl AgentAdapter for ClaudeCodeAdapter {
         })
     }
 
-    fn build(&self, run: &TaskRun) -> Result<Command, TactusError> {
-        let invocation = locate()?;
-        let mut cmd = invocation.command(&build_args(run));
-        cmd.current_dir(&run.workspace);
-        Ok(cmd)
+    fn build(&self, run: &TaskRun) -> Result<CommandSpec, TactusError> {
+        // No `current_dir`: the workspace is the runner's, carried on
+        // `RunnerRequest.workspace` (DESIGN.md:118 — the runner "owns cwd").
+        locate()?.spec(&build_args(run))
     }
 
     fn parse(&self, out: &ProcessOutput) -> Result<Outcome, TactusError> {
@@ -125,13 +142,14 @@ impl AgentAdapter for ClaudeCodeAdapter {
     /// `claude auth status --json` — a zero-spend auth probe that handles no
     /// token and reads no credential file: the CLI answers about itself, and
     /// this reads its answer.
-    fn discover(&self, _caps: &Caps) -> Result<Discovery, TactusError> {
+    fn discover(&self, runner: &dyn Runner, _caps: &Caps) -> Result<Discovery, TactusError> {
         let invocation = locate()?;
-        let out = proc::run_with_timeout(
-            invocation.command(&["auth".to_owned(), "status".to_owned(), "--json".to_owned()]),
-            "",
+        let out = runner.run(&probe_request(
+            ADAPTER_ID,
+            invocation.spec(&["auth".to_owned(), "status".to_owned(), "--json".to_owned()])?,
+            probe_ordinal::AUTH_STATUS,
             PROBE_TIMEOUT,
-        )?;
+        )?)?;
         let mut discovery = parse_auth_status(&out);
         // §13's tier classification comes from the catalog either way, but
         // saying so is what stops the pools file reading as though the roster
@@ -926,6 +944,45 @@ mod tests {
         assert_eq!(parse_output(&out).status, OutcomeStatus::Timeout);
     }
 
+    /// Every pre-flight process of this adapter carries its own identity.
+    ///
+    /// `decisions.admission_and_leases.permits.invocation_identity` says
+    /// "unique **per process**", and this adapter runs 3 of them, so the
+    /// ordinals it fixes must be 3 distinct values. The expected count is
+    /// written here from the steps the adapter performs, not read from the
+    /// table under test — a table that lost an entry would otherwise agree
+    /// with itself.
+    #[test]
+    fn every_preflight_process_has_its_own_ordinal() {
+        use std::collections::BTreeSet;
+
+        let ordinals: BTreeSet<u32> = probe_ordinal::ALL.into_iter().collect();
+        assert_eq!(
+            ordinals.len(),
+            3,
+            "`--version`, `--help`, `auth status --json` — 3 processes, 3 identities"
+        );
+        assert_eq!(probe_ordinal::ALL.len(), 3);
+
+        // And they really do render as 3 distinct identities of the packet's
+        // third form, which is the property the ordinals exist for.
+        let ids: BTreeSet<String> = probe_ordinal::ALL
+            .into_iter()
+            .map(|ordinal| {
+                crate::runner::InvocationId::probe(
+                    crate::runner::ProbeTarget::Agent(crate::runner::AgentId::new(ADAPTER_ID)),
+                    ordinal,
+                )
+                .expect("the adapter id survives an invocation identity")
+                .render()
+            })
+            .collect();
+        assert_eq!(ids.len(), 3);
+        assert!(
+            ids.iter().all(|id| id.starts_with("p.agent-claude-code.o")),
+            "the probe form, naming this agent: {ids:?}"
+        );
+    }
     // Runs only where the real CLI exists; skips silently elsewhere so CI
     // without Claude Code stays green.
     #[test]
@@ -934,7 +991,9 @@ mod tests {
             eprintln!("claude not on PATH; skipping live probe");
             return;
         }
-        let caps = ClaudeCodeAdapter.probe().expect("probe should succeed");
+        let caps = ClaudeCodeAdapter
+            .probe(&crate::runner::host::HostRunner::new())
+            .expect("probe should succeed");
         assert!(caps.json_output);
         assert!(!caps.version.is_empty());
     }

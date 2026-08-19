@@ -10,6 +10,7 @@ use crate::interaction::{self, RealSleeper};
 use crate::ir::{Answer, Plan, QuestionId, ResolvedEffortPolicy};
 use crate::ladder::FailureKind;
 use crate::rundir::{self, RunLock, RunPaths, WorktreeLock};
+use crate::runner::Runner;
 use crate::util;
 use crate::workspace::Workspace;
 
@@ -21,9 +22,29 @@ use super::preflight::{
 };
 use super::report::{RunReport, last_reason};
 
+#[cfg(test)]
 pub(super) fn resume_harness_inner(
     opts: &ResumeOptions,
     harness: &Harness<'_>,
+) -> Result<(RunReport, RunState), TactusError> {
+    let contained = crate::runner::host::contain_write_command(&mut crate::agent::proc::NoHooks)?;
+    resume_harness_inner_on(
+        opts,
+        harness,
+        &crate::runner::host::HostRunner::new(),
+        &contained,
+    )
+}
+
+/// The same resume, on an explicit boundary. See [`super::run_harness_on`], and
+/// [`super::coordinator::run_harness_inner_on`] for why `_contained` is a
+/// parameter: a resume is a write command too, and the ambient job it needs is
+/// the one no facade used to establish.
+pub(super) fn resume_harness_inner_on(
+    opts: &ResumeOptions,
+    harness: &Harness<'_>,
+    runner: &dyn Runner,
+    _contained: &crate::runner::host::Contained,
 ) -> Result<(RunReport, RunState), TactusError> {
     let run_id = rundir::resolve_run_id(&opts.repo_root, &opts.run_id)?;
     let public = rundir::public_dir(&opts.repo_root, &run_id);
@@ -171,6 +192,7 @@ pub(super) fn resume_harness_inner(
     } = preflight_with_recorded(
         &run_opts,
         harness,
+        runner,
         analysis,
         Recorded {
             reviews: recorded_reviews.clone(),
@@ -580,6 +602,7 @@ pub(super) fn resume_harness_inner(
         log,
         gate_cmds,
         adapters: harness.adapters,
+        runner,
         answers: harness.answers.unwrap_or(default_answers.as_ref()),
         notifiers,
         sleeper,

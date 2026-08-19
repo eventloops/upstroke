@@ -30,7 +30,10 @@ mod preflight;
 mod report;
 mod resume;
 
+use crate::agent::proc::NoHooks;
 use crate::error::TactusError;
+use crate::runner::Runner;
+use crate::runner::host::{Contained, HostRunner, contain_write_command};
 
 pub use options::{
     DEFAULT_ATTEMPT_TIMEOUT, DEFAULT_MAX_DEFERS, Harness, ResumeOptions, RunOptions,
@@ -52,7 +55,73 @@ pub fn run_with(opts: &RunOptions, adapters: &dyn AdapterSource) -> Result<RunRe
 }
 
 pub fn run_harness(opts: &RunOptions, harness: &Harness<'_>) -> Result<RunReport, TactusError> {
-    coordinator::run_harness_inner(opts, harness).map(|(report, _)| report)
+    run_harness_on(opts, harness, &HostRunner::new())
+}
+
+/// The same run, on an explicit [`Runner`].
+///
+/// The boundary is a parameter rather than a `Harness` field because it is not
+/// an injectable stand-in for a collaborator: it is where every process of
+/// this run executes, and DESIGN.md:612 makes it a configured choice —
+/// "`[runner]` config selects `host` or `container`". PR6 passes the container
+/// runner here; PR4 passes [`HostRunner`] and nothing else.
+///
+/// **Private, and it has to be.** `decisions.phase_zero_modules.visibility` is
+/// "pub(super) only where a sibling or tests reference an item; **no new pub
+/// or pub(crate)**; public paths unchanged", and the module's own entry
+/// enumerates the facade without it. The reason is not bookkeeping: this
+/// function drives the *schema-1..3* coordinator, and `invariants[22]` is
+/// "schema-1..3 runs are host-only and no run changes its boundary or image
+/// between epochs". A `pub` here lets a downstream crate execute a legacy run
+/// off-host, with no `RunnerPolicy` to record it and no refusal — and lets the
+/// same run come back on `HostRunner` at the next resume. Private is what
+/// makes that unreachable rather than merely undocumented.
+///
+/// # Errors
+///
+/// Whatever the run refuses or fails on.
+fn run_harness_on(
+    opts: &RunOptions,
+    harness: &Harness<'_>,
+    runner: &dyn Runner,
+) -> Result<RunReport, TactusError> {
+    // `NoHooks` is what production passes the process funnel, and the
+    // containment step is threaded the same way: the observer exists so the
+    // step has a drivable failure path (`runner::host::contain_write_command`),
+    // and production arms nothing.
+    run_contained(opts, harness, runner, || {
+        contain_write_command(&mut NoHooks)
+    })
+}
+
+/// The same run, over the containment step it must perform **first**.
+///
+/// Every public entry point above reaches the coordinator through here, so
+/// this one call is what makes `run`, `run_with` and `run_harness` write
+/// commands in INV-18's sense: "on Windows every host child is a member of the
+/// coordinator's ambient kill-on-close Job Object from creation", and
+/// `expected_failures_refusals[1]`, "ambient job cannot be created or joined
+/// (Windows) → write command refuses at startup with a diagnostic". A
+/// downstream crate calling `engine::run_with` is a coordinator exactly as the
+/// CLI is; before this it established nothing, so a kill between
+/// `CreateProcessW` and private-job assignment left the suspended stub alive
+/// and a real ambient failure could not produce the required refusal.
+///
+/// `contain` is a parameter for the same reason `src/main.rs`'s `dispatch`
+/// takes its join: no machine here can make the real one fail, and the
+/// *ordering* between containment and the first thing the coordinator does is
+/// then a testable fact rather than a written-down one
+/// (`a_facade_run_refuses_before_any_effect_when_containment_fails`). It is
+/// not a hole in the guarantee: `Contained` has a private field, so the only
+/// closure that can return one is one that establishes containment.
+fn run_contained(
+    opts: &RunOptions,
+    harness: &Harness<'_>,
+    runner: &dyn Runner,
+    contain: impl FnOnce() -> Result<Contained, TactusError>,
+) -> Result<RunReport, TactusError> {
+    let contained = contain()?;
+    coordinator::run_harness_inner_on(opts, harness, runner, &contained).map(|(report, _)| report)
 }
 
 pub fn resume(opts: &ResumeOptions) -> Result<RunReport, TactusError> {
@@ -83,7 +152,36 @@ pub fn resume_harness(
     opts: &ResumeOptions,
     harness: &Harness<'_>,
 ) -> Result<RunReport, TactusError> {
-    resume::resume_harness_inner(opts, harness).map(|(report, _)| report)
+    resume_harness_on(opts, harness, &HostRunner::new())
+}
+
+/// The same resume, on an explicit [`Runner`]. See [`run_harness_on`],
+/// including why this is private.
+///
+/// # Errors
+///
+/// Whatever the resume refuses or fails on.
+fn resume_harness_on(
+    opts: &ResumeOptions,
+    harness: &Harness<'_>,
+    runner: &dyn Runner,
+) -> Result<RunReport, TactusError> {
+    resume_contained(opts, harness, runner, || {
+        contain_write_command(&mut NoHooks)
+    })
+}
+
+/// The same resume, over the containment step it must perform first. See
+/// [`run_contained`]: a resume drives a run, so it is a write command, and the
+/// three public resume entry points reach the coordinator only through here.
+fn resume_contained(
+    opts: &ResumeOptions,
+    harness: &Harness<'_>,
+    runner: &dyn Runner,
+    contain: impl FnOnce() -> Result<Contained, TactusError>,
+) -> Result<RunReport, TactusError> {
+    let contained = contain()?;
+    resume::resume_harness_inner_on(opts, harness, runner, &contained).map(|(report, _)| report)
 }
 
 #[cfg(test)]

@@ -14,6 +14,7 @@ use tactus::answer::{self, Reply};
 use tactus::capacity;
 use tactus::connect;
 use tactus::engine::{self, RunOutcome};
+use tactus::error::TactusError;
 use tactus::export::{self, Format as ExportFormat};
 use tactus::interaction::{InteractionMode, RealSleeper};
 use tactus::status;
@@ -154,6 +155,99 @@ impl From<Interaction> for InteractionMode {
     }
 }
 
+/// Whether a command may reach a workspace effect, and therefore whether it
+/// has to establish containment before it starts.
+///
+/// **Which commands are write commands is decided by the packet, not by this
+/// file.** `decisions.sequential_substrate.startup_census`: the census is
+///
+/// > performed by every topology write command **(run, resume)** after taking
+/// > the worktree lock and before any run-id use for creation, run-lock
+/// > acquisition for a fresh run, slot or reservation initialization,
+/// > admission, credential-volume use, or probe
+///
+/// and `crash_reconstruction` anchors the ambient job at the same coordinate:
+/// "at process start **every write command** creates one non-inheritable
+/// ambient Job Object … if the ambient job cannot be created or joined the
+/// write command refuses at startup with a diagnostic **before any workspace
+/// effect** (no degraded mode; deferred)". The parenthesis in the census is the
+/// enumeration: a write command is `run` or `resume`.
+///
+/// For today's binary that is `Command::Run` and `Command::Resume`, and the
+/// classification is by **dispatch arm**, so `run --dry-run` is a write command
+/// too. That is deliberately one notch wider than "makes a workspace effect":
+/// the packet's coordinate is *process start*, which precedes flag
+/// interpretation, and a preview that shares an arm with the command that
+/// spends should not be the one place containment is skipped. It is asserted
+/// rather than left implicit (`the_dry_run_preview_is_classified_with_its_arm`).
+///
+/// `answer` writes a file into a run directory and `connect` writes the pools
+/// file, but neither is a topology write command: neither drives a run, and the
+/// census the packet anchors here is a *run's* census. `connect` and `capacity`
+/// do spawn agent CLIs to discover them — two commands, counted and asserted in
+/// `the_commands_that_spawn_outside_a_run_are_named_and_counted` — and those
+/// children are outside INV-18's "the **coordinator's** ambient … Job Object",
+/// because neither command is a coordinator of a run.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CommandClass {
+    /// A topology write command: it drives a run and must contain its children.
+    Write,
+    /// Everything else.
+    ReadOnly,
+}
+
+/// The class of one parsed command.
+///
+/// Exhaustive with no wildcard arm: a `Command` variant added later fails to
+/// compile here, so no command can join the dispatch without being classified.
+const fn command_class(command: &Command) -> CommandClass {
+    match command {
+        Command::Run { .. } | Command::Resume { .. } => CommandClass::Write,
+        Command::Connect { .. }
+        | Command::Capacity { .. }
+        | Command::Validate { .. }
+        | Command::Status { .. }
+        | Command::ExportDecisions { .. }
+        | Command::Answer { .. } => CommandClass::ReadOnly,
+    }
+}
+
+/// INV-18's host portion, as a capability rather than a call order.
+///
+/// > ambient job joined at write-command startup (refusal otherwise)
+///
+/// [`Contained`] has a private field, so nothing outside this module can build
+/// one, and [`execute`] cannot be called without one. The contract's
+/// `side_effect_vs_event_ordering` is "no events; ambient job before any
+/// spawn", and that ordering is therefore a compile error to transpose rather
+/// than a convention a later edit can quietly reverse.
+mod containment {
+    use super::{Command, CommandClass, command_class};
+    use tactus::error::TactusError;
+
+    /// Proof that this process performed its write-command containment
+    /// startup. Unit-like with a private field: only [`establish`] can make
+    /// one.
+    pub struct Contained(());
+
+    /// Establish containment for `command`, or refuse it.
+    ///
+    /// On Unix the join is a no-op that returns `Ok`: containment there is the
+    /// per-invocation reaper and the isolated process group.
+    pub fn establish(
+        command: &Command,
+        join_ambient_job: impl FnOnce() -> Result<(), TactusError>,
+    ) -> anyhow::Result<Contained> {
+        match command_class(command) {
+            CommandClass::Write => join_ambient_job()?,
+            CommandClass::ReadOnly => {}
+        }
+        Ok(Contained(()))
+    }
+}
+
+use containment::Contained;
+
 fn main() -> ExitCode {
     match run() {
         Ok(code) => code,
@@ -180,7 +274,29 @@ fn validate_options(plan: PathBuf, config: Option<PathBuf>) -> anyhow::Result<Va
 
 fn run() -> anyhow::Result<ExitCode> {
     let cli = Cli::parse();
-    match cli.command {
+    // `NoHooks` is what production passes the process funnel, and the ambient
+    // join is threaded the same way: the observer is there so the step has a
+    // failure path a test can drive on the platform where it is real
+    // (`tactus::runner::host::contain_write_command`), and production arms
+    // nothing.
+    dispatch(cli.command, || {
+        tactus::runner::host::start_write_command(&mut tactus::agent::proc::NoHooks)
+    })
+}
+
+/// Establish containment, then execute. The ambient join is a parameter so a
+/// test can drive a failure that no machine here can produce, and so the
+/// ordering between the two is testable rather than merely written down.
+fn dispatch(
+    command: Command,
+    join_ambient_job: impl FnOnce() -> Result<(), TactusError>,
+) -> anyhow::Result<ExitCode> {
+    let contained = containment::establish(&command, join_ambient_job)?;
+    execute(command, contained)
+}
+
+fn execute(command: Command, _contained: Contained) -> anyhow::Result<ExitCode> {
+    match command {
         Command::Connect { force, pools } => {
             let report = connect::run(&connect::ConnectOptions {
                 pools_path: pools,
@@ -377,4 +493,309 @@ fn prompt_for_answer(repo_root: &std::path::Path, question_id: &str) -> anyhow::
             .context("reading an answer from stdin")?;
     }
     Ok(line)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::BTreeSet;
+
+    use clap::CommandFactory;
+
+    use super::*;
+
+    /// Every subcommand this binary dispatches, with an invocation that parses
+    /// and the class the packet gives it.
+    ///
+    /// Written here by hand from `decisions.sequential_substrate.startup_census`
+    /// ("every topology write command (run, resume)"), so it is an oracle
+    /// independent of [`command_class`]. A command added to the enum without
+    /// being added here fails
+    /// [`every_dispatch_arm_is_classified_by_the_packets_rule`] — the list that
+    /// rots is replaced by a list that is checked.
+    const DISPATCH: &[(&str, &[&str], CommandClass)] = &[
+        ("connect", &["tactus", "connect"], CommandClass::ReadOnly),
+        ("capacity", &["tactus", "capacity"], CommandClass::ReadOnly),
+        (
+            "validate",
+            &["tactus", "validate", "plan.md"],
+            CommandClass::ReadOnly,
+        ),
+        ("run", &["tactus", "run", "plan.md"], CommandClass::Write),
+        (
+            "resume",
+            &["tactus", "resume", "01ABCDEF"],
+            CommandClass::Write,
+        ),
+        ("status", &["tactus", "status"], CommandClass::ReadOnly),
+        (
+            "export-decisions",
+            &["tactus", "export-decisions", "01ABCDEF"],
+            CommandClass::ReadOnly,
+        ),
+        (
+            "answer",
+            &["tactus", "answer", "q1", "--decline"],
+            CommandClass::ReadOnly,
+        ),
+    ];
+
+    /// A plan path that exists on no machine, so the dispatch arm that reads it
+    /// fails in a way nothing else produces.
+    const ABSENT_PLAN: &str = "/tactus-pr4-no-such-plan-33f1a9/plan.md";
+
+    /// The whole point of the table: a new subcommand cannot reach the dispatch
+    /// without a classification, and cannot be classified in production without
+    /// being classified here too.
+    #[test]
+    fn every_dispatch_arm_is_classified_by_the_packets_rule() {
+        let declared: BTreeSet<String> = Cli::command()
+            .get_subcommands()
+            .map(|sub| sub.get_name().to_owned())
+            .collect();
+        let tabled: BTreeSet<String> = DISPATCH
+            .iter()
+            .map(|(name, _, _)| (*name).to_owned())
+            .collect();
+        assert_eq!(
+            declared, tabled,
+            "the dispatch and this table name different commands"
+        );
+        assert_eq!(declared.len(), 8, "eight subcommands");
+        assert_eq!(DISPATCH.len(), 8, "eight rows, one per subcommand");
+
+        for (name, argv, expected) in DISPATCH {
+            let cli = Cli::try_parse_from(*argv)
+                .unwrap_or_else(|error| panic!("`{name}` does not parse from {argv:?}: {error}"));
+            assert_eq!(
+                command_class(&cli.command),
+                *expected,
+                "`{name}` is classified against the packet's rule"
+            );
+        }
+
+        let writes: Vec<&str> = DISPATCH
+            .iter()
+            .filter(|(_, _, class)| *class == CommandClass::Write)
+            .map(|(name, _, _)| *name)
+            .collect();
+        assert_eq!(
+            writes,
+            vec!["run", "resume"],
+            "the census names the write commands: `every topology write command (run, resume)`"
+        );
+        assert_eq!(
+            DISPATCH
+                .iter()
+                .filter(|(_, _, class)| *class == CommandClass::ReadOnly)
+                .count(),
+            6
+        );
+    }
+
+    /// The classification is by dispatch arm, so the preview shares the class
+    /// of the command it previews. Stated in `command_class`, asserted here, so
+    /// the widening cannot become invisible.
+    #[test]
+    fn the_dry_run_preview_is_classified_with_its_arm() {
+        let dry = Cli::try_parse_from(["tactus", "run", "plan.md", "--dry-run"]).expect("parse");
+        assert_eq!(command_class(&dry.command), CommandClass::Write);
+        let wet = Cli::try_parse_from(["tactus", "run", "plan.md"]).expect("parse");
+        assert_eq!(command_class(&wet.command), CommandClass::Write);
+    }
+
+    /// The two commands that spawn a host child outside a run, counted so the
+    /// boundary cannot grow in silence. `connect` and `capacity` both probe the
+    /// installed agent CLIs (`connect.rs:133`, `capacity.rs:840`); neither
+    /// drives a run, so neither is the "coordinator" whose ambient job INV-18
+    /// names.
+    #[test]
+    fn the_commands_that_spawn_outside_a_run_are_named_and_counted() {
+        let outside: Vec<&str> = DISPATCH
+            .iter()
+            .filter(|(name, _, _)| matches!(*name, "connect" | "capacity"))
+            .map(|(name, _, _)| *name)
+            .collect();
+        assert_eq!(outside, vec!["connect", "capacity"]);
+        assert_eq!(outside.len(), 2, "two commands, and this is the count");
+        for name in &outside {
+            let row = DISPATCH
+                .iter()
+                .find(|(n, _, _)| n == name)
+                .expect("a named command is in the table");
+            assert_eq!(row.2, CommandClass::ReadOnly);
+        }
+    }
+
+    /// A refused ambient join stops the write command **before** its arm runs.
+    ///
+    /// The oracle is that the two outcomes are different errors from different
+    /// places: the refusal names the ambient job, and the arm — reached only
+    /// when the join succeeds — names the plan it could not read. If
+    /// containment ran after the arm, or not at all, the first call would carry
+    /// the plan's error instead.
+    #[test]
+    fn a_write_command_refuses_before_any_effect_when_containment_fails() {
+        let argv = ["tactus", "run", ABSENT_PLAN, "--dry-run"];
+
+        let refused = dispatch(Cli::try_parse_from(argv).expect("parse").command, || {
+            Err(TactusError::Refused {
+                message: "the ambient Job Object could not be established (simulated failure)"
+                    .to_owned(),
+            })
+        })
+        .expect_err("a write command whose ambient job cannot be established must refuse");
+        let refused = format!("{refused:#}");
+        assert!(
+            refused.contains("ambient Job Object"),
+            "the refusal must diagnose the ambient job: {refused}"
+        );
+        assert!(
+            !refused.contains(ABSENT_PLAN),
+            "the command reached its arm before containment: {refused}"
+        );
+
+        let reached = dispatch(Cli::try_parse_from(argv).expect("parse").command, || Ok(()))
+            .expect_err("the arm then fails on its own, on the plan");
+        let reached = format!("{reached:#}");
+        assert!(
+            reached.contains(ABSENT_PLAN),
+            "with containment established the arm must run: {reached}"
+        );
+        assert!(
+            !reached.contains("ambient Job Object"),
+            "a successful join must not be reported as a refusal: {reached}"
+        );
+    }
+
+    /// **Every** write command joins, and every read-only command does not.
+    ///
+    /// `crash_reconstruction`: "at process start **every write command**
+    /// creates one non-inheritable ambient Job Object"; the contract's
+    /// `side_effect_vs_event_ordering` is "no events; ambient job before any
+    /// spawn". The two tests below drive `dispatch` with one command each —
+    /// `run --dry-run` and two read-only arms — so a containment step
+    /// conditioned on *which* write command it is (a wet `run`, a `resume`)
+    /// would keep every one of their assertions true while the two commands
+    /// that actually spend went unprotected: killed between `CreateProcess`
+    /// and private-job assignment, they leave a suspended stub with no owner,
+    /// and a real ambient failure could not produce the required startup
+    /// refusal.
+    ///
+    /// So this crosses `establish` — the classification's one consumer — with
+    /// every row of [`DISPATCH`] plus the dry-run preview, and asserts the
+    /// **count** of joins on each side. `establish` rather than `dispatch`
+    /// because it is the mutation site and because running the wet arms would
+    /// execute a run.
+    #[test]
+    fn every_write_command_establishes_containment_and_no_read_only_one_does() {
+        let mut argvs: Vec<(Vec<&str>, CommandClass)> = DISPATCH
+            .iter()
+            .map(|(_, argv, class)| (argv.to_vec(), *class))
+            .collect();
+        // The preview shares its arm's class, and the arm is what joins.
+        argvs.push((
+            vec!["tactus", "run", "plan.md", "--dry-run"],
+            CommandClass::Write,
+        ));
+        assert_eq!(argvs.len(), 9, "eight subcommands and the dry-run preview");
+
+        let mut joined = 0_usize;
+        let mut skipped = 0_usize;
+        for (argv, class) in &argvs {
+            let command = Cli::try_parse_from(argv).expect("parse").command;
+            let mut calls = 0_usize;
+            let contained = containment::establish(&command, || {
+                calls += 1;
+                Ok(())
+            });
+            assert!(
+                contained.is_ok(),
+                "a successful join must not refuse {argv:?}"
+            );
+            match class {
+                CommandClass::Write => {
+                    assert_eq!(calls, 1, "{argv:?} did not join the ambient job");
+                    joined += 1;
+                }
+                CommandClass::ReadOnly => {
+                    assert_eq!(calls, 0, "{argv:?} joined the ambient job");
+                    skipped += 1;
+                }
+            }
+
+            // And the refusal is per command, not per class: a write command
+            // whose join fails refuses, a read-only one cannot fail because it
+            // never calls it.
+            let command = Cli::try_parse_from(argv).expect("parse").command;
+            let outcome = containment::establish(&command, || {
+                Err(TactusError::Refused {
+                    message: "the ambient Job Object could not be established (simulated)"
+                        .to_owned(),
+                })
+            });
+            assert_eq!(
+                outcome.is_err(),
+                *class == CommandClass::Write,
+                "{argv:?}: a failed join must stop exactly the write commands"
+            );
+        }
+        assert_eq!(joined, 3, "`run`, `resume`, and the dry-run preview");
+        assert_eq!(skipped, 6, "the six read-only subcommands");
+    }
+
+    /// A read-only command never joins. The oracle is a join that cannot be
+    /// called without failing the test.
+    #[test]
+    fn a_read_only_command_does_not_join_the_ambient_job() {
+        for argv in [
+            vec!["tactus", "validate", ABSENT_PLAN],
+            vec!["tactus", "capacity", "--config", ABSENT_PLAN],
+        ] {
+            let command = Cli::try_parse_from(&argv).expect("parse").command;
+            assert_eq!(command_class(&command), CommandClass::ReadOnly);
+            let outcome = dispatch(command, || {
+                panic!("a read-only command joined the ambient job: {argv:?}")
+            });
+            assert!(
+                outcome.is_err(),
+                "the fixture relies on this arm failing on its own input"
+            );
+        }
+    }
+
+    /// The real join, at the real coordinate, on the platform that has one.
+    ///
+    /// One test rather than three: the ambient job is a process-wide singleton,
+    /// so "not yet established" is observable exactly once per test binary.
+    #[cfg(windows)]
+    #[test]
+    fn a_write_command_establishes_the_ambient_job_and_a_read_only_command_does_not() {
+        use tactus::agent::proc::ambient_job_established;
+
+        assert!(
+            !ambient_job_established(),
+            "nothing has run a write command in this process yet"
+        );
+        let read_only = Cli::try_parse_from(["tactus", "validate", ABSENT_PLAN])
+            .expect("parse")
+            .command;
+        let _ = dispatch(read_only, || {
+            tactus::runner::host::start_write_command(&mut tactus::agent::proc::NoHooks)
+        });
+        assert!(
+            !ambient_job_established(),
+            "a read-only command established the coordinator's ambient job"
+        );
+
+        let write = Cli::try_parse_from(["tactus", "run", ABSENT_PLAN, "--dry-run"])
+            .expect("parse")
+            .command;
+        let _ = dispatch(write, || {
+            tactus::runner::host::start_write_command(&mut tactus::agent::proc::NoHooks)
+        });
+        assert!(
+            ambient_job_established(),
+            "a write command ran without joining the coordinator's ambient job (INV-18)"
+        );
+    }
 }

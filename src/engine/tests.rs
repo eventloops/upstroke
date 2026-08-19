@@ -24,6 +24,7 @@ use crate::ir::{
 };
 use crate::review;
 use crate::rundir::{self, RunLock, RunPaths, WorktreeLock};
+use crate::runner::CommandSpec;
 use crate::workspace::Workspace;
 
 #[derive(Clone, Copy, PartialEq)]
@@ -51,6 +52,10 @@ enum Effect {
     LargeEditQuestionWriteFailure,
     /// Simulates a lying agent: success report, no changes.
     NoEdit,
+    /// Command construction succeeds, but the worker executable cannot be
+    /// spawned — the shape of an agent CLI removed, renamed, or self-updated
+    /// out from under a run that has already passed pre-flight.
+    SpawnError,
     /// Simulates an agent-side failure.
     Error,
     /// Simulates the pool being exhausted.
@@ -229,7 +234,7 @@ impl AgentAdapter for FakeAdapter {
         self.id
     }
 
-    fn probe(&self) -> Result<Caps, TactusError> {
+    fn probe(&self, _runner: &dyn crate::runner::Runner) -> Result<Caps, TactusError> {
         if let Some(message) = self.probe_error {
             return Err(TactusError::Agent {
                 message: message.to_owned(),
@@ -246,7 +251,7 @@ impl AgentAdapter for FakeAdapter {
         })
     }
 
-    fn build(&self, run: &TaskRun) -> Result<std::process::Command, TactusError> {
+    fn build(&self, run: &TaskRun) -> Result<CommandSpec, TactusError> {
         if run.profile.permissions == PermissionMode::ReadOnly {
             let effect = self
                 .calls
@@ -271,9 +276,11 @@ impl AgentAdapter for FakeAdapter {
                 behavior
             };
             if behavior == ReviewBehavior::SpawnError {
-                let mut cmd = Command::new(run.workspace.join("missing-reviewer-executable"));
-                cmd.current_dir(&run.workspace);
-                return Ok(cmd);
+                return Ok(CommandSpec::new(
+                    run.workspace
+                        .join("missing-reviewer-executable")
+                        .to_string_lossy(),
+                ));
             }
             if effect == Effect::FrozenCandidate {
                 let tree = Command::new("git")
@@ -336,9 +343,9 @@ impl AgentAdapter for FakeAdapter {
                     message: format!("fake could not jam cleanup: {e}"),
                 })?;
             }
-            let mut cmd = shell_command(&format!("echo {REVIEW_MARKER}"));
-            cmd.current_dir(&run.workspace);
-            return Ok(cmd);
+            // No `current_dir`: the runner puts the process in
+            // `RunnerRequest.workspace`, which is `run.workspace`.
+            return Ok(shell_spec(&format!("echo {REVIEW_MARKER}")));
         }
         let index = {
             let mut calls = self.calls.lock().map_err(|_| TactusError::Agent {
@@ -397,6 +404,16 @@ impl AgentAdapter for FakeAdapter {
                 )?;
                 Some(("agent-output.txt", "reviewed edit\n".to_owned()))
             }
+            Effect::SpawnError => {
+                // Return before editing anything: this attempt never gets to
+                // run, so it must not leave the workspace looking as though it
+                // did.
+                return Ok(CommandSpec::new(
+                    run.workspace
+                        .join("missing-worker-executable")
+                        .to_string_lossy(),
+                ));
+            }
             Effect::NoEdit | Effect::Error | Effect::RateLimited => None,
         };
         if let Some((name, content)) = edit {
@@ -417,9 +434,7 @@ impl AgentAdapter for FakeAdapter {
                 message: format!("fake could not block question writes: {e}"),
             })?;
         }
-        let mut cmd = shell_command("exit 0");
-        cmd.current_dir(&run.workspace);
-        Ok(cmd)
+        Ok(shell_spec("exit 0"))
     }
 
     // Delegate to the real generator so the engine's permission wiring is
@@ -502,6 +517,9 @@ impl AgentAdapter for FakeAdapter {
             | Effect::LargeEditQuestionWriteFailure
             | Effect::NoEdit
             | Effect::AskQuestion
+            // `SpawnError` never reaches here either: the runner fails to
+            // spawn it, so nothing is parsed.
+            | Effect::SpawnError
             | Effect::Exit => OutcomeStatus::Completed,
         };
         let detail = match effect {
@@ -620,8 +638,8 @@ impl RecordingSleeper {
 
 /// Shared with the production path so tests exercise the same shell
 /// invocation (including its Windows quoting) rather than a parallel one.
-fn shell_command(script: &str) -> Command {
-    crate::gates::ShellKind::native().command(script)
+fn shell_spec(script: &str) -> CommandSpec {
+    crate::gates::ShellKind::native().spec(script)
 }
 
 fn git_in(repo: &Path, args: &[&str]) -> String {
@@ -8216,4 +8234,945 @@ fn a_budget_stop_survives_a_stale_decline_file() {
     let report = run_with(&opts, &source).expect("run");
     assert_eq!(report.outcome(), RunOutcome::BudgetExceeded, "{report:?}");
     assert!(report.halted_at.is_none(), "nothing failed: {report:?}");
+}
+
+// ---------------------------------------------------------------------------
+// PR4: every process the legacy engine starts goes through the Runner
+// ---------------------------------------------------------------------------
+
+/// One process the engine asked a runner to execute.
+#[derive(Debug, Clone)]
+struct RoutedProcess {
+    role: crate::runner::ExecutionRole,
+    program: String,
+    invocation: String,
+    workspace: PathBuf,
+    agent: Option<String>,
+    slotted: bool,
+    /// What the child receives on stdin. The adapter says *whether* a prompt
+    /// is delivered this way (`AgentAdapter::stdin_payload`); the spec is what
+    /// carries the bytes, and the runner is what writes them.
+    stdin: String,
+}
+
+/// A real [`HostRunner`](crate::runner::host::HostRunner) that writes down what
+/// it was asked to run.
+///
+/// It delegates rather than stubs: a recorder that returned canned output
+/// would prove the engine *called* something and nothing about the run still
+/// working. Every assertion below is therefore made about a run that actually
+/// committed its tasks.
+struct RecordingRunner {
+    inner: crate::runner::host::HostRunner,
+    seen: Mutex<Vec<RoutedProcess>>,
+}
+
+impl RecordingRunner {
+    fn new() -> Self {
+        Self {
+            inner: crate::runner::host::HostRunner::new(),
+            seen: Mutex::new(Vec::new()),
+        }
+    }
+
+    fn seen(&self) -> Vec<RoutedProcess> {
+        self.seen.lock().expect("recorder").clone()
+    }
+}
+
+impl crate::runner::Runner for RecordingRunner {
+    fn run(
+        &self,
+        request: &crate::runner::RunnerRequest,
+    ) -> Result<ProcessOutput, crate::error::TactusError> {
+        self.seen.lock().expect("recorder").push(RoutedProcess {
+            role: request.role.clone(),
+            program: request.command.program.clone(),
+            invocation: request.invocation.render(),
+            workspace: request.workspace.clone(),
+            agent: request.agent.as_ref().map(|id| id.as_str().to_owned()),
+            slotted: request.role.is_slotted(),
+            stdin: String::from_utf8_lossy(&request.command.stdin).into_owned(),
+        });
+        crate::runner::Runner::run(&self.inner, request)
+    }
+}
+
+/// The file stem of a program path, however it was spelled.
+fn program_stem(program: &str) -> String {
+    Path::new(program)
+        .file_stem()
+        .map(|stem| stem.to_string_lossy().into_owned())
+        .unwrap_or_default()
+        .to_ascii_lowercase()
+}
+
+/// `decisions.pr_sequence[5].scope`: "probes, workers, gates, reviews go
+/// through the Runner", and `invariants_preserved`: "legacy engine behavior
+/// unchanged (**the legacy engine does not run the shell probe**)".
+///
+/// One run of two tasks, each with two gates and one review pass, driven
+/// through a recorder wrapped around the real host runner. What it establishes,
+/// in the order the contract asks for it:
+///
+/// 1. **Every** process the run started is a Runner request — the count is the
+///    run's shape (2 workers + 4 gates + 2 reviews), so a process that had
+///    gone round the seam would leave the count short and a process that had
+///    been added would leave it long.
+/// 2. The identities are the packet's first form in the **legacy generation**,
+///    written out by hand, and they are unique.
+/// 3. **No `probe(shell)` request**, and the recorder can see one — the same
+///    recorder is handed a real shell probe afterwards and the count moves
+///    from 0 to 1, so the zero is a measurement rather than a blind spot.
+/// 4. **Authoritative Git never crosses the boundary** (DESIGN.md:612): the
+///    run made commits, and not one recorded request is a `git` process.
+#[test]
+fn the_legacy_engine_routes_every_process_through_the_runner() {
+    let repo = temp_engine_repo("routed");
+    seed(
+        &repo,
+        "## One\n<!-- tactus: id=t1 kind=implement depends= -->\n\n\
+             ## Two\n<!-- tactus: id=t2 kind=implement depends= -->\n",
+        Some(
+            "[routing]\nimplement = { chain = [\"small\"], attempts_per = 1 }\n\n\
+                 [[gates]]\nname = \"first\"\ncmd = \"echo gate-one\"\n\n\
+                 [[gates]]\nname = \"second\"\ncmd = \"echo gate-two\"\n",
+        ),
+    );
+    let mut opts = options(&repo);
+    opts.config_path = Some(repo.join("tactus.toml"));
+    let source = source(vec![Effect::EditFile], vec![ReviewBehavior::Pass]);
+    let runner = RecordingRunner::new();
+    let report = run_harness_on(
+        &opts,
+        &Harness {
+            adapters: &source,
+            answers: None,
+            sleeper: None,
+        },
+        &runner,
+    )
+    .expect("run");
+
+    assert!(committed(&report, "t1"), "report: {report:?}");
+    assert!(committed(&report, "t2"), "report: {report:?}");
+    let seen = runner.seen();
+
+    // (1) and (2): the exact identities of the run, in order, written from the
+    // plan's shape and the packet's grammar rather than read back from the
+    // engine. Two tasks at plan positions 0 and 1, one attempt each, generation
+    // 0 because the legacy engine has none, and inside each attempt the worker,
+    // then gate 0 and gate 1, then review pass 0.
+    let expected_ids = vec![
+        "k0.g0.a1.worker.o0",
+        "k0.g0.a1.gate0.o0",
+        "k0.g0.a1.gate1.o0",
+        "k0.g0.a1.review_pass0.o0",
+        "k1.g0.a1.worker.o0",
+        "k1.g0.a1.gate0.o0",
+        "k1.g0.a1.gate1.o0",
+        "k1.g0.a1.review_pass0.o0",
+    ];
+    let ids: Vec<&str> = seen.iter().map(|p| p.invocation.as_str()).collect();
+    assert_eq!(ids, expected_ids, "recorded: {seen:#?}");
+    assert_eq!(
+        seen.len(),
+        2 * (1 + 2 + 1),
+        "two tasks x (worker + two gates + one review)"
+    );
+    assert_eq!(
+        ids.iter().collect::<std::collections::BTreeSet<_>>().len(),
+        ids.len(),
+        "two processes of one run share an identity"
+    );
+    assert!(
+        ids.iter().all(|id| id.contains(".g0.")),
+        "the legacy engine assigns legacy-scoped values: generation 0"
+    );
+
+    // The roles, and what each buys. R3, via `ExecutionRole::is_slotted`: a
+    // worker and a review take an {agent, pool} pair; a gate does not, because
+    // a gate is repository-controlled code and runs no agent CLI — which is
+    // also why it is handed no agent.
+    use crate::runner::ExecutionRole;
+    let by_role = |role: &ExecutionRole| seen.iter().filter(|p| &p.role == role).count();
+    assert_eq!(by_role(&ExecutionRole::Implement), 2);
+    assert_eq!(by_role(&ExecutionRole::Gate), 4);
+    assert_eq!(by_role(&ExecutionRole::Review), 2);
+    for process in &seen {
+        match process.role {
+            ExecutionRole::Implement | ExecutionRole::Review => {
+                assert!(process.slotted, "{process:?}");
+                assert_eq!(process.agent.as_deref(), Some("claude-code"), "{process:?}");
+            }
+            ExecutionRole::Gate => {
+                assert!(!process.slotted, "{process:?}");
+                assert_eq!(process.agent, None, "{process:?}");
+            }
+            ExecutionRole::Probe(_) => panic!("the legacy engine probes nothing: {process:?}"),
+        }
+    }
+
+    // The prompt still reaches the child the way the adapter says it should.
+    // `stdin_payload` is delivery policy and the spec is what carries those
+    // bytes, so the two routed agent processes must be carrying them: a worker
+    // gets the materialized task prompt, a reviewer gets the verdict prompt,
+    // and a gate — which is a shell command, not an agent — gets nothing.
+    let worker_stdin = &seen
+        .iter()
+        .find(|p| p.role == ExecutionRole::Implement)
+        .expect("a worker")
+        .stdin;
+    assert!(
+        worker_stdin.contains("## One") || worker_stdin.contains("One"),
+        "the worker prompt is delivered on stdin: {worker_stdin:?}"
+    );
+    assert!(
+        worker_stdin.contains("Acceptance") || worker_stdin.len() > 200,
+        "and it is the materialized prompt, not a token: {} bytes",
+        worker_stdin.len()
+    );
+    let review_stdin = &seen
+        .iter()
+        .find(|p| p.role == ExecutionRole::Review)
+        .expect("a review")
+        .stdin;
+    assert!(
+        review_stdin.contains("READ-ONLY"),
+        "the review prompt is delivered on stdin: {review_stdin:?}"
+    );
+    assert_ne!(
+        worker_stdin, review_stdin,
+        "a worker and a judge are not sent the same prompt"
+    );
+    for gate in seen.iter().filter(|p| p.role == ExecutionRole::Gate) {
+        assert!(gate.stdin.is_empty(), "a gate reads no stdin: {gate:?}");
+    }
+
+    // (3) The clause, and the control that makes it a measurement. The run has
+    // a recorded shell and ran four gate commands through it, and still never
+    // asked that shell to `exit 0` through the Runner — `gates::shell_available`
+    // is a PATH check and stays one.
+    let shell_probes = |seen: &[RoutedProcess]| {
+        seen.iter()
+            .filter(|p| p.role == ExecutionRole::Probe(crate::runner::ProbeTarget::Shell))
+            .count()
+    };
+    assert_eq!(
+        shell_probes(&seen),
+        0,
+        "the legacy engine ran a shell probe"
+    );
+    crate::runner::host::run_shell_probe(
+        &runner,
+        crate::gates::ShellKind::native(),
+        repo.clone(),
+        crate::runner::InvocationId::probe(crate::runner::ProbeTarget::Shell, 0)
+            .expect("the shell probe identity"),
+    )
+    .expect("the recorded shell runs `exit 0`");
+    assert_eq!(
+        shell_probes(&runner.seen()),
+        1,
+        "the recorder cannot see a shell probe, so the zero above proved nothing"
+    );
+
+    // (4) Authoritative Git never crosses the boundary. The run committed both
+    // tasks — every one of those commits was git work — and not one process
+    // the runner was asked to execute is git.
+    assert!(
+        seen.iter().all(|p| program_stem(&p.program) != "git"),
+        "a git process went through the Runner: {seen:#?}"
+    );
+    assert!(
+        !git_in(&repo, &["log", "--oneline", &report.branch]).is_empty(),
+        "the run's branch has commits, so authoritative Git did run"
+    );
+
+    // The workspace is the runner's to set, and it set a different one for the
+    // worker than for the gates and the review: an attempt edits the repo,
+    // while gates and reviewers judge the frozen candidate snapshot.
+    let worker = seen
+        .iter()
+        .find(|p| p.role == ExecutionRole::Implement)
+        .expect("a worker");
+    assert_eq!(worker.workspace, repo, "the worker runs in the repo root");
+    for process in seen.iter().filter(|p| p.role != ExecutionRole::Implement) {
+        assert_ne!(
+            process.workspace, repo,
+            "a gate or reviewer judged the live worktree: {process:?}"
+        );
+        assert!(process.workspace.is_absolute(), "{process:?}");
+    }
+}
+
+/// Every identity a *retried* attempt with two review passes and a re-ask
+/// assigns, recorded from production rather than constructed by the test.
+///
+/// `the_legacy_engine_routes_every_process_through_the_runner` above records a
+/// run whose every task runs once, with one review pass and no re-ask — so the
+/// three fields that vary *inside* an attempt's identity never vary in it:
+/// `AttemptNumber`, the review pass index, and pass-versus-re-ask. Each of
+/// those is a distinct call site in `engine::attempt`, and a call site that
+/// passes a constant where it should pass its argument is invisible to a grid
+/// of hand-built identities (`runner::tests::invocation_ids_are_unique_within_a_run…`
+/// synthesizes its tuples; `review::tests::the_one_format_reask_is_its_own_invocation…`
+/// is handed a correct pair). `invocation_identity` requires "unique per
+/// process" and "a retry attempt has a new attempt number", and INV-20 makes
+/// `review_pass(n)` and `review_reask(n)` distinct members.
+///
+/// So: one task that fails its first attempt and is retried, two gates, two
+/// review passes from two families, and a first verdict the reviewer botches.
+/// The expected list is written from the packet's grammar and this run's
+/// shape.
+#[test]
+fn a_retried_attempt_with_two_passes_and_a_reask_assigns_every_identity_from_production() {
+    let repo = temp_engine_repo("identities");
+    seed(
+        &repo,
+        FRONTIER_AUTH_PLAN,
+        Some(
+            "[routing]\n\
+             implement = { chain = [\"frontier\"], attempts_per = 2 }\n\n\
+             [[routing.overrides]]\n\
+             paths = [\"src/auth/**\"]\n\
+             second_opinion = \"different-vendor\"\n\n\
+             [[gates]]\nname = \"first\"\ncmd = \"echo gate-one\"\n\n\
+             [[gates]]\nname = \"second\"\ncmd = \"echo gate-two\"\n",
+        ),
+    );
+    let source = cross_vendor(
+        // The first attempt reports success and edits nothing, which fails
+        // outcome sanity before any gate runs; the second does the work.
+        vec![Effect::NoEdit, Effect::EditFile],
+        // The primary reviewer's first verdict is prose, so the pass spends
+        // its one format-only re-ask and then answers.
+        vec![ReviewBehavior::Unparseable, ReviewBehavior::Pass],
+        vec![ReviewBehavior::Pass],
+    );
+    let runner = RecordingRunner::new();
+    let report = run_harness_on(
+        &cross_vendor_opts(&repo),
+        &Harness {
+            adapters: &source,
+            answers: None,
+            sleeper: None,
+        },
+        &runner,
+    )
+    .expect("run");
+    assert!(committed(&report, "t1"), "report: {report:?}");
+
+    let seen = runner.seen();
+    let ids: Vec<&str> = seen.iter().map(|p| p.invocation.as_str()).collect();
+    assert_eq!(
+        ids,
+        vec![
+            // Attempt 1: the worker alone — nothing downstream of a lying
+            // agent runs.
+            "k0.g0.a1.worker.o0",
+            // Attempt 2 carries a *new attempt number* through every process
+            // it starts, not only through the worker.
+            "k0.g0.a2.worker.o0",
+            "k0.g0.a2.gate0.o0",
+            "k0.g0.a2.gate1.o0",
+            // Pass 0's verdict, and the one re-ask it is allowed — two
+            // processes, two identities, and the second is not a second run of
+            // the first.
+            "k0.g0.a2.review_pass0.o0",
+            "k0.g0.a2.review_reask0.o0",
+            // Pass 1 is the other family's, and it is pass *one*.
+            "k0.g0.a2.review_pass1.o0",
+        ],
+        "recorded: {seen:#?}"
+    );
+
+    // Hostility as counts, so the list above cannot be satisfied by a run that
+    // exercised fewer of the varying fields than it claims.
+    use std::collections::BTreeSet;
+    let attempts: BTreeSet<&str> = ids
+        .iter()
+        .map(|id| id.split('.').nth(2).expect("the attempt field"))
+        .collect();
+    assert_eq!(
+        attempts,
+        BTreeSet::from(["a1", "a2"]),
+        "two attempt numbers"
+    );
+    let roles: BTreeSet<&str> = ids
+        .iter()
+        .map(|id| id.split('.').nth(3).expect("the role field"))
+        .collect();
+    assert_eq!(
+        roles,
+        BTreeSet::from([
+            "worker",
+            "gate0",
+            "gate1",
+            "review_pass0",
+            "review_reask0",
+            "review_pass1",
+        ]),
+        "six distinct role members across the run"
+    );
+    assert_eq!(
+        ids.iter().collect::<BTreeSet<_>>().len(),
+        ids.len(),
+        "two processes of one run share an identity"
+    );
+    // `reviews_run` counts *invocations*, so the primary's two are the
+    // verdict and its re-ask — the same two the identity list names.
+    assert_eq!(
+        source.adapter.reviews_run(),
+        2,
+        "the primary reviewer's verdict and its one re-ask"
+    );
+    assert_eq!(
+        source.copilot().reviews_run(),
+        1,
+        "the second family answered once, and was not re-asked"
+    );
+}
+
+/// A worker that cannot be spawned is an **infrastructure error**, not a task
+/// failure — and the engine synthesizes no settlement for it.
+///
+/// `expected_failures_refusals[2]`: "a spawn failure uses the existing
+/// runner/engine semantics: returned error; **no halting settlement is
+/// synthesized**" (at integration, PR8's Deferred/Parked outcomes handle it).
+/// Every fake worker in this file returns a spawnable shell command, and the
+/// reviewer's spawn failures are converted to `ReviewUnavailable` *inside*
+/// `run_review` before they ever reach the coordinator's error arm — so
+/// nothing here exercised that arm, and converting it into `fail_task` would
+/// have left the suite green while turning an outage into an attributed task
+/// failure with a halt.
+///
+/// The oracle is threefold, because "returned error" alone would also be true
+/// of a run that had recorded a failure first: the call returns `Err`, the
+/// error is the runner's own spawn diagnostic, and the log carries
+/// `attempt_started` with **no** settlement after it.
+#[test]
+fn a_worker_that_cannot_be_spawned_returns_an_error_and_settles_nothing() {
+    let repo = temp_engine_repo("workerspawn");
+    seed(
+        &repo,
+        "## Implement the widget\n<!-- tactus: id=t1 kind=implement depends= -->\n",
+        Some("[routing]\nimplement = { chain = [\"small\"], attempts_per = 2 }\n"),
+    );
+    let mut opts = options(&repo);
+    opts.config_path = Some(repo.join("tactus.toml"));
+    let source = source(vec![Effect::SpawnError], vec![ReviewBehavior::Pass]);
+    let error = run_with(&opts, &source).expect_err(
+        "a worker that cannot be spawned is an infrastructure error, not a run that finished",
+    );
+    let message = error.to_string();
+    assert!(
+        message.contains("failed to spawn"),
+        "the runner's own diagnostic reaches the caller: {message}"
+    );
+    assert!(
+        message.contains("missing-worker-executable"),
+        "and it names the program: {message}"
+    );
+
+    // Nothing was settled: one attempt started, no attempt finished, no task
+    // failed, and the ladder bought no second attempt.
+    let run_id = rundir::latest_run(&repo).expect("the run created its directory");
+    let log = fs::read_to_string(paths_of(&repo, &run_id).events()).expect("events.jsonl");
+    let kinds: Vec<String> = log
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .map(|line| {
+            serde_json::from_str::<serde_json::Value>(line)
+                .expect("an event")
+                .get("event")
+                .and_then(|kind| kind.as_str())
+                .unwrap_or_default()
+                .to_owned()
+        })
+        .collect();
+    assert_eq!(
+        kinds
+            .iter()
+            .filter(|kind| *kind == "attempt_started")
+            .count(),
+        1,
+        "exactly one attempt was dispatched: {kinds:?}"
+    );
+    for settled in [
+        "attempt_finished",
+        "task_failed",
+        "task_completed",
+        "run_finished",
+    ] {
+        assert_eq!(
+            kinds.iter().filter(|kind| *kind == settled).count(),
+            0,
+            "a spawn failure synthesized `{settled}`: {kinds:?}"
+        );
+    }
+    assert_eq!(source.adapter.runs().len(), 1, "the ladder bought no retry");
+}
+
+/// The engine facade's public surface is the one the packet enumerates — no
+/// wider.
+///
+/// `decisions.phase_zero_modules.visibility`: "pub(super) only where a sibling
+/// or tests reference an item; **no new pub or pub(crate)**; public paths
+/// unchanged", and `modules["src/engine/mod.rs"]` lists the facade item by
+/// item: the five `pub use` groups, `pub fn run/run_with/run_harness`, and
+/// `pub fn resume/resume_with/resume_harness`.
+///
+/// This slice added `run_harness_on` and `resume_harness_on`, which take the
+/// boundary as a parameter. Inside the crate that is exactly right — it is how
+/// `engine::tests` drives a recording runner. Public, it is a hole in
+/// `invariants[22]` ("schema-1..3 runs are host-only and no run changes its
+/// boundary or image between epochs"): a downstream crate could execute a
+/// legacy run through a Docker or remote `Runner` with no `RunnerPolicy`
+/// recorded and no refusal, and a later ordinary `resume` would move it back
+/// on-host between epochs.
+///
+/// A `pub`/`pub(crate)` widening is invisible to every in-crate test — each
+/// caller compiles either way — so this reads the facade's own text. The
+/// expected sets are transcribed from the packet, not derived from the file.
+#[test]
+fn the_engine_facade_exposes_exactly_the_items_the_packet_enumerates() {
+    use std::collections::BTreeSet;
+
+    let source = include_str!("mod.rs");
+
+    // Every `pub fn` at the facade's top level.
+    let public_fns: BTreeSet<&str> = source
+        .lines()
+        .filter_map(|line| line.strip_prefix("pub fn "))
+        .filter_map(|rest| rest.split(['(', '<', ' ']).next())
+        .collect();
+    assert_eq!(
+        public_fns,
+        BTreeSet::from([
+            "run",
+            "run_with",
+            "run_harness",
+            "resume",
+            "resume_with",
+            "resume_harness",
+        ]),
+        "the engine facade's public functions moved away from the packet's list"
+    );
+
+    // And nothing else is exported by any other route.
+    for widening in [
+        "pub(crate) fn",
+        "pub(crate) use",
+        "pub struct",
+        "pub enum",
+        "pub const",
+    ] {
+        assert!(
+            !source.contains(widening),
+            "`{widening}` appeared in the engine facade, which the visibility rule forbids"
+        );
+    }
+
+    // The re-exports, flattened. `pub use` is the other way a name reaches the
+    // public path, and the packet enumerates these too.
+    let mut reexported: BTreeSet<&str> = BTreeSet::new();
+    let mut rest = source;
+    while let Some(start) = rest.find("pub use ") {
+        rest = &rest[start + "pub use ".len()..];
+        let end = rest.find(';').expect("a `pub use` ends in a semicolon");
+        let statement = &rest[..end];
+        rest = &rest[end..];
+        match (statement.find('{'), statement.find('}')) {
+            (Some(open), Some(close)) => {
+                for name in statement[open + 1..close].split(',') {
+                    let name = name.trim();
+                    if !name.is_empty() {
+                        reexported.insert(name);
+                    }
+                }
+            }
+            _ => {
+                reexported.insert(
+                    statement
+                        .rsplit("::")
+                        .next()
+                        .expect("a path")
+                        .trim()
+                        .trim_end_matches(';'),
+                );
+            }
+        }
+    }
+    assert_eq!(
+        reexported,
+        BTreeSet::from([
+            // options
+            "RunOptions",
+            "ResumeOptions",
+            "Harness",
+            "DEFAULT_ATTEMPT_TIMEOUT",
+            "DEFAULT_MAX_DEFERS",
+            // report
+            "RunReport",
+            "TaskReport",
+            "TaskRunStatus",
+            "RunOutcome",
+            "PoolDrainRow",
+            "topo_order",
+            // crate::agent
+            "AdapterSource",
+            "BuiltinAdapters",
+            // crate::events
+            "AttemptRecord",
+            "FailureRecord",
+            // crate::ladder
+            "AttemptFailure",
+            "FailureKind",
+            "FailureOrigin",
+        ]),
+        "the engine facade's re-exports moved away from the packet's list"
+    );
+    assert_eq!(reexported.len(), 18, "five groups, eighteen names");
+
+    // The boundary-taking helpers exist and are *not* public: this test would
+    // pass just as well if they had been deleted, which is not what it is for.
+    for private in ["fn run_harness_on(", "fn resume_harness_on("] {
+        assert!(source.contains(private), "`{private}` is gone");
+    }
+    assert!(
+        !source.contains("pub fn run_harness_on") && !source.contains("pub fn resume_harness_on"),
+        "an explicit-Runner entry point is public again"
+    );
+}
+
+/// The six public entry points of the facade, as the facade's own text spells
+/// them.
+///
+/// Read from `mod.rs` rather than written out, so a seventh public entry point
+/// cannot be added without appearing here — and therefore without being
+/// classified by the two tests below, which cross this set against a table of
+/// calls.
+fn public_facade_entry_points() -> Vec<&'static str> {
+    let source = include_str!("mod.rs");
+    let mut names: Vec<&str> = source
+        .lines()
+        .filter_map(|line| line.strip_prefix("pub fn "))
+        .filter_map(|rest| rest.split(['(', '<', ' ']).next())
+        .collect();
+    names.sort_unstable();
+    names.dedup();
+    names
+}
+
+/// **Every** public way to become a write coordinator establishes containment
+/// first — not only the CLI's.
+///
+/// `invariants[INV-18]` is "on Windows every host child is a member of the
+/// **coordinator's** ambient kill-on-close Job Object *from creation*", and
+/// `expected_failures_refusals[1]` is "ambient job cannot be created or joined
+/// (Windows) → write command refuses at startup with a diagnostic". Neither
+/// says "when the coordinator was started by `src/main.rs`".
+/// `decisions.phase_zero_modules.modules["src/engine/mod.rs"]` freezes
+/// `run/run_with/run_harness` and `resume/resume_with/resume_harness` as the
+/// facade, so all six are supported entry points: a downstream crate calling
+/// `engine::run_with` is a write coordinator, and until this test existed it
+/// established nothing at all. A kill between `CreateProcessW` and private-job
+/// assignment then left the suspended stub alive — the exact residue INV-18
+/// exists to prevent — and an ambient failure could not produce the required
+/// pre-effect refusal, because nothing attempted the join.
+///
+/// The oracle is [`crate::runner::host::containment_establishments`], which
+/// counts on the calling thread: "this call established containment", not "some
+/// earlier call in this process did". Each entry point is driven with input it
+/// must refuse (an absent plan, an unknown run id) so the assertion is about
+/// the entry point and not about a run.
+///
+/// The *class* is what is asserted: the table is crossed against the facade's
+/// own `pub fn` list, so this cannot be satisfied by covering the two the
+/// review named.
+#[test]
+fn every_public_write_coordinator_entry_point_establishes_containment() {
+    let repo = temp_engine_repo("containment-facade");
+    let mut run_opts = options(&repo);
+    run_opts.plan_path = repo.join("absent-plan.md");
+    let mut resume_opts = ResumeOptions::new("01ABSENTRUN".to_owned(), repo.clone());
+    resume_opts.pools_path = Some(no_pools());
+    resume_opts.private_root = Some(private_root_for(&repo));
+    let adapters = BuiltinAdapters;
+
+    type Call<'a> = Box<dyn Fn() -> Result<RunReport, TactusError> + 'a>;
+    let entry_points: Vec<(&str, Call<'_>)> = vec![
+        ("run", Box::new(|| run(&run_opts))),
+        ("run_with", Box::new(|| run_with(&run_opts, &adapters))),
+        (
+            "run_harness",
+            Box::new(|| run_harness(&run_opts, &Harness::new(&adapters))),
+        ),
+        ("resume", Box::new(|| resume(&resume_opts))),
+        (
+            "resume_with",
+            Box::new(|| resume_with(&resume_opts, &adapters)),
+        ),
+        (
+            "resume_harness",
+            Box::new(|| resume_harness(&resume_opts, &Harness::new(&adapters))),
+        ),
+    ];
+
+    // The class, not the instance: every public entry point of the facade is
+    // in this table, and every row of the table is one of them.
+    let mut driven: Vec<&str> = entry_points.iter().map(|(name, _)| *name).collect();
+    driven.sort_unstable();
+    assert_eq!(
+        driven,
+        public_facade_entry_points(),
+        "a public engine entry point is not driven here; every one of them makes its caller a \
+         write coordinator"
+    );
+    assert_eq!(driven.len(), 6, "six entry points, and this is the count");
+
+    for (name, call) in &entry_points {
+        let before = crate::runner::host::containment_establishments();
+        let outcome = call();
+        assert!(
+            outcome.is_err(),
+            "{name}: the fixture relies on this refusing on its own input"
+        );
+        assert_eq!(
+            crate::runner::host::containment_establishments(),
+            before + 1,
+            "`engine::{name}` entered the write coordinator without establishing containment \
+             (INV-18); a kill after CreateProcessW and before private-job assignment would leave \
+             a suspended stub alive"
+        );
+        // Windows has the other half of the same fact: the coordinator process
+        // really is a member of an ambient job now. (Process-wide and latching,
+        // so it corroborates the count above rather than replacing it.)
+        #[cfg(windows)]
+        assert!(
+            crate::agent::proc::ambient_job_established(),
+            "`engine::{name}` returned without this process joining its ambient Job Object"
+        );
+    }
+}
+
+/// The other side of the same census: a public entry point that is *not* a
+/// write coordinator does not establish containment, and there are six of them.
+///
+/// `crash_reconstruction` anchors the ambient job at "every **write** command",
+/// and `src/main.rs`'s `command_class` is the CLI's half of that split
+/// (`every_write_command_establishes_containment_and_no_read_only_one_does`,
+/// which asserts `skipped == 6`, "the six read-only subcommands"). This is the
+/// library's half, and the six rows below are **the functions those six arms
+/// call** — one per read-only subcommand, so the two censuses count the same
+/// six things from opposite ends and the distinction survives when the CLI is
+/// not involved at all.
+///
+/// `connect` and `capacity` are the interesting rows — they *do* spawn agent
+/// CLIs — and they are still not coordinators, so INV-18's "the
+/// **coordinator's** ambient … Job Object" does not reach their children.
+/// Protecting those is a stronger guarantee than the packet asks for; it is
+/// recorded as `PR4A-SPAWN-WITHOUT-AMBIENT` in `reviews/FINDINGS.md` with an
+/// owner, not done here.
+#[test]
+fn no_read_only_public_entry_point_establishes_containment() {
+    let repo = temp_engine_repo("containment-readonly");
+    let scratch = private_root_for(&repo);
+    fs::create_dir_all(&scratch).expect("scratch");
+    let absent = repo.join("absent-plan.md");
+
+    type Call<'a> = Box<dyn Fn() + 'a>;
+    let read_only: Vec<(&str, Call<'_>)> = vec![
+        (
+            "validate::run",
+            Box::new(|| {
+                let _ = crate::validate::run(&crate::validate::ValidateOptions {
+                    plan_path: absent.clone(),
+                    config_path: None,
+                    config_root: repo.clone(),
+                    pools_path: Some(no_pools()),
+                    engine_limits: config::EngineLimits::Fresh,
+                });
+            }),
+        ),
+        (
+            "status::load",
+            Box::new(|| {
+                let _ = crate::status::load(&repo, None);
+            }),
+        ),
+        (
+            "export::load",
+            Box::new(|| {
+                let _ = crate::export::load(&repo, "01ABSENTRUN");
+            }),
+        ),
+        (
+            "answer::answer",
+            Box::new(|| {
+                let _ = crate::answer::answer(&repo, "q1", crate::answer::Reply::Decline);
+            }),
+        ),
+        (
+            "capacity::report",
+            Box::new(|| {
+                let _ = capacity::report(
+                    &capacity::CapacityOptions {
+                        config_path: Some(absent.clone()),
+                        pools_path: Some(no_pools()),
+                        repo_root: repo.clone(),
+                    },
+                    &BuiltinAdapters,
+                );
+            }),
+        ),
+        (
+            "connect::run_with",
+            Box::new(|| {
+                let _ = crate::connect::run_with(
+                    &crate::connect::ConnectOptions {
+                        pools_path: Some(scratch.join("pools.toml")),
+                        force: true,
+                    },
+                    &BuiltinAdapters,
+                    // No ids: the seam exists so this test spawns nothing. What
+                    // is under test is the containment step, which happens
+                    // before any spawn or not at all.
+                    std::iter::empty(),
+                );
+            }),
+        ),
+    ];
+    assert_eq!(
+        read_only.len(),
+        6,
+        "one library entry point per read-only subcommand — the same six \
+         `src/main.rs` counts on the dispatch side"
+    );
+
+    for (name, call) in &read_only {
+        let before = crate::runner::host::containment_establishments();
+        call();
+        assert_eq!(
+            crate::runner::host::containment_establishments(),
+            before,
+            "`{name}` is not a write coordinator and established containment anyway"
+        );
+    }
+}
+
+/// Containment comes **before** the coordinator, and a failure to establish it
+/// refuses the run before any effect.
+///
+/// `side_effect_vs_event_ordering` is "no events; ambient job before any
+/// spawn", and `expected_failures_refusals[1]` is a refusal "at startup with a
+/// diagnostic". The oracle is `src/main.rs`'s: the two outcomes are different
+/// errors from different places. A refused containment names the ambient job
+/// and *not* the plan; with containment established the coordinator runs and
+/// fails on the plan instead. If establishment happened after the coordinator,
+/// or not at all, the first call would carry the plan's error.
+///
+/// The step is a parameter here for the reason `dispatch` takes one: no machine
+/// can make the real join fail on demand, and on Unix it cannot fail at all.
+/// The seam is not a hole — `Contained`'s field is private to
+/// `crate::runner::host`, so a closure that returns one has established
+/// containment.
+#[test]
+fn a_facade_run_refuses_before_any_effect_when_containment_fails() {
+    let repo = temp_engine_repo("containment-order");
+    let mut opts = options(&repo);
+    opts.plan_path = repo.join("absent-plan.md");
+    let source = source(vec![Effect::EditFile], vec![ReviewBehavior::Pass]);
+    let harness = Harness::new(&source);
+    let runner = RecordingRunner::new();
+
+    let refused = run_contained(&opts, &harness, &runner, || {
+        Err(TactusError::Refused {
+            message: "the ambient Job Object could not be established (simulated failure)"
+                .to_owned(),
+        })
+    })
+    .expect_err("a run whose ambient job cannot be established must refuse");
+    let refused = refused.to_string();
+    assert!(
+        refused.contains("ambient Job Object"),
+        "the refusal must diagnose the ambient job: {refused}"
+    );
+    assert!(
+        !refused.contains("absent-plan"),
+        "the coordinator ran before containment: {refused}"
+    );
+    assert!(
+        runner.seen().is_empty(),
+        "a run refused at startup spawned a process: {:?}",
+        runner.seen()
+    );
+
+    let reached = run_contained(&opts, &harness, &runner, || {
+        crate::runner::host::contain_write_command(&mut crate::agent::proc::NoHooks)
+    })
+    .expect_err("the coordinator then fails on its own, on the plan");
+    let reached = reached.to_string();
+    assert!(
+        reached.contains("absent-plan"),
+        "with containment established the coordinator must run: {reached}"
+    );
+    assert!(
+        !reached.contains("ambient Job Object"),
+        "a successful establishment must not be reported as a refusal: {reached}"
+    );
+}
+
+/// The same ordering, for the other coordinator. A resume is a write command:
+/// `startup_census` enumerates them "(run, resume)".
+#[test]
+fn a_facade_resume_refuses_before_any_effect_when_containment_fails() {
+    let repo = temp_engine_repo("containment-order-resume");
+    let mut opts = ResumeOptions::new("01ABSENTRUN".to_owned(), repo.clone());
+    opts.pools_path = Some(no_pools());
+    opts.private_root = Some(private_root_for(&repo));
+    let source = source(vec![Effect::EditFile], vec![ReviewBehavior::Pass]);
+    let harness = Harness::new(&source);
+    let runner = RecordingRunner::new();
+
+    let refused = resume_contained(&opts, &harness, &runner, || {
+        Err(TactusError::Refused {
+            message: "the ambient Job Object could not be established (simulated failure)"
+                .to_owned(),
+        })
+    })
+    .expect_err("a resume whose ambient job cannot be established must refuse");
+    // The resume's own refusal names the run directory it looked in; the
+    // containment refusal cannot, because it happens before the coordinator
+    // resolves anything.
+    let looked_in = repo.display().to_string();
+    let refused = refused.to_string();
+    assert!(
+        refused.contains("ambient Job Object"),
+        "the refusal must diagnose the ambient job: {refused}"
+    );
+    assert!(
+        !refused.contains(&looked_in),
+        "the coordinator ran before containment: {refused}"
+    );
+    assert!(
+        runner.seen().is_empty(),
+        "a resume refused at startup spawned a process: {:?}",
+        runner.seen()
+    );
+
+    let reached = resume_contained(&opts, &harness, &runner, || {
+        crate::runner::host::contain_write_command(&mut crate::agent::proc::NoHooks)
+    })
+    .expect_err("the coordinator then fails on its own, on the run it cannot find");
+    let reached = reached.to_string();
+    assert!(
+        reached.contains(&looked_in),
+        "with containment established the coordinator must run: {reached}"
+    );
+    assert!(
+        !reached.contains("ambient Job Object"),
+        "a successful establishment must not be reported as a refusal: {reached}"
+    );
 }

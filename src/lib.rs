@@ -43,6 +43,7 @@ pub mod plan;
 pub mod review;
 pub mod route;
 pub mod rundir;
+pub mod runner;
 pub mod status;
 pub mod topology;
 pub mod ulid;

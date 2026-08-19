@@ -16,8 +16,9 @@ use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 
-use crate::agent::proc;
 use crate::error::TactusError;
+use crate::runner::invocation::InvocationId;
+use crate::runner::{CommandSpec, Runner};
 use crate::util;
 use crate::workspace::Workspace;
 
@@ -89,39 +90,44 @@ impl ShellKind {
         }
     }
 
-    pub fn command(self, cmdline: &str) -> Command {
-        match self {
-            Self::Cmd => {
-                let mut c = Command::new("cmd");
-                // std's Windows quoting escapes embedded quotes as \" per
-                // CommandLineToArgvW rules, which cmd.exe does not un-escape;
-                // the /C tail must go through raw_arg to survive intact.
-                #[cfg(windows)]
-                {
-                    use std::os::windows::process::CommandExt;
-                    c.arg("/C");
-                    c.raw_arg(cmdline);
-                }
-                #[cfg(not(windows))]
-                c.args(["/C", cmdline]);
-                c
-            }
-            Self::Sh => {
-                let mut c = Command::new("sh");
-                c.args(["-c", cmdline]);
-                c
-            }
-            Self::Bash => {
-                let mut c = Command::new("bash");
-                c.args(["-c", cmdline]);
-                c
-            }
-            Self::PowerShell | Self::Pwsh => {
-                let mut c = Command::new(self.program());
-                c.args(["-NoProfile", "-NonInteractive", "-Command", cmdline]);
-                c
-            }
+    /// How this shell is asked to run `cmdline`, as data.
+    ///
+    /// The data form is the primitive and [`Self::command`] is derived from
+    /// it, because DESIGN.md:117 gives the runner the decision about where a
+    /// process runs and DESIGN.md:222 gives it a [`CommandSpec`] to run. A
+    /// gate that built its own `Command` would carry a spawn decision the
+    /// runner never saw — the same hole the adapter seam closes.
+    ///
+    /// There is exactly one place that knows `cmd.exe`'s `/C` tail must reach
+    /// the child un-re-quoted, and it is [`crate::runner::host::build_command`]
+    /// rather than here. Two copies of that rule would be two chances for a
+    /// gate command containing a quote to mean one thing when it is probed and
+    /// another when it is run.
+    #[must_use]
+    pub fn spec(self, cmdline: &str) -> CommandSpec {
+        let (program, args): (&str, Vec<&str>) = match self {
+            Self::Cmd => ("cmd", vec!["/C", cmdline]),
+            Self::Sh => ("sh", vec!["-c", cmdline]),
+            Self::Bash => ("bash", vec!["-c", cmdline]),
+            Self::PowerShell | Self::Pwsh => (
+                self.program(),
+                vec!["-NoProfile", "-NonInteractive", "-Command", cmdline],
+            ),
+        };
+        CommandSpec {
+            program: program.to_owned(),
+            args: args.into_iter().map(str::to_owned).collect(),
+            env: Vec::new(),
+            stdin: Vec::new(),
         }
+    }
+
+    /// [`Self::spec`] as the host runner would execute it.
+    ///
+    /// Kept because a `Command` is what several callers still want to inspect,
+    /// and derived rather than written twice so the two can never disagree.
+    pub fn command(self, cmdline: &str) -> Command {
+        crate::runner::host::build_command(&self.spec(cmdline))
     }
 }
 
@@ -137,7 +143,26 @@ pub enum GateResult {
 /// fail the attempt).
 pub trait Gate {
     fn name(&self) -> &str;
-    fn check(&self, ws: &Workspace) -> Result<GateResult, TactusError>;
+    /// Run this gate's command through `runner`, under `invocation`.
+    ///
+    /// DESIGN.md:229 is `check(&self, runner: &dyn Runner, ws: &Workspace)`;
+    /// the identity is the contract's addition — "RunnerRequest carries a
+    /// typed InvocationId" — and it is a parameter rather than a field because
+    /// a gate is rebuilt from the run record (`ShellGate::from_record`) and
+    /// runs once per attempt, so the gate is the *what* and the invocation is
+    /// the *which time*.
+    ///
+    /// # Errors
+    ///
+    /// An environment problem: the shell could not be spawned, or the runner
+    /// refused the request pre-flight. A gate *failing* is
+    /// [`GateResult::Fail`], never an error (§19).
+    fn check(
+        &self,
+        runner: &dyn Runner,
+        invocation: InvocationId,
+        ws: &Workspace,
+    ) -> Result<GateResult, TactusError>;
 }
 
 #[derive(Debug, Clone)]
@@ -170,12 +195,27 @@ impl Gate for ShellGate {
         &self.name
     }
 
-    fn check(&self, ws: &Workspace) -> Result<GateResult, TactusError> {
-        let mut command = self.shell.command(&self.cmd);
-        command.current_dir(ws.root());
+    fn check(
+        &self,
+        runner: &dyn Runner,
+        invocation: InvocationId,
+        ws: &Workspace,
+    ) -> Result<GateResult, TactusError> {
         // A spawn failure here is an environment problem (missing shell),
         // not a task failure — propagate per §19.
-        let out = proc::run_with_timeout(command, "", self.timeout)?;
+        //
+        // `agent: None` and role `Gate`: a gate is repository-controlled code
+        // and runs no agent CLI, so it takes no `{agent, pool}` pair (R3, via
+        // `ExecutionRole::is_slotted`) and `host-v1` hands it no agent's
+        // credential directory (`host::supplies_credentials`). Both are
+        // properties of the role, so naming the role correctly is what buys
+        // them.
+        let out = runner.run(&crate::runner::gate_request(
+            self.shell.spec(&self.cmd),
+            ws.root().to_path_buf(),
+            self.timeout,
+            invocation,
+        ))?;
         let mut log = String::new();
         if !out.stdout.trim().is_empty() {
             log.push_str(&out.stdout);
@@ -231,13 +271,23 @@ pub const FEEDBACK_TAIL_BYTES: usize = 8 * 1024;
 /// failure (attempt fails), `Err` for environment problems (run aborts, §19).
 pub fn run_all(
     gates: &[ShellGate],
+    runner: &dyn Runner,
+    invocation: &dyn Fn(u32) -> InvocationId,
     ws: &Workspace,
     log_dir: &Path,
     stem: &str,
     attempt: u32,
 ) -> Result<Option<GateFailure>, TactusError> {
-    for gate in gates {
-        let result = gate.check(ws)?;
+    for (index, gate) in gates.iter().enumerate() {
+        // The identity comes from the caller, keyed by this gate's position in
+        // the list the run recorded: the packet's role set is
+        // `{worker, gate(n), review_pass(n), review_reask(n)}`, and `n` is
+        // which gate, not which run of it.
+        let result = gate.check(
+            runner,
+            invocation(u32::try_from(index).unwrap_or(u32::MAX)),
+            ws,
+        )?;
         let (log, passed) = match result {
             GateResult::Pass { log } => (log, true),
             GateResult::Fail { log } => (log, false),
@@ -553,6 +603,22 @@ mod tests {
         dir
     }
 
+    /// The runner every gate test runs through: the real host one, because a
+    /// gate test is about a gate actually running.
+    fn host() -> crate::runner::host::HostRunner {
+        crate::runner::host::HostRunner::new()
+    }
+
+    /// One legacy-scoped gate identity. `TaskKey(0)`, attempt 1, gate `n` —
+    /// the packet's first form with the legacy engine's generation
+    /// (`InvocationId::legacy_attempt`).
+    fn gate_id(n: u32) -> InvocationId {
+        use crate::runner::invocation::AttemptRole;
+        use crate::topology::events::AttemptNumber;
+        use crate::topology::registry::TaskKey;
+        InvocationId::legacy_attempt(TaskKey(0), AttemptNumber(1), AttemptRole::Gate(n), 0)
+    }
+
     fn gate(cmd: &str, secs: u64) -> ShellGate {
         ShellGate {
             name: "g".to_owned(),
@@ -562,16 +628,83 @@ mod tests {
         }
     }
 
+    /// How each shell is asked to run a command line, written from the
+    /// vendors' own flags rather than from [`ShellKind::spec`].
+    ///
+    /// This is the independent pin under the whole gate/probe seam: the shell
+    /// probe's request is `ShellKind::spec` and so is a gate's, so a test that
+    /// compared the two would move both ends together the moment this changed.
+    /// The expected rows are `cmd /C`, `sh -c`, `bash -c` and PowerShell's
+    /// `-NoProfile -NonInteractive -Command` — the documented non-interactive
+    /// invocation of each — with the command line as the last argument.
+    #[test]
+    fn every_shell_spells_its_invocation_the_way_the_record_says() {
+        const LINE: &str = "cargo test --all";
+        let expected: Vec<(ShellKind, &str, Vec<&str>)> = vec![
+            (ShellKind::Cmd, "cmd", vec!["/C", LINE]),
+            (ShellKind::Sh, "sh", vec!["-c", LINE]),
+            (ShellKind::Bash, "bash", vec!["-c", LINE]),
+            (
+                ShellKind::PowerShell,
+                "powershell",
+                vec!["-NoProfile", "-NonInteractive", "-Command", LINE],
+            ),
+            (
+                ShellKind::Pwsh,
+                "pwsh",
+                vec!["-NoProfile", "-NonInteractive", "-Command", LINE],
+            ),
+        ];
+        // Every variant, and no more: a sixth shell has to be spelled here
+        // before it can be gated with.
+        assert_eq!(expected.len(), 5);
+
+        for (shell, program, args) in &expected {
+            let spec = shell.spec(LINE);
+            assert_eq!(&spec.program, program, "{shell:?}");
+            assert_eq!(spec.args, *args, "{shell:?}");
+            assert!(
+                spec.env.is_empty() && spec.stdin.is_empty(),
+                "a gate carries no overlay and no stdin: {shell:?}"
+            );
+            // The `Command` the runner builds from it says the same thing. On
+            // Windows `cmd`'s tail goes through `raw_arg`, which is why this
+            // is asserted through the runner's own translation rather than
+            // re-derived here.
+            let built = shell.command(LINE);
+            assert_eq!(built.get_program().to_string_lossy(), *program, "{shell:?}");
+            let seen: Vec<String> = built
+                .get_args()
+                .map(|arg| arg.to_string_lossy().into_owned())
+                .collect();
+            assert_eq!(seen, *args, "{shell:?}");
+        }
+
+        // Fixture hostility as a count: five shells, four distinct programs
+        // (PowerShell and pwsh are two programs with one flag set), and three
+        // distinct argument shapes. A `spec` that ignored the variant would
+        // collapse all three counts to one.
+        let programs: std::collections::BTreeSet<String> =
+            expected.iter().map(|(_, p, _)| (*p).to_owned()).collect();
+        assert_eq!(programs.len(), 5, "one program name per shell");
+        let shapes: std::collections::BTreeSet<Vec<&str>> = expected
+            .iter()
+            .map(|(_, _, a)| a.iter().take(a.len() - 1).copied().collect())
+            .collect();
+        assert_eq!(shapes.len(), 3, "/C, -c, and the PowerShell flag set");
+    }
+
     #[test]
     fn passing_and_failing_gates() {
         let repo = temp_repo("passfail");
         let ws = Workspace::open(&repo).expect("open");
         assert!(matches!(
-            gate("git --version", 30).check(&ws),
+            gate("git --version", 30).check(&host(), gate_id(0), &ws),
             Ok(GateResult::Pass { .. })
         ));
 
-        let Ok(GateResult::Fail { log }) = gate("git frobnicate-not-a-command", 30).check(&ws)
+        let Ok(GateResult::Fail { log }) =
+            gate("git frobnicate-not-a-command", 30).check(&host(), gate_id(1), &ws)
         else {
             panic!("bogus git subcommand must fail");
         };
@@ -589,7 +722,7 @@ mod tests {
         };
         let mut g = gate(cmd, 30);
         g.timeout = Duration::from_millis(300);
-        let Ok(GateResult::Fail { log }) = g.check(&ws) else {
+        let Ok(GateResult::Fail { log }) = g.check(&host(), gate_id(0), &ws) else {
             panic!("must time out");
         };
         assert!(log.contains("timed out"), "log: {log}");
@@ -602,7 +735,10 @@ mod tests {
         // `git config` with a quoted value round-trips only if the shell
         // preserved the quote grouping.
         let set = gate("git config --local test.quoted \"two words\"", 30);
-        assert!(matches!(set.check(&ws), Ok(GateResult::Pass { .. })));
+        assert!(matches!(
+            set.check(&host(), gate_id(0), &ws),
+            Ok(GateResult::Pass { .. })
+        ));
         let get = StdCommand::new("git")
             .arg("-C")
             .arg(&repo)
@@ -636,7 +772,7 @@ mod tests {
             },
             gate("git --version", 30),
         ];
-        let failure = run_all(&gates, &ws, &logs, "t1", 1)
+        let failure = run_all(&gates, &host(), &gate_id, &ws, &logs, "t1", 1)
             .expect("no environment error")
             .expect("second gate fails");
         assert_eq!(failure.gate, "bad");
@@ -657,7 +793,7 @@ mod tests {
             timeout: Duration::from_secs(30),
             shell: ShellKind::native(),
         }];
-        let failure = run_all(&gates, &ws, &logs, "a/b", 1)
+        let failure = run_all(&gates, &host(), &gate_id, &ws, &logs, "a/b", 1)
             .expect("no environment error")
             .expect("gate fails");
         assert_eq!(failure.gate, "lint:fast/unit", "report keeps the real name");

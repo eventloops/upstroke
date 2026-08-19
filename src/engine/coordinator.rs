@@ -20,6 +20,7 @@ use crate::ladder::{
 };
 use crate::review::{PassBinding, ReviewPass, ReviewPlan};
 use crate::rundir::{RunLock, RunPaths, WorktreeLock};
+use crate::runner::Runner;
 use crate::ulid;
 use crate::util;
 use crate::validate::Analysis;
@@ -40,9 +41,37 @@ use super::report::{
 ///
 /// Only tests use the second half, to hold the live fold and a replay of the
 /// same file side by side. Nothing in the engine reads state back.
+#[cfg(test)]
 pub(super) fn run_harness_inner(
     opts: &RunOptions,
     harness: &Harness<'_>,
+) -> Result<(RunReport, RunState), TactusError> {
+    let contained = crate::runner::host::contain_write_command(&mut crate::agent::proc::NoHooks)?;
+    run_harness_inner_on(
+        opts,
+        harness,
+        &crate::runner::host::HostRunner::new(),
+        &contained,
+    )
+}
+
+/// The same run, on an explicit boundary. See [`super::run_harness_on`].
+///
+/// `_contained` is INV-18's host portion as a capability: "on Windows every
+/// host child is a member of the coordinator's ambient kill-on-close Job
+/// Object **from creation**", enforced by "ambient job joined at write-command
+/// startup (refusal otherwise)". This function is the write coordinator, and
+/// [`crate::runner::host::Contained`] cannot be built outside
+/// `crate::runner::host`, so no caller — a CLI arm, the frozen public engine
+/// facade, or an entry point added later — can reach a spawn without having
+/// established containment first. That is a compile error rather than a
+/// convention, which is what the previous shape was: the CLI established it
+/// and `engine::run_with` did not.
+pub(super) fn run_harness_inner_on(
+    opts: &RunOptions,
+    harness: &Harness<'_>,
+    runner: &dyn Runner,
+    _contained: &crate::runner::host::Contained,
 ) -> Result<(RunReport, RunState), TactusError> {
     // Every read-only refusal precedes every lock: the plan, the config, and
     // `[engine]`'s ceilings are checked here, where nothing has been created
@@ -72,7 +101,7 @@ pub(super) fn run_harness_inner(
         mode,
         notifiers,
         budgets,
-    } = preflight(opts, harness, analysis)?;
+    } = preflight(opts, harness, runner, analysis)?;
 
     workspace.ensure_execution_prerequisites()?;
     workspace.ensure_run_exclusions()?;
@@ -182,6 +211,7 @@ pub(super) fn run_harness_inner(
         log,
         gate_cmds,
         adapters: harness.adapters,
+        runner,
         answers: harness.answers.unwrap_or(default_answers.as_ref()),
         notifiers,
         sleeper,
@@ -229,6 +259,12 @@ pub(super) struct Run<'a> {
     pub(super) state: RunState,
     pub(super) gate_cmds: Vec<String>,
     pub(super) adapters: &'a dyn AdapterSource,
+    /// Where every process of this run executes (DESIGN.md:118). Held for the
+    /// whole run because pre-flight's probes and the attempts must cross the
+    /// same boundary — "Probes run through that same runner, or pre-flight
+    /// could certify a host CLI/version different from the one the attempt
+    /// executes" (DESIGN.md:612).
+    pub(super) runner: &'a dyn Runner,
     pub(super) answers: &'a dyn AnswerSource,
     pub(super) notifiers: Vec<&'static dyn Notifier>,
     pub(super) sleeper: &'a dyn Sleeper,
@@ -579,6 +615,11 @@ impl Run<'_> {
                     task,
                     profile: profile.clone(),
                     adapter,
+                    runner: self.runner,
+                    // The legacy engine's own scope for an invocation
+                    // identity: this task's position in the plan. See
+                    // `AttemptCx::invocation`.
+                    task_index: u32::try_from(index).unwrap_or(u32::MAX),
                     attempt,
                     stem: stem.clone(),
                     paths: &self.paths,

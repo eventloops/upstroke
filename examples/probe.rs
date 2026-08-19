@@ -6,10 +6,14 @@
 //! each vendor's CLI about its own account. Neither runs a model.
 
 use tactus::agent;
+use tactus::runner::host::HostRunner;
 
 fn main() {
+    // Every CLI process goes through a Runner (PR4). `probe` is a host
+    // pre-flight here, so the boundary is the host one.
+    let runner = HostRunner::new();
     for adapter in agent::ADAPTERS {
-        let probed = adapter.probe();
+        let probed = adapter.probe(&runner);
         match &probed {
             Ok(caps) => println!(
                 "{}: version {} | json_output={} session_resume={} cost_reporting={} \
@@ -31,7 +35,7 @@ fn main() {
             }
         }
         let Ok(caps) = &probed else { continue };
-        match adapter.discover(caps) {
+        match adapter.discover(&runner, caps) {
             Ok(discovery) => {
                 println!(
                     "  discovery: auth={} shape={} models={}",
