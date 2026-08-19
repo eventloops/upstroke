@@ -2538,7 +2538,7 @@ mod tests {
     }
 
     #[test]
-    fn host_shell_probe_succeeds_with_recorded_shell_and_fails_when_shell_missing() {
+    fn host_shell_probe_succeeds_with_recorded_shell_and_fails_when_it_cannot_be_spawned() {
         let workspace = scratch("shell-probe");
         let runner = HostRunner::new();
 
@@ -2549,30 +2549,69 @@ mod tests {
             .shell_probe(native(), &workspace, shell_probe_invocation())
             .expect("the platform's native shell runs `exit 0`");
 
-        // (b) A shell that is genuinely not on this machine. On Unix `cmd` is
-        // not a program; on Windows `pwsh.exe` lives outside the directories
-        // `CreateProcess` searches without `PATH`, so an emptied `PATH` hides
-        // it. `cmd.exe` cannot be hidden that way -- it is in the system
-        // directory -- which is why the missing-shell case is not the same
-        // shell on both platforms.
-        let (missing_shell, missing_runner) = if cfg!(windows) {
-            let base: Vec<(OsString, OsString)> = std::env::vars_os()
-                .filter(|(name, _)| !name.to_string_lossy().eq_ignore_ascii_case("PATH"))
-                .collect();
-            (
-                ShellKind::Pwsh,
-                HostRunner::new()
-                    .with_environment(HostEnvironment::with_base(base, KeyCase::current())),
-            )
-        } else {
-            (ShellKind::Cmd, HostRunner::new())
-        };
-        let error = missing_runner
-            .shell_probe(missing_shell, &workspace, shell_probe_invocation())
-            .expect_err("a missing shell must be a returned pre-flight error");
+        // (b) The probe the host cannot complete — twice, and neither case is
+        // a claim about what happens to be installed.
+        //
+        // This used to hide `pwsh.exe` on Windows by composing a base
+        // environment with `PATH` removed, and that reasoning was wrong twice
+        // over. Windows CI caught it and the Windows guest could not: std
+        // resolves a bare Windows program name against the application
+        // directory, the system directory, the Windows directory, and then the
+        // **parent process's** `PATH` when the child environment does not
+        // supply one that finds it (`library/std/src/sys/.../windows/process.rs`,
+        // `search_paths`), so an emptied child `PATH` cannot hide any program
+        // the runner itself can see — and the GitHub-hosted image ships
+        // PowerShell 7, so the shell was there to be found. The guest passed it
+        // for the wrong reason: that machine has no `pwsh` at all.
+        //
+        // Both cases below fail because of something this test constructs and
+        // then checks, so they fail identically on a machine with every shell
+        // in existence installed.
+
+        // (b1) The recorded shell, asked to run in a directory that is not
+        // there. `HostRunner::run` gives every child an absolute
+        // `current_dir`, and starting a process in a directory that does not
+        // exist is refused by the kernel everywhere this crate runs: `chdir`
+        // answers `ENOENT` on Unix — whether std reaches it through `fork` or
+        // through `posix_spawn_file_actions_addchdir_np` — and
+        // `CreateProcessW` fails with `ERROR_DIRECTORY` on Windows. Both
+        // surface as `Err` from `Command::spawn`, which is the same production
+        // path an absent shell binary takes, and the caller must be handed a
+        // pre-flight error naming the shell rather than an `Ok`.
+        let absent = workspace.join(format!("absent-{}", crate::ulid::ulid()));
+        assert!(
+            !absent.exists(),
+            "the premise of (b1): {} must not exist",
+            absent.display()
+        );
+        let error = runner
+            .shell_probe(native(), &absent, shell_probe_invocation())
+            .expect_err("a probe the host cannot spawn is a returned pre-flight error");
         let message = error.to_string();
         assert!(message.contains("pre-flight"), "{message}");
-        assert!(message.contains(missing_shell.program()), "{message}");
+        assert!(message.contains(native().program()), "{message}");
+
+        // (b2) And the missing-program fault itself, expressed so that no
+        // installed program can satisfy it: an absolute path inside the
+        // directory (b1) just established does not exist. It contains a path
+        // separator, so it is looked up verbatim — neither `execvp`'s `PATH`
+        // walk nor std's Windows search of the system directories and the
+        // parent `PATH` is consulted for a name like this one, and there is
+        // nothing at the name.
+        let mut request =
+            shell_probe_request(native(), workspace.clone(), shell_probe_invocation());
+        request.command.program = absent.join("shell").to_string_lossy().into_owned();
+        assert!(
+            !Path::new(&request.command.program).exists(),
+            "the premise of (b2): {} must not exist",
+            request.command.program
+        );
+        let error = runner
+            .run(&request)
+            .expect_err("a program that is not there cannot be spawned");
+        let message = error.to_string();
+        assert!(message.contains("spawn"), "{message}");
+        assert!(message.contains(&request.command.program), "{message}");
 
         // (c) A shell that runs and refuses, and one that hangs. Both are
         // pre-flight errors and neither is a `ProcessOutput` the caller has to

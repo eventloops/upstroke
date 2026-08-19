@@ -8492,14 +8492,28 @@ fn the_legacy_engine_routes_every_process_through_the_runner() {
     // The workspace is the runner's to set, and it set a different one for the
     // worker than for the gates and the review: an attempt edits the repo,
     // while gates and reviewers judge the frozen candidate snapshot.
+    //
+    // `same_path`, not `==`: the runner is given the workspace root the run
+    // resolved and this test holds the `temp_dir()` name it created the repo
+    // under, and those are two spellings of one directory on any host whose
+    // temp directory is reached through a symlink (macOS: `/var` →
+    // `/private/var`) or whose user directory has an 8.3 short name (Windows
+    // CI: `RUNNER~1` for `runneradmin`). Comparing the directories rather than
+    // the strings is also what makes the `!` case below mean anything — an
+    // inequality between two spellings holds for free.
     let worker = seen
         .iter()
         .find(|p| p.role == ExecutionRole::Implement)
         .expect("a worker");
-    assert_eq!(worker.workspace, repo, "the worker runs in the repo root");
+    assert!(
+        crate::util::same_path(&worker.workspace, &repo),
+        "the worker runs in the repo root: {} is not {}",
+        worker.workspace.display(),
+        repo.display()
+    );
     for process in seen.iter().filter(|p| p.role != ExecutionRole::Implement) {
-        assert_ne!(
-            process.workspace, repo,
+        assert!(
+            !crate::util::same_path(&process.workspace, &repo),
             "a gate or reviewer judged the live worktree: {process:?}"
         );
         assert!(process.workspace.is_absolute(), "{process:?}");

@@ -288,6 +288,53 @@ fn civil_from_days(days: i64) -> (i64, i64, i64) {
     (year + i64::from(month <= 2), month, day)
 }
 
+/// Whether `left` and `right` name the same directory or file on disk.
+///
+/// Test-only, and shared rather than local because the defect it removes is a
+/// class rather than a site. `PathBuf == PathBuf` is a comparison of two
+/// strings, and a test that asserts one against a path production derived is
+/// asserting that two independent spellings of one directory came out
+/// identical. Three environment facts break that, and a Linux CI cell has none
+/// of them:
+///
+/// * macOS symlinks `/var` to `/private/var`, so anything canonicalised
+///   disagrees textually with the `std::env::temp_dir()` path it came from;
+/// * Windows hands back the 8.3 short name of a directory whose real name is
+///   long (`C:\Users\RUNNER~1\…` for `runneradmin`), and which spelling you get
+///   depends on whose user name is long — the CI runner's is, so CI saw it and
+///   a short-named developer box never can;
+/// * the same Windows path arrives with `/` from git and `\` from the OS.
+///
+/// [`std::fs::canonicalize`] is the normalisation because its contract is
+/// exactly the property wanted: "the canonical, absolute form of the path with
+/// all intermediate components normalized and symbolic links resolved". Two
+/// names for one existing directory therefore canonicalise to one string on
+/// every platform std supports, which makes this comparison mean "the same
+/// directory" on all of them rather than "the same spelling" on one of them.
+///
+/// A path that does not resolve is not the same object as one that does, so
+/// exactly one failure answers `false` — which keeps the negative form
+/// (`!same_path(…)`) honest for a workspace the run has already cleaned up.
+///
+/// # Panics
+///
+/// When *neither* side resolves. Nothing can be concluded from comparing two
+/// absent paths, and answering `false` there would be the same silent pass
+/// this helper exists to remove.
+#[cfg(test)]
+pub(crate) fn same_path(left: &Path, right: &Path) -> bool {
+    match (std::fs::canonicalize(left), std::fs::canonicalize(right)) {
+        (Ok(left), Ok(right)) => left == right,
+        (Ok(_), Err(_)) | (Err(_), Ok(_)) => false,
+        (Err(left_error), Err(right_error)) => panic!(
+            "neither `{}` ({left_error}) nor `{}` ({right_error}) resolves, so no comparison \
+             of the two says anything",
+            left.display(),
+            right.display()
+        ),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -401,5 +448,41 @@ mod tests {
         );
         // find_program must not consult any directory-less candidate.
         assert!(find_program("bait.txt").is_none());
+    }
+
+    /// Two spellings of one directory are one directory, and two directories
+    /// are not.
+    ///
+    /// The fixture is `.` and `..` rather than a symlink because those are the
+    /// one pair of "different string, same directory" that every platform
+    /// std supports normalises identically — Windows has no unprivileged
+    /// directory symlink, and the macOS `/var` case and the Windows 8.3 case
+    /// this helper exists for cannot be built on demand anywhere else. It is
+    /// the same mechanism either way: `canonicalize` resolves the path to the
+    /// object, and the object is what the assertion means.
+    #[test]
+    fn same_path_compares_directories_rather_than_spellings() {
+        let root = std::env::temp_dir().join(format!("tactus-util-same-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let inner = root.join("inner");
+        std::fs::create_dir_all(&inner).expect("scratch directories");
+
+        let detour = inner.join("..").join("inner").join(".");
+        assert_ne!(detour, inner, "the fixture must differ as a string");
+        assert!(same_path(&detour, &inner), "…and agree as a directory");
+
+        assert!(!same_path(&root, &inner), "a parent is not its child");
+        assert!(
+            !same_path(&root.join("absent"), &root),
+            "a path that does not resolve is not one that does"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    #[should_panic(expected = "so no comparison of the two says anything")]
+    fn same_path_refuses_to_answer_when_neither_side_resolves() {
+        let root = std::env::temp_dir().join(format!("tactus-util-absent-{}", std::process::id()));
+        let _ = same_path(&root.join("a"), &root.join("b"));
     }
 }

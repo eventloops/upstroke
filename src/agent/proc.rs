@@ -4901,12 +4901,31 @@ mod tests {
     /// running" — and unlike `kill(pid, 0)` it is not answered `Ok` by a
     /// zombie waiting for its reparented reaper. `EAGAIN` is the other answer:
     /// somebody still holds the write end.
+    ///
+    /// **Bytes are not an answer, so they are drained rather than counted.**
+    /// `read` returns how many bytes it moved, and this used to compare that
+    /// against zero: one byte of anything on the child's stderr — a shell
+    /// diagnostic, a linker warning, a locale complaint, none of which this
+    /// fixture controls on every platform — then reads as "a writer is still
+    /// there" for as long as the byte sits in the pipe, which is forever. EOF
+    /// is a property of the pipe once it is empty, so emptying it first is
+    /// what makes this question the one the caller means.
     #[cfg(unix)]
     fn every_pipe_writer_is_gone(fd: libc::c_int) -> bool {
-        let mut byte = [0_u8; 1];
-        // SAFETY: `fd` is a live non-blocking read end owned by this test and
-        // `byte` is a writable one-byte buffer.
-        unsafe { libc::read(fd, byte.as_mut_ptr().cast(), 1) == 0 }
+        let mut buffer = [0_u8; 256];
+        loop {
+            // SAFETY: `fd` is a live non-blocking read end owned by this test
+            // and `buffer` is a writable buffer of the length passed.
+            let read = unsafe { libc::read(fd, buffer.as_mut_ptr().cast(), buffer.len()) };
+            match read {
+                // EOF: no descriptor for the write end exists anywhere.
+                0 => return true,
+                // Somebody wrote. Not an answer either way — drain and re-ask.
+                1.. => (),
+                // `EAGAIN` (a writer holds it) or `EINTR` (ask again later).
+                _ => return false,
+            }
+        }
     }
 
     /// `kill_tree` settles the child's whole **group**, and does it before it
