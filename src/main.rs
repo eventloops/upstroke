@@ -273,15 +273,46 @@ fn validate_options(plan: PathBuf, config: Option<PathBuf>) -> anyhow::Result<Va
 }
 
 fn run() -> anyhow::Result<ExitCode> {
-    let cli = Cli::parse();
     // `NoHooks` is what production passes the process funnel, and the ambient
     // join is threaded the same way: the observer is there so the step has a
     // failure path a test can drive on the platform where it is real
     // (`tactus::runner::host::contain_write_command`), and production arms
     // nothing.
-    dispatch(cli.command, || {
-        tactus::runner::host::start_write_command(&mut tactus::agent::proc::NoHooks)
-    })
+    run_wired(Cli::parse().command, &mut tactus::agent::proc::NoHooks)
+}
+
+/// The CLI's own composition of containment and dispatch — the two statements
+/// `run` would otherwise hold, with the observer as a parameter.
+///
+/// It exists because `run` cannot be driven. `Cli::parse` reads this process's
+/// real argv and exits on a parse error, so a test cannot call `run` with a
+/// command of its choosing, and `run` was therefore the one link in
+/// `expected_failures_refusals[1]`'s chain that nothing exercised.
+/// `dispatch` is driven with an injected failure and
+/// `runner::host::start_write_command` is driven with one on the guest — but
+/// the **wiring between them** was a closure no test ever called, so
+///
+/// ```text
+/// || { let _ = tactus::runner::host::start_write_command(&mut tactus::agent::proc::NoHooks); Ok(()) }
+/// ```
+///
+/// left `tactus run … --dry-run` succeeding on a Windows host whose ambient job
+/// could not be established, against the slice `scope`'s "refusal with
+/// diagnostic if it cannot", with the whole suite green.
+///
+/// Threading the **observer** rather than the join closure is what makes the
+/// difference: `start_write_command` is then inside the function under test
+/// instead of inside its caller, and the arm `a_cli_write_command_refuses_when_
+/// the_real_containment_step_refuses` drives it with a hook that refuses at
+/// `Spawn.AmbientJobJoined`. What is left above it — `run`'s single delegating
+/// expression — constructs no `Result` of its own, which is what
+/// `the_cli_wires_the_real_containment_step_into_dispatch` reads the source to
+/// assert.
+fn run_wired(
+    command: Command,
+    hooks: &mut dyn tactus::agent::proc::SpawnHooks,
+) -> anyhow::Result<ExitCode> {
+    dispatch(command, || tactus::runner::host::start_write_command(hooks))
 }
 
 /// Establish containment, then execute. The ambient join is a parameter so a
@@ -741,6 +772,203 @@ mod tests {
         }
         assert_eq!(joined, 3, "`run`, `resume`, and the dry-run preview");
         assert_eq!(skipped, 6, "the six read-only subcommands");
+    }
+
+    /// The CLI's own wiring: `run_wired` composes the **real** containment step
+    /// with `dispatch`, on every platform.
+    ///
+    /// `a_write_command_refuses_before_any_effect_when_containment_fails` drives
+    /// `dispatch` with a join of the test's choosing, so it says nothing about
+    /// which join the CLI passes it; `runner::host`'s own tests drive
+    /// `start_write_command` directly, so they say nothing about who calls it.
+    /// This is the composition, and the oracle is production's own count:
+    /// `containment_establishments()` is incremented by `Contained::new`, which
+    /// only `contain_write_command` reaches and only after
+    /// `proc::join_ambient_job` returned `Ok`. So a `run_wired` that passed
+    /// `|| Ok(())` instead of the real step — or that never established
+    /// containment at all — cannot move it.
+    #[test]
+    fn the_cli_write_path_runs_the_real_containment_step() {
+        use tactus::runner::host::containment_establishments;
+
+        let before = containment_establishments();
+        let write = Cli::try_parse_from(["tactus", "run", ABSENT_PLAN, "--dry-run"])
+            .expect("parse")
+            .command;
+        let reached = run_wired(write, &mut tactus::agent::proc::NoHooks)
+            .expect_err("the arm then fails on its own, on the plan");
+        assert_eq!(
+            containment_establishments(),
+            before + 1,
+            "the CLI's write path did not establish containment through the real step"
+        );
+        // And it established it *before* the arm ran, which is what the count
+        // alone cannot say: the error the caller receives is the plan's.
+        let reached = format!("{reached:#}");
+        assert!(
+            reached.contains(ABSENT_PLAN),
+            "with containment established the arm must run: {reached}"
+        );
+
+        // The other side of the classification, through the same wiring.
+        let mark = containment_establishments();
+        let read_only = Cli::try_parse_from(["tactus", "validate", ABSENT_PLAN])
+            .expect("parse")
+            .command;
+        let _ = run_wired(read_only, &mut tactus::agent::proc::NoHooks);
+        assert_eq!(
+            containment_establishments(),
+            mark,
+            "a read-only command established the coordinator's containment"
+        );
+    }
+
+    /// And the refusal reaches the caller through that same wiring, on the
+    /// platform where the join can fail.
+    ///
+    /// This is the arm that kills the finding's mutation. `run_wired` threading
+    /// the **observer** is what makes it possible: with a hook armed to refuse
+    /// at `Spawn.AmbientJobJoined`, a body that discarded
+    /// `start_write_command`'s error and answered `Ok(())` would let the
+    /// dry-run preview reach its arm and fail on the *plan* instead of refusing
+    /// with the ambient job's diagnostic — which is
+    /// `expected_failures_refusals[1]` not holding for the CLI.
+    ///
+    /// Windows-only because the step it drives is: `proc::join_ambient_job` is
+    /// a no-op on Unix that never consults the observer, deliberately, so a
+    /// Linux cell cannot claim this coverage — the same boundary
+    /// `PR4-CONF-005` records for `contain_write_command`.
+    #[cfg(windows)]
+    #[test]
+    fn a_cli_write_command_refuses_when_the_real_containment_step_refuses() {
+        use tactus::agent::proc::SpawnHooks;
+        use tactus::topology::effects::{Injection, SubEffectPoint};
+
+        struct RefuseAmbientJoin;
+        impl SpawnHooks for RefuseAmbientJoin {
+            fn point(&mut self, point: SubEffectPoint) -> Injection {
+                if point == SubEffectPoint::AmbientJobJoined {
+                    Injection::Error
+                } else {
+                    Injection::Proceed
+                }
+            }
+        }
+
+        let write = Cli::try_parse_from(["tactus", "run", ABSENT_PLAN, "--dry-run"])
+            .expect("parse")
+            .command;
+        let refused = run_wired(write, &mut RefuseAmbientJoin)
+            .expect_err("a CLI write command whose ambient join refuses must refuse");
+        let refused = format!("{refused:#}");
+        // The same three fragments `runner::host::tests::the_production_
+        // containment_mint_propagates_a_join_refusal_and_mints_nothing` reads,
+        // and for its reason: what the operator has to be told is that it is
+        // the ambient job, which invariant it enforces, and that nothing ran.
+        // Named fragments rather than the whole sentence, and rather than the
+        // `SubEffectPoint` token — the refusal the CLI hands back is
+        // production's own diagnostic (`proc::AMBIENT_REFUSAL_PREFIX` +
+        // `AMBIENT_REFUSAL_SIMULATED`), not the funnel's internal coordinate.
+        for fragment in ["ambient", "INV-18", "No process was spawned"] {
+            assert!(
+                refused.contains(fragment),
+                "the CLI's refusal must say `{fragment}`: {refused}"
+            );
+        }
+        assert!(
+            !refused.contains(ABSENT_PLAN),
+            "the CLI reached its arm although containment refused: {refused}"
+        );
+    }
+
+    /// `run` itself cannot fabricate a success, because it constructs no value.
+    ///
+    /// The runtime tests above hold everything from `run_wired` down. `run` is
+    /// the one link above them that no test can call — `Cli::parse` reads this
+    /// process's real argv — so it is held the way this project already holds
+    /// claims of exactly this shape: by reading the source
+    /// (`runner::tests::every_production_process_start_is_classified`,
+    /// `every_production_runner_request_is_built_by_its_roles_builder`).
+    ///
+    /// The oracle is narrow on purpose. Both functions are pure delegations,
+    /// so neither has any reason to write an `Ok`; a body that swallowed the
+    /// call below it — `let _ = run_wired(…); Ok(ExitCode::SUCCESS)` — has to
+    /// construct one. And `start_write_command` must be named exactly once in
+    /// the file, inside `run_wired`, so the step cannot be called somewhere
+    /// that discards it and called again where a test can see it.
+    #[test]
+    fn the_cli_wires_the_real_containment_step_into_dispatch() {
+        let source = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/main.rs"),
+        )
+        .expect("read this file");
+        // Line endings are the checkout's, not the repository's: the Windows
+        // guest checks this file out with CRLF, and a census that split on
+        // `"\n#[cfg(test)]\n"` found nothing there and read the test module as
+        // production. Normalised first, so the oracle is the source and not the
+        // platform that happens to be reading it — the same class as
+        // `PR4-CI-ENVIRONMENT-ASSUMPTIONS`, and caught by the same guest.
+        let source = source.replace("\r\n", "\n");
+        let production = source
+            .split("\n#[cfg(test)]\n")
+            .next()
+            .expect("the production region");
+        assert!(
+            production.len() < source.len(),
+            "the split found no test module, so this census is reading the whole file"
+        );
+
+        // Comments are not code, and this census would otherwise be the exact
+        // hazard `reviews/FINDINGS.md` records as `PR4-CENSUS-COMMENT-ORACLE`:
+        // `run_wired`'s doc comment quotes the mutation it exists to kill, and
+        // a source count that read it would make the doc and the code
+        // indistinguishable. The rule is deliberately simple — everything from
+        // a `//` that is not part of a `://` — and it is checked, below,
+        // against a line this file is known to carry.
+        let code: String = production
+            .lines()
+            .map(|line| {
+                match line
+                    .match_indices("//")
+                    .find(|(at, _)| *at == 0 || !line[..*at].ends_with(':'))
+                {
+                    Some((at, _)) => &line[..at],
+                    None => line,
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            !code.contains("let _ = tactus::runner::host::start_write_command"),
+            "the comment strip left a doc comment's text in the code region"
+        );
+
+        assert_eq!(
+            code.matches("start_write_command(").count(),
+            1,
+            "the CLI names the containment step more than once, so one of the calls is \
+             somewhere no test drives"
+        );
+
+        for name in ["fn run() -> anyhow::Result<ExitCode> {", "fn run_wired("] {
+            let start = code
+                .find(name)
+                .unwrap_or_else(|| panic!("`{name}` is gone from src/main.rs"));
+            let body = &code[start..];
+            let end = body.find("\n}\n").expect("the function ends");
+            let body = &body[..end];
+            assert!(
+                !body.contains("Ok("),
+                "`{name}` constructs a Result of its own; it is a delegation, and the only \
+                 reason to write one is to answer success without asking: {body}"
+            );
+            if name.starts_with("fn run()") {
+                assert!(
+                    body.contains("run_wired("),
+                    "`run` no longer goes through the wiring the tests drive: {body}"
+                );
+            }
+        }
     }
 
     /// A read-only command never joins. The oracle is a join that cannot be

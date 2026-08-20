@@ -2537,8 +2537,172 @@ mod tests {
         }
     }
 
+    /// The recorded shell the missing-shell case probes for.
+    ///
+    /// `pwsh` rather than one of the other four because it is the one
+    /// [`ShellKind`] that is **not** reachable from any directory the child's
+    /// program search consults once `PATH` has been replaced: `cmd` is in the
+    /// Windows system directory always, `powershell` is in a subdirectory of it
+    /// that is on every Windows `PATH`, `sh` and `bash` are `/bin` programs on
+    /// Unix and Git-for-Windows programs on the runners. PowerShell 7 installs
+    /// outside all of those on every platform — and the helper asserts that,
+    /// rather than assuming it.
+    const MISSING_SHELL: ShellKind = ShellKind::Pwsh;
+
+    /// Set by the parent test on the helper it spawns, so the helper is inert
+    /// when `cargo test -- --ignored` runs it directly.
+    const MISSING_SHELL_MARKER: &str = "TACTUS_MISSING_SHELL_PROBE";
+
+    /// Printed by the helper after it has asserted, so the parent can tell "the
+    /// helper ran and refused" from "the helper never ran".
+    const MISSING_SHELL_OK: &str = "<<MISSING-SHELL-REFUSED";
+
+    /// The directories a child's program search consults **besides** `PATH`,
+    /// on the platform that has any.
+    ///
+    /// std resolves a bare Windows program name against the child `PATH`, the
+    /// application directory, the system directory, the Windows directory and
+    /// then the **parent's** `PATH` (`library/std/src/sys/.../windows/process.rs`,
+    /// `search_paths`). The helper controls both `PATH`s by construction; these
+    /// three it can only *check*, which is what makes the check the premise.
+    #[cfg(windows)]
+    fn windows_program_search_dirs() -> Vec<PathBuf> {
+        let windows_dir = PathBuf::from(
+            std::env::var_os("SystemRoot")
+                .or_else(|| std::env::var_os("windir"))
+                .expect("a Windows host names its own directory"),
+        );
+        vec![
+            std::env::current_exe()
+                .expect("test executable")
+                .parent()
+                .expect("the application directory")
+                .to_path_buf(),
+            windows_dir.join("System32"),
+            windows_dir,
+        ]
+    }
+
+    /// The missing-shell half of
+    /// [`host_shell_probe_succeeds_with_recorded_shell_and_fails_when_shell_missing`],
+    /// in a child process because one of the two `PATH`s that decide the answer
+    /// belongs to the **process**, not to the request.
+    ///
+    /// The previous version of this case hid `pwsh.exe` by composing a base
+    /// environment with `PATH` removed and ran in-process. Windows CI proved
+    /// that oracle invalid — `CreateProcess` also searches the *parent's*
+    /// `PATH`, so an emptied child `PATH` hides nothing the runner itself can
+    /// see, and the guest passed only because that machine has no `pwsh` at
+    /// all. A process cannot rewrite its own `PATH` for one test without racing
+    /// every other test in the binary, so the absence is constructed where it
+    /// can be: in a child whose entire `PATH` is one directory this suite
+    /// created and asserts is empty.
+    ///
+    /// Everything here is a **premise check followed by the claim**. If the
+    /// construction ever stops constructing the absence — a `PATH` that is not
+    /// the empty directory, a directory that is not empty, a `pwsh.exe` that
+    /// has appeared in one of the three directories the search reaches
+    /// regardless — this fails on the premise and says which one, rather than
+    /// passing for the wrong reason.
     #[test]
-    fn host_shell_probe_succeeds_with_recorded_shell_and_fails_when_it_cannot_be_spawned() {
+    #[ignore = "subprocess helper"]
+    fn shell_probe_missing_shell_helper() {
+        if std::env::var_os(MISSING_SHELL_MARKER).is_none() {
+            return;
+        }
+
+        // Premise 1: this process's `PATH` is exactly one directory, and that
+        // directory is empty. On Unix this is the whole search — `execvp`
+        // consults `PATH` and nothing else, and an *absent* `PATH` would be
+        // worse than a controlled one, because then `execvp` falls back to the
+        // confstr default `/bin:/usr/bin`, where the CI image really does ship
+        // `/usr/bin/pwsh`.
+        let path = std::env::var_os("PATH").expect("the parent supplies a PATH");
+        let dirs: Vec<PathBuf> = std::env::split_paths(&path).collect();
+        assert_eq!(dirs.len(), 1, "PATH must be one directory: {dirs:?}");
+        assert!(dirs[0].is_dir(), "{} is not a directory", dirs[0].display());
+        assert_eq!(
+            std::fs::read_dir(&dirs[0])
+                .expect("read the empty PATH directory")
+                .count(),
+            0,
+            "the one directory on PATH is not empty: {}",
+            dirs[0].display()
+        );
+
+        // Premise 2: the directories Windows searches whatever `PATH` says do
+        // not hold this shell either.
+        #[cfg(windows)]
+        for dir in windows_program_search_dirs() {
+            let candidate = dir.join(format!("{}.exe", MISSING_SHELL.program()));
+            assert!(
+                !candidate.exists(),
+                "the premise of this case: {} exists, so `{}` is not missing on this machine \
+                 however empty PATH is",
+                candidate.display(),
+                MISSING_SHELL.program()
+            );
+        }
+
+        // Premise 3: the workspace **exists**. The three conditions the
+        // contract's proof test composes are an existing workspace, an absent
+        // shell and `HostRunner::shell_probe`; a probe that failed because its
+        // directory was missing would prove the first of them false and test
+        // something else. `HostRunner::run` hands every child an absolute
+        // `current_dir`, so this is the difference between "the shell is not
+        // there" and "the directory is not there".
+        let workspace = scratch("missing-shell");
+        assert!(
+            workspace.is_dir(),
+            "the premise: {} must exist",
+            workspace.display()
+        );
+
+        // The claim. `HostRunner::new()` composes from *this* process's
+        // environment, so the child inherits the same one-empty-directory
+        // `PATH` — production's own composition, not a substituted one.
+        let error = HostRunner::new()
+            .shell_probe(MISSING_SHELL, &workspace, shell_probe_invocation())
+            .expect_err("a recorded shell that is not installed is a returned pre-flight error");
+        let message = error.to_string();
+        assert!(message.contains("pre-flight"), "{message}");
+        assert!(message.contains(MISSING_SHELL.program()), "{message}");
+        assert!(
+            message.contains("could not be run through the runner"),
+            "the refusal must be the spawn failure, not an exit code — a `{}` that ran and \
+             returned non-zero would mean this machine has one after all: {message}",
+            MISSING_SHELL.program()
+        );
+        assert!(
+            workspace.is_dir(),
+            "the workspace stopped existing during the probe, so this case no longer \
+             composes an existing workspace with an absent shell"
+        );
+        let _ = std::fs::remove_dir_all(&workspace);
+        println!("{MISSING_SHELL_OK} {message}");
+    }
+
+    /// `decisions.pr_sequence[5].slice_contract.proof_tests[8]`, by name.
+    ///
+    /// The contract names one test for the whole shell probe and it composes
+    /// three things: the **recorded shell** succeeding, a shell that is
+    /// **missing** failing, and both going through
+    /// [`HostRunner::shell_probe`] — the `RunnerPreflight` entry point — rather
+    /// than through the free [`run_shell_probe`] or through `Runner::run`.
+    /// Decomposing it into separately-tested layers loses exactly that
+    /// composition: with the missing-shell case gone, a `shell_probe` body of
+    ///
+    /// ```text
+    /// match run_shell_probe(self, shell, workspace.to_path_buf(), invocation) {
+    ///     Err(error) if workspace.exists() && error.to_string().contains("os error 2") => Ok(()),
+    ///     outcome => outcome,
+    /// }
+    /// ```
+    ///
+    /// survives every remaining case — (a) succeeds, (c) has no workspace, (d)
+    /// does not use the method, and (e) does not spawn.
+    #[test]
+    fn host_shell_probe_succeeds_with_recorded_shell_and_fails_when_shell_missing() {
         let workspace = scratch("shell-probe");
         let runner = HostRunner::new();
 
@@ -2549,26 +2713,54 @@ mod tests {
             .shell_probe(native(), &workspace, shell_probe_invocation())
             .expect("the platform's native shell runs `exit 0`");
 
-        // (b) The probe the host cannot complete — twice, and neither case is
-        // a claim about what happens to be installed.
-        //
-        // This used to hide `pwsh.exe` on Windows by composing a base
-        // environment with `PATH` removed, and that reasoning was wrong twice
-        // over. Windows CI caught it and the Windows guest could not: std
-        // resolves a bare Windows program name against the application
-        // directory, the system directory, the Windows directory, and then the
-        // **parent process's** `PATH` when the child environment does not
-        // supply one that finds it (`library/std/src/sys/.../windows/process.rs`,
-        // `search_paths`), so an emptied child `PATH` cannot hide any program
-        // the runner itself can see — and the GitHub-hosted image ships
-        // PowerShell 7, so the shell was there to be found. The guest passed it
-        // for the wrong reason: that machine has no `pwsh` at all.
-        //
-        // Both cases below fail because of something this test constructs and
+        // (b) A recorded shell that is **missing**, with the workspace that
+        // (a) just used still in place, through the same method — the
+        // contract's own composition. It runs in a child because the absence
+        // has to be constructed out of both `PATH`s and one of them is the
+        // process's; see [`shell_probe_missing_shell_helper`], which holds the
+        // assertions.
+        let empty_path_dir = scratch("empty-path");
+        assert_eq!(
+            std::fs::read_dir(&empty_path_dir)
+                .expect("read the empty PATH directory")
+                .count(),
+            0,
+            "the directory this test puts on the child's PATH is not empty"
+        );
+        let helper = Command::new(std::env::current_exe().expect("test executable"))
+            .args([
+                "shell_probe_missing_shell_helper",
+                "--ignored",
+                "--nocapture",
+            ])
+            .env(MISSING_SHELL_MARKER, "1")
+            .env("PATH", &empty_path_dir)
+            .current_dir(&workspace)
+            .output()
+            .expect("run the missing-shell helper");
+        let stdout = String::from_utf8_lossy(&helper.stdout).into_owned();
+        let stderr = String::from_utf8_lossy(&helper.stderr).into_owned();
+        assert!(
+            helper.status.success(),
+            "the missing-shell helper failed:\n--- stdout ---\n{stdout}\n--- stderr ---\n{stderr}"
+        );
+        assert!(
+            stdout.contains(MISSING_SHELL_OK),
+            "the helper never reached its refusal:\n{stdout}\n{stderr}"
+        );
+        assert!(
+            stdout.contains("1 passed"),
+            "the filter matched no test, so nothing was proved:\n{stdout}"
+        );
+        let _ = std::fs::remove_dir_all(&empty_path_dir);
+
+        // (c) and (d): the other two ways the host can fail to complete a
+        // probe, neither of which is a claim about what happens to be
+        // installed. Both fail because of something this test constructs and
         // then checks, so they fail identically on a machine with every shell
         // in existence installed.
 
-        // (b1) The recorded shell, asked to run in a directory that is not
+        // (c) The recorded shell, asked to run in a directory that is not
         // there. `HostRunner::run` gives every child an absolute
         // `current_dir`, and starting a process in a directory that does not
         // exist is refused by the kernel everywhere this crate runs: `chdir`
@@ -2581,7 +2773,7 @@ mod tests {
         let absent = workspace.join(format!("absent-{}", crate::ulid::ulid()));
         assert!(
             !absent.exists(),
-            "the premise of (b1): {} must not exist",
+            "the premise of (c): {} must not exist",
             absent.display()
         );
         let error = runner
@@ -2591,19 +2783,21 @@ mod tests {
         assert!(message.contains("pre-flight"), "{message}");
         assert!(message.contains(native().program()), "{message}");
 
-        // (b2) And the missing-program fault itself, expressed so that no
-        // installed program can satisfy it: an absolute path inside the
-        // directory (b1) just established does not exist. It contains a path
+        // (d) The missing-program fault at the `Runner::run` layer, expressed
+        // so that no installed program can satisfy it: an absolute path inside
+        // the directory (c) just established does not exist. It contains a path
         // separator, so it is looked up verbatim — neither `execvp`'s `PATH`
         // walk nor std's Windows search of the system directories and the
         // parent `PATH` is consulted for a name like this one, and there is
-        // nothing at the name.
+        // nothing at the name. (b) is the same fault one layer up, through the
+        // method and against the recorded shell, which is what the contract
+        // names; this one pins the layer beneath it.
         let mut request =
             shell_probe_request(native(), workspace.clone(), shell_probe_invocation());
         request.command.program = absent.join("shell").to_string_lossy().into_owned();
         assert!(
             !Path::new(&request.command.program).exists(),
-            "the premise of (b2): {} must not exist",
+            "the premise of (d): {} must not exist",
             request.command.program
         );
         let error = runner
@@ -2613,7 +2807,7 @@ mod tests {
         assert!(message.contains("spawn"), "{message}");
         assert!(message.contains(&request.command.program), "{message}");
 
-        // (c) A shell that runs and refuses, and one that hangs. Both are
+        // (e) A shell that runs and refuses, and one that hangs. Both are
         // pre-flight errors and neither is a `ProcessOutput` the caller has to
         // interpret.
         let refusing = StubRunner(Box::new(|| Ok(stub_output(Some(127), false))));
@@ -3092,16 +3286,151 @@ mod tests {
     /// injection. Same defect, same shape, one field over from the stdin one
     /// below.
     fn agent_cli_command(stdin: &[u8]) -> CommandSpec {
-        let program = std::env::current_exe().expect("this test binary's own path");
+        agent_cli_command_at(&this_test_binary(), stdin)
+    }
+
+    /// This test binary's own path, as the `String` a [`CommandSpec`] carries.
+    fn this_test_binary() -> String {
+        std::env::current_exe()
+            .expect("this test binary's own path")
+            .to_str()
+            .expect("a target directory this crate can name")
+            .to_owned()
+    }
+
+    /// [`agent_cli_command`] against an arbitrary launcher for this binary, so
+    /// the *program shape* can vary while everything else stays production's.
+    fn agent_cli_command_at(program: &str, stdin: &[u8]) -> CommandSpec {
         CommandSpec {
-            program: program
-                .to_str()
-                .expect("a target directory this crate can name")
-                .to_owned(),
+            program: program.to_owned(),
             args: vec!["--exact".to_owned(), NO_SUCH_TEST.to_owned()],
             env: Vec::new(),
             stdin: stdin.to_vec(),
         }
+    }
+
+    /// One shape a production `CommandSpec.program` can take on this platform.
+    struct ProgramShape {
+        /// What production produces it.
+        what: &'static str,
+        command: CommandSpec,
+        /// Whether the child ends up being this test binary, so its `libtest`
+        /// report is readable on stdout. False for the recorded shell, which
+        /// answers `exit 0` and prints nothing.
+        reports: bool,
+    }
+
+    /// Write a launcher into `dir` that forwards its arguments and its stdin to
+    /// this test binary, and return its absolute path.
+    ///
+    /// The two spellings are the two an installer actually produces: on Windows
+    /// npm writes a `.cmd` (or `.bat`) batch shim beside the package, and on
+    /// Unix it writes an extensionless script with a shebang. Neither is a
+    /// native executable, and `CreateProcessW`/`execve` reach both only through
+    /// an interpreter — which is precisely why a runner that treats them as a
+    /// different kind of program is a defect this suite has to be able to see.
+    fn forwarding_shim(dir: &Path, name: &str) -> String {
+        std::fs::create_dir_all(dir).expect("create the shim directory");
+        let path = dir.join(name);
+        let exe = this_test_binary();
+        if cfg!(windows) {
+            // `@echo off` so the batch text itself does not reach stdout, and
+            // the target quoted because its own path may contain a space.
+            std::fs::write(&path, format!("@echo off\r\n\"{exe}\" %*\r\n"))
+                .expect("write the batch shim");
+        } else {
+            std::fs::write(&path, format!("#!/bin/sh\nexec \"{exe}\" \"$@\"\n"))
+                .expect("write the shell shim");
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755))
+                    .expect("make the shim executable");
+            }
+        }
+        path.to_str()
+            .expect("a scratch path this crate can name")
+            .to_owned()
+    }
+
+    /// A directory name with a space in it, which is what makes the path it
+    /// contains one std must quote. `bin.rs`'s own fixture is the production
+    /// value this transcribes: `C:\Users\John Smith\npm\copilot.cmd`.
+    const A_DIRECTORY_WITH_A_SPACE: &str = "John Smith";
+
+    /// Every **program shape** production can hand the runner on this platform,
+    /// materialised under `root`.
+    ///
+    /// The list is derived from what actually reaches `CommandSpec.program` in
+    /// this crate, not from intuition. There are two producers —
+    /// `bin::Invocation::spec`, which carries the absolute path
+    /// `agent::bin::locate` resolved, and `gates::ShellKind::spec`, which
+    /// carries the recorded shell's **bare name** — and the first of them can
+    /// carry three different kinds of file, because `locate` accepts whatever
+    /// the installation is: a native executable, a batch shim, or (on Unix) a
+    /// shebang script. `bin::locate`'s own candidate list names `.cmd`
+    /// explicitly, and npm-installed agent CLIs on Windows *are*
+    /// `claude.cmd`, `codex.cmd`, `copilot.cmd`.
+    ///
+    /// Two axes, varied independently, because a suppression can key on either:
+    /// the **kind of file** (native / batch / script / bare name) and whether
+    /// the **path needs quoting** (a directory with a space in it).
+    fn program_shapes(root: &Path, stdin: &[u8]) -> Vec<ProgramShape> {
+        let shell = shell_command();
+        let mut shapes = vec![ProgramShape {
+            what: "an absolute path to a native executable — `bin::locate` on a \
+                   normally-installed CLI",
+            command: agent_cli_command(stdin),
+            reports: true,
+        }];
+        if cfg!(windows) {
+            shapes.push(ProgramShape {
+                what: "an absolute `.cmd` batch shim — how npm installs `claude`, `codex` \
+                       and `copilot` on Windows",
+                command: agent_cli_command_at(&forwarding_shim(root, "tactus-shim.cmd"), stdin),
+                reports: true,
+            });
+            shapes.push(ProgramShape {
+                what: "an absolute `.cmd` batch shim whose path contains a space — \
+                       `C:\\Users\\John Smith\\npm\\copilot.cmd`, verbatim",
+                command: agent_cli_command_at(
+                    &forwarding_shim(&root.join(A_DIRECTORY_WITH_A_SPACE), "tactus-shim.cmd"),
+                    stdin,
+                ),
+                reports: true,
+            });
+            shapes.push(ProgramShape {
+                what: "an absolute `.bat` batch shim — the other batch extension \
+                       `CreateProcessW` routes through an interpreter",
+                command: agent_cli_command_at(&forwarding_shim(root, "tactus-shim.bat"), stdin),
+                reports: true,
+            });
+        } else {
+            shapes.push(ProgramShape {
+                what: "an absolute shebang script with no extension — how npm installs a \
+                       CLI on Unix",
+                command: agent_cli_command_at(&forwarding_shim(root, "tactus-shim"), stdin),
+                reports: true,
+            });
+            shapes.push(ProgramShape {
+                what: "an absolute shebang script whose path contains a space",
+                command: agent_cli_command_at(
+                    &forwarding_shim(&root.join(A_DIRECTORY_WITH_A_SPACE), "tactus-shim"),
+                    stdin,
+                ),
+                reports: true,
+            });
+        }
+        shapes.push(ProgramShape {
+            what: "a bare program name resolved on `PATH` — `gates::ShellKind::spec`, the \
+                   only production spec that is not an absolute path",
+            command: CommandSpec {
+                stdin: Vec::new(),
+                ..shell
+            },
+            reports: false,
+        });
+        shapes
     }
 
     /// What production writes to a **worker's** stdin: the materialized task
@@ -3721,6 +4050,271 @@ mod tests {
                 "{id}: one spawn, one child"
             );
         }
+    }
+
+    /// The **program shape** dimension, over every shape production can hand
+    /// the runner rather than the one the role grid happens to carry.
+    ///
+    /// Every agent role in the five-role grid runs `std::env::current_exe()` —
+    /// a native `.exe` on Windows — and the only `.cmd` this suite ever
+    /// executes is `agent::bin::tests::a_batch_shim_runs_and_receives_its_argument`,
+    /// which calls `build_command(&spec).output()` and so bypasses `HostRunner`
+    /// and its hooks entirely. That left
+    ///
+    /// ```text
+    /// let mut no_hooks = NoHooks;
+    /// … if request.command.program.to_ascii_lowercase().ends_with(".cmd") {
+    ///        &mut no_hooks as &mut dyn SpawnHooks
+    ///    } else { &mut **hooks }
+    /// ```
+    ///
+    /// green across the whole suite while **every real Windows agent CLI** ran
+    /// with no containment observation and no fault injection — because
+    /// npm-installed agent CLIs on Windows are exactly `claude.cmd`,
+    /// `codex.cmd` and `copilot.cmd`. That is the production shape, not an
+    /// exotic one, and repair round 6 named this mutation in its own report and
+    /// neither repaired it nor carried it to `reviews/FINDINGS.md`.
+    ///
+    /// Same two claims as every other axis in this file — the points are
+    /// reached, and the observer's answer is honoured — so a shape that is
+    /// merely *observed* and not *injectable* fails here too.
+    #[test]
+    fn every_production_program_shape_reaches_the_containment_points() {
+        let points = per_spawn_points();
+        let root = scratch("program-shapes");
+        let shapes = program_shapes(&root, WORKER_STDIN.as_bytes());
+
+        // The axes, as counts, so the list cannot shrink in silence.
+        assert_eq!(
+            shapes.len(),
+            if cfg!(windows) { 5 } else { 4 },
+            "the program shapes this platform's production can produce"
+        );
+        let programs: BTreeSet<&str> = shapes
+            .iter()
+            .map(|shape| shape.command.program.as_str())
+            .collect();
+        assert_eq!(
+            programs.len(),
+            shapes.len(),
+            "two shapes share a program, so one of them proves nothing: {programs:?}"
+        );
+        assert_eq!(
+            shapes
+                .iter()
+                .filter(|shape| !Path::new(&shape.command.program).is_absolute())
+                .count(),
+            1,
+            "exactly one shape is a bare name the child's program search has to resolve"
+        );
+        assert_eq!(
+            shapes
+                .iter()
+                .filter(|shape| shape.command.program.contains(' '))
+                .count(),
+            1,
+            "exactly one shape's path needs quoting, so quoting and file kind are two \
+             fields and not one"
+        );
+        #[cfg(windows)]
+        {
+            let batch = |suffix: &str| {
+                shapes
+                    .iter()
+                    .filter(|shape| shape.command.program.to_ascii_lowercase().ends_with(suffix))
+                    .count()
+            };
+            assert_eq!(batch(".cmd"), 2, "the npm shape, with and without a space");
+            assert_eq!(batch(".bat"), 1, "the other batch extension");
+        }
+
+        for shape in &shapes {
+            let workspace = scratch("program-shape");
+            let witness = RoleWitness::new();
+            let runner = HostRunner::new().with_hooks(Box::new(witness.handle()));
+            let request = crate::runner::worker_request(
+                shape.command.clone(),
+                workspace.clone(),
+                fixture_agent(),
+                crate::engine::DEFAULT_ATTEMPT_TIMEOUT,
+                worker_invocation(),
+            );
+            let output = runner.run(&request);
+            let _ = std::fs::remove_dir_all(&workspace);
+            let output = output.unwrap_or_else(|error| panic!("{}: {error}", shape.what));
+            assert_eq!(output.code, Some(0), "{}: {output:?}", shape.what);
+            if shape.reports {
+                assert!(
+                    output.stdout.contains("0 passed"),
+                    "{}: the launcher never reached this binary, so the child under \
+                     observation is not the one this shape names: {}",
+                    shape.what,
+                    output.stdout
+                );
+            }
+
+            let harness = witness.harness.lock().expect("harness");
+            for point in points {
+                assert!(
+                    point
+                        .modes()
+                        .iter()
+                        .any(|mode| harness.reached_point(SPAWN_SITE, *point, *mode)),
+                    "{}: the funnel never reached {point}, so a CLI installed in this \
+                     shape produces no containment-hook evidence",
+                    shape.what
+                );
+            }
+            assert_eq!(
+                witness.children.lock().expect("children").len(),
+                1,
+                "{}: one spawn, one child",
+                shape.what
+            );
+        }
+
+        // And the observer's answer is honoured for every shape, at every
+        // point — observation and injection are two claims.
+        let mut injections = 0_usize;
+        for shape in &shapes {
+            for point in points {
+                let workspace = scratch("program-shape-fault");
+                let runner = HostRunner::new().with_hooks(Box::new(FailAt(*point)));
+                let request = crate::runner::worker_request(
+                    shape.command.clone(),
+                    workspace.clone(),
+                    fixture_agent(),
+                    crate::engine::DEFAULT_ATTEMPT_TIMEOUT,
+                    worker_invocation(),
+                );
+                let outcome = runner.run(&request);
+                let _ = std::fs::remove_dir_all(&workspace);
+                let error = outcome.err().unwrap_or_else(|| {
+                    panic!(
+                        "{}: the fault armed at {point} was never introduced",
+                        shape.what
+                    )
+                });
+                assert!(
+                    error.to_string().contains(&point.to_string()),
+                    "{}: the failure does not name the point it was armed at ({point}): {error}",
+                    shape.what
+                );
+                injections += 1;
+            }
+        }
+        assert_eq!(
+            injections,
+            shapes.len() * points.len(),
+            "every shape at every point, counted so the grid cannot shrink in silence"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// And the shim shape through **every role that runs a CLI**, built by that
+    /// role's own production builder.
+    ///
+    /// [`every_production_program_shape_reaches_the_containment_points`] varies
+    /// the shape against one role, the way
+    /// [`every_shipped_agent_binding_reaches_the_containment_points`] varies the
+    /// binding against one role. This is the other half: the role grid itself
+    /// carrying a batch-shim program, so a suppression keyed on the *pair*
+    /// — a `.cmd` in the reviewer's hands, say — has nowhere left to be green.
+    ///
+    /// Three roles and not five: `gate` and `probe(shell)` run the recorded
+    /// shell by production's own rule, which
+    /// `the_role_grid_sends_the_shapes_production_sends` asserts, and a fixture
+    /// that handed a gate an agent shim would be asserting something production
+    /// never does.
+    #[test]
+    fn the_cli_roles_of_the_grid_run_a_shim_shaped_program_through_the_funnel() {
+        let points = per_spawn_points();
+        let root = scratch("shim-roles");
+        let shim = forwarding_shim(
+            &root,
+            if cfg!(windows) {
+                "tactus-role-shim.cmd"
+            } else {
+                "tactus-role-shim"
+            },
+        );
+        let workspace = scratch("shim-role-workspace");
+
+        let cases: Vec<(&str, RunnerRequest)> = vec![
+            (
+                "implement",
+                crate::runner::worker_request(
+                    agent_cli_command_at(&shim, WORKER_STDIN.as_bytes()),
+                    workspace.clone(),
+                    fixture_agent(),
+                    crate::engine::DEFAULT_ATTEMPT_TIMEOUT,
+                    worker_invocation(),
+                ),
+            ),
+            (
+                "review",
+                crate::runner::review_request(
+                    agent_cli_command_at(&shim, REVIEW_STDIN.as_bytes()),
+                    workspace.clone(),
+                    fixture_agent(),
+                    crate::config::DEFAULT_REVIEW_PASS_TIMEOUT,
+                    review_invocation(),
+                ),
+            ),
+            (
+                "probe(claude-code)",
+                crate::agent::probe_request(
+                    claude::ADAPTER_ID,
+                    agent_cli_command_at(&shim, b""),
+                    0,
+                    AGENT_PROBE_TIMEOUT,
+                )
+                .expect("a shipped adapter id"),
+            ),
+        ];
+        assert_eq!(
+            cases.len(),
+            ExecutionRole::all()
+                .iter()
+                .filter(|role| {
+                    !matches!(
+                        role,
+                        ExecutionRole::Gate | ExecutionRole::Probe(ProbeTarget::Shell)
+                    )
+                })
+                .count(),
+            "every role production runs on an agent CLI, and only those"
+        );
+
+        for (what, request) in &cases {
+            assert_eq!(request.command.program, shim, "{what}: not the shim");
+            let witness = RoleWitness::new();
+            let runner = HostRunner::new().with_hooks(Box::new(witness.handle()));
+            // A probe chooses its own workspace, so the run has to happen where
+            // the request says rather than where this test would prefer.
+            std::fs::create_dir_all(&request.workspace).expect("the request's workspace");
+            let output = runner
+                .run(request)
+                .unwrap_or_else(|error| panic!("{what}: {error}"));
+            assert_eq!(output.code, Some(0), "{what}: {output:?}");
+            assert!(
+                output.stdout.contains("0 passed"),
+                "{what}: the shim never reached this binary: {}",
+                output.stdout
+            );
+            let harness = witness.harness.lock().expect("harness");
+            for point in points {
+                assert!(
+                    point
+                        .modes()
+                        .iter()
+                        .any(|mode| harness.reached_point(SPAWN_SITE, *point, *mode)),
+                    "{what}: the funnel never reached {point} for a shim-shaped program"
+                );
+            }
+        }
+        let _ = std::fs::remove_dir_all(&workspace);
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     /// The grid's non-shell child really does run nothing.
