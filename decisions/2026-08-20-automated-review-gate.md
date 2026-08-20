@@ -77,6 +77,13 @@ requirements on the panel, not history:
    removed, deliberately, so it cannot anchor on branch state, commit messages, or the
    author's PR body. It reviews the artifact in front of it.
 
+One transitional fact, surfaced by this record's own implementing review
+(`REVIEW-LEDGER-MISSING` on PR #22): `reviews/FINDINGS.md` lands with the parallelism slice
+(PR #18) and is absent on master-based heads until that merges. A reviewer that finds it
+absent notes the absence and proceeds — the union of settled dispositions does not exist yet
+at that head, and pretending otherwise would anchor the review on a file from a different
+branch.
+
 ## 3. Adjudication routes on evidence class, not severity
 
 The rules already exist and are not re-derived here. Severity is a reviewer's opinion

@@ -134,13 +134,23 @@ jobs:
               echo "reviewed SHA $REVIEWED_SHA is not an ancestor of head $head_sha" >&2
               exit 1
             fi
+            # --no-renames: rename detection folds a rename onto the exempt
+            # path into a single exempt-named entry, hiding the source's
+            # deletion (review finding DRIFT-RENAME-ENDPOINT, reproduced).
+            # The producer's status is checked explicitly: an empty diff from
+            # a failed command must fail closed, never read as "no drift" --
+            # process substitution swallows the status (DRIFT-DIFF-STATUS).
+            drift_names="$(git diff --name-only --no-renames "$REVIEWED_SHA..$head_sha")" || {
+              echo "could not compute the drift between $REVIEWED_SHA and $head_sha" >&2
+              exit 1
+            }
             while IFS= read -r drift_path; do
               [[ -z "$drift_path" ]] && continue
               if [[ "$drift_path" != "reviews/FINDINGS.md" ]]; then
                 echo "path '$drift_path' changed since the review and is outside the exempt set; a fresh review of $head_sha is required" >&2
                 exit 1
               fi
-            done < <(git diff --name-only "$REVIEWED_SHA..$head_sha")
+            done <<< "$drift_names"
           fi
           printf '%s\n' "$pr_body" | bash .github/scripts/validate-pr-ledger-evidence.sh "$head_sha"
 
@@ -307,13 +317,23 @@ jobs:
               echo "reviewed SHA $REVIEWED_SHA is not an ancestor of head $head_sha" >&2
               exit 1
             fi
+            # --no-renames: rename detection folds a rename onto the exempt
+            # path into a single exempt-named entry, hiding the source's
+            # deletion (review finding DRIFT-RENAME-ENDPOINT, reproduced).
+            # The producer's status is checked explicitly: an empty diff from
+            # a failed command must fail closed, never read as "no drift" --
+            # process substitution swallows the status (DRIFT-DIFF-STATUS).
+            drift_names="$(git diff --name-only --no-renames "$REVIEWED_SHA..$head_sha")" || {
+              echo "could not compute the drift between $REVIEWED_SHA and $head_sha" >&2
+              exit 1
+            }
             while IFS= read -r drift_path; do
               [[ -z "$drift_path" ]] && continue
               if [[ "$drift_path" != "reviews/FINDINGS.md" ]]; then
                 echo "path '$drift_path' changed since the review and is outside the exempt set; a fresh review of $head_sha is required" >&2
                 exit 1
               fi
-            done < <(git diff --name-only "$REVIEWED_SHA..$head_sha")
+            done <<< "$drift_names"
           fi
           printf '%s\n' "$pr_body" | bash .github/scripts/validate-pr-ledger-evidence.sh "$head_sha"
 
