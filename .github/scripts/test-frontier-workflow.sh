@@ -211,16 +211,27 @@ echo two >> "$subr/f"; git -C "$subr" commit -aqm s2
 sub_2="$(git -C "$subr" rev-parse HEAD)"
 glm="$drift_tmp/gitlink"; mkrepo "$glm"
 ( cd "$glm" && git -c protocol.file.allow=always submodule add -q "$subr" vendor/dep )
-git -C "$glm/vendor/dep" checkout -q "$sub_1"
 git -C "$glm" config -f .gitmodules submodule.vendor/dep.ignore all
 mkdir -p "$glm/reviews"; echo ledger > "$glm/reviews/FINDINGS.md"
-git -C "$glm" add -A; git -C "$glm" commit -qm X
+# Stage the gitlink through update-index: with ignore = all in .gitmodules,
+# some git versions silently skip a submodule path handed to git add (the box
+# staged it; ubuntu-latest did not, so the fixture built no drift and the
+# block rightly accepted -- flipping this test's verdict). cacheinfo staging
+# bypasses ignore semantics, and the fixture then asserts the drift it built.
+git -C "$glm" update-index --add --cacheinfo "160000,$sub_1,vendor/dep"
+git -C "$glm" add .gitmodules reviews/FINDINGS.md
+git -C "$glm" commit -qm X
 glm_x="$(git -C "$glm" rev-parse HEAD)"
-git -C "$glm/vendor/dep" checkout -q "$sub_2"
 echo ruling >> "$glm/reviews/FINDINGS.md"
-git -C "$glm" add reviews/FINDINGS.md vendor/dep
+git -C "$glm" update-index --add --cacheinfo "160000,$sub_2,vendor/dep"
+git -C "$glm" add reviews/FINDINGS.md
 git -C "$glm" commit -qm Y
 glm_y="$(git -C "$glm" rev-parse HEAD)"
+if [[ "$(git -C "$glm" rev-parse "$glm_x:vendor/dep")" != "$sub_1" ||
+      "$(git -C "$glm" rev-parse "$glm_y:vendor/dep")" != "$sub_2" ]]; then
+  echo "gitlink fixture failed to build the drift it claims to test" >&2
+  exit 1
+fi
 expect_refuse "$glm_x" "$glm_y" "$glm" "gitlink retarget under ignore=all" "vendor/dep"
 
 shim="$drift_tmp/shim"; mkdir -p "$shim"
