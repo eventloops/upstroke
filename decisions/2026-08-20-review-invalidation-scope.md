@@ -132,6 +132,13 @@ carries today. This paragraph is the acceptance, so a future reader knows it was
   before fixing. Every drift computation (both workflow jobs and the stage-1 mirror driver)
   now passes `--ignore-submodules=none`.
 
+- Review round 3 surfaced `DRIFT-GUARD-COVERAGE`: inverting both stale-head guards to
+  equality survived every grep fixture (named mutation `MUT-DRIFT-GUARD-INVERTED`, confirmed
+  live before fixing). `test-frontier-workflow.sh` now pins the guard polarity and
+  **executes** the extracted drift block against fixture repositories — seven behavioral
+  verdicts including the rename, gitlink, and failed-producer attacks. The workflow itself
+  needed no change in this round.
+
 ## Measured vs assumed
 
 Measured: the ff0490a/cab3d042 byte-identity; the 14:22/14:28/14:45 timeline and the 401 body
