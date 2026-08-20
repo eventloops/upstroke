@@ -1969,6 +1969,16 @@ mod tests {
         script: &'static str,
         stdin: &'static str,
         timeout: Duration,
+        /// The shortest this child can possibly have taken, as a fact about the
+        /// child rather than about the machine that runs it: a sleeper cannot
+        /// finish before it has slept, and a child killed for exceeding its
+        /// timeout ran at least that long. `None` where the fixture finishes as
+        /// fast as the machine can run it and no floor is stateable.
+        ///
+        /// This is the lower half of the duration pin. The upper half is wall
+        /// clock the test measures around each call, and neither is the
+        /// runner's own arithmetic.
+        floor: Option<Duration>,
     }
 
     fn parity_fixtures() -> Vec<ParityFixture> {
@@ -1978,12 +1988,14 @@ mod tests {
                 script: "echo hello",
                 stdin: "",
                 timeout: Duration::from_secs(30),
+                floor: None,
             },
             ParityFixture {
                 name: "non-zero exit",
                 script: "exit 7",
                 stdin: "",
                 timeout: Duration::from_secs(30),
+                floor: None,
             },
             ParityFixture {
                 name: "stderr",
@@ -1991,6 +2003,7 @@ mod tests {
                 script: "echo problem 1>&2",
                 stdin: "",
                 timeout: Duration::from_secs(30),
+                floor: None,
             },
             ParityFixture {
                 // The regression test for `build_command`'s `cmd.exe` rule:
@@ -2002,6 +2015,7 @@ mod tests {
                 script: "echo \"quoted arg\"",
                 stdin: "",
                 timeout: Duration::from_secs(30),
+                floor: None,
             },
             ParityFixture {
                 name: "stdin is delivered",
@@ -2012,6 +2026,31 @@ mod tests {
                 },
                 stdin: "payload-from-the-spec\n",
                 timeout: Duration::from_secs(30),
+                floor: None,
+            },
+            ParityFixture {
+                // The fixture that pins duration **from below** without naming
+                // the timeout. Every other fixture finishes as fast as the
+                // machine can run it, so a duration reported too *large* is
+                // caught by the elapsed bound while one reported too *small* is
+                // caught by nothing: `> 0` admits a nanosecond.
+                //
+                // A sleeping child gives the test a floor it can state in
+                // advance and that holds on any machine — a loaded one only
+                // makes the interval wider, never narrower. One second nominal,
+                // asserted at half, because `ping -n 2` is "two pings a second
+                // apart" rather than a sleep of exactly a second.
+                name: "a sleeping child is measured, not the timeout",
+                script: if cfg!(windows) {
+                    // `cmd` has no `sleep`; this is the shape the timeout
+                    // fixture below already relies on.
+                    "ping -n 2 127.0.0.1 > NUL"
+                } else {
+                    "sleep 1"
+                },
+                stdin: "",
+                timeout: Duration::from_secs(30),
+                floor: Some(Duration::from_millis(500)),
             },
             ParityFixture {
                 name: "timeout kills the tree",
@@ -2022,6 +2061,11 @@ mod tests {
                 },
                 stdin: "",
                 timeout: Duration::from_millis(400),
+                // The timeout, written again rather than read from the field
+                // beside it: a child killed for exceeding its timeout ran at
+                // least that long, and the two values are the same number for
+                // that reason rather than by construction.
+                floor: Some(Duration::from_millis(400)),
             },
         ]
     }
@@ -2039,8 +2083,15 @@ mod tests {
         for fixture in parity_fixtures() {
             let mut direct = shell.command(fixture.script);
             direct.current_dir(&workspace);
+            // Wall clock around the call, measured by the test. It is an upper
+            // bound on any honest `duration` *by construction*: the funnel
+            // starts its own clock after this instant and stops it before the
+            // drain, so `duration <= elapsed` holds however slow or loaded the
+            // machine is. See the duration assertions below.
+            let direct_started = std::time::Instant::now();
             let expected = proc::run_with_timeout(direct, fixture.stdin, fixture.timeout)
                 .unwrap_or_else(|error| panic!("{}: direct supervision: {error}", fixture.name));
+            let direct_elapsed = direct_started.elapsed();
 
             let template = shell.command(fixture.script);
             let command = CommandSpec {
@@ -2060,23 +2111,22 @@ mod tests {
                 agent: None,
                 invocation: gate_invocation(),
             };
+            let started = std::time::Instant::now();
             let actual = runner
                 .run(&request)
                 .unwrap_or_else(|error| panic!("{}: runner supervision: {error}", fixture.name));
+            let elapsed = started.elapsed();
 
             assert_eq!(actual.code, expected.code, "{}: exit code", fixture.name);
-            assert_eq!(
-                actual.stdout.replace("\r\n", "\n"),
-                expected.stdout.replace("\r\n", "\n"),
-                "{}: stdout",
-                fixture.name
-            );
-            assert_eq!(
-                actual.stderr.replace("\r\n", "\n"),
-                expected.stderr.replace("\r\n", "\n"),
-                "{}: stderr",
-                fixture.name
-            );
+            // Byte for byte, including the line endings. Both sides run the
+            // same script through the same recorded shell on the same machine,
+            // so there is nothing legitimate for a normalization to absorb —
+            // and normalizing *both* sides is how a runner that rewrote CRLF to
+            // LF would have gone unnoticed on the only platform that produces
+            // CRLF at all. `invariants_preserved[0]` says output capture is
+            // unchanged, and rewriting it is a change.
+            assert_eq!(actual.stdout, expected.stdout, "{}: stdout", fixture.name);
+            assert_eq!(actual.stderr, expected.stderr, "{}: stderr", fixture.name);
             assert_eq!(
                 actual.timed_out, expected.timed_out,
                 "{}: timed_out",
@@ -2089,31 +2139,48 @@ mod tests {
             );
             // Duration is part of the record an attempt keeps
             // (`Outcome.duration`), so "supervision unchanged" includes
-            // measuring the child rather than reporting zero. Compared as a
-            // property rather than for equality: two runs of one script take
-            // two times, and asserting they match would be asserting the
-            // machine is idle.
-            assert!(
-                actual.duration > Duration::ZERO,
-                "{}: the runner reported a zero duration",
-                fixture.name
-            );
-            assert!(
-                expected.duration > Duration::ZERO,
-                "{}: direct supervision reported a zero duration",
-                fixture.name
-            );
-            if fixture.timeout < Duration::from_secs(1) {
-                // The one fixture whose duration has a floor the test can
-                // state: a child killed for exceeding its timeout ran at least
-                // that long.
+            // measuring **this child** rather than reporting some other true
+            // fact. Not compared to the other supervisor's duration for
+            // equality: two runs of one script take two times, and asserting
+            // they match would be asserting the machine is idle.
+            //
+            // Pinned from both sides instead, against two oracles that are not
+            // the runner's own arithmetic:
+            //
+            // * above, wall clock the *test* measured around the call — an
+            //   upper bound by construction; and
+            // * `fixture.floor`, the child's own behaviour, where the fixture
+            //   has one to state.
+            //
+            // Positivity alone is what let `.map(|mut output| { output.duration
+            // = request.timeout; output })` survive a whole review round
+            // (`PR4-CONF-013`): every ordinary fixture has a 30s timeout and
+            // reports `> 0` under it, and the timeout fixture reports exactly
+            // its timeout, which its own floor admits. The elapsed bound is
+            // what that mutation cannot satisfy — a child that echoes and exits
+            // has not taken thirty seconds.
+            for (what, measured, bound) in [
+                ("the runner", actual.duration, elapsed),
+                ("direct supervision", expected.duration, direct_elapsed),
+            ] {
                 assert!(
-                    actual.duration >= fixture.timeout,
-                    "{}: timed out after {:?}, which is less than the timeout {:?}",
-                    fixture.name,
-                    actual.duration,
-                    fixture.timeout
+                    measured > Duration::ZERO,
+                    "{}: {what} reported a zero duration",
+                    fixture.name
                 );
+                assert!(
+                    measured <= bound,
+                    "{}: {what} reported {measured:?} for a call this test measured at {bound:?}",
+                    fixture.name
+                );
+                if let Some(floor) = fixture.floor {
+                    assert!(
+                        measured >= floor,
+                        "{}: {what} reported {measured:?}, less than the {floor:?} this child \
+                         cannot have finished sooner than",
+                        fixture.name
+                    );
+                }
             }
 
             codes.insert(expected.code);
@@ -2131,6 +2198,17 @@ mod tests {
         assert!(stdouts.len() >= 3, "distinct stdout values: {stdouts:?}");
         assert!(stderr_nonempty >= 1, "no fixture wrote to stderr");
         assert_eq!(timed_out.len(), 2, "both timeout outcomes are exercised");
+        // And the duration pin is counted rather than hoped for: two fixtures
+        // state a floor, one from a sleep and one from a timeout kill. A grid
+        // that lost them would still assert `> 0` on every row and read green.
+        assert_eq!(
+            parity_fixtures()
+                .iter()
+                .filter(|fixture| fixture.floor.is_some())
+                .count(),
+            2,
+            "the fixtures that pin duration from below"
+        );
     }
 
     /// The bounded capture allowance is the same one on both public funnel

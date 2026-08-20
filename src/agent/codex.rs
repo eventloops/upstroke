@@ -1590,9 +1590,13 @@ mod tests {
 {"type":"item.completed","item":{"id":"item_0","type":"command_execution"}}
 {"type":"item.completed","item":{"id":"item_1","type":"agent_message","text":"hi"}}
 {"type":"turn.completed","usage":{"input_tokens":27707,"cached_input_tokens":22016,"cache_write_input_tokens":0,"output_tokens":102,"reasoning_output_tokens":0}}"#;
-        let outcome = parse_output(&output(0, stdout, "some tracing noise"));
+        let out = output(0, stdout, "some tracing noise");
+        let outcome = parse_output(&out);
 
         assert_eq!(outcome.status, OutcomeStatus::Completed);
+        // What the supervisor measured, carried through unchanged: see the
+        // same assertion in the Claude adapter for why it is asserted at all.
+        assert_eq!(outcome.duration, out.duration);
         assert_eq!(
             outcome.session_id.as_deref(),
             Some("019ff122-4d61-7323-a217-843ddfe5932c"),

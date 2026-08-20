@@ -560,25 +560,100 @@ mod tests {
 mod built_program_tests {
     use super::*;
     use crate::ir::{Effort, PermissionMode, WorkerProfile};
+    use std::sync::{Mutex, PoisonError};
 
-    /// A built command names a program **this machine resolved**, never a
-    /// literal path an adapter carries.
+    /// A boundary that has every agent CLI, at a path no coordinator host has.
     ///
-    /// DESIGN.md:117 — an adapter "does not decide where the process runs" —
-    /// and DESIGN.md:612 — "the runner decides where it executes; adapters
-    /// never learn about containers". An adapter is still what knows *which
-    /// program* to run, and it answers by resolving the CLI on `PATH`; what it
-    /// may not do is invent one. Nothing else in the suite executes a
-    /// **built-in** adapter's `build` output at all — the parity helper
-    /// supplies its own shell spec — so an adapter that returned a hard-coded
-    /// program would have left every test green.
+    /// **This is the test's oracle, and it is deliberately not this machine's
+    /// filesystem.** The property being measured — *which* environment an
+    /// adapter's program was resolved against — cannot be measured with a
+    /// predicate over the same filesystem production consults: `is_file()` is
+    /// true of a host-resolved path whether the resolution was right or wrong,
+    /// so the oracle blesses either answer (`PR4-CONF-012`). A boundary the
+    /// test invents has an installation the test knows about and the host does
+    /// not, so "the boundary decided" and "the coordinator host decided" become
+    /// different observations.
     ///
-    /// On a machine where a CLI is absent, `build` refuses instead, and the
-    /// refusal is asserted too: that is the branch a machine without the CLI
-    /// takes, and a test that silently skipped there would be measuring
-    /// nothing while looking green.
+    /// It refuses any program that is not the one it has, the way a real
+    /// boundary would, and records every request so a boundary that was
+    /// **never asked** is distinguishable from one that answered.
+    struct Boundary {
+        /// The only agent CLI inside this boundary.
+        installed: String,
+        seen: Mutex<Vec<CommandSpec>>,
+    }
+
+    impl Boundary {
+        fn holding(installed: &str) -> Self {
+            Self {
+                installed: installed.to_owned(),
+                seen: Mutex::new(Vec::new()),
+            }
+        }
+
+        fn seen(&self) -> Vec<CommandSpec> {
+            self.seen
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .clone()
+        }
+    }
+
+    impl Runner for Boundary {
+        fn run(&self, request: &RunnerRequest) -> Result<ProcessOutput, TactusError> {
+            self.seen
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .push(request.command.clone());
+            if request.command.program == self.installed {
+                return Ok(ProcessOutput {
+                    code: Some(0),
+                    stdout: "9.9.9\n".to_owned(),
+                    stderr: String::new(),
+                    duration: Duration::from_millis(1),
+                    timed_out: false,
+                    output_limited: false,
+                });
+            }
+            Err(TactusError::Agent {
+                message: format!(
+                    "`{}` is not present inside this boundary; the agent CLI here is `{}`",
+                    request.command.program, self.installed
+                ),
+            })
+        }
+    }
+
+    /// An adapter's program is resolved on the **coordinator host**, and the
+    /// boundary that will execute it never supplies one.
+    ///
+    /// This pins PR4's actual behaviour rather than the behaviour PR6 needs,
+    /// and it is deliberate: `PR4-ADAPTER-RESOLVES-ON-THE-HOST` in
+    /// `reviews/FINDINGS.md` records why (one runner, whose boundary *is* the
+    /// host, so nothing the packet says PR4 must satisfy is unsatisfied), who
+    /// owns the change, and what breaks when a second boundary exists. **When
+    /// PR6 moves resolution behind the Runner this test fails, and that failure
+    /// is the signal to close that entry — not a regression to route around.**
+    ///
+    /// Three claims, none of which asks this machine's filesystem which answer
+    /// was right:
+    ///
+    /// 1. the boundary's own installation never reaches a spec, and the
+    ///    boundary is never asked what it has;
+    /// 2. what pre-flight sends and what the attempt would send are **one**
+    ///    program — DESIGN.md:612's "pre-flight [must not] certify a host
+    ///    CLI/version different from the one the attempt executes", in the only
+    ///    form PR4 can hold it; and
+    /// 3. where the coordinator host cannot resolve the CLI, the refusal
+    ///    happens with the boundary **unasked** although the boundary has it.
+    ///
+    /// Which branch a machine takes is a property of the machine, so both are
+    /// asserted and both are counted; a silent skip would measure nothing while
+    /// looking green. Between the two platforms this slice is measured on, both
+    /// branches run: this box has `claude` and `codex` and no `copilot`, and
+    /// the Windows guest has none of the three.
     #[test]
-    fn a_built_command_names_a_program_this_machine_resolved() {
+    fn an_adapters_program_is_the_coordinator_hosts_and_the_boundary_supplies_none() {
         let profile = |agent: &str| WorkerProfile {
             name: "impl-mid".to_owned(),
             agent: agent.to_owned(),
@@ -609,13 +684,55 @@ mod built_program_tests {
                 "codex" => "codex",
                 other => panic!("an adapter shipped without a name in this table: {other}"),
             };
-            match adapter.build(&run) {
+            let inside = if cfg!(windows) {
+                format!(r"C:\tactus-inside-the-boundary\{expected_stem}.cmd")
+            } else {
+                format!("/tactus-inside-the-boundary/{expected_stem}")
+            };
+            assert!(
+                !std::path::Path::new(&inside).exists(),
+                "the boundary's installation exists on this machine, so it witnesses nothing: \
+                 {inside}"
+            );
+
+            // `build` **first**, and that ordering is load-bearing rather than
+            // stylistic. Each adapter caches its resolution in a process-wide
+            // `OnceLock`, and `codex::locate` tests each PATH candidate *through
+            // the runner it was handed* — so a probe reaching an unfilled cache
+            // would write this fixture's answer into it and change what every
+            // sibling test in the binary resolves. `build` takes no runner, so
+            // the cell is filled from the coordinator host before any boundary
+            // is offered the chance. (The class is the one `4631a3f` repaired:
+            // a test that is not immune to its own siblings.)
+            let built = adapter.build(&run);
+            let boundary = Boundary::holding(&inside);
+            let probed = adapter.probe(&boundary);
+            let seen = boundary.seen();
+            let probe_error = probed
+                .err()
+                .map(|error| error.to_string())
+                .unwrap_or_else(|| {
+                    panic!(
+                        "{}: a boundary that does not have this CLI certified it anyway",
+                        adapter.id()
+                    )
+                });
+            assert!(
+                seen.iter().all(|spec| spec.program != inside),
+                "{}: the boundary's own installation reached a spec — resolution has moved, and \
+                 `PR4-ADAPTER-RESOLVES-ON-THE-HOST` is what to close",
+                adapter.id()
+            );
+
+            match built {
                 Ok(spec) => {
                     let program = std::path::Path::new(&spec.program);
+                    // Machine-specific, which is the whole of the debt: an
+                    // absolute path chosen here is a path only this machine is
+                    // known to have.
                     assert!(
-                        program.is_file(),
-                        "{}: built `{}`, which is not a file on this machine — an adapter's \
-                         program is a path it resolved, not one it carries",
+                        program.is_absolute(),
+                        "{}: built `{}`, which names no location at all",
                         adapter.id(),
                         spec.program
                     );
@@ -630,6 +747,33 @@ mod built_program_tests {
                         adapter.id(),
                         spec.program
                     );
+                    // Supplementary, and it is *not* the oracle: this machine
+                    // having the file says nothing about which environment
+                    // chose it. It is kept because an adapter that carried a
+                    // literal path would still have to get past it.
+                    assert!(
+                        program.is_file(),
+                        "{}: built `{}`, which is not a file on this machine — an adapter's \
+                         program is a path it resolved, not one it carries",
+                        adapter.id(),
+                        spec.program
+                    );
+                    assert!(
+                        !seen.is_empty(),
+                        "{}: the boundary was never asked to execute anything, although the \
+                         coordinator host resolved this CLI",
+                        adapter.id()
+                    );
+                    for asked in &seen {
+                        assert_eq!(
+                            asked.program,
+                            spec.program,
+                            "{}: pre-flight certified `{}` while the attempt would run `{}`",
+                            adapter.id(),
+                            asked.program,
+                            spec.program
+                        );
+                    }
                     resolved += 1;
                 }
                 Err(error) => {
@@ -637,6 +781,20 @@ mod built_program_tests {
                     assert!(
                         message.contains(expected_stem),
                         "{}: a build that cannot resolve its CLI must name it: {message}",
+                        adapter.id()
+                    );
+                    // The failure sequence, witnessed: this boundary **has**
+                    // the agent, and pre-flight refused without ever asking it.
+                    assert!(
+                        seen.is_empty(),
+                        "{}: the boundary was asked {} time(s) although the coordinator host \
+                         could not resolve this CLI",
+                        adapter.id(),
+                        seen.len()
+                    );
+                    assert!(
+                        probe_error.contains(expected_stem),
+                        "{}: a probe that cannot resolve its CLI must name it: {probe_error}",
                         adapter.id()
                     );
                     refused += 1;

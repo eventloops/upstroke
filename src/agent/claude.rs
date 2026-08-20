@@ -806,8 +806,15 @@ mod tests {
             "result":"done","session_id":"abc-123","total_cost_usd":0.42,
             "num_turns":6,"usage":{"input_tokens":1200,"output_tokens":300,
             "cache_read_input_tokens":9000}}"#;
-        let outcome = parse_output(&output(Some(0), stdout, ""));
+        let out = output(Some(0), stdout, "");
+        let outcome = parse_output(&out);
         assert_eq!(outcome.status, OutcomeStatus::Completed);
+        // What the supervisor measured, carried through unchanged. Nothing
+        // downstream re-derives it — the engine copies `Outcome.duration` into
+        // the attempt record and the report sums those — so an adapter that
+        // dropped it would report every attempt as instantaneous with the whole
+        // suite green (`invariants_preserved[0]`, "adapter parsing unchanged").
+        assert_eq!(outcome.duration, out.duration);
         assert_eq!(outcome.session_id.as_deref(), Some("abc-123"));
         assert_eq!(outcome.cost_usd, Some(0.42));
         let usage = outcome.usage.expect("usage");

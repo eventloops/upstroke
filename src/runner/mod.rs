@@ -53,7 +53,15 @@ pub use invocation::InvocationId;
 /// and (PR6) by the container runner without an adapter ever learning which.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct CommandSpec {
-    /// The program, resolved by the runner against the environment it composes.
+    /// The program to execute, as the **adapter** resolved it.
+    ///
+    /// Today that resolution happens on the coordinator host: an adapter's
+    /// `build` and `probe` locate their CLI on this machine's `PATH` and put
+    /// the absolute path here. For PR4 the machine that resolved it is also the
+    /// boundary that executes it, because the host runner is the only one. A
+    /// boundary with a filesystem of its own ends that, and the program has to
+    /// stop being a coordinator-host path — `PR4-ADAPTER-RESOLVES-ON-THE-HOST`
+    /// in `reviews/FINDINGS.md` says what breaks and owns it to PR6.
     pub program: String,
     pub args: Vec<String>,
     /// **An overlay**, not the environment. DESIGN.md:258: "`CommandSpec.env`

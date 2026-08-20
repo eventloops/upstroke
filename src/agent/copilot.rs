@@ -776,10 +776,14 @@ mod tests {
         // The reviewer's verdict travels in exactly this field on the SUCCESS
         // path — leaving it empty makes every review unparseable (step-6 #1).
         let verdict = "```json\n{\"pass\": true, \"reasons\": [\"ok\"]}\n```";
-        let outcome = parse_output(&output(Some(0), &format!("  {verdict}  \n"), ""));
+        let out = output(Some(0), &format!("  {verdict}  \n"), "");
+        let outcome = parse_output(&out);
         assert_eq!(outcome.status, OutcomeStatus::Completed);
         assert_eq!(outcome.detail.as_deref(), Some(verdict));
         assert!(outcome.diff.is_empty(), "diff is engine-owned");
+        // What the supervisor measured, carried through unchanged: see the
+        // same assertion in the Claude adapter for why it is asserted at all.
+        assert_eq!(outcome.duration, out.duration);
     }
 
     #[test]
