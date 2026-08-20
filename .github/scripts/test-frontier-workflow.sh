@@ -92,4 +92,23 @@ if [[ -z "$publish_line" || -z "$race_invalidation_line" ||
   exit 1
 fi
 
+# Exempt-path drift must be enforced in BOTH the validate and attest jobs, on
+# the trusted side, and the drifted attestation must name the reviewed SHA.
+if [[ "$(grep -cF 'git merge-base --is-ancestor "$REVIEWED_SHA" "$head_sha"' "$workflow")" -ne 2 ]]; then
+  echo "exempt-path drift must be ancestor-checked in both validate and attest" >&2
+  exit 1
+fi
+if [[ "$(grep -cF '!= "reviews/FINDINGS.md"' "$workflow")" -ne 2 ]]; then
+  echo "the exempt path set must be enforced in both validate and attest" >&2
+  exit 1
+fi
+if ! grep -Fq 'expected_external_id+=":reviewed:$REVIEWED_SHA"' "$workflow"; then
+  echo "a drifted attestation must record the reviewed SHA in the external id" >&2
+  exit 1
+fi
+if ! grep -Fq '"$ATTESTED_SHA" "$REVIEWED_SHA" "$PR_NUMBER" "$REVIEW_URL" "$EVIDENCE_DIGEST")"' "$workflow"; then
+  echo "the check payload must be built from both the attested and reviewed SHAs" >&2
+  exit 1
+fi
+
 echo "frontier workflow trust fixtures: PASS"

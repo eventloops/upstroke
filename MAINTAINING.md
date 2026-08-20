@@ -24,12 +24,19 @@ contract itself.
    the review CLI's streaming output. A timeout, transport failure, or missing verdict never passes.
 6. Fix every finding. Any code push creates a new head SHA, so return to step 3 and review the new
    head. Feature ideas discovered during review belong in the design or a follow-up unless they are
-   required for the current change to be correct.
+   required for the current change to be correct. One exception, decided in
+   `decisions/2026-08-20-review-invalidation-scope.md`: a push whose entire diff from the reviewed
+   head lies inside the exempt path set (exactly `reviews/FINDINGS.md`) does not invalidate the
+   review — re-send the step 7 dispatch with the original reviewed SHA, and the trusted workflow
+   itself verifies ancestry and the exempt-only diff before attesting the current head, recording
+   both SHAs on the published check. Everything else invalidates, deliberately.
 7. Once a review passes, post a dedicated evidence comment containing exactly
    `TACTUS_FRONTIER_REVIEW: 1`, `VERDICT: PASS`, and `REVIEWED_SHA: <full SHA>` on separate lines,
    with no other text. Send the `frontier-review` repository dispatch with the PR number, full
-   reviewed head SHA, and evidence URL. The default-branch workflow refuses stale, ambiguous, or
-   behind evidence, runs the default branch's canonical PR-body validator over the live title/body,
+   reviewed head SHA, and evidence URL. The default-branch workflow refuses ambiguous or behind
+   evidence — and stale evidence, unless the reviewed SHA is an ancestor of the current head with
+   an exempt-only diff (step 6) — runs the default branch's canonical PR-body validator over the
+   live title/body,
    validates the evidence comment, reruns formatting, Clippy, and
    all three platform test jobs from its trusted default-branch definition, then uses the dedicated
    `Tactus Frontier Review Gate` GitHub App to publish a successful `tactus-frontier-review` check

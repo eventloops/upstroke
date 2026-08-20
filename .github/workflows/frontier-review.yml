@@ -26,6 +26,7 @@ jobs:
     outputs:
       head_repository: ${{ steps.validate.outputs.head_repository }}
       head_sha: ${{ steps.validate.outputs.head_sha }}
+      reviewed_sha: ${{ steps.validate.outputs.reviewed_sha }}
       review_url: ${{ steps.validate.outputs.review_url }}
       evidence_digest: ${{ steps.validate.outputs.evidence_digest }}
     env:
@@ -82,10 +83,11 @@ jobs:
             echo "pull request #$PR_NUMBER is not open" >&2
             exit 1
           fi
-          if [[ "$head_sha" != "$REVIEWED_SHA" ]]; then
-            echo "reviewed SHA $REVIEWED_SHA is not current head $head_sha" >&2
-            exit 1
-          fi
+          # A reviewed SHA that is no longer the current head is judged below,
+          # after this job has fetched the exact PR history itself: it may
+          # carry to the head only when it is an ancestor and every changed
+          # path is exempt (exactly reviews/FINDINGS.md).
+          # decisions/2026-08-20-review-invalidation-scope.md
           if [[ "$base_ref" != "$default_branch" ]]; then
             echo "pull request targets $base_ref, not default branch $default_branch" >&2
             exit 1
@@ -118,6 +120,28 @@ jobs:
             echo "fetched pull-request ref does not match the API head" >&2
             exit 1
           fi
+          if [[ "$head_sha" != "$REVIEWED_SHA" ]]; then
+            # Exempt-path re-attestation: a review of an earlier head carries
+            # to this one only when the reviewed SHA is an ancestor and the
+            # entire diff lies inside the exempt set. Computed here from refs
+            # this trusted job fetched itself, never asserted by the requester.
+            # decisions/2026-08-20-review-invalidation-scope.md
+            if ! git cat-file -e "$REVIEWED_SHA^{commit}" 2>/dev/null; then
+              echo "reviewed SHA $REVIEWED_SHA is not in the fetched pull-request history" >&2
+              exit 1
+            fi
+            if ! git merge-base --is-ancestor "$REVIEWED_SHA" "$head_sha"; then
+              echo "reviewed SHA $REVIEWED_SHA is not an ancestor of head $head_sha" >&2
+              exit 1
+            fi
+            while IFS= read -r drift_path; do
+              [[ -z "$drift_path" ]] && continue
+              if [[ "$drift_path" != "reviews/FINDINGS.md" ]]; then
+                echo "path '$drift_path' changed since the review and is outside the exempt set; a fresh review of $head_sha is required" >&2
+                exit 1
+              fi
+            done < <(git diff --name-only "$REVIEWED_SHA..$head_sha")
+          fi
           printf '%s\n' "$pr_body" | bash .github/scripts/validate-pr-ledger-evidence.sh "$head_sha"
 
           review_comment="$(gh api "repos/$GITHUB_REPOSITORY/issues/comments/$review_comment_id")"
@@ -139,6 +163,7 @@ jobs:
           {
             echo "head_repository=$head_repository"
             echo "head_sha=$head_sha"
+            echo "reviewed_sha=$REVIEWED_SHA"
             echo "review_url=$REVIEW_URL"
             echo "evidence_digest=$evidence_digest"
           } >> "$GITHUB_OUTPUT"
@@ -207,7 +232,8 @@ jobs:
       pull-requests: read
     env:
       PR_NUMBER: ${{ github.event.client_payload.pull_request }}
-      REVIEWED_SHA: ${{ needs.validate.outputs.head_sha }}
+      REVIEWED_SHA: ${{ needs.validate.outputs.reviewed_sha }}
+      ATTESTED_SHA: ${{ needs.validate.outputs.head_sha }}
       REVIEW_URL: ${{ needs.validate.outputs.review_url }}
       EVIDENCE_DIGEST: ${{ needs.validate.outputs.evidence_digest }}
     steps:
@@ -228,7 +254,8 @@ jobs:
           # The trusted test reruns can take 30 minutes. Refuse to sign an
           # obsolete review if the PR moved, closed, or fell behind meanwhile.
           # A push racing the final API call is still safe: the App check is
-          # attached to REVIEWED_SHA, not to an abstract pull request.
+          # attached to ATTESTED_SHA, the exact head being signed, not to an
+          # abstract pull request.
           repository="$(gh api "repos/$GITHUB_REPOSITORY")"
           repository_owner="$(jq -r '.owner.login' <<< "$repository")"
           default_branch="$(jq -r '.default_branch' <<< "$repository")"
@@ -239,7 +266,7 @@ jobs:
           pr_title="$(jq -r '.title' <<< "$pr")"
           pr_body="$(jq -r '.body // ""' <<< "$pr" | tr -d '\r')"
 
-          if [[ "$state" != "open" || "$head_sha" != "$REVIEWED_SHA" || "$base_ref" != "$default_branch" ]]; then
+          if [[ "$state" != "open" || "$head_sha" != "$ATTESTED_SHA" || "$base_ref" != "$default_branch" ]]; then
             echo "pull request no longer has the validated open head and base" >&2
             exit 1
           fi
@@ -265,6 +292,28 @@ jobs:
           if [[ "$(git rev-parse "$ledger_ref^{commit}")" != "$head_sha" ]]; then
             echo "fetched pull-request ref does not match the API head" >&2
             exit 1
+          fi
+          if [[ "$head_sha" != "$REVIEWED_SHA" ]]; then
+            # Exempt-path re-attestation: a review of an earlier head carries
+            # to this one only when the reviewed SHA is an ancestor and the
+            # entire diff lies inside the exempt set. Computed here from refs
+            # this trusted job fetched itself, never asserted by the requester.
+            # decisions/2026-08-20-review-invalidation-scope.md
+            if ! git cat-file -e "$REVIEWED_SHA^{commit}" 2>/dev/null; then
+              echo "reviewed SHA $REVIEWED_SHA is not in the fetched pull-request history" >&2
+              exit 1
+            fi
+            if ! git merge-base --is-ancestor "$REVIEWED_SHA" "$head_sha"; then
+              echo "reviewed SHA $REVIEWED_SHA is not an ancestor of head $head_sha" >&2
+              exit 1
+            fi
+            while IFS= read -r drift_path; do
+              [[ -z "$drift_path" ]] && continue
+              if [[ "$drift_path" != "reviews/FINDINGS.md" ]]; then
+                echo "path '$drift_path' changed since the review and is outside the exempt set; a fresh review of $head_sha is required" >&2
+                exit 1
+              fi
+            done < <(git diff --name-only "$REVIEWED_SHA..$head_sha")
           fi
           printf '%s\n' "$pr_body" | bash .github/scripts/validate-pr-ledger-evidence.sh "$head_sha"
 
@@ -318,7 +367,7 @@ jobs:
           fi
 
           check_payload="$(bash .github/scripts/frontier-check-payload.sh \
-            "$REVIEWED_SHA" "$PR_NUMBER" "$REVIEW_URL" "$EVIDENCE_DIGEST")"
+            "$ATTESTED_SHA" "$REVIEWED_SHA" "$PR_NUMBER" "$REVIEW_URL" "$EVIDENCE_DIGEST")"
           check_run="$(GH_TOKEN="$APP_TOKEN" gh api --method POST "repos/$GITHUB_REPOSITORY/check-runs" \
             -H 'Accept: application/vnd.github+json' \
             -H 'X-GitHub-Api-Version: 2026-03-10' \
@@ -330,10 +379,13 @@ jobs:
           actual_conclusion="$(jq -r '.conclusion' <<< "$check_run")"
           actual_app_id="$(jq -r '.app.id | tostring' <<< "$check_run")"
           actual_external_id="$(jq -r '.external_id' <<< "$check_run")"
-          expected_external_id="tactus-frontier-review:pr-$PR_NUMBER:$REVIEWED_SHA:$EVIDENCE_DIGEST"
+          expected_external_id="tactus-frontier-review:pr-$PR_NUMBER:$ATTESTED_SHA:$EVIDENCE_DIGEST"
+          if [[ "$ATTESTED_SHA" != "$REVIEWED_SHA" ]]; then
+            expected_external_id+=":reviewed:$REVIEWED_SHA"
+          fi
 
           if [[ "$actual_name" != "tactus-frontier-review" ||
-                "$actual_sha" != "$REVIEWED_SHA" ||
+                "$actual_sha" != "$ATTESTED_SHA" ||
                 "$actual_status" != "completed" ||
                 "$actual_conclusion" != "success" ||
                 "$actual_app_id" != "$EXPECTED_APP_ID" ||
@@ -357,11 +409,11 @@ jobs:
           latest_body="$(jq -r '.body // ""' <<< "$latest_pr" | tr -d '\r')"
           latest_metadata_digest="$(printf '%s\0%s' "$latest_title" "$latest_body" | sha256sum | awk '{print $1}')"
           if [[ "$latest_state" != "open" ||
-                "$latest_head" != "$REVIEWED_SHA" ||
+                "$latest_head" != "$ATTESTED_SHA" ||
                 "$latest_base" != "$DEFAULT_BRANCH" ||
                 "$latest_metadata_digest" != "$METADATA_DIGEST" ]]; then
             GH_TOKEN="$APP_TOKEN" bash .github/scripts/invalidate-frontier-check.sh \
-              "$REVIEWED_SHA" "$PR_NUMBER" "$EXPECTED_APP_ID"
+              "$ATTESTED_SHA" "$PR_NUMBER" "$EXPECTED_APP_ID"
             echo "pull-request identity or metadata changed while the App check was being published" >&2
             exit 1
           fi
