@@ -51,11 +51,13 @@ if ! tmux has-session -t "${PANE%%:*}" 2>/dev/null; then
   exit 1
 fi
 
-# The order matters: strip tmux's per-line padding, THEN join. Reversing these
-# leaves spaces between fragments and the match fails.
-match="$(tmux capture-pane -t "$PANE" -p -S "$SCROLL" \
+# -J joins lines that tmux WRAPPED and leaves hard newlines intact. The previous
+# form used `tr -d '\n'`, which deleted every newline, so a wrapped URL followed
+# by a real line ("Paste code:") was welded into one string and the regex
+# returned the corrupted result as the credential URL. Frontier review of PR #19,
+# finding 10.
+match="$(tmux capture-pane -t "$PANE" -p -J -S "$SCROLL" \
          | sed 's/[[:space:]]*$//' \
-         | tr -d '\n' \
          | grep -oE "$PATTERN" \
          | tail -1)"
 

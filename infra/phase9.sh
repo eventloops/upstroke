@@ -112,6 +112,7 @@ echo
 echo "=========================================================="
 fail=0
 for k in fmt clippy test msrv win-test; do [ "${RC[$k]:-0}" -ne 0 ] && fail=1; done
+[ "${syn:-0}" -ne 0 ] && fail=1   # a syntax failure must fail the gate runner, not just print
 [ $bash_fail -ne 0 ] && fail=1
 if [ $fail -eq 0 ]; then
   echo " PHASE 9: ALL GREEN"

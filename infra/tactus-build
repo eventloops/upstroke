@@ -77,10 +77,17 @@ for i in $(seq 1 "$SLOTS"); do
   lock="$LOCKDIR/slot$i.lock"
   mkdir -p "$d" 2>/dev/null || continue
   : > "$lock" 2>/dev/null || true
-  if flock -n "$lock" true 2>/dev/null; then
+  # Acquire on a FD and HOLD it. The previous form probed with
+  # `flock -n "$lock" true` (which releases on exit) and then re-acquired with a
+  # blocking `flock`, leaving a window where another worker could take the slot.
+  # The loser then blocked on slot1 forever instead of trying slots 2-8.
+  # A lock held on an fd is inherited across exec, so this is the same lock.
+  exec {slotfd}>"$lock" 2>/dev/null || continue
+  if flock -n "$slotfd"; then
     [ "${TACTUS_BUILD_QUIET:-}" = "1" ] || echo "tactus-build: slot$i  ($d)" >&2
-    exec flock "$lock" env CARGO_TARGET_DIR="$d" "$@"
+    exec env CARGO_TARGET_DIR="$d" "$@"
   fi
+  exec {slotfd}>&-   # not ours; release before trying the next slot
 done
 
 # Every slot busy. Queue on slot1 rather than inventing a new path, which would

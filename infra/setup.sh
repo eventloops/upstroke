@@ -218,9 +218,11 @@ phase_1c() {
   # difference between a hardened box and a bricked one.
   if ! tailscale status >/dev/null 2>&1; then
     fail "tailnet is NOT up. Enabling ufw now would lock you out. Run phase 1b."
+    return 1   # `|| warn` in main suppresses errexit here; fail alone does NOT stop us
   fi
   if ! ip link show tailscale0 >/dev/null 2>&1; then
     fail "tailscale0 interface does not exist. Refusing to enable ufw."
+    return 1   # see above: without this, "Refusing" is a lie and ufw is enabled
   fi
   ok "tailscale0 present, tailnet up"
 
@@ -233,7 +235,20 @@ phase_1c() {
   # DEADMAN SWITCH. If the rules below are wrong, the box becomes unreachable
   # and the only way back in is OVH Serial-over-LAN. This timer disables ufw
   # after 5 minutes unless we cancel it, turning a lockout into a wait.
-  sudo systemd-run --on-active=300 --unit=ufw-deadman /usr/sbin/ufw --force disable
+  # A stale ufw-deadman unit makes this fail. Without the guard the phase
+  # continued and enabled ufw with NO deadman, converting a recoverable
+  # 5-minute lockout into a permanent one needing OVH Serial-over-LAN.
+  sudo systemctl reset-failed ufw-deadman.service 2>/dev/null || true
+  sudo systemctl stop ufw-deadman.timer 2>/dev/null || true
+  if ! sudo systemd-run --on-active=300 --unit=ufw-deadman /usr/sbin/ufw --force disable; then
+    fail "could not arm the deadman -- refusing to touch ufw"
+    return 1
+  fi
+  # Prove it is actually armed rather than trusting the exit code.
+  if ! sudo systemctl is-active ufw-deadman.timer >/dev/null 2>&1; then
+    fail "ufw-deadman.timer is not active -- refusing to touch ufw"
+    return 1
+  fi
   warn "deadman armed: ufw auto-disables in 5 min unless cancelled"
 
   sudo ufw default deny incoming
@@ -278,7 +293,10 @@ phase_1c() {
   # "Missing privilege separation directory" -- a FALSE negative that looks like
   # a broken config. Create it first so the check tests what we think it tests.
   sudo mkdir -p /run/sshd
-  sudo sshd -t || fail "sshd config invalid -- NOT reloading, you would lose access"
+  if ! sudo sshd -t; then
+    fail "sshd config invalid -- NOT reloading, you would lose access"
+    return 1   # this used to fall through to `systemctl reload ssh` regardless
+  fi
   ok "sshd config validates"
   sudo systemctl reload ssh
   ok "password auth disabled: $(sudo sshd -T | grep -i '^passwordauthentication')"
@@ -331,9 +349,66 @@ phase_2() {
   sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq \
     build-essential pkg-config libssl-dev \
     git curl jq tmux mosh ripgrep unzip rsync bubblewrap \
-    ca-certificates gnupg
-  require_bins git curl jq tmux mosh rg rsync bwrap cc
+    ca-certificates gnupg netcat-openbsd
+
+  # gh is NOT in Ubuntu's repos; it comes from GitHub's. preflight [7/8] and
+  # review-pr.sh both shell out to it, and tactus-winguest's wait loop needs nc
+  # (above) -- without it the guest finishes while the script waits 100 minutes.
+  if ! have gh; then
+    curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg \
+      | sudo dd of=/usr/share/keyrings/githubcli-archive-keyring.gpg status=none
+    sudo chmod go+r /usr/share/keyrings/githubcli-archive-keyring.gpg
+    echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main" \
+      | sudo tee /etc/apt/sources.list.d/github-cli.list >/dev/null
+    sudo apt-get update -qq
+    sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq gh
+  fi
+  require_bins git curl jq tmux mosh rg rsync bwrap cc gh nc
   ok "jq $(jq --version), bubblewrap $(bwrap --version | awk '{print $2}')"
+}
+
+# =============================================================================
+# PHASE tools — put the ops tooling where every later phase expects it
+# =============================================================================
+#
+# Ordered BEFORE `preflight`, which hard-fails without ~/bin/tactus-preflight.
+# That circularity is why a "fresh rebuild" previously needed a human to copy
+# files in by hand. Everything here travels alongside setup.sh in infra/.
+#
+phase_tools() {
+  phase tools "Ops tooling into ~/bin"
+  local here f
+  here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+  mkdir -p "$HOME/bin"
+
+  for f in tactus-build tactus-preflight tactus-watch tactus-session \
+           tactus-claude tactus-grab tactus-winguest; do
+    if [ -f "$here/$f" ]; then
+      install -m 755 "$here/$f" "$HOME/bin/$f"
+    else
+      warn "$f not found next to setup.sh"
+    fi
+  done
+  ok "installed: $(ls "$HOME/bin" | tr '\n' ' ')"
+
+  # phase9.sh is invoked as ~/phase9.sh, not from ~/bin.
+  if [ -f "$here/phase9.sh" ]; then
+    install -m 755 "$here/phase9.sh" "$HOME/phase9.sh"
+    ok "installed ~/phase9.sh"
+  fi
+
+  # The orchestrator session must survive logout, which needs BOTH the user unit
+  # and lingering. Without lingering systemd kills the session at logout and the
+  # tmux orchestrator dies with it.
+  if [ -f "$here/tactus-session.service" ]; then
+    mkdir -p "$HOME/.config/systemd/user"
+    install -m 644 "$here/tactus-session.service" \
+      "$HOME/.config/systemd/user/tactus-session.service"
+    systemctl --user daemon-reload 2>/dev/null || true
+    sudo loginctl enable-linger "$USER" \
+      && ok "tactus-session unit installed, lingering enabled" \
+      || warn "lingering NOT enabled -- the orchestrator will die at logout"
+  fi
 }
 
 # =============================================================================
@@ -389,6 +464,30 @@ phase_4() {
 
   sudo npm install -g @anthropic-ai/claude-code
   sudo npm install -g "@openai/codex@${CODEX_VERSION}"
+
+  # codex sandboxes every filesystem command through bubblewrap, and Ubuntu 24.04
+  # ships kernel.apparmor_restrict_unprivileged_userns=1, which blocks the user
+  # namespace bwrap needs. Without this profile every codex FILE READ fails while
+  # text round-trips keep working -- the failure that had a reviewer returning
+  # confident empty results for seven hours (2026-08-17), and which preflight
+  # [4b/8] exists to catch. The profile grants userns to /usr/bin/bwrap ONLY; the
+  # system-wide sysctl stays at 1.
+  #
+  # This was documented in comments but never provisioned, so a rebuild recreated
+  # the denial it warned about. Frontier review of PR #19, finding 2.
+  local aa_src
+  aa_src="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/apparmor-bwrap"
+  if [ -f "$aa_src" ]; then
+    sudo install -m 644 "$aa_src" /etc/apparmor.d/bwrap
+    sudo systemctl reload apparmor || warn "apparmor reload failed -- codex file reads may fail"
+    if bwrap --ro-bind / / --unshare-net --dev /dev true 2>/dev/null; then
+      ok "bwrap userns profile installed and verified"
+    else
+      warn "bwrap still cannot create a user namespace -- codex file reads will fail"
+    fi
+  else
+    warn "apparmor-bwrap missing next to setup.sh -- codex file reads will fail on Ubuntu 24.04"
+  fi
 
   ok "claude $(claude --version)"
   local cv; cv="$(codex --version)"
@@ -459,18 +558,23 @@ phase_6() {
     sudo chmod 600 "$SWAPFILE"
     sudo mkswap "$SWAPFILE" >/dev/null
     sudo swapon "$SWAPFILE"
-    ensure_line_sudo "${SWAPFILE}	none	swap	sw	0	0" /etc/fstab
   fi
+  # Outside the branch deliberately: if the swapfile was activated imperatively
+  # and its fstab entry is missing or commented, the old code skipped this and
+  # the reboot silently lost 32 GiB of swap. ensure_line_sudo is idempotent.
+  ensure_line_sudo "${SWAPFILE}	none	swap	sw	0	0" /etc/fstab
   ok "swap total: $(free -h | awk '/Swap/{print $2}')"
 
   # Persistence is not optional here and is invisible until a reboot, so assert
   # it rather than assuming the fstab edits landed.
-  sudo grep -q "$RAMTARGET" /etc/fstab \
+  # grep -q "$X" matches a COMMENTED line too, so the old check certified
+  # persistence that a reboot would disprove. Require a live (uncommented) entry.
+  sudo grep -qE "^[[:space:]]*[^#[:space:]].*${RAMTARGET}[[:space:]]" /etc/fstab \
     && ok "tmpfs persisted in /etc/fstab" \
-    || fail "tmpfs NOT in /etc/fstab -- it will vanish on reboot"
-  sudo grep -q "$SWAPFILE" /etc/fstab \
+    || fail "tmpfs NOT live in /etc/fstab -- it will vanish on reboot"
+  sudo grep -qE "^[[:space:]]*${SWAPFILE}[[:space:]]" /etc/fstab \
     && ok "swapfile persisted in /etc/fstab" \
-    || fail "swapfile NOT in /etc/fstab -- swap drops to ~1 GiB on reboot"
+    || fail "swapfile NOT live in /etc/fstab -- swap drops to ~1 GiB on reboot"
   sudo findmnt --verify >/dev/null 2>&1 \
     && ok "fstab validates" \
     || warn "findmnt --verify reported issues -- inspect before rebooting"
@@ -703,7 +807,7 @@ phase_10() {
 # =============================================================================
 # main
 # =============================================================================
-readonly PHASES=(1a 1b 1c 2 3 4 5 preflight 6 7 8 10)
+readonly PHASES=(1a 1b 1c 2 tools 3 4 5 preflight 6 7 8 10)
 
 usage() {
   printf 'usage: %s [phase ...]\n\nphases: %s\n' "$0" "${PHASES[*]}"
@@ -716,6 +820,7 @@ usage() {
   printf '  5   claude/codex auth           (MANUAL)\n'
   printf '  preflight  token health check + 6-hourly cron + MOTD banner\n'
   printf '  6   sccache, tmpfs, swap\n'
+  printf '  tools  ops tooling into ~/bin (must precede preflight)\n'
   printf '  7   windows guest VM (Server 2025 on KVM)\n'
   printf '  8   antigravity CLI (gemini 3.1 pro reviewer)\n'
   printf '  10  docker\n'

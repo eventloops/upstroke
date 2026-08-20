@@ -30,7 +30,7 @@ set -uo pipefail
 # environment must be sourced explicitly. Cron is even more barren than ssh.
 [ -f "$HOME/.cargo/env" ]  && . "$HOME/.cargo/env"
 [ -f "$HOME/.tactus-env" ] && . "$HOME/.tactus-env"
-export PATH="$HOME/.cargo/bin:/usr/local/bin:/usr/bin:/bin:$PATH"
+export PATH="$HOME/.local/bin:$HOME/.cargo/bin:/usr/local/bin:/usr/bin:/bin:$PATH"
 
 readonly MARKER="PREFLIGHT_OK_7Q2X"
 readonly STATUS_FILE="$HOME/.tactus-preflight.status"
@@ -287,12 +287,28 @@ fi
 #     `agy models` lists what the credential can actually reach, so a tier
 #     that no longer offers 3.1 Pro fails here rather than in a review.
 # ---------------------------------------------------------------------------
-say "[6/8] agy: subscription still offers ${AGY_MODEL}"
+say "[6/8] agy: ${AGY_MODEL} is offered AND is what actually answers"
 models_out="$(timeout 90 agy models 2>&1)"
 if printf '%s' "$models_out" | grep -q "$AGY_MODEL"; then
-  ok "$AGY_MODEL is offered by this credential"
+  ok "$AGY_MODEL is listed by this credential"
 else
-  bad "$AGY_MODEL NOT offered — the panel's third seat would silently run Flash. Check the AI Pro subscription on this Google account"
+  bad "$AGY_MODEL NOT offered — check the AI Pro subscription on this Google account"
+fi
+# Listing is not attribution. A quota fallback serves Flash while the entry is
+# still listed, so ask the model what it is on the pinned handle. Measured on
+# 2026-08-20: the pro handle answers "Gemini 3.1 Pro" and a flash handle answers
+# "Gemini 3.7 Flash", so this assertion can fail rather than being decorative.
+attrib_dir="$(mktemp -d)"
+attrib_out="$(timeout "$CALL_TIMEOUT" agy --model="$AGY_MODEL" --mode=plan \
+  --add-dir="$attrib_dir" --output-format=json --print-timeout=120s \
+  --print="State only your exact model name and version. No other words." 2>&1)"
+rm -rf "$attrib_dir"
+if printf '%s' "$attrib_out" | grep -qiE '3\.1[[:space:]]*pro'; then
+  ok "the model that answered identifies as 3.1 Pro"
+elif printf '%s' "$attrib_out" | grep -qi 'flash'; then
+  bad "SILENT DOWNGRADE: asked for $AGY_MODEL, a Flash model answered. The panel's third seat is not the model it claims"
+else
+  bad "could not attribute the responding model: $(printf '%s' "$attrib_out" | sed -n 's/.*"response":"\([^"]*\)".*/\1/p' | head -1 | cut -c1-80)"
 fi
 rm -rf "$agy_dir"
 
