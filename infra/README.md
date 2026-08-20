@@ -33,6 +33,7 @@ most of a day.
    preflight  token health check + 6-hourly cron + MOTD banner
    6   sccache, tmpfs, swap
    7   windows guest VM      (Server 2025 on KVM, fully unattended)
+   8   antigravity CLI       (Gemini 3.1 Pro, the S9 panel's third seat)
    10  docker
    ```
 
@@ -63,6 +64,51 @@ after a push. phase9.sh has a `win-test` gate that ships HEAD (as a git bundle) 
 guest's clone and tests that exact sha (unpushed commits: covered;
 uncommitted changes: not). `TACTUS_NO_WINDOWS=1` skips the gate loudly;
 an unreachable guest fails it rather than skipping, on purpose.
+
+## Reviewer CLIs and the preflight
+
+Three reviewer CLIs run on this box: `claude` (Fable/Opus), `codex` (Sol), and
+`agy` (Antigravity CLI, Gemini 3.1 Pro). `tactus-preflight` proves all three
+live on a 6-hourly cron and is the only thing standing between a broken
+credential and a reviewer that agrees with everything.
+
+Each CLI has its own silent-failure mode, and each has a check aimed at it:
+
+| check | what it catches |
+|---|---|
+| `[2b/8]` | the env token and `~/.claude/.credentials.json` disagreeing — i.e. a half-finished rotation certifying an account nothing runs on |
+| `[4b/8]` | codex's bwrap sandbox failing to launch, which makes every FILE READ fail while text round-trips keep working |
+| `[5b/8]` | the same for `agy`, by a marker written to disk and never put in the prompt |
+| `[6/8]` | a lapsed Google AI Pro subscription silently serving Flash instead of 3.1 Pro |
+| `[8/8]` | `GH_TOKEN` gaining attestation rights it must never have |
+
+`agy` specifics worth knowing before debugging it, each learned by watching it
+fail on this box (2026-08-20):
+
+- It **exits 0 even when it produced nothing.** The exit code is worthless;
+  assert on the JSON `status` *and* a marker, the way `[3/8]` ignores codex's
+  exit code.
+- `--output-format=json` is **mandatory**: text mode **hangs** on a denied tool
+  permission (observed >10 min on a `cat`) where json returns a structured
+  error in ~12 s. A hang inside a 6-hourly preflight is a false green waiting
+  to happen.
+- `--add-dir` is **mandatory** or the agent searches `/workspace` and fails
+  "search directory /workspace does not exist", whatever the cwd is.
+- Headless mode auto-denies every command not in `permissions.allow`
+  (`~/.gemini/antigravity-cli/settings.json`). `realpath` and `python3` are
+  both required — the first because the agent resolves paths before reading
+  them, the second because reviewer prompts query the packet with `python3 -c`.
+- A path that does not exist is classified as **`invalid_args` — malformed
+  model output** rather than a tool failure, so it ends the turn instead of
+  being handed back for the model to recover from. The partial response
+  survives in the `response` field, and `--conversation=<id>` resumes the
+  conversation, so a driver should **resume rather than restart**.
+- `status` is **sticky across a resumed conversation**: a resumed turn that
+  succeeds still reports the *original* turn's `ERROR`. Judge success on the
+  response content, never on `status` alone.
+- Retry logic must detect an **unchanged failure signature** and stop. Resuming
+  into the same permission denial four times cost ~23 minutes and ~1.4M tokens
+  and learned nothing.
 
 ## Findings worth keeping
 

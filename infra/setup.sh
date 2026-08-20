@@ -584,6 +584,97 @@ phase_7() {
 }
 
 # =============================================================================
+# PHASE 8 — Antigravity CLI (the S9 panel's third reviewer)
+# =============================================================================
+#
+# Gemini 3.1 Pro as an independent reviewer alongside Sol (codex) and Fable
+# (claude). PR4's evidence for wanting a third: three SERIAL confirmations by
+# one model each returned CHANGES_REQUIRED and each found a different class the
+# previous passes had read straight past — including a production defect on the
+# third. A single model re-samples its own blind spot.
+#
+# Google shut Gemini CLI down on 2026-06-18. `agy` (Antigravity CLI) is the
+# successor and the only supported path for a Pro/Ultra subscription. It is a
+# flat Go binary; the official installer is user-local by default, which is why
+# this phase does NOT fight npm's unwritable /usr prefix the way phase 4 does.
+#
+# THE INVOCATION IS LOAD-BEARING. Four flags, each mandatory, each learned by
+# watching it fail on this box (2026-08-20):
+#   --output-format=json  text mode HANGS on a denied tool permission —
+#                         observed >10 min on a `cat` — while json returns a
+#                         structured ERROR in ~12 s. Never run this leg in text
+#                         mode; a hang in a 6-hourly preflight is a false green
+#                         waiting to happen.
+#   --add-dir=<dir>       without it the agent searches /workspace and fails
+#                         "search directory /workspace does not exist", even
+#                         with cwd correct.
+#   --mode=plan           read-only agent mode. Unlike codex this needs no
+#                         bwrap, so the AppArmor/userns hazard that blinded a
+#                         reviewer for seven hours on PR3 does not apply here.
+#   --model=<pinned>      a lapsed or quota-exhausted subscription does not
+#                         error, it silently serves Flash.
+#
+# `agy` EXITS 0 EVEN WHEN IT PRODUCED NOTHING. The exit code is worthless;
+# assert on the JSON status and on a marker, the way [3/8] ignores codex's.
+#
+# The tool permission model denies everything in headless mode unless allowed
+# in settings.json, so the read-only command set is written there explicitly.
+#
+phase_8() {
+  phase 8 "Antigravity CLI (Gemini 3.1 Pro reviewer)"
+  if ! have agy; then
+    curl -fsSL https://antigravity.google/cli/install.sh | bash
+  fi
+  export PATH="$HOME/.local/bin:$PATH"
+  ensure_line 'export PATH="$HOME/.local/bin:$PATH"' "$HOME/.profile"
+  have agy || fail "agy not on PATH after install"
+  ok "agy $(agy --version 2>&1 | head -1)"
+
+  # Read-only command allow-list. Headless mode cannot prompt, so anything not
+  # listed here is auto-denied — and in text mode that denial HANGS.
+  # `realpath` is not optional: the agent resolves paths before reading them.
+  # python3 is NOT optional: reviewer prompts query the 645 KB packet with
+  # `python3 -c` rather than cat it, so omitting it auto-denies the one tool
+  # the review depends on. Cost of getting this wrong, measured: five resumed
+  # turns, ~1.4M tokens, zero output — a denial in headless mode CANCELs the
+  # turn with an empty response. `realpath` is likewise required: the agent
+  # resolves a path before reading it.
+  local settings="$HOME/.gemini/antigravity-cli/settings.json"
+  mkdir -p "$(dirname "$settings")"
+  [ -f "$settings" ] || echo '{}' > "$settings"
+  python3 - "$settings" <<'PYEOF'
+import json, sys
+p = sys.argv[1]
+s = json.load(open(p))
+cmds = ["cat","ls","rg","git","find","head","sed","realpath","pwd","stat","wc",
+        "grep","awk","tail","cut","sort","uniq","nl","basename","dirname",
+        "readlink","file","tree","du","echo","test","which","diff",
+        "python3","jq","tr","xargs","comm","sha256sum"]
+s.setdefault("permissions", {})["allow"] = ["command(%s)" % c for c in cmds]
+s.setdefault("enableTelemetry", False)
+json.dump(s, open(p, "w"), indent=2)
+PYEOF
+  ok "read-only command allow-list written to $settings"
+
+  # OAuth only — there is no API-key path today (upstream issue #78). The
+  # browser half cannot be automated and must not be faked.
+  if [ ! -d "$HOME/.gemini/antigravity-cli" ] || ! agy models >/dev/null 2>&1; then
+    handback \
+      "Run:  agy" \
+      "" \
+      "Choose 'Login with Google' and authorise as the account holding the" \
+      "Google AI Pro subscription (Gemini 3.1 Pro is a paid-tier model; the" \
+      "free tier silently serves Flash instead). Then /quit." \
+      "" \
+      "Verify with: tactus-preflight   — checks [5/8], [5b/8] and [6/8]."
+    return 0
+  fi
+  agy models 2>/dev/null | grep -q 'gemini-3.1-pro-high' \
+    && ok "gemini-3.1-pro-high offered by this credential" \
+    || warn "gemini-3.1-pro-high NOT offered — check the AI Pro subscription"
+}
+
+# =============================================================================
 # PHASE 10 — Docker
 # =============================================================================
 phase_10() {
@@ -612,7 +703,7 @@ phase_10() {
 # =============================================================================
 # main
 # =============================================================================
-readonly PHASES=(1a 1b 1c 2 3 4 5 preflight 6 7 10)
+readonly PHASES=(1a 1b 1c 2 3 4 5 preflight 6 7 8 10)
 
 usage() {
   printf 'usage: %s [phase ...]\n\nphases: %s\n' "$0" "${PHASES[*]}"
@@ -626,6 +717,7 @@ usage() {
   printf '  preflight  token health check + 6-hourly cron + MOTD banner\n'
   printf '  6   sccache, tmpfs, swap\n'
   printf '  7   windows guest VM (Server 2025 on KVM)\n'
+  printf '  8   antigravity CLI (gemini 3.1 pro reviewer)\n'
   printf '  10  docker\n'
 }
 

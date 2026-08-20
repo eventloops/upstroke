@@ -56,7 +56,7 @@ say
 # ---------------------------------------------------------------------------
 # 1. Claude — token present at all (a precondition, NOT proof of anything)
 # ---------------------------------------------------------------------------
-say "[1/6] claude: token present"
+say "[1/8] claude: token present"
 if [ -n "${CLAUDE_CODE_OAUTH_TOKEN:-}" ]; then
   # Length and prefix only. The value is never printed, logged or transmitted.
   ok "CLAUDE_CODE_OAUTH_TOKEN set (${#CLAUDE_CODE_OAUTH_TOKEN} chars, ${CLAUDE_CODE_OAUTH_TOKEN:0:13}...)"
@@ -70,7 +70,7 @@ fi
 # ---------------------------------------------------------------------------
 # 2. Claude — LIVE round-trip. This is the check that counts.
 # ---------------------------------------------------------------------------
-say "[2/6] claude: live round-trip"
+say "[2/8] claude: live round-trip"
 claude_out="$(timeout "$CALL_TIMEOUT" claude -p "Reply with exactly: ${MARKER}" 2>&1)"
 claude_rc=$?
 if [ $claude_rc -eq 124 ]; then
@@ -82,9 +82,42 @@ else
 fi
 
 # ---------------------------------------------------------------------------
+# 2b. Claude — the WORKERS' auth path, which is not the one checked above.
+#
+# This box has two independent Claude credentials and they can diverge silently:
+#
+#   ~/.tactus-env  CLAUDE_CODE_OAUTH_TOKEN  -- static, cannot refresh itself.
+#                                              Sourced by this script, so [2/8]
+#                                              above exercises THIS path.
+#   ~/.claude/.credentials.json               -- OAuth, auto-refreshing. Used by
+#                                              the orchestrator session and by
+#                                              EVERY `claude -p` worker, because
+#                                              workers run without the env var.
+#
+# So [2/8] can pass on a token no worker uses, and a half-completed rotation --
+# `/login` to a new account without rewriting ~/.tactus-env, or the reverse --
+# leaves this script certifying an account nothing runs on. That is the same
+# shape as [4b/8]: a check that exercised a path the real work did not, which
+# reported PASS for seven hours while every codex file read failed.
+#
+# Unsetting the variable for one call is what makes this the workers' path.
+# ---------------------------------------------------------------------------
+say "[2b/8] claude: workers' auth path (credentials file, env token unset)"
+worker_out="$(timeout "$CALL_TIMEOUT" env -u CLAUDE_CODE_OAUTH_TOKEN \
+  claude -p "Reply with exactly: ${MARKER}" 2>&1)"
+worker_rc=$?
+if [ $worker_rc -eq 124 ]; then
+  bad "claude -p on the workers' path timed out after ${CALL_TIMEOUT}s"
+elif printf '%s' "$worker_out" | grep -q "$MARKER"; then
+  ok "claude -p returned the marker without the env token -- workers can authenticate"
+else
+  bad "claude -p FAILED on the path every worker uses (rc=$worker_rc). [2/8] passing while this fails means ~/.claude/.credentials.json and ~/.tactus-env disagree: $(printf '%s' "$worker_out" | tail -2 | tr '\n' ' ')"
+fi
+
+# ---------------------------------------------------------------------------
 # 3. Codex — login status. Parse the TEXT; the exit code is worthless here.
 # ---------------------------------------------------------------------------
-say "[3/6] codex: login status"
+say "[3/8] codex: login status"
 codex_status="$(timeout 60 codex login status 2>&1)"
 # Deliberately ignoring $? — it is 0 even when logged out.
 if printf '%s' "$codex_status" | grep -qi "not logged in"; then
@@ -102,7 +135,7 @@ fi
 #    -s read-only + bubblewrap is the reviewer's containment; keep it here so
 #    the preflight exercises the same sandbox path as production.
 # ---------------------------------------------------------------------------
-say "[4/6] codex: live round-trip"
+say "[4/8] codex: live round-trip"
 tmp_dir="$(mktemp -d)"
 tmp_out="$(mktemp)"
 trap 'rm -rf "$tmp_dir" "$tmp_out"' EXIT
@@ -150,7 +183,7 @@ fi
 #     seven hours into a slice. Fixed by /etc/apparmor.d/bwrap granting userns
 #     to bwrap alone; this check is what proves the fix is still in place.
 # ---------------------------------------------------------------------------
-say "[4b/6] codex: live FILE READ (proves the bwrap sandbox launches)"
+say "[4b/8] codex: live FILE READ (proves the bwrap sandbox launches)"
 read_dir="$(mktemp -d)"
 read_out="$(mktemp)"
 printf '%s\n' "$MARKER" > "$read_dir/marker.txt"
@@ -184,6 +217,86 @@ fi
 rm -rf "$read_dir" "$read_out"
 
 # ---------------------------------------------------------------------------
+# 7. Antigravity CLI (agy) — LIVE round-trip on the S9 panel's third seat.
+#
+#    Google shut Gemini CLI down on 2026-06-18; agy is the successor and the
+#    only supported path for a Pro/Ultra subscription. Four flags are all
+#    mandatory, each learned by having it fail:
+#      --output-format=json  text mode HANGS on a denied tool permission
+#                            (observed: >10 min on a `cat`); json returns a
+#                            structured ERROR in ~12 s. Never use text here.
+#      --add-dir=<dir>       without it the agent searches /workspace and
+#                            fails "search directory /workspace does not exist"
+#                            even though cwd is correct.
+#      --mode=plan           read-only agent mode. Unlike codex this needs no
+#                            bwrap, so the AppArmor/userns hazard does not
+#                            apply to this leg.
+#      --model=...-pro-high  a subscription that lapses or exhausts quota
+#                            silently serves Flash. [7b/8] asserts the model.
+#
+#    NOTE: `agy` exits 0 even when it produced nothing. The exit code is
+#    worthless; assert on the JSON status and the marker, exactly as [3/8]
+#    ignores codex's exit code.
+# ---------------------------------------------------------------------------
+say "[5/8] agy: live round-trip (Gemini 3.1 Pro)"
+AGY_MODEL="gemini-3.1-pro-high"
+agy_dir="$(mktemp -d)"
+agy_out="$(timeout "$CALL_TIMEOUT" agy --model="$AGY_MODEL" --mode=plan \
+  --add-dir="$agy_dir" --output-format=json --print-timeout=120s \
+  --print="Reply with exactly: ${MARKER}" 2>&1)"
+agy_rc=$?
+if [ $agy_rc -eq 124 ]; then
+  bad "agy round-trip timed out after ${CALL_TIMEOUT}s"
+elif printf '%s' "$agy_out" | grep -q "\"status\":\"SUCCESS\"" \
+  && printf '%s' "$agy_out" | grep -q "$MARKER"; then
+  ok "agy returned the marker ($(printf '%s' "$agy_out" | sed -n 's/.*"duration_seconds":\([0-9]*\)\..*/\1/p')s)"
+else
+  bad "agy round-trip FAILED: $(printf '%s' "$agy_out" | sed -n 's/.*"error":"\([^"]*\)".*/\1/p' | head -1)$(printf '%s' "$agy_out" | tail -1 | cut -c1-160)"
+fi
+
+# ---------------------------------------------------------------------------
+# 7b. agy — LIVE FILE READ, marker NOT in the prompt.
+#
+#     Same reason as [4b/8]: a reviewer that cannot read files does not fail,
+#     it AGREES WITH EVERYTHING. That is the seven-hour PR3 failure, and a
+#     panel makes it worse — a blind third seat manufactures false consensus.
+#     The marker is written to disk and never appears in the prompt, so a
+#     model that cannot read cannot fake it.
+# ---------------------------------------------------------------------------
+say "[5b/8] agy: live FILE READ (marker on disk, not in the prompt)"
+agy_mark="AGYREAD-$(head -c 8 /dev/urandom | od -An -tx1 | tr -d ' \n')"
+printf '%s\n' "$agy_mark" > "$agy_dir/marker.txt"
+read_out="$(timeout "$CALL_TIMEOUT" agy --model="$AGY_MODEL" --mode=plan \
+  --add-dir="$agy_dir" --output-format=json --print-timeout=120s \
+  --print="Read the file marker.txt and reply with only its exact contents." 2>&1)"
+read_rc=$?
+if [ $read_rc -eq 124 ]; then
+  bad "agy file read timed out after ${CALL_TIMEOUT}s"
+elif printf '%s' "$read_out" | grep -q "$agy_mark"; then
+  ok "agy read a file it was never told the contents of"
+else
+  bad "agy CANNOT READ FILES — it would review blind and approve everything: $(printf '%s' "$read_out" | sed -n 's/.*"error":"\([^"]*\)".*/\1/p' | head -1)"
+fi
+
+# ---------------------------------------------------------------------------
+# 8. agy — the model that ANSWERED is the model that was ASKED.
+#
+#     A lapsed or quota-exhausted subscription does not error; it serves
+#     Flash. A Flash reviewer in a frontier panel is a false third opinion,
+#     which is worse than an absent one because it manufactures consensus.
+#     `agy models` lists what the credential can actually reach, so a tier
+#     that no longer offers 3.1 Pro fails here rather than in a review.
+# ---------------------------------------------------------------------------
+say "[6/8] agy: subscription still offers ${AGY_MODEL}"
+models_out="$(timeout 90 agy models 2>&1)"
+if printf '%s' "$models_out" | grep -q "$AGY_MODEL"; then
+  ok "$AGY_MODEL is offered by this credential"
+else
+  bad "$AGY_MODEL NOT offered — the panel's third seat would silently run Flash. Check the AI Pro subscription on this Google account"
+fi
+rm -rf "$agy_dir"
+
+# ---------------------------------------------------------------------------
 # 5. GitHub PAT — LIVE API round-trip.
 #
 #    The box pushes branches with a deploy key (git-only, no API) and opens PRs
@@ -198,7 +311,7 @@ rm -rf "$read_dir" "$read_out"
 #    succeeding, the token has been over-scoped and an agent could attest its own
 #    work onto master. See check 6.
 # ---------------------------------------------------------------------------
-say "[5/6] github: live API round-trip"
+say "[7/8] github: live API round-trip"
 if [ -z "${GH_TOKEN:-}" ]; then
   bad "GH_TOKEN is empty or unset in ~/.tactus-env"
 else
@@ -223,7 +336,7 @@ fi
 #    Contents:write, which would let the box attest its own reviews and land
 #    them on master unattended.
 # ---------------------------------------------------------------------------
-say "[6/6] github: token CANNOT attest (must be denied)"
+say "[8/8] github: token CANNOT attest (must be denied)"
 if [ -z "${GH_TOKEN:-}" ]; then
   say "  [skip] no GH_TOKEN"
 else
@@ -244,7 +357,7 @@ say
 if [ ${#FAILURES[@]} -eq 0 ]; then
   printf 'PASS %s\n' "$END_TS" > "$STATUS_FILE"
   printf '%s PASS\n' "$END_TS" >> "$LOG_FILE"
-  say "PASS — both CLIs completed a live round-trip."
+  say "PASS — all three reviewer CLIs completed a live round-trip."
   exit 0
 fi
 
