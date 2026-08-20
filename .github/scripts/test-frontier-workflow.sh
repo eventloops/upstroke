@@ -114,8 +114,8 @@ fi
 # Round-1 review findings, kept dead: a rename onto the exempt path must
 # surface its source (--no-renames), and a failed drift producer must fail
 # closed rather than read as an empty diff.
-if [[ "$(grep -cF 'git diff --name-only --no-renames "$REVIEWED_SHA..$head_sha"' "$workflow")" -ne 2 ]]; then
-  echo "drift must be computed with --no-renames in both validate and attest" >&2
+if [[ "$(grep -cF 'git diff --name-only --no-renames --ignore-submodules=none "$REVIEWED_SHA..$head_sha"' "$workflow")" -ne 2 ]]; then
+  echo "drift must be computed with --no-renames and --ignore-submodules=none in both validate and attest" >&2
   exit 1
 fi
 if grep -Fq 'done < <(git diff' "$workflow"; then

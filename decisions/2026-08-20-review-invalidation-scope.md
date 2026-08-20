@@ -51,14 +51,17 @@ the verdict. **An API failure is not a moved head.** Rules adopted in both drive
 For a dispatch whose `reviewed_sha` X differs from the current head Y, the trusted workflow:
 
 - requires `git merge-base --is-ancestor X Y` — rewritten history never inherits;
-- requires the drift `git diff --name-only --no-renames X..Y` to name no path outside the
+- requires the drift `git diff --name-only --no-renames --ignore-submodules=none X..Y` to name no path outside the
   exempt set, computed on the trusted side from refs it fetched itself. **Renames are never
   exempt**: `--no-renames` splits a rename into its endpoints, so renaming a non-exempt file
   onto the exempt path surfaces the source as a deletion and refuses — under rename
   detection, `--name-only` reports only the exempt destination (review finding
   `DRIFT-RENAME-ENDPOINT`, reproduced with an R100 before fixing). And the producer's exit
   status is checked explicitly: a diff that fails to run is a refusal, never an empty
-  "no drift" (`DRIFT-DIFF-STATUS` — process substitution swallows the status);
+  "no drift" (`DRIFT-DIFF-STATUS` — process substitution swallows the status). Submodule
+  pointers are never hidden: `--ignore-submodules=none` overrides any `ignore = all` in
+  `.gitmodules`, which otherwise drops a gitlink retarget even from `--name-status`
+  (`DRIFT-IGNORED-GITLINK`, round 2, reproduced);
 - validates the evidence comment against X, byte-exactly, unchanged
   (`validate-frontier-evidence.sh` semantics stay as they are);
 - re-runs its lint/test legs on Y as it does today, and publishes the App check on **Y** with
@@ -123,6 +126,11 @@ carries today. This paragraph is the acceptance, so a future reader knows it was
   classifier, which folds a rename into one destination-named entry). All three now treat
   renames as non-exempt and fail closed on a failed producer; both holes were reproduced
   before being fixed, and the PR's ledger carries the full rows.
+
+- Review round 2 surfaced `DRIFT-IGNORED-GITLINK`: with `ignore = all` in `.gitmodules`, a
+  gitlink retarget to an unreviewed commit vanished even from `--name-status` — reproduced
+  before fixing. Every drift computation (both workflow jobs and the stage-1 mirror driver)
+  now passes `--ignore-submodules=none`.
 
 ## Measured vs assumed
 

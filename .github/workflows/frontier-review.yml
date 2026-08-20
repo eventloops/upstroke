@@ -140,7 +140,11 @@ jobs:
             # The producer's status is checked explicitly: an empty diff from
             # a failed command must fail closed, never read as "no drift" --
             # process substitution swallows the status (DRIFT-DIFF-STATUS).
-            drift_names="$(git diff --name-only --no-renames "$REVIEWED_SHA..$head_sha")" || {
+            # --ignore-submodules=none: a submodule marked ignore=all in
+            # .gitmodules otherwise vanishes even from --name-status, letting
+            # a gitlink retarget to unreviewed code ride under an exempt edit
+            # (DRIFT-IGNORED-GITLINK, reproduced).
+            drift_names="$(git diff --name-only --no-renames --ignore-submodules=none "$REVIEWED_SHA..$head_sha")" || {
               echo "could not compute the drift between $REVIEWED_SHA and $head_sha" >&2
               exit 1
             }
@@ -323,7 +327,11 @@ jobs:
             # The producer's status is checked explicitly: an empty diff from
             # a failed command must fail closed, never read as "no drift" --
             # process substitution swallows the status (DRIFT-DIFF-STATUS).
-            drift_names="$(git diff --name-only --no-renames "$REVIEWED_SHA..$head_sha")" || {
+            # --ignore-submodules=none: a submodule marked ignore=all in
+            # .gitmodules otherwise vanishes even from --name-status, letting
+            # a gitlink retarget to unreviewed code ride under an exempt edit
+            # (DRIFT-IGNORED-GITLINK, reproduced).
+            drift_names="$(git diff --name-only --no-renames --ignore-submodules=none "$REVIEWED_SHA..$head_sha")" || {
               echo "could not compute the drift between $REVIEWED_SHA and $head_sha" >&2
               exit 1
             }
