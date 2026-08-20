@@ -991,39 +991,122 @@ mod tests {
         }
     }
 
-    /// The real join, at the real coordinate, on the platform that has one.
+    /// Where the ambient-latch helper writes what it observed.
+    #[cfg(windows)]
+    const AMBIENT_LATCH_RECORD: &str = "TACTUS_PR4_CLI_LATCH_RECORD";
+
+    /// The child half of
+    /// [`a_write_command_establishes_the_ambient_job_and_a_read_only_command_does_not`]:
+    /// it drives the CLI's real wiring and records the process-wide latch at
+    /// three points, leaving the judgement to its parent.
     ///
-    /// One test rather than three: the ambient job is a process-wide singleton,
-    /// so "not yet established" is observable exactly once per test binary.
+    /// It records rather than asserts because the parent's output is where a
+    /// developer reads a failure — this child's streams are closed — and
+    /// because the record is also the evidence that the child ran at all. Each
+    /// observation is flushed as it is taken, so a panic still leaves what was
+    /// seen up to it.
     #[cfg(windows)]
     #[test]
-    fn a_write_command_establishes_the_ambient_job_and_a_read_only_command_does_not() {
-        use tactus::agent::proc::ambient_job_established;
+    #[ignore = "subprocess helper"]
+    fn cli_ambient_latch_helper() {
+        fn note(stage: &str, record: &std::path::Path, observed: &mut Vec<String>) {
+            observed.push(format!(
+                "{stage} {}",
+                i32::from(tactus::agent::proc::ambient_job_established())
+            ));
+            std::fs::write(record, observed.join("\n")).expect("record the observation");
+        }
 
-        assert!(
-            !ambient_job_established(),
-            "nothing has run a write command in this process yet"
-        );
+        let Some(record) = std::env::var_os(AMBIENT_LATCH_RECORD) else {
+            return;
+        };
+        let record = PathBuf::from(record);
+        let mut observed = Vec::new();
+        note("start", &record, &mut observed);
+
+        // `run_wired` rather than `dispatch` with a join of our own: it is the
+        // composition `run` uses, so the child exercises the CLI's real path to
+        // the join instead of a reassembly of it.
         let read_only = Cli::try_parse_from(["tactus", "validate", ABSENT_PLAN])
             .expect("parse")
             .command;
-        let _ = dispatch(read_only, || {
-            tactus::runner::host::start_write_command(&mut tactus::agent::proc::NoHooks)
-        });
-        assert!(
-            !ambient_job_established(),
-            "a read-only command established the coordinator's ambient job"
-        );
+        let _ = run_wired(read_only, &mut tactus::agent::proc::NoHooks);
+        note("read-only", &record, &mut observed);
 
         let write = Cli::try_parse_from(["tactus", "run", ABSENT_PLAN, "--dry-run"])
             .expect("parse")
             .command;
-        let _ = dispatch(write, || {
-            tactus::runner::host::start_write_command(&mut tactus::agent::proc::NoHooks)
-        });
+        let _ = run_wired(write, &mut tactus::agent::proc::NoHooks);
+        note("write", &record, &mut observed);
+    }
+
+    /// The real join, at the real coordinate, on the platform that has one.
+    ///
+    /// In a subprocess because the ambient job is a process-wide singleton and
+    /// this binary's tests run in **threads**: "not yet established" is a fact
+    /// about a process, so a test that reads it in a shared one is reading its
+    /// siblings too. Held in-process, none of the three readings below was an
+    /// observation of this test's own commands:
+    /// `the_cli_write_path_runs_the_real_containment_step` drives a write
+    /// command through the same real step on another thread, and whichever
+    /// reading it lands between is the one that fails — before the first,
+    /// "nothing has run a write command in this process yet"; between the first
+    /// and the second, "a read-only command established the coordinator's
+    /// ambient job". Neither is what happened. Measured on the guest at one
+    /// failure in three full-suite runs when it was first seen and one in six
+    /// when it was diagnosed. The other tests here are immune for a reason that
+    /// does not extend to this one: they read `containment_establishments`, a
+    /// **thread-local** count, as a delta around their own call.
+    ///
+    /// So the oracle is unchanged — the real process-wide latch, not a
+    /// thread-local proxy, because the property is that the *process* joins —
+    /// and what changes is who observes it: a child with its own latch, running
+    /// exactly one test (`--ignored` plus a filter naming one helper), which no
+    /// sibling thread can reach.
+    ///
+    /// The premise stays checked rather than assumed. `start 0` is asserted here
+    /// as loudly as the two observations that depend on it, because a child that
+    /// somehow began with the latch set would make them vacuous. And the record
+    /// file is the evidence the child ran: a libtest filter that matches nothing
+    /// exits 0, so a parent that read only the exit status would pass with no
+    /// child at all.
+    #[cfg(windows)]
+    #[test]
+    fn a_write_command_establishes_the_ambient_job_and_a_read_only_command_does_not() {
+        let record = std::env::temp_dir().join(format!(
+            "tactus-pr4-cli-ambient-latch-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&record);
+        let status = std::process::Command::new(std::env::current_exe().expect("test executable"))
+            .args(["cli_ambient_latch_helper", "--ignored", "--nocapture"])
+            .env(AMBIENT_LATCH_RECORD, &record)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .expect("spawn the ambient-latch helper");
+        let written = std::fs::read_to_string(&record).ok();
+        let _ = std::fs::remove_file(&record);
         assert!(
-            ambient_job_established(),
-            "a write command ran without joining the coordinator's ambient job (INV-18)"
+            status.success(),
+            "the ambient-latch helper died; it had recorded {written:?}"
+        );
+        let written = written.unwrap_or_else(|| {
+            panic!(
+                "the helper wrote nothing to {}: it exited 0 without running, which is what a \
+                 libtest filter that matches no test does",
+                record.display()
+            )
+        });
+        let observed: Vec<&str> = written.lines().collect();
+        assert_eq!(
+            observed,
+            vec!["start 0", "read-only 0", "write 1"],
+            "the child's latch at three points: `start 0` or this test's premise is gone and the \
+             rest of it says nothing; `read-only 0` or a read-only command established the \
+             coordinator's ambient job; `write 1` or a write command ran without joining it \
+             (INV-18)"
         );
     }
 }
