@@ -53,3 +53,7 @@ artifacts (§15); records promoted here are the durable subset.
   `reviews/FINDINGS.md` to start; ancestor + exempt-only diff re-attests via owner
   dispatch, computed on the trusted side. Ends ledger edits discarding max-effort
   reviews of unchanged code.
+- [2026-08-21 — slices land as pull requests into their integration branch](2026-08-21-stacked-slice-prs.md):
+  slice PRs into `codex/parallelism-design` get CI, policy, and a single-reviewer
+  review of each head; attestation stays master-only and happens once on #18's
+  merge candidate. Merge commits only — a rewrite orphans ledger rows.

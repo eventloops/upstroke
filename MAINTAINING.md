@@ -47,6 +47,14 @@ contract itself.
 8. Resolve every conversation, mark the PR ready, and merge with a merge commit. Do not push or
    force-push directly to `master`. Delete the source branch after merge.
 
+Slices of a long-running design land as pull requests **into** their integration branch
+(today `codex/parallelism-design`): they receive `tactus-ci`, `tactus-pr-policy`, and a
+single-reviewer frontier review of each head, but **no attestation**. The App check is minted
+only for pull requests into `master`; the integration branch's own pull request is attested
+exactly once, on the head that merges, after its last update from `master`. Merge commits only
+on and into the integration branch — a rewrite orphans every ledger row bound to a replaced
+SHA. Decided in `decisions/2026-08-21-stacked-slice-prs.md`.
+
 The attestation workflow records a review; it does not perform one. The App-owned check is the hard
 merge gate. The ruleset binds the check name to App id `4574301`, while the App credential is kept
 out of every pull-request workflow. A same-named GitHub Actions check therefore cannot satisfy the
