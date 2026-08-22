@@ -266,8 +266,6 @@ effect_free = [
     "fence_for",
     "filename_component",
     "find_program",
-    "find_program_candidates",
-    "find_program_candidates_on_path",
     "head",
     "is_recording",
     "off",
@@ -357,6 +355,8 @@ effect_free = [
     "policy",
     "policy_digest",
     "preflight",
+    "program_resolutions",
+    "program_searches",
     "reserved_keys",
     "reserved_values",
     "run",
@@ -852,10 +852,10 @@ funnel = []
 effectful = []
 effectful_unnameable = []
 effect_free = [
+    "boundary_refused",
     "display",
     "extract_version",
-    "locate",
-    "locate_with",
+    "named",
     "spec",
 ]
 

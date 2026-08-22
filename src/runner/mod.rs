@@ -54,15 +54,33 @@ pub use invocation::InvocationId;
 /// and (PR6) by the container runner without an adapter ever learning which.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct CommandSpec {
-    /// The program to execute, as the **adapter** resolved it.
+    /// The program to execute, as the **adapter** names it — and the runner
+    /// resolves it against the environment the runner composes.
     ///
-    /// Today that resolution happens on the coordinator host: an adapter's
-    /// `build` and `probe` locate their CLI on this machine's `PATH` and put
-    /// the absolute path here. For PR4 the machine that resolved it is also the
-    /// boundary that executes it, because the host runner is the only one. A
-    /// boundary with a filesystem of its own ends that, and the program has to
-    /// stop being a coordinator-host path — `PR4-ADAPTER-RESOLVES-ON-THE-HOST`
-    /// in `reviews/FINDINGS.md` says what breaks and owns it to PR6.
+    /// A name, not a location. Until PR6 an adapter's `build` and `probe`
+    /// located their CLI on the coordinator host's `PATH` and put the absolute
+    /// host path here, which was invisible while the host runner was the only
+    /// runner and its boundary *was* this machine. With a second boundary it is
+    /// three failures — a CLI pinned in an image and absent on the host refused
+    /// before the runtime is asked anything, every spec carrying a path that
+    /// names nothing inside the image, and `Caps.version` certifying the host's
+    /// CLI while the attempt runs the image's, which is DESIGN.md:612's
+    /// sentence exactly. `PR4-ADAPTER-RESOLVES-ON-THE-HOST` in
+    /// `reviews/FINDINGS.md` is the entry; [`crate::agent::bin::Invocation::named`]
+    /// is the repair.
+    ///
+    /// This is not a new shape for the field. [`crate::gates::ShellKind::spec`]
+    /// has always put a bare `sh`, `bash`, `cmd` or `pwsh` here, for every gate
+    /// and for the `RunnerPreflight` shell probe; the three agent CLIs were the
+    /// exception. **A `String` was always wide enough** — DESIGN.md:222 freezes
+    /// `program: String`, and a name fits where a path may not
+    /// (`PR4-PROGRAM-PATH-NOT-UNICODE`).
+    ///
+    /// The corollary belongs to the *runner*: resolving a name is now a thing
+    /// each boundary does, so each boundary owns which files a name may reach.
+    /// `PR6D-HOST-RUNNER-RESOLVES-BY-PLATFORM-SEARCH` in `reviews/FINDINGS.md`
+    /// records what the host runner's answer is today and who owns tightening
+    /// it.
     pub program: String,
     pub args: Vec<String>,
     /// **An overlay**, not the environment. DESIGN.md:258: "`CommandSpec.env`

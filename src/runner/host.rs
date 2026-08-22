@@ -28,6 +28,7 @@
     clippy::disallowed_macros
 )]
 
+use std::collections::BTreeMap;
 use std::ffi::{OsStr, OsString};
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -401,6 +402,55 @@ pub struct HostRunner {
     /// concurrent scheduler will need an observer per invocation rather than
     /// per runner, and this is where that shows up.
     hooks: Mutex<Box<dyn SpawnHooks + Send>>,
+    /// What this runner has already decided a program name is —
+    /// `PR6-LANED-001`.
+    ///
+    /// DESIGN.md:612: "Probes run through that same runner, **or pre-flight
+    /// could certify a host CLI/version different from the one the attempt
+    /// executes**." Running the probe through the runner is necessary and is
+    /// not sufficient: a bare name re-searched at every spawn can find a
+    /// *different file* the second time, because `PATH` is a search order over
+    /// a filesystem that moves. `PATH=A:B` with the same name in both, `A/cli`
+    /// removed after pre-flight, and the attempt silently runs `B/cli` — one
+    /// program string, two executables, and `Caps.version` certifying the one
+    /// that did not run.
+    ///
+    /// So the answer is remembered, and **where** it is remembered is the whole
+    /// point. `PR4-ADAPTER-RESOLVES-ON-THE-HOST` removed a process-wide
+    /// `OnceLock` in each adapter, which handed one boundary's answer to the
+    /// next; putting that back would reintroduce it. This is per
+    /// [`HostRunner`] — per *boundary* — so two runners in one process still
+    /// each get their own answer, and identity is stable across the one thing
+    /// that has to agree: a run's pre-flight and its attempts. Production
+    /// constructs exactly one of these per run (`engine::run_harness`) or per
+    /// resume (`engine::resume_harness`) and borrows it as `&dyn Runner` for
+    /// pre-flight and every attempt, so per-instance *is* per-run;
+    /// `production_reaches_a_spawn_through_one_host_runner_per_run` is what
+    /// keeps that true.
+    ///
+    /// Keyed on the **question**, not on the name: the program string together
+    /// with the composed `PATH` and `PATHEXT` that answer it. Not on the whole
+    /// composed environment, and that is load-bearing rather than an
+    /// optimisation — `host-v1` supplies credential locations *role-scoped*
+    /// ([`supplies_credentials`]), so a probe's environment and its attempt's
+    /// environment differ by design, and a memo keyed on the environment would
+    /// miss on exactly the pair DESIGN.md:612 requires to agree. The three
+    /// fields that decide the answer are the three the key carries.
+    resolved: Mutex<BTreeMap<ProgramQuestion, Result<PathBuf, String>>>,
+}
+
+/// Everything that decides which file a program name is, at one boundary.
+///
+/// The key of [`HostRunner::resolved`]. `program` is [`CommandSpec::program`]
+/// verbatim; `path` and `pathext` are the composed values, `None` when the
+/// composed environment does not carry that key at all — which is a different
+/// question from carrying it empty, and is why they are `Option` rather than
+/// defaulted here.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+struct ProgramQuestion {
+    program: String,
+    path: Option<OsString>,
+    pathext: Option<OsString>,
 }
 
 impl std::fmt::Debug for HostRunner {
@@ -435,10 +485,21 @@ impl HostRunner {
             digest,
             environment: HostEnvironment::from_process(),
             hooks: Mutex::new(Box::new(NoHooks)),
+            resolved: Mutex::new(BTreeMap::new()),
         }
     }
 
     /// A host runner over an explicit environment.
+    ///
+    /// It does **not** clear [`Self::resolved`], and that is a decision rather
+    /// than an omission. The memo is keyed on the question — the program name
+    /// with the composed `PATH` and `PATHEXT` — so a new environment that
+    /// resolves a name differently asks a different question and misses, and
+    /// one that resolves it identically is entitled to the same answer. A clear
+    /// here would therefore be a line no fixture could ever see fail, which is
+    /// the shape this project treats as debt: the key is the mechanism, and
+    /// `a_resolution_question_is_the_program_and_the_environment_that_answers_it`
+    /// is what holds it.
     #[must_use]
     pub fn with_environment(mut self, environment: HostEnvironment) -> Self {
         self.environment = environment;
@@ -521,6 +582,67 @@ impl HostRunner {
     ) -> Result<(), TactusError> {
         run_shell_probe(self, shell, workspace.to_path_buf(), invocation)
     }
+
+    /// Which file `program` is, at **this** boundary — decided once and then
+    /// remembered.
+    ///
+    /// The `PR6-LANED-001` repair. [`resolve_program`] answers the question by
+    /// searching a filesystem; this decides *whether the question is asked*,
+    /// and it is asked at most once per [`ProgramQuestion`] per runner. See
+    /// [`Self::resolved`] for why per-runner rather than per-spawn (a
+    /// filesystem that moves between pre-flight and the attempt would otherwise
+    /// hand the attempt a different executable under the same name) and why
+    /// per-runner rather than process-wide (that is
+    /// `PR4-ADAPTER-RESOLVES-ON-THE-HOST`).
+    ///
+    /// **A refusal is remembered too.** Fail-closed: a run whose pre-flight
+    /// could not find `claude` on the `PATH` it composes does not silently find
+    /// it at the third attempt because something installed one meanwhile. The
+    /// stored value is the refusal's message, and [`TactusError::Refused`]
+    /// displays as exactly its message, so the replayed error is the first
+    /// one byte for byte —
+    /// `a_refused_name_is_refused_identically_without_asking_the_filesystem_again`
+    /// is what holds that rather than this sentence.
+    ///
+    /// [`program_resolutions`] counts calls here — one per spawn, whether or
+    /// not the filesystem was touched. [`program_searches`] counts the ones
+    /// that reached [`resolve_program`]. The two are separate because the
+    /// ordering predicate ("resolved once per spawn, before any of the spawn")
+    /// and the identity predicate ("searched once per boundary") are different
+    /// claims and a single counter could not hold both.
+    ///
+    /// # Errors
+    ///
+    /// [`TactusError::Refused`] — [`resolve_program`]'s, first-hand or
+    /// replayed.
+    fn program_for(
+        &self,
+        program: &str,
+        composed: &[(OsString, OsString)],
+    ) -> Result<PathBuf, TactusError> {
+        RESOLUTIONS.with(|count| count.set(count.get() + 1));
+        let case = self.environment.case();
+        let question = ProgramQuestion {
+            program: program.to_owned(),
+            path: composed_value(composed, case, "PATH").map(OsStr::to_os_string),
+            pathext: composed_value(composed, case, "PATHEXT").map(OsStr::to_os_string),
+        };
+        let mut resolved = self.resolved.lock().unwrap_or_else(PoisonError::into_inner);
+        if let Some(answer) = resolved.get(&question) {
+            return answer
+                .clone()
+                .map_err(|message| TactusError::Refused { message });
+        }
+        let answer = resolve_program(program, composed, case, ProgramNaming::current());
+        resolved.insert(
+            question,
+            match &answer {
+                Ok(file) => Ok(file.clone()),
+                Err(error) => Err(error.to_string()),
+            },
+        );
+        answer
+    }
 }
 
 impl Runner for HostRunner {
@@ -530,7 +652,32 @@ impl Runner for HostRunner {
             request.agent.as_ref(),
             &request.command.env,
         )?;
-        let mut command = build_command(&request.command);
+        // Which file the program *name* is, decided here and nowhere else.
+        //
+        // `CommandSpec::program` is a name, not a location, and DESIGN.md:118
+        // gives this runner the environment — so the boundary that executes a
+        // name is the boundary that says which file it is.
+        // `PR4-ADAPTER-RESOLVES-ON-THE-HOST` states the shape in two clauses:
+        // "`CommandSpec.program` carries the bare CLI name **and the runner
+        // resolves it against the environment it composes**". This is the
+        // second clause.
+        //
+        // **After `compose` and before anything is spawned**, both load-bearing.
+        // After, because the environment this resolves against has to be the
+        // one the child will run under — a `PATH` the overlay could not have
+        // named (it is reserved) but which a caller's `HostEnvironment` decides.
+        // Before, because a name that reaches this boundary and resolves to
+        // nothing is a pre-flight refusal naming the name, not a `NotFound` from
+        // a spawn.
+        //
+        // **And once per boundary, not once per spawn** (`PR6-LANED-001`).
+        // `HostRunner::program_for` searches the first time and remembers the
+        // answer for this runner, so a run's pre-flight and its attempts execute
+        // the same file even if the filesystem moves under them — DESIGN.md:612,
+        // which running the probe through the runner is necessary but not
+        // sufficient for.
+        let program = self.program_for(&request.command.program, &composed)?;
+        let mut command = build_command_at(&request.command, &program);
         command.current_dir(&request.workspace);
         // The composed environment *is* the environment: base, reserved
         // values, overlay, and nothing arriving by a route the record does not
@@ -576,9 +723,28 @@ impl Runner for HostRunner {
 /// the `bin` adapter seam pins its arguments against the `Command` this
 /// produces rather than against the spec alone.
 pub(crate) fn build_command(spec: &CommandSpec) -> Command {
-    let mut command = Command::new(&spec.program);
+    build_command_at(spec, Path::new(&spec.program))
+}
+
+/// [`build_command`] for a spec whose program the runner has already resolved
+/// to a file.
+///
+/// The split exists because the resolved program is a [`Path`] and
+/// [`CommandSpec::program`] is a `String` (DESIGN.md:222): a `PATH` directory
+/// whose name is not valid Unicode is legal on Unix, and writing the resolved
+/// path back into the spec would have to either refuse it or rewrite it into a
+/// path that names nothing (`PR4-PROGRAM-PATH-NOT-UNICODE`). It never becomes a
+/// `String`, so neither happens.
+///
+/// `cmd.exe`'s raw-tail rule is keyed on the program **that will execute**
+/// rather than on the spec's, so it survives resolution: `cmd`, `cmd.exe` and
+/// `C:\Windows\System32\cmd.exe` all have the file stem `cmd`, and a gate whose
+/// command line changes meaning depending on whether the runner resolved its
+/// shell is not "adapter parsing unchanged".
+fn build_command_at(spec: &CommandSpec, program: &Path) -> Command {
+    let mut command = Command::new(program);
     #[cfg(windows)]
-    if let Some(switch) = cmd_switch_index(spec) {
+    if let Some(switch) = cmd_switch_index(program, spec) {
         use std::os::windows::process::CommandExt;
 
         for arg in &spec.args[..=switch] {
@@ -597,17 +763,354 @@ pub(crate) fn build_command(spec: &CommandSpec) -> Command {
 /// The index of `cmd.exe`'s `/C` or `/K` switch, when this spec invokes
 /// `cmd.exe` at all.
 #[cfg(windows)]
-fn cmd_switch_index(spec: &CommandSpec) -> Option<usize> {
-    let program = Path::new(&spec.program)
+fn cmd_switch_index(program: &Path, spec: &CommandSpec) -> Option<usize> {
+    let stem = program
         .file_stem()
         .map(|stem| stem.to_string_lossy().into_owned())
         .unwrap_or_default();
-    if !program.eq_ignore_ascii_case("cmd") {
+    if !stem.eq_ignore_ascii_case("cmd") {
         return None;
     }
     spec.args
         .iter()
         .position(|arg| arg.eq_ignore_ascii_case("/c") || arg.eq_ignore_ascii_case("/k"))
+}
+
+// ---------------------------------------------------------------------------
+// Program resolution
+// ---------------------------------------------------------------------------
+
+/// How a platform turns a program **name** into the file names it may be.
+///
+/// A type rather than a `cfg!` at each comparison, for [`KeyCase`]'s reason and
+/// with more at stake: `PR6D-001` is a rule whose Windows arm no Linux machine
+/// could reach, and it shipped because every fixture that could have caught it
+/// was `#[cfg(windows)]` and every Windows fixture used an absolute path. Both
+/// variants are constructible on both platforms, so the Windows naming rule is
+/// executed by the Linux suite on every run and not only by the guest.
+///
+/// The *file* predicate is platform-native and cannot be gridded — Windows has
+/// no mode bits — so [`Self::is_program`] degrades to "is a file" wherever the
+/// bits do not exist. Everything above it is pure string work.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+enum ProgramNaming {
+    /// Unix. `/` separates; there are no executable extensions, so `execvp`
+    /// tries the name itself in each `PATH` directory and skips a file whose
+    /// execute bit is clear rather than failing on it.
+    Posix,
+    /// Windows. `\`, `/` and `:` all separate, and an extensionless name is not
+    /// a program: a shell appends `PATHEXT`'s entries in order. `CreateProcessW`
+    /// appends `.exe` **only**, which is the whole of `PR6D-001` — `PATHEXT`
+    /// lists `.CMD`, a shell finds `claude.cmd`, and `std::process::Command`
+    /// does not.
+    Windows,
+}
+
+impl ProgramNaming {
+    /// What this platform does.
+    const fn current() -> Self {
+        if cfg!(windows) {
+            Self::Windows
+        } else {
+            Self::Posix
+        }
+    }
+
+    /// `PATHEXT`'s entries when nothing sets it.
+    ///
+    /// `cmd.exe`'s own built-in default, **in its order**: `.COM` before `.EXE`
+    /// before `.BAT` before `.CMD`. Written here from the platform rather than
+    /// borrowed from [`crate::util::executable_extensions`], whose default is a
+    /// different order and which also probes the extensionless name — a rule
+    /// for a diagnostic, not for a spawn.
+    const DEFAULT_PATHEXT: &'static [&'static str] = &[".com", ".exe", ".bat", ".cmd"];
+
+    /// Whether `program` is a name for this boundary to resolve, rather than a
+    /// location to use as given.
+    ///
+    /// The same partition the platform itself draws: `execvp` searches `PATH`
+    /// for a name and never for something containing `/`, and std's Windows
+    /// search is reached only by `is_file_name`. A location is therefore handed
+    /// to `Command` byte for byte, which is what makes "an absolute program
+    /// spawns exactly as it did before this repair" true by construction rather
+    /// than by a fixture.
+    fn is_bare_name(self, program: &str) -> bool {
+        if program.is_empty() {
+            return false;
+        }
+        !program.chars().any(|c| match self {
+            Self::Posix => c == '/',
+            // `:` because `C:file` is drive-relative and `f:s` names an
+            // alternate data stream; neither is a name to search `PATH` for.
+            Self::Windows => matches!(c, '/' | '\\' | ':'),
+        })
+    }
+
+    /// The file names `program` may be, in the order a shell tries them.
+    ///
+    /// Windows: a name that already carries an extension is tried verbatim
+    /// first and then with each `PATHEXT` entry appended; a name without one is
+    /// **not** tried verbatim, because an extensionless file is not a program
+    /// there — `CreateProcessW` appends `.exe` to it and `cmd.exe` appends
+    /// `PATHEXT`. Trying it anyway would let a data file called `claude` sitting
+    /// in a `PATH` directory shadow the real `claude.exe`.
+    ///
+    /// Unix: the name, and nothing else.
+    fn candidates(self, program: &str, pathext: Option<&OsStr>) -> Vec<OsString> {
+        let mut names = Vec::new();
+        if self == Self::Posix {
+            names.push(OsString::from(program));
+            return names;
+        }
+        if Path::new(program).extension().is_some() {
+            names.push(OsString::from(program));
+        }
+        for extension in Self::extensions(pathext) {
+            let candidate = OsString::from(format!("{program}{extension}"));
+            if !names.contains(&candidate) {
+                names.push(candidate);
+            }
+        }
+        names
+    }
+
+    /// `PATHEXT` as a list, or the platform default when it is unset, empty, or
+    /// carries nothing usable.
+    ///
+    /// An entry that does not start with `.` is dropped rather than joined —
+    /// `PATHEXT=exe` would otherwise produce `claudeexe` — and an entry list
+    /// that ends up empty falls back to the default rather than to "no
+    /// candidates at all", because a `PATHEXT` of `;;;` is a malformed variable
+    /// and not an instruction that this machine has no programs.
+    fn extensions(pathext: Option<&OsStr>) -> Vec<String> {
+        let listed: Vec<String> = pathext
+            .map(|value| value.to_string_lossy().into_owned())
+            .unwrap_or_default()
+            .split(';')
+            .map(|entry| entry.trim().to_ascii_lowercase())
+            .filter(|entry| entry.len() > 1 && entry.starts_with('.'))
+            .collect();
+        if listed.is_empty() {
+            return Self::DEFAULT_PATHEXT
+                .iter()
+                .map(|extension| (*extension).to_owned())
+                .collect();
+        }
+        listed
+    }
+
+    /// Whether this file is one a spawn of that name would reach.
+    ///
+    /// Unix checks the execute bit because `execvp` does: a non-executable
+    /// `claude` in an early `PATH` directory is skipped there, and a resolution
+    /// that stopped at it would refuse — or spawn `EACCES` — where the old code
+    /// found the real one further along. Windows has no such bit, so existence
+    /// is the whole question there.
+    fn is_program(self, path: &Path) -> bool {
+        if !path.is_file() {
+            return false;
+        }
+        match self {
+            Self::Windows => true,
+            Self::Posix => executable_bit(path),
+        }
+    }
+}
+
+/// The execute bit, where the platform has one.
+#[cfg(unix)]
+fn executable_bit(path: &Path) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::metadata(path).is_ok_and(|meta| meta.permissions().mode() & 0o111 != 0)
+}
+
+/// Windows files carry no execute bit, so `ProgramNaming::Posix` degrades to
+/// existence when a grid drives it there. Nothing in production reaches this.
+#[cfg(not(unix))]
+fn executable_bit(_path: &Path) -> bool {
+    true
+}
+
+thread_local! {
+    /// See [`program_resolutions`].
+    static RESOLUTIONS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    /// See [`program_searches`].
+    static SEARCHES: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// How many program names **this thread** has resolved at the host boundary.
+///
+/// The same kind of observable as [`containment_establishments`], and here for
+/// the ordering rather than the count alone: resolution is specified to happen
+/// *once per spawn, before any spawn*, and a suite that proves only that the
+/// right file ran holds neither half. A [`SpawnHooks`] observer reading this at
+/// the first sub-effect point sees the resolution already done, and sees it done
+/// once — see `tests::a_program_is_resolved_once_per_spawn_and_before_any_of_it`.
+///
+/// Incremented by [`HostRunner::program_for`] on entry, so a spawn that took its
+/// answer from the runner's memo and a spawn that searched for it are counted
+/// alike: this is "was the program decided for this spawn, and when", not "did
+/// the filesystem move". [`program_searches`] is the other question, and the two
+/// are separate counters because a single one could not answer both.
+#[must_use]
+pub fn program_resolutions() -> u64 {
+    RESOLUTIONS.with(std::cell::Cell::get)
+}
+
+/// How many program names **this thread** has actually searched a filesystem
+/// for.
+///
+/// [`program_resolutions`]'s sibling and the observable of the
+/// `PR6-LANED-001` repair: `HostRunner` resolves a name **once per boundary**,
+/// not once per spawn, so that a run's pre-flight and its attempts execute the
+/// same file even when the filesystem moves between them (DESIGN.md:612). N
+/// spawns of one name through one runner move `program_resolutions` by N and
+/// this by one.
+///
+/// It has to be a second counter rather than a reinterpretation of the first,
+/// because the two predicates are independently droppable: a memo that never
+/// hits satisfies "once per spawn" and reopens :612, and a resolution moved
+/// after the first containment point satisfies "once per boundary" and reopens
+/// the ordering.
+///
+/// Incremented by [`resolve_program`] on entry, so the count moves for a
+/// program that names a location as well as for one that is searched for — the
+/// question asked is the same, and what differs is the answer.
+#[must_use]
+pub fn program_searches() -> u64 {
+    SEARCHES.with(std::cell::Cell::get)
+}
+
+/// The value of `key` in a composed environment, under this platform's name
+/// rule.
+fn composed_value<'a>(
+    composed: &'a [(OsString, OsString)],
+    case: KeyCase,
+    key: &str,
+) -> Option<&'a OsStr> {
+    composed
+        .iter()
+        .find(|(name, _)| case.same_key(name, OsStr::new(key)))
+        .map(|(_, value)| value.as_os_str())
+}
+
+/// Which file `program` names, at this boundary.
+///
+/// The second clause of `PR4-ADAPTER-RESOLVES-ON-THE-HOST`: the adapter names
+/// the CLI and consults no filesystem, and the runner resolves that name
+/// against **the environment it composes**. `composed` is that environment —
+/// the one the child is about to be given — so pre-flight and the attempt
+/// resolve identically because they compose identically (DESIGN.md:263).
+///
+/// One rule for every program this boundary runs. `gates::ShellKind::spec` has
+/// always shipped a bare `sh`, `bash`, `cmd` or `pwsh` and the three agent CLIs
+/// now do too; a second rule for one of them is how `PR6D-001` happened.
+///
+/// **What it deliberately does not search.** std's Windows fallbacks — the
+/// application directory, the system directory, the Windows directory, and the
+/// *parent* process's `PATH` — are not consulted. A runner that owns the
+/// environment (DESIGN.md:118) and then reaches outside it for a program is
+/// composing one environment and resolving against another, which is the class
+/// of bug this function exists to close. In production the composed `PATH` is
+/// the coordinator process's own (`PATH` is reserved, so no overlay can move
+/// it), and `%SystemRoot%\System32` is on it on every Windows installation, so
+/// the narrowing is reachable only by a caller that supplies a `HostEnvironment`
+/// with a `PATH` of its own — which is exactly the caller that meant it.
+///
+/// It also does not search a `PATH` entry that is not absolute — the empty
+/// entry of `PR6-LANED-003` and every other spelling of "the current
+/// directory". The reason is in the loop below; the short form is that this
+/// runner's current directory is the workspace.
+///
+/// # Errors
+///
+/// [`TactusError::Refused`] naming the program, the boundary and the `PATH` it
+/// searched, when a bare name matches nothing. Fail-closed on purpose: the
+/// alternative is handing the name to `Command` anyway and letting the spawn
+/// fail with a bare `NotFound` that names no boundary, which on Windows is
+/// precisely the failure an operator could not diagnose.
+fn resolve_program(
+    program: &str,
+    composed: &[(OsString, OsString)],
+    case: KeyCase,
+    naming: ProgramNaming,
+) -> Result<PathBuf, TactusError> {
+    SEARCHES.with(|count| count.set(count.get() + 1));
+    if !naming.is_bare_name(program) {
+        // A location, used as given — no probing, no extension, nothing this
+        // machine contributed. This is every absolute program the suite and the
+        // v0.1 product already spawn, and it must not change.
+        return Ok(PathBuf::from(program));
+    }
+    let path = composed_value(composed, case, "PATH");
+    let candidates = naming.candidates(program, composed_value(composed, case, "PATHEXT"));
+    let mut searched = 0_usize;
+    let mut skipped = 0_usize;
+    for dir in std::env::split_paths(path.unwrap_or_else(|| OsStr::new(""))) {
+        // **`PR6-LANED-003`.** A `PATH` entry that does not name a location on
+        // its own names one *relative to a current directory*, and this
+        // runner's current directory is the workspace — repository content,
+        // under automation. DESIGN.md:398-402 is explicit that repository
+        // content executing with this process's authority is the threat the
+        // container runner exists to bound; the host runner cannot bound it for
+        // gate code, but the *agent* is not gate code and must not become a way
+        // in. An **empty** entry is the finding's own case and the degenerate
+        // one — POSIX gives a null prefix the meaning "the current directory",
+        // so `PATH=:/usr/bin` with a `claude` in the workspace is a
+        // workspace-controlled agent.
+        //
+        // Fail-closed, and it costs a real capability: a program reachable only
+        // through a relative `PATH` entry is refused rather than run. That is
+        // the right side to fail on. The alternative is worse than it looks —
+        // this predicate runs against the *coordinator's* current directory
+        // while the child runs against the *workspace* — so a relative entry
+        // does not merely widen the search, it lets the runner certify one file
+        // and execute another, which is DESIGN.md:612 in the same breath.
+        //
+        // `Path::is_absolute` rather than a [`ProgramNaming`] rule: like
+        // [`ProgramNaming::is_program`], this is a question about *this*
+        // filesystem's paths rather than about how a name is spelled, and
+        // `std::env::split_paths` is already the platform's own splitter. The
+        // rule the grid does execute on both platforms is the one above it.
+        if !dir.is_absolute() {
+            skipped += 1;
+            continue;
+        }
+        searched += 1;
+        // Directory outermost, candidate innermost: `PATH` order decides
+        // between installations and `PATHEXT` order decides only within one
+        // directory. The other nesting promotes a later directory over an
+        // earlier installation, which is the shape the deleted
+        // `find_program_candidates` test pinned.
+        for candidate in &candidates {
+            let file = dir.join(candidate);
+            if naming.is_program(&file) {
+                return Ok(file);
+            }
+        }
+    }
+    Err(TactusError::Refused {
+        message: format!(
+            "the host runner cannot execute `{program}`: nothing of that name is on the PATH \
+             this runner composes ({searched} director{} searched{}, as {}). The runner resolves \
+             a program name against the environment it composes (DESIGN.md:118), so the program \
+             must be installed inside the boundary that executes it — on PATH for the host \
+             runner, in the image for a container runner. PATH: {}",
+            if searched == 1 { "y" } else { "ies" },
+            match skipped {
+                0 => String::new(),
+                1 => ", 1 PATH entry skipped as not absolute".to_owned(),
+                n => format!(", {n} PATH entries skipped as not absolute"),
+            },
+            candidates
+                .iter()
+                .map(|candidate| format!("`{}`", candidate.to_string_lossy()))
+                .collect::<Vec<_>>()
+                .join(", "),
+            path.unwrap_or_else(|| OsStr::new("<unset>"))
+                .to_string_lossy()
+        ),
+    })
 }
 
 /// Proof that this process has performed its write-command containment
@@ -6069,5 +6572,2155 @@ mod tests {
                 "cycle {cycle}: stub (pid {pid}, created {created}) survived"
             );
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // program resolution (PR6D-001)
+    // -----------------------------------------------------------------------
+
+    /// Both naming rules, exhaustively.
+    ///
+    /// The `match` is what makes it exhaustive: a variant added later fails to
+    /// compile here rather than quietly leaving every grid below, which is the
+    /// failure `PR5-RD-002` recorded one level out — a hand-written domain that
+    /// omitted a point while six guest runs reported covering it.
+    fn naming_grid() -> Vec<ProgramNaming> {
+        let mut all = Vec::new();
+        for naming in [ProgramNaming::Posix, ProgramNaming::Windows] {
+            match naming {
+                ProgramNaming::Posix | ProgramNaming::Windows => all.push(naming),
+            }
+        }
+        all
+    }
+
+    /// A composed environment holding exactly the pairs given.
+    fn composed(pairs: &[(&str, &OsStr)]) -> Vec<(OsString, OsString)> {
+        pairs
+            .iter()
+            .map(|(key, value)| (OsString::from(*key), (*value).to_os_string()))
+            .collect()
+    }
+
+    /// `PATH` as an `OsString`, from directories.
+    fn path_of(dirs: &[&Path]) -> OsString {
+        std::env::join_paths(dirs).expect("a synthetic PATH")
+    }
+
+    /// An empty file the platform would accept as a program: on Unix the
+    /// execute bit is set, because `execvp` requires it and
+    /// [`ProgramNaming::Posix`] therefore checks it.
+    fn program_file(dir: &Path, file_name: &str) -> PathBuf {
+        std::fs::create_dir_all(dir).expect("create the directory");
+        let path = dir.join(file_name);
+        std::fs::write(&path, "").expect("write the candidate");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755))
+                .expect("make the candidate executable");
+        }
+        path
+    }
+
+    /// A file that exists and is **not** a program: no execute bit.
+    ///
+    /// Unix only, because it is only there that a file's mode decides: Windows
+    /// carries no execute bit, so "exists but is not executable" is not a state
+    /// a fixture can construct on that platform at all.
+    #[cfg(unix)]
+    fn unexecutable_file(dir: &Path, file_name: &str) -> PathBuf {
+        std::fs::create_dir_all(dir).expect("create the directory");
+        let path = dir.join(file_name);
+        std::fs::write(&path, "").expect("write the candidate");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644))
+                .expect("clear the execute bit");
+        }
+        path
+    }
+
+    /// The `PATHEXT` a Windows machine ships, in its order.
+    const REAL_PATHEXT: &str = ".COM;.EXE;.BAT;.CMD;.VBS;.VBE;.JS;.JSE;.WSF;.WSH;.MSC;.CPL";
+
+    /// The file name a bare `name` is installed under here: npm's two
+    /// spellings, a batch shim on Windows and an extensionless script on Unix.
+    fn shim_file_name(name: &str) -> String {
+        if cfg!(windows) {
+            format!("{name}.cmd")
+        } else {
+            name.to_owned()
+        }
+    }
+
+    /// A runnable shim that prints `marker` and its first argument.
+    ///
+    /// The **file name is the caller's**, so the extension is a field a test
+    /// varies while the content is held constant, and the marker is the
+    /// caller's so "a shim ran" and "*this* shim ran" are different
+    /// observations.
+    fn marker_shim(dir: &Path, file_name: &str, marker: &str) -> PathBuf {
+        std::fs::create_dir_all(dir).expect("create the shim directory");
+        let path = dir.join(file_name);
+        if cfg!(windows) {
+            std::fs::write(&path, format!("@echo off\r\necho {marker}:%~1\r\n"))
+                .expect("write the batch shim");
+        } else {
+            std::fs::write(&path, format!("#!/bin/sh\necho \"{marker}:$1\"\n"))
+                .expect("write the shell shim");
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755))
+                    .expect("make the shim executable");
+            }
+        }
+        path
+    }
+
+    /// This process's environment with `PATH` — and `PATHEXT` — replaced.
+    ///
+    /// The rest of the process environment is kept rather than emptied, because
+    /// spawning a batch shim on Windows goes through `cmd.exe` and a child
+    /// stripped to two variables would be testing something else. Only the two
+    /// fields under test move.
+    fn environment_on_path(dirs: &[&Path], pathext: Option<&str>) -> HostEnvironment {
+        let case = KeyCase::current();
+        let mut base: Vec<(OsString, OsString)> = std::env::vars_os()
+            .filter(|(name, _)| {
+                !case.same_key(name, OsStr::new("PATH"))
+                    && !case.same_key(name, OsStr::new("PATHEXT"))
+            })
+            .collect();
+        base.push((os("PATH"), path_of(dirs)));
+        if let Some(value) = pathext {
+            base.push((os("PATHEXT"), os(value)));
+        }
+        HostEnvironment::with_base(base, case)
+    }
+
+    /// A gate request for `program` with one argument.
+    fn named_request(program: &str, argument: &str, workspace: &Path) -> RunnerRequest {
+        crate::runner::gate_request(
+            CommandSpec {
+                program: program.to_owned(),
+                args: vec![argument.to_owned()],
+                env: Vec::new(),
+                stdin: Vec::new(),
+            },
+            workspace.to_path_buf(),
+            Duration::from_secs(60),
+            gate_invocation(),
+        )
+    }
+
+    /// A program string, and whether each naming rule calls it a **name** (to
+    /// search for) rather than a **location** (to use as given).
+    ///
+    /// Written here from the two platforms' own rules, not read from the code
+    /// under test. The four rows the two rules disagree on are the point: on
+    /// Unix a backslash and a colon are ordinary characters in a file name, and
+    /// a rule that ignored its `self` would agree with itself on every row that
+    /// only contains `/`.
+    const NAME_TABLE: &[(&str, bool, bool)] = &[
+        // (program, is a name under Posix, is a name under Windows)
+        ("claude", true, true),
+        ("codex", true, true),
+        ("cmd", true, true),
+        ("claude.cmd", true, true),
+        ("/usr/local/bin/claude", false, false),
+        ("./claude", false, false),
+        ("sub/claude", false, false),
+        (r"C:\Users\John Smith\npm\copilot.cmd", true, false),
+        (r"sub\claude", true, false),
+        ("C:claude", true, false),
+        (r"\\?\C:\x\claude.exe", true, false),
+        ("", false, false),
+    ];
+
+    /// A program that names a **location** is handed to `Command` as given, and
+    /// only a bare name is searched for.
+    ///
+    /// This is the constraint the repair had to hold: "an absolute `program`
+    /// must spawn exactly as today". It is asserted by construction rather than
+    /// by a spawn — the environment carries no `PATH` at all, so a resolution
+    /// that searched would have nothing to find and would refuse, and every
+    /// location row instead comes back byte for byte.
+    ///
+    /// The second field held constant is the environment (empty, for every
+    /// row); what varies is the program shape and the naming rule, and the four
+    /// rows on which the two rules must **disagree** are counted so that a
+    /// `is_bare_name` which ignored its platform reports it.
+    #[test]
+    fn a_program_that_names_a_location_is_used_as_given_and_only_a_name_is_searched() {
+        let empty = composed(&[]);
+        let mut disagreements = 0_usize;
+        for (program, posix_is_name, windows_is_name) in NAME_TABLE {
+            assert_eq!(
+                ProgramNaming::Posix.is_bare_name(program),
+                *posix_is_name,
+                "Posix: `{program}`"
+            );
+            assert_eq!(
+                ProgramNaming::Windows.is_bare_name(program),
+                *windows_is_name,
+                "Windows: `{program}`"
+            );
+            if posix_is_name != windows_is_name {
+                disagreements += 1;
+            }
+
+            for naming in naming_grid() {
+                let is_name = match naming {
+                    ProgramNaming::Posix => *posix_is_name,
+                    ProgramNaming::Windows => *windows_is_name,
+                };
+                let resolved = resolve_program(program, &empty, KeyCase::Sensitive, naming);
+                if is_name {
+                    let error = resolved.expect_err(&format!(
+                        "{naming:?}: `{program}` is a name and nothing is on PATH"
+                    ));
+                    assert!(
+                        error.to_string().contains(program),
+                        "{naming:?}: the refusal must name the program: {error}"
+                    );
+                } else {
+                    assert_eq!(
+                        resolved.unwrap_or_else(|error| panic!(
+                            "{naming:?}: `{program}` is a location: {error}"
+                        )),
+                        PathBuf::from(program),
+                        "{naming:?}: a location was rewritten"
+                    );
+                }
+            }
+        }
+        assert_eq!(
+            disagreements, 4,
+            "the two naming rules must disagree on the four rows only Windows treats as \
+             locations; if they agree everywhere this grid measures one rule twice"
+        );
+    }
+
+    /// `PATH` order decides between installations; `PATHEXT` order decides only
+    /// **within** one directory.
+    ///
+    /// The intersection this repair is most exposed to, and the one a shell and
+    /// `std::process::Command` answer differently: std appends `.exe` and only
+    /// `.exe`, so an earlier directory's `claude.cmd` is invisible to it and a
+    /// later directory's `claude.exe` wins. A shell — and now this runner —
+    /// takes the earlier directory. Both axes vary independently and the
+    /// resolved files are counted as distinct values, so a nesting that swapped
+    /// the loops collapses the count.
+    ///
+    /// Driven under [`ProgramNaming::Windows`] on **both** platforms, which is
+    /// the whole reason that type exists: `PR6D-001` is a Windows rule, and a
+    /// Windows rule only the guest can execute is a rule that ships untested
+    /// six days out of seven.
+    #[test]
+    fn path_directory_order_decides_between_installations_and_pathext_only_within_one() {
+        let root = scratch("resolve-order");
+        let first = root.join("first");
+        let second = root.join("second");
+        let both = root.join("both");
+        let first_cmd = program_file(&first, "x.cmd");
+        let second_exe = program_file(&second, "x.exe");
+        let both_com = program_file(&both, "x.com");
+        let both_exe = program_file(&both, "x.exe");
+        let both_cmd = program_file(&both, "x.cmd");
+        program_file(&both, "x.bat");
+
+        let cases: Vec<(&str, Vec<&Path>, &str, &PathBuf)> = vec![
+            (
+                "an earlier directory's .cmd beats a later directory's .exe",
+                vec![&first, &second],
+                REAL_PATHEXT,
+                &first_cmd,
+            ),
+            (
+                "reversing PATH reverses the answer",
+                vec![&second, &first],
+                REAL_PATHEXT,
+                &second_exe,
+            ),
+            (
+                "within one directory PATHEXT decides, and .COM is first",
+                vec![&both],
+                REAL_PATHEXT,
+                &both_com,
+            ),
+            (
+                "reversing PATHEXT reverses the answer within that directory",
+                vec![&both],
+                ".CMD;.BAT;.EXE;.COM",
+                &both_cmd,
+            ),
+            (
+                "a directory holding four candidates still loses to an earlier one",
+                vec![&first, &both],
+                REAL_PATHEXT,
+                &first_cmd,
+            ),
+            (
+                "a PATHEXT that omits .CMD picks the .EXE beside it",
+                vec![&both, &first],
+                ".EXE;.COM",
+                &both_exe,
+            ),
+        ];
+
+        let mut resolved = BTreeSet::new();
+        for (what, dirs, pathext, expected) in cases {
+            let path = path_of(&dirs);
+            let env = composed(&[("PATH", &path), ("PATHEXT", OsStr::new(pathext))]);
+            let actual = resolve_program("x", &env, KeyCase::Insensitive, ProgramNaming::Windows)
+                .unwrap_or_else(|error| panic!("{what}: {error}"));
+            assert_eq!(&actual, expected, "{what}");
+            resolved.insert(actual);
+        }
+        // `first/x.cmd`, `second/x.exe`, `both/x.com`, `both/x.cmd`,
+        // `both/x.exe` — one per way the two axes can decide, and a grid that
+        // reaches fewer has an axis that is not varying the answer.
+        assert_eq!(
+            resolved.len(),
+            5,
+            "the grid must reach five distinct files; fewer means an axis is not varying: \
+             {resolved:?}"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// What a Windows name may be is `PATHEXT`, and never the extensionless
+    /// file beside it.
+    ///
+    /// Three things a resolution can get wrong here, each with its own row:
+    /// widening (an extensionless `claude` in a `PATH` directory shadowing the
+    /// real `claude.exe` — `CreateProcessW` appends `.exe` and `cmd.exe`
+    /// appends `PATHEXT`, and neither would run it); not reading `PATHEXT` at
+    /// all (a hard-coded list agrees with the default and diverges the moment
+    /// an operator sets one); and treating an unusable `PATHEXT` as "this
+    /// machine has no programs" rather than as a malformed variable.
+    ///
+    /// Every row holds the directory and the file set constant and varies only
+    /// `PATHEXT` and the naming rule.
+    #[test]
+    fn a_windows_name_is_pathext_and_never_the_extensionless_file() {
+        let root = scratch("resolve-pathext");
+        let dir = root.join("bin");
+        let bare = program_file(&dir, "x");
+        let exe = program_file(&dir, "x.exe");
+        let com = program_file(&dir, "x.com");
+        let foo = program_file(&dir, "x.foo");
+        let path = path_of(&[&dir]);
+
+        let resolve = |pathext: Option<&str>, naming| {
+            let mut pairs: Vec<(&str, &OsStr)> = vec![("PATH", &path)];
+            let value;
+            if let Some(text) = pathext {
+                value = OsString::from(text);
+                pairs.push(("PATHEXT", &value));
+            }
+            resolve_program("x", &composed(&pairs), KeyCase::Insensitive, naming)
+        };
+
+        // The default is the platform's, in the platform's order: `.COM` first.
+        for absent in [None, Some(""), Some(";;;"), Some("exe"), Some(".")] {
+            assert_eq!(
+                resolve(absent, ProgramNaming::Windows).expect("the default PATHEXT applies"),
+                com,
+                "PATHEXT={absent:?}: an unusable PATHEXT must fall back to the platform default, \
+                 not to \"no candidates\""
+            );
+        }
+        // And it really is read, not assumed: a PATHEXT naming one extension
+        // nobody ships picks that file over the `.exe` sitting beside it.
+        assert_eq!(
+            resolve(Some(".FOO"), ProgramNaming::Windows).expect("PATHEXT is honoured"),
+            foo
+        );
+        assert_eq!(
+            resolve(Some(".EXE"), ProgramNaming::Windows).expect("PATHEXT is honoured"),
+            exe
+        );
+        // The widening that must not happen: `x` exists and is never chosen.
+        assert!(
+            bare.is_file(),
+            "the premise: an extensionless file must be present, or this row proves nothing"
+        );
+        for pathext in [None, Some(REAL_PATHEXT), Some(".FOO")] {
+            assert_ne!(
+                resolve(pathext, ProgramNaming::Windows).expect("something resolves"),
+                bare,
+                "PATHEXT={pathext:?}: an extensionless file was treated as a Windows program"
+            );
+        }
+        // Unix has no extensions: the bare file is the only answer, and
+        // `PATHEXT` changes nothing.
+        for pathext in [None, Some(REAL_PATHEXT), Some(".FOO")] {
+            assert_eq!(
+                resolve(pathext, ProgramNaming::Posix).expect("Unix resolves the name itself"),
+                bare,
+                "PATHEXT={pathext:?}: Unix consulted PATHEXT"
+            );
+        }
+        // A name that carries an extension is tried verbatim first, under a
+        // PATHEXT that would otherwise send it elsewhere.
+        let value = OsString::from(".FOO");
+        let with_extension = resolve_program(
+            "x.exe",
+            &composed(&[("PATH", &path), ("PATHEXT", &value)]),
+            KeyCase::Insensitive,
+            ProgramNaming::Windows,
+        )
+        .expect("a name with an extension resolves");
+        assert_eq!(with_extension, exe, "`x.exe` resolved to something else");
+        // And a directory is not a program, on either rule.
+        let shadow = root.join("shadow");
+        std::fs::create_dir_all(shadow.join("x.exe")).expect("a directory named like a program");
+        let shadow_path = path_of(&[&shadow, &dir]);
+        for naming in naming_grid() {
+            let resolved = resolve_program(
+                "x.exe",
+                &composed(&[("PATH", &shadow_path)]),
+                KeyCase::Insensitive,
+                naming,
+            )
+            .unwrap_or_else(|error| panic!("{naming:?}: {error}"));
+            assert_eq!(
+                resolved, exe,
+                "{naming:?}: a directory named `x.exe` was resolved as a program"
+            );
+        }
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A candidate without the execute bit is skipped, the way `execvp` skips
+    /// it.
+    ///
+    /// The regression this guards is silent and platform-specific: `execvp`
+    /// walks past a non-executable file and finds the real installation further
+    /// along `PATH`, so a resolution that stopped at the first *existing* file
+    /// would refuse — or spawn `EACCES` — where the code it replaced ran. Two
+    /// directories, same name, and the answer must be the second.
+    #[cfg(unix)]
+    #[test]
+    fn a_candidate_without_the_execute_bit_is_skipped_the_way_execvp_skips_it() {
+        let root = scratch("resolve-mode");
+        let first = root.join("first");
+        let second = root.join("second");
+        let blocked = unexecutable_file(&first, "x");
+        let usable = program_file(&second, "x");
+
+        let both = path_of(&[&first, &second]);
+        assert_eq!(
+            resolve_program(
+                "x",
+                &composed(&[("PATH", &both)]),
+                KeyCase::Sensitive,
+                ProgramNaming::Posix
+            )
+            .expect("the executable one further along PATH"),
+            usable
+        );
+        assert!(
+            blocked.is_file(),
+            "the premise: the skipped candidate must exist"
+        );
+
+        let only_blocked = path_of(&[&first]);
+        resolve_program(
+            "x",
+            &composed(&[("PATH", &only_blocked)]),
+            KeyCase::Sensitive,
+            ProgramNaming::Posix,
+        )
+        .expect_err("a file with no execute bit is not a program");
+
+        // Windows has no such bit, so the same file is a program there — the
+        // two rules must not be the same rule.
+        assert_eq!(
+            resolve_program(
+                "x",
+                &composed(&[("PATH", &only_blocked), ("PATHEXT", OsStr::new(".EXE"))]),
+                KeyCase::Insensitive,
+                ProgramNaming::Windows,
+            )
+            .ok(),
+            None,
+            "Windows names `x` only through PATHEXT, so this row must refuse for the other reason"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A name that matches nothing is refused, naming the name and the
+    /// boundary — and an empty `PATH` entry is never searched.
+    ///
+    /// Fail-closed is the choice the repair round is held to: the alternative
+    /// is handing the name to `Command` anyway and taking a `NotFound` that
+    /// names no boundary, which on Windows is the failure an operator could not
+    /// diagnose. The empty-entry rule is here because this is the site where it
+    /// would actually execute: an empty `PATH` entry means "the current
+    /// directory" to some shells, and this runner's current directory is the
+    /// workspace — repository content, under automation.
+    #[test]
+    fn a_name_that_matches_nothing_is_refused_and_an_empty_path_entry_is_never_searched() {
+        let root = scratch("resolve-refusal");
+        let dir = root.join("bin");
+        let found = program_file(&dir, &shim_file_name("x"));
+        let empty_dir = root.join("empty");
+        std::fs::create_dir_all(&empty_dir).expect("an empty directory");
+
+        let naming = ProgramNaming::current();
+        let refuse = |path: Option<&OsStr>| {
+            let mut pairs: Vec<(&str, &OsStr)> = Vec::new();
+            if let Some(value) = path {
+                pairs.push(("PATH", value));
+            }
+            resolve_program(
+                "tactus-no-such-program",
+                &composed(&pairs),
+                KeyCase::current(),
+                naming,
+            )
+            .expect_err("nothing of that name exists")
+            .to_string()
+        };
+
+        let one_empty_entry = path_of(&[Path::new("")]);
+        let with_dir = path_of(&[&empty_dir]);
+        for (what, path, directories) in [
+            ("PATH is absent entirely", None, "0 directories"),
+            ("PATH is empty", Some(OsStr::new("")), "0 directories"),
+            (
+                "PATH is a single empty entry",
+                Some(one_empty_entry.as_os_str()),
+                "0 directories",
+            ),
+            (
+                "PATH is one real but empty directory",
+                Some(with_dir.as_os_str()),
+                "1 directory",
+            ),
+        ] {
+            let message = refuse(path);
+            assert!(
+                message.contains("tactus-no-such-program"),
+                "{what}: the refusal must name the program: {message}"
+            );
+            assert!(
+                message.contains("host runner"),
+                "{what}: the refusal must name the boundary: {message}"
+            );
+            assert!(
+                message.contains(directories),
+                "{what}: expected `{directories}` searched: {message}"
+            );
+        }
+
+        // The empty entry is skipped rather than treated as "here", and a real
+        // directory beside it is still searched: the count is the observable.
+        let mixed = path_of(&[Path::new(""), &dir]);
+        assert_eq!(
+            resolve_program(
+                "x",
+                &composed(&[("PATH", &mixed)]),
+                KeyCase::current(),
+                naming
+            )
+            .expect("the real directory is still searched"),
+            found
+        );
+        let message = resolve_program(
+            "tactus-no-such-program",
+            &composed(&[("PATH", &mixed)]),
+            KeyCase::current(),
+            naming,
+        )
+        .expect_err("nothing of that name exists")
+        .to_string();
+        assert!(
+            message.contains("1 directory searched"),
+            "the empty entry was counted as a directory: {message}"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// **`PR6D-001`.** A bare name that only `PATHEXT` resolves is executed by
+    /// the host runner — the npm-installed agent CLI, spawned the way
+    /// production now spawns it.
+    ///
+    /// `PATHEXT` lists `.CMD`; `CreateProcessW` appends `.exe` and nothing
+    /// else, and neither does Rust's `Command`. So a `CommandSpec.program` of
+    /// `claude` with `claude.cmd` on `PATH` failed with `NotFound` on every
+    /// Windows host, for the probe, the worker, the gate, the review and the
+    /// re-ask. The suite could not see it: every `.cmd` fixture in this crate
+    /// used an **absolute** path, which is a different property, and the guest
+    /// has none of the three CLIs installed.
+    ///
+    /// The platform fact is asserted **in this test**, not cited: the same
+    /// bare name is handed to `std::process::Command` under the same composed
+    /// environment first, and must fail with `NotFound`. Without that row the
+    /// claim below would pass on a platform where the bug never existed. Two
+    /// shims, two extensions, two markers and two arguments, counted as
+    /// distinct values so a fixture that ran one shim twice reports it; what is
+    /// held constant is the `PATH` directory, the runner and the composed
+    /// environment.
+    #[cfg(windows)]
+    #[test]
+    fn a_bare_name_that_only_pathext_resolves_runs_through_the_host_runner() {
+        let root = scratch("pathext-spawn");
+        let bin = root.join("bin");
+        let workspace = root.join("ws");
+        std::fs::create_dir_all(&workspace).expect("a workspace");
+
+        // Unique per run, so nothing on this machine's real PATH, in the
+        // application directory or in the system directories can satisfy it.
+        //
+        // Both arguments are **benign**, for `bin.rs`'s own reason: `%~1`
+        // strips the quotes the child received, so a `&` in the value would be
+        // re-parsed by `cmd.exe` as a command separator *inside the shim* and
+        // this case would be measuring batch re-parsing instead of resolution.
+        // Argument escaping through a batch target is
+        // `agent::bin::tests::arguments_reach_the_command_untouched`'s subject
+        // and is unaffected by which file a name resolved to. Measured on the
+        // guest: with `second & argument` the `.bat` shim exits 1 with
+        // "'argument' is not recognized", and the `.cmd` shim beside it — same
+        // resolution, benign argument — passes.
+        let stem = format!("tactus-d1-{}", crate::ulid::ulid());
+        let cases = [
+            (format!("{stem}-c"), "cmd", "CMDSHIM", "hello world"),
+            (format!("{stem}-b"), "bat", "BATSHIM", "second argument"),
+        ];
+        for (name, extension, marker, _) in &cases {
+            marker_shim(&bin, &format!("{name}.{extension}"), marker);
+        }
+
+        let environment = environment_on_path(&[&bin], Some(REAL_PATHEXT));
+        let composed_env = environment
+            .compose(&ExecutionRole::Gate, None, &[])
+            .expect("compose the child environment");
+        assert!(
+            composed_env.iter().any(|(key, value)| key == "PATHEXT"
+                && value.to_string_lossy().to_uppercase().contains(".CMD")),
+            "the premise of this case: PATHEXT must list .CMD"
+        );
+
+        let runner = HostRunner::new().with_environment(environment);
+        let mut markers = BTreeSet::new();
+        let mut arguments = BTreeSet::new();
+        for (name, extension, marker, argument) in &cases {
+            // The platform fact, executed. `std` searches the child PATH, the
+            // application directory, the system directories and the parent
+            // PATH, appending `.exe` to each — so a `.cmd`/`.bat` on PATH is
+            // invisible to it, and this is `PR6D-001` itself.
+            let mut direct = Command::new(name);
+            direct.env_clear();
+            direct.envs(composed_env.clone());
+            direct.current_dir(&workspace);
+            direct.args([argument]);
+            let error = match direct.output() {
+                Ok(output) => panic!(
+                    ".{extension}: std spawned a bare name it cannot resolve, so this platform \
+                     never had PR6D-001: {output:?}"
+                ),
+                Err(error) => error,
+            };
+            assert_eq!(
+                error.kind(),
+                std::io::ErrorKind::NotFound,
+                ".{extension}: the platform fact this test rests on has changed: {error}"
+            );
+
+            // The claim: the same name, through the runner.
+            let output = runner
+                .run(&named_request(name, argument, &workspace))
+                .unwrap_or_else(|error| panic!(".{extension}: {error}"));
+            assert_eq!(output.code, Some(0), ".{extension}: {output:?}");
+            assert!(
+                output.stdout.contains(&format!("{marker}:{argument}")),
+                ".{extension}: the shim did not run with its argument: {:?}",
+                output.stdout
+            );
+            markers.insert((*marker).to_owned());
+            arguments.insert((*argument).to_owned());
+        }
+        assert_eq!(markers.len(), 2, "both shims must have run: {markers:?}");
+        assert_eq!(
+            arguments.len(),
+            2,
+            "each shim must have received its own argument: {arguments:?}"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Two runners in one process resolve one name against **their own**
+    /// environments.
+    ///
+    /// The hazard the container runner introduces and this repair must not
+    /// reintroduce: a resolution remembered anywhere — a `OnceLock`, a field, a
+    /// process-wide cache — hands the first boundary's answer to the second,
+    /// and a value that is correct on first use and wrong on the second is
+    /// invisible to any test that constructs one runner.
+    /// `agent::built_program_tests` holds that for the adapters; this holds it
+    /// for the boundary, with real spawns.
+    ///
+    /// Both orders, because "the first caller wins" is a property of order, and
+    /// the markers are counted as distinct values.
+    #[test]
+    fn two_runners_in_one_process_resolve_one_name_against_their_own_environments() {
+        let root = scratch("resolve-two-runners");
+        let workspace = root.join("ws");
+        std::fs::create_dir_all(&workspace).expect("a workspace");
+        let name = format!("tactus-d1-{}", crate::ulid::ulid());
+        let file = shim_file_name(&name);
+
+        let left_dir = root.join("left");
+        let right_dir = root.join("right");
+        marker_shim(&left_dir, &file, "LEFT");
+        marker_shim(&right_dir, &file, "RIGHT");
+        let left = HostRunner::new()
+            .with_environment(environment_on_path(&[&left_dir], Some(REAL_PATHEXT)));
+        let right = HostRunner::new()
+            .with_environment(environment_on_path(&[&right_dir], Some(REAL_PATHEXT)));
+
+        let ran = |runner: &HostRunner, which: &str| -> String {
+            let output = runner
+                .run(&named_request(&name, "arg", &workspace))
+                .unwrap_or_else(|error| panic!("{which}: {error}"));
+            assert_eq!(output.code, Some(0), "{which}: {output:?}");
+            output.stdout.trim().to_owned()
+        };
+
+        let left_first = [ran(&left, "left"), ran(&right, "right")];
+        let right_first = [ran(&right, "right"), ran(&left, "left")];
+        assert_eq!(left_first, ["LEFT:arg", "RIGHT:arg"]);
+        assert_eq!(right_first, ["RIGHT:arg", "LEFT:arg"]);
+        let seen: BTreeSet<&String> = left_first.iter().chain(right_first.iter()).collect();
+        assert_eq!(
+            seen.len(),
+            2,
+            "one name reached two boundaries and got one answer: {seen:?}"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// An absolute program is spawned as given, even when a `PATH` directory
+    /// holds a different file of the same name.
+    ///
+    /// "An absolute `program` must spawn exactly as today" is the constraint
+    /// this repair was given, and a resolution that re-resolved one would be
+    /// invisible to every existing fixture: they all put the *only* copy of the
+    /// program at that path. Here there are two copies, so "used as given" and
+    /// "searched for" produce different output. The space in the directory name
+    /// is `bin.rs`'s own production shape, `C:\Users\John Smith\npm\`.
+    #[test]
+    fn an_absolute_program_is_spawned_as_given_even_when_path_holds_that_name() {
+        let root = scratch("resolve-absolute");
+        let workspace = root.join("ws");
+        std::fs::create_dir_all(&workspace).expect("a workspace");
+        let name = format!("tactus-d1-{}", crate::ulid::ulid());
+        let file = shim_file_name(&name);
+
+        let on_path = root.join("on-path");
+        marker_shim(&on_path, &file, "ONPATH");
+        let installed = root.join(A_DIRECTORY_WITH_A_SPACE);
+        let absolute = marker_shim(&installed, &file, "ABSOLUTE");
+        assert!(absolute.is_absolute() && absolute.to_string_lossy().contains(' '));
+
+        let runner = HostRunner::new()
+            .with_environment(environment_on_path(&[&on_path], Some(REAL_PATHEXT)));
+        let program = absolute
+            .to_str()
+            .expect("a scratch path this crate can name")
+            .to_owned();
+
+        let by_path = runner
+            .run(&named_request(&program, "arg", &workspace))
+            .expect("an absolute shim spawns");
+        assert_eq!(by_path.code, Some(0), "{by_path:?}");
+        assert_eq!(
+            by_path.stdout.trim(),
+            "ABSOLUTE:arg",
+            "an absolute program was re-resolved against PATH"
+        );
+
+        // The control: the same runner, the same name without its directory,
+        // reaches the other file — so the two really are distinguishable and
+        // the row above is not passing by coincidence.
+        let by_name = runner
+            .run(&named_request(&name, "arg", &workspace))
+            .expect("the bare name resolves on PATH");
+        assert_eq!(by_name.stdout.trim(), "ONPATH:arg");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Everything one spawn's containment observers can see about resolution.
+    struct ResolutionWitness {
+        /// `program_resolutions()` as each containment point saw it, in order.
+        at_points: Arc<Mutex<Vec<(SubEffectPoint, u64)>>>,
+    }
+
+    impl ResolutionWitness {
+        fn new() -> Self {
+            Self {
+                at_points: Arc::new(Mutex::new(Vec::new())),
+            }
+        }
+
+        fn handle(&self) -> Self {
+            Self {
+                at_points: Arc::clone(&self.at_points),
+            }
+        }
+
+        fn seen(&self) -> Vec<(SubEffectPoint, u64)> {
+            self.at_points
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .clone()
+        }
+    }
+
+    impl SpawnHooks for ResolutionWitness {
+        fn point(&mut self, point: SubEffectPoint) -> Injection {
+            self.at_points
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .push((point, program_resolutions()));
+            Injection::Proceed
+        }
+    }
+
+    /// One program name is resolved **once per spawn**, **before** any of the
+    /// spawn, and **not at all** when the request is refused earlier.
+    ///
+    /// Ordering is a set of independently droppable predicates and a suite that
+    /// proves only "the right file ran" holds none of them. The observable is
+    /// the sequence: [`program_resolutions`] read at every containment point,
+    /// which are the coordinates the funnel passes through between
+    /// `CreateProcess`/`fork` and the running child. A resolution that happened
+    /// twice shows a second increment; one that happened lazily at spawn time
+    /// shows a count that is still at the baseline when the first point fires;
+    /// one that happened before `compose` shows an increment on the request
+    /// `compose` refuses.
+    ///
+    /// Both program shapes, because "once" must hold on both branches of the
+    /// resolution — a bare name that is searched for, and an absolute path that
+    /// is not — and the bare name is a `PATHEXT`-resolved batch shim, which is
+    /// the intersection {a name to resolve} x {a file `CreateProcessW` reaches
+    /// only through an interpreter} that no fixture in this crate had.
+    #[test]
+    fn a_program_is_resolved_once_per_spawn_before_any_of_it_and_never_before_compose_refuses() {
+        let root = scratch("resolve-once");
+        let workspace = root.join("ws");
+        std::fs::create_dir_all(&workspace).expect("a workspace");
+        let name = format!("tactus-d1-{}", crate::ulid::ulid());
+        let bin = root.join("bin");
+        let shim = marker_shim(&bin, &shim_file_name(&name), "ONCE");
+        let absolute = shim
+            .to_str()
+            .expect("a scratch path this crate can name")
+            .to_owned();
+
+        for (what, program) in [
+            ("a bare name", name.clone()),
+            ("an absolute path", absolute),
+        ] {
+            let witness = ResolutionWitness::new();
+            let runner = HostRunner::new()
+                .with_environment(environment_on_path(&[&bin], Some(REAL_PATHEXT)))
+                .with_hooks(Box::new(witness.handle()));
+
+            let before = program_resolutions();
+            let output = runner
+                .run(&named_request(&program, "arg", &workspace))
+                .unwrap_or_else(|error| panic!("{what}: {error}"));
+            assert_eq!(output.stdout.trim(), "ONCE:arg", "{what}");
+            assert_eq!(
+                program_resolutions(),
+                before + 1,
+                "{what}: one spawn resolved its program more than once, or not at all"
+            );
+
+            let seen = witness.seen();
+            let points: Vec<SubEffectPoint> = seen.iter().map(|(point, _)| *point).collect();
+            assert_eq!(
+                points,
+                per_spawn_points(),
+                "{what}: a resolved program did not reach this platform's containment points \
+                 in order"
+            );
+            for (point, count) in seen {
+                assert_eq!(
+                    count,
+                    before + 1,
+                    "{what}: at {point:?} the program had been resolved {count} times, not once \
+                     — resolution must complete before any of the spawn"
+                );
+            }
+        }
+
+        // A request the environment refuses is refused **before** anything is
+        // resolved: `compose` runs first, so a reserved-key overlay never
+        // reaches the filesystem and never reaches a containment point.
+        let witness = ResolutionWitness::new();
+        let runner = HostRunner::new()
+            .with_environment(environment_on_path(&[&bin], Some(REAL_PATHEXT)))
+            .with_hooks(Box::new(witness.handle()));
+        let mut request = named_request(&name, "arg", &workspace);
+        request.command.env = vec![("PATH".to_owned(), "/somewhere/else".to_owned())];
+        let before = program_resolutions();
+        let error = runner
+            .run(&request)
+            .expect_err("an overlay naming a reserved key is refused pre-flight");
+        assert!(error.to_string().contains("reserved"), "{error}");
+        assert_eq!(
+            program_resolutions(),
+            before,
+            "a request refused by compose still resolved its program"
+        );
+        assert!(
+            witness.seen().is_empty(),
+            "a request refused by compose reached a containment point: {:?}",
+            witness.seen()
+        );
+
+        // And a name that resolves to nothing is refused **after** resolution
+        // and **before** any of the spawn: the count moves, the points do not.
+        let witness = ResolutionWitness::new();
+        let runner = HostRunner::new()
+            .with_environment(environment_on_path(&[&root.join("nothing-here")], None))
+            .with_hooks(Box::new(witness.handle()));
+        let before = program_resolutions();
+        let error = runner
+            .run(&named_request(&name, "arg", &workspace))
+            .expect_err("a name that matches nothing is refused");
+        assert!(error.to_string().contains(&name), "{error}");
+        assert_eq!(
+            program_resolutions(),
+            before + 1,
+            "the refusal did not come from a resolution"
+        );
+        assert!(
+            witness.seen().is_empty(),
+            "a refused name still reached a containment point: {:?}",
+            witness.seen()
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Every bare program this crate ships goes through **one** resolution
+    /// rule.
+    ///
+    /// Two rules is how `PR6D-001` happened: the shells' bare names worked
+    /// because a shell is an `.exe`, so nothing noticed that the agent CLIs'
+    /// bare names — the same shape, one field over — did not. The names are
+    /// written here rather than read from `ShellKind::program` and the adapter
+    /// constants, and the exhaustive `match` below ties the written table to the
+    /// enum so a sixth shell fails to compile rather than silently leaving the
+    /// grid.
+    ///
+    /// What is held constant is the directory, the shim content and the naming
+    /// rule; what varies is the name, and the resolved files are counted so a
+    /// rule that special-cased one name collapses the count.
+    #[test]
+    fn every_bare_program_this_crate_ships_goes_through_one_resolution_rule() {
+        // The five shells `gates::ShellKind::spec` can put in a spec, and the
+        // three agent CLIs `bin::Invocation::named` can.
+        const NAMES: [&str; 8] = [
+            "cmd",
+            "sh",
+            "bash",
+            "powershell",
+            "pwsh",
+            "claude",
+            "codex",
+            "copilot",
+        ];
+        for shell in [
+            ShellKind::Cmd,
+            ShellKind::Sh,
+            ShellKind::Bash,
+            ShellKind::PowerShell,
+            ShellKind::Pwsh,
+        ] {
+            match shell {
+                ShellKind::Cmd
+                | ShellKind::Sh
+                | ShellKind::Bash
+                | ShellKind::PowerShell
+                | ShellKind::Pwsh => {}
+            }
+            assert!(
+                NAMES.contains(&shell.spec("exit 0").program.as_str()),
+                "a shell ships a program this grid does not carry: {shell:?}"
+            );
+        }
+
+        let root = scratch("resolve-one-rule");
+        let bin = root.join("bin");
+        let path = path_of(&[&bin]);
+        let naming = ProgramNaming::current();
+        let mut resolved = BTreeSet::new();
+        for name in NAMES {
+            assert!(
+                naming.is_bare_name(name),
+                "`{name}` is what production ships and it is not a name"
+            );
+            let expected = program_file(&bin, &shim_file_name(name));
+            let actual = resolve_program(
+                name,
+                &composed(&[("PATH", &path), ("PATHEXT", OsStr::new(REAL_PATHEXT))]),
+                KeyCase::current(),
+                naming,
+            )
+            .unwrap_or_else(|error| panic!("{name}: {error}"));
+            assert_eq!(actual, expected, "{name}");
+            resolved.insert(actual);
+        }
+        assert_eq!(
+            resolved.len(),
+            NAMES.len(),
+            "eight names reached fewer than eight files: {resolved:?}"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Resolving `cmd` does not change `cmd.exe`'s raw-tail rule.
+    ///
+    /// `build_command`'s one Windows rule is keyed on the program, and the
+    /// program the runner hands it is now the **resolved** one — an absolute
+    /// path where the spec carried a bare name. A gate whose command line
+    /// changed meaning depending on whether its shell had been resolved is not
+    /// "adapter parsing unchanged"; `gates::ShellKind::command` says why the
+    /// tail must reach the child un-re-quoted, and this is the half of that
+    /// rule which the repair could have broken.
+    ///
+    /// **This has to spawn.** `Command::get_args` yields the same sequence for
+    /// `arg` and for `raw_arg`, so an assertion over the built `Command` cannot
+    /// tell the two apart — measured: the first version of this test was green
+    /// under the mutation it was written for. What distinguishes them is the
+    /// command line `CreateProcessW` receives, and the only oracle for that is
+    /// the child's own output: std escapes an embedded quote as `\"`, which
+    /// `cmd.exe` does not un-escape, so a re-quoted tail echoes `\"quoted`.
+    ///
+    /// The resolved path is the one **this runner** resolves, not a transcribed
+    /// `C:\Windows\System32\cmd.exe`, so the case holds on a machine whose
+    /// shell lives elsewhere; that it differs from `cmd` is asserted first, or
+    /// the two spellings would be one.
+    #[cfg(windows)]
+    #[test]
+    fn a_resolved_cmd_keeps_the_raw_tail_rule() {
+        let spec = ShellKind::Cmd.spec(r#"echo "quoted arg""#);
+        assert_eq!(spec.program, "cmd", "the shell ships a bare name");
+
+        let environment = HostEnvironment::from_process();
+        let composed = environment
+            .compose(&ExecutionRole::Gate, None, &[])
+            .expect("compose this process's environment");
+        let resolved = resolve_program(
+            &spec.program,
+            &composed,
+            environment.case(),
+            ProgramNaming::current(),
+        )
+        .expect("this runner resolves the recorded shell");
+        assert_ne!(
+            resolved,
+            PathBuf::from("cmd"),
+            "the resolved spelling must differ from the bare one, or this compares one thing \
+             with itself"
+        );
+        assert!(resolved.is_absolute(), "{}", resolved.display());
+
+        // Both spellings, spawned. The quotes must arrive as the operator wrote
+        // them, from the resolved path exactly as from the bare name.
+        let mut stdouts = BTreeSet::new();
+        for program in [PathBuf::from("cmd"), resolved.clone()] {
+            let out = build_command_at(&spec, &program)
+                .output()
+                .unwrap_or_else(|error| panic!("{}: {error}", program.display()));
+            let stdout = String::from_utf8_lossy(&out.stdout).trim().to_owned();
+            assert_eq!(
+                stdout,
+                r#""quoted arg""#,
+                "{}: the /C tail was re-quoted",
+                program.display()
+            );
+            stdouts.insert(stdout);
+        }
+        assert_eq!(
+            stdouts.len(),
+            1,
+            "resolving the shell changed what the child saw: {stdouts:?}"
+        );
+
+        // And through the production route, where the bare name is what the
+        // gate ships and the runner does the resolving.
+        let workspace = scratch("raw-tail");
+        let request = crate::runner::gate_request(
+            spec.clone(),
+            workspace.clone(),
+            Duration::from_secs(60),
+            gate_invocation(),
+        );
+        let out = HostRunner::new()
+            .run(&request)
+            .expect("a gate's shell runs through the runner");
+        assert_eq!(
+            out.stdout.trim(),
+            r#""quoted arg""#,
+            "the runner's own route re-quoted the tail"
+        );
+
+        // The control: a program that is not `cmd` does not get the rule at
+        // all, so the rows above are not true of everything. An npm shim named
+        // `claude.cmd` has the file stem `claude`, and a rule keyed on the
+        // extension rather than the stem would hand it a raw tail.
+        let shim = build_command_at(&spec, Path::new(r"C:\npm\claude.cmd"));
+        let args: Vec<String> = shim
+            .get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(
+            args,
+            vec!["/C".to_owned(), r#"echo "quoted arg""#.to_owned()],
+            "the spec's arguments must reach a non-`cmd` program unchanged"
+        );
+        let _ = std::fs::remove_dir_all(&workspace);
+    }
+
+    // -----------------------------------------------------------------------
+    // PR6-LANED-001: one boundary, one executable
+    // -----------------------------------------------------------------------
+
+    /// The request **production** sends for `role`, carrying **this** program.
+    ///
+    /// [`production_request`] fixes the program per role because there the role
+    /// is the subject; here the program is the subject and the role is what
+    /// varies, so each role's own production builder is handed the same spec.
+    /// `Probe(Shell)` returns `None` because its program is not a caller's to
+    /// choose — [`shell_probe_request`] writes the recorded shell — and the
+    /// `match` is exhaustive, so a role added later has to be classified here
+    /// rather than silently leaving the grid.
+    fn role_request_for(
+        role: &ExecutionRole,
+        program: &str,
+        argument: &str,
+        workspace: &Path,
+    ) -> Option<RunnerRequest> {
+        let spec = CommandSpec {
+            program: program.to_owned(),
+            args: vec![argument.to_owned()],
+            env: Vec::new(),
+            stdin: Vec::new(),
+        };
+        let timeout = Duration::from_secs(60);
+        match role {
+            ExecutionRole::Probe(ProbeTarget::Shell) => None,
+            ExecutionRole::Probe(ProbeTarget::Agent(agent)) => Some(
+                crate::agent::probe_request(agent.as_str(), spec, 0, timeout)
+                    .expect("a shipped adapter id"),
+            ),
+            ExecutionRole::Implement => Some(crate::runner::worker_request(
+                spec,
+                workspace.to_path_buf(),
+                fixture_agent(),
+                timeout,
+                worker_invocation(),
+            )),
+            ExecutionRole::Review => Some(crate::runner::review_request(
+                spec,
+                workspace.to_path_buf(),
+                fixture_agent(),
+                timeout,
+                review_invocation(),
+            )),
+            ExecutionRole::Gate => Some(crate::runner::gate_request(
+                spec,
+                workspace.to_path_buf(),
+                timeout,
+                gate_invocation(),
+            )),
+        }
+    }
+
+    /// **`PR6-LANED-001`.** One boundary executes **one** file for a name, even
+    /// when the filesystem moves between pre-flight and the attempt.
+    ///
+    /// DESIGN.md:612 — "Probes run through that same runner, **or pre-flight
+    /// could certify a host CLI/version different from the one the attempt
+    /// executes**". Routing the probe through the runner is necessary and is
+    /// not sufficient, and this is the fixture that says so: `PATH=first:second`
+    /// with the same name in both directories, the probe certifies
+    /// `first/<name>`, `first/<name>` is then removed, and a runner that
+    /// re-searched per spawn hands the attempt `second/<name>` — a different
+    /// executable under an unchanged `CommandSpec.program`. A test asserting
+    /// that the two *program strings* agree passes throughout, which is why the
+    /// claim it supported was wrong.
+    ///
+    /// **The control is the oracle**: a *fresh* runner over the same
+    /// environment, after the removal, does reach `second/<name>` — so the two
+    /// files are genuinely distinguishable, the removal genuinely changes the
+    /// answer, and the memoised runner's refusal is the memo rather than a
+    /// fixture that could not tell them apart.
+    ///
+    /// The second field held constant is the environment — one `HostEnvironment`
+    /// for every row, composed the same way — and what varies is the role
+    /// (`Probe(Agent)` then `Implement`, which is the pair the passage names)
+    /// and the state of the filesystem between them.
+    ///
+    /// **Fail-closed on purpose.** The attempt does not get `second/<name>`; it
+    /// gets a spawn failure naming the file pre-flight certified. An operator
+    /// reading it learns that the CLI moved under a running run, which is true,
+    /// instead of a `Caps.version` that quietly stopped describing anything.
+    #[test]
+    fn one_boundary_executes_one_file_for_a_name_across_a_probe_and_the_attempt() {
+        let root = scratch("one-executable");
+        let workspace = root.join("ws");
+        std::fs::create_dir_all(&workspace).expect("a workspace");
+        let name = format!("tactus-d2-{}", crate::ulid::ulid());
+        let file = shim_file_name(&name);
+
+        let first_dir = root.join("first");
+        let second_dir = root.join("second");
+        let first = marker_shim(&first_dir, &file, "FIRST");
+        marker_shim(&second_dir, &file, "SECOND");
+        let environment = || environment_on_path(&[&first_dir, &second_dir], Some(REAL_PATHEXT));
+
+        let runner = HostRunner::new().with_environment(environment());
+        let probe = role_request_for(
+            &ExecutionRole::Probe(ProbeTarget::Agent(fixture_agent())),
+            &name,
+            "arg",
+            &workspace,
+        )
+        .expect("an agent probe carries a chosen program");
+        let attempt = role_request_for(&ExecutionRole::Implement, &name, "arg", &workspace)
+            .expect("a worker carries a chosen program");
+
+        let searches = program_searches();
+        let certified = runner.run(&probe).expect("the probe runs the CLI");
+        assert_eq!(
+            certified.stdout.trim(),
+            "FIRST:arg",
+            "pre-flight did not certify the first installation"
+        );
+
+        // The CLI moves under the run: the file pre-flight executed is gone,
+        // and the other one — same name, same PATH, different executable — is
+        // still there.
+        std::fs::remove_file(&first).expect("remove the certified installation");
+        assert!(!first.exists());
+
+        // The oracle. A boundary that had not decided yet reaches `second`, so
+        // "resolve per spawn" really does change the answer here.
+        let fresh = HostRunner::new().with_environment(environment());
+        let moved = fresh
+            .run(
+                &role_request_for(&ExecutionRole::Implement, &name, "arg", &workspace)
+                    .expect("a worker carries a chosen program"),
+            )
+            .expect("the second installation is reachable");
+        assert_eq!(
+            moved.stdout.trim(),
+            "SECOND:arg",
+            "the fixture cannot tell the two installations apart, so it proves nothing"
+        );
+
+        // The claim. The runner that certified `first` does not silently run
+        // `second`.
+        //
+        // *What* the failure looks like is the platform's, and the two differ:
+        // on Unix the spawn of a vanished file is `ENOENT` and the runner
+        // returns an error naming it, while on Windows `std` runs a `.cmd`
+        // through `cmd.exe`, so the spawn succeeds and the interpreter exits
+        // non-zero. The claim is neither of those spellings — it is that the
+        // attempt did not run the *other* installation and did not report
+        // success — so it is asserted over everything the boundary handed back,
+        // whichever shape it came in.
+        //
+        // The text is the child's own, not a `{:?}` of it: a debug rendering
+        // escapes every backslash, and a Windows path searched for inside one
+        // would never be found however right the runner was.
+        let outcome = runner.run(&attempt);
+        let (how, said) = match &outcome {
+            Ok(output) => (
+                format!("it ran and exited {:?}", output.code),
+                format!("{}{}", output.stdout, output.stderr),
+            ),
+            Err(error) => ("it failed".to_owned(), error.to_string()),
+        };
+        assert!(
+            !said.contains("SECOND"),
+            "the attempt ran the other installation: {how}: {said}"
+        );
+        assert_ne!(
+            outcome.as_ref().ok().and_then(|output| output.code),
+            Some(0),
+            "the attempt reported success without its certified executable: {said}"
+        );
+        assert!(
+            said.contains(&first.to_string_lossy().into_owned()),
+            "what came back must name the file pre-flight certified: {how}: {said}"
+        );
+        assert_eq!(
+            program_searches(),
+            searches + 2,
+            "the memoised runner searched more than once, or the fresh one did not search"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// One name is **searched once** for a whole run, and asked for once per
+    /// spawn.
+    ///
+    /// The identity predicate and the ordering predicate are independently
+    /// droppable, so they have two counters: [`program_resolutions`] moves once
+    /// per spawn (D1's `a_program_is_resolved_once_per_spawn_…` holds that and
+    /// its position in the spawn) and [`program_searches`] moves once per
+    /// boundary. A memo that never hits satisfies the first and reopens
+    /// DESIGN.md:612; this is the fixture for the second.
+    ///
+    /// **Across roles, and that is the point.** `host-v1` supplies credential
+    /// locations *role-scoped* ([`supplies_credentials`]), so a probe's
+    /// composed environment and a gate's differ — asserted here as a
+    /// distinct-value count before anything else, because a memo keyed on the
+    /// composed environment would miss on exactly the pre-flight/attempt pair
+    /// :612 requires to agree, and this test would then be reporting that four
+    /// spawns searched four times for a good reason. The key is the three
+    /// fields that decide the answer, not the environment.
+    ///
+    /// `Probe(Shell)` is the one role absent: its program is the recorded
+    /// shell, not a caller's choice. [`role_request_for`] is exhaustive over
+    /// [`ExecutionRole`], so it is absent by classification rather than by
+    /// omission.
+    #[test]
+    fn one_name_is_searched_once_for_a_boundary_and_asked_for_once_per_spawn() {
+        let root = scratch("searched-once");
+        let workspace = root.join("ws");
+        std::fs::create_dir_all(&workspace).expect("a workspace");
+        let name = format!("tactus-d2-{}", crate::ulid::ulid());
+        let bin = root.join("bin");
+        marker_shim(&bin, &shim_file_name(&name), "ONE");
+
+        // `host-v1` supplies a credential location only when the *base* carries
+        // it, so the base has to carry one for the roles to differ at all —
+        // this machine's own environment has no `CLAUDE_CONFIG_DIR` and every
+        // role would otherwise compose the same thing.
+        let on_path = environment_on_path(&[&bin], Some(REAL_PATHEXT));
+        let case = on_path.case();
+        let mut base = on_path.base().to_vec();
+        base.retain(|(key, _)| !case.same_key(key, OsStr::new("CLAUDE_CONFIG_DIR")));
+        base.push((os("CLAUDE_CONFIG_DIR"), os("/home/tactus/.claude")));
+        let environment = HostEnvironment::with_base(base, case);
+
+        let requests: Vec<(String, RunnerRequest)> = ExecutionRole::all()
+            .iter()
+            .filter_map(|role| {
+                role_request_for(role, &name, "arg", &workspace)
+                    .map(|request| (role.label(), request))
+            })
+            .collect();
+        assert_eq!(
+            requests.len(),
+            4,
+            "four of the five roles carry a caller's program: {:?}",
+            requests.iter().map(|(role, _)| role).collect::<Vec<_>>()
+        );
+
+        // The premise: these roles really do compose different environments, so
+        // "one answer for all of them" is a claim and not a tautology.
+        let composed: BTreeSet<Vec<(OsString, OsString)>> = requests
+            .iter()
+            .map(|(_, request)| {
+                environment
+                    .compose(&request.role, request.agent.as_ref(), &request.command.env)
+                    .expect("compose each role's environment")
+            })
+            .collect();
+        assert_eq!(
+            composed.len(),
+            2,
+            "the four roles composed {} distinct environments; host-v1 scopes credential \
+             locations by role, so a gate's must differ from an agent's",
+            composed.len()
+        );
+
+        let runner = HostRunner::new().with_environment(environment);
+        let searches = program_searches();
+        let resolutions = program_resolutions();
+        let mut stdouts = BTreeSet::new();
+        for (role, request) in &requests {
+            let output = runner
+                .run(request)
+                .unwrap_or_else(|error| panic!("{role}: {error}"));
+            assert_eq!(output.code, Some(0), "{role}: {output:?}");
+            stdouts.insert(output.stdout.trim().to_owned());
+        }
+        assert_eq!(
+            stdouts,
+            BTreeSet::from(["ONE:arg".to_owned()]),
+            "the roles did not all reach one file"
+        );
+        assert_eq!(
+            program_resolutions(),
+            resolutions + 4,
+            "a program must be decided for every spawn, memo or no memo"
+        );
+        assert_eq!(
+            program_searches(),
+            searches + 1,
+            "one boundary asked the filesystem more than once for one name"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// What the memo is keyed on: the program **and** the environment that
+    /// answers for it.
+    ///
+    /// The hazard the repair introduces. A memo keyed on the program name alone
+    /// is a new way to certify the wrong executable — the same defect one layer
+    /// in — and it is invisible to every fixture above, because in production
+    /// `PATH` is reserved and constant for a run. So this asks the boundary the
+    /// same name under two environments and requires two answers.
+    ///
+    /// `program_for` directly rather than through `run`, because the only
+    /// composed value a caller can vary within one runner *through* `run` is
+    /// `PATHEXT` (an overlay may not name `PATH`, which is reserved), and
+    /// `PATHEXT` decides nothing on Unix. Both fields of the key are then
+    /// exercised on both platforms, which is the property D1's `ProgramNaming`
+    /// exists to preserve.
+    ///
+    /// Held constant: the runner, the name, and the naming rule. Varied: the
+    /// composed `PATH`, and — on Windows, where it decides anything — the
+    /// composed `PATHEXT`. The resolved files are counted as distinct values.
+    #[test]
+    fn a_resolution_question_is_the_program_and_the_environment_that_answers_it() {
+        let root = scratch("memo-key");
+        let name = format!("tactus-d2-{}", crate::ulid::ulid());
+        let file = shim_file_name(&name);
+        let left_dir = root.join("left");
+        let right_dir = root.join("right");
+        let left = marker_shim(&left_dir, &file, "LEFT");
+        let right = marker_shim(&right_dir, &file, "RIGHT");
+
+        let runner = HostRunner::new();
+        let ask = |path: &Path| -> (PathBuf, u64) {
+            let composed = composed(&[
+                ("PATH", path_of(&[path]).as_os_str()),
+                ("PATHEXT", OsStr::new(REAL_PATHEXT)),
+            ]);
+            let before = program_searches();
+            let answer = runner
+                .program_for(&name, &composed)
+                .expect("the shim is on this PATH");
+            (answer, program_searches() - before)
+        };
+
+        let (first, searched_first) = ask(&left_dir);
+        let (second, searched_second) = ask(&right_dir);
+        let (again, searched_again) = ask(&left_dir);
+        assert_eq!(first, left, "the first environment's own file");
+        assert_eq!(
+            second, right,
+            "one runner replayed one environment's answer for another's question"
+        );
+        assert_eq!(again, left, "the first question stopped being answered");
+        assert_eq!(
+            (searched_first, searched_second, searched_again),
+            (1, 1, 0),
+            "a different question must search and the same question must not"
+        );
+        let files: BTreeSet<PathBuf> = [first, second, again].into_iter().collect();
+        assert_eq!(files.len(), 2, "two environments, one answer: {files:?}");
+
+        // The other field of the key, where it decides anything.
+        #[cfg(windows)]
+        {
+            let both = root.join("both");
+            let by_cmd = marker_shim(&both, &format!("{name}.cmd"), "CMDSHIM");
+            let by_bat = marker_shim(&both, &format!("{name}.bat"), "BATSHIM");
+            let path = path_of(&[&both]);
+            let ask_ext = |pathext: &str| -> (PathBuf, u64) {
+                let composed =
+                    composed(&[("PATH", path.as_os_str()), ("PATHEXT", OsStr::new(pathext))]);
+                let before = program_searches();
+                let answer = runner
+                    .program_for(&name, &composed)
+                    .expect("a shim resolves under either PATHEXT");
+                (answer, program_searches() - before)
+            };
+            let (cmd_first, searched_cmd) = ask_ext(".CMD;.BAT");
+            let (bat_first, searched_bat) = ask_ext(".BAT;.CMD");
+            assert_eq!(cmd_first, by_cmd);
+            assert_eq!(
+                bat_first, by_bat,
+                "the memo replayed one PATHEXT's answer under another"
+            );
+            assert_eq!((searched_cmd, searched_bat), (1, 1));
+        }
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A name this boundary refused stays refused, in the same words, without
+    /// asking the filesystem again.
+    ///
+    /// The failure branch of the memo, and the one where fail-open would be
+    /// easy: not remembering a refusal means a run whose pre-flight could not
+    /// find `claude` silently finds one at the third attempt because something
+    /// installed it meanwhile — pre-flight certifying an absence the attempt
+    /// does not honour, which is DESIGN.md:612 with the polarity flipped.
+    ///
+    /// **The control is the oracle.** After the CLI appears, a *fresh* boundary
+    /// does run it. So the second refusal is the memo holding, not a fixture in
+    /// which nothing changed.
+    ///
+    /// The replayed error is required to be the first one **byte for byte**,
+    /// which is what makes storing the refusal as its message safe:
+    /// [`TactusError::Refused`] displays as exactly its message, and if that
+    /// ever stops being true this row says so.
+    #[test]
+    fn a_refused_name_is_refused_identically_without_asking_the_filesystem_again() {
+        let root = scratch("memo-refusal");
+        let workspace = root.join("ws");
+        let bin = root.join("bin");
+        std::fs::create_dir_all(&workspace).expect("a workspace");
+        std::fs::create_dir_all(&bin).expect("an empty installation directory");
+        let name = format!("tactus-d2-{}", crate::ulid::ulid());
+        let environment = || environment_on_path(&[&bin], Some(REAL_PATHEXT));
+
+        let runner = HostRunner::new().with_environment(environment());
+        let searches = program_searches();
+        let resolutions = program_resolutions();
+        let first = runner
+            .run(&named_request(&name, "arg", &workspace))
+            .expect_err("nothing of that name is installed");
+        assert!(
+            matches!(first, TactusError::Refused { .. }),
+            "an unresolvable name is a refusal: {first:?}"
+        );
+        let first = first.to_string();
+        assert!(first.contains(&name), "{first}");
+
+        // The CLI appears under the run.
+        marker_shim(&bin, &shim_file_name(&name), "LATE");
+        let again = runner
+            .run(&named_request(&name, "arg", &workspace))
+            .expect_err("this boundary already answered for that name")
+            .to_string();
+        assert_eq!(again, first, "the replayed refusal is not the first one");
+        assert_eq!(
+            program_searches(),
+            searches + 1,
+            "the refusal was not remembered, so the filesystem decided twice"
+        );
+        assert_eq!(
+            program_resolutions(),
+            resolutions + 2,
+            "both spawns must have asked for a program"
+        );
+
+        // The oracle: it really is installed now.
+        let fresh = HostRunner::new().with_environment(environment());
+        let output = fresh
+            .run(&named_request(&name, "arg", &workspace))
+            .expect("a boundary that had not answered yet finds it");
+        assert_eq!(output.stdout.trim(), "LATE:arg");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Production reaches every spawn of a run through **one** `HostRunner`.
+    ///
+    /// The memo is per boundary, so "the probe and the attempts agree" is only
+    /// true while the probe and the attempts share a runner. Nothing in the
+    /// type system says so: `run_harness_on` takes `&dyn Runner`, and an engine
+    /// that constructed one per attempt would leave the memo correct, the suite
+    /// green, and DESIGN.md:612 reopened. This is the census that fails first.
+    ///
+    /// Structural rather than behavioural, for
+    /// `the_adapters_hold_no_process_wide_resolution_state`'s reason: a runner
+    /// constructed per attempt is indistinguishable from one constructed per run
+    /// in every observation except how many times the filesystem was asked, and
+    /// that observation belongs to a fixture that would have to drive a whole
+    /// engine run against a moving filesystem.
+    ///
+    /// The expectation is written out — two construction sites, both in
+    /// `src/engine/mod.rs`, being `run_harness` and `resume_harness` — rather
+    /// than counted from the tree, because a count read from the tree grows
+    /// with it.
+    #[test]
+    fn production_reaches_a_spawn_through_one_host_runner_per_run() {
+        /// Where a `HostRunner` is constructed in the engine's production code,
+        /// and how many times in each file.
+        const SITES: [(&str, usize); 6] = [
+            ("src/engine/mod.rs", 2),
+            ("src/engine/coordinator.rs", 0),
+            ("src/engine/resume.rs", 0),
+            ("src/engine/attempt.rs", 0),
+            ("src/engine/preflight.rs", 0),
+            ("src/engine/options.rs", 0),
+        ];
+        let sources = [
+            ("src/engine/mod.rs", include_str!("../engine/mod.rs")),
+            (
+                "src/engine/coordinator.rs",
+                include_str!("../engine/coordinator.rs"),
+            ),
+            ("src/engine/resume.rs", include_str!("../engine/resume.rs")),
+            (
+                "src/engine/attempt.rs",
+                include_str!("../engine/attempt.rs"),
+            ),
+            (
+                "src/engine/preflight.rs",
+                include_str!("../engine/preflight.rs"),
+            ),
+            (
+                "src/engine/options.rs",
+                include_str!("../engine/options.rs"),
+            ),
+        ];
+        assert_eq!(
+            sources.len(),
+            SITES.len(),
+            "the census and its expectation cover different files"
+        );
+
+        let mut counted: Vec<(&str, usize)> = Vec::new();
+        let mut stripped = 0_usize;
+        for (name, source) in sources {
+            let production = crate::effects::production_region(source);
+            let kept: Vec<&str> = production
+                .lines()
+                .filter(|line| !line.trim_start().starts_with("//"))
+                .collect();
+            stripped += production.lines().count() - kept.len();
+            counted.push((name, kept.join("\n").matches("HostRunner::new(").count()));
+        }
+        assert!(
+            stripped > 100,
+            "the comment strip removed {stripped} lines, so this census is reading prose"
+        );
+        // The control: the pattern matches when it is present, so a zero means
+        // absence rather than a broken search.
+        assert_eq!(
+            "let r = HostRunner::new();"
+                .matches("HostRunner::new(")
+                .count(),
+            1,
+            "the census pattern matches nothing at all"
+        );
+        assert_eq!(
+            counted,
+            SITES.to_vec(),
+            "the engine constructs its host runner somewhere this repair did not account for. \
+             The memo behind `program_searches` is per runner, so a runner per attempt is a \
+             resolution per attempt and DESIGN.md:612 is open again"
+        );
+        // And the two are the run and the resume facade, each of which then
+        // borrows that one runner for pre-flight and every attempt.
+        let engine = crate::effects::production_region(include_str!("../engine/mod.rs"));
+        for facade in ["fn run_harness(", "fn resume_harness("] {
+            let after = engine
+                .split_once(facade)
+                .map(|(_, rest)| rest.lines().take(8).collect::<Vec<_>>().join("\n"))
+                .unwrap_or_default();
+            assert!(
+                after.contains("HostRunner::new()"),
+                "`{facade}` is not one of the two construction sites this census counted"
+            );
+        }
+    }
+
+    /// **`PR6-LANED-002` / refuted claim 3.** An **npm-style** installation of
+    /// each of the three agent CLIs runs by bare name exactly as it runs by
+    /// path.
+    ///
+    /// The equivalence `agent::built_program_tests::the_host_runner_executes_a_
+    /// bare_program_name_as_it_executes_the_resolved_path` claims, over the
+    /// installation shape that one cannot express. That row uses `git` — a
+    /// native `.exe`, which `CreateProcessW` reaches from a bare name whether or
+    /// not this runner resolves anything — so it was green on Windows while
+    /// `PR6D-001` was live. The three agent CLIs are not installed that way:
+    /// `npm install -g` writes `claude.cmd`, `codex.cmd`, `copilot.cmd`, and a
+    /// `.cmd` is reachable only through `PATHEXT`. A fixture that cannot hold
+    /// the failing installation is a correlated fixture, whatever it asserts.
+    ///
+    /// **All three names, because the behaviour that was dropped was not one
+    /// adapter's.** `PR6D-CODEX-STORE-ALIAS-WALK-DROPPED` records the deletion
+    /// as codex's Windows-Store-alias walk; the same deletion took `.cmd`/`.bat`
+    /// selection and `PATHEXT` away from `claude` and `copilot`, where a plain
+    /// npm install fails with no Store alias and no competing `PATH` entry in
+    /// sight. So the grid is the three names, each with its own marker, and the
+    /// markers are counted — a rule that special-cased one name collapses the
+    /// count.
+    ///
+    /// The installation is `<name>.cmd` on Windows and an extensionless script
+    /// on Unix, with **no `.exe` beside it**, on a `PATH` this test wrote so
+    /// that nothing installed on the machine can satisfy it. Both spellings —
+    /// the bare name, and the absolute path of the file it must resolve to — go
+    /// through the production route, `HostRunner::run`, and must produce the
+    /// same output; the two program strings are asserted to differ first, or
+    /// this would compare a thing with itself.
+    ///
+    /// It runs on **both** platforms. On Unix the property holds because
+    /// `execvp` would have satisfied it anyway, which is precisely why the
+    /// Windows arm needs a fixture that can fail rather than a `#[cfg(windows)]`
+    /// afterthought; D1's `a_bare_name_that_only_pathext_resolves_…` holds the
+    /// `NotFound` platform fact on the guest, and this holds the equivalence
+    /// everywhere.
+    ///
+    /// What varies: the CLI name and the spelling of the program. Held constant:
+    /// the runner, the environment, the argument and the files on disk — so a
+    /// difference in output can only be a difference in which file ran.
+    #[test]
+    fn an_npm_style_installation_runs_by_bare_name_exactly_as_it_runs_by_path() {
+        // The three names `bin::Invocation::named` ships, written here rather
+        // than read from the adapters' private `CLI` constants;
+        // `agent::built_program_tests::an_adapters_program_is_the_boundarys_…`
+        // is what ties each adapter to its own name.
+        const CLIS: [&str; 3] = ["claude", "codex", "copilot"];
+
+        let root = scratch("npm-style-equivalence");
+        let workspace = root.join("ws");
+        std::fs::create_dir_all(&workspace).expect("a workspace");
+        let bin = root.join("node_modules-bin");
+
+        let mut installed = Vec::new();
+        for cli in CLIS {
+            let file = shim_file_name(cli);
+            installed.push((
+                cli,
+                file.clone(),
+                marker_shim(&bin, &file, &cli.to_uppercase()),
+            ));
+        }
+
+        // The installation really is the failing shape: one file per CLI, and
+        // on Windows not one of them is an `.exe`.
+        let mut contents: Vec<String> = std::fs::read_dir(&bin)
+            .expect("read the installation directory")
+            .map(|entry| {
+                entry
+                    .expect("an installation entry")
+                    .file_name()
+                    .to_string_lossy()
+                    .into_owned()
+            })
+            .collect();
+        contents.sort();
+        let mut expected: Vec<String> = installed.iter().map(|(_, file, _)| file.clone()).collect();
+        expected.sort();
+        assert_eq!(contents, expected, "one file per CLI, and nothing else");
+        for (cli, file, _) in &installed {
+            assert_eq!(
+                Path::new(file).extension().map(OsStr::to_os_string),
+                if cfg!(windows) {
+                    Some(OsString::from("cmd"))
+                } else {
+                    None
+                },
+                "{cli}: this is not the shape npm installs an agent CLI in"
+            );
+        }
+
+        let runner =
+            HostRunner::new().with_environment(environment_on_path(&[&bin], Some(REAL_PATHEXT)));
+        let mut markers = BTreeSet::new();
+        for (cli, _, path) in &installed {
+            let located = path
+                .to_str()
+                .expect("a scratch path this crate can name")
+                .to_owned();
+            assert_ne!(*cli, located, "{cli}: the two program strings must differ");
+
+            let mut stdouts = BTreeSet::new();
+            for (what, program) in [
+                ("the bare name", (*cli).to_owned()),
+                ("the resolved path", located),
+            ] {
+                let output = runner
+                    .run(&named_request(&program, "arg", &workspace))
+                    .unwrap_or_else(|error| panic!("{cli}: {what}: {error}"));
+                assert_eq!(output.code, Some(0), "{cli}: {what}: {output:?}");
+                assert_eq!(
+                    output.stdout.trim(),
+                    format!("{}:arg", cli.to_uppercase()),
+                    "{cli}: {what}: this did not run the installed shim"
+                );
+                stdouts.insert(output.stdout.trim().to_owned());
+            }
+            assert_eq!(
+                stdouts.len(),
+                1,
+                "{cli}: the bare name and the resolved path are different programs: {stdouts:?}"
+            );
+            markers.extend(stdouts);
+        }
+        assert_eq!(
+            markers.len(),
+            CLIS.len(),
+            "the three CLIs did not reach three files: {markers:?}"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    // -----------------------------------------------------------------------
+    // PR6-LANED-003: the workspace is not a PATH directory
+    // -----------------------------------------------------------------------
+
+    /// A `PATH` entry, and whether each platform calls it a location on its
+    /// own.
+    ///
+    /// Written from the two platforms' rules rather than read from
+    /// `Path::is_absolute`, and then checked against it for the platform this
+    /// is running on — the Windows column on the guest, the Unix column here.
+    /// Every entry is free of both `PATH` separators, so one entry stays one
+    /// entry under `std::env::split_paths` on either platform.
+    const PATH_ENTRY_TABLE: &[(&str, bool, bool)] = &[
+        // (entry, is a location under Unix, is a location under Windows)
+        //
+        // The empty entry: `PR6-LANED-003` itself. POSIX gives a null prefix
+        // the meaning "the current directory".
+        ("", false, false),
+        (".", false, false),
+        ("..", false, false),
+        ("bin", false, false),
+        ("./bin", false, false),
+        // Rooted on Unix; on Windows a leading separator is relative to the
+        // *current drive*, so it is still a current-directory question.
+        ("/usr/local/bin", true, false),
+        (r"\Windows\System32", false, false),
+        // A UNC share names a location on Windows and is an ordinary file name
+        // on Unix.
+        (r"\\server\share\bin", false, true),
+        ("~/bin", false, false),
+    ];
+
+    /// Every `PATH` entry this runner searches names a location on its own.
+    ///
+    /// **`PR6-LANED-003`**, as a rule rather than as one vector. A `PATH` entry
+    /// that is not absolute is resolved against *a* current directory, and this
+    /// boundary has two of them: the coordinator's, which is what
+    /// `ProgramNaming::is_program` inspects, and the workspace, which is what
+    /// the child actually runs in. So such an entry does not merely widen the
+    /// search — it lets the runner certify one file and execute another, and
+    /// the file it executes is repository content under automation
+    /// (DESIGN.md:398-402).
+    ///
+    /// The written table is checked against `Path::is_absolute` first, so the
+    /// row below is a claim about `resolve_program` and not about `std`. What
+    /// varies is the entry; what is held constant is the program name, the
+    /// candidates and the composed environment.
+    #[test]
+    fn every_path_entry_this_runner_searches_names_a_location_on_its_own() {
+        let root = scratch("path-entry-rule");
+        let naming = ProgramNaming::current();
+        let mut located = 0_usize;
+        let mut relative = 0_usize;
+        for (entry, on_unix, on_windows) in PATH_ENTRY_TABLE {
+            let expected = if cfg!(windows) { *on_windows } else { *on_unix };
+            assert_eq!(
+                Path::new(entry).is_absolute(),
+                expected,
+                "`{entry}`: this platform disagrees with the table"
+            );
+            let message = resolve_program(
+                "tactus-no-such-program",
+                &composed(&[("PATH", OsStr::new(entry))]),
+                KeyCase::current(),
+                naming,
+            )
+            .expect_err("nothing of that name exists anywhere")
+            .to_string();
+            if expected {
+                located += 1;
+                assert!(
+                    message.contains("1 directory searched,"),
+                    "`{entry}` names a location and was not searched: {message}"
+                );
+                assert!(
+                    !message.contains("skipped"),
+                    "`{entry}` names a location and was skipped: {message}"
+                );
+            } else {
+                relative += 1;
+                assert!(
+                    message.contains(
+                        "0 directories searched, 1 PATH entry skipped as not \
+                                      absolute"
+                    ),
+                    "`{entry}` does not name a location and was searched: {message}"
+                );
+            }
+        }
+        assert_eq!(
+            (located, relative),
+            (1, 8),
+            "the table lost its teeth: it must hold entries of both kinds on both platforms"
+        );
+
+        // And "searched" means searched: the one kind of entry that is not
+        // skipped does find a program in it.
+        let bin = root.join("bin");
+        let found = program_file(&bin, &shim_file_name("x"));
+        assert_eq!(
+            resolve_program(
+                "x",
+                &composed(&[("PATH", path_of(&[&bin]).as_os_str())]),
+                KeyCase::current(),
+                naming,
+            )
+            .expect("an absolute entry is searched"),
+            found
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// **`PR6-LANED-003`.** An empty `PATH` entry never reaches the
+    /// workspace's own copy of a bare name.
+    ///
+    /// The finding's vector, executed. A coordinator whose `PATH` holds an
+    /// empty segment — `:/usr/bin`, which is what a shell profile that appends
+    /// to an unset `PATH` produces — and a request workspace containing an
+    /// executable called `claude`. POSIX gives the null prefix the meaning "the
+    /// current directory", and this runner's current directory *is* the
+    /// workspace, so a bare name handed to `Command` runs repository content
+    /// with the coordinator's authority as the agent (DESIGN.md:398-402).
+    ///
+    /// **The platform fact is executed, not cited**: every row spawns the same
+    /// bare name through `std::process::Command` under the same composed
+    /// environment and the same working directory first, and the outcome is
+    /// compared against a written expectation. Three of the four rows are ones
+    /// where the raw spawn reaches the workspace and the runner must not, and
+    /// that count is asserted — a fixture in which the two agree everywhere
+    /// proves nothing and says so.
+    ///
+    /// Unix only, and deliberately: the empty-entry-means-here rule is POSIX's,
+    /// and the fixture's installations are shell scripts. The rule that closes
+    /// it is not Unix-only —
+    /// `every_path_entry_this_runner_searches_names_a_location_on_its_own`
+    /// executes it on both platforms.
+    ///
+    /// What varies: where the empty entry sits, and whether a real installation
+    /// is on the `PATH` at all. Held constant: the workspace, its planted
+    /// executable, the name and the argument.
+    #[cfg(unix)]
+    #[test]
+    fn an_empty_path_entry_never_reaches_the_workspaces_own_copy_of_a_bare_name() {
+        let root = scratch("empty-path-entry");
+        let workspace = root.join("ws");
+        let installed_dir = root.join("installed");
+        let empty_dir = root.join("empty");
+        std::fs::create_dir_all(&empty_dir).expect("an installation directory with nothing in it");
+        let name = format!("tactus-d2-{}", crate::ulid::ulid());
+        let file = shim_file_name(&name);
+        // Repository content, under automation: the workspace's own copy.
+        marker_shim(&workspace, &file, "WORKSPACE");
+        marker_shim(&installed_dir, &file, "INSTALLED");
+
+        let installed = installed_dir.to_string_lossy().into_owned();
+        let empty = empty_dir.to_string_lossy().into_owned();
+        // (what, PATH, what a raw spawn reaches, what the runner must reach)
+        let rows: [(&str, String, &str, &str); 4] = [
+            (
+                "an empty entry before a real installation",
+                format!(":{installed}"),
+                "WORKSPACE",
+                "INSTALLED",
+            ),
+            (
+                "an empty entry after a real installation",
+                format!("{installed}:"),
+                "INSTALLED",
+                "INSTALLED",
+            ),
+            (
+                "nothing but empty entries",
+                ":".to_owned(),
+                "WORKSPACE",
+                "<refused>",
+            ),
+            (
+                "an empty entry and a directory holding nothing",
+                format!(":{empty}"),
+                "WORKSPACE",
+                "<refused>",
+            ),
+        ];
+
+        let mut raw_markers = BTreeSet::new();
+        let mut divergent = 0_usize;
+        for (what, path, raw_expected, runner_expected) in &rows {
+            let environment = HostEnvironment::with_base(
+                vec![(os("PATH"), os(path)), (os("HOME"), os("/home/tactus"))],
+                KeyCase::current(),
+            );
+            let composed_env = environment
+                .compose(&ExecutionRole::Gate, None, &[])
+                .expect("compose the child environment");
+
+            // The platform fact. `execvp` searches the child's PATH from the
+            // child's working directory, so the empty entry is the workspace.
+            let mut direct = Command::new(&name);
+            direct.env_clear();
+            direct.envs(composed_env.clone());
+            direct.current_dir(&workspace);
+            direct.arg("arg");
+            let raw = direct
+                .output()
+                .unwrap_or_else(|error| panic!("{what}: a raw spawn: {error}"));
+            let raw = String::from_utf8_lossy(&raw.stdout).trim().to_owned();
+            assert_eq!(
+                raw,
+                format!("{raw_expected}:arg"),
+                "{what}: the platform fact this row rests on has changed"
+            );
+            raw_markers.insert(raw.clone());
+
+            // The claim, through the boundary, with an observer so that a
+            // refusal is a refusal *before* any spawn rather than a failed one.
+            let witness = ResolutionWitness::new();
+            let runner = HostRunner::new()
+                .with_environment(environment)
+                .with_hooks(Box::new(witness.handle()));
+            let outcome = runner.run(&named_request(&name, "arg", &workspace));
+            if *runner_expected == "<refused>" {
+                let error = outcome
+                    .as_ref()
+                    .err()
+                    .map(std::string::ToString::to_string)
+                    .unwrap_or_else(|| format!("{what}: it ran: {outcome:?}"));
+                assert!(
+                    error.contains("host runner cannot execute"),
+                    "{what}: {error}"
+                );
+                assert!(
+                    witness.seen().is_empty(),
+                    "{what}: a refused name still reached a containment point: {:?}",
+                    witness.seen()
+                );
+            } else {
+                let output = outcome.unwrap_or_else(|error| panic!("{what}: {error}"));
+                assert_eq!(
+                    output.stdout.trim(),
+                    format!("{runner_expected}:arg"),
+                    "{what}: the runner did not reach the installed CLI"
+                );
+            }
+            if raw != format!("{runner_expected}:arg") {
+                divergent += 1;
+            }
+        }
+        assert_eq!(
+            raw_markers.len(),
+            2,
+            "the fixture cannot tell the workspace's copy from the installed one: {raw_markers:?}"
+        );
+        assert_eq!(
+            divergent, 3,
+            "on {divergent} rows a raw spawn and the runner disagreed; a fixture where they \
+             always agree cannot see this finding at all"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A relative `PATH` entry that really does name a directory is refused
+    /// rather than searched.
+    ///
+    /// The empty entry of `PR6-LANED-003` is the degenerate case of this one,
+    /// and this is the case where the two current directories the boundary has
+    /// are visibly different: the entry resolves from the **coordinator's**
+    /// working directory — asserted here, so the row is hostile — while the
+    /// child would resolve it from the **workspace**. A runner that searched it
+    /// would hand `Command` a relative program and certify a file that is not
+    /// the one that runs.
+    ///
+    /// The entry is built out of `..` back to the root and down again, so it is
+    /// genuinely relative and genuinely resolvable without anything being
+    /// written inside the repository. Unix only: the same construction on
+    /// Windows depends on the temporary directory and the working directory
+    /// sharing a drive, and a row that silently stops applying is worse than
+    /// one that is not there.
+    #[cfg(unix)]
+    #[test]
+    fn a_relative_path_entry_is_refused_even_when_it_names_a_real_directory() {
+        let root = scratch("relative-path-entry");
+        let bin = root.join("bin");
+        let name = format!("tactus-d2-{}", crate::ulid::ulid());
+        let file = shim_file_name(&name);
+        let absolute = marker_shim(&bin, &file, "RELATIVE");
+
+        let here = std::env::current_dir().expect("the coordinator's working directory");
+        let normal = |path: &Path| {
+            path.components()
+                .filter(|component| matches!(component, std::path::Component::Normal(_)))
+                .count()
+        };
+        let ups = normal(&here);
+        // Deeper than the coordinator's own directory, so that the same
+        // relative entry names a *different* place from each of them — which is
+        // the whole hazard, and a workspace that happened to sit at the same
+        // depth would hide it.
+        let mut workspace = root.clone();
+        while normal(&workspace) <= ups {
+            workspace = workspace.join("d");
+        }
+        std::fs::create_dir_all(&workspace).expect("a workspace");
+        let down = bin
+            .strip_prefix("/")
+            .expect("a Unix scratch path is rooted")
+            .to_string_lossy()
+            .into_owned();
+        let entry = format!("{}{down}", "../".repeat(ups));
+
+        // The row's own premise, both halves.
+        assert!(
+            Path::new(&entry).is_relative(),
+            "{entry} is not a relative entry, so this row is not about one"
+        );
+        assert!(
+            Path::new(&entry).join(&file).is_file(),
+            "{entry}/{file} does not resolve from the coordinator's working directory, so a \
+             runner that searched it would find nothing and this row would prove nothing"
+        );
+        assert!(
+            !workspace.join(&entry).join(&file).exists(),
+            "the entry resolves to the same file from the workspace, so the two current \
+             directories are not distinguishable here"
+        );
+
+        let witness = ResolutionWitness::new();
+        let runner = HostRunner::new()
+            .with_environment(HostEnvironment::with_base(
+                vec![(os("PATH"), os(&entry))],
+                KeyCase::current(),
+            ))
+            .with_hooks(Box::new(witness.handle()));
+        let error = runner
+            .run(&named_request(&name, "arg", &workspace))
+            .expect_err("a relative PATH entry contributes no candidate")
+            .to_string();
+        assert!(
+            error.contains("1 PATH entry skipped as not absolute"),
+            "{error}"
+        );
+        assert!(
+            witness.seen().is_empty(),
+            "a refused name still reached a containment point: {:?}",
+            witness.seen()
+        );
+
+        // The oracle: the same directory, named as a location, does run.
+        let reachable = HostRunner::new()
+            .with_environment(environment_on_path(&[&bin], Some(REAL_PATHEXT)))
+            .run(&named_request(&name, "arg", &workspace))
+            .expect("the same installation, named absolutely");
+        assert_eq!(reachable.stdout.trim(), "RELATIVE:arg");
+        assert!(absolute.is_absolute());
+        let _ = std::fs::remove_dir_all(&root);
     }
 }
