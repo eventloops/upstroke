@@ -77,9 +77,11 @@ Invoke them **from the repository root**, the way `ci.yml` does:
 bash .github/scripts/test-pr-policy.sh
 ```
 
-Not from inside `.github/scripts/` — the scripts derive their own location with
-`${BASH_SOURCE[0]%/*}`, which strips nothing when the argument carries no slash,
-and they fail. Four of the seven need `jq`.
+Not from inside `.github/scripts/`. `test-pr-policy.sh` derives its own location
+with `${BASH_SOURCE[0]%/*}`, which strips nothing when the argument carries no
+slash, so it fails outright; the others resolve their directory differently but
+still assume repository-root-relative paths. Run them the way `ci.yml` does.
+Four of the eight need `jq`.
 
 ## Hard conventions
 
@@ -111,8 +113,15 @@ evidence, Risk and rollback, Review finding ledger — and the ledger must use t
 exact canonical header. `validate-pr-body.sh` rejects anything else; run it
 locally against your body before pushing.
 
-**A new push invalidates the attestation and restarts the sequence.** Only the
-repository owner may attest; that check cannot be satisfied by an agent.
+**A new push invalidates the attestation and restarts the sequence** — with one
+exception: a push whose entire diff from the reviewed head is confined to
+`reviews/FINDINGS.md` keeps the review, and the trusted workflow re-attests the
+current head after verifying ancestry and the exempt-only diff itself
+(`decisions/2026-08-20-review-invalidation-scope.md`). That standing ledger
+arrives with the parallelism slice; until it merges, the exemption has nothing
+to match and every push invalidates. Everything else
+invalidates, deliberately. Only the repository owner may attest; that check
+cannot be satisfied by an agent.
 
 ## Where things are
 
