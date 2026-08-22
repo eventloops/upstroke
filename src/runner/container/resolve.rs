@@ -50,6 +50,11 @@
 //! `crate::runner::container::exec` and `crate::runner::host::run_shell_probe`
 //! are what implement it.
 
+#![deny(
+    clippy::disallowed_methods,
+    clippy::disallowed_types,
+    clippy::disallowed_macros
+)]
 use std::collections::BTreeMap;
 
 use thiserror::Error;

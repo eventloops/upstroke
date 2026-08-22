@@ -4,6 +4,11 @@
 //! Kept out of `resolve.rs` so `effects::production_region` — which cuts a
 //! source at its **first** `#[cfg(test)]` — sees that module whole
 //! (`PR5-R1-CFG-TEST-SHRINKS-THE-DOMAIN`).
+#![deny(
+    clippy::disallowed_methods,
+    clippy::disallowed_types,
+    clippy::disallowed_macros
+)]
 #[cfg(test)]
 mod this_file_is_test_only {}
 
