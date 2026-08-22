@@ -2647,21 +2647,28 @@ fn the_view_directory_has_one_definition_in_the_tree() {
     );
 
     let mut sites = Vec::new();
+    let mut located = Vec::new();
     for (path, source) in &container {
         let code = blank_comments(&production_region(source));
         for (index, _) in code.match_indices("\"views\"") {
             let line = code[..index].matches('\n').count() + 1;
-            sites.push(format!("{path}:{line}"));
+            // The property is "one site, and it is the census's". The LINE is
+            // incidental: pinning it made this test fail when repair C1's merge
+            // shifted census.rs by four lines, which is a true statement about
+            // line numbers and says nothing about the seam. Assert the path;
+            // carry the line into the message, where a human wants it.
+            sites.push(path.clone());
+            located.push(format!("{path}:{line}"));
         }
     }
     assert_eq!(
         sites,
-        vec!["src/runner/container/census.rs:95".to_owned()],
+        vec!["src/runner/container/census.rs".to_owned()],
         "the R19 view directory segment is declared in more than one production \
          site. `census::VIEWS_DIR` is the one definition and `exec::view_dir` \
          delegates to `census::view_path`; a second literal is a path that can \
          drift away from the census that has to find it, and no behavioural test \
-         crosses the two halves."
+         crosses the two halves. Sites found: {located:?}"
     );
 
     // And the scan can see a declaration at all: a blanker that erased the code
