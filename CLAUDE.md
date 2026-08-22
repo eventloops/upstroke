@@ -77,11 +77,12 @@ Invoke them **from the repository root**, the way `ci.yml` does:
 bash .github/scripts/test-pr-policy.sh
 ```
 
-Not from inside `.github/scripts/`. `test-pr-policy.sh` derives its own location
-with `${BASH_SOURCE[0]%/*}`, which strips nothing when the argument carries no
-slash, so it fails outright; the others resolve their directory differently but
-still assume repository-root-relative paths. Run them the way `ci.yml` does.
-Four of the eight need `jq`.
+Repository-root invocation is the convention, not a shared implementation
+requirement: most of the gates resolve their own directory and run from anywhere.
+The one that does not is `test-pr-policy.sh`, which derives its location with
+`${BASH_SOURCE[0]%/*}` -- that strips nothing when the argument carries no slash,
+so it fails outright from inside `.github/scripts/`. Run them all the way `ci.yml`
+does and the difference never matters. Four of the eight need `jq`.
 
 ## Hard conventions
 

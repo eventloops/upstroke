@@ -4,20 +4,17 @@
 #
 # THE CLAIMS THIS GATE ENFORCES -- exactly these, nothing else is in its scope:
 #
-#   C1  Every repository path CLAUDE.md or CONTRIBUTING.md names in backticks
-#       exists at this head, or EACH occurrence is qualified within its own
-#       window (three lines before to four after) by one of the marker phrases
-#       below. Qualification is syntactic: the gate checks that a phrase is
-#       present near that occurrence, not what the phrase refers to.
-#   C2  The set of gate commands each of CLAUDE.md, CONTRIBUTING.md and the
-#       pull-request template documents EQUALS the set ci.yml runs -- both
-#       directions, pinned to the msrv job's toolchain where the command is the
-#       msrv job's. A documented gate command is syntactic too: a standalone line
-#       that is a fenced-code line or a checklist item and starts with `cargo`.
-#       CI itself carries the floor the design packet names (`cargo test
-#       --all-targets`), and the MSRV triangle agrees: Cargo.toml's rust-version,
-#       the msrv job's toolchain, and the documents' `cargo +X` pin. And
-#       CLAUDE.md does not claim CONTRIBUTING.md omits a flag it carries.
+#   C1  CLAUDE.md and CONTRIBUTING.md exist. Every repository path either names
+#       in backticks exists at this head, or EACH occurrence is qualified within
+#       its own window (three lines before to four after) by one of the marker
+#       phrases below. Qualification is syntactic: the gate checks that a phrase
+#       is present near that occurrence, not what the phrase refers to. And
+#       CLAUDE.md does not carry a sentence matching
+#       /CONTRIBUTING\.md.{0,40}(omits|is stale|does not (carry|include))/ while
+#       CONTRIBUTING.md carries `--all-features` -- the stale cross-document
+#       claim PR #20's review had to catch by hand.
+#   C2  ci.yml's msrv job selects exactly one toolchain, and it is Cargo.toml's
+#       rust-version or a patch release of it.
 #   C3  CLAUDE.md's gate-count claim equals the tree, and the set of test-*.sh
 #       files in .github/scripts EQUALS the set the lint job invokes, both
 #       directions. An invocation from any other job does not count.
@@ -30,22 +27,35 @@
 #       branches [master] and nothing else; and neither attestation workflow
 #       names the integration branch anywhere.
 #
-# EVERY CHECK IS AN EQUALITY OR AN EXACT PIN. A presence test -- a substring, a
-# one-way subset, a forbidden value standing in for a required one, a flag per
-# path instead of per occurrence -- is how every earlier version of this file
-# was killed, and each fix below names the mutation it exists to kill:
-#   round 1: MUT-CI-PR-BRANCH-MASKED (whole-file grep), MUT-TEMPLATE-MSRV-REMOVED
-#            and MUT-CI-CLIPPY-ALL-FEATURES-REMOVED (hard-coded command list),
+# WITHDRAWN, DELIBERATELY (round 5 of this file's review): this gate makes NO
+# claim about which cargo commands CI runs, whether CI executes them, or which
+# commands the documents list. Four review rounds showed that surface to be
+# open-ended for a text checker -- a command can be present and skipped
+# (`if: false`), a document can be missing, an example can contain the string --
+# and the release gates are not enforced by prose in the first place: the
+# trusted attestation workflow (.github/workflows/frontier-review.yml) reruns
+# them from its own default-branch definition on every dispatch, and the
+# reviewer reads both the documents and ci.yml. The mutations that demonstrated
+# the withdrawn claims are kept by name as history, not as kills:
+# MUT-TEMPLATE-MSRV-REMOVED, MUT-CI-CLIPPY-ALL-FEATURES-REMOVED,
+# MUT-CI-MSRV-TOOLCHAIN-DRIFT's document half, MUT-CI-CARGO-TEST-STEP-DELETED,
+# MUT-CLAUDE-TEST-SCOPE-NARROWED, MUT-CI-CARGO-TEST-STEP-SKIPPED and
+# MUT-TEMPLATE-DELETED.
+#
+# EVERY CHECK THAT REMAINS IS AN EQUALITY OR AN EXACT PIN. A presence test -- a
+# substring, a one-way subset, a forbidden value standing in for a required one,
+# a flag per path instead of per occurrence -- is how every earlier version of
+# this file was killed, and each fix below names the mutation it exists to kill:
+#   round 1: MUT-CI-PR-BRANCH-MASKED (whole-file grep),
 #            MUT-ROOT-PATH-MISSPELLED (path regex blind to root files),
 #            MUT-GATE-COUNT-STALE (a count nobody checked);
 #   round 2: MUT-INVALIDATOR-MASTER-REMOVED (forbidding a value is not pinning
-#            one), MUT-CI-MSRV-TOOLCHAIN-DRIFT (toolchain normalised away),
+#            one), MUT-CI-MSRV-TOOLCHAIN-DRIFT (toolchain never compared),
 #            MUT-CI-BASH-GATE-OMITTED (files counted, invocations not);
-#   round 3: MUT-CI-CARGO-TEST-STEP-DELETED (docs ⊇ CI is one-way),
-#            MUT-MASTER-TRIGGERS-REMOVED (integration branch present, master
-#            not required), MUT-CLAUDE-TEST-SCOPE-NARROWED (substring matched an
-#            unrelated example), MUT-FORWARD-PATH-REUSED-AS-CURRENT (one
-#            qualified occurrence marked the path for all of them).
+#   round 3: MUT-MASTER-TRIGGERS-REMOVED (integration branch present, master
+#            not required), MUT-FORWARD-PATH-REUSED-AS-CURRENT (one qualified
+#            occurrence marked the path for all of them);
+#   round 4: MUT-CONTRIBUTING-DELETED (a required document treated as optional).
 set -euo pipefail
 export PATH="/usr/bin:/bin:$PATH"
 
@@ -86,7 +96,9 @@ branches_line() {
   block "$1" "$2" | grep -E '^\s*branches:' | sed -E 's/^\s+//; s/\s+$//' || true
 }
 
-# --- C1. every repository path a document names must resolve, per occurrence --
+# --- C1. the documents exist; every path they name resolves, per occurrence --
+# MUT-CONTRIBUTING-DELETED: a document this gate reads is required, not
+# optional -- a missing one is a failure, never a vacuous pass.
 # MUT-ROOT-PATH-MISSPELLED: bare document names must exist at the root, not only
 # directory-prefixed paths. MUT-FORWARD-PATH-REUSED-AS-CURRENT: a qualified
 # forward reference used to mark the PATH, so a second, unqualified occurrence of
@@ -95,7 +107,7 @@ branches_line() {
 # deliberately does not exist ("there is **no** rust-toolchain.toml").
 marker='arrives with|arrive with|not yet|until that merges|until it merges|lands with|forward reference|\*\*no |there is \*\*?no|does not exist|must not exist'
 for doc in CLAUDE.md CONTRIBUTING.md; do
-  [[ -f "$doc" ]] || continue
+  [[ -f "$doc" ]] || { error "$doc is missing: this gate requires it"; continue; }
   rooted=$(grep -oE '`(src|infra|\.github|acceptance|decisions|proposals|reviews|examples|fixtures|docs)/[A-Za-z0-9_./-]*`' "$doc" | tr -d '`' || true)
   bare=$(grep -oE '`[A-Za-z0-9][A-Za-z0-9_.-]*\.(md|toml|lock)`' "$doc" | tr -d '`' || true)
   while IFS= read -r path; do
@@ -110,92 +122,29 @@ for doc in CLAUDE.md CONTRIBUTING.md; do
   done < <(printf '%s\n%s\n' "$rooted" "$bare" | grep -v '^$' | sort -u)
 done
 
-# --- C2. documented gate commands EQUAL ci.yml's, both ways; floor; MSRV -------
-# MUT-TEMPLATE-MSRV-REMOVED / MUT-CI-CLIPPY-ALL-FEATURES-REMOVED: the authority
-# is ci.yml, never a list in this script. MUT-CI-CARGO-TEST-STEP-DELETED: a
-# one-way "documents carry what CI runs" let CI drop a documented gate, so the
-# comparison is an equality in both directions. MUT-CLAUDE-TEST-SCOPE-NARROWED:
-# a substring search found the CI command inside an unrelated example
-# (`tactus-build cargo test ...`), so documented commands are extracted as
-# standalone command lines, not searched for as text. MUT-CI-MSRV-TOOLCHAIN-
-# DRIFT: the toolchain pin was normalised away; the msrv job's commands must be
-# documented pinned to the toolchain CI actually selects, and Cargo.toml's
-# rust-version must agree with it.
-python3 - "$root" <<'PY' || failed=1
-import io, os, re, sys
-root = sys.argv[1]
-bad = False
-def fail(msg):
-    global bad
-    print(msg, file=sys.stderr)
-    bad = True
-
-ci = io.open(os.path.join(root, ".github/workflows/ci.yml"), encoding="utf-8").read()
-
-def job(name):
-    # A job is a two-space-indented key under `jobs:`; its block ends at the
-    # next key at that indentation (hyphens allowed: `merge-gate`).
-    m = re.search(r"^  %s:\n(.*?)(?=^  [A-Za-z0-9_-]+:\n|\Z)" % re.escape(name), ci, re.S | re.M)
-    return m.group(1) if m else ""
-
-run_line = re.compile(r"^\s*- run:\s*(cargo .+?)\s*$", re.M)
-ci_commands = run_line.findall(ci)
-if not ci_commands:
-    fail("could not read any cargo command from ci.yml")
-
-# The MSRV triangle.
-cargo_toml = io.open(os.path.join(root, "Cargo.toml"), encoding="utf-8").read()
-rv = re.search(r'^rust-version\s*=\s*"([0-9]+\.[0-9]+(?:\.[0-9]+)?)"', cargo_toml, re.M)
-msrv_job = job("msrv")
-toolchains = re.findall(r"^\s*toolchain:\s*(\S+)\s*$", msrv_job, re.M)
-msrv_commands = run_line.findall(msrv_job)
-if not rv:
-    fail("Cargo.toml carries no rust-version to pin the msrv job against")
-if not msrv_job:
-    fail("ci.yml has no msrv job")
-elif len(toolchains) != 1:
-    fail("ci.yml msrv job must select exactly one toolchain, found %r" % (toolchains,))
-elif not msrv_commands:
-    fail("ci.yml msrv job runs no cargo command")
-toolchain = toolchains[0] if len(toolchains) == 1 else None
-if rv and toolchain and toolchain != rv.group(1) and not toolchain.startswith(rv.group(1) + "."):
-    fail("ci.yml msrv job runs toolchain %s but Cargo.toml rust-version is %s" % (toolchain, rv.group(1)))
-
-# The floor the design packet names for release gates: cargo test --all-targets.
-if not any(c.startswith("cargo test ") and "--all-targets" in c.split() for c in ci_commands):
-    fail("ci.yml must run `cargo test --all-targets` (with any further flags): the packet's release gates require it")
-
-# What each document must say: every CI command, the msrv job's pinned to the
-# toolchain CI selects.
-expected = set()
-for c in ci_commands:
-    if c in msrv_commands and toolchain:
-        expected.add(c.replace("cargo ", "cargo +%s " % toolchain, 1))
-    else:
-        expected.add(c)
-
-# What each document says: standalone cargo command lines -- a fenced-code line
-# or a checklist item, optionally backticked, optionally followed by a comment.
-doc_line = re.compile(r"^\s*(?:- \[[ xX]\] )?`?(cargo [^`#]*?)`?\s*(?:#.*)?$", re.M)
-docs = ["CLAUDE.md", "CONTRIBUTING.md", ".github/pull_request_template.md"]
-for doc in docs:
-    p = os.path.join(root, doc)
-    if not os.path.exists(p):
-        continue
-    text = io.open(p, encoding="utf-8").read()
-    documented = set(m.group(1).strip() for m in doc_line.finditer(text))
-    for c in sorted(expected - documented):
-        fail("%s does not carry the gate command CI runs: %s" % (doc, c))
-    for c in sorted(documented - expected):
-        fail("%s documents a gate command CI does not run: %s" % (doc, c))
-raise SystemExit(1 if bad else 0)
-PY
-
-# A claim that another document is stale must not outlive the fix.
+# A claim that another document is stale must not outlive the fix. This is the
+# sentence PR #20's review caught by hand: CLAUDE.md asserted CONTRIBUTING.md
+# omitted --all-features while the same commit added it. The pattern is the
+# claim; a differently worded claim is outside C1.
 if [[ -f CLAUDE.md && -f CONTRIBUTING.md ]] \
    && grep -Fq -- '--all-features' CONTRIBUTING.md \
    && grep -qiE 'CONTRIBUTING\.md.{0,40}(omits|is stale|does not (carry|include))' CLAUDE.md; then
   error "CLAUDE.md claims CONTRIBUTING.md omits --all-features, but CONTRIBUTING.md carries it at this head"
+fi
+
+# --- C2. MSRV: ci.yml's msrv job agrees with Cargo.toml ----------------------
+# MUT-CI-MSRV-TOOLCHAIN-DRIFT: the msrv job could move to 1.86.0 while
+# Cargo.toml still promised 1.85. The job's toolchain is compared with
+# rust-version directly; no document is consulted.
+rust_version=$(sed -nE 's/^rust-version\s*=\s*"([0-9]+\.[0-9]+(\.[0-9]+)?)"\s*$/\1/p' Cargo.toml | head -1)
+[[ -n "$rust_version" ]] || error "Cargo.toml carries no rust-version to pin the msrv job against"
+msrv_toolchains=$(block .github/workflows/ci.yml msrv | grep -E '^\s*toolchain:' | sed -E 's/^\s*toolchain:\s*//; s/\s+$//' || true)
+if [[ -z "$msrv_toolchains" ]]; then
+  error "ci.yml has no msrv job selecting a toolchain"
+elif [[ "$(wc -l <<< "$msrv_toolchains")" -ne 1 ]]; then
+  error "ci.yml msrv job must select exactly one toolchain, got: $(tr '\n' ' ' <<< "$msrv_toolchains")"
+elif [[ -n "$rust_version" && "$msrv_toolchains" != "$rust_version" && "$msrv_toolchains" != "$rust_version".* ]]; then
+  error "ci.yml msrv job runs toolchain $msrv_toolchains but Cargo.toml rust-version is $rust_version"
 fi
 
 # --- C3. the gate inventory: tree == lint-job invocations; CLAUDE.md's count --
