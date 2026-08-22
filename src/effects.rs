@@ -199,70 +199,149 @@ pub struct GovernedAllow {
 /// is the standing entry for a parser written twice in this tree, so this lives
 /// here beside its sibling rather than in each census that wants it.
 ///
-/// Line comments, block comments (nested) and escapes are handled. **Raw
-/// strings are not modelled**: a `//` inside `r"…"` would truncate the rest of
-/// that line. The failure mode is therefore a needle this function does *not*
-/// find, which makes a census that uses it report something missing — loud —
-/// rather than accept something extra. Byte offsets are not preserved; line
-/// breaks are.
+/// Line comments, block comments (nested), char literals, escapes and **raw
+/// strings** (`r"…"`, `r#"…"#`, `b"…"`, `br#"…"#`) are all handled: this
+/// function tokenises exactly as [`blank_comments_and_strings`] does and differs
+/// only in keeping a literal's bytes instead of blanking them. Byte offsets are
+/// not preserved; line breaks are.
+///
+/// ## Why raw strings are modelled, and the direction the old limit had wrong
+///
+/// This used to track only `"` and document the omission as safe: "the failure
+/// mode is a needle this function does *not* find, which makes a census that
+/// uses it report something missing — **loud** — rather than accept something
+/// extra." **That is backwards for a census over an expected set, which is what
+/// every caller here is** (`PR6-LANEF-005`).
+///
+/// `r#"x" //"#` closed the literal at the second `"`, so the `//` that followed
+/// began a line comment and **the rest of that line was deleted** — including a
+/// real `"docker"` literal after it. `every_declared_effect_denial_names_a_real_path`'s
+/// "docker invocation helpers" block asserts that the set of files naming a
+/// container runtime is exactly a table of four; a fifth file whose literal was
+/// erased is *absent from the computed set*, the sets compare equal, and the
+/// census is **green with an extra Docker-naming file present**. A missed needle
+/// is a false negative, and a false negative in a set comparison is fail-open,
+/// not loud. The reviewer built that mutation and measured it.
+///
+/// So the residual is now the same as its sibling's: an unterminated literal
+/// runs to end of input, which is a file that does not compile.
 #[must_use]
 pub fn blank_comments(source: &str) -> String {
-    let mut out = String::with_capacity(source.len());
-    let mut chars = source.chars().peekable();
-    let mut in_string = false;
-    let mut escaped = false;
-    while let Some(c) = chars.next() {
-        if in_string {
-            out.push(c);
-            if escaped {
-                escaped = false;
-            } else if c == '\\' {
-                escaped = true;
-            } else if c == '"' {
-                in_string = false;
-            }
-            continue;
-        }
-        match c {
-            '"' => {
-                in_string = true;
-                out.push(c);
-            }
-            '/' if chars.peek() == Some(&'/') => {
-                for next in chars.by_ref() {
-                    if next == '\n' {
-                        out.push('\n');
-                        break;
-                    }
+    let bytes = source.as_bytes();
+    let mut out: Vec<u8> = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'/' if bytes.get(i + 1) == Some(&b'/') => {
+                // The newline itself is left for the outer loop, so line numbers
+                // survive.
+                while i < bytes.len() && bytes[i] != b'\n' {
+                    i += 1;
                 }
             }
-            '/' if chars.peek() == Some(&'*') => {
+            b'/' if bytes.get(i + 1) == Some(&b'*') => {
                 let mut depth = 1usize;
-                let mut previous = ' ';
-                for next in chars.by_ref() {
-                    if next == '\n' {
-                        out.push('\n');
-                    }
-                    if previous == '/' && next == '*' {
+                i += 2;
+                while i < bytes.len() && depth > 0 {
+                    if bytes[i] == b'/' && bytes.get(i + 1) == Some(&b'*') {
                         depth += 1;
-                        previous = ' ';
-                        continue;
-                    }
-                    if previous == '*' && next == '/' {
+                        i += 2;
+                    } else if bytes[i] == b'*' && bytes.get(i + 1) == Some(&b'/') {
                         depth -= 1;
-                        if depth == 0 {
-                            break;
+                        i += 2;
+                    } else {
+                        if bytes[i] == b'\n' {
+                            out.push(b'\n');
                         }
-                        previous = ' ';
-                        continue;
+                        i += 1;
                     }
-                    previous = next;
                 }
             }
-            _ => out.push(c),
+            b'r' | b'b' if i == 0 || !is_ident_byte(bytes[i - 1]) => {
+                // `r"…"`, `r#"…"#`, `b"…"`, `br#"…"#` — and an identifier that
+                // merely begins with one of these letters, which is why the
+                // preceding byte is checked and why a non-literal falls through
+                // to a single push.
+                match literal_end(bytes, i) {
+                    Some(end) => {
+                        out.extend_from_slice(&bytes[i..end]);
+                        i = end;
+                    }
+                    None => {
+                        out.push(bytes[i]);
+                        i += 1;
+                    }
+                }
+            }
+            b'"' => {
+                let end = literal_end(bytes, i).unwrap_or(bytes.len());
+                out.extend_from_slice(&bytes[i..end]);
+                i = end;
+            }
+            b'\'' => {
+                // A char literal is `'x'`, `'\n'` or `'\u{1}'`; `'a` is a
+                // lifetime and must be left alone. `'"'` is the one that matters
+                // here: without this arm it opens a string.
+                let is_char = bytes.get(i + 1) == Some(&b'\\')
+                    || (bytes.get(i + 2) == Some(&b'\'') && bytes.get(i + 1).is_some());
+                if is_char {
+                    let start = i;
+                    i += 1;
+                    while i < bytes.len() && bytes[i] != b'\'' {
+                        i += if bytes[i] == b'\\' { 2 } else { 1 };
+                    }
+                    i = (i + 1).min(bytes.len());
+                    out.extend_from_slice(&bytes[start..i]);
+                } else {
+                    out.push(bytes[i]);
+                    i += 1;
+                }
+            }
+            byte => {
+                out.push(byte);
+                i += 1;
+            }
         }
     }
-    out
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+/// Where the string literal starting at `from` ends, or `None` when `from` does
+/// not start one.
+///
+/// Accepts `"…"`, `b"…"`, `r"…"`, `r#"…"#` and `br##"…"##`. An unterminated
+/// literal ends at end of input — a file that does not compile.
+fn literal_end(bytes: &[u8], from: usize) -> Option<usize> {
+    let mut j = from;
+    if bytes.get(j) == Some(&b'b') {
+        j += 1;
+    }
+    let raw = bytes.get(j) == Some(&b'r');
+    if raw {
+        j += 1;
+    }
+    let hash_start = j;
+    while bytes.get(j) == Some(&b'#') {
+        j += 1;
+    }
+    let hashes = j - hash_start;
+    if bytes.get(j) != Some(&b'"') || (!raw && hashes > 0) {
+        return None;
+    }
+    j += 1;
+    if raw {
+        let close: Vec<u8> = std::iter::once(b'"')
+            .chain(std::iter::repeat_n(b'#', hashes))
+            .collect();
+        while j < bytes.len() && !bytes[j..].starts_with(&close) {
+            j += 1;
+        }
+        return Some((j + close.len()).min(bytes.len()));
+    }
+    while j < bytes.len() && bytes[j] != b'"' {
+        j += if bytes[j] == b'\\' { 2 } else { 1 };
+    }
+    Some((j + 1).min(bytes.len()))
 }
 
 #[must_use]
@@ -684,12 +763,49 @@ pub const CLASSIFIED_MODULES: &[&str] = &[
 /// Names are returned once each, sorted. Two `impl` blocks with a `new` apiece
 /// are one row: the classification is of a *name in a module*, and a name that
 /// is effectful in one impl is a name the denylist has to carry anyway.
+///
+/// **The third shape was documented and not implemented until repair round F1**
+/// (`PR6-REACHABLE-FN-PARSER-MISSES-TRAIT-DEFAULTS`, refiled as
+/// `PR6-LANEF-007`). The predicate was `visible || in_trait_impl`, and a default
+/// body inside a `pub trait` declaration is neither: it carries no visibility of
+/// its own and it is not in an `impl … for …` block. Lane F filed it as narrow
+/// because no such body reached an effect; the reviewer **built one** —
+/// `fn remove_without_a_site(&self, path: &Path) { let _ = fs::remove_file(path); }`
+/// as a default method on the public `ContainerHooks` — and clippy, all 79
+/// effects tests and all 38 container tests passed. A default body is the one
+/// place in this tree where an effect could be added to a *classified* module
+/// without appearing in its classification.
+///
+/// A trait method **declaration** (no body) is deliberately still excluded: it
+/// performs nothing, and every implementation of it is reached by the
+/// `impl … for …` shape above.
 #[must_use]
 pub fn externally_reachable_fns(source: &str) -> Vec<String> {
     let region = blank_comments_and_strings(&production_region(source));
     let bytes = region.as_bytes();
     let mut names = BTreeSet::new();
     let mut trait_impl_spans = Vec::new();
+    let mut public_trait_spans = Vec::new();
+
+    // `pub trait X: Y { … }` — the bodies inside are reachable through the
+    // trait, exactly as a trait impl's are.
+    let mut t = 0;
+    while let Some(hit) = region[t..].find("trait ") {
+        let start = t + hit;
+        t = start + "trait ".len();
+        if start > 0 && is_ident_byte(bytes[start - 1]) {
+            continue;
+        }
+        if !declares_visibility(&region[..start]) {
+            continue;
+        }
+        let Some(brace) = find_header_brace(&region, t) else {
+            continue;
+        };
+        if let Some(end) = matching(bytes, brace, b'{', b'}') {
+            public_trait_spans.push((brace, end));
+        }
+    }
 
     // `impl <something> for <something> {` — the `for` is what makes it a trait
     // impl; an inherent `impl Type {` has none before the brace.
@@ -728,7 +844,13 @@ pub fn externally_reachable_fns(source: &str) -> Vec<String> {
         let in_trait_impl = trait_impl_spans
             .iter()
             .any(|(open, close)| index > *open && index < *close);
-        if visible || in_trait_impl {
+        // A default body in a public trait, and only a default *body*:
+        // `find_header_brace` answers `None` at the `;` of a declaration.
+        let is_default_body = public_trait_spans
+            .iter()
+            .any(|(open, close)| index > *open && index < *close)
+            && find_header_brace(&region, index).is_some();
+        if visible || in_trait_impl || is_default_body {
             names.insert(name.to_owned());
         }
     }

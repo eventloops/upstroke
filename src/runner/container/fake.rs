@@ -25,6 +25,21 @@
 //! `runner::container::tests::the_fake_can_report_an_image_id_that_differs_from_the_one_create_asked_for`
 //! proves they can differ.
 
+// `PR6-LANEF-004`: the Container funnel's module-level allow is an INNER
+// attribute, and a Rust lint level is scoped by the MODULE TREE rather than by
+// the file, so every out-of-line child of `runner::container` inherited it --
+// measured, a `ContainerRuntime::start` planted in a child module passed
+// `cargo clippy --all-targets --all-features -- -D warnings`. Re-denying here
+// is what makes `decisions.effect_site_inventory.mechanism` (1)'s BUILD error
+// true of a lane's module, which is the leg the source census cannot supply.
+// Enforced for every file in this directory by `runner::container::tests::
+// every_child_module_of_the_container_funnel_states_its_own_lint_level`.
+#![deny(
+    clippy::disallowed_methods,
+    clippy::disallowed_types,
+    clippy::disallowed_macros
+)]
+
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, PoisonError};
@@ -558,6 +573,10 @@ pub(crate) const DOCKER_GATED_TESTS: &[&str] = &[
     "real_docker_reports_an_image_id_and_a_digest_for_a_reference_it_holds",
     "real_docker_refuses_a_reference_it_does_not_hold_without_pulling",
     "real_docker_creates_from_an_id_reports_it_and_reclaims_idempotently",
+    // Repair round F1: the three defects real Docker found in this file.
+    "real_docker_kill_on_an_already_exited_container_is_tolerated",
+    "real_docker_returns_both_streams_of_a_container_separately",
+    "real_docker_removing_a_container_reclaims_its_anonymous_volumes",
     // Lane A: the ContainerRunner against the real runtime.
     "real_docker_runs_from_the_recorded_image_id_and_composes_over_the_image_environment",
     "real_docker_refuses_a_reviewer_write_to_its_read_only_mount",

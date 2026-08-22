@@ -114,6 +114,56 @@ listed as a module of its own, in the idiom of `src/events/log.rs` and \
 the packet names."""
 
 [[funnel]]
+path = "src/runner/container/tests.rs"
+allows = ["clippy::disallowed_methods"]
+packet = "effect_site_inventory.mechanism (2), by attachment: the `#[cfg(test)] mod tests;` of src/runner/container.rs"
+review = """
+The Container funnel's own test module, added by PR6 and given an attribute of \
+its own by repair round F1. Until then it had NO attribute and relied on \
+inheriting `src/runner/container.rs`'s inner `#![allow(...)]` through the module \
+tree — which is `PR6-LANEF-004`, the hole that let a lane's PRODUCTION module \
+inherit the same allow and call a container primitive with the clippy gate \
+green. Every child of `src/runner/container/` now states its own lint level and \
+`runner::container::tests::every_child_module_of_the_container_funnel_states_\
+its_own_lint_level` refuses a new one that does not. \
+WHAT IT NEEDS THE ALLOW FOR: it drives all eight site-taking APIs, plants the \
+residue they are meant to find (`fs::write` of a staged half, `fs::create_dir_\
+all` of a view a reclaimer must prune) and delegates through `ContainerRuntime` \
+in its wrapper runtimes. It performs no effect outside a scratch directory of \
+its own making and returns nothing. `clippy::disallowed_types` and \
+`clippy::disallowed_macros` are RE-DENIED here rather than inherited, so a \
+`std::process::Command` or a `println!` in this file is still a build error."""
+
+[[funnel]]
+path = "src/runner/container/census/tests.rs"
+allows = ["clippy::disallowed_methods"]
+packet = "effect_site_inventory.mechanism (2), by attachment: the `#[cfg(test)] mod tests;` of src/runner/container/census.rs"
+review = """
+The startup census's test module (PR6 lane C), given an attribute of its own by \
+repair round F1 for the same reason as `src/runner/container/tests.rs`: it used \
+to inherit the funnel's allow through the module tree. It plants intents, views \
+and labelled containers for the census to classify and reclaim, which is what \
+needs `fs::write` and `fs::create_dir_all`; `census.rs` itself now carries \
+`#![deny(...)]` and reaches no denied primitive. `clippy::disallowed_types` and \
+`clippy::disallowed_macros` are re-denied here."""
+
+[[funnel]]
+path = "src/runner/container/exec.rs"
+allows = ["clippy::disallowed_methods"]
+packet = "effect_site_inventory.mechanism (2), by attachment: the `ContainerRunner`, declared beside src/runner/container.rs"
+review = """
+The `ContainerRunner` (PR6 lane A). Its PRODUCTION REGION performs no denied \
+effect at all and carries a file-level `#![deny(clippy::disallowed_methods, \
+disallowed_types, disallowed_macros)]`, so a container primitive called from a \
+lane's production code here is a build error — which is the guarantee \
+`PR6-LANEF-004` found had been inherited away. The allow is an OUTER attribute \
+on the `#[cfg(test)] mod tests` item and therefore covers the test region only: \
+the fixtures build worktrees and scratch trees with `fs::create_dir_all` and \
+`fs::write`, and drive the seam directly to seed containers the runner then \
+supervises. Recorded here rather than left inherited, so the scope is a \
+reviewed artifact rather than an accident of the module tree."""
+
+[[funnel]]
 path = "src/runner/invocation.rs"
 allows = []
 packet = "effect_site_inventory.mechanism (2): src/runner/{host,container,invocation}.rs"

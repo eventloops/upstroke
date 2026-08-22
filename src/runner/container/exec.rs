@@ -53,6 +53,21 @@
 //! and cannot be added to a running container, so `T-CONTAINER`'s prose order
 //! is not merely non-conforming — it does not run.
 
+// `PR6-LANEF-004`: the Container funnel's module-level allow is an INNER
+// attribute, and a Rust lint level is scoped by the MODULE TREE rather than by
+// the file, so every out-of-line child of `runner::container` inherited it --
+// measured, a `ContainerRuntime::start` planted in a child module passed
+// `cargo clippy --all-targets --all-features -- -D warnings`. Re-denying here
+// is what makes `decisions.effect_site_inventory.mechanism` (1)'s BUILD error
+// true of a lane's module, which is the leg the source census cannot supply.
+// Enforced for every file in this directory by `runner::container::tests::
+// every_child_module_of_the_container_funnel_states_its_own_lint_level`.
+#![deny(
+    clippy::disallowed_methods,
+    clippy::disallowed_types,
+    clippy::disallowed_macros
+)]
+
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, PoisonError};
@@ -1007,6 +1022,25 @@ fn bounded(bytes: &[u8], limit: usize) -> (String, bool) {
 // -- test-only declarations ----------------------------------------------
 // At the BOTTOM: `effects::production_region` cuts a source at its first
 // `#[cfg(test)]` (`PR5-R1-CFG-TEST-SHRINKS-THE-DOMAIN`).
+//
+// **The allow below is written ABOVE `#[cfg(test)]`, and that order is
+// load-bearing.** `runner::tests::production_region` is line-based: it excludes
+// a test module by matching a line that is exactly `#[cfg(test)]` followed by a
+// line starting `mod `, so an attribute between the two makes this whole test
+// region read as PRODUCTION and both
+// `every_production_runner_request_is_built_by_its_roles_builder` and
+// `every_production_command_spec_payload_is_classified` fail with these
+// fixtures counted as production call sites. Measured in repair round F1 and
+// filed as `PR6F1-RUNNER-PRODUCTION-REGION-BREAKS-ON-AN-ATTRIBUTE`;
+// `effects::is_module_level` skips further attributes before requiring `mod`,
+// so this order satisfies both readers.
+//
+// Allowlist placement: the **funnel section** of `effects/allowlist.toml`, by
+// attachment to `src/runner/container.rs`. It covers this file's TEST REGION
+// ONLY — the production region above keeps the file-level `#![deny(...)]`, so a
+// lane's production code here still cannot reach a container primitive
+// (`PR6-LANEF-004`). `decisions.effect_site_inventory.mechanism` (2).
+#[allow(clippy::disallowed_methods)]
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeSet;

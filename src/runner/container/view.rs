@@ -47,6 +47,11 @@
 // the packet names and the body is beside it.
 // `decisions.effect_site_inventory.mechanism` (2).
 #![allow(clippy::disallowed_methods)]
+// `PR6-LANEF-004`: the two lints this file does NOT allow are re-denied here,
+// because the Container funnel's allow is an inner attribute and would
+// otherwise reach this module through the module tree. The `allow` above is
+// this file's own, reviewed in `effects/allowlist.toml`; these two are not.
+#![deny(clippy::disallowed_types, clippy::disallowed_macros)]
 
 use std::fs;
 use std::io::Write as _;

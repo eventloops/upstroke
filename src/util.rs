@@ -428,8 +428,62 @@ pub(crate) fn barriers_performed() -> u64 {
     BARRIERS.load(std::sync::atomic::Ordering::Relaxed)
 }
 
-fn count_barrier() {
+/// The same two counts, **per thread and per half**.
+///
+/// [`BARRIERS`] is process-wide, so an assertion on its delta can only be a
+/// *lower bound* while the suite is threaded — and a lower bound is satisfied by
+/// barriers some other test's thread performed, which is exactly the hole
+/// `PR6-LANEF-001` found: with `util::fsync_file` deleted from a funnel and its
+/// ledger entry left in place, every assertion that reads the ledger still
+/// passed and a process-wide lower bound still passed too.
+///
+/// A funnel performs its barriers on the thread that called it, so a
+/// thread-local delta is **exact**: the count a caller sees is the count its own
+/// call produced. Split into the two halves because `fsync_file` and `fsync_dir`
+/// are two independently droppable predicates — "write `<name>.tmp`, fsync,
+/// rename, **fsync the directory**" — and one counter cannot tell which of them
+/// went away.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct BarrierCounts {
+    /// Entries into [`fsync_file`].
+    pub file: u64,
+    /// Entries into [`fsync_dir`].
+    pub directory: u64,
+}
+
+thread_local! {
+    static THREAD_BARRIERS: std::cell::Cell<BarrierCounts> =
+        const { std::cell::Cell::new(BarrierCounts { file: 0, directory: 0 }) };
+}
+
+/// What this **thread** has entered so far, file half and directory half.
+///
+/// Only a test reads it, in the same idiom as [`barriers_performed`]. The
+/// counters themselves are unconditional; see [`BARRIERS`] for why a
+/// `#[cfg(test)]` item in this file would truncate every source census's
+/// production region.
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) fn barriers_on_this_thread() -> BarrierCounts {
+    THREAD_BARRIERS.with(std::cell::Cell::get)
+}
+
+/// Which half of the barrier was entered.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BarrierHalf {
+    File,
+    Directory,
+}
+
+fn count_barrier(half: BarrierHalf) {
     BARRIERS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    THREAD_BARRIERS.with(|counts| {
+        let mut current = counts.get();
+        match half {
+            BarrierHalf::File => current.file += 1,
+            BarrierHalf::Directory => current.directory += 1,
+        }
+        counts.set(current);
+    });
 }
 
 /// The **file** half of the durability barrier (`PR5-CONF-012`).
@@ -442,7 +496,7 @@ fn count_barrier() {
 ///
 /// [`std::io::Error`] from `fsync`, verbatim.
 pub(crate) fn fsync_file(file: &std::fs::File) -> std::io::Result<()> {
-    count_barrier();
+    count_barrier(BarrierHalf::File);
     file.sync_all()
 }
 
@@ -471,7 +525,7 @@ pub(crate) fn fsync_file(file: &std::fs::File) -> std::io::Result<()> {
 /// [`std::io::Error`] from the open or from the flush, verbatim, so a caller can
 /// still tell a missing directory from a refused barrier.
 pub(crate) fn fsync_dir(dir: &Path) -> std::io::Result<()> {
-    count_barrier();
+    count_barrier(BarrierHalf::Directory);
     #[cfg(unix)]
     {
         std::fs::File::open(dir)?.sync_all()

@@ -47,6 +47,21 @@
 //! `RunnerPreflight`. [`census_returns_the_only_token_that_reaches_a_consumer`]
 //! is the source census that says no other construction exists.
 
+// `PR6-LANEF-004`: the Container funnel's module-level allow is an INNER
+// attribute, and a Rust lint level is scoped by the MODULE TREE rather than by
+// the file, so every out-of-line child of `runner::container` inherited it --
+// measured, a `ContainerRuntime::start` planted in a child module passed
+// `cargo clippy --all-targets --all-features -- -D warnings`. Re-denying here
+// is what makes `decisions.effect_site_inventory.mechanism` (1)'s BUILD error
+// true of a lane's module, which is the leg the source census cannot supply.
+// Enforced for every file in this directory by `runner::container::tests::
+// every_child_module_of_the_container_funnel_states_its_own_lint_level`.
+#![deny(
+    clippy::disallowed_methods,
+    clippy::disallowed_types,
+    clippy::disallowed_macros
+)]
+
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 

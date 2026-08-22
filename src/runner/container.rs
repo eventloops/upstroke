@@ -31,6 +31,21 @@
 //!   packet's own phrase for them — so a module that calls one fails
 //!   `cargo clippy -- -D warnings` unless it is in `effects/allowlist.toml`,
 //!   which is a reviewed artifact at every gate;
+//!
+//!   **This sentence was false between PR6 and repair round F1, and the shape
+//!   of its falsehood is worth keeping.** The allow below is an *inner*
+//!   attribute, and a Rust lint level is scoped by the **module tree** rather
+//!   than by the file — so `runner::container::{census, env, exec, fake,
+//!   intent, runtime, tests, view}` all inherited it, and a
+//!   `ContainerRuntime::start` planted in one of them passed the exact clippy
+//!   gate. Measured, twice: by lane A with a planted probe and by the lane-F
+//!   review (`PR6A-CONTAINER-ALLOW-IS-INHERITED-BY-EVERY-LANE-MODULE` /
+//!   `PR6-LANEF-004`). Each of those files now **re-denies** the three governed
+//!   lints, and the three that need one for their *test region* carry an allow
+//!   of their own with an `effects/allowlist.toml` entry to be read against.
+//!   [`tests::every_child_module_of_the_container_funnel_states_its_own_lint_level`]
+//!   refuses a new file here that states neither, which is what stops the hole
+//!   reopening for the next lane rather than for this one;
 //! * [`tests::every_container_effect_in_the_tree_goes_through_the_funnel`] is
 //!   the source census beside it, in the idiom of
 //!   `runner::tests::every_production_process_start_is_classified`: it names
@@ -530,16 +545,55 @@ pub struct Launched {
 /// > intent synced before docker create; container created from the recorded id
 /// > and verified before start; view mounted before start
 ///
-/// Four sites in that order, and the verification between `Create` and
-/// everything after it. **This is also what makes "container start without an
-/// intent is impossible by construction"** (`expected_failures_refusals[6]`)
-/// true of the shape a caller uses: the only sequence that reaches
-/// `Container.Start` begins by writing the intent.
+/// Four sites, and the verification between `Create` and everything after it.
+/// **This is also what makes "container start without an intent is impossible
+/// by construction"** (`expected_failures_refusals[6]`) true of the shape a
+/// caller uses: the only sequence that reaches `Container.Start` begins by
+/// writing the intent.
+///
+/// ## Why `MountGitView` precedes `Create` and not merely `Start`
+///
+/// The clause says "view mounted before start", which two orders satisfy. Only
+/// one of them runs: **the view is a bind-mount *source* of the `docker create`
+/// call**, and a bind source must exist when the container is created.
+/// Measured against `docker` 29.7.2 with `WriteIntent -> Create ->
+/// MountGitView -> Start` —
+///
+/// ```text
+/// the container runtime refused `create`: Error response from daemon: invalid
+/// mount config for type "bind": bind source path does not exist: …/views/tactus-…
+/// ```
+///
+/// — so that order cannot produce a working container for any `Implement`,
+/// `Gate` or `Review` invocation at all. `PR6A-LAUNCH-MOUNTS-THE-VIEW-AFTER-CREATE`
+/// is the finding; it was invisible to the fake, whose `create` does not care
+/// whether a source path exists, and to a real-runtime test whose `LaunchPlan`
+/// carried no mounts. `real_docker_creates_from_an_id_reports_it_and_reclaims_idempotently`
+/// now carries the view as a real mount, which is what makes it able to see it.
+///
+/// `WriteIntent -> MountGitView -> Create(+verify) -> Start` holds every clause
+/// the contract states — intent synced before create, created and verified
+/// before start, view mounted before start — and is the only order a container
+/// runtime accepts.
+///
+/// ## The cancel path, at every point it can fail
 ///
 /// On a reported image id that differs from the record the invocation is
-/// **refused before start** and the container it created is released — R26's
-/// "released on complete …, **cancel**, or shutdown" — so the ledger balances
-/// and no unstarted container is left for a census to find.
+/// **refused before start** and everything it created is released — R26's
+/// "released on complete …, **cancel**, or shutdown" and R19's "pruned on
+/// complete or **cancel**" — so both ledgers balance and no census finds
+/// residue of a refusal. The view is now mounted before the create, so the
+/// cancel has an R19 residue to prune as well as an R26 one.
+///
+/// **The cancel is failure-atomic in both directions** (`PR6-LANEF-006`): every
+/// step is attempted even after an earlier one fails, and the error returned is
+/// always the **image-integrity refusal**. Returning a cleanup failure instead
+/// would leave the operator holding "docker stop said no" while the fact that
+/// the runtime executed a substituted image went unsaid, and stopping at the
+/// first failure would leave a container *and* an intent where attempting both
+/// leaves neither — `docker rm --force` removes a running container, so
+/// `Remove` after a failed `Stop` is not a wasted call. What could not be
+/// released is named in the refusal rather than swallowed.
 ///
 /// # Errors
 ///
@@ -558,35 +612,29 @@ pub fn launch(
         &plan.name,
         &plan.intent,
     )?;
+    let view_path = mount_git_view(hooks, ContainerSite::MountGitView, view, &plan.view)?;
     let created = create_container(hooks, ContainerSite::Create, runtime, &plan.spec)?;
     if created.reported_image_id != plan.spec.image_id {
-        let refusal = TactusError::Refused {
+        let residue = cancel_created(
+            hooks,
+            runtime,
+            view,
+            &plan.private_root,
+            &plan.name,
+            Some(&view_path),
+        );
+        return Err(TactusError::Refused {
             message: format!(
                 "the container runtime created `{}` and reports image id `{}`, and the run's \
                  recorded image id is `{}`; a created container whose reported image id \
-                 differs from the record is refused before start (INV-23)",
-                plan.name, created.reported_image_id, plan.spec.image_id
+                 differs from the record is refused before start (INV-23){}",
+                plan.name,
+                created.reported_image_id,
+                plan.spec.image_id,
+                render_residue(&residue)
             ),
-        };
-        // Cancel: stop/rm and remove the intent. No view was mounted, so there
-        // is no R19 residue to prune.
-        stop_container(
-            hooks,
-            ContainerSite::Stop,
-            runtime,
-            &plan.name,
-            StopMode::Graceful,
-        )?;
-        remove_container(hooks, ContainerSite::Remove, runtime, &plan.name)?;
-        remove_intent(
-            hooks,
-            ContainerSite::RemoveIntent,
-            &plan.private_root,
-            &plan.name,
-        )?;
-        return Err(refusal);
+        });
     }
-    let view_path = mount_git_view(hooks, ContainerSite::MountGitView, view, &plan.view)?;
     start_container(hooks, ContainerSite::Start, runtime, &plan.name)?;
     Ok(Launched {
         name: plan.name.clone(),
@@ -594,6 +642,68 @@ pub fn launch(
         view_path,
         reported_image_id: created.reported_image_id,
     })
+}
+
+/// Release everything a refused launch created, **attempting every step even
+/// after one fails**, and answer what could not be released.
+///
+/// The four sites of [`release`], in the same order, with the `?` taken off.
+/// `PR6-LANEF-006`: with `?` in place a failing `Container.Stop` returned the
+/// stop error and left the container, the view and the intent behind — three
+/// residues and a masked integrity refusal, from one failure.
+///
+/// The answer is a list of descriptions rather than a `Result`, because the
+/// caller must return the refusal it already has: this function's failure is
+/// never the thing to report *instead of* an integrity violation.
+fn cancel_created(
+    hooks: &mut dyn ContainerHooks,
+    runtime: &dyn ContainerRuntime,
+    view: &dyn GitView,
+    private_root: &Path,
+    name: &ContainerName,
+    view_path: Option<&Path>,
+) -> Vec<String> {
+    let mut residue = Vec::new();
+    let mut note = |what: &str, error: &TactusError| {
+        residue.push(format!("{what}: {error}"));
+    };
+    if let Err(error) = stop_container(
+        hooks,
+        ContainerSite::Stop,
+        runtime,
+        name,
+        StopMode::Graceful,
+    ) {
+        note("the container could not be stopped", &error);
+    }
+    if let Err(error) = remove_container(hooks, ContainerSite::Remove, runtime, name) {
+        note("the container could not be removed", &error);
+    }
+    if let Some(path) = view_path {
+        if let Err(error) = unmount_git_view(hooks, ContainerSite::UnmountGitView, view, path) {
+            note("the R19 Git view could not be pruned", &error);
+        }
+    }
+    if let Err(error) = remove_intent(hooks, ContainerSite::RemoveIntent, private_root, name) {
+        note("the R26 intent record could not be removed", &error);
+    }
+    residue
+}
+
+/// What a cancel could not release, appended to the refusal that caused it.
+///
+/// Empty when the cancel balanced, which is the ordinary case and leaves the
+/// refusal's own wording untouched.
+fn render_residue(residue: &[String]) -> String {
+    if residue.is_empty() {
+        return String::new();
+    }
+    format!(
+        ". The cancel could not release everything the refused launch created, \
+         so this run's R19/R26 ledgers do not balance and a census will find the \
+         residue: {}",
+        residue.join("; ")
+    )
 }
 
 /// The completion half: "stop/rm, view removal, intent removal after
@@ -1047,6 +1157,28 @@ impl DockerCli {
     /// operation is about, rather than the subcommand, so the trace of a real
     /// run and the trace of a fake one are the same shape.
     fn exec(&self, op: RuntimeOp, target: &str, args: &[&str]) -> Result<String, RuntimeError> {
+        self.exec_streams(op, target, args)
+            .map(|(stdout, _)| String::from_utf8_lossy(&stdout).into_owned())
+    }
+
+    /// The same call, keeping **both** streams.
+    ///
+    /// `PR6A-DOCKERCLI-MERGES-STDERR-INTO-STDOUT`: [`Self::exec`] returns only
+    /// stdout and drops the child's stderr on success, so every container
+    /// invocation's stderr was lost. A gate's failure output is its stderr and
+    /// becomes retry feedback (DESIGN.md:576); both shipped adapters read
+    /// stderr; `host::run_shell_probe`'s refusal quotes `output.stderr` and
+    /// would have quoted nothing. Measured on docker 29.7.2, `docker logs`
+    /// **separates** the two streams — `docker logs <c> 2>/dev/null` gives the
+    /// container's stdout and `2>&1 >/dev/null` gives its stderr — so there was
+    /// never anything to merge and the previous comment's premise was wrong as
+    /// well as its consequence.
+    fn exec_streams(
+        &self,
+        op: RuntimeOp,
+        target: &str,
+        args: &[&str],
+    ) -> Result<(Vec<u8>, Vec<u8>), RuntimeError> {
         self.trace.runtime(op, target);
         let output = Command::new(DOCKER_PROGRAM)
             .args(args)
@@ -1056,7 +1188,7 @@ impl DockerCli {
                 detail: format!("{DOCKER_PROGRAM} could not be started: {error}"),
             })?;
         if output.status.success() {
-            return Ok(String::from_utf8_lossy(&output.stdout).into_owned());
+            return Ok((output.stdout, output.stderr));
         }
         let detail = String::from_utf8_lossy(&output.stderr).trim().to_owned();
         // The daemon-unreachable shape. `docker` reports it on stderr with a
@@ -1296,14 +1428,14 @@ impl ContainerRuntime for DockerCli {
                 detail: format!("`{name}` is gone, so its exit status cannot be collected"),
             })?;
         let exit_code = status.trim().parse::<i32>().ok();
-        let stdout = self.exec(RuntimeOp::Collect, name, &["logs", name])?;
+        // Both streams, separately. `docker logs` writes the container's stdout
+        // to its own stdout and the container's stderr to its own stderr
+        // (measured, docker 29.7.2) — see [`Self::exec_streams`].
+        let (stdout, stderr) = self.exec_streams(RuntimeOp::Collect, name, &["logs", name])?;
         Ok(ContainerExecution {
             exit_code,
-            // `docker logs` interleaves both streams on a container without a
-            // TTY unless asked otherwise; lane A separates them when it wires
-            // the ContainerRunner. Recorded here rather than silently merged.
-            stdout: stdout.into_bytes(),
-            stderr: Vec::new(),
+            stdout,
+            stderr,
         })
     }
 
@@ -1360,25 +1492,69 @@ impl ContainerRuntime for DockerCli {
             StopMode::Graceful => "stop",
             StopMode::Kill => "kill",
         };
-        match self.exec(RuntimeOp::Stop, name, &[verb, name]) {
-            Ok(_) => Ok(()),
-            // Tolerant of already-gone and of already-stopped: two concurrent
-            // reclaimers converge.
-            Err(RuntimeError::Failed { detail, .. })
-                if is_absent(&detail) || detail.contains("is not running") =>
-            {
-                Ok(())
-            }
-            Err(error) => Err(error),
-        }
+        settle_stop(self.exec(RuntimeOp::Stop, name, &[verb, name]))
     }
 
     fn remove(&self, name: &str) -> Result<(), RuntimeError> {
-        match self.exec(RuntimeOp::Remove, name, &["rm", "--force", name]) {
+        // `--volumes` (`PR6A-ANONYMOUS-VOLUMES-LEAK`). An image declaring
+        // `VOLUME` gets an **anonymous** volume per container, and `docker rm`
+        // without it leaves one behind per invocation: measured, **29** leaked
+        // from one run of this suite. Those volumes are not R20 — R20 is the
+        // operator's *named*, per-agent credential volume, "operator_owned" and
+        // `persistent_output` in all five `at_run_end` outcomes. An anonymous
+        // volume is created by `docker create` as part of the container and
+        // nothing else can ever refer to it, so it belongs to **R26** ("container
+        // + labels + global intent"), and `Container.Remove` is where R26
+        // balances. `--volumes` removes only anonymous volumes attached to this
+        // container and **never a named one**, which is what makes reclaiming it
+        // here a discharge of R26 rather than a violation of R20.
+        match self.exec(
+            RuntimeOp::Remove,
+            name,
+            &["rm", "--force", "--volumes", name],
+        ) {
             Ok(_) => Ok(()),
             Err(RuntimeError::Failed { detail, .. }) if is_absent(&detail) => Ok(()),
             Err(error) => Err(error),
         }
+    }
+}
+
+/// Whether a `docker stop` / `docker kill` failure means the container has
+/// already reached the state the caller asked for.
+///
+/// "every step idempotent and tolerant of already-gone so **two concurrent
+/// reclaimers converge**" has two shapes on a real daemon, and only one of them
+/// is "gone". Measured on `docker` 29.7.2, verbatim:
+///
+/// ```text
+/// docker kill <exited> -> Error response from daemon: cannot kill container: <n>: container <id> is not running
+/// docker kill <absent> -> Error response from daemon: cannot kill container: <n>: No such container: <n>
+/// docker stop <absent> -> Error response from daemon: No such container: <n>
+/// docker stop <exited> -> succeeds, and prints the name
+/// ```
+///
+/// The **first** row is the load-bearing one and it is what a *racing*
+/// reclaimer sees: A kills the container, B reaches `docker kill` after the
+/// state has become `Exited`, and without this tolerance B returns an error
+/// before observe / rm / view / intent cleanup — the opposite of the sentence.
+/// `PR6-LANEF-003` is the entry for it: deleting the tolerance passed every
+/// test, because every fixture serialized the reclaimers.
+fn stop_already_settled(detail: &str) -> bool {
+    is_absent(detail) || detail.contains("is not running")
+}
+
+/// `docker stop` / `docker kill`'s raw answer, as the seam's.
+///
+/// A free function taking the raw outcome rather than a `match` inside
+/// [`DockerCli::stop`], so the tolerance is reachable **without a daemon**: the
+/// branch that matters is one a real runtime only produces in a race, and a
+/// gated test is the wrong and only place it could otherwise be observed.
+fn settle_stop(outcome: Result<String, RuntimeError>) -> Result<(), RuntimeError> {
+    match outcome {
+        Ok(_) => Ok(()),
+        Err(RuntimeError::Failed { detail, .. }) if stop_already_settled(&detail) => Ok(()),
+        Err(error) => Err(error),
     }
 }
 
@@ -1418,6 +1594,32 @@ mod fake;
 pub(crate) use fake::{
     DOCKER_GATED_TESTS, FakeOwnerLiveness, FakeRuntime, RecordingHooks, docker_gate,
 };
+
+/// One `docker` subcommand, raw, for the Docker-gated tests only.
+///
+/// Two of them need what the seam deliberately does not expose: the daemon's
+/// **verbatim** stderr for an already-stopped container, so the transcribed
+/// table in `tests` can be checked against the live daemon rather than against
+/// itself; and a container carrying an **anonymous** volume, which `CreateSpec`
+/// cannot express because `Mount::Volume` requires a name.
+///
+/// Below the `#[cfg(test)]` cut deliberately. `effects::production_region` stops
+/// at the first `#[cfg(test)]` in a file, so this is invisible to every source
+/// census — including `exec::tests::the_container_subtree_can_only_inspect_a_volume`,
+/// which is the census that keeps production able to *inspect* a volume and
+/// nothing else. A test fixture is not a production capability, and this is
+/// where the tree draws that line.
+#[cfg(test)]
+impl DockerCli {
+    pub(crate) fn raw(
+        &self,
+        op: RuntimeOp,
+        target: &str,
+        args: &[&str],
+    ) -> Result<String, RuntimeError> {
+        self.exec(op, target, args)
+    }
+}
 
 #[cfg(test)]
 mod tests;
