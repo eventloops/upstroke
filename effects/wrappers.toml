@@ -255,6 +255,10 @@ effectful = [
 ]
 effectful_unnameable = []
 effect_free = [
+    # Reads two counters. The thread-local half is what makes an assertion on a
+    # durability barrier EXACT rather than a lower bound a neighbouring test's
+    # thread can satisfy (`PR6-LANEF-001`).
+    "barriers_on_this_thread",
     "barriers_performed",
     "clear",
     "deserialize",
@@ -300,6 +304,12 @@ funnel = [
 effectful = []
 effectful_unnameable = []
 effect_free = [
+    # `EventHooks` default bodies, in the classification domain since the
+    # parser was repaired (`PR6-LANEF-007`). Each returns a constant or does
+    # nothing: `WrittenShape::Complete`, `DurabilityLedger::off()`, `{}`.
+    "durability_ledger",
+    "synced",
+    "written_kill_shape",
     "bytes",
     "committed_bytes",
     "first_line_digest",
@@ -396,6 +406,9 @@ effectful = [
 ]
 effectful_unnameable = []
 effect_free = [
+    # `ContainerHooks::trace`'s default body -- `ContainerTrace::off()`, what
+    # production passes. In the domain since `PR6-LANEF-007`.
+    "trace",
     "available",
     "closed_by_a_reaper",
     "collect",
@@ -580,6 +593,11 @@ funnel = []
 effectful = []
 effectful_unnameable = []
 effect_free = [
+    # `SpawnHooks` default bodies. `child_created` does nothing; `point_mode`
+    # delegates to `point`, which is an observer question and not an effect.
+    # In the domain since `PR6-LANEF-007`.
+    "child_created",
+    "point_mode",
     "active_processes_with",
     "ambient_job_established",
     "child_in_ambient_job",

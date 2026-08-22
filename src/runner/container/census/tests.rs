@@ -8,6 +8,20 @@
 //! {resume}`. A suite that varies one at a time passes while an implementation
 //! that reclaims a **live** run's dead earlier incarnation ships.
 
+// Allowlist placement: the **funnel section** of `effects/allowlist.toml`, by
+// attachment to `src/runner/container.rs` -- the same shape `src/events/log.rs`
+// and `src/events/log/tests.rs` have, which is PR5's precedent for a funnel's
+// own test module. This file drives the eight site-taking APIs and plants the
+// residue they are meant to find, so it names `fs::write`, `fs::create_dir_all`
+// and the seam's own effectful methods directly.
+//
+// `PR6-LANEF-004`: it carries this allow **of its own** because the funnel's no
+// longer reaches it. The two lints it does not need are re-denied, so a
+// `std::process::Command` or a `println!` appearing here is still a build error.
+// `decisions.effect_site_inventory.mechanism` (2).
+#![allow(clippy::disallowed_methods)]
+#![deny(clippy::disallowed_types, clippy::disallowed_macros)]
+
 // `effects::production_region` cuts a source at its FIRST `#[cfg(test)]`, and
 // several source censuses in this tree scan every `src/**/*.rs` — including
 // this one, which is reached only through `#[cfg(test)] mod tests;` and so has

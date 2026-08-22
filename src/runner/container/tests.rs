@@ -17,6 +17,20 @@
 //! * **The dominant defect is two axes covered separately with the intersection
 //!   never built.** Each test below names the second field it holds constant.
 
+// Allowlist placement: the **funnel section** of `effects/allowlist.toml`, by
+// attachment to `src/runner/container.rs` -- the same shape `src/events/log.rs`
+// and `src/events/log/tests.rs` have, which is PR5's precedent for a funnel's
+// own test module. This file drives the eight site-taking APIs and plants the
+// residue they are meant to find, so it names `fs::write`, `fs::create_dir_all`
+// and the seam's own effectful methods directly.
+//
+// `PR6-LANEF-004`: it carries this allow **of its own** because the funnel's no
+// longer reaches it. The two lints it does not need are re-denied, so a
+// `std::process::Command` or a `println!` appearing here is still a build error.
+// `decisions.effect_site_inventory.mechanism` (2).
+#![allow(clippy::disallowed_methods)]
+#![deny(clippy::disallowed_types, clippy::disallowed_macros)]
+
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -861,93 +875,177 @@ fn every_container_site_is_taken_by_value_by_a_funnel_that_hooks_both_phases() {
     );
 }
 
-/// A funnel API refuses a site that does not name its operation, **before any
-/// effect**.
+/// A funnel API refuses a site that does not name its operation, and **no
+/// primitive effect occurs**.
 ///
 /// The site is a by-value parameter, which is what `identity` asks for; a free
 /// parameter can be passed a wrong value, so the guard is what keeps the
 /// parameter load-bearing rather than decorative. The grid is all eight sites
 /// against all eight APIs: eight accept and fifty-six refuse.
+///
+/// **`PR6-LANEF-002` is why every cell asserts more than `is_err()`.** Seven of
+/// the eight APIs used to count any `Err`, over a fixture holding nothing —
+/// and an empty fixture makes the *runtime* supply the error. Deleting only
+/// `expect_site(site, Operation::Start)` from [`start_container`] passed the
+/// whole suite, because there was no container to start and the test counted
+/// the runtime's incidental refusal. A refusal test that passes for the wrong
+/// reason is exactly the class this project keeps paying for.
+///
+/// So each cell is prepared in a state where its primitive **would succeed if
+/// it were reached** — a container to start, a container to stop, a view to
+/// remove, a record to delete, a free name to create — and each asserts three
+/// things:
+///
+/// 1. the call refused, with [`TactusError::Refused`];
+/// 2. **the trace is empty**: no site phase, no runtime operation, no view
+///    action and no durability step, which is the whole observable surface this
+///    module has and is what "before any effect" means;
+/// 3. the API's own state is byte-for-byte what it was.
+///
+/// And every API is then driven with its **own** site as a positive control, so
+/// a cell whose primitive could not have succeeded anyway fails here rather
+/// than passing vacuously.
+///
+/// Second field held constant: the runtime is reachable and holds the recorded
+/// image throughout, so no cell can refuse because the runtime was armed.
 #[test]
 fn a_funnel_api_refuses_a_site_that_does_not_name_its_operation() {
-    let fixture = Fixture::new("site-guard", RUN_A, INCARNATION_1, &shell_probe());
-    let name = fixture.plan.name.clone();
     let mut accepted = 0;
     let mut refused = 0;
-    for site in ContainerSite::ALL.iter().copied() {
-        let mut hooks = NoHooks;
-        // One API, driven over every site. `write_intent` is the one whose
-        // effect is observable without a runtime, so a refusal that still wrote
-        // is visible on disk.
-        let outcome = write_intent(&mut hooks, site, &fixture.root, &name, &fixture.plan.intent);
-        if site == ContainerSite::WriteIntent {
-            outcome.expect("the site that names the operation is accepted");
-            accepted += 1;
-            fs::remove_file(name.intent_path(&fixture.root)).expect("clean up");
-        } else {
-            let error = outcome.expect_err("a site that names another operation refuses");
-            assert!(matches!(error, TactusError::Refused { .. }));
+    for (index, own_site) in ContainerSite::ALL.iter().copied().enumerate() {
+        let root = scratch(&format!("site-guard-{index}"));
+        let trace = ContainerTrace::recording();
+        let runtime = FakeRuntime::new(trace.clone());
+        runtime.add_image(IMAGE_ID, Some(MANIFEST_DIGEST));
+        let view = DisposableDirView::new(trace.clone());
+        let ordinal = u32::try_from(index).expect("eight sites");
+        let invocation =
+            InvocationId::probe(ProbeTarget::Shell, ordinal).expect("a probe identity");
+        let name = name_for(RUN_A, INCARNATION_1, &invocation);
+        let record = intent_for(RUN_A, INCARNATION_1, &invocation);
+        let spec = spec_for(&name, &record, &root, IMAGE_ID);
+        let view_path = root.join("views").join(name.as_str());
+        let request = GitViewRequest {
+            path: view_path.clone(),
+            workspace: PathBuf::from("/srv/work/task"),
+            head: None,
+        };
+        let intent_path = name.intent_path(&root);
+        let labels = record.labels(&root);
+        let seed = |state: Liveness| {
+            runtime.seed_container(name.as_str(), labels.clone(), IMAGE_ID, IMAGE_ID, state);
+        };
+        // The state in which THIS API's primitive succeeds.
+        match own_site {
+            // Nothing on disk, so a write would land.
+            ContainerSite::WriteIntent => {}
+            // The name is free and the image is present, so a create would work.
+            ContainerSite::Create => {}
+            ContainerSite::Start => seed(Liveness::Exited),
+            // No directory, so a materialize would create one.
+            ContainerSite::MountGitView => {}
+            ContainerSite::Stop => seed(Liveness::Running),
+            ContainerSite::Remove => seed(Liveness::Exited),
+            ContainerSite::UnmountGitView => {
+                fs::create_dir_all(&view_path).expect("a view there is to remove");
+            }
+            ContainerSite::RemoveIntent => {
+                fs::create_dir_all(containers_dir(&root)).expect("the namespace");
+                fs::write(&intent_path, b"{}").expect("a record there is to remove");
+            }
+        }
+
+        let drive = |site: ContainerSite, hooks: &mut RecordingHooks| match own_site {
+            ContainerSite::WriteIntent => {
+                write_intent(hooks, site, &root, &name, &record).map(|_| ())
+            }
+            ContainerSite::Create => create_container(hooks, site, &runtime, &spec).map(|_| ()),
+            ContainerSite::Start => start_container(hooks, site, &runtime, &name),
+            ContainerSite::MountGitView => mount_git_view(hooks, site, &view, &request).map(|_| ()),
+            ContainerSite::Stop => stop_container(hooks, site, &runtime, &name, StopMode::Graceful),
+            ContainerSite::Remove => remove_container(hooks, site, &runtime, &name),
+            ContainerSite::UnmountGitView => unmount_git_view(hooks, site, &view, &view_path),
+            ContainerSite::RemoveIntent => remove_intent(hooks, site, &root, &name),
+        };
+
+        for wrong in ContainerSite::ALL.iter().copied() {
+            if wrong == own_site {
+                continue;
+            }
+            trace.clear();
+            let mut hooks = RecordingHooks::new(trace.clone());
+            let Err(error) = drive(wrong, &mut hooks) else {
+                panic!(
+                    "{} accepted `Container.{}`, which names another operation",
+                    own_site.name(),
+                    wrong.name()
+                );
+            };
             assert!(
-                !name.intent_path(&fixture.root).exists(),
-                "a refused call performed its effect anyway, under site {}",
-                site.name()
+                matches!(error, TactusError::Refused { .. }),
+                "{}/{}: {error}",
+                own_site.name(),
+                wrong.name()
             );
+            // (2) Nothing happened at all. The guard runs before `funnel`, so a
+            // correct refusal records neither hook phase — and a broken one
+            // records the phases AND the primitive's own entry.
+            assert_eq!(
+                trace.rendered(),
+                Vec::<String>::new(),
+                "{} under `Container.{}` refused and something still happened",
+                own_site.name(),
+                wrong.name()
+            );
+            // (3) And the state the primitive would have changed is untouched.
+            let held = runtime.container(name.as_str());
+            match own_site {
+                ContainerSite::WriteIntent => assert!(!intent_path.exists()),
+                ContainerSite::Create => {
+                    assert_eq!(runtime.container_names(), Vec::<String>::new())
+                }
+                ContainerSite::Start => {
+                    assert_eq!(held.map(|c| c.state), Some(Liveness::Exited));
+                }
+                ContainerSite::MountGitView => assert!(!view_path.exists()),
+                ContainerSite::Stop => {
+                    assert_eq!(held.map(|c| c.state), Some(Liveness::Running));
+                }
+                ContainerSite::Remove => assert!(held.is_some()),
+                ContainerSite::UnmountGitView => assert!(view_path.exists()),
+                ContainerSite::RemoveIntent => assert!(intent_path.exists()),
+            }
             refused += 1;
         }
-    }
-    assert_eq!((accepted, refused), (1, 7));
 
-    // And the same over the seven other APIs, counted rather than described.
-    let mut wrong_site_refusals = 0;
-    for site in ContainerSite::ALL.iter().copied() {
-        let mut hooks = NoHooks;
-        if site != ContainerSite::Create
-            && create_container(&mut hooks, site, &fixture.runtime, &fixture.plan.spec).is_err()
-        {
-            wrong_site_refusals += 1;
+        // The positive control: the same API, its own site, and the primitive
+        // really does run. Without this a cell whose primitive could not have
+        // succeeded would satisfy every assertion above by doing nothing.
+        trace.clear();
+        let mut hooks = RecordingHooks::new(trace.clone());
+        drive(own_site, &mut hooks).expect("the site that names the operation is accepted");
+        assert!(
+            !trace.rendered().is_empty(),
+            "{}: the accepted call recorded nothing, so the refusals above are vacuous",
+            own_site.name()
+        );
+        let held = runtime.container(name.as_str());
+        match own_site {
+            ContainerSite::WriteIntent => assert!(intent_path.exists()),
+            ContainerSite::Create => assert!(held.is_some()),
+            ContainerSite::Start => assert_eq!(held.map(|c| c.state), Some(Liveness::Running)),
+            ContainerSite::MountGitView => assert!(view_path.is_dir()),
+            ContainerSite::Stop => assert_eq!(held.map(|c| c.state), Some(Liveness::Exited)),
+            ContainerSite::Remove => assert!(held.is_none()),
+            ContainerSite::UnmountGitView => assert!(!view_path.exists()),
+            ContainerSite::RemoveIntent => assert!(!intent_path.exists()),
         }
-        if site != ContainerSite::Start
-            && start_container(&mut hooks, site, &fixture.runtime, &name).is_err()
-        {
-            wrong_site_refusals += 1;
-        }
-        if site != ContainerSite::Stop
-            && stop_container(
-                &mut hooks,
-                site,
-                &fixture.runtime,
-                &name,
-                StopMode::Graceful,
-            )
-            .is_err()
-        {
-            wrong_site_refusals += 1;
-        }
-        if site != ContainerSite::Remove
-            && remove_container(&mut hooks, site, &fixture.runtime, &name).is_err()
-        {
-            wrong_site_refusals += 1;
-        }
-        if site != ContainerSite::MountGitView
-            && mount_git_view(&mut hooks, site, &fixture.view, &fixture.plan.view).is_err()
-        {
-            wrong_site_refusals += 1;
-        }
-        if site != ContainerSite::UnmountGitView
-            && unmount_git_view(&mut hooks, site, &fixture.view, &fixture.plan.view.path).is_err()
-        {
-            wrong_site_refusals += 1;
-        }
-        if site != ContainerSite::RemoveIntent
-            && remove_intent(&mut hooks, site, &fixture.root, &name).is_err()
-        {
-            wrong_site_refusals += 1;
-        }
+        accepted += 1;
     }
     assert_eq!(
-        wrong_site_refusals,
-        7 * 7,
-        "seven APIs, seven wrong sites each"
+        (accepted, refused),
+        (8, 56),
+        "eight APIs, each accepting its own site and refusing the other seven"
     );
 }
 
@@ -1463,40 +1561,85 @@ fn substituted_image_id_refused_before_start() {
             .any(|(site, _)| *site == ContainerSite::Start),
         "the Start site executed despite the mismatch: {rendered:#?}"
     );
+    // The view IS mounted — it precedes `Create`, because it is a bind-mount
+    // source of it (`PR6A-LAUNCH-MOUNTS-THE-VIEW-AFTER-CREATE`) — and the cancel
+    // therefore has an R19 residue to prune. This assertion used to read "no
+    // view is mounted for a container that will not start", which the corrected
+    // order makes false; the claim it was standing for is R19 balancing, and
+    // that is asserted here directly and more strongly.
+    let mounted = at(&fixture.trace, "site:MountGitView:after");
+    let pruned = at(&fixture.trace, "site:UnmountGitView:after");
     assert!(
-        !fixture
-            .trace
-            .sites()
-            .iter()
-            .any(|(site, _)| *site == ContainerSite::MountGitView),
-        "no view is mounted for a container that will not start: {rendered:#?}"
+        mounted < pruned,
+        "the view is mounted and then pruned by the cancel: {rendered:#?}"
     );
 
-    // R26 balances: the container it created is released and the intent is
-    // gone, so no census finds residue of a refusal.
+    // R19 and R26 both balance: the container it created is released, the view
+    // is gone and the intent is gone, so no census finds residue of a refusal.
     assert_eq!(fixture.runtime.container_names(), Vec::<String>::new());
+    assert!(
+        !fixture.plan.view.path.exists(),
+        "the refused launch left its R19 view behind"
+    );
     assert!(!fixture.plan.name.intent_path(&fixture.root).exists());
     assert_eq!(list_intents(&fixture.root).expect("scan").len(), 0);
 }
 
-/// "view mounted before start", and the view really exists when the container
-/// starts.
+/// "view mounted before start" — and before **create**, because it is a
+/// bind-mount source of that call.
+///
+/// The contract clause is satisfied by two orders and only one of them runs:
+/// Docker requires a bind source to exist at `docker create`, so
+/// `WriteIntent -> Create -> MountGitView -> Start` refuses with
+/// `invalid mount config for type "bind": bind source path does not exist`.
+/// `PR6A-LAUNCH-MOUNTS-THE-VIEW-AFTER-CREATE` — measured against docker 29.7.2
+/// by lane A, invisible to the fake (whose `create` does not look at a mount
+/// source) and invisible to this file's own gated test until it started
+/// carrying the view as a real mount.
+///
+/// Second field held constant: the runtime reports the recorded id and the
+/// launch succeeds, so nothing here passes because a step failed early. The
+/// intersection is {which pair of steps} × {the sequence between them}, and the
+/// directory's existence at the moment of the create is asserted as well as the
+/// order, because "the site ran earlier" and "the directory was there" are two
+/// claims.
 #[test]
-fn the_git_view_is_mounted_before_start() {
-    let fixture = Fixture::new("view-before-start", RUN_A, INCARNATION_1, &shell_probe());
+fn the_git_view_is_mounted_before_create_and_before_start() {
+    let fixture = Fixture::new("view-before-create", RUN_A, INCARNATION_1, &shell_probe());
     let mut hooks = fixture.hooks();
     let launched =
         launch(&mut hooks, &fixture.runtime, &fixture.view, &fixture.plan).expect("launched");
 
+    let rendered = fixture.trace.rendered();
     let mounted = at(&fixture.trace, "site:MountGitView:after");
+    let created = at(&fixture.trace, &format!("rt:create:{}", fixture.plan.name));
     let started = at(&fixture.trace, &format!("rt:start:{}", fixture.plan.name));
     assert!(
+        mounted < created,
+        "the view is a bind-mount source of the create and must exist when the \
+         container is created: {rendered:#?}"
+    );
+    assert!(
+        created < started,
+        "and the create still precedes the start: {rendered:#?}"
+    );
+    assert!(
         mounted < started,
-        "the view is mounted before start: {:#?}",
-        fixture.trace.rendered()
+        "the contract's own clause, stated on its own: {rendered:#?}"
     );
     assert!(launched.view_path.is_dir(), "R19's directory exists");
     assert_eq!(launched.view_path, fixture.plan.view.path);
+
+    // The intent is still first, so moving the mount up did not move it past
+    // "intent synced before docker create".
+    let dir_synced = fixture
+        .trace
+        .position_starting("durable:dir-synced:")
+        .unwrap_or_else(|| panic!("no directory barrier in {rendered:#?}"));
+    assert!(
+        dir_synced < mounted,
+        "the intent is synced before anything else happens: {rendered:#?}"
+    );
 }
 
 /// "stop/rm, view removal, intent removal after completion" — the four sites in
@@ -1643,6 +1786,528 @@ fn reclaim_converges_from_every_combination_of_intent_and_container() {
             assert_eq!(fixture.runtime.container_names(), Vec::<String>::new());
         }
     }
+}
+
+/// The intent's durability barriers are **entered**, not merely traced.
+///
+/// `PR6-LANEF-001`. `crash_reconstruction` requires every container invocation
+/// to write a **synced** global intent, and [`super::write_synced`] records
+/// `DurableStep::Synced` / `DirSynced` in the trace beside each barrier. That
+/// record is written by the same function that performs the barrier, so it
+/// certifies itself: **deleting `util::fsync_file` and `util::fsync_dir` while
+/// leaving the two trace calls in place passed the entire suite** — every
+/// ordering assertion in this file reads the record, and the record was still
+/// there. Write and rename the intent, create the container, lose power before
+/// either the file or its directory reaches stable storage, and Docker keeps a
+/// container whose ownership record crash reconstruction cannot find.
+///
+/// So this reads the **syscall** instead. [`crate::util::barriers_on_this_thread`]
+/// counts entries into the two barrier functions per thread and per half; a
+/// funnel performs its barriers on the thread that called it, so the delta is
+/// exact rather than the lower bound a process-wide counter can support while
+/// the suite is threaded. The two halves are counted separately because
+/// `fsync_file` and `fsync_dir` are two independently droppable predicates.
+///
+/// The two axes: {which barrier} × {which call}. The trace is read only to show
+/// the two agree — never as the evidence that a barrier happened.
+#[test]
+fn the_intents_durability_barriers_are_entered_and_not_merely_traced() {
+    let fixture = Fixture::new("barriers", RUN_A, INCARNATION_1, &shell_probe());
+    let mut hooks = fixture.hooks();
+
+    let before = crate::util::barriers_on_this_thread();
+    let path = write_intent(
+        &mut hooks,
+        ContainerSite::WriteIntent,
+        &fixture.root,
+        &fixture.plan.name,
+        &fixture.plan.intent,
+    )
+    .expect("written");
+    let after = crate::util::barriers_on_this_thread();
+
+    assert_eq!(
+        after.file - before.file,
+        1,
+        "`write_intent` must enter the FILE half of the durability barrier; the \
+         staged record's own bytes have to be on stable storage before the rename"
+    );
+    assert_eq!(
+        after.directory - before.directory,
+        1,
+        "`write_intent` must enter the DIRECTORY half; a rename is not durable \
+         because the renamed file was synced — the durable thing is the entry"
+    );
+
+    // The other axis, and it is a different claim: the trace says the same
+    // thing. If these two ever disagree the trace is the one that is wrong.
+    let file = fixture.plan.name.intent_file_name();
+    let rendered = fixture.trace.rendered();
+    assert_eq!(
+        rendered
+            .iter()
+            .filter(|entry| entry.starts_with("durable:synced:"))
+            .count(),
+        1,
+        "{rendered:#?}"
+    );
+    assert!(
+        fixture
+            .trace
+            .position(&format!("durable:synced:{file}.tmp"))
+            < fixture.trace.position(&format!("durable:renamed:{file}"))
+    );
+    assert!(path.exists());
+
+    // Second cell: the whole launch. Exactly one of each, still — the view, the
+    // create and the start perform no barriers — so a barrier that quietly
+    // appeared or disappeared elsewhere in the sequence is visible here too.
+    let fixture = Fixture::new("barriers-launch", RUN_A, INCARNATION_1, &agent_probe());
+    let mut hooks = fixture.hooks();
+    let before = crate::util::barriers_on_this_thread();
+    launch(&mut hooks, &fixture.runtime, &fixture.view, &fixture.plan).expect("launched");
+    let after = crate::util::barriers_on_this_thread();
+    assert_eq!(
+        (after.file - before.file, after.directory - before.directory),
+        (1, 1),
+        "one file barrier and one directory barrier for one launch"
+    );
+}
+
+/// A cancel whose own cleanup fails still refuses with the **integrity** error,
+/// and still attempts every remaining step.
+///
+/// `PR6-LANEF-006`. [`launch`]'s image-id refusal used to `?`-chain its cleanup,
+/// so a failing `Container.Stop` returned the *stop* error before `rm`, the view
+/// removal or the intent removal ran: one failure, three residues, and the fact
+/// that the runtime had created a container from a substituted image went
+/// unsaid. "Is that true at every point it can fail?" — it was not.
+///
+/// The grid is {which of the four cancel steps fails} × {what survives}, and
+/// each of the four cells has a **distinct** observable, so a fix that merely
+/// stopped returning the first error would still fail three of them:
+///
+/// | armed | container | view | intent |
+/// |---|---|---|---|
+/// | `Stop` | removed | pruned | removed |
+/// | `Remove` | **left** | pruned | removed |
+/// | `UnmountGitView` | removed | **left** | removed |
+/// | `RemoveIntent` | removed | pruned | **left** |
+///
+/// Second field held constant: the substitution, the image ids and the plan are
+/// identical in all four cells, so what varies is only which step was armed.
+#[test]
+fn a_cancel_whose_cleanup_fails_still_refuses_with_the_integrity_error() {
+    use crate::topology::effects::HookPhase;
+
+    let cells = [
+        ContainerSite::Stop,
+        ContainerSite::Remove,
+        ContainerSite::UnmountGitView,
+        ContainerSite::RemoveIntent,
+    ];
+    let mut messages = BTreeSet::new();
+    for armed in cells {
+        let fixture = Fixture::new(
+            &format!("cancel-{}", armed.name()),
+            RUN_A,
+            INCARNATION_1,
+            &shell_probe(),
+        );
+        fixture
+            .runtime
+            .substitute_reported_image_id(fixture.plan.name.as_str(), OTHER_IMAGE_ID);
+        let mut hooks = fixture.hooks();
+        hooks.fail_at(EffectSiteId::Container(armed), HookPhase::Before);
+
+        let error = launch(&mut hooks, &fixture.runtime, &fixture.view, &fixture.plan)
+            .expect_err("a substituted image id is refused whatever the cleanup does");
+        let message = error.to_string();
+
+        // The integrity refusal survives the cleanup failure. This is the whole
+        // finding: the operator needs to know the runtime executed something
+        // other than the record, not that `docker stop` said no.
+        assert!(message.contains(OTHER_IMAGE_ID), "{armed:?}: {message}");
+        assert!(message.contains(IMAGE_ID), "{armed:?}: {message}");
+        assert!(message.contains("before start"), "{armed:?}: {message}");
+        assert!(message.contains("INV-23"), "{armed:?}: {message}");
+        // And the residue is reported rather than swallowed: fail-closed means
+        // the refusal names what it could not release.
+        assert!(
+            message.contains("could not release everything"),
+            "{armed:?}: {message}"
+        );
+        assert!(
+            message.contains(armed.name()) || message.contains(step_phrase(armed)),
+            "{armed:?}: the refusal does not say which step failed: {message}"
+        );
+        messages.insert(message);
+
+        // Never started, whatever else happened.
+        assert!(
+            fixture.trace.position_starting("rt:start:").is_none(),
+            "{armed:?}: the container was started despite the mismatch"
+        );
+
+        // The three steps that were NOT armed all ran.
+        let container_left = !fixture.runtime.container_names().is_empty();
+        let view_left = fixture.plan.view.path.exists();
+        let intent_left = fixture.plan.name.intent_path(&fixture.root).exists();
+        let expected = match armed {
+            ContainerSite::Stop => (false, false, false),
+            ContainerSite::Remove => (true, false, false),
+            ContainerSite::UnmountGitView => (false, true, false),
+            ContainerSite::RemoveIntent => (false, false, true),
+            _ => unreachable!("only the four cancel steps are armed"),
+        };
+        assert_eq!(
+            (container_left, view_left, intent_left),
+            expected,
+            "{armed:?}: exactly the armed step's residue should remain, and every \
+             other step should have run anyway"
+        );
+    }
+    assert_eq!(
+        messages.len(),
+        4,
+        "four armed steps, four distinct refusals — a message that did not name \
+         the step would collapse these"
+    );
+}
+
+/// The phrase [`super::cancel_created`] uses for each step, so the assertion
+/// above reads the message rather than the enum that wrote it.
+fn step_phrase(site: ContainerSite) -> &'static str {
+    match site {
+        ContainerSite::Stop => "could not be stopped",
+        ContainerSite::Remove => "could not be removed",
+        ContainerSite::UnmountGitView => "R19 Git view could not be pruned",
+        ContainerSite::RemoveIntent => "R26 intent record could not be removed",
+        _ => "unreachable",
+    }
+}
+
+// ---------------------------------------------------------------------------
+// 5b. Two reclaimers that actually race
+// ---------------------------------------------------------------------------
+
+/// What `docker` 29.7.2 writes to stderr, measured on the build box.
+///
+/// ```text
+/// $ docker kill <exited>
+/// Error response from daemon: cannot kill container: f1probe-a: container
+/// 0079320fdf5654fbf3aa45a154e4d49328c1cc1de3b1af4a6cc24540519ecede is not running
+/// $ docker kill <absent>
+/// Error response from daemon: cannot kill container: f1probe-nope: No such container: f1probe-nope
+/// $ docker stop <absent>
+/// Error response from daemon: No such container: f1probe-nope
+/// $ docker stop <exited>
+/// f1probe-a                                            (exit 0)
+/// ```
+///
+/// Transcribed, not invented — and
+/// `real_docker_kill_on_an_already_exited_container_is_tolerated` asks the live
+/// daemon the same question, so the table cannot drift into being its own
+/// oracle.
+const DAEMON_ALREADY_STOPPED: &str = "Error response from daemon: cannot kill container: \
+     tactus-c: container 0079320fdf5654fbf3aa45a154e4d49328c1cc1de3b1af4a6cc24540519ecede \
+     is not running";
+const DAEMON_ABSENT_ON_KILL: &str =
+    "Error response from daemon: cannot kill container: tactus-c: No such container: tactus-c";
+const DAEMON_ABSENT_ON_STOP: &str = "Error response from daemon: No such container: tactus-c";
+
+/// A `docker stop` answer meaning "already settled" is tolerated; a real
+/// failure is not.
+///
+/// `PR6-LANEF-003`. `DockerCli::stop`'s tolerance is load-bearing — it is what
+/// makes a reclaimer that arrives second converge instead of aborting — and
+/// **removing it passed every test**, because every fixture serialized the
+/// reclaimers and a serialized second reclaimer never sees the answer.
+/// [`super::settle_stop`] is a free function taking the raw outcome for exactly
+/// this reason: the branch is reachable without a daemon.
+///
+/// The intersection: {what the daemon said} × {is it tolerable}. Three
+/// tolerable answers and three that are not, counted rather than described —
+/// and the third intolerable one is `Unreachable` carrying tolerable *text*,
+/// because a runtime that could not be reached did not tell us anything about
+/// the container.
+#[test]
+fn a_stop_answer_meaning_already_settled_is_tolerated_and_a_real_failure_is_not() {
+    let failed = |detail: &str| {
+        Err(RuntimeError::Failed {
+            operation: RuntimeOp::Stop,
+            detail: detail.to_owned(),
+        })
+    };
+
+    let tolerated = [
+        DAEMON_ALREADY_STOPPED,
+        DAEMON_ABSENT_ON_KILL,
+        DAEMON_ABSENT_ON_STOP,
+    ];
+    for detail in tolerated {
+        assert_eq!(
+            super::settle_stop(failed(detail)),
+            Ok(()),
+            "a reclaimer that arrives second must converge on `{detail}`"
+        );
+    }
+    assert_eq!(
+        tolerated.iter().collect::<BTreeSet<_>>().len(),
+        3,
+        "three distinct daemon answers, not one repeated"
+    );
+
+    // Real failures stay failures. `--force` removal and a kill the daemon could
+    // not deliver are things a reclaimer must NOT report as convergence.
+    for detail in [
+        "Error response from daemon: cannot kill container: tactus-c: tried to kill \
+         container, but did not receive an exit event",
+        "Error response from daemon: cannot stop container: tactus-c: permission denied",
+    ] {
+        let error = super::settle_stop(failed(detail)).expect_err("a real failure is a failure");
+        assert!(!error.is_unreachable(), "{error}");
+        assert_eq!(error.operation(), RuntimeOp::Stop);
+    }
+
+    // And unreachable is a different answer even when its text would be
+    // tolerable: `crash_reconstruction` refuses a write command when the runtime
+    // "cannot be reached", and swallowing that here would turn a refusal into a
+    // convergence.
+    let unreachable = super::settle_stop(Err(RuntimeError::Unreachable {
+        operation: RuntimeOp::Stop,
+        detail: DAEMON_ALREADY_STOPPED.to_owned(),
+    }))
+    .expect_err("unreachable is never `already settled`");
+    assert!(unreachable.is_unreachable(), "{unreachable}");
+
+    // The control: a stop that simply worked.
+    assert_eq!(super::settle_stop(Ok("tactus-c\n".to_owned())), Ok(()));
+}
+
+/// A runtime whose `stop` answers the way the daemon does, settled through the
+/// production tolerance.
+///
+/// The point is that the **raw** answer is the daemon's and the settling is
+/// [`super::settle_stop`], the production function — so a fixture built on this
+/// is exercising the tolerance rather than a test-local copy of it. Every raw
+/// answer is recorded, so a test can assert the already-stopped branch actually
+/// fired instead of hoping it did.
+struct DockerLikeStop<'a> {
+    inner: &'a FakeRuntime,
+    raw: std::sync::Mutex<Vec<String>>,
+}
+
+impl<'a> DockerLikeStop<'a> {
+    fn new(inner: &'a FakeRuntime) -> Self {
+        Self {
+            inner,
+            raw: std::sync::Mutex::new(Vec::new()),
+        }
+    }
+
+    fn raw_answers(&self) -> Vec<String> {
+        self.raw
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+}
+
+impl ContainerRuntime for DockerLikeStop<'_> {
+    fn probe(&self) -> Result<(), RuntimeError> {
+        self.inner.probe()
+    }
+    fn image_by_reference(&self, reference: &str) -> Result<Option<ImageInspection>, RuntimeError> {
+        self.inner.image_by_reference(reference)
+    }
+    fn image_by_id(&self, id: &str) -> Result<Option<ImageInspection>, RuntimeError> {
+        self.inner.image_by_id(id)
+    }
+    fn volume_present(&self, name: &str) -> Result<bool, RuntimeError> {
+        self.inner.volume_present(name)
+    }
+    fn containers_with_label(
+        &self,
+        key: &str,
+        value: &str,
+    ) -> Result<Vec<super::runtime::DiscoveredContainer>, RuntimeError> {
+        self.inner.containers_with_label(key, value)
+    }
+    fn observe(&self, name: &str) -> Result<Liveness, RuntimeError> {
+        self.inner.observe(name)
+    }
+    fn collect(&self, name: &str) -> Result<ContainerExecution, RuntimeError> {
+        self.inner.collect(name)
+    }
+    fn create(&self, spec: &CreateSpec) -> Result<super::runtime::CreatedContainer, RuntimeError> {
+        self.inner.create(spec)
+    }
+    fn start(&self, name: &str) -> Result<(), RuntimeError> {
+        self.inner.start(name)
+    }
+
+    fn stop(&self, name: &str, mode: StopMode) -> Result<(), RuntimeError> {
+        // The daemon's own three answers, chosen by the state the container is
+        // actually in — which is what makes a second reclaimer see the
+        // already-stopped one rather than a flag a test had to set.
+        let outcome = match self.inner.observe(name)? {
+            Liveness::Running => {
+                self.inner.stop(name, mode)?;
+                Ok(format!("{name}\n"))
+            }
+            Liveness::Exited => Err(RuntimeError::Failed {
+                operation: RuntimeOp::Stop,
+                detail: DAEMON_ALREADY_STOPPED.to_owned(),
+            }),
+            Liveness::Gone => Err(RuntimeError::Failed {
+                operation: RuntimeOp::Stop,
+                detail: DAEMON_ABSENT_ON_KILL.to_owned(),
+            }),
+        };
+        self.raw
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push(match &outcome {
+                Ok(text) => format!("ok:{}", text.trim()),
+                Err(error) => format!("err:{error}"),
+            });
+        super::settle_stop(outcome)
+    }
+
+    fn remove(&self, name: &str) -> Result<(), RuntimeError> {
+        self.inner.remove(name)
+    }
+}
+
+/// A reclaimer that arrives after another has already killed the container
+/// **converges**, rather than aborting before observe / rm / view / intent.
+///
+/// `PR6-LANEF-003`'s scenario, made deterministic: reclaimer A kills the
+/// container and then crashes; B reaches `docker kill` after the state has
+/// become `Exited` and gets "is not running". Without the tolerance B returns an
+/// error and R19/R26 both keep residue — which is the opposite of "every step
+/// idempotent and tolerant of already-gone so **two concurrent reclaimers
+/// converge**".
+///
+/// Second field held constant: the container, the intent and the view are all
+/// present when B starts, so B has real work to do at every one of its five
+/// steps and cannot pass by finding nothing.
+#[test]
+fn a_reclaimer_arriving_after_another_killed_the_container_converges() {
+    let fixture = Fixture::new("second-reclaimer", RUN_A, INCARNATION_1, &shell_probe());
+    let name = fixture.plan.name.clone();
+    let view_path = fixture.plan.view.path.clone();
+    let mut hooks = fixture.hooks();
+    let launched =
+        launch(&mut hooks, &fixture.runtime, &fixture.view, &fixture.plan).expect("launched");
+    assert!(view_path.is_dir() && launched.intent_path.exists());
+
+    let docker_like = DockerLikeStop::new(&fixture.runtime);
+
+    // Reclaimer A: kills it, and gets no further.
+    stop_container(
+        &mut hooks,
+        ContainerSite::Stop,
+        &docker_like,
+        &name,
+        StopMode::Kill,
+    )
+    .expect("A killed it");
+    assert_eq!(
+        fixture.runtime.container(name.as_str()).map(|c| c.state),
+        Some(Liveness::Exited),
+        "A really did settle the container before crashing"
+    );
+
+    // Reclaimer B: the whole sequence, over a container that is already stopped.
+    reclaim(
+        &mut hooks,
+        &docker_like,
+        &fixture.view,
+        &fixture.root,
+        &name,
+        Some(&view_path),
+    )
+    .expect("B converges on a container A already killed");
+
+    // The already-stopped branch actually fired — without this the test could
+    // pass having never reached the tolerance at all.
+    let answers = docker_like.raw_answers();
+    assert!(
+        answers
+            .iter()
+            .any(|answer| answer.contains("is not running")),
+        "the daemon's already-stopped answer was never produced: {answers:#?}"
+    );
+    assert_eq!(
+        answers.len(),
+        2,
+        "one kill from A, one from B: {answers:#?}"
+    );
+
+    // And B finished the job: nothing of R19 or R26 is left.
+    assert!(!view_path.exists(), "B stopped before pruning the view");
+    assert!(
+        !launched.intent_path.exists(),
+        "B stopped before removing the intent"
+    );
+    assert_eq!(fixture.runtime.container_names(), Vec::<String>::new());
+}
+
+/// **T-CONTAINER** convergence, with the two reclaimers genuinely concurrent.
+///
+/// The reviewer's refutation of lane F's claim was that two reclaimers that
+/// actually **race** were not constructible in any fixture it built — running
+/// `reclaim` twice proves idempotence, which is a different property. This is
+/// the race: two threads, released together by a [`std::sync::Barrier`], both
+/// inside `reclaim` on one container, one runtime, one intent and one view.
+///
+/// Every interleaving must converge, and the assertion is on the terminal state
+/// rather than on who won — which is the only thing a race is allowed to
+/// assert.
+#[test]
+fn two_reclaimers_racing_one_container_converge() {
+    let fixture = Fixture::new("racing", RUN_A, INCARNATION_1, &shell_probe());
+    let name = fixture.plan.name.clone();
+    let view_path = fixture.plan.view.path.clone();
+    let mut hooks = fixture.hooks();
+    let launched =
+        launch(&mut hooks, &fixture.runtime, &fixture.view, &fixture.plan).expect("launched");
+
+    let docker_like = DockerLikeStop::new(&fixture.runtime);
+    let gate = std::sync::Barrier::new(2);
+    let view = &fixture.view;
+    let root = &fixture.root;
+
+    std::thread::scope(|scope| {
+        let mut handles = Vec::new();
+        for _ in 0..2 {
+            handles.push(scope.spawn(|| {
+                let mut hooks = NoHooks;
+                gate.wait();
+                reclaim(
+                    &mut hooks,
+                    &docker_like,
+                    view,
+                    root,
+                    &name,
+                    Some(&view_path),
+                )
+            }));
+        }
+        for (index, handle) in handles.into_iter().enumerate() {
+            handle
+                .join()
+                .expect("the reclaimer did not panic")
+                .unwrap_or_else(|error| panic!("reclaimer {index} did not converge: {error}"));
+        }
+    });
+
+    assert_eq!(docker_like.raw_answers().len(), 2, "both reclaimers ran");
+    assert!(!view_path.exists());
+    assert!(!launched.intent_path.exists());
+    assert_eq!(fixture.runtime.container_names(), Vec::<String>::new());
 }
 
 /// A container that cannot be observed terminated refuses.
@@ -2042,6 +2707,153 @@ fn walk(dir: &Path) -> Vec<PathBuf> {
     found
 }
 
+/// Which level `source` states for `lint`, or nothing.
+///
+/// Comments and string literals are blanked first, so a lint level quoted in a
+/// doc comment — which the file above and this one both do — is invisible.
+/// `PR4-CENSUS-COMMENT-ORACLE` is the standing entry for a census that counted
+/// its own prose.
+fn stated_lint_level(source: &str, lint: &str) -> Option<&'static str> {
+    let blanked = crate::effects::blank_comments_and_strings(source);
+    for (keyword, answer) in [("allow(", "allow"), ("deny(", "deny")] {
+        let mut rest = blanked.as_str();
+        while let Some(index) = rest.find(keyword) {
+            let after = &rest[index + keyword.len()..];
+            let end = after.find(')').unwrap_or(after.len());
+            if after[..end].contains(lint) {
+                return Some(answer);
+            }
+            rest = &rest[index + keyword.len()..];
+        }
+    }
+    None
+}
+
+/// Whether `effects/allowlist.toml` records `path` as allowing `lint`.
+fn allowlist_records(path: &str, lint: &str) -> bool {
+    let raw = fs::read_to_string(
+        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("effects")
+            .join("allowlist.toml"),
+    )
+    .expect("the allowlist");
+    raw.split("[[")
+        .filter(|block| block.contains(&format!("path = \"{path}\"")))
+        .any(|block| {
+            let Some(allows) = block.split("allows = [").nth(1) else {
+                return false;
+            };
+            let end = allows.find(']').unwrap_or(allows.len());
+            allows[..end].contains(lint)
+        })
+}
+
+/// Every child module of the Container funnel **states its own lint level**.
+///
+/// `PR6-LANEF-004`, and it is the one finding of this slice whose repair is
+/// about the *next* lane rather than this one. `src/runner/container.rs` opens
+/// with `#![allow(clippy::disallowed_methods, disallowed_types,
+/// disallowed_macros)]` — an **inner** attribute — and a Rust lint level is
+/// scoped by the **module tree**, not by the file. So every out-of-line child of
+/// `runner::container` inherited it, and the build-error leg of
+/// `effect_site_inventory.mechanism` (1) was not holding for exactly the modules
+/// it exists for: a `ContainerRuntime::start` planted in a child passed
+/// `cargo clippy --all-targets --all-features -- -D warnings`, measured twice.
+///
+/// Every file in this directory now either **denies** a governed lint or
+/// **allows** it with an `effects/allowlist.toml` entry a reviewer reads. The
+/// grid is {file} × {which of the three governed lints}, every cell asserted:
+/// a file that states nothing about a lint is inheriting, and inheriting is the
+/// defect.
+///
+/// The negative controls at the end are what stop this being a census that
+/// cannot refuse: the predicate is driven over sources that state nothing, that
+/// state a level only inside a doc comment, and that state each level plainly.
+#[test]
+fn every_child_module_of_the_container_funnel_states_its_own_lint_level() {
+    const GOVERNED: [&str; 3] = [
+        "clippy::disallowed_methods",
+        "clippy::disallowed_types",
+        "clippy::disallowed_macros",
+    ];
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let children = walk(&root.join("src").join("runner").join("container"));
+    assert!(
+        children.len() >= 8,
+        "the walk found only {} child modules; the census is measuring nothing",
+        children.len()
+    );
+
+    let mut missing = Vec::new();
+    let mut unlisted = Vec::new();
+    let mut cells = 0;
+    for path in &children {
+        let relative = path
+            .strip_prefix(&root)
+            .expect("under the manifest")
+            .to_string_lossy()
+            .replace('\\', "/");
+        let source = fs::read_to_string(path).expect("read source");
+        for lint in GOVERNED {
+            cells += 1;
+            match stated_lint_level(&source, lint) {
+                None => missing.push(format!("{relative} states nothing about `{lint}`")),
+                Some("allow") if !allowlist_records(&relative, lint) => unlisted.push(format!(
+                    "{relative} allows `{lint}` and effects/allowlist.toml does not record it"
+                )),
+                Some(_) => {}
+            }
+        }
+    }
+    assert!(
+        missing.is_empty(),
+        "a child of the Container funnel inherits its allow instead of stating a \
+         level of its own, which is `PR6-LANEF-004` reopening:\n{missing:#?}"
+    );
+    assert!(unlisted.is_empty(), "{unlisted:#?}");
+    assert_eq!(cells, children.len() * 3);
+
+    // The funnel itself is the one file that legitimately carries the allow, and
+    // it is in the allowlist. Asserted here so "everything denies" cannot become
+    // true by the funnel quietly denying itself out of existence.
+    let funnel = fs::read_to_string(root.join("src/runner/container.rs")).expect("the funnel");
+    for lint in GOVERNED {
+        assert_eq!(
+            stated_lint_level(&funnel, lint),
+            Some("allow"),
+            "the Container funnel no longer allows `{lint}`"
+        );
+        assert!(allowlist_records("src/runner/container.rs", lint));
+    }
+
+    // Negative controls: the predicate refuses what it is for.
+    assert_eq!(
+        stated_lint_level("fn go() {}\n", GOVERNED[0]),
+        None,
+        "a file that states nothing must read as stating nothing"
+    );
+    assert_eq!(
+        stated_lint_level(
+            "//! #![allow(clippy::disallowed_methods)]\nfn go() {}\n",
+            GOVERNED[0]
+        ),
+        None,
+        "a level quoted in a doc comment is not a level"
+    );
+    assert_eq!(
+        stated_lint_level("#![deny(clippy::disallowed_methods)]\n", GOVERNED[0]),
+        Some("deny")
+    );
+    assert_eq!(
+        stated_lint_level("#![allow(clippy::disallowed_methods)]\n", GOVERNED[0]),
+        Some("allow")
+    );
+    assert!(!allowlist_records(
+        "src/runner/container/env.rs",
+        GOVERNED[0]
+    ));
+}
+
 /// Every Docker-gated test is named in the list that counts them, and every
 /// name in the list is a test in this tree.
 ///
@@ -2192,8 +3004,33 @@ fn real_docker_refuses_a_reference_it_does_not_hold_without_pulling() {
     );
 }
 
+/// Poll a real container until it is no longer running.
+///
+/// Bounded round trips rather than a sleep, in the idiom of
+/// [`super::observe_terminated`] — `determinism` forbids sleeps, and each
+/// `docker container inspect` is itself a round trip that takes tens of
+/// milliseconds, so the bound is a real one.
+fn wait_until_terminated(docker: &dyn ContainerRuntime, name: &str) -> Liveness {
+    for _ in 0..200 {
+        let state = docker.observe(name).expect("reachable");
+        if state.is_terminated() {
+            return state;
+        }
+        std::thread::yield_now();
+    }
+    panic!("`{name}` is still running after 200 observations");
+}
+
 /// The whole R26 lifecycle against the real runtime: create from an id, verify
 /// what it reports, launch through the funnel, reclaim, and reclaim again.
+///
+/// **The plan carries the Git view as a real bind mount**, and that is the whole
+/// reason this test can see `PR6A-LAUNCH-MOUNTS-THE-VIEW-AFTER-CREATE`. It used
+/// to carry `mounts: Vec::new()`, and a real-runtime test with no mounts cannot
+/// see a mount defect: `launch` mounted the view *after* `docker create`, the
+/// view is a bind-mount **source** of that call, and Docker requires a bind
+/// source to exist at create time — so `launch` could not produce a working
+/// container with a Git view at all, and this test passed anyway.
 #[test]
 fn real_docker_creates_from_an_id_reports_it_and_reclaims_idempotently() {
     let trace = ContainerTrace::recording();
@@ -2214,6 +3051,7 @@ fn real_docker_creates_from_an_id_reports_it_and_reclaims_idempotently() {
     let record = intent_for(RUN_A, INCARNATION_1, &invocation);
     let name = name_for(RUN_A, INCARNATION_1, &invocation);
     let view = DisposableDirView::new(trace.clone());
+    let view_path = root.join("views").join(name.as_str());
     let plan = LaunchPlan {
         private_root: root.clone(),
         name: name.clone(),
@@ -2222,13 +3060,21 @@ fn real_docker_creates_from_an_id_reports_it_and_reclaims_idempotently() {
             name: name.as_str().to_owned(),
             image_id: image.id.clone(),
             labels: record.labels(&root),
-            mounts: Vec::new(),
+            // The R19 view, as a REAL bind mount whose source is the directory
+            // `Container.MountGitView` materialises. This is the mount the
+            // daemon refuses if the view is not there when the container is
+            // created, and it is what makes this test able to see the ordering.
+            mounts: vec![Mount::Path {
+                source: view_path.clone(),
+                target: "/tactus/gitview".to_owned(),
+                read_only: false,
+            }],
             env: Vec::new(),
             command: vec!["/bin/sh".to_owned(), "-c".to_owned(), "exit 0".to_owned()],
             workdir: None,
         },
         view: GitViewRequest {
-            path: root.join("views").join(name.as_str()),
+            path: view_path.clone(),
             workspace: root.clone(),
             head: None,
         },
@@ -2291,5 +3137,277 @@ fn real_docker_creates_from_an_id_reports_it_and_reclaims_idempotently() {
             .expect("reachable")
             .len(),
         0
+    );
+}
+
+/// The daemon really does answer "is not running", and `DockerCli::stop`
+/// tolerates it.
+///
+/// `PR6-LANEF-003`'s other half. `a_stop_answer_meaning_already_settled_is_tolerated_and_a_real_failure_is_not`
+/// drives [`super::settle_stop`] over a **transcribed** table, and a transcribed
+/// table becomes its own oracle the moment the daemon's wording changes. This
+/// asks the live daemon the same question — a `docker kill` of a container that
+/// has already exited, which is exactly what the second of two racing reclaimers
+/// issues — and asserts both that the phrase is still there and that the seam's
+/// `stop` converges on it.
+///
+/// Second field held constant: the same container, in one state; what varies is
+/// whether the question is asked raw or through the seam.
+#[test]
+fn real_docker_kill_on_an_already_exited_container_is_tolerated() {
+    let trace = ContainerTrace::recording();
+    let docker = match docker_gate(
+        "real_docker_kill_on_an_already_exited_container_is_tolerated",
+        trace.clone(),
+    ) {
+        Ok(docker) => docker,
+        Err(reason) => return skipped(&reason),
+    };
+    let (_, image) = match gated_image(docker.as_ref()) {
+        Ok(image) => image,
+        Err(reason) => return no_image(&reason),
+    };
+
+    let name = "tactus-f1-already-exited";
+    let spec = CreateSpec {
+        name: name.to_owned(),
+        image_id: image.id.clone(),
+        labels: BTreeMap::new(),
+        mounts: Vec::new(),
+        env: Vec::new(),
+        command: vec!["/bin/sh".to_owned(), "-c".to_owned(), "exit 0".to_owned()],
+        workdir: None,
+    };
+    let _ = docker.remove(name);
+    docker.create(&spec).expect("created");
+    docker.start(name).expect("started");
+    assert!(
+        wait_until_terminated(docker.as_ref(), name).is_terminated(),
+        "the fixture container has to actually be exited"
+    );
+
+    // The raw answer, from the daemon, verbatim.
+    let raw = docker
+        .raw(RuntimeOp::Stop, name, &["kill", name])
+        .expect_err("a kill of an exited container fails");
+    let RuntimeError::Failed { detail, .. } = &raw else {
+        panic!("the daemon was reached and answered a failure, not: {raw}");
+    };
+    assert!(
+        detail.contains("is not running"),
+        "the daemon's already-stopped wording moved, and the transcribed table in \
+         this file no longer matches it: {detail}"
+    );
+    assert!(
+        super::stop_already_settled(detail),
+        "the tolerance does not recognise the daemon's own answer: {detail}"
+    );
+
+    // And through the seam, which is what a reclaimer calls: it converges.
+    docker
+        .stop(name, StopMode::Kill)
+        .expect("a reclaimer arriving second converges on an already-stopped container");
+
+    docker.remove(name).expect("removed");
+    assert_eq!(docker.observe(name).expect("reachable"), Liveness::Gone);
+}
+
+/// A container's **stderr** comes back, and separately from its stdout.
+///
+/// `PR6A-DOCKERCLI-MERGES-STDERR-INTO-STDOUT`. `collect` returned
+/// `stderr: Vec::new()` with a comment claiming `docker logs` interleaves the
+/// streams; measured on docker 29.7.2 it **separates** them, and the code did
+/// not merge them — it discarded one. A gate's failure output becomes retry
+/// feedback (DESIGN.md:576), so a gate that fails with everything on stderr
+/// produced empty feedback, and `host::run_shell_probe`'s refusal quotes
+/// `output.stderr` and would have quoted nothing.
+///
+/// The intersection: {which stream a byte was written to} × {which field it
+/// arrives in}. Both directions of the cross are asserted — stdout must **not**
+/// carry the stderr marker and stderr must **not** carry the stdout one — so a
+/// `collect` that merged the two into both fields fails here as surely as one
+/// that dropped one.
+#[test]
+fn real_docker_returns_both_streams_of_a_container_separately() {
+    let trace = ContainerTrace::recording();
+    let docker = match docker_gate(
+        "real_docker_returns_both_streams_of_a_container_separately",
+        trace.clone(),
+    ) {
+        Ok(docker) => docker,
+        Err(reason) => return skipped(&reason),
+    };
+    let (_, image) = match gated_image(docker.as_ref()) {
+        Ok(image) => image,
+        Err(reason) => return no_image(&reason),
+    };
+
+    let name = "tactus-f1-two-streams";
+    let spec = CreateSpec {
+        name: name.to_owned(),
+        image_id: image.id.clone(),
+        labels: BTreeMap::new(),
+        mounts: Vec::new(),
+        env: Vec::new(),
+        command: vec![
+            "/bin/sh".to_owned(),
+            "-c".to_owned(),
+            "echo ON-STDOUT; echo ON-STDERR 1>&2; exit 3".to_owned(),
+        ],
+        workdir: None,
+    };
+    let _ = docker.remove(name);
+    docker.create(&spec).expect("created");
+    docker.start(name).expect("started");
+    wait_until_terminated(docker.as_ref(), name);
+
+    let collected = docker.collect(name).expect("collected");
+    let stdout = String::from_utf8_lossy(&collected.stdout).into_owned();
+    let stderr = String::from_utf8_lossy(&collected.stderr).into_owned();
+    docker.remove(name).expect("removed");
+
+    assert_eq!(
+        collected.exit_code,
+        Some(3),
+        "the exit status comes back too, and is not the CLI's own"
+    );
+    assert!(stdout.contains("ON-STDOUT"), "stdout was {stdout:?}");
+    assert!(
+        stderr.contains("ON-STDERR"),
+        "the container's stderr was discarded; a failing gate's diagnostic is its \
+         stderr and becomes retry feedback: stderr was {stderr:?}"
+    );
+    assert!(
+        !stdout.contains("ON-STDERR"),
+        "the two streams were merged into stdout: {stdout:?}"
+    );
+    assert!(
+        !stderr.contains("ON-STDOUT"),
+        "the two streams were merged into stderr: {stderr:?}"
+    );
+}
+
+/// Removing a container reclaims the **anonymous** volumes it was created with.
+///
+/// `PR6A-ANONYMOUS-VOLUMES-LEAK`. `docker rm --force` without `--volumes` leaves
+/// one anonymous volume per container behind for any image declaring `VOLUME`
+/// or any create carrying `--volume <path>`; **29 leaked from one run of this
+/// suite**, counted by lane A. Those volumes are not R20 — R20 is the
+/// operator's *named*, per-agent credential volume, `operator_owned` and
+/// `persistent_output` in all five `at_run_end` outcomes — they belong to
+/// **R26**, the container's own row, and `Container.Remove` is where R26
+/// balances.
+///
+/// The volume is identified **by name**, read back from the container the test
+/// created, rather than by counting `docker volume ls`: a count is polluted by
+/// whatever else on this machine is making volumes, and a named volume is not.
+/// The control is the assertion **before** the removal — without it, a fixture
+/// that had stopped creating an anonymous volume at all would pass silently.
+///
+/// The intersection: {a volume the run created} × {a volume the operator owns}.
+/// `--volumes` removes only the first kind, which is what makes this repair a
+/// discharge of R26 rather than a violation of R20 — and the R20 half is
+/// asserted here too, with a named volume that must survive.
+#[test]
+fn real_docker_removing_a_container_reclaims_its_anonymous_volumes() {
+    let trace = ContainerTrace::recording();
+    let docker = match docker_gate(
+        "real_docker_removing_a_container_reclaims_its_anonymous_volumes",
+        trace.clone(),
+    ) {
+        Ok(docker) => docker,
+        Err(reason) => return skipped(&reason),
+    };
+    let (_, image) = match gated_image(docker.as_ref()) {
+        Ok(image) => image,
+        Err(reason) => return no_image(&reason),
+    };
+
+    let name = "tactus-f1-anonymous-volume";
+    let named = "tactus-f1-operator-owned";
+    let _ = docker.remove(name);
+    // R20's half: a NAMED volume the operator owns, mounted into the same
+    // container. `--volumes` must not touch it.
+    let _ = docker.raw(
+        RuntimeOp::InspectVolume,
+        named,
+        &["volume", "create", named],
+    );
+    assert!(
+        docker.volume_present(named).expect("reachable"),
+        "the operator-owned control volume was not created"
+    );
+
+    docker
+        .raw(
+            RuntimeOp::Create,
+            name,
+            &[
+                "create",
+                "--name",
+                name,
+                // An ANONYMOUS volume: `CreateSpec::Mount::Volume` cannot express
+                // one because it requires a name, which is why this goes through
+                // the test-only raw accessor.
+                "--volume",
+                "/tactus-anonymous",
+                "--volume",
+                &format!("{named}:/tactus-named"),
+                &image.id,
+                "/bin/sh",
+                "-c",
+                "exit 0",
+            ],
+        )
+        .expect("created");
+
+    let anonymous = docker
+        .raw(
+            RuntimeOp::Observe,
+            name,
+            &[
+                "container",
+                "inspect",
+                name,
+                "--format",
+                "{{range .Mounts}}{{if not .Name}}{{else}}{{.Name}}\n{{end}}{{end}}",
+            ],
+        )
+        .expect("reachable")
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty() && *line != named)
+        .map(str::to_owned)
+        .next()
+        .expect("the container carries an anonymous volume");
+    // The control: it really is there before the removal, so this test cannot
+    // pass by never having created one.
+    assert!(
+        docker.volume_present(&anonymous).expect("reachable"),
+        "the fixture did not create an anonymous volume, so the assertion below \
+         would hold vacuously"
+    );
+
+    docker.remove(name).expect("removed");
+
+    let leaked = docker.volume_present(&anonymous).expect("reachable");
+    let operators_survived = docker.volume_present(named).expect("reachable");
+    // Clean up before asserting, so a failure does not leave the daemon dirty.
+    let _ = docker.raw(
+        RuntimeOp::InspectVolume,
+        &anonymous,
+        &["volume", "rm", &anonymous],
+    );
+    let _ = docker.raw(RuntimeOp::InspectVolume, named, &["volume", "rm", named]);
+
+    assert!(
+        !leaked,
+        "`docker rm` left the container's anonymous volume `{anonymous}` behind; \
+         nothing else can ever refer to it and no resource row accounts for it"
+    );
+    assert!(
+        operators_survived,
+        "the removal took the OPERATOR's named volume with it — R20 is \
+         `operator_owned` and `persistent_output` in all five at_run_end outcomes"
     );
 }

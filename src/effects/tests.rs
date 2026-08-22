@@ -2246,6 +2246,8 @@ fn the_reachable_fn_parser_finds_each_shape_this_tree_uses() {
         "pub unsafe fn unsafely() {}\n",
         "impl Thing { pub fn inherent(&self) {} fn hidden(&self) {} }\n",
         "impl Trait for Thing { fn through_the_trait(&self) {} }\n",
+        "pub trait Public { fn declared(&self) -> u8; fn defaulted(&self) -> u8 { 1 } }\n",
+        "trait Private { fn private_default(&self) -> u8 { 1 } }\n",
         "#[cfg(test)]\nmod tests { pub fn in_the_test_region() {} }\n",
     );
     let found = externally_reachable_fns(source);
@@ -2254,6 +2256,7 @@ fn the_reachable_fn_parser_finds_each_shape_this_tree_uses() {
         vec![
             "constant".to_owned(),
             "crate_visible".to_owned(),
+            "defaulted".to_owned(),
             "free".to_owned(),
             "inherent".to_owned(),
             "super_visible".to_owned(),
@@ -2262,9 +2265,98 @@ fn the_reachable_fn_parser_finds_each_shape_this_tree_uses() {
         ],
         "the parser's answer moved"
     );
-    // Seven shapes accepted, three refused, and the three are refused for three
-    // different reasons: private, private-in-an-inherent-impl, and test region.
+    // Eight shapes accepted, five refused, and the five are refused for five
+    // different reasons: private, private-in-an-inherent-impl, test region, a
+    // trait method DECLARATION (no body to classify — its implementations are
+    // reached by the `impl … for …` shape), and a default body in a trait that
+    // is not itself visible.
     assert!(!found.contains(&"private".to_owned()));
     assert!(!found.contains(&"hidden".to_owned()));
     assert!(!found.contains(&"in_the_test_region".to_owned()));
+    assert!(!found.contains(&"declared".to_owned()));
+    assert!(!found.contains(&"private_default".to_owned()));
+
+    // `PR6-LANEF-007`, stated as the reviewer's own exploit: a default body on a
+    // public trait that reaches an effect. The parser used to answer
+    // `visible || in_trait_impl`, and a default body is neither — so the body
+    // below was outside the classification domain of a CLASSIFIED module, and
+    // clippy, all 79 effects tests and all 38 container tests passed with it in
+    // the tree. It is in the domain now, which means somebody has to classify it.
+    let exploit = concat!(
+        "pub trait ContainerHooks {\n",
+        "    fn phase(&mut self) -> u8;\n",
+        "    fn remove_without_a_site(&self, path: &Path) { let _ = fs::remove_file(path); }\n",
+        "}\n",
+    );
+    assert!(
+        externally_reachable_fns(exploit).contains(&"remove_without_a_site".to_owned()),
+        "the effect a default trait body performs is invisible to the domain again"
+    );
+}
+
+/// The comment blanker models raw strings, so an unparsed literal cannot erase
+/// a later one.
+///
+/// `PR6-LANEF-005`. [`blank_comments`] used to track only `"`, and documented
+/// the omission as safe because "the failure mode is a needle this function does
+/// not find … loud rather than accept something extra". **For a census over an
+/// expected set that is backwards**: a missed needle is a false negative, the
+/// computed set stays equal to the expected one, and the census is green with a
+/// file it should have caught. `every_declared_effect_denial_names_a_real_path`'s
+/// "docker invocation helpers" block is exactly such a census, and the reviewer
+/// measured it staying green with an extra Docker-naming file present.
+///
+/// The two axes: {construct} × {is a later literal on the same line still
+/// visible}. Every row keeps a real comment invisible, so this cannot pass by
+/// the blanker having stopped blanking.
+#[test]
+fn the_comment_blanker_models_raw_strings_and_still_blanks_comments() {
+    // The reviewer's shape: a raw string whose body contains a quote and a `//`,
+    // with a real literal after it on the same line.
+    let exploit = r####"const A: &str = r#"x" //"#; const B: &str = "docker";"####;
+    let blanked = blank_comments(exploit);
+    assert!(
+        blanked.contains("\"docker\""),
+        "a raw string erased the literal after it: {blanked}"
+    );
+
+    // Every other literal shape, each with a live needle after it.
+    for (label, source) in [
+        ("raw, no hashes", r###"let a = r"//"; let b = "docker";"###),
+        ("byte raw", r###"let a = br#""//"#; let b = "docker";"###),
+        ("byte string", r#"let a = b"\"//"; let b = "docker";"#),
+        ("char literal", "let a = '\"'; let b = \"docker\";"),
+        ("escaped quote", "let a = \"\\\" //\"; let b = \"docker\";"),
+        ("block comment", "/* // */ let b = \"docker\";"),
+        ("nested block", "/* /* // */ */ let b = \"docker\";"),
+    ] {
+        assert!(
+            blank_comments(source).contains("\"docker\""),
+            "{label}: the needle after it was erased: {}",
+            blank_comments(source)
+        );
+    }
+
+    // And a real comment is still removed — in both flavours, and a doc comment
+    // quoting a needle is still invisible, which is `PR4-CENSUS-COMMENT-ORACLE`.
+    for source in [
+        "// let b = \"docker\";\nlet c = 1;",
+        "/* let b = \"docker\"; */ let c = 1;",
+        "//! names \"docker\" in prose\nlet c = 1;",
+        "/// names \"docker\" in prose\nlet c = 1;",
+    ] {
+        assert!(
+            !blank_comments(source).contains("\"docker\""),
+            "a comment naming the needle survived: {}",
+            blank_comments(source)
+        );
+    }
+
+    // Line breaks survive, because callers report line numbers.
+    let counted = "// one\n/* two\nthree */\nlet b = 1;\n";
+    assert_eq!(
+        blank_comments(counted).lines().count(),
+        counted.lines().count(),
+        "the blanker lost a line"
+    );
 }
