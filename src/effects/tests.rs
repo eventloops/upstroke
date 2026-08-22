@@ -2360,3 +2360,495 @@ fn the_comment_blanker_models_raw_strings_and_still_blanks_comments() {
         "the blanker lost a line"
     );
 }
+
+// ---------------------------------------------------------------------------
+// The T-CONTAINER mechanical checklist
+// ---------------------------------------------------------------------------
+
+/// The nineteen tests `transaction_fault_matrix` row `T-CONTAINER` names in its
+/// `test:` field, transcribed from the frozen packet.
+///
+/// **Transcribed, not read.** The packet is not in this repository, so the list
+/// is a literal here the way [`PACKET_PRIMITIVES`] is — the no-self-oracle rule
+/// requires the expected values to come from the packet's text rather than from
+/// the tree, and a literal is the only shape that survives into CI.
+///
+/// Order is the packet's own. `windows_orphan_window_documented` is the last
+/// entry and the packet writes it as `windows_orphan_window_documented (ST-16)`;
+/// the trailing citation is not part of the identifier.
+const T_CONTAINER_TESTS: [&str; 19] = [
+    "container_intent_written_before_run",
+    "container_created_from_recorded_image_id_and_verified",
+    "substituted_image_id_refused_before_start",
+    "orphan_reclaimed_before_slot_reset",
+    "live_owner_untouched_while_dead_orphan_reclaimed",
+    "labeled_orphan_without_intent_reclaimed",
+    "same_run_resume_reclaims_earlier_incarnation_orphan",
+    "same_run_resume_censuses_recorded_root_after_default_changed",
+    "probe_name_reuse_across_incarnations_never_collides",
+    "repeated_crashes_reclaim_every_dead_incarnation",
+    "concurrent_reclaimers_converge",
+    "schema4_probe_container_owned_during_preflight_untouched_by_foreign_census",
+    "legacy_container_selection_refused_before_effects",
+    "census_refuses_when_intents_exist_without_reachable_runtime",
+    "census_proceeds_without_runtime_when_no_intent_exists",
+    "census_report_names_reclaimed_probe_boundary",
+    "failing_preflight_probe_on_resume_refuses_before_recovery_event_and_reclaims_probe_containers",
+    "unix_reaper_kills_labeled_containers",
+    "windows_orphan_window_documented",
+];
+
+/// Where `name` is defined as a `#[test]` function, over code with comments and
+/// string literals blanked.
+///
+/// Blanked, because the failure this predicate exists to avoid is a name that
+/// appears only in prose. Nine of the nineteen are quoted in a doc comment
+/// somewhere in `src/runner/container/**` — `substituted_image_id_refused_
+/// before_start` is named in `runtime.rs` and twice in `fake.rs` and is a
+/// function in neither — so a `grep` for the bare string passes on a tree that
+/// deleted the test and kept the sentence describing it.
+fn defining_test_sites(name: &str) -> Vec<String> {
+    let needle = format!("fn {name}(");
+    let mut sites = Vec::new();
+    for (path, source) in scanned_sources() {
+        let code = blank_comments_and_strings(&source);
+        let Some(index) = code.find(&needle) else {
+            continue;
+        };
+        // `#[test]` sits above the signature, separated at most by the other
+        // attributes a test carries (`#[cfg(...)]`, `#[should_panic]`) and by
+        // the doc comment, which blanking has already turned into spaces.
+        let preceding = &code[index.saturating_sub(400)..index];
+        if preceding.contains("#[test]") {
+            sites.push(path);
+        }
+    }
+    sites
+}
+
+/// Every test `T-CONTAINER` names exists in this tree, as a test.
+///
+/// **The gate no gate was reading.** `phase9.sh` reads
+/// `decisions.pr_sequence[N].slice_contract.proof_tests` and fails a slice that
+/// deletes or renames one of its contract-named proof tests — the repair for
+/// `PR4-CONTRACT-NAMED-PROOF-TEST-DELETED`. All **four** of PR6's `proof_tests`
+/// are prose describing test families, so that gate parses zero identifiers out
+/// of this slice and its zero-checked-is-a-failure rule fires without measuring
+/// anything. The slice's actual mechanical checklist is somewhere else
+/// entirely: `transaction_fault_matrix` row `T-CONTAINER`'s `test:` field, which
+/// nothing in this repository read.
+///
+/// **This gate is orchestrator-added, not packet-required**, and says so rather
+/// than implying otherwise. The packet enumerates the nineteen tests; it does
+/// not require a meta-test that transcribes them. It is a control, kept because
+/// a slice whose only mechanical checklist is unread is worse off without one.
+///
+/// # What this proves, and what it does not
+///
+/// **Proves:** each of the nineteen names is a `#[test]` function in real code
+/// — not in a comment, not in a string literal, not merely a helper `fn` with
+/// the right name. A rename, a deletion, or a demotion to a plain function
+/// fails it by name, on every platform, because it is a source census rather
+/// than a symbol census (two of the nineteen are behind `cfg(unix)` /
+/// `cfg(windows)` and a symbol census would report each missing on the other
+/// platform).
+///
+/// **Does not prove:** that any of them tests what its name claims. A test with
+/// the right name and a tautological body satisfies this gate completely. That
+/// is the boundary, stated here rather than left for a reviewer to find: this
+/// is a **presence** gate over an enumeration nothing else reads, and the
+/// evidence that the nineteen hold their clauses is the mutation witnessing in
+/// the lanes' own reports, not this.
+///
+/// The second field it holds constant is the **body**; what varies is the
+/// name and the file. The controls at the end vary the other way — one body
+/// shape at a time, name held fixed — so the predicate is shown refusing a
+/// comment, a string and a plain `fn`, and accepting a real test.
+#[test]
+fn every_test_the_container_fault_row_names_is_a_test_in_this_tree() {
+    // The transcription itself is checked for the two ways a hand-written list
+    // decays: a duplicate (which would let a missing name hide behind a present
+    // one and keep the count at nineteen) and a name that is not an identifier.
+    let unique: BTreeSet<&str> = T_CONTAINER_TESTS.iter().copied().collect();
+    assert_eq!(
+        unique.len(),
+        T_CONTAINER_TESTS.len(),
+        "the transcription repeats a name"
+    );
+    for name in T_CONTAINER_TESTS {
+        assert!(
+            !name.is_empty()
+                && name
+                    .bytes()
+                    .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_')
+                && name.contains('_'),
+            "`{name}` is not the snake_case identifier the fault row names"
+        );
+    }
+
+    let mut absent = Vec::new();
+    let mut found = 0usize;
+    for name in T_CONTAINER_TESTS {
+        match defining_test_sites(name).as_slice() {
+            [] => absent.push(name),
+            sites => {
+                found += 1;
+                assert_eq!(
+                    sites.len(),
+                    1,
+                    "`{name}` is defined as a test in {} files ({sites:?}); the fault row names \
+                     one test and two would let either rot",
+                    sites.len()
+                );
+            }
+        }
+    }
+    assert!(
+        absent.is_empty(),
+        "T-CONTAINER names {} tests and {} are not tests in src/: {absent:#?}\n\
+         The fault row is this slice's mechanical checklist and nothing else reads it.",
+        T_CONTAINER_TESTS.len(),
+        absent.len()
+    );
+    assert_eq!(found, T_CONTAINER_TESTS.len());
+
+    // POSITIVE CONTROL. A census that can only say yes reports success from a
+    // predicate that matched nothing -- `PR5-DOCKER-CENSUS-CANNOT-FAIL`, where a
+    // needle that lived inside a string made the search unfalsifiable. Drive the
+    // same predicate over a name that is not in the tree and require it to say
+    // so, so a `defining_test_sites` that returned a constant fails here.
+    assert!(
+        defining_test_sites("a_test_this_tree_does_not_contain_and_never_will").is_empty(),
+        "the predicate finds a test that does not exist, so its `absent` list means nothing"
+    );
+
+    // And it must be reading a tree. `scanned_sources` asserts its own walk
+    // found files; this asserts the *blanking* left code behind, because a
+    // blanker that erased everything would make every name absent and the
+    // failure would read as nineteen deleted tests.
+    let (_, container) = scanned_sources()
+        .into_iter()
+        .find(|(path, _)| path == "src/runner/container/tests.rs")
+        .expect("the container suite is in the scanned tree");
+    let blanked = blank_comments_and_strings(&container);
+    assert!(
+        blanked.contains("#[test]"),
+        "the blanker erased the code it is meant to leave"
+    );
+    assert!(
+        !blanked.contains("Orderings are most of the contract"),
+        "the blanker left a doc comment behind, so a name in prose would satisfy this gate"
+    );
+}
+
+/// The presence predicate refuses every shape that is not a test.
+///
+/// Separated from the gate above so a failure says which half broke: the tree,
+/// or the thing that reads it. Each source varies exactly one property against
+/// the accepted shape and holds the name fixed.
+#[test]
+fn the_container_fault_row_predicate_refuses_a_name_that_is_only_prose() {
+    let name = "concurrent_reclaimers_converge";
+    let needle = format!("fn {name}(");
+
+    // Accepted: a real test.
+    let accepted = format!("#[test]\nfn {name}() {{ assert!(true); }}\n");
+    let code = blank_comments_and_strings(&accepted);
+    assert!(code.contains(&needle) && code.contains("#[test]"));
+
+    // Refused, one property changed at a time.
+    for (label, source) in [
+        (
+            "a doc comment",
+            format!("/// see fn {name}()\nfn other() {{}}\n"),
+        ),
+        (
+            "a line comment",
+            format!("// fn {name}()\nfn other() {{}}\n"),
+        ),
+        (
+            "a block comment",
+            format!("/* fn {name}() */\nfn other() {{}}\n"),
+        ),
+        (
+            "a string literal",
+            format!("const N: &str = \"fn {name}()\";\n"),
+        ),
+        ("a plain fn", format!("fn {name}() {{}}\n")),
+    ] {
+        let code = blank_comments_and_strings(&source);
+        let is_test = code
+            .find(&needle)
+            .is_some_and(|index| code[index.saturating_sub(400)..index].contains("#[test]"));
+        assert!(
+            !is_test,
+            "{label} satisfies the presence predicate, so the gate passes on a deleted test"
+        );
+    }
+}
+
+/// The R19 view directory has **one** definition in this tree.
+///
+/// `PR6E-005`. `src/runner/container/exec.rs` mounts the disposable Git view and
+/// `src/runner/container/census.rs` finds it again after a coordinator death.
+/// They were written in different lanes and each had its own definition of
+/// `<R>/views/<container-name>` — lane A's `join("views")` literal and lane C's
+/// `VIEWS_DIR` const — with nothing crossing them. Measured on the merged tree:
+/// `VIEWS_DIR = "views-mutated"` passed **all 1324 tests**, because lane C's
+/// fixtures plant orphan views through `view_path` itself and lane A's assert
+/// its own literal. A divergence leaves every orphan view unreclaimed after a
+/// crash, against `resource_accounting` R19's `NoRunFinished` ("pruned at the
+/// next write-command start after the owning container is observed terminated")
+/// and ST-16's closing clause "ledgers R19/R26 balance".
+///
+/// `exec::view_dir` now delegates to `census::view_path`, so the two cannot
+/// disagree. This is the guard against a **third** definition: the segment is
+/// declared once, by one const, and a second production site that joins a
+/// `"views"` literal fails here by name.
+///
+/// The class is `PR5D-VISIBILITY-CHECK-DUPLICATED` — a hand-maintained value
+/// kept in two places, where breaking one copy left the suite green because the
+/// other still answered.
+#[test]
+fn the_view_directory_has_one_definition_in_the_tree() {
+    // The domain is the container substrate's PRODUCTION modules. Test modules
+    // are excluded by name rather than by `production_region`, deliberately:
+    // `src/runner/container/tests.rs` is a whole-file `#[cfg(test)] mod tests;`
+    // with no inline marker, so `production_region` returns all 3 000 lines of
+    // it as production and a fixture asserting the path it expects would read as
+    // a second declaration. That inconsistency is `PR6E-006` and is a finding of
+    // its own; this test does not depend on it being repaired.
+    let container: Vec<(String, String)> = scanned_sources()
+        .into_iter()
+        .filter(|(path, _)| {
+            path.starts_with("src/runner/container") && !path.ends_with("/tests.rs")
+        })
+        .collect();
+    let modules: BTreeSet<&str> = container.iter().map(|(path, _)| path.as_str()).collect();
+    // CONTROL, and it is the one that stops this going vacuous: name the modules
+    // the scan must be looking at. A filter that matched nothing, or a rename
+    // that moved a half of the seam out of the scanned set, fails here rather
+    // than reporting one clean site — `PR5-DOCKER-CENSUS-CANNOT-FAIL`.
+    assert_eq!(
+        modules,
+        BTreeSet::from([
+            "src/runner/container.rs",
+            "src/runner/container/census.rs",
+            "src/runner/container/env.rs",
+            "src/runner/container/exec.rs",
+            "src/runner/container/fake.rs",
+            "src/runner/container/intent.rs",
+            "src/runner/container/resolve.rs",
+            "src/runner/container/runtime.rs",
+            "src/runner/container/view.rs",
+        ]),
+        "the container substrate's production modules moved; the seam this test \
+         pins may no longer be inside the scanned set"
+    );
+
+    let mut sites = Vec::new();
+    for (path, source) in &container {
+        let code = blank_comments(&production_region(source));
+        for (index, _) in code.match_indices("\"views\"") {
+            let line = code[..index].matches('\n').count() + 1;
+            sites.push(format!("{path}:{line}"));
+        }
+    }
+    assert_eq!(
+        sites,
+        vec!["src/runner/container/census.rs:95".to_owned()],
+        "the R19 view directory segment is declared in more than one production \
+         site. `census::VIEWS_DIR` is the one definition and `exec::view_dir` \
+         delegates to `census::view_path`; a second literal is a path that can \
+         drift away from the census that has to find it, and no behavioural test \
+         crosses the two halves."
+    );
+
+    // And the scan can see a declaration at all: a blanker that erased the code
+    // would report zero sites, which reads as "one definition" only because the
+    // expected list happens to be short.
+    let (_, census) = container
+        .iter()
+        .find(|(path, _)| path == "src/runner/container/census.rs")
+        .expect("the census module is in the scanned set");
+    assert!(
+        blank_comments(&production_region(census))
+            .contains("pub const VIEWS_DIR: &str = \"views\";"),
+        "the scan cannot see the declaration it is counting"
+    );
+
+    // And the two halves really do answer the same thing, driven rather than
+    // read: the mount side and the census side, same inputs, same path.
+    let root = Path::new("/private/root");
+    let name = crate::runner::container::intent::ContainerName::from_parts(
+        "repokey",
+        "run01",
+        "inc01",
+        "0123456789abcdef",
+    )
+    .expect("a well-formed container name");
+    assert_eq!(
+        crate::runner::container::exec::view_dir(root, &name),
+        crate::runner::container::census::view_path(root, &name),
+        "the runner mounts the view somewhere the census does not look"
+    );
+}
+
+/// The **domain-deciding** function is written three times, and the three
+/// disagree.
+///
+/// `PR5-R1-CFG-TEST-SHRINKS-THE-DOMAIN`, `PR6B-PRODUCTION-REGION-CUT-AT-A-CFG-\
+/// TEST-USE`, and the class `PR5D-VISIBILITY-CHECK-DUPLICATED` names: a value
+/// two places both maintain by hand disagree eventually, and the one that
+/// disagrees silently is the one that decides what a census is allowed to see.
+/// Measured across the tree by PR6 lane E, this crate has **three**
+/// `production_region` implementations with three different semantics:
+///
+/// | where | what it removes | the hazard it carries |
+/// |---|---|---|
+/// | [`production_region`] (`src/effects.rs`, `pub`) | everything from the **first** `#[cfg(test)]`, whatever it attaches to | a `#[cfg(test)] use` truncates the file |
+/// | `runner::tests::production_region` (private) | only `#[cfg(test)] mod … { … }` **blocks** | none of the above; it does not blank comments |
+/// | `events::log::tests::production_region` (private) | from the first `#[cfg(test)]` in the **raw** source | `PR4-CENSUS-COMMENT-ORACLE`: a `#[cfg(test)]` in a comment truncates |
+///
+/// They were measured against each other rather than assumed: a `run_with_\
+/// timeout` planted at the **last line** of `src/agent/claude.rs` — a file the
+/// `effects.rs` region truncates to its first 66 of 1064 lines — is **seen** by
+/// `runner::tests::every_production_process_start_is_classified`, because that
+/// census uses the second implementation. Two censuses in one crate, both
+/// answering "every production X is classified", over two different domains.
+///
+/// # What this test pins
+///
+/// The files the `effects.rs` implementation truncates at something that is
+/// **not a module**. Each one loses everything below the cut from every census
+/// that consults it, silently:
+///
+/// | file | region | cuts at |
+/// |---|---|---|
+/// | `src/engine/options.rs` | 4 / 166 | `#[cfg(test)] use` |
+/// | `src/engine/coordinator.rs` | 35 / 1598 | `#[cfg(test)] use` |
+/// | `src/engine/attempt.rs` | 25 / 721 | `#[cfg(test)] use` |
+/// | `src/engine/resume.rs` | 30 / 792 | `#[cfg(test)] pub(super) fn` |
+/// | `src/agent/claude.rs` | 66 / 1064 | `#[cfg(test)] pub const` |
+/// | `src/agent/codex.rs` | 163 / 2009 | `#[cfg(test)] pub const` |
+/// | `src/agent/copilot.rs` | 107 / 871 | `#[cfg(test)] pub const` |
+/// | `src/agent/proc.rs` | 970 / 7946 | `#[cfg(test)] pub(super) fn` |
+/// | `src/agent/bin.rs` | 224 / 533 | `#[cfg(test)] impl` |
+/// | `src/util.rs` | 680 / 897 | `#[cfg(test)] pub(crate) fn` |
+///
+/// `resume.rs`'s shape is a test-only **function**, not the `use` lane B named,
+/// so a repair written against that name alone would leave it.
+///
+/// **This does not repair them.** Moving `#[cfg(test)]` items in three
+/// schema-1..3 engine files and four PR4 adapter files is a change to earlier
+/// slices' code with reach far beyond this claim, and PR6's
+/// `invariants_preserved[1]` is "legacy engine execution unchanged". What it
+/// does is make the shrink **counted**: an eleventh file joining this set fails
+/// by name rather than quietly removing itself from every census that uses the
+/// `effects.rs` region.
+#[test]
+fn every_production_region_that_stops_early_stops_at_a_module() {
+    /// What the first `#[cfg(test)]` in `source` attaches to, or `None` when the
+    /// file has none. Read out of the **blanked** text, exactly as
+    /// [`production_region`] reads it, so a `#[cfg(test)]` quoted in a doc
+    /// comment neither cuts nor is classified — `src/runner/container.rs`
+    /// carries such a comment, its own warning about this hazard.
+    fn cut_shape(source: &str) -> Option<String> {
+        let blanked = blank_comments_and_strings(source);
+        let cut = blanked.find("#[cfg(test)]")?;
+        let after = blanked[cut + "#[cfg(test)]".len()..].trim_start();
+        Some(
+            after
+                .split_whitespace()
+                .take(3)
+                .collect::<Vec<_>>()
+                .join(" "),
+        )
+    }
+
+    /// Whether the cut is at a module — `mod tests {`, `mod fake;`,
+    /// `pub(crate) mod fixtures`, `mod this_file_is_test_only {}`. A test module
+    /// is what the region is *for*, so cutting at one loses nothing.
+    fn is_module(shape: &str) -> bool {
+        shape
+            .split_whitespace()
+            .next()
+            .is_some_and(|first| first == "mod" || first.starts_with("pub"))
+            && shape.contains("mod ")
+    }
+
+    let mut offenders = BTreeMap::new();
+    let mut at_a_module = 0usize;
+    for (path, source) in scanned_sources() {
+        let Some(shape) = cut_shape(&source) else {
+            continue;
+        };
+        if is_module(&shape) {
+            at_a_module += 1;
+            continue;
+        }
+        offenders.insert(path, shape);
+    }
+
+    let named: BTreeSet<&str> = offenders.keys().map(String::as_str).collect();
+    assert_eq!(
+        named,
+        BTreeSet::from([
+            "src/agent/bin.rs",
+            "src/agent/claude.rs",
+            "src/agent/codex.rs",
+            "src/agent/copilot.rs",
+            "src/agent/proc.rs",
+            "src/engine/attempt.rs",
+            "src/engine/coordinator.rs",
+            "src/engine/options.rs",
+            "src/engine/resume.rs",
+            "src/util.rs",
+        ]),
+        "the set of files whose `effects::production_region` stops at something \
+         other than a module moved. Everything below such a cut is invisible to \
+         every census that consults that region, silently. Shapes found: \
+         {offenders:#?}"
+    );
+
+    // CONTROLS, both directions. A classifier that answered one thing always
+    // would produce this same set by luck on a tree with ten offenders.
+    assert!(is_module("mod tests {"));
+    assert!(is_module("mod fake; #[cfg(test)]"));
+    assert!(is_module("pub(crate) mod fixtures"));
+    assert!(!is_module("use super::X;"));
+    assert!(!is_module("pub const ALL:"));
+    assert!(!is_module("pub(super) fn resume_harness_inner("));
+    assert_eq!(cut_shape("fn a() {}\n").as_deref(), None);
+    assert_eq!(
+        cut_shape("//! prose naming #[cfg(test)]\nfn a() {}\n").as_deref(),
+        None,
+        "a `#[cfg(test)]` in a comment classifies, so this census reads prose"
+    );
+
+    // And the domain really was walked: far more files cut at a module than not,
+    // so an empty or near-empty scan cannot produce the expected set.
+    assert!(
+        at_a_module > 20,
+        "only {at_a_module} file(s) cut at a module; the scan is not reading the tree"
+    );
+
+    // The three implementations are all still there. If one is deleted or
+    // unified, this table is stale and the doc comment above is a lie — which is
+    // the failure `PR5D-CI-COMPONENT-CENSUS-COMMENT-ORACLE` is about, one level
+    // out. Counted in code, not asserted from prose.
+    let definitions: usize = scanned_sources()
+        .iter()
+        .map(|(_, source)| {
+            blank_comments_and_strings(source)
+                .matches("fn production_region(")
+                .count()
+        })
+        .sum();
+    assert_eq!(
+        definitions, 3,
+        "this crate no longer has exactly three `production_region` \
+         implementations; the divergence table in this test's doc comment \
+         describes a tree that no longer exists"
+    );
+}

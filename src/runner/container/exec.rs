@@ -935,9 +935,30 @@ impl ContainerRunner {
 /// Under the run's recorded private root, beside `<R>/containers`, so a census
 /// that reclaims an orphan container has the view path without a live
 /// [`Launched`] — which is exactly how [`super::reclaim`] takes it.
+///
+/// # It delegates, and that is the whole point (`PR6E-005`)
+///
+/// This module *mounts* the view; [`super::census`] *finds* it after a crash,
+/// and the two halves are written in different lanes. Until PR6 lane E they
+/// were **two independent definitions of one path** — this function's
+/// `join("views")` literal, and `census::VIEWS_DIR` — with nothing asserting
+/// they agree. Measured on the merged tree: changing `census::VIEWS_DIR` to
+/// `"views-mutated"` passed **all 1324 tests**, because lane C's fixtures plant
+/// their orphan views through `census::view_path` itself and lane A's assert
+/// this function's literal, so each half is self-consistent and no test crosses
+/// them. A real divergence would leave every orphan view unreclaimed after a
+/// coordinator death — `resource_accounting` R19's `NoRunFinished` is "pruned at
+/// the next write-command start after the owning container is observed
+/// terminated", and ST-16's closing clause is "ledgers R19/R26 balance".
+///
+/// `census::view_path` is now the one definition and this is a delegation, so
+/// the divergence is **unrepresentable** rather than merely untested — the shape
+/// `PR4-CONF-003` established, where deleting a guarantee is a compile error
+/// instead of a silent regression. `effects::tests::the_view_directory_has_one_
+/// definition_in_the_tree` is the guard against a second one being written.
 #[must_use]
 pub fn view_dir(private_root: &Path, name: &ContainerName) -> PathBuf {
-    private_root.join("views").join(name.as_str())
+    super::census::view_path(private_root, name)
 }
 
 impl Runner for ContainerRunner {

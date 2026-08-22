@@ -148,6 +148,32 @@ needs `fs::write` and `fs::create_dir_all`; `census.rs` itself now carries \
 `clippy::disallowed_macros` are re-denied here."""
 
 [[funnel]]
+path = "src/runner/container/resolve/tests.rs"
+allows = ["clippy::disallowed_methods", "clippy::disallowed_types"]
+packet = "effect_site_inventory.mechanism (2), by attachment: the `#[cfg(test)] mod tests;` of src/runner/container/resolve.rs"
+review = """
+The container `RunnerPolicy` resolution suite (PR6 lane B). Lane B landed after \
+repair round F1 built the guard, so this file arrived with NO attribute of its \
+own and inherited the Container funnel's allow through the module tree — \
+`PR6-LANEF-004` reopening, caught by `runner::container::tests::every_child_\
+module_of_the_container_funnel_states_its_own_lint_level` and red on the merged \
+tree. `resolve.rs`, the PRODUCTION half, carries `#![deny(...)]` for all three \
+governed lints and reaches no denied primitive at all, so the build-error leg of \
+`mechanism` (1) holds for lane B's production code. \
+THE RESIDUAL, STATED RATHER THAN IMPLIED: this is the one child of \
+`src/runner/container/` that allows `clippy::disallowed_types` as well as \
+`clippy::disallowed_methods`, because its fixtures build real temporary Git \
+repositories with `std::process::Command` running `git` — three call sites — \
+alongside `fs::write`, `fs::create_dir_all` and `fs::remove_dir_all`, and its \
+wrapper runtime delegates the seam's four effectful methods. So a \
+`std::process::Command` in THIS file is not the build error it is in \
+`src/runner/container/tests.rs` and `src/runner/container/census/tests.rs`, \
+which both re-deny that lint deliberately. `src/events/log/tests.rs` and \
+`src/engine/tests.rs` are the precedent for a test module needing both. \
+`clippy::disallowed_macros` is re-denied, so a `println!` here is still an \
+error."""
+
+[[funnel]]
 path = "src/runner/container/exec.rs"
 allows = ["clippy::disallowed_methods"]
 packet = "effect_site_inventory.mechanism (2), by attachment: the `ContainerRunner`, declared beside src/runner/container.rs"

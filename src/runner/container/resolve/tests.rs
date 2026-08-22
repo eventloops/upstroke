@@ -4,11 +4,31 @@
 //! Kept out of `resolve.rs` so `effects::production_region` — which cuts a
 //! source at its **first** `#[cfg(test)]` — sees that module whole
 //! (`PR5-R1-CFG-TEST-SHRINKS-THE-DOMAIN`).
-#![deny(
-    clippy::disallowed_methods,
-    clippy::disallowed_types,
-    clippy::disallowed_macros
-)]
+
+// Allowlist placement: the **funnel section** of `effects/allowlist.toml`, by
+// attachment to `src/runner/container.rs` -- the same shape
+// `src/runner/container/tests.rs` and `src/runner/container/census/tests.rs`
+// have.
+//
+// `PR6-LANEF-004`: this file states its level **of its own** rather than
+// inheriting the Container funnel's inner `#![allow(...)]` through the module
+// tree. `resolve.rs`, the production half, carries `#![deny(...)]` for all
+// three and reaches no denied primitive at all.
+//
+// WHAT IT NEEDS THE ALLOW FOR, and the residual is stated rather than implied:
+// it builds real temporary Git repositories (`std::process::Command` running
+// `git`, `fs::write`, `fs::create_dir_all`, `fs::remove_dir_all`) and wraps a
+// `ContainerRuntime` whose four effectful methods it delegates. It is the one
+// child of this directory that allows `clippy::disallowed_types` as well as
+// `clippy::disallowed_methods`, so a `std::process::Command` here is NOT a
+// build error the way it is in the two sibling test modules -- a real
+// difference, recorded here and in `effects/allowlist.toml` instead of being
+// left to a reviewer to discover. `src/events/log/tests.rs` and
+// `src/engine/tests.rs` are the precedent for a test module needing both.
+// `clippy::disallowed_macros` is re-denied, so a `println!` is still an error.
+#![allow(clippy::disallowed_methods, clippy::disallowed_types)]
+#![deny(clippy::disallowed_macros)]
+
 #[cfg(test)]
 mod this_file_is_test_only {}
 
@@ -1573,10 +1593,21 @@ fn no_module_outside_the_container_runner_writes_a_container_intent() {
             .replace('\\', "/");
         // Test modules of the container subtree drive the funnel and name its
         // types; they are excluded by name, so a new one is a change here.
+        //
+        // `src/effects/tests.rs` is the fourth, added by PR6 lane E. It is the
+        // `#[cfg(test)] mod tests;` of `src/effects.rs` — a test module, never
+        // reachable from production — and it names `ContainerName` for one
+        // reason: `the_view_directory_has_one_definition_in_the_tree` calls
+        // `exec::view_dir` and `census::view_path` with the same name and
+        // asserts they answer the same path (`PR6E-005`, a divergence that
+        // survived all 1324 tests). It writes no intent and constructs no
+        // container. The exclusion is by exact path rather than by prefix, so
+        // it cannot widen to a sibling.
         if relative.starts_with("src/runner/container/tests")
             || relative.starts_with("src/runner/container/census/tests")
             || relative.starts_with("src/runner/container/resolve/tests")
             || relative == "src/runner/container/fake.rs"
+            || relative == "src/effects/tests.rs"
         {
             continue;
         }
