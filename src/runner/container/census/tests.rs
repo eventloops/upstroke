@@ -25,9 +25,9 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Barrier, Mutex, PoisonError};
 
 use super::{
-    Boundary, Census, CensusComplete, CensusStart, DiscoveredBy, Ownership, PrefixBytes,
-    PrefixReplay, PrefixReread, PrefixSync, StablePrefixBarrier, WriteCommand, private_root_label,
-    run_startup_census, view_path,
+    Boundary, Census, CensusComplete, CensusStart, DiscoveredBy, LABEL_FILTER, Ownership,
+    PrefixBytes, PrefixReplay, PrefixReread, PrefixSync, StablePrefixBarrier, WriteCommand,
+    private_root_label, run_startup_census, view_path,
 };
 use crate::error::TactusError;
 use crate::runner::container::intent::{
@@ -421,8 +421,10 @@ fn refusal(error: &TactusError) -> String {
 ///
 /// The rule has two arms and each arm has two outcomes, so the grid is the
 /// product and not a list of the cases that came to mind. Arm (i) has no lock
-/// axis (this process holds the lock) and arm (ii) has no incarnation axis, so
-/// the eight tuples collapse to **four** classifications — and that collapse is
+/// axis (this process holds the lock) and arm (ii) has no incarnation axis —
+/// **except** for the one value of the incarnation that is refused whatever the
+/// arm, which is `expected_failures_refusals[7]` and is unqualified. So the
+/// eight tuples collapse to **five** classifications, and that collapse is
 /// asserted as a distinct-value count rather than described.
 ///
 /// Second field held constant: the container name, the repo key and the run
@@ -459,14 +461,28 @@ fn the_liveness_rule_classifies_every_cell_of_owner_run_by_incarnation_by_lock()
             live_dir.as_path(),
             Ownership::OwnRunEarlierIncarnation,
         ),
-        // Arm (ii): another run. The incarnation is not read.
+        // This process's own incarnation under a foreign run: refused whatever
+        // the lock says, and the lock is not asked. `held` and `free` are both
+        // here because the two answers are what would differ if the check were
+        // inside arm (ii) instead of in front of it — and because the `free`
+        // cell is the dangerous one: an implementation that fell through to arm
+        // (ii) would classify it a dead owner and kill it.
         (
-            "foreign run, lock held, my incarnation's value",
+            "foreign run, lock held, my own incarnation",
             RUN_B,
             INC_1,
             live_dir.as_path(),
-            Ownership::ForeignRunLiveOwner,
+            Ownership::ForeignRunThisIncarnation,
         ),
+        (
+            "foreign run, lock free, my own incarnation",
+            RUN_B,
+            INC_1,
+            dead_dir.as_path(),
+            Ownership::ForeignRunThisIncarnation,
+        ),
+        // Arm (ii): another run, another incarnation. The incarnation is not
+        // read.
         (
             "foreign run, lock held, another incarnation",
             RUN_B,
@@ -475,14 +491,21 @@ fn the_liveness_rule_classifies_every_cell_of_owner_run_by_incarnation_by_lock()
             Ownership::ForeignRunLiveOwner,
         ),
         (
-            "foreign run, lock free, my incarnation's value",
+            "foreign run, lock held, a third incarnation",
             RUN_B,
-            INC_1,
+            INC_3,
+            live_dir.as_path(),
+            Ownership::ForeignRunLiveOwner,
+        ),
+        (
+            "foreign run, lock free, another incarnation",
+            RUN_B,
+            INC_2,
             dead_dir.as_path(),
             Ownership::ForeignRunDeadOwner,
         ),
         (
-            "foreign run, lock free, another incarnation",
+            "foreign run, lock free, a third incarnation",
             RUN_B,
             INC_3,
             dead_dir.as_path(),
@@ -498,8 +521,8 @@ fn the_liveness_rule_classifies_every_cell_of_owner_run_by_incarnation_by_lock()
     }
     assert_eq!(
         seen.len(),
-        4,
-        "the grid must reach all four classifications, not the three a one-axis fixture reaches"
+        5,
+        "the grid must reach all five classifications, not the three a one-axis fixture reaches"
     );
     assert_eq!(
         seen.into_iter().collect::<Vec<_>>(),
@@ -507,13 +530,95 @@ fn the_liveness_rule_classifies_every_cell_of_owner_run_by_incarnation_by_lock()
         "the classifications the grid reaches are exactly the ones the enum declares"
     );
 
-    // Arm (i) probes nothing: three own-run cells produced no question at all,
-    // and the four foreign cells produced one each.
+    // Exactly two of the five refuse, and neither of them reclaims. A refusal
+    // that also reclaimed would have performed an effect on behalf of a write
+    // command that never ran; a refusal classified as a dead owner would kill a
+    // held owner's container, which arm (ii) forbids absolutely.
+    assert_eq!(
+        Ownership::ALL
+            .iter()
+            .filter(|ownership| ownership.refuses())
+            .copied()
+            .collect::<Vec<_>>(),
+        vec![
+            Ownership::OwnRunThisIncarnation,
+            Ownership::ForeignRunThisIncarnation
+        ]
+    );
+    for ownership in Ownership::ALL {
+        assert!(
+            !(ownership.refuses() && ownership.reclaims()),
+            "{} both refuses and reclaims",
+            ownership.name()
+        );
+    }
+    assert_eq!(
+        Ownership::ALL
+            .iter()
+            .map(|ownership| ownership.name())
+            .collect::<BTreeSet<_>>()
+            .len(),
+        Ownership::ALL.len(),
+        "two classifications share one reported name"
+    );
+
+    // Who is asked, and who is not. Three own-run cells produced no question at
+    // all (arm (i) holds the lock), the two own-incarnation foreign cells
+    // produced none either (the check precedes the probe), and the four
+    // ordinary arm (ii) cells produced one each.
     assert_eq!(
         liveness.asked().len(),
         4,
-        "arm (i) asked whether this process's own run is running: {:?}",
+        "a cell that is refused or is arm (i) asked the lock anyway: {:?}",
         liveness.asked()
+    );
+    assert!(
+        liveness
+            .asked()
+            .iter()
+            .all(|asked| asked == &live_dir || asked == &dead_dir),
+        "{:?}",
+        liveness.asked()
+    );
+
+    // {start kind} x {incarnation}. A **fresh** run has no own run at all, so
+    // arm (i) is unreachable for it — and the refusal must not be reachable
+    // only through arm (i), which is the whole of this repair. Every cell of
+    // the grid above, replayed under a fresh start: the two own-run rows become
+    // foreign rows, and the incarnation this process generated at startup is
+    // refused under **every** run id and **every** lock state.
+    let brand_new = fresh(INC_1);
+    let fresh_liveness = RecordingLiveness::new();
+    fresh_liveness.set_live(&live_dir);
+    let mut refused = 0;
+    for (what, run_id, incarnation, run_dir, _) in &cells {
+        let got =
+            super::classify_ownership(&brand_new, run_id, incarnation, run_dir, &fresh_liveness);
+        assert_ne!(
+            got,
+            Ownership::OwnRunEarlierIncarnation,
+            "{what}: a fresh run drives no run, so nothing can be its earlier incarnation"
+        );
+        assert_ne!(got, Ownership::OwnRunThisIncarnation, "{what}");
+        if *incarnation == INC_1 {
+            assert_eq!(
+                got,
+                Ownership::ForeignRunThisIncarnation,
+                "{what}: a fresh run's own incarnation is refused whatever the intent claims"
+            );
+            refused += 1;
+        }
+        assert_eq!(got.refuses(), *incarnation == INC_1, "{what}");
+    }
+    assert!(
+        refused >= 3,
+        "the grid must carry more than one cell naming this process's incarnation"
+    );
+    assert_eq!(
+        fresh_liveness.asked().len(),
+        cells.len() - refused,
+        "a refused cell asked the owner's lock anyway: {:?}",
+        fresh_liveness.asked()
     );
 }
 
@@ -611,18 +716,29 @@ fn a_live_runs_dead_earlier_incarnation_is_untouched_by_a_foreign_census() {
     }
 }
 
-/// Arm (ii) does not read the incarnation, over a domain of them.
+/// Arm (ii) does not read the incarnation, over a domain of them — **except**
+/// the one value that is refused whatever the arm.
+///
+/// The lane's first version of this test asserted that four incarnations
+/// *including this process's own* gave one answer per lock state, and an
+/// independent review refuted it: `expected_failures_refusals[7]` attaches no
+/// arm to the condition, so the fourth value is not an arm (ii) input at all.
+/// The claim the code now holds is the one the contract states — arm (ii) is
+/// blind to the incarnation **over the incarnations that reach it**, and this
+/// process's own never reaches it.
 ///
 /// Second field held constant: the owner run and its lock state; only the
-/// incarnation moves, across four distinct values including this process's own.
+/// incarnation moves, across four distinct values, one of them this process's
+/// own.
 #[test]
-fn arm_two_gives_one_answer_whatever_the_incarnation() {
+fn arm_two_gives_one_answer_whatever_the_incarnation_that_reaches_it() {
     let liveness = RecordingLiveness::new();
     let held = PathBuf::from("/repo/.tactus/runs/held");
     let free = PathBuf::from("/repo/.tactus/runs/free");
     liveness.set_live(&held);
     let me = resume(RUN_A, INC_1);
-    let incarnations = [INC_1, INC_2, INC_3, "01KZTDDDDDDDDDDDDDDDDDDDDD"];
+    let foreign = [INC_2, INC_3, "01KZTDDDDDDDDDDDDDDDDDDDDD"];
+    let incarnations: Vec<&str> = foreign.iter().copied().chain([INC_1]).collect();
     assert_eq!(
         incarnations.iter().collect::<BTreeSet<_>>().len(),
         4,
@@ -631,7 +747,7 @@ fn arm_two_gives_one_answer_whatever_the_incarnation() {
 
     let mut held_answers = BTreeSet::new();
     let mut free_answers = BTreeSet::new();
-    for incarnation in incarnations {
+    for incarnation in foreign {
         held_answers.insert(super::classify_ownership(
             &me,
             RUN_B,
@@ -650,13 +766,32 @@ fn arm_two_gives_one_answer_whatever_the_incarnation() {
     assert_eq!(
         held_answers.into_iter().collect::<Vec<_>>(),
         vec![Ownership::ForeignRunLiveOwner],
-        "four incarnations of a live foreign owner, one answer"
+        "three incarnations of a live foreign owner, one answer"
     );
     assert_eq!(
         free_answers.into_iter().collect::<Vec<_>>(),
         vec![Ownership::ForeignRunDeadOwner],
-        "four incarnations of a dead foreign owner, one answer"
+        "three incarnations of a dead foreign owner, one answer"
     );
+
+    // And the fourth value — this process's own — is refused under **both**
+    // lock states, so the answer does not depend on the probe. Nothing was
+    // asked about the owner's lock for either cell.
+    let before = liveness.asked().len();
+    for owner_dir in [&held, &free] {
+        assert_eq!(
+            super::classify_ownership(&me, RUN_B, INC_1, owner_dir, &liveness),
+            Ownership::ForeignRunThisIncarnation,
+        );
+    }
+    assert_eq!(
+        liveness.asked().len(),
+        before,
+        "the owner's lock was probed for a candidate that is refused whatever it says: {:?}",
+        liveness.asked()
+    );
+    assert!(Ownership::ForeignRunThisIncarnation.refuses());
+    assert!(!Ownership::ForeignRunThisIncarnation.reclaims());
 }
 
 /// The incarnation is never read from the lock: the seam has no incarnation in
@@ -1736,12 +1871,65 @@ fn census_report_names_reclaimed_probe_boundary() {
 /// implementation that skipped the offending record and got on with its work
 /// fails here rather than passing quietly.
 ///
-/// Second field held constant: the reclaimable orphan is identical in both
-/// halves; the only thing that moves is whether the second record names this
-/// process's own incarnation or an earlier one.
+/// **The refusal is unqualified**, so the owner run is an axis of this fixture
+/// and not a constant: `{own run, foreign run} × {this incarnation, an earlier
+/// one} × {owner lock held, free}`. The two foreign cells are the ones an
+/// independent review found missing — an implementation that applied the
+/// refusal only inside arm (i) lets a foreign run's intent carrying this
+/// incarnation follow arm (ii), where a **free** lock reclaims it and a **held**
+/// one skips it. The `free` cell is the dangerous one and it is the one asserted
+/// hardest: nothing is killed.
+///
+/// Second field held constant: the reclaimable orphan beside the suspect is
+/// identical in every cell — same owner, same repo key, same state — so the only
+/// thing that moves is the suspect's own ownership triple.
 #[test]
 fn an_intent_naming_this_processs_own_incarnation_is_refused_before_any_effect() {
-    for (tag, incarnation, refuses) in [("own", INC_1, true), ("earlier", INC_2, false)] {
+    // `(tag, the suspect's owner run, its incarnation, is its lock held, does
+    // it refuse)`. RUN_A is the run this process drives; RUN_C is not.
+    let cells: [(&str, &str, &str, bool, bool); 6] = [
+        ("own-run-own-incarnation", RUN_A, INC_1, false, true),
+        ("own-run-earlier-incarnation", RUN_A, INC_2, false, false),
+        (
+            "foreign-run-own-incarnation-lock-free",
+            RUN_C,
+            INC_1,
+            false,
+            true,
+        ),
+        (
+            "foreign-run-own-incarnation-lock-held",
+            RUN_C,
+            INC_1,
+            true,
+            true,
+        ),
+        (
+            "foreign-run-earlier-incarnation-lock-free",
+            RUN_C,
+            INC_2,
+            false,
+            false,
+        ),
+        (
+            "foreign-run-earlier-incarnation-lock-held",
+            RUN_C,
+            INC_2,
+            true,
+            false,
+        ),
+    ];
+    assert_eq!(
+        cells
+            .iter()
+            .map(|(_, run, incarnation, held, _)| (run, incarnation, held))
+            .collect::<BTreeSet<_>>()
+            .len(),
+        6,
+        "six distinct cells of {{owner run}} x {{incarnation}} x {{lock}}"
+    );
+
+    for (tag, run_id, incarnation, lock_held, refuses) in cells {
         let harness = Harness::new(&format!("own-incarnation-{tag}"));
         let orphan_owner = Owner::new(RUN_B, INC_3, REPO_KEY_B);
         let orphan = seed(
@@ -1752,11 +1940,14 @@ fn an_intent_naming_this_processs_own_incarnation_is_refused_before_any_effect()
             Present::Both,
             Liveness::Running,
         );
-        let mine = Owner::new(RUN_A, incarnation, REPO_KEY_A);
+        let suspect_owner = Owner::new(run_id, incarnation, REPO_KEY_A);
+        if lock_held {
+            harness.liveness.set_live(&suspect_owner.run_dir);
+        }
         let suspect = seed(
             &harness.root,
             &harness.runtime,
-            &mine,
+            &suspect_owner,
             &agent_probe(),
             Present::Both,
             Liveness::Running,
@@ -1765,23 +1956,100 @@ fn an_intent_naming_this_processs_own_incarnation_is_refused_before_any_effect()
         let outcome = harness.census(&resume(RUN_A, INC_1));
         if refuses {
             let message = refusal(&outcome.expect_err("refused"));
-            assert!(message.contains("own incarnation"), "{message}");
-            assert!(message.contains("cannot exist at census time"), "{message}");
+            assert!(message.contains("own incarnation"), "[{tag}] {message}");
+            assert!(
+                message.contains("cannot exist at census time"),
+                "[{tag}] {message}"
+            );
             assert!(
                 harness.trace.sites().is_empty(),
-                "the census reclaimed something and then refused: {:#?}",
+                "[{tag}] the census reclaimed something and then refused: {:#?}",
                 harness.trace.rendered()
             );
             assert!(
                 harness.holds(&orphan) && harness.intent_exists(&orphan),
-                "the other orphan was reclaimed on behalf of a write command that refused"
+                "[{tag}] the other orphan was reclaimed on behalf of a write command that refused"
             );
-            assert!(harness.holds(&suspect));
+            assert!(
+                harness.holds(&suspect) && harness.intent_exists(&suspect),
+                "[{tag}] the container the census refused over was killed anyway"
+            );
         } else {
-            let complete = outcome.expect("an earlier incarnation is dead by construction");
-            assert_eq!(complete.report().reclaimed.len(), 2);
-            assert!(!harness.holds(&orphan) && !harness.holds(&suspect));
+            let complete = outcome.expect("an earlier incarnation is reclaimable or skipped");
+            assert!(!harness.holds(&orphan), "[{tag}] the dead orphan survived");
+            assert_eq!(
+                harness.holds(&suspect),
+                lock_held,
+                "[{tag}] a live foreign owner's container was killed, or a dead one survived"
+            );
+            assert_eq!(
+                complete.report().was_untouched(&suspect),
+                lock_held,
+                "[{tag}] the report disagrees with what happened to the machine"
+            );
         }
+    }
+}
+
+/// A **held** foreign owner's container carrying this process's incarnation is
+/// refused, and refusing it is not the same as reclaiming it.
+///
+/// The mutation an independent review measured — an early branch classifying
+/// any foreign candidate carrying the process incarnation as
+/// `ForeignRunDeadOwner` — passes a suite that only checks *that* such a
+/// candidate is treated specially. It would **kill a held owner's container**,
+/// which arm (ii) forbids in as many words ("held -> live owner -> never
+/// touched"). So the claim is made as a runtime state and not as a
+/// classification: the container is still there, its record is still there, its
+/// view is still there, and the funnel issued nothing at all.
+///
+/// Second field held constant: one owner, one lock state, one container; only
+/// the incarnation the intent names moves, between this process's own and an
+/// earlier one.
+#[test]
+fn a_live_foreign_owners_container_naming_this_incarnation_is_refused_and_not_killed() {
+    for (tag, incarnation) in [("own", INC_1), ("earlier", INC_2)] {
+        let harness = Harness::new(&format!("held-foreign-{tag}"));
+        let owner = Owner::new(RUN_C, incarnation, REPO_KEY_B);
+        harness.liveness.set_live(&owner.run_dir);
+        let container = seed(
+            &harness.root,
+            &harness.runtime,
+            &owner,
+            &shell_probe(),
+            Present::Both,
+            Liveness::Running,
+        );
+
+        let outcome = harness.census(&resume(RUN_A, INC_1));
+        if incarnation == INC_1 {
+            refusal(&outcome.expect_err("this process's own incarnation is refused"));
+        } else {
+            let complete = outcome.expect("a live foreign owner is skipped, not refused");
+            assert!(complete.report().was_untouched(&container));
+            assert_eq!(
+                complete
+                    .report()
+                    .untouched
+                    .iter()
+                    .map(|entry| entry.ownership)
+                    .collect::<Vec<_>>(),
+                vec![Ownership::ForeignRunLiveOwner]
+            );
+        }
+        // The state of the machine is identical in both halves, and it is the
+        // untouched state.
+        assert!(
+            harness.holds(&container),
+            "[{tag}] a live owner's container was killed"
+        );
+        assert!(harness.intent_exists(&container), "[{tag}]");
+        assert!(harness.view_exists(&container), "[{tag}]");
+        assert!(
+            harness.trace.sites().is_empty(),
+            "[{tag}] the funnel touched a live owner's container: {:#?}",
+            harness.trace.rendered()
+        );
     }
 }
 
@@ -2200,30 +2468,189 @@ fn both_halves_of_discovery_are_scanned_and_every_cell_is_classified() {
     assert!(complete.report().reclaimed.is_empty());
 }
 
-/// The label this census filters on is the label the funnel writes.
+/// The label this census filters on is the label the funnel writes, and its
+/// value is the one an independent table says it is.
 ///
 /// A census that filtered on a different spelling would discover nothing and
 /// report a clean machine — the "green because the test could not run" shape,
-/// with the runtime standing in for the test. The two renderings are produced by
-/// **different functions in different modules**, which is the only way this
-/// comparison means anything.
+/// with the runtime standing in for the test. There is now **one** rendering
+/// (`intent::private_root_label`) and both sides call it, so the agreement is
+/// by construction; what this test still has to hold is the *value*, and it
+/// holds it against encodings computed **out of band** and written as literals.
+/// Comparing the function against itself would prove nothing, which is how the
+/// two-copy version stayed green while the encoding was wrong.
 ///
-/// Second field held constant: one record, one root; only which side computes
-/// the string moves.
+/// Second field held constant: one record and one owner across every cell, so
+/// the only thing that moves is the root's bytes.
 #[test]
 fn the_private_root_label_this_census_filters_on_is_the_one_the_intent_writes() {
-    for root in [
-        PathBuf::from("/srv/tactus/private"),
-        PathBuf::from("/tmp/a b/c"),
-        PathBuf::from(r"C:\Users\dev\.tactus"),
-    ] {
+    // Computed with `python3 -c` from the rule "percent-encode every byte
+    // outside [A-Za-z0-9/:.-_]", not by calling the function under test.
+    const EXPECTED: &[(&str, &str)] = &[
+        ("/srv/tactus/private", "/srv/tactus/private"),
+        ("/tmp/a b/c", "/tmp/a%20b/c"),
+        ("/srv/a;b", "/srv/a%3Bb"),
+        ("/srv/a,b", "/srv/a%2Cb"),
+        ("/srv/a=b", "/srv/a%3Db"),
+        ("/srv/a%b", "/srv/a%25b"),
+        ("/srv/a%5Cb", "/srv/a%255Cb"),
+        ("/srv/caf\u{e9}", "/srv/caf%C3%A9"),
+    ];
+    for (root, expected) in EXPECTED {
+        let root = PathBuf::from(root);
+        assert_eq!(
+            private_root_label(&root),
+            *expected,
+            "the label encoding of {} moved",
+            root.display()
+        );
         let record = Owner::new(RUN_A, INC_1, REPO_KEY_A).record(&shell_probe());
         let written = record.labels(&root);
         assert_eq!(
             written.get(LABEL_PRIVATE_ROOT).map(String::as_str),
-            Some(private_root_label(&root).as_str()),
+            Some(*expected),
             "the census's filter value and the funnel's label disagree for {}",
             root.display()
+        );
+    }
+
+    // The one byte whose rendering is platform-shaped, stated as the two
+    // answers rather than as the one this platform happens to give.
+    let backslash = private_root_label(Path::new(r"/srv/a\b"));
+    if cfg!(windows) {
+        assert_eq!(backslash, "/srv/a/b");
+    } else {
+        assert_eq!(backslash, "/srv/a%5Cb");
+    }
+    let record = Owner::new(RUN_A, INC_1, REPO_KEY_A).record(&shell_probe());
+    assert_eq!(
+        record
+            .labels(Path::new(r"/srv/a\b"))
+            .get(LABEL_PRIVATE_ROOT)
+            .map(String::as_str),
+        Some(backslash.as_str())
+    );
+}
+
+/// **Different private roots are disjoint worlds** — proved with a collision
+/// pair, not with a round-trip.
+///
+/// `crash_reconstruction` says it in those words, and the container **name**
+/// was designed for it: its components are `[0-9A-Za-z_]` only, so the parse on
+/// `-` is unambiguous. The **label** is the other half — it is what `docker ps
+/// --filter label=tactus.private_root=…` selects on — and the rendering that
+/// shipped, `to_string_lossy().replace('\\', "/")`, was not injective. On Unix a
+/// backslash is an ordinary filename byte, so `<base>/a\b` and `<base>/a/b` are
+/// **different directories** that rendered to one label, and a census
+/// authorized for either queried and reclaimed the other's containers.
+///
+/// A round-trip test would not have caught it: the encoding round-trips
+/// perfectly and still maps two inputs to one output. So this asserts a
+/// **distinct-value count** over roots that differ only in the bytes an
+/// encoding is tempted to fold, and it names the pair the review found.
+///
+/// Second field held constant: every root shares the same `<base>` prefix and
+/// differs in exactly one interior byte, so nothing but that byte can be
+/// producing the distinctness.
+#[test]
+fn the_private_root_label_is_injective_over_hostile_roots() {
+    let base = Path::new("/srv/private");
+
+    // Distinct on **every** platform: none of these pairs differ only by a
+    // path separator.
+    let universal = [
+        "a/b",
+        "a%5Cb",
+        "a%2Fb",
+        "a;b",
+        "a,b",
+        "a=b",
+        "a b",
+        "a%b",
+        "a%25b",
+        "caf\u{e9}",
+        "a\u{fffd}b",
+        "ab",
+    ];
+    let roots: Vec<PathBuf> = universal.iter().map(|leaf| base.join(leaf)).collect();
+    assert_eq!(
+        roots.iter().collect::<BTreeSet<_>>().len(),
+        universal.len(),
+        "the fixture itself must carry {} distinct roots",
+        universal.len()
+    );
+    let labels: BTreeSet<String> = roots.iter().map(|root| private_root_label(root)).collect();
+    assert_eq!(
+        labels.len(),
+        universal.len(),
+        "{} distinct roots rendered to {} distinct labels; a census authorized for one of the \
+         colliding roots queries and reclaims the other's containers: {:#?}",
+        universal.len(),
+        labels.len(),
+        roots
+            .iter()
+            .map(|root| (root.display().to_string(), private_root_label(root)))
+            .collect::<Vec<_>>()
+    );
+
+    // The collision pair the review measured. On Unix these are two
+    // directories; on Windows they are one, and folding them is
+    // canonicalization rather than a collision — so the claim is made on the
+    // platform where it is a claim.
+    #[cfg(unix)]
+    {
+        let with_backslash = base.join(r"a\b");
+        let with_slash = base.join("a").join("b");
+        assert_ne!(with_backslash, with_slash);
+        assert_ne!(
+            private_root_label(&with_backslash),
+            private_root_label(&with_slash),
+            "`<base>/a\\b` and `<base>/a/b` are different directories on Unix and must not be \
+             one world"
+        );
+    }
+    #[cfg(windows)]
+    {
+        assert_eq!(
+            private_root_label(&base.join(r"a\b")),
+            private_root_label(&base.join("a").join("b")),
+            "on Windows both spellings name one directory, so one label is correct"
+        );
+    }
+
+    // The second collision the shipped rendering had, and the one a
+    // `\u{fffd}` in the table above only gestures at: `to_string_lossy` maps
+    // **every** ill-formed byte sequence to `U+FFFD`, so two distinct non-UTF-8
+    // roots — and a root that literally contains `U+FFFD` — were one label.
+    // Constructible only on Unix, where an `OsStr` is bytes.
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStrExt as _;
+        let ill_formed: Vec<PathBuf> = [b"/srv/private/a\xffb".as_slice(), b"/srv/private/a\xfeb"]
+            .iter()
+            .map(|bytes| PathBuf::from(std::ffi::OsStr::from_bytes(bytes)))
+            .collect();
+        let mut rendered: BTreeSet<String> = ill_formed
+            .iter()
+            .map(|root| private_root_label(root))
+            .collect();
+        assert_eq!(rendered.len(), 2, "two ill-formed roots, two labels");
+        rendered.insert(private_root_label(&base.join("a\u{fffd}b")));
+        assert_eq!(
+            rendered.len(),
+            3,
+            "an ill-formed root and a root that really contains U+FFFD are different roots"
+        );
+    }
+
+    // A root may not carry a byte that ends the `--filter` argument or starts
+    // another filter, whatever the operator called their directory. This is
+    // what lets `ReaperContainerScope` stop worrying about the root half.
+    for root in &roots {
+        let label = private_root_label(root);
+        assert!(
+            !label.contains([',', '=', '\n', '\r']),
+            "`{label}` would change what `--filter label=…` selects"
         );
     }
 }
@@ -2641,17 +3068,28 @@ fn the_reapers_container_selector_names_the_incarnation_and_not_the_root_alone()
     assert_eq!(scope.program(), Path::new("docker"));
 }
 
-/// A label value that could change what the filter selects is refused.
+/// A label value that could change what the filter selects cannot reach the
+/// reaper — refused for the incarnation, impossible for the root.
 ///
 /// The reaper has no error channel and no allocator: it cannot report a
 /// malformed selector, and a filter that matched more than it should would kill
-/// a live coordinator's containers. So the check is on the parent side, and it
-/// is a refusal.
+/// a live coordinator's containers. The two halves of the selector are now
+/// protected differently, and the difference is the point:
+///
+/// * the **incarnation** is used verbatim, so a hostile value is **refused**
+///   here, on the parent side;
+/// * the **root** is rendered by [`private_root_label`], which percent-encodes
+///   every byte that could end the argument, so a hostile root is *accepted*
+///   and cannot widen anything. This is strictly stronger than refusing it: an
+///   operator whose private root contains a comma gets a working reaper rather
+///   than a refusal. The scope's own check is kept as the post-condition on
+///   that encoding — it inspects the **rendered** value, so an encoding that
+///   regressed would still fail closed here.
 ///
 /// Second field held constant: the private root is well-formed in the
 /// incarnation cases and vice versa, so each case names one hostile value.
 #[test]
-fn a_reaper_scope_whose_label_value_could_widen_the_filter_is_refused() {
+fn a_reaper_scope_whose_label_value_could_widen_the_filter_cannot_reach_the_reaper() {
     let good_root = Path::new("/srv/private");
     let hostile = ["", "01KZ\nlabel=tactus.run", "a,b", "a=b"];
     assert_eq!(
@@ -2664,11 +3102,44 @@ fn a_reaper_scope_whose_label_value_could_widen_the_filter_is_refused() {
             super::ReaperContainerScope::new("docker", good_root, value).is_err(),
             "`{value}` was accepted as an incarnation"
         );
+    }
+
+    // The root half. An empty root still refuses — it renders to an empty
+    // label, and a filter that matches everything would kill a live
+    // coordinator's containers. Every other hostile root is accepted, and the
+    // selector it produces carries exactly two filters.
+    assert!(
+        super::ReaperContainerScope::new("docker", Path::new(""), INC_1).is_err(),
+        "an empty private root renders an empty filter value"
+    );
+    for value in ["01KZ\nlabel=tactus.run", "a,b", "a=b"] {
+        let scope = super::ReaperContainerScope::new("docker", Path::new(value), INC_1)
+            .unwrap_or_else(|error| {
+                panic!("`{value}` is a legal directory name and was refused: {error}")
+            });
+        let argv = scope.list_argv();
+        let filters: Vec<&String> = argv
+            .iter()
+            .filter(|argument| argument.starts_with(LABEL_FILTER))
+            .collect();
+        assert_eq!(
+            filters.len(),
+            2,
+            "`{value}` produced {filters:?}, not two filters"
+        );
         assert!(
-            super::ReaperContainerScope::new("docker", Path::new(value), INC_1).is_err(),
-            "`{value}` was accepted as a private root"
+            filters.contains(&&format!(
+                "{LABEL_FILTER}{LABEL_PRIVATE_ROOT}={}",
+                private_root_label(Path::new(value))
+            )),
+            "{argv:?}"
+        );
+        assert!(
+            filters.contains(&&format!("{LABEL_FILTER}{LABEL_INCARNATION}={INC_1}")),
+            "{argv:?}"
         );
     }
+
     // And the well-formed pair is accepted, so this is not a function that
     // refuses everything.
     assert!(super::ReaperContainerScope::new("docker", good_root, INC_1).is_ok());

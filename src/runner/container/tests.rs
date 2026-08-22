@@ -25,7 +25,7 @@ use super::fake::absent_reason;
 use super::intent::{
     self, CONTAINERS_DIR, ContainerIntent, ContainerName, INTENT_SUFFIX, LABEL_INCARNATION,
     LABEL_INVOCATION, LABEL_PRIVATE_ROOT, LABEL_RUN, LABEL_RUN_DIR, LABELS, containers_dir,
-    invocation_hash,
+    invocation_hash, private_root_label,
 };
 use super::runtime::{
     ContainerExecution, ContainerRuntime, ContainerTrace, CreateSpec, ImageInspection, Liveness,
@@ -751,11 +751,21 @@ fn windows_orphan_window_documented() {
         PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src/runner/container.rs"),
     )
     .expect("the funnel");
+    // Only the region the documentation lives in, so what follows is a claim
+    // about *that* documentation and not about whatever else the file says.
+    let region = {
+        let start = raw
+            .find("// The orphan window")
+            .expect("the section header");
+        let end = raw.find("impl OrphanWindow {").expect("the impl block");
+        assert!(start < end);
+        &raw[start..end]
+    };
     // Doc-comment markers, block quoting and emphasis removed and whitespace
     // collapsed, because a quoted sentence is wrapped by `rustfmt` at whatever
     // column it lands on and a phrase search over the raw bytes would be
     // asserting the wrap rather than the sentence.
-    let source: String = raw
+    let source: String = region
         .replace("//!", " ")
         .replace("///", " ")
         .replace(['>', '*', '`'], " ")
@@ -773,6 +783,87 @@ fn windows_orphan_window_documented() {
             "the orphan window's documentation no longer says `{phrase}`"
         );
     }
+
+    // The four phrases above are a **set**, and a set survives having its
+    // platform names swapped: documenting a Windows reaper and no Unix reaper
+    // leaves every one of them present. So the documentation is read as a
+    // *mapping* — each platform marker owns the prose up to the next marker —
+    // and the mapping is then checked against the code's own `cfg`.
+    const UNIX: &str = "cfg(unix)";
+    const WINDOWS: &str = "Windows";
+    let mut markers: Vec<(usize, bool)> = source
+        .match_indices(UNIX)
+        .map(|(at, _)| (at, true))
+        .chain(source.match_indices(WINDOWS).map(|(at, _)| (at, false)))
+        .collect();
+    markers.sort_unstable();
+    assert!(
+        markers.len() >= 2,
+        "the documentation names fewer than two platforms: {source}"
+    );
+    let mut said: BTreeMap<bool, String> = BTreeMap::new();
+    for (index, (at, is_unix)) in markers.iter().enumerate() {
+        let end = markers
+            .get(index + 1)
+            .map_or(source.len(), |(next, _)| *next);
+        said.entry(*is_unix)
+            .or_default()
+            .push_str(&source[*at..end]);
+    }
+    let unix_said = said.get(&true).map(String::as_str).unwrap_or_default();
+    let windows_said = said.get(&false).map(String::as_str).unwrap_or_default();
+    assert!(
+        !unix_said.is_empty() && !windows_said.is_empty(),
+        "both platforms must be named: {source}"
+    );
+
+    // What each platform is documented as having, read out of its own prose.
+    let unix_has_a_reaper = unix_said.contains("cleanup reaper");
+    let windows_has_a_reaper = windows_said.contains("cleanup reaper");
+    assert!(
+        unix_has_a_reaper != windows_has_a_reaper,
+        "exactly one platform has a reaper; `os_matrix` says Windows has none. \
+         unix: `{unix_said}` / windows: `{windows_said}`"
+    );
+
+    // **The tie.** The platform this test is running on is a `cfg`, and
+    // `orphan_window()` answers for that same `cfg`. A documentation block
+    // whose platform names are reversed disagrees with it here — on both
+    // platforms, in opposite directions — where the phrase set could not tell.
+    assert_eq!(
+        if cfg!(windows) {
+            windows_has_a_reaper
+        } else {
+            unix_has_a_reaper
+        },
+        window.closed_by_a_reaper(),
+        "the documentation and `orphan_window()`'s own `cfg` disagree about this platform. \
+         unix: `{unix_said}` / windows: `{windows_said}`"
+    );
+    // The named consequences, each against the platform that has them.
+    assert!(!unix_said.contains("no reaper"), "{unix_said}");
+    assert!(
+        windows_said.contains("next write-command start"),
+        "{windows_said}"
+    );
+
+    // And a second tie, to code that is not `orphan_window` itself: arming the
+    // reaper is a **no-op on Windows**, so a scope naming a program that cannot
+    // be executed is refused on the platform that has a reaper and accepted on
+    // the platform that has nothing to arm. Nothing is installed on either
+    // path, so no other test in this process inherits a scope.
+    let unarmable = crate::runner::container::census::ReaperContainerScope::new(
+        "tactus-definitely-not-a-real-docker",
+        Path::new("/srv/tactus-orphan-window/private"),
+        "01KZTAAAAAAAAAAAAAAAAAAAAA",
+    )
+    .expect("a well-formed scope");
+    assert_eq!(
+        crate::agent::proc::set_container_reclaim_scope(Some(&unarmable)).is_err(),
+        window.closed_by_a_reaper(),
+        "a platform with a reaper checks the program that reaper would exec; a platform \
+         without one has nothing to arm and must accept the call as the no-op it is"
+    );
 }
 
 /// Every one of the eight sites is taken **by value** by a funnel API, and the
@@ -2255,10 +2346,7 @@ fn real_docker_creates_from_an_id_reports_it_and_reclaims_idempotently() {
 
     // Discovery finds it by `tactus.private_root`, with its five labels.
     let discovered = docker
-        .containers_with_label(
-            LABEL_PRIVATE_ROOT,
-            &root.to_string_lossy().replace('\\', "/"),
-        )
+        .containers_with_label(LABEL_PRIVATE_ROOT, &private_root_label(&root))
         .expect("reachable");
     assert_eq!(discovered.len(), 1, "{discovered:?}");
     for label in LABELS {
@@ -2284,10 +2372,7 @@ fn real_docker_creates_from_an_id_reports_it_and_reclaims_idempotently() {
     assert!(!launched.view_path.exists());
     assert_eq!(
         docker
-            .containers_with_label(
-                LABEL_PRIVATE_ROOT,
-                &root.to_string_lossy().replace('\\', "/")
-            )
+            .containers_with_label(LABEL_PRIVATE_ROOT, &private_root_label(&root))
             .expect("reachable")
             .len(),
         0

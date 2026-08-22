@@ -73,13 +73,21 @@ use super::{ContainerHooks, FoundIntent, GitView, OrphanWindow, list_intents, or
 /// be *derivable* from what a census already knows, which is the private root
 /// and the container name.
 ///
-/// **Cross-lane seam.** Lane A's `view.rs` materialises the projection; it must
-/// materialise it at [`view_path`] or an orphan view is undiscoverable. Stated
-/// here rather than assumed because the two halves are written in different
-/// lanes.
+/// **Cross-lane seam, and it is one definition rather than an agreement.** The
+/// invocation path that *materialises* the projection reaches this function
+/// too: [`super::exec::view_dir`] is a call to [`view_path`] and nothing else.
+/// It used to be a second copy of the same `join`, and an independent review
+/// measured what that costs — changing only the producer to
+/// `<R>/views-v2/<name>` passed the whole suite and orphaned every view the
+/// census would have pruned. A convention maintained in two places is a
+/// convention only until somebody edits one of them.
 pub const VIEWS_DIR: &str = "views";
 
 /// `<R>/views/<container-name>` — the R19 view of one container invocation.
+///
+/// The single definition: [`super::exec::view_dir`] delegates here, and
+/// `exec::tests::the_view_path_the_census_prunes_is_the_one_the_invocation_mounts`
+/// holds the value against a literal rather than against either caller.
 #[must_use]
 pub fn view_path(private_root: &Path, name: &ContainerName) -> PathBuf {
     private_root.join(VIEWS_DIR).join(name.as_str())
@@ -87,14 +95,21 @@ pub fn view_path(private_root: &Path, name: &ContainerName) -> PathBuf {
 
 /// The value of the `tactus.private_root` label for this root.
 ///
-/// The same rendering [`ContainerIntent::labels`] produces, and
+/// **One definition, in the module that owns [`LABEL_PRIVATE_ROOT`]**, rather
+/// than the rendering re-derived here and pinned to the funnel's by a test. The
+/// two spellings were byte-identical and still not injective — `<R>/a\b` and
+/// `<R>/a/b` are different roots on Unix and rendered to one label — and
+/// repairing that in one copy would have left a census filtering on a value no
+/// container carries, which discovers nothing and reports a clean machine.
+/// [`super::intent::private_root_label`] carries the injectivity argument.
+///
 /// [`the_private_root_label_this_census_filters_on_is_the_one_the_intent_writes`]
-/// pins the two against each other — a census that filtered on a different
-/// spelling than the funnel labels with would discover nothing and report a
-/// clean machine.
+/// still pins the census's filter value against `ContainerIntent::labels`; it
+/// is now true by construction, and its oracle is an independent table of
+/// hand-computed encodings rather than the other copy.
 #[must_use]
 pub fn private_root_label(private_root: &Path) -> String {
-    private_root.to_string_lossy().replace('\\', "/")
+    super::intent::private_root_label(private_root)
 }
 
 // ---------------------------------------------------------------------------
@@ -366,14 +381,41 @@ impl WriteCommand {
 /// > != this run: probe that run's run.lock non-blocking; **free** -> dead owner
 /// > -> reclaim **every** container of that run **whatever its incarnation**;
 /// > **held** -> live owner -> **never touched**
+///
+/// **The own-incarnation refusal is unqualified, and that is a reading.**
+/// `crash_reconstruction` writes it inside arm (i)'s clause, but the reason it
+/// gives — "cannot exist at census time (**the census precedes every invocation
+/// incl. this incarnation's probes**)" — is a fact about *this process*, not
+/// about the owner run: an incarnation id is a per-process ULID, and this
+/// process has written no container intent at all yet, under any run id. Two
+/// other live passages state the condition with no arm attached at all:
+/// `expected_failures_refusals[7]`, "an intent naming this process's own
+/// incarnation at census time is refused", and
+/// `transaction_fault_matrix.T-CONTAINER.refusal_condition`, which lists it
+/// among the unqualified refusal conditions. So an intent that names this
+/// incarnation under a *foreign* run id is refused too — it is ownership
+/// evidence that contradicts itself, exactly like a name that disagrees with
+/// its record, and this module refuses on every other such contradiction.
+///
+/// Refusing is also the only reading compatible with arm (ii)'s absolute
+/// prohibition: a **held** foreign owner's container must never be touched, and
+/// a refusal touches nothing. Classifying it as a dead owner instead would kill
+/// a live coordinator's container.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum Ownership {
     /// Arm (i), `incarnation != mine`: dead by construction, because the run
     /// lock is exclusive and this process holds it.
     OwnRunEarlierIncarnation,
-    /// Arm (i), `incarnation == mine`: cannot exist at census time, and is
-    /// **refused** if observed. `expected_failures_refusals[7]`.
+    /// `incarnation == mine` under the run this process drives: cannot exist at
+    /// census time, and is **refused** if observed.
+    /// `expected_failures_refusals[7]`.
     OwnRunThisIncarnation,
+    /// `incarnation == mine` under a run this process is **not** driving: this
+    /// process wrote no intent under a foreign run id, so the evidence
+    /// contradicts itself. Refused, and never reclaimed — the owner's lock is
+    /// not even probed, because no answer to that question could make killing
+    /// it safe.
+    ForeignRunThisIncarnation,
     /// Arm (ii), the owner's `run.lock` is **free**: reclaim, whatever the
     /// container's incarnation.
     ForeignRunDeadOwner,
@@ -388,6 +430,7 @@ impl Ownership {
     pub const ALL: &'static [Self] = &[
         Self::OwnRunEarlierIncarnation,
         Self::OwnRunThisIncarnation,
+        Self::ForeignRunThisIncarnation,
         Self::ForeignRunDeadOwner,
         Self::ForeignRunLiveOwner,
     ];
@@ -397,14 +440,19 @@ impl Ownership {
     pub const fn reclaims(self) -> bool {
         match self {
             Self::OwnRunEarlierIncarnation | Self::ForeignRunDeadOwner => true,
-            Self::OwnRunThisIncarnation | Self::ForeignRunLiveOwner => false,
+            Self::OwnRunThisIncarnation
+            | Self::ForeignRunThisIncarnation
+            | Self::ForeignRunLiveOwner => false,
         }
     }
 
     /// Whether observing it refuses the write command.
     #[must_use]
     pub const fn refuses(self) -> bool {
-        matches!(self, Self::OwnRunThisIncarnation)
+        matches!(
+            self,
+            Self::OwnRunThisIncarnation | Self::ForeignRunThisIncarnation
+        )
     }
 
     /// As the report writes it.
@@ -413,6 +461,7 @@ impl Ownership {
         match self {
             Self::OwnRunEarlierIncarnation => "own-run-earlier-incarnation",
             Self::OwnRunThisIncarnation => "own-run-this-incarnation",
+            Self::ForeignRunThisIncarnation => "foreign-run-this-incarnation",
             Self::ForeignRunDeadOwner => "foreign-run-dead-owner",
             Self::ForeignRunLiveOwner => "foreign-run-live-owner",
         }
@@ -432,6 +481,14 @@ impl Ownership {
 ///
 /// **Arm (i) does not probe the lock at all**: this process holds it, so a probe
 /// would be asking whether it is itself alive.
+///
+/// **The own-incarnation test precedes both arms**, because
+/// `expected_failures_refusals[7]` attaches no arm to it: see [`Ownership`] for
+/// the reading and the passages. Placing it first is also what makes the
+/// refusal "before any effect" true of the *probe* as well — a candidate
+/// carrying this incarnation is refused without the owner's lock ever being
+/// asked about, since no answer to that question could make killing it safe and
+/// a "free" answer would make killing it look safe.
 #[must_use]
 pub fn classify_ownership(
     start: &CensusStart,
@@ -440,14 +497,18 @@ pub fn classify_ownership(
     owner_run_dir: &Path,
     liveness: &dyn OwnerLiveness,
 ) -> Ownership {
-    if let Some(own_run) = start.own_run() {
-        if owner_run_id == own_run {
-            return if owner_incarnation == start.incarnation() {
-                Ownership::OwnRunThisIncarnation
-            } else {
-                Ownership::OwnRunEarlierIncarnation
-            };
-        }
+    let own_run = start.own_run() == Some(owner_run_id);
+    if owner_incarnation == start.incarnation() {
+        return if own_run {
+            Ownership::OwnRunThisIncarnation
+        } else {
+            Ownership::ForeignRunThisIncarnation
+        };
+    }
+    if own_run {
+        // Arm (i), the surviving half: the run lock is exclusive and this
+        // process holds it, so every other incarnation of this run is dead.
+        return Ownership::OwnRunEarlierIncarnation;
     }
     // Arm (ii). The incarnation is deliberately not in scope here.
     if liveness.is_running(owner_run_dir) {
@@ -715,14 +776,25 @@ pub fn run_startup_census(
             census.liveness,
         );
         if ownership.refuses() {
+            // Both refusals are `expected_failures_refusals[7]`, and the
+            // condition it names is unqualified — but the two contradictions
+            // are different facts about the machine and a report that called
+            // them one thing would send a reader looking in the wrong place.
+            let why = if ownership == Ownership::OwnRunThisIncarnation {
+                "which is this process's own run and its own incarnation"
+            } else {
+                "whose incarnation is this process's own under a run this process is not \
+                 driving, so no process could have written it: an incarnation id is a \
+                 per-process ULID and this process has written no container intent at all yet"
+            };
             return Err(TactusError::Refused {
                 message: format!(
-                    "the container intent `{}` names run `{}` and incarnation `{}`, which is \
-                     this process's own incarnation; an intent naming this process's own \
-                     incarnation cannot exist at census time — the census precedes every \
-                     invocation including this incarnation's probes — and is refused if \
-                     observed (decisions.pr_sequence[7].slice_contract\
-                     .expected_failures_refusals[7])",
+                    "the container intent `{}` names run `{}` and incarnation `{}`, {why}; an \
+                     intent naming this process's own incarnation cannot exist at census time — \
+                     the census precedes every invocation including this incarnation's probes — \
+                     and is refused if observed (decisions.pr_sequence[7].slice_contract\
+                     .expected_failures_refusals[7]). Nothing was reclaimed and nothing was \
+                     probed on its behalf",
                     candidate.name, candidate.run_id, candidate.incarnation
                 ),
             });

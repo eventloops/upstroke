@@ -920,9 +920,18 @@ impl ContainerRunner {
 /// Under the run's recorded private root, beside `<R>/containers`, so a census
 /// that reclaims an orphan container has the view path without a live
 /// [`Launched`] — which is exactly how [`super::reclaim`] takes it.
+///
+/// **One definition, and it is [`super::census::view_path`]'s.** This is the
+/// *producer* of the path and the census is the *consumer*; the six intent
+/// fields the packet fixes carry no view path, so the consumer has to derive it
+/// from the private root and the container name and the two derivations have to
+/// be the same derivation. They were two copies of one `join`, and changing
+/// only this one to `<R>/views-v2/<name>` passed the entire suite while
+/// silently orphaning every view a census would have pruned — R19 quietly
+/// ceasing to balance after a crash.
 #[must_use]
 pub fn view_dir(private_root: &Path, name: &ContainerName) -> PathBuf {
-    private_root.join("views").join(name.as_str())
+    super::census::view_path(private_root, name)
 }
 
 impl Runner for ContainerRunner {
@@ -1428,6 +1437,70 @@ mod tests {
     ///
     /// Second field held constant: the role (`Implement`) and the agent
     /// binding; what varies is which withheld path is offered.
+    /// The view path an invocation **mounts** is the view path a census
+    /// **prunes**, taken from the plan the runner actually builds.
+    ///
+    /// `<R>/views/<container-name>` is a convention with a producer in one lane
+    /// and a consumer in another, and the six intent fields the packet fixes
+    /// carry no view path — so the census has to *derive* it. An independent
+    /// review measured what two copies cost: changing only the producer to
+    /// `<R>/views-v2/<name>` passed the entire suite while silently orphaning
+    /// every view the census would have pruned, which is R19 quietly ceasing to
+    /// balance after a crash. There is now one definition; this is what fails
+    /// if a second one appears.
+    ///
+    /// The oracle is not either function: the expected value is the literal
+    /// `<R>` joined with `views` joined with the name, written here.
+    ///
+    /// Second field held constant: one run identity and one private root; the
+    /// only thing that moves is the invocation, and with it the container name.
+    #[test]
+    fn the_view_path_the_census_prunes_is_the_one_the_invocation_mounts() {
+        let fixture = Fixture::new("view-path-convention", true);
+        let runner = fixture.runner();
+        let mut seen = std::collections::BTreeSet::new();
+        for ordinal in 0..3 {
+            let request = worker_request(
+                ShellKind::Sh.spec("exit 0"),
+                fixture.task_a.clone(),
+                AgentId::new("claude-code"),
+                Duration::from_secs(10),
+                worker_id(ordinal),
+            );
+            let plan = runner.plan(&request).expect("plans");
+            let name = plan.launch.name.clone();
+
+            // The literal convention, written out rather than called.
+            let expected = fixture.private_root.join("views").join(name.as_str());
+            assert_eq!(
+                plan.launch.view.path, expected,
+                "the invocation mounts a view the census would not look for"
+            );
+            assert_eq!(
+                crate::runner::container::census::view_path(&fixture.private_root, &name),
+                expected,
+                "the census prunes a view the invocation would not have mounted"
+            );
+            // And the mount the container is actually given carries that path,
+            // so this is the path on the machine and not only in a field.
+            assert!(
+                plan.mounts().iter().any(|mount| matches!(
+                    mount,
+                    Mount::Path { source, .. } if source == &expected
+                )),
+                "{:?}",
+                plan.mounts()
+            );
+            seen.insert(expected);
+        }
+        assert_eq!(
+            seen.len(),
+            3,
+            "three invocations must give three view paths; a convention that ignored the \
+             container name would give one"
+        );
+    }
+
     #[test]
     fn the_mount_set_is_the_roles_own_and_reaches_nothing_of_the_coordinators() {
         let fixture = Fixture::new("mounts", true);
@@ -3046,7 +3119,7 @@ mod tests {
 
     impl Drop for LeaveNoResidue {
         fn drop(&mut self) {
-            let label = self.private_root.to_string_lossy().replace('\\', "/");
+            let label = crate::runner::container::intent::private_root_label(&self.private_root);
             let Ok(found) = self
                 .docker
                 .containers_with_label(LABEL_PRIVATE_ROOT, &label)
@@ -3176,7 +3249,7 @@ mod tests {
             docker
                 .containers_with_label(
                     LABEL_PRIVATE_ROOT,
-                    &identity.private_root.to_string_lossy().replace('\\', "/")
+                    &crate::runner::container::intent::private_root_label(&identity.private_root)
                 )
                 .expect("reachable")
                 .len(),
