@@ -598,10 +598,15 @@ The row was filed noting the evidence to specify a permit did not exist: *"a sin
 across five slices, which is not a distribution a fault row can be written against."* PR5's final day
 produced one. Recorded here so the PR11 implementer inherits numbers rather than an anecdote.
 
-**Three exhaustion events in one working day**, against a Max-20x plan on a 5-hour rolling window:
+**Three exhaustion events in one working day, all of them on the Anthropic side** — a Max-20x plan
+on a 5-hour rolling window. **The OpenAI provider (`codex`/`gpt-5.6-sol`) was never rate-limited or
+exhausted at any point in this slice**, across four review stages including two multi-megabyte
+`max`-effort runs. That asymmetry is the reason the free-lane split works: a `codex` stage costs
+nothing against the ceiling that actually binds. Do not read `429`/`RateLimited` strings in the
+`codex` logs as throttling — those are Tactus's own capacity source being reviewed.
 
-* A `max`-effort scoped review was **killed mid-flight** with no verdict written. It was read-only over a
-  static diff, so nothing was lost but the wall-clock — relaunching after the reset re-ran it from a
+* A `max`-effort scoped review (`claude-fable-5`) was **killed mid-flight** with no verdict written. It
+  held no write tools and read a static diff, so nothing was lost but the wall-clock — relaunching after the reset re-ran it from a
   clean start. **An implementation round in the same position loses its worker's context**, not its
   edits: the tree keeps the work and a hand-written resume contract recovers the rest.
 * `claude -p` **exits** on exhaustion. It does not sleep and retry. Three implementation lanes stopped
