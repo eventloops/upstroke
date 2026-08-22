@@ -720,6 +720,271 @@ mod tests {
         );
     }
 
+    /// The three boundaries a length-prefixed encoding of *these* fields can
+    /// still collapse, each pinned against bytes written by hand.
+    ///
+    /// PR4's fixtures cross well-formed records against each other, which
+    /// catches a field that stops being encoded. They do not reach the three
+    /// places where the container half of the record has an `Option` or a
+    /// variable-length sequence, and those are where an encoding collapses:
+    ///
+    /// 1. **`digest: None` vs `digest: Some("")`.** "The manifest digest **when
+    ///    reported**" — a runtime that reported nothing and one that reported an
+    ///    empty string are different records, and PR3's `difference()` reports
+    ///    `ImageDigest` between them, so the digest INV-23 compares must too.
+    ///    `crate::runner::container::resolve` never *produces* `Some("")` — it
+    ///    collapses the two at the inspection seam, deliberately and in one
+    ///    place — but a record can carry one from a hand-edited `owner.json` or
+    ///    a future runtime, and the fold compares whatever it is given.
+    /// 2. **An absent credential-volume map vs a present empty one.** PR4 pins
+    ///    this on a *host* record; a container record is where it actually
+    ///    occurs, because `completeness()` requires container volumes to be
+    ///    `Some` and an empty map is the real answer "no agent needs
+    ///    credentials".
+    /// 3. **Concatenation coincidences.** `{"a": "bc"}` and `{"ab": "c"}` flatten
+    ///    to the same key/value sequence, as do a reference/id pair split at a
+    ///    different point. A delimiter-only encoding maps each pair onto one
+    ///    digest.
+    ///
+    /// The expected bytes are written out from the module docs' field list, so
+    /// the oracle is the grammar and not `canonical_bytes`.
+    #[test]
+    fn the_container_fields_option_and_sequence_boundaries_are_injective() {
+        // -- 1. absent digest vs empty digest --------------------------------
+        let mut absent = container_fixture();
+        let mut empty = container_fixture();
+        absent.image.as_mut().expect("image").digest = None;
+        empty.image.as_mut().expect("image").digest = Some(String::new());
+        assert_ne!(absent, empty, "the two fixtures are the same value");
+        assert_eq!(
+            absent.difference(&empty),
+            Some(crate::topology::events::RunnerField::ImageDigest),
+            "PR3 does not distinguish them, so there is nothing for the digest to preserve"
+        );
+        // version, kind, contract, image-present, reference, id, digest-absent,
+        // volumes-present, 2, the two pairs.
+        // Written out with the file's own line-continuation idiom, which strips
+        // the newline *and* the leading indentation, so the literal is the
+        // bytes and nothing else.
+        const DIGEST_ABSENT: &[u8] = b"23:tactus.runner-policy.v1;9:container;12:container-v1;\
+                                       1:1;13:tactus/ci:3.2;8:sha256:a;1:0;1:1;1:2;\
+                                       11:claude-code;8:creds-cc;5:codex;8:creds-cx;";
+        // The same, with digest-present and a zero-length value.
+        const DIGEST_EMPTY: &[u8] = b"23:tactus.runner-policy.v1;9:container;12:container-v1;\
+                                      1:1;13:tactus/ci:3.2;8:sha256:a;1:1;0:;1:1;1:2;\
+                                      11:claude-code;8:creds-cc;5:codex;8:creds-cx;";
+        assert_eq!(
+            canonical_bytes(&absent),
+            DIGEST_ABSENT,
+            "an absent digest is not encoded as the field list describes"
+        );
+        assert_eq!(
+            canonical_bytes(&empty),
+            DIGEST_EMPTY,
+            "an empty digest is not encoded as the field list describes"
+        );
+        // The two literals differ, and by the one field: a copy-paste that made
+        // them equal would make both assertions above vacuous.
+        assert_ne!(DIGEST_ABSENT, DIGEST_EMPTY);
+        assert_ne!(runner_policy_sha256(&absent), runner_policy_sha256(&empty));
+
+        // -- 2. absent volume map vs empty one, on a container record ---------
+        let mut no_volumes = container_fixture();
+        let mut empty_volumes = container_fixture();
+        no_volumes.credential_volumes = None;
+        empty_volumes.credential_volumes = Some(BTreeMap::new());
+        assert_eq!(
+            no_volumes.completeness(),
+            Err(crate::topology::events::RunnerRecordDefect::ContainerWithoutCredentialVolumes),
+            "PR3 refuses the absent one, which is why the two must not encode alike"
+        );
+        empty_volumes
+            .completeness()
+            .expect("an empty set is a real answer");
+        assert_ne!(
+            canonical_bytes(&no_volumes),
+            canonical_bytes(&empty_volumes)
+        );
+        assert_ne!(
+            runner_policy_sha256(&no_volumes),
+            runner_policy_sha256(&empty_volumes)
+        );
+
+        // -- 3. concatenation coincidences ------------------------------------
+        // Every pair below flattens to the same character sequence and differs
+        // only in where the boundaries fall. The counts are asserted rather
+        // than described.
+        let volume_pair = |key: &str, value: &str| {
+            let mut volumes = BTreeMap::new();
+            volumes.insert(key.to_owned(), value.to_owned());
+            RunnerPolicy {
+                credential_volumes: Some(volumes),
+                ..container_fixture()
+            }
+        };
+        let image_pair = |reference: &str, id: &str| RunnerPolicy {
+            image: Some(ImageIdentity {
+                reference: reference.to_owned(),
+                id: id.to_owned(),
+                digest: None,
+            }),
+            ..container_fixture()
+        };
+        let mut two_entries = BTreeMap::new();
+        two_entries.insert("a".to_owned(), "b".to_owned());
+        two_entries.insert("c".to_owned(), "d".to_owned());
+        let mut one_entry = BTreeMap::new();
+        one_entry.insert("ab".to_owned(), "cd".to_owned());
+
+        let colliding: Vec<(&str, RunnerPolicy, RunnerPolicy)> = vec![
+            (
+                "volume key/value boundary",
+                volume_pair("a", "bc"),
+                volume_pair("ab", "c"),
+            ),
+            (
+                "image reference/id boundary",
+                image_pair("ab", "c"),
+                image_pair("a", "bc"),
+            ),
+            (
+                "entry count",
+                RunnerPolicy {
+                    credential_volumes: Some(two_entries),
+                    ..container_fixture()
+                },
+                RunnerPolicy {
+                    credential_volumes: Some(one_entry),
+                    ..container_fixture()
+                },
+            ),
+        ];
+        for (name, left, right) in &colliding {
+            let flatten = |policy: &RunnerPolicy| {
+                let image = policy.image.as_ref().expect("image");
+                let volumes = policy
+                    .credential_volumes
+                    .as_ref()
+                    .expect("volumes")
+                    .iter()
+                    .map(|(key, value)| format!("{key}{value}"))
+                    .collect::<String>();
+                format!("{}{}{volumes}", image.reference, image.id)
+            };
+            assert_eq!(
+                flatten(left),
+                flatten(right),
+                "{name}: the pair does not actually collide under concatenation, so it is not \
+                 the fixture this test claims"
+            );
+            assert_ne!(
+                canonical_bytes(left),
+                canonical_bytes(right),
+                "{name}: two records forged one field boundary between them"
+            );
+            assert_ne!(
+                runner_policy_sha256(left),
+                runner_policy_sha256(right),
+                "{name}: two execution identities share one runner_policy_sha256"
+            );
+        }
+        assert_eq!(colliding.len(), 3, "three boundaries, each crossed");
+    }
+
+    /// `HostWithContainerFields` is the only defect covering the host/container
+    /// field split, and it covers **one** direction.
+    ///
+    /// The reconciliation obligation asks what PR3's `completeness()` does and
+    /// does not cover before anything is added to it. Executed rather than
+    /// asserted: the grid drives every combination of `image` and
+    /// `credential_volumes` presence against both kinds and records which
+    /// defect comes back.
+    ///
+    /// What it covers: a **host** record carrying either container field. What
+    /// it does not, and what this slice therefore holds elsewhere: an image
+    /// record whose *digest* is `Some("")` (allowed, because "when reported"
+    /// makes an absent digest legitimate and there is no shape that
+    /// distinguishes a bad one), and a container record whose credential map
+    /// is empty (allowed, because "an empty map is a real answer"). Both are
+    /// then *encoding* obligations rather than *shape* ones, which is why
+    /// `the_container_fields_option_and_sequence_boundaries_are_injective`
+    /// exists.
+    #[test]
+    fn completeness_covers_one_direction_of_the_host_container_field_split() {
+        use crate::topology::events::RunnerRecordDefect;
+
+        let image = || {
+            Some(ImageIdentity {
+                reference: "tactus/ci:3.2".to_owned(),
+                id: "sha256:a".to_owned(),
+                digest: None,
+            })
+        };
+        let mut outcomes = std::collections::BTreeMap::new();
+        for (kind, contract) in [
+            (RunnerKind::Host, RunnerContract::HostV1),
+            (RunnerKind::Container, RunnerContract::ContainerV1),
+        ] {
+            for has_image in [false, true] {
+                for has_volumes in [false, true] {
+                    let policy = RunnerPolicy {
+                        kind,
+                        policy: contract,
+                        image: has_image.then(image).flatten(),
+                        credential_volumes: has_volumes.then(BTreeMap::new),
+                    };
+                    outcomes.insert(
+                        format!("{kind:?}/image={has_image}/volumes={has_volumes}"),
+                        policy.completeness().err(),
+                    );
+                }
+            }
+        }
+        assert_eq!(outcomes.len(), 8, "eight cells");
+        // The host direction: any container field at all is refused, and by the
+        // one defect.
+        for has_image in [false, true] {
+            for has_volumes in [false, true] {
+                let expected = (has_image || has_volumes)
+                    .then_some(RunnerRecordDefect::HostWithContainerFields);
+                assert_eq!(
+                    outcomes[&format!("Host/image={has_image}/volumes={has_volumes}")],
+                    expected,
+                    "the host direction of the split moved"
+                );
+            }
+        }
+        // The container direction is not the mirror image: a missing field is
+        // named by its own defect, and a *present but empty* one is accepted.
+        assert_eq!(
+            outcomes["Container/image=false/volumes=false"],
+            Some(RunnerRecordDefect::ContainerWithoutImage)
+        );
+        assert_eq!(
+            outcomes["Container/image=false/volumes=true"],
+            Some(RunnerRecordDefect::ContainerWithoutImage)
+        );
+        assert_eq!(
+            outcomes["Container/image=true/volumes=false"],
+            Some(RunnerRecordDefect::ContainerWithoutCredentialVolumes)
+        );
+        assert_eq!(
+            outcomes["Container/image=true/volumes=true"], None,
+            "an empty credential-volume map is a complete container record"
+        );
+        // And the digest is not a completeness question at all, in either
+        // state — which is what makes it an encoding one.
+        for digest in [None, Some(String::new()), Some("sha256:b".to_owned())] {
+            let mut policy = container_fixture();
+            policy.image.as_mut().expect("image").digest = digest.clone();
+            assert_eq!(
+                policy.completeness(),
+                Ok(()),
+                "a container record with digest {digest:?} is refused by shape"
+            );
+        }
+    }
+
     /// A length-prefixed encoding is injective; a delimiter-only one is not.
     #[test]
     fn field_values_carrying_the_delimiters_do_not_collide() {

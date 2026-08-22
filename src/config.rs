@@ -24,6 +24,7 @@ use crate::error::TactusError;
 use crate::gates::ShellKind;
 use crate::interaction::InteractionMode;
 use crate::ir::{Effort, ResolvedEffortPolicy, TaskKind, Tier};
+use crate::topology::events::RunnerKind;
 use crate::util;
 
 #[derive(Debug, Default, Deserialize)]
@@ -37,6 +38,36 @@ struct RawRepoConfig {
     engine: Option<toml::Value>,
     interaction: Option<toml::Value>,
     budgets: Option<toml::Value>,
+    runner: Option<toml::Value>,
+}
+
+/// `[runner]` (DESIGN.md:612): "a runner is orthogonal to an adapter: `[runner]`
+/// config selects `host` or `container` (image, mounts)".
+///
+/// Read as a raw value like the sections above it, so a shape mistake reports as
+/// a named problem rather than a serde error about a struct nobody wrote.
+#[derive(Debug, Deserialize)]
+struct RawRunner {
+    kind: Option<String>,
+    /// The image **reference** an operator wrote. Never what a container is
+    /// created from — INV-23 pins the runtime's immutable id for that.
+    image: Option<String>,
+    /// Per-agent credential volume names (R20, operator-owned).
+    credential_volumes: Option<BTreeMap<String, String>>,
+    /// Extra mounts the boundary receives beyond the ones the runner composes.
+    mounts: Option<Vec<RawRunnerMount>>,
+    /// Everything else. Unlike `[engine]`, an unknown key here is an **error**;
+    /// see [`read_runner`].
+    #[serde(flatten)]
+    unknown: BTreeMap<String, toml::Value>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawRunnerMount {
+    source: PathBuf,
+    target: String,
+    read_only: Option<bool>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -395,6 +426,74 @@ impl EngineLimits {
     }
 }
 
+/// One extra mount an operator asked the boundary to receive.
+///
+/// DESIGN.md:612 names `image, mounts` as `[runner]`'s two configurable halves.
+/// The runner composes the role's own worktree mount, the read-only reviewer
+/// mount and the per-agent credential volume itself; this is the operator's
+/// addition to that set — a toolchain cache, a shared model directory.
+///
+/// **`read_only` defaults to `true`.** A mount the operator did not describe is
+/// the one whose blast radius they did not think about, and DESIGN.md:398 is
+/// explicit that "the v0.2 execution root is deliberately non-authoritative":
+/// a writable host path handed to gate-executed repository code is the class
+/// the container runner exists to bound. Writable is a thing you say.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RunnerMount {
+    pub source: PathBuf,
+    /// Where the boundary sees it. A container-side absolute path, so it is a
+    /// `String` and not a `PathBuf`: it is never resolved on this machine.
+    pub target: String,
+    pub read_only: bool,
+}
+
+/// What `[runner]` selects, before anything has inspected a runtime.
+///
+/// **Not** a [`RunnerPolicy`]: that record carries the runtime's immutable image
+/// id and its manifest digest, which only inspection can establish. This is the
+/// operator's *request* — the input `crate::runner::container::resolve` turns
+/// into a record, and the value INV-23's rebuild path compares against a
+/// recorded one ("today's `[runner]` config that differs warns naming the
+/// difference and is ignored").
+///
+/// [`RunnerPolicy`]: crate::topology::events::RunnerPolicy
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RunnerSelection {
+    /// PR3's wire kind, and deliberately not a second enum: the config and the
+    /// record have to be comparable, and two spellings of one choice are two
+    /// things that drift.
+    pub kind: RunnerKind,
+    /// The image reference, for a container selection.
+    pub image: Option<String>,
+    /// Per-agent credential volume names (R20).
+    pub credential_volumes: BTreeMap<String, String>,
+    /// Extra mounts, parsed and carried. Nothing in this slice acts on them —
+    /// `production_effect` is "none" — and, more durably, they are **not part of
+    /// the recorded execution identity**: INV-23's `RunnerPolicy` has four
+    /// fields and none of them is a mount list.
+    pub mounts: Vec<RunnerMount>,
+    /// Whether a `[runner]` section was present at all.
+    ///
+    /// Load-bearing for the rebuild path: an **absent** section is not "a config
+    /// that differs", so a resume with no `[runner]` in the file must not warn
+    /// that its runner kind moved.
+    pub from_config: bool,
+}
+
+impl RunnerSelection {
+    /// What an absent `[runner]` section means: the host runner, nothing else.
+    #[must_use]
+    pub fn host_default() -> Self {
+        Self {
+            kind: RunnerKind::Host,
+            image: None,
+            credential_volumes: BTreeMap::new(),
+            mounts: Vec::new(),
+            from_config: false,
+        }
+    }
+}
+
 #[derive(Debug)]
 pub struct Config {
     pub chains: BTreeMap<TaskKind, KindChain>,
@@ -455,6 +554,10 @@ pub struct Config {
     /// event before ending parked. `ZERO` disables the wait, which is what a
     /// terminal-attached run and CI both want.
     pub wait_on_block: Duration,
+    /// `[runner]` (DESIGN.md:612). Always the host selection in this build:
+    /// `kind = "container"` is refused for every schema-1..3 fresh run and
+    /// resume before any effect — see [`refuse_legacy_container_selection`].
+    pub runner: RunnerSelection,
 }
 
 /// Everything `[engine]` contributes, kept together so adding a knob does not
@@ -900,6 +1003,7 @@ pub fn load_captured_with(
     }
 
     let gates = parse_gates(raw.gates, &repo_path)?;
+    let runner = parse_runner(raw.runner, &repo_path, limits)?;
     let engine = parse_engine(raw.engine, &repo_path, limits, warnings)?;
     let interaction = parse_interaction(raw.interaction, &repo_path)?;
     let budgets = parse_budgets(raw.budgets, &repo_path)?;
@@ -929,6 +1033,216 @@ pub fn load_captured_with(
         interaction_mode: interaction.mode,
         notify: interaction.notify,
         wait_on_block: interaction.wait_on_block,
+        runner,
+    })
+}
+
+/// Every accepted `[runner]` key, written out.
+///
+/// The error messages name this rather than a serde-derived list, so a key that
+/// stops being read is a key that stops being offered.
+const RUNNER_KEYS: &str = "`kind`, `image`, `credential_volumes`, `mounts`";
+
+/// Parse `[runner]`, then refuse a container selection this engine may not make.
+///
+/// Two steps and not one, deliberately. [`read_runner`] is the whole of the
+/// parse and accepts `kind = "container"`; [`refuse_legacy_container_selection`]
+/// is the refusal `slice_contract.expected_failures_refusals[0]` names. Keeping
+/// them apart means the refusal is an independently droppable predicate — a
+/// mutation that deletes it does not also delete the ability to describe a
+/// container runner — and it means the resolution path can be given a parsed
+/// container selection without going through a door this engine keeps locked.
+fn parse_runner(
+    raw: Option<toml::Value>,
+    repo_path: &Path,
+    limits: EngineLimits,
+) -> Result<RunnerSelection, TactusError> {
+    let selection = read_runner(raw, repo_path)?;
+    refuse_legacy_container_selection(&selection, repo_path, limits)?;
+    Ok(selection)
+}
+
+/// `[runner]` as written, with no policy applied.
+fn read_runner(raw: Option<toml::Value>, repo_path: &Path) -> Result<RunnerSelection, TactusError> {
+    let config_error = |message: String| TactusError::Config {
+        path: repo_path.to_path_buf(),
+        message,
+    };
+    let Some(value) = raw else {
+        return Ok(RunnerSelection::host_default());
+    };
+    let runner: RawRunner = value.try_into().map_err(|e| {
+        config_error(format!(
+            "[runner]: {e} (expected a table with optional {RUNNER_KEYS}, where `kind` is \
+             `host` or `container`, `image` is an image reference, `credential_volumes` maps \
+             an agent id to a volume name, and `mounts` is a list of \
+             `{{ source, target, read_only }}` tables)"
+        ))
+    })?;
+    // An error, where `[engine]` warns. `[engine]`'s unknown keys are ceilings
+    // and timeouts: a typo leaves a default in place and the run does slightly
+    // less than asked. A typo here — `knid = "container"`, `iamge = "..."` —
+    // leaves the run executing on the **host** while the operator believes gate
+    // code is confined, which is the one thing this section exists to decide.
+    // Same rule as `[interaction] ask_before` and `[budgets]`, for the same
+    // reason: silently ignoring a key is silently deleting a control.
+    if let Some(key) = runner.unknown.keys().next() {
+        return Err(config_error(format!(
+            "unknown key `{key}` in [runner] (accepted: {RUNNER_KEYS})"
+        )));
+    }
+    let kind = match runner.kind.as_deref() {
+        None => RunnerKind::Host,
+        Some("host") => RunnerKind::Host,
+        Some("container") => RunnerKind::Container,
+        Some(other) => {
+            return Err(config_error(format!(
+                "[runner] `kind = \"{other}\"` is not recognized (expected `host` or `container`)"
+            )));
+        }
+    };
+    if kind == RunnerKind::Host {
+        // The config-side twin of `RunnerRecordDefect::HostWithContainerFields`,
+        // which PR3 already refuses on the recorded side. An operator who set
+        // `kind = "host"` under an image line has described two boundaries and
+        // gets one; accepting it silently is how a run executes unconfined
+        // while its config reads as if it did not.
+        let stray: Vec<&str> = [
+            ("image", runner.image.is_some()),
+            ("credential_volumes", runner.credential_volumes.is_some()),
+            ("mounts", runner.mounts.is_some()),
+        ]
+        .into_iter()
+        .filter_map(|(key, present)| present.then_some(key))
+        .collect();
+        if !stray.is_empty() {
+            return Err(config_error(format!(
+                "[runner] `kind = \"host\"` with `{}`: the host runner has no image, no \
+                 credential volumes and no mounts to give — remove the keys, or set \
+                 `kind = \"container\"` to use them",
+                stray.join("`, `")
+            )));
+        }
+    }
+    let image = match runner.image {
+        Some(image) if image.trim().is_empty() => {
+            return Err(config_error(
+                "[runner] `image` is empty; give the image reference the runtime already holds \
+                 (nothing is pulled), or remove the key"
+                    .to_owned(),
+            ));
+        }
+        other => other,
+    };
+    if kind == RunnerKind::Container && image.is_none() {
+        return Err(config_error(
+            "[runner] `kind = \"container\"` without `image`: nothing names what would execute \
+             (INV-23 records the image reference, the runtime's immutable id, and its manifest \
+             digest when reported)"
+                .to_owned(),
+        ));
+    }
+    let credential_volumes = runner.credential_volumes.unwrap_or_default();
+    for (agent, volume) in &credential_volumes {
+        if agent.trim().is_empty() || volume.trim().is_empty() {
+            return Err(config_error(format!(
+                "[runner] credential_volumes entry `{agent}` = `{volume}`: both the agent id \
+                 and the volume name must be non-empty"
+            )));
+        }
+    }
+    let mut mounts = Vec::new();
+    for mount in runner.mounts.unwrap_or_default() {
+        if mount.target.trim().is_empty() {
+            return Err(config_error(
+                "[runner] a mount has an empty `target`; give the path the boundary sees it at"
+                    .to_owned(),
+            ));
+        }
+        if mount.source.as_os_str().is_empty() {
+            return Err(config_error(format!(
+                "[runner] the mount at `{}` has an empty `source`",
+                mount.target
+            )));
+        }
+        mounts.push(RunnerMount {
+            source: mount.source,
+            target: mount.target,
+            // Writable is a thing you say. See `RunnerMount`.
+            read_only: mount.read_only.unwrap_or(true),
+        });
+    }
+    Ok(RunnerSelection {
+        kind,
+        image,
+        credential_volumes,
+        mounts,
+        from_config: true,
+    })
+}
+
+/// `expected_failures_refusals[0]`: "`[runner] kind = container` under a
+/// schema-1..3 fresh run **or** resume -> config error before any effect".
+///
+/// ## Why this is structural and not stylistic
+///
+/// `production_effect`: "the legacy engine's preflight probes precede any run
+/// identity or lock and can own no container intent". R26's own rule is that
+/// "no container ever lacks a race-free owner or a durable boundary identity",
+/// and the schema-1..3 engine has nothing to give one: it probes before it has a
+/// run id, a `run.lock` or a recorded runner. So refusing **late** — after a
+/// probe, after a lock, after any effect — is not a weaker version of this
+/// refusal, it is a different and broken one: the container it would refuse
+/// already exists and belongs to nobody.
+///
+/// ## Where "before any effect" is bought
+///
+/// Here, by position. Both write commands run
+/// `preflight::validate_inputs` — which is `config::load_captured` — as their
+/// first statement, before `Workspace::open`, before `WorktreeLock::acquire_in`
+/// and before `RunPaths::create`: `coordinator.rs`'s comment on that line is
+/// "every read-only refusal precedes every lock", and `resume.rs` marks the
+/// line after it "the first effect of the command".
+/// `runner::container::resolve::tests::legacy_container_selection_refused_before_effects`
+/// drives both commands and asserts the tree afterwards.
+///
+/// ## Both readings refuse, and that is the whole of today's answer
+///
+/// [`EngineLimits`] distinguishes a run being created from a sequential run's
+/// resume, and `expected_failures_refusals[0]` names **both**. There is no
+/// third reading in this build: `EngineLimits::Fresh` means "a run being
+/// created now", and every run this binary creates is schema-3.
+/// `PR12 config acceptance for fresh schema-4 runs only` (INV-23's
+/// `enforced_by`) is where a fresh schema-4 run learns to accept it, and that is
+/// a new reading rather than a relaxation of this one.
+///
+/// # Errors
+///
+/// [`TactusError::Config`] when `selection` is a container selection.
+fn refuse_legacy_container_selection(
+    selection: &RunnerSelection,
+    repo_path: &Path,
+    limits: EngineLimits,
+) -> Result<(), TactusError> {
+    if selection.kind != RunnerKind::Container {
+        return Ok(());
+    }
+    let reading = match limits {
+        EngineLimits::Fresh => "this run is being created by the schema-1..3 engine",
+        EngineLimits::SequentialResume => {
+            "this run was recorded by the schema-1..3 engine and keeps the boundary it started \
+             with"
+        }
+    };
+    Err(TactusError::Config {
+        path: repo_path.to_path_buf(),
+        message: format!(
+            "[runner] `kind = \"container\"` is refused: {reading}, and that engine's pre-flight \
+             probes run before any run identity or lock exists, so a container it started could \
+             have no owner run, no `run.lock` and no recorded runner identity — which is exactly \
+             what makes an orphaned container unreclaimable. Set `kind = \"host\"` or remove the \
+             key; the container runner is selectable only by schema-4 runs."
+        ),
     })
 }
 
@@ -2981,5 +3295,299 @@ agent = \"copilot\"
         let err = load(None, &hermetic(), Some(&path), &mut warnings)
             .expect_err("a blank pool name must error");
         assert!(err.to_string().contains("non-empty name"), "got: {err}");
+    }
+
+    // -----------------------------------------------------------------------
+    // `[runner]` (DESIGN.md:612)
+    // -----------------------------------------------------------------------
+
+    /// An absent `[runner]` section is the host runner, and says it was not
+    /// configured.
+    ///
+    /// `from_config` is not decoration: INV-23's rebuild path warns when
+    /// "today's `[runner]` config differs", and a repository that never wrote
+    /// one has no config to differ. The two halves are asserted separately
+    /// because a default that set `from_config: true` would be invisible in the
+    /// `kind` alone.
+    #[test]
+    fn an_absent_runner_section_is_the_unconfigured_host_runner() {
+        let mut warnings = Vec::new();
+        let cfg = load(None, &hermetic(), Some(&missing()), &mut warnings).expect("defaults");
+        assert_eq!(cfg.runner.kind, RunnerKind::Host);
+        assert_eq!(cfg.runner.image, None);
+        assert!(cfg.runner.credential_volumes.is_empty());
+        assert!(cfg.runner.mounts.is_empty());
+        assert!(
+            !cfg.runner.from_config,
+            "an absent section reported itself as configured"
+        );
+        assert!(warnings.is_empty(), "{warnings:?}");
+    }
+
+    /// The section parses every key DESIGN.md:612 names, and a mount is
+    /// read-only unless the operator said otherwise.
+    ///
+    /// `read_runner` rather than `load`, because `parse_runner` refuses a
+    /// container selection outright in this build and the parse is what is under
+    /// test here. The two are separate functions for exactly this reason.
+    ///
+    /// Second field held constant: the `kind`, which is `container` in every
+    /// assertion, so what varies is only which key is being read.
+    #[test]
+    fn the_runner_section_parses_kind_image_volumes_and_mounts() {
+        let raw: toml::Value = toml::from_str(
+            r#"
+kind = "container"
+image = "tactus/ci:3.2"
+credential_volumes = { claude-code = "creds-cc", codex = "creds-cx" }
+mounts = [
+  { source = "/opt/toolchain", target = "/opt/toolchain" },
+  { source = "/var/cache/models", target = "/models", read_only = false },
+]
+"#,
+        )
+        .expect("fixture parses as toml");
+        let selection = read_runner(Some(raw), Path::new("tactus.toml")).expect("parses");
+
+        assert_eq!(selection.kind, RunnerKind::Container);
+        assert_eq!(selection.image.as_deref(), Some("tactus/ci:3.2"));
+        assert_eq!(
+            selection.credential_volumes,
+            [
+                ("claude-code".to_owned(), "creds-cc".to_owned()),
+                ("codex".to_owned(), "creds-cx".to_owned()),
+            ]
+            .into_iter()
+            .collect::<BTreeMap<_, _>>()
+        );
+        assert_eq!(
+            selection.mounts,
+            vec![
+                RunnerMount {
+                    source: PathBuf::from("/opt/toolchain"),
+                    target: "/opt/toolchain".to_owned(),
+                    // Writable is a thing you say.
+                    read_only: true,
+                },
+                RunnerMount {
+                    source: PathBuf::from("/var/cache/models"),
+                    target: "/models".to_owned(),
+                    read_only: false,
+                },
+            ]
+        );
+        assert!(selection.from_config);
+        // The two mounts differ in `read_only` and only one of them said so, so
+        // the default is doing the work rather than the fixture.
+        assert_eq!(
+            selection
+                .mounts
+                .iter()
+                .map(|mount| mount.read_only)
+                .collect::<Vec<_>>(),
+            vec![true, false]
+        );
+    }
+
+    /// Every shape `[runner]` refuses, each with the reason, and each named.
+    ///
+    /// An unknown key is an **error** here where `[engine]` warns, and the grid
+    /// says so out loud: a mistyped key in `[engine]` leaves a ceiling at its
+    /// default, while `knid = "container"` leaves the run executing on the host
+    /// while its config reads as though gate code were confined.
+    ///
+    /// Second field held constant: every cell is a `[runner]` section and
+    /// nothing else, so no cell can fail for another section's reason.
+    #[test]
+    fn the_runner_section_refuses_every_shape_it_cannot_act_on() {
+        let cases: &[(&str, &str, &str)] = &[
+            (
+                "unknown key",
+                "knid = \"container\"\n",
+                "unknown key `knid` in [runner]",
+            ),
+            (
+                "unknown kind",
+                "kind = \"vm\"\n",
+                "[runner] `kind = \"vm\"` is not recognized",
+            ),
+            (
+                "host with an image",
+                "kind = \"host\"\nimage = \"tactus/ci:3.2\"\n",
+                "[runner] `kind = \"host\"` with `image`",
+            ),
+            (
+                "host with volumes and mounts",
+                "credential_volumes = { claude-code = \"c\" }\nmounts = []\n",
+                "with `credential_volumes`, `mounts`",
+            ),
+            (
+                "container without an image",
+                "kind = \"container\"\n",
+                "[runner] `kind = \"container\"` without `image`",
+            ),
+            (
+                "empty image",
+                "kind = \"container\"\nimage = \"  \"\n",
+                "[runner] `image` is empty",
+            ),
+            (
+                "empty volume name",
+                "kind = \"container\"\nimage = \"i\"\ncredential_volumes = { claude-code = \"\" }\n",
+                "both the agent id and the volume name must be non-empty",
+            ),
+            (
+                "empty mount target",
+                "kind = \"container\"\nimage = \"i\"\nmounts = [{ source = \"/a\", target = \"\" }]\n",
+                "a mount has an empty `target`",
+            ),
+            (
+                "empty mount source",
+                "kind = \"container\"\nimage = \"i\"\nmounts = [{ source = \"\", target = \"/b\" }]\n",
+                "the mount at `/b` has an empty `source`",
+            ),
+            (
+                "unknown mount key",
+                "kind = \"container\"\nimage = \"i\"\nmounts = [{ source = \"/a\", target = \"/b\", ro = true }]\n",
+                "[runner]:",
+            ),
+            (
+                "not a table",
+                "",
+                // A `[runner]` that is a scalar cannot be written as a section
+                // header, so this cell is driven directly below.
+                "[runner]:",
+            ),
+        ];
+
+        let mut refused = 0;
+        for (label, body, needle) in cases {
+            let raw: toml::Value = if *label == "not a table" {
+                toml::Value::String("container".to_owned())
+            } else {
+                toml::from_str(body).expect("fixture parses as toml")
+            };
+            let error = read_runner(Some(raw), Path::new("tactus.toml"))
+                .expect_err("this shape is refused");
+            let TactusError::Config { message, .. } = &error else {
+                panic!("`{label}`: refused as {error:?}, not as a config error");
+            };
+            assert!(
+                message.contains(needle),
+                "`{label}`: the message does not name the problem: {message}"
+            );
+            refused += 1;
+        }
+        assert_eq!(refused, cases.len(), "every shape was driven");
+
+        // The control: the shape these are all variations on is accepted, so
+        // the refusals above are about what each cell changed.
+        let ok: toml::Value =
+            toml::from_str("kind = \"container\"\nimage = \"tactus/ci:3.2\"\n").expect("toml");
+        read_runner(Some(ok), Path::new("tactus.toml")).expect("the base shape is accepted");
+    }
+
+    /// The `[runner]` a `tactus.toml` writes is the value resolution consumes,
+    /// end to end.
+    ///
+    /// PR12's activation is one call — `refuse_legacy_container_selection` in
+    /// [`parse_runner`] — and everything on either side of it already works.
+    /// This drives the whole chain that will be live then, from TOML bytes to a
+    /// `RunnerPolicy` that PR3's `completeness()` accepts, so the two halves are
+    /// known to fit rather than assumed to.
+    ///
+    /// Second field held constant: the runtime, which holds exactly what the
+    /// TOML names, so every assertion is about the value that crossed the seam.
+    #[test]
+    fn a_container_section_parses_into_the_selection_resolution_consumes() {
+        use crate::runner::container::FakeRuntime;
+        use crate::runner::container::resolve::resolve_container;
+        use crate::runner::container::runtime::ContainerTrace;
+
+        let raw: toml::Value = toml::from_str(
+            r#"
+kind = "container"
+image = "tactus/ci:3.2"
+credential_volumes = { claude-code = "creds-cc" }
+"#,
+        )
+        .expect("toml");
+        let selection = read_runner(Some(raw), Path::new("tactus.toml")).expect("parses");
+
+        let runtime = FakeRuntime::new(ContainerTrace::off());
+        runtime.add_image("sha256:abc", Some("sha256:def"));
+        runtime.tag("tactus/ci:3.2", "sha256:abc");
+        runtime.add_volume("creds-cc");
+
+        let policy = resolve_container(&runtime, &selection).expect("resolves");
+        let image = policy.image.as_ref().expect("image");
+        assert_eq!(image.reference, "tactus/ci:3.2", "from the TOML");
+        assert_eq!(image.id, "sha256:abc", "from the runtime");
+        assert_eq!(image.digest.as_deref(), Some("sha256:def"));
+        assert_eq!(
+            policy.credential_volumes.as_ref().expect("volumes")["claude-code"],
+            "creds-cc",
+            "from the TOML"
+        );
+        policy.completeness().expect("a complete record");
+
+        // The control: the same TOML against a runtime that holds nothing is
+        // refused, so the success above is about what the runtime had.
+        let empty = FakeRuntime::new(ContainerTrace::off());
+        resolve_container(&empty, &selection)
+            .expect_err("a runtime holding nothing cannot resolve it");
+    }
+
+    /// A container selection is refused under both readings; a host one is not.
+    ///
+    /// The unit-level twin of
+    /// `runner::container::resolve::tests::legacy_container_selection_refused_before_effects`,
+    /// which drives the same refusal through both write commands. This one
+    /// pins that the refusal is a property of `refuse_legacy_container_selection`
+    /// alone, so deleting it from `parse_runner` is a distinct, separately
+    /// witnessed kill.
+    #[test]
+    fn the_legacy_refusal_is_about_the_kind_and_about_nothing_else() {
+        for limits in [EngineLimits::Fresh, EngineLimits::SequentialResume] {
+            let container = RunnerSelection {
+                kind: RunnerKind::Container,
+                image: Some("tactus/ci:3.2".to_owned()),
+                credential_volumes: BTreeMap::new(),
+                mounts: Vec::new(),
+                from_config: true,
+            };
+            let host = RunnerSelection {
+                kind: RunnerKind::Host,
+                ..container.clone()
+            };
+            // The two selections differ in the kind and in nothing else.
+            assert_eq!(
+                RunnerSelection {
+                    kind: container.kind,
+                    ..host.clone()
+                },
+                container
+            );
+
+            let error =
+                refuse_legacy_container_selection(&container, Path::new("tactus.toml"), limits)
+                    .expect_err("a container selection is refused");
+            let TactusError::Config { message, .. } = &error else {
+                panic!("{limits:?}: refused as {error:?}");
+            };
+            assert!(
+                message.contains("[runner] `kind = \"container\"` is refused"),
+                "{limits:?}: {message}"
+            );
+            // The message says which reading it is, so an operator can tell a
+            // refused fresh run from a refused resume.
+            let expected = match limits {
+                EngineLimits::Fresh => "is being created by the schema-1..3 engine",
+                EngineLimits::SequentialResume => "keeps the boundary it started with",
+            };
+            assert!(message.contains(expected), "{limits:?}: {message}");
+            refuse_legacy_container_selection(&host, Path::new("tactus.toml"), limits)
+                .expect("a host selection is not refused");
+        }
     }
 }
