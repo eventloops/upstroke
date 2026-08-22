@@ -765,3 +765,100 @@ the window: how much has been spent in the last five hours, by whom, at what eff
 Two practical consequences already paid for on PR5: pacing matters more than total (four concurrent
 `max` reviewers exhaust a window that the same four run sequentially would not), and a worker killed by
 the window is not short of budget — it is early, and the same work succeeds unchanged after the reset.
+
+## 16. PR6 — what nine reviews and a withheld catalogue found
+
+The container Runner slice ran four per-lane reviews and five whole-slice lenses, and measured a
+**193-entry mutation catalogue** authored from the frozen packet alone before any container code existed
+and withheld from every implementer. **136 of the 138 applicable entries were killed (98.6%)**; both
+survivors were repaired. Nine reviews produced **71 findings**, every one carrying a mutation the
+reviewer applied and measured.
+
+This section records what generalises. The per-finding detail is in the slice's own reports.
+
+### The one that mattered most, and why the suite could not see it
+
+`expected_failures_refusals[5]` is *"gate write outside mount fails"*, and DESIGN.md:610 calls confining
+gate-executed repository code the first thing a container uniquely buys. **A Gate could write outside
+every declared mount**: Docker received the role bind mounts but no read-only root filesystem, so
+`sh -c 'printf owned >/outside-role-mount'` exited **0** into the writable container layer.
+
+The test *"explicitly permits container-layer writes and checks only host bytes."* It proves **"the host
+is unharmed"** — which is true, and which the orchestrator quoted approvingly as kernel-level evidence.
+
+> **A test can prove a true, weaker statement indefinitely while the stated guarantee is false.**
+
+When replacing an assertion, check that the new one is *the contract's claim* and not a neighbouring true
+one. Repaired by `--read-only`, with the assertion now on the write failing.
+
+### The witnessing rule this slice had to learn
+
+Lane F witnessed **16** mutations — more rigour than any lane on this project — and an independent
+review refuted **three** of the claims they supported. Each mutation deleted the **mechanism together
+with its observable**:
+
+| mutation as written | what it proved | minimal mutation | result |
+|---|---|---|---|
+| delete `fsync_file` **and** its `Synced` trace record | the **record** is asserted | delete the fsync, keep the record | whole suite passes |
+| `expect_site` always `Ok` | **`write_intent`'s** guard is asserted | delete only `start_container`'s | passes |
+| run reclaim twice | **idempotence** | two reclaimers actually racing | not constructible in any fixture built |
+
+> **Delete the mechanism and leave every observable in place.** If the suite still passes, the test is
+> asserting the observable rather than the mechanism — the self-oracle shape wearing a witness's clothes.
+
+This is the rule after *"a fixture that lands green having never been seen red is not coverage"*, and it
+is now in the slice's `repair-common.md`.
+
+### `PR5-R1-CFG-TEST-SHRINKS-THE-DOMAIN`, three times in one slice
+
+`effects::production_region` cuts a source at its **first** `#[cfg(test)]`. In PR6 it defeated, in order:
+
+1. **lane A's R20 census**, which concatenated the container sources and called `production_region` once,
+   so the first test boundary truncated every module appended after it — while its positive control still
+   fired, *on the truncated domain*;
+2. **the orchestrator's own witness** of a guard repair, where a duplicate literal planted *below* a
+   `#[cfg(test)]` was correctly not seen, and the conclusion "the guard did not fire" was one step from
+   weakening a good guard;
+3. **`PR6-ACCT-002`**, reporting the same census *still* scanning only the first file.
+
+Lane F had warned lanes A and C about this by name in its own report. It recurred anyway.
+
+> **A positive control proves a census can see something. It does not prove the census sees the domain it
+> names.**
+
+### One defect arrives wearing several names
+
+Five lenses named one defect three times — `PR6-CORRECTNESS-004` = `PR6-RECOV-001`; `PR6-CONV-001` =
+`PR6-CORRECTNESS-009`; `PR6-ENUM-004` = `PR6-CORRECTNESS-003`. The orchestrator partitioned repairs by
+**finding id**, verified the partition was disjoint (it was), and sent **one defect to two lanes**, which
+solved it two incompatible ways interleaved through one function. That diff was discarded and re-run
+rather than hand-merged, because twelve interleaved regions in a 1639-line diff is how PR5's round 7
+became a revert.
+
+> **Partition repair work by the code path a finding touches, not by the identifier a lens assigned it.**
+
+Independent lenses agreeing is the signal this process exists to produce. It also means the same defect
+arrives several times under different names, and only reading the *location* tells you so.
+
+### A bare name given to something that does not resolve bare names — twice
+
+* **Windows**: `CommandSpec.program` carrying `claude` into `CreateProcessW`, which appends `.exe` and
+  ignores `PATHEXT` — so every npm-installed agent CLI failed to spawn (`PR6D-001`).
+* **Unix**: the cleanup reaper passing `docker` to `execv`, which does not search `PATH` at all — so no
+  labeled container was ever reclaimed after a coordinator death (`PR6-LANEC-002`).
+
+Different subsystems, different platforms, different reviewers, one shape. The second has a real
+constraint behind it: the reaper runs post-`fork`, pre-`exec`, and `execvp` is not async-signal-safe while
+`execv` is. Repaired by resolving in the parent and handing the absolute path down.
+
+### Three defects, three platforms, one oracle each
+
+| defect | the only place it was visible |
+|---|---|
+| the bare-name repair breaking npm `.cmd` CLIs | the Windows guest |
+| `launch` mounting the Git view **after** `create`, so no container with a view could start | real Docker |
+| `SIGSTOP` landing before the supervised worker's first write | macOS CI |
+
+None was visible from the others and none from reading; twelve green local gates said nothing about any
+of them. The first was **predicted** by a catalogue entry naming a function that did not exist
+(`HostRunner::resolve_program`) and then measured on the guest.
