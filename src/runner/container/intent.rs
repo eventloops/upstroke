@@ -121,6 +121,63 @@ pub const LABELS: &[&str] = &[
     LABEL_INVOCATION,
 ];
 
+/// The bytes [`private_root_label`] passes through unescaped.
+///
+/// `/` is here because it is a path separator on both platforms and keeping it
+/// literal is what makes a label readable; `:` because a Windows drive letter
+/// is not ambiguous with anything. Nothing else structural survives: `%` is the
+/// escape and must itself escape, and `,`, `=` and the line terminators are the
+/// bytes that would end a `docker --filter label=…` argument or start another
+/// one, so a root carrying them cannot widen a filter.
+const LABEL_UNRESERVED: &[u8] = b"/:.-_";
+
+/// The value of the `tactus.private_root` label for a root.
+///
+/// **Injective, and it is the second thing in this module that has to be.**
+/// [`ContainerName`] was designed for injectivity — its components are
+/// `[0-9A-Za-z_]` only, so the parse on `-` is unambiguous — because
+/// `crash_reconstruction` says "different private roots are **disjoint
+/// worlds**". The label is the other half of that sentence: it is the value
+/// `docker ps --filter label=tactus.private_root=…` selects on, so two distinct
+/// roots that render to one label are one world, and a census authorized for
+/// either queries — and reclaims — the containers of the other.
+///
+/// The rendering that shipped was `to_string_lossy().replace('\\', "/")`, which
+/// collides two ways. `<R>/a\b` and `<R>/a/b` are **different directories on
+/// Unix**, where a backslash is an ordinary filename byte, and they rendered to
+/// one label; and `to_string_lossy` maps every ill-formed byte sequence to
+/// `U+FFFD`, so two distinct non-UTF-8 roots rendered to one label as well.
+///
+/// So: percent-encode the path's own bytes. Every byte outside
+/// [`LABEL_UNRESERVED`] and the ASCII alphanumerics becomes `%XX`, upper-case
+/// hex, which is injective because `%` is itself escaped and every escape is a
+/// fixed three bytes.
+///
+/// **The one byte that is platform-shaped is `\`, and it is not an exception to
+/// injectivity.** On Windows `\` and `/` are both path separators and `<R>\a`
+/// and `<R>/a` name the same directory, so rendering `\` as `/` maps *equal*
+/// roots to one label — canonicalization, which injectivity over paths asks
+/// for. On Unix `\` names a different directory and is escaped like any other
+/// byte. The `cfg` and this sentence are asserted against each other by
+/// `census::tests::the_private_root_label_is_injective_over_hostile_roots`.
+#[must_use]
+pub fn private_root_label(private_root: &Path) -> String {
+    let bytes = private_root.as_os_str().as_encoded_bytes();
+    let mut label = String::with_capacity(bytes.len());
+    for &byte in bytes {
+        if byte.is_ascii_alphanumeric() || LABEL_UNRESERVED.contains(&byte) {
+            label.push(char::from(byte));
+        } else if byte == b'\\' && cfg!(windows) {
+            label.push('/');
+        } else {
+            label.push('%');
+            label.push(char::from(b"0123456789ABCDEF"[usize::from(byte >> 4)]));
+            label.push(char::from(b"0123456789ABCDEF"[usize::from(byte & 0x0f)]));
+        }
+    }
+    label
+}
+
 // ---------------------------------------------------------------------------
 // The record
 // ---------------------------------------------------------------------------
@@ -170,7 +227,7 @@ impl ContainerIntent {
         let mut labels = BTreeMap::new();
         labels.insert(
             LABEL_PRIVATE_ROOT.to_owned(),
-            private_root.to_string_lossy().replace('\\', "/"),
+            private_root_label(private_root),
         );
         labels.insert(LABEL_RUN.to_owned(), self.run_id.clone());
         labels.insert(LABEL_RUN_DIR.to_owned(), self.run_dir.clone());

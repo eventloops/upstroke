@@ -1635,6 +1635,7 @@ fn child_exited_unreaped(child: &Child) -> std::io::Result<bool> {
 /// while it is nonzero.
 #[cfg(unix)]
 mod termination {
+    use std::path::PathBuf;
     use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU8, Ordering};
     use std::sync::{Arc, Mutex, OnceLock};
     use std::thread;
@@ -4122,18 +4123,12 @@ mod termination {
         Mutex<Option<crate::runner::container::census::ReaperContainerScope>>,
     > = OnceLock::new();
 
-    /// How many list-and-kill rounds one reaper performs.
-    ///
-    /// The `docker ps` output is read into a fixed buffer, because a reaper
-    /// cannot grow one. A machine with more labeled containers than the buffer
-    /// holds is not silently truncated: each round kills and removes what it
-    /// read, so the next round's listing is shorter, and the loop stops when a
-    /// round finds nothing. Bounded so a runtime that keeps reporting the same
-    /// container cannot hold R28 for ever.
-    const REAPER_CONTAINER_ROUNDS: usize = 8;
-
     /// The fixed listing buffer. A `--no-trunc` id is 64 bytes plus a newline,
-    /// so this is 126 containers per round.
+    /// so this is **126 containers per listing** — and a reaper cannot grow a
+    /// buffer, so the number of *rounds* is what has to be unbounded. It was
+    /// `8`, which made the buffer size a silent ceiling of 126 x 8 = **1,008
+    /// containers**: a coordinator dying with 1,009 of them left one behind and
+    /// reported the same success it reports on a clean machine.
     const REAPER_PS_BUFFER: usize = 8192;
 
     /// The ceiling on one `docker` invocation, in 10 ms ticks.
@@ -4164,6 +4159,51 @@ mod termination {
         Ok(())
     }
 
+    /// The absolute program the reaper will `execv`, resolved **before** the
+    /// fork.
+    ///
+    /// **`execv` does not search `PATH`. Only `execvp` does** — and `execvp` is
+    /// not on the POSIX async-signal-safe list, so a reaper (a `fork`-only child
+    /// of a multithreaded process) may not call it. A bare `docker` handed to
+    /// `execv` therefore resolves against nothing at all: the listing child
+    /// `_exit(127)`s, the pipe carries no bytes, and the reaper reports exactly
+    /// the same success it reports on a clean machine. Measured, not reasoned —
+    /// it is what shipped, and the only fixture used an absolute stub.
+    ///
+    /// So the search happens here, on the parent side, in ordinary code with an
+    /// error channel: the same discipline that renders every other byte the
+    /// reaper needs before the fork. `execvp`'s own rule is mirrored exactly —
+    /// a name containing a `/` is a path and is used verbatim (that is what
+    /// `execv` already does correctly); a name with no `/` is searched for on
+    /// `PATH`, and one `PATH` cannot resolve is **refused** rather than handed
+    /// to a child that has no way to say so.
+    ///
+    /// [`crate::util::find_program`] is the resolver deliberately: it is the
+    /// one `runner::container::DockerCli::available` asks when it decides the
+    /// runtime is present, so the reaper execs the binary the rest of the engine
+    /// means by `docker`.
+    fn resolve_reaper_program(program: &std::path::Path) -> Result<PathBuf, TactusError> {
+        use std::os::unix::ffi::OsStrExt as _;
+        if program.as_os_str().as_bytes().contains(&b'/') {
+            return Ok(program.to_path_buf());
+        }
+        let refused = |why: &str| TactusError::Refused {
+            message: format!(
+                "the Unix reaper's container scope names the program `{}`, which {why}; a reaper \
+                 is a fork-only child restricted to async-signal-safe calls, so it must be handed \
+                 an already-resolved path — `execv` does not search `PATH` and `execvp` is not \
+                 async-signal-safe — and a scope whose program cannot be resolved is refused here \
+                 rather than silently reclaiming nothing",
+                program.display()
+            ),
+        };
+        let name = program.to_str().ok_or_else(|| {
+            refused("carries no separator and is not UTF-8, so it cannot be looked up on `PATH`")
+        })?;
+        crate::util::find_program(name)
+            .ok_or_else(|| refused("carries no separator and is not on this process's `PATH`"))
+    }
+
     /// The argument vectors for `scope`, or why they cannot be built.
     fn render_container_argv(
         scope: &crate::runner::container::census::ReaperContainerScope,
@@ -4175,10 +4215,20 @@ mod termination {
                 scope.program().display()
             ),
         };
-        let program = std::ffi::CString::new(scope.program().as_os_str().as_encoded_bytes())
-            .map_err(|_| nul(&scope.program().to_string_lossy()))?;
+        let resolved = resolve_reaper_program(scope.program())?;
+        let program = std::ffi::CString::new(resolved.as_os_str().as_encoded_bytes())
+            .map_err(|_| nul(&resolved.to_string_lossy()))?;
         let mut ps = Vec::new();
-        for argument in scope.list_argv() {
+        for (index, argument) in scope.list_argv().into_iter().enumerate() {
+            // `argv[0]` is the resolved path too, so the program the child execs
+            // and the program it reports itself as are one string in every one
+            // of the three invocations — `ps` here, `kill` and `rm` from
+            // `containers.program` directly.
+            let argument = if index == 0 {
+                resolved.to_string_lossy().into_owned()
+            } else {
+                argument
+            };
             ps.push(std::ffi::CString::new(argument.clone()).map_err(|_| nul(&argument))?);
         }
         let mut ps_argv: Vec<*const libc::c_char> =
@@ -4212,12 +4262,48 @@ mod termination {
     /// Every call here is async-signal-safe: `fork`, `execv`, `pipe`, `dup2`,
     /// `open`, `close`, `poll`, `read`, `waitpid`, `kill`, `_exit`.
     fn reclaim_labeled_containers(containers: &ReaperContainers) {
-        for _ in 0..REAPER_CONTAINER_ROUNDS {
-            let mut buffer = [0_u8; REAPER_PS_BUFFER];
+        // Two fixed buffers and no round counter. The loop ends on one of three
+        // conditions, and none of them is a container count:
+        //
+        // 1. the listing is **empty** — everything this selector names is gone;
+        // 2. the listing is **byte-identical to the previous round's** — the
+        //    runtime answered with exactly what it answered before, so the
+        //    `kill`/`rm` of that round removed nothing and another round would
+        //    repeat it. This is the real form of the guard the round count was
+        //    standing in for ("a runtime that keeps reporting the same
+        //    container cannot hold R28 for ever"), and it is both tighter (it
+        //    fires on the second round rather than the eighth) and not a
+        //    ceiling on how much work a healthy runtime may be given;
+        // 3. no complete id was parsed out of a non-empty listing.
+        //
+        // Termination without a count: the selector names one **dead**
+        // incarnation, so nothing can add to the set while this runs — the only
+        // process that creates containers under that incarnation label is the
+        // coordinator that died. The set is therefore finite and non-growing,
+        // each round either shrinks it or answers identically, and every
+        // `docker` invocation inside a round is itself bounded by
+        // [`REAPER_DOCKER_TICKS`].
+        //
+        // Stopping on (2) is not a silent give-up: what it leaves behind is a
+        // labeled container the runtime will not remove, and that is exactly
+        // the residue the **next write command's census** is required to refuse
+        // over — `refusal_condition`'s "a dead owner's or dead incarnation's
+        // labeled container that cannot be observed terminated blocks
+        // admission". The reaper closes the window early; the census is what
+        // makes failing to close it loud.
+        let mut buffer = [0_u8; REAPER_PS_BUFFER];
+        let mut previous = [0_u8; REAPER_PS_BUFFER];
+        let mut previous_filled = usize::MAX;
+        loop {
             let filled = list_labeled_containers(containers, &mut buffer);
             if filled == 0 {
                 return;
             }
+            if filled == previous_filled && buffer[..filled] == previous[..filled] {
+                return;
+            }
+            previous[..filled].copy_from_slice(&buffer[..filled]);
+            previous_filled = filled;
             let mut settled = 0_usize;
             let mut start = 0_usize;
             for index in 0..filled {
@@ -4838,6 +4924,311 @@ mod termination {
                 let _ = libc::waitpid(pid, std::ptr::null_mut(), 0);
             }
             assert_eq!(observed, Some(false));
+        }
+
+        /// The program handed to `execv` is **always absolute**, and a bare name
+        /// `PATH` cannot resolve is refused where there is still an error channel.
+        ///
+        /// `execv` does not search `PATH`; only `execvp` does, and `execvp` is not
+        /// async-signal-safe, so a reaper may not call it. The production spelling
+        /// is `runner::container::DOCKER_PROGRAM` — the bare name `docker`
+        /// — so a reaper handed that name unresolved lists nothing, reclaims
+        /// nothing, and reports success.
+        ///
+        /// Second field held constant: the private root and the incarnation are the
+        /// same in every cell, so the only thing that moves is the **spelling of
+        /// the program** — bare-and-resolvable, bare-and-absent, and a path.
+        #[test]
+        fn the_reaper_program_is_resolved_to_an_absolute_path_before_the_fork() {
+            use crate::runner::container::census::ReaperContainerScope;
+            use std::ffi::OsStr;
+            use std::os::unix::ffi::OsStrExt as _;
+            use std::path::Path;
+
+            const ROOT: &str = "/srv/tactus-reaper-resolve/private";
+            const INCARNATION: &str = "01KZTBBBBBBBBBBBBBBBBBBBBB";
+
+            fn scope(program: &str) -> ReaperContainerScope {
+                ReaperContainerScope::new(program, Path::new(ROOT), INCARNATION)
+                    .expect("a well-formed scope")
+            }
+            fn execd(rendered: &ReaperContainers) -> std::path::PathBuf {
+                std::path::PathBuf::from(OsStr::from_bytes(rendered.program.as_bytes()))
+            }
+
+            // (1) A bare name that `PATH` resolves. `git` rather than `docker`
+            // because the property is about resolution and every machine that
+            // builds this repository has git; `util::find_program_resolves_real_
+            // tools_and_misses_fake_ones` is where that is already relied on.
+            let rendered = render_container_argv(&scope("git")).expect("git is on PATH");
+            let program = execd(&rendered);
+            assert!(
+                program.is_absolute(),
+                "`execv` was handed `{}`, which it will not search `PATH` for",
+                program.display()
+            );
+            assert!(
+                program.is_file(),
+                "`{}` is not a file on this machine",
+                program.display()
+            );
+            assert_eq!(
+                program.file_name(),
+                Some(OsStr::new("git")),
+                "the resolution found something other than the program it was asked for: {}",
+                program.display()
+            );
+            // `argv[0]` is the resolved path too, so the string the child execs and
+            // the string it reports itself as cannot drift apart.
+            let argv0 = unsafe { std::ffi::CStr::from_ptr(rendered.ps_argv[0]) };
+            assert_eq!(argv0.to_bytes(), program.as_os_str().as_bytes());
+
+            // (2) A bare name `PATH` cannot resolve is refused, while there is
+            // still somewhere to report it: a reaper has no error channel.
+            let absent = scope("tactus-definitely-not-a-real-docker");
+            let message = match render_container_argv(&absent) {
+                Ok(_) => panic!("an unresolvable bare program was accepted"),
+                Err(error) => error.to_string(),
+            };
+            assert!(
+                message.contains("PATH") && message.contains("tactus-definitely-not-a-real-docker"),
+                "{message}"
+            );
+            // And the refusal reaches the caller that arms the reaper, which is the
+            // only place with an error channel. Nothing is installed on this path,
+            // so no other test in this process inherits a scope.
+            assert!(
+                set_container_reclaim_scope(Some(&absent)).is_err(),
+                "arming accepted a scope whose program cannot be executed"
+            );
+
+            // (3) A name carrying a separator is a path and is used verbatim —
+            // exactly `execvp`'s own rule, and what `execv` already does correctly.
+            let rendered = render_container_argv(&scope("/usr/bin/docker")).expect("a path");
+            assert_eq!(execd(&rendered), Path::new("/usr/bin/docker"));
+            let rendered = render_container_argv(&scope("./docker")).expect("a relative path");
+            assert_eq!(execd(&rendered), Path::new("./docker"));
+        }
+
+        /// A scratch directory, a recording `docker` stub, and the rendered
+        /// argument vectors that name it.
+        fn reaper_stub(tag: &str, script: &str) -> (std::path::PathBuf, ReaperContainers) {
+            use std::os::unix::fs::PermissionsExt as _;
+            let dir = std::env::temp_dir().join(format!(
+                "tactus-reaper-rounds-{tag}-{}-{}",
+                std::process::id(),
+                crate::ulid::ulid()
+            ));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir).expect("scratch");
+            let stub = dir.join("docker-stub");
+            std::fs::write(&stub, script).expect("write the stub");
+            std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755))
+                .expect("make the stub executable");
+            // The stub finds its own scratch directory through `dirname $0`,
+            // so nothing about this fixture depends on process-wide state and
+            // two of these may run concurrently.
+            let scope = crate::runner::container::census::ReaperContainerScope::new(
+                &stub,
+                std::path::Path::new("/srv/tactus-reaper-rounds/private"),
+                "01KZTAAAAAAAAAAAAAAAAAAAAA",
+            )
+            .expect("a scope");
+            let rendered = render_container_argv(&scope).expect("argv");
+            (dir, rendered)
+        }
+
+        /// Every line of the stub's log whose first word is `verb`, in order.
+        fn logged(dir: &std::path::Path, verb: &str) -> Vec<String> {
+            std::fs::read_to_string(dir.join("argv.log"))
+                .unwrap_or_default()
+                .lines()
+                .filter(|line| line.split_whitespace().next() == Some(verb))
+                .map(str::to_owned)
+                .collect()
+        }
+
+        /// The reaper performs **as many rounds as the machine needs**, not a
+        /// fixed number of them.
+        ///
+        /// The listing buffer is fixed at [`REAPER_PS_BUFFER`] and a
+        /// `--no-trunc` id is 65 bytes with its newline, so one listing holds
+        /// **126** ids. A round count of 8 therefore made the reaper's reach a
+        /// silent **1,008** containers: a coordinator dying with 1,009 left one
+        /// behind and the reaper reported the same success it reports on a
+        /// clean machine. Twelve rounds is more than eight and few enough to
+        /// run in a fraction of a second; what it measures is that the count is
+        /// gone, not that the count is twelve.
+        ///
+        /// Second field held constant: exactly one container is listed in every
+        /// round, so the number of ids per listing cannot be what ends the
+        /// loop — only the number of rounds moves.
+        #[test]
+        fn the_reaper_performs_as_many_rounds_as_the_machine_needs() {
+            const ROUNDS: usize = 12;
+            let (dir, rendered) = reaper_stub(
+                "unbounded",
+                &format!(
+                    "#!/bin/sh\n\
+                     d=$(dirname \"$0\")\n\
+                     printf '%s\\n' \"$*\" >> \"$d/argv.log\"\n\
+                     case \"$1\" in\n\
+                     ps) n=$(cat \"$d/round\" 2>/dev/null || echo 0); n=$((n+1)); \
+                     echo \"$n\" > \"$d/round\"; \
+                     [ \"$n\" -gt {ROUNDS} ] || printf '%064d\\n' \"$n\" ;;\n\
+                     esac\n\
+                     exit 0\n"
+                ),
+            );
+
+            reclaim_labeled_containers(&rendered);
+
+            let killed: std::collections::BTreeSet<String> = logged(&dir, "kill")
+                .into_iter()
+                .map(|line| line["kill ".len()..].to_owned())
+                .collect();
+            let removed: std::collections::BTreeSet<String> = logged(&dir, "rm")
+                .into_iter()
+                .map(|line| line["rm --force ".len()..].to_owned())
+                .collect();
+            // The expected ids come from the stub's own rule, written out here
+            // rather than read back from what the reaper did.
+            let expected: std::collections::BTreeSet<String> =
+                (1..=ROUNDS).map(|n| format!("{n:064}")).collect();
+            assert_eq!(
+                killed,
+                expected,
+                "the reaper stopped early: it killed {} of {ROUNDS}",
+                killed.len()
+            );
+            assert_eq!(removed, expected, "kill and rm did not settle the same set");
+            assert!(
+                logged(&dir, "ps").len() > ROUNDS,
+                "{} listings for {ROUNDS} rounds plus the empty one that ends the loop",
+                logged(&dir, "ps").len()
+            );
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+
+        /// A listing **larger than the buffer** is not silently truncated: the
+        /// ids that did not fit are settled by a later round.
+        ///
+        /// This is the other half of the 126 x 8 arithmetic, and the two are a
+        /// product: a fixture that varied only the number of rounds would not
+        /// notice a buffer that dropped what it could not hold, and one that
+        /// varied only the number of ids would not notice a round count. 130 is
+        /// the smallest number that crosses the boundary — 130 x 65 = 8,450
+        /// bytes into an 8,192-byte buffer — so the first listing is cut inside
+        /// an id, which is the case a parser is most likely to get wrong.
+        ///
+        /// Second field held constant: the stub removes exactly what it is
+        /// told to remove and invents nothing, so the only thing that moves
+        /// between rounds is how much of the set is left.
+        #[test]
+        fn the_reaper_settles_more_containers_than_one_listing_holds() {
+            const CONTAINERS: usize = 130;
+            let (dir, rendered) = reaper_stub(
+                "over-buffer",
+                "#!/bin/sh\n\
+                 d=$(dirname \"$0\")\n\
+                 printf '%s\\n' \"$*\" >> \"$d/argv.log\"\n\
+                 case \"$1\" in\n\
+                 ps) ls \"$d/ids\" 2>/dev/null ;;\n\
+                 rm) rm -f \"$d/ids/$3\" ;;\n\
+                 esac\n\
+                 exit 0\n",
+            );
+            std::fs::create_dir_all(dir.join("ids")).expect("the id set");
+            let expected: std::collections::BTreeSet<String> = (1..=CONTAINERS)
+                .map(|n| format!("{n:064}"))
+                .inspect(|id| std::fs::write(dir.join("ids").join(id), "").expect("an id"))
+                .collect();
+            assert_eq!(expected.len(), CONTAINERS);
+            const {
+                assert!(
+                    CONTAINERS * 65 > REAPER_PS_BUFFER,
+                    "the fixture must not fit in one listing"
+                );
+            }
+
+            reclaim_labeled_containers(&rendered);
+
+            let killed: std::collections::BTreeSet<String> = logged(&dir, "kill")
+                .into_iter()
+                .map(|line| line["kill ".len()..].to_owned())
+                .collect();
+            let removed: std::collections::BTreeSet<String> = logged(&dir, "rm")
+                .into_iter()
+                .map(|line| line["rm --force ".len()..].to_owned())
+                .collect();
+            assert_eq!(
+                killed,
+                expected,
+                "{} of {CONTAINERS} containers were killed; the ids past the end of the first \
+                 listing were dropped rather than settled by a later round",
+                killed.len()
+            );
+            assert_eq!(removed, expected);
+            assert_eq!(
+                std::fs::read_dir(dir.join("ids"))
+                    .expect("the id set")
+                    .count(),
+                0,
+                "the stub still holds containers the reaper never removed"
+            );
+            assert!(
+                logged(&dir, "ps").len() >= 3,
+                "one listing cannot hold 130 ids"
+            );
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+
+        /// A runtime that keeps answering with the **same listing** ends the
+        /// loop on the second round, and does not repeat for ever.
+        ///
+        /// This is the guard the round count used to be, in its real form. The
+        /// reaper holds R28 — the shared cleanup hold the next coordinator waits
+        /// on — so a loop that could not end would turn "docker is wedged" into
+        /// "no run on this machine can ever start again".
+        ///
+        /// Second field held constant: the id set, which never changes; only
+        /// the number of times the reaper is willing to ask about it moves.
+        #[test]
+        fn a_runtime_that_keeps_answering_the_same_listing_ends_the_loop() {
+            // The stub answers with the same two ids twice and then with
+            // nothing. The third listing is what makes this fixture finite: an
+            // implementation with **no** no-progress guard still terminates
+            // here, and is caught by the counts rather than by a hang, because
+            // a test that measures a missing bound by hanging measures nothing.
+            let (dir, rendered) = reaper_stub(
+                "no-progress",
+                "#!/bin/sh\n\
+                 d=$(dirname \"$0\")\n\
+                 printf '%s\\n' \"$*\" >> \"$d/argv.log\"\n\
+                 case \"$1\" in\n\
+                 ps) n=$(cat \"$d/round\" 2>/dev/null || echo 0); n=$((n+1)); \
+                 echo \"$n\" > \"$d/round\"; \
+                 [ \"$n\" -gt 2 ] || { printf '%064d\\n' 1; printf '%064d\\n' 2; } ;;\n\
+                 esac\n\
+                 exit 0\n",
+            );
+
+            reclaim_labeled_containers(&rendered);
+
+            // Two listings: the first is acted on, the second is recognised as
+            // the same answer and ends the loop **there** — the third listing,
+            // which the stub is willing to answer, is never asked for. Each
+            // container was attempted exactly once, so nothing is retried
+            // against a runtime that has already refused to remove it.
+            assert_eq!(
+                logged(&dir, "ps").len(),
+                2,
+                "a repeated listing was acted on again: {:?}",
+                logged(&dir, "ps")
+            );
+            assert_eq!(logged(&dir, "kill").len(), 2, "{:?}", logged(&dir, "kill"));
+            assert_eq!(logged(&dir, "rm").len(), 2, "{:?}", logged(&dir, "rm"));
+            let _ = std::fs::remove_dir_all(&dir);
         }
     }
 }
@@ -7793,9 +8184,29 @@ mod tests {
             false
         }
 
-        for coordinator_dies in [true, false] {
-            let dir = scratch(if coordinator_dies { "dies" } else { "lives" });
-            let stub = dir.join("docker-stub");
+        // {program spelling} x {coordinator dies}. The **bare** cell is the
+        // production shape — `runner::container::DOCKER_PROGRAM` is the bare
+        // name `docker` — and here it is resolvable *only* through `PATH`: the
+        // stub is written into a scratch directory prepended to the
+        // coordinator's `PATH`, and nothing of that name exists in the working
+        // directory the coordinator inherits. `execv` does not search `PATH`,
+        // so this is the cell that dies when the resolution before the fork
+        // goes away; the path-spelled cell is what keeps a repair that resolved
+        // bare names from breaking the spelling that already worked.
+        //
+        // The fourth cell, {bare} x {lives}, is deliberately absent: on the
+        // clean-exit path the reaper execs nothing at all, so the spelling
+        // cannot discriminate there and the cell would assert the same absent
+        // log as the one beside it.
+        const STUB_NAME: &str = "tactus-reaper-docker-stub";
+        for (bare, coordinator_dies) in [(true, true), (false, true), (false, false)] {
+            let cell = match (bare, coordinator_dies) {
+                (true, true) => "bare-dies",
+                (false, true) => "path-dies",
+                _ => "path-lives",
+            };
+            let dir = scratch(cell);
+            let stub = dir.join(STUB_NAME);
             let log = dir.join("argv.log");
             // A recording `docker`. It reports one container the first time it
             // is listed and nothing once that container has been removed, which
@@ -7825,11 +8236,16 @@ mod tests {
 
             let agent_path = dir.join("agent");
             let reaper_path = dir.join("reaper");
+            let named: std::path::PathBuf = if bare {
+                std::path::PathBuf::from(STUB_NAME)
+            } else {
+                stub.clone()
+            };
             let mut coordinator = Command::new(std::env::current_exe().expect("test executable"));
             coordinator
                 .args(["unix_reaper_container_helper", "--ignored", "--nocapture"])
                 .env("TACTUS_REAPER_CONTAINERS", "1")
-                .env("TACTUS_STUB", &stub)
+                .env("TACTUS_STUB", &named)
                 .env("TACTUS_STUB_DIR", &dir)
                 .env("TACTUS_ROOT", PRIVATE_ROOT)
                 .env("TACTUS_INCARNATION", INCARNATION)
@@ -7838,6 +8254,18 @@ mod tests {
                 .stdin(Stdio::null())
                 .stdout(Stdio::null())
                 .stderr(Stdio::null());
+            if bare {
+                // Only through `PATH`: the scratch directory first, the
+                // inherited entries after it so the stub's own `sleep` still
+                // resolves.
+                let inherited = std::env::var_os("PATH").unwrap_or_default();
+                let mut search = vec![dir.clone()];
+                search.extend(std::env::split_paths(&inherited));
+                coordinator.env(
+                    "PATH",
+                    std::env::join_paths(search).expect("a synthetic PATH"),
+                );
+            }
             if !coordinator_dies {
                 coordinator.env("TACTUS_REAPER_CONTAINERS_CLEAN_EXIT", "1");
             }
@@ -7868,7 +8296,7 @@ mod tests {
             // (3) R28 is still held while the container kill is in flight.
             assert!(
                 wait_for(&dir.join("killing"), Duration::from_secs(30)),
-                "the reaper never issued a container kill"
+                "[{cell}] the reaper never issued a container kill"
             );
             assert!(
                 alive(reaper_pid),
@@ -7889,7 +8317,10 @@ mod tests {
                 }
                 thread::sleep(Duration::from_millis(20));
             };
-            assert!(lines.len() >= 3, "the reaper's docker log is {lines:#?}");
+            assert!(
+                lines.len() >= 3,
+                "[{cell}] the reaper's docker log is {lines:#?}"
+            );
             assert!(lines[0].starts_with("ps "), "{lines:#?}");
             assert_eq!(lines[1], format!("kill {CONTAINER_ID}"), "{lines:#?}");
             assert_eq!(lines[2], format!("rm --force {CONTAINER_ID}"), "{lines:#?}");
