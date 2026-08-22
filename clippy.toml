@@ -102,7 +102,7 @@ disallowed-methods = [
     { path = "libc::mkfifo", reason = "TACTUS-EFFECT: creates a path" },
     { path = "libc::mkdtemp", reason = "TACTUS-EFFECT: creates a directory" },
     { path = "libc::pipe", reason = "TACTUS-EFFECT: creates descriptors" },
-    { path = "libc::pipe2", reason = "TACTUS-EFFECT: creates descriptors" },
+    { path = "libc::pipe2", reason = "TACTUS-EFFECT: creates descriptors", allow-invalid = true },
     { path = "libc::waitpid", reason = "TACTUS-EFFECT R22: reaps a child, changing process-table state" },
     { path = "libc::waitid", reason = "TACTUS-EFFECT R22: reaps a child, changing process-table state" },
     { path = "libc::signal", reason = "TACTUS-EFFECT: process-wide disposition" },

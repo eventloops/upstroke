@@ -767,6 +767,22 @@ fn every_denied_path_this_host_can_resolve_does_resolve() {
 fn host_conditional_paths() -> Vec<&'static str> {
     if cfg!(windows) {
         vec!["std::os::unix::fs::symlink"]
+    } else if cfg!(target_os = "macos") {
+        // `libc::pipe2` is Linux-only: the `libc` crate does not define it for
+        // Darwin, so the denial resolves on Linux and does not here. That is the
+        // "a denial that enforces nothing" class `clippy.toml`'s header warns
+        // about -- but it is **vacuous** rather than a hole, because a path that
+        // does not resolve is also a path no macOS code can call. Recorded here
+        // rather than suppressed, so the set stays asserted on every host.
+        //
+        // Found by CI, not locally: this project has a Windows guest and no
+        // macOS host, and `PR5-MACOS-CLIPPY-NEVER-RUN` predicted this exact test
+        // would be the one to see it.
+        vec![
+            "std::os::windows::fs::symlink_dir",
+            "std::os::windows::fs::symlink_file",
+            "libc::pipe2",
+        ]
     } else {
         vec![
             "std::os::windows::fs::symlink_dir",
@@ -936,6 +952,13 @@ fn every_platform_conditional_denial_names_something_real() {
     assert_eq!(
         suppressed,
         BTreeSet::from([
+            // Real on Linux, no module on Darwin: `libc` does not define `pipe2`
+            // for macOS. Added after CI's macOS job found it -- this project has
+            // a Windows guest and no macOS host, which is `PR5-MACOS-CLIPPY-NEVER-
+            // RUN`. The suppression is what keeps a future macOS lint job green;
+            // `host_conditional_paths` still asserts the path is unresolved there,
+            // because that test strips `allow-invalid` before it probes.
+            "libc::pipe2",
             "std::os::unix::fs::symlink",
             "std::os::windows::fs::symlink_dir",
             "std::os::windows::fs::symlink_file",
