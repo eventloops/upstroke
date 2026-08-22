@@ -67,6 +67,7 @@
 // `effects::production_region` cuts a source at its FIRST `#[cfg(test)]`, so a
 // test-only `mod` here would remove every funnel below it from the census that
 // proves this group has a funnel at all (`PR5-R1-CFG-TEST-SHRINKS-THE-DOMAIN`).
+pub mod census;
 pub mod intent;
 pub mod runtime;
 
@@ -285,20 +286,39 @@ impl GitView for DisposableDirView {
     }
 
     fn discard(&self, path: &Path) -> Result<(), TactusError> {
-        match fs::remove_dir_all(path) {
-            Ok(()) => {}
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(source) => {
-                return Err(TactusError::Io {
-                    path: path.to_path_buf(),
-                    source,
-                });
-            }
-        }
+        // R19's half of "every step idempotent and tolerant of already-gone so
+        // two concurrent reclaimers converge". The errno is not the question —
+        // see [`RACING_ACCESS_ATTEMPTS`], and the Windows guest measurement that
+        // put it there.
+        racing_removal(path, || fs::remove_dir_all(path))?;
         self.trace.view(ViewAction::Discarded, path);
         Ok(())
     }
 }
+
+/// How many times a path that another reclaimer may be removing is asked about
+/// before a failure is believed.
+///
+/// **The whole reason this exists is a platform difference, measured on the
+/// Windows guest and invisible on Linux.** "every step idempotent and tolerant
+/// of already-gone so two concurrent reclaimers converge" is usually written as
+/// `if error.kind() == NotFound`, and on Windows the losing reclaimer does not
+/// get `NotFound`: a file or directory another process is deleting is
+/// **delete-pending**, and opening it answers `ERROR_ACCESS_DENIED` — `kind() ==
+/// PermissionDenied` — until the winner's handle closes. An errno test
+/// therefore cannot tell "somebody else is removing it" from "I may not touch
+/// it", and tolerating `PermissionDenied` outright would silently treat a
+/// genuinely protected path as reclaimed.
+///
+/// So the question asked is the **outcome**, not the errno: retry, and believe
+/// the failure only once the path has stopped changing under it. Delete-pending
+/// clears when the winner's own call returns, so this is a handoff rather than a
+/// wait, and [`std::thread::yield_now`] is what it costs.
+///
+/// Bounded rather than timed, for the reason [`TERMINATION_OBSERVATIONS`] is: a
+/// wait with no bound turns "this path cannot be removed" into "this write
+/// command never returns".
+pub const RACING_ACCESS_ATTEMPTS: usize = 64;
 
 // ---------------------------------------------------------------------------
 // The eight site-taking APIs
@@ -765,6 +785,47 @@ pub fn read_intent(path: &Path) -> Result<ContainerIntent, TactusError> {
     })
 }
 
+/// Read one record back, answering `None` when it went away under the read.
+///
+/// The read half of [`RACING_ACCESS_ATTEMPTS`]: on Windows a file another
+/// process is deleting answers `PermissionDenied` until that delete completes,
+/// so "is it gone?" is a question about the outcome and not about the first
+/// errno. A record that is present and unreadable is still an error, after the
+/// bound — silently skipping one would let a census admit over a container whose
+/// ownership evidence it could not read.
+///
+/// # Errors
+///
+/// [`TactusError::Refused`] when the file is not a `ContainerIntent`,
+/// [`TactusError::Io`] when it is still there and still unreadable after
+/// [`RACING_ACCESS_ATTEMPTS`] attempts.
+fn read_racing(path: &Path) -> Result<Option<ContainerIntent>, TactusError> {
+    let mut last = None;
+    for _ in 0..RACING_ACCESS_ATTEMPTS {
+        match read_intent(path) {
+            Ok(record) => return Ok(Some(record)),
+            Err(TactusError::Io { source, .. })
+                if source.kind() == std::io::ErrorKind::NotFound =>
+            {
+                return Ok(None);
+            }
+            Err(TactusError::Io { source, .. }) => {
+                last = Some(source);
+                std::thread::yield_now();
+            }
+            // Not an IO answer at all: the bytes were read and are not a
+            // record. Retrying cannot change that.
+            Err(other) => return Err(other),
+        }
+    }
+    Err(TactusError::Io {
+        path: path.to_path_buf(),
+        source: last.unwrap_or_else(|| {
+            std::io::Error::other("the record could not be read and reported no reason")
+        }),
+    })
+}
+
 /// Every intent record under `<R>/containers`, sorted by name.
 ///
 /// "discovery at every write-command start **scans the whole namespace
@@ -802,7 +863,22 @@ pub fn list_intents(private_root: &Path) -> Result<Vec<FoundIntent>, TactusError
             continue;
         };
         let path = entry.path();
-        let record = read_intent(&path)?;
+        // A record that vanished between the directory read and this one is a
+        // record another reclaimer removed, and that is not an error: "every
+        // step idempotent and tolerant of already-gone so **two concurrent
+        // reclaimers converge**".
+        //
+        // Measured by lane C, not reasoned. With a bare `?` here,
+        // `census::tests::concurrent_reclaimers_converge` refused with
+        // `Io { NotFound }` on Linux in 2 of 20 runs, and with
+        // `Io { PermissionDenied }` on the Windows guest — a whole write
+        // command failing because another write command was tidying at the same
+        // moment. A **malformed** record is still an error: "the record could
+        // not be parsed" and "the record is gone" are different answers, and
+        // only one of them licenses proceeding.
+        let Some(record) = read_racing(&path)? else {
+            continue;
+        };
         found.push(FoundIntent { name, path, record });
     }
     found.sort_by(|a, b| a.name.cmp(&b.name));
@@ -871,19 +947,47 @@ fn write_synced(path: &Path, bytes: &[u8], trace: &ContainerTrace) -> Result<(),
     Ok(())
 }
 
-/// Remove a file that may not be there.
+/// Remove a file that may not be there, or may be going away under another
+/// reclaimer.
 fn remove_if_present(path: &Path, trace: &ContainerTrace) -> Result<(), TactusError> {
-    match fs::remove_file(path) {
-        Ok(()) => {
-            trace.durable(DurableStep::Removed, path);
-            Ok(())
-        }
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(source) => Err(TactusError::Io {
-            path: path.to_path_buf(),
-            source,
-        }),
+    if racing_removal(path, || fs::remove_file(path))? {
+        trace.durable(DurableStep::Removed, path);
     }
+    Ok(())
+}
+
+/// Perform `remove` until the path is gone, however it went.
+///
+/// Answers whether **this** caller was the one that removed it, so a trace
+/// records the removal once rather than once per reclaimer.
+///
+/// See [`RACING_ACCESS_ATTEMPTS`] for why this is not `if kind() == NotFound`.
+///
+/// # Errors
+///
+/// [`TactusError::Io`] when the path is still there, and still refusing, after
+/// [`RACING_ACCESS_ATTEMPTS`] attempts.
+fn racing_removal(
+    path: &Path,
+    mut remove: impl FnMut() -> Result<(), std::io::Error>,
+) -> Result<bool, TactusError> {
+    let mut last = None;
+    for _ in 0..RACING_ACCESS_ATTEMPTS {
+        match remove() {
+            Ok(()) => return Ok(true),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+            Err(error) => {
+                last = Some(error);
+                std::thread::yield_now();
+            }
+        }
+    }
+    Err(TactusError::Io {
+        path: path.to_path_buf(),
+        source: last.unwrap_or_else(|| {
+            std::io::Error::other("the path could not be removed and reported no reason")
+        }),
+    })
 }
 
 // ---------------------------------------------------------------------------

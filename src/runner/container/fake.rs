@@ -558,6 +558,8 @@ pub(crate) const DOCKER_GATED_TESTS: &[&str] = &[
     "real_docker_reports_an_image_id_and_a_digest_for_a_reference_it_holds",
     "real_docker_refuses_a_reference_it_does_not_hold_without_pulling",
     "real_docker_creates_from_an_id_reports_it_and_reclaims_idempotently",
+    // Lane C: the startup census against the real runtime.
+    "real_docker_census_reclaims_a_dead_owner_and_spares_a_live_one",
 ];
 
 /// Why a gated test skipped.

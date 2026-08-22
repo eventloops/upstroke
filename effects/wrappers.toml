@@ -599,6 +599,13 @@ effect_free = [
     "process_creation_time",
     "run_with_timeout",
     "run_with_timeout_hooked",
+    # Writes a value into a process-local `OnceLock<Mutex<..>>` that every
+    # cleanup reaper started afterwards renders into argv before its `fork`.
+    # No effect outside this process: the reaper performs the effect, inside
+    # `Container.Stop`/`Container.Remove`'s own primitives, and only after its
+    # coordinator has died. The same classification `poison_ambient_for_tests`
+    # carries, for the same reason.
+    "set_container_reclaim_scope",
     "terminate_and_wait",
     "terminate_and_wait_with",
 ]
@@ -855,6 +862,10 @@ effect_free = [
 effect = [
     "_exit",
     "close",
+    # Rewrites the descriptor table of the process that calls it. The Unix
+    # reaper's container half puts its listing pipe on fd 1 with it, in the
+    # forked child before `execv`.
+    "dup2",
     "execl",
     "execle",
     "execlp",
@@ -969,6 +980,7 @@ not_an_effect = [
     "_SC_OPEN_MAX",
     "__errno_location",
     "__error",
+    "c_char",
     "c_int",
     "c_short",
     "c_void",
