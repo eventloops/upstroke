@@ -591,3 +591,35 @@ whose first twenty lines are the ledger table it is complaining about rather tha
 Related: the same rewrite left four other worktree branches based on pre-rewrite commits, which was
 foreseen and communicated. It is only the *PR-body* references that were missed, because they are data
 in a place `git` does not look.
+
+### `PR5-CAPACITY-NOT-A-TOPOLOGY-RESOURCE` — the measurement its row was waiting for
+
+The row was filed noting the evidence to specify a permit did not exist: *"a single usage-limit event
+across five slices, which is not a distribution a fault row can be written against."* PR5's final day
+produced one. Recorded here so the PR11 implementer inherits numbers rather than an anecdote.
+
+**Three exhaustion events in one working day**, against a Max-20x plan on a 5-hour rolling window:
+
+* A `max`-effort scoped review was **killed mid-flight** with no verdict written. It was read-only over a
+  static diff, so nothing was lost but the wall-clock — relaunching after the reset re-ran it from a
+  clean start. **An implementation round in the same position loses its worker's context**, not its
+  edits: the tree keeps the work and a hand-written resume contract recovers the rest.
+* `claude -p` **exits** on exhaustion. It does not sleep and retry. Three implementation lanes stopped
+  this way earlier in the slice and each needed a resume contract; none resumed itself.
+* The **failure is silent at the wrapper**. A background job's exit code is its wrapper's, not the
+  worker's: one review reported success while the worker had returned rc=1 with `You've hit your session
+  limit`. Reading the wrapper's code instead of the worker's is how a killed review gets recorded as a
+  finished one.
+
+**Burn is dominated by effort tier and context size, not by wall-clock or worker count.** Measured the
+same day: a single `claude-opus-5` worker at `xhigh` ran at roughly **0.07 %/min**; a `claude-fable-5`
+reviewer at `max` at roughly **0.5 %/min** — about seven times the rate for one worker of nominally the
+same shape. An orchestrator session's own overhead grows with its transcript, because every tool call
+re-sends the accumulated context; a session carried across a completed slice pays for that slice on
+every subsequent turn. Two estimates made from wall-clock alone that day were wrong by 6x in one
+direction and then by 7x in the other, which is the argument for a permit rather than a heuristic.
+
+**What this does not settle.** Whether a permit belongs in the frozen contract is still the open
+question the row states, and `decisions.resource_accounting` still calls per-agent and per-pool limits
+process-lifetime ephemeral scheduler state. Nothing here argues for amending the packet before PR11
+brokers concurrency; it argues that when PR11 does, the distribution exists.
