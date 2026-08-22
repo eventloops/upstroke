@@ -36,6 +36,10 @@ The contract that keeps this folder safe:
 
 ## Index
 
+- [2026-08-22 — v0.3 — repository hazard map](2026-08-22-v0.3-hazard-map.md):
+  path-indexed design defects and review findings, fed back into Phase 1 as
+  mandatory question-exhaustion items where they overlap a story's path hints.
+  The map generates questions, never answers; absence renders as unknown.
 - [2026-08-13 — v0.5 — portfolio coordination and cross-story scheduling](2026-08-13-v0.5-portfolio-coordination.md):
   coordinate multiple active stories as one portfolio — shared work, hidden
   dependencies, contention, parallelism.
