@@ -44,3 +44,16 @@ artifacts (§15); records promoted here are the durable subset.
   schema-4 immutable candidates, exact-tree verification, crash-safe CAS
   integration, bounded human-gated repair tasks, and the shared worktree/runner
   boundary.
+- [2026-08-20 — the automated review gate](2026-08-20-automated-review-gate.md):
+  single reviewer every head, three-model panel once on the merge candidate; S9's
+  remit moves to it. Stage 1 (comment-only) authorised; auto-merge is not, and the
+  reviewer's credential separation is advisory, not enforced.
+- [2026-08-20 — what invalidates a frontier review](2026-08-20-review-invalidation-scope.md):
+  reviews bind to the exact tree modulo an explicit exempt set — exactly
+  `reviews/FINDINGS.md` to start; ancestor + exempt-only diff re-attests via owner
+  dispatch, computed on the trusted side. Ends ledger edits discarding max-effort
+  reviews of unchanged code.
+- [2026-08-21 — slices land as pull requests into their integration branch](2026-08-21-stacked-slice-prs.md):
+  slice PRs into `codex/parallelism-design` get CI, policy, and a single-reviewer
+  review of each head; attestation stays master-only and happens once on #18's
+  merge candidate. Merge commits only — a rewrite orphans ledger rows.
