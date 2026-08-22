@@ -546,3 +546,29 @@ A 1-in-18 test flake is not worth a path that can delete outside the authorized 
   reviewer was measuring whether the fix *worked*; the read-only reviewer was reasoning about what the
   fix *cost*. Only the second question found this, and it needed no execution to answer — the mechanism
   is visible in the control flow. Two families, two extensions, one shared core.
+
+## 14. A history rewrite invalidates every reviewed-SHA reference in the PR ledger
+
+Stripping the Claude co-author trailers required rewriting three commits, which changed the SHA of
+those and every commit after them. The rewrite itself was safe and verified — root trees byte-identical,
+only messages changed — and the working tree was preserved through a `reset --soft`, so nothing was
+lost in the repository.
+
+**What was not anticipated: the PR body pins findings to reviewed SHAs.** `pr-policy.yml` validates
+that each ledger row's reviewed SHA is available, and two of the referenced commits — `59bef93` and
+`cdb1952` — were at or after the earliest rewritten commit. Both became orphaned on the remote the
+moment the branch was force-pushed, and eighteen ledger rows pointed at them.
+
+The remapping was unambiguous because the rewrite changed no content: each orphaned commit has exactly
+one commit in the new history with an **identical tree**, so `59bef93 -> bc07139` and
+`cdb1952 -> 1a9cb20` were derived by tree equality rather than by matching subjects, which could
+collide. Every SHA in the body was then re-checked as an ancestor of the head before the edit.
+
+**The rule.** Before force-pushing a branch that has an open PR, grep the PR body for 40-hex SHAs and
+check each against the rewritten history; remap by tree identity. The failure is silent at push time —
+the push succeeds, CI goes green, and only the policy gate notices, several minutes later and in a log
+whose first twenty lines are the ledger table it is complaining about rather than the complaint.
+
+Related: the same rewrite left four other worktree branches based on pre-rewrite commits, which was
+foreseen and communicated. It is only the *PR-body* references that were missed, because they are data
+in a place `git` does not look.
