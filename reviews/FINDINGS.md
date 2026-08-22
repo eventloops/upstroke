@@ -743,3 +743,20 @@ line carries the `rc`, so it is visible to a reader, but a batch that reports su
 nothing is how an unmeasured entry becomes a counted one. With the unbounded `cargo test` and the ignored
 second argument, all three defects share one shape: **the harness guards every way of producing a wrong
 number and none of the ways of producing no number at all.**
+
+### Capacity: the constraint is a rate against a rolling window, not a volume
+
+Observed 2026-08-22, and it changes what a permit would have to model. On the day PR5 exhausted its
+5-hour window three times — killing one `max`-effort review mid-flight — the **weekly** allowance stood
+at **97% remaining**. The aggregate was never close to spent.
+
+So the resource that actually refuses work is a **rate over a short rolling window**, and the ceiling
+that never binds is the long one. A permit modelled as a budget drawn down over a slice would have
+reported ample capacity at every moment work was being refused. What it would have to model instead is
+the window: how much has been spent in the last five hours, by whom, at what effort tier — and
+`decisions.resource_accounting`'s existing framing of per-agent and per-pool limits as
+*process-lifetime ephemeral scheduler state* is closer to that shape than a durable row would be.
+
+Two practical consequences already paid for on PR5: pacing matters more than total (four concurrent
+`max` reviewers exhaust a window that the same four run sequentially would not), and a worker killed by
+the window is not short of budget — it is early, and the same work succeeds unchanged after the reset.
