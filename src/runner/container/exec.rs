@@ -77,7 +77,7 @@ use crate::agent::ProcessOutput;
 use crate::error::TactusError;
 use crate::rundir::RunPaths;
 use crate::runner::policy::runner_policy_sha256;
-use crate::runner::{AgentId, ExecutionRole, Runner, RunnerRequest};
+use crate::runner::{AgentId, ExecutionRole, InvocationId, Runner, RunnerRequest};
 use crate::topology::events::{RunnerContract, RunnerKind, RunnerPolicy};
 
 use super::env::{BoundaryLayout, ContainerEnvironment, RoleScope, supplies_credential_location};
@@ -703,14 +703,21 @@ impl ContainerRunner {
             &self.identity.incarnation,
             &request.invocation,
         )?;
-        let intent = ContainerIntent {
-            run_id: self.identity.run_id.clone(),
-            run_dir: self.identity.run_dir.to_string_lossy().replace('\\', "/"),
-            incarnation: self.identity.incarnation.clone(),
-            repo_key: self.identity.repo_key.clone(),
-            invocation: request.invocation.render(),
-            runner_policy_sha256: self.digest.clone(),
-        };
+        // `ContainerIntent::new` encodes the run directory (`PR6-RECOV-001`).
+        // The rendering this replaced was `to_string_lossy().replace('\\',
+        // "/")`, which on Unix mapped `<repo>\a/runs/X` — a real directory,
+        // since a backslash is an ordinary filename byte there — onto
+        // `<repo>/a/runs/X`, a *different* real directory. A foreign census
+        // then probed the wrong `run.lock`, found none, and killed a live run's
+        // container. `intent::path_label` carries the argument.
+        let intent = ContainerIntent::new(
+            self.identity.run_id.clone(),
+            &self.identity.run_dir,
+            self.identity.incarnation.clone(),
+            self.identity.repo_key.clone(),
+            request.invocation.render(),
+            self.digest.clone(),
+        );
 
         let git = if receives_a_worktree(&request.role) {
             view::resolve(&request.workspace)?
@@ -752,6 +759,7 @@ impl ContainerRunner {
         Ok(InvocationPlan {
             launch: LaunchPlan {
                 private_root: self.identity.private_root.clone(),
+                invocation: request.invocation.clone(),
                 spec: CreateSpec {
                     name: name.as_str().to_owned(),
                     // INV-23: the recorded **id**, never the reference.
@@ -1005,14 +1013,18 @@ impl ContainerRunner {
             }
         };
         if created.reported_image_id != plan.spec.image_id {
-            let refusal = TactusError::Refused {
-                message: format!(
-                    "the container runtime created `{}` and reports image id `{}`, and the \
-                     run's recorded image id is `{}`; a created container whose reported image \
-                     id differs from the record is refused before start (INV-23)",
-                    plan.name, created.reported_image_id, plan.spec.image_id
-                ),
-            };
+            // R2's error type, R1's cleanup. The two lanes repaired this one
+            // path for different findings: R2 made a mid-run mismatch
+            // *distinguishable* from a pre-flight one (they were the same
+            // generic Refused), and R1 made the cleanup attempt **every** step
+            // instead of stopping at the first failure and masking the
+            // integrity error underneath it. Both are needed, so the
+            // distinguishable error is the `cause` R1's `cancelled` carries.
+            let refusal = ImageIdMismatch::of(&plan.invocation).error(
+                &plan.name,
+                &created.reported_image_id,
+                &plan.spec.image_id,
+            );
             return Err(self.cancelled(
                 hooks,
                 plan,
@@ -1183,6 +1195,101 @@ impl ContainerRunner {
             if !self.poll.is_zero() {
                 std::thread::sleep(self.poll);
             }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// INV-23's two outcomes, which differ by phase
+// ---------------------------------------------------------------------------
+
+/// What a created container's reported image id differing from the record
+/// means, which depends on **when** it is observed.
+///
+/// `expected_failures_refusals[3]`, in full: "a created container whose
+/// reported image id differs from the record is **refused before start
+/// (pre-flight/rebuild)** or **settled as a `RunnerSpawnFailure` outage
+/// (mid-run)**". Two outcomes, and the contract distinguishes them: a refusal
+/// stops the write command before it has spent anything, and an outage defers
+/// an already-running task's attempt without burning it
+/// (`UnavailableOutcome::Deferred` — "an outage never fails a task on its
+/// own").
+///
+/// The shipped code returned one [`TactusError::Refused`] for both, so a caller
+/// could not tell the two phases apart and the mid-run half of the clause was
+/// unreachable — `PR6-CORRECTNESS-001`. The *settlement event* is PR7's
+/// (`invariants_introduced`: the container transition is "test-only until PR7
+/// wires `TopologyRun`"), and `src/topology/**` is frozen; what this slice owes
+/// is that the two phases arrive at a caller as **different things**, so PR7
+/// has something to map. This is that thing.
+///
+/// **The phase is read from the invocation and nothing else.** A
+/// [`InvocationId::Probe`] is a `RunnerPreflight` container — the pre-flight
+/// and rebuild path, which by construction runs before any work — and an
+/// [`InvocationId::Attempt`] or [`InvocationId::Sequence`] is a worker, gate or
+/// reviewer invocation inside a run that is already spending. Deriving it from
+/// anything else (a flag on the runner, a phase the caller passes) would let
+/// the two disagree.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum ImageIdMismatch {
+    /// Pre-flight or rebuild: **refuse before start**, before any spend.
+    RefusedBeforeStart,
+    /// Mid-run: the invocation could not be spawned on the recorded boundary,
+    /// which the run settles as a `RunnerSpawnFailure` outage.
+    SpawnFailureOutage,
+}
+
+impl ImageIdMismatch {
+    /// Both outcomes, so a grid over phases is a grid over all of them.
+    pub const ALL: &'static [Self] = &[Self::RefusedBeforeStart, Self::SpawnFailureOutage];
+
+    /// Which outcome this invocation's mismatch has.
+    #[must_use]
+    pub const fn of(invocation: &InvocationId) -> Self {
+        match invocation {
+            InvocationId::Probe { .. } => Self::RefusedBeforeStart,
+            InvocationId::Attempt { .. } | InvocationId::Sequence { .. } => {
+                Self::SpawnFailureOutage
+            }
+        }
+    }
+
+    /// The error a caller settles from.
+    ///
+    /// **The variant is the classification**, not a substring of the message: a
+    /// caller that had to grep prose to tell a refusal from an outage would be
+    /// reading an oracle nobody can keep stable. [`TactusError::Agent`] is this
+    /// engine's existing channel for "the runner could not produce a usable
+    /// process" — `agent::proc` returns it for a failed spawn and
+    /// `gates::Scripted::SpawnFailure` returns it — which is the shape
+    /// `InfrastructureKind::RunnerSpawnFailure` settles.
+    #[must_use]
+    pub fn error(self, name: &ContainerName, reported: &str, recorded: &str) -> TactusError {
+        let message = format!(
+            "the container runtime created `{name}` and reports image id `{reported}`, and the \
+             run's recorded image id is `{recorded}`; a created container whose reported image \
+             id differs from the record is refused before start (INV-23){}",
+            match self {
+                Self::RefusedBeforeStart => String::new(),
+                Self::SpawnFailureOutage => format!(
+                    ". This invocation is mid-run, so the boundary the run recorded could not be \
+                     entered for `{name}` and the attempt settles as a RunnerSpawnFailure outage \
+                     rather than failing on its own"
+                ),
+            }
+        );
+        match self {
+            Self::RefusedBeforeStart => TactusError::Refused { message },
+            Self::SpawnFailureOutage => TactusError::Agent { message },
+        }
+    }
+
+    /// As a report writes it.
+    #[must_use]
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::RefusedBeforeStart => "refused-before-start",
+            Self::SpawnFailureOutage => "runner-spawn-failure-outage",
         }
     }
 }
@@ -2278,23 +2385,38 @@ mod tests {
         );
     }
 
-    /// A reported image id that differs from the record refuses **before
-    /// start**, in both phases, through the one code path.
+    /// A reported image id that differs from the record never reaches
+    /// `Container.Start`, and **the two phases arrive at the caller as
+    /// different things**.
     ///
-    /// INV-23 gives the mismatch two outcomes that differ by phase — a refusal
-    /// during pre-flight or rebuild, and a `RunnerSpawnFailure` outage
-    /// settlement mid-run. The **settlement** is an event and belongs to PR7
-    /// (`invariants_introduced`: the container transition is "test-only until
-    /// PR7 wires TopologyRun"); what this slice owns is that the refusal is the
-    /// same at both phases and that `Container.Start` is never reached at
-    /// either. So the grid is {pre-flight probe, in-run worker} × {mismatch},
-    /// and the second field held constant is the runtime, which is reachable
-    /// throughout.
+    /// `expected_failures_refusals[3]` gives the mismatch two outcomes: "refused
+    /// before start (**pre-flight/rebuild**)" or "settled as a
+    /// **`RunnerSpawnFailure` outage** (mid-run)". The shipped code returned one
+    /// `TactusError::Refused` for both, so the mid-run half was unreachable to
+    /// any caller — `PR6-CORRECTNESS-001`, whose surviving mutation was to
+    /// change the variant and keep the message, because the test checked only
+    /// `expect_err`, substrings, `Start`'s absence and cleanup.
+    ///
+    /// So the grid is `{pre-flight probe, in-run worker, in-run integration
+    /// sequence} × {mismatch}` and the assertion is on the **variant**, not on
+    /// prose. What is common to every cell — never started, nothing left behind
+    /// — is asserted in every cell too, because a fix that distinguished the
+    /// phases by *starting* one of them would otherwise pass.
+    ///
+    /// The settlement event itself is PR7's: `invariants_introduced` makes the
+    /// container transition "test-only until PR7 wires TopologyRun", and
+    /// `src/topology/**` is frozen. What this slice owes is the distinction,
+    /// and `ImageIdMismatch` is where PR7 reads it.
+    ///
+    /// Second field held constant: the runtime is reachable throughout and the
+    /// same image id is substituted in every cell, so only the invocation's
+    /// phase moves.
     #[test]
     fn a_substituted_reported_image_id_refuses_before_start_in_both_phases() {
-        for (phase, build) in [
+        for (phase, expected, build) in [
             (
                 "pre-flight",
+                ImageIdMismatch::RefusedBeforeStart,
                 (|fixture: &Fixture| {
                     host::shell_probe_request(
                         ShellKind::Sh,
@@ -2303,15 +2425,38 @@ mod tests {
                     )
                 }) as fn(&Fixture) -> RunnerRequest,
             ),
-            ("mid-run", |fixture: &Fixture| {
-                worker_request(
-                    ShellKind::Sh.spec("exit 0"),
-                    fixture.task_a.clone(),
-                    AgentId::new("claude-code"),
-                    Duration::from_secs(10),
-                    worker_id(0),
-                )
-            }),
+            (
+                "mid-run worker",
+                ImageIdMismatch::SpawnFailureOutage,
+                |fixture: &Fixture| {
+                    worker_request(
+                        ShellKind::Sh.spec("exit 0"),
+                        fixture.task_a.clone(),
+                        AgentId::new("claude-code"),
+                        Duration::from_secs(10),
+                        worker_id(0),
+                    )
+                },
+            ),
+            (
+                "mid-run sequence gate",
+                ImageIdMismatch::SpawnFailureOutage,
+                |fixture: &Fixture| {
+                    let mut request = worker_request(
+                        ShellKind::Sh.spec("exit 0"),
+                        fixture.task_a.clone(),
+                        AgentId::new("claude-code"),
+                        Duration::from_secs(10),
+                        worker_id(0),
+                    );
+                    request.invocation = InvocationId::sequence(
+                        crate::topology::events::SequenceId(7),
+                        crate::runner::invocation::SequenceRole::Gate(0),
+                        0,
+                    );
+                    request
+                },
+            ),
         ] {
             let fixture = Fixture::new(&format!("mismatch-{phase}"), true);
             let runner = fixture.runner();
@@ -2328,6 +2473,26 @@ mod tests {
             assert!(message.contains(IMAGE_ID), "{phase}: {message}");
             assert!(message.contains(OTHER_IMAGE_ID), "{phase}: {message}");
             assert!(message.contains("INV-23"), "{phase}: {message}");
+
+            // The phase, as the error's own shape. A caller settles from this.
+            assert_eq!(
+                ImageIdMismatch::of(&request.invocation),
+                expected,
+                "{phase}: the phase was classified from the invocation wrongly"
+            );
+            match expected {
+                ImageIdMismatch::RefusedBeforeStart => assert!(
+                    matches!(refusal, TactusError::Refused { .. }),
+                    "{phase}: a pre-flight mismatch must be a refusal before any spend: \
+                     {refusal:?}"
+                ),
+                ImageIdMismatch::SpawnFailureOutage => assert!(
+                    matches!(refusal, TactusError::Agent { .. }),
+                    "{phase}: a mid-run mismatch reached the caller as the same generic refusal a \
+                     pre-flight one does, so the RunnerSpawnFailure outage settlement the \
+                     contract requires is unreachable: {refusal:?}"
+                ),
+            }
 
             // Before start, and that is asserted as an absence rather than as
             // an error having come back.
@@ -2357,6 +2522,86 @@ mod tests {
                     .exists()
             );
         }
+    }
+
+    /// The phase is read from the invocation, over every form an invocation has.
+    ///
+    /// The oracle is an independent table over `InvocationId`'s three variants —
+    /// derived from the type, not from `ImageIdMismatch::of` — and the
+    /// distinct-value count is asserted, so a classifier that collapsed to one
+    /// answer fails here whatever it collapsed to.
+    #[test]
+    fn the_image_mismatch_phase_is_read_from_the_invocation() {
+        let cells: [(&str, InvocationId, ImageIdMismatch); 5] = [
+            (
+                "the RunnerPreflight shell probe",
+                shell_probe_id(),
+                ImageIdMismatch::RefusedBeforeStart,
+            ),
+            (
+                "a RunnerPreflight agent probe",
+                agent_probe_id("claude-code"),
+                ImageIdMismatch::RefusedBeforeStart,
+            ),
+            (
+                "an attempt's worker",
+                worker_id(0),
+                ImageIdMismatch::SpawnFailureOutage,
+            ),
+            (
+                "an attempt's gate",
+                gate_id(1),
+                ImageIdMismatch::SpawnFailureOutage,
+            ),
+            (
+                "an integration sequence's gate",
+                InvocationId::sequence(
+                    crate::topology::events::SequenceId(7),
+                    crate::runner::invocation::SequenceRole::Gate(0),
+                    0,
+                ),
+                ImageIdMismatch::SpawnFailureOutage,
+            ),
+        ];
+        assert_eq!(
+            cells
+                .iter()
+                .map(|(_, invocation, _)| invocation.render())
+                .collect::<BTreeSet<_>>()
+                .len(),
+            cells.len(),
+            "five distinct invocation identities"
+        );
+
+        let mut seen = BTreeSet::new();
+        for (what, invocation, expected) in &cells {
+            let got = ImageIdMismatch::of(invocation);
+            assert_eq!(got, *expected, "{what}");
+            seen.insert(got);
+            // And the error the classification builds carries it in its variant
+            // rather than in prose.
+            let name =
+                ContainerName::new(REPO_KEY, RUN_ID, INCARNATION_1, invocation).expect("a name");
+            let error = got.error(&name, OTHER_IMAGE_ID, IMAGE_ID);
+            assert_eq!(
+                matches!(error, TactusError::Refused { .. }),
+                *expected == ImageIdMismatch::RefusedBeforeStart,
+                "{what}: {error:?}"
+            );
+        }
+        assert_eq!(
+            seen.into_iter().collect::<Vec<_>>(),
+            ImageIdMismatch::ALL.to_vec(),
+            "the grid must reach both outcomes the contract names"
+        );
+        assert_eq!(
+            ImageIdMismatch::ALL
+                .iter()
+                .map(|outcome| outcome.name())
+                .collect::<BTreeSet<_>>()
+                .len(),
+            ImageIdMismatch::ALL.len()
+        );
     }
 
     /// A policy that is not a usable container policy is refused at
@@ -3677,9 +3922,15 @@ mod tests {
             let record: ContainerIntent =
                 serde_json::from_slice(bytes).expect("the six fields parse");
             assert_eq!(record.run_id, RUN_ID);
+            // R1 wrote this against the backslash-rewrite encoding that repair
+            // R2 replaced with a percent-encoding. Decode through the accessor
+            // the census itself uses, which asserts the round-trip rather than
+            // one side of it -- strictly stronger than comparing the stored
+            // bytes to a hand-written transform.
             assert_eq!(
-                record.run_dir,
-                fixture.paths.public.to_string_lossy().replace('\\', "/")
+                crate::runner::container::intent::owner_run_dir(&record.run_dir, "intent record")
+                    .expect("the recorded run dir decodes"),
+                fixture.paths.public
             );
             assert_eq!(record.incarnation, INCARNATION_1);
             assert_eq!(record.repo_key, REPO_KEY);

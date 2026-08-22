@@ -46,14 +46,15 @@ use super::runtime::{
     Mount, OwnerLiveness, RuntimeError, RuntimeOp, StopMode, TracePhase,
 };
 use super::{
-    DOCKER_GATED_TESTS, DisposableDirView, FakeOwnerLiveness, FakeRuntime, FoundIntent,
-    GitViewRequest, LaunchPlan, Launched, NoHooks, OrphanWindow, RecordingHooks,
-    TERMINATION_OBSERVATIONS, create_container, docker_gate, launch, list_intents, mount_git_view,
-    observe_terminated, read_intent, reclaim, release, remove_container, remove_intent,
-    start_container, stop_container, unmount_git_view, write_intent,
+    DOCKER_GATED_TESTS, DisposableDirView, FakeOwnerLiveness, FakeRuntime, FoundIntent, GitView,
+    GitViewRequest, LaunchPlan, Launched, NoHooks, OrphanWindow, PS_FIELD_SEPARATOR, PS_FORMAT,
+    PS_LABELS, RecordingHooks, TERMINATION_OBSERVATIONS, classify_docker_failure, create_container,
+    docker_gate, is_unreachable_diagnostic, launch, list_intents, mount_git_view,
+    observe_terminated, parse_ps_output, read_intent, reclaim, release, remove_container,
+    remove_intent, start_container, stop_container, unmount_git_view, write_intent,
 };
 use crate::error::TactusError;
-use crate::runner::{AgentId, InvocationId, ProbeTarget};
+use crate::runner::{AgentId, CommandSpec, InvocationId, ProbeTarget, host};
 use crate::topology::effects::{
     Adjacent, ContainerSite, DurableEvent, EffectSiteId, FaultRow, ResourceRow, SiteScope,
 };
@@ -180,6 +181,7 @@ impl Fixture {
             plan: LaunchPlan {
                 private_root: root.clone(),
                 name,
+                invocation: invocation.clone(),
                 intent: record,
                 spec,
                 view,
@@ -3182,6 +3184,7 @@ fn real_docker_creates_from_an_id_reports_it_and_reclaims_idempotently() {
     let plan = LaunchPlan {
         private_root: root.clone(),
         name: name.clone(),
+        invocation: invocation.clone(),
         intent: record.clone(),
         spec: CreateSpec {
             name: name.as_str().to_owned(),
@@ -3534,4 +3537,762 @@ fn real_docker_removing_a_container_reclaims_its_anonymous_volumes() {
         "the removal took the OPERATOR's named volume with it — R20 is \
          `operator_owned` and `persistent_output` in all five at_run_end outcomes"
     );
+}
+
+// ---------------------------------------------------------------------------
+// `PR6-RECOV-002` — `docker ps` renders labels ambiguously, so this does not
+// ask it to
+// ---------------------------------------------------------------------------
+
+/// The format string asks for exactly the labels the parser names, in order.
+///
+/// Two lists that must agree; the failure mode if they drift is a field read
+/// under the wrong name, which for `tactus.run_dir` is a probe of another run's
+/// lock. The oracle is the format string's own text, scanned for `{{.Label
+/// "…"}}` — an independent derivation from `PS_LABELS`, not a restatement.
+#[test]
+fn the_ps_format_asks_for_exactly_the_labels_the_parser_names() {
+    let mut asked = Vec::new();
+    let mut rest = PS_FORMAT;
+    while let Some(at) = rest.find("{{.Label \"") {
+        rest = &rest[at + "{{.Label \"".len()..];
+        let end = rest.find('"').expect("an unterminated .Label placeholder");
+        asked.push(&rest[..end]);
+        rest = &rest[end..];
+    }
+    assert_eq!(
+        asked,
+        PS_LABELS.to_vec(),
+        "the format string and PS_LABELS disagree about which label is which field"
+    );
+    assert_eq!(
+        asked.iter().collect::<BTreeSet<_>>().len(),
+        LABELS.len(),
+        "the census asks for all five labels the intent writes, each once"
+    );
+    assert_eq!(
+        asked.iter().copied().collect::<BTreeSet<_>>(),
+        LABELS.iter().copied().collect::<BTreeSet<_>>()
+    );
+    // The name field, and exactly one separator per field boundary.
+    assert!(PS_FORMAT.starts_with("{{.Names}}"));
+    assert_eq!(
+        PS_FORMAT.matches(PS_FIELD_SEPARATOR).count(),
+        PS_LABELS.len(),
+        "one separator between each of the {} fields",
+        PS_LABELS.len() + 1
+    );
+    assert!(
+        !PS_FORMAT.contains("{{.Labels}}"),
+        "`{{{{.Labels}}}}` renders every label as an unescaped comma-joined string and a label \
+         value may contain commas; asking for it is `PR6-RECOV-002`"
+    );
+}
+
+/// A label value carrying the delimiters of the *old* rendering survives whole.
+///
+/// The parse's oracle is a hand-written table of `(rendered line, expected
+/// name, expected labels)`, built from what `docker ps` really prints — see
+/// `real_docker_renders_a_comma_bearing_label_value_whole` for the same values
+/// checked against the live daemon.
+///
+/// Second field held constant: every line carries the same container name and
+/// the same four other labels; only `tactus.run_dir`'s bytes move, across
+/// values that are and are not hostile to a comma-joined format.
+#[test]
+fn a_label_value_carrying_a_comma_or_an_equals_is_read_whole() {
+    let sep = PS_FIELD_SEPARATOR;
+    let values = [
+        "/repo/.tactus/runs/B",
+        "/repo/a%2Cb/.tactus/runs/B",
+        // Not values `path_label` emits — a foreign container may carry
+        // anything, and the parser must still read the field it was given
+        // rather than the prefix before the first comma.
+        "/repo/a,b/.tactus/runs/B",
+        "/repo/a=b/.tactus/runs/B",
+        "/repo/a,tactus.run=IMPOSTOR/.tactus/runs/B",
+    ];
+    assert_eq!(
+        values.iter().collect::<BTreeSet<_>>().len(),
+        values.len(),
+        "five distinct run directories"
+    );
+    for value in values {
+        let line =
+            format!("tactus-k-r-i-h{sep}/srv/private{sep}RUNB{sep}{value}{sep}INC2{sep}p.shell.o0");
+        let found = parse_ps_output(&line).expect("one container");
+        assert_eq!(found.len(), 1, "`{value}`");
+        assert_eq!(found[0].name, "tactus-k-r-i-h", "`{value}`");
+        assert_eq!(
+            found[0].label(LABEL_RUN_DIR),
+            Some(value),
+            "`{value}`: the run directory was truncated, and arm (ii) probes a shorter path"
+        );
+        assert_eq!(found[0].label(LABEL_RUN), Some("RUNB"), "`{value}`");
+        assert_eq!(found[0].label(LABEL_INCARNATION), Some("INC2"), "`{value}`");
+        assert_eq!(
+            found[0].label(LABEL_PRIVATE_ROOT),
+            Some("/srv/private"),
+            "`{value}`"
+        );
+        assert_eq!(
+            found[0].label(LABEL_INVOCATION),
+            Some("p.shell.o0"),
+            "`{value}`"
+        );
+    }
+}
+
+/// A line whose fields do not line up is **refused**, not mis-split.
+///
+/// The fail-closed half of choosing a delimiter: this engine's own label values
+/// never carry `U+001F` or a newline, but a foreign container carrying this
+/// private root's label may carry anything, and a census that guessed which
+/// field was the owner's run directory would probe another run's lock. `Failed`
+/// and not `Unreachable`, because the daemon answered.
+///
+/// Second field held constant: every line below is one container's worth of
+/// output with a valid name; only the field count moves.
+#[test]
+fn a_ps_line_whose_fields_do_not_line_up_is_refused() {
+    let sep = PS_FIELD_SEPARATOR;
+    let good = format!("c{sep}/srv/private{sep}RUNB{sep}/repo/runs/B{sep}INC2{sep}p.shell.o0");
+    assert_eq!(parse_ps_output(&good).expect("well formed").len(), 1);
+
+    for (what, line) in [
+        (
+            "a value carrying the field separator",
+            format!("{good}{sep}extra"),
+        ),
+        ("a short line", format!("c{sep}/srv/private{sep}RUNB")),
+        (
+            "a value carrying a newline, which splits one container across two lines",
+            good.replace("/repo/runs/B", "/repo/runs\nB"),
+        ),
+    ] {
+        let error = parse_ps_output(&line).expect_err(what);
+        assert!(
+            !error.is_unreachable(),
+            "{what}: the daemon answered, so this is not unreachability: {error}"
+        );
+        assert_eq!(error.operation(), RuntimeOp::ListByLabel, "{what}");
+    }
+
+    // An empty rendered value is an absent label, and both are refused
+    // downstream. A container with no name at all is skipped rather than
+    // refused: `docker ps` renders a blank line for nothing this filter
+    // selected.
+    let empty = format!("c{sep}/srv/private{sep}RUNB{sep}{sep}INC2{sep}p.shell.o0");
+    let found = parse_ps_output(&empty).expect("well formed");
+    assert_eq!(found[0].label(LABEL_RUN_DIR), None);
+    assert!(parse_ps_output("\n   \n").expect("blank").is_empty());
+}
+
+// ---------------------------------------------------------------------------
+// `PR6-RECOV-005` — "permission denied" is not "no runtime"
+// ---------------------------------------------------------------------------
+
+/// The verbatim stderr of a `docker` that could not be reached, and the command
+/// that produced each.
+///
+/// Transcribed from runs on this project's build box against `docker` 29.7.2.
+/// This is the table `is_unreachable_diagnostic` is measured against, and it is
+/// **not** derived from `UNREACHABLE_DIAGNOSTICS`:
+/// `real_docker_prints_the_transcribed_unreachable_diagnostics` replays two of
+/// these through the live CLI so the oracle is the daemon.
+const UNREACHABLE_STDERR: &[(&str, &str)] = &[
+    (
+        "sudo -u nobody docker ps",
+        "permission denied while trying to connect to the docker API at unix:///var/run/docker.sock",
+    ),
+    (
+        "DOCKER_HOST=unix:///nonexistent/docker.sock docker ps",
+        "failed to connect to the docker API at unix:///nonexistent/docker.sock; check if the \
+         path is correct and if the daemon is running: dial unix /nonexistent/docker.sock: \
+         connect: no such file or directory",
+    ),
+    (
+        "DOCKER_HOST=tcp://127.0.0.1:1 docker ps",
+        "Cannot connect to the Docker daemon at tcp://127.0.0.1:1. Is the docker daemon running?",
+    ),
+    (
+        "an older client, kept because the wording is still shipped",
+        "Got permission denied while trying to connect to the Docker daemon socket at \
+         unix:///var/run/docker.sock: Head \"http://%2Fvar%2Frun%2Fdocker.sock/_ping\": dial unix \
+         /var/run/docker.sock: connect: permission denied",
+    ),
+    (
+        "docker on Windows with no engine, named pipe absent",
+        "error during connect: Get \"http://%2F%2F.%2Fpipe%2Fdocker_engine/_ping\": open \
+         //./pipe/docker_engine: The system cannot find the file specified.",
+    ),
+];
+
+/// The stderr of a daemon that **answered** and refused.
+///
+/// The other half of the classification, and it has to be a table of its own:
+/// a predicate that returned `true` for everything would pass the table above
+/// and turn every real failure into "proceed without a runtime".
+const ANSWERED_STDERR: &[&str] = &[
+    "Error response from daemon: No such container: no-such-container-xyz",
+    "Error response from daemon: cannot kill container: c: container 9f is not running",
+    "Error response from daemon: conflict: unable to remove repository reference",
+    "invalid reference format",
+    "docker: 'nope' is not a docker command.",
+    "Error response from daemon: pull access denied for private/image, repository does not exist",
+];
+
+/// Every measured "could not be reached" classifies as unreachable, and every
+/// measured "answered and refused" does not.
+///
+/// `crash_reconstruction`: "with no intent and no reachable runtime it
+/// **proceeds**". `PR6-RECOV-005`: the shipped three-string test classified the
+/// socket-permission diagnostic as `Failed`, so a census with no intents at all
+/// refused — on the single most common configuration of a machine that has
+/// Docker installed and not configured. Measuring it turned up a second one:
+/// `docker` 29's wording for an **absent socket** was also classified `Failed`.
+///
+/// Second field held constant: one operation and one call shape in every cell;
+/// only the diagnostic text moves.
+#[test]
+fn the_docker_diagnostic_classifier_tells_unreachable_from_answered() {
+    for (command, detail) in UNREACHABLE_STDERR {
+        assert!(
+            is_unreachable_diagnostic(detail),
+            "`{command}` produced a diagnostic classified as an answered failure, so a census \
+             with no container evidence refuses instead of proceeding: {detail}"
+        );
+        let error = classify_docker_failure(RuntimeOp::ListByLabel, (*detail).to_owned());
+        assert!(error.is_unreachable(), "`{command}`");
+        assert!(
+            super::census::proceeds_without(&error),
+            "`{command}`: the census would refuse"
+        );
+    }
+    for detail in ANSWERED_STDERR {
+        assert!(
+            !is_unreachable_diagnostic(detail),
+            "a daemon that answered was classified unreachable, so a write command proceeds past \
+             a runtime that will not list: {detail}"
+        );
+        let error = classify_docker_failure(RuntimeOp::ListByLabel, (*detail).to_owned());
+        assert!(!error.is_unreachable(), "{detail}");
+        assert!(!super::census::proceeds_without(&error), "{detail}");
+    }
+    assert!(UNREACHABLE_STDERR.len() >= 5 && ANSWERED_STDERR.len() >= 5);
+}
+
+/// The two `docker` diagnostic tables never claim one message.
+///
+/// `stop_already_settled` matches "is not running", which is a **reached**
+/// daemon reporting a container's state; if an unreachable shape ever matched
+/// it, a racing reclaimer's tolerated error would become "the runtime cannot be
+/// reached" and refuse the write command. Asserted over both tables at once so
+/// a future entry in either is checked against the other.
+#[test]
+fn the_two_docker_diagnostic_tables_never_claim_one_message() {
+    for (command, detail) in UNREACHABLE_STDERR {
+        assert!(
+            !super::is_absent(detail),
+            "`{command}`: an unreachable runtime read as an absent object, which is tolerated \
+             silently: {detail}"
+        );
+    }
+    for detail in ANSWERED_STDERR {
+        assert!(!is_unreachable_diagnostic(detail), "{detail}");
+    }
+    // And the one message that is *most* at risk: a racing reclaimer's kill.
+    let racing =
+        "Error response from daemon: cannot kill container: c: container 9f is not running";
+    assert!(super::stop_already_settled(racing));
+    assert!(!is_unreachable_diagnostic(racing));
+}
+
+/// The live daemon's `.Labels` really is ambiguous, and `.Label "…"` really is
+/// not.
+///
+/// `PR6-RECOV-002`'s premise, checked against `docker` rather than against a
+/// transcription of it: a container is created whose `tactus.run_dir` contains
+/// a comma, and the two renderings are compared. The comma-joined one is
+/// **asserted to be ambiguous** — it is byte-identical to what a container with
+/// an extra label would print — and the census's own path is asserted to give
+/// the value back whole.
+///
+/// Second field held constant: one container, one label set; only the format
+/// string handed to `docker ps` moves.
+#[test]
+fn real_docker_renders_a_comma_bearing_label_value_whole() {
+    let trace = ContainerTrace::recording();
+    let docker = match docker_gate(
+        "real_docker_renders_a_comma_bearing_label_value_whole",
+        trace,
+    ) {
+        Ok(docker) => docker,
+        Err(reason) => return skipped(&reason),
+    };
+    let (_, image) = match gated_image(docker.as_ref()) {
+        Ok(image) => image,
+        Err(reason) => return no_image(&reason),
+    };
+
+    let root = format!("/srv/private/r2-labels-{}", std::process::id());
+    let hostile = "/repo/a,b=c/.tactus/runs/RUNB";
+    let name = format!("tactus-r2labels-{}", std::process::id());
+    let mut labels = BTreeMap::new();
+    labels.insert(LABEL_PRIVATE_ROOT.to_owned(), root.clone());
+    labels.insert(LABEL_RUN.to_owned(), "RUNB".to_owned());
+    labels.insert(LABEL_RUN_DIR.to_owned(), hostile.to_owned());
+    labels.insert(LABEL_INCARNATION.to_owned(), "INC2".to_owned());
+    labels.insert(LABEL_INVOCATION.to_owned(), "p.shell.o0".to_owned());
+    let spec = CreateSpec {
+        name: name.clone(),
+        image_id: image.id.clone(),
+        labels,
+        mounts: Vec::new(),
+        env: Vec::new(),
+        command: vec!["/bin/sh".to_owned(), "-c".to_owned(), "exit 0".to_owned()],
+        workdir: None,
+        // Repair R1 added this field after R2 wrote this test. `true` matches
+        // every other CreateSpec in the suite and is what the runner now
+        // supplies; this container only runs `exit 0` and writes nothing.
+        read_only_root: true,
+    };
+    docker.create(&spec).expect("create the labelled container");
+
+    // (a) What the census asks for, through the production seam.
+    let found = docker
+        .containers_with_label(LABEL_PRIVATE_ROOT, &root)
+        .expect("list by label");
+    let listed = found
+        .iter()
+        .find(|container| container.name == name)
+        .unwrap_or_else(|| panic!("the container is not in {found:#?}"));
+    assert_eq!(
+        listed.label(LABEL_RUN_DIR),
+        Some(hostile),
+        "the owner's run directory came back truncated, so arm (ii) would probe a shorter path"
+    );
+    assert_eq!(listed.label(LABEL_RUN), Some("RUNB"));
+    assert_eq!(listed.label(LABEL_INCARNATION), Some("INC2"));
+
+    // (b) The rendering that shipped, from the same daemon, asserted to be
+    // ambiguous. `{{.Labels}}` prints the comma inside the value exactly as it
+    // prints the separator between labels, so the bytes below are also a
+    // perfectly good rendering of a *different* label set — which is what makes
+    // parsing them a guess rather than a read.
+    let raw = docker
+        .raw(
+            RuntimeOp::ListByLabel,
+            &root,
+            &[
+                "ps",
+                "--all",
+                "--filter",
+                &format!("label={LABEL_PRIVATE_ROOT}={root}"),
+                "--format",
+                "{{.Labels}}",
+            ],
+        )
+        .expect("the daemon answers");
+    let line = raw.lines().next().expect("one line").to_owned();
+    assert!(
+        line.contains(hostile),
+        "the daemon did not print the value at all: {line:?}"
+    );
+    let truncated = line
+        .split(',')
+        .find_map(|pair| pair.strip_prefix(&format!("{LABEL_RUN_DIR}=")))
+        .expect("the shipped parser's answer");
+    assert_ne!(
+        truncated, hostile,
+        "this test's premise is that `{{{{.Labels}}}}` is ambiguous, and on this daemon it was \
+         not: {line:?}"
+    );
+    assert!(
+        hostile.starts_with(truncated),
+        "the shipped parser truncated to `{truncated}`, which is a prefix of the real value and \
+         therefore a different, shorter directory"
+    );
+
+    docker.remove(&name).expect("reclaim the container");
+}
+
+/// The transcribed unreachable diagnostics are what the live CLI prints.
+///
+/// `UNREACHABLE_STDERR` is a table of strings, and a table compared only
+/// against the classifier built from it proves nothing. This asks the real
+/// `docker` binary for two of them — an absent socket and a socket this process
+/// may not use — and classifies **its** stderr.
+///
+/// It drives `docker` directly rather than through [`DockerCli`], because
+/// `DOCKER_HOST` is process-wide and the seam deliberately configures no
+/// socket (`non_goals[3]`, "remote runners").
+#[test]
+fn real_docker_prints_the_transcribed_unreachable_diagnostics() {
+    let trace = ContainerTrace::recording();
+    if let Err(reason) = docker_gate(
+        "real_docker_prints_the_transcribed_unreachable_diagnostics",
+        trace,
+    ) {
+        return skipped(&reason);
+    }
+
+    let mut cases: Vec<(&str, String)> = Vec::new();
+    cases.push((
+        "an absent socket",
+        format!("unix:///nonexistent-{}/docker.sock", std::process::id()),
+    ));
+
+    // A socket path this process may not reach into. `chmod 000` is the
+    // deterministic way to produce the *permission* diagnostic without a second
+    // user account; running as root would defeat it, so that case is skipped
+    // rather than asserted falsely.
+    #[cfg(unix)]
+    let denied = {
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = std::env::temp_dir().join(format!("tactus-r2-denied-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).expect("a scratch directory");
+        fs::set_permissions(&dir, fs::Permissions::from_mode(0o000)).expect("chmod 000");
+        let reachable = fs::read_dir(&dir).is_ok();
+        if reachable {
+            let _ = fs::set_permissions(&dir, fs::Permissions::from_mode(0o755));
+            let _ = fs::remove_dir_all(&dir);
+            None
+        } else {
+            cases.push((
+                "a socket this process may not use",
+                format!("unix://{}/docker.sock", dir.display()),
+            ));
+            Some(dir)
+        }
+    };
+
+    for (what, host) in &cases {
+        let spec = CommandSpec::new(super::DOCKER_PROGRAM)
+            .arg("ps")
+            .arg("--all")
+            .arg("--quiet");
+        let output = host::build_command(&spec)
+            .env("DOCKER_HOST", host)
+            .output()
+            .expect("docker starts");
+        assert!(!output.status.success(), "[{what}] docker succeeded");
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_owned();
+        assert!(
+            is_unreachable_diagnostic(&stderr),
+            "[{what}] the live CLI printed a diagnostic this classifier calls an answered \
+             failure, so a census with no container evidence would refuse: {stderr:?}"
+        );
+        assert!(
+            classify_docker_failure(RuntimeOp::ListByLabel, stderr.clone()).is_unreachable(),
+            "[{what}] {stderr:?}"
+        );
+    }
+    assert!(
+        cases.len() >= 2 || cfg!(not(unix)),
+        "the permission case did not run: this process may be root"
+    );
+
+    #[cfg(unix)]
+    if let Some(dir) = denied {
+        use std::os::unix::fs::PermissionsExt as _;
+        let _ = fs::set_permissions(&dir, fs::Permissions::from_mode(0o755));
+        let _ = fs::remove_dir_all(&dir);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// `PR6-RECOV-004` — the production liveness probe, against a lock a real other
+// process holds
+// ---------------------------------------------------------------------------
+
+/// The child of [`the_production_lock_probe_sees_a_lock_another_process_holds`].
+///
+/// Takes a real `RunLock` on the directory it is given, creates the readiness
+/// file it was told to, and waits. `#[ignore]`d because it is a fixture rather
+/// than a test: it is invoked by name, as a subprocess, in the idiom
+/// `rundir::tests::lock_child_holds_the_run` established for exactly this.
+///
+/// It signals through a **file** rather than through stdout, so the fixture
+/// needs neither `println!` nor a piped `Stdio` — `clippy::disallowed_macros`
+/// is re-denied in this file by `PR6-LANEF-004` and this repair does not widen
+/// that.
+#[test]
+#[ignore = "spawned as a subprocess by the_production_lock_probe_sees_a_lock_another_process_holds"]
+fn container_lock_probe_child_holds_the_run() {
+    let public = PathBuf::from(std::env::var("TACTUS_TEST_LOCK_DIR").expect("run dir"));
+    let ready = PathBuf::from(std::env::var("TACTUS_TEST_READY").expect("readiness path"));
+    let _held = crate::rundir::RunLock::acquire(&public).expect("the child takes the run lock");
+    fs::write(&ready, b"held").expect("say the lock is held");
+    std::thread::sleep(std::time::Duration::from_secs(30));
+}
+
+/// [`LockProbe`] answers **true** for a run another **process** is really
+/// driving, and **false** once it lets go.
+///
+/// `PR6-RECOV-004`. Arm (ii) is "probe that run's run.lock non-blocking; free ->
+/// dead owner -> reclaim …; **held -> live owner -> never touched**", and every
+/// census fixture in this slice injects a `RecordingLiveness` or a
+/// `FakeOwnerLiveness`. The only assertion against the production adapter used a
+/// directory with **no lock** and expected `false` — so `is_running` returning a
+/// constant `false` passed the whole suite, and a constant `false` classifies
+/// every live owner as dead and kills its containers.
+///
+/// It has to be a real second **process**, and that is not incidental:
+/// `fcntl` locks are per-process, and `rundir::is_running` answers from this
+/// process's own `claims` table before it opens anything. A lock taken *here*
+/// would exercise the claims path and bless an adapter that consulted only
+/// that — which is precisely the "reports false while foreign run B holds it"
+/// shape the finding names, since a foreign run is by definition another
+/// process. `rundir::tests::a_second_process_is_refused_the_run_lock` spawns a
+/// child for the same reason, and this borrows its shape.
+///
+/// The child is started through [`host::build_command`], the crate's one
+/// producer of a `std::process::Command`, so this file never names the
+/// disallowed type.
+///
+/// Second field held constant: one directory, one probe, one process asking;
+/// only whether the owner process is alive moves.
+#[test]
+fn the_production_lock_probe_sees_a_lock_another_process_holds() {
+    let root = scratch("lock-probe-held");
+    let paths =
+        crate::rundir::RunPaths::with_private_root(&root, "01KZRN48A4ZK3AEDST3RJ8HMA4", &root);
+    paths.create().expect("the run directories");
+    let ready = root.join("held");
+    let probe = super::runtime::LockProbe;
+
+    // Before: nobody holds it.
+    assert!(
+        !probe.is_running(&paths.public),
+        "a run nobody is driving reads as live"
+    );
+
+    let exe = std::env::current_exe().expect("test binary");
+    let spec = CommandSpec::new(exe.to_string_lossy().into_owned())
+        .arg("--exact")
+        .arg("runner::container::tests::container_lock_probe_child_holds_the_run")
+        .arg("--ignored");
+    let mut child = host::build_command(&spec)
+        .env("TACTUS_TEST_LOCK_DIR", &paths.public)
+        .env("TACTUS_TEST_READY", &ready)
+        .spawn()
+        .expect("spawn the owner process");
+
+    // Wait for it to say it has the lock rather than sleeping and hoping.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    while !ready.exists() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the owner process never took the lock"
+        );
+        assert!(
+            child.try_wait().expect("child status").is_none(),
+            "the owner process ended before taking the lock"
+        );
+        std::thread::yield_now();
+    }
+
+    // Held, and the probe says so **and returns**: `T-CONTAINER.resume_action`
+    // is "probe the owner's run.lock **non-blocking**", so this call is the one
+    // a blocking implementation would never come back from. The bound is
+    // generous — it is here to fail a `LockProbe` that waits, not to measure
+    // one that does not.
+    let started = std::time::Instant::now();
+    assert!(
+        probe.is_running(&paths.public),
+        "a run another process is really driving reads as dead, so a foreign census would kill \
+         its containers"
+    );
+    let elapsed = started.elapsed();
+    assert!(
+        elapsed < std::time::Duration::from_secs(5),
+        "the probe took {elapsed:?} on a held lock; a census that waits on a live neighbour \
+         stalls every write command"
+    );
+
+    // And the answer follows the world rather than being a constant: once the
+    // owner is gone the same directory reads free. Without this half a probe
+    // hard-coded to `true` would pass the assertion above.
+    let _ = child.kill();
+    let _ = child.wait();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    while probe.is_running(&paths.public) {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the lock was still held long after its owner died"
+        );
+        std::thread::yield_now();
+    }
+    let _ = fs::remove_dir_all(&root);
+}
+
+// ---------------------------------------------------------------------------
+// `PR6-CORRECTNESS-009` — the R19 view's removal converges, and fails closed
+// ---------------------------------------------------------------------------
+
+/// Every `GitView::discard` in the tree removes through the **one** retrying
+/// removal.
+///
+/// `crash_reconstruction`: "every step idempotent and tolerant of already-gone
+/// so **two concurrent reclaimers converge**". On Windows the loser of that
+/// race does not get `NotFound` — a directory whose last handle has closed is
+/// delete-pending and `remove_dir_all` reports `PermissionDenied` until the
+/// name goes away — so a `match` that tolerates only `NotFound` refuses one of
+/// two converging write commands. `DisposableDirView` had been repaired;
+/// `RoleGitView`, the projection a real run mounts, had not, and every
+/// concurrent-census fixture used the other one (`PR6-CORRECTNESS-009`).
+///
+/// This is a source census because the platform behaviour it is about cannot be
+/// produced deterministically on Linux, and because "there is one removal" is a
+/// claim about the tree rather than about a call. It is the shape
+/// `the_view_directory_has_one_definition_in_the_tree` already uses for the
+/// other half of this same seam. The behavioural halves are the two tests
+/// below.
+#[test]
+fn every_view_discard_removes_through_the_one_racing_removal() {
+    /// The out-of-line test substrate of this subtree, excluded **by name**
+    /// rather than by a pattern, so a new one is a change here. Everything else
+    /// is cut at its first `#[cfg(test)]` by `production_region`; these files
+    /// have none, being test modules in their entirety.
+    const SUBSTRATE: &[&str] = &[
+        "src/runner/container/fake.rs",
+        "src/runner/container/tests.rs",
+        "src/runner/container/census/tests.rs",
+        "src/runner/container/resolve/tests.rs",
+    ];
+
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let mut offenders = Vec::new();
+    let mut occurrences = 0;
+    let mut excluded = 0;
+    for path in walk(&root.join("src/runner")) {
+        let relative = path
+            .strip_prefix(&root)
+            .expect("under the manifest")
+            .to_string_lossy()
+            .replace('\\', "/");
+        if SUBSTRATE.contains(&relative.as_str()) {
+            excluded += 1;
+            continue;
+        }
+        let source = fs::read_to_string(&path).expect("read source");
+        // Strings blanked as well: this test's own doc comment and the literal
+        // it scans for would otherwise be findings about itself. Whitespace
+        // flattened so a rustfmt wrap is not a false finding.
+        let production =
+            crate::effects::blank_comments_and_strings(&crate::effects::production_region(&source));
+        let flat = production.split_whitespace().collect::<Vec<_>>().join(" ");
+        let removals = flat.matches("remove_dir_all(").count();
+        let authorised = flat
+            .matches("racing_removal(path, || fs::remove_dir_all(path))")
+            .count();
+        occurrences += removals;
+        if removals != authorised {
+            offenders.push(format!(
+                "{relative} has {removals} directory removal(s) and {authorised} of them go \
+                 through `racing_removal`; a `match` on `remove_dir_all` that tolerates only \
+                 `NotFound` refuses the loser of a Windows delete-pending race"
+            ));
+        }
+    }
+    assert_eq!(
+        excluded,
+        SUBSTRATE.len(),
+        "a file named in SUBSTRATE is not in the tree, so the exclusion is stale"
+    );
+    assert!(
+        occurrences >= 2,
+        "the census found {occurrences} directory removals in the production region of \
+         src/runner; it is measuring nothing"
+    );
+    assert!(offenders.is_empty(), "{offenders:#?}");
+}
+
+/// Discarding a view twice converges, and the second call is not an error.
+///
+/// The already-gone half of "two concurrent reclaimers converge", made
+/// deterministic by serialising the two reclaimers rather than racing them —
+/// the race itself is `census::tests::concurrent_reclaimers_converge`, and this
+/// is the predicate underneath it, held against the **`RoleGitView`** the
+/// concurrent fixtures do not use.
+///
+/// Second field held constant: the same path, the same view, the same trace in
+/// both calls; only whether the directory is still there moves.
+#[test]
+fn discarding_a_role_view_twice_converges() {
+    let trace = ContainerTrace::recording();
+    let view: &dyn GitView = &super::view::RoleGitView::new(trace.clone());
+    let root = scratch("role-view-twice");
+    let path = root.join("views").join("tactus-k-r-i-h");
+    fs::create_dir_all(path.join("objects").join("pack")).expect("a view with depth");
+    fs::write(path.join("HEAD"), b"0000\n").expect("a file in it");
+
+    view.discard(&path).expect("the first reclaimer");
+    assert!(!path.exists());
+    view.discard(&path)
+        .expect("the second reclaimer must converge, not refuse");
+    assert!(!path.exists());
+}
+
+/// A view that genuinely **cannot** be removed refuses, and says nothing was
+/// discarded.
+///
+/// The fail-closed half, and the test for what this repair could have got
+/// wrong. The smaller fix — tolerating `PermissionDenied` outright — would make
+/// a protected view report success; the census would then go on to remove the
+/// intent, and admission would proceed over R19 residue that nothing can ever
+/// reclaim, because the record naming it is gone. `resource_accounting` R19
+/// requires orphan views reclaimed, and "reclaimed" is not "forgotten".
+///
+/// Constructed on Unix by clearing the parent directory's write bit, which is
+/// deterministic and is not delete-pending — the two are different states and
+/// only one of them is transient. Skipped under a uid that ignores the bit.
+///
+/// Second field held constant: the same view, the same path, the same content;
+/// only the parent's permissions move.
+#[test]
+#[cfg(unix)]
+fn a_role_view_that_cannot_be_removed_refuses_and_records_nothing() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let trace = ContainerTrace::recording();
+    let view: &dyn GitView = &super::view::RoleGitView::new(trace.clone());
+    let root = scratch("role-view-protected");
+    let parent = root.join("views");
+    let path = parent.join("tactus-k-r-i-h");
+    fs::create_dir_all(&path).expect("the view");
+    fs::write(path.join("HEAD"), b"0000\n").expect("a file in it");
+    fs::set_permissions(&parent, fs::Permissions::from_mode(0o500)).expect("clear the write bit");
+    if fs::remove_dir_all(&path).is_ok() {
+        // Running as root, or on a filesystem that ignores the mode. Restore
+        // and say so rather than asserting something that is not true here.
+        let _ = fs::set_permissions(&parent, fs::Permissions::from_mode(0o755));
+        return;
+    }
+
+    let error = view
+        .discard(&path)
+        .expect_err("a view that is still there must not be reported discarded");
+    assert!(
+        matches!(error, TactusError::Io { .. }),
+        "the refusal must carry the IO error that stopped it: {error:?}"
+    );
+    assert!(
+        path.exists(),
+        "the fixture's premise: the view is still there"
+    );
+    assert!(
+        !trace
+            .rendered()
+            .iter()
+            .any(|entry| entry.contains("discard")),
+        "a view that was not removed was recorded as discarded, so the census would remove the \
+         intent that names it and leave R19 residue nothing can reclaim: {:#?}",
+        trace.rendered()
+    );
+
+    let _ = fs::set_permissions(&parent, fs::Permissions::from_mode(0o755));
+    let _ = fs::remove_dir_all(&root);
 }

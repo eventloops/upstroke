@@ -101,6 +101,7 @@ use crate::error::TactusError;
 use crate::topology::effects::{ContainerSite, EffectSiteId, HookPhase, Injection};
 use crate::util;
 
+use crate::runner::InvocationId;
 use intent::{ContainerIntent, ContainerName, INTENT_STAGED_SUFFIX, IntentWritten, containers_dir};
 use runtime::{
     ContainerExecution, ContainerRuntime, ContainerTrace, CreateSpec, CreatedContainer,
@@ -570,6 +571,13 @@ pub struct LaunchPlan {
     /// `<R>` — the run's **recorded** private root.
     pub private_root: PathBuf,
     pub name: ContainerName,
+    /// Which invocation this container is, as the tuple rather than as the
+    /// rendered string the intent carries.
+    ///
+    /// INV-23 gives an image-id mismatch **two** outcomes and the phase is what
+    /// chooses between them, so the phase has to be readable at the point the
+    /// mismatch is observed: see [`exec::ImageIdMismatch`].
+    pub invocation: InvocationId,
     pub intent: ContainerIntent,
     /// The create arguments. `spec.image_id` is the record's image id, and it
     /// is what the reported id is verified against.
@@ -1239,22 +1247,7 @@ impl DockerCli {
             return Ok((output.stdout, output.stderr));
         }
         let detail = String::from_utf8_lossy(&output.stderr).trim().to_owned();
-        // The daemon-unreachable shape. `docker` reports it on stderr with a
-        // zero-or-nonzero status depending on subcommand, so the classification
-        // is by message rather than by code.
-        if detail.contains("Cannot connect to the Docker daemon")
-            || detail.contains("error during connect")
-            || detail.contains("Is the docker daemon running")
-        {
-            return Err(RuntimeError::Unreachable {
-                operation: op,
-                detail,
-            });
-        }
-        Err(RuntimeError::Failed {
-            operation: op,
-            detail,
-        })
+        Err(classify_docker_failure(op, detail))
     }
 
     /// `docker inspect` a thing, tolerating "no such object" as absence.
@@ -1347,6 +1340,199 @@ fn split_list(raw: &str) -> Vec<String> {
         .collect()
 }
 
+/// The field separator of [`PS_FORMAT`]'s output.
+///
+/// `U+001F` INFORMATION SEPARATOR ONE, the byte its name is for. It is not a
+/// character any of this engine's own label values carry — a path label is
+/// percent-encoded ASCII, a run id and an incarnation are ULIDs, an invocation
+/// is `[0-9A-Za-z._]` — but a **foreign** container carrying this private
+/// root's label may carry anything at all, so [`parse_ps_output`] treats a line
+/// with the wrong field count as unreadable evidence and refuses rather than
+/// trusting a mis-split.
+const PS_FIELD_SEPARATOR: char = '\u{1f}';
+
+/// `docker ps --format` for the census: **one placeholder per label**.
+///
+/// `{{.Labels}}` renders every label of a container as an **unescaped
+/// comma-joined `key=value` string**, and a label value may itself contain
+/// commas and `=`. Measured on this box, `docker` 29.7.2, a container labelled
+/// `tactus.run=RUN1` and `tactus.run_dir=/a,b=c`:
+///
+/// ```text
+/// --format '{{.Names}}|{{.Labels}}'      -> r2probe|tactus.run=RUN1,tactus.run_dir=/a,b=c
+/// --format '{{.Label "tactus.run_dir"}}' -> /a,b=c
+/// ```
+///
+/// The first is ambiguous *in the daemon's own output* — `tactus.run_dir=/a`
+/// and a label `b=c` is an equally good reading of those bytes, and it is the
+/// reading the shipped `split(',')` took. For `tactus.run_dir` that truncation
+/// sends arm (ii)'s probe to a shorter, different directory, finds no
+/// `run.lock`, and reclaims a **live** owner's container (`PR6-RECOV-002`). So
+/// this asks the daemon for each field on its own, which is the one rendering
+/// that cannot be ambiguous, rather than parsing a format that permits its own
+/// delimiter inside a field.
+///
+/// All five labels, not the three the census reads today: the discovered
+/// container's map is the same shape it always was, so a later reader is not
+/// silently handed a map that lost the two nobody happened to need.
+const PS_FORMAT: &str = "{{.Names}}\u{1f}{{.Label \"tactus.private_root\"}}\
+     \u{1f}{{.Label \"tactus.run\"}}\u{1f}{{.Label \"tactus.run_dir\"}}\
+     \u{1f}{{.Label \"tactus.incarnation\"}}\u{1f}{{.Label \"tactus.invocation\"}}";
+
+/// The labels [`PS_FORMAT`] asks for, in the order it asks for them.
+///
+/// Written out beside the format string and checked against it by
+/// `tests::the_ps_format_asks_for_exactly_the_labels_the_parser_names`, so a
+/// placeholder added to one and not the other is a failing test rather than a
+/// field read under the wrong name.
+const PS_LABELS: &[&str] = &[
+    intent::LABEL_PRIVATE_ROOT,
+    intent::LABEL_RUN,
+    intent::LABEL_RUN_DIR,
+    intent::LABEL_INCARNATION,
+    intent::LABEL_INVOCATION,
+];
+
+/// `docker ps`'s answer, one container per line.
+///
+/// **A line whose field count is not `1 + PS_LABELS.len()` is refused**, and
+/// that is the fail-closed half of [`PS_FIELD_SEPARATOR`]: a label value
+/// carrying the separator splits into too many fields and one carrying a
+/// newline splits its container across two lines with too few, and either way
+/// the values no longer line up with the names. Guessing which field is which
+/// at that point is how a census probes the wrong lock.
+///
+/// An **empty** rendered value is recorded as an absent label rather than as a
+/// present empty one, because `{{.Label "x"}}` renders both as the empty string
+/// and this side cannot tell them apart. Both are refused downstream —
+/// `census::from_labels_alone` refuses a missing ownership label and
+/// `intent::owner_run_dir` refuses an empty run directory — so the collapse
+/// costs a diagnostic's precision and never an admission.
+///
+/// # Errors
+///
+/// [`RuntimeError::Failed`] naming the line, when a line does not carry exactly
+/// the fields [`PS_FORMAT`] asks for. `Failed` and not `Unreachable`: the
+/// daemon answered.
+fn parse_ps_output(text: &str) -> Result<Vec<DiscoveredContainer>, RuntimeError> {
+    let expected = 1 + PS_LABELS.len();
+    let mut found = Vec::new();
+    for line in text.lines().filter(|line| !line.trim().is_empty()) {
+        let fields: Vec<&str> = line.split(PS_FIELD_SEPARATOR).collect();
+        if fields.len() != expected {
+            return Err(RuntimeError::Failed {
+                operation: RuntimeOp::ListByLabel,
+                detail: format!(
+                    "`docker ps` rendered {} field(s) for one container and this format asks for \
+                     {expected}: {line:?}. A label value carrying the field separator or a line \
+                     terminator makes the values stop lining up with their names, and a census \
+                     that guessed which field was the owner's run directory would probe another \
+                     run's lock",
+                    fields.len()
+                ),
+            });
+        }
+        let name = fields[0].trim().to_owned();
+        if name.is_empty() {
+            continue;
+        }
+        let mut labels = BTreeMap::new();
+        for (key, value) in PS_LABELS.iter().zip(&fields[1..]) {
+            if !value.is_empty() {
+                labels.insert((*key).to_owned(), (*value).to_owned());
+            }
+        }
+        found.push(DiscoveredContainer { name, labels });
+    }
+    Ok(found)
+}
+
+/// The diagnostics that mean **the daemon was never reached**, lower-cased.
+///
+/// `crash_reconstruction` hangs a whole branch on this distinction: "the
+/// container runtime is required only when an intent exists or a labeled
+/// container is discoverable … with **no intent and no reachable runtime it
+/// proceeds**". A machine with `docker` installed and the daemon not reachable
+/// by *this* process is the ordinary configuration, not a fault, and every
+/// diagnostic below is one this engine must proceed past when it holds no
+/// container evidence. Getting it wrong the other way — classifying "cannot
+/// reach" as "reached and refused" — makes `tactus run` refuse to start at all
+/// on a machine that has no container work to do (`PR6-RECOV-005`).
+///
+/// **Measured, not recalled.** Every entry was produced on this project's build
+/// box against `docker` 29.7.2 and is transcribed from that run's stderr; the
+/// command that produced each is beside it, and
+/// `tests::the_transcribed_unreachable_diagnostics_are_what_the_live_cli_prints`
+/// replays two of them through the real CLI so the table's oracle is the daemon
+/// rather than this list.
+///
+/// | # | command | stderr |
+/// |---|---|---|
+/// | 1 | `sudo -u nobody docker ps` | `permission denied while trying to connect to the docker API at unix:///var/run/docker.sock` |
+/// | 2 | `DOCKER_HOST=unix:///nonexistent/docker.sock docker ps` | `failed to connect to the docker API at unix:///nonexistent/docker.sock; check if the path is correct and if the daemon is running: dial unix …: connect: no such file or directory` |
+/// | 3 | `DOCKER_HOST=tcp://127.0.0.1:1 docker ps` | `Cannot connect to the Docker daemon at tcp://127.0.0.1:1. Is the docker daemon running?` |
+///
+/// Rows 1 **and** 2 were both classified `Failed` by the three-string test this
+/// replaced: row 1 is the socket-permission case the review reproduced, and row
+/// 2 — `docker` 29's wording for an absent socket — is the shape a machine with
+/// the daemon stopped produces, so the misclassification was not the rare case
+/// it looked like. Row 2 does contain the words "if the daemon is running", but
+/// the shipped predicate looked for the older `Is the docker daemon running`,
+/// case-sensitively, and matched neither.
+///
+/// **Windows** keeps `error during connect` and the named-pipe wording it
+/// wraps (`open //./pipe/docker_engine: The system cannot find the file
+/// specified`), which is why that entry stays even though no row above produced
+/// it on Linux.
+///
+/// Nothing here may overlap [`stop_already_settled`]'s `is not running`, which
+/// is a **reached** daemon reporting a container's state; entries are whole
+/// connection phrases for that reason, and
+/// `tests::the_two_docker_diagnostic_tables_never_claim_one_message` holds the
+/// two tables apart.
+const UNREACHABLE_DIAGNOSTICS: &[&str] = &[
+    "cannot connect to the docker daemon",
+    "error during connect",
+    "is the docker daemon running",
+    "if the daemon is running",
+    "permission denied while trying to connect",
+    "failed to connect to the docker api",
+    "the docker daemon is not running",
+];
+
+/// Whether a `docker` failure means the daemon was never reached.
+///
+/// Case-insensitive: `docker` 29 lower-cased "docker API" where earlier
+/// versions wrote "Docker daemon", and a classification that turns on the case
+/// of a vendor's prose is a classification that breaks on the next release.
+///
+/// See [`UNREACHABLE_DIAGNOSTICS`] for the measured table and for why this is a
+/// named function with its own tests rather than a `matches!` at the call site:
+/// every fake in this slice injects [`RuntimeError::Unreachable`] *directly*,
+/// so nothing but a test of this function tests the thing that decides it.
+#[must_use]
+pub fn is_unreachable_diagnostic(detail: &str) -> bool {
+    let lower = detail.to_ascii_lowercase();
+    UNREACHABLE_DIAGNOSTICS
+        .iter()
+        .any(|shape| lower.contains(shape))
+}
+
+/// One failed `docker` invocation, as the seam's error.
+///
+/// A free function taking the raw stderr rather than a branch inside
+/// [`DockerCli::exec_streams`], for the reason [`settle_stop`] is one: the
+/// classification is reachable — and testable — **without a daemon**, and the
+/// census tests can hand a fake runtime the error a verbatim diagnostic really
+/// produces instead of asserting on an `Unreachable` they minted themselves.
+#[must_use]
+pub fn classify_docker_failure(operation: RuntimeOp, detail: String) -> RuntimeError {
+    if is_unreachable_diagnostic(&detail) {
+        return RuntimeError::Unreachable { operation, detail };
+    }
+    RuntimeError::Failed { operation, detail }
+}
+
 /// Whether a `docker` failure means "the object is not there".
 fn is_absent(detail: &str) -> bool {
     let lower = detail.to_ascii_lowercase();
@@ -1410,31 +1596,9 @@ impl ContainerRuntime for DockerCli {
         let text = self.exec(
             RuntimeOp::ListByLabel,
             value,
-            &[
-                "ps",
-                "--all",
-                "--filter",
-                &filter,
-                "--format",
-                "{{.Names}}\u{1f}{{.Labels}}",
-            ],
+            &["ps", "--all", "--filter", &filter, "--format", PS_FORMAT],
         )?;
-        let mut found = Vec::new();
-        for line in text.lines().filter(|line| !line.trim().is_empty()) {
-            let mut fields = line.split('\u{1f}');
-            let name = fields.next().unwrap_or_default().trim().to_owned();
-            if name.is_empty() {
-                continue;
-            }
-            let mut labels = BTreeMap::new();
-            for pair in fields.next().unwrap_or_default().split(',') {
-                if let Some((key, value)) = pair.split_once('=') {
-                    labels.insert(key.trim().to_owned(), value.trim().to_owned());
-                }
-            }
-            found.push(DiscoveredContainer { name, labels });
-        }
-        Ok(found)
+        parse_ps_output(&text)
     }
 
     fn observe(&self, name: &str) -> Result<Liveness, RuntimeError> {
