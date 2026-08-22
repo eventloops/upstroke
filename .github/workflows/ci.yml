@@ -1,10 +1,13 @@
 name: CI
 
 on:
+  # The integration branch for the parallel-execution design receives slice
+  # pull requests and is tested on every merge into it; its slices are
+  # reviewed but never attested. decisions/2026-08-21-stacked-slice-prs.md
   push:
-    branches: [master]
+    branches: [master, codex/parallelism-design]
   pull_request:
-    branches: [master]
+    branches: [master, codex/parallelism-design]
     types: [opened, edited, synchronize, reopened]
 
 permissions:
