@@ -696,3 +696,50 @@ forward as "five regressions" — that is the claim this exercise exists to avoi
 * **`recat-batch.sh` ignores its second argument.** It writes to stdout and expects the caller to
   redirect. Passing a log path *and* redirecting elsewhere sends every verdict to the void while the run
   looks healthy.
+
+### Final result — 190 of 190, and two corrections to the interim entry above
+
+**184 of 190 still die.** 174 `KILLED` plus 10 that fail to compile — and that second group is a **kill,
+not an unmeasurable**: `WONT_COMPILE` now is `KILLED_BY_TYPES` then, the same outcome under a different
+label, because those mutations are caught by the type system. The interim entry above counted them as
+unmeasurable, which was wrong.
+
+**The repairs demonstrably work: 37 of the 38 survivors ruled *repaired* now die**, measured against the
+code that shipped rather than against the tree they were written on. That is the strongest single result
+of the exercise and it was not visible from any other instrument.
+
+**Two entries resolved by platform, in opposite directions.** Measuring the same entry on both platforms
+is what separated them:
+
+* `PR5-EVENTS-006` — Linux `SURVIVED`, guest `KILLED`. Its assertion is about an append-only
+  `FILE_APPEND_DATA` handle lacking `FILE_WRITE_DATA`, which has no Unix analogue, so surviving on Linux
+  is **correct**. Not a regression.
+* `PR5-WORKSPACE-003` — Linux `KILLED`, guest `SURVIVED`. The reverse: a real Windows-side survivor that
+  the Linux run would have reported as fine. `WorkspaceManager::repo_key`.
+
+Neither could have been settled on one platform, and three Windows entries were nearly left unmeasured.
+
+### The six that need adjudication. Owner: G2.
+
+| entry | target | was | note |
+|---|---|---|---|
+| `PR5-RUNDIR-030` | `prove_private_half_ownership` | KILLED | production and fixtures byte-identical to catalogue time |
+| `PR5-EVENTS-020` | `prove_prefix_stable` equality oracle | KILLED | |
+| `PR5-WORKSPACE-068` | `force_remove_residue` | KILLED | |
+| `PR5-WORKSPACE-070` | `ResidueSamplingHarness::record_sample` | KILLED | |
+| `PR5-EVENTS-051` | legacy `EventLog::append` flush step | SURVIVED | **the one repair of 38 that did not take** |
+| `PR5-WORKSPACE-003` | `WorkspaceManager::repo_key` | KILLED | **Windows only** — Linux kills it |
+
+Every one of their killing assertions is still in the tree, so no repair deleted a test. Each is either a
+**narrowed assertion** (real detection loss) or an **equivalent mutant** from re-expressing prose — two
+different findings, and calling them six regressions without settling which would be the mistake this
+exercise exists to prevent.
+
+### A third harness defect, and it is the same shape as the other two
+
+A guest entry whose `win-iter` invocation fails returns `rc=6` with **no verdict**, and the batch records
+`exit=0` and moves on. Three Windows entries were "measured" that way and produced nothing; the `RESULT`
+line carries the `rc`, so it is visible to a reader, but a batch that reports success while measuring
+nothing is how an unmeasured entry becomes a counted one. With the unbounded `cargo test` and the ignored
+second argument, all three defects share one shape: **the harness guards every way of producing a wrong
+number and none of the ways of producing no number at all.**
