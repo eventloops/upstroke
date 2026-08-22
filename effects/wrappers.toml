@@ -708,6 +708,9 @@ effect_free = [
     "effort_for",
     "files",
     "for_resume",
+    # `RunnerSelection::host_default` — what an absent `[runner]` section means.
+    # A struct literal over owned values; it reaches no primitive and no path.
+    "host_default",
     "implementation_effort",
     "load",
     "load_captured",

@@ -62,7 +62,8 @@
 )]
 
 // -- module declarations -------------------------------------------------
-// APPEND ONLY. Lane A adds `exec`, `view` and `env`; lane C adds `census`.
+// APPEND ONLY. Lane A adds `exec`, `view` and `env`; lane C adds `census`;
+// lane B adds `resolve`.
 // Keep every `#[cfg(test)]` declaration at the BOTTOM of this file:
 // `effects::production_region` cuts a source at its FIRST `#[cfg(test)]`, so a
 // test-only `mod` here would remove every funnel below it from the census that
@@ -71,6 +72,7 @@ pub mod census;
 pub mod env;
 pub mod exec;
 pub mod intent;
+pub mod resolve;
 pub mod runtime;
 pub mod view;
 
