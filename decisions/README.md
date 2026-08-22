@@ -35,7 +35,7 @@ artifacts (§15); records promoted here are the durable subset.
 - [2026-08-11 — self-hosting v0.2](2026-08-11-self-hosting-v02.md): v0.2
   development runs through tactus; the claim is auditable from commit tags.
 - [2026-08-11 — gate config across a resume](2026-08-11-resume-gate-config.md):
-  resume re-derives gates it should take from the record. Remedy under revision.
+  resume runs the gates the record carries, warning on config drift; verified live.
 - [2026-08-11 — Codex reasoning effort](2026-08-11-codex-reasoning-effort.md):
   every Codex review had run at `low`; effort is now a routing axis, verified live.
 - [2026-08-11 — decision export schema](2026-08-11-export-decisions-schema.md):

@@ -25,9 +25,13 @@ The contract that keeps this folder safe:
     it. Omit the segment only when the work is genuinely unplaceable.
 - **Every proposal opens with a status block:** `Status:` (`Draft`,
   `In council`, `Decided → <link>`, `Parked`, `Withdrawn`), `Target:` (living
-  version estimate), `Filed:` (date). A proposal may be revised while in
-  council; note material revisions under the status block rather than silently
-  rewriting.
+  version estimate), and `Filed:` (date). New or materially revised proposals
+  also state `Review:` (`Unreviewed`, `In review`, or `Reviewed` with critique
+  links); absence on an older file means unrecorded, not reviewed. Status and
+  review evidence are orthogonal: a draft is not reviewed merely because it was
+  filed, and a critique does not make it authoritative. A proposal may be
+  revised while in council; note material revisions under the status block
+  rather than silently rewriting.
 - **Critiques live beside their proposal** as
   `<proposal-stem>-critique-<family>.md` (family = model family per DESIGN.md
   §11.3 — the council's seat identity). Critiques are dated records of what a
@@ -36,6 +40,39 @@ The contract that keeps this folder safe:
 
 ## Index
 
+- [2026-08-22 — v0.3 — repository hazard map](2026-08-22-v0.3-hazard-map.md):
+  path-indexed design defects and review findings, fed back into Phase 1 as
+  mandatory question-exhaustion items where they overlap a story's path hints.
+  The map generates questions, never answers; absence renders as unknown.
+- [2026-08-15 — v0.3+ — proposal disposition ledger and rationale history](2026-08-15-v0.3-proposal-disposition-ledger.md):
+  **Unreviewed draft.** Preserve approved, rejected, parked, withdrawn, and
+  superseded reasoning with explicit revisit conditions and an eventual curated
+  customer-facing projection.
+- [2026-08-15 — v0.3+ — blind normalized design council](2026-08-15-v0.3-blind-normalized-design-council.md):
+  **Unreviewed draft.** Separate anonymous design, challenge, synthesis,
+  implementation, and review seats through a provider-neutral normalized
+  envelope; keep the protocol manual until critical parallelism lands.
+- [2026-08-15 — v0.2 — pull-request rationale and acceptance traceability](2026-08-15-v0.2-pr-rationale-and-acceptance-traceability.md):
+  **Unreviewed draft.** Make truthful what/why, acceptance mapping, risk,
+  verification, deferral, and recovery evidence part of every PR review.
+- [2026-08-15 — v0.2 — review convergence and defect governance](2026-08-15-v0.2-review-convergence-and-defect-governance.md):
+  **Unreviewed draft.** Cap ordinary semantic frontier invocations at three,
+  distinguish introduced/fix-regression/pre-existing defects, require
+  regression evidence, and prioritize confirmed work through a versioned C/S/L
+  matrix.
+- [2026-08-15 — v0.2 — streamed agent supervision and independent review deadlines](2026-08-15-v0.2-streamed-agent-supervision.md):
+  **Unreviewed draft.** Decode provider streams into sanitized activity,
+  preserve bounded private evidence, and give every frontier review pass its
+  own fail-closed deadline before parallel self-hosting.
+- [2026-08-13 — v0.2 — engine-owned implementation checkpoints and selective rewind](2026-08-13-v0.2-implementation-checkpoints.md):
+  **Unreviewed draft.** Preserve bounded private A/B/C checkpoints during one
+  implementation so a bad D can rewind to C, while final verification still
+  judges the complete task-base-to-result change.
+- [2026-08-13 — v0.2 — machine-readable Tactus commit provenance](2026-08-13-v0.2-tactus-commit-provenance.md):
+  **Unreviewed draft.** Retain `[tactus]` as the human-visible subject marker
+  and augment it with run/task/work/revision Git trailers, a predictable
+  `tactus` display identity, and optional annotated tags that expose accepted
+  `Initial work → Fix N` lineages without tagging rejected attempts.
 - [2026-08-13 — v0.5 — portfolio coordination and cross-story scheduling](2026-08-13-v0.5-portfolio-coordination.md):
   coordinate multiple active stories as one portfolio — shared work, hidden
   dependencies, contention, parallelism.
@@ -44,6 +81,8 @@ The contract that keeps this folder safe:
   a read-only public projection of the event log — tactus building tactus,
   with receipts.
 - [2026-08-13 — v0.2 — structured review-finding telemetry](2026-08-13-v0.2-review-finding-telemetry.md):
-  extend the verdict contract with a `findings` array; additive event fields,
-  export schema 2; telemetry never changes a logically consistent verification outcome, while a
-  self-contradictory pass still fails closed without another model call.
+  **Unreviewed draft.** Extend the verdict contract with a `findings` array and
+  stable lifecycle hooks; additive event fields and export schema 2 preserve
+  the rule that telemetry never changes a logically consistent verification
+  outcome, while a self-contradictory pass still fails closed without another
+  model call.
