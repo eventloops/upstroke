@@ -70,7 +70,7 @@ use the CI form regardless, so the two stay equivalent when that changes.
 toolchain selection is explicit at call sites, so nothing auto-corrects a wrong
 default. Install 1.85.0 alongside stable.
 
-Seven bash gates in `.github/scripts/test-*.sh` also run in CI's `lint` job.
+8 `test-*.sh` gates in `.github/scripts/` also run in CI's `lint` job.
 Invoke them **from the repository root**, the way `ci.yml` does:
 
 ```bash
@@ -117,9 +117,11 @@ locally against your body before pushing.
 exception: a push whose entire diff from the reviewed head is confined to
 `reviews/FINDINGS.md` keeps the review, and the trusted workflow re-attests the
 current head after verifying ancestry and the exempt-only diff itself
-(`decisions/2026-08-20-review-invalidation-scope.md`). That standing ledger
-arrives with the parallelism slice; until it merges, the exemption has nothing
-to match and every push invalidates. Everything else
+(`decisions/2026-08-20-review-invalidation-scope.md`). The exemption is about
+the path, not about the file already existing: a push that only *adds*
+`reviews/FINDINGS.md` is itself exempt-only, which is how that standing ledger
+-- it arrives with the parallelism slice -- can land without costing the review
+it is meant to record. Everything else
 invalidates, deliberately. Only the repository owner may attest; that check
 cannot be satisfied by an agent.
 
@@ -132,7 +134,7 @@ cannot be satisfied by an agent.
 | `CONTRIBUTING.md` | Contributor rules and CLA |
 | `decisions/` | Dated, immutable decision records |
 | `proposals/` | Dated design proposals and their critiques |
-| `.github/scripts/` | The 7 `test-*.sh` gates and the `validate-*` helpers they exercise |
+| `.github/scripts/` | The 8 `test-*.sh` gates and the `validate-*` helpers they exercise |
 | `acceptance/RESULT.md` | The v0.1 acceptance run write-up |
 | `reviews/` | Review records, and the standing finding ledger once it lands |
 
