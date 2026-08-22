@@ -528,6 +528,24 @@ A 1-in-18 test flake is not worth a path that can delete outside the authorized 
   `src/workspace_manager.rs`.** Closing it requires restoring containment authorization *before*
   widening what removal proceeds on — the two must be solved together, which is why round 7's
   ordering failed. Reverting is not a repair; the residue still does not converge, it merely fails safe.
+### If one of these fires before G2, this is what it looks like
+
+**Symptom.** A write command (`run`, `resume`) fails at start, in `reclaim_intents`. Git's own
+enumeration is what breaks first, so the error names a registration file rather than anything Tactus
+owns — `fatal: failed to read .git/worktrees/<slot>/commondir: Success` is the observed shape, and
+`Success` is `strerror(0)` rather than a real errno. Every production call site propagates with `?`
+(`src/workspace_manager.rs:1433`, `:1816`); **nothing panics and nothing is deleted**, so the repository
+is intact and the failure is a refusal, not damage.
+
+**Manual recovery.** Remove the affected registration directory — `rm -rf
+<common-git-dir>/worktrees/<slot>` — and re-run. `git worktree prune` alone may not clear it, because a
+`locked` file left by the same interrupted registration is exactly what prune skips.
+
+**How to recognise it is this and not a regression.** The residue is only reachable by a kill landing
+inside `git worktree add`'s registration window, so it follows a crash or interrupt rather than a clean
+run, and the slot is one that was mid-creation. If a *clean* run produces it, that is new and is not
+this row.
+
 * **`PR5-RD-003` and the other uncovered neighbours.** A kill in that registration window can also leave
   `gitdir` absent, zero-length, partial, or containing valid **non-UTF-8** Unix path bytes — where both
   scans use `read_to_string` and silently skip the entry, so the residue does not converge even with
