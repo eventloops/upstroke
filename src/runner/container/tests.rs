@@ -147,6 +147,7 @@ fn spec_for(
         env: vec![("HOME".to_owned(), "/home/tactus".to_owned())],
         command: vec!["/bin/sh".to_owned(), "-c".to_owned(), "exit 0".to_owned()],
         workdir: Some("/work".to_owned()),
+        read_only_root: true,
     }
 }
 
@@ -358,6 +359,7 @@ fn the_fake_can_report_an_image_id_that_differs_from_the_one_create_asked_for() 
         env: Vec::new(),
         command: Vec::new(),
         workdir: None,
+        read_only_root: true,
     };
 
     // Healthy: the runtime reports what it was asked for.
@@ -411,6 +413,7 @@ fn volume_presence_is_a_toggle_and_absence_refuses_a_create() {
         env: Vec::new(),
         command: Vec::new(),
         workdir: None,
+        read_only_root: true,
     };
     let refused = runtime.create(&spec).expect_err("an absent volume refuses");
     assert!(!refused.is_unreachable(), "the runtime answered; it failed");
@@ -466,6 +469,7 @@ fn the_availability_toggle_is_per_operation_so_ps_can_answer_while_inspect_canno
                     env: Vec::new(),
                     command: Vec::new(),
                     workdir: None,
+                    read_only_root: true,
                 })
                 .is_err(),
             RuntimeOp::Start => runtime.start("x").is_err(),
@@ -584,6 +588,7 @@ fn the_call_log_is_ordered_and_holds_every_operation() {
         env: Vec::new(),
         command: Vec::new(),
         workdir: None,
+        read_only_root: true,
     };
     runtime.probe().expect("reachable");
     runtime.create(&spec).expect("created");
@@ -894,7 +899,7 @@ fn every_container_site_is_taken_by_value_by_a_funnel_that_hooks_both_phases() {
     let mut hooks = fixture.hooks();
     let name = fixture.plan.name.clone();
 
-    write_intent(
+    let written = write_intent(
         &mut hooks,
         ContainerSite::WriteIntent,
         &fixture.root,
@@ -906,6 +911,7 @@ fn every_container_site_is_taken_by_value_by_a_funnel_that_hooks_both_phases() {
         &mut hooks,
         ContainerSite::Create,
         &fixture.runtime,
+        &written,
         &fixture.plan.spec,
     )
     .expect("created");
@@ -916,7 +922,7 @@ fn every_container_site_is_taken_by_value_by_a_funnel_that_hooks_both_phases() {
         &fixture.plan.view,
     )
     .expect("view");
-    start_container(&mut hooks, ContainerSite::Start, &fixture.runtime, &name).expect("started");
+    start_container(&mut hooks, ContainerSite::Start, &fixture.runtime, &written).expect("started");
     stop_container(
         &mut hooks,
         ContainerSite::Stop,
@@ -1026,6 +1032,24 @@ fn a_funnel_api_refuses_a_site_that_does_not_name_its_operation() {
         let seed = |state: Liveness| {
             runtime.seed_container(name.as_str(), labels.clone(), IMAGE_ID, IMAGE_ID, state);
         };
+        // `create_container` and `start_container` take an `IntentWritten`, and
+        // there is no way to call them without one — that is
+        // `expected_failures_refusals[6]`, "container start without an intent
+        // is impossible by construction". The proof is minted from a record
+        // written **directly** rather than through `write_intent`, so this
+        // cell's trace still starts empty and assertion (2) keeps meaning what
+        // it says.
+        let proof = matches!(own_site, ContainerSite::Create | ContainerSite::Start).then(|| {
+            fs::create_dir_all(containers_dir(&root)).expect("the namespace");
+            fs::write(
+                &intent_path,
+                serde_json::to_vec(&record).expect("a serializable record"),
+            )
+            .expect("the record this container's proof reads");
+            crate::runner::container::intent::IntentWritten::certify(&root, &name)
+                .expect("the record is on disk, so it certifies")
+        });
+
         // The state in which THIS API's primitive succeeds.
         match own_site {
             // Nothing on disk, so a write would land.
@@ -1050,8 +1074,14 @@ fn a_funnel_api_refuses_a_site_that_does_not_name_its_operation() {
             ContainerSite::WriteIntent => {
                 write_intent(hooks, site, &root, &name, &record).map(|_| ())
             }
-            ContainerSite::Create => create_container(hooks, site, &runtime, &spec).map(|_| ()),
-            ContainerSite::Start => start_container(hooks, site, &runtime, &name),
+            ContainerSite::Create => {
+                let proof = proof.as_ref().expect("the Create cell mints one");
+                create_container(hooks, site, &runtime, proof, &spec).map(|_| ())
+            }
+            ContainerSite::Start => {
+                let proof = proof.as_ref().expect("the Start cell mints one");
+                start_container(hooks, site, &runtime, proof)
+            }
             ContainerSite::MountGitView => mount_git_view(hooks, site, &view, &request).map(|_| ()),
             ContainerSite::Stop => stop_container(hooks, site, &runtime, &name, StopMode::Graceful),
             ContainerSite::Remove => remove_container(hooks, site, &runtime, &name),
@@ -1199,7 +1229,7 @@ fn a_hook_armed_at_a_phase_fails_the_funnel_at_that_phase() {
 fn the_intent_record_carries_the_six_fields_and_each_is_read_back() {
     let fixture = Fixture::new("six-fields", RUN_A, INCARNATION_1, &shell_probe());
     let mut hooks = fixture.hooks();
-    let path = write_intent(
+    let written = write_intent(
         &mut hooks,
         ContainerSite::WriteIntent,
         &fixture.root,
@@ -1207,8 +1237,13 @@ fn the_intent_record_carries_the_six_fields_and_each_is_read_back() {
         &fixture.plan.intent,
     )
     .expect("written");
+    let path = written.path().to_path_buf();
 
     let read = read_intent(&path).expect("read back");
+    // The proof `write_intent` mints carries the record it read back, so the
+    // capability and the file are the same six fields rather than two.
+    assert_eq!(written.record(), &read, "the proof and the file disagree");
+    assert_eq!(written.name(), &fixture.plan.name);
     assert_eq!(read.run_id, RUN_A);
     assert_eq!(read.run_dir, format!("/srv/public/{RUN_A}"));
     assert_eq!(read.incarnation, INCARNATION_1);
@@ -1907,7 +1942,7 @@ fn the_intents_durability_barriers_are_entered_and_not_merely_traced() {
     let mut hooks = fixture.hooks();
 
     let before = crate::util::barriers_on_this_thread();
-    let path = write_intent(
+    let written = write_intent(
         &mut hooks,
         ContainerSite::WriteIntent,
         &fixture.root,
@@ -1915,6 +1950,7 @@ fn the_intents_durability_barriers_are_entered_and_not_merely_traced() {
         &fixture.plan.intent,
     )
     .expect("written");
+    let path = written.path().to_path_buf();
     let after = crate::util::barriers_on_this_thread();
 
     assert_eq!(
@@ -3163,6 +3199,7 @@ fn real_docker_creates_from_an_id_reports_it_and_reclaims_idempotently() {
             env: Vec::new(),
             command: vec!["/bin/sh".to_owned(), "-c".to_owned(), "exit 0".to_owned()],
             workdir: None,
+            read_only_root: true,
         },
         view: GitViewRequest {
             path: view_path.clone(),
@@ -3262,6 +3299,7 @@ fn real_docker_kill_on_an_already_exited_container_is_tolerated() {
         env: Vec::new(),
         command: vec!["/bin/sh".to_owned(), "-c".to_owned(), "exit 0".to_owned()],
         workdir: None,
+        read_only_root: true,
     };
     let _ = docker.remove(name);
     docker.create(&spec).expect("created");
@@ -3340,6 +3378,7 @@ fn real_docker_returns_both_streams_of_a_container_separately() {
             "echo ON-STDOUT; echo ON-STDERR 1>&2; exit 3".to_owned(),
         ],
         workdir: None,
+        read_only_root: true,
     };
     let _ = docker.remove(name);
     docker.create(&spec).expect("created");

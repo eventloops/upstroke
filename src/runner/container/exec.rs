@@ -230,7 +230,13 @@ impl Withheld {
 /// it. That is the point: "a test that checks *the worktree is mounted* passes
 /// on a container that also mounts `/`", and a hand-written forbidden list
 /// passes on a layout that has moved.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+/// **There is no empty `Confinement` and no `Default`**, which is the repair
+/// for `PR6-CORRECTNESS-011` / `PR6-ENUM-002`: [`Self::of_run`] is the only
+/// constructor, so a `ContainerRunner` that withholds nothing is not a value
+/// this module can produce. The shape is `PR4-CONF-003`'s — the property is
+/// established by the function that derives it from the layout, not asserted by
+/// a caller who remembered to call a builder.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Confinement {
     entries: Vec<(Withheld, PathBuf)>,
 }
@@ -238,33 +244,61 @@ pub struct Confinement {
 impl Confinement {
     /// Everything `identity`'s run withholds.
     ///
-    /// Derived from [`RunPaths`], which is the type that owns the layout, so
-    /// this set moves when the layout moves. `run` adds one more per
-    /// invocation: the workspace's **resolved** common Git directory, which is
-    /// where a linked worktree's refs really are rather than where an assumed
-    /// `<repo>/.git` would be.
+    /// Derived from the types that own the layout — [`RunPaths`] for the run's
+    /// two halves and [`crate::workspace_manager::execution_root_of`] plus
+    /// [`crate::workspace_manager::Slot`] for the worktree namespaces — so this
+    /// set moves when the layout moves. `run` adds one more per invocation: the
+    /// workspace's **resolved** common Git directory, which is where a linked
+    /// worktree's refs really are rather than where an assumed `<repo>/.git`
+    /// would be.
+    ///
+    /// ## The sibling-worktree namespace (`PR6-CORRECTNESS-013`)
+    ///
+    /// DESIGN.md:400 is "A container receives only **its role's one worktree**
+    /// mount; it never receives … **sibling worktrees**". Until repair R1 this
+    /// helper named no worktree path at all and every fixture added its own
+    /// siblings by hand, so a Gate handed the run's **execution root** as its
+    /// workspace was accepted and received every task and merge worktree in one
+    /// mount.
+    ///
+    /// The check below is "a mount is, or is an ancestor of, a withheld path",
+    /// so withholding the execution root refuses a mount of it or of anything
+    /// above it. That leaves one directory level between the root and a
+    /// worktree — `<root>/tasks`, `<root>/merge`, `<root>/snapshots` — which is
+    /// *inside* the root and still contains two worktrees, so each namespace
+    /// directory is withheld as well. They are derived from `Slot::relative()`
+    /// rather than written out: `Slot` is the type that decides where a
+    /// worktree lives, and a hand-written list is a list that keeps passing
+    /// after the layout has moved.
+    ///
+    /// What is deliberately **not** refused is a mount of one worktree that
+    /// happens to be another role's. The runner mounts the one workspace the
+    /// request names and cannot tell "mine" from "a sibling"; which worktree a
+    /// role gets is the engine's decision, and DESIGN.md:400's clause is about
+    /// receiving *more than one*.
     #[must_use]
     pub fn of_run(identity: &RunIdentity, repo_root: &Path) -> Self {
         let paths =
             RunPaths::with_private_root(repo_root, &identity.run_id, &identity.private_root);
-        Self {
-            entries: vec![
-                (Withheld::PublicLog, paths.public),
-                (Withheld::PrivateArtifacts, paths.private),
-                (
-                    Withheld::PrivateArtifacts,
-                    super::intent::containers_dir(&identity.private_root),
-                ),
-                (Withheld::AuthoritativeGit, repo_root.join(".git")),
-            ],
+        let execution_root = crate::workspace_manager::execution_root_of(
+            &identity.private_root,
+            &identity.repo_key,
+            &identity.run_id,
+        );
+        let mut entries = vec![
+            (Withheld::PublicLog, paths.public),
+            (Withheld::PrivateArtifacts, paths.private),
+            (
+                Withheld::PrivateArtifacts,
+                super::intent::containers_dir(&identity.private_root),
+            ),
+            (Withheld::AuthoritativeGit, repo_root.join(".git")),
+            (Withheld::SiblingWorktree, execution_root.clone()),
+        ];
+        for namespace in worktree_namespaces(&execution_root) {
+            entries.push((Withheld::SiblingWorktree, namespace));
         }
-    }
-
-    /// An empty set, for a caller with no run — a probe before P0, and every
-    /// fixture that is not about confinement.
-    #[must_use]
-    pub fn none() -> Self {
-        Self::default()
+        Self { entries }
     }
 
     /// Withhold one more path under `category`.
@@ -308,6 +342,39 @@ impl Confinement {
         }
         found
     }
+}
+
+/// `<execution root>/{tasks, merge, snapshots}` — the directories one level
+/// above a worktree, each of which holds several.
+///
+/// Derived from [`crate::workspace_manager::Slot::relative`], which is the
+/// function that decides where a worktree lives, by taking the first component
+/// of one representative path per variant. Deduplicated and sorted, so two
+/// variants sharing a namespace would collapse rather than double.
+fn worktree_namespaces(execution_root: &Path) -> Vec<PathBuf> {
+    use crate::workspace_manager::{Slot, SnapshotName};
+    let representatives = [
+        Slot::Task {
+            key: "0".to_owned(),
+            generation: 0,
+        },
+        Slot::Staging { sequence: 0 },
+        Slot::Snapshot {
+            name: SnapshotName::gates(0, 0),
+        },
+    ];
+    let mut namespaces: Vec<PathBuf> = representatives
+        .iter()
+        .filter_map(|slot| {
+            slot.relative()
+                .components()
+                .next()
+                .map(|first| execution_root.join(first))
+        })
+        .collect();
+    namespaces.sort();
+    namespaces.dedup();
+    namespaces
 }
 
 // ---------------------------------------------------------------------------
@@ -390,6 +457,29 @@ impl InvocationPlan {
     }
 }
 
+/// How far a launch got before it failed, and therefore what has to be
+/// released.
+///
+/// The intent is not a field: every exit of [`ContainerRunner::launch`] that
+/// can fail is *after* the intent is written, and `remove_intent` is
+/// idempotent, so releasing it is unconditional. A boolean for it would be a
+/// field with one value.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Reached {
+    /// The R19 view directory, when it was materialised.
+    view: Option<PathBuf>,
+    /// Whether `docker create` returned a container.
+    container: bool,
+}
+
+impl Reached {
+    /// The intent is written and nothing else exists.
+    const INTENT_ONLY: Self = Self {
+        view: None,
+        container: false,
+    };
+}
+
 /// The `Container` / `container-v1` [`Runner`].
 ///
 /// Holds the **recorded** `RunnerPolicy` rather than resolving one: resolution
@@ -434,7 +524,26 @@ impl std::fmt::Debug for ContainerRunner {
 }
 
 impl ContainerRunner {
-    /// A runner for `identity`'s run, executing in `policy`'s recorded image.
+    /// A runner for `identity`'s run in `repo_root`, executing in `policy`'s
+    /// recorded image and composing over `environment`.
+    ///
+    /// **`repo_root` and `environment` are parameters and not builder calls,
+    /// and that is the repair for `PR6-CORRECTNESS-011` / `PR6-ENUM-002`.** The
+    /// confinement is computed here, from [`Confinement::of_run`], so there is
+    /// no construction that yields a runner withholding nothing — the previous
+    /// default was `Confinement::none()` with the real set added by an
+    /// *optional* `with_confinement`, and a caller who forgot it got a runner
+    /// that would mount the run's own public log for a Gate. The builder is
+    /// gone; a caller who wants to withhold *more* uses
+    /// [`Self::also_withholding`], which can only add.
+    ///
+    /// `environment` is mandatory for the same reason at the other boundary:
+    /// the default was `ContainerEnvironment::inherited()`, an empty base, so
+    /// the runner supplied no `PATH` at all and the image's own — possibly
+    /// carrying a working-directory-relative component — decided which binary a
+    /// bare program name resolved to (`PR6-CORRECTNESS-006`). DESIGN.md:260
+    /// says the runner "supplies role-scoped `HOME`, `PATH`, and credential
+    /// locations"; a runner that read no base could supply none of them.
     ///
     /// # Errors
     ///
@@ -443,6 +552,8 @@ impl ContainerRunner {
     pub fn new(
         policy: RunnerPolicy,
         identity: RunIdentity,
+        repo_root: &Path,
+        environment: ContainerEnvironment,
         runtime: Box<dyn ContainerRuntime>,
     ) -> Result<Self, TactusError> {
         let image_id = recorded_image_id(&policy)?.to_owned();
@@ -451,15 +562,16 @@ impl ContainerRunner {
         let layout = BoundaryLayout::new();
         let view = RoleGitView::new(ContainerTrace::off())
             .for_reader(layout.git_view(), layout.git_objects());
+        let confinement = Confinement::of_run(&identity, repo_root);
         Ok(Self {
             policy,
             image_id,
             digest,
             volumes,
             identity,
-            environment: ContainerEnvironment::inherited(),
+            environment,
             layout,
-            confinement: Confinement::none(),
+            confinement,
             runtime,
             view: Box::new(view),
             view_is_explicit: false,
@@ -467,13 +579,6 @@ impl ContainerRunner {
             poll: SUPERVISION_POLL,
             output_limit: OUTPUT_LIMIT_BYTES,
         })
-    }
-
-    /// Compose from an explicit image environment.
-    #[must_use]
-    pub fn with_environment(mut self, environment: ContainerEnvironment) -> Self {
-        self.environment = environment;
-        self
     }
 
     /// Use an explicit boundary layout, and point the Git view's alternate at
@@ -485,10 +590,15 @@ impl ContainerRunner {
         self
     }
 
-    /// Withhold this run's own paths from every container it starts.
+    /// Withhold one **more** path from every container this runner starts.
+    ///
+    /// Monotone by construction: it appends to the set
+    /// [`Confinement::of_run`] derived and there is no setter that replaces it,
+    /// so no call sequence can leave a runner withholding less than its run
+    /// does.
     #[must_use]
-    pub fn with_confinement(mut self, confinement: Confinement) -> Self {
-        self.confinement = confinement;
+    pub fn also_withholding(mut self, category: Withheld, path: impl Into<PathBuf>) -> Self {
+        self.confinement = self.confinement.withholding(category, path);
         self
     }
 
@@ -650,8 +760,26 @@ impl ContainerRunner {
                     mounts,
                     env,
                     command,
-                    workdir: receives_a_worktree(&request.role)
-                        .then(|| self.layout.workspace().to_owned()),
+                    // Always a value, never the image's own choice. A role
+                    // with a worktree runs in it; a probe, which has none,
+                    // runs in the ephemeral scratch mount — a directory that
+                    // exists in every image because this runner declares it,
+                    // that is writable under a read-only root, and that
+                    // carries nothing. `PR6-CORRECTNESS-006`: leaving this
+                    // `None` for probes handed the working directory to the
+                    // image's `WORKDIR`, so what a probe certified depended on
+                    // a value the runner had not read.
+                    workdir: Some(if receives_a_worktree(&request.role) {
+                        self.layout.workspace().to_owned()
+                    } else {
+                        self.layout.scratch().to_owned()
+                    }),
+                    // `expected_failures_refusals[5]`, for every role. A
+                    // reviewer's `:ro` worktree is not the whole of "read-only"
+                    // if the container layer around it is writable, and a gate
+                    // is "repository-controlled code which no agent permission
+                    // surface can ever bound" (DESIGN.md:610).
+                    read_only_root: true,
                 },
                 view: GitViewRequest {
                     path: view_path.clone(),
@@ -754,6 +882,16 @@ impl ContainerRunner {
                 }
             }
         }
+        // (5) the ephemeral scratch surface, for **every** role. With
+        // `CreateSpec::read_only_root` the container's own layer is closed, so
+        // without this a `sh -c` gate could not write a temporary file and
+        // `git` could not write its own. It carries no host source, so it is
+        // the one writable surface that is neither the role's nor the
+        // coordinator's — which is what keeps "gate write outside mount fails"
+        // a claim about a mount list rather than about a hole.
+        mounts.push(Mount::Tmpfs {
+            target: self.layout.scratch().to_owned(),
+        });
         mounts
     }
 
@@ -795,11 +933,28 @@ impl ContainerRunner {
     /// the shape a caller uses: the only sequence in this module that reaches
     /// `Container.Start` begins by writing the intent.
     ///
-    /// On a reported image id that differs from the record the invocation is
-    /// **refused before start** and everything it created is released — R26's
-    /// "released on complete …, **cancel**, or shutdown" and R19's "pruned on
-    /// complete or **cancel**" — so both ledgers balance and no census finds
-    /// residue of a refusal.
+    /// ## Every way out of this function releases what it reached
+    ///
+    /// `PR6-CORRECTNESS-003` / `PR6-ENUM-003`. There are four exits and until
+    /// repair R1 only one of them cleaned up:
+    ///
+    /// | fails at | reached | released before |
+    /// |---|---|---|
+    /// | `MountGitView` | intent | — nothing did |
+    /// | `Create` | intent, view | — nothing did |
+    /// | reported id mismatch | intent, view, container | fail-**fast**: a failing `Stop` skipped the rm, the view and the intent *and masked the integrity refusal* |
+    /// | `Start` | intent, view, container | — nothing did |
+    ///
+    /// R26 is "released on complete (stop/rm, view removed, intent removed),
+    /// **cancel**, or shutdown" and R19 is "pruned on complete or **cancel**".
+    /// A `?` that returns without a [`Launched`] value returns without anything
+    /// for `Runner::run`'s own release to act on, so each of those exits left a
+    /// container, a view and an intent for the census to find. Every exit now
+    /// goes through [`Self::cancel`], which attempts **every** step even after
+    /// one fails and answers what it could not release; the error returned is
+    /// always the *original* one with that residue appended, because "docker
+    /// stop said no" is never the thing to report instead of "the runtime
+    /// executed a substituted image".
     ///
     /// # Errors
     ///
@@ -810,25 +965,45 @@ impl ContainerRunner {
         hooks: &mut dyn ContainerHooks,
         plan: &LaunchPlan,
     ) -> Result<Launched, TactusError> {
-        let intent_path = write_intent(
+        let written = write_intent(
             hooks,
             ContainerSite::WriteIntent,
             &plan.private_root,
             &plan.name,
             &plan.intent,
         )?;
-        let view_path = mount_git_view(
+        let intent_path = written.path().to_path_buf();
+        let view_path = match mount_git_view(
             hooks,
             ContainerSite::MountGitView,
             self.view.as_ref(),
             &plan.view,
-        )?;
-        let created = create_container(
+        ) {
+            Ok(path) => path,
+            Err(error) => {
+                return Err(self.cancelled(hooks, plan, error, Reached::INTENT_ONLY));
+            }
+        };
+        let created = match create_container(
             hooks,
             ContainerSite::Create,
             self.runtime.as_ref(),
+            &written,
             &plan.spec,
-        )?;
+        ) {
+            Ok(created) => created,
+            Err(error) => {
+                return Err(self.cancelled(
+                    hooks,
+                    plan,
+                    error,
+                    Reached {
+                        view: Some(view_path),
+                        container: false,
+                    },
+                ));
+            }
+        };
         if created.reported_image_id != plan.spec.image_id {
             let refusal = TactusError::Refused {
                 message: format!(
@@ -838,30 +1013,112 @@ impl ContainerRunner {
                     plan.name, created.reported_image_id, plan.spec.image_id
                 ),
             };
-            self.release(
+            return Err(self.cancelled(
                 hooks,
-                &plan.private_root,
-                &Launched {
-                    name: plan.name.clone(),
-                    intent_path,
-                    view_path,
-                    reported_image_id: created.reported_image_id,
+                plan,
+                refusal,
+                Reached {
+                    view: Some(view_path),
+                    container: true,
                 },
-            )?;
-            return Err(refusal);
+            ));
         }
-        start_container(
-            hooks,
-            ContainerSite::Start,
-            self.runtime.as_ref(),
-            &plan.name,
-        )?;
+        if let Err(error) =
+            start_container(hooks, ContainerSite::Start, self.runtime.as_ref(), &written)
+        {
+            return Err(self.cancelled(
+                hooks,
+                plan,
+                error,
+                Reached {
+                    view: Some(view_path),
+                    container: true,
+                },
+            ));
+        }
         Ok(Launched {
             name: plan.name.clone(),
             intent_path,
             view_path,
             reported_image_id: created.reported_image_id,
         })
+    }
+
+    /// Release what a failed launch reached and answer `cause` with whatever
+    /// could not be released appended.
+    ///
+    /// The answer is never the cleanup's own failure: an operator holding "the
+    /// container could not be stopped" instead of "the runtime executed a
+    /// substituted image" has been handed the symptom and not the diagnosis.
+    fn cancelled(
+        &self,
+        hooks: &mut dyn ContainerHooks,
+        plan: &LaunchPlan,
+        cause: TactusError,
+        reached: Reached,
+    ) -> TactusError {
+        let residue = self.cancel(hooks, &plan.private_root, &plan.name, &reached);
+        if residue.is_empty() {
+            return cause;
+        }
+        TactusError::Refused {
+            message: format!(
+                "{cause}. The cancel could not release everything the failed launch created, \
+                 so this run's R19/R26 ledgers do not balance and a census will find the \
+                 residue: {}",
+                residue.join("; ")
+            ),
+        }
+    }
+
+    /// Stop, remove, unmount and remove-intent for whatever `reached` says
+    /// exists, **attempting every step even after one fails**.
+    ///
+    /// `PR6-LANEF-006`'s shape, applied to the runner's own launch rather than
+    /// to `super::launch`: with `?` in place a failing `Container.Stop` left
+    /// the container, the view and the intent behind — three residues from one
+    /// failure. `docker rm --force` removes a running container, so `Remove`
+    /// after a failed `Stop` is not a wasted call.
+    fn cancel(
+        &self,
+        hooks: &mut dyn ContainerHooks,
+        private_root: &Path,
+        name: &ContainerName,
+        reached: &Reached,
+    ) -> Vec<String> {
+        let mut residue = Vec::new();
+        if reached.container {
+            if let Err(error) = stop_container(
+                hooks,
+                ContainerSite::Stop,
+                self.runtime.as_ref(),
+                name,
+                super::runtime::StopMode::Graceful,
+            ) {
+                residue.push(format!("the container could not be stopped: {error}"));
+            }
+            if let Err(error) =
+                remove_container(hooks, ContainerSite::Remove, self.runtime.as_ref(), name)
+            {
+                residue.push(format!("the container could not be removed: {error}"));
+            }
+        }
+        if let Some(path) = &reached.view {
+            if let Err(error) = unmount_git_view(
+                hooks,
+                ContainerSite::UnmountGitView,
+                self.view.as_ref(),
+                path,
+            ) {
+                residue.push(format!("the R19 Git view could not be pruned: {error}"));
+            }
+        }
+        if let Err(error) = remove_intent(hooks, ContainerSite::RemoveIntent, private_root, name) {
+            residue.push(format!(
+                "the R26 intent record could not be removed: {error}"
+            ));
+        }
+        residue
     }
 
     /// "stop/rm, view removal, intent removal **after completion**".
@@ -1113,6 +1370,41 @@ mod tests {
     /// would be caught by content rather than by the absence of a file.
     const EVENT_LOG_MARKER: &str = "COORDINATOR-EVENT-LOG-a5f2";
 
+    /// The `PATH` the fake fixtures' image environment carries.
+    ///
+    /// Absolute-only, which is what `ContainerEnvironment::certify_path` now
+    /// requires: a runner whose composed environment names no `PATH`, or names
+    /// one with a working-directory-relative component, refuses every
+    /// invocation (`PR6-CORRECTNESS-006`). The value is the one every image
+    /// this suite discovers actually carries, read off `docker image inspect`
+    /// for `tactus-test/git:v1`, `alpine:3.20` and `busybox:latest`.
+    const IMAGE_PATH: &str = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin";
+
+    /// A `PATH` whose second component is the working directory.
+    ///
+    /// `.` explicitly rather than an empty component, so the two shapes
+    /// `cwd_dependent_path_components` classifies are exercised by different
+    /// fixtures rather than by one.
+    const CWD_RELATIVE_PATH: &str = "/usr/local/bin:.:/usr/bin";
+
+    /// The image environment the fake fixtures compose over.
+    ///
+    /// Explicit rather than `ContainerEnvironment::inherited()`, which is now a
+    /// base that refuses: DESIGN.md:260 has the runner supply `PATH`, and an
+    /// empty base supplies nothing.
+    fn image_environment() -> ContainerEnvironment {
+        ContainerEnvironment::from_image(
+            [
+                ("PATH", IMAGE_PATH),
+                ("HOME", "/root"),
+                ("TACTUS_IMAGE_MARKER", IMAGE_MARKER_VALUE),
+            ]
+            .into_iter()
+            .map(|(key, value)| (key.to_owned(), value.to_owned()))
+            .collect(),
+        )
+    }
+
     fn container_policy() -> RunnerPolicy {
         RunnerPolicy {
             kind: RunnerKind::Container,
@@ -1317,11 +1609,20 @@ mod tests {
             }
         }
 
-        /// Everything this run withholds, including its two sibling worktrees.
+        /// Everything this run withholds.
+        ///
+        /// **The two sibling worktrees are no longer added by hand.** They were
+        /// until repair R1, and `PR6-CORRECTNESS-013` is what that cost:
+        /// `Confinement::of_run` named no worktree path at all, so the helper
+        /// production uses withheld nothing about worktrees and only the
+        /// fixtures pretended otherwise. `of_run` now derives the execution
+        /// root and its three namespaces, which is what makes this method a
+        /// plain delegation — and what makes the sibling assertions in
+        /// `the_mount_set_is_the_roles_own_and_reaches_nothing_of_the_coordinators`
+        /// statements about the production helper rather than about the
+        /// fixture.
         fn confinement(&self) -> Confinement {
             Confinement::of_run(&self.identity, &self.repo)
-                .withholding(Withheld::SiblingWorktree, self.task_b.clone())
-                .withholding(Withheld::SiblingWorktree, self.merge.clone())
         }
 
         fn runner(&self) -> ContainerRunner {
@@ -1329,11 +1630,16 @@ mod tests {
         }
 
         fn runner_with(&self, identity: RunIdentity) -> ContainerRunner {
-            ContainerRunner::new(container_policy(), identity, Box::new(self.runtime.clone()))
-                .expect("a container policy")
-                .with_hooks(Box::new(RecordingHooks::new(self.trace.clone())))
-                .with_confinement(self.confinement())
-                .with_poll(Duration::ZERO)
+            ContainerRunner::new(
+                container_policy(),
+                identity,
+                &self.repo,
+                image_environment(),
+                Box::new(self.runtime.clone()),
+            )
+            .expect("a container policy")
+            .with_hooks(Box::new(RecordingHooks::new(self.trace.clone())))
+            .with_poll(Duration::ZERO)
         }
 
         /// The concrete host paths this run withholds, as a table a test can
@@ -1463,7 +1769,8 @@ mod tests {
             .iter()
             .filter_map(|mount| match mount {
                 Mount::Path { source, .. } => Some(source.clone()),
-                Mount::Volume { .. } => None,
+                // Neither carries a host path, so neither can hand one over.
+                Mount::Volume { .. } | Mount::Tmpfs { .. } => None,
             })
             .collect()
     }
@@ -1565,7 +1872,7 @@ mod tests {
         );
         let plan = runner.plan(&request).expect("plans");
 
-        // Positive: four mounts, each with its target and its disposition.
+        // Positive: five mounts, each with its target and its disposition.
         let mounts = plan.mounts();
         let targets: Vec<&str> = mounts.iter().map(Mount::target).collect();
         assert_eq!(
@@ -1576,6 +1883,7 @@ mod tests {
                 "/tactus/gitobjects",
                 "/tactus/workspace/.git",
                 "/tactus/credentials/claude-code",
+                "/tmp",
             ],
             "the mount set moved"
         );
@@ -1588,6 +1896,22 @@ mod tests {
             target_of(mounts, "/tactus/workspace").map(Mount::read_only),
             Some(false),
             "an implementer writes to its worktree"
+        );
+        // The scratch surface is a tmpfs and therefore carries **no host
+        // source**: it is the one writable place that is neither the role's own
+        // worktree nor anything of the coordinator's, which is what lets
+        // `CreateSpec::read_only_root` close the container layer without making
+        // `sh` unusable.
+        assert_eq!(
+            target_of(mounts, "/tmp"),
+            Some(&Mount::Tmpfs {
+                target: "/tmp".to_owned()
+            }),
+            "the scratch surface is not a tmpfs"
+        );
+        assert!(
+            plan.launch.spec.read_only_root,
+            "the container layer is writable, so `gate write outside mount fails` does not hold"
         );
 
         // Negative: no mount source is a withheld path or an ancestor of one.
@@ -1767,10 +2091,11 @@ mod tests {
                 ..container_policy()
             },
             fixture.identity.clone(),
+            &fixture.repo,
+            image_environment(),
             Box::new(fixture.runtime.clone()),
         )
         .expect("a container policy with no volumes")
-        .with_confinement(fixture.confinement())
         .with_poll(Duration::ZERO);
 
         let mut mounted = 0_usize;
@@ -1781,7 +2106,7 @@ mod tests {
                 let plan = runner.plan(&request).expect("plans");
                 let volume = plan.mounts().iter().find_map(|mount| match mount {
                     Mount::Volume { name, target, .. } => Some((name.clone(), target.clone())),
-                    Mount::Path { .. } => None,
+                    Mount::Path { .. } | Mount::Tmpfs { .. } => None,
                 });
                 let key = request.agent.as_ref().and_then(host::credential_location);
                 let in_env = key.and_then(|key| {
@@ -2071,6 +2396,8 @@ mod tests {
             ContainerRunner::new(
                 policy,
                 fixture.identity.clone(),
+                &fixture.repo,
+                image_environment(),
                 Box::new(fixture.runtime.clone()),
             )
             .err()
@@ -2080,6 +2407,8 @@ mod tests {
         let runner = ContainerRunner::new(
             container_policy(),
             fixture.identity.clone(),
+            &fixture.repo,
+            image_environment(),
             Box::new(fixture.runtime.clone()),
         )
         .expect("accepted");
@@ -2878,11 +3207,12 @@ mod tests {
                 let runner = ContainerRunner::new(
                     container_policy(),
                     fixture.identity.clone(),
+                    &fixture.repo,
+                    image_environment(),
                     Box::new(fixture.runtime.clone()),
                 )
                 .expect("a container policy")
                 .with_hooks(Box::new(hooks))
-                .with_confinement(fixture.confinement())
                 .with_poll(Duration::ZERO);
                 let request = worker_request(
                     ShellKind::Sh.spec("exit 0"),
@@ -3015,6 +3345,864 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
+    // 5b. Repair R1: confinement, the intent capability, and cwd-independence
+    // -----------------------------------------------------------------------
+
+    /// One row per invocation: the container's name, and the bytes of its
+    /// intent record — `None` when there was none, which is the state
+    /// catalogue survivor `PR6-INTENT-020` describes.
+    type SeenIntents = Arc<Mutex<Vec<(String, Option<Vec<u8>>)>>>;
+
+    /// A `GitView` that reads the container's intent record at the moment the
+    /// view is materialised.
+    ///
+    /// `Container.MountGitView` runs **after** `Container.WriteIntent` and
+    /// **before** `Container.Create`, so this observes `<R>/containers` at
+    /// exactly the point the contract says the record must already be there:
+    /// "intent synced before docker create". The record is removed again when
+    /// the invocation completes, which is why a test that looked afterwards
+    /// could only ever see an absence.
+    #[derive(Debug)]
+    struct IntentPeek {
+        inner: crate::runner::container::DisposableDirView,
+        private_root: PathBuf,
+        seen: SeenIntents,
+    }
+
+    impl GitView for IntentPeek {
+        fn materialize(&self, request: &GitViewRequest) -> Result<PathBuf, TactusError> {
+            // The view directory is `<R>/views/<container-name>`, so its file
+            // name is the container's.
+            let name = request
+                .path
+                .file_name()
+                .expect("a view path names a container")
+                .to_string_lossy()
+                .into_owned();
+            let record = std::fs::read(
+                crate::runner::container::intent::containers_dir(&self.private_root)
+                    .join(format!("{name}.intent")),
+            )
+            .ok();
+            self.seen
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .push((name, record));
+            self.inner.materialize(request)
+        }
+
+        fn discard(&self, path: &Path) -> Result<(), TactusError> {
+            self.inner.discard(path)
+        }
+    }
+
+    /// A `GitView` whose materialisation fails, so `Container.MountGitView` can
+    /// be the step a launch dies at.
+    #[derive(Debug, Default)]
+    struct FailingView;
+
+    impl GitView for FailingView {
+        fn materialize(&self, request: &GitViewRequest) -> Result<PathBuf, TactusError> {
+            Err(TactusError::Refused {
+                message: format!("VIEW-REFUSED for {}", request.path.display()),
+            })
+        }
+
+        fn discard(&self, _path: &Path) -> Result<(), TactusError> {
+            Ok(())
+        }
+    }
+
+    /// The **public constructor** withholds every category from every role that
+    /// receives a worktree, with no builder call at all.
+    ///
+    /// `PR6-CORRECTNESS-011` / `PR6-ENUM-002`. `ContainerRunner::new` used to
+    /// default to `Confinement::none()` with the real set added by an optional
+    /// `with_confinement`, so the runner a caller gets by construction
+    /// withheld nothing: `PR6-ENUM-002`'s mutation is literally "omit
+    /// `with_confinement` at a construction site and submit
+    /// `identity.private_root` as a worker workspace", and `-011`'s is "apply
+    /// configured confinement only to `ExecutionRole::Implement`". This runner
+    /// is built with **`new` and nothing else**, and the grid crosses all four
+    /// withheld categories with all five roles, so a rule that held for one
+    /// role fails here.
+    ///
+    /// The two probe roles are the other half of the grid rather than an
+    /// omission: a probe receives no worktree at all
+    /// ([`receives_a_worktree`]), so a hostile workspace cannot reach it — and
+    /// that is asserted as "no mount source is under the hostile path" rather
+    /// than assumed.
+    #[test]
+    fn the_public_constructor_withholds_every_category_from_every_role() {
+        let fixture = Fixture::new("default-confinement", true);
+        let runner = ContainerRunner::new(
+            container_policy(),
+            fixture.identity.clone(),
+            &fixture.repo,
+            image_environment(),
+            Box::new(fixture.runtime.clone()),
+        )
+        .expect("a container policy");
+
+        let execution_root =
+            crate::workspace_manager::execution_root_of(&fixture.private_root, REPO_KEY, RUN_ID);
+        // One hostile workspace per category, each written from the type that
+        // owns that path rather than read back out of `Confinement`.
+        let hostile: Vec<(Withheld, PathBuf)> = vec![
+            (Withheld::PublicLog, fixture.paths.public.clone()),
+            (Withheld::PrivateArtifacts, fixture.private_root.clone()),
+            (Withheld::SiblingWorktree, execution_root),
+            (Withheld::AuthoritativeGit, fixture.repo.clone()),
+        ];
+
+        let mut refused = 0_usize;
+        let mut probe_cells = 0_usize;
+        let mut named: BTreeSet<Withheld> = BTreeSet::new();
+        for (category, workspace) in &hostile {
+            for request in requests(workspace) {
+                if receives_a_worktree(&request.role) {
+                    let refusal = runner
+                        .plan(&request)
+                        .expect_err("a workspace containing a withheld path is refused");
+                    let message = refusal.to_string();
+                    assert!(
+                        message.contains(category.passage()),
+                        "{} / {}: {message}",
+                        request.role,
+                        workspace.display()
+                    );
+                    named.insert(*category);
+                    refused += 1;
+                } else {
+                    let plan = runner
+                        .plan(&request)
+                        .expect("a probe has no worktree to refuse");
+                    for source in sources(plan.mounts()) {
+                        assert!(
+                            !source.starts_with(workspace),
+                            "{}: a probe was handed `{}`",
+                            request.role,
+                            source.display()
+                        );
+                    }
+                    probe_cells += 1;
+                }
+            }
+        }
+        assert_eq!(
+            refused,
+            4 * 3,
+            "four categories crossed with three worktree roles"
+        );
+        assert_eq!(
+            probe_cells,
+            4 * 2,
+            "four categories crossed with two probe roles"
+        );
+        assert_eq!(named.len(), Withheld::ALL.len(), "{named:?}");
+
+        // The control: the role's own worktree plans on the same runner, so the
+        // refusals above are about the path and not about `plan` being broken.
+        let mut planned = 0_usize;
+        for request in requests(&fixture.task_a) {
+            runner
+                .plan(&request)
+                .expect("the role's own worktree plans");
+            planned += 1;
+        }
+        assert_eq!(planned, 5);
+
+        // And nothing was created on the way to any of it.
+        assert!(
+            list_intents(&fixture.private_root)
+                .expect("scan")
+                .is_empty()
+        );
+        assert!(fixture.runtime.fake().container_names().is_empty());
+    }
+
+    /// The execution root **and each of its three worktree namespaces** are
+    /// withheld, and any one worktree is not.
+    ///
+    /// `PR6-CORRECTNESS-013`. `Confinement::of_run` named no worktree path at
+    /// all — the fixtures added siblings by hand, so the production helper was
+    /// unmeasured — and a Gate handed the run's execution root received every
+    /// task and merge worktree in one mount. Withholding only the root would
+    /// leave `<root>/tasks`, which still holds two, so the namespaces are
+    /// withheld too.
+    ///
+    /// The expected paths are built from
+    /// [`crate::workspace_manager::execution_root_of`] and the packet's own
+    /// three namespace names, **not** read back from `Confinement::entries` —
+    /// that would be the function's own oracle.
+    ///
+    /// Second field held constant: the run identity and the repository; what
+    /// varies is only which directory of the worktree namespace is offered.
+    #[test]
+    fn the_execution_root_and_its_worktree_namespaces_are_withheld_and_one_worktree_is_not() {
+        let fixture = Fixture::new("exec-root", true);
+        let runner = fixture.runner();
+        let execution_root =
+            crate::workspace_manager::execution_root_of(&fixture.private_root, REPO_KEY, RUN_ID);
+        // `decisions.workspace_candidates.manager`: "tasks/k<key>-g<gen>,
+        // merge/s<seq>", plus `snapshots`.
+        let namespaces: Vec<PathBuf> = vec![
+            execution_root.clone(),
+            execution_root.join("tasks"),
+            execution_root.join("merge"),
+            execution_root.join("snapshots"),
+        ];
+
+        // (a) `of_run` names each of them, under the sibling-worktree category.
+        let confinement = Confinement::of_run(&fixture.identity, &fixture.repo);
+        for path in &namespaces {
+            assert!(
+                confinement
+                    .entries()
+                    .iter()
+                    .any(
+                        |(category, entry)| *category == Withheld::SiblingWorktree && entry == path
+                    ),
+                "`of_run` does not withhold `{}`: {:?}",
+                path.display(),
+                confinement.entries()
+            );
+        }
+
+        // (b) and a role handed one is refused, naming the category.
+        let mut refused = 0_usize;
+        for path in &namespaces {
+            for request in requests(path) {
+                if !receives_a_worktree(&request.role) {
+                    continue;
+                }
+                let refusal = runner
+                    .plan(&request)
+                    .expect_err("a mount containing every worktree is refused");
+                assert!(
+                    refusal
+                        .to_string()
+                        .contains(Withheld::SiblingWorktree.passage()),
+                    "{} / {}: {refusal}",
+                    request.role,
+                    path.display()
+                );
+                refused += 1;
+            }
+        }
+        assert_eq!(
+            refused,
+            4 * 3,
+            "four namespace directories, three worktree roles"
+        );
+
+        // (c) The over-refusal control, which is what this fix could most
+        // easily get wrong: withholding the namespace must not withhold the
+        // worktrees inside it. Each of the run's three real worktrees plans,
+        // for each worktree role — a container receives *one* worktree, and
+        // which one is the engine's decision, not this runner's.
+        let mut planned = 0_usize;
+        for workspace in [&fixture.task_a, &fixture.task_b, &fixture.merge] {
+            for request in requests(workspace) {
+                if !receives_a_worktree(&request.role) {
+                    continue;
+                }
+                runner
+                    .plan(&request)
+                    .unwrap_or_else(|error| panic!("{}: {error}", workspace.display()));
+                planned += 1;
+            }
+        }
+        assert_eq!(planned, 3 * 3, "three worktrees, three worktree roles");
+    }
+
+    /// Every role — **both probe kinds included** — writes and syncs its own
+    /// six-field intent record, and it is on disk before its container is
+    /// created.
+    ///
+    /// Catalogue survivor `PR6-INTENT-020`: an agent probe container created
+    /// with no intent record passed, because the suite exercised both probe
+    /// kinds and never asserted that each writes its own record.
+    /// `T-CONTAINER.boundary` is "the RunnerPreflight shell and agent probe
+    /// containers are container invocations **like every other**", so the grid
+    /// is all five roles rather than the two the finding names.
+    ///
+    /// The record is read at `Container.MountGitView`, which is between the
+    /// write and the create: after the invocation completes the record is gone,
+    /// so a test that looked afterwards could only ever see an absence. The six
+    /// field values are literals from this module's constants and from the
+    /// request's own `InvocationId` — never from `plan.launch.intent`, which is
+    /// the runner's own answer.
+    ///
+    /// Second field held constant: the run, the incarnation and the image;
+    /// what varies is the role, and with it the invocation.
+    #[test]
+    fn every_role_writes_and_syncs_its_own_six_field_intent_before_its_container_is_created() {
+        let fixture = Fixture::new("intent-per-invocation", true);
+        let seen: SeenIntents = Arc::new(Mutex::new(Vec::new()));
+        let runner = ContainerRunner::new(
+            container_policy(),
+            fixture.identity.clone(),
+            &fixture.repo,
+            image_environment(),
+            Box::new(fixture.runtime.clone()),
+        )
+        .expect("a container policy")
+        .with_hooks(Box::new(RecordingHooks::new(fixture.trace.clone())))
+        .with_view(Box::new(IntentPeek {
+            inner: crate::runner::container::DisposableDirView::new(fixture.trace.clone()),
+            private_root: fixture.private_root.clone(),
+            seen: Arc::clone(&seen),
+        }))
+        .with_poll(Duration::ZERO);
+
+        let all = requests(&fixture.task_a);
+        assert_eq!(all.len(), 5, "all five roles");
+        let mut expected: Vec<(String, String)> = Vec::new();
+        for request in &all {
+            let name = ContainerName::new(REPO_KEY, RUN_ID, INCARNATION_1, &request.invocation)
+                .expect("a name");
+            expected.push((name.as_str().to_owned(), request.invocation.render()));
+            runner.run(request).expect("runs");
+        }
+
+        let seen = seen.lock().unwrap_or_else(PoisonError::into_inner).clone();
+        assert_eq!(seen.len(), 5, "five invocations, five views");
+        let mut invocations: BTreeSet<String> = BTreeSet::new();
+        for ((name, bytes), (expected_name, expected_invocation)) in seen.iter().zip(&expected) {
+            assert_eq!(name, expected_name, "the view names another container");
+            let bytes = bytes.as_ref().unwrap_or_else(|| {
+                panic!("`{name}` reached Container.Create with no intent record of its own")
+            });
+            let record: ContainerIntent =
+                serde_json::from_slice(bytes).expect("the six fields parse");
+            assert_eq!(record.run_id, RUN_ID);
+            assert_eq!(
+                record.run_dir,
+                fixture.paths.public.to_string_lossy().replace('\\', "/")
+            );
+            assert_eq!(record.incarnation, INCARNATION_1);
+            assert_eq!(record.repo_key, REPO_KEY);
+            assert_eq!(
+                &record.invocation, expected_invocation,
+                "`{name}` carries another invocation's record"
+            );
+            assert_eq!(
+                record.runner_policy_sha256,
+                crate::runner::policy::runner_policy_sha256(&container_policy())
+            );
+            invocations.insert(record.invocation.clone());
+        }
+        assert_eq!(
+            invocations.len(),
+            5,
+            "five invocations must write five distinct records: {invocations:?}"
+        );
+
+        // **Synced**, and before the create. The durability trio is counted
+        // across the five invocations and each record's own two entries are
+        // ordered against that container's own `create`.
+        let rendered = fixture.trace.rendered();
+        assert_eq!(
+            rendered
+                .iter()
+                .filter(|entry| entry.as_str() == "durable:dir-synced:containers")
+                .count(),
+            5,
+            "a rename is durable because the directory entry is, and there are five: {rendered:#?}"
+        );
+        for (name, _) in &expected {
+            let at = |needle: String| {
+                fixture
+                    .trace
+                    .position(&needle)
+                    .unwrap_or_else(|| panic!("`{needle}` is not in {rendered:#?}"))
+            };
+            let synced = at(format!("durable:synced:{name}.intent.tmp"));
+            let renamed = at(format!("durable:renamed:{name}.intent"));
+            let created = at(format!("rt:create:{name}"));
+            assert!(
+                synced < renamed && renamed < created,
+                "`{name}`: synced {synced}, renamed {renamed}, created {created}"
+            );
+        }
+    }
+
+    /// A container cannot be created or started except under **its own**
+    /// published intent record.
+    ///
+    /// `PR6-CORRECTNESS-012` / `PR6-ENUM-001`.
+    /// `expected_failures_refusals[6]` is "container start without an intent is
+    /// **impossible by construction**", and it was impossible only by nobody
+    /// having written the bypass: `create_container` and `start_container` were
+    /// public, took a bare `ContainerName`, and a
+    /// `ContainerRunner::start_existing(name)` added tomorrow would have
+    /// compiled. They now take an `IntentWritten`, and this pins the two things
+    /// the type system cannot say on its own:
+    ///
+    /// 1. the proof cannot be minted for a record that is not there, or that is
+    ///    not a `ContainerIntent`;
+    /// 2. a proof for **another** container is refused, before any effect — so
+    ///    "an intent was written" cannot stand in for "this container's intent
+    ///    was written".
+    ///
+    /// The third leg is a compile error and has no test: `start_container` has
+    /// no parameter that names a container other than the proof.
+    #[test]
+    fn a_container_is_created_and_started_only_under_its_own_intent_record() {
+        // `exit_on_start: false`, so a started container stays `Running` and the
+        // control below observes the start rather than the decorator's own
+        // exit.
+        let fixture = Fixture::new("intent-capability", false);
+        let root = fixture.private_root.clone();
+        let mine =
+            ContainerName::new(REPO_KEY, RUN_ID, INCARNATION_1, &worker_id(0)).expect("a name");
+        let other =
+            ContainerName::new(REPO_KEY, RUN_ID, INCARNATION_1, &worker_id(1)).expect("a name");
+
+        // (1a) Absent: the proof cannot be minted at all.
+        let refusal = crate::runner::container::intent::IntentWritten::certify(&root, &mine)
+            .expect_err("there is no record, so there is no proof");
+        assert!(
+            matches!(
+                &refusal,
+                TactusError::Io { source, .. } if source.kind() == std::io::ErrorKind::NotFound
+            ),
+            "a missing record must refuse as a missing file: {refusal}"
+        );
+
+        // (1b) Present and not a record: still no proof. "The record could not
+        // be parsed" and "the record is gone" are different answers and only
+        // one of them is an absence.
+        std::fs::create_dir_all(crate::runner::container::intent::containers_dir(&root))
+            .expect("the namespace");
+        std::fs::write(mine.intent_path(&root), b"{\"not\":\"an intent\"}")
+            .expect("a malformed record");
+        let refusal = crate::runner::container::intent::IntentWritten::certify(&root, &mine)
+            .expect_err("a malformed record is not evidence");
+        assert!(matches!(refusal, TactusError::Refused { .. }), "{refusal}");
+
+        // The control: a real record certifies, so (1a) and (1b) are about the
+        // record and not about `certify` never succeeding.
+        let mut hooks = RecordingHooks::new(fixture.trace.clone());
+        let plan = fixture
+            .runner()
+            .plan(&worker_request(
+                ShellKind::Sh.spec("exit 0"),
+                fixture.task_a.clone(),
+                AgentId::new("claude-code"),
+                Duration::from_secs(10),
+                worker_id(0),
+            ))
+            .expect("plans");
+        let proof = crate::runner::container::write_intent(
+            &mut hooks,
+            ContainerSite::WriteIntent,
+            &root,
+            &mine,
+            &plan.launch.intent,
+        )
+        .expect("the record publishes and certifies");
+        assert_eq!(proof.name(), &mine);
+
+        // (2) A proof for another container is refused, before any effect.
+        fixture.trace.clear();
+        let mut spec = plan.launch.spec.clone();
+        spec.name = other.as_str().to_owned();
+        let refusal = crate::runner::container::create_container(
+            &mut hooks,
+            ContainerSite::Create,
+            &fixture.runtime,
+            &proof,
+            &spec,
+        )
+        .expect_err("`other` has no record of its own");
+        let message = refusal.to_string();
+        assert!(message.contains(other.as_str()), "{message}");
+        assert!(message.contains(mine.as_str()), "{message}");
+        assert!(
+            message.contains("expected_failures_refusals[6]"),
+            "{message}"
+        );
+        assert_eq!(
+            fixture.trace.rendered(),
+            Vec::<String>::new(),
+            "the mismatch refused and something still happened: {:#?}",
+            fixture.trace.rendered()
+        );
+        assert!(fixture.runtime.fake().container_names().is_empty());
+
+        // The control: the same call with the matching proof creates, so the
+        // refusal above is about the name and not about the spec.
+        crate::runner::container::create_container(
+            &mut hooks,
+            ContainerSite::Create,
+            &fixture.runtime,
+            &proof,
+            &plan.launch.spec,
+        )
+        .expect("its own proof creates");
+        assert_eq!(
+            fixture.runtime.fake().container_names(),
+            vec![mine.as_str().to_owned()]
+        );
+        crate::runner::container::start_container(
+            &mut hooks,
+            ContainerSite::Start,
+            &fixture.runtime,
+            &proof,
+        )
+        .expect("and starts the container the proof names");
+        assert_eq!(
+            fixture
+                .runtime
+                .fake()
+                .container(mine.as_str())
+                .map(|held| held.state),
+            Some(Liveness::Running)
+        );
+    }
+
+    /// A launch that fails at **any** step releases everything it reached, and
+    /// answers with the original cause.
+    ///
+    /// `PR6-CORRECTNESS-003` / `PR6-ENUM-003`. There are four ways out of
+    /// `ContainerRunner::launch` before a `Launched` value exists, and until
+    /// repair R1 three of them returned through `?` with nothing to release —
+    /// so `Runner::run`'s own release never ran and the container, the view and
+    /// the intent all survived. The fourth, the reported-image-id mismatch,
+    /// released **fail-fast**: a failing `Container.Stop` skipped the rm, the
+    /// view and the intent *and masked the integrity refusal*.
+    ///
+    /// The grid is {failure point} × {cleanup healthy, `Container.Stop`
+    /// failing} — the intersection, because a cleanup that runs and a cleanup
+    /// that runs *after an earlier step failed* are different claims. In every
+    /// cell: the error names the original cause, and R19/R26 balance.
+    ///
+    /// Second field held constant: the request, the role and the recorded image
+    /// id, which match in every cell except the one whose subject is a
+    /// mismatch.
+    #[test]
+    fn a_launch_that_fails_at_any_step_releases_everything_it_reached() {
+        #[derive(Clone, Copy, PartialEq, Eq)]
+        enum Where {
+            View,
+            Create,
+            Mismatch,
+            Start,
+        }
+        let points: &[(&str, Where, &str)] = &[
+            (
+                "the view cannot be materialised",
+                Where::View,
+                "VIEW-REFUSED",
+            ),
+            ("`docker create` fails", Where::Create, "armed failing"),
+            ("the reported image id differs", Where::Mismatch, "INV-23"),
+            ("`docker start` fails", Where::Start, "armed failing"),
+        ];
+
+        let mut cells = 0_usize;
+        let mut with_residue = 0_usize;
+        for (tag, point, marker) in points {
+            for stop_fails in [false, true] {
+                let fixture = Fixture::new(
+                    &format!(
+                        "atomic-{}-{stop_fails}",
+                        tag.replace(|c: char| !c.is_ascii_alphanumeric(), "-")
+                    ),
+                    true,
+                );
+                let request = worker_request(
+                    ShellKind::Sh.spec("exit 0"),
+                    fixture.task_a.clone(),
+                    AgentId::new("claude-code"),
+                    Duration::from_secs(10),
+                    worker_id(0),
+                );
+                let name = ContainerName::new(REPO_KEY, RUN_ID, INCARNATION_1, &request.invocation)
+                    .expect("a name");
+                let mut runner = fixture.runner();
+                match point {
+                    Where::View => runner = runner.with_view(Box::new(FailingView)),
+                    Where::Create => fixture.runtime.fake().set_failing(RuntimeOp::Create),
+                    Where::Mismatch => fixture
+                        .runtime
+                        .fake()
+                        .substitute_reported_image_id(name.as_str(), OTHER_IMAGE_ID),
+                    Where::Start => fixture.runtime.fake().set_failing(RuntimeOp::Start),
+                }
+                if stop_fails {
+                    fixture.runtime.fake().set_failing(RuntimeOp::Stop);
+                }
+
+                let refusal = runner.run(&request).expect_err("the launch fails");
+                let message = refusal.to_string();
+                // (1) The cause, never the cleanup's own failure.
+                assert!(
+                    message.contains(marker),
+                    "{tag} (stop_fails: {stop_fails}): the original cause was masked: {message}"
+                );
+
+                // (2) R26 and R19 balance: nothing survives, whichever step
+                // failed. A failing `Stop` does not stop the rm — `docker rm
+                // --force` removes a running container — so the ledgers still
+                // balance and the residue clause is the honest record of which
+                // step could not be taken.
+                assert!(
+                    fixture.runtime.fake().container_names().is_empty(),
+                    "{tag} (stop_fails: {stop_fails}): a container survived"
+                );
+                assert!(
+                    list_intents(&fixture.private_root)
+                        .expect("scan")
+                        .is_empty(),
+                    "{tag} (stop_fails: {stop_fails}): an intent survived"
+                );
+                assert!(
+                    !fixture
+                        .private_root
+                        .join("views")
+                        .join(name.as_str())
+                        .exists(),
+                    "{tag} (stop_fails: {stop_fails}): a view survived"
+                );
+
+                // (3) The container was never started, except in the cell whose
+                // subject is a failing start.
+                if *point != Where::Start {
+                    assert!(
+                        !fixture.trace.ops().contains(&RuntimeOp::Start),
+                        "{tag}: the container was started"
+                    );
+                }
+
+                // (4) A failing `Stop` is *named* rather than swallowed, and
+                // only where a container existed to stop.
+                let container_existed = matches!(point, Where::Mismatch | Where::Start);
+                let expects_residue = stop_fails && container_existed;
+                assert_eq!(
+                    message.contains("could not be stopped"),
+                    expects_residue,
+                    "{tag} (stop_fails: {stop_fails}): {message}"
+                );
+                if expects_residue {
+                    // And every later step was still attempted: the remove, the
+                    // view and the intent all have their sites in the trace
+                    // after the stop that failed.
+                    let sites: Vec<String> = fixture
+                        .trace
+                        .rendered()
+                        .into_iter()
+                        .filter(|entry| entry.starts_with("site:"))
+                        .collect();
+                    for later in [
+                        "site:Remove:before",
+                        "site:UnmountGitView:before",
+                        "site:RemoveIntent:before",
+                    ] {
+                        assert!(
+                            sites.contains(&later.to_owned()),
+                            "{tag}: `{later}` was skipped after the stop failed: {sites:#?}"
+                        );
+                    }
+                    with_residue += 1;
+                }
+                cells += 1;
+            }
+        }
+        assert_eq!(
+            cells, 8,
+            "four failure points crossed with two cleanup states"
+        );
+        assert_eq!(
+            with_residue, 2,
+            "two of the cells created a container to fail to stop"
+        );
+    }
+
+    /// The working directory is the **runner's**, for every role, and never the
+    /// image's.
+    ///
+    /// `PR6-CORRECTNESS-006`, the half `CreateSpec` can carry. A probe's
+    /// `workdir` was `None`, which hands the working directory to the image's
+    /// `WORKDIR` — so what a probe certified depended on a value the runner had
+    /// not read, and the finding's mutation (`None` -> `Some("/")`) changed
+    /// nothing any test could see. Both values are pinned here, so the mutation
+    /// dies in either direction.
+    #[test]
+    fn the_working_directory_is_the_runners_own_for_every_role() {
+        let fixture = Fixture::new("workdir", true);
+        let runner = fixture.runner();
+        let mut seen: BTreeMap<String, String> = BTreeMap::new();
+        for request in requests(&fixture.task_a) {
+            let plan = runner.plan(&request).expect("plans");
+            let workdir = plan.launch.spec.workdir.clone().unwrap_or_else(|| {
+                panic!("{}: the image chose the working directory", request.role)
+            });
+            seen.insert(request.role.label(), workdir);
+        }
+        assert_eq!(
+            seen,
+            BTreeMap::from([
+                ("implement".to_owned(), "/tactus/workspace".to_owned()),
+                ("gate".to_owned(), "/tactus/workspace".to_owned()),
+                ("review".to_owned(), "/tactus/workspace".to_owned()),
+                ("probe(shell)".to_owned(), "/tmp".to_owned()),
+                ("probe(claude-code)".to_owned(), "/tmp".to_owned()),
+            ]),
+            "the working directory rule moved"
+        );
+        // Both values are declared mounts, so no role runs in a directory the
+        // runner did not give it.
+        for request in requests(&fixture.task_a) {
+            let plan = runner.plan(&request).expect("plans");
+            let workdir = plan.launch.spec.workdir.clone().expect("pinned");
+            assert!(
+                plan.mounts().iter().any(|mount| mount.target() == workdir),
+                "{}: the working directory `{workdir}` is not a declared mount",
+                request.role
+            );
+        }
+    }
+
+    /// A `PATH` that resolves against the working directory is refused, for
+    /// every role, before any effect.
+    ///
+    /// `PR6-CORRECTNESS-006`, the half that matters. A probe has no worktree and
+    /// an attempt has one, so their working directories differ **by design**;
+    /// with a relative `PATH` component the repository's own worktree is on the
+    /// executable search path and repository content decides which `claude` the
+    /// attempt runs while pre-flight certified another. Both refusals are here
+    /// — the relative component, and the empty base that was the production
+    /// default and supplied no `PATH` at all.
+    ///
+    /// Second field held constant: the workspace, the image and the run; what
+    /// varies is the base and the role.
+    #[test]
+    fn a_cwd_relative_or_absent_path_refuses_every_role_before_any_effect() {
+        let fixture = Fixture::new("hostile-path", true);
+        let cases: Vec<(&str, ContainerEnvironment, &str)> = vec![
+            (
+                "a relative component",
+                ContainerEnvironment::from_image(vec![(
+                    "PATH".to_owned(),
+                    CWD_RELATIVE_PATH.to_owned(),
+                )]),
+                "DESIGN.md:612",
+            ),
+            (
+                "no PATH at all — the production default",
+                ContainerEnvironment::inherited(),
+                "names no `PATH`",
+            ),
+        ];
+        let mut refused = 0_usize;
+        for (tag, environment, expected) in cases {
+            let runner = ContainerRunner::new(
+                container_policy(),
+                fixture.identity.clone(),
+                &fixture.repo,
+                environment,
+                Box::new(fixture.runtime.clone()),
+            )
+            .expect("a container policy");
+            for request in requests(&fixture.task_a) {
+                let refusal = runner
+                    .plan(&request)
+                    .expect_err("an environment that cannot certify resolution is refused");
+                assert!(
+                    refusal.to_string().contains(expected),
+                    "{tag} / {}: {refusal}",
+                    request.role
+                );
+                refused += 1;
+            }
+        }
+        assert_eq!(refused, 2 * 5, "two hostile bases crossed with five roles");
+
+        // Nothing was created on the way to any of them: the refusal is in
+        // `plan`, which performs no effect.
+        assert!(
+            list_intents(&fixture.private_root)
+                .expect("scan")
+                .is_empty()
+        );
+        assert!(fixture.runtime.fake().container_names().is_empty());
+
+        // The control: the same runner over an absolute-only base plans and
+        // supplies that value to every role, probe and attempt alike — which is
+        // the property the refusals exist to protect.
+        let runner = fixture.runner();
+        let mut supplied: BTreeSet<String> = BTreeSet::new();
+        for request in requests(&fixture.task_a) {
+            let plan = runner.plan(&request).expect("plans");
+            supplied.insert(
+                plan.env()
+                    .iter()
+                    .find(|(key, _)| key == "PATH")
+                    .map(|(_, value)| value.clone())
+                    .expect("the runner supplies PATH"),
+            );
+        }
+        assert_eq!(
+            supplied,
+            BTreeSet::from([IMAGE_PATH.to_owned()]),
+            "the five roles do not execute under one PATH"
+        );
+    }
+
+    /// Every role's container gets a **read-only root** and exactly one
+    /// ephemeral scratch mount, and no other writable surface without a host
+    /// source.
+    ///
+    /// `PR6-CORRECTNESS-008` / `PR6-ENUM-005`, the half a machine with no
+    /// container runtime can assert — which is the Windows guest, and which is
+    /// why it is here as well as in the gated test that runs the write.
+    #[test]
+    fn every_role_gets_a_read_only_root_and_one_ephemeral_scratch_mount() {
+        let fixture = Fixture::new("read-only-root", true);
+        let runner = fixture.runner();
+        let mut rows = 0_usize;
+        for request in requests(&fixture.task_a) {
+            let plan = runner.plan(&request).expect("plans");
+            assert!(
+                plan.launch.spec.read_only_root,
+                "{}: the container layer is writable, so a write outside every declared \
+                 mount would succeed",
+                request.role
+            );
+            let scratch: Vec<Mount> = plan
+                .mounts()
+                .iter()
+                .filter(|mount| matches!(mount, Mount::Tmpfs { .. }))
+                .cloned()
+                .collect();
+            assert_eq!(
+                scratch,
+                vec![Mount::Tmpfs {
+                    target: "/tmp".to_owned()
+                }],
+                "{}: {:?}",
+                request.role,
+                plan.mounts()
+            );
+            // Every other mount has a source the coordinator can name — a host
+            // path or an operator-owned volume — so the mount list is the whole
+            // of what the container may write and none of it is anonymous.
+            for mount in plan.mounts() {
+                let declared = match mount {
+                    Mount::Path { .. } | Mount::Volume { .. } => true,
+                    Mount::Tmpfs { target } => target == "/tmp",
+                };
+                assert!(declared, "{}: {mount:?}", request.role);
+            }
+            rows += 1;
+        }
+        assert_eq!(rows, 5);
+    }
+
+    // -----------------------------------------------------------------------
     // 6. Docker-gated: what the fake cannot prove
     // -----------------------------------------------------------------------
 
@@ -3111,6 +4299,65 @@ mod tests {
         }
     }
 
+    /// The **reserved** part of the recorded image's own environment, read from
+    /// the daemon.
+    ///
+    /// DESIGN.md:259-260: "the container runner [starts] from the image
+    /// environment; each supplies role-scoped `HOME`, `PATH`, and credential
+    /// locations". A gated fixture is the one place in this suite that can
+    /// honour the first clause literally, because it has a real image to read;
+    /// the fake fixtures state an equivalent base as a literal. Either way the
+    /// runner is given a base carrying an absolute-only `PATH`, which
+    /// `ContainerEnvironment::certify_path` now requires.
+    ///
+    /// **Filtered to the reserved keys**, and that is the point rather than an
+    /// economy: `docker create --env` *overlays* the image environment, so a
+    /// variable the runner does not name still reaches the child. Passing the
+    /// whole image environment back would restate every one of those in the
+    /// runner's own `--env` list and make
+    /// "overlays a runner-owned base rather than replacing it" unmeasurable —
+    /// the marker assertion below would be comparing the fixture with itself.
+    ///
+    /// **Not a self-oracle.** This reads the *image's* declared environment out
+    /// of the daemon; the assertions are about what a process *inside a
+    /// container* sees and resolves, which a different mechanism decides.
+    fn image_environment_of(
+        docker: &crate::runner::container::DockerCli,
+        image_id: &str,
+    ) -> ContainerEnvironment {
+        let raw = docker
+            .raw(
+                RuntimeOp::InspectImageById,
+                image_id,
+                &[
+                    "image",
+                    "inspect",
+                    image_id,
+                    "--format",
+                    "{{join .Config.Env \"\u{1f}\"}}",
+                ],
+            )
+            .expect("the image's environment");
+        let declared: Vec<(String, String)> = raw
+            .trim_end_matches('\n')
+            .split('\u{1f}')
+            .filter_map(|entry| entry.split_once('='))
+            .map(|(key, value)| (key.to_owned(), value.to_owned()))
+            .collect();
+        assert!(
+            declared.iter().any(|(key, _)| key == "PATH"),
+            "the discovered image declares no PATH, so nothing below measures \
+             resolution: {declared:?}"
+        );
+        let reserved = host::reserved_keys();
+        ContainerEnvironment::from_image(
+            declared
+                .into_iter()
+                .filter(|(key, _)| reserved.iter().any(|name| name == key))
+                .collect(),
+        )
+    }
+
     /// A `RunIdentity` for a gated test, under a scratch private root.
     ///
     /// `run_id` is a **parameter** because the container name is
@@ -3147,6 +4394,17 @@ mod tests {
         ("confine", "01KZGATEDC000000000000000C"),
         ("gitview", "01KZGATEDD000000000000000D"),
         ("parity", "01KZGATEDE000000000000000E"),
+        // Repair R1. The ids carry the round rather than continuing the
+        // `…GATED<letter>` sequence, and that is not cosmetic: a container name
+        // is `tactus-<repo_key>-<run_id>-<incarnation>-<invocation-hash>` and
+        // carries no worktree, so two *trees* whose gated suites pick the same
+        // run id and invocation ordinal fight over one container name on a
+        // shared daemon. Measured: repair round R3 added a gated test with
+        // `01KZGATEDG000000000000000G` at the same time this one did, and the
+        // two collided with `Conflict. The container name … is already in use`.
+        ("outside", "01KZR1GATED000000000000001"),
+        ("daemonspec", "01KZR1GATED000000000000002"),
+        ("shadow", "01KZR1GATED000000000000003"),
     ];
 
     fn gated_run(tag: &str) -> &'static str {
@@ -3200,12 +4458,24 @@ mod tests {
     ///
     /// Three separately droppable claims against the real runtime:
     ///
-    /// * the composed `CreateSpec.env` does **not** name `PATH`, and `$PATH` is
-    ///   nevertheless set inside the container — so the base really is the
-    ///   image's and the runner overlaid it rather than replacing it. That is
-    ///   image-independent, which is why it is the primary measurement.
+    /// * the runner **supplies** `PATH` — DESIGN.md:260, "each supplies
+    ///   role-scoped `HOME`, `PATH`, and credential locations" — and the value
+    ///   the child sees is the one the runner named. A key the runner did *not*
+    ///   name and the image did (`TACTUS_IMAGE_MARKER`) reaches the child
+    ///   anyway, which is what "overlays a runner-owned base rather than
+    ///   replacing it" means and is the half a `PATH` assertion alone cannot
+    ///   make.
     /// * the adapter's overlay key lands.
     /// * the working directory is the role's worktree mount.
+    ///
+    /// **The first claim used to be its opposite** — "the composed
+    /// `CreateSpec.env` does not name `PATH`" — and repair R1 inverted it
+    /// deliberately, not to make anything pass. `ContainerEnvironment::inherited`
+    /// composed an empty base, so the *image's* `PATH` decided which binary a
+    /// bare program name resolved to; with a relative component in it, a probe
+    /// (no worktree) and the attempt it certifies (a worktree) resolve
+    /// different binaries. `PR6-CORRECTNESS-006`. The old assertion was true
+    /// and was a statement that the runner supplied nothing.
     ///
     /// Second field held constant: the role and the workspace; what varies
     /// across the three claims is which part of the environment is read.
@@ -3239,11 +4509,12 @@ mod tests {
         let runner = ContainerRunner::new(
             real_policy(&image_id),
             identity.clone(),
+            &repo_dir,
+            image_environment_of(docker.as_ref(), &image_id),
             Box::new((*docker).clone()),
         )
         .expect("a container policy")
         .with_hooks(Box::new(RecordingHooks::new(trace.clone())))
-        .with_confinement(Confinement::of_run(&identity, &repo_dir))
         .with_poll(Duration::from_millis(10));
 
         let request = gate_request(
@@ -3260,12 +4531,28 @@ mod tests {
             gate_id(0),
         );
 
-        // The composed environment names no `PATH`: the runner's base is empty
-        // and the runtime supplies the image's.
+        // The runner supplies `PATH`, and every component of it is absolute.
         let plan = runner.plan(&request).expect("plans");
+        let supplied_path = plan
+            .env()
+            .iter()
+            .find(|(key, _)| key == "PATH")
+            .map(|(_, value)| value.clone())
+            .expect("the runner supplies PATH (DESIGN.md:260)");
         assert!(
-            !plan.env().iter().any(|(key, _)| key == "PATH"),
-            "the runner named PATH, so the assertion below would prove nothing: {:?}",
+            super::super::env::cwd_dependent_path_components(&supplied_path).is_empty(),
+            "the runner supplied a working-directory-relative PATH: {supplied_path}"
+        );
+        // And it did not *replace* the image environment: the marker key is one
+        // the runner never names, and it is read back from inside the container
+        // below. Without this the `PATH` assertion above would be consistent
+        // with a runner that had thrown the image environment away.
+        assert!(
+            !plan
+                .env()
+                .iter()
+                .any(|(key, _)| key == "TACTUS_IMAGE_MARKER"),
+            "the runner named the image's own key, so the overlay claim below is vacuous: {:?}",
             plan.env()
         );
         assert_eq!(plan.launch.spec.image_id, image_id);
@@ -3280,10 +4567,11 @@ mod tests {
                 .unwrap_or_else(|| panic!("`{key}` is not in {:?}", output.stdout))
                 .to_owned()
         };
-        assert!(
-            line("PATH=").contains("/bin"),
-            "the image environment did not reach the child: {:?}",
-            output.stdout
+        assert_eq!(
+            line("PATH="),
+            supplied_path,
+            "the child ran under a PATH the runner did not supply, so pre-flight cannot \
+             certify which binary an attempt resolves (DESIGN.md:612)"
         );
         assert_eq!(line("OVERLAY="), "landed", "the overlay did not land");
         assert_eq!(line("PWD="), "/tactus/workspace");
@@ -3350,10 +4638,11 @@ mod tests {
         let runner = ContainerRunner::new(
             real_policy(&image_id),
             identity.clone(),
+            &repo_dir,
+            image_environment_of(docker.as_ref(), &image_id),
             Box::new((*docker).clone()),
         )
         .expect("a container policy")
-        .with_confinement(Confinement::of_run(&identity, &repo_dir))
         .with_poll(Duration::from_millis(10));
 
         let mut outcomes = Vec::new();
@@ -3502,13 +4791,11 @@ mod tests {
         let runner = ContainerRunner::new(
             real_policy(&image_id),
             identity.clone(),
+            &repo_dir,
+            image_environment_of(docker.as_ref(), &image_id),
             Box::new((*docker).clone()),
         )
         .expect("a container policy")
-        .with_confinement(
-            Confinement::of_run(&identity, &repo_dir)
-                .withholding(Withheld::SiblingWorktree, sibling.clone()),
-        )
         .with_poll(Duration::from_millis(10));
 
         let mut script = String::from("cat /tactus/workspace/mine.txt;");
@@ -3562,6 +4849,502 @@ mod tests {
         assert_eq!(repo::git_ok(&repo_dir, &["rev-parse", "HEAD"]), head);
     }
 
+    /// `expected_failures_refusals[5]`: "**gate write outside mount fails**" —
+    /// the refusal itself, observed inside the container.
+    ///
+    /// `PR6-CORRECTNESS-008` / `PR6-ENUM-005`, and the distinction that produced
+    /// them. `real_docker_confines_a_gate_to_its_mount` proves **"the host is
+    /// unharmed"**: it explicitly permits container-layer writes and asserts on
+    /// host bytes. That is true, and it is weaker than the contract's sentence —
+    /// with no read-only root filesystem the gate's
+    /// `printf owned >/outside-role-mount` exited **0**, and a test can prove a
+    /// true, weaker statement indefinitely while the stated guarantee does not
+    /// hold. So this test asserts the **write fails**, from the container's own
+    /// report, and never looks at the host at all.
+    ///
+    /// The grid is {a path outside every declared mount} × {a declared writable
+    /// mount}, and the second column is not decoration: a container in which
+    /// *nothing* could be written would satisfy the first column while being
+    /// unusable, so the two controls — the role's own worktree and the declared
+    /// scratch surface — are what say the confinement is a boundary rather than
+    /// a brick.
+    ///
+    /// The hostile paths are chosen to cover the three shapes a write can take:
+    /// the root of the container filesystem, a directory the image itself
+    /// populates, and — the interesting one — a **sibling of the role's own
+    /// mount**, `/tactus/escape`, which a naive "only paths under the mount
+    /// targets are writable" implementation would let through.
+    #[test]
+    fn real_docker_a_gate_write_outside_every_declared_mount_fails() {
+        let trace = ContainerTrace::recording();
+        let docker = match docker_gate(
+            "real_docker_a_gate_write_outside_every_declared_mount_fails",
+            trace.clone(),
+        ) {
+            Ok(docker) => docker,
+            Err(reason) => return skipped(&reason),
+        };
+        let (_, image_id) = match discover(docker.as_ref(), PREFERRED_IMAGES) {
+            Ok(found) => found,
+            Err(reason) => return no_image(&reason),
+        };
+
+        let root = repo::scratch("real-outside");
+        let run_id = gated_run("outside");
+        let repo_dir = root.join("repo");
+        let (head, _) = repo::repository(&repo_dir);
+        let identity = real_identity(&root, &repo_dir, run_id);
+        let execution_root =
+            crate::workspace_manager::execution_root_of(&identity.private_root, REPO_KEY, run_id);
+        let mine = execution_root.join("tasks").join("kalpha-g0");
+        repo::worktree(&repo_dir, &mine, &head);
+
+        let _residue = LeaveNoResidue {
+            docker: (*docker).clone(),
+            private_root: identity.private_root.clone(),
+        };
+        let runner = ContainerRunner::new(
+            real_policy(&image_id),
+            identity.clone(),
+            &repo_dir,
+            image_environment_of(docker.as_ref(), &image_id),
+            Box::new((*docker).clone()),
+        )
+        .expect("a container policy")
+        .with_poll(Duration::from_millis(10));
+
+        // Outside every declared mount, and inside the two that are writable.
+        const OUTSIDE: &[&str] = &[
+            "/outside-role-mount",
+            "/etc/tactus-escaped",
+            "/usr/local/bin/tactus-escaped",
+            // A sibling of the role's own mount target.
+            "/tactus/escape",
+        ];
+        let inside: Vec<String> = vec![
+            format!("{}/written-by-the-gate", BoundaryLayout::DEFAULT_WORKSPACE),
+            format!("{}/written-by-the-gate", BoundaryLayout::DEFAULT_SCRATCH),
+        ];
+
+        let mut script = String::new();
+        for path in OUTSIDE
+            .iter()
+            .map(|p| (*p).to_owned())
+            .chain(inside.clone())
+        {
+            script.push_str(&format!(
+                "if ( printf owned > '{path}' ) 2>/dev/null; then echo 'WROTE {path}'; \
+                 else echo 'FAILED {path}'; fi;"
+            ));
+        }
+        let request = gate_request(
+            ShellKind::Sh.spec(&script),
+            mine.clone(),
+            Duration::from_secs(60),
+            gate_id(0),
+        );
+        // The mount set the claim is about, taken from the plan rather than
+        // assumed, so "outside every declared mount" is checked against the
+        // list the container is actually given.
+        let plan = runner.plan(&request).expect("plans");
+        let targets: Vec<&str> = plan.mounts().iter().map(Mount::target).collect();
+        for path in OUTSIDE {
+            assert!(
+                !targets.iter().any(|target| path.starts_with(target)),
+                "`{path}` is inside a declared mount, so refusing it proves nothing: {targets:?}"
+            );
+        }
+        assert!(plan.launch.spec.read_only_root);
+
+        let output = runner.run(&request).expect("runs");
+        let said = |path: &str| -> String {
+            output
+                .stdout
+                .lines()
+                .find(|line| line.ends_with(path))
+                .unwrap_or_else(|| {
+                    panic!(
+                        "`{path}` is in neither stream — stdout {:?} / stderr {:?}",
+                        output.stdout, output.stderr
+                    )
+                })
+                .to_owned()
+        };
+        for path in OUTSIDE {
+            assert_eq!(
+                said(path),
+                format!("FAILED {path}"),
+                "a gate wrote outside every declared mount, so \
+                 `expected_failures_refusals[5]` does not hold: {:?}",
+                output.stdout
+            );
+        }
+        // The controls: the role's own worktree and the declared scratch
+        // surface are writable, so the refusals above are a boundary and not a
+        // container that can do nothing.
+        for path in &inside {
+            assert_eq!(said(path), format!("WROTE {path}"), "{:?}", output.stdout);
+        }
+        assert_eq!(
+            std::fs::read_to_string(mine.join("written-by-the-gate"))
+                .expect("the gate's own worktree write reached the host"),
+            "owned"
+        );
+    }
+
+    /// The daemon's own container carries **exactly** the spec's mounts and a
+    /// read-only root.
+    ///
+    /// `PR6-ENUM-005`'s surviving mutation is not about the spec at all: it is
+    /// "append `--mount type=bind,source=/tmp,target=/outside` directly to
+    /// Docker's argv, **bypassing `CreateSpec.mounts`**". Every fake test sees
+    /// the unchanged spec, and a gated test that only writes to paths it knows
+    /// about never asks the daemon what the container really has. So this test
+    /// asks: it reads `.Mounts` and `.HostConfig.ReadonlyRootfs` back off the
+    /// created container and compares them to the plan, and an argv-appended
+    /// mount is a destination the plan does not name.
+    ///
+    /// The container is created through the funnel and never started, which is
+    /// what lets it be inspected: `Runner::run` releases on both paths, so a
+    /// container that had run would be gone before anything could look at it.
+    #[test]
+    fn real_docker_the_daemon_holds_exactly_the_specs_mounts_and_a_read_only_root() {
+        let trace = ContainerTrace::recording();
+        let docker = match docker_gate(
+            "real_docker_the_daemon_holds_exactly_the_specs_mounts_and_a_read_only_root",
+            trace.clone(),
+        ) {
+            Ok(docker) => docker,
+            Err(reason) => return skipped(&reason),
+        };
+        let (_, image_id) = match discover(docker.as_ref(), PREFERRED_IMAGES) {
+            Ok(found) => found,
+            Err(reason) => return no_image(&reason),
+        };
+
+        let root = repo::scratch("real-daemonspec");
+        let run_id = gated_run("daemonspec");
+        let repo_dir = root.join("repo");
+        let (head, _) = repo::repository(&repo_dir);
+        let identity = real_identity(&root, &repo_dir, run_id);
+        let execution_root =
+            crate::workspace_manager::execution_root_of(&identity.private_root, REPO_KEY, run_id);
+        let mine = execution_root.join("tasks").join("kalpha-g0");
+        repo::worktree(&repo_dir, &mine, &head);
+
+        let _residue = LeaveNoResidue {
+            docker: (*docker).clone(),
+            private_root: identity.private_root.clone(),
+        };
+        let runner = ContainerRunner::new(
+            real_policy(&image_id),
+            identity.clone(),
+            &repo_dir,
+            image_environment_of(docker.as_ref(), &image_id),
+            Box::new((*docker).clone()),
+        )
+        .expect("a container policy")
+        .with_poll(Duration::from_millis(10));
+
+        let request = gate_request(
+            ShellKind::Sh.spec("exit 0"),
+            mine.clone(),
+            Duration::from_secs(60),
+            gate_id(0),
+        );
+        let plan = runner.plan(&request).expect("plans");
+        let name = plan.launch.name.clone();
+
+        // Write the intent, materialise the view, create — and stop there.
+        // The view is the runner's own projection rather than a bare directory:
+        // a linked worktree's `.git` pointer file is a bind **source** of the
+        // create, so a directory-only view fails `docker create` outright.
+        let mut hooks = crate::runner::container::NoHooks;
+        let view = RoleGitView::new(ContainerTrace::off()).for_reader(
+            BoundaryLayout::DEFAULT_GIT_VIEW,
+            BoundaryLayout::DEFAULT_GIT_OBJECTS,
+        );
+        let written = crate::runner::container::write_intent(
+            &mut hooks,
+            ContainerSite::WriteIntent,
+            &identity.private_root,
+            &name,
+            &plan.launch.intent,
+        )
+        .expect("the record publishes");
+        crate::runner::container::mount_git_view(
+            &mut hooks,
+            ContainerSite::MountGitView,
+            &view,
+            &plan.launch.view,
+        )
+        .expect("the view is a bind source, so it exists before the create");
+        crate::runner::container::create_container(
+            &mut hooks,
+            ContainerSite::Create,
+            docker.as_ref(),
+            &written,
+            &plan.launch.spec,
+        )
+        .expect("created");
+
+        let read_only = docker
+            .raw(
+                RuntimeOp::Observe,
+                name.as_str(),
+                &[
+                    "container",
+                    "inspect",
+                    name.as_str(),
+                    "--format",
+                    "{{.HostConfig.ReadonlyRootfs}}",
+                ],
+            )
+            .expect("the daemon answers");
+        assert_eq!(
+            read_only.trim(),
+            "true",
+            "the daemon gave the container a writable root filesystem"
+        );
+
+        let raw = docker
+            .raw(
+                RuntimeOp::Observe,
+                name.as_str(),
+                &[
+                    "container",
+                    "inspect",
+                    name.as_str(),
+                    "--format",
+                    "{{range .Mounts}}{{.Type}}\u{1f}{{.Destination}}\u{1f}{{.RW}}\u{1e}{{end}}",
+                ],
+            )
+            .expect("the daemon answers");
+        let daemon: BTreeSet<(String, String, bool)> = raw
+            .trim()
+            .split('\u{1e}')
+            .filter(|entry| !entry.trim().is_empty())
+            .map(|entry| {
+                let fields: Vec<&str> = entry.trim().split('\u{1f}').collect();
+                (
+                    fields.first().copied().unwrap_or_default().to_owned(),
+                    fields.get(1).copied().unwrap_or_default().to_owned(),
+                    fields.get(2).copied().unwrap_or_default() == "true",
+                )
+            })
+            .collect();
+        let planned: BTreeSet<(String, String, bool)> = plan
+            .mounts()
+            .iter()
+            .map(|mount| {
+                let kind = match mount {
+                    Mount::Path { .. } => "bind",
+                    Mount::Volume { .. } => "volume",
+                    Mount::Tmpfs { .. } => "tmpfs",
+                };
+                (
+                    kind.to_owned(),
+                    mount.target().to_owned(),
+                    !mount.read_only(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            daemon, planned,
+            "the container the daemon holds is not the one `CreateSpec` describes — a mount \
+             that reaches the daemon without going through `CreateSpec.mounts` is exactly \
+             `PR6-ENUM-005`'s surviving mutation"
+        );
+        // The control: the comparison is not two empty sets.
+        assert!(planned.len() >= 4, "{planned:?}");
+        assert!(
+            planned.contains(&("tmpfs".to_owned(), "/tmp".to_owned(), true)),
+            "{planned:?}"
+        );
+
+        crate::runner::container::reclaim(
+            &mut hooks,
+            docker.as_ref(),
+            &view,
+            &identity.private_root,
+            &name,
+            Some(&view_dir(&identity.private_root, &name)),
+        )
+        .expect("reclaimed");
+    }
+
+    /// A binary planted in the worktree cannot become the CLI the attempt runs,
+    /// and a probe and an attempt resolve the same name to the same thing.
+    ///
+    /// `PR6-CORRECTNESS-006`, end to end. DESIGN.md:612: "Probes run through
+    /// that same runner, or pre-flight could certify a host CLI/version
+    /// different from the one the attempt executes." A probe has no worktree
+    /// and an attempt has one, so their working directories differ **by
+    /// design**; with `PATH=.:/usr/bin` the attempt's `claude` is whatever the
+    /// repository put in the worktree and pre-flight certified something else.
+    ///
+    /// Two cells, and they are the two halves of the repair:
+    ///
+    /// 1. an image environment whose `PATH` resolves against the working
+    ///    directory is **refused before any effect** — no container is created
+    ///    at all, checked against the daemon by label;
+    /// 2. under the absolute-only `PATH` the runner supplies, the planted
+    ///    binary is not resolvable by name in either the probe or the attempt,
+    ///    and a name that *is* on the path resolves to the same absolute file
+    ///    in both.
+    ///
+    /// The control is inside the same command: the gate proves the shim is
+    /// really there and really executable in its own worktree, so "not found"
+    /// is a statement about resolution and not about the fixture.
+    #[test]
+    fn real_docker_a_worktree_binary_cannot_shadow_the_certified_cli() {
+        let trace = ContainerTrace::recording();
+        let docker = match docker_gate(
+            "real_docker_a_worktree_binary_cannot_shadow_the_certified_cli",
+            trace.clone(),
+        ) {
+            Ok(docker) => docker,
+            Err(reason) => return skipped(&reason),
+        };
+        let (_, image_id) = match discover(docker.as_ref(), PREFERRED_IMAGES) {
+            Ok(found) => found,
+            Err(reason) => return no_image(&reason),
+        };
+
+        let root = repo::scratch("real-shadow");
+        let run_id = gated_run("shadow");
+        let repo_dir = root.join("repo");
+        let (head, _) = repo::repository(&repo_dir);
+        let identity = real_identity(&root, &repo_dir, run_id);
+        let execution_root =
+            crate::workspace_manager::execution_root_of(&identity.private_root, REPO_KEY, run_id);
+        let mine = execution_root.join("tasks").join("kalpha-g0");
+        repo::worktree(&repo_dir, &mine, &head);
+
+        // The shim the repository controls, named as a CLI this engine drives.
+        let shim = mine.join("claude");
+        std::fs::write(&shim, "#!/bin/sh\necho SHIMMED\n").expect("the shim");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            std::fs::set_permissions(&shim, std::fs::Permissions::from_mode(0o755))
+                .expect("executable");
+        }
+
+        let _residue = LeaveNoResidue {
+            docker: (*docker).clone(),
+            private_root: identity.private_root.clone(),
+        };
+        let label = crate::runner::container::intent::private_root_label(&identity.private_root);
+
+        // (1) The refusal, before any effect.
+        let hostile = ContainerRunner::new(
+            real_policy(&image_id),
+            identity.clone(),
+            &repo_dir,
+            ContainerEnvironment::from_image(vec![("PATH".to_owned(), format!(".:{IMAGE_PATH}"))]),
+            Box::new((*docker).clone()),
+        )
+        .expect("a container policy")
+        .with_poll(Duration::from_millis(10));
+        let refusal = hostile
+            .run(&gate_request(
+                ShellKind::Sh.spec("claude"),
+                mine.clone(),
+                Duration::from_secs(60),
+                gate_id(1),
+            ))
+            .expect_err("a cwd-relative PATH is refused");
+        assert!(refusal.to_string().contains("DESIGN.md:612"), "{refusal}");
+        assert_eq!(
+            docker
+                .containers_with_label(LABEL_PRIVATE_ROOT, &label)
+                .expect("reachable")
+                .len(),
+            0,
+            "the refusal created a container"
+        );
+
+        // (2) The guarantee, under the PATH the runner supplies.
+        let runner = ContainerRunner::new(
+            real_policy(&image_id),
+            identity.clone(),
+            &repo_dir,
+            image_environment_of(docker.as_ref(), &image_id),
+            Box::new((*docker).clone()),
+        )
+        .expect("a container policy")
+        .with_poll(Duration::from_millis(10));
+
+        let script = "printf 'PWD=%s\\n' \"$(pwd)\"; \
+             printf 'CLAUDE=%s\\n' \"$(command -v claude || echo NOTFOUND)\"; \
+             printf 'SH=%s\\n' \"$(command -v sh || echo NOTFOUND)\"";
+        let gate = gate_request(
+            ShellKind::Sh.spec(&format!(
+                "{script}; printf 'SHIM=%s\\n' \"$(test -x ./claude && echo PRESENT || echo ABSENT)\""
+            )),
+            mine.clone(),
+            Duration::from_secs(60),
+            gate_id(0),
+        );
+        let probe = crate::agent::probe_request(
+            "claude-code",
+            ShellKind::Sh.spec(script),
+            0,
+            Duration::from_secs(60),
+        )
+        .expect("an agent probe request");
+
+        let mut answers: Vec<(&str, BTreeMap<String, String>)> = Vec::new();
+        for (tag, request) in [("the attempt", gate), ("the probe", probe)] {
+            let output = runner.run(&request).expect("runs");
+            assert_eq!(output.code, Some(0), "{tag}: stderr {}", output.stderr);
+            let mut read = BTreeMap::new();
+            for line in output.stdout.lines() {
+                if let Some((key, value)) = line.split_once('=') {
+                    read.insert(key.to_owned(), value.trim().to_owned());
+                }
+            }
+            answers.push((tag, read));
+        }
+
+        // The two really do run in different working directories — the premise
+        // of the finding, asserted rather than assumed.
+        assert_eq!(answers[0].1["PWD"], BoundaryLayout::DEFAULT_WORKSPACE);
+        assert_eq!(answers[1].1["PWD"], BoundaryLayout::DEFAULT_SCRATCH);
+        assert_ne!(answers[0].1["PWD"], answers[1].1["PWD"]);
+        // The control: the shim is there, and it is executable.
+        assert_eq!(
+            answers[0].1["SHIM"], "PRESENT",
+            "the shim is not in the attempt's worktree, so NOTFOUND below proves nothing"
+        );
+        // Neither resolves it, and both resolve a name that is on the path to
+        // the same absolute file.
+        assert_eq!(
+            answers[0].1["CLAUDE"], "NOTFOUND",
+            "repository content became the CLI the attempt runs"
+        );
+        assert_eq!(answers[1].1["CLAUDE"], "NOTFOUND");
+        assert_eq!(
+            answers[0].1["SH"], answers[1].1["SH"],
+            "pre-flight certified a different binary from the one the attempt executes \
+             (DESIGN.md:612)"
+        );
+        assert!(
+            answers[0].1["SH"].starts_with('/'),
+            "{:?}",
+            answers[0].1["SH"]
+        );
+
+        assert_eq!(
+            docker
+                .containers_with_label(LABEL_PRIVATE_ROOT, &label)
+                .expect("reachable")
+                .len(),
+            0
+        );
+    }
+
     /// `proof_tests[1]`: "**Git-dependent gate sees only the role view**",
     /// against a real container.
     ///
@@ -3604,10 +5387,11 @@ mod tests {
         let runner = ContainerRunner::new(
             real_policy(&image_id),
             identity.clone(),
+            &repo_dir,
+            image_environment_of(docker.as_ref(), &image_id),
             Box::new((*docker).clone()),
         )
         .expect("a container policy")
-        .with_confinement(Confinement::of_run(&identity, &repo_dir))
         .with_poll(Duration::from_millis(10));
 
         // `safe.directory` because the host paths are owned by the coordinator's
@@ -3719,10 +5503,11 @@ mod tests {
         let runner = ContainerRunner::new(
             real_policy(&image_id),
             identity.clone(),
+            &repo_dir,
+            image_environment_of(docker.as_ref(), &image_id),
             Box::new((*docker).clone()),
         )
         .expect("a container policy")
-        .with_confinement(Confinement::of_run(&identity, &repo_dir))
         .with_poll(Duration::from_millis(10));
 
         let container_rows = crate::runner::tests::adapter_parse_parity(&runner, &workspace);
@@ -3762,8 +5547,12 @@ mod tests {
             "real_docker_confines_a_gate_to_its_mount",
             "real_docker_a_git_dependent_gate_sees_only_the_role_view",
             "real_docker_adapter_parsing_matches_the_host_table",
+            // Repair round R1.
+            "real_docker_a_gate_write_outside_every_declared_mount_fails",
+            "real_docker_the_daemon_holds_exactly_the_specs_mounts_and_a_read_only_root",
+            "real_docker_a_worktree_binary_cannot_shadow_the_certified_cli",
         ];
-        assert_eq!(MINE.len(), 5);
+        assert_eq!(MINE.len(), 8);
         assert_eq!(GATED_RUNS.len(), MINE.len(), "one run id per gated test");
         let ids: BTreeSet<&str> = GATED_RUNS.iter().map(|(_, run)| *run).collect();
         assert_eq!(

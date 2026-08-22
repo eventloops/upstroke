@@ -101,7 +101,7 @@ use crate::error::TactusError;
 use crate::topology::effects::{ContainerSite, EffectSiteId, HookPhase, Injection};
 use crate::util;
 
-use intent::{ContainerIntent, ContainerName, INTENT_STAGED_SUFFIX, containers_dir};
+use intent::{ContainerIntent, ContainerName, INTENT_STAGED_SUFFIX, IntentWritten, containers_dir};
 use runtime::{
     ContainerExecution, ContainerRuntime, ContainerTrace, CreateSpec, CreatedContainer,
     DiscoveredContainer, DurableStep, Liveness, RuntimeError, RuntimeOp, StopMode, TracePhase,
@@ -353,7 +353,15 @@ pub const RACING_ACCESS_ATTEMPTS: usize = 64;
 /// in the trace beside the primitive that performs it, so a deleted step is a
 /// missing trace entry rather than an invisible loss of durability.
 ///
-/// Returns the path of the published record, which is data and not a handle.
+/// Returns an [`IntentWritten`] — the **capability** the create and start
+/// funnels require, not a handle and not merely a path.
+///
+/// The value is minted by [`IntentWritten::certify`], which reads the published
+/// record back and parses it, so it is evidence about the filesystem rather
+/// than about this function having been called. That read is also the one
+/// observation this slice makes of "intent **synced** before docker create": a
+/// rename that did not land is a refusal here rather than a container the
+/// census cannot account for.
 ///
 /// # Errors
 ///
@@ -366,16 +374,17 @@ pub fn write_intent(
     private_root: &Path,
     name: &ContainerName,
     record: &ContainerIntent,
-) -> Result<PathBuf, TactusError> {
+) -> Result<IntentWritten, TactusError> {
     expect_site(site, Operation::WriteIntent)?;
     let path = name.intent_path(private_root);
     let trace = hooks.trace();
+    let root = private_root.to_path_buf();
     funnel(hooks, site, || {
         let bytes = serde_json::to_vec(record).map_err(|error| TactusError::Git {
             message: format!("serializing the container intent for `{name}`: {error}"),
         })?;
         write_synced(&path, &bytes, &trace)?;
-        Ok(path.clone())
+        IntentWritten::certify(&root, name)
     })
 }
 
@@ -387,21 +396,36 @@ pub fn write_intent(
 /// runtime's own answer; [`launch`] verifies it against the record **before
 /// start**.
 ///
+/// It takes an [`IntentWritten`], which is the "intent synced **before** docker
+/// create" clause made structural: the argument cannot be produced without the
+/// record being on disk. The proof must be **this** container's — a proof for
+/// another name is refused before any effect, so a caller cannot write one
+/// intent and create a different container under it.
+///
 /// # Errors
 ///
-/// [`TactusError::Refused`] when `site` does not name this operation or the
-/// runtime refuses.
+/// [`TactusError::Refused`] when `site` does not name this operation, when
+/// `intent` does not name `spec.name`, or when the runtime refuses.
 pub fn create_container(
     hooks: &mut dyn ContainerHooks,
     site: ContainerSite,
     runtime: &dyn ContainerRuntime,
+    intent: &IntentWritten,
     spec: &CreateSpec,
 ) -> Result<CreatedContainer, TactusError> {
     expect_site(site, Operation::Create)?;
+    expect_intent_for(intent, &spec.name, "created")?;
     funnel(hooks, site, || runtime.create(spec).map_err(refused))
 }
 
 /// `Container.Start` (R26).
+///
+/// **The container to start is named by the proof and by nothing else.**
+/// `expected_failures_refusals[6]` is "container start without an intent is
+/// impossible by construction"; with a `&ContainerName` parameter that
+/// sentence was true only of the sequences somebody had happened to write, and
+/// a `start_existing(name)` added later compiled. With [`IntentWritten`] there
+/// is no argument to pass that is not evidence.
 ///
 /// # Errors
 ///
@@ -411,11 +435,32 @@ pub fn start_container(
     hooks: &mut dyn ContainerHooks,
     site: ContainerSite,
     runtime: &dyn ContainerRuntime,
-    name: &ContainerName,
+    intent: &IntentWritten,
 ) -> Result<(), TactusError> {
     expect_site(site, Operation::Start)?;
-    funnel(hooks, site, || {
-        runtime.start(name.as_str()).map_err(refused)
+    let name = intent.name().as_str().to_owned();
+    funnel(hooks, site, || runtime.start(&name).map_err(refused))
+}
+
+/// Refuse a proof that owns some other container.
+///
+/// The proof carries the name it was certified for, so this is the check that
+/// stops "an intent was written" from standing in for "**this** container's
+/// intent was written". Fail-closed: a mismatch refuses before the effect
+/// rather than proceeding on evidence about something else.
+fn expect_intent_for(intent: &IntentWritten, name: &str, verb: &str) -> Result<(), TactusError> {
+    if intent.name().as_str() == name {
+        return Ok(());
+    }
+    Err(TactusError::Refused {
+        message: format!(
+            "`{name}` cannot be {verb} under the intent record of `{}`; every container \
+             invocation writes its own synced intent in `<R>/containers` \
+             (decisions.admission_and_leases.permits.crash_reconstruction) and \
+             `container start without an intent is impossible by construction` \
+             (expected_failures_refusals[6])",
+            intent.name()
+        ),
     })
 }
 
@@ -607,15 +652,16 @@ pub fn launch(
     view: &dyn GitView,
     plan: &LaunchPlan,
 ) -> Result<Launched, TactusError> {
-    let intent_path = write_intent(
+    let written = write_intent(
         hooks,
         ContainerSite::WriteIntent,
         &plan.private_root,
         &plan.name,
         &plan.intent,
     )?;
+    let intent_path = written.path().to_path_buf();
     let view_path = mount_git_view(hooks, ContainerSite::MountGitView, view, &plan.view)?;
-    let created = create_container(hooks, ContainerSite::Create, runtime, &plan.spec)?;
+    let created = create_container(hooks, ContainerSite::Create, runtime, &written, &plan.spec)?;
     if created.reported_image_id != plan.spec.image_id {
         let residue = cancel_created(
             hooks,
@@ -637,7 +683,7 @@ pub fn launch(
             ),
         });
     }
-    start_container(hooks, ContainerSite::Start, runtime, &plan.name)?;
+    start_container(hooks, ContainerSite::Start, runtime, &written)?;
     Ok(Launched {
         name: plan.name.clone(),
         intent_path,
@@ -1444,6 +1490,15 @@ impl ContainerRuntime for DockerCli {
     fn create(&self, spec: &CreateSpec) -> Result<CreatedContainer, RuntimeError> {
         let mut args: Vec<String> =
             vec!["create".to_owned(), "--name".to_owned(), spec.name.clone()];
+        if spec.read_only_root {
+            // `expected_failures_refusals[5]`. Measured against `docker`
+            // 29.7.2: without it `sh -c 'printf owned >/outside-role-mount'`
+            // exits **0** and the byte lands in the container's writable layer,
+            // so a gate's write outside every declared mount succeeds and only
+            // the weaker "the host is unharmed" holds. With it the same command
+            // answers `Read-only file system` and exits non-zero.
+            args.push("--read-only".to_owned());
+        }
         for (key, value) in &spec.labels {
             args.push("--label".to_owned());
             args.push(format!("{key}={value}"));
@@ -1575,6 +1630,12 @@ fn mount_argument(mount: &runtime::Mount) -> String {
         runtime::Mount::Volume { name, target, .. } => {
             parts.push("type=volume".to_owned());
             parts.push(format!("source={name}"));
+            parts.push(format!("target={target}"));
+        }
+        runtime::Mount::Tmpfs { target } => {
+            // No source and no name: the surface exists only inside this
+            // container and dies with it.
+            parts.push("type=tmpfs".to_owned());
             parts.push(format!("target={target}"));
         }
     }
