@@ -40,6 +40,10 @@ The contract that keeps this folder safe:
 
 ## Index
 
+- [2026-08-22 — v0.3 — repository hazard map](2026-08-22-v0.3-hazard-map.md):
+  path-indexed design defects and review findings, fed back into Phase 1 as
+  mandatory question-exhaustion items where they overlap a story's path hints.
+  The map generates questions, never answers; absence renders as unknown.
 - [2026-08-15 — v0.3+ — proposal disposition ledger and rationale history](2026-08-15-v0.3-proposal-disposition-ledger.md):
   **Unreviewed draft.** Preserve approved, rejected, parked, withdrawn, and
   superseded reasoning with explicit revisit conditions and an eventual curated
