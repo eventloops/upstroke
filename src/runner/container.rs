@@ -403,10 +403,34 @@ pub fn write_intent(
 /// another name is refused before any effect, so a caller cannot write one
 /// intent and create a different container under it.
 ///
+/// ## Every named volume is re-inspected here, **before** the create
+///
+/// `PR6-ACCT-001` / `PR6-CORRECTNESS-014`. R20 is `operator_owned` and
+/// `persistent_output` — "**never created** or pruned by a run" — in all five
+/// `at_run_end` outcomes, and `docker create` does not honour that: measured
+/// against `docker` 29.7.2, `--mount type=volume,source=<absent>,target=/creds`
+/// **succeeds and creates an empty named volume**, which the container then
+/// starts from. A run would have created an operator-owned resource, and the
+/// vendor CLI inside it would find no token where its credentials should be and
+/// re-authenticate into a volume nothing provisioned.
+///
+/// Resolution inspects the volumes once, long before this
+/// ([`resolve::rebuild_by_inspection`]'s `inspect_volumes`); a volume can be
+/// removed between that inspection and this call, and only a check *here* sees
+/// it. The check is [`ContainerRuntime::volume_present`] — a read-only
+/// inspection, so it is not a site and performs no effect — and it runs before
+/// [`funnel`] is entered at all, so a refusal happens before
+/// `Container.Create`'s `Before` phase rather than between the phases.
+///
+/// **Fail-closed in both directions**: a volume that is absent refuses, and a
+/// runtime that will not answer *whether* it is present refuses too. "The
+/// runtime did not say" is not "the volume is there".
+///
 /// # Errors
 ///
 /// [`TactusError::Refused`] when `site` does not name this operation, when
-/// `intent` does not name `spec.name`, or when the runtime refuses.
+/// `intent` does not name `spec.name`, when a named volume the spec mounts is
+/// absent or cannot be inspected, or when the runtime refuses.
 pub fn create_container(
     hooks: &mut dyn ContainerHooks,
     site: ContainerSite,
@@ -416,7 +440,49 @@ pub fn create_container(
 ) -> Result<CreatedContainer, TactusError> {
     expect_site(site, Operation::Create)?;
     expect_intent_for(intent, &spec.name, "created")?;
+    expect_mounted_volumes_present(runtime, spec)?;
     funnel(hooks, site, || runtime.create(spec).map_err(refused))
+}
+
+/// Refuse a create whose named volumes are not already there.
+///
+/// See [`create_container`] for why this is here and not only at resolution.
+fn expect_mounted_volumes_present(
+    runtime: &dyn ContainerRuntime,
+    spec: &CreateSpec,
+) -> Result<(), TactusError> {
+    for mount in &spec.mounts {
+        let runtime::Mount::Volume { name, target, .. } = mount else {
+            continue;
+        };
+        let present = runtime
+            .volume_present(name)
+            .map_err(|error| TactusError::Refused {
+                message: format!(
+                    "the container runtime could not be asked whether the credential volume \
+                     `{name}` exists before creating `{}`: {error}. A named volume that \
+                     `docker create` does not find is created empty by the runtime, and R20 is \
+                     `operator_owned` — \"never created or pruned by a run\" \
+                     (decisions.resource_accounting.rows[R20]) — so a runtime that will not \
+                     answer refuses rather than risking it",
+                    spec.name
+                ),
+            })?;
+        if !present {
+            return Err(TactusError::Refused {
+                message: format!(
+                    "the credential volume `{name}`, which `{}` mounts at `{target}`, is not \
+                     present in the container runtime. R20 credential volumes are \
+                     `operator_owned` and `persistent_output` — \"never created or pruned by a \
+                     run\" (decisions.resource_accounting.rows[R20]) — and `docker create` \
+                     creates an absent named volume rather than refusing, so this invocation is \
+                     refused before any container exists",
+                    spec.name
+                ),
+            });
+        }
+    }
+    Ok(())
 }
 
 /// `Container.Start` (R26).
@@ -719,29 +785,84 @@ fn cancel_created(
     name: &ContainerName,
     view_path: Option<&Path>,
 ) -> Vec<String> {
+    cancel_reached(hooks, runtime, view, private_root, name, true, view_path)
+}
+
+/// The one exhaustive cleanup in this tree: stop, remove, unmount, remove the
+/// intent — **attempting every step even after one fails**, and never removing
+/// the R26 record while it is the only thing that can find the R19 residue.
+///
+/// `ContainerRunner::cancel` and `ContainerRunner::release` delegate here, and
+/// so does [`cancel_created`]. One definition, deliberately: the view-path
+/// derivation was two copies of one `join` until `PR6E-005` measured them
+/// apart, and a cleanup rule split across two files is the same shape.
+///
+/// ## Why `RemoveIntent` is conditional (`PR6-ACCT-005`)
+///
+/// **The intent is the R19 view's only recovery anchor.** The startup census
+/// discovers candidates from `<R>/containers` and from `docker ps` by label
+/// (`census::run_startup_census` steps 1 and 3), and derives a view path only
+/// *after* it has such a candidate — it never enumerates `<R>/views`. So a
+/// cleanup that fails to prune the view and then removes the intent anyway has
+/// deleted the only evidence that names the residue: the container is gone, the
+/// record is gone, and the directory is permanently undiscoverable. R19's
+/// `NoRunFinished` cell is "pruned at the next write-command start **after the
+/// owning container is observed terminated**" and ST-16's closing clause is
+/// "ledgers R19/R26 balance"; neither can hold for a view nothing can find.
+///
+/// The rule is therefore: **the anchor outlives what it anchors.** If the view
+/// removal was attempted and failed, the intent stays, the failure is named in
+/// the residue, and the next census finds an intent-only candidate, derives the
+/// same view path and retries. The retained record is itself reported as
+/// residue, so "the ledgers do not balance" is still said out loud rather than
+/// traded for a tidy directory.
+///
+/// This is the fail-**closed** direction. Removing the record is the fail-open
+/// one, and it reads as the tidier cleanup right up until an operator has to
+/// find the directory by hand.
+fn cancel_reached(
+    hooks: &mut dyn ContainerHooks,
+    runtime: &dyn ContainerRuntime,
+    view: &dyn GitView,
+    private_root: &Path,
+    name: &ContainerName,
+    container_exists: bool,
+    view_path: Option<&Path>,
+) -> Vec<String> {
     let mut residue = Vec::new();
-    let mut note = |what: &str, error: &TactusError| {
-        residue.push(format!("{what}: {error}"));
-    };
-    if let Err(error) = stop_container(
-        hooks,
-        ContainerSite::Stop,
-        runtime,
-        name,
-        StopMode::Graceful,
-    ) {
-        note("the container could not be stopped", &error);
-    }
-    if let Err(error) = remove_container(hooks, ContainerSite::Remove, runtime, name) {
-        note("the container could not be removed", &error);
-    }
-    if let Some(path) = view_path {
-        if let Err(error) = unmount_git_view(hooks, ContainerSite::UnmountGitView, view, path) {
-            note("the R19 Git view could not be pruned", &error);
+    if container_exists {
+        if let Err(error) = stop_container(
+            hooks,
+            ContainerSite::Stop,
+            runtime,
+            name,
+            StopMode::Graceful,
+        ) {
+            residue.push(format!("the container could not be stopped: {error}"));
+        }
+        if let Err(error) = remove_container(hooks, ContainerSite::Remove, runtime, name) {
+            residue.push(format!("the container could not be removed: {error}"));
         }
     }
+    let mut view_survives = false;
+    if let Some(path) = view_path {
+        if let Err(error) = unmount_git_view(hooks, ContainerSite::UnmountGitView, view, path) {
+            residue.push(format!("the R19 Git view could not be pruned: {error}"));
+            view_survives = true;
+        }
+    }
+    if view_survives {
+        residue.push(format!(
+            "the R26 intent record of `{name}` is deliberately retained, because it is the only \
+             thing a later census can discover that unpruned R19 view through \
+             (decisions.resource_accounting.rows[R19].at_run_end.NoRunFinished)"
+        ));
+        return residue;
+    }
     if let Err(error) = remove_intent(hooks, ContainerSite::RemoveIntent, private_root, name) {
-        note("the R26 intent record could not be removed", &error);
+        residue.push(format!(
+            "the R26 intent record could not be removed: {error}"
+        ));
     }
     residue
 }
@@ -765,9 +886,23 @@ fn render_residue(residue: &[String]) -> String {
 /// The completion half: "stop/rm, view removal, intent removal after
 /// completion".
 ///
+/// **Exhaustive, like the cancel** (`PR6-ACCT-004`). This chained its four
+/// sites with `?` until repair round R3b, so a `Container.Stop` that failed on
+/// a completed invocation skipped the *still viable* forced remove, the view
+/// prune and the intent removal — three residues from one failure, on the
+/// ordinary completion path rather than on a refusal. `docker rm --force`
+/// removes a running container, so `Remove` after a failed `Stop` is not a
+/// wasted call, and R26 is "released **on complete** (stop/rm, view removed,
+/// intent removed), cancel, or shutdown".
+///
+/// What could not be released is named in the error rather than swallowed, and
+/// [`cancel_reached`]'s anchor rule applies here too: a view that could not be
+/// pruned keeps its intent, because the intent is the only thing a later census
+/// can find it through.
+///
 /// # Errors
 ///
-/// Whatever a step returns.
+/// [`TactusError::Refused`] naming every step that failed.
 pub fn release(
     hooks: &mut dyn ContainerHooks,
     runtime: &dyn ContainerRuntime,
@@ -775,26 +910,26 @@ pub fn release(
     private_root: &Path,
     launched: &Launched,
 ) -> Result<(), TactusError> {
-    stop_container(
+    let residue = cancel_reached(
         hooks,
-        ContainerSite::Stop,
         runtime,
-        &launched.name,
-        StopMode::Graceful,
-    )?;
-    remove_container(hooks, ContainerSite::Remove, runtime, &launched.name)?;
-    unmount_git_view(
-        hooks,
-        ContainerSite::UnmountGitView,
         view,
-        &launched.view_path,
-    )?;
-    remove_intent(
-        hooks,
-        ContainerSite::RemoveIntent,
         private_root,
         &launched.name,
-    )
+        true,
+        Some(&launched.view_path),
+    );
+    if residue.is_empty() {
+        return Ok(());
+    }
+    Err(TactusError::Refused {
+        message: format!(
+            "the release of `{}` could not complete every step, so this run's R19/R26 ledgers \
+             do not balance and a census will find the residue: {}",
+            launched.name,
+            residue.join("; ")
+        ),
+    })
 }
 
 /// How many times reclaim asks whether a container has terminated.
@@ -1052,6 +1187,107 @@ pub fn list_intents(private_root: &Path) -> Result<Vec<FoundIntent>, TactusError
     }
     found.sort_by(|a, b| a.name.cmp(&b.name));
     Ok(found)
+}
+
+/// One `<name>.intent.tmp` in `<R>/containers` whose published half is absent.
+///
+/// `PR6-ACCT-007`. [`write_synced`] durably creates the staged file before it
+/// renames, so a crash — or a failing write, fsync or rename — leaves one
+/// behind **before any container exists**: [`create_container`] takes an
+/// [`IntentWritten`], which [`IntentWritten::certify`] mints by reading the
+/// *published* record back, so nothing can have been created under a name whose
+/// rename never landed.
+///
+/// [`list_intents`] skips it, exactly as `Answer.StageWrite`'s `.partial` is
+/// skipped — a reader may not adopt writer-owned residue. That is right for
+/// *discovery* and leaves the file with no reclaim path at all: no intent
+/// candidate, no labeled container, so nothing ever calls [`remove_intent`] for
+/// it. `census::run_startup_census` now enumerates them separately and gives
+/// each one a disposition, so the staged half is **R26 residue with an
+/// accounting class** rather than a file the tree has no row for.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StagedIntent {
+    pub name: ContainerName,
+    pub path: PathBuf,
+    /// The record, when the staged bytes are a complete one.
+    ///
+    /// `Some` is a write that finished and a rename that did not: the record is
+    /// as authoritative as a published one, and the census classifies it under
+    /// the ordinary owner-liveness rule because it carries the owner's run
+    /// directory. `None` is genuinely torn — the ownership evidence is the
+    /// **name**, which carries the run id and the incarnation but not the run
+    /// directory, so arm (ii)'s lock probe has nothing to ask about.
+    pub record: Option<ContainerIntent>,
+}
+
+/// Every staged intent under `<R>/containers` whose published half is absent,
+/// sorted by name.
+///
+/// A name that also has a published `<name>.intent` is **not** here: that name
+/// is an ordinary candidate, and [`remove_intent`] removes both halves when it
+/// is reclaimed.
+///
+/// # Errors
+///
+/// [`TactusError::Io`] when the directory or a file cannot be read,
+/// [`TactusError::Refused`] when a staged file's stem is not a well-formed
+/// container name — the same refusal [`list_intents`] gives a malformed
+/// published one, for the same reason: an unreadable name in this namespace is
+/// evidence the census could not classify, not evidence it may ignore.
+pub fn list_staged_intents(private_root: &Path) -> Result<Vec<StagedIntent>, TactusError> {
+    let dir = containers_dir(private_root);
+    let entries = match fs::read_dir(&dir) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(source) => return Err(TactusError::Io { path: dir, source }),
+    };
+    let mut found = Vec::new();
+    for entry in entries {
+        let entry = entry.map_err(|source| TactusError::Io {
+            path: dir.clone(),
+            source,
+        })?;
+        let file_name = entry.file_name().to_string_lossy().into_owned();
+        let Some(stem) = file_name.strip_suffix(INTENT_STAGED_SUFFIX) else {
+            continue;
+        };
+        let name = ContainerName::rebuild(stem)?;
+        if name.intent_path(private_root).exists() {
+            continue;
+        }
+        let path = entry.path();
+        // Tolerant of already-gone, like every other read in this namespace: a
+        // staged file that vanished under the scan is a writer that finished
+        // its rename, or another reclaimer, and neither is an error.
+        let record = match fs::read(&path) {
+            Ok(bytes) => serde_json::from_slice::<ContainerIntent>(&bytes).ok(),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(source) => return Err(TactusError::Io { path, source }),
+        };
+        found.push(StagedIntent { name, path, record });
+    }
+    found.sort_by(|a, b| a.name.cmp(&b.name));
+    Ok(found)
+}
+
+/// Remove one staged intent file.
+///
+/// Not a site of its own: the frozen [`ContainerSite`] has eight variants and
+/// `RemoveIntent` is the one that accounts for the R26 record, both halves of
+/// it — [`remove_intent`] already removes the staged file beside the published
+/// one. This is that same site, reached for a name whose published half never
+/// existed.
+///
+/// # Errors
+///
+/// As [`remove_intent`].
+pub fn remove_staged_intent(
+    hooks: &mut dyn ContainerHooks,
+    site: ContainerSite,
+    private_root: &Path,
+    name: &ContainerName,
+) -> Result<(), TactusError> {
+    remove_intent(hooks, site, private_root, name)
 }
 
 // ---------------------------------------------------------------------------
@@ -1540,7 +1776,48 @@ fn is_absent(detail: &str) -> bool {
         || lower.contains("no such container")
         || lower.contains("no such image")
         || lower.contains("no such volume")
-        || lower.contains("is already in progress")
+}
+
+/// The verbatim shape the daemon answers the **loser** of two overlapping
+/// removals with.
+///
+/// Measured on `docker` 29.7.2 by starting a container that writes 800 MiB and
+/// issuing eight concurrent `docker rm --force --volumes`; one succeeded and
+/// printed the name, and every other one printed exactly:
+///
+/// ```text
+/// Error response from daemon: removal of container <name> is already in progress
+/// ```
+///
+/// This is **not** absence, and it is not "already stopped" either — it is the
+/// third state a racing reclaimer sees, and `T-CONTAINER.resume_action`'s
+/// "(idempotent; **concurrent reclaimers converge**)" is false without it: the
+/// losing reclaimer would return an error before `rm`, the view prune and the
+/// intent removal, and the write command driving it would refuse rather than
+/// converge. `PR6-CONV-002` is the entry; every fake race converged because
+/// `FakeRuntime::remove` cannot produce this answer at all.
+pub const REMOVAL_IN_PROGRESS: &str = "is already in progress";
+
+/// Whether a `docker rm` failure means the container is gone, or is going away
+/// under somebody else.
+fn remove_already_settled(detail: &str) -> bool {
+    is_absent(detail) || detail.to_ascii_lowercase().contains(REMOVAL_IN_PROGRESS)
+}
+
+/// `docker rm`'s raw answer, as the seam's.
+///
+/// A free function for the reason [`settle_stop`] is one: the branch that
+/// matters is one a real daemon produces **only** in a race, so a gated test is
+/// the wrong and only place it could otherwise be observed. The transcribed
+/// diagnostic is checked against the live daemon by
+/// `tests::real_docker_prints_the_transcribed_removal_in_progress_diagnostic`,
+/// so the table's oracle is `docker` and not this file.
+fn settle_remove(outcome: Result<String, RuntimeError>) -> Result<(), RuntimeError> {
+    match outcome {
+        Ok(_) => Ok(()),
+        Err(RuntimeError::Failed { detail, .. }) if remove_already_settled(&detail) => Ok(()),
+        Err(error) => Err(error),
+    }
 }
 
 impl ContainerRuntime for DockerCli {
@@ -1729,15 +2006,11 @@ impl ContainerRuntime for DockerCli {
         // balances. `--volumes` removes only anonymous volumes attached to this
         // container and **never a named one**, which is what makes reclaiming it
         // here a discharge of R26 rather than a violation of R20.
-        match self.exec(
+        settle_remove(self.exec(
             RuntimeOp::Remove,
             name,
             &["rm", "--force", "--volumes", name],
-        ) {
-            Ok(_) => Ok(()),
-            Err(RuntimeError::Failed { detail, .. }) if is_absent(&detail) => Ok(()),
-            Err(error) => Err(error),
-        }
+        ))
     }
 }
 
@@ -1762,7 +2035,11 @@ impl ContainerRuntime for DockerCli {
 /// `PR6-LANEF-003` is the entry for it: deleting the tolerance passed every
 /// test, because every fixture serialized the reclaimers.
 fn stop_already_settled(detail: &str) -> bool {
-    is_absent(detail) || detail.contains("is not running")
+    // `remove_already_settled` and not `is_absent`: a `docker kill` issued
+    // against a container another reclaimer is already removing answers with
+    // `REMOVAL_IN_PROGRESS` too, and that container is on its way out either
+    // way.
+    remove_already_settled(detail) || detail.contains("is not running")
 }
 
 /// `docker stop` / `docker kill`'s raw answer, as the seam's.

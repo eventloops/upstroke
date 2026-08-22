@@ -91,6 +91,27 @@ const ALTERNATES: &str = "objects/info/alternates";
 /// know in a Git directory.
 pub const WORKTREE_GITFILE: &str = "worktree.gitfile";
 
+/// The prefix of a split index's shared half, which lives beside `index` in the
+/// **worktree's own** Git directory.
+///
+/// `git update-index --split-index` (and `core.splitIndex = true`, which
+/// `feature.manyFiles` turns on) writes most of the index's entries into
+/// `<git-dir>/sharedindex.<oid>` and leaves `index` holding a `link` extension
+/// naming it. An `index` copied without it is an index Git refuses to read at
+/// all — measured, verbatim:
+///
+/// ```text
+/// fatal: <view>/sharedindex.<oid>: index file open failed: No such file or directory
+/// ```
+///
+/// so `PR6-CORRECTNESS-010`: DESIGN.md:612's "**exact** detached HEAD/index …
+/// so Git-dependent tools work" was false of every split-index worktree, and
+/// the gate that reads it would fail on the repository's Git configuration
+/// rather than on its own subject. It is index data of the same repository, so
+/// it carries no ref, no remote and no credential helper — nothing
+/// [`WITHHELD_ENTRIES`] is about.
+pub const SHARED_INDEX_PREFIX: &str = "sharedindex.";
+
 // ---------------------------------------------------------------------------
 // Where a worktree's Git actually is
 // ---------------------------------------------------------------------------
@@ -493,6 +514,12 @@ fn project(
         }
     }
 
+    // And the half a **split** index keeps beside it. See
+    // [`SHARED_INDEX_PREFIX`]: without this the projected index is one Git
+    // refuses to open, so "exact index" holds only for repositories that do not
+    // use `core.splitIndex`.
+    copy_shared_indexes(&layout.git_dir, view)?;
+
     // Read-only objects: borrowed through Git's own alternate mechanism, which
     // Git resolves through and never writes to. Every object this view's reader
     // creates lands in `objects/` below, which the release prunes.
@@ -514,6 +541,58 @@ fn project(
         format!("{GITDIR_PREFIX} {}\n", reader.view).as_bytes(),
     )?;
     Ok(())
+}
+
+/// Copy every `sharedindex.*` beside the source index into the view, and answer
+/// which names were copied.
+///
+/// **Every one, not the one the `link` extension names.** Reading that name out
+/// of the index means parsing the index: the extension block sits after the
+/// entries, index v4 prefix-compresses entry paths, and a scan for the four
+/// bytes `link` matches a path that happens to contain them. A wrong parse here
+/// silently drops the file again, which is the failure being repaired. Git
+/// keeps at most a small number of these — the live one and, briefly, the one
+/// it replaced — they are index data of the repository the view already
+/// borrows, and the whole directory is discarded with the invocation.
+///
+/// # Errors
+///
+/// [`TactusError::Io`] when the Git directory or a shared index cannot be read.
+fn copy_shared_indexes(git_dir: &Path, view: &Path) -> Result<Vec<String>, TactusError> {
+    let entries = match fs::read_dir(git_dir) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(source) => {
+            return Err(TactusError::Io {
+                path: git_dir.to_path_buf(),
+                source,
+            });
+        }
+    };
+    let mut copied = Vec::new();
+    for entry in entries {
+        let entry = entry.map_err(|source| TactusError::Io {
+            path: git_dir.to_path_buf(),
+            source,
+        })?;
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if !name.starts_with(SHARED_INDEX_PREFIX) {
+            continue;
+        }
+        let from = entry.path();
+        let bytes = match fs::read(&from) {
+            Ok(bytes) => bytes,
+            // Git replaced it between the listing and the read; the `index`
+            // this view carries names the one that is there, and a shared index
+            // that went away under the scan was not it.
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(source) => return Err(TactusError::Io { path: from, source }),
+        };
+        write_file(&view.join(&name), &bytes)?;
+        copied.push(name);
+    }
+    copied.sort();
+    Ok(copied)
 }
 
 /// The view's `config`.
@@ -1358,5 +1437,144 @@ mod tests {
                 .into_iter()
                 .collect();
         assert_eq!(kinds.len(), 2);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// R3b: the half a split index keeps beside itself
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod split_index_tests {
+    use super::fixtures::{git_ok, repository, scratch, worktree};
+    use super::*;
+
+    /// A **split** index projects whole, and real Git reads it.
+    ///
+    /// `PR6-CORRECTNESS-010`. `core.splitIndex` — which
+    /// `git update-index --split-index` sets and which `feature.manyFiles`
+    /// turns on — moves most of the index's entries into
+    /// `<git-dir>/sharedindex.<oid>` and leaves `index` holding a `link`
+    /// extension naming it. The projection copied `index` alone, so the view's
+    /// index named a file that was not there and Git refused to open it at all:
+    ///
+    /// ```text
+    /// fatal: <view>/sharedindex.<oid>: index file open failed: No such file or directory
+    /// ```
+    ///
+    /// DESIGN.md:612 is "**exact** detached HEAD/index … so Git-dependent tools
+    /// work", and a gate reading that view failed on the repository's Git
+    /// configuration rather than on its own subject. No fixture created a split
+    /// index, so the whole class was invisible.
+    ///
+    /// The grid is **{ordinary index, split index} × {is the view readable}**,
+    /// and the ordinary cell is the control: it carries no `sharedindex.*`, so
+    /// "the view works" in the split cell is attributable to the copy and not
+    /// to Git ignoring the extension.
+    ///
+    /// The oracle is **Git**, not this module: each cell runs
+    /// `git ls-files` against the projected view and compares it with the same
+    /// command against the source worktree. A projection that produced an index
+    /// this code was happy with and Git was not would fail here.
+    ///
+    /// Second field held constant: the same repository, the same worktree, the
+    /// same staged file and the same HEAD in both cells; only whether the index
+    /// was split moves.
+    #[test]
+    fn a_split_index_projects_with_the_shared_half_it_links_to() {
+        for (label, split) in [("ordinary", false), ("split", true)] {
+            let root = scratch(&format!("split-index-{label}"));
+            let repo = root.join("repo");
+            let (head, _) = repository(&repo);
+            let workspace = root.join("tasks").join("k0-g0");
+            worktree(&repo, &workspace, &head);
+
+            // Something staged, so the index is not the empty one and
+            // `ls-files` has an answer that can differ.
+            std::fs::write(workspace.join("staged.txt"), "staged\n").expect("a file");
+            git_ok(&workspace, &["add", "staged.txt"]);
+            if split {
+                git_ok(&workspace, &["update-index", "--split-index"]);
+            }
+
+            let layout = resolve(&workspace)
+                .expect("resolves")
+                .expect("a repository");
+            let shared: Vec<String> = std::fs::read_dir(&layout.git_dir)
+                .expect("the worktree git dir")
+                .filter_map(|entry| {
+                    let name = entry.ok()?.file_name().to_string_lossy().into_owned();
+                    name.starts_with(SHARED_INDEX_PREFIX).then_some(name)
+                })
+                .collect();
+            // The premise of each cell, measured rather than assumed: only the
+            // split one has a shared half.
+            assert_eq!(
+                !shared.is_empty(),
+                split,
+                "[{label}] the fixture did not build the index it names: {shared:?}"
+            );
+
+            let view_path = root.join("view");
+            RoleGitView::new(ContainerTrace::off())
+                .materialize(&GitViewRequest {
+                    path: view_path.clone(),
+                    workspace: workspace.clone(),
+                    head: None,
+                })
+                .expect("materializes");
+
+            // Every shared half the source had, the view has — by name.
+            for name in &shared {
+                assert!(
+                    view_path.join(name).exists(),
+                    "[{label}] the projection dropped `{name}`, which its own `index` links to"
+                );
+            }
+            let in_view: Vec<String> = std::fs::read_dir(&view_path)
+                .expect("the view")
+                .filter_map(|entry| {
+                    let name = entry.ok()?.file_name().to_string_lossy().into_owned();
+                    name.starts_with(SHARED_INDEX_PREFIX).then_some(name)
+                })
+                .collect();
+            assert_eq!(
+                in_view.len(),
+                shared.len(),
+                "[{label}] the view carries a different number of shared indexes than its source"
+            );
+
+            // The oracle: Git itself, over the projected view, compared with
+            // Git over the source worktree.
+            let through_view = crate::runner::container::view::fixtures::git(
+                &workspace,
+                &[
+                    "--git-dir",
+                    &view_path.to_string_lossy(),
+                    "--work-tree",
+                    &workspace.to_string_lossy(),
+                    "ls-files",
+                    "--cached",
+                ],
+            );
+            assert_eq!(
+                through_view.code,
+                Some(0),
+                "[{label}] Git could not read the projected index: {}",
+                through_view.stderr
+            );
+            let expected = git_ok(&workspace, &["ls-files", "--cached"]);
+            assert_eq!(
+                through_view.stdout.trim(),
+                expected,
+                "[{label}] the projected index is not the source worktree's exact index"
+            );
+            assert!(
+                expected.contains("staged.txt"),
+                "[{label}] the fixture staged nothing, so the comparison above is vacuous"
+            );
+
+            let _ = std::fs::remove_dir_all(&root);
+        }
     }
 }

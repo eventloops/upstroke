@@ -46,10 +46,10 @@ use super::runtime::{
     Mount, OwnerLiveness, RuntimeError, RuntimeOp, StopMode, TracePhase,
 };
 use super::{
-    DOCKER_GATED_TESTS, DisposableDirView, FakeOwnerLiveness, FakeRuntime, FoundIntent, GitView,
-    GitViewRequest, LaunchPlan, Launched, NoHooks, OrphanWindow, PS_FIELD_SEPARATOR, PS_FORMAT,
-    PS_LABELS, RecordingHooks, TERMINATION_OBSERVATIONS, classify_docker_failure, create_container,
-    docker_gate, is_unreachable_diagnostic, launch, list_intents, mount_git_view,
+    DOCKER_GATED_TESTS, DisposableDirView, DockerCli, FakeOwnerLiveness, FakeRuntime, FoundIntent,
+    GitView, GitViewRequest, LaunchPlan, Launched, NoHooks, OrphanWindow, PS_FIELD_SEPARATOR,
+    PS_FORMAT, PS_LABELS, RecordingHooks, TERMINATION_OBSERVATIONS, classify_docker_failure,
+    create_container, docker_gate, is_unreachable_diagnostic, launch, list_intents, mount_git_view,
     observe_terminated, parse_ps_output, read_intent, reclaim, release, remove_container,
     remove_intent, start_container, stop_container, unmount_git_view, write_intent,
 };
@@ -2020,8 +2020,24 @@ fn the_intents_durability_barriers_are_entered_and_not_merely_traced() {
 /// |---|---|---|---|
 /// | `Stop` | removed | pruned | removed |
 /// | `Remove` | **left** | pruned | removed |
-/// | `UnmountGitView` | removed | **left** | removed |
+/// | `UnmountGitView` | removed | **left** | **left, deliberately** |
 /// | `RemoveIntent` | removed | pruned | **left** |
+///
+/// ## The third row changed in repair round R3b, and it is the finding
+///
+/// `PR6-ACCT-005`. It read "`UnmountGitView` → removed / left / **removed**",
+/// and that is the state a startup census cannot recover from: discovery is
+/// `<R>/containers` plus `docker ps` by label, and the view path is derived
+/// only *after* a candidate is found — `<R>/views` is never enumerated. So a
+/// cancel that failed to prune the view and then removed the intent anyway had
+/// deleted the only thing that could ever find the directory again. The test
+/// pinned that state as correct.
+///
+/// The intent is the R19 view's **recovery anchor** and now outlives what it
+/// anchors: the retained record is itself reported in the residue, so the
+/// ledgers are still said not to balance, and
+/// `census::tests::an_unpruned_view_is_reclaimed_because_its_intent_survived`
+/// drives the census that closes it.
 ///
 /// Second field held constant: the substitution, the image ids and the plan are
 /// identical in all four cells, so what varies is only which step was armed.
@@ -2070,7 +2086,7 @@ fn a_cancel_whose_cleanup_fails_still_refuses_with_the_integrity_error() {
             message.contains(armed.name()) || message.contains(step_phrase(armed)),
             "{armed:?}: the refusal does not say which step failed: {message}"
         );
-        messages.insert(message);
+        messages.insert(message.clone());
 
         // Never started, whatever else happened.
         assert!(
@@ -2085,7 +2101,8 @@ fn a_cancel_whose_cleanup_fails_still_refuses_with_the_integrity_error() {
         let expected = match armed {
             ContainerSite::Stop => (false, false, false),
             ContainerSite::Remove => (true, false, false),
-            ContainerSite::UnmountGitView => (false, true, false),
+            // The anchor rule: an unpruned view keeps its record.
+            ContainerSite::UnmountGitView => (false, true, true),
             ContainerSite::RemoveIntent => (false, false, true),
             _ => unreachable!("only the four cancel steps are armed"),
         };
@@ -2095,6 +2112,20 @@ fn a_cancel_whose_cleanup_fails_still_refuses_with_the_integrity_error() {
             "{armed:?}: exactly the armed step's residue should remain, and every \
              other step should have run anyway"
         );
+        if armed == ContainerSite::UnmountGitView {
+            // Retained on purpose, and said so — an operator reading "the view
+            // could not be pruned" and finding the record gone would have no
+            // way to know the directory exists.
+            assert!(
+                message.contains("deliberately retained"),
+                "the refusal does not say the record was kept as the view's recovery anchor: \
+                 {message}"
+            );
+            assert!(
+                message.contains("R19"),
+                "the refusal does not name the row it is protecting: {message}"
+            );
+        }
     }
     assert_eq!(
         messages.len(),
@@ -4295,4 +4326,549 @@ fn a_role_view_that_cannot_be_removed_refuses_and_records_nothing() {
 
     let _ = fs::set_permissions(&parent, fs::Permissions::from_mode(0o755));
     let _ = fs::remove_dir_all(&root);
+}
+
+// ---------------------------------------------------------------------------
+// R3b: R20 is never created by a run, and the runtime does not enforce that
+// ---------------------------------------------------------------------------
+
+/// A create whose named volume is absent is **refused before any effect**.
+///
+/// `PR6-ACCT-001` / `PR6-CORRECTNESS-014`. R20 is `operator_owned` and
+/// `persistent_output` — "never created or pruned by a run" — in all five
+/// `at_run_end` outcomes, and `docker create` does not honour it: measured
+/// against `docker` 29.7.2, `--mount type=volume,source=<absent>,target=/creds`
+/// **succeeds and creates an empty named volume**. Resolution inspects the
+/// volumes once, before the worktree lock; a volume removed between that
+/// inspection and the invocation is seen by nothing but a check at the create
+/// itself.
+///
+/// The grid is **{which agent's volume is missing} × {how the runtime answers}**
+/// and its second axis is the one a single-cell fixture misses: a runtime that
+/// *will not say* whether the volume exists must refuse too, because "the
+/// runtime did not answer" is not "the volume is there". Every cell holds the
+/// same spec, the same intent proof and the same image; only the volume state
+/// moves.
+///
+/// "Before any effect" is asserted on the **trace**, not inferred: no
+/// `rt:create` and no `site:Create` entry at all, so the refusal precedes even
+/// the funnel's `Before` phase.
+#[test]
+fn a_create_whose_named_volume_is_absent_is_refused_before_any_effect() {
+    /// Three agents, three volume names — all distinct, so a check that
+    /// inspected the wrong one is visible.
+    const CREDENTIALS: &[(&str, &str)] = &[
+        ("claude-code", "tactus-creds-claude"),
+        ("copilot", "tactus-creds-copilot"),
+        ("codex", "tactus-creds-codex"),
+    ];
+
+    let mut refusals = BTreeSet::new();
+    for (agent, volume) in CREDENTIALS {
+        for (label, present, reachable) in [
+            ("absent", false, true),
+            ("present", true, true),
+            ("unreachable", true, false),
+        ] {
+            let fixture = Fixture::new(
+                &format!("volume-{agent}-{label}"),
+                RUN_A,
+                INCARNATION_1,
+                &shell_probe(),
+            );
+            for (_, other) in CREDENTIALS {
+                if other != volume {
+                    fixture.runtime.add_volume(other);
+                }
+            }
+            if present {
+                fixture.runtime.add_volume(volume);
+            }
+            let mut spec = fixture.plan.spec.clone();
+            spec.mounts.push(Mount::Volume {
+                name: (*volume).to_owned(),
+                target: format!("/tactus/credentials/{agent}"),
+                read_only: false,
+            });
+            if !reachable {
+                // Only the volume inspection is armed: the whole daemon being
+                // down is a different refusal, and this cell is about a runtime
+                // that answers everything else and will not answer this.
+                fixture.runtime.set_unreachable(RuntimeOp::InspectVolume);
+            }
+
+            let mut hooks = fixture.hooks();
+            let written = write_intent(
+                &mut hooks,
+                ContainerSite::WriteIntent,
+                &fixture.root,
+                &fixture.plan.name,
+                &fixture.plan.intent,
+            )
+            .expect("the intent");
+            let outcome = create_container(
+                &mut hooks,
+                ContainerSite::Create,
+                &fixture.runtime,
+                &written,
+                &spec,
+            );
+
+            if present && reachable {
+                outcome.expect("a provisioned volume creates");
+                assert!(fixture.trace.position_starting("rt:create:").is_some());
+                continue;
+            }
+
+            let error = outcome.expect_err("an unprovisioned R20 volume refuses");
+            let message = error.to_string();
+            // **Before ANY effect, asserted first.** This fake happens to
+            // refuse an absent mounted volume too, and a real daemon does the
+            // opposite — it creates one — so an assertion on *who* refused
+            // would be an assertion about the fixture. The ordering is the
+            // claim that belongs to the engine: the create site was never
+            // entered at all, which is only true of a check that runs before
+            // the funnel.
+            assert!(
+                fixture.trace.position_starting("rt:create:").is_none(),
+                "[{agent}/{label}] the runtime was asked to create: {:#?}",
+                fixture.trace.rendered()
+            );
+            assert!(
+                !fixture
+                    .trace
+                    .rendered()
+                    .iter()
+                    .any(|entry| entry == "site:Create:before"),
+                "[{agent}/{label}] the funnel entered `Container.Create`: {:#?}",
+                fixture.trace.rendered()
+            );
+            assert!(
+                message.contains(volume),
+                "[{agent}/{label}] the refusal does not name the volume: {message}"
+            );
+            assert!(
+                message.contains("R20"),
+                "[{agent}/{label}] the refusal does not name the row: {message}"
+            );
+            refusals.insert(message);
+            // And nothing was created on the way past: the other two volumes
+            // are still exactly the two the fixture provisioned.
+            if reachable {
+                assert!(!fixture.runtime.volume_present(volume).expect("reachable"));
+            }
+        }
+    }
+    assert_eq!(
+        refusals.len(),
+        6,
+        "three agents x two refusing runtime states, each naming its own volume: a refusal that \
+         did not name the volume would collapse these"
+    );
+}
+
+/// The daemon really does create the volume, so the guard above is not
+/// defending against a fake.
+///
+/// `PR6-ACCT-001`'s premise, measured rather than asserted. The engine's own
+/// `create` is never reached: this drives `docker create` directly through the
+/// test-only raw accessor with a volume name the daemon does not hold, and then
+/// asks the daemon whether it now holds one. R20's "never created by a run" is
+/// therefore an **engine** guarantee and not a runtime one, which is exactly
+/// why the check lives in `create_container`.
+///
+/// Second field held constant: the same image and the same container name in
+/// both halves; only whether the volume was provisioned first moves.
+#[test]
+fn real_docker_creates_an_absent_named_volume_rather_than_refusing() {
+    let trace = ContainerTrace::recording();
+    let docker = match docker_gate(
+        "real_docker_creates_an_absent_named_volume_rather_than_refusing",
+        trace.clone(),
+    ) {
+        Ok(docker) => docker,
+        Err(reason) => return skipped(&reason),
+    };
+    let (_, image) = match gated_image(docker.as_ref()) {
+        Ok(image) => image,
+        Err(reason) => return no_image(&reason),
+    };
+
+    let name = "tactus-r3b-implicit-volume";
+    let volume = "tactus-r3b-absent-credential-volume";
+    let _ = docker.remove(name);
+    let _ = docker.raw(
+        RuntimeOp::InspectVolume,
+        volume,
+        &["volume", "rm", "--force", volume],
+    );
+    // The premise: it is not there.
+    assert!(
+        !docker.volume_present(volume).expect("reachable"),
+        "the fixture could not clear `{volume}`, so the measurement below would be vacuous"
+    );
+
+    let created = docker.raw(
+        RuntimeOp::Create,
+        name,
+        &[
+            "create",
+            "--name",
+            name,
+            "--mount",
+            &format!("type=volume,source={volume},target=/tactus/credentials/codex"),
+            &image.id,
+            "/bin/sh",
+            "-c",
+            "exit 0",
+        ],
+    );
+    let now_present = docker.volume_present(volume).unwrap_or(false);
+    // Clean up before asserting.
+    let _ = docker.remove(name);
+    let _ = docker.raw(
+        RuntimeOp::InspectVolume,
+        volume,
+        &["volume", "rm", "--force", volume],
+    );
+
+    created.expect("`docker create` accepts a volume name it does not hold");
+    assert!(
+        now_present,
+        "the daemon refused to create the absent volume, which would make \
+         `expect_mounted_volumes_present` unnecessary — if this ever fails, re-derive \
+         `PR6-ACCT-001` against this docker version before deleting anything"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// R3b: the third answer a racing reclaimer gets
+// ---------------------------------------------------------------------------
+
+/// What `docker` 29.7.2 answers the **loser** of two overlapping removals,
+/// measured on the build box.
+///
+/// ```text
+/// $ docker create --name c alpine sh -c 'dd if=/dev/zero of=/big bs=1M count=800; sleep 5'
+/// $ docker start c
+/// $ for i in 1..8; do docker rm --force --volumes c & done
+/// c                                                          (one winner, exit 0)
+/// Error response from daemon: removal of container c is already in progress   (x7)
+/// ```
+///
+/// Transcribed, not invented, and
+/// [`real_docker_prints_the_transcribed_removal_in_progress_diagnostic`] asks
+/// the live daemon the same question so the table cannot become its own oracle.
+const DAEMON_REMOVAL_IN_PROGRESS: &str =
+    "Error response from daemon: removal of container tactus-c is already in progress";
+
+/// A `docker rm` answer meaning "somebody else is already removing it" is
+/// tolerated; a real failure is not.
+///
+/// `PR6-CONV-002`. This is the **third** state a racing reclaimer sees, and it
+/// is neither "gone" nor "already stopped": `T-CONTAINER.resume_action`'s
+/// "(idempotent; **concurrent reclaimers converge**)" is false without it,
+/// because the loser returns an error before `rm`, the view prune and the
+/// intent removal, and the write command driving it refuses instead of
+/// converging. Deleting the tolerance passed the whole suite: `FakeRuntime`'s
+/// `remove` cannot produce this answer at all, and the one real-Docker reclaim
+/// is sequential.
+///
+/// [`super::settle_remove`] is a free function over the raw outcome for the
+/// reason [`super::settle_stop`] is: the branch is reachable — and testable —
+/// **without a daemon**, which is what makes it assertable at all on CI and on
+/// the Windows guest.
+///
+/// The intersection: {what the daemon said} × {is it tolerable}, with the
+/// tolerable answers counted as **distinct** values so three cells cannot be
+/// one string repeated. The `Unreachable` cell carries tolerable *text*,
+/// because a runtime that could not be reached said nothing about the
+/// container.
+#[test]
+fn a_removal_answer_meaning_already_in_progress_is_tolerated_and_a_real_failure_is_not() {
+    let failed = |detail: &str| {
+        Err(RuntimeError::Failed {
+            operation: RuntimeOp::Remove,
+            detail: detail.to_owned(),
+        })
+    };
+
+    let tolerated = [
+        DAEMON_REMOVAL_IN_PROGRESS,
+        DAEMON_ABSENT_ON_STOP,
+        "Error response from daemon: No such object: tactus-c",
+    ];
+    for detail in tolerated {
+        assert_eq!(
+            super::settle_remove(failed(detail)),
+            Ok(()),
+            "a reclaimer that arrives second must converge on `{detail}`"
+        );
+    }
+    assert_eq!(
+        tolerated.iter().collect::<BTreeSet<_>>().len(),
+        3,
+        "three distinct daemon answers, not one repeated"
+    );
+    // The clause is its own predicate, and it is not covered by absence: the
+    // in-progress answer contains none of the "no such …" shapes.
+    assert!(
+        !super::is_absent(DAEMON_REMOVAL_IN_PROGRESS),
+        "an in-progress removal is not an absent container; if `is_absent` starts covering it, \
+         the tolerance below stops being an independently droppable predicate"
+    );
+    assert!(super::remove_already_settled(DAEMON_REMOVAL_IN_PROGRESS));
+    // Case-insensitively, because a vendor that recapitalises its prose must
+    // not turn a convergence into a refusal.
+    assert!(super::remove_already_settled(
+        &DAEMON_REMOVAL_IN_PROGRESS.to_ascii_uppercase()
+    ));
+
+    for detail in [
+        "Error response from daemon: cannot remove container: tactus-c: permission denied",
+        "Error response from daemon: You cannot remove a running container tactus-c",
+    ] {
+        let error = super::settle_remove(failed(detail)).expect_err("a real failure is a failure");
+        assert!(!error.is_unreachable(), "{error}");
+        assert_eq!(error.operation(), RuntimeOp::Remove);
+    }
+
+    let unreachable = super::settle_remove(Err(RuntimeError::Unreachable {
+        operation: RuntimeOp::Remove,
+        detail: DAEMON_REMOVAL_IN_PROGRESS.to_owned(),
+    }))
+    .expect_err("unreachable is never `already settled`");
+    assert!(unreachable.is_unreachable(), "{unreachable}");
+
+    // A `docker kill` racing a removal gets the same answer, and it is on its
+    // way out either way.
+    assert!(super::stop_already_settled(DAEMON_REMOVAL_IN_PROGRESS));
+
+    // The control: a removal that simply worked.
+    assert_eq!(super::settle_remove(Ok("tactus-c\n".to_owned())), Ok(()));
+}
+
+/// The live daemon really does answer overlapping removals that way.
+///
+/// The oracle for [`DAEMON_REMOVAL_IN_PROGRESS`]. A transcribed diagnostic
+/// checked only against the code that reads it proves nothing, so this races
+/// real `docker rm` calls against a container whose removal takes long enough
+/// to overlap — 800 MiB of zeroes written into its layer — and asserts that the
+/// loser's verbatim stderr both (a) matches the shape the table carries and
+/// (b) settles through the production tolerance.
+///
+/// Second field held constant: every racer issues the **same** removal against
+/// the **same** container; only which one the daemon serves first moves. A run
+/// in which no racer loses is reported as a skip of the measurement rather than
+/// as a pass, so a machine fast enough to serialise them cannot make this
+/// vacuously green.
+#[test]
+fn real_docker_prints_the_transcribed_removal_in_progress_diagnostic() {
+    let trace = ContainerTrace::recording();
+    let docker = match docker_gate(
+        "real_docker_prints_the_transcribed_removal_in_progress_diagnostic",
+        trace.clone(),
+    ) {
+        Ok(docker) => docker,
+        Err(reason) => return skipped(&reason),
+    };
+    let (_, image) = match gated_image(docker.as_ref()) {
+        Ok(image) => image,
+        Err(reason) => return no_image(&reason),
+    };
+
+    let name = "tactus-r3b-removal-race";
+    let mut observed: Option<String> = None;
+    // A few attempts: the race is real and a machine may serve one removal
+    // before the others are issued.
+    for _ in 0..4 {
+        let _ = docker.remove(name);
+        docker
+            .raw(
+                RuntimeOp::Create,
+                name,
+                &[
+                    "create",
+                    "--name",
+                    name,
+                    &image.id,
+                    "/bin/sh",
+                    "-c",
+                    "dd if=/dev/zero of=/big bs=1M count=800 2>/dev/null; sleep 5",
+                ],
+            )
+            .expect("created");
+        docker.raw(RuntimeOp::Start, name, &["start", name]).ok();
+        // Let it write, so the removal has something to tear down.
+        std::thread::sleep(std::time::Duration::from_millis(1_500));
+
+        let answers: Vec<Result<String, RuntimeError>> = std::thread::scope(|scope| {
+            let handles: Vec<_> = (0..8)
+                .map(|_| {
+                    scope.spawn(|| {
+                        DockerCli::new(ContainerTrace::off()).raw(
+                            RuntimeOp::Remove,
+                            name,
+                            &["rm", "--force", "--volumes", name],
+                        )
+                    })
+                })
+                .collect();
+            handles
+                .into_iter()
+                .map(|handle| handle.join().expect("a racer panicked"))
+                .collect()
+        });
+        observed = answers.into_iter().find_map(|answer| match answer {
+            Err(RuntimeError::Failed { detail, .. })
+                if detail
+                    .to_ascii_lowercase()
+                    .contains(super::REMOVAL_IN_PROGRESS) =>
+            {
+                Some(detail)
+            }
+            _ => None,
+        });
+        if observed.is_some() {
+            break;
+        }
+    }
+    let _ = docker.remove(name);
+
+    let Some(detail) = observed else {
+        // Not a pass: the measurement did not happen, and this says so in the
+        // same voice a missing image does.
+        return no_image(
+            "no `docker rm` lost the race after four rounds, so the removal-in-progress \
+             diagnostic was not measured on this machine and these tests never pull (non_goals[1])",
+        );
+    };
+    // (a) The transcribed table names the same shape the daemon printed.
+    assert!(
+        detail
+            .to_ascii_lowercase()
+            .contains(super::REMOVAL_IN_PROGRESS),
+        "the daemon's answer is `{detail}`, and the transcribed shape is \
+         `{}`",
+        super::REMOVAL_IN_PROGRESS
+    );
+    assert!(
+        detail.contains("removal of container"),
+        "the daemon's answer changed shape: {detail}"
+    );
+    // (b) The production tolerance settles it.
+    assert_eq!(
+        super::settle_remove(Err(RuntimeError::Failed {
+            operation: RuntimeOp::Remove,
+            detail: detail.clone(),
+        })),
+        Ok(()),
+        "the loser of a real removal race does not converge: {detail}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// R3b: the completion path releases exhaustively too
+// ---------------------------------------------------------------------------
+
+/// A release whose own cleanup fails still attempts every remaining step, and
+/// says what it could not release.
+///
+/// `PR6-ACCT-004`. [`release`] — the "stop/rm, view removal, intent removal
+/// **after completion**" half — `?`-chained its four sites, so a
+/// `Container.Stop` that failed on an invocation that had **completed** skipped
+/// the still-viable forced remove, the view prune and the intent removal: three
+/// residues from one failure, on the ordinary path rather than on a refusal.
+/// `docker rm --force` removes a running container, so `Remove` after a failed
+/// `Stop` is not a wasted call.
+///
+/// The cleanup-fault grid already existed for the *cancel* path and the two
+/// were separate implementations, so the exhaustive one was tested and the
+/// fail-fast one shipped. There is now one implementation
+/// ([`super::cancel_reached`]) and this is the completion path's grid over it.
+///
+/// | armed | container | view | intent |
+/// |---|---|---|---|
+/// | `Stop` | removed | pruned | removed |
+/// | `Remove` | **left** | pruned | removed |
+/// | `UnmountGitView` | removed | **left** | **left** (the R19 anchor) |
+/// | `RemoveIntent` | removed | pruned | **left** |
+///
+/// Second field held constant: the launch succeeds identically in all four
+/// cells — same image ids, same plan, no substitution — so what varies is only
+/// which release step was armed.
+#[test]
+fn a_release_whose_cleanup_fails_still_attempts_every_remaining_step() {
+    use crate::topology::effects::HookPhase;
+
+    let mut messages = BTreeSet::new();
+    for armed in [
+        ContainerSite::Stop,
+        ContainerSite::Remove,
+        ContainerSite::UnmountGitView,
+        ContainerSite::RemoveIntent,
+    ] {
+        let fixture = Fixture::new(
+            &format!("release-{}", armed.name()),
+            RUN_A,
+            INCARNATION_1,
+            &shell_probe(),
+        );
+        let mut hooks = fixture.hooks();
+        let launched = launch(&mut hooks, &fixture.runtime, &fixture.view, &fixture.plan)
+            .expect("the launch itself succeeds");
+        // The control: everything the release has to remove is really there.
+        assert!(!fixture.runtime.container_names().is_empty());
+        assert!(launched.view_path.exists());
+        assert!(launched.intent_path.exists());
+
+        hooks.fail_at(EffectSiteId::Container(armed), HookPhase::Before);
+        let error = release(
+            &mut hooks,
+            &fixture.runtime,
+            &fixture.view,
+            &fixture.root,
+            &launched,
+        )
+        .expect_err("a release that could not finish must say so");
+        let message = error.to_string();
+        assert!(
+            message.contains("could not complete every step"),
+            "{armed:?}: {message}"
+        );
+        assert!(
+            message.contains(armed.name()) || message.contains(step_phrase(armed)),
+            "{armed:?}: the error does not say which step failed: {message}"
+        );
+        messages.insert(message.clone());
+
+        let container_left = !fixture.runtime.container_names().is_empty();
+        let view_left = launched.view_path.exists();
+        let intent_left = launched.intent_path.exists();
+        let expected = match armed {
+            ContainerSite::Stop => (false, false, false),
+            ContainerSite::Remove => (true, false, false),
+            ContainerSite::UnmountGitView => (false, true, true),
+            ContainerSite::RemoveIntent => (false, false, true),
+            _ => unreachable!("only the four release steps are armed"),
+        };
+        assert_eq!(
+            (container_left, view_left, intent_left),
+            expected,
+            "{armed:?}: exactly the armed step's residue should remain, and every other step \
+             should have run anyway"
+        );
+        if armed == ContainerSite::UnmountGitView {
+            assert!(
+                message.contains("deliberately retained"),
+                "the R19 anchor rule does not hold on the completion path: {message}"
+            );
+        }
+    }
+    assert_eq!(
+        messages.len(),
+        4,
+        "four armed steps, four distinct errors — an error that did not name the step would \
+         collapse these"
+    );
 }

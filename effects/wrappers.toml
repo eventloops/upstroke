@@ -392,6 +392,10 @@ funnel = [
     "remove_container",
     "unmount_git_view",
     "remove_intent",
+    # `PR6-ACCT-007`: `Container.RemoveIntent` reached for a name whose
+    # published half never landed. The frozen `ContainerSite` has eight
+    # variants and this is that same site, not a ninth.
+    "remove_staged_intent",
     "launch",
     "release",
     "reclaim",
@@ -422,6 +426,9 @@ effect_free = [
     "image_by_id",
     "image_by_reference",
     "list_intents",
+    # `PR6-ACCT-007`: the staged half of the same namespace scan. A directory
+    # read and a parse, like `list_intents` beside it.
+    "list_staged_intents",
     "new",
     "observe",
     "observe_terminated",

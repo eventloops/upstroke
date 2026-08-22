@@ -516,12 +516,27 @@ static EMPTY: BTreeMap<String, String> = BTreeMap::new();
 /// a warning that said "image id" would be naming a field the operator cannot
 /// edit and cannot fix.
 ///
-/// An **absent** `[runner]` section is not a config that differs. A resume whose
-/// repository never configured a runner must not be told its runner kind moved.
+/// ## An absent `[runner]` section is a selection, not an exemption
+///
+/// `PR6-CORRECTNESS-015`. This began with `if !today.from_config { return None
+/// }`, on the reading that "a resume whose repository never configured a runner
+/// must not be told its runner kind moved". That sentence is true, and the
+/// guard is not what makes it true: [`RunnerSelection::host_default`] — what an
+/// absent section means — renders through [`today_in_record_shape`] as exactly
+/// `{Host, HostV1, None, None}`, which is exactly what a host run records, so
+/// [`RunnerPolicy::difference`] already answers `None` for it. The guard bought
+/// nothing there and cost the case it was hiding: a run that recorded a
+/// **container** runner and whose `[runner]` section was then **deleted**.
+/// Today's effective selection is the host default, which is as real an edit as
+/// changing the kind in place, and the operator got no warning at all — the one
+/// clause `decisions.sequential_substrate.runner` states about a differing
+/// config ("warns naming the difference and is ignored") silently did not apply
+/// to the largest possible difference.
+///
+/// So the comparison is unconditional and the *rendering* carries the rule:
+/// absent means host-default, and a host record with no section still produces
+/// no warning because there is genuinely no difference.
 fn configured_difference(record: &RunnerPolicy, today: &RunnerSelection) -> Option<RunnerField> {
-    if !today.from_config {
-        return None;
-    }
     record.difference(&today_in_record_shape(record, today))
 }
 

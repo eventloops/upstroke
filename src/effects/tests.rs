@@ -2859,3 +2859,293 @@ fn every_production_region_that_stops_early_stops_at_a_module() {
          describes a tree that no longer exists"
     );
 }
+
+// ---------------------------------------------------------------------------
+// R3b: the enumerations the reconciliation promised and did not supply
+// ---------------------------------------------------------------------------
+
+/// The nine `expected_failures_refusals`, each with the **ordering predicate**
+/// it carries and the test that holds it.
+///
+/// `PR6-ENUM-011`. The reconciliation document states that the nine refusals
+/// and the twelve ST-16 variants "are mapped" and never supplies the mappings,
+/// so a clause with neither a named test nor an owned deferral was
+/// indistinguishable from one with both. A promise in a markdown file is not
+/// something a build can read; this is.
+///
+/// `(clause, ordering predicate, test)`. The ordering is written out because it
+/// is the **independently droppable** half: a refusal test that proves only
+/// *that* it refused holds none of "before any effect", "before any lock or
+/// effect", "before any spawn", "before start", "before any recovery event", or
+/// "by construction".
+const PR6_REFUSALS: [(&str, &str, &str); 9] = [
+    (
+        "[runner] kind = container under a schema-1..3 fresh run or resume",
+        "before any effect",
+        "legacy_container_selection_refused_before_effects",
+    ),
+    (
+        "unreachable runtime / reference absent / credential volume absent, at resolution",
+        "before any lock or effect",
+        "resolution_refuses_each_of_its_faults_before_any_lock_or_effect",
+    ),
+    (
+        "a recorded shell or agent CLI that fails inside the recorded image",
+        "before any recovery event or work spawn",
+        "failing_preflight_probe_on_resume_refuses_before_recovery_event_and_reclaims_probe_containers",
+    ),
+    (
+        "a created container whose reported image id differs from the record",
+        "before start",
+        "substituted_image_id_refused_before_start",
+    ),
+    (
+        "reviewer write attempt",
+        "the mount is `:ro`, so the write fails in the runtime",
+        "real_docker_refuses_a_reviewer_write_to_its_read_only_mount",
+    ),
+    (
+        "gate write outside mount",
+        "the container root is read-only, so the write fails in the runtime",
+        "real_docker_a_gate_write_outside_every_declared_mount_fails",
+    ),
+    (
+        "container start without an intent",
+        "by construction",
+        "a_container_is_created_and_started_only_under_its_own_intent_record",
+    ),
+    (
+        "an intent naming this process's own incarnation at census time",
+        "before any effect",
+        "an_intent_naming_this_processs_own_incarnation_is_refused_before_any_effect",
+    ),
+    (
+        "an unreclaimable labeled container / intents without a reachable runtime",
+        "blocks admission; before any recovery event",
+        "census_refuses_when_intents_exist_without_reachable_runtime",
+    ),
+];
+
+/// The twelve ST-16 variants (a)–(l), each mapped to the test that drives it.
+///
+/// `PR6-ENUM-011`. `T_CONTAINER_TESTS` is the packet's `test:` field and is a
+/// *presence* list; this is the **variant** enumeration, which is a different
+/// axis — several variants share a named test and one variant is carried by a
+/// test the `test:` field does not name.
+const ST16_VARIANTS: [(char, &str, &str); 12] = [
+    (
+        'a',
+        "single owner dies -> next write-command start reclaims",
+        "orphan_reclaimed_before_slot_reset",
+    ),
+    (
+        'b',
+        "live coordinator A while dead B's orphan exists in the same private root",
+        "live_owner_untouched_while_dead_orphan_reclaimed",
+    ),
+    (
+        'c',
+        "labeled container without an intent, same liveness rule",
+        "labeled_orphan_without_intent_reclaimed",
+    ),
+    (
+        'd',
+        "the Unix reaper kills labeled containers",
+        "unix_reaper_kills_labeled_containers",
+    ),
+    (
+        'e',
+        "Windows documents the orphan window",
+        "windows_orphan_window_documented",
+    ),
+    (
+        'f',
+        "same-run resume censuses the recorded root after the default moved",
+        "same_run_resume_censuses_recorded_root_after_default_changed",
+    ),
+    (
+        'g',
+        "three incarnations, orphans from two dead ones, no collision",
+        "repeated_crashes_reclaim_every_dead_incarnation",
+    ),
+    (
+        'h',
+        "a foreign write command and the resuming incarnation converge",
+        "concurrent_reclaimers_converge",
+    ),
+    (
+        'i',
+        "schema-1..3 container selection refused; schema-4 probe containers untouched by a foreign census",
+        "schema4_probe_container_owned_during_preflight_untouched_by_foreign_census",
+    ),
+    (
+        'j',
+        "intents present and runtime unreachable -> refuse; no intent and no runtime -> proceed",
+        "census_proceeds_without_runtime_when_no_intent_exists",
+    ),
+    (
+        'k',
+        "a probe container killed before run_started is reclaimed, its boundary named",
+        "census_report_names_reclaimed_probe_boundary",
+    ),
+    (
+        'l',
+        "a resume whose pre-flight probe fails ends before any recovery event, resumable",
+        "failing_preflight_probe_on_resume_refuses_before_recovery_event_and_reclaims_probe_containers",
+    ),
+];
+
+/// The clauses of `invariants_introduced` and of ST-20 that this slice owns,
+/// each with a test **or** an owned deferral.
+///
+/// `PR6-ENUM-011`. The reconciliation decomposed neither, so descendant
+/// containment, resumed-epoch attribution and report/status attribution had
+/// neither a named test nor an owner. A deferral is written as
+/// `defer:<slice>` and is as much an answer as a test name — what is not an
+/// answer is silence.
+const PR6_CLAUSES: [(&str, &str); 12] = [
+    (
+        "role mounts and no others",
+        "the_mount_set_is_the_roles_own_and_reaches_nothing_of_the_coordinators",
+    ),
+    (
+        "no engine refs, event log, or private artifacts visible",
+        "the_role_view_carries_no_engine_refs_and_no_link_back_into_the_repository",
+    ),
+    (
+        "disposable Git view",
+        "a_git_dependent_tool_reads_the_role_view_and_cannot_see_the_engines_refs",
+    ),
+    (
+        "probes certify the shell and CLI that will run",
+        "the_shell_probe_runs_through_this_runner_as_a_registered_container_invocation",
+    ),
+    (
+        "container contains descendants",
+        "real_docker_a_container_contains_a_daemonised_descendant",
+    ),
+    (
+        "INV-15: container intent/reclaim with incarnation-aware owner liveness",
+        "the_liveness_rule_classifies_every_cell_of_owner_run_by_incarnation_by_lock",
+    ),
+    (
+        "every container invocation has an owner run whose identity precedes it",
+        "legacy_container_selection_refused_before_effects",
+    ),
+    (
+        "INV-23: resolution by inspection, immutable image id, creation from the id with verification",
+        "container_created_from_recorded_image_id_and_verified",
+    ),
+    (
+        "INV-23: rebuild-from-record, inspection refusals before any spawn",
+        "the_rebuild_returns_the_recorded_runner_exactly_however_the_config_differs",
+    ),
+    (
+        "ST-20: every probe and invocation of the RESUMED epoch executes under the recorded boundary",
+        "defer:PR7",
+    ),
+    (
+        "ST-20: report.json and status name the run's kind, policy, image reference, id and digest",
+        "defer:PR10",
+    ),
+    ("the container transition is wired into a run", "defer:PR7"),
+];
+
+/// Every enumeration the reconciliation promised is supplied here, and every
+/// entry either names a test that exists or defers to a named slice.
+///
+/// `PR6-ENUM-011`. Three separate claims, each of which the document made and
+/// none of which anything read:
+///
+/// 1. the **nine** refusals are mapped — and to an *ordering predicate* as well
+///    as to a test, because the ordering is the droppable half;
+/// 2. the **twelve** ST-16 variants (a)–(l) are mapped;
+/// 3. `invariants_introduced` and the prose `proof_tests` are decomposed into
+///    clauses, each with a test **or an owned deferral**.
+///
+/// A name that is not a `#[test]` in this tree fails here, through the same
+/// [`defining_test_sites`] census `T_CONTAINER_TESTS` uses — so this cannot be
+/// satisfied by prose, by a helper function with the right name, or by a string
+/// in a comment.
+///
+/// **What this does not prove**, stated for the same reason the gate above
+/// states it: that the named test holds the clause. This is a *mapping* gate.
+/// The evidence that the clauses hold is the mutation witnessing recorded in
+/// the repair reports.
+#[test]
+fn every_pr6_refusal_st16_variant_and_invariant_clause_names_a_test_or_an_owner() {
+    // (1) The nine refusals, with distinct clauses and distinct orderings.
+    assert_eq!(PR6_REFUSALS.len(), 9, "the contract states nine refusals");
+    let clauses: BTreeSet<&str> = PR6_REFUSALS.iter().map(|(clause, ..)| *clause).collect();
+    assert_eq!(clauses.len(), 9, "two rows name the same refusal");
+    let orderings: BTreeSet<&str> = PR6_REFUSALS.iter().map(|(_, order, _)| *order).collect();
+    assert!(
+        orderings.len() >= 5,
+        "the nine refusals carry {} distinct ordering predicates; a mapping in which every \
+         refusal has the same ordering is one that dropped the orderings",
+        orderings.len()
+    );
+
+    // (2) The twelve ST-16 variants, (a)-(l), each present exactly once.
+    assert_eq!(ST16_VARIANTS.len(), 12);
+    let letters: Vec<char> = ST16_VARIANTS.iter().map(|(letter, ..)| *letter).collect();
+    assert_eq!(
+        letters,
+        ('a'..='l').collect::<Vec<char>>(),
+        "the variants are not (a) through (l), in order and complete"
+    );
+
+    // (3) The clause decomposition, with deferrals owned by a named slice.
+    let deferred: Vec<&str> = PR6_CLAUSES
+        .iter()
+        .map(|(_, answer)| *answer)
+        .filter(|answer| answer.starts_with("defer:"))
+        .collect();
+    assert!(
+        !deferred.is_empty(),
+        "a decomposition in which nothing is deferred is one that quietly claimed PR7's and \
+         PR10's clauses"
+    );
+    for answer in &deferred {
+        let owner = answer.trim_start_matches("defer:");
+        assert!(
+            owner.starts_with("PR") && owner[2..].chars().all(|c| c.is_ascii_digit()),
+            "`{answer}` defers to nobody in particular"
+        );
+    }
+
+    // Every name that is not a deferral is a `#[test]` in this tree.
+    let named: Vec<&str> = PR6_REFUSALS
+        .iter()
+        .map(|(_, _, test)| *test)
+        .chain(ST16_VARIANTS.iter().map(|(_, _, test)| *test))
+        .chain(
+            PR6_CLAUSES
+                .iter()
+                .map(|(_, answer)| *answer)
+                .filter(|answer| !answer.starts_with("defer:")),
+        )
+        .collect();
+    assert!(named.len() >= 28, "{}", named.len());
+    for name in &named {
+        assert!(
+            !defining_test_sites(name).is_empty(),
+            "`{name}` is named by the PR6 reconciliation and is not a `#[test]` in this tree"
+        );
+    }
+
+    // And the ST-16 mapping is consistent with the packet's own `test:` field:
+    // every variant's test that appears there appears under the same name.
+    for (letter, _, test) in &ST16_VARIANTS {
+        if T_CONTAINER_TESTS.contains(test) {
+            continue;
+        }
+        // A variant carried by a test the `test:` field does not name is
+        // allowed and must be visible, not silent.
+        assert!(
+            matches!(letter, 'a' | 'b' | 'i'),
+            "ST-16 ({letter}) is mapped to `{test}`, which the packet's own `test:` field does \
+             not name; only the variants whose clause is split across tests may do that"
+        );
+    }
+}
