@@ -410,6 +410,12 @@ effect_free = [
     # production passes. In the domain since `PR6-LANEF-007`.
     "trace",
     "available",
+    # `PR6-RECOV-005`: the two halves of "could not be reached" vs "reached and
+    # refused". Both read a string and return a value; neither touches the
+    # machine, which is the point -- the classification is reachable, and
+    # testable, without a daemon.
+    "classify_docker_failure",
+    "is_unreachable_diagnostic",
     "closed_by_a_reaper",
     "collect",
     "containers_with_label",

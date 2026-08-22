@@ -438,17 +438,29 @@ impl GitView for RoleGitView {
         Ok(request.path.clone())
     }
 
+    /// **Through the one racing removal** (`PR6-CORRECTNESS-009`).
+    ///
+    /// `crash_reconstruction` requires "every step idempotent and tolerant of
+    /// already-gone so **two concurrent reclaimers converge**", and on Windows
+    /// the loser of that race does not get `NotFound`: a directory whose last
+    /// handle has closed is *delete-pending*, and `remove_dir_all` reports
+    /// `PermissionDenied` until the name actually goes away. This implementation
+    /// tolerated only `NotFound`, so one of two converging write commands
+    /// refused. [`super::DisposableDirView`] had already been repaired; this
+    /// one is the projection a real run mounts, and the concurrent-census
+    /// fixtures all used the other.
+    ///
+    /// **Tolerating `PermissionDenied` outright would be the wrong repair** and
+    /// it is worth saying why, because it is the smaller diff: a view that is
+    /// genuinely protected — an open handle inside it on Windows, a read-only
+    /// parent on Unix — would then be reported discarded, the census would go on
+    /// to remove the intent, and admission would proceed over R19 residue that
+    /// nothing will ever reclaim, because the record naming it is gone.
+    /// [`super::racing_removal`] retries and then **fails**, which is the
+    /// fail-closed shape: a delete-pending name disappears within a few
+    /// attempts, and a protected one still refuses after all of them.
     fn discard(&self, path: &Path) -> Result<(), TactusError> {
-        match fs::remove_dir_all(path) {
-            Ok(()) => {}
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(source) => {
-                return Err(TactusError::Io {
-                    path: path.to_path_buf(),
-                    source,
-                });
-            }
-        }
+        super::racing_removal(path, || fs::remove_dir_all(path))?;
         self.trace.view(ViewAction::Discarded, path);
         Ok(())
     }

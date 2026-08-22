@@ -397,40 +397,45 @@ impl WriteCommand {
 /// > -> reclaim **every** container of that run **whatever its incarnation**;
 /// > **held** -> live owner -> **never touched**
 ///
-/// **The own-incarnation refusal is unqualified, and that is a reading.**
-/// `crash_reconstruction` writes it inside arm (i)'s clause, but the reason it
-/// gives — "cannot exist at census time (**the census precedes every invocation
-/// incl. this incarnation's probes**)" — is a fact about *this process*, not
-/// about the owner run: an incarnation id is a per-process ULID, and this
-/// process has written no container intent at all yet, under any run id. Two
-/// other live passages state the condition with no arm attached at all:
-/// `expected_failures_refusals[7]`, "an intent naming this process's own
-/// incarnation at census time is refused", and
-/// `transaction_fault_matrix.T-CONTAINER.refusal_condition`, which lists it
-/// among the unqualified refusal conditions. So an intent that names this
-/// incarnation under a *foreign* run id is refused too — it is ownership
-/// evidence that contradicts itself, exactly like a name that disagrees with
-/// its record, and this module refuses on every other such contradiction.
+/// **The own-incarnation refusal belongs to arm (i), and that is a reading —
+/// the opposite of the one that shipped** (`PR6-RECOV-003`).
 ///
-/// Refusing is also the only reading compatible with arm (ii)'s absolute
-/// prohibition: a **held** foreign owner's container must never be touched, and
-/// a refusal touches nothing. Classifying it as a dead owner instead would kill
-/// a live coordinator's container.
+/// The rule above is an exhaustive dichotomy on the *owner run*, and the
+/// refusal clause is written **inside arm (i)**, after its colon. Arm (ii) then
+/// says what it does with the incarnation, in as many words: "reclaim every
+/// container of that run **whatever its incarnation**". "Whatever" includes
+/// this process's own, so the two clauses do not overlap and there is nothing
+/// to adjudicate between them; `transaction_fault_matrix.T-CONTAINER
+/// .resume_action` states the same rule in the same order — "owner run == this
+/// run -> incarnation != this process's incarnation -> … -> reclaim; owner run
+/// != this run -> probe the owner's run.lock non-blocking; held -> skip; free
+/// -> reclaim".
+///
+/// The shipped code hoisted the incarnation comparison **in front of** the
+/// split and refused on it under any run id, on the strength of
+/// `expected_failures_refusals[7]` — "an intent naming this process's own
+/// incarnation at census time is refused" — read as unqualified. That line is
+/// the contract's one-sentence summary of arm (i)'s clause, and a summary that
+/// drops a qualifier is not a second rule. Two live passages state the
+/// classification arm-first; one summary states it arm-free; the classification
+/// wins.
+///
+/// **What the hoisted check cost.** A foreign run whose recorded incarnation
+/// equals this process's never reached arm (ii) at all, so its owner's lock was
+/// never probed and a perfectly dead owner's container blocked every write
+/// command under that private root, permanently, with no operator remedy. The
+/// hoisted check was not the safer choice either way: arm (ii) reclaims only on
+/// a **free** lock, so the live-owner container it was supposed to protect is
+/// protected by the probe.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum Ownership {
     /// Arm (i), `incarnation != mine`: dead by construction, because the run
     /// lock is exclusive and this process holds it.
     OwnRunEarlierIncarnation,
-    /// `incarnation == mine` under the run this process drives: cannot exist at
-    /// census time, and is **refused** if observed.
-    /// `expected_failures_refusals[7]`.
+    /// Arm (i), `incarnation == mine`: cannot exist at census time — the census
+    /// precedes every invocation including this incarnation's probes — and is
+    /// **refused** if observed. `expected_failures_refusals[7]`.
     OwnRunThisIncarnation,
-    /// `incarnation == mine` under a run this process is **not** driving: this
-    /// process wrote no intent under a foreign run id, so the evidence
-    /// contradicts itself. Refused, and never reclaimed — the owner's lock is
-    /// not even probed, because no answer to that question could make killing
-    /// it safe.
-    ForeignRunThisIncarnation,
     /// Arm (ii), the owner's `run.lock` is **free**: reclaim, whatever the
     /// container's incarnation.
     ForeignRunDeadOwner,
@@ -445,7 +450,6 @@ impl Ownership {
     pub const ALL: &'static [Self] = &[
         Self::OwnRunEarlierIncarnation,
         Self::OwnRunThisIncarnation,
-        Self::ForeignRunThisIncarnation,
         Self::ForeignRunDeadOwner,
         Self::ForeignRunLiveOwner,
     ];
@@ -455,19 +459,14 @@ impl Ownership {
     pub const fn reclaims(self) -> bool {
         match self {
             Self::OwnRunEarlierIncarnation | Self::ForeignRunDeadOwner => true,
-            Self::OwnRunThisIncarnation
-            | Self::ForeignRunThisIncarnation
-            | Self::ForeignRunLiveOwner => false,
+            Self::OwnRunThisIncarnation | Self::ForeignRunLiveOwner => false,
         }
     }
 
     /// Whether observing it refuses the write command.
     #[must_use]
     pub const fn refuses(self) -> bool {
-        matches!(
-            self,
-            Self::OwnRunThisIncarnation | Self::ForeignRunThisIncarnation
-        )
+        matches!(self, Self::OwnRunThisIncarnation)
     }
 
     /// As the report writes it.
@@ -476,7 +475,6 @@ impl Ownership {
         match self {
             Self::OwnRunEarlierIncarnation => "own-run-earlier-incarnation",
             Self::OwnRunThisIncarnation => "own-run-this-incarnation",
-            Self::ForeignRunThisIncarnation => "foreign-run-this-incarnation",
             Self::ForeignRunDeadOwner => "foreign-run-dead-owner",
             Self::ForeignRunLiveOwner => "foreign-run-live-owner",
         }
@@ -497,13 +495,16 @@ impl Ownership {
 /// **Arm (i) does not probe the lock at all**: this process holds it, so a probe
 /// would be asking whether it is itself alive.
 ///
-/// **The own-incarnation test precedes both arms**, because
-/// `expected_failures_refusals[7]` attaches no arm to it: see [`Ownership`] for
-/// the reading and the passages. Placing it first is also what makes the
-/// refusal "before any effect" true of the *probe* as well — a candidate
-/// carrying this incarnation is refused without the owner's lock ever being
-/// asked about, since no answer to that question could make killing it safe and
-/// a "free" answer would make killing it look safe.
+/// **The owner-run split comes first, and the incarnation is read only inside
+/// the arm that reads it** — see [`Ownership`] for the passages and for what
+/// hoisting the comparison in front of the split cost (`PR6-RECOV-003`).
+///
+/// The probe is [`OwnerLiveness::is_running`], called **once**, because
+/// `T-CONTAINER.resume_action` says "probe the owner's run.lock
+/// **non-blocking**; held -> skip". A retry loop around a held lock is a census
+/// that waits on a live neighbour, which is a stall at every write-command
+/// start; `census::tests::the_owner_lock_is_probed_exactly_once_per_candidate`
+/// asserts the call count rather than the answer.
 #[must_use]
 pub fn classify_ownership(
     start: &CensusStart,
@@ -512,20 +513,17 @@ pub fn classify_ownership(
     owner_run_dir: &Path,
     liveness: &dyn OwnerLiveness,
 ) -> Ownership {
-    let own_run = start.own_run() == Some(owner_run_id);
-    if owner_incarnation == start.incarnation() {
-        return if own_run {
+    if start.own_run() == Some(owner_run_id) {
+        // Arm (i). The run lock is exclusive and this process holds it, so
+        // every other incarnation of this run is dead; this one cannot exist.
+        return if owner_incarnation == start.incarnation() {
             Ownership::OwnRunThisIncarnation
         } else {
-            Ownership::ForeignRunThisIncarnation
+            Ownership::OwnRunEarlierIncarnation
         };
     }
-    if own_run {
-        // Arm (i), the surviving half: the run lock is exclusive and this
-        // process holds it, so every other incarnation of this run is dead.
-        return Ownership::OwnRunEarlierIncarnation;
-    }
-    // Arm (ii). The incarnation is deliberately not in scope here.
+    // Arm (ii). The incarnation is deliberately not in scope here: "reclaim
+    // every container of that run whatever its incarnation".
     if liveness.is_running(owner_run_dir) {
         Ownership::ForeignRunLiveOwner
     } else {
@@ -791,25 +789,14 @@ pub fn run_startup_census(
             census.liveness,
         );
         if ownership.refuses() {
-            // Both refusals are `expected_failures_refusals[7]`, and the
-            // condition it names is unqualified — but the two contradictions
-            // are different facts about the machine and a report that called
-            // them one thing would send a reader looking in the wrong place.
-            let why = if ownership == Ownership::OwnRunThisIncarnation {
-                "which is this process's own run and its own incarnation"
-            } else {
-                "whose incarnation is this process's own under a run this process is not \
-                 driving, so no process could have written it: an incarnation id is a \
-                 per-process ULID and this process has written no container intent at all yet"
-            };
             return Err(TactusError::Refused {
                 message: format!(
-                    "the container intent `{}` names run `{}` and incarnation `{}`, {why}; an \
-                     intent naming this process's own incarnation cannot exist at census time — \
-                     the census precedes every invocation including this incarnation's probes — \
-                     and is refused if observed (decisions.pr_sequence[7].slice_contract\
-                     .expected_failures_refusals[7]). Nothing was reclaimed and nothing was \
-                     probed on its behalf",
+                    "the container intent `{}` names run `{}` and incarnation `{}`, which is this \
+                     process's own run and its own incarnation; an intent naming this process's \
+                     own incarnation cannot exist at census time — the census precedes every \
+                     invocation including this incarnation's probes — and is refused if observed \
+                     (decisions.pr_sequence[7].slice_contract.expected_failures_refusals[7]). \
+                     Nothing was reclaimed and nothing was probed on its behalf",
                     candidate.name, candidate.run_id, candidate.incarnation
                 ),
             });
@@ -940,13 +927,17 @@ fn merge(
     let mut by_name: BTreeMap<String, Candidate> = BTreeMap::new();
     for found in intents {
         check_name_against_record(&found)?;
+        // Decoded and checked rooted here, not turned into a `PathBuf` by
+        // assumption: this is the directory arm (ii) probes a `run.lock` in,
+        // and every wrong answer to that probe is "free", which reclaims.
+        let run_dir = found.record.run_dir_path()?;
         by_name.insert(
             found.name.as_str().to_owned(),
             Candidate {
                 name: found.name,
                 run_id: found.record.run_id,
                 incarnation: found.record.incarnation,
-                run_dir: PathBuf::from(found.record.run_dir),
+                run_dir,
                 boundary: Boundary::FromIntent(found.record.runner_policy_sha256),
                 discovered_by: DiscoveredBy::IntentOnly,
                 intent_path: Some(found.path),
@@ -997,11 +988,17 @@ fn from_labels_alone(
         };
         fields.push(value.to_owned());
     }
+    // `PR6-CORRECTNESS-016`: a *present* `tactus.run_dir` still has to say
+    // where its owner's lock is. The missing-key arm above and this one are
+    // separate predicates — the shipped code held only the first, so a label
+    // set that varied which key was absent passed while `tactus.run_dir=`
+    // reached the probe as `./run.lock`.
+    let run_dir = super::intent::owner_run_dir(&fields[2], "container's labels")?;
     let candidate = Candidate {
         name,
         run_id: fields[0].clone(),
         incarnation: fields[1].clone(),
-        run_dir: PathBuf::from(&fields[2]),
+        run_dir,
         boundary: Boundary::NoIntentRecord,
         discovered_by: DiscoveredBy::LabelOnly,
         intent_path: None,

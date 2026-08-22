@@ -121,7 +121,7 @@ pub const LABELS: &[&str] = &[
     LABEL_INVOCATION,
 ];
 
-/// The bytes [`private_root_label`] passes through unescaped.
+/// The bytes [`path_label`] passes through unescaped.
 ///
 /// `/` is here because it is a path separator on both platforms and keeping it
 /// literal is what makes a label readable; `:` because a Windows drive letter
@@ -131,27 +131,44 @@ pub const LABELS: &[&str] = &[
 /// one, so a root carrying them cannot widen a filter.
 const LABEL_UNRESERVED: &[u8] = b"/:.-_";
 
-/// The value of the `tactus.private_root` label for a root.
+/// The hex digits an escape is written with, and the only ones
+/// [`decode_path_label`] accepts.
+const HEX: &[u8; 16] = b"0123456789ABCDEF";
+
+/// A path as a label value: percent-encoded, injective, and ASCII.
 ///
-/// **Injective, and it is the second thing in this module that has to be.**
-/// [`ContainerName`] was designed for injectivity — its components are
-/// `[0-9A-Za-z_]` only, so the parse on `-` is unambiguous — because
-/// `crash_reconstruction` says "different private roots are **disjoint
-/// worlds**". The label is the other half of that sentence: it is the value
+/// **Injective, and two things in this module have to be.** [`ContainerName`]
+/// was designed for injectivity — its components are `[0-9A-Za-z_]` only, so
+/// the parse on `-` is unambiguous — because `crash_reconstruction` says
+/// "different private roots are **disjoint worlds**". A label is the other half
+/// of that sentence: `tactus.private_root` is the value
 /// `docker ps --filter label=tactus.private_root=…` selects on, so two distinct
 /// roots that render to one label are one world, and a census authorized for
 /// either queries — and reclaims — the containers of the other.
+///
+/// **`tactus.run_dir` is the same function for a sharper reason.** It is the
+/// owner's public run directory, and arm (ii) of the liveness rule *probes that
+/// directory's `run.lock`*: "free -> dead owner -> reclaim; held -> live owner
+/// -> never touched". A rendering that maps two directories onto one string
+/// sends the probe to a **different, real** directory, finds no lock there, and
+/// classifies a **live** owner as dead — which kills a running coordinator's
+/// container. `PR6-RECOV-001` is that entry.
 ///
 /// The rendering that shipped was `to_string_lossy().replace('\\', "/")`, which
 /// collides two ways. `<R>/a\b` and `<R>/a/b` are **different directories on
 /// Unix**, where a backslash is an ordinary filename byte, and they rendered to
 /// one label; and `to_string_lossy` maps every ill-formed byte sequence to
 /// `U+FFFD`, so two distinct non-UTF-8 roots rendered to one label as well.
+/// Substituting one ambiguity for another — rewriting `:` as well, say — keeps
+/// every existing fixture green, which is why the property asserted is a
+/// **colliding pair**, not a round trip.
 ///
 /// So: percent-encode the path's own bytes. Every byte outside
 /// [`LABEL_UNRESERVED`] and the ASCII alphanumerics becomes `%XX`, upper-case
 /// hex, which is injective because `%` is itself escaped and every escape is a
-/// fixed three bytes.
+/// fixed three bytes. [`decode_path_label`] is the inverse and exists: an
+/// encoding the census cannot undo would be injective and useless, because the
+/// probe needs the *path* back.
 ///
 /// **The one byte that is platform-shaped is `\`, and it is not an exception to
 /// injectivity.** On Windows `\` and `/` are both path separators and `<R>\a`
@@ -161,8 +178,8 @@ const LABEL_UNRESERVED: &[u8] = b"/:.-_";
 /// byte. The `cfg` and this sentence are asserted against each other by
 /// `census::tests::the_private_root_label_is_injective_over_hostile_roots`.
 #[must_use]
-pub fn private_root_label(private_root: &Path) -> String {
-    let bytes = private_root.as_os_str().as_encoded_bytes();
+pub fn path_label(path: &Path) -> String {
+    let bytes = path.as_os_str().as_encoded_bytes();
     let mut label = String::with_capacity(bytes.len());
     for &byte in bytes {
         if byte.is_ascii_alphanumeric() || LABEL_UNRESERVED.contains(&byte) {
@@ -171,11 +188,87 @@ pub fn private_root_label(private_root: &Path) -> String {
             label.push('/');
         } else {
             label.push('%');
-            label.push(char::from(b"0123456789ABCDEF"[usize::from(byte >> 4)]));
-            label.push(char::from(b"0123456789ABCDEF"[usize::from(byte & 0x0f)]));
+            label.push(char::from(HEX[usize::from(byte >> 4)]));
+            label.push(char::from(HEX[usize::from(byte & 0x0f)]));
         }
     }
     label
+}
+
+/// The value of the `tactus.private_root` label for a root.
+///
+/// A name for one use of [`path_label`], kept because the private root is the
+/// value a `docker ps --filter` argument is built from and the call sites read
+/// better for saying so.
+#[must_use]
+pub fn private_root_label(private_root: &Path) -> String {
+    path_label(private_root)
+}
+
+/// [`path_label`]'s inverse: the path a label value was encoded from.
+///
+/// **Fail-closed, and deliberately strict.** A value this function cannot
+/// decode is not a value any funnel wrote, and the census's answer to evidence
+/// it cannot read is to refuse and block admission — never to guess a path and
+/// then probe a lock there. `%` followed by anything but two upper-case hex
+/// digits is the only malformed shape [`path_label`] cannot produce, so it is
+/// the only one refused.
+///
+/// On Unix an `OsStr` is bytes and the decode is exact. On Windows an `OsStr`
+/// is WTF-8 and only its UTF-8 subset can be rebuilt safely — the alternative
+/// is `OsStr::from_encoded_bytes_unchecked`, whose contract a hostile label
+/// value cannot be trusted to meet. A Windows path outside UTF-8 is an unpaired
+/// surrogate in a file name; refusing it is the fail-closed side of that trade
+/// and is stated here rather than discovered.
+///
+/// # Errors
+///
+/// [`TactusError::Refused`] when `value` carries a malformed escape, or when
+/// the decoded bytes are not a path this platform can name.
+pub fn decode_path_label(value: &str) -> Result<PathBuf, TactusError> {
+    let refuse = |why: &str| TactusError::Refused {
+        message: format!(
+            "the label value `{value}` is not a tactus path label ({why}); a path label is its \
+             bytes with everything outside `[0-9A-Za-z]` and `{}` percent-encoded, and a value \
+             this engine could not have written is not evidence a census may probe a lock from",
+            String::from_utf8_lossy(LABEL_UNRESERVED)
+        ),
+    };
+    let raw = value.as_bytes();
+    let mut bytes = Vec::with_capacity(raw.len());
+    let mut index = 0;
+    while index < raw.len() {
+        if raw[index] != b'%' {
+            bytes.push(raw[index]);
+            index += 1;
+            continue;
+        }
+        let (Some(high), Some(low)) = (raw.get(index + 1), raw.get(index + 2)) else {
+            return Err(refuse("a `%` with fewer than two digits after it"));
+        };
+        let (Some(high), Some(low)) = (
+            HEX.iter().position(|digit| digit == high),
+            HEX.iter().position(|digit| digit == low),
+        ) else {
+            return Err(refuse("a `%` not followed by two upper-case hex digits"));
+        };
+        // `as u8` cannot truncate: both indices are positions in a 16-byte
+        // table, so the value is `0..=255` by construction.
+        bytes.push(((high << 4) | low) as u8);
+        index += 3;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStringExt as _;
+        Ok(PathBuf::from(std::ffi::OsString::from_vec(bytes)))
+    }
+    #[cfg(not(unix))]
+    {
+        match String::from_utf8(bytes) {
+            Ok(text) => Ok(PathBuf::from(text)),
+            Err(_) => Err(refuse("bytes that are not valid UTF-8 on this platform")),
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -193,7 +286,16 @@ pub fn private_root_label(private_root: &Path) -> String {
 pub struct ContainerIntent {
     /// Owner run id.
     pub run_id: String,
-    /// Run directory — the **public** path, canonical.
+    /// Run directory — the **public** path, canonical, as a [`path_label`].
+    ///
+    /// **Encoded, and the record and the label carry one spelling.** The
+    /// `tactus.run_dir` label is this field verbatim, so a second rendering
+    /// would be a second thing to keep in step; and the census reaches the
+    /// owner's `run.lock` through [`Self::run_dir_path`], which is
+    /// [`decode_path_label`] and the rooted check in one place. Build the
+    /// record with [`Self::new`] rather than filling this in by hand — a raw
+    /// path whose bytes are all unreserved is its own encoding and survives
+    /// either way, but one carrying a `%` does not.
     pub run_dir: String,
     /// Coordinator incarnation id: a per-process ULID, never read from a lock
     /// file.
@@ -211,6 +313,39 @@ pub struct ContainerIntent {
 }
 
 impl ContainerIntent {
+    /// The six fields, with the run directory encoded on the way in.
+    ///
+    /// The one construction site production code uses, so "the record's run
+    /// directory is a [`path_label`]" is true by construction rather than by
+    /// every caller remembering.
+    #[must_use]
+    pub fn new(
+        run_id: String,
+        run_dir: &Path,
+        incarnation: String,
+        repo_key: String,
+        invocation: String,
+        runner_policy_sha256: String,
+    ) -> Self {
+        Self {
+            run_id,
+            run_dir: path_label(run_dir),
+            incarnation,
+            repo_key,
+            invocation,
+            runner_policy_sha256,
+        }
+    }
+
+    /// The owner's public run directory, decoded and checked.
+    ///
+    /// # Errors
+    ///
+    /// As [`owner_run_dir`].
+    pub fn run_dir_path(&self) -> Result<PathBuf, TactusError> {
+        owner_run_dir(&self.run_dir, "intent record")
+    }
+
     /// The five labels this intent's container carries, given the private root
     /// its record lives under.
     ///
@@ -235,6 +370,68 @@ impl ContainerIntent {
         labels.insert(LABEL_INVOCATION.to_owned(), self.invocation.clone());
         labels
     }
+}
+
+/// The owner's public run directory, from a record field or a label value.
+///
+/// **The census probes `<run_dir>/run.lock` and acts on the answer**, so this
+/// is the function that decides which lock the question "is that owner alive?"
+/// is asked about. Two shapes must never reach it as a path:
+///
+/// * the **empty** value, which joins to `run.lock` — a path relative to
+///   whatever directory this process happens to be in, where there is no lock,
+///   so a live owner reads as dead and its running container is killed
+///   (`PR6-CORRECTNESS-016`);
+/// * any other **relative** value, for the same reason with more steps.
+///
+/// The predicate is [`Path::has_root`] and not `is_absolute`, deliberately. On
+/// Windows `is_absolute` additionally requires a prefix, so `/srv/…` — the
+/// shape every Unix-written record carries and every cross-platform fixture
+/// uses — is *not* absolute there, and the check would refuse on one platform
+/// what it accepts on the other. `has_root` is the property that actually
+/// matters here: a rooted path does not depend on the process's working
+/// directory. A drive-relative `C:dir` has no root and is refused.
+///
+/// Refusing is what `expected_failures_refusals[8]` asks for — "an unreclaimable
+/// labeled container blocks admission" — and it is the fail-closed side: the
+/// alternative to refusing unownable evidence is probing *something*, and every
+/// wrong probe answers "free", which reclaims.
+///
+/// # Errors
+///
+/// [`TactusError::Refused`] when `value` does not decode, is empty, or is not
+/// rooted.
+pub fn owner_run_dir(value: &str, source: &str) -> Result<PathBuf, TactusError> {
+    if value.is_empty() {
+        return Err(TactusError::Refused {
+            message: format!(
+                "the {source} carries an empty `{LABEL_RUN_DIR}`; the liveness rule probes \
+                 `<run_dir>/run.lock` non-blocking and an empty owner directory would probe \
+                 `run.lock` relative to this process's working directory, find no lock, and \
+                 classify a live owner as dead. Evidence that does not say where its owner's \
+                 lock is cannot be reclaimed under the rule, and an unreclaimable labeled \
+                 container blocks admission"
+            ),
+        });
+    }
+    // Wrapped, not propagated: a census refusal that did not name the field
+    // would leave an operator reading a decoder's complaint with no way to know
+    // which piece of evidence carried it.
+    let path = decode_path_label(value).map_err(|error| TactusError::Refused {
+        message: format!("the {source}'s `{LABEL_RUN_DIR}` is unreadable: {error}"),
+    })?;
+    if !path.has_root() {
+        return Err(TactusError::Refused {
+            message: format!(
+                "the {source} carries `{LABEL_RUN_DIR}={value}`, which is a relative path; the \
+                 owner's run directory is the **public** path and the liveness rule probes \
+                 `<run_dir>/run.lock` from it, so a value resolved against this process's \
+                 working directory asks about a lock that is not the owner's. An unreclaimable \
+                 labeled container blocks admission"
+            ),
+        });
+    }
+    Ok(path)
 }
 
 // ---------------------------------------------------------------------------

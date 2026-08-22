@@ -92,6 +92,14 @@ struct State {
     /// An operation that reaches the runtime and fails, which is a different
     /// answer from unreachable and drives the other half of the refusal split.
     failing: BTreeSet<RuntimeOp>,
+    /// A verbatim `docker` stderr this operation answers with, classified by
+    /// the production classifier rather than by the test.
+    ///
+    /// `PR6-RECOV-005`: every other arming here mints a `RuntimeError` variant
+    /// **directly**, so the whole suite could pass while the function that
+    /// decides which variant a real diagnostic becomes was wrong. This is the
+    /// one arming that goes through `super::classify_docker_failure`.
+    diagnostics: BTreeMap<RuntimeOp, String>,
     /// (6) Containers, with their owner labels and incarnations.
     containers: BTreeMap<String, FakeContainer>,
     /// (3) Substitution injection: what `create` will report for this name.
@@ -125,6 +133,9 @@ impl FakeRuntime {
     fn enter(&self, op: RuntimeOp, target: &str) -> Result<(), RuntimeError> {
         self.trace.runtime(op, target);
         let state = self.state();
+        if let Some(detail) = state.diagnostics.get(&op) {
+            return Err(super::classify_docker_failure(op, detail.clone()));
+        }
         if state.unreachable.contains(&op) {
             return Err(RuntimeError::Unreachable {
                 operation: op,
@@ -218,6 +229,12 @@ impl FakeRuntime {
     /// Make one operation reachable again.
     pub(crate) fn set_reachable(&self, op: RuntimeOp) {
         self.state().unreachable.remove(&op);
+    }
+
+    /// Arm one operation to answer with a **verbatim `docker` stderr**, whose
+    /// classification is the production classifier's rather than the test's.
+    pub(crate) fn set_docker_stderr(&self, op: RuntimeOp, detail: &str) {
+        self.state().diagnostics.insert(op, detail.to_owned());
     }
 
     /// Arm one operation to reach the runtime and fail.
@@ -585,6 +602,9 @@ pub(crate) const DOCKER_GATED_TESTS: &[&str] = &[
     "real_docker_adapter_parsing_matches_the_host_table",
     // Lane C: the startup census against the real runtime.
     "real_docker_census_reclaims_a_dead_owner_and_spares_a_live_one",
+    // Repair round R2: the two tables whose oracle has to be the daemon.
+    "real_docker_renders_a_comma_bearing_label_value_whole",
+    "real_docker_prints_the_transcribed_unreachable_diagnostics",
 ];
 
 /// Why a gated test skipped.
