@@ -1,3 +1,8 @@
+// LEGACY-EFFECT: this module is in the **frozen legacy section** of
+// `effects/allowlist.toml`, which carries its justification and the condition
+// under which the section shrinks. `decisions.effect_site_inventory.mechanism` (2).
+#![allow(clippy::disallowed_methods, clippy::disallowed_types)]
+
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -25,6 +30,7 @@ use crate::ir::{
 use crate::review;
 use crate::rundir::{self, RunLock, RunPaths, WorktreeLock};
 use crate::runner::CommandSpec;
+use crate::topology::effects::EventSite;
 use crate::workspace::Workspace;
 
 #[derive(Clone, Copy, PartialEq)]
@@ -844,6 +850,154 @@ fn task<'a>(report: &'a RunReport, id: &str) -> &'a TaskReport {
         .iter()
         .find(|t| t.id == id)
         .unwrap_or_else(|| panic!("no task `{id}` in {report:?}"))
+}
+
+// ---- a returned legacy append error ------------------------------------
+
+/// Fails the **third** legacy append of a live run, by returning an error at
+/// `Event.LegacyAppend`'s `Written` point.
+///
+/// The third, and the number is load-bearing rather than arbitrary:
+/// `run_harness_inner_on` emits `run_started` and then the capacity snapshot —
+/// two appends — *before* `drain_and_report` is called at all, so a fault at
+/// either tests the startup path and never reaches the branch both findings are
+/// about. The third is the first append inside `drain()`, which is where
+/// `production_effect`'s "it reports and stops" and the partial report live.
+/// `a_returned_legacy_append_error_still_leaves_the_partial_report` checks that
+/// the two startup appends really did land, so if this number ever stops being
+/// the right one it fails loudly instead of passing for the wrong reason.
+#[derive(Default)]
+struct FailTheThirdLegacyAppend {
+    entered: u32,
+}
+
+impl crate::events::log::EventHooks for FailTheThirdLegacyAppend {
+    fn point(
+        &mut self,
+        site: EventSite,
+        point: crate::topology::effects::SubEffectPoint,
+        mode: crate::topology::effects::InjectionMode,
+    ) -> crate::topology::effects::Injection {
+        use crate::topology::effects::{Injection, InjectionMode, SubEffectPoint};
+        if site != EventSite::LegacyAppend
+            || point != SubEffectPoint::Written
+            || mode != InjectionMode::ErrorReturn
+        {
+            return Injection::Proceed;
+        }
+        self.entered += 1;
+        if self.entered == 3 {
+            Injection::Error
+        } else {
+            Injection::Proceed
+        }
+    }
+}
+
+fn fail_the_third_legacy_append() -> Box<dyn crate::events::log::EventHooks> {
+    Box::<FailTheThirdLegacyAppend>::default()
+}
+
+/// A returned append error **stops the run** — it is not swallowed and carried
+/// on from (`PR5-CONF-010`).
+///
+/// `production_effect` says "the legacy engine's handling of a returned append
+/// error is unchanged — **it reports and stops**". The shipped code did;
+/// nothing required it to. Replacing `Run::emit`'s `?` with an arm that pushed
+/// a warning and returned `Ok` **survived the whole suite**: every append
+/// failure the suite injected targeted an `EventLog` a test had built directly,
+/// and `emit` reached `EventLog::append`, which hard-codes `NoEventHooks`, so
+/// no fixture could make a **live `Run`**'s append fail at all.
+///
+/// The two axes this crosses are *whose* `EventLog` fails and *what observes
+/// the failure*. `src/events/log/tests.rs` holds the first constant at "a log
+/// the test owns" and varies the second exhaustively; the census beside those
+/// tests reads the coordinator's source and can see that the branch returns,
+/// but not that the error ever gets to it. What varies here is the log: it is
+/// the live run's own, reached through `engine::run_with`, and the assertion is
+/// on the value the *caller* receives.
+#[test]
+fn a_returned_legacy_append_error_stops_the_run() {
+    let repo = temp_engine_repo("legacy-append-error");
+    let mut opts = options(&repo);
+    opts.log_hooks = Some(fail_the_third_legacy_append);
+    let source = fake(Effect::EditFile);
+
+    let error = run_with(&opts, &source)
+        .expect_err("a returned append error must reach the caller, not be swallowed");
+    let message = error.to_string();
+    assert!(
+        message.contains("Event.LegacyAppend"),
+        "the error must be the append's own, naming its site: {message}"
+    );
+    assert!(
+        message.contains("Written"),
+        "…and its point, so an operator can tell which coordinate failed: {message}"
+    );
+}
+
+/// …and the partial report is written beside the log on the way out
+/// (`PR5-CONF-011`).
+///
+/// Deleting `drain_and_report`'s partial `finish()` and `rundir::write_report`
+/// survived the whole suite, for the same reason and one branch further on.
+///
+/// **This is the legacy path and the repair must not generalize.**
+/// `coordinator_integration.append_error_protocol` forbids exactly the
+/// opposite for schema-4 — "no report, status, question payload, or cleanup is
+/// derived from the poisoned fold" and "still performs no retry, **report from
+/// memory**, cleanup, or fold mutation". So the assertion below is on the
+/// legacy `report.json` only, and nothing here is asserted of the topology
+/// coordinator.
+///
+/// Held constant with the sibling above: the same fault, at the same append, in
+/// the same fixture. What varies is what is examined — the caller's return
+/// value there, the run directory here.
+#[test]
+fn a_returned_legacy_append_error_still_leaves_the_partial_report() {
+    let repo = temp_engine_repo("legacy-append-partial");
+    let mut opts = options(&repo);
+    opts.log_hooks = Some(fail_the_third_legacy_append);
+    let source = fake(Effect::EditFile);
+
+    run_with(&opts, &source).expect_err("the append error stops the run");
+
+    // The run directory the failed run created, found by its own log rather
+    // than by a run id the caller never received.
+    let runs = opts.repo_root.join(".tactus").join("runs");
+    let public = fs::read_dir(&runs)
+        .expect("the runs root")
+        .flatten()
+        .map(|entry| entry.path())
+        .find(|path| path.join("events.jsonl").is_file())
+        .expect("the failed run left its public directory and its log");
+    // The premise: the fault fired *inside* `drain()`, not during startup.
+    // `run_started` and the capacity snapshot are appends 1 and 2 and both must
+    // have landed whole; the third is the one that failed, and its Written
+    // error-return arm leaves a torn prefix rather than a complete line.
+    let log = fs::read_to_string(public.join("events.jsonl")).expect("the log");
+    let complete = log.lines().filter(|line| line.ends_with('}')).count();
+    assert!(
+        complete >= 2,
+        "only {complete} complete line(s) in the log: the injected failure landed on \
+         a startup append, so this test never reached drain_and_report's branch"
+    );
+
+    let report = public.join("report.json");
+    assert!(
+        report.is_file(),
+        "no report beside {}: the legacy engine's partial report is a courtesy for \
+         whoever opens the directory next, and failing to write it must not be \
+         silent (PR5-CONF-011)",
+        public.display()
+    );
+    let parsed: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(&report).expect("read the partial report"))
+            .expect("the partial report is JSON");
+    assert!(
+        parsed.get("tasks").is_some(),
+        "the partial report is a report, not a stub: {parsed}"
+    );
 }
 
 // ---- step 1-6 behaviour, unchanged by the ladder ----------------------
@@ -5374,31 +5528,38 @@ fn resume_refuses_schema_two_spend_question_without_task_parked() {
     strip_event_field(&paths, "attempt_finished", "parking");
     truncate_log_after(&paths, "attempt_finished");
     let mut warnings = Vec::new();
-    let mut log = EventLog::open(&paths.events(), &mut warnings).expect("legacy log");
-    log.append(EventBody::LadderEscalated {
-        task: "t1".to_owned(),
-        attempt: 1,
-        rung: 0,
-        data: events::LadderEscalated {
-            to_rung: 1,
-            tier: "small".to_owned(),
-            summary: "escalate".to_owned(),
-            detail: None,
-        },
-    })
-    .expect("legacy escalation");
-    log.append(EventBody::QuestionRaised {
-        task: "t1".to_owned(),
-        data: Box::new(events::QuestionRaised {
-            question: Question {
-                id: QuestionId::from("q-spend-prefix"),
-                kind: QuestionKind::ApproveSpend,
-                affected_tasks: vec![TaskId::from("t1")],
-                context: "approve spend".to_owned(),
-                options: Vec::new(),
+    let mut log = EventLog::open(EventSite::LegacyOpenLog, &paths.events(), &mut warnings)
+        .expect("legacy log");
+    log.append(
+        EventSite::LegacyAppend,
+        EventBody::LadderEscalated {
+            task: "t1".to_owned(),
+            attempt: 1,
+            rung: 0,
+            data: events::LadderEscalated {
+                to_rung: 1,
+                tier: "small".to_owned(),
+                summary: "escalate".to_owned(),
+                detail: None,
             },
-        }),
-    })
+        },
+    )
+    .expect("legacy escalation");
+    log.append(
+        EventSite::LegacyAppend,
+        EventBody::QuestionRaised {
+            task: "t1".to_owned(),
+            data: Box::new(events::QuestionRaised {
+                question: Question {
+                    id: QuestionId::from("q-spend-prefix"),
+                    kind: QuestionKind::ApproveSpend,
+                    affected_tasks: vec![TaskId::from("t1")],
+                    context: "approve spend".to_owned(),
+                    options: Vec::new(),
+                },
+            }),
+        },
+    )
     .expect("legacy question");
     drop(log);
     let before = fs::read(paths.events()).expect("ambiguous prefix");
@@ -6025,28 +6186,35 @@ fn follow_ignores_a_terminal_marker_superseded_by_resume() {
     let report = run_with(&options(&repo), &source).expect("run");
     let paths = paths_of(&repo, &report.run_id);
     let mut warnings = Vec::new();
-    let mut log = events::EventLog::open(&paths.events(), &mut warnings).expect("open log");
-    log.append(EventBody::RunResumed {
-        data: events::RunResumed {
-            head_sha: "second-epoch".to_owned(),
-            interrupted_attempts: 0,
-            discarded: Vec::new(),
-            gates: None,
-            effort_policy: None,
-            reviews: None,
-            chains: None,
-            normalized_plan_digest: None,
+    let mut log = events::EventLog::open(EventSite::LegacyOpenLog, &paths.events(), &mut warnings)
+        .expect("open log");
+    log.append(
+        EventSite::LegacyAppend,
+        EventBody::RunResumed {
+            data: events::RunResumed {
+                head_sha: "second-epoch".to_owned(),
+                interrupted_attempts: 0,
+                discarded: Vec::new(),
+                gates: None,
+                effort_policy: None,
+                reviews: None,
+                chains: None,
+                normalized_plan_digest: None,
+            },
         },
-    })
+    )
     .expect("resume marker");
-    log.append(EventBody::RunFinished {
-        data: events::RunFinished {
-            outcome: events::RunOutcome::Complete,
-            halted_at: None,
-            committed: 1,
-            parked: 0,
+    log.append(
+        EventSite::LegacyAppend,
+        EventBody::RunFinished {
+            data: events::RunFinished {
+                outcome: events::RunOutcome::Complete,
+                halted_at: None,
+                committed: 1,
+                parked: 0,
+            },
         },
-    })
+    )
     .expect("second finish");
     drop(log);
 
@@ -6079,28 +6247,36 @@ fn follow_waits_at_held_historical_terminal_until_resume_marker() {
                 return;
             }
             let mut warnings = Vec::new();
-            let mut log = events::EventLog::open(&self.events, &mut warnings).expect("log");
-            log.append(EventBody::RunResumed {
-                data: events::RunResumed {
-                    head_sha: "resumed-head".to_owned(),
-                    interrupted_attempts: 0,
-                    discarded: Vec::new(),
-                    gates: None,
-                    effort_policy: None,
-                    reviews: None,
-                    chains: None,
-                    normalized_plan_digest: None,
+            let mut log =
+                events::EventLog::open(EventSite::LegacyOpenLog, &self.events, &mut warnings)
+                    .expect("log");
+            log.append(
+                EventSite::LegacyAppend,
+                EventBody::RunResumed {
+                    data: events::RunResumed {
+                        head_sha: "resumed-head".to_owned(),
+                        interrupted_attempts: 0,
+                        discarded: Vec::new(),
+                        gates: None,
+                        effort_policy: None,
+                        reviews: None,
+                        chains: None,
+                        normalized_plan_digest: None,
+                    },
                 },
-            })
+            )
             .expect("resume marker");
-            log.append(EventBody::RunFinished {
-                data: events::RunFinished {
-                    outcome: events::RunOutcome::Complete,
-                    halted_at: None,
-                    committed: 1,
-                    parked: 0,
+            log.append(
+                EventSite::LegacyAppend,
+                EventBody::RunFinished {
+                    data: events::RunFinished {
+                        outcome: events::RunOutcome::Complete,
+                        halted_at: None,
+                        committed: 1,
+                        parked: 0,
+                    },
                 },
-            })
+            )
             .expect("new terminal");
             drop(log);
             drop(lock.take());

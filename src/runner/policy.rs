@@ -547,6 +547,179 @@ mod tests {
         );
     }
 
+    /// `field` copies its value's **bytes**, and does nothing else to them.
+    ///
+    /// The module docs give the grammar as `f(s) = <byte-length>:<bytes>;`, and
+    /// that is written out here rather than read from `field` — a length prefix
+    /// computed by the function under test would agree with any transformation
+    /// the function also applied.
+    ///
+    /// This is the whole class in one assertion. `PR5-CORRECTNESS-004` is
+    /// `value.replace('_', "-")` and `PR5-SEAMS-002` is `value.trim()`; a
+    /// `to_ascii_lowercase`, a whitespace collapse, a Unicode normalisation and
+    /// a delimiter escape are the same defect wearing different clothes, and
+    /// every one of them changes these bytes. INV-23 makes this record
+    /// "execution identity", compared **exactly** across the P1 marker, the P3b
+    /// owner record and `run_started(4).runner`, so any two values the type
+    /// distinguishes must reach the digest distinguishable.
+    #[test]
+    fn field_writes_its_values_bytes_and_transforms_nothing() {
+        let hostile = [
+            "",
+            " ",
+            "creds",
+            "Creds",
+            "CREDS",
+            "creds_a",
+            "creds-a",
+            "creds a",
+            "creds  a",
+            "creds\ta",
+            " creds",
+            "creds ",
+            "creds\n",
+            "creds\r\n",
+            "creds:1;",
+            "creds/../etc",
+            "cafe\u{301}",
+            "caf\u{e9}",
+            "\u{1f600}",
+            "creds\0a",
+        ];
+        let mut encodings = std::collections::BTreeSet::new();
+        for value in hostile {
+            let mut out = Vec::new();
+            field(&mut out, value);
+            let mut expected = value.len().to_string().into_bytes();
+            expected.push(b':');
+            expected.extend_from_slice(value.as_bytes());
+            expected.push(b';');
+            assert_eq!(
+                out,
+                expected,
+                "`{}` was not written verbatim: `{}`",
+                value.escape_debug(),
+                String::from_utf8_lossy(&out).escape_debug()
+            );
+            encodings.insert(out);
+        }
+        assert_eq!(
+            encodings.len(),
+            hostile.len(),
+            "two of the hostile values encode alike, so the set is not the \
+             witness it claims to be"
+        );
+        // The length prefix counts **bytes**, not characters — a two-byte `é`
+        // and a four-byte emoji say so, and a `chars().count()` would not.
+        let mut wide = Vec::new();
+        field(&mut wide, "caf\u{e9}");
+        assert_eq!(wide, b"5:caf\xc3\xa9;".to_vec());
+    }
+
+    /// Two records differing by a character a normaliser would collapse carry
+    /// two digests, in **every** string position of the record.
+    ///
+    /// `PR5-CORRECTNESS-004` names one position (a credential volume's value)
+    /// and one pair (`creds_a` vs `creds-a`); `PR5-SEAMS-002` names the same
+    /// position and a whitespace pair. The class is neither: it is any
+    /// normalisation, anywhere a string reaches [`canonical_bytes`]. So the
+    /// pairs are crossed against every position the record has — image
+    /// reference, image id, image digest, credential-volume **key**, and
+    /// credential-volume **value** — and the counts are asserted rather than
+    /// described.
+    ///
+    /// The failure this prevents is not a wrong answer but a *silent* one: the
+    /// marker's `runner_policy_sha256` and `owner.json`'s full record would
+    /// agree while carrying different execution identities, and
+    /// `prove_private_half_ownership`'s digest conjunct would mint deletion
+    /// authority for a private half belonging to a different runner.
+    #[test]
+    fn a_normalisable_difference_in_any_string_position_moves_the_digest() {
+        /// Pairs a normaliser would fold together. Each is *one* transformation
+        /// away from its twin, so a digest that cannot separate them names the
+        /// transformation that was applied.
+        const PAIRS: &[(&str, &str, &str)] = &[
+            ("underscore/hyphen", "creds_a", "creds-a"),
+            ("trailing space", "creds", "creds  "),
+            ("leading space", "creds", "  creds"),
+            ("interior collapse", "creds a", "creds  a"),
+            ("tab for space", "creds\ta", "creds a"),
+            ("trailing newline", "creds", "creds\n"),
+            ("carriage return", "creds", "creds\r"),
+            ("ascii case", "creds", "Creds"),
+            ("unicode composition", "cafe\u{301}", "caf\u{e9}"),
+            ("empty against blank", "", " "),
+            ("dotted", "creds", "creds."),
+        ];
+
+        // Every string position of the record, by name, as a setter.
+        #[allow(clippy::type_complexity)]
+        let positions: &[(&str, fn(&mut RunnerPolicy, &str))] = &[
+            ("image reference", |policy, value| {
+                policy.image.as_mut().expect("image").reference = value.to_owned();
+            }),
+            ("image id", |policy, value| {
+                policy.image.as_mut().expect("image").id = value.to_owned();
+            }),
+            ("image digest", |policy, value| {
+                policy.image.as_mut().expect("image").digest = Some(value.to_owned());
+            }),
+            ("credential volume key", |policy, value| {
+                let volumes = policy.credential_volumes.as_mut().expect("volumes");
+                volumes.remove("codex");
+                volumes.insert(value.to_owned(), "creds-cx".to_owned());
+            }),
+            ("credential volume value", |policy, value| {
+                policy
+                    .credential_volumes
+                    .as_mut()
+                    .expect("volumes")
+                    .insert("codex".to_owned(), value.to_owned());
+            }),
+        ];
+
+        let mut checked = 0_usize;
+        for (position, set) in positions {
+            for (pair, left, right) in PAIRS {
+                assert_ne!(left, right, "{pair}: the fixture pair is one value");
+                let mut a = container_fixture();
+                let mut b = container_fixture();
+                set(&mut a, left);
+                set(&mut b, right);
+                assert_ne!(
+                    a, b,
+                    "{position}/{pair}: the two records are equal, so the digest \
+                     is not being asked anything"
+                );
+                assert_ne!(
+                    canonical_bytes(&a),
+                    canonical_bytes(&b),
+                    "{position}/{pair}: `{}` and `{}` canonicalize alike",
+                    left.escape_debug(),
+                    right.escape_debug()
+                );
+                assert_ne!(
+                    runner_policy_sha256(&a),
+                    runner_policy_sha256(&b),
+                    "{position}/{pair}: two execution identities share one \
+                     runner_policy_sha256, so INV-23's exact equality cannot see \
+                     the difference"
+                );
+                checked += 1;
+            }
+        }
+        assert_eq!(
+            positions.len(),
+            5,
+            "five string positions: reference, id, digest, volume key, volume value"
+        );
+        assert_eq!(PAIRS.len(), 11, "eleven normalisations");
+        assert_eq!(
+            checked, 55,
+            "every position crossed with every normalisation"
+        );
+    }
+
     /// A length-prefixed encoding is injective; a delimiter-only one is not.
     #[test]
     fn field_values_carrying_the_delimiters_do_not_collide() {

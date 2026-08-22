@@ -8,6 +8,10 @@
 //! diff must plausibly add test code; lenient by design, with step-6 review
 //! as the backstop); the dynamic fail-on-base/pass-on-HEAD check needs v0.2
 //! worktrees to run safely.
+// LEGACY-EFFECT: this module is in the **frozen legacy section** of
+// `effects/allowlist.toml`, which carries its justification and the condition
+// under which the section shrinks. `decisions.effect_site_inventory.mechanism` (2).
+#![allow(clippy::disallowed_methods, clippy::disallowed_types)]
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -726,6 +730,224 @@ mod tests {
             panic!("must time out");
         };
         assert!(log.contains("timed out"), "log: {log}");
+    }
+
+    // -----------------------------------------------------------------------
+    // What a ShellGate does with what the Runner hands back
+    // -----------------------------------------------------------------------
+
+    /// A Runner that answers with exactly what a test tells it to.
+    ///
+    /// The gate tests above all run a **real** `HostRunner`, which is right for
+    /// what they measure and is why two of this mapping's branches had never
+    /// been reached: a working host cannot produce `output_limited` on demand
+    /// (`PR5-CORRECTNESS-011`) and cannot be made to fail its spawn without
+    /// depending on what is installed on the machine — the environment-
+    /// assumption class recorded as `PR4-CI-ENVIRONMENT-ASSUMPTIONS`
+    /// (`PR5-CORRECTNESS-007`). So the supervision result becomes an input.
+    ///
+    /// It records what it was asked, so a grid cannot pass while sending a
+    /// request production never sends.
+    struct ScriptedRunner {
+        answer: Scripted,
+        seen: std::sync::Mutex<Vec<crate::runner::RunnerRequest>>,
+    }
+
+    enum Scripted {
+        /// What the process did.
+        Output(Box<crate::agent::ProcessOutput>),
+        /// What a spawn failure looks like: `agent::proc` maps a failed
+        /// `ProcessTree::spawn` to `TactusError::Agent { "failed to spawn …" }`.
+        SpawnFailure,
+    }
+
+    impl ScriptedRunner {
+        fn new(answer: Scripted) -> Self {
+            Self {
+                answer,
+                seen: std::sync::Mutex::new(Vec::new()),
+            }
+        }
+
+        fn seen(&self) -> Vec<crate::runner::RunnerRequest> {
+            self.seen
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone()
+        }
+    }
+
+    impl Runner for ScriptedRunner {
+        fn run(
+            &self,
+            request: &crate::runner::RunnerRequest,
+        ) -> Result<crate::agent::ProcessOutput, TactusError> {
+            self.seen
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push(request.clone());
+            match &self.answer {
+                Scripted::Output(out) => Ok((**out).clone()),
+                Scripted::SpawnFailure => Err(TactusError::Agent {
+                    message: "failed to spawn `sh`: No such file or directory (os error 2)"
+                        .to_owned(),
+                }),
+            }
+        }
+    }
+
+    fn supervised(
+        code: Option<i32>,
+        timed_out: bool,
+        output_limited: bool,
+    ) -> crate::agent::ProcessOutput {
+        crate::agent::ProcessOutput {
+            code,
+            stdout: "some output\n".to_owned(),
+            stderr: "some diagnostics\n".to_owned(),
+            duration: Duration::from_millis(7),
+            timed_out,
+            output_limited,
+        }
+    }
+
+    /// What the gate must do with each shape the supervisor can hand it.
+    ///
+    /// The expectation is a **literal per row**, not a re-derivation of
+    /// `check`'s branch order — a function may not be its own oracle
+    /// (`PR3-SELF-ORACLE`), and the two rows that matter here are precisely the
+    /// ones where a re-derivation would agree with the wrong branch order:
+    /// `output_limited` with `code == Some(0)`, and `timed_out` with
+    /// `code == Some(0)`. Both are `Fail`, because §19 makes a gate's verdict a
+    /// statement about *evidence*, and truncated or supervisor-terminated
+    /// evidence authorizes nothing.
+    ///
+    /// Twelve supervised shapes — three exit codes crossed with both flags —
+    /// plus the un-run process, which is not a verdict at all.
+    #[test]
+    fn a_shell_gate_maps_every_supervision_result_the_way_the_contract_says() {
+        /// (code, `timed_out`, `output_limited`, expected pass?, what the log
+        /// must name).
+        const GRID: &[(Option<i32>, bool, bool, bool, &str)] = &[
+            (Some(0), false, false, true, ""),
+            (Some(1), false, false, false, "exit code"),
+            (None, false, false, false, "exit code"),
+            (Some(0), true, false, false, "timed out"),
+            (Some(1), true, false, false, "timed out"),
+            (None, true, false, false, "timed out"),
+            (Some(0), false, true, false, "output limit"),
+            (Some(1), false, true, false, "output limit"),
+            (None, false, true, false, "output limit"),
+            (Some(0), true, true, false, "output limit"),
+            (Some(1), true, true, false, "output limit"),
+            (None, true, true, false, "output limit"),
+        ];
+
+        let repo = temp_repo("supervision-grid");
+        let ws = Workspace::open(&repo).expect("open");
+        let mut passes = 0_usize;
+        let mut fails = 0_usize;
+        for (code, timed_out, output_limited, expect_pass, must_name) in GRID {
+            let runner = ScriptedRunner::new(Scripted::Output(Box::new(supervised(
+                *code,
+                *timed_out,
+                *output_limited,
+            ))));
+            let cell = format!("code={code:?} timed_out={timed_out} limited={output_limited}");
+            let result = gate("does-not-matter", 30)
+                .check(&runner, gate_id(0), &ws)
+                .unwrap_or_else(|error| {
+                    panic!("{cell}: a supervised result is a verdict: {error}")
+                });
+            match (result, expect_pass) {
+                (GateResult::Pass { log }, true) => {
+                    assert!(
+                        log.contains("some output"),
+                        "{cell}: the log carries stdout"
+                    );
+                    passes += 1;
+                }
+                (GateResult::Fail { log }, false) => {
+                    assert!(
+                        log.contains(must_name),
+                        "{cell}: the log must say why it failed (`{must_name}`): {log}"
+                    );
+                    assert!(
+                        log.contains("some output") && log.contains("some diagnostics"),
+                        "{cell}: and still carry the evidence: {log}"
+                    );
+                    fails += 1;
+                }
+                (actual, _) => panic!("{cell}: expected pass={expect_pass}, got {actual:?}"),
+            }
+            // The request really is the one production sends for this role.
+            let seen = runner.seen();
+            assert_eq!(seen.len(), 1, "{cell}: one process per gate check");
+            assert!(
+                matches!(seen[0].role, crate::runner::ExecutionRole::Gate)
+                    && seen[0].agent.is_none(),
+                "{cell}: a gate runs unbound in the Gate role"
+            );
+        }
+        assert_eq!(GRID.len(), 12, "three exit codes crossed with both flags");
+        assert_eq!(passes, 1, "exactly one shape is a pass");
+        assert_eq!(fails, 11, "and every other shape is a failure");
+    }
+
+    /// A process that never ran is an environment problem, not a verdict.
+    ///
+    /// `decisions.pr_sequence[5].slice_contract.expected_failures_refusals[2]`:
+    /// "spawn failure -> existing semantics (**returned error**; no halting
+    /// settlement is synthesized …)". A `GateResult::Fail` here is a synthesized
+    /// settlement: it becomes a `GateFailure`, an `attempt_finished` and a
+    /// ladder transition, so a machine with a broken shell would burn a task's
+    /// whole retry ladder on an outage. §19's own words are in `check`'s doc
+    /// comment: "A gate *failing* is `GateResult::Fail`, never an error".
+    ///
+    /// Both layers, because the propagation is the claim and it has two steps:
+    /// `ShellGate::check` returns the error, and `run_all` — which owns the
+    /// short-circuit and the evidence file — hands it out rather than turning it
+    /// into `Ok(Some(GateFailure))`.
+    #[test]
+    fn a_gate_whose_process_never_ran_returns_the_error_and_synthesizes_nothing() {
+        let repo = temp_repo("spawn-failure");
+        let ws = Workspace::open(&repo).expect("open");
+        let logs = temp_dir("spawn-failure-logs");
+
+        let runner = ScriptedRunner::new(Scripted::SpawnFailure);
+        let error = gate("does-not-matter", 30)
+            .check(&runner, gate_id(0), &ws)
+            .expect_err("an infrastructure failure is not a gate verdict");
+        assert!(
+            error.to_string().contains("failed to spawn"),
+            "the runner's own diagnostic reaches the caller: {error}"
+        );
+
+        // And through `run_all`, where the settlement would be synthesized. Two
+        // gates, so a short-circuit that returned `Ok(None)` after skipping
+        // them both would still be caught by the count below.
+        let runner = ScriptedRunner::new(Scripted::SpawnFailure);
+        let gates = [gate("first", 30), gate("second", 30)];
+        let error = run_all(&gates, &runner, &gate_id, &ws, &logs, "task-stem", 1)
+            .expect_err("run_all propagates it");
+        assert!(
+            error.to_string().contains("failed to spawn"),
+            "and names the same thing: {error}"
+        );
+        assert_eq!(
+            runner.seen().len(),
+            1,
+            "the first failure stops the sequence"
+        );
+        let written: Vec<_> = fs::read_dir(&logs)
+            .expect("log dir")
+            .filter_map(Result::ok)
+            .map(|entry| entry.file_name())
+            .collect();
+        assert!(
+            written.is_empty(),
+            "a process that never ran leaves no evidence file: {written:?}"
+        );
     }
 
     #[test]

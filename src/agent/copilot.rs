@@ -44,6 +44,10 @@
 //! Docs:
 //! <https://docs.github.com/en/copilot/reference/copilot-cli-reference/cli-programmatic-reference>
 //! (flags verified Aug 2026).
+// LEGACY-EFFECT: this module is in the **frozen legacy section** of
+// `effects/allowlist.toml`, which carries its justification and the condition
+// under which the section shrinks. `decisions.effect_site_inventory.mechanism` (2).
+#![allow(clippy::disallowed_methods, clippy::disallowed_macros)]
 
 use std::path::PathBuf;
 use std::sync::OnceLock;

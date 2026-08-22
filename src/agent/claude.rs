@@ -6,6 +6,10 @@
 //! a narrow per-run settings JSON the engine materializes to a file and this
 //! adapter passes via `--settings`, keeping the workspace's own
 //! `.claude/settings.json` untouched.
+// LEGACY-EFFECT: this module is in the **frozen legacy section** of
+// `effects/allowlist.toml`, which carries its justification and the condition
+// under which the section shrinks. `decisions.effect_site_inventory.mechanism` (2).
+#![allow(clippy::disallowed_methods, clippy::disallowed_macros)]
 
 use std::path::PathBuf;
 use std::sync::OnceLock;

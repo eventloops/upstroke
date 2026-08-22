@@ -22,6 +22,10 @@
 //! grant that no longer matches the command it is meant to authorize. The
 //! module comment used to argue that two copies of the quoting logic would be
 //! two chances to get it wrong. The right number was zero.
+// LEGACY-EFFECT: this module is in the **frozen legacy section** of
+// `effects/allowlist.toml`, which carries its justification and the condition
+// under which the section shrinks. `decisions.effect_site_inventory.mechanism` (2).
+#![allow(clippy::disallowed_methods)]
 
 use std::path::PathBuf;
 use std::sync::OnceLock;
@@ -177,6 +181,32 @@ pub fn extract_version(stdout: &str) -> String {
                 .to_owned()
         })
         .unwrap_or_else(|| first_line.to_owned())
+}
+
+/// Test-only constructors.
+///
+/// Below every production item on purpose: `effects::production_region` cuts a
+/// file at its **first** `#[cfg(test)]`, so a test-only item placed among the
+/// production ones takes the rest of the file out of the wrapper-classification
+/// domain — silently, and `mechanism` (3)'s "every pubfn … is classified" would
+/// then be true of a domain nobody drew. That is `PR5D-VISIBILITY-CHECK-
+/// DUPLICATED`'s shape one level out, and it was measured here: five of this
+/// module's functions left the census the moment a `#[cfg(test)] fn` was added
+/// above them.
+#[cfg(test)]
+impl Invocation {
+    /// An invocation naming `path`, for tests that need one without asking
+    /// this machine what it has installed.
+    ///
+    /// Production's only constructors are [`locate`] and [`locate_with`], which
+    /// resolve against `PATH` and memoise into a process-wide `OnceLock` that
+    /// every sibling test in the binary then reads. A test that needs to drive
+    /// a *pre-flight sequence* — the six strict-config parser probes, say —
+    /// must not go through them. That is the hazard `4631a3f` repaired once
+    /// already.
+    pub(crate) fn at(path: impl Into<PathBuf>) -> Self {
+        Self { path: path.into() }
+    }
 }
 
 #[cfg(test)]

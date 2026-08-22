@@ -4,6 +4,10 @@
 //! strategy) and user-level `~/.tactus/pools.toml` (capacity pools, normally
 //! written by `tactus connect`). Both missing is the normal fresh-repo case
 //! and falls back to derived defaults silently.
+// LEGACY-EFFECT: this module is in the **frozen legacy section** of
+// `effects/allowlist.toml`, which carries its justification and the condition
+// under which the section shrinks. `decisions.effect_site_inventory.mechanism` (2).
+#![allow(clippy::disallowed_methods)]
 
 use std::collections::BTreeMap;
 use std::fs;

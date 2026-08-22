@@ -3359,28 +3359,68 @@ mod tests {
     }
 
     /// A run directory holding one frozen plan and one log, removed on drop.
+    ///
+    /// Every effect here goes through a funnel that takes a site — the run
+    /// directory through `RunDir.CreatePublicDir`, the frozen plan through
+    /// `RunDir.WritePlan`, the log through `Event.LegacyOpenLog` and
+    /// `Event.LegacyAppend`, the teardown through `RunDir.RemovePublicHusk`.
+    /// It has to: `decisions.effect_site_inventory.mechanism` (2) puts a raw
+    /// `fs` call in a **topology** module beyond reach of every allow the
+    /// allowlist can grant, because the legacy section "never contains a
+    /// topology module (src/topology/**, …)" and the funnel section's clause is
+    /// about performing effects inside site-taking APIs. PR5 lane D turned the
+    /// denial on; this is what it demanded, and nothing about what the test
+    /// below proves has changed.
     struct RunFixture {
         root: PathBuf,
+        public: PathBuf,
     }
 
     impl RunFixture {
+        /// One run directory: the plan, and a log written once.
+        ///
+        /// The plan is rewritten in place by [`Self::reproject`] rather than a
+        /// second fixture being built beside this one, because the log would
+        /// then be appended twice and `EventLog::append` stamps the wall clock —
+        /// two logs, two sets of timestamps, and `Row::run_started_at` carries
+        /// them into the export. One log, one set of timestamps, and the only
+        /// thing that differs between the two projections is the plan, which is
+        /// exactly the claim.
         fn new(tag: &str, plan: &Plan, log: &[Event]) -> Self {
             let root =
                 std::env::temp_dir().join(format!("tactus-registry-{tag}-{}", std::process::id()));
             let public = crate::rundir::public_dir(&root, RUN_ID);
-            std::fs::create_dir_all(&public).expect("run directory");
-            std::fs::write(public.join("plan.normalized.json"), normalized_bytes(plan))
+            let hooks = &mut crate::rundir::NoHooks;
+            crate::rundir::create_public_dir(&public, hooks).expect("run directory");
+            crate::rundir::write_plan(&public, &normalized_bytes(plan), hooks)
                 .expect("frozen plan");
-            let lines: Vec<String> = log
-                .iter()
-                .map(|event| serde_json::to_string(event).expect("event json"))
-                .collect();
-            std::fs::write(
-                public.join("events.jsonl"),
-                format!("{}\n", lines.join("\n")),
+            let mut warnings = Vec::new();
+            let mut writer = crate::events::EventLog::open(
+                crate::topology::effects::EventSite::LegacyOpenLog,
+                &public.join("events.jsonl"),
+                &mut warnings,
             )
             .expect("event log");
-            Self { root }
+            assert!(warnings.is_empty(), "{warnings:?}");
+            for event in log {
+                writer
+                    .append(
+                        crate::topology::effects::EventSite::LegacyAppend,
+                        event.body.clone(),
+                    )
+                    .expect("append");
+            }
+            Self { root, public }
+        }
+
+        /// Replace the frozen plan, leaving the log alone.
+        fn reproject(&self, plan: &Plan) {
+            crate::rundir::write_plan(
+                &self.public,
+                &normalized_bytes(plan),
+                &mut crate::rundir::NoHooks,
+            )
+            .expect("frozen plan");
         }
 
         fn exported(&self, format: crate::export::Format) -> Vec<u8> {
@@ -3393,7 +3433,7 @@ mod tests {
 
     impl Drop for RunFixture {
         fn drop(&mut self) {
-            let _ = std::fs::remove_dir_all(&self.root);
+            let _ = crate::rundir::remove_public_husk(&self.public, &mut crate::rundir::NoHooks);
         }
     }
 
@@ -3403,13 +3443,14 @@ mod tests {
         let rebuilt = round_tripped(&plan);
         let log = event_log(&started_for(&plan));
 
-        let from_plan = RunFixture::new("plan", &plan, &log);
-        let from_registry = RunFixture::new("registry", &rebuilt, &log);
+        let run = RunFixture::new("projection", &plan, &log);
 
         for format in [crate::export::Format::Jsonl, crate::export::Format::Csv] {
-            let expected = from_plan.exported(format);
+            run.reproject(&plan);
+            let expected = run.exported(format);
+            run.reproject(&rebuilt);
             assert_eq!(
-                from_registry.exported(format),
+                run.exported(format),
                 expected,
                 "the export projection moved"
             );

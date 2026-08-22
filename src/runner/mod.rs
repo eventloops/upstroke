@@ -1236,8 +1236,48 @@ mod tests {
         kept
     }
 
+    /// Every source file the crate declares as `#[cfg(test)] mod <name>;`.
+    ///
+    /// Such a file is test code end to end, and [`production_region`] — which
+    /// cuts a file at its first *inline* `#[cfg(test)]` — has nothing to cut in
+    /// one, so it would count the whole of it as production. The set is read
+    /// out of the declarations rather than listed by hand: it was
+    /// `src/engine/tests.rs` alone until PR5 moved the Event funnel into
+    /// `src/events/log.rs` with two test modules of its own, and the census
+    /// failed on the first file the hand-maintained list did not know about.
+    fn whole_file_test_modules(files: &[PathBuf]) -> std::collections::BTreeSet<PathBuf> {
+        files
+            .iter()
+            .flat_map(|path| {
+                let source = std::fs::read_to_string(path).expect("read source");
+                let parent = path.parent().expect("a source file has a directory");
+                let stem = path.file_stem().expect("a source file has a name");
+                let dir = if stem == "mod" || stem == "lib" || stem == "main" {
+                    parent.to_path_buf()
+                } else {
+                    parent.join(stem)
+                };
+                source
+                    .split("#[cfg(test)]")
+                    .skip(1)
+                    .filter_map(|rest| {
+                        let name = rest.trim_start().strip_prefix("mod ")?;
+                        let name = name.split(';').next()?.trim();
+                        (!name.is_empty() && !name.contains('{')).then(|| {
+                            [
+                                dir.join(format!("{name}.rs")),
+                                dir.join(name).join("mod.rs"),
+                            ]
+                        })
+                    })
+                    .flatten()
+                    .collect::<Vec<_>>()
+            })
+            .collect()
+    }
+
     /// Every `src/**/*.rs`, as `(repo-relative path, production region)`, with
-    /// the whole-file test module left out.
+    /// whole-file test modules left out.
     fn production_sources() -> Vec<(String, String)> {
         fn walk(dir: &std::path::Path, into: &mut Vec<PathBuf>) {
             let mut entries: Vec<_> = std::fs::read_dir(dir)
@@ -1258,17 +1298,24 @@ mod tests {
         let mut files = Vec::new();
         walk(&root.join("src"), &mut files);
         assert!(files.len() > 20, "the walk found the tree: {}", files.len());
+        let test_modules = whole_file_test_modules(&files);
+        // The control: a derivation that found nothing would silently count
+        // every test file as production, which is the failure this replaces.
+        assert!(
+            test_modules.contains(&root.join("src").join("engine").join("tests.rs")),
+            "the `#[cfg(test)] mod tests;` derivation found no engine test module: {test_modules:?}"
+        );
         files
             .into_iter()
             .filter_map(|path| {
+                if test_modules.contains(&path) {
+                    return None;
+                }
                 let relative = path
                     .strip_prefix(&root)
                     .expect("under the manifest")
                     .to_string_lossy()
                     .replace('\\', "/");
-                if relative == "src/engine/tests.rs" {
-                    return None;
-                }
                 let source = std::fs::read_to_string(&path).expect("read source");
                 Some((relative, production_region(&source)))
             })
@@ -1408,6 +1455,37 @@ mod tests {
                  never do.\" A git call that started going through the Runner \
                  would be a defect in the other direction",
             ),
+            (
+                "src/workspace_manager.rs",
+                2,
+                0,
+                0,
+                "the same decision as src/workspace.rs, for the schema-4 \
+                 primitives: authoritative Git, deliberately NOT routed \
+                 (DESIGN.md:612). Two `Command::new(` — one hook-free builder \
+                 every effectful funnel goes through, and one read-only \
+                 inspection helper the residue classifier uses — and no \
+                 `.spawn()`, because every one of them is a `.output()` the \
+                 funnel waits on. `decisions.workspace_candidates.manager` puts \
+                 worktrees, snapshots, refs and Git objects behind these \
+                 funnels; nothing here is a CLI, a gate, or a reviewer",
+            ),
+            (
+                "src/effects.rs",
+                1,
+                0,
+                0,
+                "NOT a process start at all: the one `Command::new(` is inside \
+                 `DENIAL_FIXTURES`, a string constant whose whole purpose is to \
+                 be REFUSED. `effects::tests::every_declared_effect_denial_\
+                 refuses_for_the_reason_it_declares` compiles it against \
+                 `clippy.toml` and asserts it emits `clippy::disallowed_types` \
+                 naming `std::process::Command` — so this row is the denylist's \
+                 own evidence, and if it ever started compiling clean that test \
+                 fails first. This census counts literal occurrences and does \
+                 not strip string literals (`PR4-CENSUS-COMMENT-ORACLE`), which \
+                 is why the row exists rather than the count being zero",
+            ),
         ];
 
         fn count(haystack: &str, needle: &str) -> usize {
@@ -1437,11 +1515,13 @@ mod tests {
              (DESIGN.md:612): route it through the Runner, or say here why it \
              is one of the things that never crosses the boundary"
         );
-        // The table names three files, and it is the *set* that is the claim:
+        // The table names five files, and it is the *set* that is the claim:
         // adapters, gates, review and the engine appear nowhere in it, which
         // is what "every CLI and gate process executes through Runner" means
-        // once the migration has happened.
-        assert_eq!(expected.len(), 3);
+        // once the migration has happened. Four of the five really do start a
+        // process; the fifth, `src/effects.rs`, is a fixture that exists to be
+        // refused, and its row says so.
+        assert_eq!(expected.len(), 5);
         for name in [
             "src/gates.rs",
             "src/review.rs",
@@ -1474,9 +1554,18 @@ mod tests {
         // its writes execute.
         for (file, why) in [
             (
-                "src/events.rs",
-                "the event log: DESIGN.md:612 puts it, with authoritative Git, \
-                 among the things that never cross the boundary",
+                "src/events/mod.rs",
+                "the event vocabulary and fold: DESIGN.md:612 puts the event log, \
+                 with authoritative Git, among the things that never cross the \
+                 boundary",
+            ),
+            (
+                // PR5 moved the writer here. The claim follows the code: this
+                // file is now the only one that writes the log, so it is the
+                // one an append-by-subprocess would have to appear in.
+                "src/events/log.rs",
+                "the event log writer: DESIGN.md:612 puts it, with authoritative \
+                 Git, among the things that never cross the boundary",
             ),
             (
                 "src/topology/events.rs",
@@ -1643,16 +1732,39 @@ mod tests {
     /// `CommandSpec`'s builders and `std::process::Command`'s methods spell
     /// them the same way, and each row says which it is. A file that grows one
     /// fails here until somebody decides whether the grids have to carry it.
+    ///
+    /// **A method call is not the only way to populate a field.**
+    /// `PR5-FIDELITY-001`: the two spec *constructors* build a `CommandSpec`
+    /// with a struct literal, so `env: Vec::new()` at `src/agent/bin.rs`
+    /// becoming an argument-dependent overlay is a production site this census
+    /// could not see at all — pre-flight would then launch the probe with an
+    /// overlay the spending command does not carry, against DESIGN.md:262-264.
+    /// So the third column counts struct-literal `env:`/`stdin:` initializers
+    /// too, and the constructors are enumerated rows like everything else.
     #[test]
     fn every_production_command_spec_payload_is_classified() {
         use std::collections::BTreeMap;
 
-        /// (file, `.stdin(`, `.env(`, and what they are).
-        const EXPECTED: &[(&str, usize, usize, &str)] = &[
+        /// (file, `.stdin(`, `.env(`, struct-literal `env:`/`stdin:`, and what
+        /// they are).
+        const EXPECTED: &[(&str, usize, usize, usize, &str)] = &[
+            (
+                "src/agent/bin.rs",
+                0,
+                0,
+                2,
+                "`Invocation::spec` — one of the crate's two CommandSpec \
+                 constructors. Both payload fields are `Vec::new()`, and \
+                 `a_command_specs_payload_does_not_depend_on_its_arguments` is \
+                 what says they stay constant over production's own argument \
+                 vectors. Invisible to the method-call columns, which is why \
+                 this column exists (PR5-FIDELITY-001)",
+            ),
             (
                 "src/agent/proc.rs",
                 1,
                 1,
+                0,
                 "the process funnel's own `Command`: `.stdin(Stdio::piped())` \
                  is the pipe it writes the payload into, and the `.env` is the \
                  reaper's `/bin/ps` query on macOS. Neither is a CommandSpec",
@@ -1661,12 +1773,23 @@ mod tests {
                 "src/engine/attempt.rs",
                 1,
                 0,
+                0,
                 "the worker's prompt: `CommandSpec::stdin` from \
                  `AgentAdapter::stdin_payload`. The role grid carries it",
             ),
             (
+                "src/gates.rs",
+                0,
+                0,
+                2,
+                "`ShellKind::spec` — the crate's other CommandSpec \
+                 constructor, and the same answer: two `Vec::new()` payload \
+                 fields, held constant by the same test",
+            ),
+            (
                 "src/review.rs",
                 1,
+                0,
                 0,
                 "the reviewer's prompt, from the same seam. The role grid \
                  carries it",
@@ -1675,38 +1798,218 @@ mod tests {
                 "src/workspace.rs",
                 1,
                 4,
+                0,
                 "authoritative Git, which DESIGN.md:612 keeps off the boundary \
                  entirely: `std::process::Command` methods on git invocations, \
                  not a CommandSpec",
             ),
+            (
+                "src/workspace_manager.rs",
+                2,
+                6,
+                0,
+                "authoritative Git again, and the same answer: \
+                 `std::process::Command` methods on git invocations, never a \
+                 CommandSpec. The two `.stdin(` are `Stdio::null()` on the two \
+                 builders — these funnels feed no payload to a child — and the \
+                 six `.env(` are the fixed author/committer identity and dates \
+                 that make a commit-tree a function of its inputs rather than \
+                 of the machine",
+            ),
         ];
 
-        let mut found: BTreeMap<String, (usize, usize)> = BTreeMap::new();
+        let mut found: BTreeMap<String, (usize, usize, usize)> = BTreeMap::new();
+        let mut stripped = 0_usize;
         for (relative, production) in production_sources() {
-            let code: String = production
+            let kept: Vec<&str> = production
                 .lines()
                 .filter(|line| !line.trim_start().starts_with("//"))
-                .collect::<Vec<_>>()
-                .join("\n");
+                .collect();
+            stripped += production.lines().count() - kept.len();
+            let code: String = kept.join("\n");
             let counts = (
                 code.matches(".stdin(").count(),
                 code.matches(".env(").count(),
+                // Struct-literal initializers of the same two fields. Anchored
+                // at the start of a line so `.env(` chains and doc prose cannot
+                // contribute, and counted separately so a row says which kind
+                // of population it is.
+                code.lines()
+                    .filter(|line| {
+                        let line = line.trim_start();
+                        line.starts_with("env:") || line.starts_with("stdin:")
+                    })
+                    .count(),
             );
-            if counts != (0, 0) {
+            if counts != (0, 0, 0) {
                 found.insert(relative, counts);
             }
         }
+        // The comment strip is a census over a file format that has comments,
+        // which is `PR4-CENSUS-COMMENT-ORACLE`'s class. Assert it removed
+        // something: a strip that silently stopped working would put every doc
+        // comment mentioning `.env(` back into the counts.
+        assert!(
+            stripped > 100,
+            "the comment strip removed {stripped} lines, so it is not working"
+        );
 
-        let expected: BTreeMap<String, (usize, usize)> = EXPECTED
+        let expected: BTreeMap<String, (usize, usize, usize)> = EXPECTED
             .iter()
-            .map(|(file, stdin, env, _)| ((*file).to_owned(), (*stdin, *env)))
+            .map(|(file, stdin, env, literal, _)| ((*file).to_owned(), (*stdin, *env, *literal)))
             .collect();
         assert_eq!(
             found, expected,
             "a production call site populates a CommandSpec payload field. Classify it, and if \
              it is a spec field, make the fixture grids carry that shape — an observer \
-             suppression keyed on a field no grid varies is invisible (PR4-CONF-006)"
+             suppression keyed on a field no grid varies is invisible (PR4-CONF-006), and one \
+             keyed on a field no census counts is invisible twice (PR5-FIDELITY-001)"
         );
+    }
+
+    /// The two spec constructors' payload is a function of nothing.
+    ///
+    /// DESIGN.md:262-264: "Probe and execution compose the **same** base,
+    /// mounts, reserved values, and overlay, so pre-flight certifies the
+    /// environment that will actually spend." A probe and a work command differ
+    /// in exactly one thing — their **arguments** — so an overlay that varies
+    /// with the arguments is an overlay that differs between pre-flight and
+    /// spend, and `PR5-FIDELITY-001` is that edit at `bin::Invocation::spec`.
+    ///
+    /// The census above says a site *exists*; this says what it produces. Both
+    /// are needed and neither implies the other: a census cannot tell
+    /// `Vec::new()` from a conditional, and a fixture that built one spec
+    /// cannot tell a constant from a function of its input.
+    ///
+    /// The argument vectors are production's own — every adapter's `--version`
+    /// probe, every adapter's `build_args` fresh and resumed, Codex's six
+    /// strict-config parser probes' shape, and the gate/shell dialects — so
+    /// this is a statement about the values production actually passes and not
+    /// about invented ones.
+    #[test]
+    fn a_command_specs_payload_does_not_depend_on_its_arguments() {
+        use crate::agent::bin::Invocation;
+
+        fn run(agent: &str, resume: Option<&str>) -> crate::agent::TaskRun {
+            crate::agent::TaskRun {
+                prompt: "Do the thing.".to_owned(),
+                profile: crate::ir::WorkerProfile {
+                    name: "impl-mid".to_owned(),
+                    agent: agent.to_owned(),
+                    model: "a-model".to_owned(),
+                    pool: "a-pool".to_owned(),
+                    permissions: crate::ir::PermissionMode::ReadOnly,
+                    effort: Some(crate::ir::Effort::Medium),
+                    max_turns: Some(30),
+                    extra_args: Vec::new(),
+                },
+                workspace: PathBuf::from("."),
+                gate_cmds: Vec::new(),
+                resume_session: resume.map(str::to_owned),
+                settings_path: None,
+            }
+        }
+
+        let mut argument_vectors: Vec<Vec<String>> = vec![
+            vec!["--version".to_owned()],
+            vec!["--help".to_owned()],
+            vec!["exec".to_owned(), "--help".to_owned()],
+            vec![
+                "exec".to_owned(),
+                "--ignore-user-config".to_owned(),
+                "--strict-config".to_owned(),
+                "-c".to_owned(),
+                "model_reasoning_effort=xhigh".to_owned(),
+            ],
+            vec!["login".to_owned(), "status".to_owned()],
+            vec!["debug".to_owned(), "models".to_owned()],
+            Vec::new(),
+        ];
+        for id in ["claude-code", "codex", "copilot"] {
+            for resume in [None, Some("session-1")] {
+                argument_vectors.push(match id {
+                    "claude-code" => crate::agent::claude::build_args(&run(id, resume)),
+                    "codex" => crate::agent::codex::build_args(&run(id, resume)),
+                    _ => crate::agent::copilot::build_args(&run(id, resume)),
+                });
+            }
+        }
+        assert!(
+            argument_vectors.len() >= 13,
+            "the argument vectors are production's own: {}",
+            argument_vectors.len()
+        );
+        assert!(
+            argument_vectors
+                .iter()
+                .any(|args| args.first().is_some_and(|arg| arg == "--version")),
+            "a probe's argument vector must be among them, or the claim is untested"
+        );
+        assert!(
+            argument_vectors
+                .iter()
+                .any(|args| args.first().is_some_and(|arg| arg == "exec")),
+            "and a work command's"
+        );
+
+        // (a) `bin::Invocation::spec`, the agent-CLI constructor.
+        let invocation = Invocation::at(if cfg!(windows) {
+            r"C:\nowhere\claude.cmd"
+        } else {
+            "/nowhere/claude"
+        });
+        /// One spec's payload: its overlay and its stdin.
+        type Payload = (Vec<(String, String)>, Vec<u8>);
+        let mut payloads: Vec<Payload> = Vec::new();
+        for args in &argument_vectors {
+            let spec = invocation.spec(args).expect("a Unicode path");
+            assert_eq!(&spec.args, args, "the arguments are carried verbatim");
+            payloads.push((spec.env, spec.stdin));
+        }
+        let first = payloads.first().expect("at least one vector").clone();
+        for (index, payload) in payloads.iter().enumerate() {
+            assert_eq!(
+                payload, &first,
+                "`Invocation::spec` gave argument vector {index} ({:?}) a different \
+                 payload than it gave {:?} — pre-flight would then certify an \
+                 environment other than the one that spends",
+                argument_vectors[index], argument_vectors[0]
+            );
+        }
+        assert_eq!(
+            first,
+            (Vec::new(), Vec::new()),
+            "and the payload production's constructor writes is empty"
+        );
+
+        // (b) `gates::ShellKind::spec`, the other one. Every dialect, because
+        // the shell is a field of the record and not a constant.
+        let mut shell_payloads: Vec<Payload> = Vec::new();
+        use crate::gates::ShellKind;
+        for shell in [
+            ShellKind::Cmd,
+            ShellKind::Sh,
+            ShellKind::Bash,
+            ShellKind::PowerShell,
+            ShellKind::Pwsh,
+        ] {
+            for line in ["exit 0", "cargo test --all", "echo \"quoted arg\""] {
+                let spec = shell.spec(line);
+                shell_payloads.push((spec.env, spec.stdin));
+            }
+        }
+        assert_eq!(
+            shell_payloads.len(),
+            15,
+            "five dialects, three command lines"
+        );
+        for payload in &shell_payloads {
+            assert_eq!(
+                payload,
+                &(Vec::new(), Vec::new()),
+                "`ShellKind::spec` populated a payload field"
+            );
+        }
     }
 
     #[test]

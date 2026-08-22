@@ -1,3 +1,8 @@
+// LEGACY-EFFECT: this module is in the **frozen legacy section** of
+// `effects/allowlist.toml`, which carries its justification and the condition
+// under which the section shrinks. `decisions.effect_site_inventory.mechanism` (2).
+#![allow(clippy::disallowed_methods)]
+
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::PathBuf;
@@ -21,6 +26,7 @@ use super::preflight::{
     preflight_with_recorded, validate_inputs,
 };
 use super::report::{RunReport, last_reason};
+use crate::topology::effects::EventSite;
 
 #[cfg(test)]
 pub(super) fn resume_harness_inner(
@@ -590,7 +596,7 @@ pub(super) fn resume_harness_inner_on(
     // state is moved into the scheduler — what the earlier process learned
     // about the pools, which a resumed run's snapshot must not forget.
     let prior_signals = capacity::observe(&replayed.events).exhausted;
-    let log = EventLog::open(&paths.events(), &mut warnings)?;
+    let log = EventLog::open(EventSite::LegacyOpenLog, &paths.events(), &mut warnings)?;
     let established_reviews = recorded_complete_reviews
         .is_none()
         .then(|| review_plan.clone());
@@ -600,6 +606,7 @@ pub(super) fn resume_harness_inner_on(
         workspace: &workspace,
         paths,
         log,
+        log_hooks: Box::new(crate::events::log::NoEventHooks),
         gate_cmds,
         adapters: harness.adapters,
         runner,

@@ -31,6 +31,14 @@
 //! macOS, where there is no unprivileged descendant-containment primitive.
 //! Within the host-runner contract, run ownership cannot be handed to a resume
 //! -- or appear suspended -- while an isolated agent group is running.
+// LEGACY-EFFECT: this module is in the **frozen legacy section** of
+// `effects/allowlist.toml`, which carries its justification and the condition
+// under which the section shrinks. `decisions.effect_site_inventory.mechanism` (2).
+#![allow(
+    clippy::disallowed_methods,
+    clippy::disallowed_types,
+    clippy::disallowed_macros
+)]
 
 use std::io::{Read, Write};
 use std::ops::{Deref, DerefMut};
@@ -114,6 +122,41 @@ fn apply(injection: Injection, point: SubEffectPoint) -> Result<(), TactusError>
                 "the process funnel was made to fail at its `{point}` containment step"
             ),
         }),
+    }
+}
+
+/// What a **memoised** one-shot establishment reports to a caller.
+///
+/// A `OnceLock` holding a `Result` has exactly two arms and one of them is not
+/// otherwise reachable in a test: the coordinator joins one ambient job for its
+/// whole life, so a process that memoised a success can never observe a failure
+/// and a process that memoised a failure never got a coordinator. Every ambient
+/// failure this suite can build is the *injected* one, which fires strictly
+/// before the memo is consulted — so `Err(_) => Ok(())` here left the whole
+/// suite green while a Windows coordinator whose `CreateJobObjectW` failed
+/// carried on into `run`/`resume` with no ambient kill-on-close job at all: the
+/// degraded mode `crash_reconstruction` forbids ("no degraded mode; deferred")
+/// and `expected_failures_refusals[1]` requires a startup refusal for
+/// (`PR5-CORRECTNESS-010`).
+///
+/// Generic and platform-independent **so that arm can be executed on any
+/// machine**. The value it decides about is Windows-only; the decision is not,
+/// and a decision only one platform can test is a decision one platform never
+/// tests.
+///
+/// # Errors
+///
+/// The memoised diagnostic, verbatim — the caller renders it into the refusal,
+/// so a *fresh* message here would name something that did not happen.
+// Unix has no ambient job and therefore no production caller; the test below is
+// the only one there, and running it there is the point. `dead_code` is not a
+// governed lint (`effects::GOVERNED_LINTS`), so this is outside the
+// allow-placement scan rather than an exception to it.
+#[cfg_attr(not(windows), allow(dead_code))]
+pub(crate) fn memoised_outcome<T>(memo: &Result<T, String>) -> Result<(), String> {
+    match memo {
+        Ok(_) => Ok(()),
+        Err(message) => Err(message.clone()),
     }
 }
 
@@ -669,6 +712,19 @@ pub fn child_in_ambient_job(pid: u32) -> Option<bool> {
     windows_job::ambient_contains(pid)
 }
 
+/// Memoise an ambient establishment **failure**, before anything has joined.
+///
+/// Test-only, and it spends this process's one ambient cell — so it belongs
+/// only in a subprocess helper. It exists because the failure it plants is the
+/// one no machine can produce on demand: `CreateJobObjectW` and
+/// `AssignProcessToJobObject` succeed on a working Windows host, and the memo
+/// means a process only ever sees one answer. Returns whether the cell was
+/// still free.
+#[cfg(all(windows, test))]
+pub(crate) fn poison_ambient_for_tests(message: &str) -> bool {
+    windows_job::poison_ambient_for_tests(message)
+}
+
 #[cfg(windows)]
 mod windows_job {
     use std::io;
@@ -1021,18 +1077,29 @@ mod windows_job {
     unsafe impl Sync for AmbientJob {}
 
     /// Create the ambient job and put this process in it, once.
+    ///
+    /// The memo is decided by [`super::memoised_outcome`] rather than by a
+    /// `match` here, because that arm is unreachable in this process once
+    /// either answer has been taken. See its documentation.
     pub(super) fn join_ambient() -> Result<(), String> {
-        match AMBIENT.get_or_init(|| {
+        super::memoised_outcome(AMBIENT.get_or_init(|| {
             // SAFETY: `GetCurrentProcess` is the documented pseudo-handle for
             // this process and the job handle is live. Windows 8 and later
             // nest jobs, so an existing job (cargo's, a CI runner's, an
             // OpenSSH session's) is a parent of this one rather than a
             // conflict.
             create_ambient(|job, process| unsafe { AssignProcessToJobObject(job, process) })
-        }) {
-            Ok(_) => Ok(()),
-            Err(message) => Err(message.clone()),
-        }
+        }))
+    }
+
+    /// Memoise an ambient **failure** before anything has joined, so a test
+    /// process can carry a real one through [`join_ambient`].
+    ///
+    /// Spends the process's one ambient cell, so it belongs only in a
+    /// subprocess helper. Returns whether the cell was still free.
+    #[cfg(test)]
+    pub(super) fn poison_ambient_for_tests(message: &str) -> bool {
+        AMBIENT.set(Err(message.to_owned())).is_ok()
     }
 
     /// The body of [`join_ambient`], over the assignment call it makes.
@@ -1083,6 +1150,184 @@ mod windows_job {
         // process, because closing it terminates this process.
         let job = std::mem::ManuallyDrop::new(job);
         Ok(AmbientJob(job.handle))
+    }
+
+    /// Whether the ambient job has been established in this process.
+    pub(super) fn ambient_established() -> bool {
+        matches!(AMBIENT.get(), Some(Ok(_)))
+    }
+
+    /// Whether `pid` is a member of this process's ambient job.
+    ///
+    /// `None` when no ambient job has been established, or the process cannot
+    /// be opened. The kernel answers, so this is an oracle independent of the
+    /// spawn path it checks.
+    pub(super) fn ambient_contains(pid: u32) -> Option<bool> {
+        let Some(Ok(job)) = AMBIENT.get() else {
+            return None;
+        };
+        let process = OpenHandle::open(pid)?;
+        let mut member = 0;
+        // SAFETY: both handles are live and `member` is a writable BOOL.
+        let queried = unsafe { IsProcessInJob(process.0, job.0, &raw mut member) };
+        if queried == 0 {
+            return None;
+        }
+        Some(member != 0)
+    }
+
+    /// A borrowed process handle with query and synchronise rights.
+    struct OpenHandle(HANDLE);
+
+    impl OpenHandle {
+        fn open(pid: u32) -> Option<Self> {
+            // SAFETY: no borrowed inputs; a failure returns null.
+            let handle =
+                unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION | SYNCHRONIZE, 0, pid) };
+            if handle.is_null() {
+                return None;
+            }
+            Some(Self(handle))
+        }
+    }
+
+    impl Drop for OpenHandle {
+        fn drop(&mut self) {
+            // SAFETY: this wrapper uniquely owns the handle it opened.
+            let _ = unsafe { CloseHandle(self.0) };
+        }
+    }
+
+    fn creation_time(handle: HANDLE) -> Option<u64> {
+        let mut created = FILETIME::default();
+        let mut exited = FILETIME::default();
+        let mut kernel = FILETIME::default();
+        let mut user = FILETIME::default();
+        // SAFETY: four correctly typed writable output structures and a live
+        // handle with PROCESS_QUERY_LIMITED_INFORMATION.
+        let queried = unsafe {
+            GetProcessTimes(
+                handle,
+                &raw mut created,
+                &raw mut exited,
+                &raw mut kernel,
+                &raw mut user,
+            )
+        };
+        if queried == 0 {
+            return None;
+        }
+        Some((u64::from(created.dwHighDateTime) << 32) | u64::from(created.dwLowDateTime))
+    }
+
+    pub(super) fn process_creation_time(pid: u32) -> Option<u64> {
+        let handle = OpenHandle::open(pid)?;
+        creation_time(handle.0)
+    }
+
+    pub(super) fn process_alive(pid: u32, expected_creation_time: u64) -> bool {
+        let Some(handle) = OpenHandle::open(pid) else {
+            return false;
+        };
+        if creation_time(handle.0) != Some(expected_creation_time) {
+            // The pid was reused: whatever is running under it now is not the
+            // process the caller asked about.
+            return false;
+        }
+        // SAFETY: the handle carries SYNCHRONIZE. A process object is signaled
+        // exactly when the process has terminated, which is a stronger answer
+        // than an exit code a job termination chooses for us.
+        unsafe { WaitForSingleObject(handle.0, 0) == WAIT_TIMEOUT }
+    }
+
+    pub(super) fn resume_only_thread(process_id: u32) -> io::Result<()> {
+        let thread_handle = primary_thread(process_id)?;
+        // SAFETY: this handle has THREAD_SUSPEND_RESUME access and identifies
+        // the primary thread created suspended by `Command::spawn`.
+        if unsafe { ResumeThread(thread_handle.0) } == u32::MAX {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(())
+    }
+
+    /// How many outstanding suspends the child's primary thread carries.
+    ///
+    /// The Windows counterpart of `child_leads_its_own_group`: an oracle for
+    /// "is this child still suspended" that asks the kernel rather than the
+    /// crate, so the `CreatedSuspended`, `PrivateJobAssigned` and `Resumed`
+    /// coordinates can be measured against the operations they name instead of
+    /// against each other. `SuspendThread` returns the count *before* its own
+    /// increment and the matching `ResumeThread` puts it back, so the
+    /// observation leaves the child exactly as it found it.
+    ///
+    /// Test-only, like the Unix one and for the same reason: as a production
+    /// guard it could only ever withhold a point it cannot add information to.
+    #[cfg(test)]
+    pub(super) fn primary_thread_suspend_count(process_id: u32) -> io::Result<u32> {
+        use windows_sys::Win32::System::Threading::SuspendThread;
+
+        let thread_handle = primary_thread(process_id)?;
+        // SAFETY: the handle carries THREAD_SUSPEND_RESUME and names a live
+        // thread; the immediately following resume restores the count.
+        let previous = unsafe { SuspendThread(thread_handle.0) };
+        if previous == u32::MAX {
+            return Err(io::Error::last_os_error());
+        }
+        // SAFETY: as above; this undoes the suspend just taken.
+        if unsafe { ResumeThread(thread_handle.0) } == u32::MAX {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(previous)
+    }
+
+    /// A suspend/resume handle on `process_id`'s primary thread.
+    fn primary_thread(process_id: u32) -> io::Result<Snapshot> {
+        // CREATE_SUSPENDED prevents the process from creating another thread,
+        // so the one owned thread in this system snapshot is necessarily its
+        // primary thread.
+        // SAFETY: the snapshot call has no borrowed inputs.
+        let snapshot = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0) };
+        if snapshot == INVALID_HANDLE_VALUE {
+            return Err(io::Error::last_os_error());
+        }
+        let snapshot = Snapshot(snapshot);
+        let mut entry = THREADENTRY32 {
+            dwSize: u32::try_from(size_of::<THREADENTRY32>())
+                .expect("thread entry structure fits in u32"),
+            ..THREADENTRY32::default()
+        };
+        // SAFETY: `entry` advertises its correct size and remains writable.
+        if unsafe { Thread32First(snapshot.0, &mut entry) } == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        let thread_id = loop {
+            if entry.th32OwnerProcessID == process_id {
+                break entry.th32ThreadID;
+            }
+            // SAFETY: same valid snapshot and output entry as above.
+            if unsafe { Thread32Next(snapshot.0, &mut entry) } == 0 {
+                return Err(io::Error::new(
+                    io::ErrorKind::NotFound,
+                    "could not find the suspended agent primary thread",
+                ));
+            }
+        };
+        // SAFETY: the enumerated thread id belongs to the still-suspended
+        // child; the returned handle is non-inheritable.
+        let thread_handle = unsafe { OpenThread(THREAD_SUSPEND_RESUME, 0, thread_id) };
+        if thread_handle.is_null() {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(Snapshot(thread_handle))
+    }
+
+    struct Snapshot(HANDLE);
+
+    impl Drop for Snapshot {
+        fn drop(&mut self) {
+            // SAFETY: this wrapper uniquely owns its snapshot/thread handle.
+            let _ = unsafe { CloseHandle(self.0) };
+        }
     }
 
     #[cfg(test)]
@@ -1308,184 +1553,6 @@ mod windows_job {
                 message.contains("2 seconds"),
                 "the diagnostic must name its bound: {message}"
             );
-        }
-    }
-
-    /// Whether the ambient job has been established in this process.
-    pub(super) fn ambient_established() -> bool {
-        matches!(AMBIENT.get(), Some(Ok(_)))
-    }
-
-    /// Whether `pid` is a member of this process's ambient job.
-    ///
-    /// `None` when no ambient job has been established, or the process cannot
-    /// be opened. The kernel answers, so this is an oracle independent of the
-    /// spawn path it checks.
-    pub(super) fn ambient_contains(pid: u32) -> Option<bool> {
-        let Some(Ok(job)) = AMBIENT.get() else {
-            return None;
-        };
-        let process = OpenHandle::open(pid)?;
-        let mut member = 0;
-        // SAFETY: both handles are live and `member` is a writable BOOL.
-        let queried = unsafe { IsProcessInJob(process.0, job.0, &raw mut member) };
-        if queried == 0 {
-            return None;
-        }
-        Some(member != 0)
-    }
-
-    /// A borrowed process handle with query and synchronise rights.
-    struct OpenHandle(HANDLE);
-
-    impl OpenHandle {
-        fn open(pid: u32) -> Option<Self> {
-            // SAFETY: no borrowed inputs; a failure returns null.
-            let handle =
-                unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION | SYNCHRONIZE, 0, pid) };
-            if handle.is_null() {
-                return None;
-            }
-            Some(Self(handle))
-        }
-    }
-
-    impl Drop for OpenHandle {
-        fn drop(&mut self) {
-            // SAFETY: this wrapper uniquely owns the handle it opened.
-            let _ = unsafe { CloseHandle(self.0) };
-        }
-    }
-
-    fn creation_time(handle: HANDLE) -> Option<u64> {
-        let mut created = FILETIME::default();
-        let mut exited = FILETIME::default();
-        let mut kernel = FILETIME::default();
-        let mut user = FILETIME::default();
-        // SAFETY: four correctly typed writable output structures and a live
-        // handle with PROCESS_QUERY_LIMITED_INFORMATION.
-        let queried = unsafe {
-            GetProcessTimes(
-                handle,
-                &raw mut created,
-                &raw mut exited,
-                &raw mut kernel,
-                &raw mut user,
-            )
-        };
-        if queried == 0 {
-            return None;
-        }
-        Some((u64::from(created.dwHighDateTime) << 32) | u64::from(created.dwLowDateTime))
-    }
-
-    pub(super) fn process_creation_time(pid: u32) -> Option<u64> {
-        let handle = OpenHandle::open(pid)?;
-        creation_time(handle.0)
-    }
-
-    pub(super) fn process_alive(pid: u32, expected_creation_time: u64) -> bool {
-        let Some(handle) = OpenHandle::open(pid) else {
-            return false;
-        };
-        if creation_time(handle.0) != Some(expected_creation_time) {
-            // The pid was reused: whatever is running under it now is not the
-            // process the caller asked about.
-            return false;
-        }
-        // SAFETY: the handle carries SYNCHRONIZE. A process object is signaled
-        // exactly when the process has terminated, which is a stronger answer
-        // than an exit code a job termination chooses for us.
-        unsafe { WaitForSingleObject(handle.0, 0) == WAIT_TIMEOUT }
-    }
-
-    pub(super) fn resume_only_thread(process_id: u32) -> io::Result<()> {
-        let thread_handle = primary_thread(process_id)?;
-        // SAFETY: this handle has THREAD_SUSPEND_RESUME access and identifies
-        // the primary thread created suspended by `Command::spawn`.
-        if unsafe { ResumeThread(thread_handle.0) } == u32::MAX {
-            return Err(io::Error::last_os_error());
-        }
-        Ok(())
-    }
-
-    /// How many outstanding suspends the child's primary thread carries.
-    ///
-    /// The Windows counterpart of `child_leads_its_own_group`: an oracle for
-    /// "is this child still suspended" that asks the kernel rather than the
-    /// crate, so the `CreatedSuspended`, `PrivateJobAssigned` and `Resumed`
-    /// coordinates can be measured against the operations they name instead of
-    /// against each other. `SuspendThread` returns the count *before* its own
-    /// increment and the matching `ResumeThread` puts it back, so the
-    /// observation leaves the child exactly as it found it.
-    ///
-    /// Test-only, like the Unix one and for the same reason: as a production
-    /// guard it could only ever withhold a point it cannot add information to.
-    #[cfg(test)]
-    pub(super) fn primary_thread_suspend_count(process_id: u32) -> io::Result<u32> {
-        use windows_sys::Win32::System::Threading::SuspendThread;
-
-        let thread_handle = primary_thread(process_id)?;
-        // SAFETY: the handle carries THREAD_SUSPEND_RESUME and names a live
-        // thread; the immediately following resume restores the count.
-        let previous = unsafe { SuspendThread(thread_handle.0) };
-        if previous == u32::MAX {
-            return Err(io::Error::last_os_error());
-        }
-        // SAFETY: as above; this undoes the suspend just taken.
-        if unsafe { ResumeThread(thread_handle.0) } == u32::MAX {
-            return Err(io::Error::last_os_error());
-        }
-        Ok(previous)
-    }
-
-    /// A suspend/resume handle on `process_id`'s primary thread.
-    fn primary_thread(process_id: u32) -> io::Result<Snapshot> {
-        // CREATE_SUSPENDED prevents the process from creating another thread,
-        // so the one owned thread in this system snapshot is necessarily its
-        // primary thread.
-        // SAFETY: the snapshot call has no borrowed inputs.
-        let snapshot = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0) };
-        if snapshot == INVALID_HANDLE_VALUE {
-            return Err(io::Error::last_os_error());
-        }
-        let snapshot = Snapshot(snapshot);
-        let mut entry = THREADENTRY32 {
-            dwSize: u32::try_from(size_of::<THREADENTRY32>())
-                .expect("thread entry structure fits in u32"),
-            ..THREADENTRY32::default()
-        };
-        // SAFETY: `entry` advertises its correct size and remains writable.
-        if unsafe { Thread32First(snapshot.0, &mut entry) } == 0 {
-            return Err(io::Error::last_os_error());
-        }
-        let thread_id = loop {
-            if entry.th32OwnerProcessID == process_id {
-                break entry.th32ThreadID;
-            }
-            // SAFETY: same valid snapshot and output entry as above.
-            if unsafe { Thread32Next(snapshot.0, &mut entry) } == 0 {
-                return Err(io::Error::new(
-                    io::ErrorKind::NotFound,
-                    "could not find the suspended agent primary thread",
-                ));
-            }
-        };
-        // SAFETY: the enumerated thread id belongs to the still-suspended
-        // child; the returned handle is non-inheritable.
-        let thread_handle = unsafe { OpenThread(THREAD_SUSPEND_RESUME, 0, thread_id) };
-        if thread_handle.is_null() {
-            return Err(io::Error::last_os_error());
-        }
-        Ok(Snapshot(thread_handle))
-    }
-
-    struct Snapshot(HANDLE);
-
-    impl Drop for Snapshot {
-        fn drop(&mut self) {
-            // SAFETY: this wrapper uniquely owns its snapshot/thread handle.
-            let _ = unsafe { CloseHandle(self.0) };
         }
     }
 }
@@ -4453,6 +4520,47 @@ impl Drain {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A memoised establishment failure is reported to **every** later caller.
+    ///
+    /// `crash_reconstruction`: "if the ambient job cannot be created or joined
+    /// the write command refuses at startup with a diagnostic before any
+    /// workspace effect (**no degraded mode**; deferred)". The memo makes the
+    /// first caller's answer every caller's answer, so an arm that turned a
+    /// remembered failure back into success is a degraded mode that no later
+    /// call can escape (`PR5-CORRECTNESS-010`).
+    ///
+    /// Runs on every platform, deliberately. The value is Windows-only; the
+    /// decision about it is not, and before this the only machine that could
+    /// have executed the failing arm was one where the arm was unreachable —
+    /// a process that memoised a failure never got a coordinator to observe it
+    /// with.
+    #[test]
+    fn a_memoised_establishment_failure_reaches_every_later_caller() {
+        // The success arm, so this is not a test that only ever says "Err".
+        assert_eq!(memoised_outcome::<()>(&Ok(())), Ok(()));
+
+        // The failure arm, and the diagnostic is the memo's own: the caller
+        // renders it into the operator-facing refusal, so a fresh or empty
+        // message would name something that did not happen.
+        for message in [
+            "it could not be created (Access is denied. (os error 5))",
+            "it could not be configured (os error 87)",
+            "AssignProcessToJobObject refused",
+        ] {
+            assert_eq!(
+                memoised_outcome::<()>(&Err(message.to_owned())),
+                Err(message.to_owned()),
+                "a remembered failure must come back as that failure"
+            );
+        }
+
+        // And it is stable: the *second* caller gets the same answer as the
+        // first, which is the whole of what a memo promises.
+        let memo: Result<(), String> = Err("it could not be created".to_owned());
+        assert_eq!(memoised_outcome(&memo), memoised_outcome(&memo));
+        assert!(memoised_outcome(&memo).is_err());
+    }
 
     // Windows-first-class: exercise the supervisor through cmd.exe, which is
     // always present there; use sh on everything else.

@@ -36,6 +36,10 @@
 //! a commit. It goes to an `Unblock` question instead. Nothing here should make
 //! that harder to add — which is why a lens is an enum with behaviour hanging
 //! off it rather than a bool.
+// LEGACY-EFFECT: this module is in the **frozen legacy section** of
+// `effects/allowlist.toml`, which carries its justification and the condition
+// under which the section shrinks. `decisions.effect_site_inventory.mechanism` (2).
+#![allow(clippy::disallowed_methods, clippy::disallowed_macros)]
 
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};

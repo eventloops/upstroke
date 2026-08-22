@@ -4,6 +4,10 @@
 //!
 //! Zero spend: `probe()` reads `--version` and `--help`, and `discover()` asks
 //! each vendor's CLI about its own account. Neither runs a model.
+// LEGACY-EFFECT: this module is in the **frozen legacy section** of
+// `effects/allowlist.toml`, which carries its justification and the condition
+// under which the section shrinks. `decisions.effect_site_inventory.mechanism` (2).
+#![allow(clippy::disallowed_macros)]
 
 use tactus::agent;
 use tactus::runner::host::HostRunner;

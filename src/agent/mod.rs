@@ -397,6 +397,163 @@ mod tests {
         assert!(by_id("aider").is_none(), "aider arrives in v0.2");
     }
 
+    /// A stdout every adapter would call a **success**, written in that
+    /// adapter's own answer shape.
+    ///
+    /// Load-bearing rather than convenient: it is what makes the supervision
+    /// grid below hostile. With a failure payload, dropping the supervision
+    /// checks would still report `AgentError` and the cells would pass for the
+    /// wrong reason.
+    fn a_successful_answer_from(id: &str) -> String {
+        match id {
+            "claude-code" => {
+                r#"{"session_id":"s-1","total_cost_usd":0.5,"result":"done","subtype":"success"}"#
+                    .to_owned()
+            }
+            "copilot" => "done".to_owned(),
+            "codex" => [
+                r#"{"type":"thread.started","thread_id":"th-1"}"#,
+                r#"{"type":"item.completed","item":{"type":"agent_message","text":"done"}}"#,
+                r#"{"type":"turn.completed","usage":{"input_tokens":11,"output_tokens":7}}"#,
+            ]
+            .join("\n"),
+            other => panic!("an adapter shipped without an answer shape here: {other}"),
+        }
+    }
+
+    /// **Every** adapter maps **every** supervision result the same way.
+    ///
+    /// `invariants_preserved[0]` is "process supervision, timeout, output
+    /// capture, **adapter parsing** unchanged", and the supervisor's two flags
+    /// are inputs to parsing, not to it alone: `output_limited` means the tree
+    /// was terminated with the transcript truncated, and `timed_out` means it
+    /// was terminated for exceeding its wall clock. A truncated transcript
+    /// authorizes nothing (`PR5-CORRECTNESS-013`) and a timeout is a distinct
+    /// ladder input from a generic agent failure (`PR5-CORRECTNESS-014`).
+    ///
+    /// The domain is `ADAPTERS`, from the type, and the expectations are
+    /// literals — a table, not a re-derivation of the branch order. That is the
+    /// point: the two rows where an exit code of 0 meets a set flag are exactly
+    /// the rows a re-derivation would get wrong in the same direction the code
+    /// would.
+    ///
+    /// Claude and Copilot had direct flag-to-status tests; Codex's flag
+    /// fixtures exercised its strict-config *preflight validators*, so no test
+    /// had ever parsed an output-limited or timed-out Codex execution. That is
+    /// the "guarantee proved for the variant that was looked at" class, and the
+    /// guard for it is a domain taken from the type.
+    #[test]
+    fn every_adapter_maps_every_supervision_result_the_same_way() {
+        use crate::ir::OutcomeStatus;
+
+        /// One supervision shape: name, exit code, `timed_out`,
+        /// `output_limited`, the status every adapter must report, and a
+        /// substring the detail must carry.
+        type SupervisionCell = (
+            &'static str,
+            Option<i32>,
+            bool,
+            bool,
+            OutcomeStatus,
+            &'static str,
+        );
+        const GRID: &[SupervisionCell] = &[
+            (
+                "clean success",
+                Some(0),
+                false,
+                false,
+                OutcomeStatus::Completed,
+                "done",
+            ),
+            (
+                "output-limited although it exited 0",
+                Some(0),
+                false,
+                true,
+                OutcomeStatus::AgentError,
+                "output limit",
+            ),
+            (
+                "output-limited and terminated",
+                None,
+                false,
+                true,
+                OutcomeStatus::AgentError,
+                "output limit",
+            ),
+            (
+                "timed out although it exited 0",
+                Some(0),
+                true,
+                false,
+                OutcomeStatus::Timeout,
+                "wall-clock timeout",
+            ),
+            (
+                "timed out and terminated",
+                None,
+                true,
+                false,
+                OutcomeStatus::Timeout,
+                "wall-clock timeout",
+            ),
+            (
+                "an ordinary non-zero exit",
+                Some(1),
+                false,
+                false,
+                OutcomeStatus::AgentError,
+                "",
+            ),
+        ];
+
+        let mut statuses: Vec<OutcomeStatus> = Vec::new();
+        let mut cells = 0_usize;
+        for adapter in ADAPTERS {
+            let stdout = a_successful_answer_from(adapter.id());
+            for (name, code, timed_out, output_limited, expected, must_carry) in GRID {
+                let out = ProcessOutput {
+                    code: *code,
+                    stdout: stdout.clone(),
+                    stderr: String::new(),
+                    duration: Duration::from_millis(9),
+                    timed_out: *timed_out,
+                    output_limited: *output_limited,
+                };
+                let cell = format!("{}/{name}", adapter.id());
+                let outcome = adapter
+                    .parse(&out)
+                    .unwrap_or_else(|error| panic!("{cell}: parse: {error}"));
+                assert_eq!(outcome.status, *expected, "{cell}: wrong status");
+                if !must_carry.is_empty() {
+                    let detail = outcome.detail.clone().unwrap_or_default();
+                    assert!(
+                        detail.contains(must_carry),
+                        "{cell}: the detail must say why (`{must_carry}`): {detail:?}"
+                    );
+                }
+                // The duration is the supervisor's, on every route.
+                assert_eq!(outcome.duration, out.duration, "{cell}: duration");
+                if !statuses.contains(expected) {
+                    statuses.push(*expected);
+                }
+                cells += 1;
+            }
+        }
+
+        assert_eq!(GRID.len(), 6, "six supervision shapes");
+        assert_eq!(cells, 18, "every shipped adapter crossed with every shape");
+        assert_eq!(
+            statuses.len(),
+            3,
+            "Completed, AgentError and Timeout are three distinct answers: {statuses:?}"
+        );
+        // A `Timeout` really is a different answer from an `AgentError`, which
+        // is what makes cells 4 and 5 worth having: the ladder acts on it.
+        assert_ne!(OutcomeStatus::Timeout, OutcomeStatus::AgentError);
+    }
+
     /// What an agent probe *is*, against the two passages that say so.
     ///
     /// INV-18: "every agent CLI invocation **incl. agent probes** acquires its

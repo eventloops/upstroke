@@ -19,6 +19,14 @@
 //!   joins its ambient kill-on-close Job Object before any spawn, so every host
 //!   child is a member at creation; a failure refuses the write command with a
 //!   diagnostic.
+// Allowlist placement: the **funnel section** of `effects/allowlist.toml`, which
+// carries this module's review clause -- effects only inside site-taking APIs,
+// no writable handle returned. `decisions.effect_site_inventory.mechanism` (2).
+#![allow(
+    clippy::disallowed_methods,
+    clippy::disallowed_types,
+    clippy::disallowed_macros
+)]
 
 use std::ffi::{OsStr, OsString};
 use std::path::{Path, PathBuf};
@@ -1488,6 +1496,145 @@ mod tests {
         );
     }
 
+    /// The same claim, over **every** role production binds to an agent and
+    /// **every** shipped binding — in the children, not in a map.
+    ///
+    /// DESIGN.md:258-264: "each supplies role-scoped `HOME`, `PATH`, and
+    /// credential locations", and "Probe and execution compose the **same**
+    /// base, mounts, reserved values, and overlay, so pre-flight certifies the
+    /// environment that will actually spend."
+    ///
+    /// The test above holds one pair — `Probe(Agent(claude-code))` against
+    /// `Implement` — and `supplies_credentials` names **three** roles. So a
+    /// forwarding site that dropped the binding for `Review` alone left every
+    /// child-level comparison green: direct `compose` tests bypass the
+    /// forwarding site entirely, the actual-child parity compares Probe with
+    /// Implement, the credential-child test compares Gate with Implement, and
+    /// the Review cells of the role grid never look at their environment
+    /// (`PR5-CORRECTNESS-009`). The domain is therefore taken from
+    /// `ExecutionRole::all()` and filtered by `supplies_credentials`, so a role
+    /// added later is covered or fails here.
+    ///
+    /// Three sentinels rather than equality alone, because two identical
+    /// *absences* are also equal: one value that can only have come from the
+    /// base, one that can only have come from the overlay, and the credential
+    /// location, which can only have come from the **binding** — which is the
+    /// one the finding is about, and the one a stripped binding removes.
+    #[test]
+    fn every_credential_supplied_role_composes_one_environment_per_binding() {
+        let workspace = scratch("binding-parity");
+        let mut base = synthetic_base();
+        base.push((os("TACTUS_BASE_SENTINEL"), os("base-only-value")));
+        // A credential location already in the base, which is the failure
+        // sequence's own starting state: composition strips reserved keys, and
+        // only the agent binding can put the value back.
+        for (_, key) in CREDENTIAL_LOCATIONS {
+            base.push((os(key), os(&format!("/host/{key}"))));
+        }
+        let runner = HostRunner::new()
+            .with_environment(HostEnvironment::with_base(base, KeyCase::current()));
+
+        let command = CommandSpec {
+            program: std::env::current_exe()
+                .expect("test executable")
+                .to_string_lossy()
+                .into_owned(),
+            args: vec![
+                "environment_dump_helper".to_owned(),
+                "--ignored".to_owned(),
+                "--nocapture".to_owned(),
+            ],
+            env: vec![
+                ("TACTUS_ENV_DUMP".to_owned(), "1".to_owned()),
+                (
+                    "TACTUS_OVERLAY_SENTINEL".to_owned(),
+                    "overlay-only-value".to_owned(),
+                ),
+            ],
+            stdin: Vec::new(),
+        };
+
+        let bound: Vec<ExecutionRole> = ExecutionRole::all()
+            .into_iter()
+            .filter(supplies_credentials)
+            .collect();
+        assert_eq!(
+            bound.len(),
+            3,
+            "`supplies_credentials` names three roles: {bound:?}"
+        );
+
+        let mut cells = 0_usize;
+        for (id, key) in CREDENTIAL_LOCATIONS {
+            let agent = AgentId::new(*id);
+            let mut per_role: Vec<(String, Vec<String>)> = Vec::new();
+            for role in &bound {
+                let request = match role {
+                    ExecutionRole::Probe(ProbeTarget::Agent(_)) => crate::agent::probe_request(
+                        id,
+                        command.clone(),
+                        1,
+                        Duration::from_secs(120),
+                    )
+                    .expect("production builds the probe request"),
+                    ExecutionRole::Implement => crate::runner::worker_request(
+                        command.clone(),
+                        workspace.clone(),
+                        agent.clone(),
+                        Duration::from_secs(120),
+                        worker_invocation(),
+                    ),
+                    ExecutionRole::Review => crate::runner::review_request(
+                        command.clone(),
+                        workspace.clone(),
+                        agent.clone(),
+                        Duration::from_secs(120),
+                        review_invocation(),
+                    ),
+                    other => panic!("`supplies_credentials` grew a role with no builder: {other}"),
+                };
+                assert_eq!(
+                    request.agent.as_ref(),
+                    Some(&agent),
+                    "{role}: production binds this role to the agent"
+                );
+                let environment = dumped_environment(&runner, &request);
+                assert!(
+                    environment.contains(&"TACTUS_BASE_SENTINEL=base-only-value".to_owned()),
+                    "{id}/{role}: the base did not reach the child: {environment:?}"
+                );
+                assert!(
+                    environment.contains(&"TACTUS_OVERLAY_SENTINEL=overlay-only-value".to_owned()),
+                    "{id}/{role}: the overlay did not reach the child: {environment:?}"
+                );
+                // The binding's own contribution. `key` is a reserved key, so a
+                // child carrying it carries a value composition put there —
+                // and a role whose binding was dropped on the way to `compose`
+                // carries nothing under this name at all.
+                assert!(
+                    environment
+                        .iter()
+                        .any(|line| line.starts_with(&format!("{key}="))),
+                    "{id}/{role}: no `{key}` reached the child, so pre-flight certifies \
+                     a different credential location than the spending process: {environment:?}"
+                );
+                per_role.push((role.to_string(), environment));
+                cells += 1;
+            }
+
+            let (first_role, first) = &per_role[0];
+            for (role, environment) in &per_role[1..] {
+                assert_eq!(
+                    environment, first,
+                    "{id}: `{role}` composes a different environment than `{first_role}`, \
+                     so pre-flight certifies an environment that will not spend"
+                );
+            }
+        }
+        let _ = std::fs::remove_dir_all(&workspace);
+        assert_eq!(cells, 9, "three bound roles x three shipped bindings");
+    }
+
     /// What `host-v1` supplies for `HOME`, `PATH` and `USERPROFILE`, asserted
     /// from the passages that decide it.
     ///
@@ -2208,6 +2355,330 @@ mod tests {
                 .count(),
             2,
             "the fixtures that pin duration from below"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // output transparency  (`invariants_preserved[0]`: "output capture …
+    // unchanged")
+    // -----------------------------------------------------------------------
+
+    /// What the transparency shim prints on stdout: JSON Lines, because that is
+    /// the shape whose *first* lines carry the meaning — a Codex transcript's
+    /// `thread.started` (the session) and its `item.completed` (the verdict)
+    /// both precede the final `turn.completed`.
+    const TRANSPARENT_STDOUT: &[&str] = &[
+        r#"{"type":"thread.started","thread_id":"th-transparency"}"#,
+        r#"{"type":"item.completed","item":{"type":"agent_message","text":"the verdict"}}"#,
+        r#"{"type":"turn.completed","usage":{"input_tokens":11,"output_tokens":7}}"#,
+    ];
+
+    /// And on stderr, which is captured by the same funnel and is where a Codex
+    /// run puts its tracing log.
+    const TRANSPARENT_STDERR: &[&str] = &["tracing line one", "tracing line two"];
+
+    /// A launcher that ignores its arguments and prints
+    /// [`TRANSPARENT_STDOUT`] and [`TRANSPARENT_STDERR`].
+    ///
+    /// Not [`forwarding_shim`]: that one forwards to this test binary, whose
+    /// `libtest` output is what it is. This child's output is chosen by the
+    /// test, so "what the child produced" and "what the runner returned" are
+    /// two things that can be compared.
+    ///
+    /// Every payload byte is `echo`-safe in both dialects — JSON carries none
+    /// of `&`, `<`, `>`, `|`, `^`, and a `"` is printed literally by `cmd`'s
+    /// `echo`.
+    ///
+    /// **The redirection goes first on Windows.** `cmd`'s `echo` prints
+    /// *everything* between the command and the redirection operator, so
+    /// `echo foo 1>&2` emits `foo` followed by a **trailing space** — measured
+    /// on the guest, where the first run of this grid failed with
+    /// `["tracing line one "]` against `["tracing line one"]`. `1>&2 echo foo`
+    /// has no such gap. A test that trimmed instead would have stopped being
+    /// able to see a runner that trimmed.
+    fn transparency_shim(dir: &Path, name: &str) -> String {
+        std::fs::create_dir_all(dir).expect("create the shim directory");
+        let path = dir.join(name);
+        let mut script = String::new();
+        if cfg!(windows) {
+            script.push_str("@echo off\r\n");
+            for line in TRANSPARENT_STDOUT {
+                script.push_str(&format!("echo {line}\r\n"));
+            }
+            for line in TRANSPARENT_STDERR {
+                script.push_str(&format!("1>&2 echo {line}\r\n"));
+            }
+            script.push_str("exit /b 0\r\n");
+        } else {
+            script.push_str("#!/bin/sh\n");
+            for line in TRANSPARENT_STDOUT {
+                script.push_str(&format!("printf '%s\\n' '{line}'\n"));
+            }
+            for line in TRANSPARENT_STDERR {
+                script.push_str(&format!("printf '%s\\n' '{line}' 1>&2\n"));
+            }
+            script.push_str("exit 0\n");
+        }
+        std::fs::write(&path, script).expect("write the transparency shim");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755))
+                .expect("make the shim executable");
+        }
+        path.to_str()
+            .expect("a scratch path this crate can name")
+            .to_owned()
+    }
+
+    /// A captured stream as lines, with the platform's terminator folded away.
+    fn captured_lines(stream: &str) -> Vec<String> {
+        stream
+            .replace("\r\n", "\n")
+            .lines()
+            .map(str::to_owned)
+            .collect()
+    }
+
+    /// One `TaskRun`, so each adapter's own `build_args` can be asked what
+    /// production's argument vector for it is.
+    fn transparency_run(agent: &str, resume: Option<&str>) -> crate::agent::TaskRun {
+        crate::agent::TaskRun {
+            prompt: "Do the thing.".to_owned(),
+            profile: crate::ir::WorkerProfile {
+                name: "impl-mid".to_owned(),
+                agent: agent.to_owned(),
+                model: "a-model".to_owned(),
+                pool: "a-pool".to_owned(),
+                permissions: crate::ir::PermissionMode::ReadOnly,
+                effort: Some(crate::ir::Effort::Medium),
+                max_turns: Some(30),
+                extra_args: Vec::new(),
+            },
+            workspace: PathBuf::from("."),
+            gate_cmds: Vec::new(),
+            resume_session: resume.map(str::to_owned),
+            settings_path: None,
+        }
+    }
+
+    /// `HostRunner::run` hands back **the child's whole output**, for every
+    /// request shape production sends.
+    ///
+    /// `invariants_preserved[0]` is "process supervision, timeout, **output
+    /// capture**, adapter parsing unchanged", and `PR5-CORRECTNESS-012` is a
+    /// runner that keeps only the last stdout line when the role is
+    /// `Implement`/`Review`, the agent is `codex` and the first argument is
+    /// `exec` — after which a successful review loses its session and its
+    /// verdict and is re-asked, and can end as `ReviewFailed`.
+    ///
+    /// Three axes, varied independently, because a suppression can key on any
+    /// of them and the existing grids hold two of them fixed:
+    ///
+    /// * **role** — built by production's own builder, never by this fixture;
+    /// * **agent binding** — all three shipped ids, not one;
+    /// * **the argument vector** — each adapter's real one, from its own `pub
+    ///   fn build_args`, so `exec`, `-p` and the bare-prompt form all appear.
+    ///   *Every* existing grid in this file sends `["--exact", NO_SUCH_TEST]`,
+    ///   which is why an `args[0]`-keyed edit had nowhere to fail. That is
+    ///   `PR4-CONF-006`'s class one field further over, and this is the field.
+    ///
+    /// The resumed shape is carried too: `codex exec resume <id>` moves the
+    /// subcommand's position, so a check on `args[0]` and one on "is this an
+    /// exec" are different predicates.
+    #[test]
+    fn the_runner_returns_the_childs_whole_output_for_every_production_request_shape() {
+        let root = scratch("transparency");
+        let workspace = root.join("workspace");
+        std::fs::create_dir_all(&workspace).expect("workspace");
+        let shim = transparency_shim(
+            &root,
+            if cfg!(windows) {
+                "tactus-transparency.cmd"
+            } else {
+                "tactus-transparency"
+            },
+        );
+        let runner = HostRunner::new();
+
+        let mut cells = 0_usize;
+        let mut roles = BTreeSet::new();
+        let mut agents = BTreeSet::new();
+        let mut argv_heads = BTreeSet::new();
+
+        for adapter in crate::agent::ADAPTERS {
+            let id = adapter.id();
+            for (what, args) in [
+                ("fresh", build_args_for(id, None)),
+                ("resumed", build_args_for(id, Some("session-1"))),
+            ] {
+                let command = CommandSpec {
+                    program: shim.clone(),
+                    args: args.clone(),
+                    env: Vec::new(),
+                    stdin: b"the materialized prompt\n".to_vec(),
+                };
+                for (role_name, request) in [
+                    (
+                        "Implement",
+                        crate::runner::worker_request(
+                            command.clone(),
+                            workspace.clone(),
+                            crate::runner::AgentId::new(id),
+                            crate::engine::DEFAULT_ATTEMPT_TIMEOUT,
+                            worker_invocation(),
+                        ),
+                    ),
+                    (
+                        "Review",
+                        crate::runner::review_request(
+                            command.clone(),
+                            workspace.clone(),
+                            crate::runner::AgentId::new(id),
+                            crate::config::DEFAULT_REVIEW_PASS_TIMEOUT,
+                            review_invocation(),
+                        ),
+                    ),
+                ] {
+                    let cell = format!("{id}/{what}/{role_name}");
+                    let output = runner
+                        .run(&request)
+                        .unwrap_or_else(|error| panic!("{cell}: {error}"));
+                    assert_transparent(&cell, &output);
+                    roles.insert(role_name);
+                    agents.insert(id);
+                    argv_heads.insert(args.first().cloned().unwrap_or_default());
+                    cells += 1;
+                }
+            }
+        }
+
+        // The probe role too: pre-flight reads a CLI's own answer, and a
+        // truncated one is a capability read wrong rather than lost work.
+        for adapter in crate::agent::ADAPTERS {
+            let request = crate::agent::probe_request(
+                adapter.id(),
+                CommandSpec {
+                    program: shim.clone(),
+                    args: vec!["--version".to_owned()],
+                    env: Vec::new(),
+                    stdin: Vec::new(),
+                },
+                0,
+                AGENT_PROBE_TIMEOUT,
+            )
+            .expect("a probe identity for a shipped adapter");
+            let cell = format!("{}/probe", adapter.id());
+            let output = runner
+                .run(&request)
+                .unwrap_or_else(|error| panic!("{cell}: {error}"));
+            assert_transparent(&cell, &output);
+            roles.insert("Probe");
+            argv_heads.insert("--version".to_owned());
+            cells += 1;
+        }
+
+        // And the unbound role, whose program is the recorded shell rather than
+        // a located CLI — the other half of the program-shape partition.
+        let script = if cfg!(windows) {
+            TRANSPARENT_STDOUT
+                .iter()
+                .map(|line| format!("echo {line}"))
+                .chain(
+                    // Redirection first, for the trailing-space reason on
+                    // `transparency_shim`.
+                    TRANSPARENT_STDERR
+                        .iter()
+                        .map(|line| format!("1>&2 echo {line}")),
+                )
+                .collect::<Vec<_>>()
+                .join("& ")
+        } else {
+            TRANSPARENT_STDOUT
+                .iter()
+                .map(|line| format!("printf '%s\\n' '{line}'"))
+                .chain(
+                    TRANSPARENT_STDERR
+                        .iter()
+                        .map(|line| format!("printf '%s\\n' '{line}' 1>&2")),
+                )
+                .collect::<Vec<_>>()
+                .join("; ")
+        };
+        let request = crate::runner::gate_request(
+            native().spec(&script),
+            workspace.clone(),
+            crate::config::DEFAULT_GATE_TIMEOUT,
+            gate_invocation(),
+        );
+        let output = runner.run(&request).expect("the gate role");
+        assert_transparent("gate/shell", &output);
+        roles.insert("Gate");
+        cells += 1;
+
+        let _ = std::fs::remove_dir_all(&root);
+
+        // Hostility as counts, not prose.
+        assert_eq!(
+            cells, 16,
+            "3 adapters x 2 shapes x 2 roles, 3 probes, 1 gate"
+        );
+        assert_eq!(roles.len(), 4, "four roles: {roles:?}");
+        assert_eq!(agents.len(), 3, "all three shipped bindings: {agents:?}");
+        assert!(
+            argv_heads.contains("exec"),
+            "Codex's own subcommand must be among the argument vectors sent: {argv_heads:?}"
+        );
+        assert!(
+            argv_heads.len() >= 3,
+            "the argument vector is an axis, not a constant: {argv_heads:?}"
+        );
+    }
+
+    /// Each adapter's production argument vector, from the adapter itself.
+    fn build_args_for(id: &str, resume: Option<&str>) -> Vec<String> {
+        let run = transparency_run(id, resume);
+        match id {
+            "claude-code" => crate::agent::claude::build_args(&run),
+            "codex" => crate::agent::codex::build_args(&run),
+            "copilot" => crate::agent::copilot::build_args(&run),
+            other => panic!("an adapter shipped without an entry here: {other}"),
+        }
+    }
+
+    /// Every line the child wrote came back, in order, on the stream it was
+    /// written to.
+    fn assert_transparent(cell: &str, output: &ProcessOutput) {
+        assert_eq!(
+            output.code,
+            Some(0),
+            "{cell}: the child exited 0: {output:?}"
+        );
+        assert!(!output.timed_out, "{cell}: not a timeout");
+        assert!(!output.output_limited, "{cell}: not output-limited");
+        assert_eq!(
+            captured_lines(&output.stdout),
+            TRANSPARENT_STDOUT
+                .iter()
+                .map(|line| (*line).to_owned())
+                .collect::<Vec<_>>(),
+            "{cell}: stdout is not what the child wrote"
+        );
+        assert_eq!(
+            captured_lines(&output.stderr),
+            TRANSPARENT_STDERR
+                .iter()
+                .map(|line| (*line).to_owned())
+                .collect::<Vec<_>>(),
+            "{cell}: stderr is not what the child wrote"
+        );
+        // Named separately, because "the last line survived" is the assertion a
+        // truncating runner would still pass.
+        assert!(
+            output.stdout.contains("thread.started"),
+            "{cell}: the *first* line is gone, which is the session and the \
+             verdict: {:?}",
+            output.stdout
         );
     }
 
@@ -3304,24 +3775,92 @@ mod tests {
     // the containment points, observed at runtime on **every** role
     // -----------------------------------------------------------------------
 
-    /// The containment points one spawn reaches on this platform.
+    /// **Every** containment point this host declares, read out of the frozen
+    /// inventory rather than transcribed from it.
+    ///
+    /// `SPAWN_SITE.sub_effects()` is `Process.Spawn`'s own list and
+    /// `SubEffectPoint::platform()` is the point's own host, both in
+    /// `src/topology/effects.rs`, so a point added to the site later is in this
+    /// domain the moment it exists. That is not tidiness: the hand-written
+    /// Windows list this replaced named `CreatedSuspended`, `PrivateJobAssigned`
+    /// and `Resumed` and silently omitted `AmbientJobJoined`, so the kill grid
+    /// iterated three of the four points the platform has and six guest runs
+    /// reported covering a point none of them had executed (`PR5-RD-002`). A
+    /// domain that can omit a point is a domain whose coverage claim is a
+    /// coincidence.
+    fn containment_points() -> Vec<SubEffectPoint> {
+        let host = if cfg!(windows) {
+            Platform::Windows
+        } else {
+            Platform::Unix
+        };
+        SPAWN_SITE
+            .sub_effects()
+            .iter()
+            .copied()
+            .filter(|point| point.platform() == host || point.platform() == Platform::Any)
+            .collect()
+    }
+
+    /// The containment points one **spawn** reaches on this platform: every
+    /// point of [`containment_points`] that is not a startup step.
     ///
     /// `AmbientJobJoined` is a write-command *startup* step rather than a
     /// per-spawn one — it is reached by [`HostRunner::start_write_command`],
-    /// not by running a command — so the Windows set is the other three. It is
-    /// role-free by construction (the ambient job is a property of the
-    /// process, established once before anything can spawn) and is witnessed
-    /// by `windows_ambient_job_unavailable_refuses_before_effects`.
-    fn per_spawn_points() -> &'static [SubEffectPoint] {
-        if cfg!(windows) {
-            &[
-                SubEffectPoint::CreatedSuspended,
-                SubEffectPoint::PrivateJobAssigned,
-                SubEffectPoint::Resumed,
-            ]
+    /// not by running a command. It is role-free by construction (the ambient
+    /// job is a property of the process, established once before anything can
+    /// spawn) and is witnessed for error-return by
+    /// `windows_ambient_job_unavailable_refuses_before_effects` and for kill by
+    /// `a_kill_armed_at_any_containment_point_actually_kills`, which iterates
+    /// the *whole* domain rather than this subset.
+    fn per_spawn_points() -> Vec<SubEffectPoint> {
+        containment_points()
+            .into_iter()
+            .filter(|point| !STARTUP_POINTS.contains(point))
+            .collect()
+    }
+
+    /// The containment points a write command reaches at **startup**, before it
+    /// has spawned anything.
+    const STARTUP_POINTS: &[SubEffectPoint] = &[SubEffectPoint::AmbientJobJoined];
+
+    /// The two domains partition the platform's points, and neither is empty.
+    ///
+    /// The partition is the property that makes `per_spawn_points` safe to
+    /// derive by subtraction: a point added to `Process.Spawn` later lands in
+    /// one of the two by construction, and cannot land in neither. Asserted
+    /// against `containment_points`, which is itself derived from the frozen
+    /// inventory, so the only way to lose a point from both is to delete it
+    /// from `src/topology/effects.rs`.
+    #[test]
+    fn the_startup_and_per_spawn_domains_partition_this_platforms_points() {
+        let all = containment_points();
+        let per_spawn = per_spawn_points();
+        let startup: Vec<SubEffectPoint> = all
+            .iter()
+            .copied()
+            .filter(|point| STARTUP_POINTS.contains(point))
+            .collect();
+        assert_eq!(
+            all.len(),
+            per_spawn.len() + startup.len(),
+            "a point is in both domains or in neither: all={all:?} per_spawn={per_spawn:?} \
+             startup={startup:?}"
+        );
+        assert_eq!(all.len(), 4, "this platform's containment points: {all:?}");
+        assert_eq!(
+            startup.len(),
+            usize::from(cfg!(windows)),
+            "the ambient join is Windows' one startup point and Unix has none: {startup:?}"
+        );
+        // Derived, not transcribed: the domain agrees with the packet's own
+        // platform split for this host.
+        let expected: &[SubEffectPoint] = if cfg!(windows) {
+            WINDOWS_POINTS
         } else {
             UNIX_POINTS
-        }
+        };
+        assert_eq!(all, expected, "the derived domain left the packet's split");
     }
 
     /// The child of a role whose production program is **the recorded shell**:
@@ -4046,7 +4585,7 @@ mod tests {
                 .unwrap_or_else(|error| panic!("{what}: {error}"));
             assert_eq!(output.code, Some(0), "{what}: {output:?}");
             let harness = witness.harness.lock().expect("harness");
-            for point in points {
+            for point in &points {
                 assert!(
                     point
                         .modes()
@@ -4112,7 +4651,7 @@ mod tests {
             assert_eq!(output.code, Some(0), "{id}: {output:?}");
 
             let harness = witness.harness.lock().expect("harness");
-            for point in points {
+            for point in &points {
                 assert!(
                     point
                         .modes()
@@ -4232,7 +4771,7 @@ mod tests {
             }
 
             let harness = witness.harness.lock().expect("harness");
-            for point in points {
+            for point in &points {
                 assert!(
                     point
                         .modes()
@@ -4255,7 +4794,7 @@ mod tests {
         // point — observation and injection are two claims.
         let mut injections = 0_usize;
         for shape in &shapes {
-            for point in points {
+            for point in &points {
                 let workspace = scratch("program-shape-fault");
                 let runner = HostRunner::new().with_hooks(Box::new(FailAt(*point)));
                 let request = crate::runner::worker_request(
@@ -4381,7 +4920,7 @@ mod tests {
                 output.stdout
             );
             let harness = witness.harness.lock().expect("harness");
-            for point in points {
+            for point in &points {
                 assert!(
                     point
                         .modes()
@@ -4485,7 +5024,7 @@ mod tests {
 
             {
                 let harness = witness.harness.lock().expect("harness");
-                for point in points {
+                for point in &points {
                     assert!(
                         point
                             .modes()
@@ -4532,6 +5071,227 @@ mod tests {
         );
     }
 
+    // -----------------------------------------------------------------------
+    // Kill mode, actually executed
+    // -----------------------------------------------------------------------
+
+    /// Which containment point the kill helper is to die at.
+    const SPAWN_KILL_POINT: &str = "TACTUS_SPAWN_KILL_POINT";
+
+    /// A hook that kills the funnel at one named point and nowhere else.
+    struct KillAtPoint(SubEffectPoint);
+
+    impl SpawnHooks for KillAtPoint {
+        fn point(&mut self, point: SubEffectPoint) -> crate::topology::effects::Injection {
+            if point == self.0 {
+                crate::topology::effects::Injection::Kill
+            } else {
+                crate::topology::effects::Injection::Proceed
+            }
+        }
+
+        /// A point consulted at **two** coordinates is killed at the one the
+        /// kill mode belongs at, and not at the other one.
+        ///
+        /// `Spawn.AmbientJobJoined` is that point: its error-return coordinate
+        /// is *before* the join and its kill coordinate is *after* it. The
+        /// inherited default answers `point()` to both, so a hook armed for a
+        /// kill would abort at the earlier, error-return coordinate — before
+        /// there is an ambient handle to close, which is the state the point's
+        /// kill claim says there is not. The grid would still see an abort and
+        /// would still pass, while witnessing a coordinate the packet does not
+        /// name. That is the same shape of false witness as the omitted point
+        /// itself (`PR5-RD-002`), one layer in.
+        fn point_mode(
+            &mut self,
+            point: SubEffectPoint,
+            mode: InjectionMode,
+        ) -> crate::topology::effects::Injection {
+            if mode == InjectionMode::Kill {
+                self.point(point)
+            } else {
+                crate::topology::effects::Injection::Proceed
+            }
+        }
+    }
+
+    /// The child half of [`a_kill_armed_at_any_containment_point_actually_kills`].
+    ///
+    /// A kill is `std::process::abort` for the reason [`proc::apply`] gives: the
+    /// claim under test is what a coordinator that dies **without running any
+    /// cleanup** does, and both `panic!` and `exit` run destructors — including
+    /// the one that closes the very job handle whose close-on-death is the
+    /// mechanism. So it needs a process of its own.
+    ///
+    /// It **establishes containment first**, which is not decoration. On Windows
+    /// a kill at `CreatedSuspended` leaves a suspended stub by construction —
+    /// that is the state INV-18 exists for — and the only thing that reaps it is
+    /// the ambient job's handle closing when this process dies. A helper that
+    /// skipped the step would leak one suspended `cmd.exe` per point onto the
+    /// guest, **measured**: the first run of this grid left three of them and a
+    /// hung parent. On Unix the step is a no-op and the per-invocation reaper
+    /// settles the group instead.
+    ///
+    /// **The startup step is where the arming happens for a startup point.**
+    /// This used to run `start_write_command(&mut NoHooks)` unconditionally and
+    /// only then install `KillAtPoint`, so `Spawn.AmbientJobJoined` — which is
+    /// reached by that call and by nothing later — could not receive a kill at
+    /// all, and six guest runs of a grid that claimed to cover it executed it
+    /// zero times (`PR5-RD-002`). A startup point is now armed *on the startup
+    /// call*, which is the only place it is consulted.
+    #[test]
+    #[ignore = "subprocess helper"]
+    fn spawn_funnel_kill_helper() {
+        let Ok(name) = std::env::var(SPAWN_KILL_POINT) else {
+            return;
+        };
+        let point = containment_points()
+            .into_iter()
+            .find(|point| point.name() == name)
+            .unwrap_or_else(|| panic!("the parent named a point this platform has not: {name}"));
+        let workspace = scratch("kill-helper");
+        if STARTUP_POINTS.contains(&point) {
+            // The point's kill coordinate is *inside* this call, after the real
+            // ambient join. Reaching the line after it means the kill never
+            // fired, and the parent reads a clean exit as exactly that.
+            let _ = start_write_command(&mut KillAtPoint(point));
+            std::process::exit(0);
+        }
+        start_write_command(&mut proc::NoHooks)
+            .expect("the helper establishes containment before it spawns anything");
+        let runner = HostRunner::new().with_hooks(Box::new(KillAtPoint(point)));
+        // Every point this platform declares is reached by an ordinary spawn,
+        // which is what `every_role_reaches_the_containment_points_of_this_
+        // platform` establishes; the gate role is the cheapest of the five.
+        let _ = runner.run(&crate::runner::gate_request(
+            shell_command(),
+            workspace.clone(),
+            crate::config::DEFAULT_GATE_TIMEOUT,
+            gate_invocation(),
+        ));
+        let _ = std::fs::remove_dir_all(&workspace);
+        // Reached only if the kill did not fire, which the parent detects as a
+        // clean exit.
+        std::process::exit(0);
+    }
+
+    /// `Injection::Kill` **aborts**, at every containment point that declares
+    /// the mode on this platform.
+    ///
+    /// `decisions.effect_site_inventory.scope` requires "every parent-side
+    /// sub-effect point observed **executed** at least once by the suite in
+    /// every injection mode the point supports", and every containment point
+    /// declares `Kill` (`SubEffectPoint::modes`). Nothing had ever let one
+    /// fire: the runtime reach tests arm nothing, and the fault grid injects
+    /// `Injection::Error` — deliberately, because an abort would take the test
+    /// binary with it. So `Injection::Kill => Ok(())` in `proc::apply` passed
+    /// the whole suite (`PR5-SEAMS-001`), and with it every ST-07 kill-mode
+    /// claim about `Process.Spawn`.
+    ///
+    /// This is the sibling of `events::log::tests::a_kill_at_each_append_point_
+    /// leaves_the_shape_the_packet_tables`, and the same idiom: a subprocess
+    /// helper, and the child's death **checked** rather than assumed — not a
+    /// clean exit, no `panicked at` on stderr, and on Unix the signal is
+    /// `SIGABRT` and not some other way of dying.
+    ///
+    /// The domain is [`containment_points()`] — **every** point this platform
+    /// declares, read out of `Process.Spawn`'s own `sub_effects()` and each
+    /// point's own `platform()`, so a point added later is covered by
+    /// construction rather than by someone remembering to add it here. It was a
+    /// hand-written three-element list, which omitted `AmbientJobJoined`
+    /// (`PR5-RD-002`): the grid, its helper and this doc comment all agreed
+    /// that the Windows ambient join was covered in kill mode, and it had never
+    /// once executed in that mode on the guest.
+    ///
+    /// Both of the funnel's two appliers are inside the domain: on Unix all
+    /// four points go through `proc::apply`, and on Windows `AmbientJobJoined`
+    /// goes through `apply` while the three per-spawn points go through
+    /// `apply_io`. That is the second reason the omission mattered — with
+    /// `AmbientJobJoined` absent, no Windows run of this grid touched `apply`
+    /// at all.
+    ///
+    /// **The helper's output goes to files, and this waits on the process
+    /// rather than on its pipes.** `Command::output()` returns when the pipe
+    /// write ends close, not when the child exits, and on Windows
+    /// `CreateProcessW` inherits handles — so the grandchild this helper leaves
+    /// **suspended by design** holds a duplicate of the pipe and `output()`
+    /// blocks for ever. Measured on the guest, where it hung the whole run.
+    #[test]
+    fn a_kill_armed_at_any_containment_point_actually_kills() {
+        let helper = format!(
+            "{}::spawn_funnel_kill_helper",
+            module_path!()
+                .split_once("::")
+                .expect("this module is not the crate root")
+                .1
+        );
+        let points = containment_points();
+        assert!(
+            !points.is_empty(),
+            "this platform declares no containment point, so nothing is measured"
+        );
+        let capture = scratch("kill-capture");
+        for point in &points {
+            assert!(
+                point.modes().contains(&InjectionMode::Kill),
+                "{point}: this grid is about the kill mode and this point does not declare it"
+            );
+            let out_path = capture.join(format!("{}.out", point.name()));
+            let err_path = capture.join(format!("{}.err", point.name()));
+            let status = Command::new(std::env::current_exe().expect("the test executable"))
+                .args([helper.as_str(), "--ignored", "--exact"])
+                .env(SPAWN_KILL_POINT, point.name())
+                .stdout(std::fs::File::create(&out_path).expect("capture stdout"))
+                .stderr(std::fs::File::create(&err_path).expect("capture stderr"))
+                .status()
+                .unwrap_or_else(|error| panic!("{point}: spawning the helper: {error}"));
+            let stdout = std::fs::read_to_string(&out_path).unwrap_or_default();
+            let stderr = std::fs::read_to_string(&err_path).unwrap_or_default();
+
+            assert!(
+                !status.success(),
+                "{point}: the helper exited cleanly, so the kill never fired.\n{stdout}"
+            );
+            assert!(
+                !stderr.contains("panicked at"),
+                "{point}: the helper panicked rather than aborting, so destructors ran \
+                 and this is not what a coordinator kill leaves:\n{stderr}"
+            );
+            #[cfg(unix)]
+            {
+                use std::os::unix::process::ExitStatusExt;
+                assert_eq!(
+                    status.signal(),
+                    Some(libc::SIGABRT),
+                    "{point}: a kill is an abort, and this child died some other way \
+                     (code {:?})",
+                    status.code()
+                );
+            }
+            #[cfg(not(unix))]
+            assert_ne!(
+                status.code(),
+                Some(101),
+                "{point}: 101 is the harness's panic status, not an abort"
+            );
+        }
+        let _ = std::fs::remove_dir_all(&capture);
+        // The count, so a domain that shrank would fail here rather than pass
+        // vacuously — four on **both** platforms, which is what the frozen
+        // inventory declares and what the omitted `AmbientJobJoined` made read
+        // as three.
+        assert_eq!(
+            points.len(),
+            4,
+            "the frozen inventory's containment points for this platform: {points:?}"
+        );
+        assert_eq!(
+            points.contains(&SubEffectPoint::AmbientJobJoined),
+            cfg!(windows),
+            "the Windows startup point is in the kill grid's domain exactly on Windows"
+        );
+    }
+
     /// A hook that fails the funnel at one named point and nowhere else.
     struct FailAt(SubEffectPoint);
 
@@ -4574,7 +5334,7 @@ mod tests {
         );
         let mut injections = 0_usize;
         for role in &roles {
-            for point in points {
+            for point in &points {
                 let runner = HostRunner::new().with_hooks(Box::new(FailAt(*point)));
                 let workspace = scratch("role-fault");
                 let outcome = run_in_role(&runner, role, &workspace);
@@ -5060,6 +5820,107 @@ mod tests {
              after it for its kill claim; got {observed:?}"
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Set for the child that is to carry a **real** memoised ambient failure.
+    #[cfg(windows)]
+    const POISON_AMBIENT: &str = "TACTUS_POISON_AMBIENT";
+
+    /// The child half of
+    /// [`a_real_memoised_ambient_failure_refuses_the_write_command`].
+    ///
+    /// It spends this process's one ambient cell, which is why it needs a
+    /// process of its own: `AMBIENT` is a `OnceLock` and the test binary's
+    /// other tests need it unspent.
+    #[cfg(windows)]
+    #[test]
+    #[ignore = "subprocess helper"]
+    fn poisoned_ambient_helper() {
+        const MESSAGE: &str = "it could not be created (simulated by the helper)";
+        if std::env::var_os(POISON_AMBIENT).is_none() {
+            return;
+        }
+        assert!(
+            proc::poison_ambient_for_tests(MESSAGE),
+            "the ambient cell was already spent, so this helper measures nothing"
+        );
+
+        // (1) The funnel's own entry point reports the remembered failure.
+        let error = proc::join_ambient_job(&mut proc::NoHooks)
+            .expect_err("a memoised failure is a failure for every later caller");
+        let rendered = error.to_string();
+        assert!(rendered.contains(MESSAGE), "the diagnostic: {rendered}");
+        assert!(
+            rendered.contains("No process was spawned"),
+            "and it says nothing ran: {rendered}"
+        );
+
+        // (2) The production mint refuses, and mints nothing.
+        let before = containment_establishments();
+        let error = contain_write_command(&mut proc::NoHooks)
+            .err()
+            .map(|error| error.to_string())
+            .unwrap_or_else(|| panic!("a Contained was minted with no ambient job"));
+        assert!(error.contains(MESSAGE), "the mint's diagnostic: {error}");
+        assert_eq!(
+            containment_establishments(),
+            before,
+            "an establishment was counted although the join failed"
+        );
+
+        // (3) And the CLI's unit-returning entry, which is what `src/main.rs`
+        // calls before any dispatch arm.
+        start_write_command(&mut proc::NoHooks).expect_err("the CLI write path refuses too");
+
+        println!("POISONED-AMBIENT-REFUSED");
+    }
+
+    /// A **real** memoised ambient failure refuses the write command.
+    ///
+    /// `crash_reconstruction`: "if the ambient job cannot be created or joined
+    /// the write command refuses at startup with a diagnostic before any
+    /// workspace effect (no degraded mode; deferred)", and
+    /// `expected_failures_refusals[1]` requires the same refusal.
+    ///
+    /// `PR4-CONF-005` closed the *injected* half — an observer refusing at
+    /// `Spawn.AmbientJobJoined`, which fires strictly **before** the memo is
+    /// consulted. `PR5-CORRECTNESS-010` is the half beyond it: no test had ever
+    /// carried an actual memoised `Err` through `join_ambient`'s match, so
+    /// `Err(_) => Ok(())` there left `join_ambient_job` reporting success,
+    /// `contain_write_command` minting `Contained`, and `run`/`resume` taking
+    /// workspace effects with no ambient kill-on-close job.
+    ///
+    /// Windows only, and that is the invariant rather than a gap:
+    /// `join_ambient_job` is a no-op on Unix and has no memo to poison. The
+    /// platform-independent half of the same claim — that a remembered failure
+    /// comes back as that failure — is `agent::proc::tests::
+    /// a_memoised_establishment_failure_reaches_every_later_caller`, which runs
+    /// everywhere.
+    #[cfg(windows)]
+    #[test]
+    fn a_real_memoised_ambient_failure_refuses_the_write_command() {
+        let helper = format!(
+            "{}::poisoned_ambient_helper",
+            module_path!()
+                .split_once("::")
+                .expect("this module is not the crate root")
+                .1
+        );
+        let output = Command::new(std::env::current_exe().expect("the test executable"))
+            .args([helper.as_str(), "--ignored", "--exact", "--nocapture"])
+            .env(POISON_AMBIENT, "1")
+            .output()
+            .expect("spawn the poisoned-ambient helper");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            output.status.success(),
+            "the helper failed:\n{stdout}\n{stderr}"
+        );
+        assert!(
+            stdout.contains("POISONED-AMBIENT-REFUSED"),
+            "the helper never reached its own conclusion, so it asserted nothing:\n{stdout}"
+        );
     }
 
     /// Where the coordinator helper writes the identity of the stub it created

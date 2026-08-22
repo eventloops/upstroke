@@ -2,6 +2,14 @@
 // Copyright (C) 2026 Cameron Lambert. Licensed under the GNU AGPL v3 only;
 // see LICENSE, or <https://www.gnu.org/licenses/>. Commercial licences are
 // available for use the AGPL does not permit — see README.md.
+// LEGACY-EFFECT: this module is in the **frozen legacy section** of
+// `effects/allowlist.toml`, which carries its justification and the condition
+// under which the section shrinks. `decisions.effect_site_inventory.mechanism` (2).
+#![allow(
+    clippy::disallowed_macros,
+    clippy::disallowed_methods,
+    clippy::disallowed_types
+)]
 
 use std::io::{BufRead, IsTerminal, Read};
 use std::path::PathBuf;

@@ -21,6 +21,10 @@
 //!   nothing. `--force` still carries the operator's own keys across, because
 //!   `profile`, `monthly_allowance` and `endpoint` are things discovery cannot
 //!   supply and replacing the file must not quietly delete.
+// LEGACY-EFFECT: this module is in the **frozen legacy section** of
+// `effects/allowlist.toml`, which carries its justification and the condition
+// under which the section shrinks. `decisions.effect_site_inventory.mechanism` (2).
+#![allow(clippy::disallowed_methods, clippy::disallowed_macros)]
 
 use std::fmt::Write as _;
 use std::fs;

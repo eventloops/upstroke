@@ -1,3 +1,8 @@
+// LEGACY-EFFECT: this module is in the **frozen legacy section** of
+// `effects/allowlist.toml`, which carries its justification and the condition
+// under which the section shrinks. `decisions.effect_site_inventory.mechanism` (2).
+#![allow(clippy::disallowed_methods)]
+
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
 use std::fs;
@@ -19,8 +24,9 @@ use crate::ladder::{
     self, AttemptFailure, FailureKind, FailureOrigin, LadderPolicy, LadderState, Next,
 };
 use crate::review::{PassBinding, ReviewPass, ReviewPlan};
-use crate::rundir::{RunLock, RunPaths, WorktreeLock};
+use crate::rundir::{self, RunLock, RunPaths, WorktreeLock};
 use crate::runner::Runner;
+use crate::topology::effects::EventSite;
 use crate::ulid;
 use crate::util;
 use crate::validate::Analysis;
@@ -133,11 +139,7 @@ pub(super) fn run_harness_inner_on(
     let plan_path = paths.plan_json();
     let normalized_plan = normalized_plan_bytes(&analysis.plan, &plan_path)?;
     let normalized_plan_digest = events::normalized_plan_digest(&normalized_plan);
-    let opened = fs::write(&plan_path, &normalized_plan)
-        .map_err(|source| TactusError::Io {
-            path: plan_path.clone(),
-            source,
-        })
+    let opened = rundir::write_plan(&paths.public, &normalized_plan, &mut rundir::NoHooks)
         .and_then(|()| {
             let read_back = fs::read(&plan_path).map_err(|source| TactusError::Io {
                 path: plan_path.clone(),
@@ -195,7 +197,7 @@ pub(super) fn run_harness_inner_on(
         wait_on_block.unwrap_or(analysis.config.wait_on_block),
         sleeper,
     );
-    let log = EventLog::open(&paths.events(), &mut warnings)?;
+    let log = EventLog::open(EventSite::LegacyOpenLog, &paths.events(), &mut warnings)?;
     let mut run = Run {
         state: RunState::new(
             analysis
@@ -209,6 +211,7 @@ pub(super) fn run_harness_inner_on(
         workspace: &workspace,
         paths,
         log,
+        log_hooks: legacy_append_hooks(opts),
         gate_cmds,
         adapters: harness.adapters,
         runner,
@@ -255,6 +258,26 @@ pub(super) struct Run<'a> {
     /// The append-only record. Every mutation below goes through
     /// [`Run::emit`], never straight at `state`.
     pub(super) log: EventLog,
+    /// The observer the **legacy** append funnel is driven through.
+    ///
+    /// Production passes [`NoEventHooks`], which is precisely what
+    /// `EventLog::append` passes on its own, so nothing about the legacy
+    /// engine's behaviour moves — `invariants_preserved[1]`. What moves is that
+    /// the failure is now *reachable* (`PR5-CONF-010`, `PR5-CONF-011`).
+    ///
+    /// `production_effect` says "the legacy engine's handling of a returned
+    /// append error is unchanged — **it reports and stops**". The shipped code
+    /// did; nothing required it to. Replacing this function's `?` with an arm
+    /// that pushed a warning and returned `Ok` survived the whole suite, because
+    /// every append failure the suite injects targets an `EventLog` a test
+    /// built directly, and no fixture could make a **live `Run`**'s append fail:
+    /// `emit` called `append`, which hard-codes `NoEventHooks`. A source census
+    /// cannot tell propagation from swallowing inside a live run.
+    ///
+    /// This is the resolution `PR4-CONF-005` reached for the same shape — no
+    /// machine here can make the real primitive fail, so the observer becomes a
+    /// parameter and production passes the no-op one.
+    pub(super) log_hooks: Box<dyn crate::events::log::EventHooks>,
     /// Derived state — the same fold `resume` and `status` build from the log.
     pub(super) state: RunState,
     pub(super) gate_cmds: Vec<String>,
@@ -317,6 +340,25 @@ pub(super) struct Run<'a> {
     pub(super) after_candidate_capture: Option<AfterCandidateCapture>,
 }
 
+/// The observer the live run's legacy append funnel is driven through.
+///
+/// Production is [`NoEventHooks`] — the same thing `EventLog::append` passes —
+/// on both arms. The `#[cfg(test)]` arm exists so a fixture can make a live
+/// `Run`'s append fail (`PR5-CONF-010`, `PR5-CONF-011`).
+#[cfg(test)]
+fn legacy_append_hooks(opts: &RunOptions) -> Box<dyn crate::events::log::EventHooks> {
+    match opts.log_hooks {
+        Some(make) => make(),
+        None => Box::new(crate::events::log::NoEventHooks),
+    }
+}
+
+/// See the `#[cfg(test)]` twin above.
+#[cfg(not(test))]
+fn legacy_append_hooks(_opts: &RunOptions) -> Box<dyn crate::events::log::EventHooks> {
+    Box::new(crate::events::log::NoEventHooks)
+}
+
 impl Run<'_> {
     /// Append an event and fold it in.
     ///
@@ -325,7 +367,10 @@ impl Run<'_> {
     /// its own log the same computation rather than two that agree by
     /// inspection.
     pub(super) fn emit(&mut self, body: EventBody) -> Result<(), TactusError> {
-        let event = self.log.append(body)?;
+        let site = EventSite::LegacyAppend;
+        let event = self
+            .log
+            .append_hooked(site, body, self.log_hooks.as_mut())?;
         self.state.apply(&event);
         Ok(())
     }
@@ -339,7 +384,7 @@ impl Run<'_> {
             // next, and failing to write it must not mask the error that
             // actually stopped the run.
             let partial = self.finish();
-            let _ = util::write_json(&self.paths.report_json(), &partial);
+            let _ = rundir::write_report(&self.paths.public, &partial, &mut rundir::NoHooks);
             return Err(error);
         }
         let report = self.finish();
@@ -361,7 +406,7 @@ impl Run<'_> {
                 parked: u32::try_from(report.parked_tasks().len()).unwrap_or(u32::MAX),
             },
         })?;
-        util::write_json(&self.paths.report_json(), &report)?;
+        rundir::write_report(&self.paths.public, &report, &mut rundir::NoHooks)?;
         Ok(report)
     }
 

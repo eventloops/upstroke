@@ -57,6 +57,15 @@ pub struct RunOptions {
     /// after the engine has frozen its candidate object identities.
     #[cfg(test)]
     pub(super) after_candidate_capture: Option<AfterCandidateCapture>,
+    /// The observer the live run's **legacy** append funnel is driven through.
+    ///
+    /// `None` is production and means [`crate::events::log::NoEventHooks`],
+    /// which is what `EventLog::append` uses anyway. It is here so a fixture can
+    /// make a **live `Run`**'s append fail (`PR5-CONF-010`, `PR5-CONF-011`);
+    /// nothing else in the tree can, and both surviving mutations were on the
+    /// path that failure takes.
+    #[cfg(test)]
+    pub(super) log_hooks: Option<fn() -> Box<dyn crate::events::log::EventHooks>>,
 }
 
 impl RunOptions {
@@ -76,6 +85,8 @@ impl RunOptions {
             budget_usd: None,
             #[cfg(test)]
             after_candidate_capture: None,
+            #[cfg(test)]
+            log_hooks: None,
         }
     }
 

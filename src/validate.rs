@@ -1,5 +1,9 @@
 //! `tactus validate`: parse → config → graph checks → routing preview →
 //! rendered report. No execution of anything.
+// LEGACY-EFFECT: this module is in the **frozen legacy section** of
+// `effects/allowlist.toml`, which carries its justification and the condition
+// under which the section shrinks. `decisions.effect_site_inventory.mechanism` (2).
+#![allow(clippy::disallowed_methods)]
 
 use std::collections::BTreeMap;
 use std::fs;
