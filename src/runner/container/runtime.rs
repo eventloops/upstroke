@@ -259,6 +259,14 @@ pub struct ImageInspection {
 /// never receives the public log, sibling worktrees, or private artifacts", and
 /// DESIGN.md:612 adds the read-only reviewer mount and the per-agent credential
 /// volume ("persistent volumes, not ephemeral copies").
+///
+/// **Every writable surface a container has is one of these**, which is what
+/// makes `expected_failures_refusals[5]` — "gate write outside mount fails" —
+/// a statement with a decidable subject. [`CreateSpec::read_only_root`] closes
+/// the container layer, so the mount list is the whole of what a container may
+/// write; a scratch surface a shell needs is therefore a [`Mount::Tmpfs`] and
+/// not an implicit hole. `PR6-CORRECTNESS-008` / `PR6-ENUM-005` are the entries
+/// for what it cost when it was not.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Mount {
     /// A host path, bound at `target`.
@@ -274,6 +282,16 @@ pub enum Mount {
         target: String,
         read_only: bool,
     },
+    /// An ephemeral in-memory scratch surface, with no host source and no
+    /// name.
+    ///
+    /// A container whose root filesystem is read-only still needs somewhere to
+    /// put a temporary file — `sh` here-documents, `git`'s own temporaries, an
+    /// agent CLI's cache — and the alternative to declaring it is leaving the
+    /// whole container layer writable, which is the defect this variant exists
+    /// to remove. It carries **no host path**, so nothing the container writes
+    /// here can reach the coordinator, and it dies with the container.
+    Tmpfs { target: String },
 }
 
 impl Mount {
@@ -281,15 +299,21 @@ impl Mount {
     #[must_use]
     pub fn target(&self) -> &str {
         match self {
-            Self::Path { target, .. } | Self::Volume { target, .. } => target,
+            Self::Path { target, .. } | Self::Volume { target, .. } | Self::Tmpfs { target } => {
+                target
+            }
         }
     }
 
     /// Whether the mount is read-only.
+    ///
+    /// A tmpfs that could not be written would be a mount with no purpose, so
+    /// this variant has no flag rather than a flag that is always `false`.
     #[must_use]
     pub const fn read_only(&self) -> bool {
         match self {
             Self::Path { read_only, .. } | Self::Volume { read_only, .. } => *read_only,
+            Self::Tmpfs { .. } => false,
         }
     }
 }
@@ -315,7 +339,31 @@ pub struct CreateSpec {
     /// The command line, from the `CommandSpec`.
     pub command: Vec<String>,
     /// The child's working directory inside the container.
+    ///
+    /// **Always `Some`.** DESIGN.md:118 gives a runner "cwd, mounts,
+    /// environment, supervision, and timeout", and a `None` here is a runner
+    /// that let the *image* pick the working directory — which is how a probe
+    /// and the attempt it certifies came to run in two different directories
+    /// (`PR6-CORRECTNESS-006`). `Option` survives because the field is the
+    /// runtime seam's and a caller outside this slice may have no opinion; the
+    /// container runner's [`super::exec::ContainerRunner::plan`] never produces
+    /// one.
     pub workdir: Option<String>,
+    /// Whether the container's own root filesystem is read-only.
+    ///
+    /// `expected_failures_refusals[5]`: "**gate write outside mount fails**".
+    /// Without this the role bind mounts are correct and the write still
+    /// succeeds — into the container's writable layer — so the refusal the
+    /// contract states does not hold and only the weaker "the host is unharmed"
+    /// does. DESIGN.md:610 calls the container "the first mechanism in this
+    /// design that confines gate-executed repository code"; this field is that
+    /// mechanism, and [`Mount::Tmpfs`] is what a container still legitimately
+    /// needs to write.
+    ///
+    /// A field rather than an unconditional argv flag so the obligation is
+    /// assertable from a [`CreateSpec`] on a machine with no container runtime
+    /// — including the Windows guest, which has none.
+    pub read_only_root: bool,
 }
 
 /// What `docker create` gives back.

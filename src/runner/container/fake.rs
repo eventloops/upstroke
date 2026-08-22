@@ -585,6 +585,12 @@ pub(crate) const DOCKER_GATED_TESTS: &[&str] = &[
     "real_docker_adapter_parsing_matches_the_host_table",
     // Lane C: the startup census against the real runtime.
     "real_docker_census_reclaims_a_dead_owner_and_spares_a_live_one",
+    // Repair round R1: what "confines gate-executed repository code" and
+    // "pre-flight certifies the environment that will actually spend" mean
+    // against a real daemon rather than against a spec.
+    "real_docker_a_gate_write_outside_every_declared_mount_fails",
+    "real_docker_the_daemon_holds_exactly_the_specs_mounts_and_a_read_only_root",
+    "real_docker_a_worktree_binary_cannot_shadow_the_certified_cli",
 ];
 
 /// Why a gated test skipped.

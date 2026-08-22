@@ -82,6 +82,7 @@ pub struct BoundaryLayout {
     credentials: String,
     git_view: String,
     git_objects: String,
+    scratch: String,
 }
 
 impl Default for BoundaryLayout {
@@ -126,6 +127,18 @@ impl BoundaryLayout {
     /// container.
     pub const DEFAULT_GIT_OBJECTS: &'static str = "/tactus/gitobjects";
 
+    /// The ephemeral scratch surface, and the working directory of a role that
+    /// has no worktree.
+    ///
+    /// `/tmp` because that is the directory a POSIX shell, `git` and every CLI
+    /// this engine drives already write temporaries to, and because
+    /// `CreateSpec::read_only_root` closes the container's own layer: without a
+    /// declared writable scratch mount a gate could not run `sh` at all. It is
+    /// a `Mount::Tmpfs` and therefore has **no host source**, so "gate write
+    /// outside mount fails" stays a statement about a mount list every entry of
+    /// which is either the role's own or unreachable from the coordinator.
+    pub const DEFAULT_SCRATCH: &'static str = "/tmp";
+
     /// The default layout.
     #[must_use]
     pub fn new() -> Self {
@@ -134,6 +147,7 @@ impl BoundaryLayout {
             credentials: Self::DEFAULT_CREDENTIALS.to_owned(),
             git_view: Self::DEFAULT_GIT_VIEW.to_owned(),
             git_objects: Self::DEFAULT_GIT_OBJECTS.to_owned(),
+            scratch: Self::DEFAULT_SCRATCH.to_owned(),
         }
     }
 
@@ -144,12 +158,14 @@ impl BoundaryLayout {
         credentials: impl Into<String>,
         git_view: impl Into<String>,
         git_objects: impl Into<String>,
+        scratch: impl Into<String>,
     ) -> Self {
         Self {
             workspace: workspace.into(),
             credentials: credentials.into(),
             git_view: git_view.into(),
             git_objects: git_objects.into(),
+            scratch: scratch.into(),
         }
     }
 
@@ -169,6 +185,13 @@ impl BoundaryLayout {
     #[must_use]
     pub fn git_objects(&self) -> &str {
         &self.git_objects
+    }
+
+    /// The ephemeral scratch surface, and the working directory of a role that
+    /// has no worktree.
+    #[must_use]
+    pub fn scratch(&self) -> &str {
+        &self.scratch
     }
 
     /// `<workspace>/.git` — where a Git-dependent tool looks, and what the
@@ -245,6 +268,51 @@ pub const fn supplies_credential_location(role: &ExecutionRole) -> bool {
 /// does not reserve.
 pub const CONTAINER_KEY_CASE: KeyCase = KeyCase::Sensitive;
 
+/// The separator between `PATH` components at the container boundary.
+///
+/// `:` unconditionally, for the reason [`CONTAINER_KEY_CASE`] is
+/// `KeyCase::Sensitive`: the boundary is the image, DESIGN.md:610 puts the
+/// repository "WSL-side", and the image is Linux even when the coordinator is
+/// not. A `cfg!(windows)` here would split the container's `PATH` on `;` on a
+/// Windows coordinator and find one enormous component that happens to be
+/// absolute.
+pub const CONTAINER_PATH_SEPARATOR: char = ':';
+
+/// The `PATH` components that make a bare program name resolve **relative to
+/// the working directory**.
+///
+/// Two shapes, and the second is the one that is missed: a component that is
+/// literally `.`, and a component that is **empty** — `PATH=/usr/bin:` and
+/// `PATH=:/usr/bin` and `PATH=/a::/b` all name the current directory, which is
+/// POSIX and is what a trailing separator produces by accident. Anything that
+/// does not begin with `/` is relative, so the test is one rule and the two
+/// shapes are consequences of it.
+///
+/// ## Why this is a refusal and not a filter
+///
+/// DESIGN.md:612: "Probes run through that same runner, or pre-flight could
+/// certify a host CLI/version different from the one the attempt executes."
+/// A probe has no worktree and an attempt has one, so their working directories
+/// necessarily differ — that difference is *designed*, and it cannot be
+/// removed. What must not differ is which binary a name resolves to. With a
+/// relative component in `PATH` the repository's own worktree is on the
+/// executable search path, so repository-controlled content decides which
+/// `claude` an Implement invocation runs while pre-flight certified another
+/// one (`PR6-CORRECTNESS-006`).
+///
+/// Dropping the offending components would also make resolution
+/// cwd-independent, and would do it by silently changing what the operator's
+/// image asked for. Refusing says so. `pr_sequence[7]`'s own idiom is a refusal
+/// before any effect, and `plan` performs none.
+#[must_use]
+pub fn cwd_dependent_path_components(value: &str) -> Vec<String> {
+    value
+        .split(CONTAINER_PATH_SEPARATOR)
+        .filter(|component| !component.starts_with('/'))
+        .map(str::to_owned)
+        .collect()
+}
+
 /// What one request's environment is composed for.
 ///
 /// A struct rather than four parameters because the four travel together and a
@@ -310,6 +378,17 @@ impl ContainerEnvironment {
     /// cannot do is hand over the credentials themselves: the volume is either
     /// mounted at that path or it is not, and for a gate it is not. The mount
     /// is the boundary; the variable is a pointer.
+    ///
+    /// **[`Self::compose`] now refuses every environment built from this base**
+    /// (`PR6-CORRECTNESS-006`), and the constructor survives only so that
+    /// refusal has a subject. An empty base supplies no `PATH`, so the image's
+    /// own decides which binary a bare program name resolves to; if that `PATH`
+    /// carries a relative component — `.`, or the empty component a trailing
+    /// `:` produces — a probe and the attempt it certifies resolve different
+    /// binaries, because a probe has no worktree and an attempt has one. The
+    /// honest reading of DESIGN.md:259-260 is that the runner *reads* the image
+    /// environment and supplies `PATH` from it; a caller that has performed
+    /// that read-only inspection passes it here through [`Self::from_image`].
     #[must_use]
     pub fn inherited() -> Self {
         Self::from_image(Vec::new())
@@ -395,6 +474,9 @@ impl ContainerEnvironment {
     /// refuses it: an overlay permitted to restate `PATH` today because the
     /// value happens to match is an overlay that breaks silently the day the
     /// runner's value changes.
+    ///
+    /// [`TactusError::Refused`] also when the composed environment does not
+    /// supply an absolute-only `PATH` — see [`Self::certify_path`].
     pub fn compose(
         &self,
         scope: &RoleScope<'_>,
@@ -411,7 +493,61 @@ impl ContainerEnvironment {
         for (key, value) in overlay {
             upsert(&mut composed, self.case, key.clone(), value.clone());
         }
+        self.certify_path(&composed)?;
         Ok(composed)
+    }
+
+    /// Refuse an environment under which a bare program name would resolve
+    /// against the working directory.
+    ///
+    /// Two refusals, and each is separately droppable:
+    ///
+    /// * the composed environment names **no** `PATH`, so the image's own
+    ///   decides resolution and this runner cannot say what it is. That is what
+    ///   [`Self::inherited`] produces, and it was the production default — a
+    ///   runner that supplied none of the three values DESIGN.md:260 says it
+    ///   supplies;
+    /// * the composed `PATH` carries a working-directory-relative component, so
+    ///   the same name resolves to different binaries in a probe (which has no
+    ///   worktree) and in the attempt it certifies (which has one).
+    ///
+    /// Composed rather than base, because the reserved-key step is what puts
+    /// `PATH` there and a check on the base would pass an implementation that
+    /// dropped it.
+    ///
+    /// # Errors
+    ///
+    /// [`TactusError::Refused`], naming the offending components.
+    pub fn certify_path(&self, composed: &[(String, String)]) -> Result<(), TactusError> {
+        let Some((_, value)) = composed
+            .iter()
+            .find(|(name, _)| self.case.same_key(name.as_ref(), "PATH".as_ref()))
+        else {
+            return Err(TactusError::Refused {
+                message: "the container runner composed an environment that names no `PATH`, so \
+                          the recorded image's own would decide which binary every bare program \
+                          name resolves to. DESIGN.md:260 has the runner supply role-scoped \
+                          `HOME`, `PATH`, and credential locations, and DESIGN.md:263 has \
+                          pre-flight certify the environment that will actually spend — neither \
+                          holds for a base this runner never read"
+                    .to_owned(),
+            });
+        };
+        let relative = cwd_dependent_path_components(value);
+        if relative.is_empty() {
+            return Ok(());
+        }
+        Err(TactusError::Refused {
+            message: format!(
+                "the container runner was given `PATH={value}`, whose component(s) {relative:?} \
+                 resolve against the working directory. A probe has no worktree and an attempt \
+                 has one, so the same bare program name would resolve to different binaries in \
+                 the two — DESIGN.md:612: \"Probes run through that same runner, or pre-flight \
+                 could certify a host CLI/version different from the one the attempt executes\". \
+                 Every `PATH` component at this boundary must be absolute (an empty component is \
+                 the working directory)"
+            ),
+        })
     }
 
     /// The reserved-key refusal on its own, so a caller can certify an overlay
@@ -873,6 +1009,7 @@ mod tests {
             "/elsewhere/creds",
             "/elsewhere/view",
             "/elsewhere/objects",
+            "/elsewhere/scratch",
         );
         assert_eq!(moved.git_pointer(), "/elsewhere/ws/.git");
         assert_eq!(moved.git_view(), "/elsewhere/view");
@@ -905,6 +1042,108 @@ mod tests {
         // would hide one of them.
         let distinct: std::collections::BTreeSet<&String> = before.iter().collect();
         assert_eq!(distinct.len(), before.len(), "{before:?}");
+    }
+
+    /// A `PATH` component is cwd-dependent exactly when it is not absolute, and
+    /// the classification is compared against a table written here.
+    ///
+    /// `PR6-CORRECTNESS-006`. The expected answers come from POSIX's own rule —
+    /// "a null pathname in `PATH` is a legacy spelling of the current working
+    /// directory" — and from what `.` means, not from calling the function and
+    /// recording what it said. Both hostile shapes are covered separately
+    /// because they are separately droppable: an implementation that tested
+    /// `component == "."` passes every `.` row and lets `PATH=/usr/bin:`
+    /// through, and one that tested `is_empty()` does the converse.
+    ///
+    /// Second field held constant: the separator, which is `:` in every row —
+    /// what varies is only the shape of one component.
+    #[test]
+    fn a_path_component_is_cwd_dependent_exactly_when_it_is_not_absolute() {
+        let table: &[(&str, &[&str])] = &[
+            // Absolute-only: nothing is relative.
+            ("/usr/local/bin:/usr/bin:/bin", &[]),
+            ("/bin", &[]),
+            // An explicit current directory.
+            ("/usr/local/bin:.:/usr/bin", &["."]),
+            (".", &["."]),
+            ("..:/bin", &[".."]),
+            // The empty component, in each of the three places a trailing,
+            // leading or doubled separator puts it.
+            ("/usr/bin:", &[""]),
+            (":/usr/bin", &[""]),
+            ("/a::/b", &[""]),
+            ("", &[""]),
+            // A bare relative directory name, which is neither `.` nor empty.
+            ("bin:/usr/bin", &["bin"]),
+            ("/usr/bin:tools/bin", &["tools/bin"]),
+            // Several at once, reported in order.
+            (".:/usr/bin:", &[".", ""]),
+            // A Windows-shaped value at a Linux boundary is one relative
+            // component, not two absolute ones: `CONTAINER_PATH_SEPARATOR` is
+            // `:` whatever the coordinator is, so this must refuse rather than
+            // parse.
+            ("C:\\Windows", &["C", "\\Windows"]),
+        ];
+        let mut relative_rows = 0_usize;
+        let mut absolute_rows = 0_usize;
+        for (value, expected) in table {
+            let found = cwd_dependent_path_components(value);
+            assert_eq!(&found, expected, "`PATH={value}`");
+            if expected.is_empty() {
+                absolute_rows += 1;
+            } else {
+                relative_rows += 1;
+            }
+        }
+        assert_eq!((absolute_rows, relative_rows), (2, 11), "the table shrank");
+
+        // And the refusal is the composition step's, for every role: a value
+        // that classifies as hostile must actually stop an invocation, and a
+        // classification nobody consults would pass the loop above.
+        let volumes = volumes();
+        let layout = BoundaryLayout::new();
+        let mut refused = 0_usize;
+        let mut composed_ok = 0_usize;
+        for role in ExecutionRole::all() {
+            let agent = binding(&role);
+            let scope = scope(&role, agent.as_ref(), &volumes, &layout);
+
+            let hostile = ContainerEnvironment::from_image(vec![(
+                "PATH".to_owned(),
+                "/usr/local/bin:.:/usr/bin".to_owned(),
+            )]);
+            let refusal = hostile
+                .compose(&scope, &[])
+                .expect_err("a cwd-relative PATH is refused");
+            let message = refusal.to_string();
+            assert!(message.contains("PATH="), "{role}: {message}");
+            assert!(message.contains("DESIGN.md:612"), "{role}: {message}");
+            refused += 1;
+
+            // No PATH at all is the other refusal, and it is the one
+            // production had: `inherited()` composes an empty base.
+            let silent = ContainerEnvironment::inherited();
+            let refusal = silent
+                .compose(&scope, &[])
+                .expect_err("an environment naming no PATH is refused");
+            assert!(
+                refusal.to_string().contains("names no `PATH`"),
+                "{role}: {refusal}"
+            );
+            refused += 1;
+
+            // The control: absolute-only composes, so the two refusals above
+            // are about the value and not about composition being broken.
+            let good = ContainerEnvironment::from_image(image_base());
+            good.compose(&scope, &[])
+                .expect("an absolute-only PATH composes");
+            composed_ok += 1;
+        }
+        assert_eq!(
+            (refused, composed_ok),
+            (10, 5),
+            "five roles, two refusals each"
+        );
     }
 
     /// The role rule is exhaustive over the five roles, and it is the packet's

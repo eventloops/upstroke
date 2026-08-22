@@ -19,6 +19,27 @@
 //! Nothing here performs an effect. The write and the removal are funnel APIs
 //! in `src/runner/container.rs`, under `ContainerSite::WriteIntent` and
 //! `ContainerSite::RemoveIntent`.
+//!
+//! ## The one thing here that is not data: [`IntentWritten`]
+//!
+//! `expected_failures_refusals[6]` is "container start without an intent is
+//! **impossible by construction**". Before repair R1 it was impossible by
+//! nobody having written it: `create_container` and `start_container` were
+//! public, took a bare [`ContainerName`], performed no inspection, and a
+//! `start_existing(name)` added tomorrow would have compiled
+//! (`PR6-CORRECTNESS-012` / `PR6-ENUM-001`, and catalogue survivor
+//! `PR6-INTENT-020` reached the same clause from the other side).
+//!
+//! [`IntentWritten`] is the capability, in the idiom `PR4-CONF-003` established
+//! for `Contained`: the two funnel APIs that create and start a container take
+//! one, and there are exactly two ways to obtain it — `container::write_intent`,
+//! which writes the record, and [`IntentWritten::certify`], which **reads the
+//! published record back and parses it**. A private field alone would not do
+//! it: Rust privacy makes a private item of `runner::container` visible to
+//! every child module of `runner::container`, which is where the lanes are, so
+//! the proof is grounded in the filesystem instead of in visibility. Forging
+//! one therefore requires writing a well-formed intent record at
+//! `<R>/containers/<name>.intent` — which is writing the intent.
 
 // `PR6-LANEF-004`: the Container funnel's module-level allow is an INNER
 // attribute, and a Rust lint level is scoped by the MODULE TREE rather than by
@@ -36,6 +57,7 @@
 )]
 
 use std::collections::BTreeMap;
+use std::fs;
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
@@ -234,6 +256,92 @@ impl ContainerIntent {
         labels.insert(LABEL_INCARNATION.to_owned(), self.incarnation.clone());
         labels.insert(LABEL_INVOCATION.to_owned(), self.invocation.clone());
         labels
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The capability: proof that a container's intent record is published
+// ---------------------------------------------------------------------------
+
+/// Evidence that `<R>/containers/<name>.intent` exists and is a
+/// [`ContainerIntent`].
+///
+/// `expected_failures_refusals[6]`: "container start without an intent is
+/// **impossible by construction**". `super::create_container` and
+/// `super::start_container` take one of these by reference, so reaching
+/// `Container.Create` or `Container.Start` without the record is not a thing a
+/// caller can express.
+///
+/// **The proof is a filesystem observation, not a private field**, and that is
+/// forced rather than chosen: `runner::container::exec`, `::census` and every
+/// other lane module is a *descendant* of `runner::container`, and Rust makes
+/// an ancestor's private items visible to its descendants — so a token minted
+/// only inside `container.rs` would be forgeable from `exec.rs` by writing the
+/// struct literal. Grounding the proof in `<R>/containers` closes that: the
+/// only way to obtain one is to have the record on disk, which is the property
+/// the clause is about. It is the tree's own "ground truth is the diff, not the
+/// transcript" applied to ownership evidence.
+///
+/// The fields are private so the pair (name, path) cannot be recombined — a
+/// proof for container A cannot be relabelled as a proof for container B.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IntentWritten {
+    name: ContainerName,
+    path: PathBuf,
+    record: ContainerIntent,
+}
+
+impl IntentWritten {
+    /// Read `<R>/containers/<name>.intent` back and certify it.
+    ///
+    /// The **only** constructor. `super::write_intent` calls it after
+    /// publishing, which is what makes its return value a proof rather than a
+    /// path; a census or a reclaimer that already holds a record calls it
+    /// directly. Either way the record was on disk when the proof was made.
+    ///
+    /// # Errors
+    ///
+    /// [`TactusError::Io`] when the record is absent or unreadable —
+    /// `ErrorKind::NotFound` is the "no intent" case and is a refusal, not an
+    /// absence to tolerate — and [`TactusError::Refused`] when the bytes are
+    /// not a [`ContainerIntent`].
+    pub fn certify(private_root: &Path, name: &ContainerName) -> Result<Self, TactusError> {
+        let path = name.intent_path(private_root);
+        let bytes = fs::read(&path).map_err(|source| TactusError::Io {
+            path: path.clone(),
+            source,
+        })?;
+        let record: ContainerIntent =
+            serde_json::from_slice(&bytes).map_err(|error| TactusError::Refused {
+                message: format!(
+                    "`{}` is not a container intent, so it is not evidence that `{name}` is \
+                     owned: {error}",
+                    path.display()
+                ),
+            })?;
+        Ok(Self {
+            name: name.clone(),
+            path,
+            record,
+        })
+    }
+
+    /// The container this record owns.
+    #[must_use]
+    pub const fn name(&self) -> &ContainerName {
+        &self.name
+    }
+
+    /// Where the record is.
+    #[must_use]
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    /// The six fields, as they were read back.
+    #[must_use]
+    pub const fn record(&self) -> &ContainerIntent {
+        &self.record
     }
 }
 

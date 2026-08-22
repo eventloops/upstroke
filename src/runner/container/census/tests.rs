@@ -3247,6 +3247,7 @@ fn real_docker_census_reclaims_a_dead_owner_and_spares_a_live_one() {
                 env: Vec::new(),
                 command: vec!["sleep".to_owned(), "120".to_owned()],
                 workdir: None,
+                read_only_root: true,
             },
             view: crate::runner::container::GitViewRequest {
                 path: view_path(&root, &name),
