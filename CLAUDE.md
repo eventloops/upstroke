@@ -62,9 +62,9 @@ cargo test --all-targets --all-features
 cargo +1.85.0 check --locked --all-targets --all-features   # MSRV
 ```
 
-`--all-features` is what CI runs; `CONTRIBUTING.md` omits it and is stale on
-that line. The crate defines no features today, so the two are equivalent for
-now — use the CI form so they stay equivalent when that changes.
+`--all-features` is what CI runs, and `CONTRIBUTING.md` states the same four
+commands. The crate defines no features today, so the flag is a no-op for now —
+use the CI form regardless, so the two stay equivalent when that changes.
 
 `1.85.0` is required and pinned by CI. There is **no `rust-toolchain.toml`** —
 toolchain selection is explicit at call sites, so nothing auto-corrects a wrong
@@ -89,7 +89,7 @@ and they fail. Four of the seven need `jq`.
 - **All paths through `std::path`.** Windows is a first-class target — CI runs
   the full test and MSRV matrix on ubuntu, macos and windows.
 - **Conventional commit titles**, enforced on PR titles by
-  `.github/scripts/validate-pr-body.sh`: `type(scope): summary`, where type is
+  `.github/scripts/validate-pr-body.sh`: `type(optional-scope): summary`, where type is
   one of feat, fix, docs, refactor, test, chore, ci, build, perf, security,
   release, revert.
 
@@ -125,16 +125,20 @@ repository owner may attest; that check cannot be satisfied by an agent.
 | `proposals/` | Dated design proposals and their critiques |
 | `.github/scripts/` | The 7 `test-*.sh` gates and the `validate-*` helpers they exercise |
 | `acceptance/RESULT.md` | The v0.1 acceptance run write-up |
-| `infra/` | Provisioning and ops tooling for the dedicated build box |
+| `reviews/` | Review records, and the standing finding ledger once it lands |
 
-`src/` is one crate: `engine/` (attempt, coordinator, options, preflight,
-report, resume), `plan/`, `agent/` (Claude Code, Copilot, Codex adapters),
-`topology/` (v0.2, schema-4 registry, **not wired into any production path**),
-plus the flat modules.
+`src/` is one crate. On master it is `plan/`, `agent/` (Claude Code, Copilot,
+Codex adapters), and flat modules — `engine.rs`, `events.rs`, `review.rs`,
+`gates.rs`, `ladder.rs`, `route.rs`, `capacity.rs`, `rundir.rs`, `workspace.rs`
+among them. **Check the tree rather than this list**: the v0.2 topology work
+splits `engine.rs` into `engine/` and adds `topology/`, and it reaches master
+only when its pull request merges.
 
 ## On the dedicated build box
 
-If you are on the build box rather than a workstation, read `infra/README.md`.
+If you are on the build box rather than a workstation, read `infra/README.md`
+(it arrives with the build-box provisioning pull request; until that merges the
+rules below are the whole contract).
 The rule that matters most:
 
 **Use `tactus-build`, never set `CARGO_TARGET_DIR` yourself.**
