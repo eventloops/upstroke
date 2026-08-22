@@ -558,6 +558,12 @@ pub(crate) const DOCKER_GATED_TESTS: &[&str] = &[
     "real_docker_reports_an_image_id_and_a_digest_for_a_reference_it_holds",
     "real_docker_refuses_a_reference_it_does_not_hold_without_pulling",
     "real_docker_creates_from_an_id_reports_it_and_reclaims_idempotently",
+    // Lane A: the ContainerRunner against the real runtime.
+    "real_docker_runs_from_the_recorded_image_id_and_composes_over_the_image_environment",
+    "real_docker_refuses_a_reviewer_write_to_its_read_only_mount",
+    "real_docker_confines_a_gate_to_its_mount",
+    "real_docker_a_git_dependent_gate_sees_only_the_role_view",
+    "real_docker_adapter_parsing_matches_the_host_table",
 ];
 
 /// Why a gated test skipped.
