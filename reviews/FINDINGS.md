@@ -623,3 +623,76 @@ direction and then by 7x in the other, which is the argument for a permit rather
 question the row states, and `decisions.resource_accounting` still calls per-agent and per-pool limits
 process-lifetime ephemeral scheduler state. Nothing here argues for amending the packet before PR11
 brokers concurrency; it argues that when PR11 does, the distribution exists.
+
+## 15. The catalogue re-measured against the shipped code
+
+A passing suite proves the tests pass; only re-applying the catalogue proves they still **detect**. The
+210-entry catalogue was measured at 10:32–10:54 on 2026-08-21, and two production-changing repair rounds
+landed after it (13:00 and 16:30). This re-runs every entry that previously died — the 151
+`KILLED`/`KILLED_BY_TYPES` plus the 38 survivors ruled *repaired*, **189 that must die** — against the
+tree that actually shipped.
+
+**Status: 160 of 190 measured. 152 killed. Five survivors carried below, one resolved, five
+`TARGET_MOVED`, three unmeasurable. Thirty entries still running.**
+
+### Resolved: `PR5-EVENTS-006` is not a regression
+
+Its killing assertion is Windows-only — *"an append-only `FILE_APPEND_DATA` handle lacks
+`FILE_WRITE_DATA`"* — which has no Unix analogue, so the mutation survives on Linux **by construction**.
+Measured on the guest it dies: `rc=101`, `1093 passed / 11 failed`, panicking in
+`a_torn_tail_is_truncated_on_open_with_a_warning_at_both_open_sites`. A Windows entry measured on Linux
+proves nothing, in either direction.
+
+### The five that need adjudication, and the question that decides them
+
+| entry | target | was |
+|---|---|---|
+| `PR5-RUNDIR-030` | `prove_private_half_ownership`, the commit-record absence conjunct | KILLED |
+| `PR5-EVENTS-020` | `prove_prefix_stable` equality oracle | KILLED |
+| `PR5-WORKSPACE-068` | `force_remove_residue` | KILLED |
+| `PR5-WORKSPACE-070` | `ResidueSamplingHarness::record_sample` | KILLED |
+| `PR5-EVENTS-051` | legacy `EventLog::append` flush step | SURVIVED, then **repaired** and witnessed dying by round 2 |
+
+**Every one of their killing assertions is still present in the tree** — the legacy I/O trace at
+`src/events/log/tests.rs:1306`, the reread-instability tests at `:2594` and `:2683`,
+`unreachable_objects(&fixture.base).expect("fsck")` at `src/workspace_manager.rs:6810`, and *"an
+unclassifiable residue is durable state no tabled action recovers"* at `:7585`. So **no repair deleted a
+test.** That leaves exactly two possibilities per entry, and they are not the same finding:
+
+1. **The assertion was narrowed** so it no longer distinguishes the mutated behaviour — a real
+   regression in detection power.
+2. **The re-expressed mutation is not the original.** The catalogue records mutations as *prose*, so the
+   re-measurement re-implemented each one; a differently-expressed mutation can be an **equivalent
+   mutant**, unkillable by construction and never the same test. `recatsub.py`'s own header names this
+   as *"the most expensive possible false positive"* for this exercise.
+
+`PR5-RUNDIR-030` leans hard toward (2): the production check is byte-identical to catalogue time
+(`fs::symlink_metadata(locator.join(COMMIT_RECORD)).is_ok()`, line 1359 then, 1564 now) and every
+fixture still writes `b"{}"`, so nothing that could have dissolved it changed. The other four sit in
+`events/log.rs` and the residue harness, which rounds 3–6 worked heavily, so (1) is live for those.
+
+**Settling it is mechanical and bounded**: compare each re-expressed patcher against what the entry's
+prose actually specifies, and where they agree, bisect the assertion. **Owner: G2.** Do not carry these
+forward as "five regressions" — that is the claim this exercise exists to avoid making without evidence.
+
+### Also outstanding
+
+* **Five `TARGET_MOVED`** — `sync_surviving_prefix`, `publish_json_atomically`, `add_task_worktree`,
+  `write_worktree_intent`. A repair relocated the code the mutation names; each needs re-expressing
+  against the new site before it means anything. Recorded rather than counted as dead.
+* **Three Windows entries never measured** — `PR5-WORKSPACE-003`, `-034`, `-059` are on the guest
+  manifest and were not run. Given `PR5-EVENTS-006`, an unmeasured Windows entry is a genuine gap.
+* **Three unmeasurable** — one `WONT_COMPILE`, one `NO_VERDICT`, one recorded without a diff.
+
+### Two harness defects this run exposed
+
+* **No timeout on `cargo test`.** `PR5-RUNDIR-069` rewrites `is_running()` to
+  `return lock_file(public).exists()`, so anything waiting on a run waits for ever: the mutation **hangs**
+  the suite rather than failing it. The batch then never advances and the job is killed with no verdict —
+  which reads as nothing rather than as a kill. Now bounded at 900s and recorded as `KILLED_BY_HANG`,
+  because a non-terminating suite *is* detection, just not the kind the parser understood. The harness
+  guarded every *silent* failure — anchors asserted, restores sha256-verified, unrecognised trees refused
+  — and none of those guards is reached by a hang.
+* **`recat-batch.sh` ignores its second argument.** It writes to stdout and expects the caller to
+  redirect. Passing a log path *and* redirecting elsewhere sends every verdict to the void while the run
+  looks healthy.
