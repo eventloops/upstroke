@@ -68,8 +68,11 @@
 // test-only `mod` here would remove every funnel below it from the census that
 // proves this group has a funnel at all (`PR5-R1-CFG-TEST-SHRINKS-THE-DOMAIN`).
 pub mod census;
+pub mod env;
+pub mod exec;
 pub mod intent;
 pub mod runtime;
+pub mod view;
 
 use std::collections::BTreeMap;
 use std::fs;
