@@ -115,8 +115,9 @@ locally against your body before pushing.
 
 **A new push invalidates the attestation and restarts the sequence** — with one
 exception: a push whose entire diff from the reviewed head is confined to
-`reviews/FINDINGS.md` keeps the review, and the trusted workflow re-attests the
-current head after verifying ancestry and the exempt-only diff itself
+`reviews/FINDINGS.md` (not yet on master; it arrives with the parallelism slice)
+keeps the review, and the trusted workflow re-attests the current head after
+verifying ancestry and the exempt-only diff itself
 (`decisions/2026-08-20-review-invalidation-scope.md`). The exemption is about
 the path, not about the file already existing: a push that only *adds*
 `reviews/FINDINGS.md` is itself exempt-only, which is how that standing ledger
