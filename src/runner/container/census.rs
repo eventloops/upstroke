@@ -68,6 +68,7 @@ use std::path::{Path, PathBuf};
 use sha2::{Digest, Sha256};
 
 use crate::error::TactusError;
+use crate::topology::effects::ContainerSite;
 
 use super::intent::{
     ContainerName, LABEL_INCARNATION, LABEL_PRIVATE_ROOT, LABEL_RUN, LABEL_RUN_DIR,
@@ -618,6 +619,58 @@ pub struct Candidate {
 // The report, and the token
 // ---------------------------------------------------------------------------
 
+/// How the identity that owned a reclaimed container has to be settled.
+///
+/// `T-CONTAINER.resume_action` ends "… **then settle the owning identity
+/// interrupted**", and `T-CONTAINER.authoritative_state` opens "**unknown
+/// spend**". Those two clauses are one answer and there is only one of it:
+/// *every* container a census reclaims belonged to an attempt or verification
+/// (or to a probe's pre-run husk) that was cut off mid-flight, and no census can
+/// know what the vendor charged for it.
+///
+/// **The value is a constant, and that is the whole point** (`PR6-RECOV-006`).
+/// The state that tempts an implementation to say otherwise is
+/// [`DiscoveredBy::IntentOnly`]: the container is not there, so it *looks* like
+/// nothing ran — but that is exactly the post-Unix-reaper state, where the
+/// reaper killed and removed a container whose invocation had been running and
+/// spending for however long. Deriving the settlement from `discovered_by`
+/// would record those attempts as completed, with their spend unaccounted. So
+/// the settlement is a field of [`Reclaimed`] rather than something a consumer
+/// infers, and [`Reclaimed::settlement`] is the same value for all three
+/// discovery cells.
+///
+/// **What PR7 owns and this does not**: emitting the settlement *event*. PR6
+/// has `durable_events: none` and the container transition is "test-only until
+/// PR7 wires `TopologyRun`". What this slice owes is the value PR7 maps, stated
+/// where the census produces it instead of left for a later reader to derive.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum OwnerSettlement {
+    /// The owning attempt, verification or probe husk is settled
+    /// **interrupted**, with **unknown spend**.
+    InterruptedWithUnknownSpend,
+}
+
+impl OwnerSettlement {
+    /// Every settlement a reclaim can produce. One, deliberately: see the type.
+    pub const ALL: &'static [Self] = &[Self::InterruptedWithUnknownSpend];
+
+    /// As a report writes it.
+    #[must_use]
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::InterruptedWithUnknownSpend => "interrupted-unknown-spend",
+        }
+    }
+
+    /// Whether the owning identity's spend is known. Never.
+    #[must_use]
+    pub const fn spend_is_known(self) -> bool {
+        match self {
+            Self::InterruptedWithUnknownSpend => false,
+        }
+    }
+}
+
 /// One container this census reclaimed.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Reclaimed {
@@ -629,6 +682,10 @@ pub struct Reclaimed {
     /// "the census report names each reclaimed container's boundary from its
     /// `runner_policy_sha256`".
     pub boundary: Boundary,
+    /// "then settle the owning identity interrupted" — with "unknown spend".
+    /// See [`OwnerSettlement`] for why this does not depend on
+    /// [`Self::discovered_by`].
+    pub settlement: OwnerSettlement,
 }
 
 /// One container this census deliberately left alone.
@@ -657,6 +714,54 @@ pub enum RuntimeUse {
     NotRequired,
 }
 
+/// What became of one `<name>.intent.tmp` whose published half never landed.
+///
+/// `PR6-ACCT-007`. The staged file is **R26** — it is the intent record, one
+/// `rename` short of published — so it needs a disposition in every census that
+/// sees it, not merely to be skipped by discovery.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum StagedDisposition {
+    /// The staged bytes were a complete record, so the file was classified
+    /// under the ordinary owner-liveness rule and appears in
+    /// [`CensusReport::reclaimed`] or [`CensusReport::untouched`] like any other
+    /// candidate. Its run directory came from the record it carries.
+    Adopted,
+    /// Genuinely torn, and the **name** says it belongs to a dead incarnation
+    /// of the run this process is driving (arm (i), dead by construction). The
+    /// file is removed.
+    Removed,
+    /// Genuinely torn, and the name says it belongs to **another run**. Arm
+    /// (ii) probes that run's `run.lock`, and a torn file carries no run
+    /// directory to probe — so this census cannot establish that its owner is
+    /// dead and leaves it alone. That owner's own next write-command start
+    /// classifies it under arm (i) and removes it; until then it is reported
+    /// here rather than being silent residue.
+    RetainedForeignOwner,
+}
+
+impl StagedDisposition {
+    /// Every disposition, written out.
+    pub const ALL: &'static [Self] = &[Self::Adopted, Self::Removed, Self::RetainedForeignOwner];
+
+    /// As the report writes it.
+    #[must_use]
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::Adopted => "adopted",
+            Self::Removed => "removed",
+            Self::RetainedForeignOwner => "retained-foreign-owner",
+        }
+    }
+}
+
+/// One staged intent record this census accounted for.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StagedResidue {
+    pub name: ContainerName,
+    pub path: PathBuf,
+    pub disposition: StagedDisposition,
+}
+
 /// What one census did.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CensusReport {
@@ -673,6 +778,9 @@ pub struct CensusReport {
     pub reclaimed: Vec<Reclaimed>,
     /// Sorted by container name.
     pub untouched: Vec<Untouched>,
+    /// Every `<name>.intent.tmp` with no published half, and what became of it.
+    /// Sorted by container name.
+    pub staged: Vec<StagedResidue>,
 }
 
 impl CensusReport {
@@ -775,8 +883,41 @@ pub fn run_startup_census(
 ) -> Result<CensusComplete, TactusError> {
     let private_root = census.private_root;
     let intents = list_intents(private_root)?;
+    // `PR6-ACCT-007`: the staged half of the namespace, read in the same scan
+    // and before any effect, because a torn one that names this process's own
+    // incarnation refuses for the same reason a published one does and a
+    // refusal must precede every reclaim.
+    let staged = super::list_staged_intents(private_root)?;
     let (discovered, runtime_use) = discover_by_label(census.runtime, private_root, &intents)?;
-    let candidates = merge(private_root, intents, discovered)?;
+    let mut candidates = merge(private_root, intents, discovered)?;
+    let mut staged_residue = Vec::new();
+    for entry in staged {
+        match entry.record {
+            // A finished write whose rename did not land. The record carries
+            // the owner's run directory, so this is an ordinary candidate under
+            // the ordinary rule — arm (ii) included.
+            Some(record) => {
+                let found = FoundIntent {
+                    name: entry.name.clone(),
+                    path: entry.path.clone(),
+                    record,
+                };
+                candidates.push(candidate_from_intent(found)?);
+                staged_residue.push(StagedResidue {
+                    name: entry.name,
+                    path: entry.path,
+                    disposition: StagedDisposition::Adopted,
+                });
+            }
+            // Genuinely torn. The ownership evidence is the name.
+            None => staged_residue.push(StagedResidue {
+                name: entry.name,
+                path: entry.path,
+                disposition: StagedDisposition::RetainedForeignOwner,
+            }),
+        }
+    }
+    candidates.sort_by(|left, right| left.name.cmp(&right.name));
 
     // Step 4: classify everything, and refuse before any effect.
     let mut decided = Vec::with_capacity(candidates.len());
@@ -835,8 +976,39 @@ pub fn run_startup_census(
             ownership,
             discovered_by: candidate.discovered_by,
             boundary: candidate.boundary,
+            // The same value for every cell of {intent present} x {container
+            // present}, deliberately: see `OwnerSettlement`.
+            settlement: OwnerSettlement::InterruptedWithUnknownSpend,
         });
     }
+
+    // Step 5b: the torn staging files, after the reclaims that may have removed
+    // some of them. Arm (i) only — a torn record carries no run directory, so
+    // arm (ii)'s lock probe has nothing to ask about and its owner reclaims its
+    // own at its next write-command start (`PR6-ACCT-007`).
+    for residue in &mut staged_residue {
+        if residue.disposition != StagedDisposition::RetainedForeignOwner {
+            continue;
+        }
+        let parts = ContainerName::parse(residue.name.as_str())?;
+        if census.start.own_run() != Some(parts.run_id.as_str())
+            || parts.incarnation == census.start.incarnation()
+        {
+            // A foreign run's torn file, or this incarnation's own — and this
+            // incarnation has launched nothing, so its own staged file is
+            // residue of a *previous* process that happened to share the id,
+            // which no census may adopt. Both are left alone and reported.
+            continue;
+        }
+        super::remove_staged_intent(
+            hooks,
+            ContainerSite::RemoveIntent,
+            private_root,
+            &residue.name,
+        )?;
+        residue.disposition = StagedDisposition::Removed;
+    }
+    staged_residue.sort_by(|left, right| left.name.cmp(&right.name));
 
     Ok(CensusComplete {
         report: CensusReport {
@@ -847,6 +1019,7 @@ pub fn run_startup_census(
             orphan_window: orphan_window(),
             reclaimed,
             untouched,
+            staged: staged_residue,
         },
     })
 }
@@ -926,22 +1099,9 @@ fn merge(
 ) -> Result<Vec<Candidate>, TactusError> {
     let mut by_name: BTreeMap<String, Candidate> = BTreeMap::new();
     for found in intents {
-        check_name_against_record(&found)?;
-        // Decoded and checked rooted here, not turned into a `PathBuf` by
-        // assumption: this is the directory arm (ii) probes a `run.lock` in,
-        // and every wrong answer to that probe is "free", which reclaims.
-        let run_dir = found.record.run_dir_path()?;
         by_name.insert(
             found.name.as_str().to_owned(),
-            Candidate {
-                name: found.name,
-                run_id: found.record.run_id,
-                incarnation: found.record.incarnation,
-                run_dir,
-                boundary: Boundary::FromIntent(found.record.runner_policy_sha256),
-                discovered_by: DiscoveredBy::IntentOnly,
-                intent_path: Some(found.path),
-            },
+            candidate_from_intent(found)?,
         );
     }
     for container in discovered {
@@ -954,6 +1114,30 @@ fn merge(
         by_name.insert(container.name.clone(), candidate);
     }
     Ok(by_name.into_values().collect())
+}
+
+/// One record — published or staged-but-complete — as a candidate.
+///
+/// Factored out of [`merge`] so the staged half of the namespace is classified
+/// by the **same** derivation and not by a second copy of it: the record's run
+/// directory is decoded and checked rooted here, and the name is checked against
+/// the record's fields, whichever half of the namespace the record came from
+/// (`PR6-ACCT-007`).
+fn candidate_from_intent(found: FoundIntent) -> Result<Candidate, TactusError> {
+    check_name_against_record(&found)?;
+    // Decoded and checked rooted here, not turned into a `PathBuf` by
+    // assumption: this is the directory arm (ii) probes a `run.lock` in,
+    // and every wrong answer to that probe is "free", which reclaims.
+    let run_dir = found.record.run_dir_path()?;
+    Ok(Candidate {
+        name: found.name,
+        run_id: found.record.run_id,
+        incarnation: found.record.incarnation,
+        run_dir,
+        boundary: Boundary::FromIntent(found.record.runner_policy_sha256),
+        discovered_by: DiscoveredBy::IntentOnly,
+        intent_path: Some(found.path),
+    })
 }
 
 /// A labeled container with no record — "treated as an orphan of its **labeled**
@@ -1220,7 +1404,7 @@ impl ReaperContainerScope {
         ]
     }
 
-    /// `docker rm --force <id>`, including `argv[0]`.
+    /// `docker rm --force --volumes <id>`, including `argv[0]`.
     ///
     /// The reaper does **kill/rm** and nothing else: `T-CONTAINER.resume_action`
     /// is "on Unix the cleanup reaper performs **kill/rm** earlier when the
@@ -1229,12 +1413,28 @@ impl ReaperContainerScope {
     /// [`super::reclaim`] is idempotent and tolerant of already-gone — the
     /// ordinary post-reaper state is an intent whose container is already gone,
     /// which is [`DiscoveredBy::IntentOnly`].
+    ///
+    /// **`--volumes`, the same removal `DockerCli::remove` issues**
+    /// (`PR6-ACCT-006`). The anonymous volume an image's `VOLUME` declaration
+    /// creates per container is R26 — part of the container, referable by
+    /// nothing else — and the reaper is the last thing that can name it: once
+    /// the container is gone the next census sees `DiscoveredBy::IntentOnly`
+    /// and has no handle on the volume at all. Measured on docker 29.7.2:
+    /// `rm --force --volumes` removes the container's anonymous volumes and
+    /// leaves a mounted **named** one intact, so this discharges R26 without
+    /// touching R20.
+    ///
+    /// `proc::tests::the_unix_reaper_kills_labeled_containers_before_releasing_r28`
+    /// asserts the argv the forked reaper **actually executed** against this
+    /// function, so the fork-side `c"…"` literals — which nothing can read back
+    /// at runtime — cannot drift from it.
     #[must_use]
     pub fn remove_argv(&self, id: &str) -> Vec<String> {
         vec![
             self.program.to_string_lossy().into_owned(),
             "rm".to_owned(),
             "--force".to_owned(),
+            "--volumes".to_owned(),
             id.to_owned(),
         ]
     }

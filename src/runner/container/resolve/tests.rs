@@ -870,6 +870,29 @@ fn a_config_that_differs_warns_naming_the_field_that_moved() {
     extra_volume
         .credential_volumes
         .insert("copilot".to_owned(), "creds-copilot".to_owned());
+    // **Two fields at once.** Every other cell moves exactly one, and an
+    // implementation that answered `None` whenever more than one had moved
+    // would pass all of them while a two-field edit warned about nothing
+    // (`PR6-CORRECTNESS-015`). `RunnerPolicy::difference` reports the first
+    // field in its own order, which for these two is the reference.
+    let mut reference_and_volumes = selection();
+    reference_and_volumes.image = Some("someone/else:9".to_owned());
+    reference_and_volumes.credential_volumes.remove("codex");
+    // The control: each half of that edit is independently a difference, so the
+    // cell below is genuinely the *intersection* and not one edit with a
+    // no-op beside it.
+    let mut only_reference = selection();
+    only_reference.image = Some("someone/else:9".to_owned());
+    let mut only_volumes = selection();
+    only_volumes.credential_volumes.remove("codex");
+    assert_eq!(
+        configured_difference(&recorded(), &only_reference),
+        Some(RunnerField::ImageReference)
+    );
+    assert_eq!(
+        configured_difference(&recorded(), &only_volumes),
+        Some(RunnerField::CredentialVolumes)
+    );
 
     let cases: Vec<(&str, RunnerSelection, Option<RunnerField>)> = vec![
         ("identical", selection(), None),
@@ -888,6 +911,11 @@ fn a_config_that_differs_warns_naming_the_field_that_moved() {
             "extra volume",
             extra_volume,
             Some(RunnerField::CredentialVolumes),
+        ),
+        (
+            "reference and volumes together",
+            reference_and_volumes,
+            Some(RunnerField::ImageReference),
         ),
     ];
 
@@ -951,35 +979,101 @@ fn a_config_that_differs_warns_naming_the_field_that_moved() {
     }
 }
 
-/// An **absent** `[runner]` section is not "a config that differs".
+/// An absent `[runner]` section is a **selection**, and whether it differs
+/// depends on what the run recorded.
 ///
-/// The intersection {section present} × {selection differs}. Every repository
-/// that never configured a runner has an absent section, and a resume that told
-/// them their runner kind had moved would be warning about a file they did not
-/// write. The two cells carry the *same* `RunnerSelection` value apart from
-/// `from_config`, so the flag is the only thing that can be doing the work.
+/// The intersection **{section present or absent} × {recorded kind}**, which is
+/// the cell `PR6-CORRECTNESS-015` found missing. This test previously asserted
+/// only the first axis — "absent never warns" — against a **container** record,
+/// and so pinned the defect: a run that recorded a container runner and whose
+/// `[runner]` section was subsequently **deleted** is running under an
+/// effective selection of host/default, which is as real an edit as changing
+/// `kind` in place, and it warned about nothing.
+///
+/// The claim the original test was protecting is still here and is still true,
+/// and it is the **host-record** row: a repository that never configured a
+/// runner is not told its runner kind moved. It holds because
+/// `RunnerSelection::host_default()` renders to exactly what a host run
+/// records, not because a flag suppresses the comparison — which is the
+/// difference between a guarantee and a silence.
+///
+/// Second field held constant: the runtime, ready in every cell, so no cell can
+/// warn or not warn for an inspection reason.
 #[test]
-fn an_absent_runner_section_is_not_a_config_that_differs() {
-    let mut present = RunnerSelection::host_default();
-    present.from_config = true;
+fn an_absent_runner_section_warns_only_when_the_record_is_not_the_default() {
+    let mut present_host = RunnerSelection::host_default();
+    present_host.from_config = true;
     let absent = RunnerSelection::host_default();
     assert_eq!(
         RunnerSelection {
             from_config: absent.from_config,
-            ..present.clone()
+            ..present_host.clone()
         },
         absent,
         "the two selections differ by more than `from_config`"
     );
 
-    for (label, today, expect_warning) in [("absent", absent, false), ("present", present, true)] {
+    let host_record = RunnerPolicy {
+        kind: RunnerKind::Host,
+        policy: RunnerContract::HostV1,
+        image: None,
+        credential_volumes: None,
+    };
+
+    // {section} x {record}: four cells, and only the three that are a real
+    // difference warn.
+    let cells: Vec<(&str, RunnerPolicy, RunnerSelection, Option<RunnerField>)> = vec![
+        (
+            "absent section, host record",
+            host_record.clone(),
+            absent.clone(),
+            None,
+        ),
+        (
+            "present host section, host record",
+            host_record.clone(),
+            present_host.clone(),
+            None,
+        ),
+        (
+            "absent section, container record",
+            recorded(),
+            absent,
+            Some(RunnerField::Kind),
+        ),
+        (
+            "present host section, container record",
+            recorded(),
+            present_host,
+            Some(RunnerField::Kind),
+        ),
+        (
+            "present container section, container record",
+            recorded(),
+            selection(),
+            None,
+        ),
+    ];
+
+    for (label, record, today, expected) in cells {
+        assert_eq!(
+            configured_difference(&record, &today),
+            expected,
+            "`{label}`: the wrong field was named"
+        );
         let (runtime, _trace) = ready_runtime();
         let mut warnings = Vec::new();
-        rebuild_by_inspection(&runtime, &recorded(), &today, &mut warnings).expect("rebuilds");
+        if record.kind == RunnerKind::Container {
+            rebuild_by_inspection(&runtime, &record, &today, &mut warnings).expect("rebuilds");
+        }
         let differed = warnings
             .iter()
             .any(|warning| warning.contains("differs from the runner this run recorded"));
-        assert_eq!(differed, expect_warning, "`{label}`: {warnings:?}");
+        assert_eq!(
+            differed,
+            expected.is_some() && record.kind == RunnerKind::Container,
+            "`{label}`: {warnings:?}"
+        );
     }
 }
 

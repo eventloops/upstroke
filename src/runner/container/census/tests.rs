@@ -158,9 +158,22 @@ impl Owner {
 enum Present {
     /// A record and a container: the ordinary running state.
     Both,
-    /// A record and no container: a crash between the intent write and
-    /// `docker create`, or a Unix reaper that already killed and removed it.
+    /// A record, no container and **no view**: a crash between the intent write
+    /// and `docker create`. Nothing was mounted, so there is nothing to prune.
     IntentOnly,
+    /// A record, no container and a **view**: the ordinary state after the Unix
+    /// reaper has run. It performs `kill/rm` and nothing else
+    /// (`T-CONTAINER.resume_action`), so the invocation's R19 directory and its
+    /// R26 record both outlive the container.
+    ///
+    /// `PR6-CONV-003`. `IntentOnly` was documented as covering **both**
+    /// situations and seeded only for the first, so `{intent present} ×
+    /// {container present}` and `{view present}` were correlated in every
+    /// fixture: a regression that skipped view cleanup for an intent-only
+    /// candidate removed the final record, returned `CensusComplete`, and
+    /// stranded a now-undiscoverable R19 directory — with the whole suite
+    /// green.
+    IntentAndViewAfterReaper,
     /// A container and no record: "a labeled container without an intent".
     LabelOnly,
 }
@@ -181,7 +194,10 @@ fn seed(
         write_intent(&mut hooks, ContainerSite::WriteIntent, root, &name, &record)
             .expect("write the intent");
     }
-    if present != Present::IntentOnly {
+    if !matches!(
+        present,
+        Present::IntentOnly | Present::IntentAndViewAfterReaper
+    ) {
         runtime.seed_container(
             name.as_str(),
             record.labels(root),
@@ -189,7 +205,12 @@ fn seed(
             IMAGE_ID,
             state,
         );
-        // R19: the view a live invocation would have mounted.
+    }
+    // R19 exists whenever the invocation got as far as mounting it, which is
+    // every state except "crashed before `docker create`". The view is
+    // deliberately **not** tied to the container's presence: the post-reaper
+    // state has one and no container.
+    if present != Present::IntentOnly {
         fs::create_dir_all(view_path(root, &name)).expect("an orphan view directory");
     }
     name
@@ -1357,84 +1378,114 @@ fn same_run_resume_censuses_recorded_root_after_default_changed() {
 /// **two** dead incarnations that are all reclaimed with no name or intent
 /// collision".
 ///
-/// Second field held constant: every orphan is the **same deterministic probe
-/// identity** under the **same run** and the **same repo key**, so the only
-/// thing separating three names and three intent paths is the incarnation
-/// component — which is exactly the thing the packet says it is for.
+/// ## The cardinality is the clause (`PR6-ENUM-008`)
+///
+/// This seeded **three** dead incarnations and resumed as a **fourth**, which
+/// is a different sentence: the variant says three incarnations *total*, of
+/// which two are dead and the third is the one doing the censusing. The
+/// enumerated cell — exactly two `OwnRunEarlierIncarnation` candidates — was
+/// therefore never built, and an implementation that mishandled precisely two
+/// while handling one and three passed.
+///
+/// Both cardinalities are driven now, as a grid, with the reclaimed count
+/// asserted per cell: `{1, 2, 3} dead incarnations` × `the resuming
+/// incarnation is the next one`. Two is ST-16 (g)'s cell; one and three are
+/// what make it a measurement of the count rather than of a threshold.
+///
+/// Second field held constant: every orphan of a cell is the **same
+/// deterministic probe identity** under the **same run** and the **same repo
+/// key**, so the only thing separating the names and the intent paths is the
+/// incarnation component — which is exactly the thing the packet says it is
+/// for. The last dead incarnation of each cell carries a *different*
+/// invocation, so no cell is n copies of one shape.
 #[test]
 fn repeated_crashes_reclaim_every_dead_incarnation() {
-    let harness = Harness::new("three-incarnations");
-    let probe = shell_probe();
-    let mut names = Vec::new();
-    for incarnation in [INC_1, INC_2] {
-        let owner = Owner::new(RUN_A, incarnation, REPO_KEY_A);
-        names.push(seed(
-            &harness.root,
-            &harness.runtime,
-            &owner,
-            &probe,
-            Present::Both,
-            Liveness::Running,
-        ));
-    }
-    // A third incarnation of the same run, from a different invocation, so the
-    // fixture is not three copies of one shape.
-    let third = Owner::new(RUN_A, INC_3, REPO_KEY_A);
-    names.push(seed(
-        &harness.root,
-        &harness.runtime,
-        &third,
-        &agent_probe(),
-        Present::Both,
-        Liveness::Running,
-    ));
+    /// Four incarnations, so the resuming one is always a fresh value and
+    /// never one of the dead.
+    const INCARNATIONS: &[&str] = &[INC_1, INC_2, INC_3, "01KZTDDDDDDDDDDDDDDDDDDDDD"];
+    const RESUMING: &str = "01KZTEEEEEEEEEEEEEEEEEEEEE";
 
-    assert_eq!(
-        names.iter().collect::<BTreeSet<_>>().len(),
-        3,
-        "three distinct container names"
-    );
-    assert_eq!(
-        names
+    for dead_count in 1..=3_usize {
+        let harness = Harness::new(&format!("incarnations-{dead_count}"));
+        let probe = shell_probe();
+        let mut names = Vec::new();
+        for (ordinal, incarnation) in INCARNATIONS.iter().take(dead_count).enumerate() {
+            let owner = Owner::new(RUN_A, incarnation, REPO_KEY_A);
+            // The last one carries a different invocation identity.
+            let invocation = if ordinal + 1 == dead_count {
+                agent_probe()
+            } else {
+                probe.clone()
+            };
+            names.push(seed(
+                &harness.root,
+                &harness.runtime,
+                &owner,
+                &invocation,
+                Present::Both,
+                Liveness::Running,
+            ));
+        }
+
+        assert_eq!(
+            names.iter().collect::<BTreeSet<_>>().len(),
+            dead_count,
+            "{dead_count} distinct container names"
+        );
+        assert_eq!(
+            names
+                .iter()
+                .map(|name| name.intent_path(&harness.root))
+                .collect::<BTreeSet<_>>()
+                .len(),
+            dead_count,
+            "{dead_count} distinct intent paths: no earlier ownership evidence was overwritten"
+        );
+        assert_eq!(
+            fs::read_dir(containers_dir(&harness.root))
+                .expect("the namespace")
+                .count(),
+            dead_count
+        );
+
+        // The next incarnation of the same run resumes and censuses. ST-16 (g)
+        // is the `dead_count == 2` cell: three incarnations in total, orphans
+        // from the two dead ones.
+        let complete = harness
+            .census(&resume(RUN_A, RESUMING))
+            .expect("the census completes");
+        let report = complete.report();
+        assert_eq!(
+            report.reclaimed.len(),
+            dead_count,
+            "{dead_count} dead incarnations, {} reclaimed",
+            report.reclaimed.len()
+        );
+        let reclaimed_incarnations: BTreeSet<&str> = report
+            .reclaimed
             .iter()
-            .map(|name| name.intent_path(&harness.root))
-            .collect::<BTreeSet<_>>()
-            .len(),
-        3,
-        "three distinct intent paths: no earlier ownership evidence was overwritten"
-    );
-    assert_eq!(
-        fs::read_dir(containers_dir(&harness.root))
-            .expect("the namespace")
-            .count(),
-        3
-    );
-
-    // The fourth incarnation resumes and censuses.
-    let complete = harness
-        .census(&resume(RUN_A, "01KZTDDDDDDDDDDDDDDDDDDDDD"))
-        .expect("the census completes");
-    let report = complete.report();
-    assert_eq!(report.reclaimed.len(), 3);
-    let reclaimed_incarnations: BTreeSet<&str> = report
-        .reclaimed
-        .iter()
-        .map(|entry| entry.incarnation.as_str())
-        .collect();
-    assert_eq!(
-        reclaimed_incarnations,
-        [INC_1, INC_2, INC_3].into_iter().collect::<BTreeSet<_>>()
-    );
-    for name in &names {
-        assert!(!harness.holds(name) && !harness.intent_exists(name));
+            .map(|entry| entry.incarnation.as_str())
+            .collect();
+        assert_eq!(
+            reclaimed_incarnations,
+            INCARNATIONS
+                .iter()
+                .take(dead_count)
+                .copied()
+                .collect::<BTreeSet<_>>(),
+            "the reclaimed set is not exactly the dead incarnations"
+        );
+        for name in &names {
+            assert!(!harness.holds(name) && !harness.intent_exists(name));
+        }
+        assert_eq!(
+            fs::read_dir(containers_dir(&harness.root))
+                .expect("the namespace")
+                .count(),
+            0,
+            "the namespace is empty: every record was removed, not merely the last one"
+        );
     }
-    assert_eq!(
-        fs::read_dir(containers_dir(&harness.root))
-            .expect("the namespace")
-            .count(),
-        0,
-        "the namespace is empty: every record was removed, not merely the last one"
-    );
 }
 
 /// (11) Two reclaimers **actually racing** on one container converge.
@@ -1446,14 +1497,39 @@ fn repeated_crashes_reclaim_every_dead_incarnation() {
 /// So the two run on two threads, released together by a
 /// [`Barrier`], over many rounds so the interleaving actually varies.
 ///
+/// ## The pair is ST-16 (h)'s pair, and the result is asserted converged
+///
+/// `PR6-CONV-002`. Both reclaimers used to be `CensusStart::FreshRun`, and the
+/// closing assertion was `total >= 4` — which **a fully serialised run
+/// satisfies**: one census reports 4, the other reports 0, and nothing about
+/// the second one was ever a reclaim. ST-16 (h) names the pair exactly — "two
+/// concurrent reclaimers (**a foreign write command and the resuming
+/// incarnation**) converge idempotently on the same dead container" — so one
+/// side is now a resume of the orphans' own run and the other a fresh foreign
+/// write command under the same private root. They classify the same
+/// containers through **different arms** of the liveness rule: the resuming
+/// incarnation through arm (i) (own run, earlier incarnation, dead by
+/// construction) and the foreign command through arm (ii) (another run, lock
+/// free). That is the shape the packet describes and it is a strictly harder
+/// fixture than two copies of one arm.
+///
+/// The serialised outcome is refused rather than accepted: **both** reclaimers
+/// must report at least one reclaim in at least one round, and the run counts
+/// how many rounds actually interleaved. A machine that serialised every round
+/// fails here instead of passing.
+///
 /// Second field held constant: both reclaimers are handed the **same** runtime,
-/// the same root and the same container; the only thing that differs between
-/// them is which thread gets there first.
+/// the same root and the same four containers; what differs is which write
+/// command each one is and which thread gets there first.
 #[test]
 fn concurrent_reclaimers_converge() {
     const ROUNDS: usize = 24;
     let dead = Owner::new(RUN_B, INC_1, REPO_KEY_A);
     let probe = shell_probe();
+    // How many rounds saw both sides do work. Convergence is about an
+    // interleaving, so a run in which none did is a run that measured
+    // idempotence and called it convergence.
+    let mut interleaved = 0_usize;
 
     for round in 0..ROUNDS {
         let root = scratch(&format!("converge-{round}"));
@@ -1484,8 +1560,20 @@ fn concurrent_reclaimers_converge() {
         assert_eq!(names.iter().collect::<BTreeSet<_>>().len(), 4);
         let gate = Arc::new(Barrier::new(2));
 
+        // ST-16 (h)'s two write commands. `RUN_B` owns the orphans, so the
+        // resume reaches them through arm (i) and the foreign fresh run
+        // reaches them through arm (ii) with `RUN_B`'s lock free.
+        let starts = [
+            ("resuming incarnation", resume(RUN_B, INC_2)),
+            (
+                "foreign write command",
+                CensusStart::FreshRun {
+                    incarnation: INC_3.to_owned(),
+                },
+            ),
+        ];
         let mut handles = Vec::new();
-        for _ in 0..2 {
+        for (label, start) in starts {
             let root = root.clone();
             let runtime = Arc::clone(&runtime);
             let gate = Arc::clone(&gate);
@@ -1493,11 +1581,8 @@ fn concurrent_reclaimers_converge() {
                 let liveness = RecordingLiveness::new();
                 let view = DisposableDirView::new(ContainerTrace::off());
                 let mut hooks = RecordingHooks::new(ContainerTrace::off());
-                let start = CensusStart::FreshRun {
-                    incarnation: INC_2.to_owned(),
-                };
                 gate.wait();
-                run_startup_census(
+                let outcome = run_startup_census(
                     &mut hooks,
                     &Census {
                         private_root: &root,
@@ -1507,20 +1592,46 @@ fn concurrent_reclaimers_converge() {
                         view: &view,
                     },
                 )
-                .map(|complete| complete.report().reclaimed.len())
+                .map(|complete| {
+                    let report = complete.report();
+                    (
+                        report.reclaimed.len(),
+                        report
+                            .reclaimed
+                            .iter()
+                            .map(|entry| entry.ownership)
+                            .collect::<BTreeSet<_>>(),
+                    )
+                });
+                (label, outcome)
             }));
         }
         let outcomes: Vec<_> = handles
             .into_iter()
             .map(|handle| handle.join().expect("a reclaimer panicked"))
             .collect();
-        for outcome in &outcomes {
+        for (label, outcome) in &outcomes {
             assert!(
                 outcome.is_ok(),
-                "a concurrent reclaimer refused instead of converging: {outcome:?}"
+                "the {label} refused instead of converging: {outcome:?}"
             );
+            // Whichever arm did the work, it was the arm that side is for.
+            if let Ok((_, arms)) = outcome {
+                let expected = if *label == "resuming incarnation" {
+                    Ownership::OwnRunEarlierIncarnation
+                } else {
+                    Ownership::ForeignRunDeadOwner
+                };
+                for arm in arms {
+                    assert_eq!(
+                        *arm, expected,
+                        "the {label} reclaimed through the wrong arm of the liveness rule"
+                    );
+                }
+            }
         }
-        // Whichever order they interleaved in, the machine converged.
+        // The converged result, asserted: nothing of any of the four remains,
+        // whichever order they interleaved in.
         for name in &names {
             assert!(runtime.container(name.as_str()).is_none());
             assert!(!name.intent_path(&root).exists());
@@ -1529,18 +1640,31 @@ fn concurrent_reclaimers_converge() {
         // Somebody did the work. The loser may legitimately find a container
         // already gone and report fewer; between them they must account for all
         // four. What must never happen is a refusal, asserted above.
-        let total: usize = outcomes
+        let counts: Vec<usize> = outcomes
             .iter()
-            .map(|outcome| *outcome.as_ref().unwrap_or(&0))
-            .sum();
+            .map(|(_, outcome)| outcome.as_ref().map_or(0, |(count, _)| *count))
+            .collect();
+        let total: usize = counts.iter().sum();
         assert!(
             total >= names.len(),
             "round {round}: two reclaimers between them reported {total} of {} orphans they \
              removed",
             names.len()
         );
+        if counts.iter().all(|count| *count > 0) {
+            interleaved += 1;
+        }
         let _ = fs::remove_dir_all(&root);
     }
+    // Two threads released at a barrier and then serialised every single time
+    // is a fixture that proved idempotence and reported convergence. This is
+    // the assertion that the interleaving actually happened.
+    assert!(
+        interleaved > 0,
+        "in none of {ROUNDS} rounds did both reclaimers remove anything, so this fixture never \
+         interleaved and `T-CONTAINER.resume_action`'s \"concurrent reclaimers converge\" was \
+         not measured"
+    );
 }
 
 /// The sharpest interleaving, made deterministic.
@@ -2605,7 +2729,12 @@ fn both_halves_of_discovery_are_scanned_and_every_cell_is_classified() {
             name,
             match present {
                 Present::Both => DiscoveredBy::IntentAndLabel,
-                Present::IntentOnly => DiscoveredBy::IntentOnly,
+                // The two intent-only situations are indistinguishable to
+                // discovery, which is the point of `PR6-CONV-003`: they differ
+                // only in whether a view is on disk, and
+                // `an_intent_only_candidate_after_the_reaper_still_has_its_view_pruned`
+                // is the fixture that varies that.
+                Present::IntentOnly | Present::IntentAndViewAfterReaper => DiscoveredBy::IntentOnly,
                 Present::LabelOnly => DiscoveredBy::LabelOnly,
             },
         ));
@@ -3234,9 +3363,14 @@ fn the_reapers_container_selector_names_the_incarnation_and_not_the_root_alone()
     // two: the view and the record are the next census's.
     let scope = super::ReaperContainerScope::new("docker", roots[0], INC_1).expect("a scope");
     assert_eq!(scope.kill_argv("abc"), vec!["docker", "kill", "abc"]);
+    // `--volumes` is in the table because the reaper is the last thing that can
+    // name a container's **anonymous** volumes: after it removes the container
+    // the following intent-only census has no handle on them
+    // (`PR6-ACCT-006`). The expected vector is written out here rather than
+    // read back from the function.
     assert_eq!(
         scope.remove_argv("abc"),
-        vec!["docker", "rm", "--force", "abc"]
+        vec!["docker", "rm", "--force", "--volumes", "abc"]
     );
     assert_eq!(scope.program(), Path::new("docker"));
 }
@@ -4409,4 +4543,434 @@ fn st16_j_refuses_before_any_effect_and_before_the_token_that_precedes_recovery(
         outcome.is_err(),
         "a refusing census must produce no CensusComplete"
     );
+}
+
+// ---------------------------------------------------------------------------
+// R3b: the post-reaper state, the recovery anchor, the settlement, the staged
+// half, and what a removal that never succeeds does to admission
+// ---------------------------------------------------------------------------
+
+/// The ordinary post-Unix-reaper state: no container, **a view**, an intent.
+///
+/// `PR6-CONV-003`. `DiscoveredBy::IntentOnly` covers two situations — a crash
+/// between the intent write and `docker create`, and the state the Unix reaper
+/// leaves, since it performs `kill/rm` and nothing else
+/// (`T-CONTAINER.resume_action`). Every fixture seeded only the first, so
+/// "intent-only" and "no view" were perfectly correlated and a reclaim that
+/// skipped view cleanup for intent-only candidates removed the final record,
+/// returned `CensusComplete`, and stranded an R19 directory nothing can ever
+/// find again — with the suite green.
+///
+/// The grid is **{crash before create, after the reaper} × {view on disk}** and
+/// its diagonal is the cell that was missing. The reclaimed report is
+/// `IntentOnly` in both cells, which is what makes the two indistinguishable to
+/// a consumer and is exactly why the *view* has to be handled unconditionally.
+///
+/// Second field held constant: the same owner, the same invocation and the same
+/// resuming incarnation in both cells; only whether the view was mounted moves.
+#[test]
+fn an_intent_only_candidate_after_the_reaper_still_has_its_view_pruned() {
+    for (label, present, view_seeded) in [
+        ("crashed before docker create", Present::IntentOnly, false),
+        (
+            "the Unix reaper removed the container",
+            Present::IntentAndViewAfterReaper,
+            true,
+        ),
+    ] {
+        let harness = Harness::new(&format!("post-reaper-{}", present as u8));
+        let dead = Owner::new(RUN_A, INC_1, REPO_KEY_A);
+        let name = seed(
+            &harness.root,
+            &harness.runtime,
+            &dead,
+            &shell_probe(),
+            present,
+            Liveness::Gone,
+        );
+        // The premise of each cell, asserted rather than assumed.
+        assert_eq!(
+            harness.view_exists(&name),
+            view_seeded,
+            "[{label}] the fixture did not build the state it names"
+        );
+        assert!(!harness.holds(&name), "[{label}] the container is gone");
+        assert!(harness.intent_exists(&name));
+
+        let complete = harness
+            .census(&resume(RUN_A, INC_2))
+            .expect("the census completes");
+        let report = complete.report();
+        assert_eq!(report.reclaimed.len(), 1, "[{label}]");
+        assert_eq!(
+            report.reclaimed[0].discovered_by,
+            DiscoveredBy::IntentOnly,
+            "[{label}] both situations report the same discovery, which is why the view cannot \
+             be handled by discovery"
+        );
+        assert!(
+            !harness.view_exists(&name),
+            "[{label}] the R19 view survived the reclaim; R19's `NoRunFinished` cell is `pruned \
+             at the next write-command start after the owning container is observed terminated`, \
+             and the intent that named it has just been removed"
+        );
+        assert!(!harness.intent_exists(&name), "[{label}]");
+        // And the whole namespace is empty, so nothing is left under `<R>` for
+        // a later census to find — which is what "the ledgers balance" means.
+        assert_eq!(
+            fs::read_dir(containers_dir(&harness.root))
+                .expect("the namespace")
+                .count(),
+            0,
+            "[{label}]"
+        );
+    }
+}
+
+/// A view that could not be pruned keeps its intent, and the **next** census
+/// reclaims it.
+///
+/// `PR6-ACCT-005`, end to end. Discovery is `<R>/containers` plus `docker ps`
+/// by label, and the view path is derived only after a candidate exists —
+/// `<R>/views` is never enumerated. So an intent removed after a failed view
+/// prune is an R19 directory with no discoverable owner, permanently. The cure
+/// is that the record outlives what it anchors; the proof is that a second
+/// census, with the obstruction gone, finds it and prunes it.
+///
+/// The intersection: **{view removal fails, succeeds} × {census runs again}**.
+/// Cell (fails, no second census) is the residue state; cell (fails, second
+/// census) is the recovery; the success cells are the control that says the
+/// obstruction is what did it.
+#[test]
+fn an_unpruned_view_is_reclaimed_because_its_intent_survived() {
+    use crate::topology::effects::{EffectSiteId, HookPhase};
+
+    let harness = Harness::new("anchor");
+    let dead = Owner::new(RUN_A, INC_1, REPO_KEY_A);
+    let name = seed(
+        &harness.root,
+        &harness.runtime,
+        &dead,
+        &shell_probe(),
+        Present::Both,
+        Liveness::Running,
+    );
+    assert!(harness.view_exists(&name), "the fixture's premise");
+
+    // First census: the view removal is made to fail.
+    let mut hooks = RecordingHooks::new(harness.trace.clone());
+    hooks.fail_at(
+        EffectSiteId::Container(ContainerSite::UnmountGitView),
+        HookPhase::Before,
+    );
+    let refused = harness
+        .run_with(&mut hooks, &resume(RUN_A, INC_2))
+        .expect_err("a census that could not prune a view must not report completion");
+    let _ = refusal(&refused);
+
+    // The residue state: the container is gone, the view is not, and the
+    // record that names it is **still there**.
+    assert!(!harness.holds(&name), "the container was removed");
+    assert!(harness.view_exists(&name), "the fixture's obstruction held");
+    assert!(
+        harness.intent_exists(&name),
+        "the R26 record was removed while the R19 view it is the only handle on survived; \
+         `<R>/views` is never enumerated, so nothing can ever find that directory again"
+    );
+
+    // Second census, obstruction gone: the anchor is what makes this possible.
+    let complete = harness
+        .census(&resume(RUN_A, INC_3))
+        .expect("the census completes");
+    assert_eq!(complete.report().reclaimed.len(), 1);
+    assert!(!harness.view_exists(&name), "R19 still has residue");
+    assert!(!harness.intent_exists(&name));
+
+    // The control: with nothing armed, one census does the whole thing.
+    let clean = Harness::new("anchor-control");
+    let name = seed(
+        &clean.root,
+        &clean.runtime,
+        &dead,
+        &shell_probe(),
+        Present::Both,
+        Liveness::Running,
+    );
+    clean
+        .census(&resume(RUN_A, INC_2))
+        .expect("the census completes");
+    assert!(!clean.view_exists(&name) && !clean.intent_exists(&name));
+}
+
+/// Every reclaimed container settles its owning identity **interrupted, with
+/// unknown spend** — whichever half of discovery found it.
+///
+/// `PR6-RECOV-006`. `T-CONTAINER.authoritative_state` opens "**unknown
+/// spend**" and `resume_action` ends "then settle the owning identity
+/// **interrupted**". The container tests asserted cleanup and record deletion
+/// and nothing about the outcome, so a `Reclaimed` that derived a *success*
+/// from `discovered_by == IntentOnly` compiled and passed — and that is the
+/// tempting derivation, because an intent-only candidate has no container and
+/// so looks like an attempt that never ran. It is the ordinary post-Unix-reaper
+/// state: the container was killed *because* it was running, and whatever it
+/// spent is unaccounted.
+///
+/// The grid is **{IntentOnly, LabelOnly, IntentAndLabel} × {the settlement}**,
+/// which is every cell of `DiscoveredBy::ALL`, plus the post-reaper cell that
+/// has a view — so the answer is asserted to be a constant over the whole
+/// discovery axis rather than over the two cells that happened to be seeded.
+#[test]
+fn every_reclaimed_container_settles_its_owner_interrupted_with_unknown_spend() {
+    use crate::runner::container::census::OwnerSettlement;
+
+    let cells = [
+        (Present::Both, DiscoveredBy::IntentAndLabel),
+        (Present::IntentOnly, DiscoveredBy::IntentOnly),
+        (Present::IntentAndViewAfterReaper, DiscoveredBy::IntentOnly),
+        (Present::LabelOnly, DiscoveredBy::LabelOnly),
+    ];
+    let mut covered = BTreeSet::new();
+    for (present, expected) in cells {
+        let harness = Harness::new(&format!("settle-{}", present as u8));
+        let dead = Owner::new(RUN_B, INC_1, REPO_KEY_A);
+        let name = seed(
+            &harness.root,
+            &harness.runtime,
+            &dead,
+            &shell_probe(),
+            present,
+            Liveness::Running,
+        );
+        let complete = harness.census(&fresh(INC_2)).expect("the census completes");
+        let report = complete.report();
+        assert_eq!(report.reclaimed.len(), 1, "{present:?}");
+        let entry = &report.reclaimed[0];
+        assert_eq!(entry.name, name);
+        assert_eq!(entry.discovered_by, expected, "{present:?}");
+        assert_eq!(
+            entry.settlement,
+            OwnerSettlement::InterruptedWithUnknownSpend,
+            "{present:?}: a reclaimed container's owning identity settles interrupted, and its \
+             spend is unknown — a container with no record and no runtime object is the state \
+             the Unix reaper leaves behind, not evidence that nothing ran"
+        );
+        assert!(
+            !entry.settlement.spend_is_known(),
+            "{present:?}: `authoritative_state` opens `unknown spend`"
+        );
+        covered.insert(entry.discovered_by);
+    }
+    assert_eq!(
+        covered,
+        DiscoveredBy::ALL.iter().copied().collect::<BTreeSet<_>>(),
+        "every cell of the discovery grid must produce a settlement"
+    );
+    // One settlement, over the whole grid: the value is not a function of
+    // anything the census observed.
+    assert_eq!(
+        OwnerSettlement::ALL.len(),
+        1,
+        "a second settlement would need a rule saying which candidates get it"
+    );
+    assert_eq!(
+        OwnerSettlement::InterruptedWithUnknownSpend.name(),
+        "interrupted-unknown-spend"
+    );
+}
+
+/// A staged `<name>.intent.tmp` with no published half is accounted for, and
+/// what happens to it depends on whose it is.
+///
+/// `PR6-ACCT-007`. `write_synced` durably creates the staged file before it
+/// renames, so a crash between the two leaves one behind **before any container
+/// exists** — `create_container` takes an `IntentWritten`, which is minted by
+/// reading the *published* record back. `list_intents` skips the staged half
+/// (writer-owned residue no reader may adopt), which is right for discovery and
+/// left the file with no reclaim path at all: no candidate, no labeled
+/// container, so nothing ever called `remove_intent` for it.
+///
+/// The grid is **{the staged bytes parse, are torn} × {whose name it carries}**:
+///
+/// | staged bytes | owner | disposition |
+/// |---|---|---|
+/// | a complete record | anyone | `Adopted` — an ordinary candidate under the ordinary rule |
+/// | torn | this run, earlier incarnation | `Removed` — arm (i), dead by construction |
+/// | torn | another run | `RetainedForeignOwner` — arm (ii) needs a run directory a torn file has none of |
+///
+/// The `Adopted` row is what makes the reclaim path exist at all; the third row
+/// is the fail-closed one, and it is *reported* rather than silent so INV-22
+/// has a class for it.
+#[test]
+fn a_staged_intent_with_no_published_half_is_accounted_for() {
+    use crate::runner::container::census::StagedDisposition;
+
+    let harness = Harness::new("staged");
+    let probe = shell_probe();
+
+    // (a) A complete record, staged but never renamed, owned by a dead
+    //     incarnation of the run this process is resuming.
+    let adopted_owner = Owner::new(RUN_A, INC_1, REPO_KEY_A);
+    let adopted = adopted_owner.name(&probe);
+    let staged_path = |name: &ContainerName| {
+        containers_dir(&harness.root).join(format!("{}.intent.tmp", name.as_str()))
+    };
+    fs::create_dir_all(containers_dir(&harness.root)).expect("the namespace");
+    fs::write(
+        staged_path(&adopted),
+        serde_json::to_vec(&adopted_owner.record(&probe)).expect("serialize"),
+    )
+    .expect("a staged record");
+    // Its view exists: the crash was after the mount and before the rename.
+    fs::create_dir_all(view_path(&harness.root, &adopted)).expect("a view");
+
+    // (b) Torn bytes under this run's earlier incarnation.
+    let mine = Owner::new(RUN_A, INC_2, REPO_KEY_A).name(&agent_probe());
+    fs::write(staged_path(&mine), b"{\"run_id\":\"01KZ").expect("a torn record");
+
+    // (c) Torn bytes under **another** run.
+    let foreign = Owner::new(RUN_C, INC_1, REPO_KEY_B).name(&probe);
+    fs::write(staged_path(&foreign), b"").expect("a torn record");
+
+    // The premise: `list_intents` sees none of them, which is why nothing
+    // reclaimed them.
+    assert!(
+        crate::runner::container::list_intents(&harness.root)
+            .expect("scan")
+            .is_empty(),
+        "a staged file was adopted by discovery, which is a different defect"
+    );
+
+    let complete = harness
+        .census(&resume(RUN_A, INC_3))
+        .expect("the census completes");
+    let report = complete.report();
+    let by_name: BTreeMap<&str, StagedDisposition> = report
+        .staged
+        .iter()
+        .map(|entry| (entry.name.as_str(), entry.disposition))
+        .collect();
+    assert_eq!(by_name.len(), 3, "{:?}", report.staged);
+    assert_eq!(
+        by_name[adopted.as_str()],
+        StagedDisposition::Adopted,
+        "a complete staged record carries the owner's run directory, so it classifies under the \
+         ordinary rule"
+    );
+    assert_eq!(by_name[mine.as_str()], StagedDisposition::Removed);
+    assert_eq!(
+        by_name[foreign.as_str()],
+        StagedDisposition::RetainedForeignOwner,
+        "arm (ii) probes the owner's `run.lock` and a torn record names no run directory, so \
+         this census cannot establish that its owner is dead"
+    );
+
+    // The adopted one was reclaimed like any other candidate: both halves of
+    // its record and its view are gone.
+    assert!(!staged_path(&adopted).exists());
+    assert!(!harness.view_exists(&adopted));
+    assert_eq!(
+        report
+            .reclaimed
+            .iter()
+            .map(|entry| entry.name.as_str())
+            .collect::<Vec<_>>(),
+        vec![adopted.as_str()],
+        "the adopted staged record is a candidate; the torn ones are not"
+    );
+
+    // The torn ones went where the table says.
+    assert!(!staged_path(&mine).exists(), "this run's own torn residue");
+    assert!(
+        staged_path(&foreign).exists(),
+        "another run's torn residue was removed on evidence this census does not have"
+    );
+    assert_eq!(
+        StagedDisposition::ALL.len(),
+        3,
+        "every disposition is exercised above; a fourth would be unexercised"
+    );
+    // And nothing else in the namespace: exactly the foreign torn file.
+    assert_eq!(
+        fs::read_dir(containers_dir(&harness.root))
+            .expect("the namespace")
+            .count(),
+        1
+    );
+}
+
+/// A removal that keeps failing **blocks admission** rather than admitting over
+/// residue.
+///
+/// `PR6-CONV-004`. `racing_removal` retries `RACING_ACCESS_ATTEMPTS` times and
+/// then returns `Io`, and that final refusal is the fail-closed half of the
+/// Windows delete-pending repair: a delete-pending name disappears within a few
+/// attempts and a genuinely protected one still refuses after all of them.
+/// Nothing kept a *view or intent* removal failing through the bound, so
+/// turning that `Err` into `Ok(false)` — "treat it as gone" — passed: every
+/// removal fixture reached `Ok` or `NotFound` first.
+///
+/// What that mutation costs is not a wrong return value, it is **admission**:
+/// the census would return `CensusComplete`, the token that
+/// `crash_reconstruction` requires before "slot/reservation initialization,
+/// admission, an invocation's first use of an agent's credential volume, and
+/// this incarnation's own probes" — over a view it could not remove and whose
+/// intent it had just deleted.
+///
+/// The obstruction is a parent directory with its write bit cleared, which is
+/// deterministic and is **not** delete-pending: the two are different states
+/// and only one is transient. Skipped under a uid that ignores the bit.
+///
+/// The intersection: **{removal succeeds, removal never succeeds} × {is there a
+/// census token}**. The success cell is the control, without which a test in
+/// which nothing could be reclaimed would pass.
+#[test]
+#[cfg(unix)]
+fn a_view_removal_that_never_succeeds_blocks_admission() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let harness = Harness::new("removal-exhausted");
+    let dead = Owner::new(RUN_A, INC_1, REPO_KEY_A);
+    let name = seed(
+        &harness.root,
+        &harness.runtime,
+        &dead,
+        &shell_probe(),
+        Present::Both,
+        Liveness::Running,
+    );
+    let view = view_path(&harness.root, &name);
+    fs::write(view.join("HEAD"), b"0000\n").expect("a file in the view");
+    let views = view.parent().expect("the views directory").to_path_buf();
+    fs::set_permissions(&views, fs::Permissions::from_mode(0o500)).expect("clear the write bit");
+    if fs::remove_dir_all(&view).is_ok() {
+        // Running as root, or on a filesystem that ignores the mode.
+        let _ = fs::set_permissions(&views, fs::Permissions::from_mode(0o755));
+        return;
+    }
+
+    let error = harness
+        .census(&resume(RUN_A, INC_2))
+        .expect_err("a census that could not prune an orphan view must not hand out its token");
+    assert!(
+        matches!(error, TactusError::Io { .. }),
+        "the refusal must carry the IO error that stopped it, after the retry bound: {error:?}"
+    );
+    assert!(
+        view.exists(),
+        "the fixture's premise: the view is still there"
+    );
+    assert!(
+        harness.intent_exists(&name),
+        "the only handle on the unreclaimed view was deleted"
+    );
+
+    // The control: with the obstruction gone, the same census completes and
+    // hands out the token.
+    let _ = fs::set_permissions(&views, fs::Permissions::from_mode(0o755));
+    let complete = harness
+        .census(&resume(RUN_A, INC_3))
+        .expect("the census completes once the view can be removed");
+    assert_eq!(complete.report().reclaimed.len(), 1);
+    assert!(!view.exists() && !harness.intent_exists(&name));
+    let _ = fs::remove_dir_all(&harness.root);
 }

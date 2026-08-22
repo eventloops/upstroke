@@ -86,8 +86,7 @@ use super::runtime::{ContainerRuntime, ContainerTrace, CreateSpec, Mount, Runtim
 use super::view::{self, RoleGitView};
 use super::{
     ContainerHooks, GitView, GitViewRequest, LaunchPlan, Launched, NoHooks, create_container,
-    mount_git_view, remove_container, remove_intent, start_container, stop_container,
-    unmount_git_view, write_intent,
+    mount_git_view, start_container, write_intent,
 };
 use crate::topology::effects::ContainerSite;
 
@@ -973,13 +972,25 @@ impl ContainerRunner {
         hooks: &mut dyn ContainerHooks,
         plan: &LaunchPlan,
     ) -> Result<Launched, TactusError> {
-        let written = write_intent(
+        // The **fifth** exit (`PR6-ACCT-003`). R1's table began at
+        // `MountGitView` because a `write_intent` that fails has written
+        // nothing — which is true only of a failure at the `Before` phase. The
+        // funnel runs its primitive and *then* consults the `After` phase, and
+        // `IntentWritten::certify` reads the published record back, so a
+        // failure here is a durable R26 record with no container and no view:
+        // residue a census has to reclaim, from a launch that never launched.
+        let written = match write_intent(
             hooks,
             ContainerSite::WriteIntent,
             &plan.private_root,
             &plan.name,
             &plan.intent,
-        )?;
+        ) {
+            Ok(written) => written,
+            Err(error) => {
+                return Err(self.cancelled(hooks, plan, error, Reached::INTENT_ONLY));
+            }
+        };
         let intent_path = written.path().to_path_buf();
         let view_path = match mount_git_view(
             hooks,
@@ -989,7 +1000,26 @@ impl ContainerRunner {
         ) {
             Ok(path) => path,
             Err(error) => {
-                return Err(self.cancelled(hooks, plan, error, Reached::INTENT_ONLY));
+                // **The view path, not `INTENT_ONLY`** (`PR6-ACCT-003`). The
+                // funnel runs its primitive and then consults the `After`
+                // phase, so a `MountGitView` that fails may have materialised
+                // the directory first — and the `Err` arm carries no path to
+                // say so. The request's own `path` is where it would be, and
+                // `GitView::discard` is idempotent and tolerant of
+                // already-gone, so naming it costs a no-op in the `Before` cell
+                // and is the difference between a pruned R19 directory and an
+                // orphan in the `After` one. Measured: with `INTENT_ONLY` here,
+                // arming `MountGitView`'s `After` phase left a view behind and
+                // removed the intent that was the only handle on it.
+                return Err(self.cancelled(
+                    hooks,
+                    plan,
+                    error,
+                    Reached {
+                        view: Some(plan.view.path.clone()),
+                        container: false,
+                    },
+                ));
             }
         };
         let created = match create_container(
@@ -1001,13 +1031,24 @@ impl ContainerRunner {
         ) {
             Ok(created) => created,
             Err(error) => {
+                // `container: true`, for the reason the view path is named
+                // above (`PR6-ACCT-003`): a `Container.Create` that fails at
+                // the `After` phase has already created the container, and the
+                // real equivalent is a `docker create` that succeeds and whose
+                // following inspect fails — `DockerCli::create` reads the
+                // reported image id back, and that read can fail on a container
+                // that exists. `stop` and `remove` are both tolerant of
+                // already-gone (`settle_stop`, `settle_remove`), so this is a
+                // pair of no-ops when nothing was created. Measured: with
+                // `container: false` here, arming `Create`'s `After` phase left
+                // the container behind.
                 return Err(self.cancelled(
                     hooks,
                     plan,
                     error,
                     Reached {
                         view: Some(view_path),
-                        container: false,
+                        container: true,
                     },
                 ));
             }
@@ -1091,6 +1132,13 @@ impl ContainerRunner {
     /// the container, the view and the intent behind — three residues from one
     /// failure. `docker rm --force` removes a running container, so `Remove`
     /// after a failed `Stop` is not a wasted call.
+    ///
+    /// **The body is [`super::cancel_reached`] and nothing else**
+    /// (`PR6-ACCT-004`/`PR6-ACCT-005`): this was a second copy of the same four
+    /// steps, and the copy in `super` grew the R19 recovery-anchor rule while
+    /// this one did not. Two implementations of one cleanup rule is the shape
+    /// `PR6E-005` measured on the view-path derivation, where the two halves
+    /// were each self-consistent and nothing crossed them.
     fn cancel(
         &self,
         hooks: &mut dyn ContainerHooks,
@@ -1098,80 +1146,42 @@ impl ContainerRunner {
         name: &ContainerName,
         reached: &Reached,
     ) -> Vec<String> {
-        let mut residue = Vec::new();
-        if reached.container {
-            if let Err(error) = stop_container(
-                hooks,
-                ContainerSite::Stop,
-                self.runtime.as_ref(),
-                name,
-                super::runtime::StopMode::Graceful,
-            ) {
-                residue.push(format!("the container could not be stopped: {error}"));
-            }
-            if let Err(error) =
-                remove_container(hooks, ContainerSite::Remove, self.runtime.as_ref(), name)
-            {
-                residue.push(format!("the container could not be removed: {error}"));
-            }
-        }
-        if let Some(path) = &reached.view {
-            if let Err(error) = unmount_git_view(
-                hooks,
-                ContainerSite::UnmountGitView,
-                self.view.as_ref(),
-                path,
-            ) {
-                residue.push(format!("the R19 Git view could not be pruned: {error}"));
-            }
-        }
-        if let Err(error) = remove_intent(hooks, ContainerSite::RemoveIntent, private_root, name) {
-            residue.push(format!(
-                "the R26 intent record could not be removed: {error}"
-            ));
-        }
-        residue
+        super::cancel_reached(
+            hooks,
+            self.runtime.as_ref(),
+            self.view.as_ref(),
+            private_root,
+            name,
+            reached.container,
+            reached.view.as_deref(),
+        )
     }
 
     /// "stop/rm, view removal, intent removal **after completion**".
     ///
-    /// The same four sites [`super::release`] performs and in the same order;
-    /// written here because [`Self::launch`] is, and one sequence that a reader
-    /// can check against the contract clause beats two halves in two files.
+    /// [`super::release`], which is the one place those four sites are
+    /// performed in that order. It was a second copy until repair round R3b,
+    /// and the copy was the fail-**fast** one: `PR6-ACCT-004` measured that a
+    /// `Container.Stop` failure on a *completed* invocation skipped the still
+    /// viable `rm`, the view prune and the intent removal, while the exhaustive
+    /// implementation the cleanup-fault grid tests lived on the other path and
+    /// never reached `Runner::run`.
     ///
     /// # Errors
     ///
-    /// Whatever a step returns.
+    /// [`TactusError::Refused`] naming every step that could not be completed.
     fn release(
         &self,
         hooks: &mut dyn ContainerHooks,
         private_root: &Path,
         launched: &Launched,
     ) -> Result<(), TactusError> {
-        stop_container(
+        super::release(
             hooks,
-            ContainerSite::Stop,
             self.runtime.as_ref(),
-            &launched.name,
-            super::runtime::StopMode::Graceful,
-        )?;
-        remove_container(
-            hooks,
-            ContainerSite::Remove,
-            self.runtime.as_ref(),
-            &launched.name,
-        )?;
-        unmount_git_view(
-            hooks,
-            ContainerSite::UnmountGitView,
             self.view.as_ref(),
-            &launched.view_path,
-        )?;
-        remove_intent(
-            hooks,
-            ContainerSite::RemoveIntent,
             private_root,
-            &launched.name,
+            launched,
         )
     }
 
@@ -2216,15 +2226,29 @@ mod tests {
                     Mount::Path { .. } | Mount::Tmpfs { .. } => None,
                 });
                 let key = request.agent.as_ref().and_then(host::credential_location);
+                // `filter(non-empty)`: since `PR6-CORRECTNESS-007` a location
+                // the role is **not** given is named with nothing rather than
+                // omitted, because `docker create --env` overlays the image's
+                // environment and an omitted key is one the image decides. So
+                // "supplied" is a value and not a presence.
                 let in_env = key.and_then(|key| {
                     plan.env()
                         .iter()
                         .find(|(name, _)| name == key)
                         .map(|(_, value)| value.clone())
+                        .filter(|value| !value.is_empty())
                 });
                 let expected = recorded
                     && supplies_credential_location(&request.role)
                     && request.agent.is_some();
+                if let Some(key) = key {
+                    assert!(
+                        plan.env().iter().any(|(name, _)| name == key),
+                        "{} (recorded: {recorded}): `{key}` is not named at all, so the recorded \
+                         image's own value reaches the container",
+                        request.role
+                    );
+                }
                 assert_eq!(
                     volume.is_some(),
                     expected,
@@ -2290,8 +2314,16 @@ mod tests {
                  `host-v1` refuses this shape whatever agent the request names",
                 request.role
             );
-            assert!(
-                !plan.env().iter().any(|(key, _)| key == "CLAUDE_CONFIG_DIR"),
+            // Named with **nothing**, not omitted: an omitted key is one the
+            // recorded image decides, and this role must be told it has no
+            // location rather than left to inherit one
+            // (`PR6-CORRECTNESS-007`).
+            assert_eq!(
+                plan.env()
+                    .iter()
+                    .find(|(key, _)| key == "CLAUDE_CONFIG_DIR")
+                    .map(|(_, value)| value.as_str()),
+                Some(""),
                 "{}: and it was told where they live",
                 request.role
             );
@@ -2750,6 +2782,18 @@ mod tests {
     /// recorded **shell or agent CLI** that fails inside the recorded image".
     /// Second field held constant: the image id, which matches the record in
     /// every cell, so what varies is only what the process did.
+    ///
+    /// ## Both cells go through the thing that turns failure into refusal
+    ///
+    /// `PR6-ENUM-007`. The agent cell called `runner.run` directly and asserted
+    /// a nonzero `ProcessOutput`, which is not what the clause says: the shell
+    /// cell reaches its refusal through `host::run_shell_probe`, and the agent
+    /// half's equivalent is [`AgentAdapter::probe`], which is where a nonzero
+    /// `--version` becomes a `TactusError`. Deleting that refusal left this
+    /// named test green, because "the runner returned code 1" was all it
+    /// asked. It now drives `ClaudeCodeAdapter::probe` over the container
+    /// runner and asserts the **refusal**, so the cell holds
+    /// `proof_tests[3]`'s "an agent probe **fails** when the CLI is absent".
     #[test]
     fn failing_preflight_probe_on_resume_refuses_before_recovery_event_and_reclaims_probe_containers()
      {
@@ -2791,6 +2835,40 @@ mod tests {
                 assert!(refusal.to_string().contains("sh"), "{refusal}");
                 assert!(refusal.to_string().contains("127"), "{refusal}");
             } else {
+                // Through the adapter, which is what turns a nonzero
+                // `--version` into a refusal. `runner.run` alone returns
+                // `Ok(ProcessOutput { code: Some(1) })` — a spawn that
+                // succeeded — and a run that stopped there would settle a
+                // resume as *certified* on a CLI that is not there.
+                let adapter: &dyn crate::agent::AgentAdapter =
+                    &crate::agent::claude::ClaudeCodeAdapter;
+                let refusal = adapter
+                    .probe(&runner)
+                    .expect_err("an agent CLI that fails inside the image refuses");
+                let message = refusal.to_string();
+                assert!(
+                    message.contains("claude"),
+                    "{tag}: the refusal does not name the CLI: {message}"
+                );
+                // **The `--version` refusal specifically.** `probe` runs
+                // `--version` and then `--help`, and the second has refusals of
+                // its own; an `expect_err` alone is satisfied by either, so
+                // deleting the nonzero-exit check on `--version` still left
+                // this cell green (measured). The clause is "an agent probe
+                // **fails when the CLI is absent**", and what observes that is
+                // the first spawn's exit status.
+                assert!(
+                    message.contains("--version"),
+                    "{tag}: the refusal came from somewhere other than the CLI's own exit \
+                     status: {message}"
+                );
+                assert!(
+                    message.contains(&format!("{exit:?}")),
+                    "{tag}: the refusal does not carry the exit status: {message}"
+                );
+                // The control: the spawn itself succeeded, so the refusal is
+                // the adapter's reading of the result and not a spawn failure
+                // dressed up as one.
                 let request = crate::agent::probe_request(
                     "claude-code",
                     ShellKind::Sh.spec("claude --version"),
@@ -3084,10 +3162,42 @@ mod tests {
                 .into_iter()
                 .collect();
 
-            // Same keys, for every role.
+            // Same keys, for every role — **plus** the locations the container
+            // withholds explicitly.
+            //
+            // This is the one structural asymmetry between the two boundaries
+            // and it is stated rather than skipped (`PR6-CORRECTNESS-007`): the
+            // host runner calls `env_clear()` and installs the composed vector
+            // as the *whole* environment, so a key it omits is genuinely
+            // absent; the container runner's vector is `docker create --env`,
+            // which **overlays** the image's environment, so a key it omits is
+            // a key the image decides. Naming what is withheld is how the
+            // container reaches the same *effective* environment the host
+            // reaches by omission — which is what parity is about.
+            let withheld: BTreeMap<String, String> = container_env
+                .withheld_credential_locations(&scope)
+                .into_iter()
+                .collect();
+            for (key, value) in &withheld {
+                assert_eq!(value, "", "{role}: `{key}` is withheld with a value");
+                assert!(
+                    !host_composed.contains_key(key),
+                    "{role}: the host supplies `{key}`, so the container must not withhold it"
+                );
+                assert_eq!(
+                    container_composed.get(key).map(String::as_str),
+                    Some(""),
+                    "{role}: `{key}` is withheld and is not in the composed vector, so the \
+                     image's own value reaches the container"
+                );
+            }
+            let container_supplied: Vec<&String> = container_composed
+                .keys()
+                .filter(|key| !withheld.contains_key(*key))
+                .collect();
             assert_eq!(
                 host_composed.keys().collect::<Vec<_>>(),
-                container_composed.keys().collect::<Vec<_>>(),
+                container_supplied,
                 "{role}: the two runners composed different key sets"
             );
             // Same values everywhere except the credential location.
@@ -3517,6 +3627,626 @@ mod tests {
         }
     }
 
+    /// Every `.rs` file of the container subtree, with each file's **own**
+    /// production region.
+    ///
+    /// ## Why this is a function and not three lines at a call site
+    ///
+    /// `PR6-ACCT-002`, which is `PR5-R1-CFG-TEST-SHRINKS-THE-DOMAIN` for the
+    /// third time in this slice. The census below concatenated the sources and
+    /// called `production_region` **once**: that function cuts a source at its
+    /// **first** `#[cfg(test)]`, and `src/runner/container.rs` has one, so
+    /// everything appended after it — `runtime.rs`, `intent.rs`, `exec.rs`,
+    /// `env.rs`, `view.rs` — was cut away entirely. `census.rs` and `resolve.rs`
+    /// were not in the list at all. The census was reading one file and
+    /// reporting on seven, and its positive control happened to live before the
+    /// cut, so it stayed green while measuring almost nothing.
+    ///
+    /// So: the directory is **enumerated**, not listed; each file is cut on its
+    /// own; and the caller is handed the per-file regions so it can assert the
+    /// domain did not shrink.
+    /// The two answers: the production regions in the domain, and the files
+    /// deliberately outside it.
+    ///
+    /// Membership is derived from **where `container.rs` declares the module**,
+    /// which is the tree's own rule and is written at the top of that file:
+    /// "Keep every `#[cfg(test)]` declaration at the BOTTOM". `production_region`
+    /// cuts at the first `#[cfg(test)]`, so a `mod x;` above the cut is a
+    /// production module and one below it is test-only. Deriving it this way
+    /// rather than listing exclusions is what makes a *new* file a failure here
+    /// instead of a silent addition to either set.
+    ///
+    /// A test-only file has no `#[cfg(test)]` of its own — its gate is at the
+    /// declaration site — so `production_region` of it is the **whole file**,
+    /// and including one would put every fixture's `docker volume create` into
+    /// a census of production vocabulary.
+    fn container_subtree_production_regions() -> (Vec<(String, String)>, BTreeSet<String>) {
+        let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("src")
+            .join("runner");
+        let funnel = std::fs::read_to_string(dir.join("container.rs")).expect("the funnel");
+        let declarations =
+            crate::effects::blank_comments(&crate::effects::production_region(&funnel));
+        let mut regions = vec![("container.rs".to_owned(), declarations.clone())];
+        let mut excluded = BTreeSet::new();
+        let mut names: Vec<String> = std::fs::read_dir(dir.join("container"))
+            .expect("the container subtree")
+            .map(|entry| entry.expect("an entry").file_name())
+            .filter_map(|name| {
+                let name = name.to_string_lossy().into_owned();
+                name.ends_with(".rs").then_some(name)
+            })
+            .collect();
+        names.sort();
+        for name in names {
+            let stem = name.trim_end_matches(".rs");
+            if !declarations.contains(&format!("mod {stem};")) {
+                excluded.insert(name);
+                continue;
+            }
+            let source =
+                std::fs::read_to_string(dir.join("container").join(&name)).expect("a module");
+            regions.push((
+                name,
+                crate::effects::blank_comments(&crate::effects::production_region(&source)),
+            ));
+        }
+        (regions, excluded)
+    }
+
+    /// Every exit of `launch` releases what it reached **even when the effect
+    /// was already committed**.
+    ///
+    /// `PR6-ACCT-003`, the axis the fail-fast grid beside this one does not
+    /// carry. That grid makes a *primitive* fail — a runtime armed failing, a
+    /// view that refuses to materialise — so at every exit the effect never
+    /// happened. The funnel's other failure mode is the opposite one: it runs
+    /// the primitive and *then* consults the `After` phase
+    /// (`container::funnel`), which is what an `Injection::Error` at `After`
+    /// models and what a real `docker create` that succeeds and whose following
+    /// inspect fails does. The state at the exit is therefore strictly larger:
+    /// the record is published, the directory exists, the container exists.
+    ///
+    /// The intersection is **{which site} × {effect committed}**, and the
+    /// committed column is the one that was empty. `Container.WriteIntent` is
+    /// in it because that exit was a bare `?` until this round: a `Before`
+    /// failure there has written nothing, so the exit looked harmless, and an
+    /// `After` failure leaves a durable R26 record with no container and no
+    /// view.
+    ///
+    /// In every cell: R26's container and record and R19's view are all gone,
+    /// and R20's volume is untouched.
+    ///
+    /// Second field held constant: the request, the role and the recorded image
+    /// id are identical in all eight cells; only the armed site and phase move.
+    #[test]
+    fn a_launch_that_fails_after_a_committed_effect_still_releases_everything() {
+        use crate::topology::effects::{EffectSiteId, HookPhase};
+
+        let sites = [
+            ContainerSite::WriteIntent,
+            ContainerSite::MountGitView,
+            ContainerSite::Create,
+            ContainerSite::Start,
+        ];
+        let mut cells = 0_usize;
+        for site in sites {
+            for phase in [HookPhase::Before, HookPhase::After] {
+                let fixture = Fixture::new(&format!("committed-{}-{phase}", site.name()), true);
+                let mut hooks = RecordingHooks::new(fixture.trace.clone());
+                hooks.fail_at(EffectSiteId::Container(site), phase);
+                let runner = ContainerRunner::new(
+                    container_policy(),
+                    fixture.identity.clone(),
+                    &fixture.repo,
+                    image_environment(),
+                    Box::new(fixture.runtime.clone()),
+                )
+                .expect("a container policy")
+                .with_hooks(Box::new(hooks))
+                .with_poll(Duration::ZERO);
+
+                let request = worker_request(
+                    ShellKind::Sh.spec("exit 0"),
+                    fixture.task_a.clone(),
+                    AgentId::new("claude-code"),
+                    Duration::from_secs(10),
+                    worker_id(0),
+                );
+                let name = ContainerName::new(REPO_KEY, RUN_ID, INCARNATION_1, &request.invocation)
+                    .expect("a name");
+
+                let refusal = runner
+                    .run(&request)
+                    .expect_err("the funnel was made to fail");
+                assert!(
+                    refusal.to_string().contains(site.name()),
+                    "[{site:?}/{phase}] the error does not name the site that failed: {refusal}"
+                );
+
+                // The premise of the committed column: at `After` the
+                // primitive really did run, so there was something to release.
+                if phase == HookPhase::After {
+                    let ran = match site {
+                        ContainerSite::WriteIntent => fixture
+                            .trace
+                            .rendered()
+                            .iter()
+                            .any(|entry| entry.starts_with("durable:renamed")),
+                        ContainerSite::MountGitView => fixture
+                            .trace
+                            .rendered()
+                            .iter()
+                            .any(|entry| entry.starts_with("view:materialized")),
+                        ContainerSite::Create => fixture.trace.ops().contains(&RuntimeOp::Create),
+                        _ => fixture.trace.ops().contains(&RuntimeOp::Start),
+                    };
+                    assert!(
+                        ran,
+                        "[{site:?}/{phase}] the primitive did not run, so this is not the \
+                         committed-effect cell it claims to be: {:#?}",
+                        fixture.trace.rendered()
+                    );
+                }
+
+                // R26 and R19 balance, whichever cell this is.
+                assert!(
+                    fixture.runtime.fake().container_names().is_empty(),
+                    "[{site:?}/{phase}] a container survived"
+                );
+                assert!(
+                    list_intents(&fixture.private_root)
+                        .expect("scan")
+                        .is_empty(),
+                    "[{site:?}/{phase}] an R26 intent record survived"
+                );
+                assert!(
+                    !crate::runner::container::intent::containers_dir(&fixture.private_root)
+                        .join(format!("{}.intent.tmp", name.as_str()))
+                        .exists(),
+                    "[{site:?}/{phase}] a staged R26 record survived"
+                );
+                assert!(
+                    !view_dir(&fixture.private_root, &name).exists(),
+                    "[{site:?}/{phase}] an R19 view survived"
+                );
+                // R20 is untouched in every cell.
+                for (_, volume) in VOLUMES {
+                    assert!(
+                        fixture.runtime.volume_present(volume).expect("reachable"),
+                        "[{site:?}/{phase}] `{volume}` is gone"
+                    );
+                }
+                cells += 1;
+            }
+        }
+        assert_eq!(cells, 8, "four sites x {{Before, After}}");
+    }
+
+    /// The five `at_run_end` outcomes are **driven**, each through the
+    /// mechanism its row names, and every physical resource is checked
+    /// afterwards.
+    ///
+    /// `PR6-ACCT-008`. The tables were transcribed and counted — five constant
+    /// strings, four `"released"` values, one seeded census — and a table copied
+    /// into a test is a table. There was no R19 outcome table at all, and the
+    /// R20 disposition grid asserted "one per outcome" by checking that a vector
+    /// had five elements.
+    ///
+    /// ## What this slice can and cannot drive
+    ///
+    /// A run-end outcome is a fold over the event log and PR6 has
+    /// `durable_events: "none"`, so `Complete`, `Parked`, `Halted` and
+    /// `BudgetExceeded` are not states this slice can enter. What each of them
+    /// *names* is a **mechanism**, and R26's lifecycle sentence enumerates
+    /// them: "released on complete (stop/rm, view removed, intent removed),
+    /// **cancel**, or **shutdown**", with `NoRunFinished` "reclaimed … at the
+    /// next write-command start". Every mechanism in that sentence is
+    /// reachable here, so the table below maps each outcome to one and the
+    /// mapping is asserted **total** — a sixth outcome, or an outcome with no
+    /// mechanism, fails here rather than being counted.
+    ///
+    /// ## Per resource, not per site
+    ///
+    /// INV-22 is "every physical or logical owned resource has, for every
+    /// lifecycle state, exactly one accounting class and exactly one
+    /// non-overlapping inventory row". The site-mapping test proves one row per
+    /// *effect site*, which is a different statement: it cannot see the staged
+    /// intent record, the implicitly created named volume, or a standalone
+    /// view. So the ledger here is over the **resources** a container
+    /// invocation owns, each named with its row, and each observed after every
+    /// mechanism.
+    #[test]
+    fn every_at_run_end_outcome_is_driven_through_its_mechanism_and_the_ledgers_balance() {
+        /// The mechanism a run-end outcome disposes of R19/R26 through.
+        #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+        enum Mechanism {
+            /// "released on **complete** (stop/rm, view removed, intent
+            /// removed)".
+            Complete,
+            /// "…, **cancel**, …" — the invocation was stopped before it
+            /// finished on its own. `slice_contract.cancellation`: "timeout or
+            /// shutdown stops and removes the container".
+            Cancel,
+            /// "…, or **shutdown**" — the launch itself was refused and
+            /// everything it reached was released.
+            Shutdown,
+            /// R26's fifth cell: "reclaimed when the owner or its incarnation
+            /// is dead", at the next write-command start.
+            Census,
+        }
+
+        /// `decisions.resource_accounting.rows[{R19,R20,R26}].at_run_end`,
+        /// transcribed, with the mechanism this slice drives each through.
+        const OUTCOMES: &[(&str, &str, &str, &str, Mechanism)] = &[
+            (
+                "Complete",
+                "pruned",
+                "persistent_output",
+                "released",
+                Mechanism::Complete,
+            ),
+            (
+                "Parked",
+                "pruned",
+                "persistent_output",
+                "released",
+                Mechanism::Cancel,
+            ),
+            (
+                "Halted",
+                "pruned",
+                "persistent_output",
+                "released",
+                Mechanism::Shutdown,
+            ),
+            (
+                "BudgetExceeded",
+                "pruned",
+                "persistent_output",
+                "released",
+                Mechanism::Cancel,
+            ),
+            (
+                "NoRunFinished",
+                "pruned at the next write-command start after the owning container is observed \
+                 terminated",
+                "persistent_output",
+                "reclaimed when the owner or its incarnation is dead",
+                Mechanism::Census,
+            ),
+        ];
+        assert_eq!(OUTCOMES.len(), 5, "the five `at_run_end` outcomes");
+        assert_eq!(
+            OUTCOMES
+                .iter()
+                .filter(|(_, r19, ..)| *r19 == "pruned")
+                .count(),
+            4,
+            "R19 is `pruned` in four outcomes; the fifth is pruned by the census"
+        );
+        assert_eq!(
+            OUTCOMES
+                .iter()
+                .filter(|(_, _, r20, ..)| *r20 == "persistent_output")
+                .count(),
+            5,
+            "R20 is `persistent_output` in ALL five — the row has no cell in which a run may \
+             touch it"
+        );
+        assert_eq!(
+            OUTCOMES
+                .iter()
+                .filter(|(_, _, _, r26, _)| *r26 == "released")
+                .count(),
+            4,
+            "a container surviving a park or a budget stop keeps spending while the run is \
+             supposed to be quiescent"
+        );
+        // Total: every outcome has a mechanism, and every mechanism the
+        // lifecycle sentence names is used by an outcome.
+        let mechanisms: BTreeSet<Mechanism> =
+            OUTCOMES.iter().map(|(.., mechanism)| *mechanism).collect();
+        assert_eq!(
+            mechanisms,
+            BTreeSet::from([
+                Mechanism::Complete,
+                Mechanism::Cancel,
+                Mechanism::Shutdown,
+                Mechanism::Census,
+            ]),
+            "an outcome maps to a mechanism this slice does not drive, or a mechanism the \
+             lifecycle sentence names is driven by no outcome"
+        );
+
+        let volume = "tactus-creds-claude";
+        for (outcome, r19, r20, r26, mechanism) in OUTCOMES {
+            let fixture = Fixture::new(&format!("outcome-{outcome}"), true);
+            // R20's premise: the operator's volume is there before anything
+            // runs. `persistent_output` is a claim about a resource that
+            // exists.
+            assert!(
+                fixture.runtime.volume_present(volume).expect("reachable"),
+                "[{outcome}] the operator's volume was not there to begin with"
+            );
+
+            let request = worker_request(
+                ShellKind::Sh.spec("exit 0"),
+                fixture.task_a.clone(),
+                AgentId::new("claude-code"),
+                Duration::from_secs(10),
+                worker_id(0),
+            );
+            let name = ContainerName::new(REPO_KEY, RUN_ID, INCARNATION_1, &request.invocation)
+                .expect("a name");
+            let view = view_dir(&fixture.private_root, &name);
+            let intent = name.intent_path(&fixture.private_root);
+            let staged = crate::runner::container::intent::containers_dir(&fixture.private_root)
+                .join(format!("{}.intent.tmp", name.as_str()));
+
+            match mechanism {
+                Mechanism::Complete => {
+                    fixture.runner().run(&request).expect("completes");
+                }
+                Mechanism::Cancel => {
+                    // The cancellation clause: "timeout or shutdown stops and
+                    // removes the container". The container is left **running**
+                    // by the fake, so the supervisor really does reach its
+                    // deadline with something to stop — a fixture whose
+                    // container exits on start would take the ordinary
+                    // completion path and be a fifth copy of the cell above.
+                    let fixture = Fixture::new(&format!("outcome-{outcome}-live"), false);
+                    let mut request = request.clone();
+                    request.timeout = Duration::ZERO;
+                    let output = fixture.runner().run(&request).expect("times out");
+                    assert!(
+                        output.timed_out,
+                        "[{outcome}] the cancellation cell did not cancel anything"
+                    );
+                    assert!(
+                        fixture.trace.ops().contains(&RuntimeOp::Stop),
+                        "[{outcome}] nothing was stopped"
+                    );
+                    assert!(
+                        fixture.runtime.fake().container_names().is_empty()
+                            && list_intents(&fixture.private_root)
+                                .expect("scan")
+                                .is_empty()
+                            && !view_dir(&fixture.private_root, &name).exists(),
+                        "[{outcome}] R19/R26 residue after a cancel"
+                    );
+                    assert!(
+                        fixture.runtime.volume_present(volume).expect("reachable"),
+                        "[{outcome}] the run pruned an operator-owned credential volume"
+                    );
+                    continue;
+                }
+                Mechanism::Shutdown => {
+                    // The launch is refused mid-sequence and releases what it
+                    // reached. R26's "shutdown" is the run stopping before an
+                    // invocation could finish, which is the same disposal path.
+                    fixture
+                        .runtime
+                        .fake()
+                        .substitute_reported_image_id(name.as_str(), OTHER_IMAGE_ID);
+                    fixture.runner().run(&request).expect_err("refuses");
+                }
+                Mechanism::Census => {
+                    // Seeded rather than run: the owner is a *dead* incarnation,
+                    // which by construction is not this process.
+                    let mut hooks = RecordingHooks::new(fixture.trace.clone());
+                    let dead = fixture.runner_with(RunIdentity {
+                        incarnation: INCARNATION_2.to_owned(),
+                        ..fixture.identity.clone()
+                    });
+                    let plan = dead.plan(&request).expect("plans");
+                    crate::runner::container::launch(
+                        &mut hooks,
+                        &fixture.runtime,
+                        &crate::runner::container::view::RoleGitView::new(fixture.trace.clone()),
+                        &plan.launch,
+                    )
+                    .expect("the dead incarnation's container");
+                    let orphan = plan.launch.name.clone();
+                    assert!(
+                        orphan.intent_path(&fixture.private_root).exists()
+                            && view_dir(&fixture.private_root, &orphan).exists()
+                            && !fixture.runtime.fake().container_names().is_empty(),
+                        "[{outcome}] the orphan was not seeded"
+                    );
+                    let liveness = crate::runner::container::FakeOwnerLiveness::new();
+                    let view_impl =
+                        crate::runner::container::view::RoleGitView::new(fixture.trace.clone());
+                    crate::runner::container::census::run_startup_census(
+                        &mut hooks,
+                        &crate::runner::container::census::Census {
+                            private_root: &fixture.private_root,
+                            start: &crate::runner::container::census::CensusStart::FreshRun {
+                                incarnation: INCARNATION_1.to_owned(),
+                            },
+                            runtime: &fixture.runtime,
+                            liveness: &liveness,
+                            view: &view_impl,
+                        },
+                    )
+                    .expect("the census completes");
+                    assert!(
+                        fixture.runtime.fake().container_names().is_empty(),
+                        "[{outcome}] R26: the container"
+                    );
+                    assert!(
+                        !orphan.intent_path(&fixture.private_root).exists(),
+                        "[{outcome}] R26: the intent record"
+                    );
+                    assert!(
+                        !view_dir(&fixture.private_root, &orphan).exists(),
+                        "[{outcome}] R19: the view"
+                    );
+                    assert!(
+                        fixture.runtime.volume_present(volume).expect("reachable"),
+                        "[{outcome}] the census pruned an operator-owned credential volume"
+                    );
+                    continue;
+                }
+            }
+
+            // The per-resource ledger, for the two mechanisms that fall
+            // through: R26's container, R26's record (both halves), R19's
+            // directory, R20's volume.
+            assert!(
+                fixture.runtime.fake().container_names().is_empty(),
+                "[{outcome}] R26 `{r26}`: the container survived"
+            );
+            assert!(!intent.exists(), "[{outcome}] R26 `{r26}`: the record");
+            assert!(!staged.exists(), "[{outcome}] R26 `{r26}`: the staged half");
+            assert!(
+                !view.exists(),
+                "[{outcome}] R19 `{r19}`: the view directory"
+            );
+            for (_, other) in VOLUMES {
+                assert!(
+                    fixture.runtime.volume_present(other).expect("reachable"),
+                    "[{outcome}] R20 `{r20}`: `{other}` is gone"
+                );
+            }
+        }
+    }
+
+    /// Every physical resource a container invocation owns has exactly one row.
+    ///
+    /// `PR6-ACCT-008`'s second half, and INV-22's own sentence: "exactly one
+    /// accounting class and exactly one **non-overlapping** inventory row per
+    /// `decisions.resource_accounting`". The site-mapping census proves one row
+    /// per *effect site*; a site is not a resource, and the resources with no
+    /// site of their own are exactly the ones nothing was checking — the staged
+    /// intent record, the anonymous volume a `VOLUME` declaration creates, and
+    /// the named volume `docker create` creates implicitly.
+    ///
+    /// The table is the resources, not the sites, and each row names where in
+    /// this tree that resource is disposed of. Everything here is asserted
+    /// against the packet's row text rather than against the code.
+    #[test]
+    fn every_physical_resource_of_a_container_invocation_maps_to_exactly_one_row() {
+        /// `(resource, row, class while it exists, what disposes of it)`.
+        const RESOURCES: &[(&str, &str, &str, &str)] = &[
+            (
+                "the running container and its labels",
+                "R26",
+                "released",
+                "Container.Stop + Container.Remove",
+            ),
+            (
+                "the published `<name>.intent` record",
+                "R26",
+                "released",
+                "Container.RemoveIntent",
+            ),
+            (
+                "the staged `<name>.intent.tmp` half",
+                "R26",
+                "released",
+                "Container.RemoveIntent, reached by the census's staged sweep",
+            ),
+            (
+                "the anonymous volume an image's VOLUME declaration creates",
+                "R26",
+                "released",
+                "Container.Remove, which issues `rm --force --volumes`",
+            ),
+            (
+                "the disposable Git view directory",
+                "R19",
+                "pruned",
+                "Container.UnmountGitView",
+            ),
+            (
+                "the per-agent credential volume",
+                "R20",
+                "persistent_output",
+                "nothing: never created or pruned by a run",
+            ),
+        ];
+
+        // (1) One row per resource, and the rows are the three this slice owns.
+        let rows: BTreeSet<&str> = RESOURCES.iter().map(|(_, row, ..)| *row).collect();
+        assert_eq!(
+            rows,
+            BTreeSet::from(["R19", "R20", "R26"]),
+            "a container invocation's resources map outside the three rows this slice owns"
+        );
+        let names: BTreeSet<&str> = RESOURCES.iter().map(|(name, ..)| *name).collect();
+        assert_eq!(
+            names.len(),
+            RESOURCES.len(),
+            "two rows name the same resource, so the inventory overlaps"
+        );
+
+        // (2) One class per row, over every resource in it: a row whose
+        // resources disagreed about their class would be two rows.
+        let mut by_row: BTreeMap<&str, BTreeSet<&str>> = BTreeMap::new();
+        for (_, row, class, _) in RESOURCES {
+            by_row.entry(row).or_default().insert(class);
+        }
+        for (row, classes) in &by_row {
+            assert_eq!(
+                classes.len(),
+                1,
+                "`{row}` holds resources of {classes:?}, so it is not one accounting class"
+            );
+        }
+        assert_eq!(by_row["R19"], BTreeSet::from(["pruned"]));
+        assert_eq!(by_row["R20"], BTreeSet::from(["persistent_output"]));
+        assert_eq!(by_row["R26"], BTreeSet::from(["released"]));
+        // Every class named is one `decisions.resource_accounting.classes`
+        // declares.
+        for (_, _, class, _) in RESOURCES {
+            assert!(
+                [
+                    "released",
+                    "consumed",
+                    "persistent_output",
+                    "pruned",
+                    "resumably_open"
+                ]
+                .contains(class),
+                "`{class}` is not one of the five accounting classes"
+            );
+        }
+
+        // (3) The R20 row is the only one with no disposer, and that is the
+        // whole of `enforcement_domains.operator_owned`.
+        let undisposed: Vec<&str> = RESOURCES
+            .iter()
+            .filter(|(_, _, _, by)| by.starts_with("nothing"))
+            .map(|(name, ..)| *name)
+            .collect();
+        assert_eq!(
+            undisposed,
+            vec!["the per-agent credential volume"],
+            "a resource other than R20 has nothing that releases it, or R20 acquired one"
+        );
+
+        // (4) Every disposer that names a site names one of the frozen eight,
+        // so a resource cannot be disposed of by something outside the funnel.
+        let site_names: BTreeSet<&str> =
+            ContainerSite::ALL.iter().map(|site| site.name()).collect();
+        let mut named = 0_usize;
+        for (resource, _, _, by) in RESOURCES {
+            for word in by.split(|c: char| !(c.is_ascii_alphanumeric() || c == '.')) {
+                let Some(site) = word.strip_prefix("Container.") else {
+                    continue;
+                };
+                assert!(
+                    site_names.contains(site),
+                    "`{resource}` is disposed of at `Container.{site}`, which is not one of the \
+                     frozen eight sites"
+                );
+                named += 1;
+            }
+        }
+        assert!(named >= 4, "the disposers name no sites at all");
+    }
+
     /// Nothing in the container subtree can create or prune a volume.
     ///
     /// The runtime assertion above measures the dispositions a test drove; this
@@ -3524,39 +4254,111 @@ mod tests {
     /// credential volumes: **never created or pruned by a run**". The seam has
     /// one volume method and it returns a `bool`, and the `docker` CLI issues
     /// exactly one volume subcommand, which is `inspect`.
+    ///
+    /// **The domain has a control** (`PR6-ACCT-002`): every file of the subtree
+    /// is enumerated from the directory rather than listed by hand, every one
+    /// contributes a non-trivial production region, and the *set* of files is
+    /// asserted to contain the seven this slice wrote. A future `#[cfg(test)]`
+    /// hoisted to the top of any of them, or a new module added beside them,
+    /// fails here rather than silently emptying the census.
     #[test]
     fn the_container_subtree_can_only_inspect_a_volume() {
-        let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("src")
-            .join("runner");
-        let mut sources = std::fs::read_to_string(dir.join("container.rs")).expect("the funnel");
-        for name in ["runtime.rs", "intent.rs", "exec.rs", "env.rs", "view.rs"] {
-            sources.push_str(
-                &std::fs::read_to_string(dir.join("container").join(name)).expect("a module"),
+        let (regions, excluded) = container_subtree_production_regions();
+
+        // -- the control on the domain itself --------------------------------
+        let files: BTreeSet<&str> = regions.iter().map(|(name, _)| name.as_str()).collect();
+        assert_eq!(
+            files,
+            [
+                "container.rs",
+                "census.rs",
+                "env.rs",
+                "exec.rs",
+                "intent.rs",
+                "resolve.rs",
+                "runtime.rs",
+                "view.rs",
+            ]
+            .into_iter()
+            .collect::<BTreeSet<_>>(),
+            "the domain of the R20 vocabulary census moved. Every production module of the \
+             container subtree must be in it: `PR6-ACCT-002` measured this census reading \
+             `container.rs` alone and reporting on seven files, because the sources were \
+             concatenated and cut at the FIRST `#[cfg(test)]`"
+        );
+        assert_eq!(
+            excluded,
+            ["fake.rs", "tests.rs"]
+                .into_iter()
+                .map(str::to_owned)
+                .collect::<BTreeSet<_>>(),
+            "a file of this subtree is neither declared above `container.rs`'s `#[cfg(test)]` cut \
+             (production, in the domain) nor below it (test-only, excluded), so nothing decides \
+             which it is"
+        );
+        for (name, production) in &regions {
+            assert!(
+                production.len() > 2_000,
+                "`{name}`'s production region is {} bytes, so the census below is measuring \
+                 almost nothing of it — this is `PR5-R1-CFG-TEST-SHRINKS-THE-DOMAIN`",
+                production.len()
             );
         }
-        let production =
-            crate::effects::blank_comments(&crate::effects::production_region(&sources));
-        // The control: the read-only inspection really is there, so a census
-        // that had stopped finding anything fails here rather than reporting
-        // silence.
+        let joined: String = regions
+            .iter()
+            .map(|(_, production)| production.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        // The positive control: the read-only inspection really is there, so a
+        // census that had stopped finding anything fails here rather than
+        // reporting silence. It lives in `container.rs` **below** the old cut
+        // point's neighbours, so it is also evidence the domain is whole.
         assert_eq!(
-            production.matches("\"volume\",").count(),
+            joined.matches("\"volume\",").count(),
             1,
             "the `docker volume` census is measuring nothing"
         );
-        assert!(production.contains("\"inspect\""));
+        assert!(joined.contains("\"inspect\""));
         for mutating in ["\"create\", ", "volume rm", "volume prune", "\"prune\""] {
             assert_eq!(
-                production.matches(mutating).count(),
+                joined.matches(mutating).count(),
                 0,
                 "the container subtree names `{mutating}`, so a run could create or prune a volume"
             );
         }
+
+        // -- and the vocabulary census is not the whole claim -----------------
+        // `docker create` creates an absent named volume **implicitly**, with
+        // no `volume create` anywhere (measured, docker 29.7.2). No search over
+        // this subtree's text can see that, so the domain census is paired with
+        // the guard that can: every `Mount::Volume` is re-inspected before the
+        // create, in `container::create_container`.
+        // `a_create_whose_named_volume_is_absent_is_refused_before_any_effect`
+        // drives it; this asserts the guard is *in the production region*, so
+        // it cannot be deleted while the vocabulary census stays green.
+        let funnel = &regions
+            .iter()
+            .find(|(name, _)| name == "container.rs")
+            .expect("the funnel")
+            .1;
+        assert!(
+            funnel.contains("fn expect_mounted_volumes_present"),
+            "the create-time volume guard is gone, so `docker create` can create an R20 volume \
+             without this subtree naming `volume create` at all"
+        );
+        assert_eq!(
+            funnel.matches("expect_mounted_volumes_present").count(),
+            2,
+            "the guard must be defined and called exactly once"
+        );
+
         // And the seam has one volume method.
-        let seam =
-            std::fs::read_to_string(dir.join("container").join("runtime.rs")).expect("the seam");
-        let seam = crate::effects::blank_comments(&crate::effects::production_region(&seam));
+        let seam = &regions
+            .iter()
+            .find(|(name, _)| name == "runtime.rs")
+            .expect("the seam")
+            .1;
         assert_eq!(seam.matches("fn volume").count(), 1, "one volume method");
         assert!(
             seam.contains("fn volume_present(&self, name: &str) -> Result<bool, RuntimeError>")
@@ -4228,10 +5030,22 @@ mod tests {
                     );
                 }
 
-                // (4) A failing `Stop` is *named* rather than swallowed, and
-                // only where a container existed to stop.
-                let container_existed = matches!(point, Where::Mismatch | Where::Start);
-                let expects_residue = stop_fails && container_existed;
+                // (4) A failing `Stop` is *named* rather than swallowed, at
+                // every exit where the cancel attempts one.
+                //
+                // That is every exit **past** the create call, including the
+                // one where the create itself failed (`PR6-ACCT-003`): the
+                // funnel runs its primitive before consulting the `After`
+                // phase, and `DockerCli::create` reads the reported image id
+                // back afterwards, so a `Container.Create` that returns `Err`
+                // may have left a container. The cancel cannot tell, so it
+                // attempts the stop and the removal — both tolerant of
+                // already-gone against a real daemon — and reports whatever the
+                // runtime answered. This fake is armed to fail *every* stop,
+                // including one against a container that was never created,
+                // which is why the Create cell now names a stop failure too.
+                let attempts_stop = matches!(point, Where::Create | Where::Mismatch | Where::Start);
+                let expects_residue = stop_fails && attempts_stop;
                 assert_eq!(
                     message.contains("could not be stopped"),
                     expects_residue,
@@ -4267,8 +5081,8 @@ mod tests {
             "four failure points crossed with two cleanup states"
         );
         assert_eq!(
-            with_residue, 2,
-            "two of the cells created a container to fail to stop"
+            with_residue, 3,
+            "three of the cells reach the cancel with a container that may exist"
         );
     }
 
@@ -4489,6 +5303,20 @@ mod tests {
     const MARKER_IMAGE: &str = "tactus-test/git:v1";
     const IMAGE_MARKER_VALUE: &str = "image-environment-v1";
 
+    /// The image whose **own environment** sets credential-location variables.
+    ///
+    /// `PR6-CORRECTNESS-007` cannot be measured against an image that sets
+    /// none: the defect is that `docker create --env` overlays the image
+    /// environment, so a key the runner omits is a key the image supplies.
+    /// `DOCKER-SUBSTRATE.md` records how it is built, from a base the machine
+    /// already holds and with no network.
+    const CREDENTIAL_ENV_IMAGE: &str = "tactus-test/credenv:v1";
+
+    /// The image variable that is **not** a credential location, so "the
+    /// withheld keys were overridden" is distinguishable from "the image
+    /// environment was wiped".
+    const CREDENTIAL_ENV_CONTROL: (&str, &str) = ("GH_CONFIG_DIR", "/image/gh");
+
     /// What a Docker-gated test does when there is no runtime.
     ///
     /// It **reads** the reason rather than returning silently, so a skip that
@@ -4656,6 +5484,9 @@ mod tests {
         ("outside", "01KZR1GATED000000000000001"),
         ("daemonspec", "01KZR1GATED000000000000002"),
         ("shadow", "01KZR1GATED000000000000003"),
+        // Repair R3b, with its own round prefix for the reason above.
+        ("credenv", "01KZR3BGATED00000000000001"),
+        ("descendant", "01KZR3BGATED00000000000002"),
     ];
 
     fn gated_run(tag: &str) -> &'static str {
@@ -5784,6 +6615,276 @@ mod tests {
         );
     }
 
+    /// The recorded image sets a credential location, and a role that takes
+    /// none does not receive it **inside the container**.
+    ///
+    /// `PR6-CORRECTNESS-007`, against the daemon. The unit-level assertion is
+    /// about the composed vector, and the composed vector is not the
+    /// container's environment: `docker create --env` **overlays** the image's
+    /// own, so a key the runner omits is a key the image decides. This runs a
+    /// gate — repository-controlled code, the one thing no agent permission
+    /// surface bounds — inside an image whose `ENV` sets `CODEX_HOME` and
+    /// `CLAUDE_CONFIG_DIR`, and reads the variables back from inside.
+    ///
+    /// Second field held constant: the same image and the same command in both
+    /// halves; only the role moves. `GH_CONFIG_DIR` is the control — an image
+    /// variable that is not a credential location — so a runner that wiped the
+    /// image environment rather than overriding two keys of it fails here.
+    #[test]
+    fn real_docker_withholds_an_image_credential_variable_from_a_role_that_takes_none() {
+        let trace = ContainerTrace::recording();
+        let docker = match docker_gate(
+            "real_docker_withholds_an_image_credential_variable_from_a_role_that_takes_none",
+            trace.clone(),
+        ) {
+            Ok(docker) => docker,
+            Err(reason) => return skipped(&reason),
+        };
+        let (_, image_id) = match discover(docker.as_ref(), &[CREDENTIAL_ENV_IMAGE]) {
+            Ok(found) => found,
+            Err(reason) => return no_image(&reason),
+        };
+        // The premise, read from the daemon rather than assumed: this image
+        // really does set a credential location.
+        let declared = docker
+            .raw(
+                RuntimeOp::InspectImageById,
+                &image_id,
+                &[
+                    "image",
+                    "inspect",
+                    &image_id,
+                    "--format",
+                    "{{join .Config.Env \"\u{1f}\"}}",
+                ],
+            )
+            .expect("the image environment");
+        assert!(
+            declared.contains("CODEX_HOME=/image/codex"),
+            "`{CREDENTIAL_ENV_IMAGE}` does not set a credential location, so this measurement \
+             would be vacuous: {declared}"
+        );
+
+        let root = repo::scratch("real-credenv");
+        let repo_dir = root.join("repo");
+        repo::repository(&repo_dir);
+        let identity = real_identity(&root, &repo_dir, gated_run("credenv"));
+        let workspace = root.join("plain-workspace");
+        std::fs::create_dir_all(&workspace).expect("a workspace");
+        let _residue = LeaveNoResidue {
+            docker: (*docker).clone(),
+            private_root: identity.private_root.clone(),
+        };
+
+        // A policy that DOES record a credential volume for codex would be
+        // creating operator state; the withholding is about the *variable*, and
+        // the mount is separately asserted by
+        // `the_credential_volume_is_mounted_exactly_when_its_location_is_supplied`.
+        let runner = ContainerRunner::new(
+            real_policy(&image_id),
+            identity,
+            &repo_dir,
+            image_environment_of(docker.as_ref(), &image_id),
+            Box::new((*docker).clone()),
+        )
+        .expect("a container policy")
+        .with_hooks(Box::new(RecordingHooks::new(trace.clone())))
+        .with_poll(Duration::from_millis(10));
+
+        let (control_key, control_value) = CREDENTIAL_ENV_CONTROL;
+        let spec = ShellKind::Sh.spec(&format!(
+            "printf 'CODEX=[%s]\\n' \"$CODEX_HOME\"; \
+             printf 'CLAUDE=[%s]\\n' \"$CLAUDE_CONFIG_DIR\"; \
+             printf 'CONTROL=[%s]\\n' \"${{{control_key}}}\""
+        ));
+        let request = gate_request(spec, workspace, Duration::from_secs(60), gate_id(0));
+        let output = runner.run(&request).expect("runs");
+        assert_eq!(output.code, Some(0), "stderr: {}", output.stderr);
+        let line = |key: &str| -> String {
+            output
+                .stdout
+                .lines()
+                .find_map(|line| line.strip_prefix(key))
+                .unwrap_or_else(|| panic!("`{key}` is not in {:?}", output.stdout))
+                .to_owned()
+        };
+        assert_eq!(
+            line("CODEX="),
+            "[]",
+            "a gate ran with the image's own `CODEX_HOME`; DESIGN.md:258-262 has each runner \
+             supply ROLE-SCOPED credential locations, and a location the composed vector does \
+             not name is one the image supplies"
+        );
+        assert_eq!(line("CLAUDE="), "[]", "stdout: {}", output.stdout);
+        assert_eq!(
+            line("CONTROL="),
+            format!("[{control_value}]"),
+            "the image environment was wiped rather than overridden, so the two assertions \
+             above hold for the wrong reason"
+        );
+    }
+
+    /// A container contains its **descendants**, including one that has left
+    /// the leader's session.
+    ///
+    /// `PR6-ENUM-006`. `invariants_introduced[0]` is "container contains
+    /// descendants", and nothing in this suite observed one: the timeout
+    /// fixture runs a single `sleep` and checks one container liveness bit, so
+    /// a cancellation that terminated or forgot only the leader would pass it.
+    ///
+    /// The descendant is `setsid`-detached, which is exactly what escapes a
+    /// host process-group kill (`agent::proc`'s whole subject), and it is
+    /// observed **in the host's own process table** rather than by timing: a
+    /// container's processes are ordinary host processes in another namespace,
+    /// so `/proc/<pid>/cmdline` can name them. Each `sleep` carries a marker
+    /// argument nothing else on the machine uses.
+    ///
+    /// The intersection: {leader, detached descendant} × {container running,
+    /// container reclaimed}. The two "running" cells are the control — without
+    /// them a test in which nothing ever started would pass.
+    #[test]
+    #[cfg(unix)]
+    fn real_docker_a_container_contains_a_daemonised_descendant() {
+        /// Distinct markers, so the leader and the descendant are told apart by
+        /// value and not by order.
+        ///
+        /// They are the **durations** the two `sleep` calls are given, so they
+        /// have to be numbers — `sleep 999111r3b` answers `invalid number` and
+        /// exits 1, which is a container that ends before its timeout and a
+        /// fixture that measures nothing. Two implausible second counts, far
+        /// apart in value, are what makes them recognisable in `/proc` without
+        /// making them unrunnable.
+        const LEADER_MARKER: &str = "903222";
+        const DESCENDANT_MARKER: &str = "903111";
+
+        /// Every pid whose argv contains `marker`, read from `/proc`.
+        ///
+        /// `contains` over argv entries rather than a substring of the whole
+        /// buffer, so this process's own command line — which carries the
+        /// marker as a literal in the binary, not in argv — cannot match.
+        fn pids_with(marker: &str) -> Vec<String> {
+            let mut found = Vec::new();
+            let Ok(entries) = std::fs::read_dir("/proc") else {
+                return found;
+            };
+            for entry in entries.flatten() {
+                let name = entry.file_name().to_string_lossy().into_owned();
+                if !name.chars().all(|c| c.is_ascii_digit()) {
+                    continue;
+                }
+                let Ok(raw) = std::fs::read(entry.path().join("cmdline")) else {
+                    continue;
+                };
+                if raw
+                    .split(|byte| *byte == 0)
+                    .filter(|arg| !arg.is_empty())
+                    .any(|arg| String::from_utf8_lossy(arg) == marker)
+                {
+                    found.push(name);
+                }
+            }
+            found
+        }
+
+        let trace = ContainerTrace::recording();
+        let docker = match docker_gate(
+            "real_docker_a_container_contains_a_daemonised_descendant",
+            trace.clone(),
+        ) {
+            Ok(docker) => docker,
+            Err(reason) => return skipped(&reason),
+        };
+        let (_, image_id) = match discover(docker.as_ref(), PREFERRED_IMAGES) {
+            Ok(found) => found,
+            Err(reason) => return no_image(&reason),
+        };
+
+        let root = repo::scratch("real-descendant");
+        let repo_dir = root.join("repo");
+        repo::repository(&repo_dir);
+        let identity = real_identity(&root, &repo_dir, gated_run("descendant"));
+        let workspace = root.join("plain-workspace");
+        std::fs::create_dir_all(&workspace).expect("a workspace");
+        let _residue = LeaveNoResidue {
+            docker: (*docker).clone(),
+            private_root: identity.private_root.clone(),
+        };
+
+        let runner = ContainerRunner::new(
+            real_policy(&image_id),
+            identity.clone(),
+            &repo_dir,
+            image_environment_of(docker.as_ref(), &image_id),
+            Box::new((*docker).clone()),
+        )
+        .expect("a container policy")
+        .with_hooks(Box::new(RecordingHooks::new(trace.clone())))
+        .with_poll(Duration::from_millis(10));
+
+        // The leader spawns a detached descendant and then blocks. The runner's
+        // own timeout is what stops the container, which is
+        // `slice_contract.cancellation`: "timeout or shutdown stops and removes
+        // the container".
+        let mut request = gate_request(
+            ShellKind::Sh.spec(&format!(
+                "if command -v setsid >/dev/null 2>&1; then \
+                   setsid sleep {DESCENDANT_MARKER} >/dev/null 2>&1 & \
+                 else \
+                   sleep {DESCENDANT_MARKER} >/dev/null 2>&1 & \
+                 fi; \
+                 sleep {LEADER_MARKER}"
+            )),
+            workspace,
+            Duration::from_secs(120),
+            gate_id(0),
+        );
+        request.timeout = Duration::from_secs(3);
+
+        // The controls, sampled from another thread while the invocation is in
+        // flight: both processes really are on this machine.
+        let seen = std::thread::scope(|scope| {
+            let sampler = scope.spawn(|| {
+                let deadline = Instant::now() + Duration::from_secs(20);
+                let mut leader = false;
+                let mut descendant = false;
+                while Instant::now() < deadline && !(leader && descendant) {
+                    leader |= !pids_with(LEADER_MARKER).is_empty();
+                    descendant |= !pids_with(DESCENDANT_MARKER).is_empty();
+                    std::thread::sleep(Duration::from_millis(50));
+                }
+                (leader, descendant)
+            });
+            let output = runner.run(&request).expect("runs");
+            assert!(output.timed_out, "the fixture did not reach its timeout");
+            sampler.join().expect("the sampler panicked")
+        });
+        assert_eq!(
+            seen,
+            (true, true),
+            "the fixture never had a leader and a detached descendant running at once, so the \
+             containment assertion below would hold vacuously"
+        );
+
+        // The container is gone, and so is everything it contained. The
+        // descendant left the leader's session, so a cancellation that killed
+        // only the leader's process group would leave it here.
+        let leader = pids_with(LEADER_MARKER);
+        let descendant = pids_with(DESCENDANT_MARKER);
+        // The descendant first: it is the invariant's subject, and a leader
+        // assertion that fires before it would report the wrong thing about a
+        // cancellation that left both alive.
+        assert!(
+            descendant.is_empty(),
+            "a `setsid`-detached descendant survived its container, so \
+             `invariants_introduced[0]` (\"container contains descendants\") does not hold: \
+             {descendant:?}"
+        );
+        assert!(
+            leader.is_empty(),
+            "the invocation's leader survived its container: {leader:?}"
+        );
+    }
+
     /// Every Docker-gated test this lane adds is on the list that counts them.
     ///
     /// `every_docker_gated_test_is_named_and_present` in the substrate's own
@@ -5802,8 +6903,11 @@ mod tests {
             "real_docker_a_gate_write_outside_every_declared_mount_fails",
             "real_docker_the_daemon_holds_exactly_the_specs_mounts_and_a_read_only_root",
             "real_docker_a_worktree_binary_cannot_shadow_the_certified_cli",
+            // Repair round R3b.
+            "real_docker_withholds_an_image_credential_variable_from_a_role_that_takes_none",
+            "real_docker_a_container_contains_a_daemonised_descendant",
         ];
-        assert_eq!(MINE.len(), 8);
+        assert_eq!(MINE.len(), 10);
         assert_eq!(GATED_RUNS.len(), MINE.len(), "one run id per gated test");
         let ids: BTreeSet<&str> = GATED_RUNS.iter().map(|(_, run)| *run).collect();
         assert_eq!(

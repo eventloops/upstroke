@@ -611,6 +611,12 @@ pub(crate) const DOCKER_GATED_TESTS: &[&str] = &[
     // Repair round R2: the two tables whose oracle has to be the daemon.
     "real_docker_renders_a_comma_bearing_label_value_whole",
     "real_docker_prints_the_transcribed_unreachable_diagnostics",
+    // Repair round R3b: the two daemon behaviours the engine has to compensate
+    // for, and the two claims whose only honest oracle is a live container.
+    "real_docker_creates_an_absent_named_volume_rather_than_refusing",
+    "real_docker_prints_the_transcribed_removal_in_progress_diagnostic",
+    "real_docker_withholds_an_image_credential_variable_from_a_role_that_takes_none",
+    "real_docker_a_container_contains_a_daemonised_descendant",
 ];
 
 /// Why a gated test skipped.

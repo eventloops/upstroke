@@ -4322,10 +4322,26 @@ mod termination {
                         std::ptr::null(),
                     ];
                     spawn_docker(containers.program.as_ptr(), kill.as_ptr());
-                    let remove: [*const libc::c_char; 5] = [
+                    // `--volumes`, exactly as `DockerCli::remove` issues it
+                    // (`PR6-ACCT-006`). An image declaring `VOLUME` gets one
+                    // **anonymous** volume per container, and `docker rm`
+                    // without this leaves one behind for every container the
+                    // reaper removes: measured, 29 leaked from a single run of
+                    // this suite through the ordinary path before
+                    // `PR6A-ANONYMOUS-VOLUMES-LEAK` put the flag there. Those
+                    // volumes are R26 — created by `docker create` as part of
+                    // the container, referable by nothing else — and once the
+                    // reaper has removed the container the following
+                    // intent-only census has no handle on them at all, so this
+                    // is the *only* point at which they can be reclaimed.
+                    // `--volumes` removes anonymous volumes and **never a named
+                    // one**, so it cannot touch R20 (measured on docker 29.7.2:
+                    // a mounted named volume survives `rm --force --volumes`).
+                    let remove: [*const libc::c_char; 6] = [
                         containers.program.as_ptr(),
                         c"rm".as_ptr(),
                         c"--force".as_ptr(),
+                        c"--volumes".as_ptr(),
                         id,
                         std::ptr::null(),
                     ];
@@ -5089,7 +5105,7 @@ mod termination {
                 .collect();
             let removed: std::collections::BTreeSet<String> = logged(&dir, "rm")
                 .into_iter()
-                .map(|line| line["rm --force ".len()..].to_owned())
+                .map(|line| line["rm --force --volumes ".len()..].to_owned())
                 .collect();
             // The expected ids come from the stub's own rule, written out here
             // rather than read back from what the reaper did.
@@ -5134,7 +5150,7 @@ mod termination {
                  printf '%s\\n' \"$*\" >> \"$d/argv.log\"\n\
                  case \"$1\" in\n\
                  ps) ls \"$d/ids\" 2>/dev/null ;;\n\
-                 rm) rm -f \"$d/ids/$3\" ;;\n\
+                 rm) rm -f \"$d/ids/$4\" ;;\n\
                  esac\n\
                  exit 0\n",
             );
@@ -5159,7 +5175,7 @@ mod termination {
                 .collect();
             let removed: std::collections::BTreeSet<String> = logged(&dir, "rm")
                 .into_iter()
-                .map(|line| line["rm --force ".len()..].to_owned())
+                .map(|line| line["rm --force --volumes ".len()..].to_owned())
                 .collect();
             assert_eq!(
                 killed,
@@ -8323,7 +8339,29 @@ mod tests {
             );
             assert!(lines[0].starts_with("ps "), "{lines:#?}");
             assert_eq!(lines[1], format!("kill {CONTAINER_ID}"), "{lines:#?}");
-            assert_eq!(lines[2], format!("rm --force {CONTAINER_ID}"), "{lines:#?}");
+            // The removal the reaper **actually executed**, against the
+            // declaration in `ReaperContainerScope::remove_argv` rather than
+            // against a literal repeated here (`PR6-ACCT-006`). The fork side
+            // builds its argv from `c"…"` literals that nothing can read back
+            // at runtime, so without this comparison the declaration and the
+            // behaviour are two self-consistent halves with nothing crossing
+            // them — the shape `PR6E-005` measured on the view path. `argv[0]`
+            // is dropped because the stub logs the arguments only.
+            //
+            // `--volumes` is what makes it the same removal `DockerCli::remove`
+            // issues: the reaper is the *only* thing that removes a dead
+            // coordinator's containers on Unix, and an `rm` without it leaks
+            // one anonymous volume per container into a state no later census
+            // can discover, the container being gone and nothing else referring
+            // to the volume.
+            let declared = crate::runner::container::census::ReaperContainerScope::new(
+                "docker",
+                std::path::Path::new(PRIVATE_ROOT),
+                INCARNATION,
+            )
+            .expect("a scope")
+            .remove_argv(CONTAINER_ID);
+            assert_eq!(lines[2], declared[1..].join(" "), "{lines:#?}");
 
             // (1) Both filters, two distinct values.
             let filters: Vec<&str> = lines[0]

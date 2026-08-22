@@ -457,6 +457,54 @@ impl ContainerEnvironment {
         supplied
     }
 
+    /// The credential-location keys this scope is **not** given, each with the
+    /// value that says so at the boundary.
+    ///
+    /// ## Why an empty value and not an absent key (`PR6-CORRECTNESS-007`)
+    ///
+    /// `docker create --env K=V` **overlays** the image's environment; it does
+    /// not replace it. So a key the composed vector simply *omits* is not a key
+    /// the container lacks — it is a key whose value the **image** chooses.
+    /// Measured on `docker` 29.7.2 against an image declaring
+    /// `ENV CODEX_HOME=/image/codex`: a container created with no `CODEX_HOME`
+    /// in its spec runs with `CODEX_HOME=/image/codex`. Every role therefore
+    /// received every credential location the image happened to carry, and
+    /// DESIGN.md:258-262's "each supplies **role-scoped** … credential
+    /// locations" was false of a gate, a reviewer and the shell probe — the
+    /// three roles [`supplies_credential_location`] refuses by name.
+    ///
+    /// The runtime has no "unset" for an image variable, and the two remaining
+    /// spellings are not equivalent: bare `--env K` **passes the client's own
+    /// value through** when the coordinator has one, which turns an image leak
+    /// into a *host* leak. `K=` is the spelling that names the key and gives it
+    /// nothing.
+    ///
+    /// **Unconditional, not conditional on the base carrying the key.** The
+    /// base is a read of the recorded image, and a rule that only neutralises
+    /// what that read happened to return is a rule whose correctness depends on
+    /// the read being complete. Stating "this role has no location for this
+    /// agent" for all three keys costs three environment entries and depends on
+    /// nothing.
+    ///
+    /// This is a pointer and never a token — the credentials are the *volume*,
+    /// and for these roles it is not mounted (`ContainerRunner::mounts`). The
+    /// mount is the boundary; this closes the gap between the boundary and what
+    /// the process is told about it.
+    #[must_use]
+    pub fn withheld_credential_locations(&self, scope: &RoleScope<'_>) -> Vec<(String, String)> {
+        let supplied = self.reserved_values(scope);
+        crate::runner::host::CREDENTIAL_LOCATIONS
+            .iter()
+            .map(|(_, key)| *key)
+            .filter(|key| {
+                !supplied
+                    .iter()
+                    .any(|(name, _)| self.case.same_key(name.as_ref(), key.as_ref()))
+            })
+            .map(|key| (key.to_owned(), String::new()))
+            .collect()
+    }
+
     /// Base, then reserved values, then overlay — DESIGN.md:263's own order
     /// ("the same base, mounts, reserved values, and overlay").
     ///
@@ -488,6 +536,14 @@ impl ContainerEnvironment {
             composed.retain(|(name, _)| !self.case.same_key(name.as_ref(), reserved.as_ref()));
         }
         for (key, value) in self.reserved_values(scope) {
+            upsert(&mut composed, self.case, key, value);
+        }
+        // The keys this role is *not* given, named explicitly rather than
+        // omitted — see `withheld_credential_locations`. After the supplied
+        // ones and before the overlay, so the two sets cannot collide (a key in
+        // one is by construction not in the other) and the overlay's own
+        // reserved-key refusal still governs.
+        for (key, value) in self.withheld_credential_locations(scope) {
             upsert(&mut composed, self.case, key, value);
         }
         for (key, value) in overlay {
@@ -601,6 +657,8 @@ fn upsert(into: &mut Vec<(String, String)>, case: KeyCase, key: String, value: S
 // every source census (`PR5-R1-CFG-TEST-SHRINKS-THE-DOMAIN`).
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeSet;
+
     use super::*;
     use crate::runner::host::{CREDENTIAL_LOCATIONS, HostEnvironment, RESERVED_ALWAYS};
 
@@ -810,6 +868,13 @@ mod tests {
     /// field is the one that matters: a rule keyed only on the role would
     /// supply a location for a volume the record does not name, and a rule
     /// keyed only on the record would hand a gate an agent's credentials.
+    ///
+    /// **"Withheld" is `KEY=` and not an absent key** (`PR6-CORRECTNESS-007`).
+    /// A composed vector that merely omits the key leaves the value to the
+    /// image, because `docker create --env` overlays rather than replaces — so
+    /// every cell here asserts on the *pair* (named, value) and not on presence
+    /// alone. All three credential-location keys are named in every one of the
+    /// ten cells; only the value moves.
     #[test]
     fn the_credential_location_is_role_scoped_and_names_the_boundarys_own_path() {
         let environment = ContainerEnvironment::from_image(image_base());
@@ -825,8 +890,19 @@ mod tests {
             for (recorded_volumes, is_recorded) in [(&recorded, true), (&empty, false)] {
                 let scope = scope(&role, agent.as_ref(), recorded_volumes, &layout);
                 let composed = environment.compose(&scope, &[]).expect("composes");
+                // Every credential-location key is named, whatever the role: an
+                // unnamed key is a key the image decides.
+                for (_, key) in CREDENTIAL_LOCATIONS {
+                    assert!(
+                        value(&composed, key).is_some(),
+                        "{role} (volume recorded: {is_recorded}): `{key}` is not named at all, so \
+                         the recorded image's own value reaches the container"
+                    );
+                }
                 let key = agent.as_ref().and_then(credential_location);
-                let found = key.and_then(|key| value(&composed, key));
+                let found = key
+                    .and_then(|key| value(&composed, key))
+                    .filter(|value| !value.is_empty());
                 let expected =
                     supplies_credential_location(&role) && agent.is_some() && is_recorded;
                 assert_eq!(
@@ -844,6 +920,14 @@ mod tests {
                     targets.push(found.to_owned());
                     supplied += 1;
                 } else {
+                    if let Some(key) = key {
+                        assert_eq!(
+                            value(&composed, key),
+                            Some(""),
+                            "{role} (volume recorded: {is_recorded}): a withheld location must be \
+                             named with nothing, not left to the image"
+                        );
+                    }
                     withheld += 1;
                 }
             }
@@ -868,7 +952,7 @@ mod tests {
             let composed = environment.compose(&scope, &[]).expect("composes");
             assert_eq!(
                 value(&composed, "CLAUDE_CONFIG_DIR"),
-                None,
+                Some(""),
                 "{role} named an agent and was handed its credential location"
             );
             hostile += 1;
@@ -931,50 +1015,128 @@ mod tests {
         );
     }
 
-    /// The base's own copies of the reserved keys are dropped before the runner
-    /// supplies them.
+    /// An image credential variable does not survive into a role that takes
+    /// none — and "does not survive" means the composed vector **overrides**
+    /// it, not that the vector is silent about it.
     ///
-    /// This is the assertion `host-v1`'s own doc comment says the step exists
-    /// for, transcribed to the other boundary: an implementation that cloned
-    /// the base and upserted would leave every credential location the *image*
-    /// happens to carry in a gate's environment, and would be output-equivalent
-    /// to deleting the step, because `reserved_values` reads its values back
-    /// out of the same base.
+    /// ## The weaker true statement this test used to prove
     ///
-    /// Second field held constant: the image, which carries `CODEX_HOME` in
-    /// both cells; what varies is the role.
+    /// `PR6-CORRECTNESS-007`. It asserted `value(&composed, "CODEX_HOME") ==
+    /// None` for a gate: true, and a claim about *this vector*, not about the
+    /// container. `docker create --env K=V` **overlays** the image's
+    /// environment — measured on `docker` 29.7.2 against an image declaring
+    /// `ENV CODEX_HOME=/image/codex`, a container whose spec names no
+    /// `CODEX_HOME` runs with `CODEX_HOME=/image/codex`. So the omission the
+    /// old assertion proved was exactly the mechanism by which the image's
+    /// value reached the role, and DESIGN.md:258-262's "each supplies
+    /// **role-scoped** … credential locations" was false of every role
+    /// `supplies_credential_location` refuses.
+    ///
+    /// The grid is now **{image sets the key} × {role receives it}**, all four
+    /// cells, because the withholding is unconditional: a rule that neutralised
+    /// only what the base happened to carry would be correct exactly as far as
+    /// the image-environment read was complete.
+    ///
+    /// `GH_CONFIG_DIR` is the control — an image variable that is *not* a
+    /// credential location — so "the withheld keys were overridden" is
+    /// distinguishable from "the image environment was wiped".
     #[test]
     fn an_image_credential_variable_does_not_survive_into_a_role_that_takes_none() {
-        let mut base = image_base();
-        base.push(("CODEX_HOME".to_owned(), "/image/codex".to_owned()));
-        let environment = ContainerEnvironment::from_image(base);
         let volumes = volumes();
         let layout = BoundaryLayout::new();
         let codex = AgentId::new("codex");
 
-        let gate = ExecutionRole::Gate;
-        let composed = environment
-            .compose(&scope(&gate, Some(&codex), &volumes, &layout), &[])
-            .expect("composes");
-        assert_eq!(
-            value(&composed, "CODEX_HOME"),
-            None,
-            "a gate is repository-controlled code and was handed an agent's credential location"
-        );
+        let with_image_value = {
+            let mut base = image_base();
+            base.push(("CODEX_HOME".to_owned(), "/image/codex".to_owned()));
+            base.push(("GH_CONFIG_DIR".to_owned(), "/image/gh".to_owned()));
+            ContainerEnvironment::from_image(base)
+        };
+        let without_image_value = {
+            let mut base = image_base();
+            base.push(("GH_CONFIG_DIR".to_owned(), "/image/gh".to_owned()));
+            ContainerEnvironment::from_image(base)
+        };
 
-        let implement = ExecutionRole::Implement;
-        let composed = environment
-            .compose(&scope(&implement, Some(&codex), &volumes, &layout), &[])
-            .expect("composes");
+        let mut cells = 0_usize;
+        for (image_label, environment) in [
+            ("image sets CODEX_HOME", &with_image_value),
+            ("image sets no CODEX_HOME", &without_image_value),
+        ] {
+            // (a) A role that takes none: the key is **named**, with nothing.
+            let composed = environment
+                .compose(
+                    &scope(&ExecutionRole::Gate, Some(&codex), &volumes, &layout),
+                    &[],
+                )
+                .expect("composes");
+            assert_eq!(
+                value(&composed, "CODEX_HOME"),
+                Some(""),
+                "{image_label}: a gate is repository-controlled code, and a `CODEX_HOME` this \
+                 vector does not name is a `CODEX_HOME` the image chooses"
+            );
+            // The control: the image's non-credential variable is carried
+            // through **unchanged**, so what happened to `CODEX_HOME` is a
+            // targeted override and not a wiped environment.
+            assert_eq!(
+                value(&composed, "GH_CONFIG_DIR"),
+                Some("/image/gh"),
+                "{image_label}: the image environment was wiped rather than overridden"
+            );
+            cells += 1;
+
+            // (b) A role that takes one: the boundary's own path, never the
+            // image's.
+            let composed = environment
+                .compose(
+                    &scope(&ExecutionRole::Implement, Some(&codex), &volumes, &layout),
+                    &[],
+                )
+                .expect("composes");
+            assert_eq!(
+                value(&composed, "CODEX_HOME"),
+                Some(layout.credentials(&codex).as_str()),
+                "{image_label}: the value is the boundary's mount target, not the image's own path"
+            );
+            assert_ne!(
+                value(&composed, "CODEX_HOME"),
+                Some("/image/codex"),
+                "{image_label}: the image's value survived the supply step"
+            );
+            cells += 1;
+        }
+        assert_eq!(cells, 4, "{{image sets the key}} x {{role receives it}}");
+
+        // And the withheld set is exactly "every credential location this scope
+        // is not given" — an independent recomputation from
+        // `CREDENTIAL_LOCATIONS`, not a read-back of the function under test.
+        let gate = scope(&ExecutionRole::Gate, Some(&codex), &volumes, &layout);
+        let withheld: BTreeSet<String> = with_image_value
+            .withheld_credential_locations(&gate)
+            .into_iter()
+            .map(|(key, value)| {
+                assert_eq!(value, "", "a withheld location carries a value");
+                key
+            })
+            .collect();
         assert_eq!(
-            value(&composed, "CODEX_HOME"),
-            Some(layout.credentials(&codex).as_str()),
-            "the value is the boundary's mount target, not the image's own path"
+            withheld,
+            CREDENTIAL_LOCATIONS
+                .iter()
+                .map(|(_, key)| (*key).to_owned())
+                .collect::<BTreeSet<_>>(),
+            "a gate takes no credential location at all, so all three are withheld"
         );
-        assert_ne!(
-            value(&composed, "CODEX_HOME"),
-            Some("/image/codex"),
-            "the image's value survived the supply step"
+        let implement = scope(&ExecutionRole::Implement, Some(&codex), &volumes, &layout);
+        let withheld: BTreeSet<String> = with_image_value
+            .withheld_credential_locations(&implement)
+            .into_iter()
+            .map(|(key, _)| key)
+            .collect();
+        assert!(
+            !withheld.contains("CODEX_HOME") && withheld.len() == CREDENTIAL_LOCATIONS.len() - 1,
+            "the one location this scope is given must not also be withheld: {withheld:?}"
         );
     }
 
