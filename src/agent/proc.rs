@@ -7155,6 +7155,32 @@ mod tests {
         false
     }
 
+    /// Wait until the supervised worker has written its marker at least once.
+    ///
+    /// **Why this exists.** Every stop test sends its signal to the whole
+    /// process group immediately after spawn, and then reads the marker. If the
+    /// worker has not yet created it, the group is already stopped, the file can
+    /// never appear, and the first read fails `ENOENT` — for ever, not flakily.
+    /// `wait_for_stop` cannot cover this: it observes the *helper*, and says
+    /// nothing about whether the worker ever ran.
+    ///
+    /// Measured on PR6: `agent::proc::tests::uncatchable_sigstop_covers_the_isolated_tree`
+    /// failed on `macos-latest` with *"progress before signal 17: No such file
+    /// or directory"* on a tree whose suite had grown to 1243 macOS tests. The
+    /// race is PR4-era and pre-existing; it surfaced when the runner got busier.
+    /// A test that passes because a spawn usually wins a race is not a test.
+    #[cfg(unix)]
+    fn wait_for_first_progress(marker: &std::path::Path, context: &str) {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while Instant::now() < deadline {
+            if marker.exists() {
+                return;
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+        panic!("the supervised worker never recorded progress before {context}");
+    }
+
     #[cfg(unix)]
     fn settled_progress_after_stop(marker: &std::path::Path, context: &str) -> String {
         // A process-group snapshot can report every member stopped while a
@@ -7389,6 +7415,7 @@ mod tests {
     fn assert_stop_covers_the_isolated_tree(signal: libc::c_int, tag: &str) {
         let mut helper = spawn_signal_helper(tag, true, false);
         let pid = helper.pid();
+        wait_for_first_progress(&helper.marker, &format!("signal {signal}"));
         assert_eq!(unsafe { libc::kill(-pid, signal) }, 0);
         assert!(
             wait_for_stop(pid, Duration::from_secs(10)),
@@ -7435,6 +7462,7 @@ mod tests {
     fn terminal_suspend_and_continue_cover_the_isolated_tree() {
         let mut helper = spawn_signal_helper("job-control", true, false);
         let pid = helper.pid();
+        wait_for_first_progress(&helper.marker, "suspend interval");
         // SAFETY: `pid` is the id of the helper's dedicated process group, so
         // this models terminal foreground-group job control without touching
         // the surrounding test runner.
@@ -7473,6 +7501,7 @@ mod tests {
     fn an_inherited_blocked_sigcont_still_releases_the_isolated_tree() {
         let mut helper = spawn_signal_helper("job-control-cont-blocked", true, false);
         let pid = helper.pid();
+        wait_for_first_progress(&helper.marker, "blocked SIGCONT");
         assert_eq!(unsafe { libc::kill(-pid, libc::SIGTSTP) }, 0);
         assert!(
             wait_for_stop(pid, Duration::from_secs(10)),
@@ -7542,6 +7571,7 @@ mod tests {
     fn an_ignored_sighup_does_not_wake_a_suspended_tree() {
         let mut helper = spawn_signal_helper("job-control-nohup", true, true);
         let pid = helper.pid();
+        wait_for_first_progress(&helper.marker, "ignored SIGHUP");
         assert_eq!(unsafe { libc::kill(-pid, libc::SIGTSTP) }, 0);
         assert!(
             wait_for_stop(pid, Duration::from_secs(10)),
