@@ -94,8 +94,9 @@ if [[ -f CLAUDE.md && -f CONTRIBUTING.md ]] \
 fi
 
 # --- 3. the gate inventory CLAUDE.md advertises must match the tree ---------
-# DOC-GATE-COUNT-STALE: this change added an eighth gate while CLAUDE.md still
-# said seven, in two places. A count is a fact about the tree; check it.
+# DOC-GATE-COUNT-STALE / MUT-GATE-COUNT-STALE: this change added an eighth gate
+# while CLAUDE.md still said seven, in two places. A count is a fact about the
+# tree; check it.
 actual_gates=$(ls .github/scripts/test-*.sh 2>/dev/null | wc -l | tr -d '[:space:]')
 if [[ -f CLAUDE.md ]]; then
   while IFS= read -r claimed; do
