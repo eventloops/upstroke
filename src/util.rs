@@ -161,49 +161,6 @@ pub fn find_program(name: &str) -> Option<PathBuf> {
     None
 }
 
-/// Resolve every matching program in shell PATH order: directory first, then
-/// the caller's name preference, then executable extension. Returning all
-/// candidates lets an adapter skip an unspawnable app alias without promoting
-/// a later directory ahead of a usable earlier installation.
-pub(crate) fn find_program_candidates(names: &[&str]) -> Vec<PathBuf> {
-    let path_var = std::env::var_os("PATH").unwrap_or_default();
-    find_program_candidates_on_path(names, &path_var)
-}
-
-pub(crate) fn find_program_candidates_on_path(
-    names: &[&str],
-    path_var: &std::ffi::OsStr,
-) -> Vec<PathBuf> {
-    let mut found = Vec::new();
-    for dir in std::env::split_paths(path_var) {
-        if dir.as_os_str().is_empty() {
-            continue;
-        }
-        for name in names {
-            let base = dir.join(name);
-            let explicit_extension = Path::new(name).extension().is_some();
-            let extensions = if explicit_extension {
-                vec![String::new()]
-            } else {
-                executable_extensions()
-            };
-            for extension in extensions {
-                let candidate = if extension.is_empty() {
-                    base.clone()
-                } else {
-                    let mut with_extension = base.as_os_str().to_owned();
-                    with_extension.push(extension);
-                    PathBuf::from(with_extension)
-                };
-                if candidate.is_file() && !found.contains(&candidate) {
-                    found.push(candidate);
-                }
-            }
-        }
-    }
-    found
-}
-
 /// One durability primitive, as a funnel actually performed it.
 ///
 /// The Event lane has had a ledger of these since PR5 opened
@@ -717,31 +674,6 @@ mod tests {
     fn find_program_resolves_real_tools_and_misses_fake_ones() {
         assert!(find_program("git").is_some(), "git is on PATH in this repo");
         assert!(find_program("tactus-definitely-not-real-xyz").is_none());
-    }
-
-    #[test]
-    fn candidate_resolution_preserves_path_directory_precedence() {
-        let root =
-            std::env::temp_dir().join(format!("tactus-util-path-order-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&root);
-        let first = root.join("first");
-        let second = root.join("second");
-        std::fs::create_dir_all(&first).expect("first PATH directory");
-        std::fs::create_dir_all(&second).expect("second PATH directory");
-        let first_program = first.join("codex.exe");
-        let second_program = second.join("codex.cmd");
-        std::fs::write(&first_program, "").expect("first candidate");
-        std::fs::write(&second_program, "").expect("second candidate");
-        let path = std::env::join_paths([&first, &second]).expect("synthetic PATH");
-
-        let found = find_program_candidates_on_path(&["codex.cmd", "codex.exe"], &path);
-
-        assert_eq!(
-            found,
-            [first_program, second_program],
-            "the name preference must not promote a later PATH directory"
-        );
-        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]

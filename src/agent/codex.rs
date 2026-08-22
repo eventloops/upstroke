@@ -92,7 +92,6 @@
 #![allow(clippy::disallowed_methods, clippy::disallowed_macros)]
 
 use std::path::PathBuf;
-use std::sync::OnceLock;
 use std::time::Duration;
 
 use serde::Deserialize;
@@ -137,22 +136,18 @@ const REQUIRED_RESUME_FLAGS: [&str; 4] = ["--json", "--model", "-c", "--config"]
 /// Which of this adapter's pre-flight processes each identity is.
 ///
 /// Named rather than counted, for the reason [`super::probe_request`] gives —
-/// and this is the adapter that makes the reason concrete. Binary resolution
-/// here *spawns*, once per PATH candidate, and it caches: the second
-/// `probe()` in one process performs none of those spawns. A counter would
-/// therefore renumber every capability step on the second call, and two
-/// pre-flights of one machine would mint different identities for the same
-/// work.
+/// and this is the adapter that made the reason concrete. Binary resolution
+/// here used to *spawn*, once per PATH candidate, and to cache the answer, so
+/// the second `probe()` in one process performed none of those spawns; a
+/// counter would have renumbered every capability step on the second call, and
+/// two pre-flights of one machine would have minted different identities for
+/// the same work.
 ///
-/// Two blocks, which is what keeps a variable-length step from colliding with
-/// a fixed one:
-///
-/// * `0 .. RESOLUTION_BASE` — the capability probe and discovery, one named
-///   ordinal per step, in the order they run.
-/// * `RESOLUTION_BASE ..` — one per PATH candidate tested for usability, in
-///   PATH order. Unbounded in principle (one candidate per PATH entry per
-///   name), which is exactly why it may not share a block with the fixed
-///   steps.
+/// **That variable-length step is gone** — the adapter names its CLI and the
+/// boundary resolves it (`PR4-ADAPTER-RESOLVES-ON-THE-HOST`), so every process
+/// this adapter starts is now a fixed, named step. The table below is
+/// therefore the whole domain, which is what
+/// `every_preflight_process_has_its_own_ordinal` asserts.
 mod probe_ordinal {
     pub const VERSION: u32 = 0;
     pub const EXEC_HELP: u32 = 1;
@@ -164,8 +159,6 @@ mod probe_ordinal {
     pub const PROBE_MODELS: u32 = 9;
     pub const LOGIN_STATUS: u32 = 10;
     pub const DISCOVER_MODELS: u32 = 11;
-    /// Where the per-PATH-candidate block starts.
-    pub const RESOLUTION_BASE: u32 = 1_000;
     /// Every fixed ordinal above, for the uniqueness assertion.
     #[cfg(test)]
     pub const ALL: [u32; 12] = [
@@ -209,13 +202,15 @@ impl AgentAdapter for CodexAdapter {
     }
 
     fn probe(&self, runner: &dyn Runner) -> Result<Caps, TactusError> {
-        let invocation = locate(runner)?;
-        let out = runner.run(&probe_request(
-            ADAPTER_ID,
-            invocation.spec(&["--version".to_owned()])?,
-            probe_ordinal::VERSION,
-            PROBE_TIMEOUT,
-        )?)?;
+        let invocation = cli();
+        let out = runner
+            .run(&probe_request(
+                ADAPTER_ID,
+                invocation.spec(&["--version".to_owned()])?,
+                probe_ordinal::VERSION,
+                PROBE_TIMEOUT,
+            )?)
+            .map_err(|cause| bin::boundary_refused(CLI, INSTALL_HINT, &cause))?;
         if out.output_limited {
             return Err(TactusError::Agent {
                 message: format!(
@@ -306,9 +301,12 @@ impl AgentAdapter for CodexAdapter {
         // (`RunnerRequest.workspace`) rather than one this adapter set, which
         // is DESIGN.md:118's split and changes nothing about the mechanism.
         //
-        // `resolved()` rather than `locate()`: `build` is data-only and may
-        // not spawn, so it never runs the PATH-candidate usability probe.
-        resolved()?.spec(&build_args(run))
+        // `cli()` names the CLI and the runner decides which file that is, so
+        // `build` performs no lookup of any kind and sends exactly the program
+        // string `probe` certified. `build` being data-only used to force a
+        // second, non-spawning resolution path beside the probing one; there is
+        // now one path, and it is a function of its argument.
+        cli().spec(&build_args(run))
     }
 
     fn parse(&self, out: &ProcessOutput) -> Result<Outcome, TactusError> {
@@ -325,13 +323,15 @@ impl AgentAdapter for CodexAdapter {
     /// `tactus connect` writes a pool an operator can trust rather than a
     /// shrug.
     fn discover(&self, runner: &dyn Runner, _caps: &Caps) -> Result<Discovery, TactusError> {
-        let invocation = locate(runner)?;
-        let out = runner.run(&probe_request(
-            ADAPTER_ID,
-            invocation.spec(&["login".to_owned(), "status".to_owned()])?,
-            probe_ordinal::LOGIN_STATUS,
-            PROBE_TIMEOUT,
-        )?)?;
+        let invocation = cli();
+        let out = runner
+            .run(&probe_request(
+                ADAPTER_ID,
+                invocation.spec(&["login".to_owned(), "status".to_owned()])?,
+                probe_ordinal::LOGIN_STATUS,
+                PROBE_TIMEOUT,
+            )?)
+            .map_err(|cause| bin::boundary_refused(CLI, INSTALL_HINT, &cause))?;
         let mut discovery = parse_login_status(&out);
         let models = runner.run(&probe_request(
             ADAPTER_ID,
@@ -1051,88 +1051,29 @@ fn parse_login_status(out: &ProcessOutput) -> Discovery {
 }
 
 // ---------------------------------------------------------------------------
-// Binary discovery — npm ships this as codex.cmd on Windows, which
-// CreateProcess cannot exec directly; `super::bin` owns the mechanics.
+// The CLI this adapter names, and what to tell an operator whose boundary
+// does not have it. `super::bin` owns the mechanics.
 // ---------------------------------------------------------------------------
 
-fn candidate_names() -> &'static [&'static str] {
-    if cfg!(windows) {
-        &["codex.exe", "codex.cmd", "codex.bat"]
-    } else {
-        &["codex"]
-    }
-}
-
-static RESOLVED: OnceLock<Option<Invocation>> = OnceLock::new();
-
-/// Resolve the binary, spawning through `runner` to test each candidate.
+/// This CLI, as the boundary that will execute it names it.
 ///
-/// The pre-flight path. Windows Store can put a package payload on PATH that
-/// is visible to filesystem lookup but returns access denied when spawned, so
-/// each candidate is tested before the answer is cached and a later npm shim
-/// in the real PATH order can still win. That test is an agent CLI process
-/// like any other, so it goes through the Runner too — one identity per
-/// candidate, from `probe_ordinal::RESOLUTION_BASE` in PATH order.
-fn locate(runner: &dyn Runner) -> Result<Invocation, TactusError> {
-    locate_in(runner, &RESOLVED, candidate_names())
-}
+/// One name, not a platform-dependent candidate list. This adapter used to
+/// resolve the name against the coordinator host's `PATH`, spawning once per
+/// candidate to skip a Windows Store package payload that is visible to a
+/// filesystem lookup but returns access denied when spawned. Both halves were
+/// answers to a question an adapter may not ask: the boundary that executes
+/// the CLI is the thing that knows which file the name is, and with a
+/// container runner it is not this machine's filesystem at all
+/// (`PR4-ADAPTER-RESOLVES-ON-THE-HOST`). Skipping an unspawnable candidate is
+/// now the job of whatever resolves the name; so is `PATHEXT`.
+const CLI: &str = "codex";
 
-/// [`locate`] over the cache and the candidate names it consults.
-///
-/// Both are parameters for the reason the process funnel takes an observer:
-/// the ordinal this loop hands each candidate is **computed**, not declared, so
-/// `every_preflight_process_has_its_own_ordinal`'s table cannot speak for it —
-/// and driving the real [`RESOLVED`] would spend the process's one memoised
-/// answer and change what every sibling test in the binary resolves
-/// (`4631a3f`'s class). Production passes [`RESOLVED`] and
-/// [`candidate_names`], here and nowhere else.
-fn locate_in(
-    runner: &dyn Runner,
-    cache: &OnceLock<Option<Invocation>>,
-    names: &[&str],
-) -> Result<Invocation, TactusError> {
-    let mut candidate_index = 0u32;
-    bin::locate_with(
-        names,
-        cache,
-        |candidate| {
-            let ordinal = probe_ordinal::RESOLUTION_BASE + candidate_index;
-            candidate_index += 1;
-            // A candidate whose path cannot be carried in a `CommandSpec` is
-            // simply not usable, and PATH order continues past it: this is the
-            // one place where refusing the whole run would be wrong, because
-            // the next entry may hold a perfectly ordinary installation.
-            candidate
-                .spec(&["--version".to_owned()])
-                .and_then(|spec| probe_request(ADAPTER_ID, spec, ordinal, PROBE_TIMEOUT))
-                .and_then(|request| runner.run(&request))
-                .is_ok_and(|output| !output.timed_out && output.code == Some(0))
-        },
-        missing_codex,
-    )
-}
+/// What to tell an operator whose boundary has no `codex`.
+const INSTALL_HINT: &str = "Install the OpenAI Codex CLI there (`npm install -g @openai/codex`), or select a different \
+     agent.";
 
-/// Resolve the binary **without spawning anything**.
-///
-/// What `build` uses, because `build` is data-only (DESIGN.md:117) and a
-/// `build` that spawned would be carrying a process decision past the Runner —
-/// the precise hole `CommandSpec` closes. It shares [`RESOLVED`] with
-/// [`locate`], so once pre-flight has resolved and cached a usable binary this
-/// returns exactly that one; the engine always probes before it builds
-/// (`preflight::prepare` runs before any attempt), which
-/// `engine::tests::the_legacy_engine_routes_every_process_through_the_runner`
-/// witnesses by ordering. Resolving first here — only reachable outside a
-/// run — takes the first PATH candidate without testing it.
-fn resolved() -> Result<Invocation, TactusError> {
-    bin::locate(candidate_names(), &RESOLVED, missing_codex)
-}
-
-fn missing_codex(tried: &[&str]) -> String {
-    format!(
-        "no usable codex binary found on PATH (looked for {}); install the OpenAI Codex CLI \
-         (`npm install -g @openai/codex`) or adjust PATH",
-        tried.join(", ")
-    )
+fn cli() -> Invocation {
+    Invocation::named(CLI)
 }
 
 /// Registry entry, so `by_id("codex")` resolves without this module being
@@ -1729,19 +1670,28 @@ mod tests {
     /// The answers are what let the sequence *complete*: a validator that
     /// refuses stops the walk, and a walk that stops after one process cannot
     /// say anything about the identities of the other five.
+    /// A boundary that answers every one of this adapter's pre-flight
+    /// processes, and records each request.
+    ///
+    /// It answers by **argument**, never by program: what the CLI is called at
+    /// the boundary is the boundary's business, and a fixture that keyed on the
+    /// program string would be asserting the adapter's answer against itself.
     struct RecordingRunner {
         seen: std::sync::Mutex<Vec<crate::runner::RunnerRequest>>,
-        /// `false` makes every candidate unusable, so the resolution loop walks
-        /// the whole PATH candidate list instead of stopping at the first.
-        candidates_usable: bool,
     }
 
     impl RecordingRunner {
-        fn new(candidates_usable: bool) -> Self {
+        fn new() -> Self {
             Self {
                 seen: std::sync::Mutex::new(Vec::new()),
-                candidates_usable,
             }
+        }
+
+        fn programs(&self) -> Vec<String> {
+            self.seen()
+                .iter()
+                .map(|request| request.command.program.clone())
+                .collect()
         }
 
         fn seen(&self) -> Vec<crate::runner::RunnerRequest> {
@@ -1788,11 +1738,35 @@ mod tests {
                 ));
             }
             if args.contains("--version") {
-                return Ok(output(
-                    i32::from(!self.candidates_usable),
-                    "codex-cli 0.9.9\n",
-                    "",
-                ));
+                return Ok(output(0, "codex-cli 0.9.9\n", ""));
+            }
+            if args == "exec --help" {
+                return Ok(output(0, "--json --sandbox --model -c, --config", ""));
+            }
+            if args == "exec resume --help" {
+                return Ok(output(0, "--json --model -c, --config", ""));
+            }
+            if args == "debug models" {
+                // Every model the catalog knows, each advertising every
+                // effort. Derived from the catalog rather than written out:
+                // nothing here asserts *which* models exist, so the catalog is
+                // an input to this fixture and the oracle for nothing.
+                let models: Vec<_> = catalog::known_models(ADAPTER_ID)
+                    .into_iter()
+                    .map(|slug| {
+                        json!({
+                            "slug": slug,
+                            "supported_reasoning_levels": Effort::ALL
+                                .into_iter()
+                                .map(|effort| json!({ "effort": effort.to_string() }))
+                                .collect::<Vec<_>>(),
+                        })
+                    })
+                    .collect();
+                return Ok(output(0, &json!({ "models": models }).to_string(), ""));
+            }
+            if args == "login status" {
+                return Ok(output(0, "Logged in using ChatGPT\n", ""));
             }
             Ok(output(0, "", ""))
         }
@@ -1815,11 +1789,12 @@ mod tests {
     /// (`PR5-CORRECTNESS-008`). The repair is to stop asking the table and
     /// start asking the requests.
     ///
-    /// The invocation is built with [`Invocation::at`] rather than resolved, so
-    /// nothing here touches [`RESOLVED`] or this machine's `PATH`.
+    /// The invocation is built with [`Invocation::at`] rather than named, so
+    /// this drives the six config probes over an absolute program without
+    /// depending on what this machine has installed.
     #[test]
     fn the_six_config_parser_probes_are_six_distinct_identities() {
-        let runner = RecordingRunner::new(true);
+        let runner = RecordingRunner::new();
         let invocation = Invocation::at(if cfg!(windows) {
             r"C:\nowhere\codex.cmd"
         } else {
@@ -1879,70 +1854,98 @@ mod tests {
         );
     }
 
-    /// Every candidate the resolution loop tests carries its own identity too.
+    /// The twelve declared ordinals are **exactly** the processes this
+    /// adapter's pre-flight starts — no thirteenth, and none outside the table.
     ///
-    /// The other **computed** ordinal in this adapter, and the same class:
-    /// `RESOLUTION_BASE + candidate_index`, which `probe_ordinal::ALL` does not
-    /// and cannot enumerate because `PATH` is unbounded.
+    /// This replaces `every_binary_resolution_candidate_carries_its_own_identity`,
+    /// and the property it carries is the one that mattered: *no process this
+    /// adapter starts takes an identity the table does not enumerate.* That
+    /// test could only assert it of the variable-length block separately,
+    /// because binary resolution spawned once per unbounded PATH candidate and
+    /// no table could speak for it. The adapter now names its CLI and the
+    /// boundary resolves it (`PR4-ADAPTER-RESOLVES-ON-THE-HOST`), so the
+    /// variable-length block is gone and the claim can be made over the whole
+    /// domain at once, against the requests rather than against the table.
     ///
-    /// A private cache and a caller-supplied name list, so this neither spends
-    /// the process's one memoised resolution nor depends on `codex` being
-    /// installed. The premise — that this machine really offers more than one
-    /// candidate — is asserted rather than hoped for: with one candidate a
-    /// collision is unobservable, and a silent skip would measure nothing while
-    /// looking green.
+    /// Both entry points, because `probe` and `discover` are separately
+    /// droppable and each has its own ordinals: ten and two.
     #[test]
-    fn every_binary_resolution_candidate_carries_its_own_identity() {
-        // Programs every machine of each family has, chosen so the list yields
-        // several distinct files. `find_program_candidates` de-duplicates by
-        // path, so repeating one name would not widen the list.
-        let names: &[&str] = if cfg!(windows) {
-            &["cmd.exe", "where.exe", "find.exe"]
-        } else {
-            &["sh", "ls", "cat"]
-        };
-        let candidates = crate::util::find_program_candidates(names);
-        assert!(
-            candidates.len() >= 2,
-            "this machine offers {} candidate(s) for {names:?}, so a per-candidate \
-             identity collision could not be observed here",
-            candidates.len()
-        );
-
-        let runner = RecordingRunner::new(false);
-        let cache: OnceLock<Option<Invocation>> = OnceLock::new();
-        locate_in(&runner, &cache, names)
-            .expect_err("every candidate was made unusable, so resolution refuses");
+    fn preflight_starts_exactly_the_processes_the_ordinal_table_declares() {
+        let runner = RecordingRunner::new();
+        let caps = CodexAdapter
+            .probe(&runner)
+            .expect("the scripted boundary satisfies every pre-flight validator");
+        assert_eq!(runner.identities().len(), 10, "probe's ten processes");
+        CodexAdapter
+            .discover(&runner, &caps)
+            .expect("the scripted boundary answers discovery too");
 
         let identities = runner.identities();
         assert_eq!(
             identities.len(),
-            candidates.len(),
-            "one process per candidate: {identities:?} for {candidates:?}"
+            12,
+            "probe's ten and discovery's two: {identities:?}"
         );
         let distinct: BTreeSet<&String> = identities.iter().collect();
         assert_eq!(
             distinct.len(),
             identities.len(),
-            "two candidates were tested under one identity: {identities:?}"
+            "two pre-flight processes shared one identity: {identities:?}"
         );
 
-        // The per-candidate block and the fixed block cannot meet.
+        // Every ordinal actually used is one the table declares. The table is
+        // the expected value here and the requests are the result, which is
+        // the direction that catches a step taking an ordinal nobody reserved.
         let declared: BTreeSet<u32> = probe_ordinal::ALL.into_iter().collect();
-        for id in &identities {
-            let ordinal: u32 = id
-                .rsplit_once(".o")
-                .and_then(|(_, ordinal)| ordinal.parse().ok())
-                .expect("a probe identity ends in its ordinal");
-            assert!(
-                ordinal >= probe_ordinal::RESOLUTION_BASE,
-                "{id}: a candidate probe took an ordinal below the per-candidate block"
-            );
-            assert!(
-                !declared.contains(&ordinal),
-                "{id}: collided with the table"
-            );
-        }
+        let used: BTreeSet<u32> = identities
+            .iter()
+            .map(|id| {
+                id.rsplit_once(".o")
+                    .and_then(|(_, ordinal)| ordinal.parse().ok())
+                    .expect("a probe identity ends in its ordinal")
+            })
+            .collect();
+        assert_eq!(
+            used, declared,
+            "the ordinals pre-flight used and the ordinals the table declares differ"
+        );
+    }
+
+    /// Every pre-flight process this adapter starts names the CLI and nothing
+    /// this machine contributed — over the whole pre-flight, not one call.
+    ///
+    /// The second field this holds constant is **the boundary**: the same
+    /// adapter is driven against two boundaries in one process, in both
+    /// orders, and each must be asked the identical program string. A
+    /// resolution memoised in a process-wide cell — which is what this adapter
+    /// had — is invisible to any test that constructs one runner, and would
+    /// hand the second boundary the first one's answer.
+    #[test]
+    fn every_preflight_process_names_the_cli_at_whichever_boundary_is_asked() {
+        let first = RecordingRunner::new();
+        let second = RecordingRunner::new();
+        let caps = CodexAdapter.probe(&first).expect("first boundary");
+        CodexAdapter
+            .discover(&first, &caps)
+            .expect("first boundary discovery");
+        let caps = CodexAdapter.probe(&second).expect("second boundary");
+        CodexAdapter
+            .discover(&second, &caps)
+            .expect("second boundary discovery");
+
+        // `codex`, written here rather than read from `CLI`: a constant
+        // compared against itself proves nothing.
+        let programs = first.programs();
+        assert_eq!(programs.len(), 12);
+        assert!(
+            programs.iter().all(|program| program == "codex"),
+            "a pre-flight process carried something other than the bare CLI name: {programs:?}"
+        );
+        assert_eq!(
+            programs,
+            second.programs(),
+            "the second boundary in this process was asked something different from the first"
+        );
     }
 
     /// Every pre-flight process of this adapter carries its own identity.
@@ -1983,23 +1986,15 @@ mod tests {
             ids.iter().all(|id| id.starts_with("p.agent-codex.o")),
             "the probe form, naming this agent: {ids:?}"
         );
-
-        // The fixed block and the per-candidate block cannot meet: binary
-        // resolution here spawns once per PATH candidate and PATH is
-        // unbounded, so the two are separated by construction rather than by
-        // counting.
-        assert!(
-            probe_ordinal::ALL
-                .into_iter()
-                .all(|ordinal| ordinal < probe_ordinal::RESOLUTION_BASE),
-            "a fixed step reached the per-candidate block"
-        );
     }
     // Runs only where the real CLI exists; deterministic contract fixtures do
     // the compatibility proof, while this catches local help/catalog drift.
     #[test]
     fn probe_against_real_binary_when_present() {
-        if resolved().is_err() {
+        // The host runner's boundary *is* this machine, so what gates this is
+        // whether this machine has the CLI — asked of `util::find_program`
+        // rather than of the adapter, which no longer knows.
+        if crate::util::find_program(CLI).is_none() {
             eprintln!("codex not on PATH; skipping live probe");
             return;
         }
