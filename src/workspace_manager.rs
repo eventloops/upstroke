@@ -7738,7 +7738,7 @@ mod tests {
                 record.recovered,
                 "every sample recovered by its classified action"
             );
-            records.push((site, record));
+            records.push((site, record, run.budget, run.replayed));
         }
         assert_eq!(
             records.len(),
@@ -7967,9 +7967,15 @@ mod tests {
             "sampling_n": SAMPLING_N,
             "sites": records
                 .iter()
-                .map(|(site, record)| serde_json::json!({
+                .map(|(site, record, budget, replayed)| serde_json::json!({
                     "site": site.name(),
                     "n": record.n,
+                    // The timescale the kill ladder was cut from. A red run's
+                    // artifact carries it, and `TACTUS_RESIDUE_BUDGET_US` feeds it
+                    // back -- which is what makes this sampler reproducible, since
+                    // it has no seed and this duration is all of its variance.
+                    "budget_us": u64::try_from(budget.as_micros()).unwrap_or(u64::MAX),
+                    "budget_replayed": replayed,
                     "none": record.histogram.none,
                     "internal": record.histogram.internal,
                     "after": record.histogram.after,
@@ -7986,7 +7992,7 @@ mod tests {
                 .expect("the emitted histogram parses");
         let sites = back["sites"].as_array().expect("a sites array");
         assert_eq!(sites.len(), 4, "one histogram per sampled site");
-        for (entry, (site, record)) in sites.iter().zip(&records) {
+        for (entry, (site, record, budget, _)) in sites.iter().zip(&records) {
             assert_eq!(
                 entry["site"],
                 site.name(),
@@ -8002,6 +8008,12 @@ mod tests {
                 "{site}: the written histogram accounts for every sample"
             );
             assert_eq!(entry["unclassified"], record.unclassified);
+            assert_eq!(
+                entry["budget_us"].as_u64(),
+                u64::try_from(budget.as_micros()).ok(),
+                "{site}: the artifact must carry the timescale a replay needs, or a \
+                 red CI run cannot be reproduced from it"
+            );
         }
     }
 
@@ -8016,6 +8028,12 @@ mod tests {
     /// by something that is not the code under test.
     struct SamplingRun {
         record: SamplingRecord,
+        /// The timescale the kill ladder was cut from, and whether it was measured
+        /// on this machine or replayed from `TACTUS_RESIDUE_BUDGET_US`. This is the
+        /// whole of the run's variance -- see [`measure_budget`] -- so it is the
+        /// whole of what reproducing a red run needs.
+        budget: std::time::Duration,
+        replayed: bool,
         /// What `classify_object_residue` answered for each sample, in order.
         /// `None` is a sample it could not classify at all.
         observed: Vec<Option<ObjectResidue>>,
@@ -8102,7 +8120,23 @@ mod tests {
         let tag = format!("sample-{}", site.variant().to_lowercase());
         let fixture = Fixture::created(&tag);
         let base = fixture.base.clone();
-        let budget = measure_budget(site, &fixture);
+        let measured = measure_budget(site, &fixture);
+        let replayed = replayed_budget(site);
+        let budget = replayed.unwrap_or(measured);
+        println!(
+            "residue sampling {site}: budget={}us{} ladder={:?}",
+            budget.as_micros(),
+            if replayed.is_some() {
+                format!(" (replayed; measured {}us)", measured.as_micros())
+            } else {
+                String::new()
+            },
+            (0..SAMPLING_N)
+                .map(|run| budget
+                    .mul_f64(f64::from(run + 1) / f64::from(SAMPLING_N + 1))
+                    .as_micros())
+                .collect::<Vec<_>>()
+        );
         let mut observed: Vec<Option<ObjectResidue>> = Vec::new();
         let mut recovered = true;
 
@@ -8134,6 +8168,8 @@ mod tests {
 
         let (histogram, unclassified) = tally(&observed);
         SamplingRun {
+            budget,
+            replayed: replayed.is_some(),
             record: SamplingRecord {
                 n: SAMPLING_N,
                 histogram,
@@ -8240,6 +8276,39 @@ mod tests {
             .remove_intent(&mut NoHooks, &probe)
             .expect("remove the probe intent");
         elapsed.max(std::time::Duration::from_micros(200))
+    }
+
+    /// A recorded timescale to replay instead of measuring one.
+    ///
+    /// **There is no random number generator in this sampler and nothing to seed.**
+    /// The kill ladder is a fixed set of fractions — `(run + 1) / (SAMPLING_N + 1)` —
+    /// of a single duration, and that duration is how long one real `git` took on
+    /// this machine at this moment. Load, page cache and disk move it; the fractions
+    /// never move. So the measured budget is the entire variance of the run, and
+    /// pinning it is the only thing that makes a failure reproducible.
+    ///
+    /// A fixed default would be worse than the status quo: the point of re-measuring
+    /// on every run is that the ladder lands in different places on different
+    /// machines, which is how a sampler with `SAMPLING_N = 8` covers more than eight
+    /// kill points over its lifetime. The measurement stays; it is merely recorded,
+    /// and overridable when replaying one specific red run.
+    fn replayed_budget(site: EffectSiteId) -> Option<std::time::Duration> {
+        // Per site, never one number for all four. Their natural timescales differ
+        // by more than 40x -- `CandidateStage` measures tens of milliseconds and
+        // `ProposalCherryPick` about one -- so a single budget applied across them
+        // does not replay the red run, it runs a different experiment. Measured:
+        // forcing `CandidateWriteTree` to `CandidateStage`'s budget moved its
+        // histogram from none=4/internal=4 to none=7/internal=1.
+        //
+        // The format is the artifact's own: `Site.Name=micros`, comma separated,
+        // which is what `residue-histogram.json` already reports per site.
+        let raw = std::env::var("TACTUS_RESIDUE_BUDGET_US").ok()?;
+        raw.split(',')
+            .filter_map(|pair| pair.split_once('='))
+            .find(|(name, _)| name.trim() == site.name())
+            .and_then(|(_, micros)| micros.trim().parse::<u64>().ok())
+            .filter(|micros| *micros > 0)
+            .map(std::time::Duration::from_micros)
     }
 
     /// Enough work in the worktree that the sampled command has a middle to be
