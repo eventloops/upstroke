@@ -897,3 +897,32 @@ deliberately inspect a fixture after a panic would lose their evidence.
 Two operational notes for whoever picks this up. `df -h` reports the box healthy at 72% while every
 write fails — only `df -i` shows it. And the failure does not announce itself as a disk problem: it
 surfaced as four mutation entries aborting mid-measurement.
+
+### Deterministic container names plus end-of-test cleanup is not enough
+
+Two real-Docker tests went red on the shipping head — `real_docker_census_reclaims_a_dead_owner_and_
+spares_a_live_one` and `real_docker_the_daemon_holds_exactly_the_specs_mounts_and_a_read_only_root` —
+while the only change in that commit was a documentation edit. Both passed in isolation minutes later
+under `TACTUS_REQUIRE_DOCKER`, so a skip would have failed.
+
+The cause was four containers left over from an earlier run this session that had been **SIGKILLed** when
+the box exhausted its inodes: two `Exited (137)`, two still `Created`. Their names were the deterministic
+ones these tests recreate, so `docker create` hit a name conflict.
+
+Both tests already clean up after themselves — a `cleanup` closure on every exit path in one, a
+`LeaveNoResidue` RAII guard in the other. Both are correct, and neither can help: **no in-process
+cleanup runs when the process is SIGKILLed.**
+
+The fix is a pre-clean — reclaim the names before using them — and the idiom is only correct here because
+the names are *deterministic*:
+
+> **A pre-clean removes the previous run's residue exactly when the name recurs.** Keyed by something
+> unique per process — a pid, a ULID — it can never name anything an earlier run created, and it
+> degrades into an unconditional retry that cleans nothing. `src/rundir.rs`'s `scratch` is the second
+> shape; these container fixtures are the first.
+
+Recorded as **debt, not repaired in this slice.** The tests hold what they claim; robustness to SIGKILL
+is a guarantee beyond their contract, the trigger was an operator-caused disk exhaustion that has been
+cleared, and an unreviewed change to shared test infrastructure is how PR5's round 7 became a revert.
+It should be repaired before PR7, where parallel runs make a stranger container the normal case rather
+than the aftermath of a crash.
