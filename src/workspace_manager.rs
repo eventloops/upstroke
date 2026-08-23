@@ -3924,21 +3924,53 @@ mod tests {
         fs::remove_dir_all(&root).expect("this test cleans up after itself");
     }
 
-    /// Run `body`, returning its panic message if it panicked. The default hook
-    /// is suppressed for the duration: these tests panic on purpose and the
-    /// backtrace noise would bury the assertions that matter.
+    /// Run `body`, returning its panic message if it panicked.
+    ///
+    /// **The panic hook is deliberately left alone.** An earlier version took it,
+    /// installed a no-op and restored it afterwards, to keep intentional panics
+    /// out of the test output. The hook is process-global and these tests run in
+    /// parallel, so two of them interleaving —
+    /// `A` takes `H` installs `a`; `B` takes `a` installs `b`; `A` restores `H`;
+    /// `B` restores `a` — leaves the process running with a no-op hook for good,
+    /// and every later panic anywhere in the suite loses its message and
+    /// backtrace. Tidy output is not worth that: the noise below is a few lines,
+    /// and the alternative silently disarms the diagnostics of every other test.
     fn panic_message(body: impl FnOnce()) -> Option<String> {
-        let previous = std::panic::take_hook();
-        std::panic::set_hook(Box::new(|_| {}));
-        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(body));
-        std::panic::set_hook(previous);
-        outcome.err().map(|payload| {
-            payload
-                .downcast_ref::<String>()
-                .cloned()
-                .or_else(|| payload.downcast_ref::<&str>().map(|s| (*s).to_owned()))
-                .unwrap_or_else(|| "<non-string panic payload>".to_owned())
-        })
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(body))
+            .err()
+            .map(|payload| {
+                payload
+                    .downcast_ref::<String>()
+                    .cloned()
+                    .or_else(|| payload.downcast_ref::<&str>().map(|s| (*s).to_owned()))
+                    .unwrap_or_else(|| "<non-string panic payload>".to_owned())
+            })
+    }
+
+    /// The refusal `sampled_command` gives for a site it does not handle. Matched
+    /// rather than assumed, so a panic for any *other* reason is not silently read
+    /// as absence — see [`has_sampling_command`].
+    const NO_SAMPLING_COMMAND: &str = "is not one of the four commands the contract samples";
+
+    /// Whether `sampled_command` handles `site`, distinguishing "does not handle
+    /// it" from "blew up for some other reason".
+    ///
+    /// Treating *every* panic as absence was a real hole: an arm added to
+    /// `sampled_command` but omitted from `SAMPLED_SITES` — validating its slot
+    /// and panicking because the test supplies a task slot — read as absent, which
+    /// matched its absence from the list, and the drift went undetected. Measured.
+    fn has_sampling_command(site: EffectSiteId, fixture: &Fixture, slot: &Slot) -> bool {
+        match panic_message(|| {
+            let _unused = sampled_command(site, fixture, slot);
+        }) {
+            None => true,
+            Some(message) if message.contains(NO_SAMPLING_COMMAND) => false,
+            Some(message) => panic!(
+                "`{}` panicked for a reason other than being unsampled, so this test cannot \
+                 tell whether it has a command: {message}",
+                site.name()
+            ),
+        }
     }
 
     /// The partition itself, over **every** real site rather than one example.
@@ -3986,8 +4018,7 @@ mod tests {
         let fixture = Fixture::created("site-list-agreement");
         let slot = fixture.task("agree", 0);
         for site in EffectSiteId::all() {
-            let has_command =
-                panic_message(|| drop(sampled_command(site, &fixture, &slot))).is_none();
+            let has_command = has_sampling_command(site, &fixture, &slot);
             assert_eq!(
                 has_command,
                 SAMPLED_SITES.contains(&site),
