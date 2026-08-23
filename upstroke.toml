@@ -1,6 +1,6 @@
-# tactus, run through tactus (decisions/2026-08-11-self-hosting-v02.md).
+# upstroke, run through upstroke (decisions/2026-08-11-self-hosting-v02.md).
 #
-# Repo-level overrides only; subscriptions live in ~/.tactus/pools.toml, which
+# Repo-level overrides only; subscriptions live in ~/.upstroke/pools.toml, which
 # travels with the person rather than the repository (§17).
 
 # Self-hosted runs use frontier workers for every task kind. The Codex pin is
@@ -62,5 +62,5 @@ timeout_secs = 1800
 # record governing what a resume verifies against, so an edit that lands here
 # applies to the next run rather than retroactively to this one.
 [[routing.overrides]]
-paths = ["tactus.toml", "DESIGN.md"]
+paths = ["upstroke.toml", "DESIGN.md"]
 second_opinion = "different-vendor"

@@ -1,7 +1,7 @@
 # Pagination rework
 
 ## Design the pagination API
-<!-- tactus: id=api-design kind=design depends= tier=frontier out=api-contract -->
+<!-- upstroke: id=api-design kind=design depends= tier=frontier out=api-contract -->
 Define cursor format, page-size limits, and error contract.
 
 Acceptance:
@@ -9,11 +9,11 @@ Acceptance:
 - Error contract covers empty pages
 
 ## Implement cursor encoding
-<!-- tactus: id=cursors kind=implement depends=api-design needs=api-contract paths=src/api/** -->
+<!-- upstroke: id=cursors kind=implement depends=api-design needs=api-contract paths=src/api/** -->
 Implement opaque cursor encode/decode per the contract.
 
 ## Fix off-by-one in list endpoint
-<!-- tactus: id=fix-obo kind=fix depends=cursors min=mid paths=src/api/** -->
+<!-- upstroke: id=fix-obo kind=fix depends=cursors min=mid paths=src/api/** -->
 
 ## Update API docs
-<!-- tactus: id=docs kind=docs depends=fix-obo -->
+<!-- upstroke: id=docs kind=docs depends=fix-obo -->

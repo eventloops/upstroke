@@ -1,4 +1,4 @@
-// tactus — headless orchestration engine for AI coding agents.
+// upstroke — headless orchestration engine for AI coding agents.
 // Copyright (C) 2026 Cameron Lambert. Licensed under the GNU AGPL v3 only;
 // see LICENSE, or <https://www.gnu.org/licenses/>. Commercial licences are
 // available for use the AGPL does not permit — see README.md.
@@ -10,14 +10,14 @@ use std::time::Duration;
 
 use anyhow::Context;
 use clap::{Parser, Subcommand, ValueEnum};
-use tactus::answer::{self, Reply};
-use tactus::capacity;
-use tactus::connect;
-use tactus::engine::{self, RunOutcome};
-use tactus::export::{self, Format as ExportFormat};
-use tactus::interaction::{InteractionMode, RealSleeper};
-use tactus::status;
-use tactus::validate::{self, ValidateOptions};
+use upstroke::answer::{self, Reply};
+use upstroke::capacity;
+use upstroke::connect;
+use upstroke::engine::{self, RunOutcome};
+use upstroke::export::{self, Format as ExportFormat};
+use upstroke::interaction::{InteractionMode, RealSleeper};
+use upstroke::status;
+use upstroke::validate::{self, ValidateOptions};
 
 /// §12: a run that ends with tasks parked on unanswered questions completed
 /// neither cleanly nor in error. CI has to be able to tell the difference, so
@@ -26,12 +26,12 @@ const EXIT_PARKED: u8 = 2;
 
 /// §13: a run stopped by its own budget completed neither cleanly, in error,
 /// nor waiting on a human. CI has to tell "your ceiling stopped it" from "a task
-/// failed" without parsing prose — and `tactus resume --budget` is what it does
+/// failed" without parsing prose — and `upstroke resume --budget` is what it does
 /// about it, which is different from what it does about either of the others.
 const EXIT_BUDGET: u8 = 3;
 
 #[derive(Parser)]
-#[command(name = "tactus", version, about = "Conductor for AI coding agents")]
+#[command(name = "upstroke", version, about = "Conductor for AI coding agents")]
 struct Cli {
     #[command(subcommand)]
     command: Command,
@@ -39,22 +39,22 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
-    /// Discover installed agent CLIs and write ~/.tactus/pools.toml
+    /// Discover installed agent CLIs and write ~/.upstroke/pools.toml
     Connect {
         /// Replace an existing pools file that differs from what this would
         /// write. Without it, connect prints the difference and refuses.
         #[arg(long)]
         force: bool,
-        /// Pools file path (default: ~/.tactus/pools.toml)
+        /// Pools file path (default: ~/.upstroke/pools.toml)
         #[arg(long)]
         pools: Option<PathBuf>,
     },
     /// Show every pool: remaining estimate, resets, and what each strategy would do
     Capacity {
-        /// Repo config path (default: ./tactus.toml, optional)
+        /// Repo config path (default: ./upstroke.toml, optional)
         #[arg(long)]
         config: Option<PathBuf>,
-        /// Pools file path (default: ~/.tactus/pools.toml)
+        /// Pools file path (default: ~/.upstroke/pools.toml)
         #[arg(long)]
         pools: Option<PathBuf>,
     },
@@ -65,7 +65,7 @@ enum Command {
         /// Write plan.normalized.json (the IR) to the current directory
         #[arg(long)]
         emit_json: bool,
-        /// Repo config path (default: ./tactus.toml, optional)
+        /// Repo config path (default: ./upstroke.toml, optional)
         #[arg(long)]
         config: Option<PathBuf>,
     },
@@ -77,7 +77,7 @@ enum Command {
         /// zero spend
         #[arg(long)]
         dry_run: bool,
-        /// Repo config path (default: ./tactus.toml, optional)
+        /// Repo config path (default: ./upstroke.toml, optional)
         #[arg(long)]
         config: Option<PathBuf>,
         /// Override [interaction] mode; `never` is the CI setting — questions
@@ -136,7 +136,7 @@ enum Command {
 }
 
 /// CLI spelling of [`InteractionMode`], so CI does not have to edit
-/// `tactus.toml` to stop a run waiting on a human.
+/// `upstroke.toml` to stop a run waiting on a human.
 #[derive(Clone, Copy, ValueEnum)]
 enum Interaction {
     Never,
@@ -303,7 +303,7 @@ fn run() -> anyhow::Result<ExitCode> {
                 (Some(choice), _, _) => Reply::Option(choice),
                 (_, Some(text), _) => Reply::Text(text),
                 // Nothing given: show the question and read one line, so the
-                // common case is `tactus answer <id>` and then just type.
+                // common case is `upstroke answer <id>` and then just type.
                 (None, None, false) => Reply::Text(prompt_for_answer(&repo_root, &question_id)?),
             };
             let recorded = answer::answer(&repo_root, &question_id, reply)?;
@@ -315,7 +315,7 @@ fn run() -> anyhow::Result<ExitCode> {
                 println!("that run is live; it will pick this up and un-park the task");
             } else {
                 println!(
-                    "continue the run with:\n    tactus resume {}",
+                    "continue the run with:\n    upstroke resume {}",
                     recorded.run_id
                 );
             }

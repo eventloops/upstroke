@@ -6,7 +6,7 @@
 
 ## Verdict
 
-`tactus export-decisions <run-id> [--format jsonl|csv]` emits export schema 2: one logical row per recorded worker attempt, in raw `AttemptStarted` encounter order. JSONL is the default. CSV carries the same facts as a stable rectangular column set. Both go to stdout, leaving persistence and location to the caller. Schema 2 retains schema 1's columns and JSON shape but extends the exhaustive `failure_kind` domain with `review_input_too_large` and `review_input_opaque`; consumers must select behavior from `schema_version`, not assume an open enum.
+`upstroke export-decisions <run-id> [--format jsonl|csv]` emits export schema 2: one logical row per recorded worker attempt, in raw `AttemptStarted` encounter order. JSONL is the default. CSV carries the same facts as a stable rectangular column set. Both go to stdout, leaving persistence and location to the caller. Schema 2 retains schema 1's columns and JSON shape but extends the exhaustive `failure_kind` domain with `review_input_too_large` and `review_input_opaque`; consumers must select behavior from `schema_version`, not assume an open enum.
 
 The command is local and read-only. It resolves an exact run id or unambiguous prefix by the existing run-directory rules, reads that run's event log and frozen `plan.normalized.json`, and uses the existing read-only liveness probe. It makes no HTTP request, switches no branch, acquires no run lock, and writes neither repository nor run record. It refuses a currently live run with an actionable error: a moving partial dataset is not a decision record.
 
@@ -32,7 +32,7 @@ JSON types below are normative. A “measured” field is a stored fact copied f
 |---|---|---|---|
 | `schema_version` | integer, always `2` | never | exporter-supplied schema metadata |
 | `run_id` | string | never | measured, `RunStarted` |
-| `tactus_version` | string | never | measured, `RunStarted` |
+| `upstroke_version` | string | never | measured, `RunStarted` |
 | `run_started_at` | RFC 3339 string | never | measured, `RunStarted` event timestamp |
 | `attempt_started_at` | RFC 3339 string | never | measured, `AttemptStarted` event timestamp |
 | `attempt_finished_at` | RFC 3339 string | yes | measured settlement event timestamp; null for a dangling start |
@@ -96,7 +96,7 @@ This separation is deliberate: provider and infrastructure failures are not evid
 CSV uses this stable column order, one header followed by one row per JSONL object:
 
 ```text
-schema_version,run_id,tactus_version,run_started_at,attempt_started_at,attempt_finished_at,task_id,task_title,attempt,rung,task_kind,suggested_tier,minimum_tier,dependency_count,acceptance_count,path_hints_json,artifact_input_count,artifact_output_count,chain_tiers_json,attempts_per,selected_tier,selection_origin,adapter_id,adapter_cli_version,model,effort,pool,session_resumed,duration_ms,cost_usd,usage_input_tokens,usage_output_tokens,usage_cache_creation_input_tokens,usage_cache_read_input_tokens,usage_num_turns,usage_reasoning_output_tokens,outcome,failure_kind,failure_origin,failure_category,work_evidence,failure_reason,reviews_json
+schema_version,run_id,upstroke_version,run_started_at,attempt_started_at,attempt_finished_at,task_id,task_title,attempt,rung,task_kind,suggested_tier,minimum_tier,dependency_count,acceptance_count,path_hints_json,artifact_input_count,artifact_output_count,chain_tiers_json,attempts_per,selected_tier,selection_origin,adapter_id,adapter_cli_version,model,effort,pool,session_resumed,duration_ms,cost_usd,usage_input_tokens,usage_output_tokens,usage_cache_creation_input_tokens,usage_cache_read_input_tokens,usage_num_turns,usage_reasoning_output_tokens,outcome,failure_kind,failure_origin,failure_category,work_evidence,failure_reason,reviews_json
 ```
 
 Null scalar values are empty cells. Booleans are `true` or `false`; numbers use their JSON decimal form. `path_hints_json`, `chain_tiers_json`, and `reviews_json` contain compact valid JSON text representing the corresponding arrays (including the nested review objects). The whole file uses RFC 4180 records: comma delimiter, doubled embedded quotes, quoted fields when they contain a comma, quote, CR, or LF, and CRLF record endings. A small, tested escaping helper is preferable to adding a dependency solely for this encoder; preserving the dependency surface is part of the decision.

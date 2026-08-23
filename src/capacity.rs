@@ -1,11 +1,11 @@
 //! The capacity engine (DESIGN.md §13) — **read-only in v0.1**.
 //!
-//! Three things live here: the pool types `~/.tactus/pools.toml` parses into,
+//! Three things live here: the pool types `~/.upstroke/pools.toml` parses into,
 //! the estimator that turns observations into a per-pool remaining figure, and
 //! the fold that collects those observations from a run's event log.
 //!
 //! §13's sequencing is the reason nothing routes on any of it yet: v0.1 ships
-//! the estimator so `tactus capacity` and the dry-run preview can show what each
+//! the estimator so `upstroke capacity` and the dry-run preview can show what each
 //! strategy *would* do, and v0.2 wires it into the binder once the estimates
 //! have been watched for a while. So `pool_for` fills `WorkerProfile.pool` for
 //! **attribution only** — the binder still picks models from the catalog and
@@ -35,7 +35,7 @@
 //! rather than a token the engine ever handles". That mechanism is real on both
 //! vendors and is a config-*directory* variable: `COPILOT_HOME` (documented) and
 //! `CLAUDE_CONFIG_DIR` (works, undocumented as of Aug 2026). The shape that
-//! fits is tactus-defined profile directories — `~/.tactus/profiles/<name>` —
+//! fits is upstroke-defined profile directories — `~/.upstroke/profiles/<name>` —
 //! handed to the CLI through that variable, with login staying a user-driven
 //! interactive step the engine never automates. "Does this CLI honour profile
 //! selection" then becomes a `probe()` axis like any other, verified at
@@ -154,7 +154,7 @@ impl fmt::Display for Source {
 /// `monthly_allowance = "auto"` or a number of units.
 ///
 /// `Auto` is honest rather than convenient: it means the size of the allowance
-/// is not known to tactus, which is different from it being zero and different
+/// is not known to upstroke, which is different from it being zero and different
 /// again from it being unlimited.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum Allowance {
@@ -172,7 +172,7 @@ impl fmt::Display for Allowance {
 }
 
 /// §13's default margins, applied when the pools file is silent. Both are also
-/// what `tactus connect` writes, so a hand-edited file and a generated one mean
+/// what `upstroke connect` writes, so a hand-edited file and a generated one mean
 /// the same thing.
 pub const DEFAULT_SAFETY_MARGIN: f64 = 0.15;
 pub const DEFAULT_RESERVE: f64 = 0.20;
@@ -587,7 +587,7 @@ fn estimate_one(pool: &Pool, obs: &Observations) -> PoolEstimate {
                     Confidence::SelfMetered,
                 ) {
                     notes.push(
-                        "a ceiling, not a measurement: this counts only what tactus spawned in this \
+                        "a ceiling, not a measurement: this counts only what upstroke spawned in this \
                          repository, so earlier runs, other repositories, and your own interactive \
                          sessions have all drawn against the same allowance unseen"
                             .to_owned(),
@@ -754,10 +754,10 @@ pub fn strategy_preview(mode: &str, estimates: &[PoolEstimate]) -> Vec<String> {
 }
 
 // ---------------------------------------------------------------------------
-// `tactus capacity`
+// `upstroke capacity`
 // ---------------------------------------------------------------------------
 
-/// `tactus capacity [--config <path>] [--pools <path>]` (§18).
+/// `upstroke capacity [--config <path>] [--pools <path>]` (§18).
 #[derive(Debug, Clone, Default)]
 pub struct CapacityOptions {
     pub config_path: Option<std::path::PathBuf>,
@@ -789,12 +789,12 @@ pub struct AgentStatus {
     pub notes: Vec<String>,
 }
 
-/// Collect everything `tactus capacity` reports: pools from config, self-metered
+/// Collect everything `upstroke capacity` reports: pools from config, self-metered
 /// spend from the latest run in this repo, and a live probe per agent.
 pub fn report(
     opts: &CapacityOptions,
     adapters: &dyn crate::agent::AdapterSource,
-) -> Result<CapacityReport, crate::error::TactusError> {
+) -> Result<CapacityReport, crate::error::UpstrokeError> {
     let mut warnings = Vec::new();
     let config = crate::config::load(
         opts.config_path.as_deref(),
@@ -852,7 +852,7 @@ pub fn report(
                 if !missing.is_empty() {
                     warnings.push(format!(
                         "{} does not advertise catalogued model(s): {}. Pins and cross-family \
-                         review may bind to a `--model` value this CLI rejects — upgrade tactus \
+                         review may bind to a `--model` value this CLI rejects — upgrade upstroke \
                          or pin a model it lists.",
                         pool.agent,
                         missing.join(", ")
@@ -898,8 +898,8 @@ impl CapacityReport {
         }
         if self.pools.is_empty() {
             out.push_str(
-                "no pools connected. Run `tactus connect` to discover the agent CLIs on this \
-                 machine and write ~/.tactus/pools.toml.\n",
+                "no pools connected. Run `upstroke connect` to discover the agent CLIs on this \
+                 machine and write ~/.upstroke/pools.toml.\n",
             );
             return out;
         }

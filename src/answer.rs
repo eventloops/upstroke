@@ -1,18 +1,18 @@
-//! `tactus answer <question-id>` — the cross-process answer channel (§12).
+//! `upstroke answer <question-id>` — the cross-process answer channel (§12).
 //!
 //! A question is raised by one process and answered by a person who may be
 //! nowhere near it: at another terminal, hours later, or after the run has
 //! already ended. So the command does not talk to the engine at all. It writes
 //! the answer beside the question, and whichever engine is or will be driving
 //! that run picks it up — a live one on its next scheduler turn, or the next
-//! `tactus resume`.
+//! `upstroke resume`.
 //!
 //! That indirection is what makes §12's promise ("a run survives its
 //! notifier") true of answers as well as delivery.
 
 use std::path::Path;
 
-use crate::error::TactusError;
+use crate::error::UpstrokeError;
 use crate::interaction::{self, QuestionRecord};
 use crate::ir::{Answer, QuestionId};
 use crate::rundir;
@@ -38,17 +38,17 @@ pub struct Answered {
 }
 
 /// Record an answer to a question, found by id or unambiguous prefix.
-pub fn answer(repo_root: &Path, wanted: &str, reply: Reply) -> Result<Answered, TactusError> {
+pub fn answer(repo_root: &Path, wanted: &str, reply: Reply) -> Result<Answered, UpstrokeError> {
     let found = rundir::find_question(repo_root, wanted)?;
     let id = QuestionId(found.question_id.clone());
     let questions = found.public.join("questions");
 
     let path = questions.join(format!("{}.json", found.question_id));
-    let text = std::fs::read_to_string(&path).map_err(|source| TactusError::Io {
+    let text = std::fs::read_to_string(&path).map_err(|source| UpstrokeError::Io {
         path: path.clone(),
         source,
     })?;
-    let record: QuestionRecord = serde_json::from_str(&text).map_err(|e| TactusError::Parse {
+    let record: QuestionRecord = serde_json::from_str(&text).map_err(|e| UpstrokeError::Parse {
         message: format!("{}: {e}", path.display()),
     })?;
 
@@ -56,7 +56,7 @@ pub fn answer(repo_root: &Path, wanted: &str, reply: Reply) -> Result<Answered, 
     // wins race: the first answer may already have driven a retry, and the
     // second would look like it had an effect it cannot have.
     if let Some(existing) = &record.answer {
-        return Err(TactusError::Refused {
+        return Err(UpstrokeError::Refused {
             message: format!(
                 "question {} was already answered ({}). Answers are applied once; if the task \
                  needs different guidance it will raise a new question.",
@@ -71,7 +71,7 @@ pub fn answer(repo_root: &Path, wanted: &str, reply: Reply) -> Result<Answered, 
         Reply::Text(text) => interaction::interpret(&record.question, &text),
         Reply::Option(choice) => {
             interaction::answer_for_option(&record.question, choice).ok_or_else(|| {
-                TactusError::Refused {
+                UpstrokeError::Refused {
                     message: format!(
                         "there is no option {choice} on this question; it offers {}",
                         if record.question.options.is_empty() {
@@ -92,7 +92,7 @@ pub fn answer(repo_root: &Path, wanted: &str, reply: Reply) -> Result<Answered, 
     // would write a file the engine then ingests as an answer, which is not
     // what the operator asked for.
     if answer == Answer::Unanswered {
-        return Err(TactusError::Refused {
+        return Err(UpstrokeError::Refused {
             message: "an empty answer would leave the task exactly as it is; pass --text with \
                       the guidance, --option N, or --decline to give up on the task"
                 .to_owned(),
@@ -100,7 +100,7 @@ pub fn answer(repo_root: &Path, wanted: &str, reply: Reply) -> Result<Answered, 
     }
 
     let answers = found.public.join("answers");
-    std::fs::create_dir_all(&answers).map_err(|source| TactusError::Io {
+    std::fs::create_dir_all(&answers).map_err(|source| UpstrokeError::Io {
         path: answers.clone(),
         source,
     })?;
@@ -116,17 +116,17 @@ pub fn answer(repo_root: &Path, wanted: &str, reply: Reply) -> Result<Answered, 
 }
 
 /// Render the question for an operator deciding what to say.
-pub fn show(repo_root: &Path, wanted: &str) -> Result<String, TactusError> {
+pub fn show(repo_root: &Path, wanted: &str) -> Result<String, UpstrokeError> {
     let found = rundir::find_question(repo_root, wanted)?;
     let path = found
         .public
         .join("questions")
         .join(format!("{}.json", found.question_id));
-    let text = std::fs::read_to_string(&path).map_err(|source| TactusError::Io {
+    let text = std::fs::read_to_string(&path).map_err(|source| UpstrokeError::Io {
         path: path.clone(),
         source,
     })?;
-    let record: QuestionRecord = serde_json::from_str(&text).map_err(|e| TactusError::Parse {
+    let record: QuestionRecord = serde_json::from_str(&text).map_err(|e| UpstrokeError::Parse {
         message: format!("{}: {e}", path.display()),
     })?;
     Ok(interaction::render_question(&record.question))
@@ -147,7 +147,8 @@ mod tests {
     use std::path::PathBuf;
 
     fn scratch(tag: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!("tactus-answer-{tag}-{}", std::process::id()));
+        let dir =
+            std::env::temp_dir().join(format!("upstroke-answer-{tag}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).expect("scratch");
         dir

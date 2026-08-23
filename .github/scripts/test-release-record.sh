@@ -11,9 +11,9 @@ valid_release='{
   "immutable": true,
   "draft": false,
   "assets": [
-    {"name":"tactus-x86_64-unknown-linux-gnu.tar.gz","state":"uploaded","digest":"sha256:0303030303030303030303030303030303030303030303030303030303030303"},
-    {"name":"tactus-aarch64-apple-darwin.tar.gz","state":"uploaded","digest":"sha256:0101010101010101010101010101010101010101010101010101010101010101"},
-    {"name":"tactus-x86_64-pc-windows-msvc.zip","state":"uploaded","digest":"sha256:0202020202020202020202020202020202020202020202020202020202020202"}
+    {"name":"upstroke-x86_64-unknown-linux-gnu.tar.gz","state":"uploaded","digest":"sha256:0303030303030303030303030303030303030303030303030303030303030303"},
+    {"name":"upstroke-aarch64-apple-darwin.tar.gz","state":"uploaded","digest":"sha256:0101010101010101010101010101010101010101010101010101010101010101"},
+    {"name":"upstroke-x86_64-pc-windows-msvc.zip","state":"uploaded","digest":"sha256:0202020202020202020202020202020202020202020202020202020202020202"}
   ]
 }'
 

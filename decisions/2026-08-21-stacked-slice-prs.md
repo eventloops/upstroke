@@ -2,8 +2,8 @@
 
 **Verdict.** From the next slice (PR6) onward, each slice of the parallel-execution design is
 a branch off `codex/parallelism-design` and a pull request **into** it — not a run of commits
-on it. Slice pull requests receive `tactus-ci`, `tactus-pr-policy`, and a single-reviewer
-frontier review of each head; they are **not attested**. The App-owned `tactus-frontier-review`
+on it. Slice pull requests receive `upstroke-ci`, `upstroke-pr-policy`, and a single-reviewer
+frontier review of each head; they are **not attested**. The App-owned `upstroke-frontier-review`
 check is minted only for pull requests into `master`, so the integration branch's own pull
 request (#18) is attested exactly once, on the head that merges, after its last update from
 `master`. Slice merges use merge commits; the integration branch is never rebased or squashed.
@@ -28,7 +28,7 @@ request (#18) is attested exactly once, on the head that merges, after its last 
 
 ## What is gated where
 
-| Pull request | `tactus-ci` | `tactus-pr-policy` | frontier review | App attestation |
+| Pull request | `upstroke-ci` | `upstroke-pr-policy` | frontier review | App attestation |
 |---|---|---|---|---|
 | slice → `codex/parallelism-design` | yes | yes | single reviewer per head, report only | **no** |
 | `codex/parallelism-design` → `master` (#18) | yes | yes | panel, once, on the merge candidate | yes, exactly once |

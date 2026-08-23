@@ -1,4 +1,4 @@
-//! tactus — headless orchestration engine for AI coding agents.
+//! upstroke — headless orchestration engine for AI coding agents.
 //!
 //! Copyright (C) 2026 Cameron Lambert
 //!

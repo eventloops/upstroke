@@ -49,8 +49,8 @@ jobs:
       # git but no identity, and several tests commit.
       - name: Configure git identity
         run: |
-          git config --global user.email "ci@tactus.local"
-          git config --global user.name "tactus CI"
+          git config --global user.email "ci@upstroke.local"
+          git config --global user.name "upstroke CI"
 
       - run: cargo test --all-targets --all-features
 
@@ -97,7 +97,7 @@ jobs:
   # names. `always()` makes a failed or cancelled dependency produce a failed
   # aggregate instead of a missing required check that never settles.
   merge-gate:
-    name: tactus-ci
+    name: upstroke-ci
     if: always()
     needs: [lint, msrv, test]
     runs-on: ubuntu-latest

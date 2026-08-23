@@ -1,5 +1,5 @@
 [package]
-name = "tactus"
+name = "upstroke"
 # 0.1.0 because §21's definition of done was actually met, on 2026-08-10: a
 # five-task plan ran unattended against a scratch repository through every one
 # of its five criteria and the kill/resume test — `acceptance/RESULT.md` is the
@@ -15,7 +15,7 @@ edition = "2024"
 rust-version = "1.85"
 license = "AGPL-3.0-only"
 description = "Headless orchestration engine for AI coding agents — the conductor, not an instrument"
-repository = "https://github.com/keybindings/tactus"
+repository = "https://github.com/eventloops/upstroke"
 readme = "README.md"
 keywords = ["ai", "agents", "orchestration", "automation", "cli"]
 categories = ["command-line-utilities", "development-tools"]
@@ -25,10 +25,11 @@ categories = ["command-line-utilities", "development-tools"]
 exclude = [
     "reviews/",
     ".github/",
-    ".tactus/",
+    ".upstroke/",
     ".testagent/",
     "acceptance/",
     "docs/",
+    "scripts/",
 ]
 
 [dependencies]

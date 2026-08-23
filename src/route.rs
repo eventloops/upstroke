@@ -175,8 +175,8 @@ mod tests {
     fn hermetic() -> (PathBuf, PathBuf) {
         static DIRS: OnceLock<(PathBuf, PathBuf)> = OnceLock::new();
         DIRS.get_or_init(|| {
-            let dir =
-                std::env::temp_dir().join(format!("tactus-route-hermetic-{}", std::process::id()));
+            let dir = std::env::temp_dir()
+                .join(format!("upstroke-route-hermetic-{}", std::process::id()));
             std::fs::create_dir_all(&dir).expect("scratch dir");
             // A real, empty pools file: an explicit pools path that does not
             // exist is a hard error, and `None` would read the operator's own.
@@ -262,7 +262,7 @@ mod tests {
 
     #[test]
     fn path_floor_raises_start_with_override_source() {
-        let dir = std::env::temp_dir().join(format!("tactus-route-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("upstroke-route-{}", std::process::id()));
         std::fs::create_dir_all(&dir).expect("scratch dir");
         let cfg_path: PathBuf = dir.join("floor.toml");
         std::fs::write(
@@ -308,7 +308,7 @@ mod tests {
 
     #[test]
     fn pins_bind_their_tier() {
-        let dir = std::env::temp_dir().join(format!("tactus-route-pin-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("upstroke-route-pin-{}", std::process::id()));
         std::fs::create_dir_all(&dir).expect("scratch dir");
         let cfg_path = dir.join("pin.toml");
         std::fs::write(

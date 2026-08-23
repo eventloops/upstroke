@@ -7,7 +7,7 @@
 
 - **Date:** 2026-08-10
 - **Scope:** DESIGN.md §21's definition of done — criteria (a)–(e) plus the
-  kill/resume test — against `acceptance/plan.md` and `acceptance/tactus.toml`
+  kill/resume test — against `acceptance/plan.md` and `acceptance/upstroke.toml`
   in a scratch repo (`acceptance-target`), engine at `50341df`
 - **Runs:** two. `01KZNFE917Y1XE34STAWK7833W` (run 1) and
   `01KZNG12FJA9DSJEYSK46NVBSC` (run 2)
@@ -36,7 +36,7 @@ rejected the change *for complying*, re-raising the same question.
 | **a** | A small-model task passes gates first try | 2 | `readme: committed 6bbfd6f — Document the size-parsing API [small ok] (51.0s, claude-haiku-4-5 $0.0980 + review claude-opus-5 $0.4313)`. Ledger: `readme 1 small ok`. One attempt, no escalation, three gates green. Reproduced in run 1 (`fc5c72c`, `[small ok]`) | **PASS** |
 | **b** | A gate failure recovers via same-rung session-resume feedback | 2 | `parse-basic: committed 3951824 [small×2 ok]`. Attempt 1 `failure.kind: review_failed`; `ladder_retry {"resume":true,"tier":"small"}` carrying a 7-item `detail`; attempt 2 `resume_session: fe0117f7-89b9-47f7-996d-da86784b42e8`, `resumed: true`, review `passed`. Same rung both times — `rung=0` on each `attempt_started` | **PASS**, with a caveat below |
 | **c** | One task escalates a rung and passes | 2 | `parse-edges: committed fd4daa2 [small failed → mid ok]`. `ladder_escalated` after attempt 1 (`rung=0`), then `attempt_started rung=1` on `claude-sonnet-5`, committed. `attempts_per = 1` on `fix` means any first failure escalates, and it did | **PASS** |
-| **d** | A question parks a task while an independent task proceeds, answered via `tactus answer` | 2 | `format-policy` raised `q-01KZNH0MHZDMXS24Y57K6YJXHP [clarify]` → `task_parked`. `changelog` (`depends=`, last in plan order) then ran and committed `4ced3f5` **while format-policy stayed parked** — invariant 6, visible. Run ended exit 2. `tactus answer <id> --text …` → `tactus resume` → committed `397a512` | **PASS** |
+| **d** | A question parks a task while an independent task proceeds, answered via `upstroke answer` | 2 | `format-policy` raised `q-01KZNH0MHZDMXS24Y57K6YJXHP [clarify]` → `task_parked`. `changelog` (`depends=`, last in plan order) then ran and committed `4ced3f5` **while format-policy stayed parked** — invariant 6, visible. Run ended exit 2. `upstroke answer <id> --text …` → `upstroke resume` → committed `397a512` | **PASS** |
 | **e** | The summary reports per-task attempts, models, api-equivalent cost, and per-pool drain, with the dry run having previewed capacity | 2 | Ledger table below. Dry run beforehand printed `capacity: 2 pool(s) connected` and both pools' `unknown [unknown]` with the §13 note, at zero spend | **PASS** |
 | **kill** | Kill the engine mid-run; `resume` finishes it | 1 | Tree-killed 3 processes mid-attempt. `attempt_interrupted` with `cost_usd: null`; `run_resumed {"interrupted_attempts":1,"discarded":["M  src/lib.rs","A  src/size.rs"]}`; retry on the **same rung**; `parse-basic: committed ac1e862 [small×2 ok]` | **PASS** |
 
@@ -86,7 +86,7 @@ and "four" are both true of this day and the difference is which run is meant.
 | # | Defect | Severity | Evidence | Fix |
 |---|--------|----------|----------|-----|
 | 1 | **`status` reported a live run as halted, with its working attempt as a failure.** `status::load` called `settle_interrupted()` unconditionally, then checked `is_running` — so the settlement that makes a *killed* run read correctly was also applied to a run an engine was actively driving | normal | Run 1, while `readme` attempt 1 was mid-review (it went on to pass and commit `fc5c72c`): `readme: skipped (run halted)`, ledger `readme 1 small failed`, `run complete: 0 task(s) committed`. All three false; the lock check three lines below printed the correct `state: running now` | `2e5ab10`. Settle only when nothing holds the run's lock; give `RunReport` a `running` flag so the projection has its own vocabulary. Regression test fails without it (`left: 1, right: 0`) |
-| 2 | **The operator's answer never reached the reviewer.** `feedback_section` quotes a human answer to the *worker* as a binding instruction; the review prompt was built from the task, its acceptance criteria, reference artifacts and the diff — and answers live in `.tactus/runs/<id>/answers/`, which is not the repository | **serious** | Run 2's first resume. Operator answered "fall back to bare bytes"; the worker complied ("following Policy 3"); the reviewer failed it: *"no operator choice for the inexact-value policy exists anywhere in the repository (checked plan.md, tactus.toml, README.md, CHANGELOG.md, and all five commits) … the implementer made it anyway"*. `format-policy` re-parked on `q-01KZNHAEGX7JBGYQ3Z65Q15DP4`, a duplicate of its own question | `7626543`. Route the same human feedback entries into the review prompt, above the fence and framed as a decision rather than agent-authored data |
+| 2 | **The operator's answer never reached the reviewer.** `feedback_section` quotes a human answer to the *worker* as a binding instruction; the review prompt was built from the task, its acceptance criteria, reference artifacts and the diff — and answers live in `.upstroke/runs/<id>/answers/`, which is not the repository | **serious** | Run 2's first resume. Operator answered "fall back to bare bytes"; the worker complied ("following Policy 3"); the reviewer failed it: *"no operator choice for the inexact-value policy exists anywhere in the repository (checked plan.md, upstroke.toml, README.md, CHANGELOG.md, and all five commits) … the implementer made it anyway"*. `format-policy` re-parked on `q-01KZNHAEGX7JBGYQ3Z65Q15DP4`, a duplicate of its own question | `7626543`. Route the same human feedback entries into the review prompt, above the fence and framed as a decision rather than agent-authored data |
 | 3 | **`$-0.0000` — a negative zero in the total**, in both the summary and the ledger line | nit | Run 1 live status: `total: $-0.0000 (api-equivalent)` and `total $-0.0000 (api-equivalent; …)` | `4f7628c`. Left open here because the reasoning below it was wrong: `Iterator::sum` does **not** fold f64 from `+0.0`. It folds from `-0.0`, the true additive identity in IEEE 754 — `-0.0 + x` preserves the sign of `x` where `0.0 + x` does not — so the sum of no costs at all is negative zero and `{:.4}` prints the sign. Nothing was negative; the empty sum was. Reproduced on the first real-repo run and fixed by folding from `+0.0`, which cannot change a non-empty total |
 
 ### Why defect 2 is the serious one
@@ -112,7 +112,7 @@ Defect 1 was likewise re-verified live, mid-run:
 
 ```
   format-policy: running now — attempt 3 on small (claude-haiku-4-5)
-run in progress: 4 task(s) committed so far on tactus/run-01KZNG12FJA9DSJEYSK46NVBSC
+run in progress: 4 task(s) committed so far on upstroke/run-01KZNG12FJA9DSJEYSK46NVBSC
 ```
 
 ### The fourth defect, from the first real-library run
@@ -140,7 +140,7 @@ retry they were preserved for always starts cold. Fixed in `7829ad0`.
 ## Surprises worth keeping
 
 - **Run 1 was killed by the Claude Code CLI updating itself mid-run**, not by
-  anything tactus did. At `09:23:34Z` — between `parse-basic` starting and
+  anything upstroke did. At `09:23:34Z` — between `parse-basic` starting and
   `parse-edges` failing — the updater renamed
   `…\scoop\…\claude-code\bin\claude.exe` to `claude.exe.old.1786353814086` and
   installed the new build into the **npm-global** prefix instead. PATH reaches
@@ -157,7 +157,7 @@ retry they were preserved for always starts cold. Fixed in `7829ad0`.
   `Interrupted` and `RateLimited` from work failures already; an
   agent-could-not-launch failure arguably belongs in that family. **Not filed as
   a defect** — it is a design call, not a bug, and worth a decision before v0.2.
-- **`tactus status` is the ledger; `tactus run` is not.** The run's own stdout
+- **`upstroke status` is the ledger; `upstroke run` is not.** The run's own stdout
   prints the summary but not the attempts table or the per-pool drain — those
   come from `status`. §21(e) is satisfied, but by the second command.
 - **Question payloads are free text, not structured options.** The agent wrote
@@ -177,14 +177,14 @@ retry they were preserved for always starts cold. Fixed in `7829ad0`.
   the demo recording, capture the terminal itself.
 - **Run artifacts are split across two roots**, which the run book does not say:
   `events.jsonl`, `plan.normalized.json`, `questions/`, `answers/` and
-  `run.lock` live in the target repo's `.tactus/runs/<id>/`; `gates/`,
+  `run.lock` live in the target repo's `.upstroke/runs/<id>/`; `gates/`,
   `reviews/`, `settings/` and `transcripts/` live under
-  `~/.tactus/runs/<id>/`. The engine writes to `~/.tactus` as a matter of
-  course, not only via `tactus connect`.
+  `~/.upstroke/runs/<id>/`. The engine writes to `~/.upstroke` as a matter of
+  course, not only via `upstroke connect`.
 
 ## What the run actually built
 
-Five engine-authored commits on `tactus/run-01KZNG12FJA9DSJEYSK46NVBSC`, on top
+Five engine-authored commits on `upstroke/run-01KZNG12FJA9DSJEYSK46NVBSC`, on top
 of seed `862323f`, working tree clean. On the delivered tree: `cargo clippy
 --all-targets -- -D warnings` clean, `cargo test` 36 passed. `format_size(0)`
 returns `"0"` — the edge the operator settled explicitly in the second answer
@@ -195,6 +195,6 @@ rendering `"0GiB"` unasserted.
 
 - Terminal logs: `C:\Projects\Personal\acceptance-logs\` — `run2.log`,
   `run2-resume.log`, `run2-resume2.log` (`run1.log` is empty; see above)
-- Event logs and questions/answers: `acceptance-target\.tactus\runs\<id>\`
-- Gate logs, reviewer verdicts, transcripts: `~\.tactus\runs\<id>\`
+- Event logs and questions/answers: `acceptance-target\.upstroke\runs\<id>\`
+- Gate logs, reviewer verdicts, transcripts: `~\.upstroke\runs\<id>\`
 - Both run branches are preserved in `acceptance-target`

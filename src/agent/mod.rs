@@ -15,7 +15,7 @@ use std::process::Command;
 use serde::{Deserialize, Serialize};
 
 use crate::capacity::PoolKind;
-use crate::error::TactusError;
+use crate::error::UpstrokeError;
 use crate::ir::{Effort, Outcome, WorkerProfile};
 
 pub use proc::ProcessOutput;
@@ -23,7 +23,7 @@ pub use proc::ProcessOutput;
 /// Whether the vendor's CLI says it is signed in.
 ///
 /// Three states, not two. "Could not tell" must never render as "not
-/// connected": `tactus connect` writes a file an operator then trusts, and a
+/// connected": `upstroke connect` writes a file an operator then trusts, and a
 /// confident *wrong* "you are not logged in" sends them to re-authenticate an
 /// account that was fine.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -141,11 +141,11 @@ pub trait AgentAdapter: Send + Sync {
     fn id(&self) -> &'static str;
     /// Locate the binary and report version + capabilities. Ran at pre-flight;
     /// a missing binary is a refusal to start, not a task failure (§19).
-    fn probe(&self) -> Result<Caps, TactusError>;
-    fn build(&self, run: &TaskRun) -> Result<Command, TactusError>;
-    fn parse(&self, out: &ProcessOutput) -> Result<Outcome, TactusError>;
+    fn probe(&self) -> Result<Caps, UpstrokeError>;
+    fn build(&self, run: &TaskRun) -> Result<Command, UpstrokeError>;
+    fn parse(&self, out: &ProcessOutput) -> Result<Outcome, UpstrokeError>;
 
-    /// §13's `tactus connect`: ask this agent's CLI about the account behind
+    /// §13's `upstroke connect`: ask this agent's CLI about the account behind
     /// it — signed in or not, what shape its quota is, which models it offers.
     ///
     /// Subprocesses the vendor's own CLI and parses what came back. No HTTP, no
@@ -163,7 +163,7 @@ pub trait AgentAdapter: Send + Sync {
     /// The default reports nothing rather than being required, so an adapter
     /// cannot silently claim discovery it does not do — [`Discovery::unknown`]
     /// is an honest "could not tell", and every consumer treats it as one.
-    fn discover(&self, _caps: &Caps) -> Result<Discovery, TactusError> {
+    fn discover(&self, _caps: &Caps) -> Result<Discovery, UpstrokeError> {
         Ok(Discovery::unknown())
     }
 
@@ -182,7 +182,7 @@ pub trait AgentAdapter: Send + Sync {
         _gate_cmds: &[String],
         _dir: &std::path::Path,
         _stem: &str,
-    ) -> Result<Option<PathBuf>, TactusError> {
+    ) -> Result<Option<PathBuf>, UpstrokeError> {
         Ok(None)
     }
 }

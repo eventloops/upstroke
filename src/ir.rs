@@ -31,7 +31,7 @@ impl From<&str> for TaskId {
 }
 
 /// Identifier for one question raised during a run. Short enough to type at a
-/// prompt: `tactus answer <id>` (step 8) accepts any unambiguous prefix.
+/// prompt: `upstroke answer <id>` (step 8) accepts any unambiguous prefix.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(transparent)]
 pub struct QuestionId(pub String);
@@ -107,7 +107,7 @@ impl Tier {
 /// Codex also exposes `ultra`, documented as "maximum reasoning with automatic
 /// task delegation". That remains deliberately unreachable: it changes what
 /// the agent *does*, not only how hard it thinks, and nothing in this design has
-/// audited an agent spawning its own subagents inside a tactus attempt.
+/// audited an agent spawning its own subagents inside a upstroke attempt.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Effort {
@@ -515,8 +515,8 @@ mod tests {
     #[test]
     fn content_hash_is_stable() {
         assert_eq!(content_hash(b""), "cbf29ce484222325");
-        assert_eq!(content_hash(b"tactus"), content_hash(b"tactus"));
-        assert_ne!(content_hash(b"tactus"), content_hash(b"tactvs"));
+        assert_eq!(content_hash(b"upstroke"), content_hash(b"upstroke"));
+        assert_ne!(content_hash(b"upstroke"), content_hash(b"tactvs"));
     }
 
     #[test]
