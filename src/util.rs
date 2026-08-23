@@ -161,49 +161,6 @@ pub fn find_program(name: &str) -> Option<PathBuf> {
     None
 }
 
-/// Resolve every matching program in shell PATH order: directory first, then
-/// the caller's name preference, then executable extension. Returning all
-/// candidates lets an adapter skip an unspawnable app alias without promoting
-/// a later directory ahead of a usable earlier installation.
-pub(crate) fn find_program_candidates(names: &[&str]) -> Vec<PathBuf> {
-    let path_var = std::env::var_os("PATH").unwrap_or_default();
-    find_program_candidates_on_path(names, &path_var)
-}
-
-pub(crate) fn find_program_candidates_on_path(
-    names: &[&str],
-    path_var: &std::ffi::OsStr,
-) -> Vec<PathBuf> {
-    let mut found = Vec::new();
-    for dir in std::env::split_paths(path_var) {
-        if dir.as_os_str().is_empty() {
-            continue;
-        }
-        for name in names {
-            let base = dir.join(name);
-            let explicit_extension = Path::new(name).extension().is_some();
-            let extensions = if explicit_extension {
-                vec![String::new()]
-            } else {
-                executable_extensions()
-            };
-            for extension in extensions {
-                let candidate = if extension.is_empty() {
-                    base.clone()
-                } else {
-                    let mut with_extension = base.as_os_str().to_owned();
-                    with_extension.push(extension);
-                    PathBuf::from(with_extension)
-                };
-                if candidate.is_file() && !found.contains(&candidate) {
-                    found.push(candidate);
-                }
-            }
-        }
-    }
-    found
-}
-
 /// One durability primitive, as a funnel actually performed it.
 ///
 /// The Event lane has had a ledger of these since PR5 opened
@@ -428,8 +385,62 @@ pub(crate) fn barriers_performed() -> u64 {
     BARRIERS.load(std::sync::atomic::Ordering::Relaxed)
 }
 
-fn count_barrier() {
+/// The same two counts, **per thread and per half**.
+///
+/// [`BARRIERS`] is process-wide, so an assertion on its delta can only be a
+/// *lower bound* while the suite is threaded — and a lower bound is satisfied by
+/// barriers some other test's thread performed, which is exactly the hole
+/// `PR6-LANEF-001` found: with `util::fsync_file` deleted from a funnel and its
+/// ledger entry left in place, every assertion that reads the ledger still
+/// passed and a process-wide lower bound still passed too.
+///
+/// A funnel performs its barriers on the thread that called it, so a
+/// thread-local delta is **exact**: the count a caller sees is the count its own
+/// call produced. Split into the two halves because `fsync_file` and `fsync_dir`
+/// are two independently droppable predicates — "write `<name>.tmp`, fsync,
+/// rename, **fsync the directory**" — and one counter cannot tell which of them
+/// went away.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct BarrierCounts {
+    /// Entries into [`fsync_file`].
+    pub file: u64,
+    /// Entries into [`fsync_dir`].
+    pub directory: u64,
+}
+
+thread_local! {
+    static THREAD_BARRIERS: std::cell::Cell<BarrierCounts> =
+        const { std::cell::Cell::new(BarrierCounts { file: 0, directory: 0 }) };
+}
+
+/// What this **thread** has entered so far, file half and directory half.
+///
+/// Only a test reads it, in the same idiom as [`barriers_performed`]. The
+/// counters themselves are unconditional; see [`BARRIERS`] for why a
+/// `#[cfg(test)]` item in this file would truncate every source census's
+/// production region.
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) fn barriers_on_this_thread() -> BarrierCounts {
+    THREAD_BARRIERS.with(std::cell::Cell::get)
+}
+
+/// Which half of the barrier was entered.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BarrierHalf {
+    File,
+    Directory,
+}
+
+fn count_barrier(half: BarrierHalf) {
     BARRIERS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    THREAD_BARRIERS.with(|counts| {
+        let mut current = counts.get();
+        match half {
+            BarrierHalf::File => current.file += 1,
+            BarrierHalf::Directory => current.directory += 1,
+        }
+        counts.set(current);
+    });
 }
 
 /// The **file** half of the durability barrier (`PR5-CONF-012`).
@@ -442,7 +453,7 @@ fn count_barrier() {
 ///
 /// [`std::io::Error`] from `fsync`, verbatim.
 pub(crate) fn fsync_file(file: &std::fs::File) -> std::io::Result<()> {
-    count_barrier();
+    count_barrier(BarrierHalf::File);
     file.sync_all()
 }
 
@@ -471,7 +482,7 @@ pub(crate) fn fsync_file(file: &std::fs::File) -> std::io::Result<()> {
 /// [`std::io::Error`] from the open or from the flush, verbatim, so a caller can
 /// still tell a missing directory from a refused barrier.
 pub(crate) fn fsync_dir(dir: &Path) -> std::io::Result<()> {
-    count_barrier();
+    count_barrier(BarrierHalf::Directory);
     #[cfg(unix)]
     {
         std::fs::File::open(dir)?.sync_all()
@@ -717,31 +728,6 @@ mod tests {
     fn find_program_resolves_real_tools_and_misses_fake_ones() {
         assert!(find_program("git").is_some(), "git is on PATH in this repo");
         assert!(find_program("tactus-definitely-not-real-xyz").is_none());
-    }
-
-    #[test]
-    fn candidate_resolution_preserves_path_directory_precedence() {
-        let root =
-            std::env::temp_dir().join(format!("tactus-util-path-order-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&root);
-        let first = root.join("first");
-        let second = root.join("second");
-        std::fs::create_dir_all(&first).expect("first PATH directory");
-        std::fs::create_dir_all(&second).expect("second PATH directory");
-        let first_program = first.join("codex.exe");
-        let second_program = second.join("codex.cmd");
-        std::fs::write(&first_program, "").expect("first candidate");
-        std::fs::write(&second_program, "").expect("second candidate");
-        let path = std::env::join_paths([&first, &second]).expect("synthetic PATH");
-
-        let found = find_program_candidates_on_path(&["codex.cmd", "codex.exe"], &path);
-
-        assert_eq!(
-            found,
-            [first_program, second_program],
-            "the name preference must not promote a later PATH directory"
-        );
-        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]

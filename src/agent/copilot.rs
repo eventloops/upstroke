@@ -50,7 +50,6 @@
 #![allow(clippy::disallowed_methods, clippy::disallowed_macros)]
 
 use std::path::PathBuf;
-use std::sync::OnceLock;
 use std::time::Duration;
 
 use serde_json::json;
@@ -117,13 +116,15 @@ impl AgentAdapter for CopilotAdapter {
     }
 
     fn probe(&self, runner: &dyn Runner) -> Result<Caps, TactusError> {
-        let invocation = locate()?;
-        let out = runner.run(&probe_request(
-            ADAPTER_ID,
-            invocation.spec(&["--version".to_owned()])?,
-            probe_ordinal::VERSION,
-            PROBE_TIMEOUT,
-        )?)?;
+        let invocation = cli();
+        let out = runner
+            .run(&probe_request(
+                ADAPTER_ID,
+                invocation.spec(&["--version".to_owned()])?,
+                probe_ordinal::VERSION,
+                PROBE_TIMEOUT,
+            )?)
+            .map_err(|cause| bin::boundary_refused(CLI, INSTALL_HINT, &cause))?;
         if out.output_limited {
             return Err(TactusError::Agent {
                 message: format!(
@@ -180,8 +181,11 @@ impl AgentAdapter for CopilotAdapter {
     }
 
     fn build(&self, run: &TaskRun) -> Result<CommandSpec, TactusError> {
-        // No `current_dir`: the runner owns cwd (DESIGN.md:118).
-        locate()?.spec(&build_args(run))
+        // No `current_dir`: the runner owns cwd (DESIGN.md:118). No
+        // resolution either: `cli()` names the CLI and the runner decides
+        // which file that is, so this and `probe` send one program string by
+        // construction.
+        cli().spec(&build_args(run))
     }
 
     fn parse(&self, out: &ProcessOutput) -> Result<Outcome, TactusError> {
@@ -203,9 +207,10 @@ impl AgentAdapter for CopilotAdapter {
     /// enumeration, so the day this CLI grows one, `connect` starts
     /// cross-checking the catalog without another decision being made.
     fn discover(&self, _runner: &dyn Runner, caps: &Caps) -> Result<Discovery, TactusError> {
-        // Still located, so `connect` fails this agent the same way pre-flight
-        // would rather than writing a pool for a binary that is not there.
-        let invocation = locate()?;
+        // Named rather than located: this reports on the CLI a run would
+        // execute, and which file that is belongs to the boundary that
+        // executes it. Nothing here asks this machine what it has.
+        let invocation = cli();
         let mut discovery = Discovery::unknown().with_note(format!(
             "`{}` reports no non-interactive auth state, so whether this account is signed in \
              could not be checked without spending",
@@ -460,25 +465,19 @@ fn parse_output(out: &ProcessOutput) -> Outcome {
 // CreateProcess cannot exec directly; `super::bin` owns the mechanics.
 // ---------------------------------------------------------------------------
 
-fn candidate_names() -> &'static [&'static str] {
-    if cfg!(windows) {
-        &["copilot.exe", "copilot.cmd", "copilot.bat"]
-    } else {
-        &["copilot"]
-    }
-}
+/// This CLI, as the boundary that will execute it names it.
+///
+/// One name, not a platform-dependent candidate list: choosing between
+/// `copilot.exe`, `copilot.cmd` and `copilot.bat` was a filesystem lookup, and
+/// this adapter no longer performs one. See [`Invocation::named`].
+const CLI: &str = "copilot";
 
-/// This adapter's own resolution cache; `bin::locate` fills it once.
-static RESOLVED: OnceLock<Option<Invocation>> = OnceLock::new();
+/// What to tell an operator whose boundary has no `copilot`.
+const INSTALL_HINT: &str = "Install the GitHub Copilot CLI there (`npm install -g @github/copilot`), or select a \
+     different agent.";
 
-fn locate() -> Result<Invocation, TactusError> {
-    bin::locate(candidate_names(), &RESOLVED, |tried| {
-        format!(
-            "copilot binary not found on PATH (looked for {}); install the GitHub Copilot CLI \
-             (`npm install -g @github/copilot`) or adjust PATH",
-            tried.join(", ")
-        )
-    })
+fn cli() -> Invocation {
+    Invocation::named(CLI)
 }
 
 #[cfg(test)]
@@ -859,7 +858,7 @@ mod tests {
     // without the Copilot CLI stays green.
     #[test]
     fn probe_against_real_binary_when_present() {
-        if locate().is_err() {
+        if crate::util::find_program(CLI).is_none() {
             eprintln!("copilot not on PATH; skipping live probe");
             return;
         }

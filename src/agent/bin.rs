@@ -1,5 +1,14 @@
-//! Locating and invoking an agent CLI — the parts every adapter needs and
+//! Naming and invoking an agent CLI — the parts every adapter needs and
 //! none of them should own privately.
+//!
+//! **This module used to *locate* the CLI, and it deliberately no longer
+//! does.** An adapter names its CLI; the boundary that will execute it decides
+//! which file that name is. `PR4-ADAPTER-RESOLVES-ON-THE-HOST` in
+//! `reviews/FINDINGS.md` is the entry, [`Invocation::named`] is the repair, and
+//! DESIGN.md:612 is the sentence it serves: "Probes run through that same
+//! runner, **or pre-flight could certify a host CLI/version different from the
+//! one the attempt executes**", with the normal container case being "an image
+//! with version-pinned CLIs" that a coordinator host need not have at all.
 //!
 //! Windows is why this module exists. Both agent CLIs ship as npm packages, so
 //! the thing on PATH is frequently a `.cmd` shim rather than a native
@@ -28,16 +37,59 @@
 #![allow(clippy::disallowed_methods)]
 
 use std::path::PathBuf;
-use std::sync::OnceLock;
 
 use crate::error::TactusError;
 use crate::runner::CommandSpec;
 use crate::util;
 
-/// A located agent binary and how to spawn it.
+/// An agent CLI as a program string, and how to spawn it.
+///
+/// The field is a [`PathBuf`] rather than a `String` because a program string
+/// **may** be a path: [`Invocation::at`] still builds one from an absolute
+/// path, and [`Invocation::spec`]'s refusal is the boundary at which a path
+/// that a `String` cannot carry is named rather than silently rewritten
+/// (`PR4-PROGRAM-PATH-NOT-UNICODE`). Production constructs only
+/// [`Invocation::named`], whose input is a `&str` and therefore always
+/// representable — so that conflict no longer has a production instance,
+/// while the refusal that documents it stays reachable and tested.
 #[derive(Debug, Clone)]
 pub struct Invocation {
     path: PathBuf,
+}
+
+impl Invocation {
+    /// The agent CLI as the **boundary that will execute it** names it.
+    ///
+    /// A bare program name, and that is the whole repair. The adapter knows
+    /// "an official CLI" (DESIGN.md:117); it does not know which filesystem
+    /// will hold it, and until this it answered that question anyway by
+    /// resolving against the coordinator host's `PATH` and serialising an
+    /// absolute host path into [`CommandSpec::program`]. With one runner whose
+    /// boundary *is* the host that was invisible. With a container runner it is
+    /// three separate failures, and `PR4-ADAPTER-RESOLVES-ON-THE-HOST` names
+    /// them: a CLI pinned in the image and absent on the host was refused
+    /// before the runtime was asked anything; every spec carried a path that
+    /// names nothing inside the image; and `Caps.version` certified the host's
+    /// CLI while the attempt ran the image's.
+    ///
+    /// A bare name is not a new shape for this crate. [`crate::gates::ShellKind::spec`]
+    /// has always put one in a spec — `sh`, `bash`, `cmd`, `pwsh` — for every
+    /// gate and for the `RunnerPreflight` shell probe, and the host runner has
+    /// always executed it. The three agent CLIs were the exception; this makes
+    /// them the rule.
+    ///
+    /// **There is no cache and nothing to key.** `probe` and `build` call this,
+    /// it is a function of its argument alone, and the two therefore agree by
+    /// construction rather than by an ordering between them. That is the
+    /// answer to "two runners in one process": a resolution that is correct on
+    /// first use and wrong on the second needs a resolution to be *remembered*,
+    /// and this remembers nothing.
+    #[must_use]
+    pub fn named(name: &str) -> Self {
+        Self {
+            path: PathBuf::from(name),
+        }
+    }
 }
 
 impl Invocation {
@@ -102,59 +154,36 @@ impl Invocation {
     }
 }
 
-/// Resolve the first of `names` that exists on PATH, caching the answer in the
-/// adapter's own `cache`.
+/// Rewrite a runner's refusal to execute `name` into something an operator can
+/// act on, saying **where** the CLI is missing.
 ///
-/// PATH resolution is process-stable and the engine builds one command per
-/// task after probing, so each adapter resolves once. The cache is passed in
-/// rather than kept here because two adapters must not share one slot.
+/// This is the operator-facing half of the repair, and it is needed *because*
+/// of it. Before, the adapter refused with "claude binary not found on PATH …
+/// install Claude Code" — a true sentence, because the only boundary was this
+/// machine. Now the boundary may be a container image, and "not found" without
+/// "not found *where*" sends the operator to install a CLI on a host that will
+/// never execute it.
 ///
-/// `missing` renders the error when nothing resolves; it takes the names that
-/// were tried so the message can name them.
-pub fn locate(
-    names: &[&str],
-    cache: &OnceLock<Option<Invocation>>,
-    missing: impl FnOnce(&[&str]) -> String,
-) -> Result<Invocation, TactusError> {
-    locate_with(names, cache, |_| true, missing)
-}
-
-/// Resolve the first usable candidate in shell PATH order and cache it.
-///
-/// Some platforms expose aliases that look like files but cannot be spawned.
-/// The predicate lets an adapter reject one of those and continue through the
-/// remaining PATH entries. Rejection happens before the cache is populated, so
-/// a bad alias cannot poison every later probe and attempt in this process.
-pub fn locate_with(
-    names: &[&str],
-    cache: &OnceLock<Option<Invocation>>,
-    usable: impl FnMut(&Invocation) -> bool,
-    missing: impl FnOnce(&[&str]) -> String,
-) -> Result<Invocation, TactusError> {
-    let mut usable = usable;
-    cache
-        .get_or_init(|| {
-            // util::find_program_candidates skips empty PATH segments, which
-            // would otherwise resolve a bare name against the current
-            // directory — i.e. run a binary out of the repo being worked on.
-            first_usable(
-                util::find_program_candidates(names)
-                    .into_iter()
-                    .map(|path| Invocation { path }),
-                &mut usable,
-            )
-        })
-        .clone()
-        .ok_or_else(|| TactusError::Agent {
-            message: missing(names),
-        })
-}
-
-fn first_usable(
-    candidates: impl IntoIterator<Item = Invocation>,
-    usable: &mut impl FnMut(&Invocation) -> bool,
-) -> Option<Invocation> {
-    candidates.into_iter().find(|candidate| usable(candidate))
+/// It reads this machine's `PATH` **only after the boundary has already
+/// refused**, and only to say which of the two situations the operator is in.
+/// Nothing it returns decides what runs. `install_hint` is the adapter's own
+/// sentence about how its CLI is installed.
+pub fn boundary_refused(name: &str, install_hint: &str, cause: &TactusError) -> TactusError {
+    let on_this_host = match util::find_program(name) {
+        Some(path) => format!(
+            "this coordinator host has `{name}` at `{}`, so the boundary this run executes in is \
+             not this host",
+            path.display()
+        ),
+        None => format!("this coordinator host has no `{name}` on PATH either"),
+    };
+    TactusError::Agent {
+        message: format!(
+            "`{name}` could not be executed by the runner this run uses: {cause}. It must be \
+             installed inside the boundary that executes it — on PATH for the host runner, in the \
+             image for a container runner. {install_hint} ({on_this_host})"
+        ),
+    }
 }
 
 /// First `digits.digits.digits` token wins; otherwise the trimmed first line
@@ -198,12 +227,12 @@ impl Invocation {
     /// An invocation naming `path`, for tests that need one without asking
     /// this machine what it has installed.
     ///
-    /// Production's only constructors are [`locate`] and [`locate_with`], which
-    /// resolve against `PATH` and memoise into a process-wide `OnceLock` that
-    /// every sibling test in the binary then reads. A test that needs to drive
-    /// a *pre-flight sequence* — the six strict-config parser probes, say —
-    /// must not go through them. That is the hazard `4631a3f` repaired once
-    /// already.
+    /// Production's only constructor is [`Invocation::named`], whose argument
+    /// is a bare CLI name. This exists for the tests that must drive a spec
+    /// carrying an **absolute** program — the host runner's own fixture grids
+    /// pin the difference between a shell's bare name and an absolute native
+    /// executable, and [`Invocation::spec`]'s non-Unicode refusal has no other
+    /// input at all.
     pub(crate) fn at(path: impl Into<PathBuf>) -> Self {
         Self { path: path.into() }
     }
@@ -279,36 +308,107 @@ mod tests {
         );
     }
 
+    /// A named CLI is the name and nothing else — no directory, no extension,
+    /// nothing this machine contributed.
+    ///
+    /// The expected values are written here, not read from the adapters: a
+    /// constructor compared only against the code that produced it proves
+    /// nothing. What is asserted is the *shape* — one path component, not
+    /// absolute — because that is the property a coordinator-host resolution
+    /// cannot have, on either platform, whatever this machine happens to have
+    /// installed.
     #[test]
-    fn a_missing_binary_reports_every_name_it_tried() {
-        static CACHE: OnceLock<Option<Invocation>> = OnceLock::new();
-        let names = ["tactus-definitely-not-a-real-binary"];
-        let error = locate(&names, &CACHE, |tried| {
-            format!("not found (looked for {})", tried.join(", "))
-        })
-        .expect_err("nothing should resolve");
-        assert!(
-            error
-                .to_string()
-                .contains("tactus-definitely-not-a-real-binary"),
-            "got: {error}"
-        );
+    fn a_named_cli_carries_no_location() {
+        for name in ["claude", "codex", "copilot"] {
+            let spec = Invocation::named(name)
+                .spec(&["--version".to_owned()])
+                .expect("a bare name is always representable as a String");
+            assert_eq!(spec.program, name);
+            let program = Path::new(&spec.program);
+            assert!(
+                !program.is_absolute(),
+                "{name}: a named CLI became an absolute path"
+            );
+            assert_eq!(
+                program.components().count(),
+                1,
+                "{name}: a named CLI grew a directory component"
+            );
+            assert_eq!(
+                program.extension(),
+                None,
+                "{name}: a named CLI grew an extension"
+            );
+            assert_eq!(Invocation::named(name).display(), name);
+        }
     }
 
+    /// The same name, twice, is the same spec — which is what makes `probe`
+    /// and `build` agree without an ordering between them.
+    ///
+    /// The old constructor memoised into a process-wide `OnceLock`, so the
+    /// *first* caller in the process decided the answer for every later one.
+    /// This asserts the property that replaced it: the constructor is a
+    /// function of its argument, so no call can be poisoned by an earlier one.
+    /// Both call orders, because "the first caller wins" is a property of
+    /// order.
     #[test]
-    fn an_unusable_candidate_is_skipped_before_the_answer_is_cached() {
-        let first = invocation(r"C:\WindowsApps\codex.exe");
-        let second = invocation(r"C:\Users\me\npm\codex.cmd");
-        let mut inspected = Vec::new();
+    fn naming_a_cli_is_a_function_of_its_argument_alone() {
+        let claude_first = [
+            Invocation::named("claude").display(),
+            Invocation::named("codex").display(),
+            Invocation::named("claude").display(),
+        ];
+        let codex_first = [
+            Invocation::named("codex").display(),
+            Invocation::named("claude").display(),
+            Invocation::named("codex").display(),
+        ];
+        assert_eq!(claude_first, ["claude", "codex", "claude"]);
+        assert_eq!(codex_first, ["codex", "claude", "codex"]);
+    }
 
-        let selected = first_usable([first, second.clone()], &mut |candidate| {
-            inspected.push(candidate.display());
-            candidate.display() == second.display()
-        })
-        .expect("the later usable installation wins");
+    /// A refusal from the boundary says which boundary, and whether this host
+    /// has the CLI — the two are different situations with different fixes.
+    ///
+    /// Both branches, and both asserted rather than whichever this machine
+    /// happens to take: `tactus-definitely-not-a-real-binary` is absent
+    /// everywhere by construction, and the present branch is driven with a
+    /// program every machine of each family has.
+    #[test]
+    fn a_boundary_refusal_says_where_the_cli_is_missing() {
+        let cause = TactusError::Agent {
+            message: "no such file or directory".to_owned(),
+        };
 
-        assert_eq!(selected.display(), second.display());
-        assert_eq!(inspected.len(), 2, "the bad alias was actually tested");
+        let absent = boundary_refused("tactus-definitely-not-a-real-binary", "install it.", &cause)
+            .to_string();
+        assert!(
+            absent.contains("tactus-definitely-not-a-real-binary"),
+            "{absent}"
+        );
+        assert!(absent.contains("no such file or directory"), "{absent}");
+        assert!(
+            absent.contains("in the image for a container runner"),
+            "{absent}"
+        );
+        assert!(
+            absent.contains("no `tactus-definitely-not-a-real-binary` on PATH either"),
+            "{absent}"
+        );
+
+        let present_name = if cfg!(windows) { "cmd" } else { "sh" };
+        let present_path = util::find_program(present_name)
+            .expect("every machine of this family has a shell on PATH");
+        let present = boundary_refused(present_name, "install it.", &cause).to_string();
+        assert!(
+            present.contains(&present_path.display().to_string()),
+            "the message must name where this host has it: {present}"
+        );
+        assert!(
+            present.contains("not this host"),
+            "the message must say the boundary is not this host: {present}"
+        );
     }
 
     /// A `.cmd` shim really does execute, and an argument really does arrive.

@@ -765,3 +765,164 @@ the window: how much has been spent in the last five hours, by whom, at what eff
 Two practical consequences already paid for on PR5: pacing matters more than total (four concurrent
 `max` reviewers exhaust a window that the same four run sequentially would not), and a worker killed by
 the window is not short of budget — it is early, and the same work succeeds unchanged after the reset.
+
+## 16. PR6 — what nine reviews and a withheld catalogue found
+
+The container Runner slice ran four per-lane reviews and five whole-slice lenses, and measured a
+**193-entry mutation catalogue** authored from the frozen packet alone before any container code existed
+and withheld from every implementer. **136 of the 138 applicable entries were killed (98.6%)**; both
+survivors were repaired. Nine reviews produced **71 findings**, every one carrying a mutation the
+reviewer applied and measured.
+
+This section records what generalises. The per-finding detail is in the slice's own reports.
+
+### The one that mattered most, and why the suite could not see it
+
+`expected_failures_refusals[5]` is *"gate write outside mount fails"*, and DESIGN.md:610 calls confining
+gate-executed repository code the first thing a container uniquely buys. **A Gate could write outside
+every declared mount**: Docker received the role bind mounts but no read-only root filesystem, so
+`sh -c 'printf owned >/outside-role-mount'` exited **0** into the writable container layer.
+
+The test *"explicitly permits container-layer writes and checks only host bytes."* It proves **"the host
+is unharmed"** — which is true, and which the orchestrator quoted approvingly as kernel-level evidence.
+
+> **A test can prove a true, weaker statement indefinitely while the stated guarantee is false.**
+
+When replacing an assertion, check that the new one is *the contract's claim* and not a neighbouring true
+one. Repaired by `--read-only`, with the assertion now on the write failing.
+
+### The witnessing rule this slice had to learn
+
+Lane F witnessed **16** mutations — more rigour than any lane on this project — and an independent
+review refuted **three** of the claims they supported. Each mutation deleted the **mechanism together
+with its observable**:
+
+| mutation as written | what it proved | minimal mutation | result |
+|---|---|---|---|
+| delete `fsync_file` **and** its `Synced` trace record | the **record** is asserted | delete the fsync, keep the record | whole suite passes |
+| `expect_site` always `Ok` | **`write_intent`'s** guard is asserted | delete only `start_container`'s | passes |
+| run reclaim twice | **idempotence** | two reclaimers actually racing | not constructible in any fixture built |
+
+> **Delete the mechanism and leave every observable in place.** If the suite still passes, the test is
+> asserting the observable rather than the mechanism — the self-oracle shape wearing a witness's clothes.
+
+This is the rule after *"a fixture that lands green having never been seen red is not coverage"*, and it
+is now in the slice's `repair-common.md`.
+
+### `PR5-R1-CFG-TEST-SHRINKS-THE-DOMAIN`, three times in one slice
+
+`effects::production_region` cuts a source at its **first** `#[cfg(test)]`. In PR6 it defeated, in order:
+
+1. **lane A's R20 census**, which concatenated the container sources and called `production_region` once,
+   so the first test boundary truncated every module appended after it — while its positive control still
+   fired, *on the truncated domain*;
+2. **the orchestrator's own witness** of a guard repair, where a duplicate literal planted *below* a
+   `#[cfg(test)]` was correctly not seen, and the conclusion "the guard did not fire" was one step from
+   weakening a good guard;
+3. **`PR6-ACCT-002`**, reporting the same census *still* scanning only the first file.
+
+Lane F had warned lanes A and C about this by name in its own report. It recurred anyway.
+
+> **A positive control proves a census can see something. It does not prove the census sees the domain it
+> names.**
+
+### One defect arrives wearing several names
+
+Five lenses named one defect three times — `PR6-CORRECTNESS-004` = `PR6-RECOV-001`; `PR6-CONV-001` =
+`PR6-CORRECTNESS-009`; `PR6-ENUM-004` = `PR6-CORRECTNESS-003`. The orchestrator partitioned repairs by
+**finding id**, verified the partition was disjoint (it was), and sent **one defect to two lanes**, which
+solved it two incompatible ways interleaved through one function. That diff was discarded and re-run
+rather than hand-merged, because twelve interleaved regions in a 1639-line diff is how PR5's round 7
+became a revert.
+
+> **Partition repair work by the code path a finding touches, not by the identifier a lens assigned it.**
+
+Independent lenses agreeing is the signal this process exists to produce. It also means the same defect
+arrives several times under different names, and only reading the *location* tells you so.
+
+### A bare name given to something that does not resolve bare names — twice
+
+* **Windows**: `CommandSpec.program` carrying `claude` into `CreateProcessW`, which appends `.exe` and
+  ignores `PATHEXT` — so every npm-installed agent CLI failed to spawn (`PR6D-001`).
+* **Unix**: the cleanup reaper passing `docker` to `execv`, which does not search `PATH` at all — so no
+  labeled container was ever reclaimed after a coordinator death (`PR6-LANEC-002`).
+
+Different subsystems, different platforms, different reviewers, one shape. The second has a real
+constraint behind it: the reaper runs post-`fork`, pre-`exec`, and `execvp` is not async-signal-safe while
+`execv` is. Repaired by resolving in the parent and handing the absolute path down.
+
+### Three defects, three platforms, one oracle each
+
+| defect | the only place it was visible |
+|---|---|
+| the bare-name repair breaking npm `.cmd` CLIs | the Windows guest |
+| `launch` mounting the Git view **after** `create`, so no container with a view could start | real Docker |
+| `SIGSTOP` landing before the supervised worker's first write | macOS CI |
+
+None was visible from the others and none from reading; twelve green local gates said nothing about any
+of them. The first was **predicted** by a catalogue entry naming a function that did not exist
+(`HostRunner::resolve_program`) and then measured on the guest.
+
+### The test suite leaks a temp directory per fixture, and it exhausted the build box
+
+Found while re-measuring the catalogue, when the box stopped being able to create files with **237 GB
+free**. Inodes were at **100%** — 58,466,304 used, 0 available. `/tmp` held **1,639,765** `tactus-*`
+fixture directories, enough that the directory entry itself was 114 MB.
+
+The mechanism is one line, in `src/rundir.rs`:
+
+```rust
+fn scratch(tag: &str) -> PathBuf {
+    let dir = std::env::temp_dir().join(format!("tactus-rundir-{tag}-{}", std::process::id()));
+    let _ = fs::remove_dir_all(&dir);
+```
+
+The `remove_dir_all` runs at **creation**, not at drop, and the name is keyed by `{tag}-{pid}`. It makes
+a fixture idempotent *within* one process. It never removes anything after a test, and the next test
+process has a different pid and therefore a different name, so the previous run's directories are not
+merely left behind — they are unreachable by that cleanup for the rest of the machine's life.
+
+Measured on the shipping tree, immune to a concurrent cleanup by counting only entries newer than a
+marker: **66 tests executed, 117 fixture directories left behind.** A full run of the current 1385-test
+suite leaks on the order of 2,400. The box had accumulated 1.6 million.
+
+`pre_existing` — the helper dates to `dc56475` (2026-08-09) and PR6 changes `src/rundir.rs` in zero
+files. It is recorded here rather than repaired here because it is project-wide and outside this slice's
+contract, and because the repair is a judgement call: a `Drop` guard is the obvious fix, but tests that
+deliberately inspect a fixture after a panic would lose their evidence.
+
+> **A cleanup that runs at setup is not a cleanup. It is a retry.** The distinction is invisible while
+> disk is measured in bytes and fatal once it is measured in inodes.
+
+Two operational notes for whoever picks this up. `df -h` reports the box healthy at 72% while every
+write fails — only `df -i` shows it. And the failure does not announce itself as a disk problem: it
+surfaced as four mutation entries aborting mid-measurement.
+
+### Deterministic container names plus end-of-test cleanup is not enough
+
+Two real-Docker tests went red on the shipping head — `real_docker_census_reclaims_a_dead_owner_and_
+spares_a_live_one` and `real_docker_the_daemon_holds_exactly_the_specs_mounts_and_a_read_only_root` —
+while the only change in that commit was a documentation edit. Both passed in isolation minutes later
+under `TACTUS_REQUIRE_DOCKER`, so a skip would have failed.
+
+The cause was four containers left over from an earlier run this session that had been **SIGKILLed** when
+the box exhausted its inodes: two `Exited (137)`, two still `Created`. Their names were the deterministic
+ones these tests recreate, so `docker create` hit a name conflict.
+
+Both tests already clean up after themselves — a `cleanup` closure on every exit path in one, a
+`LeaveNoResidue` RAII guard in the other. Both are correct, and neither can help: **no in-process
+cleanup runs when the process is SIGKILLed.**
+
+The fix is a pre-clean — reclaim the names before using them — and the idiom is only correct here because
+the names are *deterministic*:
+
+> **A pre-clean removes the previous run's residue exactly when the name recurs.** Keyed by something
+> unique per process — a pid, a ULID — it can never name anything an earlier run created, and it
+> degrades into an unconditional retry that cleans nothing. `src/rundir.rs`'s `scratch` is the second
+> shape; these container fixtures are the first.
+
+Recorded as **debt, not repaired in this slice.** The tests hold what they claim; robustness to SIGKILL
+is a guarantee beyond their contract, the trigger was an operator-caused disk exhaustion that has been
+cleared, and an unreviewed change to shared test infrastructure is how PR5's round 7 became a revert.
+It should be repaired before PR7, where parallel runs make a stranger container the normal case rather
+than the aftermath of a crash.

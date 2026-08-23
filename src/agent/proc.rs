@@ -725,6 +725,45 @@ pub(crate) fn poison_ambient_for_tests(message: &str) -> bool {
     windows_job::poison_ambient_for_tests(message)
 }
 
+/// Arm this process's cleanup reapers to kill the coordinator's labeled
+/// containers when the coordinator dies, or disarm them with `None`.
+///
+/// `decisions.admission_and_leases.permits.os_matrix`, in full:
+///
+/// > Linux and macOS (`cfg(unix)`): the cleanup reaper survives coordinator
+/// > death, settles the dead coordinator's process groups while holding R28,
+/// > and **additionally kills the dead coordinator's labeled containers**,
+/// > closing the orphan window; Windows: **no reaper**; … containers are
+/// > reclaimed at the **next write-command start** (orphan window until then;
+/// > documented; a portable watchdog is deferred).
+///
+/// So this is a **no-op on Windows**, and that is the documented half rather
+/// than an omission: [`crate::runner::container::orphan_window`] is the value
+/// that says so and `runner::container::tests::windows_orphan_window_documented`
+/// is what asserts the platform and the code agree.
+///
+/// The scope is read **before** the fork, by every reaper started after this
+/// call: a reaper already running keeps the scope it was started with, because
+/// it is a `fork`-only child that cannot be handed anything afterwards.
+///
+/// # Errors
+///
+/// Whatever building the argument vectors returns — on Unix, a scope whose
+/// rendered strings carry an interior NUL.
+pub fn set_container_reclaim_scope(
+    scope: Option<&crate::runner::container::census::ReaperContainerScope>,
+) -> Result<(), TactusError> {
+    #[cfg(unix)]
+    {
+        termination::set_container_reclaim_scope(scope)
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = scope;
+        Ok(())
+    }
+}
+
 #[cfg(windows)]
 mod windows_job {
     use std::io;
@@ -1596,6 +1635,7 @@ fn child_exited_unreaped(child: &Child) -> std::io::Result<bool> {
 /// while it is nonzero.
 #[cfg(unix)]
 mod termination {
+    use std::path::PathBuf;
     use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU8, Ordering};
     use std::sync::{Arc, Mutex, OnceLock};
     use std::thread;
@@ -2510,6 +2550,11 @@ mod termination {
         }
         let open_max = libc::c_int::try_from(open_max)
             .map_err(|_| "Unix open-file descriptor ceiling exceeds c_int".to_owned())?;
+        // Rendered BEFORE the fork, like `cleanup_paths` above and for the same
+        // reason: the reaper may not allocate. `None` is the ordinary state of
+        // every run today — nothing selects a container Runner until PR12 — and
+        // costs the reaper nothing at all.
+        let containers = container_scope_for_a_new_reaper();
         let command = create_cloexec_pipe()
             .map_err(|error| format!("creating Unix cleanup-reaper command pipe: {error}"))?;
         let ack = match create_cloexec_pipe() {
@@ -2550,7 +2595,14 @@ mod termination {
             if !lock_cleanup_paths(&cleanup_paths) {
                 unsafe { libc::_exit(1) };
             }
-            reaper_loop(parent, command[0], ack[1], open_max, cleanup_delay_ms);
+            reaper_loop(
+                parent,
+                command[0],
+                ack[1],
+                open_max,
+                cleanup_delay_ms,
+                containers.as_ref(),
+            );
         }
 
         // Close the parent's race with the child-side setpgid. Either call may
@@ -2660,6 +2712,7 @@ mod termination {
         ack_fd: libc::c_int,
         open_max: libc::c_int,
         cleanup_delay_ms: u64,
+        containers: Option<&ReaperContainers>,
     ) -> ! {
         let mut pgid = 0_i32;
         let mut anchor = 0_i32;
@@ -2683,29 +2736,21 @@ mod termination {
                 if last_errno_is_interrupted() {
                     continue;
                 }
-                if pgid > 0 {
-                    cleanup_reaper_group(pgid, anchor, cleanup_delay_ms);
-                }
+                settle_after_coordinator_death(pgid, anchor, cleanup_delay_ms, containers);
                 unsafe { libc::_exit(0) };
             }
             if unsafe { libc::getppid() } != parent {
-                if pgid > 0 {
-                    cleanup_reaper_group(pgid, anchor, cleanup_delay_ms);
-                }
+                settle_after_coordinator_death(pgid, anchor, cleanup_delay_ms, containers);
                 unsafe { libc::_exit(0) };
             }
             if polled > 0 && command.revents & (libc::POLLERR | libc::POLLNVAL) != 0 {
-                if pgid > 0 {
-                    cleanup_reaper_group(pgid, anchor, cleanup_delay_ms);
-                }
+                settle_after_coordinator_death(pgid, anchor, cleanup_delay_ms, containers);
                 unsafe { libc::_exit(0) };
             }
             if polled > 0 && command.revents & (libc::POLLIN | libc::POLLHUP) != 0 {
                 let mut frame = [0_u8; 5];
                 if !read_raw_exact(command_fd, &mut frame) {
-                    if pgid > 0 {
-                        cleanup_reaper_group(pgid, anchor, cleanup_delay_ms);
-                    }
+                    settle_after_coordinator_death(pgid, anchor, cleanup_delay_ms, containers);
                     unsafe { libc::_exit(0) };
                 }
                 let requested = i32::from_ne_bytes([frame[1], frame[2], frame[3], frame[4]]);
@@ -2735,9 +2780,7 @@ mod termination {
                     _ => false,
                 };
                 if !write_raw(ack_fd, &[if accepted { REAPER_OK } else { REAPER_FAIL }]) {
-                    if pgid > 0 {
-                        cleanup_reaper_group(pgid, anchor, cleanup_delay_ms);
-                    }
+                    settle_after_coordinator_death(pgid, anchor, cleanup_delay_ms, containers);
                     unsafe { libc::_exit(0) };
                 }
             }
@@ -4050,6 +4093,456 @@ mod termination {
         true
     }
 
+    // -----------------------------------------------------------------------
+    // The container half of the orphan window — ST-16 (d)
+    // -----------------------------------------------------------------------
+
+    /// The `docker` argument vectors, rendered before any fork.
+    ///
+    /// A reaper is a `fork`-only child of a multithreaded process: after the
+    /// fork it may call only async-signal-safe functions, so it can neither
+    /// format a filter nor allocate an argv. Every byte it will ever need is
+    /// therefore built here, on the parent side, exactly as `spawn_reaper`'s
+    /// `cleanup_paths` are — and a `CString`'s buffer does not move when the
+    /// struct that owns it does, so the pointer array stays valid.
+    struct ReaperContainers {
+        program: std::ffi::CString,
+        /// Kept alive for the pointers in `ps_argv`.
+        _ps: Vec<std::ffi::CString>,
+        /// NULL-terminated `argv` for `docker ps …`.
+        ps_argv: Vec<*const libc::c_char>,
+    }
+
+    /// The scope every reaper started from now on inherits, or `None`.
+    ///
+    /// A reaper already running keeps the scope it was forked with; there is no
+    /// channel for handing one a new one, and inventing a wire frame for it
+    /// would put a variable-length message into a protocol whose frames are five
+    /// bytes.
+    static CONTAINER_SCOPE: OnceLock<
+        Mutex<Option<crate::runner::container::census::ReaperContainerScope>>,
+    > = OnceLock::new();
+
+    /// The fixed listing buffer. A `--no-trunc` id is 64 bytes plus a newline,
+    /// so this is **126 containers per listing** — and a reaper cannot grow a
+    /// buffer, so the number of *rounds* is what has to be unbounded. It was
+    /// `8`, which made the buffer size a silent ceiling of 126 x 8 = **1,008
+    /// containers**: a coordinator dying with 1,009 of them left one behind and
+    /// reported the same success it reports on a clean machine.
+    const REAPER_PS_BUFFER: usize = 8192;
+
+    /// The ceiling on one `docker` invocation, in 10 ms ticks.
+    ///
+    /// `determinism` forbids sleeps in tests and this is not one: it is the
+    /// fail-safe that keeps a wedged daemon from holding R28 — the shared
+    /// cleanup hold the next coordinator waits on — for ever. A reaper that
+    /// waited without a bound would convert "docker is hung" into "no run on
+    /// this machine can ever start again".
+    const REAPER_DOCKER_TICKS: usize = 3_000;
+
+    /// Arm or disarm the container scope. See
+    /// [`super::set_container_reclaim_scope`].
+    pub(super) fn set_container_reclaim_scope(
+        scope: Option<&crate::runner::container::census::ReaperContainerScope>,
+    ) -> Result<(), TactusError> {
+        // Rendered here so a scope that cannot be turned into argv is refused
+        // by the caller that set it, rather than silently doing nothing inside
+        // a reaper that has no error channel.
+        if let Some(scope) = scope {
+            render_container_argv(scope)?;
+        }
+        let mut held = CONTAINER_SCOPE
+            .get_or_init(|| Mutex::new(None))
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        *held = scope.cloned();
+        Ok(())
+    }
+
+    /// The absolute program the reaper will `execv`, resolved **before** the
+    /// fork.
+    ///
+    /// **`execv` does not search `PATH`. Only `execvp` does** — and `execvp` is
+    /// not on the POSIX async-signal-safe list, so a reaper (a `fork`-only child
+    /// of a multithreaded process) may not call it. A bare `docker` handed to
+    /// `execv` therefore resolves against nothing at all: the listing child
+    /// `_exit(127)`s, the pipe carries no bytes, and the reaper reports exactly
+    /// the same success it reports on a clean machine. Measured, not reasoned —
+    /// it is what shipped, and the only fixture used an absolute stub.
+    ///
+    /// So the search happens here, on the parent side, in ordinary code with an
+    /// error channel: the same discipline that renders every other byte the
+    /// reaper needs before the fork. `execvp`'s own rule is mirrored exactly —
+    /// a name containing a `/` is a path and is used verbatim (that is what
+    /// `execv` already does correctly); a name with no `/` is searched for on
+    /// `PATH`, and one `PATH` cannot resolve is **refused** rather than handed
+    /// to a child that has no way to say so.
+    ///
+    /// [`crate::util::find_program`] is the resolver deliberately: it is the
+    /// one `runner::container::DockerCli::available` asks when it decides the
+    /// runtime is present, so the reaper execs the binary the rest of the engine
+    /// means by `docker`.
+    fn resolve_reaper_program(program: &std::path::Path) -> Result<PathBuf, TactusError> {
+        use std::os::unix::ffi::OsStrExt as _;
+        if program.as_os_str().as_bytes().contains(&b'/') {
+            return Ok(program.to_path_buf());
+        }
+        let refused = |why: &str| TactusError::Refused {
+            message: format!(
+                "the Unix reaper's container scope names the program `{}`, which {why}; a reaper \
+                 is a fork-only child restricted to async-signal-safe calls, so it must be handed \
+                 an already-resolved path — `execv` does not search `PATH` and `execvp` is not \
+                 async-signal-safe — and a scope whose program cannot be resolved is refused here \
+                 rather than silently reclaiming nothing",
+                program.display()
+            ),
+        };
+        let name = program.to_str().ok_or_else(|| {
+            refused("carries no separator and is not UTF-8, so it cannot be looked up on `PATH`")
+        })?;
+        crate::util::find_program(name)
+            .ok_or_else(|| refused("carries no separator and is not on this process's `PATH`"))
+    }
+
+    /// The argument vectors for `scope`, or why they cannot be built.
+    fn render_container_argv(
+        scope: &crate::runner::container::census::ReaperContainerScope,
+    ) -> Result<ReaperContainers, TactusError> {
+        let nul = |value: &str| TactusError::Refused {
+            message: format!(
+                "the Unix reaper's container scope renders `{value}`, which carries an interior \
+                 NUL and cannot be an argument to `{}`",
+                scope.program().display()
+            ),
+        };
+        let resolved = resolve_reaper_program(scope.program())?;
+        let program = std::ffi::CString::new(resolved.as_os_str().as_encoded_bytes())
+            .map_err(|_| nul(&resolved.to_string_lossy()))?;
+        let mut ps = Vec::new();
+        for (index, argument) in scope.list_argv().into_iter().enumerate() {
+            // `argv[0]` is the resolved path too, so the program the child execs
+            // and the program it reports itself as are one string in every one
+            // of the three invocations — `ps` here, `kill` and `rm` from
+            // `containers.program` directly.
+            let argument = if index == 0 {
+                resolved.to_string_lossy().into_owned()
+            } else {
+                argument
+            };
+            ps.push(std::ffi::CString::new(argument.clone()).map_err(|_| nul(&argument))?);
+        }
+        let mut ps_argv: Vec<*const libc::c_char> =
+            ps.iter().map(|argument| argument.as_ptr()).collect();
+        ps_argv.push(std::ptr::null());
+        Ok(ReaperContainers {
+            program,
+            _ps: ps,
+            ps_argv,
+        })
+    }
+
+    /// What a reaper about to be forked should carry.
+    fn container_scope_for_a_new_reaper() -> Option<ReaperContainers> {
+        let scope = CONTAINER_SCOPE
+            .get()?
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()?;
+        render_container_argv(&scope).ok()
+    }
+
+    /// Kill and remove every labeled container of the dead coordinator.
+    ///
+    /// `T-CONTAINER.resume_action`: "on Unix the cleanup reaper performs
+    /// **kill/rm** earlier when the coordinator dies". Only kill and rm: the
+    /// Git view and the intent record are removed by the next write command's
+    /// census, which is why every step of `runner::container::reclaim` is
+    /// idempotent and tolerant of already-gone.
+    ///
+    /// Every call here is async-signal-safe: `fork`, `execv`, `pipe`, `dup2`,
+    /// `open`, `close`, `poll`, `read`, `waitpid`, `kill`, `_exit`.
+    fn reclaim_labeled_containers(containers: &ReaperContainers) {
+        // Two fixed buffers and no round counter. The loop ends on one of three
+        // conditions, and none of them is a container count:
+        //
+        // 1. the listing is **empty** — everything this selector names is gone;
+        // 2. the listing is **byte-identical to the previous round's** — the
+        //    runtime answered with exactly what it answered before, so the
+        //    `kill`/`rm` of that round removed nothing and another round would
+        //    repeat it. This is the real form of the guard the round count was
+        //    standing in for ("a runtime that keeps reporting the same
+        //    container cannot hold R28 for ever"), and it is both tighter (it
+        //    fires on the second round rather than the eighth) and not a
+        //    ceiling on how much work a healthy runtime may be given;
+        // 3. no complete id was parsed out of a non-empty listing.
+        //
+        // Termination without a count: the selector names one **dead**
+        // incarnation, so nothing can add to the set while this runs — the only
+        // process that creates containers under that incarnation label is the
+        // coordinator that died. The set is therefore finite and non-growing,
+        // each round either shrinks it or answers identically, and every
+        // `docker` invocation inside a round is itself bounded by
+        // [`REAPER_DOCKER_TICKS`].
+        //
+        // Stopping on (2) is not a silent give-up: what it leaves behind is a
+        // labeled container the runtime will not remove, and that is exactly
+        // the residue the **next write command's census** is required to refuse
+        // over — `refusal_condition`'s "a dead owner's or dead incarnation's
+        // labeled container that cannot be observed terminated blocks
+        // admission". The reaper closes the window early; the census is what
+        // makes failing to close it loud.
+        let mut buffer = [0_u8; REAPER_PS_BUFFER];
+        let mut previous = [0_u8; REAPER_PS_BUFFER];
+        let mut previous_filled = usize::MAX;
+        loop {
+            let filled = list_labeled_containers(containers, &mut buffer);
+            if filled == 0 {
+                return;
+            }
+            if filled == previous_filled && buffer[..filled] == previous[..filled] {
+                return;
+            }
+            previous[..filled].copy_from_slice(&buffer[..filled]);
+            previous_filled = filled;
+            let mut settled = 0_usize;
+            let mut start = 0_usize;
+            for index in 0..filled {
+                if buffer[index] != b'\n' {
+                    continue;
+                }
+                // NUL-terminate the id where it lies. Nothing is allocated and
+                // nothing is copied; the buffer is this frame's own.
+                buffer[index] = 0;
+                if index > start {
+                    let id = buffer[start..].as_ptr().cast::<libc::c_char>();
+                    let kill: [*const libc::c_char; 4] = [
+                        containers.program.as_ptr(),
+                        c"kill".as_ptr(),
+                        id,
+                        std::ptr::null(),
+                    ];
+                    spawn_docker(containers.program.as_ptr(), kill.as_ptr());
+                    // `--volumes`, exactly as `DockerCli::remove` issues it
+                    // (`PR6-ACCT-006`). An image declaring `VOLUME` gets one
+                    // **anonymous** volume per container, and `docker rm`
+                    // without this leaves one behind for every container the
+                    // reaper removes: measured, 29 leaked from a single run of
+                    // this suite through the ordinary path before
+                    // `PR6A-ANONYMOUS-VOLUMES-LEAK` put the flag there. Those
+                    // volumes are R26 — created by `docker create` as part of
+                    // the container, referable by nothing else — and once the
+                    // reaper has removed the container the following
+                    // intent-only census has no handle on them at all, so this
+                    // is the *only* point at which they can be reclaimed.
+                    // `--volumes` removes anonymous volumes and **never a named
+                    // one**, so it cannot touch R20 (measured on docker 29.7.2:
+                    // a mounted named volume survives `rm --force --volumes`).
+                    let remove: [*const libc::c_char; 6] = [
+                        containers.program.as_ptr(),
+                        c"rm".as_ptr(),
+                        c"--force".as_ptr(),
+                        c"--volumes".as_ptr(),
+                        id,
+                        std::ptr::null(),
+                    ];
+                    spawn_docker(containers.program.as_ptr(), remove.as_ptr());
+                    settled = settled.saturating_add(1);
+                }
+                start = index + 1;
+            }
+            if settled == 0 {
+                return;
+            }
+        }
+    }
+
+    /// Run `docker ps …` and read its ids into `buffer`, returning how many
+    /// bytes arrived.
+    fn list_labeled_containers(containers: &ReaperContainers, buffer: &mut [u8]) -> usize {
+        let mut fds = [0 as libc::c_int; 2];
+        if unsafe { libc::pipe(fds.as_mut_ptr()) } != 0 {
+            return 0;
+        }
+        let pid = unsafe { libc::fork() };
+        if pid < 0 {
+            close_fd(fds[0]);
+            close_fd(fds[1]);
+            return 0;
+        }
+        if pid == 0 {
+            unsafe {
+                // The reaper closed every inherited descriptor including 0, 1
+                // and 2, so `pipe` may well have handed back fd 0 and fd 1
+                // themselves. Move the write end onto stdout only when it is
+                // not already there, and never close the descriptor that IS
+                // stdout: doing so leaves `docker ps` writing to a closed fd,
+                // the listing empty, and nothing reclaimed — with the reaper
+                // reporting exactly the same success it reports on a clean
+                // machine. Measured, not reasoned: it is what happened.
+                if fds[1] != 1 && libc::dup2(fds[1], 1) < 0 {
+                    libc::_exit(127);
+                }
+                if fds[0] != 1 {
+                    close_fd(fds[0]);
+                }
+                if fds[1] != 1 {
+                    close_fd(fds[1]);
+                }
+                quiet_standard_descriptors();
+                libc::execv(containers.program.as_ptr(), containers.ps_argv.as_ptr());
+                libc::_exit(127);
+            }
+        }
+        close_fd(fds[1]);
+        let filled = read_bounded(fds[0], buffer);
+        close_fd(fds[0]);
+        reap_bounded(pid);
+        filled
+    }
+
+    /// `docker <verb> <id>`, output discarded, bounded.
+    fn spawn_docker(program: *const libc::c_char, argv: *const *const libc::c_char) {
+        let pid = unsafe { libc::fork() };
+        if pid < 0 {
+            return;
+        }
+        if pid == 0 {
+            unsafe {
+                quiet_standard_descriptors();
+                libc::execv(program, argv);
+                libc::_exit(127);
+            }
+        }
+        reap_bounded(pid);
+    }
+
+    /// Give the exec'd `docker` real standard descriptors.
+    ///
+    /// The reaper closed every inherited descriptor including 0, 1 and 2, so
+    /// without this a `docker` that opened a file would be handed **fd 1 or fd
+    /// 2** for it and would then write its output or its diagnostics into that
+    /// file. `/dev/null` on whichever of the three is still free is the
+    /// cheapest way to make the numbers mean what they mean.
+    ///
+    /// A descriptor that is **already** open is left alone, which is what keeps
+    /// this from undoing the listing child's pipe on fd 1.
+    unsafe fn quiet_standard_descriptors() {
+        unsafe {
+            // In this order: `open` returns the lowest free descriptor, so
+            // filling 0 first is what lets 1 and 2 land where they are asked
+            // for without a `dup2` at all.
+            ensure_standard_descriptor(0, libc::O_RDONLY);
+            ensure_standard_descriptor(1, libc::O_WRONLY);
+            ensure_standard_descriptor(2, libc::O_WRONLY);
+        }
+    }
+
+    /// Open `/dev/null` onto `target` unless something is already there.
+    unsafe fn ensure_standard_descriptor(target: libc::c_int, flags: libc::c_int) {
+        unsafe {
+            if libc::fcntl(target, libc::F_GETFD) != -1 {
+                return;
+            }
+            let opened = libc::open(c"/dev/null".as_ptr(), flags);
+            if opened < 0 {
+                return;
+            }
+            if opened != target {
+                let _ = libc::dup2(opened, target);
+                close_fd(opened);
+            }
+        }
+    }
+
+    /// Read until EOF, the buffer is full, or the ceiling is reached.
+    fn read_bounded(fd: libc::c_int, buffer: &mut [u8]) -> usize {
+        let mut used = 0_usize;
+        let mut ticks = 0_usize;
+        while used < buffer.len() {
+            let mut waiting = libc::pollfd {
+                fd,
+                events: libc::POLLIN,
+                revents: 0,
+            };
+            let ready = unsafe { libc::poll(&mut waiting, 1, 10) };
+            if ready < 0 {
+                if last_errno_is_interrupted() {
+                    continue;
+                }
+                return used;
+            }
+            if ready == 0 {
+                ticks = ticks.saturating_add(1);
+                if ticks >= REAPER_DOCKER_TICKS {
+                    return used;
+                }
+                continue;
+            }
+            let read = unsafe {
+                libc::read(
+                    fd,
+                    buffer.as_mut_ptr().add(used).cast(),
+                    buffer.len() - used,
+                )
+            };
+            if read > 0 {
+                used += read as usize;
+            } else if read < 0 && last_errno_is_interrupted() {
+                continue;
+            } else {
+                return used;
+            }
+        }
+        used
+    }
+
+    /// Wait for one `docker`, and kill it rather than hold R28 for ever.
+    fn reap_bounded(pid: libc::pid_t) {
+        for _ in 0..REAPER_DOCKER_TICKS {
+            let waited = unsafe { libc::waitpid(pid, std::ptr::null_mut(), libc::WNOHANG) };
+            if waited == pid {
+                return;
+            }
+            if waited < 0 && !last_errno_is_interrupted() {
+                return;
+            }
+            raw_sleep_10ms();
+        }
+        unsafe {
+            let _ = libc::kill(pid, libc::SIGKILL);
+        }
+        loop {
+            let waited = unsafe { libc::waitpid(pid, std::ptr::null_mut(), 0) };
+            if waited == pid || (waited < 0 && !last_errno_is_interrupted()) {
+                return;
+            }
+        }
+    }
+
+    /// What a reaper does when its **coordinator has died**: settle the group,
+    /// then close the container half of the orphan window.
+    ///
+    /// Separate from the [`REAPER_CLEANUP`] path on purpose, and this is the
+    /// distinction the whole extension turns on. `REAPER_CLEANUP` and
+    /// [`REAPER_CANCEL`] are the **live** coordinator asking for its invocation
+    /// to be settled; killing its labeled containers there would kill the
+    /// containers of a coordinator that is still spending through them, which is
+    /// `authoritative_state`'s "a live incarnation's containers must not be
+    /// touched" — the opposite of what this exists for.
+    fn settle_after_coordinator_death(
+        pgid: i32,
+        anchor: libc::pid_t,
+        cleanup_delay_ms: u64,
+        containers: Option<&ReaperContainers>,
+    ) {
+        if pgid > 0 {
+            cleanup_reaper_group(pgid, anchor, cleanup_delay_ms);
+        }
+        if let Some(containers) = containers {
+            reclaim_labeled_containers(containers);
+        }
+    }
+
     #[cfg(test)]
     mod tests {
         use super::*;
@@ -4447,6 +4940,311 @@ mod termination {
                 let _ = libc::waitpid(pid, std::ptr::null_mut(), 0);
             }
             assert_eq!(observed, Some(false));
+        }
+
+        /// The program handed to `execv` is **always absolute**, and a bare name
+        /// `PATH` cannot resolve is refused where there is still an error channel.
+        ///
+        /// `execv` does not search `PATH`; only `execvp` does, and `execvp` is not
+        /// async-signal-safe, so a reaper may not call it. The production spelling
+        /// is `runner::container::DOCKER_PROGRAM` — the bare name `docker`
+        /// — so a reaper handed that name unresolved lists nothing, reclaims
+        /// nothing, and reports success.
+        ///
+        /// Second field held constant: the private root and the incarnation are the
+        /// same in every cell, so the only thing that moves is the **spelling of
+        /// the program** — bare-and-resolvable, bare-and-absent, and a path.
+        #[test]
+        fn the_reaper_program_is_resolved_to_an_absolute_path_before_the_fork() {
+            use crate::runner::container::census::ReaperContainerScope;
+            use std::ffi::OsStr;
+            use std::os::unix::ffi::OsStrExt as _;
+            use std::path::Path;
+
+            const ROOT: &str = "/srv/tactus-reaper-resolve/private";
+            const INCARNATION: &str = "01KZTBBBBBBBBBBBBBBBBBBBBB";
+
+            fn scope(program: &str) -> ReaperContainerScope {
+                ReaperContainerScope::new(program, Path::new(ROOT), INCARNATION)
+                    .expect("a well-formed scope")
+            }
+            fn execd(rendered: &ReaperContainers) -> std::path::PathBuf {
+                std::path::PathBuf::from(OsStr::from_bytes(rendered.program.as_bytes()))
+            }
+
+            // (1) A bare name that `PATH` resolves. `git` rather than `docker`
+            // because the property is about resolution and every machine that
+            // builds this repository has git; `util::find_program_resolves_real_
+            // tools_and_misses_fake_ones` is where that is already relied on.
+            let rendered = render_container_argv(&scope("git")).expect("git is on PATH");
+            let program = execd(&rendered);
+            assert!(
+                program.is_absolute(),
+                "`execv` was handed `{}`, which it will not search `PATH` for",
+                program.display()
+            );
+            assert!(
+                program.is_file(),
+                "`{}` is not a file on this machine",
+                program.display()
+            );
+            assert_eq!(
+                program.file_name(),
+                Some(OsStr::new("git")),
+                "the resolution found something other than the program it was asked for: {}",
+                program.display()
+            );
+            // `argv[0]` is the resolved path too, so the string the child execs and
+            // the string it reports itself as cannot drift apart.
+            let argv0 = unsafe { std::ffi::CStr::from_ptr(rendered.ps_argv[0]) };
+            assert_eq!(argv0.to_bytes(), program.as_os_str().as_bytes());
+
+            // (2) A bare name `PATH` cannot resolve is refused, while there is
+            // still somewhere to report it: a reaper has no error channel.
+            let absent = scope("tactus-definitely-not-a-real-docker");
+            let message = match render_container_argv(&absent) {
+                Ok(_) => panic!("an unresolvable bare program was accepted"),
+                Err(error) => error.to_string(),
+            };
+            assert!(
+                message.contains("PATH") && message.contains("tactus-definitely-not-a-real-docker"),
+                "{message}"
+            );
+            // And the refusal reaches the caller that arms the reaper, which is the
+            // only place with an error channel. Nothing is installed on this path,
+            // so no other test in this process inherits a scope.
+            assert!(
+                set_container_reclaim_scope(Some(&absent)).is_err(),
+                "arming accepted a scope whose program cannot be executed"
+            );
+
+            // (3) A name carrying a separator is a path and is used verbatim —
+            // exactly `execvp`'s own rule, and what `execv` already does correctly.
+            let rendered = render_container_argv(&scope("/usr/bin/docker")).expect("a path");
+            assert_eq!(execd(&rendered), Path::new("/usr/bin/docker"));
+            let rendered = render_container_argv(&scope("./docker")).expect("a relative path");
+            assert_eq!(execd(&rendered), Path::new("./docker"));
+        }
+
+        /// A scratch directory, a recording `docker` stub, and the rendered
+        /// argument vectors that name it.
+        fn reaper_stub(tag: &str, script: &str) -> (std::path::PathBuf, ReaperContainers) {
+            use std::os::unix::fs::PermissionsExt as _;
+            let dir = std::env::temp_dir().join(format!(
+                "tactus-reaper-rounds-{tag}-{}-{}",
+                std::process::id(),
+                crate::ulid::ulid()
+            ));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir).expect("scratch");
+            let stub = dir.join("docker-stub");
+            std::fs::write(&stub, script).expect("write the stub");
+            std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755))
+                .expect("make the stub executable");
+            // The stub finds its own scratch directory through `dirname $0`,
+            // so nothing about this fixture depends on process-wide state and
+            // two of these may run concurrently.
+            let scope = crate::runner::container::census::ReaperContainerScope::new(
+                &stub,
+                std::path::Path::new("/srv/tactus-reaper-rounds/private"),
+                "01KZTAAAAAAAAAAAAAAAAAAAAA",
+            )
+            .expect("a scope");
+            let rendered = render_container_argv(&scope).expect("argv");
+            (dir, rendered)
+        }
+
+        /// Every line of the stub's log whose first word is `verb`, in order.
+        fn logged(dir: &std::path::Path, verb: &str) -> Vec<String> {
+            std::fs::read_to_string(dir.join("argv.log"))
+                .unwrap_or_default()
+                .lines()
+                .filter(|line| line.split_whitespace().next() == Some(verb))
+                .map(str::to_owned)
+                .collect()
+        }
+
+        /// The reaper performs **as many rounds as the machine needs**, not a
+        /// fixed number of them.
+        ///
+        /// The listing buffer is fixed at [`REAPER_PS_BUFFER`] and a
+        /// `--no-trunc` id is 65 bytes with its newline, so one listing holds
+        /// **126** ids. A round count of 8 therefore made the reaper's reach a
+        /// silent **1,008** containers: a coordinator dying with 1,009 left one
+        /// behind and the reaper reported the same success it reports on a
+        /// clean machine. Twelve rounds is more than eight and few enough to
+        /// run in a fraction of a second; what it measures is that the count is
+        /// gone, not that the count is twelve.
+        ///
+        /// Second field held constant: exactly one container is listed in every
+        /// round, so the number of ids per listing cannot be what ends the
+        /// loop — only the number of rounds moves.
+        #[test]
+        fn the_reaper_performs_as_many_rounds_as_the_machine_needs() {
+            const ROUNDS: usize = 12;
+            let (dir, rendered) = reaper_stub(
+                "unbounded",
+                &format!(
+                    "#!/bin/sh\n\
+                     d=$(dirname \"$0\")\n\
+                     printf '%s\\n' \"$*\" >> \"$d/argv.log\"\n\
+                     case \"$1\" in\n\
+                     ps) n=$(cat \"$d/round\" 2>/dev/null || echo 0); n=$((n+1)); \
+                     echo \"$n\" > \"$d/round\"; \
+                     [ \"$n\" -gt {ROUNDS} ] || printf '%064d\\n' \"$n\" ;;\n\
+                     esac\n\
+                     exit 0\n"
+                ),
+            );
+
+            reclaim_labeled_containers(&rendered);
+
+            let killed: std::collections::BTreeSet<String> = logged(&dir, "kill")
+                .into_iter()
+                .map(|line| line["kill ".len()..].to_owned())
+                .collect();
+            let removed: std::collections::BTreeSet<String> = logged(&dir, "rm")
+                .into_iter()
+                .map(|line| line["rm --force --volumes ".len()..].to_owned())
+                .collect();
+            // The expected ids come from the stub's own rule, written out here
+            // rather than read back from what the reaper did.
+            let expected: std::collections::BTreeSet<String> =
+                (1..=ROUNDS).map(|n| format!("{n:064}")).collect();
+            assert_eq!(
+                killed,
+                expected,
+                "the reaper stopped early: it killed {} of {ROUNDS}",
+                killed.len()
+            );
+            assert_eq!(removed, expected, "kill and rm did not settle the same set");
+            assert!(
+                logged(&dir, "ps").len() > ROUNDS,
+                "{} listings for {ROUNDS} rounds plus the empty one that ends the loop",
+                logged(&dir, "ps").len()
+            );
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+
+        /// A listing **larger than the buffer** is not silently truncated: the
+        /// ids that did not fit are settled by a later round.
+        ///
+        /// This is the other half of the 126 x 8 arithmetic, and the two are a
+        /// product: a fixture that varied only the number of rounds would not
+        /// notice a buffer that dropped what it could not hold, and one that
+        /// varied only the number of ids would not notice a round count. 130 is
+        /// the smallest number that crosses the boundary — 130 x 65 = 8,450
+        /// bytes into an 8,192-byte buffer — so the first listing is cut inside
+        /// an id, which is the case a parser is most likely to get wrong.
+        ///
+        /// Second field held constant: the stub removes exactly what it is
+        /// told to remove and invents nothing, so the only thing that moves
+        /// between rounds is how much of the set is left.
+        #[test]
+        fn the_reaper_settles_more_containers_than_one_listing_holds() {
+            const CONTAINERS: usize = 130;
+            let (dir, rendered) = reaper_stub(
+                "over-buffer",
+                "#!/bin/sh\n\
+                 d=$(dirname \"$0\")\n\
+                 printf '%s\\n' \"$*\" >> \"$d/argv.log\"\n\
+                 case \"$1\" in\n\
+                 ps) ls \"$d/ids\" 2>/dev/null ;;\n\
+                 rm) rm -f \"$d/ids/$4\" ;;\n\
+                 esac\n\
+                 exit 0\n",
+            );
+            std::fs::create_dir_all(dir.join("ids")).expect("the id set");
+            let expected: std::collections::BTreeSet<String> = (1..=CONTAINERS)
+                .map(|n| format!("{n:064}"))
+                .inspect(|id| std::fs::write(dir.join("ids").join(id), "").expect("an id"))
+                .collect();
+            assert_eq!(expected.len(), CONTAINERS);
+            const {
+                assert!(
+                    CONTAINERS * 65 > REAPER_PS_BUFFER,
+                    "the fixture must not fit in one listing"
+                );
+            }
+
+            reclaim_labeled_containers(&rendered);
+
+            let killed: std::collections::BTreeSet<String> = logged(&dir, "kill")
+                .into_iter()
+                .map(|line| line["kill ".len()..].to_owned())
+                .collect();
+            let removed: std::collections::BTreeSet<String> = logged(&dir, "rm")
+                .into_iter()
+                .map(|line| line["rm --force --volumes ".len()..].to_owned())
+                .collect();
+            assert_eq!(
+                killed,
+                expected,
+                "{} of {CONTAINERS} containers were killed; the ids past the end of the first \
+                 listing were dropped rather than settled by a later round",
+                killed.len()
+            );
+            assert_eq!(removed, expected);
+            assert_eq!(
+                std::fs::read_dir(dir.join("ids"))
+                    .expect("the id set")
+                    .count(),
+                0,
+                "the stub still holds containers the reaper never removed"
+            );
+            assert!(
+                logged(&dir, "ps").len() >= 3,
+                "one listing cannot hold 130 ids"
+            );
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+
+        /// A runtime that keeps answering with the **same listing** ends the
+        /// loop on the second round, and does not repeat for ever.
+        ///
+        /// This is the guard the round count used to be, in its real form. The
+        /// reaper holds R28 — the shared cleanup hold the next coordinator waits
+        /// on — so a loop that could not end would turn "docker is wedged" into
+        /// "no run on this machine can ever start again".
+        ///
+        /// Second field held constant: the id set, which never changes; only
+        /// the number of times the reaper is willing to ask about it moves.
+        #[test]
+        fn a_runtime_that_keeps_answering_the_same_listing_ends_the_loop() {
+            // The stub answers with the same two ids twice and then with
+            // nothing. The third listing is what makes this fixture finite: an
+            // implementation with **no** no-progress guard still terminates
+            // here, and is caught by the counts rather than by a hang, because
+            // a test that measures a missing bound by hanging measures nothing.
+            let (dir, rendered) = reaper_stub(
+                "no-progress",
+                "#!/bin/sh\n\
+                 d=$(dirname \"$0\")\n\
+                 printf '%s\\n' \"$*\" >> \"$d/argv.log\"\n\
+                 case \"$1\" in\n\
+                 ps) n=$(cat \"$d/round\" 2>/dev/null || echo 0); n=$((n+1)); \
+                 echo \"$n\" > \"$d/round\"; \
+                 [ \"$n\" -gt 2 ] || { printf '%064d\\n' 1; printf '%064d\\n' 2; } ;;\n\
+                 esac\n\
+                 exit 0\n",
+            );
+
+            reclaim_labeled_containers(&rendered);
+
+            // Two listings: the first is acted on, the second is recognised as
+            // the same answer and ends the loop **there** — the third listing,
+            // which the stub is willing to answer, is never asked for. Each
+            // container was attempted exactly once, so nothing is retried
+            // against a runtime that has already refused to remove it.
+            assert_eq!(
+                logged(&dir, "ps").len(),
+                2,
+                "a repeated listing was acted on again: {:?}",
+                logged(&dir, "ps")
+            );
+            assert_eq!(logged(&dir, "kill").len(), 2, "{:?}", logged(&dir, "kill"));
+            assert_eq!(logged(&dir, "rm").len(), 2, "{:?}", logged(&dir, "rm"));
+            let _ = std::fs::remove_dir_all(&dir);
         }
     }
 }
@@ -6764,6 +7562,32 @@ mod tests {
         false
     }
 
+    /// Wait until the supervised worker has written its marker at least once.
+    ///
+    /// **Why this exists.** Every stop test sends its signal to the whole
+    /// process group immediately after spawn, and then reads the marker. If the
+    /// worker has not yet created it, the group is already stopped, the file can
+    /// never appear, and the first read fails `ENOENT` — for ever, not flakily.
+    /// `wait_for_stop` cannot cover this: it observes the *helper*, and says
+    /// nothing about whether the worker ever ran.
+    ///
+    /// Measured on PR6: `agent::proc::tests::uncatchable_sigstop_covers_the_isolated_tree`
+    /// failed on `macos-latest` with *"progress before signal 17: No such file
+    /// or directory"* on a tree whose suite had grown to 1243 macOS tests. The
+    /// race is PR4-era and pre-existing; it surfaced when the runner got busier.
+    /// A test that passes because a spawn usually wins a race is not a test.
+    #[cfg(unix)]
+    fn wait_for_first_progress(marker: &std::path::Path, context: &str) {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while Instant::now() < deadline {
+            if marker.exists() {
+                return;
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+        panic!("the supervised worker never recorded progress before {context}");
+    }
+
     #[cfg(unix)]
     fn settled_progress_after_stop(marker: &std::path::Path, context: &str) -> String {
         // A process-group snapshot can report every member stopped while a
@@ -6998,6 +7822,7 @@ mod tests {
     fn assert_stop_covers_the_isolated_tree(signal: libc::c_int, tag: &str) {
         let mut helper = spawn_signal_helper(tag, true, false);
         let pid = helper.pid();
+        wait_for_first_progress(&helper.marker, &format!("signal {signal}"));
         assert_eq!(unsafe { libc::kill(-pid, signal) }, 0);
         assert!(
             wait_for_stop(pid, Duration::from_secs(10)),
@@ -7044,6 +7869,7 @@ mod tests {
     fn terminal_suspend_and_continue_cover_the_isolated_tree() {
         let mut helper = spawn_signal_helper("job-control", true, false);
         let pid = helper.pid();
+        wait_for_first_progress(&helper.marker, "suspend interval");
         // SAFETY: `pid` is the id of the helper's dedicated process group, so
         // this models terminal foreground-group job control without touching
         // the surrounding test runner.
@@ -7082,6 +7908,7 @@ mod tests {
     fn an_inherited_blocked_sigcont_still_releases_the_isolated_tree() {
         let mut helper = spawn_signal_helper("job-control-cont-blocked", true, false);
         let pid = helper.pid();
+        wait_for_first_progress(&helper.marker, "blocked SIGCONT");
         assert_eq!(unsafe { libc::kill(-pid, libc::SIGTSTP) }, 0);
         assert!(
             wait_for_stop(pid, Duration::from_secs(10)),
@@ -7151,6 +7978,7 @@ mod tests {
     fn an_ignored_sighup_does_not_wake_a_suspended_tree() {
         let mut helper = spawn_signal_helper("job-control-nohup", true, true);
         let pid = helper.pid();
+        wait_for_first_progress(&helper.marker, "ignored SIGHUP");
         assert_eq!(unsafe { libc::kill(-pid, libc::SIGTSTP) }, 0);
         assert!(
             wait_for_stop(pid, Duration::from_secs(10)),
@@ -7241,5 +8069,347 @@ mod tests {
         let cmd = Command::new("tactus-definitely-not-a-real-binary");
         let err = run_with_timeout(cmd, "", Duration::from_secs(1)).expect_err("must fail");
         assert!(err.to_string().contains("failed to spawn"));
+    }
+
+    // -----------------------------------------------------------------------
+    // ST-16 (d) — the Unix reaper kills the dead coordinator's containers
+    // -----------------------------------------------------------------------
+
+    /// A disposable coordinator that arms the container scope, starts one
+    /// supervised agent, and then waits to be killed.
+    ///
+    /// A subprocess, because the claim is about what survives a coordinator's
+    /// death and this test process must survive to assert it. The `docker` the
+    /// scope names is a **recording stub**, so the argument vectors the reaper
+    /// actually execs are readable afterwards and the assertion is on a
+    /// sequence rather than on "a container went away".
+    #[cfg(unix)]
+    #[test]
+    #[ignore = "subprocess helper"]
+    #[allow(clippy::zombie_processes)]
+    fn unix_reaper_container_helper() {
+        if std::env::var_os("TACTUS_REAPER_CONTAINERS").is_none() {
+            return;
+        }
+        let stub = std::path::PathBuf::from(std::env::var_os("TACTUS_STUB").expect("stub path"));
+        let root = std::path::PathBuf::from(std::env::var_os("TACTUS_ROOT").expect("root"));
+        let incarnation = std::env::var("TACTUS_INCARNATION").expect("incarnation");
+        let agent = std::path::PathBuf::from(std::env::var_os("TACTUS_AGENT").expect("agent path"));
+
+        let scope =
+            crate::runner::container::census::ReaperContainerScope::new(stub, &root, &incarnation)
+                .expect("a scope");
+        super::set_container_reclaim_scope(Some(&scope)).expect("arm the reaper");
+
+        let mut supervisor = termination::Supervisor::begin().expect("start a private reaper");
+        let mut command = Command::new("/bin/sh");
+        command
+            .args(["-c", "sleep 120"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        supervisor.prepare(&mut command);
+        let child = command.spawn().expect("spawn an agent in its own group");
+        supervisor
+            .register(child.id())
+            .expect("register the agent group");
+        std::fs::write(&agent, child.id().to_string()).expect("record the agent pid");
+        if std::env::var_os("TACTUS_REAPER_CONTAINERS_CLEAN_EXIT").is_some() {
+            // The **live**-coordinator half: the invocation is settled the
+            // ordinary way and this process exits without dying.
+            drop(supervisor);
+            return;
+        }
+        thread::sleep(Duration::from_secs(120));
+        std::mem::forget(supervisor);
+    }
+
+    /// The Unix reaper kills the dead coordinator's labeled containers.
+    ///
+    /// ST-16 (d), and `os_matrix`: "the cleanup reaper survives coordinator
+    /// death, settles the dead coordinator's process groups **while holding
+    /// R28**, and **additionally kills the dead coordinator's labeled
+    /// containers**, closing the orphan window".
+    ///
+    /// Four claims, each separately droppable, and each asserted:
+    ///
+    /// 1. the selector names **both** `tactus.private_root` and
+    ///    `tactus.incarnation`, with two distinct values — a reaper that
+    ///    filtered on the private root alone would kill every container of every
+    ///    run under `<R>`, including a **live** coordinator's, which is exactly
+    ///    what `authoritative_state` forbids;
+    /// 2. the order is `ps` → `kill` → `rm --force`, taken from the stub's own
+    ///    ordered log;
+    /// 3. R28 is **still held** while the kill is in flight — the stub blocks
+    ///    inside `kill` and the reaper is observed alive there, so a reaper that
+    ///    released its hold and then reclaimed would fail;
+    /// 4. the agent group is settled too, so the container half did not replace
+    ///    the process half.
+    ///
+    /// **Second field held constant**: the fixture is run twice with the same
+    /// scope, the same stub and the same agent — the only thing that moves is
+    /// whether the coordinator **dies** or exits cleanly. On a clean exit the
+    /// stub is never invoked at all, which is the assertion that keeps a reaper
+    /// from killing a live coordinator's containers on the ordinary settle path.
+    #[cfg(unix)]
+    #[test]
+    fn unix_reaper_kills_labeled_containers() {
+        const CONTAINER_ID: &str =
+            "c0ffee0000000000000000000000000000000000000000000000000000000001";
+        const PRIVATE_ROOT: &str = "/srv/tactus-reaper-fixture/private";
+        const INCARNATION: &str = "01KZTAAAAAAAAAAAAAAAAAAAAA";
+
+        fn scratch(tag: &str) -> std::path::PathBuf {
+            let dir = std::env::temp_dir().join(format!(
+                "tactus-reaper-containers-{tag}-{}-{}",
+                std::process::id(),
+                crate::ulid::ulid()
+            ));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir).expect("scratch");
+            dir
+        }
+        fn alive(pid: i32) -> bool {
+            // SAFETY: signal 0 performs no delivery.
+            unsafe { libc::kill(pid, 0) == 0 }
+        }
+        fn read_pid(path: &std::path::Path, timeout: Duration) -> i32 {
+            let deadline = Instant::now() + timeout;
+            loop {
+                if let Ok(text) = std::fs::read_to_string(path) {
+                    if let Ok(pid) = text.trim().parse() {
+                        return pid;
+                    }
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "{} never carried a pid",
+                    path.display()
+                );
+                thread::sleep(Duration::from_millis(10));
+            }
+        }
+        fn wait_for(path: &std::path::Path, timeout: Duration) -> bool {
+            let deadline = Instant::now() + timeout;
+            while Instant::now() < deadline {
+                if path.exists() {
+                    return true;
+                }
+                thread::sleep(Duration::from_millis(10));
+            }
+            false
+        }
+
+        // {program spelling} x {coordinator dies}. The **bare** cell is the
+        // production shape — `runner::container::DOCKER_PROGRAM` is the bare
+        // name `docker` — and here it is resolvable *only* through `PATH`: the
+        // stub is written into a scratch directory prepended to the
+        // coordinator's `PATH`, and nothing of that name exists in the working
+        // directory the coordinator inherits. `execv` does not search `PATH`,
+        // so this is the cell that dies when the resolution before the fork
+        // goes away; the path-spelled cell is what keeps a repair that resolved
+        // bare names from breaking the spelling that already worked.
+        //
+        // The fourth cell, {bare} x {lives}, is deliberately absent: on the
+        // clean-exit path the reaper execs nothing at all, so the spelling
+        // cannot discriminate there and the cell would assert the same absent
+        // log as the one beside it.
+        const STUB_NAME: &str = "tactus-reaper-docker-stub";
+        for (bare, coordinator_dies) in [(true, true), (false, true), (false, false)] {
+            let cell = match (bare, coordinator_dies) {
+                (true, true) => "bare-dies",
+                (false, true) => "path-dies",
+                _ => "path-lives",
+            };
+            let dir = scratch(cell);
+            let stub = dir.join(STUB_NAME);
+            let log = dir.join("argv.log");
+            // A recording `docker`. It reports one container the first time it
+            // is listed and nothing once that container has been removed, which
+            // is what ends the reaper's bounded round loop. `kill` blocks so the
+            // R28 assertion has a window to observe.
+            std::fs::write(
+                &stub,
+                format!(
+                    "#!/bin/sh\n\
+                     printf '%s\\n' \"$*\" >> \"$TACTUS_STUB_DIR/argv.log\"\n\
+                     case \"$1\" in\n\
+                     ps) [ -f \"$TACTUS_STUB_DIR/removed\" ] || printf '%s\\n' '{CONTAINER_ID}' ;;\n\
+                     kill) : > \"$TACTUS_STUB_DIR/killing\"; sleep 1 ;;\n\
+                     rm) : > \"$TACTUS_STUB_DIR/removed\" ;;\n\
+                     esac\n\
+                     exit 0\n"
+                )
+                .replace("{CONTAINER_ID}", CONTAINER_ID),
+            )
+            .expect("write the stub");
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt as _;
+                std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755))
+                    .expect("make the stub executable");
+            }
+
+            let agent_path = dir.join("agent");
+            let reaper_path = dir.join("reaper");
+            let named: std::path::PathBuf = if bare {
+                std::path::PathBuf::from(STUB_NAME)
+            } else {
+                stub.clone()
+            };
+            let mut coordinator = Command::new(std::env::current_exe().expect("test executable"));
+            coordinator
+                .args(["unix_reaper_container_helper", "--ignored", "--nocapture"])
+                .env("TACTUS_REAPER_CONTAINERS", "1")
+                .env("TACTUS_STUB", &named)
+                .env("TACTUS_STUB_DIR", &dir)
+                .env("TACTUS_ROOT", PRIVATE_ROOT)
+                .env("TACTUS_INCARNATION", INCARNATION)
+                .env("TACTUS_AGENT", &agent_path)
+                .env("TACTUS_TEST_REAPER_PID_PATH", &reaper_path)
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null());
+            if bare {
+                // Only through `PATH`: the scratch directory first, the
+                // inherited entries after it so the stub's own `sleep` still
+                // resolves.
+                let inherited = std::env::var_os("PATH").unwrap_or_default();
+                let mut search = vec![dir.clone()];
+                search.extend(std::env::split_paths(&inherited));
+                coordinator.env(
+                    "PATH",
+                    std::env::join_paths(search).expect("a synthetic PATH"),
+                );
+            }
+            if !coordinator_dies {
+                coordinator.env("TACTUS_REAPER_CONTAINERS_CLEAN_EXIT", "1");
+            }
+            let mut coordinator = coordinator.spawn().expect("spawn a disposable coordinator");
+
+            let agent_pid = read_pid(&agent_path, Duration::from_secs(30));
+            let reaper_pid = read_pid(&reaper_path, Duration::from_secs(30));
+
+            if !coordinator_dies {
+                // The live half: the coordinator settles its invocation and
+                // exits. Nothing may have been killed on its behalf.
+                coordinator.wait().expect("reap the coordinator");
+                thread::sleep(Duration::from_millis(500));
+                assert!(
+                    !log.exists(),
+                    "the reaper reclaimed a LIVE coordinator's containers on the ordinary \
+                     settle path: {:?}",
+                    std::fs::read_to_string(&log)
+                );
+                let _ = std::fs::remove_dir_all(&dir);
+                continue;
+            }
+
+            assert!(alive(agent_pid), "the agent never started");
+            coordinator.kill().expect("hard-kill the coordinator");
+            coordinator.wait().expect("reap the coordinator");
+
+            // (3) R28 is still held while the container kill is in flight.
+            assert!(
+                wait_for(&dir.join("killing"), Duration::from_secs(30)),
+                "[{cell}] the reaper never issued a container kill"
+            );
+            assert!(
+                alive(reaper_pid),
+                "the reaper exited — releasing its shared cleanup hold — before the container \
+                 kill it was in the middle of returned"
+            );
+
+            // (2) The order, from the stub's own ordered log.
+            let deadline = Instant::now() + Duration::from_secs(30);
+            let lines = loop {
+                let lines: Vec<String> = std::fs::read_to_string(&log)
+                    .unwrap_or_default()
+                    .lines()
+                    .map(str::to_owned)
+                    .collect();
+                if lines.len() >= 3 || Instant::now() >= deadline {
+                    break lines;
+                }
+                thread::sleep(Duration::from_millis(20));
+            };
+            assert!(
+                lines.len() >= 3,
+                "[{cell}] the reaper's docker log is {lines:#?}"
+            );
+            assert!(lines[0].starts_with("ps "), "{lines:#?}");
+            assert_eq!(lines[1], format!("kill {CONTAINER_ID}"), "{lines:#?}");
+            // The removal the reaper **actually executed**, against the
+            // declaration in `ReaperContainerScope::remove_argv` rather than
+            // against a literal repeated here (`PR6-ACCT-006`). The fork side
+            // builds its argv from `c"…"` literals that nothing can read back
+            // at runtime, so without this comparison the declaration and the
+            // behaviour are two self-consistent halves with nothing crossing
+            // them — the shape `PR6E-005` measured on the view path. `argv[0]`
+            // is dropped because the stub logs the arguments only.
+            //
+            // `--volumes` is what makes it the same removal `DockerCli::remove`
+            // issues: the reaper is the *only* thing that removes a dead
+            // coordinator's containers on Unix, and an `rm` without it leaks
+            // one anonymous volume per container into a state no later census
+            // can discover, the container being gone and nothing else referring
+            // to the volume.
+            let declared = crate::runner::container::census::ReaperContainerScope::new(
+                "docker",
+                std::path::Path::new(PRIVATE_ROOT),
+                INCARNATION,
+            )
+            .expect("a scope")
+            .remove_argv(CONTAINER_ID);
+            assert_eq!(lines[2], declared[1..].join(" "), "{lines:#?}");
+
+            // (1) Both filters, two distinct values.
+            let filters: Vec<&str> = lines[0]
+                .split_whitespace()
+                .filter(|word| word.starts_with("label="))
+                .collect();
+            assert_eq!(
+                filters.len(),
+                2,
+                "the reaper's selector is `{}`; a filter on the private root alone names every \
+                 container of every run under it, including a live coordinator's",
+                lines[0]
+            );
+            assert!(
+                filters
+                    .iter()
+                    .any(|filter| *filter == format!("label=tactus.private_root={PRIVATE_ROOT}"))
+            );
+            assert!(
+                filters
+                    .iter()
+                    .any(|filter| *filter == format!("label=tactus.incarnation={INCARNATION}"))
+            );
+            assert_eq!(
+                filters
+                    .iter()
+                    .collect::<std::collections::BTreeSet<_>>()
+                    .len(),
+                2,
+                "two filters carrying one value is one filter"
+            );
+
+            // (4) The process half still happened.
+            let settled_by = Instant::now() + Duration::from_secs(30);
+            while alive(agent_pid) && Instant::now() < settled_by {
+                thread::sleep(Duration::from_millis(50));
+            }
+            let settled = !alive(agent_pid);
+            // SAFETY: cleanup for the failing case, a no-op for the passing one.
+            unsafe {
+                let _ = libc::kill(agent_pid, libc::SIGKILL);
+                let _ = libc::kill(-agent_pid, libc::SIGKILL);
+            }
+            let _ = std::fs::remove_dir_all(&dir);
+            assert!(
+                settled,
+                "the container half replaced the process half: the agent group survived"
+            );
+        }
     }
 }

@@ -12,7 +12,6 @@
 #![allow(clippy::disallowed_methods, clippy::disallowed_macros)]
 
 use std::path::PathBuf;
-use std::sync::OnceLock;
 use std::time::Duration;
 
 use serde_json::{Value, json};
@@ -76,13 +75,15 @@ impl AgentAdapter for ClaudeCodeAdapter {
     }
 
     fn probe(&self, runner: &dyn Runner) -> Result<Caps, TactusError> {
-        let invocation = locate()?;
-        let out = runner.run(&probe_request(
-            ADAPTER_ID,
-            invocation.spec(&["--version".to_owned()])?,
-            probe_ordinal::VERSION,
-            PROBE_TIMEOUT,
-        )?)?;
+        let invocation = cli();
+        let out = runner
+            .run(&probe_request(
+                ADAPTER_ID,
+                invocation.spec(&["--version".to_owned()])?,
+                probe_ordinal::VERSION,
+                PROBE_TIMEOUT,
+            )?)
+            .map_err(|cause| bin::boundary_refused(CLI, INSTALL_HINT, &cause))?;
         if out.output_limited {
             return Err(TactusError::Agent {
                 message: format!(
@@ -136,7 +137,10 @@ impl AgentAdapter for ClaudeCodeAdapter {
     fn build(&self, run: &TaskRun) -> Result<CommandSpec, TactusError> {
         // No `current_dir`: the workspace is the runner's, carried on
         // `RunnerRequest.workspace` (DESIGN.md:118 — the runner "owns cwd").
-        locate()?.spec(&build_args(run))
+        // No resolution either: `cli()` names the CLI and the runner decides
+        // which file that is, so this and `probe` above send one program
+        // string by construction.
+        cli().spec(&build_args(run))
     }
 
     fn parse(&self, out: &ProcessOutput) -> Result<Outcome, TactusError> {
@@ -147,13 +151,15 @@ impl AgentAdapter for ClaudeCodeAdapter {
     /// token and reads no credential file: the CLI answers about itself, and
     /// this reads its answer.
     fn discover(&self, runner: &dyn Runner, _caps: &Caps) -> Result<Discovery, TactusError> {
-        let invocation = locate()?;
-        let out = runner.run(&probe_request(
-            ADAPTER_ID,
-            invocation.spec(&["auth".to_owned(), "status".to_owned(), "--json".to_owned()])?,
-            probe_ordinal::AUTH_STATUS,
-            PROBE_TIMEOUT,
-        )?)?;
+        let invocation = cli();
+        let out = runner
+            .run(&probe_request(
+                ADAPTER_ID,
+                invocation.spec(&["auth".to_owned(), "status".to_owned(), "--json".to_owned()])?,
+                probe_ordinal::AUTH_STATUS,
+                PROBE_TIMEOUT,
+            )?)
+            .map_err(|cause| bin::boundary_refused(CLI, INSTALL_HINT, &cause))?;
         let mut discovery = parse_auth_status(&out);
         // §13's tier classification comes from the catalog either way, but
         // saying so is what stops the pools file reading as though the roster
@@ -585,24 +591,21 @@ fn parse_usage(payload: &Value) -> Option<Usage> {
 // mechanics live in `super::bin`, shared with every other adapter.
 // ---------------------------------------------------------------------------
 
-fn candidate_names() -> &'static [&'static str] {
-    if cfg!(windows) {
-        &["claude.exe", "claude.cmd", "claude.bat"]
-    } else {
-        &["claude"]
-    }
-}
+/// This CLI, as the boundary that will execute it names it.
+///
+/// One name, not a platform-dependent candidate list. Choosing between
+/// `claude.exe`, `claude.cmd` and `claude.bat` was a *filesystem lookup*, and
+/// this adapter no longer performs one: on Windows the extension search is
+/// `PATHEXT`'s and belongs to whatever resolves the name, and inside a
+/// container image there is no extension to search. `gates::ShellKind::spec`
+/// has always named `cmd` and `pwsh` exactly this way.
+const CLI: &str = "claude";
 
-/// This adapter's own resolution cache; `bin::locate` fills it once.
-static RESOLVED: OnceLock<Option<Invocation>> = OnceLock::new();
+/// What to tell an operator whose boundary has no `claude`.
+const INSTALL_HINT: &str = "Install Claude Code there, or select a different agent.";
 
-fn locate() -> Result<Invocation, TactusError> {
-    bin::locate(candidate_names(), &RESOLVED, |tried| {
-        format!(
-            "claude binary not found on PATH (looked for {}); install Claude Code or adjust PATH",
-            tried.join(", ")
-        )
-    })
+fn cli() -> Invocation {
+    Invocation::named(CLI)
 }
 
 #[cfg(test)]
@@ -998,7 +1001,10 @@ mod tests {
     // without Claude Code stays green.
     #[test]
     fn probe_against_real_binary_when_present() {
-        if locate().is_err() {
+        // The host runner's boundary *is* this machine, so what gates this is
+        // whether this machine has the CLI — asked of `util::find_program`
+        // rather than of the adapter, which no longer knows.
+        if crate::util::find_program(CLI).is_none() {
             eprintln!("claude not on PATH; skipping live probe");
             return;
         }

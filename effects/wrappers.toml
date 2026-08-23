@@ -255,6 +255,10 @@ effectful = [
 ]
 effectful_unnameable = []
 effect_free = [
+    # Reads two counters. The thread-local half is what makes an assertion on a
+    # durability barrier EXACT rather than a lower bound a neighbouring test's
+    # thread can satisfy (`PR6-LANEF-001`).
+    "barriers_on_this_thread",
     "barriers_performed",
     "clear",
     "deserialize",
@@ -262,8 +266,6 @@ effect_free = [
     "fence_for",
     "filename_component",
     "find_program",
-    "find_program_candidates",
-    "find_program_candidates_on_path",
     "head",
     "is_recording",
     "off",
@@ -300,6 +302,12 @@ funnel = [
 effectful = []
 effectful_unnameable = []
 effect_free = [
+    # `EventHooks` default bodies, in the classification domain since the
+    # parser was repaired (`PR6-LANEF-007`). Each returns a constant or does
+    # nothing: `WrittenShape::Complete`, `DurabilityLedger::off()`, `{}`.
+    "durability_ledger",
+    "synced",
+    "written_kill_shape",
     "bytes",
     "committed_bytes",
     "first_line_digest",
@@ -347,6 +355,8 @@ effect_free = [
     "policy",
     "policy_digest",
     "preflight",
+    "program_resolutions",
+    "program_searches",
     "reserved_keys",
     "reserved_values",
     "run",
@@ -358,6 +368,75 @@ effect_free = [
     "with_base",
     "with_environment",
     "with_hooks",
+]
+
+# PR6's Container funnel. The read-only inspections of `ContainerRuntime`
+# (`probe`, `image_by_reference`, `image_by_id`, `volume_present`,
+# `containers_with_label`, `observe`, `collect`) are classified EFFECT-FREE:
+# `ContainerSite` has no inspection variant, `classify_object_residue` is the
+# tree's precedent for "a read-only inspection (no effect)", and lane B's policy
+# resolution is required to call them ("resolved by read-only inspection"). They
+# do start a `docker` subprocess, and that subprocess start is accounted by
+# `src/runner/container.rs`'s row in
+# `runner::tests::every_production_process_start_is_classified` rather than
+# here.
+[[module]]
+path = "src/runner/container.rs"
+crate_path = "tactus::runner::container"
+funnel = [
+    "write_intent",
+    "create_container",
+    "start_container",
+    "mount_git_view",
+    "stop_container",
+    "remove_container",
+    "unmount_git_view",
+    "remove_intent",
+    # `PR6-ACCT-007`: `Container.RemoveIntent` reached for a name whose
+    # published half never landed. The frozen `ContainerSite` has eight
+    # variants and this is that same site, not a ninth.
+    "remove_staged_intent",
+    "launch",
+    "release",
+    "reclaim",
+]
+effectful = [
+    "runtime::ContainerRuntime::create",
+    "runtime::ContainerRuntime::start",
+    "runtime::ContainerRuntime::stop",
+    "runtime::ContainerRuntime::remove",
+    "GitView::materialize",
+    "GitView::discard",
+]
+effectful_unnameable = []
+effect_free = [
+    # `ContainerHooks::trace`'s default body -- `ContainerTrace::off()`, what
+    # production passes. In the domain since `PR6-LANEF-007`.
+    "trace",
+    "available",
+    # `PR6-RECOV-005`: the two halves of "could not be reached" vs "reached and
+    # refused". Both read a string and return a value; neither touches the
+    # machine, which is the point -- the classification is reachable, and
+    # testable, without a daemon.
+    "classify_docker_failure",
+    "is_unreachable_diagnostic",
+    "closed_by_a_reaper",
+    "collect",
+    "containers_with_label",
+    "image_by_id",
+    "image_by_reference",
+    "list_intents",
+    # `PR6-ACCT-007`: the staged half of the same namespace scan. A directory
+    # read and a parse, like `list_intents` beside it.
+    "list_staged_intents",
+    "new",
+    "observe",
+    "observe_terminated",
+    "orphan_window",
+    "phase",
+    "probe",
+    "read_intent",
+    "volume_present",
 ]
 
 [[module]]
@@ -527,6 +606,11 @@ funnel = []
 effectful = []
 effectful_unnameable = []
 effect_free = [
+    # `SpawnHooks` default bodies. `child_created` does nothing; `point_mode`
+    # delegates to `point`, which is an observer question and not an effect.
+    # In the domain since `PR6-LANEF-007`.
+    "child_created",
+    "point_mode",
     "active_processes_with",
     "ambient_job_established",
     "child_in_ambient_job",
@@ -546,6 +630,13 @@ effect_free = [
     "process_creation_time",
     "run_with_timeout",
     "run_with_timeout_hooked",
+    # Writes a value into a process-local `OnceLock<Mutex<..>>` that every
+    # cleanup reaper started afterwards renders into argv before its `fork`.
+    # No effect outside this process: the reaper performs the effect, inside
+    # `Container.Stop`/`Container.Remove`'s own primitives, and only after its
+    # coordinator has died. The same classification `poison_ambient_for_tests`
+    # carries, for the same reason.
+    "set_container_reclaim_scope",
     "terminate_and_wait",
     "terminate_and_wait_with",
 ]
@@ -648,6 +739,9 @@ effect_free = [
     "effort_for",
     "files",
     "for_resume",
+    # `RunnerSelection::host_default` — what an absent `[runner]` section means.
+    # A struct literal over owned values; it reaches no primitive and no path.
+    "host_default",
     "implementation_effort",
     "load",
     "load_captured",
@@ -774,10 +868,10 @@ funnel = []
 effectful = []
 effectful_unnameable = []
 effect_free = [
+    "boundary_refused",
     "display",
     "extract_version",
-    "locate",
-    "locate_with",
+    "named",
     "spec",
 ]
 
@@ -802,6 +896,10 @@ effect_free = [
 effect = [
     "_exit",
     "close",
+    # Rewrites the descriptor table of the process that calls it. The Unix
+    # reaper's container half puts its listing pipe on fd 1 with it, in the
+    # forked child before `execv`.
+    "dup2",
     "execl",
     "execle",
     "execlp",
@@ -916,6 +1014,7 @@ not_an_effect = [
     "_SC_OPEN_MAX",
     "__errno_location",
     "__error",
+    "c_char",
     "c_int",
     "c_short",
     "c_void",
