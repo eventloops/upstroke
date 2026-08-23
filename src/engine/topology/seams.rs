@@ -21,7 +21,6 @@
 //! abstraction would be the duplication the rest of this design exists to
 //! avoid.
 
-use std::path::Path;
 use std::sync::{Arc, Mutex};
 
 use crate::agent::proc::SpawnHooks;
@@ -294,25 +293,6 @@ impl IdSource for RealIds {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Containment helper shared by the lanes
-// ---------------------------------------------------------------------------
-
-/// Whether `path` is inside `root` after both are canonicalised.
-///
-/// A convenience over the two funnels' own containment checks, for the
-/// *reporting* paths that must name a location without deleting anything. It
-/// authorises nothing: every deletion goes through the funnel that owns its
-/// site, and `WorkspaceManager::contained` remains the only gate on a removal
-/// inside the execution root.
-#[must_use]
-pub fn is_within(root: &Path, path: &Path) -> bool {
-    let (Ok(root), Ok(path)) = (root.canonicalize(), path.canonicalize()) else {
-        return false;
-    };
-    path.starts_with(&root) && path != root
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -480,39 +460,5 @@ mod tests {
         assert_eq!(fixed.run_id(), fixed.run_id());
         assert_eq!(fixed.incarnation(), fixed.incarnation());
         assert_eq!(fixed.pid(), 4242);
-    }
-
-    /// Containment is canonical and excludes the root itself.
-    ///
-    /// Over paths that already exist, because this module may create none:
-    /// `src/engine/topology/**` is a `TOPOLOGY_MODULE`, so `fs::create_dir_all`
-    /// is a disallowed method here in tests as well as in production.
-    ///
-    /// The reason it may carry no allow is narrower than "topology modules may
-    /// not be allowlisted", which is false —
-    /// `the_legacy_section_never_contains_a_topology_module` asserts four
-    /// topology modules are in the **funnel** section, and the ban is on the
-    /// legacy section alone. The reason is that a funnel entry must be
-    /// "reviewed to perform effects only inside site-taking APIs", and this
-    /// module is a conductor, not a funnel: it has no site-taking API to
-    /// confine an effect to. The repository
-    /// this crate is compiled from supplies a root and a child that are both
-    /// real, both stable, and neither of which anything has to make.
-    #[test]
-    fn is_within_is_canonical_and_excludes_the_root_itself() {
-        let root = Path::new(env!("CARGO_MANIFEST_DIR"));
-        let inside = root.join("src").join("engine");
-
-        assert!(is_within(root, &inside));
-        assert!(!is_within(root, root), "the root is not inside itself");
-        assert!(!is_within(&inside, root), "the relation is not symmetric");
-        assert!(
-            !is_within(root, &root.join("upstroke-is-within-absent")),
-            "a path that does not canonicalise is not inside anything"
-        );
-        assert!(
-            !is_within(&root.join("upstroke-is-within-absent"), &inside),
-            "a root that does not canonicalise contains nothing"
-        );
     }
 }

@@ -780,6 +780,20 @@ impl TopologyFold {
     // `run_started` yet, rather than an `Option`: no task of an unstarted run
     // is ready, and such a run holds no entitlement. Those are statements, not
     // defaults.
+    //
+    // **A poisoned fold authorises nothing.** `plan_transition` refuses with
+    // `FoldError::Poisoned` once an append has returned an error, and INV-20
+    // says "no completion is applied after the fold is poisoned by a returned
+    // append error". A predicate that kept answering `true` would let the
+    // coordinator select work from a state this process can no longer vouch
+    // for, and the append-error protocol's "no report, cleanup, or question
+    // payload is derived from the poisoned fold" would hold in the emit path
+    // and leak here. So every predicate below is false once poisoned.
+    //
+    // `pipeline_held` is the one exception and stays a count: it is accounting,
+    // not authorisation. Its caller must not derive a report from it after a
+    // poisoned append either, but that is a rule about reports, and answering
+    // `0` would be a false statement about the run rather than a refusal.
     // -----------------------------------------------------------------------
 
     /// Whether `key` may be dispatched into a fresh generation.
@@ -787,7 +801,7 @@ impl TopologyFold {
     /// `decisions.admission_and_leases.ready`.
     #[must_use]
     pub fn ready(&self, key: TaskKey) -> bool {
-        self.run.as_ref().is_some_and(|run| run.ready(key))
+        !self.poisoned && self.run.as_ref().is_some_and(|run| run.ready(key))
     }
 
     /// Whether `key` may take its next attempt in the generation it retained.
@@ -797,7 +811,7 @@ impl TopologyFold {
     /// of the predicate, which is why a caller must not re-derive it.
     #[must_use]
     pub fn ready_retry(&self, key: TaskKey) -> bool {
-        self.run.as_ref().is_some_and(|run| run.ready_retry(key))
+        !self.poisoned && self.run.as_ref().is_some_and(|run| run.ready_retry(key))
     }
 
     /// The pipeline entitlement currently held, derived from the fold.
@@ -813,7 +827,7 @@ impl TopologyFold {
     /// Whether a further pipeline entitlement is within `max_parallel`.
     #[must_use]
     pub fn pipeline_reservable(&self) -> bool {
-        self.run.as_ref().is_some_and(RunState::pipeline_reservable)
+        !self.poisoned && self.run.as_ref().is_some_and(RunState::pipeline_reservable)
     }
 
     /// Whether some task could be dispatched, retried, or integrated from this
@@ -824,17 +838,21 @@ impl TopologyFold {
     /// ceiling check is applied *to*, not a substitute for it.
     #[must_use]
     pub fn structurally_admissible(&self) -> bool {
-        self.run
-            .as_ref()
-            .is_some_and(RunState::structurally_admissible)
+        !self.poisoned
+            && self
+                .run
+                .as_ref()
+                .is_some_and(RunState::structurally_admissible)
     }
 
     /// Whether an integration transaction could start from this state.
     #[must_use]
     pub fn integration_admissible(&self) -> bool {
-        self.run
-            .as_ref()
-            .is_some_and(RunState::integration_admissible)
+        !self.poisoned
+            && self
+                .run
+                .as_ref()
+                .is_some_and(RunState::integration_admissible)
     }
 
     // -----------------------------------------------------------------------
@@ -4326,6 +4344,48 @@ mod tests {
             "a retained generation is retried, never re-dispatched"
         );
         assert!(fold.structurally_admissible());
+    }
+
+    /// A poisoned fold authorises nothing.
+    ///
+    /// INV-20: "no completion is applied after the fold is poisoned by a
+    /// returned append error". `plan_transition` already refuses; a predicate
+    /// that kept answering `true` would let the coordinator select work from a
+    /// state this process can no longer vouch for.
+    #[test]
+    fn a_poisoned_fold_authorises_nothing_while_still_reporting_what_it_holds() {
+        let mut fold = started();
+        assert!(
+            fold.structurally_admissible(),
+            "`alpha` is dispatchable before anything happens"
+        );
+        apply(&mut fold, &dispatch(ALPHA, 0, &sha("base")));
+        assert_eq!(fold.pipeline_held(), 1);
+        // `alpha` now has an open generation and the other two depend on it,
+        // so nothing is admissible even unpoisoned. Poison it from a state
+        // where the *entitlement* is held, which is what the last assertion
+        // is about.
+
+        fold.poison();
+
+        assert!(fold.is_poisoned());
+        for key in [ZETA, ALPHA, MID] {
+            assert!(!fold.ready(key), "a poisoned fold offered a dispatch");
+            assert!(!fold.ready_retry(key), "a poisoned fold offered a retry");
+        }
+        assert!(!fold.pipeline_reservable());
+        assert!(!fold.structurally_admissible());
+        assert!(!fold.integration_admissible());
+
+        // Accounting, not authorisation: answering `0` here would be a false
+        // statement about the run rather than a refusal. The rule that keeps a
+        // report from being derived from this is the append-error protocol's,
+        // and it belongs in the emit path.
+        assert_eq!(
+            fold.pipeline_held(),
+            1,
+            "the entitlement is still held; only the authorisation is withdrawn"
+        );
     }
 
     /// Drive one task from pending to merged over the fast path, at the head

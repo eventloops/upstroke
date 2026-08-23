@@ -230,6 +230,28 @@ pub struct SlotAssertion {
     released: u32,
 }
 
+/// Whether `invocation`'s process takes an atomic `{agent, pool?}` slot pair.
+///
+/// `permits.agent_pool_slots` lists the slotted roles and then excludes two by
+/// name: "**gate invocations and the shell probe acquire no slot**". Both
+/// exclusions are recoverable from the identity alone — a gate is
+/// `AttemptRole::Gate`/`SequenceRole::Gate`, the shell probe is
+/// `ProbeTarget::Shell` — so this is a total function of the id rather than a
+/// second field a caller could set wrongly.
+///
+/// [`crate::runner::ExecutionRole::is_slotted`] states the same rule over the
+/// request's role. The two agree by construction because both read the packet
+/// sentence, and `a_gate_and_the_shell_probe_are_refused_a_slot_pair` pins
+/// this side of it; `src/runner/**` is frozen, so they cannot be unified here.
+#[must_use]
+pub fn is_slotted(invocation: &InvocationId) -> bool {
+    match invocation {
+        InvocationId::Attempt { role, .. } => !matches!(role, AttemptRole::Gate(_)),
+        InvocationId::Sequence { role, .. } => !matches!(role, SequenceRole::Gate(_)),
+        InvocationId::Probe { target, .. } => matches!(target, ProbeTarget::Agent(_)),
+    }
+}
+
 /// The atomic pair a slotted invocation holds.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SlotPair {
@@ -258,6 +280,14 @@ impl SlotAssertion {
         invocation: &InvocationId,
         pair: SlotPair,
     ) -> Result<(), UpstrokeError> {
+        if !is_slotted(invocation) {
+            return Err(UpstrokeError::Refused {
+                message: format!(
+                    "`{invocation}` is a gate or the shell probe and acquires no slot: \
+                     `permits.agent_pool_slots` excludes both by name"
+                ),
+            });
+        }
         if let Some((held, _)) = &self.held {
             return Err(UpstrokeError::Refused {
                 message: format!(
@@ -293,6 +323,19 @@ impl SlotAssertion {
                 message: format!("`{invocation}` released a slot pair nothing holds"),
             }),
         }
+    }
+
+    /// The pair `invocation` holds, if it holds one.
+    ///
+    /// Present so a test can assert **which** pair was taken. Without it the
+    /// stored [`SlotPair`] is write-only, and "agent probes acquire their slot
+    /// pair (asserted)" would assert only that *a* pair was held.
+    #[must_use]
+    pub fn pair_of(&self, invocation: &InvocationId) -> Option<&SlotPair> {
+        self.held
+            .as_ref()
+            .filter(|(held, _)| held == invocation)
+            .map(|(_, pair)| pair)
     }
 
     /// Whether `invocation` holds the pair.
@@ -795,6 +838,64 @@ mod tests {
             .expect("then the second");
         slots.release(&review).expect("release the second");
         assert!(slots.balances());
+    }
+
+    /// A gate and the shell probe are refused a slot pair.
+    ///
+    /// `permits.agent_pool_slots` excludes both by name. Asserted over every
+    /// shape of identity rather than one, because the rule is three separate
+    /// exclusions — `AttemptRole::Gate`, `SequenceRole::Gate`,
+    /// `ProbeTarget::Shell` — and a check that knew only the first would pass a
+    /// suite testing only attempts.
+    #[test]
+    fn a_gate_and_the_shell_probe_are_refused_a_slot_pair() {
+        let attempt = ids(1);
+        let seq = SequenceIdentities::new(SequenceId(1));
+
+        for (label, id) in [
+            ("an attempt's gate", attempt.gate(0, 0)),
+            ("a sequence's gate", seq.gate(0, 0)),
+            (
+                "the shell probe",
+                PreflightIdentities::shell(0).expect("the shell probe"),
+            ),
+        ] {
+            assert!(!is_slotted(&id), "{label} was classified as slotted");
+            let mut slots = SlotAssertion::new();
+            let refused = slots
+                .acquire(&id, pair("claude"))
+                .expect_err("{label} was given a slot pair");
+            assert!(
+                refused.to_string().contains("acquires no slot"),
+                "{label}: {refused}"
+            );
+            assert!(slots.is_empty(), "{label} left a pair held");
+            assert!(slots.balances());
+        }
+
+        // And the four slotted shapes are still accepted, so the refusal is a
+        // rule rather than a blanket.
+        for (label, id) in [
+            ("the worker", attempt.worker()),
+            ("a review pass", attempt.review_pass(0, 0)),
+            ("a re-ask", attempt.review_reask(0, 0)),
+            (
+                "an agent probe",
+                PreflightIdentities::agent("claude", 0).expect("an agent probe"),
+            ),
+        ] {
+            assert!(is_slotted(&id), "{label} was classified as non-slotted");
+            let mut slots = SlotAssertion::new();
+            slots
+                .acquire(&id, pair("claude"))
+                .unwrap_or_else(|error| panic!("{label} was refused a slot pair: {error}"));
+            assert_eq!(
+                slots.pair_of(&id).map(|p| p.agent.as_str()),
+                Some("claude"),
+                "{label} held a pair the table cannot name"
+            );
+            slots.release(&id).expect("released");
+        }
     }
 
     /// A release naming another invocation is refused, not ignored.

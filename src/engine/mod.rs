@@ -31,11 +31,16 @@ mod report;
 mod resume;
 /// The schema-4 run lifecycle.
 ///
-/// `pub` where its siblings are private, and deliberately: the capability
-/// types in here carry compile-fail fixtures that build out-of-process
-/// against the public path. Behind a private `mod` every one of those
-/// refusals would collapse to `E0603` — a compile-fail test passing because
-/// the module is unreachable, not because the token did its job.
+/// `pub` where its siblings are private, and deliberately. The capability
+/// types this module will carry are to be guarded by compile-fail fixtures
+/// that build out-of-process against the public path, in the shape
+/// `src/rundir.rs` already uses for [`crate::rundir::PrivateHalfProof`].
+/// Behind a private `mod` every one of those refusals would collapse to
+/// `E0603` — a compile-fail test passing because the module is unreachable
+/// rather than because the token did its job.
+///
+/// No such fixture exists yet: the visibility is set ahead of the types, which
+/// is the cheap order to do it in.
 pub mod topology;
 
 use crate::agent::proc::NoHooks;

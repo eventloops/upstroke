@@ -14,14 +14,22 @@
 //! classified findings across PR3–PR6, `wrong_internal_assumption` is 48.3%,
 //! three times `wrong_external_fact`.
 //!
-//! That measurement is why the shape here is what it is. A rule this module
-//! could get wrong at runtime is preferably a rule the type checker refuses to
-//! compile: the recovery order is a chain of witnesses each consuming the last,
-//! the creator's one deletion boundary is a token minted from the outcome of
-//! the step that could have crossed it, and P0–P8 is a typestate. That is the
-//! same device [`crate::rundir::PrivateHalfProof`],
+//! That measurement is the argument for the shape this module is being built
+//! into: a rule it could get wrong at runtime is preferably a rule the type
+//! checker refuses to compile. Three such rules are **planned and not yet
+//! written** — a recovery order that is a chain of witnesses each consuming the
+//! last, a creator deletion boundary minted only from the outcome of the step
+//! that could have crossed it, and P0–P8 as a typestate. None of them exists
+//! here today; what exists is the seams and the identity ledgers they will be
+//! built on.
+//!
+//! Stated in the future tense deliberately. The device is established —
+//! [`crate::rundir::PrivateHalfProof`],
 //! [`crate::runner::container::intent::IntentWritten`] and
-//! [`crate::topology::fold::TopologyDelta`] already use, for the same reason.
+//! [`crate::topology::fold::TopologyDelta`] all use it — but a module comment
+//! that describes an intended shape as an existing one is a false claim about
+//! the code, and this project treats that as a defect rather than as
+//! optimism.
 //!
 //! # Nothing here is a production path yet
 //!
@@ -35,9 +43,9 @@ pub mod seams;
 
 pub use identity::{
     AttemptIdentities, InvocationLedger, PreflightIdentities, ReservationKind, Reservations,
-    SequenceIdentities, SlotAssertion, SlotPair,
+    SequenceIdentities, SlotAssertion, SlotPair, is_slotted,
 };
 pub use seams::{
     HarnessTopologyHooks, IdSource, NoTopologyHooks, RealIds, SystemClock, TimeSource,
-    TopologyHooks, is_within,
+    TopologyHooks,
 };
