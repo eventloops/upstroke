@@ -495,13 +495,14 @@ fn the_legacy_section_never_contains_a_topology_module() {
         "a topology module is in the frozen legacy section"
     );
 
-    // Executed: each of the four banned shapes is refused on its own, so a
-    // check that only knew about `src/topology/` would fail here.
+    // Executed: each of the banned shapes is refused on its own, so a check
+    // that only knew about `src/topology/` would fail here.
     let probes = [
         "src/topology/registry.rs",
         "src/runner/mod.rs",
         "src/workspace_manager.rs",
         "src/engine/topology.rs",
+        "src/engine/topology/create.rs",
     ];
     for probe in probes {
         assert_eq!(
@@ -514,6 +515,36 @@ fn the_legacy_section_never_contains_a_topology_module() {
         probes.len(),
         TOPOLOGY_MODULES.len(),
         "one probe per banned shape"
+    );
+
+    // The gap the fifth shape closes, executed rather than described.
+    //
+    // `topology_modules_among` matches with `str::starts_with`, and the packet
+    // sentence names `src/engine/topology.rs` — a file. PR7 makes the schema-4
+    // engine a directory, and `"src/engine/topology/create.rs"` does not start
+    // with `"src/engine/topology.rs"`. Run the check with only the four shapes
+    // the sentence names and it returns nothing for a submodule: the ban would
+    // have stopped covering every file of the module it exists to cover, and
+    // nothing would have said so.
+    //
+    // A test that has never been seen red is not coverage. This is the red.
+    let sentence_shapes = [
+        "src/topology/",
+        "src/runner/",
+        "src/workspace_manager.rs",
+        "src/engine/topology.rs",
+    ];
+    let submodule = "src/engine/topology/create.rs";
+    assert!(
+        !submodule.starts_with("src/engine/topology.rs"),
+        "the prefix relation this entry exists for no longer holds"
+    );
+    assert!(
+        !sentence_shapes
+            .iter()
+            .any(|banned| submodule.starts_with(banned) || *banned == submodule),
+        "the four shapes the packet sentence names already cover `{submodule}`, \
+         so the fifth entry is dead weight and should be removed"
     );
 
     // The ban is on the LEGACY section alone: the same sentence puts

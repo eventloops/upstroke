@@ -651,11 +651,24 @@ pub const FROZEN_LEGACY_ALLOWLIST: &[&str] = &[
 /// `src/runner/{host,container,invocation}.rs` and `src/workspace_manager.rs`
 /// are in the funnel section without contradiction — the same sentence lists
 /// them there.
+///
+/// `src/engine/topology/` is the fifth entry and is **not** in the packet
+/// sentence, which names `src/engine/topology.rs` only. It is here because
+/// [`topology_modules_among`] matches with `str::starts_with`, and
+/// `"src/engine/topology/create.rs"` does not start with
+/// `"src/engine/topology.rs"` — the sentence's four shapes were written when
+/// the schema-4 engine was one file, and PR7 makes it a directory. Without
+/// this entry the ban silently stops covering every submodule of the module it
+/// exists to cover. Widening a ban is not a relaxation of the packet, and
+/// `the_legacy_section_never_contains_a_topology_module` executes the gap: it
+/// asserts the four-entry list misses a submodule that the five-entry list
+/// catches.
 pub const TOPOLOGY_MODULES: &[&str] = &[
     "src/topology/",
     "src/runner/",
     "src/workspace_manager.rs",
     "src/engine/topology.rs",
+    "src/engine/topology/",
 ];
 
 /// Entries of `current` that the frozen list does not contain — i.e. growth.

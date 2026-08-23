@@ -758,6 +758,86 @@ impl TopologyFold {
     }
 
     // -----------------------------------------------------------------------
+    // Selection predicates
+    //
+    // `decisions.admission_and_leases` defines `ready` and `ready_retry` as
+    // "structural over fold state only", and INV-22 makes entitlements
+    // fold-enforced. The loop that drives a run therefore has to ask the fold
+    // these questions rather than answer them itself: a second implementation
+    // of "which generation classes hold the pipeline entitlement" is two rules
+    // that can disagree, and `wrong_internal_assumption` is the largest
+    // measured root cause in this project by a factor of three.
+    //
+    // What stays with the caller is the packet's actual division of labour:
+    // the loop decides *which* eligible item to take and checks the budget
+    // ceiling (`sequential_substrate.loop`; a breach appends `budget_exceeded`
+    // before any effect), and the fold decides *whether* an item is
+    // structurally eligible. These accessors are that second half and nothing
+    // more — each delegates to the private predicate it names and adds no
+    // logic of its own.
+    //
+    // Each returns the value that is true of a run which has not recorded its
+    // `run_started` yet, rather than an `Option`: no task of an unstarted run
+    // is ready, and such a run holds no entitlement. Those are statements, not
+    // defaults.
+    // -----------------------------------------------------------------------
+
+    /// Whether `key` may be dispatched into a fresh generation.
+    ///
+    /// `decisions.admission_and_leases.ready`.
+    #[must_use]
+    pub fn ready(&self, key: TaskKey) -> bool {
+        self.run.as_ref().is_some_and(|run| run.ready(key))
+    }
+
+    /// Whether `key` may take its next attempt in the generation it retained.
+    ///
+    /// `decisions.admission_and_leases.ready_retry`. False in any incarnation
+    /// but the retaining one — `retained_incarnation == state.resumes` is part
+    /// of the predicate, which is why a caller must not re-derive it.
+    #[must_use]
+    pub fn ready_retry(&self, key: TaskKey) -> bool {
+        self.run.as_ref().is_some_and(|run| run.ready_retry(key))
+    }
+
+    /// The pipeline entitlement currently held, derived from the fold.
+    ///
+    /// Generations in `OpenNoAttempt`, `InFlight` and `Promoting` hold one
+    /// each; `RetainedIdle` and `Closed` hold none; an unresolved integration
+    /// transaction holds one. `decisions.admission_and_leases.permits.pipeline`.
+    #[must_use]
+    pub fn pipeline_held(&self) -> usize {
+        self.run.as_ref().map_or(0, RunState::pipeline_held)
+    }
+
+    /// Whether a further pipeline entitlement is within `max_parallel`.
+    #[must_use]
+    pub fn pipeline_reservable(&self) -> bool {
+        self.run.as_ref().is_some_and(RunState::pipeline_reservable)
+    }
+
+    /// Whether some task could be dispatched, retried, or integrated from this
+    /// state alone.
+    ///
+    /// Budget, capacity and runner availability are not consulted — this is
+    /// what "structurally admissible" means, and it is the predicate the
+    /// ceiling check is applied *to*, not a substitute for it.
+    #[must_use]
+    pub fn structurally_admissible(&self) -> bool {
+        self.run
+            .as_ref()
+            .is_some_and(RunState::structurally_admissible)
+    }
+
+    /// Whether an integration transaction could start from this state.
+    #[must_use]
+    pub fn integration_admissible(&self) -> bool {
+        self.run
+            .as_ref()
+            .is_some_and(RunState::integration_admissible)
+    }
+
+    // -----------------------------------------------------------------------
     // The transition
     // -----------------------------------------------------------------------
 
@@ -4135,6 +4215,117 @@ mod tests {
                 },
             },
         })
+    }
+
+    // --- selection accessors -----------------------------------------------
+
+    /// The accessors answer for an unstarted run, and answer it as a statement
+    /// rather than as an `Option` the caller must decide what to do with.
+    #[test]
+    fn selection_accessors_report_an_unstarted_run_as_holding_and_offering_nothing() {
+        let fold = TopologyFold::new(inputs());
+        assert_eq!(fold.pipeline_held(), 0, "nothing is dispatched yet");
+        assert!(!fold.pipeline_reservable(), "there is no max_parallel yet");
+        assert!(!fold.structurally_admissible());
+        assert!(!fold.integration_admissible());
+        for key in [ZETA, ALPHA, MID] {
+            assert!(!fold.ready(key), "no task of an unstarted run is ready");
+            assert!(!fold.ready_retry(key));
+        }
+    }
+
+    /// `ready` is the fold's predicate, not a constant: exactly the task whose
+    /// dependencies are met is ready, and the two that depend on it are not.
+    #[test]
+    fn ready_names_only_the_task_whose_dependencies_are_merged() {
+        let fold = started();
+        assert!(fold.ready(ALPHA), "`alpha` has no dependencies");
+        assert!(!fold.ready(ZETA), "`zeta` depends on `alpha`");
+        assert!(!fold.ready(MID), "`mid` depends on `alpha` and `zeta`");
+        assert!(
+            fold.structurally_admissible(),
+            "one ready task makes the run admissible"
+        );
+        assert!(
+            !fold.integration_admissible(),
+            "nothing is queued for integration"
+        );
+    }
+
+    /// `pipeline_held` counts what the packet says holds the entitlement, and
+    /// the count moves with the generation class.
+    ///
+    /// This is the accessor a caller would otherwise re-derive by walking
+    /// `GenerationClass` itself, so the assertion is that the accessor agrees
+    /// with the classes actually present — not merely that it returns a number.
+    #[test]
+    fn pipeline_held_tracks_the_generation_classes_that_hold_the_entitlement() {
+        let mut fold = started();
+        assert_eq!(fold.pipeline_held(), 0);
+
+        apply(&mut fold, &dispatch(ALPHA, 0, &sha("base")));
+        assert_eq!(
+            fold.pipeline_held(),
+            1,
+            "`OpenNoAttempt` holds a pipeline entitlement"
+        );
+        assert!(matches!(
+            fold.task(ALPHA).and_then(TaskFold::open).map(|g| &g.class),
+            Some(GenerationClass::OpenNoAttempt)
+        ));
+        assert!(
+            !fold.ready(ALPHA),
+            "a task with an open generation is not ready for a fresh dispatch"
+        );
+
+        let start = attempt_started(&fold, ALPHA, 0, 1, 0);
+        apply(&mut fold, &start);
+        assert_eq!(fold.pipeline_held(), 1, "`InFlight` holds one, not two");
+
+        // max_parallel is 3 in this fixture, so one held entitlement leaves
+        // room — the reservable predicate is a comparison, not a boolean flag.
+        assert!(fold.pipeline_reservable());
+    }
+
+    /// A settlement to `RetainedIdle` releases the pipeline entitlement while
+    /// keeping the generation open — the one class whose two properties differ.
+    #[test]
+    fn a_retained_generation_holds_no_pipeline_entitlement_and_is_ready_to_retry() {
+        let mut fold = started();
+        apply(&mut fold, &dispatch(ALPHA, 0, &sha("base")));
+        let start = attempt_started(&fold, ALPHA, 0, 1, 0);
+        apply(&mut fold, &start);
+        apply(
+            &mut fold,
+            &settle(
+                ALPHA,
+                0,
+                1,
+                AttemptSettlement::Retained {
+                    retained_session: SessionId("sess-ÜNI-0007".to_owned()),
+                    retained_incarnation: Epoch(0),
+                },
+            ),
+        );
+
+        assert_eq!(
+            fold.pipeline_held(),
+            0,
+            "`RetainedIdle` releases the entitlement"
+        );
+        assert!(
+            fold.task(ALPHA).and_then(TaskFold::open).is_some(),
+            "and keeps the generation open"
+        );
+        assert!(
+            fold.ready_retry(ALPHA),
+            "the retaining incarnation may retry in place"
+        );
+        assert!(
+            !fold.ready(ALPHA),
+            "a retained generation is retried, never re-dispatched"
+        );
+        assert!(fold.structurally_admissible());
     }
 
     /// Drive one task from pending to merged over the fast path, at the head
