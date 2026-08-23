@@ -3916,6 +3916,101 @@ mod tests {
         fs::create_dir_all(present.join("nested")).expect("a tree to remove");
         assert!(remove_tree_once_handles_close(&present).is_ok());
         assert!(!present.exists(), "and it is actually gone");
+        // `scratch` has no `Drop` guard, so a test that does not remove its own
+        // root leaves one empty directory in the temp dir per process, forever.
+        // Three had already accumulated from this test alone before it was
+        // noticed -- the same leak recorded against `rundir.rs::scratch` in
+        // `reviews/FINDINGS.md`, reintroduced by the test that reported it.
+        fs::remove_dir_all(&root).expect("this test cleans up after itself");
+    }
+
+    /// The repair's own blind spot. Validating against the whole `EffectSiteId`
+    /// registry accepted any *real* site, including the many this sampler never
+    /// drives — so `Object.CandidateCommitTree` parsed, matched none of the four
+    /// sampled sites, and every one of them fell through to a fresh measurement
+    /// while the run reported success.
+    ///
+    /// Measured on the unfixed repair: zero `replayed` markers, four fresh
+    /// budgets, `test result: ok`. No mutation was needed to expose it.
+    #[test]
+    fn a_real_site_this_sampler_never_drives_is_refused() {
+        let stage = EffectSiteId::Object(ObjectSite::CandidateStage);
+        assert_eq!(
+            parse_budget_spec("Object.CandidateCommitTree=44365", stage),
+            Err(BudgetSpecError::NotSampled(
+                "Object.CandidateCommitTree".to_owned()
+            )),
+        );
+        // Every site the sampler *does* drive is still accepted, so the new check
+        // narrows the domain to exactly the replayable set and no further.
+        for site in SAMPLED_SITES {
+            assert_eq!(
+                parse_budget_spec(&format!("{}=1000", site.name()), site),
+                Ok(Some(std::time::Duration::from_micros(1000))),
+                "{} is sampled and must be replayable",
+                site.name()
+            );
+        }
+    }
+
+    /// `std::env::var` reports `NotPresent` and `NotUnicode` as different errors.
+    /// Collapsing them made a spec that was set but not valid UTF-8 look exactly
+    /// like no spec at all — every site measuring fresh, against the adjacent
+    /// promise that an unhonourable spec is refused.
+    ///
+    /// This tests the environment *edge* rather than the parser. All the other
+    /// replay tests call `parse_budget_spec` directly, so before this existed the
+    /// panic arm could be replaced with `Err(_) => None` and the whole suite
+    /// stayed green.
+    #[test]
+    fn an_absent_variable_is_absence_and_a_present_one_is_not() {
+        let stage = EffectSiteId::Object(ObjectSite::CandidateStage);
+        assert_eq!(
+            budget_from_var(Err(std::env::VarError::NotPresent), stage),
+            None,
+            "no spec means measure, which is the ordinary case"
+        );
+        assert_eq!(
+            budget_from_var(Ok("Object.CandidateStage=44365".to_owned()), stage),
+            Some(std::time::Duration::from_micros(44365)),
+        );
+    }
+
+    /// The edge must refuse a spec the parser rejects, not just an unreadable
+    /// variable. Without this, replacing the parse-error arm with
+    /// `Err(_) => None` leaves every other replay test green: they all call
+    /// `parse_budget_spec` directly and never exercise what the edge does with
+    /// its answer.
+    #[test]
+    #[should_panic(expected = "not a spec this run can honour")]
+    fn a_spec_the_parser_rejects_is_refused_at_the_environment_edge() {
+        let _ = budget_from_var(
+            Ok("Object.CandidateStgae=44365".to_owned()),
+            EffectSiteId::Object(ObjectSite::CandidateStage),
+        );
+    }
+
+    /// The other half of the edge: a value that is present but unusable must not
+    /// be mistaken for absence.
+    #[test]
+    #[should_panic(expected = "not valid UTF-8")]
+    fn a_present_but_non_unicode_variable_is_refused_not_treated_as_unset() {
+        let invalid = {
+            #[cfg(unix)]
+            {
+                use std::os::unix::ffi::OsStringExt as _;
+                std::ffi::OsString::from_vec(vec![0x66, 0x6f, 0x80, 0x6f])
+            }
+            #[cfg(not(unix))]
+            {
+                use std::os::windows::ffi::OsStringExt as _;
+                std::ffi::OsString::from_wide(&[0x66, 0x6f, 0xD800, 0x6f])
+            }
+        };
+        let _ = budget_from_var(
+            Err(std::env::VarError::NotUnicode(invalid)),
+            EffectSiteId::Object(ObjectSite::CandidateStage),
+        );
     }
 
     /// A process the engine killed can still be closing its handles, and on Windows
@@ -7833,12 +7928,7 @@ mod tests {
     #[test]
     fn sampled_git_child_kills_every_residue_classified_and_recovered() {
         let mut records = Vec::new();
-        for site in [
-            EffectSiteId::Object(ObjectSite::CandidateStage),
-            EffectSiteId::Object(ObjectSite::CandidateWriteTree),
-            EffectSiteId::Object(ObjectSite::ProposalCherryPick),
-            EffectSiteId::Worktree(WorktreeSite::Add),
-        ] {
+        for site in SAMPLED_SITES {
             let run = sample_site(site);
             let record = run.record;
             println!(
@@ -8457,6 +8547,22 @@ mod tests {
     /// machines, which is how a sampler with `SAMPLING_N = 8` covers more than eight
     /// kill points over its lifetime. The measurement stays; it is merely recorded,
     /// and overridable when replaying one specific red run.
+    /// The sites this sampler drives, and therefore the only sites a replay spec
+    /// may name.
+    ///
+    /// Shared with [`parse_budget_spec`] so the two cannot disagree. Validating
+    /// against the whole `EffectSiteId` registry was not enough: it accepted
+    /// `Object.CandidateCommitTree` — a real site nothing here samples — whereupon
+    /// every site fell through to a fresh measurement and the run reported success
+    /// having replayed nothing. That is the same fail-open the strictness was added
+    /// to remove, wearing a name that passes validation.
+    const SAMPLED_SITES: [EffectSiteId; 4] = [
+        EffectSiteId::Object(ObjectSite::CandidateStage),
+        EffectSiteId::Object(ObjectSite::CandidateWriteTree),
+        EffectSiteId::Object(ObjectSite::ProposalCherryPick),
+        EffectSiteId::Worktree(WorktreeSite::Add),
+    ];
+
     /// Why a `TACTUS_RESIDUE_BUDGET_US` spec was refused.
     #[derive(Debug, PartialEq, Eq)]
     enum BudgetSpecError {
@@ -8467,6 +8573,11 @@ mod tests {
         /// every entry is validated, which is why this is an error rather than a
         /// miss.
         UnknownSite(String),
+        /// A real site that this sampler never drives. Distinct from
+        /// [`Self::UnknownSite`] because the fix is different: the name is spelled
+        /// correctly and simply cannot be replayed, which the message should say
+        /// rather than claiming it does not exist.
+        NotSampled(String),
         /// A value that is not a positive whole number of microseconds.
         NotAPositiveInteger(String),
         /// A value past [`MAX_REPLAY_BUDGET_US`].
@@ -8511,6 +8622,9 @@ mod tests {
             // way as one that does not exist at all.
             let named = EffectSiteId::from_name(name)
                 .map_err(|_| BudgetSpecError::UnknownSite(name.to_owned()))?;
+            if !SAMPLED_SITES.contains(&named) {
+                return Err(BudgetSpecError::NotSampled(name.to_owned()));
+            }
             if seen.iter().any(|already| already == name) {
                 return Err(BudgetSpecError::Duplicate(name.to_owned()));
             }
@@ -8533,17 +8647,26 @@ mod tests {
         Ok(found)
     }
 
-    /// The environment edge: read the variable, then hand the parsing to
-    /// [`parse_budget_spec`].
+    /// Decide a replay from what the environment gave us.
     ///
-    /// A spec that cannot be honoured **panics** rather than falling back to a
-    /// fresh measurement. Failing open was the original defect: an operator asking
-    /// to replay a red run got a green one that had replayed nothing, and the only
-    /// evidence was a missing word in stdout. A replay that does not replay is
-    /// worse than no replay, because it answers the question it did not ask.
-    fn replayed_budget(site: EffectSiteId) -> Option<std::time::Duration> {
-        let Ok(raw) = std::env::var("TACTUS_RESIDUE_BUDGET_US") else {
-            return None;
+    /// Takes the [`std::env::var`] result rather than reading it, so the three
+    /// cases can be tested without mutating process-global state that parallel
+    /// tests share. The distinction matters: `var` reports **`NotPresent` and
+    /// `NotUnicode` as different errors**, and collapsing them made a spec that
+    /// was present but not valid UTF-8 look exactly like no spec at all — every
+    /// site measuring fresh while the adjacent promise says an unhonourable spec
+    /// is refused.
+    fn budget_from_var(
+        var: Result<String, std::env::VarError>,
+        site: EffectSiteId,
+    ) -> Option<std::time::Duration> {
+        let raw = match var {
+            Ok(raw) => raw,
+            Err(std::env::VarError::NotPresent) => return None,
+            Err(std::env::VarError::NotUnicode(raw)) => panic!(
+                "TACTUS_RESIDUE_BUDGET_US is set but is not valid UTF-8 ({raw:?}), so it \
+                 cannot be parsed. It will not be treated as unset."
+            ),
         };
         match parse_budget_spec(&raw, site) {
             Ok(found) => found,
@@ -8552,6 +8675,12 @@ mod tests {
                  Fix the spec or unset it; it will not be silently ignored."
             ),
         }
+    }
+
+    /// The environment read itself, kept to one line so nothing but the read is
+    /// untestable.
+    fn replayed_budget(site: EffectSiteId) -> Option<std::time::Duration> {
+        budget_from_var(std::env::var("TACTUS_RESIDUE_BUDGET_US"), site)
     }
 
     /// Enough work in the worktree that the sampled command has a middle to be
