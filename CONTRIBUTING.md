@@ -6,12 +6,11 @@ project currently is.
 
 Every change enters `master` through the same path: open a draft pull request early, wait for the
 deterministic CI and PR-policy gates, then obtain an independent frontier-model review of the exact
-green head before merge. The default-branch attestation workflow reruns the mechanical gates on
-that exact SHA and uses a repository-scoped GitHub App to publish the required
-`upstroke-frontier-review` check. The branch rules bind that check to the App's integration id, and a
-new push invalidates it and restarts the sequence. See [`MAINTAINING.md`](MAINTAINING.md) for the
-full lifecycle, attestation step, and emergency policy. Contributions from external forks remain
-provisional until the separately owned fork canary described there has passed.
+green head before merge. The reviewed SHA and a durable link to the verdict are recorded in the
+pull request; a new push invalidates the review and restarts the sequence; the owner's merge is the
+attestation. See [`MAINTAINING.md`](MAINTAINING.md) for the full lifecycle, trust boundary, and
+emergency policy. Contributions from external forks remain provisional: the required checks are
+candidate-controlled, so a fork's entire diff — workflow edits included — is reviewed before merge.
 
 ## Before you send a PR
 
