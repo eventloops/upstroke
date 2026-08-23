@@ -1227,7 +1227,32 @@ mod tests {
     /// is the first line at exactly the module's own indentation.
     /// `src/engine/tests.rs` is a whole test module (`engine/mod.rs`:
     /// `#[cfg(test)] mod tests;`) and is excluded as one by every caller.
+    ///
+    /// **A visibility qualifier does not make a test module production.** The
+    /// predicate read the line after the attribute as `starts_with("mod ")`, so
+    /// a `#[cfg(test)] pub(crate) mod` — the shape a test module that another
+    /// module's tests must reach has to take — was kept whole and its
+    /// `Command::new` counted as a production process start. Measured: PR7's
+    /// `workspace_manager::fixture`, which exists precisely because a topology
+    /// module's tests cannot name `Command` themselves. This does not widen
+    /// what counts as test code: the block is still `#[cfg(test)]`-gated, which
+    /// is the whole of what "not production" means here.
     fn production_region(source: &str) -> String {
+        /// Whether `line` declares a module, with or without a visibility
+        /// qualifier in front of it.
+        fn declares_module(line: &str) -> bool {
+            let line = line.trim_start();
+            let rest = match line.find("mod ") {
+                Some(0) => return true,
+                Some(at) => &line[..at],
+                None => return false,
+            };
+            // Only a visibility qualifier may precede it: `pub`, `pub(crate)`,
+            // `pub(super)`, `pub(in …)`. Anything else — a `use` naming a
+            // module, a comment — is not a declaration.
+            rest.trim_end().starts_with("pub") && !rest.contains('=')
+        }
+
         let lines: Vec<&str> = source.lines().collect();
         let mut kept = String::new();
         let mut index = 0;
@@ -1236,7 +1261,7 @@ mod tests {
             let is_test_mod = line.trim() == "#[cfg(test)]"
                 && lines
                     .get(index + 1)
-                    .is_some_and(|next| next.trim_start().starts_with("mod "));
+                    .is_some_and(|next| declares_module(next));
             if !is_test_mod {
                 kept.push_str(line);
                 kept.push('\n');

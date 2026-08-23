@@ -38,7 +38,9 @@
 //! [`super::coordinator`]; a schema-4 run is reachable only from a
 //! `#[cfg(test)]` writer selector. PR12 activates it.
 
+pub mod attempt;
 pub mod candidate;
+pub mod dispatch;
 pub mod emit;
 pub mod identity;
 pub mod seams;
@@ -46,9 +48,17 @@ pub mod select;
 pub mod settle;
 pub mod startup;
 
+pub use attempt::{
+    AttemptContext, AttemptOutcome, AttemptPlan, AttemptRun, Capture, GatePlan, Judgement,
+    ReviewerPlan, Verdict,
+};
 pub use candidate::{
     CandidateJournal, CandidateNames, CandidateRecovery, JudgedTree, OrphanPin, PinnedCandidate,
     PromotingCandidate, QueuedCandidate, UnpinnedCandidate,
+};
+pub use dispatch::{
+    DispatchKind, DispatchRequest, Dispatched, EventEmitter, Reuse, close_at_run_end, dispatch,
+    materialize_repair, resume_open_no_attempt, task_slot, verify_or_recreate,
 };
 pub use emit::{
     AppendError, AppendOutcome, EmitError, EmitState, FirstAppendDisposition, RunIdentity, emit,
@@ -71,3 +81,20 @@ pub use startup::{
     BarrierHeld, CensusInputs, FreshCensused, ResumeCensused, RunDirCensusReport, RunDirEntry,
     RunDirOutcome, StartupCensus, WorktreeLocked, resume_census, startup_census,
 };
+
+/// The schema-4 run that `dispatch.rs` and `attempt.rs` are tested against.
+///
+/// One fixture for both, because the two halves of one lifecycle are tested
+/// against one run: an attempt test needs a dispatched generation and a
+/// dispatch test needs the attempt that never started. Declared here rather
+/// than under either module for the same reason.
+///
+/// **Private, and declared last.** Private because a module's own descendants
+/// can see it — `dispatch::tests` and `attempt::tests` both are — so a `pub`
+/// qualifier would widen it for nothing and would stop the two source censuses
+/// that recognise a whole-file test module by the literal `#[cfg(test)] mod `
+/// from recognising this one. Last because `effects::production_region` cuts a
+/// file at its first `#[cfg(test)]`, and a declaration higher up would take the
+/// re-exports above it out of every census that reads that region.
+#[cfg(test)]
+mod scaffold;

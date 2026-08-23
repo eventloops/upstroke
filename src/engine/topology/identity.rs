@@ -338,6 +338,19 @@ impl SlotAssertion {
             .map(|(_, pair)| pair)
     }
 
+    /// The invocation holding the pair, if any.
+    ///
+    /// [`Self::holds`] answers "is it this one"; this answers "which one". A
+    /// cancellation needs the second: `permits.protocol` cancels "a granted or
+    /// non-slotted running invocation", and at a halt the coordinator knows
+    /// that *a* pair is held without knowing whether it belongs to the worker,
+    /// a reviewer or a re-ask. Releasing by guess would leave the ledger
+    /// unbalanced at process end with nothing to say so.
+    #[must_use]
+    pub fn held(&self) -> Option<&InvocationId> {
+        self.held.as_ref().map(|(invocation, _)| invocation)
+    }
+
     /// Whether `invocation` holds the pair.
     #[must_use]
     pub fn holds(&self, invocation: &InvocationId) -> bool {

@@ -91,6 +91,7 @@ effect_free = [
     "ledger",
     "new",
     "object_directory",
+    "object_exists",
     "observed_residue_elements",
     "phase",
     "private_root",
