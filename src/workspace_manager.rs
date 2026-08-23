@@ -1056,8 +1056,10 @@ pub struct WorkspaceManager {
 ///
 /// Unix needs none of it — unlinking detaches the name regardless of open descriptors,
 /// so the first attempt succeeds — and the retry is not compiled in there. The bound
-/// is deliberate: a handle held longer than `ATTEMPTS * STEP` is not a closing process
-/// and its error is returned unchanged rather than masked.
+/// is deliberate: a handle held longer than `ATTEMPTS * STEP` is not a closing process,
+/// and the **last attempt's** error is returned rather than masked. It is not necessarily
+/// the first attempt's — a permanent ACL denial and a closing handle both answer error 5,
+/// and only the passage of `ATTEMPTS * STEP` tells them apart.
 ///
 /// **This is not `runner::container::racing_removal`, and the two must not be merged.**
 /// That one resolves a *handoff*: two threads racing on one path, where the loser needs
@@ -1078,6 +1080,15 @@ fn remove_tree_once_handles_close(path: &Path) -> std::io::Result<()> {
     loop {
         let error = match fs::remove_dir_all(path) {
             Ok(()) => return Ok(()),
+            // The path is gone, which for a *removal* is the requested outcome.
+            // On Windows this is exactly how a delete-pending name resolves: an
+            // earlier attempt answered `ERROR_ACCESS_DENIED`, the last handle
+            // closed, and the name went away — with no second actor involved, so
+            // the sequence arises on its own rather than needing a race with
+            // another remover. Reporting failure there would skip the Git-admin
+            // cleanup below for a tree that is already deleted.
+            // `runner::container::racing_removal` treats `NotFound` the same way.
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
             Err(error) => error,
         };
         let closing = matches!(
@@ -1095,7 +1106,13 @@ fn remove_tree_once_handles_close(path: &Path) -> std::io::Result<()> {
 
 #[cfg(not(windows))]
 fn remove_tree_once_handles_close(path: &Path) -> std::io::Result<()> {
-    fs::remove_dir_all(path)
+    match fs::remove_dir_all(path) {
+        // Same convergence rule as the Windows arm, so the two agree on what a
+        // removal *means*. Unix reaches it only by racing another remover rather
+        // than by delete-pending, but the answer is the same: the path is gone.
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        other => other,
+    }
 }
 
 impl WorkspaceManager {
@@ -3757,6 +3774,148 @@ mod tests {
             !fixture.manager.execution_root().exists(),
             "and perform no effect"
         );
+    }
+
+    /// `PR28-REPLAY-FAILS-OPEN`. A misspelled site name is byte-for-byte
+    /// indistinguishable from "this site was deliberately left to measure", so a
+    /// parser that only looks for the site it wants cannot tell them apart. It
+    /// returned `None`, the run measured fresh, and an operator who asked to
+    /// replay a red run got a green one that replayed nothing.
+    ///
+    /// Measured before the fix: `Object.CandidateStgae=44365` produced
+    /// `budget=39916us` with no `replayed` marker.
+    #[test]
+    fn a_replay_spec_naming_an_unknown_site_is_refused_rather_than_ignored() {
+        let stage = EffectSiteId::Object(ObjectSite::CandidateStage);
+        assert_eq!(
+            parse_budget_spec("Object.CandidateStgae=44365", stage),
+            Err(BudgetSpecError::UnknownSite(
+                "Object.CandidateStgae".to_owned()
+            )),
+        );
+        // The control that makes the assertion mean something: the *correctly*
+        // spelled name is accepted, so the refusal is about the typo and not
+        // about the parser rejecting everything.
+        assert_eq!(
+            parse_budget_spec("Object.CandidateStage=44365", stage),
+            Ok(Some(std::time::Duration::from_micros(44365))),
+        );
+    }
+
+    /// `PR28-REPLAY-FAILS-OPEN`, second shape. The old parser took the **first**
+    /// entry matching the site and then tried to parse it; a malformed first
+    /// entry produced `None` and a later valid duplicate was never reached.
+    ///
+    /// Measured before the fix: `...=abc,...=44365` produced `budget=40971us`
+    /// with no `replayed` marker, while `...=44365,...=abc` replayed at 44365 —
+    /// so which entry won depended on order, which is reason enough to refuse
+    /// duplicates outright.
+    #[test]
+    fn a_duplicated_site_is_refused_rather_than_resolved_by_order() {
+        let stage = EffectSiteId::Object(ObjectSite::CandidateStage);
+        assert_eq!(
+            parse_budget_spec(
+                "Object.CandidateStage=abc,Object.CandidateStage=44365",
+                stage
+            ),
+            Err(BudgetSpecError::NotAPositiveInteger(
+                "Object.CandidateStage=abc".to_owned()
+            )),
+        );
+        assert_eq!(
+            parse_budget_spec("Object.CandidateStage=1,Object.CandidateStage=2", stage),
+            Err(BudgetSpecError::Duplicate(
+                "Object.CandidateStage".to_owned()
+            )),
+        );
+    }
+
+    /// `PR28-REPLAY-UNBOUNDED`. `u64::MAX` parsed happily. Measured before the
+    /// fix: the printed ladder's first rung asked for 2_049_638_230_412_172_119
+    /// microseconds — about **64,949 years** — and `kill_git_child` sleeps
+    /// unconditionally, so the run would have ended at CI's job timeout rather
+    /// than at any assertion.
+    #[test]
+    fn a_replay_budget_past_the_ceiling_is_refused() {
+        let stage = EffectSiteId::Object(ObjectSite::CandidateStage);
+        assert_eq!(
+            parse_budget_spec("Object.CandidateStage=18446744073709551615", stage),
+            Err(BudgetSpecError::AboveCeiling {
+                site: "Object.CandidateStage".to_owned(),
+                micros: u64::MAX,
+            }),
+        );
+        // The boundary itself is allowed, so the ceiling is a limit and not an
+        // off-by-one that silently narrows what a replay may ask for.
+        assert_eq!(
+            parse_budget_spec(
+                &format!("Object.CandidateStage={MAX_REPLAY_BUDGET_US}"),
+                stage
+            ),
+            Ok(Some(std::time::Duration::from_micros(MAX_REPLAY_BUDGET_US))),
+        );
+    }
+
+    /// The legitimate partial replay this must not break: pin some sites, leave
+    /// the rest to measure. Witnessed by hand while building the feature — two
+    /// sites replayed and two measured in the same run — and pinned here so the
+    /// validation added above cannot quietly turn "unmentioned" into an error.
+    #[test]
+    fn a_spec_that_omits_a_site_leaves_that_site_to_be_measured() {
+        assert_eq!(
+            parse_budget_spec(
+                "Object.CandidateStage=44365",
+                EffectSiteId::Object(ObjectSite::ProposalCherryPick)
+            ),
+            Ok(None),
+        );
+        assert_eq!(
+            parse_budget_spec("", EffectSiteId::Object(ObjectSite::CandidateStage)),
+            Ok(None),
+        );
+    }
+
+    /// A malformed entry is refused even when it names no site this run asks
+    /// about, because the operator's intent was to replay and half a spec cannot
+    /// deliver it.
+    #[test]
+    fn a_malformed_entry_is_refused_even_for_a_site_this_run_does_not_want() {
+        assert_eq!(
+            parse_budget_spec(
+                "Object.ProposalCherryPick",
+                EffectSiteId::Object(ObjectSite::CandidateStage)
+            ),
+            Err(BudgetSpecError::Malformed(
+                "Object.ProposalCherryPick".to_owned()
+            )),
+        );
+    }
+
+    /// `PR28-NOTFOUND-NOT-CONVERGENCE`. A removal whose path is already gone has
+    /// achieved what it was asked to achieve. Before the fix this returned
+    /// `Err(NotFound)`, and `remove_worktree` would then skip the Git-admin
+    /// cleanup that follows it for a tree that was already deleted.
+    ///
+    /// On Windows the sequence needs no second actor: an attempt answers
+    /// `ERROR_ACCESS_DENIED` for a delete-pending name, the last handle closes,
+    /// and the next attempt finds nothing. Verified red before the fix by a
+    /// scratch test on the guest, which asserted `is_err()` and passed.
+    #[test]
+    fn removing_a_path_that_is_already_gone_is_convergence_not_failure() {
+        let root = scratch("already-gone");
+        fs::create_dir_all(&root).expect("fixture root");
+        let absent = root.join("no-such-tree");
+        assert!(!absent.exists(), "the fixture must not create it");
+        assert!(
+            remove_tree_once_handles_close(&absent).is_ok(),
+            "a path that is already gone is the outcome a removal wanted"
+        );
+        // And the ordinary case still works, so the arm above has not been
+        // widened into "every error is success".
+        let present = root.join("a-tree");
+        fs::create_dir_all(present.join("nested")).expect("a tree to remove");
+        assert!(remove_tree_once_handles_close(&present).is_ok());
+        assert!(!present.exists(), "and it is actually gone");
     }
 
     /// A process the engine killed can still be closing its handles, and on Windows
@@ -7973,7 +8132,9 @@ mod tests {
                     // The timescale the kill ladder was cut from. A red run's
                     // artifact carries it, and `TACTUS_RESIDUE_BUDGET_US` feeds it
                     // back -- which is what makes this sampler reproducible, since
-                    // it has no seed and this duration is all of its variance.
+                    // it has no seed and this duration is the only variance a
+                    // replay can pin. Wake times, Git's own progress, cache state
+                    // and scheduling still vary between runs.
                     "budget_us": u64::try_from(budget.as_micros()).unwrap_or(u64::MAX),
                     "budget_replayed": replayed,
                     "none": record.histogram.none,
@@ -8030,8 +8191,10 @@ mod tests {
         record: SamplingRecord,
         /// The timescale the kill ladder was cut from, and whether it was measured
         /// on this machine or replayed from `TACTUS_RESIDUE_BUDGET_US`. This is the
-        /// whole of the run's variance -- see [`measure_budget`] -- so it is the
-        /// whole of what reproducing a red run needs.
+        /// only variance a replay can pin -- see [`measure_budget`] -- so it is the
+        /// most a recorded run can offer. It is not *all* the variance: actual wake
+        /// times, Git's progress, cache state and scheduling still differ, so a
+        /// replay reproduces the nominal ladder rather than the original run.
         budget: std::time::Duration,
         replayed: bool,
         /// What `classify_object_residue` answered for each sample, in order.
@@ -8284,31 +8447,111 @@ mod tests {
     /// The kill ladder is a fixed set of fractions — `(run + 1) / (SAMPLING_N + 1)` —
     /// of a single duration, and that duration is how long one real `git` took on
     /// this machine at this moment. Load, page cache and disk move it; the fractions
-    /// never move. So the measured budget is the entire variance of the run, and
-    /// pinning it is the only thing that makes a failure reproducible.
+    /// never move. So the measured budget is the only variance a replay can pin,
+    /// and pinning it is the nearest thing to a reproducible failure available here
+    /// -- the ladder becomes identical, though the wake times it produces and Git's
+    /// own progress against them still vary run to run.
     ///
     /// A fixed default would be worse than the status quo: the point of re-measuring
     /// on every run is that the ladder lands in different places on different
     /// machines, which is how a sampler with `SAMPLING_N = 8` covers more than eight
     /// kill points over its lifetime. The measurement stays; it is merely recorded,
     /// and overridable when replaying one specific red run.
+    /// Why a `TACTUS_RESIDUE_BUDGET_US` spec was refused.
+    #[derive(Debug, PartialEq, Eq)]
+    enum BudgetSpecError {
+        /// An entry with no `=`.
+        Malformed(String),
+        /// A site name no `EffectSiteId` answers to. Almost always a typo — and a
+        /// typo is **indistinguishable from "leave this site to measure"** unless
+        /// every entry is validated, which is why this is an error rather than a
+        /// miss.
+        UnknownSite(String),
+        /// A value that is not a positive whole number of microseconds.
+        NotAPositiveInteger(String),
+        /// A value past [`MAX_REPLAY_BUDGET_US`].
+        AboveCeiling { site: String, micros: u64 },
+        /// The same site named twice, where which one wins would depend on order.
+        Duplicate(String),
+    }
+
+    /// The largest replay budget a spec may ask for.
+    ///
+    /// Four sites each sleep a ladder summing to about four budgets, so the whole
+    /// sampling costs roughly `16 x budget`. At five seconds that is 80 seconds of
+    /// sleeping — generous, since the largest budget ever *measured* here is about
+    /// 45 ms, and bounded, which unbounded input was not: `u64::MAX` parsed happily
+    /// and asked its first rung to sleep about 64,949 years, ending only at CI's
+    /// job timeout.
+    const MAX_REPLAY_BUDGET_US: u64 = 5_000_000;
+
+    /// Parse a replay spec, validating **every** entry, and return the budget for
+    /// `site` if the spec names it.
+    ///
+    /// Takes the spec as an argument rather than reading the environment, so it can
+    /// be unit tested without mutating process-global state that parallel tests
+    /// share. [`replayed_budget`] does the environment read at the edge.
+    fn parse_budget_spec(
+        raw: &str,
+        site: EffectSiteId,
+    ) -> Result<Option<std::time::Duration>, BudgetSpecError> {
+        let mut found = None;
+        let mut seen: Vec<String> = Vec::new();
+        for entry in raw
+            .split(',')
+            .map(str::trim)
+            .filter(|entry| !entry.is_empty())
+        {
+            let (name, micros) = entry
+                .split_once('=')
+                .ok_or_else(|| BudgetSpecError::Malformed(entry.to_owned()))?;
+            let (name, micros) = (name.trim(), micros.trim());
+            // Validated against the real site registry, not a list of the four this
+            // test samples, so a name that is merely misspelled is caught the same
+            // way as one that does not exist at all.
+            let named = EffectSiteId::from_name(name)
+                .map_err(|_| BudgetSpecError::UnknownSite(name.to_owned()))?;
+            if seen.iter().any(|already| already == name) {
+                return Err(BudgetSpecError::Duplicate(name.to_owned()));
+            }
+            seen.push(name.to_owned());
+            let value = micros
+                .parse::<u64>()
+                .ok()
+                .filter(|value| *value > 0)
+                .ok_or_else(|| BudgetSpecError::NotAPositiveInteger(entry.to_owned()))?;
+            if value > MAX_REPLAY_BUDGET_US {
+                return Err(BudgetSpecError::AboveCeiling {
+                    site: name.to_owned(),
+                    micros: value,
+                });
+            }
+            if named == site {
+                found = Some(std::time::Duration::from_micros(value));
+            }
+        }
+        Ok(found)
+    }
+
+    /// The environment edge: read the variable, then hand the parsing to
+    /// [`parse_budget_spec`].
+    ///
+    /// A spec that cannot be honoured **panics** rather than falling back to a
+    /// fresh measurement. Failing open was the original defect: an operator asking
+    /// to replay a red run got a green one that had replayed nothing, and the only
+    /// evidence was a missing word in stdout. A replay that does not replay is
+    /// worse than no replay, because it answers the question it did not ask.
     fn replayed_budget(site: EffectSiteId) -> Option<std::time::Duration> {
-        // Per site, never one number for all four. Their natural timescales differ
-        // by more than 40x -- `CandidateStage` measures tens of milliseconds and
-        // `ProposalCherryPick` about one -- so a single budget applied across them
-        // does not replay the red run, it runs a different experiment. Measured:
-        // forcing `CandidateWriteTree` to `CandidateStage`'s budget moved its
-        // histogram from none=4/internal=4 to none=7/internal=1.
-        //
-        // The format is the artifact's own: `Site.Name=micros`, comma separated,
-        // which is what `residue-histogram.json` already reports per site.
-        let raw = std::env::var("TACTUS_RESIDUE_BUDGET_US").ok()?;
-        raw.split(',')
-            .filter_map(|pair| pair.split_once('='))
-            .find(|(name, _)| name.trim() == site.name())
-            .and_then(|(_, micros)| micros.trim().parse::<u64>().ok())
-            .filter(|micros| *micros > 0)
-            .map(std::time::Duration::from_micros)
+        let Ok(raw) = std::env::var("TACTUS_RESIDUE_BUDGET_US") else {
+            return None;
+        };
+        match parse_budget_spec(&raw, site) {
+            Ok(found) => found,
+            Err(error) => panic!(
+                "TACTUS_RESIDUE_BUDGET_US is not a spec this run can honour: {error:?}. \
+                 Fix the spec or unset it; it will not be silently ignored."
+            ),
+        }
     }
 
     /// Enough work in the worktree that the sampled command has a middle to be
