@@ -38,11 +38,16 @@
 //! [`super::coordinator`]; a schema-4 run is reachable only from a
 //! `#[cfg(test)]` writer selector. PR12 activates it.
 
+pub mod candidate;
 pub mod emit;
 pub mod identity;
 pub mod seams;
 pub mod startup;
 
+pub use candidate::{
+    CandidateJournal, CandidateNames, CandidateRecovery, JudgedTree, OrphanPin, PinnedCandidate,
+    PromotingCandidate, QueuedCandidate, UnpinnedCandidate,
+};
 pub use emit::{
     AppendError, AppendOutcome, EmitError, EmitState, FirstAppendDisposition, RunIdentity, emit,
 };

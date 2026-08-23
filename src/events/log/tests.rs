@@ -3326,6 +3326,8 @@ fn the_stable_prefix_barrier_is_the_only_way_a_log_becomes_a_topology_fold() {
     // Sorted, asserted sorted, and asserted duplicate-free: an entry appended in
     // the wrong place, or twice by two merges, fails here rather than passing.
     const FOLD_MENTIONS: &[&str] = &[
+        // PR7's candidate pipeline. Holds a fold, builds none from bytes.
+        "src/engine/topology/candidate.rs",
         // PR7's emit path. It holds a fold and appends to a log and builds
         // neither from bytes — it obtains one from `establish_stable_prefix` —
         // so it names the type without adding to `callers` below.
