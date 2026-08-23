@@ -29,6 +29,7 @@ exclude = [
     ".testagent/",
     "acceptance/",
     "docs/",
+    "scripts/",
 ]
 
 [dependencies]

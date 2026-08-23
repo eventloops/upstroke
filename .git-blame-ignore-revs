@@ -1,0 +1,5 @@
+# Mechanical commits that should not own lines in `git blame`.
+# Use with: git config blame.ignoreRevsFile .git-blame-ignore-revs
+
+# The project rename (see CHANGELOG.md, Unreleased).
+94622ecfe47ac854bcf60a4f3ca5a29537abf672
