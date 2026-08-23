@@ -38,6 +38,6 @@ pub use identity::{
     SequenceIdentities, SlotAssertion, SlotPair,
 };
 pub use seams::{
-    HarnessTopologyHooks, IdSource, NoTopologyHooks, RealIds, SystemTime, TimeSource,
+    HarnessTopologyHooks, IdSource, NoTopologyHooks, RealIds, SystemClock, TimeSource,
     TopologyHooks, is_within,
 };

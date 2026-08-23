@@ -226,10 +226,17 @@ pub trait TimeSource {
 }
 
 /// Production: the system wall clock.
+///
+/// Named `SystemClock` rather than `SystemTime`. The obvious name shadows
+/// [`std::time::SystemTime`] inside the one module whose stated rule is that
+/// nothing here calls `SystemTime::now` — a reader grepping for that call would
+/// find this type instead, and a reviewer checking the rule would have to
+/// resolve the shadow by hand. A rule that is checkable by grep stops being one
+/// the moment its subject is ambiguous.
 #[derive(Debug, Clone, Copy, Default)]
-pub struct SystemTime;
+pub struct SystemClock;
 
-impl TimeSource for SystemTime {
+impl TimeSource for SystemClock {
     fn now_rfc3339(&self) -> String {
         crate::util::rfc3339_utc_now()
     }
@@ -443,7 +450,7 @@ mod tests {
     /// the fixed one produces exactly what it was given.
     #[test]
     fn a_time_source_produces_the_timestamp_a_durable_event_records() {
-        let live = SystemTime.now_rfc3339();
+        let live = SystemClock.now_rfc3339();
         assert_eq!(live.len(), 20, "RFC 3339 UTC to the second: {live}");
         assert!(live.ends_with('Z'), "{live}");
         assert_eq!(&live[4..5], "-");
@@ -479,8 +486,16 @@ mod tests {
     ///
     /// Over paths that already exist, because this module may create none:
     /// `src/engine/topology/**` is a `TOPOLOGY_MODULE`, so `fs::create_dir_all`
-    /// is a disallowed method here in tests as well as in production, and this
-    /// module carries no allow and may never be allowlisted. The repository
+    /// is a disallowed method here in tests as well as in production.
+    ///
+    /// The reason it may carry no allow is narrower than "topology modules may
+    /// not be allowlisted", which is false —
+    /// `the_legacy_section_never_contains_a_topology_module` asserts four
+    /// topology modules are in the **funnel** section, and the ban is on the
+    /// legacy section alone. The reason is that a funnel entry must be
+    /// "reviewed to perform effects only inside site-taking APIs", and this
+    /// module is a conductor, not a funnel: it has no site-taking API to
+    /// confine an effect to. The repository
     /// this crate is compiled from supplies a root and a child that are both
     /// real, both stable, and neither of which anything has to make.
     #[test]
