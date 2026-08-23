@@ -68,17 +68,17 @@ The contract that keeps this folder safe:
   **Unreviewed draft.** Preserve bounded private A/B/C checkpoints during one
   implementation so a bad D can rewind to C, while final verification still
   judges the complete task-base-to-result change.
-- [2026-08-13 — v0.2 — machine-readable Tactus commit provenance](2026-08-13-v0.2-tactus-commit-provenance.md):
-  **Unreviewed draft.** Retain `[tactus]` as the human-visible subject marker
+- [2026-08-13 — v0.2 — machine-readable Upstroke commit provenance](2026-08-13-v0.2-upstroke-commit-provenance.md):
+  **Unreviewed draft.** Retain `[upstroke]` as the human-visible subject marker
   and augment it with run/task/work/revision Git trailers, a predictable
-  `tactus` display identity, and optional annotated tags that expose accepted
+  `upstroke` display identity, and optional annotated tags that expose accepted
   `Initial work → Fix N` lineages without tagging rejected attempts.
 - [2026-08-13 — v0.5 — portfolio coordination and cross-story scheduling](2026-08-13-v0.5-portfolio-coordination.md):
   coordinate multiple active stories as one portfolio — shared work, hidden
   dependencies, contention, parallelism.
   Critiques: [claude](2026-08-13-v0.5-portfolio-coordination-critique-claude.md).
 - [2026-08-13 — v0.3 — public run viewer](2026-08-13-v0.3-public-run-viewer.md):
-  a read-only public projection of the event log — tactus building tactus,
+  a read-only public projection of the event log — upstroke building upstroke,
   with receipts.
 - [2026-08-13 — v0.2 — structured review-finding telemetry](2026-08-13-v0.2-review-finding-telemetry.md):
   **Unreviewed draft.** Extend the verdict contract with a `findings` array and

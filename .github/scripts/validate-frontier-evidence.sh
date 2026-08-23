@@ -8,9 +8,9 @@ fi
 
 reviewed_sha="$1"
 comment_body="$(cat)"
-expected_body="$(printf 'TACTUS_FRONTIER_REVIEW: 1\nVERDICT: PASS\nREVIEWED_SHA: %s' "$reviewed_sha")"
+expected_body="$(printf 'UPSTROKE_FRONTIER_REVIEW: 1\nVERDICT: PASS\nREVIEWED_SHA: %s' "$reviewed_sha")"
 
 if [[ "$comment_body" != "$expected_body" ]]; then
-  echo "review evidence must be exactly one TACTUS_FRONTIER_REVIEW v1 PASS record for $reviewed_sha" >&2
+  echo "review evidence must be exactly one UPSTROKE_FRONTIER_REVIEW v1 PASS record for $reviewed_sha" >&2
   exit 1
 fi

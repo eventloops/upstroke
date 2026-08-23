@@ -9,7 +9,7 @@ trap 'rm -rf -- "$scratch"' EXIT
 
 git -C "$scratch" init -q
 git -C "$scratch" config user.name 'ledger fixture'
-git -C "$scratch" config user.email 'ledger-fixture@tactus.local'
+git -C "$scratch" config user.email 'ledger-fixture@upstroke.local'
 mkdir -p "$scratch/src"
 printf '%s\n' 'fn implementation() {}' 'fn regression_guard_exists() {}' > "$scratch/src/example.rs"
 git -C "$scratch" add src/example.rs

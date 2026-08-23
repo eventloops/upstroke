@@ -1,4 +1,4 @@
-# Contributing to tactus
+# Contributing to upstroke
 
 Contributions are welcome. Please open an issue before starting anything substantial — the build
 order in `DESIGN.md` §21 is deliberate, and it's worth checking that a change fits where the
@@ -8,7 +8,7 @@ Every change enters `master` through the same path: open a draft pull request ea
 deterministic CI and PR-policy gates, then obtain an independent frontier-model review of the exact
 green head before merge. The default-branch attestation workflow reruns the mechanical gates on
 that exact SHA and uses a repository-scoped GitHub App to publish the required
-`tactus-frontier-review` check. The branch rules bind that check to the App's integration id, and a
+`upstroke-frontier-review` check. The branch rules bind that check to the App's integration id, and a
 new push invalidates it and restarts the sequence. See [`MAINTAINING.md`](MAINTAINING.md) for the
 full lifecycle, attestation step, and emergency policy. Contributions from external forks remain
 provisional until the separately owned fork canary described there has passed.
@@ -56,13 +56,13 @@ pull request is your acceptance, and it applies to every contribution you make t
 
 ### Why this exists
 
-tactus is released under the AGPL, which some organisations cannot use — a policy prohibition, or
+upstroke is released under the AGPL, which some organisations cannot use — a policy prohibition, or
 a product they need to keep closed. Being able to offer those users a commercial licence is part
 of how the project intends to sustain itself. That is only possible if one party can license the
 whole codebase, which is what clause 2 preserves.
 
 The trade is explicit and worth stating plainly: your contribution may end up in a commercially
-licensed copy of tactus. Everything you contribute also remains available to everyone under the
+licensed copy of upstroke. Everything you contribute also remains available to everyone under the
 AGPL, permanently — that cannot be taken back. If clause 2 isn't acceptable to you, say so in the
 PR; a change can often be reworked as a suggestion instead, and that's a perfectly good way to
 contribute.

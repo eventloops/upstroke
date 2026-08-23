@@ -6,7 +6,7 @@
 //! fail, be missing, or be a phone, and the run survives either way. An
 //! [`AnswerSource`] is where an answer comes *back* from; v0.1 ships the
 //! attached terminal, and step 8 replaces it with an event-log reader backing
-//! `tactus answer <id>` without anything else moving.
+//! `upstroke answer <id>` without anything else moving.
 //!
 //! Every question is also written to `questions/<id>.json` (§15) the moment it
 //! is raised. That file — not the terminal output — is the contract a
@@ -21,7 +21,7 @@ use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 
-use crate::error::TactusError;
+use crate::error::UpstrokeError;
 use crate::ir::{Answer, Question, QuestionId, QuestionKind};
 use crate::ulid;
 use crate::util;
@@ -94,7 +94,7 @@ pub fn new_question_id() -> QuestionId {
 }
 
 /// §15: `questions/<question-id>.json`, the payload notifiers and UIs read.
-pub fn write_question(dir: &Path, record: &QuestionRecord) -> Result<(), TactusError> {
+pub fn write_question(dir: &Path, record: &QuestionRecord) -> Result<(), UpstrokeError> {
     let path = dir.join(format!(
         "{}.json",
         util::filename_component(record.question.id.as_str())
@@ -102,7 +102,7 @@ pub fn write_question(dir: &Path, record: &QuestionRecord) -> Result<(), TactusE
     util::write_json(&path, record)
 }
 
-/// Where `tactus answer` leaves an answer for a running or future engine.
+/// Where `upstroke answer` leaves an answer for a running or future engine.
 ///
 /// Answers arrive as *files*, not as lines appended to `events.jsonl`. Keeping
 /// the log single-writer is what makes it safe to reason about at all: two
@@ -121,31 +121,31 @@ pub fn answer_path(dir: &Path, id: &QuestionId) -> PathBuf {
 /// any moment. That atomicity is what lets [`read_answer`] be strict: it
 /// refuses a file it cannot parse rather than skipping it, which is only a
 /// safe policy because a half-written file can never be observed. A corrupt
-/// one therefore means something outside tactus wrote here, and silently
+/// one therefore means something outside upstroke wrote here, and silently
 /// ignoring what might be an operator's answer is worse than stopping to say
 /// so.
-pub fn write_answer(dir: &Path, id: &QuestionId, answer: &Answer) -> Result<(), TactusError> {
+pub fn write_answer(dir: &Path, id: &QuestionId, answer: &Answer) -> Result<(), UpstrokeError> {
     let component = util::filename_component(id.as_str());
     let staged = dir.join(format!("{component}.json.partial"));
     util::write_json(&staged, answer)?;
     let path = answer_path(dir, id);
-    std::fs::rename(&staged, &path).map_err(|source| TactusError::Io {
+    std::fs::rename(&staged, &path).map_err(|source| UpstrokeError::Io {
         path: path.clone(),
         source,
     })
 }
 
 /// Read an answer if one has been left. `None` simply means not yet.
-pub fn read_answer(dir: &Path, id: &QuestionId) -> Result<Option<Answer>, TactusError> {
+pub fn read_answer(dir: &Path, id: &QuestionId) -> Result<Option<Answer>, UpstrokeError> {
     let path = answer_path(dir, id);
     match std::fs::read_to_string(&path) {
         Ok(text) => serde_json::from_str(&text)
             .map(Some)
-            .map_err(|e| TactusError::Parse {
+            .map_err(|e| UpstrokeError::Parse {
                 message: format!("{}: {e}", path.display()),
             }),
         Err(source) if source.kind() == std::io::ErrorKind::NotFound => Ok(None),
-        Err(source) => Err(TactusError::Io { path, source }),
+        Err(source) => Err(UpstrokeError::Io { path, source }),
     }
 }
 
@@ -178,7 +178,7 @@ pub fn render_question(question: &Question) -> String {
 /// which is what lets a run outlive its notifier.
 pub trait Notifier {
     fn id(&self) -> &'static str;
-    fn ask(&self, question: &Question) -> Result<(), TactusError>;
+    fn ask(&self, question: &Question) -> Result<(), UpstrokeError>;
 }
 
 /// Announces a question on stderr as soon as it is raised (§12: eagerly, at
@@ -191,7 +191,7 @@ impl Notifier for CliNotifier {
         "cli"
     }
 
-    fn ask(&self, question: &Question) -> Result<(), TactusError> {
+    fn ask(&self, question: &Question) -> Result<(), UpstrokeError> {
         let first_line = question
             .context
             .lines()
@@ -244,11 +244,11 @@ pub fn notifiers_for(ids: &[String], warnings: &mut Vec<String>) -> Vec<&'static
 }
 
 /// Where an answer comes from. Step 8 adds an event-log implementation behind
-/// `tactus answer <id>`; the engine does not change when it does.
+/// `upstroke answer <id>`; the engine does not change when it does.
 pub trait AnswerSource {
     fn id(&self) -> &'static str;
     /// Called only at a hard block (§12), never mid-frontier.
-    fn resolve(&self, question: &Question) -> Result<Answer, TactusError>;
+    fn resolve(&self, question: &Question) -> Result<Answer, UpstrokeError>;
 }
 
 /// CI and every other detached context: nobody is there. Note this returns
@@ -261,7 +261,7 @@ impl AnswerSource for UnattendedAnswers {
         "unattended"
     }
 
-    fn resolve(&self, _question: &Question) -> Result<Answer, TactusError> {
+    fn resolve(&self, _question: &Question) -> Result<Answer, UpstrokeError> {
         Ok(Answer::Unanswered)
     }
 }
@@ -276,7 +276,7 @@ impl AnswerSource for TerminalAnswers {
         "terminal"
     }
 
-    fn resolve(&self, question: &Question) -> Result<Answer, TactusError> {
+    fn resolve(&self, question: &Question) -> Result<Answer, UpstrokeError> {
         let stdin = std::io::stdin();
         if !stdin.is_terminal() {
             return Ok(Answer::Unanswered);
@@ -301,9 +301,9 @@ const PROMPT_LEGEND: &str = "answer (a number picks an option, `skip` fails this
 
 /// §19's hard block, for a run nobody is sitting in front of.
 ///
-/// A detached but interactive run — `nohup`, a service unit, `tactus run &` —
+/// A detached but interactive run — `nohup`, a service unit, `upstroke run &` —
 /// has no terminal to prompt at, but it is not CI either: a human is expected,
-/// just not right now. So it waits for `tactus answer` to leave a file, which
+/// just not right now. So it waits for `upstroke answer` to leave a file, which
 /// is what "hard block (interactive)" means when the block cannot be a prompt.
 ///
 /// The budget is shared across every question this run asks rather than per
@@ -349,7 +349,7 @@ impl AnswerSource for EventLogAnswers<'_> {
         "event-log"
     }
 
-    fn resolve(&self, question: &Question) -> Result<Answer, TactusError> {
+    fn resolve(&self, question: &Question) -> Result<Answer, UpstrokeError> {
         if let Some(answer) = read_answer(&self.dir, &question.id)? {
             return Ok(answer);
         }
@@ -361,7 +361,7 @@ impl AnswerSource for EventLogAnswers<'_> {
         }
         eprintln!(
             "\n{}\nNobody is attached to this run, so it is waiting for an answer. From another \
-             terminal:\n\n    tactus answer {}\n",
+             terminal:\n\n    upstroke answer {}\n",
             render_question(question),
             question.id
         );
@@ -374,7 +374,7 @@ impl AnswerSource for EventLogAnswers<'_> {
             }
         }
         eprintln!(
-            "no answer arrived for {}; the task stays parked and `tactus resume` will pick up \
+            "no answer arrived for {}; the task stays parked and `upstroke resume` will pick up \
              an answer written later",
             question.id
         );
@@ -431,7 +431,7 @@ pub(crate) fn answer_for_option(question: &Question, choice: usize) -> Option<An
 ///
 /// §12 lists two v0.1 channels, and which one applies is not a mode question
 /// alone: `on_block` at an attached terminal means *prompt*, and the identical
-/// config detached means *wait for `tactus answer`*. Deciding it here rather
+/// config detached means *wait for `upstroke answer`*. Deciding it here rather
 /// than in the engine keeps that distinction where the channels live.
 ///
 /// A zero budget collapses the detached case back to parking immediately,
@@ -560,7 +560,7 @@ mod tests {
 
     #[test]
     fn questions_are_written_where_a_ui_can_read_them() {
-        let dir = std::env::temp_dir().join(format!("tactus-questions-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("upstroke-questions-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).expect("dir");
 
@@ -620,7 +620,7 @@ mod tests {
 
     #[test]
     fn the_answer_channel_follows_the_mode_and_the_situation() {
-        let dir = std::env::temp_dir().join("tactus-answers-for");
+        let dir = std::env::temp_dir().join("upstroke-answers-for");
         let budget = Duration::from_secs(60);
         let idle = CountingSleeper::default();
         assert_eq!(
@@ -648,7 +648,7 @@ mod tests {
 
     #[test]
     fn answers_survive_the_trip_through_a_file() {
-        let dir = std::env::temp_dir().join(format!("tactus-answer-io-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("upstroke-answer-io-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).expect("dir");
         let id = QuestionId::from("q-TEST");
@@ -679,8 +679,8 @@ mod tests {
     #[test]
     fn a_detached_run_waits_for_an_answer_file_then_gives_up() {
         // §19's "hard block (interactive)" for a run with no terminal: it
-        // waits for `tactus answer` rather than degrading to CI behaviour.
-        let dir = std::env::temp_dir().join(format!("tactus-answer-wait-{}", std::process::id()));
+        // waits for `upstroke answer` rather than degrading to CI behaviour.
+        let dir = std::env::temp_dir().join(format!("upstroke-answer-wait-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).expect("dir");
 
@@ -744,7 +744,7 @@ mod tests {
         }
     }
 
-    /// Stands in for an operator running `tactus answer` mid-wait.
+    /// Stands in for an operator running `upstroke answer` mid-wait.
     struct ArrivingSleeper {
         dir: std::path::PathBuf,
         id: QuestionId,

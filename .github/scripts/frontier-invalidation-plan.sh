@@ -39,7 +39,7 @@ jq -e \
       [
         .check_runs[]
         | select(
-            .name == "tactus-frontier-review"
+            .name == "upstroke-frontier-review"
             and .head_sha == $head_sha
             and .app.id == $expected_app_id
             and (.status != "completed" or .conclusion == "success")

@@ -47,7 +47,7 @@ if [[ "$review_url" == "$review_comment_id" || ! "$review_comment_id" =~ ^[1-9][
   exit 2
 fi
 
-external_id="tactus-frontier-review:pr-$pr_number:$attested_sha:$evidence_digest"
+external_id="upstroke-frontier-review:pr-$pr_number:$attested_sha:$evidence_digest"
 if [[ "$attested_sha" == "$reviewed_sha" ]]; then
   summary="PR #$pr_number passed independent frontier review for exact head \`$attested_sha\`."
 else
@@ -62,7 +62,7 @@ jq -n \
   --arg external_id "$external_id" \
   --arg summary "$summary" \
   '{
-    name: "tactus-frontier-review",
+    name: "upstroke-frontier-review",
     head_sha: $attested_sha,
     status: "completed",
     conclusion: "success",

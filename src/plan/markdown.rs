@@ -2,7 +2,7 @@
 //!
 //! `##`/`###` sections become tasks (heading → title, prose → body). A plan
 //! with no such sections falls back to top-level checklist items or numbered
-//! plan-mode steps. The `<!-- tactus: ... -->` annotation grammar overrides
+//! plan-mode steps. The `<!-- upstroke: ... -->` annotation grammar overrides
 //! the heuristics;
 //! annotations are read from pulldown-cmark HTML events, never regexed out of
 //! raw text. Unknown annotation attributes warn and never error.
@@ -12,7 +12,7 @@ use std::ops::Range;
 use pulldown_cmark::{Event, HeadingLevel, Options, Parser, Tag, TagEnd};
 
 use super::{Parsed, PlanAdapter};
-use crate::error::TactusError;
+use crate::error::UpstrokeError;
 use crate::ir::{
     Artifact, ArtifactId, Plan, PlanSource, Task, TaskId, TaskKind, Tier, content_hash,
 };
@@ -33,7 +33,7 @@ impl PlanAdapter for MarkdownPlanAdapter {
         })
     }
 
-    fn parse_with_warnings(&self, raw: &str) -> Result<Parsed, TactusError> {
+    fn parse_with_warnings(&self, raw: &str) -> Result<Parsed, UpstrokeError> {
         let mut warnings = Vec::new();
         let sections = split_sections(raw);
         let drafts: Vec<Draft> = if sections.is_empty() {
@@ -45,7 +45,7 @@ impl PlanAdapter for MarkdownPlanAdapter {
                 .collect()
         };
         if drafts.is_empty() {
-            return Err(TactusError::Parse {
+            return Err(UpstrokeError::Parse {
                 message: "no tasks found: expected `##`/`###` sections, a top-level checklist, \
                           or numbered steps"
                     .to_owned(),
@@ -151,7 +151,7 @@ fn split_sections(raw: &str) -> Vec<Section> {
             Event::InlineHtml(t) | Event::Html(t) => {
                 if let Some(scan) = in_heading.as_mut() {
                     for comment in comments_in(&t) {
-                        if let Some(body) = tactus_body(comment.inner) {
+                        if let Some(body) = upstroke_body(comment.inner) {
                             if scan.annotation.is_none() {
                                 scan.annotation = Some(body.to_owned());
                             }
@@ -169,15 +169,15 @@ fn strip_trailing_colon(text: &str) -> &str {
     text.trim().trim_end_matches(':').trim_end()
 }
 
-/// The body of a `<!-- tactus: ... -->` comment, or `None` for ordinary
+/// The body of a `<!-- upstroke: ... -->` comment, or `None` for ordinary
 /// author comments.
-fn tactus_body(inner: &str) -> Option<&str> {
-    inner.trim().strip_prefix("tactus:")
+fn upstroke_body(inner: &str) -> Option<&str> {
+    inner.trim().strip_prefix("upstroke:")
 }
 
 /// Accumulates consecutive HTML events before scanning for annotations:
 /// pulldown-cmark emits one event per line inside an HTML block, so a
-/// multi-line `<!-- tactus: ... -->` comment is only complete once its
+/// multi-line `<!-- upstroke: ... -->` comment is only complete once its
 /// neighbours are joined. Consecutive events are contiguous in the source, so
 /// buffer offsets map linearly back to absolute spans.
 #[derive(Default)]
@@ -232,7 +232,7 @@ impl AnnotationSink {
     fn accept(&mut self, body: &str, ctx: &str, warnings: &mut Vec<String>) {
         if self.annotation.is_some() {
             warnings.push(format!(
-                "multiple tactus annotations in {ctx}; using the first"
+                "multiple upstroke annotations in {ctx}; using the first"
             ));
             return;
         }
@@ -270,7 +270,7 @@ fn section_draft(raw: &str, section: &Section, warnings: &mut Vec<String>) -> Dr
     if let Some(inline) = &section.inline_annotation {
         sink.accept(inline, &ctx, warnings);
     }
-    // Spans of tactus annotation comments (slice-relative), removed from body.
+    // Spans of upstroke annotation comments (slice-relative), removed from body.
     let mut annotation_spans: Vec<Range<usize>> = Vec::new();
     let mut html = HtmlAccumulator::default();
 
@@ -291,7 +291,7 @@ fn section_draft(raw: &str, section: &Section, warnings: &mut Vec<String>) -> Dr
             html.push(t, &range);
         } else {
             for (span, inner) in html.take_comments() {
-                if let Some(body) = tactus_body(&inner) {
+                if let Some(body) = upstroke_body(&inner) {
                     sink.accept(body, &ctx, warnings);
                     annotation_spans.push(span);
                 }
@@ -381,7 +381,7 @@ fn section_draft(raw: &str, section: &Section, warnings: &mut Vec<String>) -> Dr
         }
     }
     for (span, inner) in html.take_comments() {
-        if let Some(body) = tactus_body(&inner) {
+        if let Some(body) = upstroke_body(&inner) {
             sink.accept(body, &ctx, warnings);
             annotation_spans.push(span);
         }
@@ -423,7 +423,7 @@ fn checklist_drafts(raw: &str, warnings: &mut Vec<String>) -> Vec<Draft> {
             html.push(t, &range);
         } else if let Some((_, sink)) = current.as_mut() {
             for (_, inner) in html.take_comments() {
-                if let Some(body) = tactus_body(&inner) {
+                if let Some(body) = upstroke_body(&inner) {
                     sink.accept(body, "checklist item", warnings);
                 }
             }
@@ -831,7 +831,7 @@ mod tests {
         assert!(api.acceptance[0].contains("Cursor format"));
         assert!(api.body.contains("Define cursor format"));
         assert!(
-            !api.body.contains("tactus:"),
+            !api.body.contains("upstroke:"),
             "annotation stripped from body"
         );
 
@@ -890,7 +890,7 @@ mod tests {
 
     #[test]
     fn unknown_attribute_warns_but_still_parses() {
-        let parsed = parse("## Fix the thing\n<!-- tactus: id=fix-1 wibble=frob -->\n");
+        let parsed = parse("## Fix the thing\n<!-- upstroke: id=fix-1 wibble=frob -->\n");
         assert_eq!(parsed.plan.tasks[0].id, TaskId::from("fix-1"));
         assert!(
             parsed
@@ -904,7 +904,7 @@ mod tests {
 
     #[test]
     fn malformed_attribute_and_bad_values_warn() {
-        let parsed = parse("## Task one\n<!-- tactus: standalone tier=galactic kind=wat -->\n");
+        let parsed = parse("## Task one\n<!-- upstroke: standalone tier=galactic kind=wat -->\n");
         let joined = parsed.warnings.join("\n");
         assert!(joined.contains("malformed annotation attribute `standalone`"));
         assert!(joined.contains("unknown tier `galactic`"));
@@ -915,7 +915,7 @@ mod tests {
 
     #[test]
     fn empty_depends_is_explicit_none_and_absent_is_document_order() {
-        let raw = "## First\n\n## Second\n<!-- tactus: depends= -->\n\n## Third\n";
+        let raw = "## First\n\n## Second\n<!-- upstroke: depends= -->\n\n## Third\n";
         let tasks = parse(raw).plan.tasks;
         assert!(tasks[0].depends_on.is_empty());
         assert!(
@@ -941,7 +941,7 @@ mod tests {
         let raw = "\
 # Checklist plan
 
-- [ ] Design the widget API <!-- tactus: id=widget-api tier=frontier -->
+- [ ] Design the widget API <!-- upstroke: id=widget-api tier=frontier -->
 - [x] Implement the widget store
 - [ ] Test widget rendering
 ";
@@ -954,7 +954,7 @@ mod tests {
         assert_eq!(tasks[2].kind, TaskKind::Test);
         assert_eq!(tasks[2].depends_on, [tasks[1].id.clone()]);
         assert!(
-            !tasks[0].title.contains("tactus"),
+            !tasks[0].title.contains("upstroke"),
             "annotation not in title"
         );
     }
@@ -1004,14 +1004,14 @@ mod tests {
 
     #[test]
     fn needs_without_producer_warns() {
-        let parsed = parse("## Build it\n<!-- tactus: needs=ghost-contract -->\n");
+        let parsed = parse("## Build it\n<!-- upstroke: needs=ghost-contract -->\n");
         assert!(parsed.warnings.iter().any(|w| w.contains("ghost-contract")));
     }
 
     #[test]
     fn path_hints_collected_from_body_and_annotation() {
         let parsed = parse(
-            "## Implement cursor codec\n<!-- tactus: paths=src/api/** -->\nTouch `src/api/cursor.rs` and src/api/mod.rs while at it.\n",
+            "## Implement cursor codec\n<!-- upstroke: paths=src/api/** -->\nTouch `src/api/cursor.rs` and src/api/mod.rs while at it.\n",
         );
         let hints = &parsed.plan.tasks[0].path_hints;
         assert_eq!(hints[0], "src/api/**", "annotation paths come first");
@@ -1053,7 +1053,7 @@ mod tests {
     #[test]
     fn an_invisible_comment_does_not_disarm_acceptance() {
         let parsed = parse(
-            "## Task\n<!-- tactus: id=t1 -->\n\nAcceptance:\n\n<!-- note -->\n\n- still collected\n",
+            "## Task\n<!-- upstroke: id=t1 -->\n\nAcceptance:\n\n<!-- note -->\n\n- still collected\n",
         );
         assert_eq!(parsed.plan.tasks[0].acceptance, ["still collected"]);
     }
@@ -1078,7 +1078,7 @@ mod tests {
     #[test]
     fn multi_line_annotations_are_parsed() {
         let parsed = parse(
-            "## Design the API\n<!-- tactus: id=api-design kind=design\n     depends= tier=frontier -->\nBody text.\n",
+            "## Design the API\n<!-- upstroke: id=api-design kind=design\n     depends= tier=frontier -->\nBody text.\n",
         );
         let task = &parsed.plan.tasks[0];
         assert_eq!(task.id, TaskId::from("api-design"));
@@ -1086,7 +1086,7 @@ mod tests {
         assert_eq!(task.suggested_tier, Some(Tier::Frontier));
         assert!(task.depends_on.is_empty(), "depends= honored across lines");
         assert!(
-            !task.body.contains("tactus:"),
+            !task.body.contains("upstroke:"),
             "annotation stripped: {}",
             task.body
         );
@@ -1099,11 +1099,11 @@ mod tests {
 
     #[test]
     fn inline_heading_annotations_are_parsed() {
-        let parsed = parse("## Fix the parser <!-- tactus: id=fix-1 depends= -->\nBody.\n");
+        let parsed = parse("## Fix the parser <!-- upstroke: id=fix-1 depends= -->\nBody.\n");
         let task = &parsed.plan.tasks[0];
         assert_eq!(task.id, TaskId::from("fix-1"));
         assert!(task.depends_on.is_empty());
-        assert!(!task.title.contains("tactus"), "title: {}", task.title);
+        assert!(!task.title.contains("upstroke"), "title: {}", task.title);
     }
 
     #[test]

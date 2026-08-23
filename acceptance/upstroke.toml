@@ -24,7 +24,7 @@ wait_on_block_secs = 900
 [budgets]
 # The seatbelt. Frontier review runs on every attempt, so the realistic cost of
 # this plan is roughly $1–3 — this is a ceiling, not an estimate. Crossing it
-# stops the run at exit 3, and `tactus resume <id> --budget 30` continues.
+# stops the run at exit 3, and `upstroke resume <id> --budget 30` continues.
 run_usd = 15.0
 
 [routing]
@@ -49,7 +49,7 @@ review = { tier = "frontier" }
 
 # Cross-vendor second opinion (§11.3). Needs the Copilot CLI installed —
 # pre-flight REFUSES to start without it rather than quietly reviewing once, so
-# leave this commented until `tactus capacity` shows a copilot pool.
+# leave this commented until `upstroke capacity` shows a copilot pool.
 #
 # Watch what it matches. A task with no explicit `paths=` gets path hints
 # INFERRED from its prose, so `readme` and `changelog` both carry `src/` purely

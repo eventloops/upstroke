@@ -1,11 +1,16 @@
-# tactus
+# upstroke
 
-[![CI](https://github.com/keybindings/tactus/actions/workflows/ci.yml/badge.svg)](https://github.com/keybindings/tactus/actions/workflows/ci.yml)
-[![crates.io](https://img.shields.io/crates/v/tactus.svg)](https://crates.io/crates/tactus)
-[![license](https://img.shields.io/crates/l/tactus.svg)](LICENSE)
+> Formerly `tactus`. Named for the upstroke — the conductor's preparatory beat, the upward
+> motion of the baton that tells every player when to come in. In engines and in flight the
+> upstroke is the recovery stroke, the one that doesn't deliver the power; in conducting
+> that's the point. It's the preparation that makes the downbeat land together.
+
+[![CI](https://github.com/eventloops/upstroke/actions/workflows/ci.yml/badge.svg)](https://github.com/eventloops/upstroke/actions/workflows/ci.yml)
+[![crates.io](https://img.shields.io/crates/v/upstroke.svg)](https://crates.io/crates/upstroke)
+[![license](https://img.shields.io/crates/l/upstroke.svg)](LICENSE)
 
 A headless orchestration engine for AI coding agents. A frontier model and you design a piece
-of work together; `tactus` then executes that plan unattended — normalizing it into a dependency
+of work together; `upstroke` then executes that plan unattended — normalizing it into a dependency
 graph of typed tasks, dispatching each to an existing coding-agent CLI with a model chosen per
 task, verifying every result through objective gates and strong-model review, and committing
 only what passes.
@@ -27,7 +32,7 @@ conductor, not an instrument.
 > `acceptance/RESULT.md` is the write-up. Parallelism, worktrees, Aider, and capacity-driven
 > routing are v0.2.
 >
-> **[See a run, start to finish →](https://keybindings.github.io/tactus/)** — captured output from
+> **[See a run, start to finish →](https://eventloops.github.io/upstroke/)** — captured output from
 > both: the verdict where a reviewer rejected a fix that built clean and passed all 722 tests
 > comes from the run against a published .NET library, and the interactive replay and ledger come
 > from the acceptance run. The page says which is which.
@@ -35,29 +40,29 @@ conductor, not an instrument.
 ## What works today
 
 ```bash
-tactus connect
+upstroke connect
 ```
 
 Discovers the agent CLIs installed on this machine, asks each one about its own account, and
-writes `~/.tactus/pools.toml`. No HTTP, no token ever handled — it subprocesses the vendors'
+writes `~/.upstroke/pools.toml`. No HTTP, no token ever handled — it subprocesses the vendors'
 own CLIs. The file is hand-editable and never overwritten without `--force`.
 
 ```bash
-tactus validate plan.md
+upstroke validate plan.md
 ```
 
 Parses an annotated markdown plan into a task graph, resolves each task's model escalation
 chain, and prints the table with the source of every decision — at zero spend.
 
 ```bash
-tactus run plan.md --dry-run
+upstroke run plan.md --dry-run
 ```
 
 Everything except the agents: parse, route, show the effective gates, and preview each pool's
 estimated capacity and what your strategy would do with it. Spends nothing, probes nothing.
 
 ```bash
-tactus capacity
+upstroke capacity
 ```
 
 Every pool: auth state, estimated remaining with its confidence, resets, margins, and what
@@ -65,16 +70,16 @@ Every pool: auth state, estimated remaining with its confidence, resets, margins
 an unmeasured pool reads as **unknown**, never as full.
 
 ```bash
-tactus run plan.md --budget 15
+upstroke run plan.md --budget 15
 ```
 
-Executes for real: creates a `tactus/run-<id>` branch, runs one agent per task, captures the
+Executes for real: creates a `upstroke/run-<id>` branch, runs one agent per task, captures the
 diff itself, runs your gates, has a read-only reviewer judge the diff against the task's
 acceptance criteria, and commits per task. Every transition lands in `events.jsonl`, which is
-what `tactus status`, `tactus answer`, and `tactus resume` read back.
+what `upstroke status`, `upstroke answer`, and `upstroke resume` read back.
 
 ```bash
-tactus resume <run-id> --budget 30
+upstroke resume <run-id> --budget 30
 ```
 
 Continues a run that was interrupted, ended with tasks parked on questions, or stopped at its
@@ -84,8 +89,8 @@ the run record; editing them applies to a new run rather than changing the stand
 through this one.
 
 ```bash
-tactus export-decisions <run-id>
-tactus export-decisions <run-id> --format csv
+upstroke export-decisions <run-id>
+upstroke export-decisions <run-id> --format csv
 ```
 
 Exports one non-live run's local routing decisions to stdout, as JSONL by default or RFC
@@ -93,7 +98,7 @@ Exports one non-live run's local routing decisions to stdout, as JSONL by defaul
 request, and writes nothing; redirect stdout if you want to keep a file. A run id may be an
 unambiguous prefix. Live runs are refused because their dataset is still moving. Null JSON values,
 empty CSV cells, and `selection_origin: "unknown"` mean an older run did not record that fact—not
-that tactus inferred it from today's plan or configuration. Recoverable crash residue at the end
+that upstroke inferred it from today's plan or configuration. Recoverable crash residue at the end
 of an otherwise valid log is reported on stderr without contaminating the exported stdout stream.
 
 ### Exit codes
@@ -103,7 +108,7 @@ of an otherwise valid log is reported on stderr without contaminating the export
 | 0 | complete |
 | 1 | a task failed and the run halted |
 | 2 | the run ended with tasks parked on unanswered questions |
-| 3 | the run stopped at its budget — raise it and `tactus resume` |
+| 3 | the run stopped at its budget — raise it and `upstroke resume` |
 
 ## Plans
 
@@ -113,10 +118,10 @@ renders:
 
 ```markdown
 ## Design the pagination API
-<!-- tactus: id=api-design kind=design depends= tier=frontier out=api-contract -->
+<!-- upstroke: id=api-design kind=design depends= tier=frontier out=api-contract -->
 
 ## Fix off-by-one in list endpoint
-<!-- tactus: id=fix-obo kind=fix depends=api-design min=mid paths=src/api/** -->
+<!-- upstroke: id=fix-obo kind=fix depends=api-design min=mid paths=src/api/** -->
 ```
 
 Unknown attributes warn; they never fail a plan.
@@ -150,7 +155,7 @@ Config splits along its natural seam: **pools are user-level** — your subscrip
 you — while **routing, gates and budgets are repo-level** overrides on derived defaults. A fresh
 repo runs with zero config.
 
-`tactus.toml`, in the repo:
+`upstroke.toml`, in the repo:
 
 ```toml
 [routing]
@@ -188,7 +193,7 @@ timeout_secs = 1200
 
 Gates are derived from the repo's shape when unconfigured (Cargo.toml, go.mod, package.json).
 
-`~/.tactus/pools.toml`, written by `tactus connect` and yours to edit:
+`~/.upstroke/pools.toml`, written by `upstroke connect` and yours to edit:
 
 ```toml
 [pools.claude-code]
@@ -224,14 +229,14 @@ These are invariants, not aspirations — they're what make it safe to leave run
 - **Narrow permissions.** Unattended agents get file tools plus exactly the configured gate
   commands — never a skip-all-permissions flag. Reviewers are read-only.
 - **Independent review is preferred and its fallback is explicit.** Where a task runs on the exact
-  model that would have reviewed it, Tactus opportunistically rebinds to another model family. If
+  model that would have reviewed it, Upstroke opportunistically rebinds to another model family. If
   that alternative cannot be probed, the run warns with the affected tasks and falls back to the
   frozen same-model reviewer instead of silently claiming independence. A configured blast-radius
   second opinion is stricter: another model family must be available, both reviewers judge the same
   diff independently, and both must pass.
 - **An empty diff can never pass.** "Done" claims require changed code.
 - **Estimates are never optimistic.** A capacity pool nothing has measured reads as *unknown*,
-  not as full; a figure derived from what tactus alone has spent is shown as a ceiling (`≤`)
+  not as full; a figure derived from what upstroke alone has spent is shown as a ceiling (`≤`)
   rather than a measurement, because everything it cannot see — other repositories, your own
   interactive sessions — only ever drew *more*; and every estimate is discounted by a safety
   margin and a reserve floor before it is shown.
@@ -240,7 +245,7 @@ These are invariants, not aspirations — they're what make it safe to leave run
 
 Rust 1.85+ (edition 2024), Git 2.40+ (the exact-tree review check requires
 `git check-attr --source`), and [Claude Code](https://docs.claude.com/en/docs/claude-code/overview)
-on `PATH`. Tactus probes that Git capability before dispatching a worker. The
+on `PATH`. Upstroke probes that Git capability before dispatching a worker. The
 [GitHub Copilot CLI](https://docs.github.com/en/copilot/reference/copilot-cli-reference/cli-programmatic-reference)
 is optional and unlocks the cross-family second opinion. Windows, macOS and Linux are all
 first-class.
@@ -251,8 +256,8 @@ timeout, or abrupt conductor death. Unix and WSL host runs retain a cleanup leas
 descendants. Deliberately daemonised Unix escape remains outside the host-runner contract.
 
 Host-run mode is for trusted repositories and plans. Repository-controlled gates execute candidate
-build/test code as the Tactus user's OS account; no shipped host sandbox prevents that code from
-finding or modifying `.tactus` run files. Adapter deny rules reduce accidental access but do not
+build/test code as the Upstroke user's OS account; no shipped host sandbox prevents that code from
+finding or modifying `.upstroke` run files. Adapter deny rules reduce accidental access but do not
 make the event log tamper-resistant against hostile candidate code. Isolating coordinator state
 from workers, reviewers, and gates remains a container-runner/authority-layout blocker; use a
 dedicated OS account or VM for untrusted input until that boundary ships.
@@ -265,8 +270,8 @@ In plain terms, for the two things people usually want to know:
 
 - **Running it costs you nothing and obliges you to nothing.** The AGPL's obligations attach to
   *distributing* the software or *offering a modified version to others over a network*. Using
-  tactus on your own machine — including at work, including on proprietary code — triggers
-  neither. Nothing links into your code: tactus is a separate process that shells out to other
+  upstroke on your own machine — including at work, including on proprietary code — triggers
+  neither. Nothing links into your code: upstroke is a separate process that shells out to other
   separate processes, so your repository is not a derivative work of it.
 - **Building on it means sharing back.** Fork it, modify it, sell it if you like — but the source
   stays open under the same licence, including if you offer it to others as a hosted service.

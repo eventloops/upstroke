@@ -7,7 +7,7 @@
 
 pub mod markdown;
 
-use crate::error::TactusError;
+use crate::error::UpstrokeError;
 use crate::ir::Plan;
 
 /// A parsed plan plus non-fatal findings (unknown annotation attributes,
@@ -22,11 +22,11 @@ pub struct Parsed {
 pub trait PlanAdapter: Send + Sync {
     fn id(&self) -> &'static str;
     fn sniff(&self, raw: &str) -> bool;
-    fn parse_with_warnings(&self, raw: &str) -> Result<Parsed, TactusError>;
+    fn parse_with_warnings(&self, raw: &str) -> Result<Parsed, UpstrokeError>;
 
     /// The §8 signature; the warning-carrying form above is what `validate`
     /// consumes.
-    fn parse(&self, raw: &str) -> Result<Plan, TactusError> {
+    fn parse(&self, raw: &str) -> Result<Plan, UpstrokeError> {
         self.parse_with_warnings(raw).map(|p| p.plan)
     }
 }
@@ -34,12 +34,12 @@ pub trait PlanAdapter: Send + Sync {
 /// Registry in sniff order; first match wins.
 pub static ADAPTERS: &[&dyn PlanAdapter] = &[&markdown::MarkdownPlanAdapter];
 
-pub fn detect(raw: &str) -> Result<&'static dyn PlanAdapter, TactusError> {
+pub fn detect(raw: &str) -> Result<&'static dyn PlanAdapter, UpstrokeError> {
     ADAPTERS
         .iter()
         .copied()
         .find(|a| a.sniff(raw))
-        .ok_or_else(|| TactusError::Parse {
+        .ok_or_else(|| UpstrokeError::Parse {
             message: format!(
                 "no plan adapter recognizes this file (available: {})",
                 ADAPTERS

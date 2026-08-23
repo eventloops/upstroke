@@ -17,7 +17,7 @@
 //! `&`, `|`, `%`, embedded quotes, `^`, spaces, and the empty argument.
 //!
 //! Copilot is what made that matter. Its permission surface is argv, so gate
-//! commands — strings a user writes in `tactus.toml` — now reach a Windows
+//! commands — strings a user writes in `upstroke.toml` — now reach a Windows
 //! command line, and a mangled `--allow-tool=shell(<gate>)` is a permission
 //! grant that no longer matches the command it is meant to authorize. The
 //! module comment used to argue that two copies of the quoting logic would be
@@ -27,7 +27,7 @@ use std::path::PathBuf;
 use std::process::Command;
 use std::sync::OnceLock;
 
-use crate::error::TactusError;
+use crate::error::UpstrokeError;
 use crate::util;
 
 /// A located agent binary and how to spawn it.
@@ -66,7 +66,7 @@ pub fn locate(
     names: &[&str],
     cache: &OnceLock<Option<Invocation>>,
     missing: impl FnOnce(&[&str]) -> String,
-) -> Result<Invocation, TactusError> {
+) -> Result<Invocation, UpstrokeError> {
     locate_with(names, cache, |_| true, missing)
 }
 
@@ -81,7 +81,7 @@ pub fn locate_with(
     cache: &OnceLock<Option<Invocation>>,
     usable: impl FnMut(&Invocation) -> bool,
     missing: impl FnOnce(&[&str]) -> String,
-) -> Result<Invocation, TactusError> {
+) -> Result<Invocation, UpstrokeError> {
     let mut usable = usable;
     cache
         .get_or_init(|| {
@@ -96,7 +96,7 @@ pub fn locate_with(
             )
         })
         .clone()
-        .ok_or_else(|| TactusError::Agent {
+        .ok_or_else(|| UpstrokeError::Agent {
             message: missing(names),
         })
 }
@@ -124,7 +124,7 @@ pub fn extract_version(stdout: &str) -> String {
         // Trailing punctuation is not part of a version. The Copilot CLI ends
         // its line with a full stop — `GitHub Copilot CLI 1.0.78.` — which
         // otherwise rides along into `Caps.version` and out through every
-        // message that quotes it (`tactus capacity`, and the probe refusal that
+        // message that quotes it (`upstroke capacity`, and the probe refusal that
         // names the version an adapter would not support).
         .map(|t| {
             t.trim_start_matches('v')
@@ -193,7 +193,7 @@ mod tests {
     #[test]
     fn a_missing_binary_reports_every_name_it_tried() {
         static CACHE: OnceLock<Option<Invocation>> = OnceLock::new();
-        let names = ["tactus-definitely-not-a-real-binary"];
+        let names = ["upstroke-definitely-not-a-real-binary"];
         let error = locate(&names, &CACHE, |tried| {
             format!("not found (looked for {})", tried.join(", "))
         })
@@ -201,7 +201,7 @@ mod tests {
         assert!(
             error
                 .to_string()
-                .contains("tactus-definitely-not-a-real-binary"),
+                .contains("upstroke-definitely-not-a-real-binary"),
             "got: {error}"
         );
     }
@@ -230,9 +230,9 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn a_batch_shim_runs_and_receives_its_argument() {
-        let dir = std::env::temp_dir().join(format!("tactus-bin-shim-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("upstroke-bin-shim-{}", std::process::id()));
         std::fs::create_dir_all(&dir).expect("scratch dir");
-        let shim = dir.join("tactus-test-shim.cmd");
+        let shim = dir.join("upstroke-test-shim.cmd");
         // `%~1` strips the quotes the child got; a benign argument keeps this
         // about plumbing rather than about batch re-parsing.
         std::fs::write(&shim, "@echo off\r\necho GOT:%~1\r\n").expect("write shim");
