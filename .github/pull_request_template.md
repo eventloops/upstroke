@@ -32,11 +32,11 @@ Passing review evidence URL:
      slice pull request into an integration branch is reviewed but never
      attested, so those two stay unchecked — decisions/2026-08-21-stacked-slice-prs.md. -->
 
-- [ ] `tactus-ci` and `tactus-pr-policy` passed before frontier review began
+- [ ] `upstroke-ci` and `upstroke-pr-policy` passed before frontier review began
 - [ ] The independent frontier review used `max` effort on the exact current head
 - [ ] Every actionable finding is fixed; follow-ups contain only non-blocking suggestions or feature ideas
-- [ ] The evidence comment contains only `TACTUS_FRONTIER_REVIEW: 1`, `VERDICT: PASS`, and `REVIEWED_SHA: <full SHA>`
-- [ ] The App-owned `tactus-frontier-review` check succeeded on the current head
+- [ ] The evidence comment contains only `UPSTROKE_FRONTIER_REVIEW: 1`, `VERDICT: PASS`, and `REVIEWED_SHA: <full SHA>`
+- [ ] The App-owned `upstroke-frontier-review` check succeeded on the current head
 - [ ] Every review conversation is resolved
 
 ## Risk and rollback

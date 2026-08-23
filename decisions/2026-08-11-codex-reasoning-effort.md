@@ -21,7 +21,7 @@ Probed WSL-side against codex-cli 0.147.0 on a ChatGPT **Pro** plan (upgraded th
 - **There is no pro-tier model.** Pro is a plan/quota tier; the frontier slug stays `gpt-5.6-sol`. The roster is server-driven and moves under you — it refreshed mid-probe and gained a ninth model (`gpt-5.3-codex-spark`).
 - **The plan tier is not discoverable locally.** `auth.json` carries `auth_mode`, tokens, `account_id`, `last_refresh` and no plan field; `codex login status` says only "Logged in using ChatGPT". Plus vs Pro therefore cannot be detected — for this pool §13's "pools are connected, not configured" hits a hard limit, and the plan shape must be operator-declared.
 - **No `rate_limits` anywhere in the `codex exec` JSON stream** — usage tokens only. Codex capacity estimation has no local quota signal at all, which is stronger than the adapter's recorded "usage without pricing".
-- A local model roster *does* exist (`models_cache.json`), so the adapter's probe note that "no model listing is offered" is true of the CLI surface but not of the install. It is a real discovery source for `tactus connect`, with the staleness caveat that it is a server-fetched cache.
+- A local model roster *does* exist (`models_cache.json`), so the adapter's probe note that "no model listing is offered" is true of the CLI surface but not of the install. It is a real discovery source for `upstroke connect`, with the staleness caveat that it is a server-fetched cache.
 - `-c` is accepted on `codex exec resume` (a bogus session id fails at session lookup, not argument parsing) — unlike `-s`, which that shape rejects.
 - The provider validates the effort value server-side and rejects an unknown one with a **400 after the turn has started**, so a typo costs an attempt rather than failing fast. Its accepted set, read off that error: `none, minimal, low, medium, high, xhigh, max`.
 - Incidental confirmation: a `401 token_expired` on the websocket transport, then a successful HTTPS fallback and refresh — the rotating-refresh-token behaviour §21's runner commitment already assumed when it specified persistent credential volumes.
@@ -44,12 +44,12 @@ Two decisions the build forced, recorded because neither was obvious from the pr
 ## Rejected options
 
 - **Exposing codex's `xhigh`** — an intermediate no other adapter can honour, in a ladder that is deliberately vendor-neutral.
-- **Exposing `ultra`** — "maximum reasoning with automatic task delegation" is a change in what the agent *does*, and nothing in this design has audited an agent spawning subagents inside a tactus attempt.
+- **Exposing `ultra`** — "maximum reasoning with automatic task delegation" is a change in what the agent *does*, and nothing in this design has audited an agent spawning subagents inside a upstroke attempt.
 - **Discovering the effort value at spend time** rather than validating at config load — the provider's 400 arrives mid-turn, so a typo would burn an attempt and report as an agent failure.
 
 ## Addendum (2026-08-12) — role policy and the fifth shared level
 
-The rejection of `xhigh` depended on it being Codex-only. That premise expired: the locally probed CLIs now all advertise the same useful five-level set. Codex 0.147.0 accepts `model_reasoning_effort`; Claude Code 2.1.226 on Windows and 2.1.227 under the self-hosting WSL environment advertise `--effort <low|medium|high|xhigh|max>`; and Copilot CLI 1.0.78 advertises `--effort/--reasoning-effort` with those five levels (plus its lower `none` and `minimal`). Tactus now maps all five explicitly in every built-in adapter and makes `--effort` a probed, required flag for Claude Code and Copilot, so an older incompatible CLI refuses at pre-flight rather than silently ignoring the policy.
+The rejection of `xhigh` depended on it being Codex-only. That premise expired: the locally probed CLIs now all advertise the same useful five-level set. Codex 0.147.0 accepts `model_reasoning_effort`; Claude Code 2.1.226 on Windows and 2.1.227 under the self-hosting WSL environment advertise `--effort <low|medium|high|xhigh|max>`; and Copilot CLI 1.0.78 advertises `--effort/--reasoning-effort` with those five levels (plus its lower `none` and `minimal`). Upstroke now maps all five explicitly in every built-in adapter and makes `--effort` a probed, required flag for Claude Code and Copilot, so an older incompatible CLI refuses at pre-flight rather than silently ignoring the policy.
 
 `[routing.effort]` sets independent `implementation` and `review` values. A role value outranks a pin's effort and the tier default: that precedence is what makes “always xhigh for implementation, always max for review” true across every rung and review pass. With no role value, the original pin-then-tier behavior is unchanged. Values are validated while loading config, and each effective value remains recorded on the attempt or review event. `ultra` remains excluded because its automatic delegation changes the orchestration boundary.
 
@@ -59,7 +59,7 @@ Run **`01KZS7R0V1ZD6MC290MG350QXF`**, WSL-side against a seeded scratch repo: on
 
 What it establishes, in descending order of how hard it was to fake:
 
-- **The effort reached the provider.** Codex's own session rollout for the review thread records `"effort":"high"`. This is the CLI's record of what it received, not tactus's record of what it meant to send — the two had disagreed silently for the whole life of the adapter, which is the defect this run closes.
+- **The effort reached the provider.** Codex's own session rollout for the review thread records `"effort":"high"`. This is the CLI's record of what it received, not upstroke's record of what it meant to send — the two had disagreed silently for the whole life of the adapter, which is the defect this run closes.
 - **The reviewer actually reasoned.** 511 of 757 output tokens were `reasoning_output_tokens`. The pre-fix probe on a trivial prompt returned 0.
 - **The families really differ.** `run_started` records `reviews.primary = codex/gpt-5.6-sol` with the alternative `claude-code/claude-opus-4-8` held in reserve, and the implementer was Anthropic. §11.3 satisfied on the substance, not the label.
 - **The verdict was a reading, not a rubber stamp.** It cited `src/clamp.rs:2` and `:3` by line, checked the "no code path can panic" criterion against the actual conversion, and reasoned explicitly that `unwrap_or` is not the prohibited panicking `unwrap` — a distinction a rubber stamp does not make.
@@ -69,7 +69,7 @@ What it establishes, in descending order of how hard it was to fake:
 
 > **Correction (made during the split).** The original Addendum E called this "the third consecutive hit". That was wrong and is exactly the kind of flattery a prediction log exists to prevent: the standing tally is **four prior misses, all overestimates of roughly 2×, and this is the first hit** — earned by estimating attempt-count first rather than scaling off a previous run's total.
 
-**What it does not establish:** that `high` produces *better* judgement than `low`. That would need the same diff judged both ways, and §23.2's own finding — two identical configurations produced two different failure modes — says a single paired run would not settle it either. The claim here is narrower and is the one that was actually broken: tactus now decides the effort, states it, and can prove which one was used.
+**What it does not establish:** that `high` produces *better* judgement than `low`. That would need the same diff judged both ways, and §23.2's own finding — two identical configurations produced two different failure modes — says a single paired run would not settle it either. The claim here is narrower and is the one that was actually broken: upstroke now decides the effort, states it, and can prove which one was used.
 
 ## Follow-on observation (2026-08-11) — the reviewer contradicted itself on the same construct
 

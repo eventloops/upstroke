@@ -1,4 +1,4 @@
-<title>Watch it fail safely — tactus</title>
+<title>Watch it fail safely — upstroke</title>
 <style>
 :root{--bg:#fff;--fg:#16150f;--dim:#5f5e5a;--faint:#8a8880;--line:#e2e0d8;--card:#faf9f5;
 --ok:#3b6d11;--okbg:#eaf3de;--run:#185fa5;--runbg:#e6f1fb;--park:#854f0b;--parkbg:#faeeda;--idle:#8a8880;--idlebg:#f1efe8;--code:#f5f3ec}
@@ -61,7 +61,7 @@ letter-spacing:.03em;margin:0 0 7px}
 
 <p>A dry run costs nothing and answers the two questions worth asking first — what will it do, and what could it cost.</p>
 
-<pre class="scroll"><code>$ tactus run plan.md --config tactus.toml --budget 12 --dry-run
+<pre class="scroll"><code>$ upstroke run plan.md --config upstroke.toml --budget 12 --dry-run
 
 id           kind  deps  chain
 -----------  ----  ----  -----
@@ -84,7 +84,7 @@ dry run: no agents executed, nothing spent</code></pre>
 <p>The engine holds its own terminal, so this is the view from the second one. Scrub through a real 45-minute run — five tasks, one dependency chain, one independent task. This one is the <em>acceptance</em> run, against a scratch repository rather than FluentRoslyn: it is the run with a dependency graph worth showing, and with the parked question below. Every state is derived from its append-only event log, which is exactly how the dashboard would work.</p>
 
 <div class="panel">
-  <p class="src"><b>replaying</b> .tactus/runs/01KZNG12FJA9DSJEYSK46NVBSC/events.jsonl — 45 events, 45 minutes</p>
+  <p class="src"><b>replaying</b> .upstroke/runs/01KZNG12FJA9DSJEYSK46NVBSC/events.jsonl — 45 events, 45 minutes</p>
   <div class="ctl">
     <button id="play">Play</button>
     <input type="range" id="scrub" min="0" value="0">
@@ -92,7 +92,7 @@ dry run: no agents executed, nothing spent</code></pre>
   </div>
   <p class="cap" id="cap"></p>
   <svg id="dag" width="100%" viewBox="0 0 900 250" role="img" aria-labelledby="dagt">
-    <title id="dagt">Task graph of a tactus run, coloured by state</title>
+    <title id="dagt">Task graph of a upstroke run, coloured by state</title>
   </svg>
   <div class="legend">
     <span><i style="background:var(--okbg);border:1px solid var(--ok)"></i>committed</span>
@@ -125,7 +125,7 @@ dry run: no agents executed, nothing spent</code></pre>
 
 <p>This is the acceptance run's ledger, matching the replay above — seventeen lines. Per task: how many attempts, which rungs it climbed, what the implementer spent, and what the reviewer spent, kept in separate columns because folding them together makes a cheap rung look expensive. FluentRoslyn's own bill is in the closing section.</p>
 
-<p class="src"><b>$</b> tactus status 01KZNG12FJA9DSJEYSK46NVBSC</p>
+<p class="src"><b>$</b> upstroke status 01KZNG12FJA9DSJEYSK46NVBSC</p>
 <pre class="scroll"><code>  task           attempts  trail                  worker   review   total
   readme         1         small ok               $0.0980  $0.4313  $0.5292
   parse-basic    2         small×2 ok             $0.1502  $1.0475  $1.1977
@@ -142,8 +142,8 @@ dry run: no agents executed, nothing spent</code></pre>
 
 <p>The engine commits to its own branch. Your working branch is never touched, and every commit arrives already reviewed by a model from a different family than the one that wrote it.</p>
 
-<pre class="scroll"><code>$ git log --oneline -n 2 tactus/run-01KZNMR59E5ATC9MBYY29WZB6E
-54a5909 [tactus] literals: Emit float and double special values as source that compiles
+<pre class="scroll"><code>$ git log --oneline -n 2 upstroke/run-01KZNMR59E5ATC9MBYY29WZB6E
+54a5909 [upstroke] literals: Emit float and double special values as source that compiles
 9580f55 correct ROADMAP's coverage claim, which Review 3 closed
 
 $ git log --oneline -n 1 main

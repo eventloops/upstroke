@@ -3,7 +3,7 @@
 - **Date:** 2026-08-09
 - **Scope:** commit `35558b2`, files `src/connect.rs`, `src/agent/mod.rs`,
   `src/agent/claude.rs`, `src/agent/copilot.rs`, `src/config.rs`,
-  `src/catalog.rs` — everything that decides what `~/.tactus/pools.toml` says,
+  `src/catalog.rs` — everything that decides what `~/.upstroke/pools.toml` says,
   kept with the parser that reads it back
 - **Level:** max — 10 finder angles, then the three load-bearing claims driven
   by throwaway tests rather than by argument
@@ -28,7 +28,7 @@ it overrides exists to protect.
 | 1 | **Pool order was alphabetical, not file order.** `RawPools.pools` is a `BTreeMap`, so `Config.pools` came out sorted by name — while its own doc and `capacity::pool_for` both promise "table order as preference … moving a pool up the file promotes it". That order is the *only* mechanism an operator has for choosing between two accounts on one vendor, which is exactly what §13's `profile` seam exists for | normal | CONFIRMED (test: `[pools.work]` written first, `[pools.personal]` second, loaded as `["personal", "work"]`) | `BTreeMap<String, toml::Spanned<toml::Value>>`, re-sorted by span offset. Exact, and no new dependency — `Spanned` is already in `toml` |
 | 2 | **`connect` reported "unchanged" after a login, leaving the file saying NOT signed in.** Auth state is rendered only as a comment, and `settings_of` strips comments before comparing — so the one thing that had changed was the one thing invisible to the comparison | normal | CONFIRMED (test: second connect with `Authenticated` returns `Wrote::Unchanged`; file still reads `NOT signed in`) | Two comparisons, because two questions are being asked. *May* this be replaced turns on settings; *should* it be rewritten turns on everything except the header's timestamp. See #9 for the other half of this trade |
 | 3 | **`[budgets] pool_fraction = 0.5` was accepted in total silence.** No `deny_unknown_fields`, no leftover-key sweep. §13 names per-pool budgets, so that is the key an operator reading the design reaches for first — and they would believe a pool was capped while nothing capped it | low | CONFIRMED (test: loads with zero warnings and zero errors) | `deny_unknown_fields` on `Budgets`. `AskBefore` already had it; `RawPool` already warns by name |
-| 4 | An explicit **`--pools <typo>` silently yielded no pools**, so `tactus capacity` answered "no pools connected. Run `tactus connect`" — sending the operator to regenerate a file that was fine while their flag was wrong. `read_repo_config`, twenty lines above, has modelled the right rule for `--config` since step 1 | low | CONFIRMED | The same `required` distinction: explicit and absent is an error, discovered and absent is the normal fresh case |
+| 4 | An explicit **`--pools <typo>` silently yielded no pools**, so `upstroke capacity` answered "no pools connected. Run `upstroke connect`" — sending the operator to regenerate a file that was fine while their flag was wrong. `read_repo_config`, twenty lines above, has modelled the right rule for `--config` since step 1 | low | CONFIRMED | The same `required` distinction: explicit and absent is an error, discovered and absent is the normal fresh case |
 | 5 | **`--force` silently discarded `profile`, `monthly_allowance` and `endpoint`** — none of which `connect` can discover — while the refusal message recommended it. `profile` is the whole point of D2's seam and `monthly_allowance` is the only thing that makes a self-metered estimate possible at all | low | CONFIRMED | The operator's keys are read before anything is written and carried onto the matching pool; `render_pool` emits them. Asserted in the clobber test |
 | 6 | Pool-shape classification matched **substrings, api-set first**, so a description carrying both an api-ish and a subscription-ish word came out `ApiKey`, and `pro` matched inside `provider`. Worse asymmetrically: a confident *wrong* shape suppresses the "kind below is a default" comment, so the caveat vanishes exactly when it is most needed | low | PLAUSIBLE | `classify_shape`: whole tokens against two named sets, and **both-or-neither ⇒ `None`**. Ambiguity now says so by saying nothing |
 | 7 | **Copilot was probed twice per `connect` and per `capacity`** — `discover()` called `self.probe()` after the caller already had. Four subprocesses where two would do, each carrying a 15s timeout | low | CONFIRMED | `discover(&Caps)`. Discovery always runs beside a probe, so taking its result is the honest signature |
@@ -76,7 +76,7 @@ stopped updating anything.
 - **Invariant 2 held everywhere.** `discover` subprocesses the vendor's own CLI
   and parses stdout; nothing reads a credential file, handles a token, or opens
   a socket. The `--force` carry reads the pools file the operator wrote, which
-  is tactus's own artefact.
+  is upstroke's own artefact.
 - The three-state `AuthState` is used correctly at every site: no path renders
   `Unknown` as "not connected".
 - `parse_auth_status` degrades to `Unknown` on a timeout, on non-JSON, on

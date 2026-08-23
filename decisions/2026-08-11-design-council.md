@@ -1,11 +1,11 @@
-# Decision record — multi-model design council for tactus
+# Decision record — multi-model design council for upstroke
 
 **Date:** 2026-08-11
 **Status:** Decided — adopted as manual practice now; machinery deferred pending the miss/catch record (v0.3 design-pane era at the earliest).
-**Inputs:** *Tactus Multi-Model Design Council* and *Tactus Adaptive Agent Routing Engine* (GPT-5.6-sol drafts, kept outside the repo), reviewed against DESIGN.md v2.1 (§2, §5, §11.3, §21, §23.2) in a Fable 5 critique session. Decisions: project owner.
+**Inputs:** *Upstroke Multi-Model Design Council* and *Upstroke Adaptive Agent Routing Engine* (GPT-5.6-sol drafts, kept outside the repo), reviewed against DESIGN.md v2.1 (§2, §5, §11.3, §21, §23.2) in a Fable 5 critique session. Decisions: project owner.
 **Siblings from the same session** (originally addenda here, split out per `README.md`): [self-hosting v0.2](2026-08-11-self-hosting-v02.md) · [resume gate config](2026-08-11-resume-gate-config.md) · [Codex reasoning effort](2026-08-11-codex-reasoning-effort.md).
 
-**The idea under decision:** run high-stakes tactus design decisions through multiple independent frontier models — independent proposals, cross-critique, synthesis, adversarial review — instead of a single designer. The sol doc proposes it as a five-phase product subsystem ("council mode").
+**The idea under decision:** run high-stakes upstroke design decisions through multiple independent frontier models — independent proposals, cross-critique, synthesis, adversarial review — instead of a single designer. The sol doc proposes it as a five-phase product subsystem ("council mode").
 
 ---
 
@@ -24,7 +24,7 @@ Adopt the council **through the self-hosting/bootstrap lens, manual-first, zero 
 
 ## Reasoning
 
-- **Bootstrap economics.** Tactus's own development is a stream of council-grade decisions (the sol doc's §61 prototype list is effectively the backlog). Each gates weeks of implementation at real prices ($3–12/task; rework cycles at frontier rates). A council round at an estimated $30–100 is trivially justified *if the process catches real things* —
+- **Bootstrap economics.** Upstroke's own development is a stream of council-grade decisions (the sol doc's §61 prototype list is effectively the backlog). Each gates weeks of implementation at real prices ($3–12/task; rework cycles at frontier rates). A council round at an estimated $30–100 is trivially justified *if the process catches real things* —
 - **and it demonstrably does.** This review session is the existence proof: sol proposed, a different family critiqued against the spec, and real defects surfaced before implementation inherited them (collisions with §23.2's measured findings, a missing §5 output contract, an unaudited divergence-extractor trust gap).
 - **Coverage update — a position revised during review.** The initial critique held that frontier models mostly converge given the same brief, making parallel generation the weakest phase. Direct evidence dented this: sol's drafts contained non-overlapping, adoptable ideas the Fable-authored spec lacked (failure taxonomy, `selection_origin`, pre-execution difficulty snapshots). Coverage failures are also the *invisible* class — the better design nobody generated leaves no trace — so "the record shows detection dominated" carried selection bias. Second and third family generators therefore earn their seats on open problems.
 - **More-intelligence-earlier is measured, not aspirational.** §23.2 recorded that escalating early cost less than retrying cheap ($2.73 vs $3.21) because frontier review is charged per attempt. The design-phase analog compounds, since design errors gate everything downstream.

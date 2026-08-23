@@ -1,4 +1,4 @@
-//! `tactus status` — the run, folded out of its own log (DESIGN.md §15).
+//! `upstroke status` — the run, folded out of its own log (DESIGN.md §15).
 //!
 //! Status is a pure read: it opens no branch, spawns no agent, and takes no
 //! lock. Everything it shows is derived by replaying `events.jsonl` through
@@ -14,7 +14,7 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use crate::engine::RunReport;
-use crate::error::TactusError;
+use crate::error::UpstrokeError;
 use crate::events::{self, Event, EventBody, LogTail, RunStarted, RunState};
 use crate::interaction::Sleeper;
 use crate::ir::Plan;
@@ -66,10 +66,10 @@ impl RunStatus {
 }
 
 /// Load a run: the newest one, or any unambiguous id prefix.
-pub fn load(repo_root: &Path, run_id: Option<&str>) -> Result<RunStatus, TactusError> {
+pub fn load(repo_root: &Path, run_id: Option<&str>) -> Result<RunStatus, UpstrokeError> {
     let run_id = match run_id {
         Some(wanted) => rundir::resolve_run_id(repo_root, wanted)?,
-        None => rundir::latest_run(repo_root).ok_or_else(|| TactusError::Refused {
+        None => rundir::latest_run(repo_root).ok_or_else(|| UpstrokeError::Refused {
             message: format!(
                 "no runs found under {} — nothing has run in this repository yet",
                 rundir::runs_root(repo_root).display()
@@ -91,7 +91,7 @@ pub fn load(repo_root: &Path, run_id: Option<&str>) -> Result<RunStatus, TactusE
     let started = events::started_of(&events, &events_path)?.clone();
     let effective_schema = events::ensure_supported_schema(&started, &events, &events_path)?;
     if started.run_id != run_id {
-        return Err(TactusError::EventLog {
+        return Err(UpstrokeError::EventLog {
             path: events_path.clone(),
             message: format!(
                 "run_started id `{}` does not match directory `{run_id}`",
@@ -102,13 +102,13 @@ pub fn load(repo_root: &Path, run_id: Option<&str>) -> Result<RunStatus, TactusE
     let paths = RunPaths::from_parts(public.clone(), PathBuf::from(&started.private_dir));
 
     let plan_path = paths.plan_json();
-    let plan_bytes = std::fs::read(&plan_path).map_err(|source| TactusError::Io {
+    let plan_bytes = std::fs::read(&plan_path).map_err(|source| UpstrokeError::Io {
         path: plan_path.clone(),
         source,
     })?;
     if effective_schema >= 3 {
         let recorded = events::recorded_normalized_plan_digest(&events).ok_or_else(|| {
-            TactusError::EventLog {
+            UpstrokeError::EventLog {
                 path: events_path.clone(),
                 message: "event schema 3 does not record the normalized-plan SHA-256 digest"
                     .to_owned(),
@@ -116,7 +116,7 @@ pub fn load(repo_root: &Path, run_id: Option<&str>) -> Result<RunStatus, TactusE
         })?;
         let actual = events::normalized_plan_digest(&plan_bytes);
         if actual != recorded {
-            return Err(TactusError::EventLog {
+            return Err(UpstrokeError::EventLog {
                 path: plan_path.clone(),
                 message: format!(
                     "normalized plan digest `{actual}` does not match recorded digest `{recorded}`"
@@ -124,11 +124,11 @@ pub fn load(repo_root: &Path, run_id: Option<&str>) -> Result<RunStatus, TactusE
             });
         }
     }
-    let plan: Plan = serde_json::from_slice(&plan_bytes).map_err(|e| TactusError::Parse {
+    let plan: Plan = serde_json::from_slice(&plan_bytes).map_err(|e| UpstrokeError::Parse {
         message: format!("{}: {e}", plan_path.display()),
     })?;
     if plan.source.hash != started.plan_hash {
-        return Err(TactusError::EventLog {
+        return Err(UpstrokeError::EventLog {
             path: plan_path.clone(),
             message: format!(
                 "frozen plan hash `{}` does not match run-start hash `{}`",
@@ -192,7 +192,7 @@ pub fn render(status: &RunStatus) -> String {
         let _ = writeln!(
             out,
             "state: interrupted — this run stopped without finishing{}. Continue it with:\n    \
-             tactus resume {}",
+             upstroke resume {}",
             if status.interrupted > 0 {
                 format!(
                     ", with {} attempt(s) cut off mid-flight",
@@ -217,7 +217,7 @@ pub fn render(status: &RunStatus) -> String {
     if !open.is_empty() {
         let _ = writeln!(out, "waiting on {} answer(s):", open.len());
         for record in open {
-            let _ = writeln!(out, "    tactus answer {}", record.question.id);
+            let _ = writeln!(out, "    upstroke answer {}", record.question.id);
         }
     }
     let _ = writeln!(out, "transcripts: {}", status.paths.private.display());
@@ -345,7 +345,7 @@ pub fn describe(event: &Event) -> String {
         }
         EventBody::TaskFailed { task, data } => format!("{task}: failed — {}", data.reason),
         EventBody::QuestionRaised { task, data } => format!(
-            "{task}: asking {} — answer with `tactus answer {}`",
+            "{task}: asking {} — answer with `upstroke answer {}`",
             data.question.kind, data.question.id
         ),
         EventBody::QuestionAnswered { data } => {
@@ -406,7 +406,7 @@ pub fn follow(
     poll: Duration,
     max_idle_polls: u32,
     out: &mut dyn std::io::Write,
-) -> Result<(), TactusError> {
+) -> Result<(), UpstrokeError> {
     let mut tail = LogTail::new(status.paths.events());
     let mut warnings = Vec::new();
     let mut idle = 0;
@@ -468,9 +468,9 @@ pub fn follow(
 /// interrupted attempt from the stale prefix.
 fn stable_event_bytes_with(
     path: &Path,
-    mut read: impl FnMut() -> Result<Vec<u8>, TactusError>,
+    mut read: impl FnMut() -> Result<Vec<u8>, UpstrokeError>,
     mut held: impl FnMut() -> bool,
-) -> Result<(Vec<u8>, bool), TactusError> {
+) -> Result<(Vec<u8>, bool), UpstrokeError> {
     const MAX_SNAPSHOT_ATTEMPTS: usize = 8;
     for _ in 0..MAX_SNAPSHOT_ATTEMPTS {
         let held_before = held();
@@ -489,7 +489,7 @@ fn stable_event_bytes_with(
             return Ok((second, false));
         }
     }
-    Err(TactusError::Refused {
+    Err(UpstrokeError::Refused {
         message: format!(
             "{} kept changing while status checked whether its engine was live; retry status once the transition settles",
             path.display()
@@ -561,7 +561,7 @@ mod tests {
                 task: "t1".to_owned(),
                 data: TaskCommitted {
                     sha: "0123456789abcdef".to_owned(),
-                    message: "[tactus] t1: do it".to_owned(),
+                    message: "[upstroke] t1: do it".to_owned(),
                 },
             }),
             event(EventBody::RunFinished {
@@ -597,7 +597,7 @@ mod tests {
                 },
             }),
         }));
-        assert!(line.contains("tactus answer q-01ABC"), "{line}");
+        assert!(line.contains("upstroke answer q-01ABC"), "{line}");
     }
 
     #[test]
@@ -720,7 +720,7 @@ mod tests {
     fn the_ledger_keeps_worker_and_review_spend_apart() {
         let report = RunReport {
             run_id: "01RUN".to_owned(),
-            branch: "tactus/run-01RUN".to_owned(),
+            branch: "upstroke/run-01RUN".to_owned(),
             gates: vec!["check".to_owned()],
             gates_from_config: true,
             warnings: Vec::new(),

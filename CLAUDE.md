@@ -2,7 +2,7 @@
 
 Context for Claude Code sessions working on this repository.
 
-## What tactus is
+## What upstroke is
 
 A headless orchestration engine for AI coding agents, in Rust. It normalises an
 annotated markdown plan into a dependency graph of typed tasks, dispatches each
@@ -19,7 +19,7 @@ The ones a change is most likely to trip over:
 
 - **Agents edit files; the engine owns git.** Agents are told never to commit.
 - **The engine never speaks HTTP.** All model interaction is inside agent
-  subprocesses. `tactus connect` shells out to each vendor CLI and asks it about
+  subprocesses. `upstroke connect` shells out to each vendor CLI and asks it about
   its own account — no token is ever handled.
 - **Ground truth is the diff, not the transcript.** Gates check, reviewers
   judge, feedback quotes `git diff` captured by the engine.
@@ -101,12 +101,12 @@ does and the difference never matters. Four of the eight need `jq`.
 `MAINTAINING.md` is authoritative for the full lifecycle. In outline:
 
 1. Open a **draft PR early**.
-2. Deterministic CI and PR-policy gates go green. `tactus-ci` aggregates lint,
+2. Deterministic CI and PR-policy gates go green. `upstroke-ci` aggregates lint,
    msrv and the test matrix and is a required context.
 3. An independent **frontier-model review** of the exact green head, recorded
    as a PR comment.
 4. The attestation workflow reruns the mechanical gates on that SHA and
-   publishes the required `tactus-frontier-review` check.
+   publishes the required `upstroke-frontier-review` check.
 5. **Merge commits only.** Resolve every review conversation first.
 
 The PR body must contain all six sections — Summary, Scope, Validation, Review
@@ -154,15 +154,15 @@ If you are on the build box rather than a workstation, read `infra/README.md`
 rules below are the whole contract).
 The rule that matters most:
 
-**Use `tactus-build`, never set `CARGO_TARGET_DIR` yourself.**
+**Use `upstroke-build`, never set `CARGO_TARGET_DIR` yourself.**
 
 ```bash
-tactus-build cargo test --all-targets --all-features
+upstroke-build cargo test --all-targets --all-features
 ```
 
 sccache keys on the target directory, not the source path. One target dir per
 worktree is an unbounded set of paths, so no two worktrees ever share a cache
-entry. `tactus-build` allocates from a bounded slot pool: full isolation between
+entry. `upstroke-build` allocates from a bounded slot pool: full isolation between
 concurrent builds, repeating paths, cache hits.
 
 ## Traps that have already cost time
