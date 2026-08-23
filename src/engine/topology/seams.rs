@@ -164,13 +164,44 @@ impl HarnessTopologyHooks {
         &self.harness
     }
 
-    /// Also record every durability primitive the two record-writing funnels
+    /// Also record every durability primitive the record-writing funnels
     /// perform, which is how a P1/P3b/P5b ordering assertion sees the fsyncs.
+    ///
+    /// Three families, not two. The Event funnel is the one whose contract is
+    /// *entirely* durability — the append's write/flush/sync and the barrier's
+    /// prefix sync — and it was the family this method did not reach, because
+    /// [`crate::events::log::HarnessEventHooks`] answered no durability
+    /// question at all until PR7 taught it to.
     #[must_use]
     pub fn recording_durability(mut self) -> Self {
         self.effects = self.effects.recording_durability();
         self.rundir = self.rundir.clone().recording_durability();
+        self.events = self.events.clone().recording_durability();
         self
+    }
+
+    /// Ask the Event funnel to leave the **torn** durable shape at a kill
+    /// armed on `Written`, rather than the complete-unsynced one.
+    ///
+    /// `SubEffectPoint::Written`'s frozen kill entry tables two durable shapes
+    /// under one key, so no arming can choose between them and the bundle has
+    /// to. Without this, T-APPEND's (w) row — the torn tail the next open
+    /// truncates — is unreachable through the bundle at all. Off by default:
+    /// the production shape is one `write_all` of the whole line.
+    #[must_use]
+    pub fn with_written_kill_shape(mut self, shape: crate::events::log::WrittenShape) -> Self {
+        self.events = self.events.clone().with_written_kill_shape(shape);
+        self
+    }
+
+    /// The Event-family observer, so a barrier assertion can read the
+    /// durability ledger and the sync records it collected.
+    ///
+    /// The sites themselves are on the shared [`HookHarness`] and are read
+    /// there; these are the answers a `(site, phase)` key cannot carry.
+    #[must_use]
+    pub fn event_observer(&self) -> &crate::events::log::HarnessEventHooks {
+        &self.events
     }
 }
 

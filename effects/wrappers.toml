@@ -305,6 +305,12 @@ effect_free = [
     # `EventHooks` default bodies, in the classification domain since the
     # parser was repaired (`PR6-LANEF-007`). Each returns a constant or does
     # nothing: `WrittenShape::Complete`, `DurabilityLedger::off()`, `{}`.
+    #
+    # `durability_ledger` and `synced` are also `HarnessEventHooks`'s overrides
+    # from PR7. Both stay effect-free: one hands back a clone of an in-memory
+    # `Vec` handle and the other pushes a `SyncRecord` onto one. Neither
+    # touches a file — the sync they describe was performed by
+    # `sync_log_file`/`sync_directory`, which are the funnel's own.
     "durability_ledger",
     "synced",
     "written_kill_shape",
@@ -317,6 +323,8 @@ effect_free = [
     "harness",
     "into_parts",
     "kind",
+    # PR7: `HarnessEventHooks`'s durability read-back. In-memory only.
+    "ledger",
     "log",
     "name",
     "new",
@@ -327,8 +335,15 @@ effect_free = [
     "poll",
     "read_all",
     "read_bytes",
+    # PR7: turns this observer's ledger on. Allocates a `Vec`; performs nothing.
+    "recording_durability",
     "round_trip",
     "skip_existing",
+    # PR7: the collected `SyncRecord`s, cloned out of a mutex.
+    "syncs",
+    # PR7: sets which of `Written`'s two tabled durable shapes this observer
+    # asks the funnel for. Stores an enum; the funnel performs the write.
+    "with_written_kill_shape",
 ]
 
 [[module]]

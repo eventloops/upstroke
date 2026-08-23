@@ -2840,6 +2840,375 @@ fn every_barrier_step_is_reachable_and_named() {
 }
 
 // ---------------------------------------------------------------------------
+// T-APPEND: the kill rows, and the two shapes only a raw mutation can build
+// ---------------------------------------------------------------------------
+//
+// `T-APPEND`'s `boundary` splits into kill cases — (w) bytes partially written,
+// (u) the full line written but not yet synced, (s) synced — and error-return
+// cases. The error-return halves belong to the emit path and live with it in
+// `src/engine/topology/emit.rs`, which as a `TOPOLOGY_MODULE` may name neither
+// `std::process::Command` nor a raw `std::fs` mutation. The kill halves need
+// both: a kill is `std::process::abort` and its claim is what a process that
+// runs **no** cleanup leaves durable, and "a line lost before the barrier"
+// needs the loss to be real. So they are here, beside the kill apparatus this
+// file already has, and they reuse [`kill_at`] rather than growing a second
+// one.
+//
+// **What "recovery matches the row" is measured as.** These logs are
+// `defer_wait_elapsed` lines, which the checked fold refuses before a
+// `run_started` — so the assertion is over [`TopologyFold::parse_log`], the
+// barrier's own step-(5) parser, and over the *whole event vector* rather than
+// any projection of it. That is what recovery consumes, so equality of vectors
+// is stronger than equality of anything derived from them, not weaker.
+
+/// Hash rather than length: a one-character edit does not move a length, and
+/// "the surviving prefix is the before-append one" is a claim about bytes.
+fn digest_of(bytes: &[u8]) -> String {
+    format!("{:x}", Sha256::digest(bytes))
+}
+
+/// A durable before-append prefix, and the events it replays to.
+///
+/// `topology_line(7)` rather than `topology_line(1)`: the kill helper appends
+/// round 1, so a seed of round 1 would make "the line that survived" and "the
+/// line that was already there" the same bytes, and every assertion below
+/// would hold for the wrong reason.
+fn seeded_prefix(tag: &str) -> (PathBuf, Vec<u8>, Vec<TopologyEvent>) {
+    let path = log_path(tag);
+    let mut warnings = Vec::new();
+    let mut log = EventLog::open(EventSite::OpenLog, &path, &mut warnings).expect("open");
+    log.append_topology(EventSite::Append, &topology_line(7))
+        .expect("the before-append prefix");
+    drop(log);
+    let bytes = fs::read(&path).expect("the seeded log");
+    let events = TopologyFold::parse_log(&bytes).expect("the seed replays");
+    (path, bytes, events)
+}
+
+/// What the log would hold if the killed append had committed.
+fn after_append_events(before: &[TopologyEvent]) -> Vec<TopologyEvent> {
+    let mut events = before.to_vec();
+    events.push(topology_event(1));
+    events
+}
+
+/// T-APPEND (w): "bytes partially written (torn tail: no terminating
+/// newline)". `durable_state` is "the previous prefix (an unterminated final
+/// line is not an event: the newline is the commit marker)", and
+/// `resume_action` is "`Event.OpenLog` truncates an unterminated final line
+/// before taking the append handle … only then does recovery follow the fault
+/// row of the surviving prefix (before-append …)".
+#[test]
+fn torn_tail_truncated_on_open_and_recovery_matches_before_append_row() {
+    let (path, before, before_events) = seeded_prefix("torn-before-append-row");
+
+    // A real process death inside the write, in the torn half of `Written`'s
+    // kill entry.
+    let killed = kill_at("written-torn", SubEffectPoint::Written, &path);
+    assert!(
+        killed.len() > before.len(),
+        "the child died before it wrote anything, so there is no torn tail to truncate"
+    );
+    assert!(
+        !killed.ends_with(b"\n"),
+        "a torn tail has no commit marker: {}",
+        String::from_utf8_lossy(&killed[before.len()..])
+    );
+
+    // The open normalizes it, before it takes the append handle.
+    let mut warnings = Vec::new();
+    let log = EventLog::open(EventSite::OpenLog, &path, &mut warnings).expect("open");
+    drop(log);
+
+    let survived = fs::read(&path).expect("the log after the open");
+    assert_eq!(
+        digest_of(&survived),
+        digest_of(&before),
+        "the surviving prefix is not the before-append one"
+    );
+    assert_eq!(
+        TopologyFold::parse_log(&survived).expect("the surviving prefix replays"),
+        before_events,
+        "recovery would follow the after-append order for a line that was never committed"
+    );
+    assert!(
+        warnings
+            .iter()
+            .any(|warning| warning.contains("never finished being written")),
+        "the truncation is reported: {warnings:?}"
+    );
+    // And the two rows really differ, so the assertion above is a choice.
+    assert_ne!(before_events, after_append_events(&before_events));
+}
+
+/// T-APPEND (u): "the full line written but not yet synced". `durable_state`
+/// is "**either** the previous prefix or the prefix incl. the line, decided by
+/// what survives at the next open", and `authoritative_state` is "exactly the
+/// durable prefix; the adjacent effect's fault row applies to **whichever
+/// prefix survived**".
+///
+/// So the assertion is deliberately a disjunction *plus* a statement of which
+/// arm this machine produced. A test that asserted only the arm would be
+/// asserting a durability guarantee the packet does not make; one that asserted
+/// only the disjunction would pass for a log that lost the whole prefix.
+#[test]
+fn unsynced_line_recovery_matches_whichever_prefix_survived() {
+    let (path, _before, before_events) = seeded_prefix("unsynced-whichever");
+    let after_events = after_append_events(&before_events);
+    assert_ne!(before_events, after_events, "the two rows must differ");
+
+    let killed = kill_at("written-complete", SubEffectPoint::Written, &path);
+    assert!(
+        killed.ends_with(b"\n"),
+        "the complete-unsynced shape is the whole line, commit marker included"
+    );
+
+    let mut warnings = Vec::new();
+    let log = EventLog::open(EventSite::OpenLog, &path, &mut warnings).expect("open");
+    drop(log);
+    let survived = fs::read(&path).expect("the log after the open");
+    let recovered = TopologyFold::parse_log(&survived).expect("the surviving prefix replays");
+
+    assert!(
+        recovered == before_events || recovered == after_events,
+        "recovery followed neither row: {recovered:?}"
+    );
+    assert_eq!(
+        recovered, after_events,
+        "on this machine the line survived the kill, so recovery follows the after-append order"
+    );
+    assert!(
+        warnings.is_empty(),
+        "a complete line is not a torn tail and nothing was truncated: {warnings:?}"
+    );
+    assert_eq!(
+        digest_of(&survived),
+        digest_of(&killed),
+        "the open changed a prefix that was already at a commit marker"
+    );
+}
+
+/// T-APPEND (s): "synced". `durable_state` is "the prefix incl. the line" with
+/// no disjunction, which is the whole difference from (u) — and the reason
+/// this is a separate test rather than a second cell of the one above.
+#[test]
+fn synced_line_recovery_matches_after_append_row() {
+    let (path, before, before_events) = seeded_prefix("synced-after-append-row");
+    let after_events = after_append_events(&before_events);
+
+    let killed = kill_at("synced", SubEffectPoint::Synced, &path);
+    assert!(killed.ends_with(b"\n"));
+    assert!(killed.len() > before.len());
+
+    let mut warnings = Vec::new();
+    let log = EventLog::open(EventSite::OpenLog, &path, &mut warnings).expect("open");
+    drop(log);
+    let survived = fs::read(&path).expect("the log after the open");
+
+    assert_eq!(
+        TopologyFold::parse_log(&survived).expect("the surviving prefix replays"),
+        after_events,
+        "a synced line is not 'either prefix'"
+    );
+    assert_ne!(
+        TopologyFold::parse_log(&survived).expect("replays"),
+        before_events,
+        "recovery followed the before-append row for a line that was made durable"
+    );
+    assert!(warnings.is_empty(), "{warnings:?}");
+}
+
+/// `stable_prefix_barrier`: "a line an earlier process wrote but never synced
+/// or whose sync reported failure" is made durable by the barrier's own
+/// `SyncPrefix`, and thereafter "a line the barrier synced **cannot be reverted
+/// by a later loss**".
+///
+/// Two crashes, which is what makes the claim more than a restatement of the
+/// previous test: the first leaves the line unsynced, the barrier syncs it, and
+/// the second crash — a torn write on top of it — does not take it away.
+#[test]
+fn unsynced_line_made_durable_by_barrier_survives_later_power_loss() {
+    let (path, _before, before_events) = seeded_prefix("barrier-durability");
+    let after_events = after_append_events(&before_events);
+
+    // Crash one: the complete-unsynced shape.
+    let unsynced = kill_at("written-complete", SubEffectPoint::Written, &path);
+    assert!(unsynced.ends_with(b"\n"));
+    let full = unsynced.len() as u64;
+
+    // The barrier's step (2): the whole surviving prefix — including that
+    // line — is successfully synced by the reopening process.
+    let mut witness = Witness::default().recording_durability();
+    let mut warnings = Vec::new();
+    let log = EventLog::open_hooked(EventSite::OpenLog, &path, &mut warnings, &mut witness)
+        .expect("open");
+    drop(log);
+    assert_eq!(
+        witness.file_syncs(),
+        vec![full],
+        "the open synced the surviving prefix at its full length"
+    );
+    assert!(witness.steps().contains(&DurableStep::SyncedFile));
+
+    // Crash two, on top of the now-durable prefix: a torn write that the next
+    // open truncates away.
+    let torn = kill_at("written-torn", SubEffectPoint::Written, &path);
+    assert!(
+        !torn.ends_with(b"\n"),
+        "the second crash left no commit marker"
+    );
+    assert!(torn.len() > unsynced.len());
+
+    let mut warnings = Vec::new();
+    let log = EventLog::open(EventSite::OpenLog, &path, &mut warnings).expect("open");
+    drop(log);
+    let survived = fs::read(&path).expect("the log after the second open");
+
+    assert_eq!(
+        digest_of(&survived),
+        digest_of(&unsynced),
+        "the barrier-synced prefix did not survive the second crash"
+    );
+    assert_eq!(
+        TopologyFold::parse_log(&survived).expect("the surviving prefix replays"),
+        after_events,
+        "the line the barrier made durable was reverted by a later loss"
+    );
+    assert_ne!(before_events, after_events);
+}
+
+/// `stable_prefix_barrier`: "the barrier makes no claim about lines lost before
+/// it — a line no effect ever depended on may still be lost and then converges
+/// to the before-append order of its fault row **precisely because nothing
+/// acted on it**".
+///
+/// The loss has to be real, which is why this test is here rather than beside
+/// the emit path: nothing in any funnel removes a committed line, so the only
+/// way to model a power loss that drops an unsynced write is to truncate the
+/// file directly. It happens **before** any open, so no process ever saw the
+/// line, let alone acted on it.
+#[test]
+fn unsynced_line_lost_before_barrier_converges_to_before_append_order() {
+    let (path, before, before_events) = seeded_prefix("unsynced-lost");
+    let after_events = after_append_events(&before_events);
+
+    let unsynced = kill_at("written-complete", SubEffectPoint::Written, &path);
+    assert!(unsynced.ends_with(b"\n"), "the line reached the file");
+    assert!(unsynced.len() > before.len());
+
+    // The loss: the unsynced tail is gone, and no process has opened the log
+    // since the crash — so nothing has been authorized by that line, which is
+    // the premise the convergence rests on.
+    fs::OpenOptions::new()
+        .write(true)
+        .open(&path)
+        .expect("open for truncation")
+        .set_len(before.len() as u64)
+        .expect("the unsynced tail is lost");
+
+    let mut warnings = Vec::new();
+    let log = EventLog::open(EventSite::OpenLog, &path, &mut warnings).expect("open");
+    drop(log);
+    let survived = fs::read(&path).expect("the log after the open");
+
+    assert_eq!(digest_of(&survived), digest_of(&before));
+    assert_eq!(
+        TopologyFold::parse_log(&survived).expect("the surviving prefix replays"),
+        before_events,
+        "a lost line still steered recovery"
+    );
+    assert!(
+        warnings.is_empty(),
+        "a lost line is not a torn tail: {warnings:?}"
+    );
+
+    // The control. The identical fixture, with the loss removed, converges to
+    // the *other* row — so the assertion above is about the loss and not about
+    // a fixture that could only ever produce one answer.
+    let (kept_path, _, kept_before) = seeded_prefix("unsynced-kept");
+    let kept = kill_at("written-complete", SubEffectPoint::Written, &kept_path);
+    assert!(kept.ends_with(b"\n"));
+    let mut warnings = Vec::new();
+    let log = EventLog::open(EventSite::OpenLog, &kept_path, &mut warnings).expect("open");
+    drop(log);
+    assert_eq!(
+        TopologyFold::parse_log(&fs::read(&kept_path).expect("log")).expect("replays"),
+        after_append_events(&kept_before),
+        "without the loss the same fixture must reach the after-append order"
+    );
+    assert_ne!(before_events, after_events);
+}
+
+/// `stable_prefix_barrier`: an unstable reread "performs none of those effects:
+/// the write command ends … **the run is NoRunFinished and resumable, and the
+/// next resume re-establishes the barrier from (a0)**".
+///
+/// `an_unstable_reread_refuses_naming_prove_prefix_stable_and_hands_out_no_handle`
+/// covers the three clauses of the proof and the naming. What is asserted here
+/// is the other half of the same sentence, and it is the half a refusal that
+/// "repaired" the log would fail: nothing was done, and the next barrier over
+/// the same path holds.
+#[test]
+fn unstable_reread_after_open_sync_refuses_resumably() {
+    let path = log_path("unstable-resumable");
+    let committed = topology_line(3);
+    let mut warnings = Vec::new();
+    let mut log = EventLog::open(EventSite::OpenLog, &path, &mut warnings).expect("open");
+    log.append_topology(EventSite::Append, &committed)
+        .expect("a committed prefix");
+    drop(log);
+    let synced = fs::read(&path).expect("log");
+    assert!(!synced.is_empty());
+
+    // The reread differs from the prefix synced at open, which is the only
+    // thing the proof is about.
+    let mut rewriter = Rewrite::after_sync(&path, b"");
+    let error = establish_stable_prefix(&path, inputs(), None, &mut warnings, &mut rewriter)
+        .expect_err("an unstable reread authorizes nothing");
+    assert_eq!(error.step, BarrierStep::ProvePrefixStable);
+    assert!(
+        error.to_string().contains("the run is resumable"),
+        "the refusal says so in the words the packet uses: {error}"
+    );
+
+    // Nothing was done *by the refusal*: the log is exactly what the rewrite
+    // left, neither restored nor repaired.
+    assert_eq!(
+        fs::read(&path).expect("the log after the refusal"),
+        Vec::<u8>::new(),
+        "the refusal touched the log"
+    );
+
+    // Resumable. The next barrier over the same path holds and hands out both
+    // halves — which is what "the next resume re-establishes the barrier"
+    // means, and what a refusal that had left a half-truncated file would not
+    // allow.
+    let mut prefix =
+        establish_stable_prefix(&path, inputs(), None, &mut warnings, &mut NoEventHooks)
+            .expect("the next resume establishes the barrier");
+    assert!(prefix.bytes().is_empty());
+    assert_eq!(prefix.log().opened_at(), EventSite::OpenLog);
+    assert_eq!(prefix.log().poisoned_at(), None);
+
+    // The control. The identical bytes, with the rewrite removed, get *past*
+    // step (4) and refuse at step (5) instead — these fixture lines need a
+    // `run_started` the frozen inputs do not describe. So the refusal above was
+    // caused by the instability rather than by anything the fixture would have
+    // refused anyway, which is the one thing a single-cell refusal test cannot
+    // otherwise tell.
+    let untouched = log_path("unstable-resumable-control");
+    fs::write(&untouched, &synced).expect("seed");
+    let control =
+        establish_stable_prefix(&untouched, inputs(), None, &mut warnings, &mut NoEventHooks)
+            .expect_err("these lines are refused by the checked fold, not by the proof");
+    assert_eq!(
+        control.step,
+        BarrierStep::CheckedReplay,
+        "with the reread stable the proof passes and the barrier reaches the replay"
+    );
+}
+
+// ---------------------------------------------------------------------------
 // Structure
 // ---------------------------------------------------------------------------
 
@@ -3010,10 +3379,12 @@ fn the_stable_prefix_barrier_is_the_only_way_a_log_becomes_a_topology_fold() {
 
     assert!(scanned > 40, "the walk found only {scanned} source files");
     assert_eq!(
-        mentioning, 3,
-        "the control: `TopologyFold` is named in the production half of the fold, its census and \
-         this funnel. A different number means the regions this census scanned are not the ones \
-         it thinks they are, and its zero counts would prove nothing"
+        mentioning, 4,
+        "the control: `TopologyFold` is named in the production half of the fold, its census, this \
+         funnel, and PR7's emit path — which holds a fold and appends to a log but builds neither \
+         from bytes, so it adds nothing to `callers` below. A different number means the regions \
+         this census scanned are not the ones it thinks they are, and its zero counts would prove \
+         nothing"
     );
 
     assert_eq!(

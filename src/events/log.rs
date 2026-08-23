@@ -186,22 +186,112 @@ pub struct NoEventHooks;
 impl EventHooks for NoEventHooks {}
 
 /// The ST-07 observer: records into PR3's harness and returns what was armed.
+///
+/// It answers **all four** of [`EventHooks`]'s questions, and the three beyond
+/// `phase` are not decoration.
+///
+/// [`HookHarness`] is keyed by `(site, phase)`, and two of this funnel's
+/// answers are not expressible in that key at all:
+///
+/// * **Durability.** While this observer overrode `phase` and `point` only, the
+///   shared bundle could see *that* `Event.OpenLog` ran and nothing whatever
+///   about what it made durable — for the one funnel whose contract is almost
+///   entirely durability. Every test of the stable-prefix barrier then needed a
+///   private observer that touches no `HookHarness`, which is the failure the
+///   bundle exists to prevent (`HarnessTopologyHooks`: "an observation that
+///   lands anywhere else is an observation the evidence table will not have").
+///   [`Self::ledger`] is the ordered trace of primitives and [`Self::syncs`] is
+///   the richer per-sync record `proof_tests[9]` reads ("the **sync ledger**
+///   shows the synced length equal to the file length after open").
+/// * **Which durable shape a kill at `Written` leaves.** `SubEffectPoint::
+///   Written`'s frozen doc tables *two* — torn, and complete-unsynced — under
+///   one key, so the harness cannot say which and the funnel cannot choose.
+///   [`WrittenShape::Torn`] is reachable through
+///   [`EventHooks::written_kill_shape`] and through nothing else, so a bundle
+///   that did not override it could not produce T-APPEND's (w) row at all.
+///   [`Self::with_written_kill_shape`] is how a suite asks for it, and the
+///   default stays [`WrittenShape::Complete`] — the shape production writes,
+///   in a single `write_all`.
+///
+/// Cloning shares both logs, for the reason [`DurabilityLedger`] gives: a
+/// bundle hands its clone into a funnel body and the test still reads what the
+/// body recorded.
 #[derive(Debug, Clone)]
 pub struct HarnessEventHooks {
     harness: Arc<Mutex<HookHarness>>,
+    ledger: DurabilityLedger,
+    syncs: Arc<Mutex<Vec<SyncRecord>>>,
+    written: WrittenShape,
 }
 
 impl HarnessEventHooks {
     /// Observe through `harness`.
+    ///
+    /// Durability recording starts **off** and the written shape starts at the
+    /// production one, exactly as [`crate::rundir::HarnessHooks::new`] and
+    /// [`crate::workspace_manager::HarnessEffects::new`] start their ledgers
+    /// off: a ledger costs an allocation per primitive, a torn write costs a
+    /// second `write_all`, and only a test that asked for either wants it. Both
+    /// are opt-in, so `production_effect: none` is a property of the
+    /// constructor rather than of every call site.
     #[must_use]
     pub fn new(harness: Arc<Mutex<HookHarness>>) -> Self {
-        Self { harness }
+        Self {
+            harness,
+            ledger: DurabilityLedger::off(),
+            syncs: Arc::new(Mutex::new(Vec::new())),
+            written: WrittenShape::Complete,
+        }
     }
 
     /// The harness this observer records into.
     #[must_use]
     pub fn harness(&self) -> &Arc<Mutex<HookHarness>> {
         &self.harness
+    }
+
+    /// Also record every durability primitive this funnel performs, in order.
+    #[must_use]
+    pub fn recording_durability(mut self) -> Self {
+        self.ledger = DurabilityLedger::recording();
+        self
+    }
+
+    /// Which of the two durable shapes `Written`'s kill entry tables this
+    /// observer asks the funnel to leave behind.
+    ///
+    /// [`WrittenShape::Torn`] splits the line's `write_all` in two with the
+    /// `Written` kill consult between the halves, so a kill armed there lands
+    /// in T-APPEND's (w) row — a partial line with no terminating newline —
+    /// rather than its complete-unsynced one. With nothing armed the two halves
+    /// are both written and the bytes are identical, which is why the shape is
+    /// observable from the ledger (two `Wrote` entries, not one) and not from
+    /// the file.
+    #[must_use]
+    pub fn with_written_kill_shape(mut self, shape: WrittenShape) -> Self {
+        self.written = shape;
+        self
+    }
+
+    /// The durability ledger this observer records into.
+    #[must_use]
+    pub fn ledger(&self) -> DurabilityLedger {
+        self.ledger.clone()
+    }
+
+    /// Every sync the funnel reported, in the order it reported them.
+    ///
+    /// Recorded whether or not [`Self::recording_durability`] was asked for:
+    /// a [`SyncRecord`] is one value per successful sync rather than one per
+    /// primitive attempt, so it is not the thing whose cost the ledger switch
+    /// exists to gate, and a barrier test that had to remember to turn it on
+    /// would silently assert nothing when it forgot.
+    #[must_use]
+    pub fn syncs(&self) -> Vec<SyncRecord> {
+        self.syncs
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
     }
 }
 
@@ -220,6 +310,21 @@ impl EventHooks for HarnessEventHooks {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         harness.hook(EffectSiteId::Event(site), HookPhase::Point { point, mode })
+    }
+
+    fn durability_ledger(&self) -> DurabilityLedger {
+        self.ledger.clone()
+    }
+
+    fn synced(&mut self, record: &SyncRecord) {
+        self.syncs
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push(record.clone());
+    }
+
+    fn written_kill_shape(&mut self, _site: EventSite) -> WrittenShape {
+        self.written
     }
 }
 
