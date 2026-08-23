@@ -3924,6 +3924,118 @@ mod tests {
         fs::remove_dir_all(&root).expect("this test cleans up after itself");
     }
 
+    /// Run `body`, returning its panic message if it panicked. The default hook
+    /// is suppressed for the duration: these tests panic on purpose and the
+    /// backtrace noise would bury the assertions that matter.
+    fn panic_message(body: impl FnOnce()) -> Option<String> {
+        let previous = std::panic::take_hook();
+        std::panic::set_hook(Box::new(|_| {}));
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(body));
+        std::panic::set_hook(previous);
+        outcome.err().map(|payload| {
+            payload
+                .downcast_ref::<String>()
+                .cloned()
+                .or_else(|| payload.downcast_ref::<&str>().map(|s| (*s).to_owned()))
+                .unwrap_or_else(|| "<non-string panic payload>".to_owned())
+        })
+    }
+
+    /// The partition itself, over **every** real site rather than one example.
+    ///
+    /// An earlier version of this test named `Object.CandidateCommitTree` alone,
+    /// which asserted an instance and not the property: replacing the
+    /// `SAMPLED_SITES` membership check with `named == CandidateCommitTree`
+    /// special-cased that one site, left every other unsampled site failing open,
+    /// and the whole suite stayed green. Measured.
+    #[test]
+    fn every_real_site_is_either_replayable_or_refused_as_unsampled() {
+        let all = EffectSiteId::all();
+        assert!(
+            all.len() > SAMPLED_SITES.len(),
+            "there must be unsampled sites, or this test asserts nothing"
+        );
+        for site in all {
+            let spec = format!("{}=1000", site.name());
+            let got = parse_budget_spec(&spec, site);
+            if SAMPLED_SITES.contains(&site) {
+                assert_eq!(
+                    got,
+                    Ok(Some(std::time::Duration::from_micros(1000))),
+                    "{} is sampled and must be replayable",
+                    site.name()
+                );
+            } else {
+                assert_eq!(
+                    got,
+                    Err(BudgetSpecError::NotSampled(site.name().to_owned())),
+                    "{} is a real site this sampler never drives, so naming it must \
+                     refuse rather than fall through to a fresh measurement",
+                    site.name()
+                );
+            }
+        }
+    }
+
+    /// `SAMPLED_SITES` and the command table are two statements of one fact.
+    /// Nothing but this test makes them agree: adding an arm to `sampled_command`
+    /// without adding the site here would leave the new arm unreachable through a
+    /// replay and unobserved by any other test.
+    #[test]
+    fn the_replayable_site_list_matches_the_commands_that_exist() {
+        let fixture = Fixture::created("site-list-agreement");
+        let slot = fixture.task("agree", 0);
+        for site in EffectSiteId::all() {
+            let has_command =
+                panic_message(|| drop(sampled_command(site, &fixture, &slot))).is_none();
+            assert_eq!(
+                has_command,
+                SAMPLED_SITES.contains(&site),
+                "{} has a sampling command but is not in SAMPLED_SITES (or the reverse); \
+                 the two lists have drifted",
+                site.name()
+            );
+        }
+    }
+
+    /// **Every** refusal must reach the operator through the environment edge,
+    /// not merely the one an earlier test happened to use.
+    ///
+    /// With only `UnknownSite` covered, `Err(BudgetSpecError::NotSampled(_)) => None`
+    /// survived: the direct parser test still saw `NotSampled`, the edge test still
+    /// panicked for its typo, and a real-but-unsampled spec fell through to four
+    /// fresh measurements. Asserting the variant name appears also pins the
+    /// `{error:?}` in the message, whose removal would hide the distinction the
+    /// two errors exist to draw.
+    #[test]
+    fn every_refusal_reaches_the_operator_through_the_environment_edge() {
+        let stage = EffectSiteId::Object(ObjectSite::CandidateStage);
+        for (spec, variant) in [
+            ("Object.CandidateStgae=1", "UnknownSite"),
+            ("Object.CandidateCommitTree=1", "NotSampled"),
+            ("Object.CandidateStage", "Malformed"),
+            ("Object.CandidateStage=abc", "NotAPositiveInteger"),
+            ("Object.CandidateStage=99999999", "AboveCeiling"),
+            (
+                "Object.CandidateStage=1,Object.CandidateStage=2",
+                "Duplicate",
+            ),
+        ] {
+            let message = panic_message(|| {
+                let _unused: Option<std::time::Duration> =
+                    budget_from_var(Ok(spec.to_owned()), stage);
+            })
+            .unwrap_or_else(|| {
+                panic!("`{spec}` must be refused at the edge, not silently measured")
+            });
+            assert!(
+                message.contains(variant),
+                "the refusal for `{spec}` must name {variant} so the operator can tell \
+                 the refusals apart; got: {message}"
+            );
+        }
+    }
+
     /// The repair's own blind spot. Validating against the whole `EffectSiteId`
     /// registry accepted any *real* site, including the many this sampler never
     /// drives — so `Object.CandidateCommitTree` parsed, matched none of the four
