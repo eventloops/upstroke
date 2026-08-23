@@ -21,21 +21,20 @@
 #   C4  The workflow trigger contract is EXACTLY what the slice-PR record
 #       decided (decisions/2026-08-21-stacked-slice-prs.md): ci.yml triggers on
 #       push and pull_request, pr-policy.yml on pull_request, each with the branch
-#       list [master, codex/parallelism-design] and nothing else;
-#       frontier-review.yml triggers on repository_dispatch and nothing else;
-#       frontier-review-invalidate.yml triggers on pull_request_target with
-#       branches [master] and nothing else; and neither attestation workflow
-#       names the integration branch anywhere.
+#       list [master, codex/parallelism-design] and nothing else. The two
+#       attestation workflows that record once pinned were retired with the App
+#       check (decisions/2026-08-23-retire-app-attestation.md); there is no
+#       privileged workflow left to pin.
 #
 # WITHDRAWN, DELIBERATELY (round 5 of this file's review): this gate makes NO
 # claim about which cargo commands CI runs, whether CI executes them, or which
 # commands the documents list. Four review rounds showed that surface to be
 # open-ended for a text checker -- a command can be present and skipped
 # (`if: false`), a document can be missing, an example can contain the string --
-# and the release gates are not enforced by prose in the first place: the
-# trusted attestation workflow (.github/workflows/frontier-review.yml) reruns
-# them from its own default-branch definition on every dispatch, and the
-# reviewer reads both the documents and ci.yml. The mutations that demonstrated
+# and the release gates are not enforced by prose in the first place: at the time
+# the trusted attestation workflow reran them from its own default-branch
+# definition on every dispatch (retired since, see C4), and the reviewer reads
+# both the documents and ci.yml. The mutations that demonstrated
 # the withdrawn claims are kept by name as history, not as kills:
 # MUT-TEMPLATE-MSRV-REMOVED, MUT-CI-CLIPPY-ALL-FEATURES-REMOVED,
 # MUT-CI-MSRV-TOOLCHAIN-DRIFT's document half, MUT-CI-CARGO-TEST-STEP-DELETED,
@@ -187,7 +186,7 @@ fi
 # MUT-INVALIDATOR-MASTER-REMOVED: forbidding the integration-branch name is not
 # pinning master; the invalidator's filter is compared for exact equality too.
 # The event set of every workflow is pinned as well, so a trigger cannot be
-# added to the attestation path, or removed from the slice path, unnoticed.
+# added or removed from the slice path unnoticed.
 # decisions/2026-08-21-stacked-slice-prs.md
 slice_list='branches: [master, codex/parallelism-design]'
 pin_events() {  # pin_events <file> <expected events, sorted, space separated>
@@ -202,8 +201,7 @@ pin_branches() {  # pin_branches <file> <event> <expected branches line>
   [[ "$got" == "$want" ]] \
     || error "$f: $event must carry exactly '$want', got: ${got:-<none>}"
 }
-for f in .github/workflows/ci.yml .github/workflows/pr-policy.yml \
-         .github/workflows/frontier-review.yml .github/workflows/frontier-review-invalidate.yml; do
+for f in .github/workflows/ci.yml .github/workflows/pr-policy.yml; do
   [[ -f "$f" ]] || error "$f is missing"
 done
 if [[ -f .github/workflows/ci.yml ]]; then
@@ -215,21 +213,6 @@ if [[ -f .github/workflows/pr-policy.yml ]]; then
   pin_events .github/workflows/pr-policy.yml "pull_request"
   pin_branches .github/workflows/pr-policy.yml pull_request "$slice_list"
 fi
-if [[ -f .github/workflows/frontier-review.yml ]]; then
-  pin_events .github/workflows/frontier-review.yml "repository_dispatch"
-fi
-if [[ -f .github/workflows/frontier-review-invalidate.yml ]]; then
-  pin_events .github/workflows/frontier-review-invalidate.yml "pull_request_target"
-  pin_branches .github/workflows/frontier-review-invalidate.yml pull_request_target 'branches: [master]'
-fi
-# Attestation is never minted for a slice pull request, so neither attestation
-# workflow may name the integration branch at all -- in a trigger or anywhere.
-for wf in frontier-review frontier-review-invalidate; do
-  f=".github/workflows/$wf.yml"
-  [[ -f "$f" ]] || continue
-  grep -Fq 'codex/parallelism-design' "$f" \
-    && error "$f must stay master-only: attestation is never minted for a slice pull request"
-done
 
 if (( failed )); then
   echo "documentation consistency fixtures: FAIL" >&2

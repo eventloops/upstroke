@@ -70,7 +70,7 @@ use the CI form regardless, so the two stay equivalent when that changes.
 toolchain selection is explicit at call sites, so nothing auto-corrects a wrong
 default. Install 1.85.0 alongside stable.
 
-8 `test-*.sh` gates in `.github/scripts/` also run in CI's `lint` job.
+4 `test-*.sh` gates in `.github/scripts/` also run in CI's `lint` job.
 Invoke them **from the repository root**, the way `ci.yml` does:
 
 ```bash
@@ -82,7 +82,8 @@ requirement: most of the gates resolve their own directory and run from anywhere
 The one that does not is `test-pr-policy.sh`, which derives its location with
 `${BASH_SOURCE[0]%/*}` -- that strips nothing when the argument carries no slash,
 so it fails outright from inside `.github/scripts/`. Run them all the way `ci.yml`
-does and the difference never matters. Four of the eight need `jq`.
+does and the difference never matters. One of the four, `test-release-record.sh`,
+needs `jq`.
 
 ## Hard conventions
 
@@ -104,39 +105,39 @@ does and the difference never matters. Four of the eight need `jq`.
 2. Deterministic CI and PR-policy gates go green. `upstroke-ci` aggregates lint,
    msrv and the test matrix and is a required context.
 3. An independent **frontier-model review** of the exact green head, recorded
-   as a PR comment.
-4. The attestation workflow reruns the mechanical gates on that SHA and
-   publishes the required `upstroke-frontier-review` check.
-5. **Merge commits only.** Resolve every review conversation first.
+   in the PR body: the reviewed SHA and a durable link to the verdict.
+4. **Merge commits only.** Resolve every review conversation first. The
+   owner's merge is the attestation; there is no machine-minted review check
+   (`decisions/2026-08-23-retire-app-attestation.md`).
 
 The PR body must contain all six sections — Summary, Scope, Validation, Review
 evidence, Risk and rollback, Review finding ledger — and the ledger must use the
 exact canonical header. `validate-pr-body.sh` rejects anything else; run it
 locally against your body before pushing.
 
-**A new push invalidates the attestation and restarts the sequence** — with one
-exception: a push whose entire diff from the reviewed head is confined to
-`reviews/FINDINGS.md` (not yet on master; it arrives with the parallelism slice)
-keeps the review, and the trusted workflow re-attests the current head after
-verifying ancestry and the exempt-only diff itself
+**A new push invalidates the review and restarts the sequence** — review the
+new head — with one exception: a push whose entire diff from the reviewed head
+is confined to `reviews/FINDINGS.md` (not yet on master; it arrives with the
+parallelism slice) keeps the review; record both SHAs in the PR's review
+evidence and confirm the exempt-only diff yourself before merging
 (`decisions/2026-08-20-review-invalidation-scope.md`). The exemption is about
 the path, not about the file already existing: a push that only *adds*
-`reviews/FINDINGS.md` is itself exempt-only, which is how that standing ledger
--- it arrives with the parallelism slice -- can land without costing the review
-it is meant to record. Everything else
-invalidates, deliberately. Only the repository owner may attest; that check
-cannot be satisfied by an agent.
+`reviews/FINDINGS.md` -- it arrives with the parallelism slice -- is itself
+exempt-only, which is how that standing ledger can land without costing the
+review it is meant to record. Everything else invalidates, deliberately.
+Agents never merge to `master`: merging is the owner's act, and an agent
+session has no standing to do it even when it runs on the owner's token.
 
 ## Where things are
 
 | Path | What |
 |---|---|
 | `DESIGN.md` | The design; §4 invariants, §21 build order |
-| `MAINTAINING.md` | Full merge lifecycle, attestation, emergency policy |
+| `MAINTAINING.md` | Full merge lifecycle, trust boundary, release contract |
 | `CONTRIBUTING.md` | Contributor rules and CLA |
 | `decisions/` | Dated, immutable decision records |
 | `proposals/` | Dated design proposals and their critiques |
-| `.github/scripts/` | The 8 `test-*.sh` gates and the `validate-*` helpers they exercise |
+| `.github/scripts/` | The 4 `test-*.sh` gates and the `validate-*` helpers they exercise |
 | `acceptance/RESULT.md` | The v0.1 acceptance run write-up |
 | `reviews/` | Review records, and the standing finding ledger once it lands |
 

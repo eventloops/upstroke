@@ -27,16 +27,10 @@ Review transport and per-pass wall-clock limit:
 
 Passing review evidence URL:
 
-<!-- Two of the six rows below are attestation-specific -- the evidence comment
-     and the App-owned check -- and apply only to pull requests into `master`. A
-     slice pull request into an integration branch is reviewed but never
-     attested, so those two stay unchecked — decisions/2026-08-21-stacked-slice-prs.md. -->
-
 - [ ] `upstroke-ci` and `upstroke-pr-policy` passed before frontier review began
 - [ ] The independent frontier review used `max` effort on the exact current head
 - [ ] Every actionable finding is fixed; follow-ups contain only non-blocking suggestions or feature ideas
-- [ ] The evidence comment contains only `UPSTROKE_FRONTIER_REVIEW: 1`, `VERDICT: PASS`, and `REVIEWED_SHA: <full SHA>`
-- [ ] The App-owned `upstroke-frontier-review` check succeeded on the current head
+- [ ] `Reviewed head SHA` above is the head being merged, or differs from it by an exempt-only diff
 - [ ] Every review conversation is resolved
 
 ## Risk and rollback
