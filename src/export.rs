@@ -6,7 +6,7 @@ use std::path::Path;
 
 use serde::Serialize;
 
-use crate::error::TactusError;
+use crate::error::UpstrokeError;
 use crate::events::{self, AttemptRecord, Event, EventBody, ReviewPassOutcome, SelectionOrigin};
 use crate::ir::{Effort, Plan, Task, TaskKind, Tier, Usage};
 use crate::ladder::{FailureKind, FailureOrigin};
@@ -24,7 +24,7 @@ pub enum Format {
 pub struct Row {
     schema_version: u32,
     run_id: String,
-    tactus_version: String,
+    upstroke_version: String,
     run_started_at: String,
     attempt_started_at: String,
     attempt_finished_at: Option<String>,
@@ -124,13 +124,13 @@ struct Settlement<'a> {
 struct RunContext<'a> {
     events_path: &'a Path,
     run_id: &'a str,
-    tactus_version: &'a str,
+    upstroke_version: &'a str,
     started_at: &'a str,
 }
 
 /// Load and validate one stable run snapshot. No config, source plan, adapter,
 /// or report is consulted.
-pub fn load(repo_root: &Path, wanted: &str) -> Result<Loaded, TactusError> {
+pub fn load(repo_root: &Path, wanted: &str) -> Result<Loaded, UpstrokeError> {
     let run_id = rundir::resolve_run_id(repo_root, wanted)?;
     let public = rundir::public_dir(repo_root, &run_id);
     let events_path = public.join("events.jsonl");
@@ -148,7 +148,7 @@ pub fn load(repo_root: &Path, wanted: &str) -> Result<Loaded, TactusError> {
         let mut run_starts = log
             .iter()
             .filter(|event| matches!(event.body, EventBody::RunStarted { .. }));
-        let started_event = run_starts.next().ok_or_else(|| TactusError::EventLog {
+        let started_event = run_starts.next().ok_or_else(|| UpstrokeError::EventLog {
             path: events_path.clone(),
             message: "no run_started event".to_owned(),
         })?;
@@ -175,13 +175,13 @@ pub fn load(repo_root: &Path, wanted: &str) -> Result<Loaded, TactusError> {
         )?;
 
         let plan_path = public.join("plan.normalized.json");
-        let plan_bytes = std::fs::read(&plan_path).map_err(|source| TactusError::Io {
+        let plan_bytes = std::fs::read(&plan_path).map_err(|source| UpstrokeError::Io {
             path: plan_path.clone(),
             source,
         })?;
         if effective_schema >= 3 {
             let recorded = events::recorded_normalized_plan_digest(&log).ok_or_else(|| {
-                TactusError::EventLog {
+                UpstrokeError::EventLog {
                     path: events_path.clone(),
                     message: "event schema 3 does not record the normalized-plan SHA-256 digest"
                         .to_owned(),
@@ -198,7 +198,7 @@ pub fn load(repo_root: &Path, wanted: &str) -> Result<Loaded, TactusError> {
             }
         }
         let plan: Plan =
-            serde_json::from_slice(&plan_bytes).map_err(|error| TactusError::Parse {
+            serde_json::from_slice(&plan_bytes).map_err(|error| UpstrokeError::Parse {
                 message: format!("{}: {error}", plan_path.display()),
             })?;
         if plan.source.hash != started.plan_hash {
@@ -218,7 +218,7 @@ pub fn load(repo_root: &Path, wanted: &str) -> Result<Loaded, TactusError> {
         let context = RunContext {
             events_path: &events_path,
             run_id: &run_id,
-            tactus_version: &started.tactus_version,
+            upstroke_version: &started.upstroke_version,
             started_at: &started_event.ts,
         };
 
@@ -260,7 +260,7 @@ pub fn load(repo_root: &Path, wanted: &str) -> Result<Loaded, TactusError> {
             let expected_tier = usize::try_from(*rung)
                 .ok()
                 .and_then(|index| chain.tiers.get(index))
-                .ok_or_else(|| TactusError::EventLog {
+                .ok_or_else(|| UpstrokeError::EventLog {
                     path: events_path.clone(),
                     message: format!("rung is outside the recorded chain for {}", key_text(&key)),
                 })?;
@@ -303,7 +303,7 @@ pub fn load(repo_root: &Path, wanted: &str) -> Result<Loaded, TactusError> {
 fn unique_tasks<'a>(
     plan: &'a Plan,
     path: &Path,
-) -> Result<BTreeMap<String, &'a Task>, TactusError> {
+) -> Result<BTreeMap<String, &'a Task>, UpstrokeError> {
     let mut out = BTreeMap::new();
     for task in &plan.tasks {
         if out.insert(task.id.to_string(), task).is_some() {
@@ -317,7 +317,7 @@ fn unique_chains<'a>(
     chains: &'a [events::ChainSummary],
     tasks: &BTreeMap<String, &'_ Task>,
     path: &Path,
-) -> Result<BTreeMap<String, &'a events::ChainSummary>, TactusError> {
+) -> Result<BTreeMap<String, &'a events::ChainSummary>, UpstrokeError> {
     let mut out = BTreeMap::new();
     for chain in chains {
         if !tasks.contains_key(&chain.task) {
@@ -365,7 +365,7 @@ fn unique_chains<'a>(
 fn settlements<'a>(
     log: &'a [Event],
     path: &Path,
-) -> Result<BTreeMap<AttemptKey, Settlement<'a>>, TactusError> {
+) -> Result<BTreeMap<AttemptKey, Settlement<'a>>, UpstrokeError> {
     let mut out = BTreeMap::new();
     for (index, event) in log.iter().enumerate() {
         let (kind, task, attempt, rung, profile, record, parking, transition) = match &event.body {
@@ -435,7 +435,7 @@ fn validate_settlement(
     start_profile: &str,
     start: &events::AttemptStarted,
     settlement: &Settlement<'_>,
-) -> Result<(), TactusError> {
+) -> Result<(), UpstrokeError> {
     if settlement.index <= start_index {
         return invalid(
             path,
@@ -567,7 +567,7 @@ fn build_row(
     task: &Task,
     chain: &events::ChainSummary,
     settlement: Option<&Settlement<'_>>,
-) -> Result<Row, TactusError> {
+) -> Result<Row, UpstrokeError> {
     let EventBody::AttemptStarted {
         attempt,
         rung,
@@ -614,7 +614,7 @@ fn build_row(
     Ok(Row {
         schema_version: EXPORT_SCHEMA_VERSION,
         run_id: context.run_id.to_owned(),
-        tactus_version: context.tactus_version.to_owned(),
+        upstroke_version: context.upstroke_version.to_owned(),
         run_started_at: context.started_at.to_owned(),
         attempt_started_at: start_event.ts.clone(),
         attempt_finished_at: settlement.map(|done| done.ts.to_owned()),
@@ -790,17 +790,17 @@ fn duration_ms(
     path: &Path,
     identity: &str,
     value: std::time::Duration,
-) -> Result<u64, TactusError> {
-    u64::try_from(value.as_millis()).map_err(|_| TactusError::EventLog {
+) -> Result<u64, UpstrokeError> {
+    u64::try_from(value.as_millis()).map_err(|_| UpstrokeError::EventLog {
         path: path.to_owned(),
         message: format!("attempt duration exceeds export schema range for {identity}"),
     })
 }
 
-fn validate_cost(path: &Path, label: &str, cost: Option<f64>) -> Result<(), TactusError> {
+fn validate_cost(path: &Path, label: &str, cost: Option<f64>) -> Result<(), UpstrokeError> {
     if let Some(cost) = cost {
         if !cost.is_finite() || cost < 0.0 {
-            return Err(TactusError::EventLog {
+            return Err(UpstrokeError::EventLog {
                 path: path.to_owned(),
                 message: format!("{label} cost must be finite and non-negative, got {cost}"),
             });
@@ -809,12 +809,12 @@ fn validate_cost(path: &Path, label: &str, cost: Option<f64>) -> Result<(), Tact
     Ok(())
 }
 
-fn validate_timestamp(path: &Path, label: &str, value: &str) -> Result<(), TactusError> {
+fn validate_timestamp(path: &Path, label: &str, value: &str) -> Result<(), UpstrokeError> {
     if !is_supported_rfc3339(value) {
-        return Err(TactusError::EventLog {
+        return Err(UpstrokeError::EventLog {
             path: path.to_owned(),
             message: format!(
-                "{label} timestamp `{value}` is not RFC 3339 in tactus's supported \
+                "{label} timestamp `{value}` is not RFC 3339 in upstroke's supported \
                  no-leap-second profile"
             ),
         });
@@ -822,12 +822,12 @@ fn validate_timestamp(path: &Path, label: &str, value: &str) -> Result<(), Tactu
     Ok(())
 }
 
-/// Validate the RFC 3339 subset Tactus can record.
+/// Validate the RFC 3339 subset Upstroke can record.
 ///
 /// Event timestamps come from `SystemTime` as ordinary Unix seconds, so the
 /// writer can never emit `:60`. Rejecting leap-second notation avoids accepting
 /// it on arbitrary dates (which requires an external announcement table) while
-/// retaining every timestamp an authentic Tactus writer can produce.
+/// retaining every timestamp an authentic Upstroke writer can produce.
 fn is_supported_rfc3339(value: &str) -> bool {
     let bytes = value.as_bytes();
     if bytes.len() < 20
@@ -899,7 +899,7 @@ fn decimal(bytes: &[u8], start: usize, len: usize) -> Option<u32> {
     })
 }
 
-fn begin_snapshot(public: &Path, run_id: &str, path: &Path) -> Result<Vec<u8>, TactusError> {
+fn begin_snapshot(public: &Path, run_id: &str, path: &Path) -> Result<Vec<u8>, UpstrokeError> {
     begin_snapshot_with(
         run_id,
         || rundir::is_running(public),
@@ -910,8 +910,8 @@ fn begin_snapshot(public: &Path, run_id: &str, path: &Path) -> Result<Vec<u8>, T
 fn begin_snapshot_with(
     run_id: &str,
     mut is_running: impl FnMut() -> bool,
-    mut read: impl FnMut() -> Result<Vec<u8>, TactusError>,
-) -> Result<Vec<u8>, TactusError> {
+    mut read: impl FnMut() -> Result<Vec<u8>, UpstrokeError>,
+) -> Result<Vec<u8>, UpstrokeError> {
     if is_running() {
         return Err(live_refusal(run_id));
     }
@@ -927,7 +927,7 @@ fn finish_snapshot(
     run_id: &str,
     path: &Path,
     original: &[u8],
-) -> Result<(), TactusError> {
+) -> Result<(), UpstrokeError> {
     finish_snapshot_with(
         run_id,
         original,
@@ -940,14 +940,14 @@ fn finish_snapshot_with(
     run_id: &str,
     original: &[u8],
     mut is_running: impl FnMut() -> bool,
-    mut read: impl FnMut() -> Result<Vec<u8>, TactusError>,
-) -> Result<(), TactusError> {
+    mut read: impl FnMut() -> Result<Vec<u8>, UpstrokeError>,
+) -> Result<(), UpstrokeError> {
     let current = read()?;
     if is_running() {
         return Err(live_refusal(run_id));
     }
     if current != original {
-        return Err(TactusError::Refused {
+        return Err(UpstrokeError::Refused {
             message: format!(
                 "run `{run_id}` changed while its decision snapshot was being read; retry once the run is settled"
             ),
@@ -956,8 +956,8 @@ fn finish_snapshot_with(
     Ok(())
 }
 
-fn live_refusal(run_id: &str) -> TactusError {
-    TactusError::Refused {
+fn live_refusal(run_id: &str) -> UpstrokeError {
+    UpstrokeError::Refused {
         message: format!(
             "run `{run_id}` is live and its decision dataset is still moving; wait for it to finish or stop it before exporting"
         ),
@@ -977,7 +977,7 @@ pub fn write(rows: &[Row], format: Format, out: &mut impl Write) -> anyhow::Resu
     Ok(())
 }
 
-const CSV_HEADER: &str = "schema_version,run_id,tactus_version,run_started_at,attempt_started_at,attempt_finished_at,task_id,task_title,attempt,rung,task_kind,suggested_tier,minimum_tier,dependency_count,acceptance_count,path_hints_json,artifact_input_count,artifact_output_count,chain_tiers_json,attempts_per,selected_tier,selection_origin,adapter_id,adapter_cli_version,model,effort,pool,session_resumed,duration_ms,cost_usd,usage_input_tokens,usage_output_tokens,usage_cache_creation_input_tokens,usage_cache_read_input_tokens,usage_num_turns,usage_reasoning_output_tokens,outcome,failure_kind,failure_origin,failure_category,work_evidence,failure_reason,reviews_json\r\n";
+const CSV_HEADER: &str = "schema_version,run_id,upstroke_version,run_started_at,attempt_started_at,attempt_finished_at,task_id,task_title,attempt,rung,task_kind,suggested_tier,minimum_tier,dependency_count,acceptance_count,path_hints_json,artifact_input_count,artifact_output_count,chain_tiers_json,attempts_per,selected_tier,selection_origin,adapter_id,adapter_cli_version,model,effort,pool,session_resumed,duration_ms,cost_usd,usage_input_tokens,usage_output_tokens,usage_cache_creation_input_tokens,usage_cache_read_input_tokens,usage_num_turns,usage_reasoning_output_tokens,outcome,failure_kind,failure_origin,failure_category,work_evidence,failure_reason,reviews_json\r\n";
 
 fn write_csv(rows: &[Row], out: &mut impl Write) -> anyhow::Result<()> {
     out.write_all(CSV_HEADER.as_bytes())?;
@@ -986,7 +986,7 @@ fn write_csv(rows: &[Row], out: &mut impl Write) -> anyhow::Result<()> {
         let fields = vec![
             row.schema_version.to_string(),
             row.run_id.clone(),
-            row.tactus_version.clone(),
+            row.upstroke_version.clone(),
             row.run_started_at.clone(),
             row.attempt_started_at.clone(),
             opt(&row.attempt_finished_at),
@@ -1058,14 +1058,14 @@ fn scalar<T: ToString>(value: Option<T>) -> String {
 fn key_text(key: &AttemptKey) -> String {
     format!("task `{}`, attempt {}, rung {}", key.0, key.1, key.2)
 }
-fn bad_join(path: &Path, task: &str, source: &str) -> TactusError {
-    TactusError::EventLog {
+fn bad_join(path: &Path, task: &str, source: &str) -> UpstrokeError {
+    UpstrokeError::EventLog {
         path: path.to_owned(),
         message: format!("attempt task `{task}` is absent from {source}"),
     }
 }
-fn invalid<T>(path: &Path, message: String) -> Result<T, TactusError> {
-    Err(TactusError::EventLog {
+fn invalid<T>(path: &Path, message: String) -> Result<T, UpstrokeError> {
+    Err(UpstrokeError::EventLog {
         path: path.to_owned(),
         message,
     })
@@ -1185,7 +1185,7 @@ mod tests {
         fn new(tag: &str, events: Vec<Value>, tasks: Vec<Value>) -> Self {
             static NEXT: AtomicUsize = AtomicUsize::new(0);
             let root = std::env::temp_dir().join(format!(
-                "tactus-export-{tag}-{}-{}",
+                "upstroke-export-{tag}-{}-{}",
                 std::process::id(),
                 NEXT.fetch_add(1, Ordering::Relaxed)
             ));
@@ -1252,12 +1252,12 @@ mod tests {
             "event": "run_started",
             "data": {
                 "schema": 1,
-                "tactus_version": "0.0-old",
+                "upstroke_version": "0.0-old",
                 "run_id": RUN_ID,
-                "branch": "tactus/run-test",
+                "branch": "upstroke/run-test",
                 "base_sha": "abc",
                 "plan_path": "today.md",
-                "config_path": "tactus.toml",
+                "config_path": "upstroke.toml",
                 "plan_hash": "frozen-hash",
                 "private_dir": "/not/read",
                 "gates": [],
@@ -1516,11 +1516,11 @@ mod tests {
         // These current inputs are traps: the exporter must never consult them.
         fs::write(
             fixture.root.join("today.md"),
-            "# today\n<!-- tactus: kind=docs tier=frontier paths=WRONG -->",
+            "# today\n<!-- upstroke: kind=docs tier=frontier paths=WRONG -->",
         )
         .expect("source-plan trap");
         fs::write(
-            fixture.root.join("tactus.toml"),
+            fixture.root.join("upstroke.toml"),
             "[routing]\nfix = { chain = [\"frontier\"], attempts_per = 99 }\n",
         )
         .expect("config trap");
@@ -1585,7 +1585,7 @@ mod tests {
                 "selected_tier",
                 "selection_origin",
                 "session_resumed",
-                "tactus_version",
+                "upstroke_version",
                 "task_features",
                 "task_id",
                 "task_title",
@@ -1690,7 +1690,7 @@ mod tests {
             vec![task("old", "old task")],
         );
         fs::write(
-            fixture.root.join("tactus.toml"),
+            fixture.root.join("upstroke.toml"),
             "[pins.small]\nagent = \"today-agent\"\nmodel = \"today-model\"\n",
         )
         .expect("config trap");
@@ -1832,7 +1832,7 @@ mod tests {
         started["data"]["schema"] = json!(events::SCHEMA_VERSION + 1);
         let fixture = Fixture::new("future-schema", vec![started], vec![task("task", "task")]);
         let error = load_error(&fixture);
-        assert!(error.contains("written by a newer tactus"), "{error}");
+        assert!(error.contains("written by a newer upstroke"), "{error}");
         assert!(error.contains("Upgrade rather than"), "{error}");
     }
 

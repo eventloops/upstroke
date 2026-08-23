@@ -47,7 +47,7 @@ use serde_json::Value;
 use crate::agent::{AgentAdapter, TaskRun, proc};
 use crate::catalog::{self, Family};
 use crate::config::Config;
-use crate::error::TactusError;
+use crate::error::UpstrokeError;
 use crate::ir::{Effort, OutcomeStatus, PermissionMode, Plan, Task, Tier, Verdict, WorkerProfile};
 use crate::route::ResolvedChain;
 use crate::util;
@@ -202,13 +202,13 @@ impl Default for ReviewPlan {
 impl ReviewPlan {
     /// Validate and materialize the timeout recorded for this run. A corrupt
     /// zero must fail closed on resume rather than disabling supervision.
-    pub fn pass_timeout(&self) -> Result<Duration, TactusError> {
+    pub fn pass_timeout(&self) -> Result<Duration, UpstrokeError> {
         match self.pass_timeout_secs {
-            Some(0) => Err(TactusError::Refused {
+            Some(0) => Err(UpstrokeError::Refused {
                 message: "the recorded review plan has pass_timeout_secs = 0; a review pass must have a positive wall-clock budget".to_owned(),
             }),
             Some(seconds) => Ok(Duration::from_secs(seconds)),
-            None => Err(TactusError::Refused {
+            None => Err(UpstrokeError::Refused {
                 message: "the recorded review plan has no pass_timeout_secs; event schema 3 requires the timeout to be explicit".to_owned(),
             }),
         }
@@ -354,14 +354,14 @@ impl ReviewPlan {
 /// two model families on their blast-radius paths, and quietly giving them one
 /// is step-6 finding #10 all over again. The implicit anti-self-review rebind
 /// merely **warns**, because nobody asked for it and refusing would make
-/// tactus unusable on a single-vendor install.
+/// upstroke unusable on a single-vendor install.
 pub fn plan_for(
     plan: &Plan,
     chains: &[ResolvedChain],
     cfg: &Config,
     has_adapter: impl Fn(&str) -> bool,
     warnings: &mut Vec<String>,
-) -> Result<ReviewPlan, TactusError> {
+) -> Result<ReviewPlan, UpstrokeError> {
     let tier = cfg.review_tier.unwrap_or(Tier::Frontier);
     let demanded: Vec<Option<&crate::config::CompiledOverride>> = plan
         .tasks
@@ -381,7 +381,7 @@ pub fn plan_for(
         // Contradictory config: one key says judge nothing, another says judge
         // twice. Only an error where it would actually change what runs.
         if let Some(index) = demanded.iter().position(Option::is_some) {
-            return Err(TactusError::Refused {
+            return Err(UpstrokeError::Refused {
                 message: format!(
                     "task `{}` matches a [[routing.overrides]] asking for a cross-vendor second \
                      opinion, but [routing] review = {{ enabled = false }} turns review off \
@@ -426,7 +426,7 @@ pub fn plan_for(
             second_opinion.push(None);
             continue;
         };
-        let family = primary_family.ok_or_else(|| TactusError::Refused {
+        let family = primary_family.ok_or_else(|| UpstrokeError::Refused {
             message: format!(
                 "task `{}` requires a cross-vendor second opinion, but the review binding {} is \
                  not in the capability catalog, so its model family is unknown",
@@ -434,7 +434,7 @@ pub fn plan_for(
                 primary.describe()
             ),
         })?;
-        let binding = cross(family).ok_or_else(|| TactusError::Refused {
+        let binding = cross(family).ok_or_else(|| UpstrokeError::Refused {
             message: format!(
                 "task `{}` matches [[routing.overrides]] paths [{}], which require a second \
                  opinion from a different model family — but no {tier}-tier model outside the \
@@ -552,7 +552,7 @@ pub fn profile_for(agent: &str, model: &str, name: &str, effort: Effort) -> Work
 
 fn unavailable_after_error(
     stage: &str,
-    error: TactusError,
+    error: UpstrokeError,
     cost_usd: Option<f64>,
     invocations: u32,
     transcript: PathBuf,
@@ -568,7 +568,7 @@ fn unavailable_after_error(
     }
 }
 
-pub fn run_review(cx: &ReviewCx<'_>) -> Result<ReviewOutcome, TactusError> {
+pub fn run_review(cx: &ReviewCx<'_>) -> Result<ReviewOutcome, UpstrokeError> {
     // Validate the complete evidence before permission files are written or an
     // adapter can build/spawn a model command. An incomplete review is no
     // review, so large tasks fail closed rather than losing early paths.
@@ -752,9 +752,9 @@ const REASK_PROMPT: &str = "Your previous answer did not contain a parseable ver
     change>], \"needs_human\": <true or false>}\n\
     ```\n";
 
-fn materialize_prompt(cx: &ReviewCx<'_>) -> Result<String, TactusError> {
+fn materialize_prompt(cx: &ReviewCx<'_>) -> Result<String, UpstrokeError> {
     if let Some(error) = complete_diff_error(cx.diff) {
-        return Err(TactusError::Refused {
+        return Err(UpstrokeError::Refused {
             message: error.to_string(),
         });
     }
@@ -764,7 +764,7 @@ fn materialize_prompt(cx: &ReviewCx<'_>) -> Result<String, TactusError> {
     // leads, because it frames everything below it.
     prompt.push_str(cx.lens.preamble());
     prompt.push_str(
-        "You are reviewing one task's changes for the tactus engine. You have READ-ONLY access: \
+        "You are reviewing one task's changes for the upstroke engine. You have READ-ONLY access: \
          do not edit files, do not run commands.\n\n\
          Your job is to find reasons this change should NOT be accepted. A reviewer who agrees \
          by default is worthless. Be specific and cite the diff. If the change genuinely meets \
@@ -983,18 +983,18 @@ mod tests {
             "never-invoked"
         }
 
-        fn probe(&self) -> Result<crate::agent::Caps, TactusError> {
+        fn probe(&self) -> Result<crate::agent::Caps, UpstrokeError> {
             panic!("oversized review must refuse before probing")
         }
 
-        fn build(&self, _run: &TaskRun) -> Result<std::process::Command, TactusError> {
+        fn build(&self, _run: &TaskRun) -> Result<std::process::Command, UpstrokeError> {
             panic!("oversized review must refuse before command build")
         }
 
         fn parse(
             &self,
             _out: &crate::agent::ProcessOutput,
-        ) -> Result<crate::ir::Outcome, TactusError> {
+        ) -> Result<crate::ir::Outcome, UpstrokeError> {
             panic!("oversized review must refuse before parse")
         }
 
@@ -1004,7 +1004,7 @@ mod tests {
             _gate_cmds: &[String],
             _dir: &Path,
             _stem: &str,
-        ) -> Result<Option<PathBuf>, TactusError> {
+        ) -> Result<Option<PathBuf>, UpstrokeError> {
             panic!("oversized review must refuse before permission materialization")
         }
     }
@@ -1026,11 +1026,11 @@ mod tests {
             "deadline-test"
         }
 
-        fn probe(&self) -> Result<crate::agent::Caps, TactusError> {
+        fn probe(&self) -> Result<crate::agent::Caps, UpstrokeError> {
             panic!("direct review test does not probe")
         }
 
-        fn build(&self, _run: &TaskRun) -> Result<std::process::Command, TactusError> {
+        fn build(&self, _run: &TaskRun) -> Result<std::process::Command, UpstrokeError> {
             use std::sync::atomic::Ordering;
 
             let invocation = self.builds.fetch_add(1, Ordering::SeqCst);
@@ -1047,15 +1047,15 @@ mod tests {
                 "review::tests::review_deadline_helper",
                 "--nocapture",
             ]);
-            command.env("TACTUS_REVIEW_DEADLINE_HELPER", marker);
-            command.env("TACTUS_REVIEW_DEADLINE_MS", delay_ms);
+            command.env("UPSTROKE_REVIEW_DEADLINE_HELPER", marker);
+            command.env("UPSTROKE_REVIEW_DEADLINE_MS", delay_ms);
             Ok(command)
         }
 
         fn parse(
             &self,
             out: &crate::agent::ProcessOutput,
-        ) -> Result<crate::ir::Outcome, TactusError> {
+        ) -> Result<crate::ir::Outcome, UpstrokeError> {
             let (status, detail) = if out.timed_out {
                 (OutcomeStatus::Timeout, Some("deadline expired".to_owned()))
             } else if out.stdout.contains("first-unparseable") {
@@ -1099,13 +1099,13 @@ mod tests {
             "unavailable-test"
         }
 
-        fn probe(&self) -> Result<crate::agent::Caps, TactusError> {
+        fn probe(&self) -> Result<crate::agent::Caps, UpstrokeError> {
             panic!("direct review test does not probe")
         }
 
-        fn build(&self, run: &TaskRun) -> Result<std::process::Command, TactusError> {
+        fn build(&self, run: &TaskRun) -> Result<std::process::Command, UpstrokeError> {
             match self.stage {
-                UnavailableStage::Build => Err(TactusError::Agent {
+                UnavailableStage::Build => Err(UpstrokeError::Agent {
                     message: "scripted review build failure".to_owned(),
                 }),
                 UnavailableStage::Spawn => Ok(std::process::Command::new(
@@ -1131,7 +1131,7 @@ mod tests {
         fn parse(
             &self,
             out: &crate::agent::ProcessOutput,
-        ) -> Result<crate::ir::Outcome, TactusError> {
+        ) -> Result<crate::ir::Outcome, UpstrokeError> {
             match self.stage {
                 UnavailableStage::Transcript => Ok(crate::ir::Outcome {
                     status: OutcomeStatus::Completed,
@@ -1157,9 +1157,9 @@ mod tests {
             _gate_cmds: &[String],
             _dir: &Path,
             _stem: &str,
-        ) -> Result<Option<PathBuf>, TactusError> {
+        ) -> Result<Option<PathBuf>, UpstrokeError> {
             match self.stage {
-                UnavailableStage::Permissions => Err(TactusError::Agent {
+                UnavailableStage::Permissions => Err(UpstrokeError::Agent {
                     message: "scripted review permission failure".to_owned(),
                 }),
                 UnavailableStage::Build
@@ -1171,10 +1171,10 @@ mod tests {
 
     #[test]
     fn review_deadline_helper() {
-        let Ok(marker) = std::env::var("TACTUS_REVIEW_DEADLINE_HELPER") else {
+        let Ok(marker) = std::env::var("UPSTROKE_REVIEW_DEADLINE_HELPER") else {
             return;
         };
-        let delay_ms = std::env::var("TACTUS_REVIEW_DEADLINE_MS")
+        let delay_ms = std::env::var("UPSTROKE_REVIEW_DEADLINE_MS")
             .expect("helper delay")
             .parse::<u64>()
             .expect("numeric helper delay");
@@ -1214,7 +1214,7 @@ mod tests {
             ),
         ] {
             let root = std::env::temp_dir().join(format!(
-                "tactus-review-unavailable-{}-{stage:?}",
+                "upstroke-review-unavailable-{}-{stage:?}",
                 std::process::id()
             ));
             std::fs::create_dir_all(&root).expect("review scratch");
@@ -1625,7 +1625,7 @@ mod tests {
     #[test]
     fn verdict_reask_uses_the_remaining_pass_deadline() {
         let root =
-            std::env::temp_dir().join(format!("tactus-review-deadline-{}", std::process::id()));
+            std::env::temp_dir().join(format!("upstroke-review-deadline-{}", std::process::id()));
         std::fs::create_dir_all(&root).expect("review scratch");
         let task = task();
         let adapter = DeadlineAdapter::new();
@@ -1729,7 +1729,7 @@ mod tests {
     #[test]
     fn without_an_alternative_the_primary_stands_even_when_it_wrote_the_code() {
         // Single-vendor install: `plan_for` has already warned about this. The
-        // review still happens — refusing would make tactus unusable without a
+        // review still happens — refusing would make upstroke unusable without a
         // second CLI installed.
         let mut plan = plan_with(None);
         plan.drop_alternative();
@@ -1815,7 +1815,7 @@ mod tests {
     // ---------------------------------------------------------------------
 
     fn scratch_config(name: &str, body: &str) -> Config {
-        let dir = std::env::temp_dir().join(format!("tactus-review-plan-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("upstroke-review-plan-{}", std::process::id()));
         std::fs::create_dir_all(&dir).expect("scratch dir");
         let path = dir.join(name);
         std::fs::write(&path, body).expect("write config");
@@ -1827,15 +1827,15 @@ mod tests {
     ///
     /// A real, empty file rather than an absent one: an explicit pools path
     /// that does not exist is a hard error, and `None` would reach for the
-    /// operator's own `~/.tactus/pools.toml`. Created once because every caller
+    /// operator's own `~/.upstroke/pools.toml`. Created once because every caller
     /// wants the same bytes, and rewriting one shared path from parallel tests
     /// truncates it under a reader — `name` above is unique per test, this was
     /// the one file they all shared.
     fn no_pools() -> std::path::PathBuf {
         static PATH: std::sync::OnceLock<std::path::PathBuf> = std::sync::OnceLock::new();
         PATH.get_or_init(|| {
-            let dir =
-                std::env::temp_dir().join(format!("tactus-review-nopools-{}", std::process::id()));
+            let dir = std::env::temp_dir()
+                .join(format!("upstroke-review-nopools-{}", std::process::id()));
             std::fs::create_dir_all(&dir).expect("scratch dir");
             let path = dir.join("pools.toml");
             std::fs::write(&path, "# no pools\n").expect("empty pools file");

@@ -156,7 +156,7 @@ bash -n "$block"
 
 mkrepo() {
   git init -q "$1"
-  git -C "$1" config user.email fixtures@tactus.invalid
+  git -C "$1" config user.email fixtures@upstroke.invalid
   git -C "$1" config user.name "drift fixtures"
 }
 run_drift() {

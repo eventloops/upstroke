@@ -25,7 +25,7 @@ The contract that keeps this folder safe:
 - **Cross-link freely.** A decision that constrains another should say so in both
   directions.
 
-When design work runs through tactus itself, council ledgers land as run
+When design work runs through upstroke itself, council ledgers land as run
 artifacts (§15); records promoted here are the durable subset.
 
 ## Index
@@ -33,7 +33,7 @@ artifacts (§15); records promoted here are the durable subset.
 - [2026-08-11 — multi-model design council](2026-08-11-design-council.md): adopt
   the council manual-first, ≤3 family seats, critique-heavy; machinery deferred.
 - [2026-08-11 — self-hosting v0.2](2026-08-11-self-hosting-v02.md): v0.2
-  development runs through tactus; the claim is auditable from commit tags.
+  development runs through upstroke; the claim is auditable from commit tags.
 - [2026-08-11 — gate config across a resume](2026-08-11-resume-gate-config.md):
   resume runs the gates the record carries, warning on config drift; verified live.
 - [2026-08-11 — Codex reasoning effort](2026-08-11-codex-reasoning-effort.md):

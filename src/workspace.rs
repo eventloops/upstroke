@@ -8,7 +8,7 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 
-use crate::error::TactusError;
+use crate::error::UpstrokeError;
 use crate::events::PreparedCommit;
 
 pub struct Workspace {
@@ -34,13 +34,13 @@ impl Workspace {
     /// from a subdirectory would otherwise scope `git clean` to that
     /// subdirectory while staging stays whole-tree, so rollback would leave
     /// residue above the current directory.
-    pub fn open(root: &Path) -> Result<Self, TactusError> {
+    pub fn open(root: &Path) -> Result<Self, UpstrokeError> {
         let probe = Self {
             root: root.to_path_buf(),
         };
         let inside = probe.git(&["rev-parse", "--is-inside-work-tree"])?;
         if inside.trim() != "true" {
-            return Err(TactusError::Git {
+            return Err(UpstrokeError::Git {
                 message: format!("{} is not a git worktree", root.display()),
             });
         }
@@ -64,10 +64,10 @@ impl Workspace {
     /// joining the visible `.git` path would either fail or collapse distinct
     /// worktrees onto one lease. Git resolves the exact per-worktree directory
     /// for us without changing tracked or working-tree state.
-    pub(crate) fn worktree_git_dir(&self) -> Result<PathBuf, TactusError> {
+    pub(crate) fn worktree_git_dir(&self) -> Result<PathBuf, UpstrokeError> {
         let git_dir = self.git_path(&["rev-parse", "--absolute-git-dir"])?;
         if !git_dir.is_absolute() {
-            return Err(TactusError::Git {
+            return Err(UpstrokeError::Git {
                 message: format!(
                     "git rev-parse --absolute-git-dir returned a relative path: {}",
                     git_dir.display()
@@ -80,7 +80,7 @@ impl Workspace {
     /// Decode one path printed by Git without requiring Unix path bytes to be
     /// UTF-8. Git appends a platform line ending; remove only that delimiter,
     /// never legal leading or trailing path bytes.
-    fn git_path(&self, args: &[&str]) -> Result<PathBuf, TactusError> {
+    fn git_path(&self, args: &[&str]) -> Result<PathBuf, UpstrokeError> {
         let mut output = self.git_output(args)?;
         #[cfg(windows)]
         {
@@ -89,7 +89,7 @@ impl Workspace {
             } else if output.ends_with(b"\n") {
                 output.pop();
             }
-            let path = String::from_utf8(output).map_err(|error| TactusError::Git {
+            let path = String::from_utf8(output).map_err(|error| UpstrokeError::Git {
                 message: format!(
                     "git {} returned a path that is not valid UTF-8: {error}",
                     args.join(" ")
@@ -110,7 +110,7 @@ impl Workspace {
             if output.ends_with(b"\n") {
                 output.pop();
             }
-            let path = String::from_utf8(output).map_err(|error| TactusError::Git {
+            let path = String::from_utf8(output).map_err(|error| UpstrokeError::Git {
                 message: format!(
                     "git {} returned a path that is not valid UTF-8: {error}",
                     args.join(" ")
@@ -120,9 +120,9 @@ impl Workspace {
         }
     }
 
-    fn git(&self, args: &[&str]) -> Result<String, TactusError> {
+    fn git(&self, args: &[&str]) -> Result<String, UpstrokeError> {
         let output = self.git_output(args)?;
-        String::from_utf8(output).map_err(|error| TactusError::Git {
+        String::from_utf8(output).map_err(|error| UpstrokeError::Git {
             message: format!(
                 "git {} returned output that is not valid UTF-8: {error}",
                 args.join(" ")
@@ -130,17 +130,17 @@ impl Workspace {
         })
     }
 
-    fn git_output(&self, args: &[&str]) -> Result<Vec<u8>, TactusError> {
+    fn git_output(&self, args: &[&str]) -> Result<Vec<u8>, UpstrokeError> {
         let output = Command::new("git")
             .arg("-C")
             .arg(&self.root)
             .args(args)
             .output()
-            .map_err(|e| TactusError::Git {
+            .map_err(|e| UpstrokeError::Git {
                 message: format!("failed to run git: {e}"),
             })?;
         if !output.status.success() {
-            return Err(TactusError::Git {
+            return Err(UpstrokeError::Git {
                 message: format!(
                     "git {} failed: {}",
                     args.join(" "),
@@ -154,7 +154,10 @@ impl Workspace {
     /// Run a Git command with every repository-configured hook and fsmonitor
     /// disabled. Keep this raw-output primitive reusable by reference updates,
     /// whose expected compare-and-swap failures need the real exit status.
-    pub(crate) fn run_git_with_private_hooks(&self, args: &[&str]) -> Result<Output, TactusError> {
+    pub(crate) fn run_git_with_private_hooks(
+        &self,
+        args: &[&str],
+    ) -> Result<Output, UpstrokeError> {
         let hooks = PrivateHooksDir::create()?;
         let mut hooks_config = OsString::from("core.hooksPath=");
         hooks_config.push(&hooks.path);
@@ -166,15 +169,15 @@ impl Workspace {
             .args(["-c", "core.fsmonitor=false"])
             .args(args)
             .output()
-            .map_err(|e| TactusError::Git {
+            .map_err(|e| UpstrokeError::Git {
                 message: format!("failed to run git: {e}"),
             })
     }
 
-    fn git_output_with_private_hooks(&self, args: &[&str]) -> Result<Vec<u8>, TactusError> {
+    fn git_output_with_private_hooks(&self, args: &[&str]) -> Result<Vec<u8>, UpstrokeError> {
         let output = self.run_git_with_private_hooks(args)?;
         if !output.status.success() {
-            return Err(TactusError::Git {
+            return Err(UpstrokeError::Git {
                 message: format!(
                     "git {} failed: {}",
                     args.join(" "),
@@ -185,9 +188,9 @@ impl Workspace {
         Ok(output.stdout)
     }
 
-    fn git_with_private_hooks(&self, args: &[&str]) -> Result<String, TactusError> {
+    fn git_with_private_hooks(&self, args: &[&str]) -> Result<String, UpstrokeError> {
         let output = self.git_output_with_private_hooks(args)?;
-        String::from_utf8(output).map_err(|error| TactusError::Git {
+        String::from_utf8(output).map_err(|error| UpstrokeError::Git {
             message: format!(
                 "git {} returned output that is not valid UTF-8: {error}",
                 args.join(" ")
@@ -195,7 +198,11 @@ impl Workspace {
         })
     }
 
-    fn git_output_with_input(&self, args: &[&str], input: Vec<u8>) -> Result<Vec<u8>, TactusError> {
+    fn git_output_with_input(
+        &self,
+        args: &[&str],
+        input: Vec<u8>,
+    ) -> Result<Vec<u8>, UpstrokeError> {
         let hooks = PrivateHooksDir::create()?;
         let mut hooks_config = OsString::from("core.hooksPath=");
         hooks_config.push(&hooks.path);
@@ -210,24 +217,24 @@ impl Workspace {
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .spawn()
-            .map_err(|e| TactusError::Git {
+            .map_err(|e| UpstrokeError::Git {
                 message: format!("failed to run git: {e}"),
             })?;
-        let mut stdin = child.stdin.take().ok_or_else(|| TactusError::Git {
+        let mut stdin = child.stdin.take().ok_or_else(|| UpstrokeError::Git {
             message: format!("git {} did not open stdin", args.join(" ")),
         })?;
         // Read stdout/stderr while feeding the complete NUL-delimited path
         // list. A large index can otherwise fill check-attr's stdout pipe and
         // deadlock the parent while it is still writing stdin.
         let writer = std::thread::spawn(move || stdin.write_all(&input));
-        let output = child.wait_with_output().map_err(|e| TactusError::Git {
+        let output = child.wait_with_output().map_err(|e| UpstrokeError::Git {
             message: format!("waiting for git {}: {e}", args.join(" ")),
         })?;
-        let write_result = writer.join().map_err(|_| TactusError::Git {
+        let write_result = writer.join().map_err(|_| UpstrokeError::Git {
             message: format!("writing paths to git {} panicked", args.join(" ")),
         })?;
         if !output.status.success() {
-            return Err(TactusError::Git {
+            return Err(UpstrokeError::Git {
                 message: format!(
                     "git {} failed: {}",
                     args.join(" "),
@@ -235,16 +242,16 @@ impl Workspace {
                 ),
             });
         }
-        write_result.map_err(|e| TactusError::Git {
+        write_result.map_err(|e| UpstrokeError::Git {
             message: format!("writing paths to git {}: {e}", args.join(" ")),
         })?;
         Ok(output.stdout)
     }
 
-    fn prepared_update_ref(&self, args: &[&str]) -> Result<(), TactusError> {
+    fn prepared_update_ref(&self, args: &[&str]) -> Result<(), UpstrokeError> {
         let output = self.run_git_with_private_hooks(args)?;
         if !output.status.success() {
-            return Err(TactusError::Git {
+            return Err(UpstrokeError::Git {
                 message: format!(
                     "git {} failed: {}",
                     args.join(" "),
@@ -255,12 +262,12 @@ impl Workspace {
         Ok(())
     }
 
-    fn commit_tree_with_tactus_identity(
+    fn commit_tree_with_upstroke_identity(
         &self,
         tree_oid: &str,
         parent_oid: &str,
         message: &str,
-    ) -> Result<String, TactusError> {
+    ) -> Result<String, UpstrokeError> {
         let args = ["commit-tree", tree_oid, "-p", parent_oid, "-m", message];
         let output = Command::new("git")
             .arg("-C")
@@ -268,16 +275,16 @@ impl Workspace {
             .args(args)
             // Environment identity overrides repository/global config and any
             // inherited GIT_AUTHOR_* or GIT_COMMITTER_* values.
-            .env("GIT_AUTHOR_NAME", "tactus")
-            .env("GIT_AUTHOR_EMAIL", "tactus@tactus.local")
-            .env("GIT_COMMITTER_NAME", "tactus")
-            .env("GIT_COMMITTER_EMAIL", "tactus@tactus.local")
+            .env("GIT_AUTHOR_NAME", "upstroke")
+            .env("GIT_AUTHOR_EMAIL", "upstroke@upstroke.local")
+            .env("GIT_COMMITTER_NAME", "upstroke")
+            .env("GIT_COMMITTER_EMAIL", "upstroke@upstroke.local")
             .output()
-            .map_err(|e| TactusError::Git {
+            .map_err(|e| UpstrokeError::Git {
                 message: format!("failed to run git: {e}"),
             })?;
         if !output.status.success() {
-            return Err(TactusError::Git {
+            return Err(UpstrokeError::Git {
                 message: format!(
                     "git {} failed: {}",
                     args.join(" "),
@@ -285,7 +292,7 @@ impl Workspace {
                 ),
             });
         }
-        String::from_utf8(output.stdout).map_err(|error| TactusError::Git {
+        String::from_utf8(output.stdout).map_err(|error| UpstrokeError::Git {
             message: format!(
                 "git {} returned output that is not valid UTF-8: {error}",
                 args.join(" ")
@@ -294,7 +301,7 @@ impl Workspace {
     }
 
     /// §14 pre-flight: the engine refuses dirty trees.
-    pub fn is_clean(&self) -> Result<bool, TactusError> {
+    pub fn is_clean(&self) -> Result<bool, UpstrokeError> {
         self.refuse_worktree_filters_before("git status")?;
         Ok(self
             .git_with_private_hooks(&["status", "--porcelain"])?
@@ -305,7 +312,7 @@ impl Workspace {
     /// Repository prerequisites whose absence would make the captured tree
     /// incomplete or its attribute policy unverifiable. Run this before any
     /// worker is dispatched on both fresh and resumed runs.
-    pub fn ensure_execution_prerequisites(&self) -> Result<(), TactusError> {
+    pub fn ensure_execution_prerequisites(&self) -> Result<(), UpstrokeError> {
         require_check_attr_source(self.git_output_with_input(
             &["check-attr", "--source=HEAD", "--stdin", "-z", "filter"],
             Vec::new(),
@@ -313,7 +320,7 @@ impl Workspace {
         self.refuse_sparse_checkout()
     }
 
-    fn refuse_sparse_checkout(&self) -> Result<(), TactusError> {
+    fn refuse_sparse_checkout(&self) -> Result<(), UpstrokeError> {
         let configured =
             self.run_git_with_private_hooks(&["config", "--bool", "--get", "core.sparseCheckout"])?;
         let sparse_configured = if configured.status.success() {
@@ -321,7 +328,7 @@ impl Workspace {
                 b"true\n" | b"true\r\n" => true,
                 b"false\n" | b"false\r\n" => false,
                 other => {
-                    return Err(TactusError::Git {
+                    return Err(UpstrokeError::Git {
                         message: format!(
                             "git config returned an invalid core.sparseCheckout value `{}`",
                             String::from_utf8_lossy(other).trim()
@@ -332,7 +339,7 @@ impl Workspace {
         } else if configured.status.code() == Some(1) {
             false
         } else {
-            return Err(TactusError::Git {
+            return Err(UpstrokeError::Git {
                 message: format!(
                     "checking core.sparseCheckout failed: {}",
                     String::from_utf8_lossy(&configured.stderr).trim()
@@ -347,15 +354,15 @@ impl Workspace {
             .split(|byte| *byte == 0)
             .any(|entry| entry.starts_with(b"S "));
         if sparse_configured || has_skipped_entry {
-            return Err(TactusError::Refused {
-                message: "sparse checkout is active (or the index has skip-worktree entries); tactus requires a complete worktree so workers, gates, and reviewers see every candidate path. Run `git sparse-checkout disable` and clear any manual skip-worktree bits before starting or resuming."
+            return Err(UpstrokeError::Refused {
+                message: "sparse checkout is active (or the index has skip-worktree entries); upstroke requires a complete worktree so workers, gates, and reviewers see every candidate path. Run `git sparse-checkout disable` and clear any manual skip-worktree bits before starting or resuming."
                     .to_owned(),
             });
         }
         Ok(())
     }
 
-    pub fn current_branch(&self) -> Result<String, TactusError> {
+    pub fn current_branch(&self) -> Result<String, UpstrokeError> {
         Ok(self
             .git(&["rev-parse", "--abbrev-ref", "HEAD"])?
             .trim()
@@ -365,28 +372,28 @@ impl Workspace {
     /// The full direct branch ref currently checked out by this worktree.
     /// Prepared publication is deliberately unavailable from detached HEAD or
     /// through a symbolic branch alias: the run records one concrete local ref.
-    pub fn current_branch_ref(&self) -> Result<String, TactusError> {
+    pub fn current_branch_ref(&self) -> Result<String, UpstrokeError> {
         let output = Command::new("git")
             .arg("-C")
             .arg(&self.root)
             .args(["symbolic-ref", "--quiet", "--no-recurse", "HEAD"])
             .output()
-            .map_err(|e| TactusError::Git {
+            .map_err(|e| UpstrokeError::Git {
                 message: format!("failed to run git: {e}"),
             })?;
         if !output.status.success() {
-            return Err(TactusError::Git {
-                message: "HEAD is detached; tactus requires the recorded run branch to own every candidate"
+            return Err(UpstrokeError::Git {
+                message: "HEAD is detached; upstroke requires the recorded run branch to own every candidate"
                     .to_owned(),
             });
         }
-        let branch_ref = String::from_utf8(output.stdout).map_err(|error| TactusError::Git {
+        let branch_ref = String::from_utf8(output.stdout).map_err(|error| UpstrokeError::Git {
             message: format!("git symbolic-ref returned output that is not valid UTF-8: {error}"),
         })?;
         let branch_ref = branch_ref.trim().to_owned();
         self.validate_branch_ref(&branch_ref)?;
         if self.symbolic_ref_target(&branch_ref)?.is_some() {
-            return Err(TactusError::Git {
+            return Err(UpstrokeError::Git {
                 message: format!(
                     "recorded branch ref `{branch_ref}` is itself symbolic; refusing ambiguous publication"
                 ),
@@ -395,7 +402,7 @@ impl Workspace {
         Ok(branch_ref)
     }
 
-    pub fn head_sha(&self) -> Result<String, TactusError> {
+    pub fn head_sha(&self) -> Result<String, UpstrokeError> {
         Ok(self
             .git(&["rev-parse", "--short", "HEAD"])?
             .trim()
@@ -407,7 +414,7 @@ impl Workspace {
     /// object count — a sha written by one checkout would not compare equal to
     /// the same sha read by another, which is exactly the check §15 asks
     /// `resume` to make.
-    pub fn head_sha_full(&self) -> Result<String, TactusError> {
+    pub fn head_sha_full(&self) -> Result<String, UpstrokeError> {
         Ok(self.git(&["rev-parse", "HEAD"])?.trim().to_owned())
     }
 
@@ -415,14 +422,14 @@ impl Workspace {
     ///
     /// How `resume` tells a commit sitting directly on its own record apart
     /// from history that arrived some other way.
-    pub fn parent_sha(&self, sha: &str) -> Result<Option<String>, TactusError> {
+    pub fn parent_sha(&self, sha: &str) -> Result<Option<String>, UpstrokeError> {
         let output = Command::new("git")
             .arg("-C")
             .arg(&self.root)
             .args(["rev-parse", "--verify", "--quiet"])
             .arg(format!("{sha}^"))
             .output()
-            .map_err(|e| TactusError::Git {
+            .map_err(|e| UpstrokeError::Git {
                 message: format!("failed to run git: {e}"),
             })?;
         if !output.status.success() {
@@ -435,14 +442,14 @@ impl Workspace {
     }
 
     /// A commit's subject — the first line of its message.
-    pub fn commit_subject(&self, sha: &str) -> Result<String, TactusError> {
+    pub fn commit_subject(&self, sha: &str) -> Result<String, UpstrokeError> {
         Ok(self
             .git(&["log", "-1", "--format=%s", sha, "--"])?
             .trim()
             .to_owned())
     }
 
-    pub fn create_branch(&self, name: &str) -> Result<(), TactusError> {
+    pub fn create_branch(&self, name: &str) -> Result<(), UpstrokeError> {
         self.refuse_worktree_filters_before("git switch")?;
         let tree_oid = self.git(&["rev-parse", "HEAD^{tree}"])?;
         self.refuse_unsafe_checkout_tree(tree_oid.trim())?;
@@ -453,7 +460,7 @@ impl Workspace {
 
     /// Move to an existing branch — how `resume` gets back onto the run's own
     /// branch when the operator has wandered off it.
-    pub fn switch_branch(&self, name: &str) -> Result<(), TactusError> {
+    pub fn switch_branch(&self, name: &str) -> Result<(), UpstrokeError> {
         self.refuse_worktree_filters_before("git switch")?;
         let revision = format!("refs/heads/{name}^{{tree}}");
         let tree_oid = self.git(&["rev-parse", "--verify", &revision])?;
@@ -463,14 +470,14 @@ impl Workspace {
     }
 
     /// Whether a branch exists locally.
-    pub fn branch_exists(&self, name: &str) -> Result<bool, TactusError> {
+    pub fn branch_exists(&self, name: &str) -> Result<bool, UpstrokeError> {
         let output = Command::new("git")
             .arg("-C")
             .arg(&self.root)
             .args(["rev-parse", "--verify", "--quiet"])
             .arg(format!("refs/heads/{name}"))
             .output()
-            .map_err(|e| TactusError::Git {
+            .map_err(|e| UpstrokeError::Git {
                 message: format!("failed to run git: {e}"),
             })?;
         Ok(output.status.success())
@@ -478,7 +485,7 @@ impl Workspace {
 
     /// A one-line-per-path summary of everything uncommitted, for telling the
     /// operator what a resume is about to discard.
-    pub fn uncommitted_summary(&self) -> Result<Vec<String>, TactusError> {
+    pub fn uncommitted_summary(&self) -> Result<Vec<String>, UpstrokeError> {
         self.refuse_worktree_filters_before("git status")?;
         Ok(self
             .git_with_private_hooks(&["status", "--porcelain"])?
@@ -488,25 +495,25 @@ impl Workspace {
             .collect())
     }
 
-    /// Keep `.tactus/` (run dirs, transcripts) out of `status` and out of the
+    /// Keep `.upstroke/` (run dirs, transcripts) out of `status` and out of the
     /// engine's own commits.
     ///
-    /// This is a self-ignoring `.tactus/.gitignore` containing `*` (the
+    /// This is a self-ignoring `.upstroke/.gitignore` containing `*` (the
     /// pattern cargo uses for `target/`) rather than an entry in
     /// `.git/info/exclude`: it needs no read-modify-write of a file the user
     /// owns, disappears with the directory, and — unlike `info/exclude` under
     /// `--git-dir` — behaves correctly in a linked worktree, where git reads
     /// excludes only from the common directory.
-    pub fn ensure_run_exclusions(&self) -> Result<(), TactusError> {
-        let dir = self.root.join(".tactus");
-        fs::create_dir_all(&dir).map_err(|e| TactusError::Git {
+    pub fn ensure_run_exclusions(&self) -> Result<(), UpstrokeError> {
+        let dir = self.root.join(".upstroke");
+        fs::create_dir_all(&dir).map_err(|e| UpstrokeError::Git {
             message: format!("creating {}: {e}", dir.display()),
         })?;
         let ignore_path = dir.join(".gitignore");
         if fs::read_to_string(&ignore_path).is_ok_and(|c| c.contains('*')) {
             return Ok(());
         }
-        fs::write(&ignore_path, "*\n").map_err(|e| TactusError::Git {
+        fs::write(&ignore_path, "*\n").map_err(|e| UpstrokeError::Git {
             message: format!("writing {}: {e}", ignore_path.display()),
         })
     }
@@ -520,11 +527,11 @@ impl Workspace {
     /// configured `diff.external` (difftastic and friends) would replace it
     /// wholesale and `color.ui` would inject escape codes, corrupting every
     /// downstream check that reads it.
-    pub fn capture_candidate(&self) -> Result<CapturedCandidate, TactusError> {
+    pub fn capture_candidate(&self) -> Result<CapturedCandidate, UpstrokeError> {
         let branch_ref = self.current_branch_ref()?;
         let parent_oid = self.head_sha_full()?;
         if let Some(problem) = self.worktree_filter_problem("git add")? {
-            return Err(TactusError::Git { message: problem });
+            return Err(UpstrokeError::Git { message: problem });
         }
         self.git_with_private_hooks(&["add", "-A"])?;
         let tree_oid = self.staged_tree_oid()?;
@@ -543,7 +550,7 @@ impl Workspace {
         let observed_branch_ref = self.current_branch_ref()?;
         let observed_parent = self.head_sha_full()?;
         if observed_branch_ref != branch_ref || observed_parent != parent_oid {
-            return Err(TactusError::Git {
+            return Err(UpstrokeError::Git {
                 message: format!(
                     "HEAD moved from {branch_ref} at {parent_oid} to {observed_branch_ref} at {observed_parent} while capturing the candidate"
                 ),
@@ -558,11 +565,11 @@ impl Workspace {
     }
 
     /// Backward-compatible diff-only capture for existing callers.
-    pub fn capture_diff(&self) -> Result<String, TactusError> {
+    pub fn capture_diff(&self) -> Result<String, UpstrokeError> {
         Ok(self.capture_candidate()?.diff)
     }
 
-    fn worktree_filter_problem(&self, operation: &str) -> Result<Option<String>, TactusError> {
+    fn worktree_filter_problem(&self, operation: &str) -> Result<Option<String>, UpstrokeError> {
         // Commands that inspect or update worktree entries (`add`, `status`,
         // `switch`, `commit`) can run clean/process filters before a later
         // tree policy check. Enumerate tracked and addable untracked paths
@@ -578,9 +585,9 @@ impl Workspace {
         self.filter_problem_for_paths(paths, None, operation)
     }
 
-    fn refuse_worktree_filters_before(&self, operation: &str) -> Result<(), TactusError> {
+    fn refuse_worktree_filters_before(&self, operation: &str) -> Result<(), UpstrokeError> {
         if let Some(problem) = self.worktree_filter_problem(operation)? {
-            return Err(TactusError::Git { message: problem });
+            return Err(UpstrokeError::Git { message: problem });
         }
         Ok(())
     }
@@ -591,7 +598,7 @@ impl Workspace {
     /// blob while gates see the smudged file. Dirty submodules similarly hide
     /// executable inputs behind an unchanged gitlink. Neither can be reviewed
     /// completely, so both are policy failures rather than gate results.
-    pub fn review_input_problem(&self) -> Result<Option<String>, TactusError> {
+    pub fn review_input_problem(&self) -> Result<Option<String>, UpstrokeError> {
         let tree_oid = self.staged_tree_oid()?;
         self.review_input_problem_for_tree(&tree_oid)
     }
@@ -602,7 +609,7 @@ impl Workspace {
     pub fn review_input_problem_for_tree(
         &self,
         tree_oid: &str,
-    ) -> Result<Option<String>, TactusError> {
+    ) -> Result<Option<String>, UpstrokeError> {
         self.validate_tree_oid(tree_oid)?;
         if let Some(problem) = self.worktree_filter_problem("git status")? {
             return Ok(Some(problem));
@@ -628,7 +635,7 @@ impl Workspace {
         self.tree_input_problem(tree_oid)
     }
 
-    fn tree_input_problem(&self, tree_oid: &str) -> Result<Option<String>, TactusError> {
+    fn tree_input_problem(&self, tree_oid: &str) -> Result<Option<String>, UpstrokeError> {
         // A captured .gitattributes can attach a filter to an otherwise
         // unchanged file, so changed names are insufficient. `ls-tree`
         // enumerates every path in the exact candidate and exposes gitlinks.
@@ -641,7 +648,7 @@ impl Workspace {
             let tab = entry
                 .iter()
                 .position(|byte| *byte == b'\t')
-                .ok_or_else(|| TactusError::Git {
+                .ok_or_else(|| UpstrokeError::Git {
                     message: "git ls-tree returned a malformed tree entry".to_owned(),
                 })?;
             let metadata = &entry[..tab];
@@ -668,7 +675,7 @@ impl Workspace {
         paths: Vec<u8>,
         tree_oid: Option<&str>,
         operation: &str,
-    ) -> Result<Option<String>, TactusError> {
+    ) -> Result<Option<String>, UpstrokeError> {
         let attrs = if paths.is_empty() {
             Vec::new()
         } else if let Some(tree_oid) = tree_oid {
@@ -682,7 +689,7 @@ impl Workspace {
             fields.pop();
         }
         if fields.len() % 3 != 0 {
-            return Err(TactusError::Git {
+            return Err(UpstrokeError::Git {
                 message: "git check-attr returned malformed NUL-delimited output".to_owned(),
             });
         }
@@ -691,7 +698,7 @@ impl Workspace {
             let attribute = record[1];
             let value = record[2];
             if attribute != b"filter" {
-                return Err(TactusError::Git {
+                return Err(UpstrokeError::Git {
                     message: "git check-attr returned an unexpected attribute".to_owned(),
                 });
             }
@@ -712,10 +719,10 @@ impl Workspace {
         Ok(None)
     }
 
-    fn refuse_unsafe_checkout_tree(&self, tree_oid: &str) -> Result<(), TactusError> {
+    fn refuse_unsafe_checkout_tree(&self, tree_oid: &str) -> Result<(), UpstrokeError> {
         self.validate_tree_oid(tree_oid)?;
         if let Some(problem) = self.tree_input_problem(tree_oid)? {
-            return Err(TactusError::Git {
+            return Err(UpstrokeError::Git {
                 message: format!("refusing checkout before configured code can run: {problem}"),
             });
         }
@@ -725,7 +732,7 @@ impl Workspace {
     /// Read the full object ID of the index tree once. Callers that run more
     /// than one verifier can retain this identity and materialize the same
     /// bytes for each verifier even if the source index later changes.
-    pub fn staged_tree_oid(&self) -> Result<String, TactusError> {
+    pub fn staged_tree_oid(&self) -> Result<String, UpstrokeError> {
         let tree = self.git_with_private_hooks(&["write-tree"])?;
         let tree = tree.trim().to_owned();
         self.validate_tree_oid(&tree)?;
@@ -736,12 +743,12 @@ impl Workspace {
     /// Kept for existing callers; new callers that need more than one snapshot
     /// should retain `capture_candidate()` and use
     /// `gate_snapshot_for_candidate()`.
-    pub fn gate_snapshot(&self) -> Result<GateWorkspace, TactusError> {
+    pub fn gate_snapshot(&self) -> Result<GateWorkspace, UpstrokeError> {
         let parent_oid = self.head_sha_full()?;
         let tree = self.staged_tree_oid()?;
         let observed_parent = self.head_sha_full()?;
         if observed_parent != parent_oid {
-            return Err(TactusError::Git {
+            return Err(UpstrokeError::Git {
                 message: format!(
                     "HEAD moved from {parent_oid} to {observed_parent} while preparing the gate snapshot"
                 ),
@@ -754,7 +761,7 @@ impl Workspace {
     /// Gates run here, never in the worker's workspace, so ignored files,
     /// build residue, and gate side-effects cannot influence or contaminate the
     /// commit under review.
-    pub fn gate_snapshot_for_tree(&self, tree_oid: &str) -> Result<GateWorkspace, TactusError> {
+    pub fn gate_snapshot_for_tree(&self, tree_oid: &str) -> Result<GateWorkspace, UpstrokeError> {
         let parent_oid = self.head_sha_full()?;
         self.gate_snapshot_for_candidate(&parent_oid, tree_oid)
     }
@@ -766,7 +773,7 @@ impl Workspace {
         &self,
         parent_oid: &str,
         tree_oid: &str,
-    ) -> Result<GateWorkspace, TactusError> {
+    ) -> Result<GateWorkspace, UpstrokeError> {
         self.gate_snapshot_for_candidate_in(parent_oid, tree_oid, &std::env::temp_dir())
     }
 
@@ -778,7 +785,7 @@ impl Workspace {
         parent_oid: &str,
         tree_oid: &str,
         store: &Path,
-    ) -> Result<GateWorkspace, TactusError> {
+    ) -> Result<GateWorkspace, UpstrokeError> {
         self.gate_snapshot_for_candidate_in_with_mode(
             parent_oid,
             tree_oid,
@@ -791,13 +798,13 @@ impl Workspace {
     /// Reclaim every durable gate-worktree intent in `store`. Callers must use
     /// the same repository that created the store; intent names contain no
     /// path supplied by the candidate and cannot escape these fixed children.
-    pub fn reclaim_gate_workspaces(&self, store: &Path) -> Result<usize, TactusError> {
+    pub fn reclaim_gate_workspaces(&self, store: &Path) -> Result<usize, UpstrokeError> {
         let intents = store.join("intents");
         let entries = match fs::read_dir(&intents) {
             Ok(entries) => entries,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(0),
             Err(source) => {
-                return Err(TactusError::Io {
+                return Err(UpstrokeError::Io {
                     path: intents,
                     source,
                 });
@@ -805,19 +812,19 @@ impl Workspace {
         };
         let mut reclaimed = 0;
         for entry in entries {
-            let entry = entry.map_err(|source| TactusError::Io {
+            let entry = entry.map_err(|source| UpstrokeError::Io {
                 path: intents.clone(),
                 source,
             })?;
             let name = entry.file_name();
-            let name = name.to_str().ok_or_else(|| TactusError::Git {
+            let name = name.to_str().ok_or_else(|| UpstrokeError::Git {
                 message: format!(
                     "snapshot intent {} has a non-UTF-8 name",
                     entry.path().display()
                 ),
             })?;
             let Some(snapshot) = name.strip_suffix(".intent") else {
-                return Err(TactusError::Git {
+                return Err(UpstrokeError::Git {
                     message: format!(
                         "unexpected file {} in the snapshot intent directory",
                         entry.path().display()
@@ -825,7 +832,7 @@ impl Workspace {
                 });
             };
             if !valid_snapshot_name(snapshot) {
-                return Err(TactusError::Git {
+                return Err(UpstrokeError::Git {
                     message: format!("invalid snapshot intent name `{name}`"),
                 });
             }
@@ -845,7 +852,7 @@ impl Workspace {
         parent_oid: &str,
         tree_oid: &str,
         temp_root: &Path,
-    ) -> Result<GateWorkspace, TactusError> {
+    ) -> Result<GateWorkspace, UpstrokeError> {
         self.gate_snapshot_for_candidate_in_with(
             parent_oid,
             tree_oid,
@@ -860,9 +867,9 @@ impl Workspace {
         tree_oid: &str,
         temp_root: &Path,
         add_worktree: F,
-    ) -> Result<GateWorkspace, TactusError>
+    ) -> Result<GateWorkspace, UpstrokeError>
     where
-        F: FnOnce(&Path, &Path, &str) -> Result<(), TactusError>,
+        F: FnOnce(&Path, &Path, &str) -> Result<(), UpstrokeError>,
     {
         self.gate_snapshot_for_candidate_in_with_mode(
             parent_oid,
@@ -880,26 +887,26 @@ impl Workspace {
         store_or_root: &Path,
         store_mode: SnapshotStoreMode,
         add_worktree: F,
-    ) -> Result<GateWorkspace, TactusError>
+    ) -> Result<GateWorkspace, UpstrokeError>
     where
-        F: FnOnce(&Path, &Path, &str) -> Result<(), TactusError>,
+        F: FnOnce(&Path, &Path, &str) -> Result<(), UpstrokeError>,
     {
         self.validate_commit_oid(parent_oid)?;
         self.validate_tree_oid(tree_oid)?;
         if let Some(problem) = self.tree_input_problem(tree_oid)? {
-            return Err(TactusError::Git { message: problem });
+            return Err(UpstrokeError::Git { message: problem });
         }
         let commit = self.git(&[
             "-c",
-            "user.name=tactus",
+            "user.name=upstroke",
             "-c",
-            "user.email=tactus@tactus.local",
+            "user.email=upstroke@upstroke.local",
             "commit-tree",
             tree_oid,
             "-p",
             parent_oid,
             "-m",
-            "[tactus] ephemeral gate snapshot",
+            "[upstroke] ephemeral gate snapshot",
         ])?;
         let pending = match store_mode {
             SnapshotStoreMode::EphemeralUnderRoot => {
@@ -921,23 +928,23 @@ impl Workspace {
         Ok(pending.finish(workspace))
     }
 
-    fn validate_tree_oid(&self, tree_oid: &str) -> Result<(), TactusError> {
+    fn validate_tree_oid(&self, tree_oid: &str) -> Result<(), UpstrokeError> {
         self.validate_object_oid(tree_oid, "tree")
     }
 
-    fn validate_commit_oid(&self, commit_oid: &str) -> Result<(), TactusError> {
+    fn validate_commit_oid(&self, commit_oid: &str) -> Result<(), UpstrokeError> {
         self.validate_object_oid(commit_oid, "commit")
     }
 
-    fn validate_object_oid(&self, oid: &str, expected_kind: &str) -> Result<(), TactusError> {
+    fn validate_object_oid(&self, oid: &str, expected_kind: &str) -> Result<(), UpstrokeError> {
         if !matches!(oid.len(), 40 | 64) || !oid.bytes().all(|byte| byte.is_ascii_hexdigit()) {
-            return Err(TactusError::Git {
+            return Err(UpstrokeError::Git {
                 message: format!("`{oid}` is not a full Git object ID"),
             });
         }
         let kind = self.git(&["cat-file", "-t", oid])?;
         if kind.trim() != expected_kind {
-            return Err(TactusError::Git {
+            return Err(UpstrokeError::Git {
                 message: format!(
                     "Git object {oid} is a {}, not a {expected_kind}",
                     kind.trim()
@@ -952,7 +959,7 @@ impl Workspace {
         path: &Path,
         hooks_path: &Path,
         commit: &str,
-    ) -> Result<(), TactusError> {
+    ) -> Result<(), UpstrokeError> {
         let mut hooks_config = OsString::from("core.hooksPath=");
         hooks_config.push(hooks_path);
         let output = Command::new("git")
@@ -972,11 +979,11 @@ impl Workspace {
             .arg(path)
             .arg(commit)
             .output()
-            .map_err(|e| TactusError::Git {
+            .map_err(|e| UpstrokeError::Git {
                 message: format!("failed to run git worktree add: {e}"),
             })?;
         if !output.status.success() {
-            return Err(TactusError::Git {
+            return Err(UpstrokeError::Git {
                 message: format!(
                     "git worktree add failed: {}",
                     String::from_utf8_lossy(&output.stderr).trim()
@@ -986,7 +993,7 @@ impl Workspace {
         Ok(())
     }
 
-    fn verify_gate_worktree(&self, path: &Path, hooks_path: &Path) -> Result<(), TactusError> {
+    fn verify_gate_worktree(&self, path: &Path, hooks_path: &Path) -> Result<(), UpstrokeError> {
         let mut hooks_config = OsString::from("core.hooksPath=");
         hooks_config.push(hooks_path);
         let output = Command::new("git")
@@ -1004,11 +1011,11 @@ impl Workspace {
                 "--ignore-submodules=none",
             ])
             .output()
-            .map_err(|e| TactusError::Git {
+            .map_err(|e| UpstrokeError::Git {
                 message: format!("failed to verify gate worktree: {e}"),
             })?;
         if !output.status.success() {
-            return Err(TactusError::Git {
+            return Err(UpstrokeError::Git {
                 message: format!(
                     "verifying gate worktree failed: {}",
                     String::from_utf8_lossy(&output.stderr).trim()
@@ -1016,7 +1023,7 @@ impl Workspace {
             });
         }
         if !output.stdout.is_empty() {
-            return Err(TactusError::Git {
+            return Err(UpstrokeError::Git {
                 message: format!(
                     "gate worktree materialized with unexpected tracked or untracked state: {}",
                     String::from_utf8_lossy(&output.stdout)
@@ -1035,35 +1042,35 @@ impl Workspace {
         tree_oid: &str,
         message: &str,
         pin_ref: &str,
-    ) -> Result<PreparedCommit, TactusError> {
+    ) -> Result<PreparedCommit, UpstrokeError> {
         self.validate_branch_ref(branch_ref)?;
         self.validate_commit_oid(parent_oid)?;
         self.validate_tree_oid(tree_oid)?;
         let observed_branch_ref = self.current_branch_ref()?;
         let observed_parent = self.head_sha_full()?;
         if observed_branch_ref != branch_ref || observed_parent != parent_oid {
-            return Err(TactusError::Git {
+            return Err(UpstrokeError::Git {
                 message: format!(
                     "HEAD moved from captured branch {branch_ref} at {parent_oid} to {observed_branch_ref} at {observed_parent}; refusing to prepare it"
                 ),
             });
         }
         if message.trim().is_empty() || message.contains('\r') || message.contains('\n') {
-            return Err(TactusError::Git {
+            return Err(UpstrokeError::Git {
                 message: "refusing to prepare a commit with an empty or multi-line subject"
                     .to_owned(),
             });
         }
         self.validate_prepared_ref(pin_ref)?;
         if let Some(target) = self.symbolic_ref_target(pin_ref)? {
-            return Err(TactusError::Git {
+            return Err(UpstrokeError::Git {
                 message: format!(
                     "prepared ref `{pin_ref}` is symbolic to `{target}`; refusing to follow it"
                 ),
             });
         }
         let commit_sha = self
-            .commit_tree_with_tactus_identity(tree_oid, parent_oid, message)?
+            .commit_tree_with_upstroke_identity(tree_oid, parent_oid, message)?
             .trim()
             .to_owned();
         let prepared = PreparedCommit {
@@ -1075,7 +1082,7 @@ impl Workspace {
             pin_ref: pin_ref.to_owned(),
         };
         if !self.prepared_commit_matches(&prepared)? {
-            return Err(TactusError::Git {
+            return Err(UpstrokeError::Git {
                 message: "git created a commit object that does not match the prepared identity"
                     .to_owned(),
             });
@@ -1085,13 +1092,13 @@ impl Workspace {
             "update-ref",
             "--no-deref",
             "-m",
-            "tactus: pin prepared task",
+            "upstroke: pin prepared task",
             pin_ref,
             &prepared.commit_sha,
             &zero,
         ])?;
         if self.prepared_pin_target(pin_ref)?.as_deref() != Some(prepared.commit_sha.as_str()) {
-            return Err(TactusError::Git {
+            return Err(UpstrokeError::Git {
                 message: format!(
                     "prepared ref `{pin_ref}` did not become the exact direct pin for {}",
                     prepared.commit_sha
@@ -1102,14 +1109,17 @@ impl Workspace {
     }
 
     /// Commit whatever `capture_diff` staged. §14: commit-per-task,
-    /// `[tactus] <task-id>: <title>`.
-    pub fn commit(&self, message: &str) -> Result<String, TactusError> {
+    /// `[upstroke] <task-id>: <title>`.
+    pub fn commit(&self, message: &str) -> Result<String, UpstrokeError> {
         self.refuse_worktree_filters_before("git commit")?;
         self.git_with_private_hooks(&["commit", "-q", "-m", message])?;
         self.head_sha()
     }
 
-    pub fn prepared_commit_matches(&self, prepared: &PreparedCommit) -> Result<bool, TactusError> {
+    pub fn prepared_commit_matches(
+        &self,
+        prepared: &PreparedCommit,
+    ) -> Result<bool, UpstrokeError> {
         if !valid_object_id(&prepared.parent_sha)
             || !valid_object_id(&prepared.tree_sha)
             || !valid_object_id(&prepared.commit_sha)
@@ -1125,13 +1135,13 @@ impl Workspace {
             .arg(&self.root)
             .args(["cat-file", "commit", &prepared.commit_sha])
             .output()
-            .map_err(|e| TactusError::Git {
+            .map_err(|e| UpstrokeError::Git {
                 message: format!("failed to run git: {e}"),
             })?;
         if !output.status.success() {
             return Ok(false);
         }
-        let object = String::from_utf8(output.stdout).map_err(|error| TactusError::Git {
+        let object = String::from_utf8(output.stdout).map_err(|error| UpstrokeError::Git {
             message: format!("prepared commit object is not valid UTF-8: {error}"),
         })?;
         let Some((headers, body)) = object.split_once("\n\n") else {
@@ -1150,23 +1160,26 @@ impl Workspace {
             .find_map(|line| line.strip_prefix("committer "));
         Ok(tree == Some(prepared.tree_sha.as_str())
             && parents == [prepared.parent_sha.as_str()]
-            && author.is_some_and(|value| value.starts_with("tactus <tactus@tactus.local> "))
-            && committer.is_some_and(|value| value.starts_with("tactus <tactus@tactus.local> "))
+            && author.is_some_and(|value| value.starts_with("upstroke <upstroke@upstroke.local> "))
+            && committer
+                .is_some_and(|value| value.starts_with("upstroke <upstroke@upstroke.local> "))
             && body.trim_end_matches('\n') == prepared.message)
     }
 
-    fn validate_prepared_ref(&self, pin_ref: &str) -> Result<(), TactusError> {
-        if !pin_ref.starts_with("refs/tactus/prepared/") {
-            return Err(TactusError::Git {
-                message: format!("prepared ref `{pin_ref}` is outside tactus's private namespace"),
+    fn validate_prepared_ref(&self, pin_ref: &str) -> Result<(), UpstrokeError> {
+        if !pin_ref.starts_with("refs/upstroke/prepared/") {
+            return Err(UpstrokeError::Git {
+                message: format!(
+                    "prepared ref `{pin_ref}` is outside upstroke's private namespace"
+                ),
             });
         }
         self.git(&["check-ref-format", pin_ref]).map(|_| ())
     }
 
-    fn validate_branch_ref(&self, branch_ref: &str) -> Result<(), TactusError> {
+    fn validate_branch_ref(&self, branch_ref: &str) -> Result<(), UpstrokeError> {
         if !branch_ref.starts_with("refs/heads/") {
-            return Err(TactusError::Git {
+            return Err(UpstrokeError::Git {
                 message: format!(
                     "refusing prepared publication outside a local branch: `{branch_ref}`"
                 ),
@@ -1176,19 +1189,19 @@ impl Workspace {
     }
 
     /// Return the immediate symbolic target without dereferencing it.
-    fn symbolic_ref_target(&self, refname: &str) -> Result<Option<String>, TactusError> {
+    fn symbolic_ref_target(&self, refname: &str) -> Result<Option<String>, UpstrokeError> {
         let output = Command::new("git")
             .arg("-C")
             .arg(&self.root)
             .args(["symbolic-ref", "--quiet", "--no-recurse", refname])
             .output()
-            .map_err(|e| TactusError::Git {
+            .map_err(|e| UpstrokeError::Git {
                 message: format!("failed to run git: {e}"),
             })?;
         if output.status.success() {
             return String::from_utf8(output.stdout)
                 .map(|target| Some(target.trim().to_owned()))
-                .map_err(|error| TactusError::Git {
+                .map_err(|error| UpstrokeError::Git {
                     message: format!(
                         "git symbolic-ref returned output that is not valid UTF-8: {error}"
                     ),
@@ -1197,7 +1210,7 @@ impl Workspace {
         if output.status.code() == Some(1) {
             return Ok(None);
         }
-        Err(TactusError::Git {
+        Err(UpstrokeError::Git {
             message: format!(
                 "git symbolic-ref --quiet {refname} failed: {}",
                 String::from_utf8_lossy(&output.stderr).trim()
@@ -1205,10 +1218,10 @@ impl Workspace {
         })
     }
 
-    pub fn prepared_pin_target(&self, pin_ref: &str) -> Result<Option<String>, TactusError> {
+    pub fn prepared_pin_target(&self, pin_ref: &str) -> Result<Option<String>, UpstrokeError> {
         self.validate_prepared_ref(pin_ref)?;
         if let Some(target) = self.symbolic_ref_target(pin_ref)? {
-            return Err(TactusError::Git {
+            return Err(UpstrokeError::Git {
                 message: format!(
                     "prepared ref `{pin_ref}` is symbolic to `{target}`; refusing to follow it"
                 ),
@@ -1219,7 +1232,7 @@ impl Workspace {
             .arg(&self.root)
             .args(["rev-parse", "--verify", "--quiet", pin_ref])
             .output()
-            .map_err(|e| TactusError::Git {
+            .map_err(|e| UpstrokeError::Git {
                 message: format!("failed to run git: {e}"),
             })?;
         if !output.status.success() {
@@ -1230,7 +1243,7 @@ impl Workspace {
         ))
     }
 
-    pub fn remove_prepared_pin(&self, prepared: &PreparedCommit) -> Result<(), TactusError> {
+    pub fn remove_prepared_pin(&self, prepared: &PreparedCommit) -> Result<(), UpstrokeError> {
         match self.prepared_pin_target(&prepared.pin_ref)? {
             None => Ok(()),
             Some(target) if target == prepared.commit_sha => self.prepared_update_ref(&[
@@ -1240,7 +1253,7 @@ impl Workspace {
                 &prepared.pin_ref,
                 &prepared.commit_sha,
             ]),
-            Some(target) => Err(TactusError::Git {
+            Some(target) => Err(UpstrokeError::Git {
                 message: format!(
                     "prepared ref `{}` points at {target}, not the recorded commit {}; refusing to delete another object",
                     prepared.pin_ref, prepared.commit_sha
@@ -1252,7 +1265,7 @@ impl Workspace {
     /// Remove a private pin for an attempt that never durably recorded a
     /// successful settlement. The target is read then supplied as the expected
     /// old value, so even cleanup is compare-and-swap.
-    pub fn remove_orphan_prepared_pin(&self, pin_ref: &str) -> Result<(), TactusError> {
+    pub fn remove_orphan_prepared_pin(&self, pin_ref: &str) -> Result<(), UpstrokeError> {
         if let Some(target) = self.prepared_pin_target(pin_ref)? {
             self.prepared_update_ref(&["update-ref", "--no-deref", "-d", pin_ref, &target])?;
         }
@@ -1263,10 +1276,10 @@ impl Workspace {
         &self,
         branch_ref: &str,
         prepared: &PreparedCommit,
-    ) -> Result<(), TactusError> {
+    ) -> Result<(), UpstrokeError> {
         self.validate_branch_ref(branch_ref)?;
         if prepared.branch_ref != branch_ref {
-            return Err(TactusError::Git {
+            return Err(UpstrokeError::Git {
                 message: format!(
                     "prepared commit belongs to `{}`, not requested publication ref `{branch_ref}`",
                     prepared.branch_ref
@@ -1275,21 +1288,21 @@ impl Workspace {
         }
         let observed_branch_ref = self.current_branch_ref()?;
         if observed_branch_ref != branch_ref {
-            return Err(TactusError::Git {
+            return Err(UpstrokeError::Git {
                 message: format!(
                     "HEAD is on `{observed_branch_ref}`, not recorded run branch `{branch_ref}`; refusing publication"
                 ),
             });
         }
         if !self.prepared_commit_matches(prepared)? {
-            return Err(TactusError::Git {
+            return Err(UpstrokeError::Git {
                 message: "refusing to advance HEAD to a commit that does not match its durable prepared identity".to_owned(),
             });
         }
         if self.prepared_pin_target(&prepared.pin_ref)?.as_deref()
             != Some(prepared.commit_sha.as_str())
         {
-            return Err(TactusError::Git {
+            return Err(UpstrokeError::Git {
                 message: format!(
                     "prepared ref `{}` does not pin {}; refusing to advance HEAD",
                     prepared.pin_ref, prepared.commit_sha
@@ -1300,7 +1313,7 @@ impl Workspace {
             "update-ref",
             "--no-deref",
             "-m",
-            "tactus: publish reviewed task",
+            "upstroke: publish reviewed task",
             branch_ref,
             &prepared.commit_sha,
             &prepared.parent_sha,
@@ -1308,7 +1321,7 @@ impl Workspace {
         let published_branch_ref = self.current_branch_ref()?;
         let published_head = self.head_sha_full()?;
         if published_branch_ref != branch_ref || published_head != prepared.commit_sha {
-            return Err(TactusError::Git {
+            return Err(UpstrokeError::Git {
                 message: format!(
                     "recorded run branch {branch_ref} advanced to {}, but worktree HEAD is now {published_branch_ref} at {published_head}; preserving the prepared pin for resume",
                     prepared.commit_sha
@@ -1323,7 +1336,7 @@ impl Workspace {
     /// failed attempt and the post-commit scrub that keeps gate side-effects
     /// (build artifacts, lockfile churn) from leaking into the next task's
     /// captured diff.
-    pub fn discard_uncommitted(&self) -> Result<(), TactusError> {
+    pub fn discard_uncommitted(&self) -> Result<(), UpstrokeError> {
         let tree_oid = self.git(&["rev-parse", "HEAD^{tree}"])?;
         self.refuse_unsafe_checkout_tree(tree_oid.trim())?;
         self.git_with_private_hooks(&["reset", "-q", "--hard", "HEAD"])?;
@@ -1331,10 +1344,10 @@ impl Workspace {
     }
 }
 
-fn require_check_attr_source(probe: Result<Vec<u8>, TactusError>) -> Result<(), TactusError> {
-    probe.map(|_| ()).map_err(|error| TactusError::Refused {
+fn require_check_attr_source(probe: Result<Vec<u8>, UpstrokeError>) -> Result<(), UpstrokeError> {
+    probe.map(|_| ()).map_err(|error| UpstrokeError::Refused {
         message: format!(
-            "Git 2.40 or newer is required: tactus must bind filter-attribute checks to the exact captured tree with `git check-attr --source` before gates or review ({error})"
+            "Git 2.40 or newer is required: upstroke must bind filter-attribute checks to the exact captured tree with `git check-attr --source` before gates or review ({error})"
         ),
     })
 }
@@ -1344,13 +1357,13 @@ struct PrivateHooksDir {
 }
 
 impl PrivateHooksDir {
-    fn create() -> Result<Self, TactusError> {
+    fn create() -> Result<Self, UpstrokeError> {
         let path = std::env::temp_dir().join(format!(
-            "tactus-empty-hooks-{}-{}",
+            "upstroke-empty-hooks-{}-{}",
             std::process::id(),
             crate::ulid::ulid()
         ));
-        create_private_dir(&path).map_err(|error| TactusError::Git {
+        create_private_dir(&path).map_err(|error| UpstrokeError::Git {
             message: format!(
                 "creating private empty hooks directory {}: {error}",
                 path.display()
@@ -1387,13 +1400,13 @@ struct PendingGateWorkspace {
 impl PendingGateWorkspace {
     /// Create a uniquely named, owner-private store beneath a caller-owned
     /// root. The root may be shared (notably `/tmp`) and is never chmodded.
-    fn create(source_root: &Path, temp_root: &Path) -> Result<Self, TactusError> {
+    fn create(source_root: &Path, temp_root: &Path) -> Result<Self, UpstrokeError> {
         let store = temp_root.join(format!(
-            "tactus-gate-worktrees-{}-{}",
+            "upstroke-gate-worktrees-{}-{}",
             std::process::id(),
             crate::ulid::ulid()
         ));
-        create_private_dir(&store).map_err(|error| TactusError::Git {
+        create_private_dir(&store).map_err(|error| UpstrokeError::Git {
             message: format!(
                 "creating private gate snapshot store {}: {error}",
                 store.display()
@@ -1409,9 +1422,9 @@ impl PendingGateWorkspace {
     }
 
     /// Use the exact stable store whose synced intents resume will reclaim.
-    fn create_in_store(source_root: &Path, store: &Path) -> Result<Self, TactusError> {
+    fn create_in_store(source_root: &Path, store: &Path) -> Result<Self, UpstrokeError> {
         if store == std::env::temp_dir() {
-            return Err(TactusError::Git {
+            return Err(UpstrokeError::Git {
                 message: format!(
                     "the shared system temp root {} is not a durable snapshot store; supply an owner-private child directory",
                     store.display()
@@ -1425,9 +1438,9 @@ impl PendingGateWorkspace {
         source_root: &Path,
         store: &Path,
         ephemeral_store: Option<PathBuf>,
-    ) -> Result<Self, TactusError> {
+    ) -> Result<Self, UpstrokeError> {
         let name = format!(
-            "tactus-gates-{}-{}",
+            "upstroke-gates-{}-{}",
             std::process::id(),
             crate::ulid::ulid()
         );
@@ -1440,7 +1453,7 @@ impl PendingGateWorkspace {
             worktrees.as_path(),
             hooks.as_path(),
         ] {
-            create_private_dir_all(directory).map_err(|error| TactusError::Git {
+            create_private_dir_all(directory).map_err(|error| UpstrokeError::Git {
                 message: format!(
                     "creating private gate snapshot store {}: {error}",
                     directory.display()
@@ -1453,7 +1466,7 @@ impl PendingGateWorkspace {
         let hooks_path = hooks.join(&name);
         if let Err(error) = create_private_dir(&path) {
             let _ = fs::remove_file(&intent_path);
-            return Err(TactusError::Git {
+            return Err(UpstrokeError::Git {
                 message: format!(
                     "creating private gate snapshot directory {}: {error}",
                     path.display()
@@ -1463,7 +1476,7 @@ impl PendingGateWorkspace {
         if let Err(error) = create_private_dir(&hooks_path) {
             let _ = fs::remove_dir(&path);
             let _ = fs::remove_file(&intent_path);
-            return Err(TactusError::Git {
+            return Err(UpstrokeError::Git {
                 message: format!(
                     "creating private empty hooks directory {}: {error}",
                     hooks_path.display()
@@ -1509,7 +1522,7 @@ impl Drop for PendingGateWorkspace {
     }
 }
 
-fn create_snapshot_intent(path: &Path) -> Result<(), TactusError> {
+fn create_snapshot_intent(path: &Path) -> Result<(), UpstrokeError> {
     let mut options = OpenOptions::new();
     options.create_new(true).write(true);
     #[cfg(unix)]
@@ -1517,28 +1530,28 @@ fn create_snapshot_intent(path: &Path) -> Result<(), TactusError> {
         use std::os::unix::fs::OpenOptionsExt;
         options.mode(0o600);
     }
-    let file = options.open(path).map_err(|source| TactusError::Io {
+    let file = options.open(path).map_err(|source| UpstrokeError::Io {
         path: path.to_path_buf(),
         source,
     })?;
-    file.sync_all().map_err(|source| TactusError::Io {
+    file.sync_all().map_err(|source| UpstrokeError::Io {
         path: path.to_path_buf(),
         source,
     })?;
     sync_parent(path)
 }
 
-fn sync_parent(path: &Path) -> Result<(), TactusError> {
+fn sync_parent(path: &Path) -> Result<(), UpstrokeError> {
     #[cfg(unix)]
     {
-        let parent = path.parent().ok_or_else(|| TactusError::Git {
+        let parent = path.parent().ok_or_else(|| UpstrokeError::Git {
             message: format!("snapshot intent {} has no parent", path.display()),
         })?;
-        let directory = fs::File::open(parent).map_err(|source| TactusError::Io {
+        let directory = fs::File::open(parent).map_err(|source| UpstrokeError::Io {
             path: parent.to_path_buf(),
             source,
         })?;
-        directory.sync_all().map_err(|source| TactusError::Io {
+        directory.sync_all().map_err(|source| UpstrokeError::Io {
             path: parent.to_path_buf(),
             source,
         })?;
@@ -1549,7 +1562,7 @@ fn sync_parent(path: &Path) -> Result<(), TactusError> {
 }
 
 fn valid_snapshot_name(name: &str) -> bool {
-    name.starts_with("tactus-gates-")
+    name.starts_with("upstroke-gates-")
         && name
             .bytes()
             .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
@@ -1590,7 +1603,7 @@ fn cleanup_gate_workspace(
     path: &Path,
     hooks_path: &Path,
     intent_path: &Path,
-) -> Result<(), TactusError> {
+) -> Result<(), UpstrokeError> {
     let mut hooks_config = OsString::from("core.hooksPath=");
     hooks_config.push(hooks_path);
     let removal = Command::new("git")
@@ -1607,11 +1620,11 @@ fn cleanup_gate_workspace(
         ])
         .arg(path)
         .output()
-        .map_err(|error| TactusError::Git {
+        .map_err(|error| UpstrokeError::Git {
             message: format!("failed to remove gate worktree {}: {error}", path.display()),
         })?;
     if worktree_is_registered(source_root, path, &hooks_config)? {
-        return Err(TactusError::Git {
+        return Err(UpstrokeError::Git {
             message: format!(
                 "could not reclaim registered gate worktree {}: {}",
                 path.display(),
@@ -1628,7 +1641,7 @@ fn cleanup_gate_workspace(
         Ok(()) => sync_parent(intent_path)?,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
         Err(source) => {
-            return Err(TactusError::Io {
+            return Err(UpstrokeError::Io {
                 path: intent_path.to_path_buf(),
                 source,
             });
@@ -1647,7 +1660,7 @@ fn worktree_is_registered(
     source_root: &Path,
     path: &Path,
     hooks_config: &std::ffi::OsStr,
-) -> Result<bool, TactusError> {
+) -> Result<bool, UpstrokeError> {
     let output = Command::new("git")
         .arg("-C")
         .arg(source_root)
@@ -1662,11 +1675,11 @@ fn worktree_is_registered(
             "-z",
         ])
         .output()
-        .map_err(|error| TactusError::Git {
+        .map_err(|error| UpstrokeError::Git {
             message: format!("failed to verify gate-worktree reclamation: {error}"),
         })?;
     if !output.status.success() {
-        return Err(TactusError::Git {
+        return Err(UpstrokeError::Git {
             message: format!(
                 "verifying gate-worktree reclamation failed: {}",
                 String::from_utf8_lossy(&output.stderr).trim()
@@ -1736,7 +1749,7 @@ mod tests {
     use std::env;
 
     fn temp_repo(tag: &str) -> PathBuf {
-        let dir = env::temp_dir().join(format!("tactus-ws-{tag}-{}", std::process::id()));
+        let dir = env::temp_dir().join(format!("upstroke-ws-{tag}-{}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).expect("create repo dir");
         let run = |args: &[&str]| {
@@ -1753,8 +1766,8 @@ mod tests {
             );
         };
         run(&["init", "-q", "-b", "main"]);
-        run(&["config", "user.email", "test@tactus.local"]);
-        run(&["config", "user.name", "tactus tests"]);
+        run(&["config", "user.email", "test@upstroke.local"]);
+        run(&["config", "user.name", "upstroke tests"]);
         fs::write(dir.join("README.md"), "seed\n").expect("seed file");
         run(&["add", "-A"]);
         run(&["commit", "-q", "-m", "seed"]);
@@ -1793,7 +1806,7 @@ mod tests {
         let repo = temp_repo("open");
         assert!(Workspace::open(&repo).is_ok());
 
-        let plain = env::temp_dir().join(format!("tactus-ws-plain-{}", std::process::id()));
+        let plain = env::temp_dir().join(format!("upstroke-ws-plain-{}", std::process::id()));
         fs::create_dir_all(&plain).expect("plain dir");
         assert!(Workspace::open(&plain).is_err());
     }
@@ -1825,7 +1838,7 @@ mod tests {
 
     #[test]
     fn git_without_check_attr_source_is_refused_before_worker_spend() {
-        let error = require_check_attr_source(Err(TactusError::Git {
+        let error = require_check_attr_source(Err(UpstrokeError::Git {
             message: "error: unknown option `source=HEAD`".to_owned(),
         }))
         .expect_err("missing exact-tree attribute support must fail closed")
@@ -1856,15 +1869,18 @@ mod tests {
     fn branch_diff_commit_cycle() {
         let repo = temp_repo("cycle");
         let ws = Workspace::open(&repo).expect("open");
-        ws.create_branch("tactus/run-TEST").expect("branch");
-        assert_eq!(ws.current_branch().expect("branch name"), "tactus/run-TEST");
+        ws.create_branch("upstroke/run-TEST").expect("branch");
+        assert_eq!(
+            ws.current_branch().expect("branch name"),
+            "upstroke/run-TEST"
+        );
 
         fs::write(repo.join("new.rs"), "fn main() {}\n").expect("new file");
         let diff = ws.capture_diff().expect("diff");
         assert!(diff.contains("new.rs"), "diff sees new files: {diff}");
         assert!(diff.contains("fn main"), "diff carries content");
 
-        let sha = ws.commit("[tactus] t1: demo").expect("commit");
+        let sha = ws.commit("[upstroke] t1: demo").expect("commit");
         assert!(!sha.is_empty());
         assert!(ws.is_clean().expect("clean after commit"));
         assert!(ws.capture_diff().expect("empty diff").trim().is_empty());
@@ -1873,7 +1889,7 @@ mod tests {
         let full = ws.head_sha_full().expect("full sha");
         assert_eq!(
             ws.commit_subject(&full).expect("subject"),
-            "[tactus] t1: demo"
+            "[upstroke] t1: demo"
         );
         let parent = ws.parent_sha(&full).expect("parent").expect("has a parent");
         assert_ne!(parent, full);
@@ -1967,13 +1983,13 @@ mod tests {
         fs::write(repo.join("README.md"), "later unreviewed index\n").expect("later edit");
         ws.capture_diff().expect("move index past candidate");
 
-        let pin_ref = "refs/tactus/prepared/01RUN/0-1";
+        let pin_ref = "refs/upstroke/prepared/01RUN/0-1";
         let prepared = ws
             .prepare_commit_from_candidate(
                 &candidate.branch_ref,
                 &candidate.parent_oid,
                 &candidate.tree_oid,
-                "[tactus] t1: task",
+                "[upstroke] t1: task",
                 pin_ref,
             )
             .expect("commit-tree and pin creation ignore candidate hooks");
@@ -1987,11 +2003,11 @@ mod tests {
             .git(&["cat-file", "commit", &prepared.commit_sha])
             .expect("prepared object");
         assert!(
-            object.contains("author tactus <tactus@tactus.local> "),
+            object.contains("author upstroke <upstroke@upstroke.local> "),
             "{object}"
         );
         assert!(
-            object.contains("committer tactus <tactus@tactus.local> "),
+            object.contains("committer upstroke <upstroke@upstroke.local> "),
             "{object}"
         );
         assert_eq!(
@@ -2024,7 +2040,7 @@ mod tests {
 
         fs::write(repo.join("README.md"), "reviewed candidate\n").expect("candidate");
         let candidate = ws.capture_candidate().expect("capture");
-        let pin_ref = "refs/tactus/prepared/01RUN/0-1";
+        let pin_ref = "refs/upstroke/prepared/01RUN/0-1";
         run_git(&repo, &["symbolic-ref", pin_ref, "refs/heads/victim"]);
 
         let prepare_error = ws
@@ -2032,7 +2048,7 @@ mod tests {
                 &candidate.branch_ref,
                 &candidate.parent_oid,
                 &candidate.tree_oid,
-                "[tactus] t1: task",
+                "[upstroke] t1: task",
                 pin_ref,
             )
             .expect_err("a private prepared pin must be direct");
@@ -2082,8 +2098,8 @@ mod tests {
                 &candidate.branch_ref,
                 &candidate.parent_oid,
                 &candidate.tree_oid,
-                "[tactus] t1: task",
-                "refs/tactus/prepared/01RUN/0-1",
+                "[upstroke] t1: task",
+                "refs/upstroke/prepared/01RUN/0-1",
             )
             .expect_err("same object on another branch is still the wrong owner");
         assert!(
@@ -2097,8 +2113,8 @@ mod tests {
                 &candidate.branch_ref,
                 &candidate.parent_oid,
                 &candidate.tree_oid,
-                "[tactus] t1: task",
-                "refs/tactus/prepared/01RUN/0-1",
+                "[upstroke] t1: task",
+                "refs/upstroke/prepared/01RUN/0-1",
             )
             .expect("prepare on captured branch");
         ws.switch_branch("other").expect("switch after preparation");
@@ -2135,14 +2151,14 @@ mod tests {
     }
 
     #[test]
-    fn run_exclusions_hide_tactus_dir() {
+    fn run_exclusions_hide_upstroke_dir() {
         let repo = temp_repo("exclude");
         let ws = Workspace::open(&repo).expect("open");
         ws.ensure_run_exclusions().expect("exclude");
         ws.ensure_run_exclusions().expect("idempotent");
-        fs::create_dir_all(repo.join(".tactus").join("runs")).expect("run dir");
-        fs::write(repo.join(".tactus").join("runs").join("x.json"), "{}").expect("artifact");
-        assert!(ws.is_clean().expect("tactus dir invisible"));
+        fs::create_dir_all(repo.join(".upstroke").join("runs")).expect("run dir");
+        fs::write(repo.join(".upstroke").join("runs").join("x.json"), "{}").expect("artifact");
+        assert!(ws.is_clean().expect("upstroke dir invisible"));
         assert!(
             ws.capture_diff().expect("diff").trim().is_empty(),
             "run artifacts never enter a commit"
@@ -2152,10 +2168,10 @@ mod tests {
     #[test]
     fn exclusions_work_in_a_linked_worktree() {
         let repo = temp_repo("worktree-main");
-        let linked = repo
-            .parent()
-            .expect("parent")
-            .join(format!("tactus-ws-worktree-linked-{}", std::process::id()));
+        let linked = repo.parent().expect("parent").join(format!(
+            "upstroke-ws-worktree-linked-{}",
+            std::process::id()
+        ));
         let _ = fs::remove_dir_all(&linked);
         let out = Command::new("git")
             .arg("-C")
@@ -2180,8 +2196,8 @@ mod tests {
             "each physical worktree needs an independent lease directory"
         );
         ws.ensure_run_exclusions().expect("exclude");
-        fs::create_dir_all(linked.join(".tactus").join("runs")).expect("run dir");
-        fs::write(linked.join(".tactus").join("runs").join("t.json"), "{}").expect("artifact");
+        fs::create_dir_all(linked.join(".upstroke").join("runs")).expect("run dir");
+        fs::write(linked.join(".upstroke").join("runs").join("t.json"), "{}").expect("artifact");
         assert!(
             ws.is_clean().expect("status"),
             "linked worktrees read excludes from the common dir, so info/exclude would not work"
@@ -2208,14 +2224,14 @@ mod tests {
     fn worktree_git_dir_preserves_non_utf8_repo_path() {
         use std::os::unix::ffi::OsStringExt;
 
-        let mut name = format!("tactus-ws-non-utf8-git-dir-{}-", std::process::id()).into_bytes();
+        let mut name = format!("upstroke-ws-non-utf8-git-dir-{}-", std::process::id()).into_bytes();
         name.push(0xff);
         let repo = env::temp_dir().join(OsString::from_vec(name));
         let _ = fs::remove_dir_all(&repo);
         fs::create_dir(&repo).expect("create non-UTF-8 repo");
         run_git(&repo, &["init", "-q", "-b", "main"]);
-        run_git(&repo, &["config", "user.email", "test@tactus.local"]);
-        run_git(&repo, &["config", "user.name", "tactus tests"]);
+        run_git(&repo, &["config", "user.email", "test@upstroke.local"]);
+        run_git(&repo, &["config", "user.name", "upstroke tests"]);
         fs::write(repo.join("README.md"), "seed\n").expect("seed file");
         run_git(&repo, &["add", "-A"]);
         run_git(&repo, &["commit", "-q", "-m", "seed"]);
@@ -2333,7 +2349,7 @@ mod tests {
         let ws = Workspace::open(&repo).expect("open");
         fs::write(
             repo.join(".gitattributes"),
-            "filtered.txt filter=tactus-test\n",
+            "filtered.txt filter=upstroke-test\n",
         )
         .expect("filter attribute");
         fs::write(repo.join("filtered.txt"), "semantic bytes\n").expect("filtered file");
@@ -2356,7 +2372,7 @@ mod tests {
             .expect("inspect attributes")
             .expect("filtered evidence must fail closed");
         assert!(problem.contains("filtered.txt"), "{problem}");
-        assert!(problem.contains("tactus-test"), "{problem}");
+        assert!(problem.contains("upstroke-test"), "{problem}");
         assert!(problem.contains("different bytes"), "{problem}");
     }
 
@@ -2373,7 +2389,7 @@ mod tests {
         // from `diff --cached --name-only` but is still a gate input.
         fs::write(
             repo.join(".gitattributes"),
-            "unchanged.txt filter=tactus-test\n",
+            "unchanged.txt filter=upstroke-test\n",
         )
         .expect("candidate attributes");
         let error = ws
@@ -2391,7 +2407,7 @@ mod tests {
             .expect("inspect every path in the captured tree")
             .expect("filter on unchanged path must fail closed");
         assert!(problem.contains("unchanged.txt"), "{problem}");
-        assert!(problem.contains("tactus-test"), "{problem}");
+        assert!(problem.contains("upstroke-test"), "{problem}");
     }
 
     #[test]
@@ -2410,11 +2426,11 @@ mod tests {
             &repo,
             &[
                 "config",
-                "filter.tactus-test.clean",
+                "filter.upstroke-test.clean",
                 "sh .githooks/filter-helper",
             ],
         );
-        run_git(&repo, &["config", "filter.tactus-test.smudge", "cat"]);
+        run_git(&repo, &["config", "filter.upstroke-test.smudge", "cat"]);
 
         fs::write(
             repo.join(".githooks").join("filter-helper"),
@@ -2423,7 +2439,7 @@ mod tests {
         .expect("candidate helper");
         fs::write(
             repo.join(".gitattributes"),
-            "payload.txt filter=tactus-test\n",
+            "payload.txt filter=upstroke-test\n",
         )
         .expect("candidate attributes");
         fs::write(repo.join("payload.txt"), "candidate\n").expect("candidate payload");
@@ -2466,11 +2482,11 @@ mod tests {
             &repo,
             &[
                 "config",
-                "filter.tactus-status.clean",
+                "filter.upstroke-status.clean",
                 "sh .githooks/status-filter",
             ],
         );
-        run_git(&repo, &["config", "filter.tactus-status.smudge", "cat"]);
+        run_git(&repo, &["config", "filter.upstroke-status.smudge", "cat"]);
 
         fs::write(
             repo.join(".githooks").join("status-filter"),
@@ -2479,7 +2495,7 @@ mod tests {
         .expect("candidate helper");
         fs::write(
             repo.join(".gitattributes"),
-            "payload.txt filter=tactus-status\n",
+            "payload.txt filter=upstroke-status\n",
         )
         .expect("candidate attributes");
         let payload = repo.join("payload.txt");
@@ -2668,19 +2684,19 @@ mod tests {
         run_git(&repo, &["switch", "-q", "-c", "filtered"]);
         fs::write(
             repo.join(".gitattributes"),
-            "payload.txt filter=tactus-switch\n",
+            "payload.txt filter=upstroke-switch\n",
         )
         .expect("attributes");
         fs::write(repo.join("payload.txt"), "filtered branch\n").expect("payload");
         run_git(&repo, &["add", "-A"]);
         run_git(&repo, &["commit", "-q", "-m", "seed filtered branch"]);
         run_git(&repo, &["switch", "-q", "main"]);
-        run_git(&repo, &["config", "filter.tactus-switch.clean", "cat"]);
+        run_git(&repo, &["config", "filter.upstroke-switch.clean", "cat"]);
         run_git(
             &repo,
             &[
                 "config",
-                "filter.tactus-switch.smudge",
+                "filter.upstroke-switch.smudge",
                 "sh .githooks/smudge-helper",
             ],
         );
@@ -2755,16 +2771,20 @@ mod tests {
         let repo = temp_repo("reset-filter-helper");
         fs::write(
             repo.join(".gitattributes"),
-            "README.md filter=tactus-reset\n",
+            "README.md filter=upstroke-reset\n",
         )
         .expect("target attributes");
         fs::write(repo.join("zz-reset-helper"), "#!/bin/sh\ncat\n").expect("baseline helper");
         run_git(&repo, &["add", "-A"]);
         run_git(&repo, &["commit", "-q", "-m", "seed reset filter"]);
-        run_git(&repo, &["config", "filter.tactus-reset.clean", "cat"]);
+        run_git(&repo, &["config", "filter.upstroke-reset.clean", "cat"]);
         run_git(
             &repo,
-            &["config", "filter.tactus-reset.smudge", "sh zz-reset-helper"],
+            &[
+                "config",
+                "filter.upstroke-reset.smudge",
+                "sh zz-reset-helper",
+            ],
         );
 
         fs::write(
@@ -2858,7 +2878,7 @@ mod tests {
                 // populated the worktree, then the overall add operation is
                 // reported as failed (as a failing post-checkout hook did).
                 ws.add_gate_worktree(path, hooks_path, commit)?;
-                Err(TactusError::Git {
+                Err(UpstrokeError::Git {
                     message: "synthetic late worktree-add failure".to_owned(),
                 })
             },
@@ -2901,7 +2921,7 @@ mod tests {
                 attempted_path = Some(path.to_path_buf());
                 ws.add_gate_worktree(path, hooks_path, commit)?;
                 fs::write(path.join("unexpected-residue"), "not in candidate\n").map_err(
-                    |error| TactusError::Git {
+                    |error| UpstrokeError::Git {
                         message: format!("creating synthetic residue: {error}"),
                     },
                 )?;
@@ -2931,12 +2951,12 @@ mod tests {
     #[test]
     #[ignore = "subprocess helper"]
     fn gate_snapshot_owner_helper() {
-        if env::var_os("TACTUS_SNAPSHOT_OWNER").is_none() {
+        if env::var_os("UPSTROKE_SNAPSHOT_OWNER").is_none() {
             return;
         }
-        let repo = PathBuf::from(env::var_os("TACTUS_REPO").expect("repo path"));
-        let store = PathBuf::from(env::var_os("TACTUS_SNAPSHOT_STORE").expect("store path"));
-        let ready = PathBuf::from(env::var_os("TACTUS_READY").expect("ready path"));
+        let repo = PathBuf::from(env::var_os("UPSTROKE_REPO").expect("repo path"));
+        let store = PathBuf::from(env::var_os("UPSTROKE_SNAPSHOT_STORE").expect("store path"));
+        let ready = PathBuf::from(env::var_os("UPSTROKE_READY").expect("ready path"));
         let workspace = Workspace::open(&repo).expect("open helper workspace");
         let parent = workspace.head_sha_full().expect("snapshot parent");
         let tree = workspace.staged_tree_oid().expect("snapshot tree");
@@ -2956,7 +2976,7 @@ mod tests {
     fn hard_killed_snapshot_owner_is_reclaimed_before_resume() {
         let repo = temp_repo("snapshot-hard-kill");
         let store = env::temp_dir().join(format!(
-            "tactus-snapshot-store-{}-{}",
+            "upstroke-snapshot-store-{}-{}",
             std::process::id(),
             crate::ulid::ulid()
         ));
@@ -2967,10 +2987,10 @@ mod tests {
             .expect("registrations before");
         let mut owner = Command::new(env::current_exe().expect("test executable"))
             .args(["gate_snapshot_owner_helper", "--ignored", "--nocapture"])
-            .env("TACTUS_SNAPSHOT_OWNER", "1")
-            .env("TACTUS_REPO", &repo)
-            .env("TACTUS_SNAPSHOT_STORE", &store)
-            .env("TACTUS_READY", &ready)
+            .env("UPSTROKE_SNAPSHOT_OWNER", "1")
+            .env("UPSTROKE_REPO", &repo)
+            .env("UPSTROKE_SNAPSHOT_STORE", &store)
+            .env("UPSTROKE_READY", &ready)
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .spawn()
@@ -3054,7 +3074,7 @@ mod tests {
         );
 
         let temp_root = env::temp_dir().join(format!(
-            "tactus-shared-temp-root-{}-{}",
+            "upstroke-shared-temp-root-{}-{}",
             std::process::id(),
             crate::ulid::ulid()
         ));
@@ -3147,7 +3167,7 @@ mod tests {
         let ws = Workspace::open(&repo).expect("open");
         let parent = ws.head_sha_full().expect("parent");
         let tree = ws.staged_tree_oid().expect("tree");
-        let mut name = format!("tactus-non-utf8-tmp-{}-", std::process::id()).into_bytes();
+        let mut name = format!("upstroke-non-utf8-tmp-{}-", std::process::id()).into_bytes();
         name.push(0xff);
         let temp_root = env::temp_dir().join(OsString::from_vec(name));
         let _ = fs::remove_dir_all(&temp_root);

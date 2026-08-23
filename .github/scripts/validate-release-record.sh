@@ -7,7 +7,7 @@ if [[ $# -ne 1 || -z "$1" ]]; then
 fi
 
 expected_tag="$1"
-expected_assets='["tactus-aarch64-apple-darwin.tar.gz","tactus-x86_64-pc-windows-msvc.zip","tactus-x86_64-unknown-linux-gnu.tar.gz"]'
+expected_assets='["upstroke-aarch64-apple-darwin.tar.gz","upstroke-x86_64-pc-windows-msvc.zip","upstroke-x86_64-unknown-linux-gnu.tar.gz"]'
 
 if ! jq -e --arg tag "$expected_tag" --argjson expected "$expected_assets" '
   (.tag_name == $tag) and

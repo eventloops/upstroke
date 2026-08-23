@@ -87,7 +87,7 @@ const EXAMPLE_FRONTIER: CatalogEntry = entry(
 /// The Copilot half was checked against GitHub's supported-models reference on
 /// 2026-08-09; plain `gpt-5` and `gemini-2.5-pro` had already left the roster
 /// and were replaced (see the entries). Slugs churn faster than releases do, so
-/// treat every name here as point-in-time: `tactus connect` cross-checks the
+/// treat every name here as point-in-time: `upstroke connect` cross-checks the
 /// roster against what the installed CLI advertises wherever that CLI can
 /// actually enumerate models. Claude Code and Copilot cannot today; Codex's
 /// local `debug models` catalog is validated during its probe.

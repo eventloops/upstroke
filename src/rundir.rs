@@ -1,6 +1,6 @@
 //! Run directory layout (DESIGN.md §15) and run discovery.
 //!
-//! §15 draws the whole run directory under `.tactus/runs/<run-id>/`. This
+//! §15 draws the whole run directory under `.upstroke/runs/<run-id>/`. This
 //! module splits it in two, and the reason is enforcement rather than tidiness.
 //!
 //! A reviewer is a read-only agent pointed at the workspace, so every path
@@ -24,7 +24,7 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
-use crate::error::TactusError;
+use crate::error::UpstrokeError;
 use crate::util;
 use crate::workspace::Workspace;
 
@@ -43,11 +43,11 @@ const PRIVATE_DIRS: [&str; 5] = [
 /// Where one run's files live, split by who is allowed to read them.
 #[derive(Debug, Clone)]
 pub struct RunPaths {
-    /// `<repo>/.tactus/runs/<run-id>` — `events.jsonl`, the frozen plan,
+    /// `<repo>/.upstroke/runs/<run-id>` — `events.jsonl`, the frozen plan,
     /// artifacts, questions, answers, the lock. Git-ignored, but present
     /// beside the repository it describes.
     pub public: PathBuf,
-    /// `~/.tactus/runs/<run-id>` — transcripts, review verdicts, gate logs,
+    /// `~/.upstroke/runs/<run-id>` — transcripts, review verdicts, gate logs,
     /// and the per-attempt permission settings that define each sandbox.
     pub private: PathBuf,
 }
@@ -59,7 +59,7 @@ impl RunPaths {
     }
 
     /// Layout with an explicit private root — how tests stay out of the real
-    /// `~/.tactus`, and how a caller pins the location deliberately.
+    /// `~/.upstroke`, and how a caller pins the location deliberately.
     pub fn with_private_root(repo_root: &Path, run_id: &str, private_root: &Path) -> Self {
         Self {
             public: public_dir(repo_root, run_id),
@@ -76,13 +76,13 @@ impl RunPaths {
 
     /// Create both trees. Callers do this once at run start; every accessor
     /// below assumes it has happened.
-    pub fn create(&self) -> Result<(), TactusError> {
+    pub fn create(&self) -> Result<(), UpstrokeError> {
         let dirs = PUBLIC_DIRS
             .iter()
             .map(|name| self.public.join(name))
             .chain(PRIVATE_DIRS.iter().map(|name| self.private.join(name)));
         for dir in dirs {
-            fs::create_dir_all(&dir).map_err(|source| TactusError::Io {
+            fs::create_dir_all(&dir).map_err(|source| UpstrokeError::Io {
                 path: dir.clone(),
                 source,
             })?;
@@ -115,7 +115,7 @@ impl RunPaths {
         self.public.join("questions")
     }
 
-    /// Where `tactus answer` drops an answer for the engine to ingest.
+    /// Where `upstroke answer` drops an answer for the engine to ingest.
     pub fn answers(&self) -> PathBuf {
         self.public.join("answers")
     }
@@ -148,23 +148,23 @@ impl RunPaths {
     }
 }
 
-/// `~/.tactus`, or a temp-dir equivalent when no home resolves.
+/// `~/.upstroke`, or a temp-dir equivalent when no home resolves.
 ///
 /// The fallback is deliberately still outside the workspace. Falling back to
 /// the repo would keep runs working on a machine with no `HOME` while silently
 /// dropping the isolation this module exists for — a security property that
 /// degrades quietly is worse than one that was never claimed.
 fn default_private_root() -> PathBuf {
-    util::user_tactus_dir().unwrap_or_else(|| std::env::temp_dir().join("tactus"))
+    util::user_upstroke_dir().unwrap_or_else(|| std::env::temp_dir().join("upstroke"))
 }
 
-/// `<repo>/.tactus/runs/<run-id>` — §15's documented location.
+/// `<repo>/.upstroke/runs/<run-id>` — §15's documented location.
 pub fn public_dir(repo_root: &Path, run_id: &str) -> PathBuf {
     runs_root(repo_root).join(run_id)
 }
 
 pub fn runs_root(repo_root: &Path) -> PathBuf {
-    repo_root.join(".tactus").join("runs")
+    repo_root.join(".upstroke").join("runs")
 }
 
 /// Every run in this repo, oldest first.
@@ -186,7 +186,7 @@ pub fn list_runs(repo_root: &Path) -> Vec<String> {
     runs
 }
 
-/// The most recent run — what `tactus status` reports when given no id.
+/// The most recent run — what `upstroke status` reports when given no id.
 pub fn latest_run(repo_root: &Path) -> Option<String> {
     list_runs(repo_root).pop()
 }
@@ -197,7 +197,7 @@ pub fn latest_run(repo_root: &Path) -> Option<String> {
 /// An exact match wins outright rather than being treated as one candidate
 /// among several: a full id is never ambiguous, even if some other run happens
 /// to extend it.
-pub fn resolve_run_id(repo_root: &Path, wanted: &str) -> Result<String, TactusError> {
+pub fn resolve_run_id(repo_root: &Path, wanted: &str) -> Result<String, UpstrokeError> {
     let runs = list_runs(repo_root);
     let wanted_upper = wanted.to_ascii_uppercase();
     // The entry as it exists on disk, not the uppercased input. The comparison
@@ -213,14 +213,14 @@ pub fn resolve_run_id(repo_root: &Path, wanted: &str) -> Result<String, TactusEr
         .collect();
     match matches.as_slice() {
         [only] => Ok((*only).clone()),
-        [] => Err(TactusError::Refused {
+        [] => Err(UpstrokeError::Refused {
             message: if runs.is_empty() {
                 format!("no runs found under {}", runs_root(repo_root).display())
             } else {
                 format!("no run matches that id; known runs: {}", runs.join(", "))
             },
         }),
-        several => Err(TactusError::Refused {
+        several => Err(UpstrokeError::Refused {
             message: format!(
                 "that prefix matches {} runs ({}); use more characters",
                 several.len(),
@@ -238,7 +238,7 @@ pub fn resolve_run_id(repo_root: &Path, wanted: &str) -> Result<String, TactusEr
 #[derive(Debug)]
 pub struct FoundQuestion {
     pub run_id: String,
-    /// The run's public directory — everything `tactus answer` touches.
+    /// The run's public directory — everything `upstroke answer` touches.
     pub public: PathBuf,
     /// The full question id, expanded from whatever prefix was typed.
     pub question_id: String,
@@ -249,7 +249,7 @@ pub struct FoundQuestion {
 /// Scans every run rather than requiring the operator to remember which one
 /// asked: the notifier hands them a question id, not a run id, so a question
 /// id is what the command has to accept.
-pub fn find_question(repo_root: &Path, wanted: &str) -> Result<FoundQuestion, TactusError> {
+pub fn find_question(repo_root: &Path, wanted: &str) -> Result<FoundQuestion, UpstrokeError> {
     let wanted_upper = wanted.to_ascii_uppercase();
     let mut exact: Option<FoundQuestion> = None;
     let mut matches: Vec<FoundQuestion> = Vec::new();
@@ -279,16 +279,16 @@ pub fn find_question(repo_root: &Path, wanted: &str) -> Result<FoundQuestion, Ta
         return Ok(found);
     }
     match matches.len() {
-        1 => matches.pop().ok_or_else(|| TactusError::Refused {
+        1 => matches.pop().ok_or_else(|| UpstrokeError::Refused {
             message: "question vanished while resolving it".to_owned(),
         }),
-        0 => Err(TactusError::Refused {
+        0 => Err(UpstrokeError::Refused {
             message: format!(
                 "no question with that id under {}",
                 runs_root(repo_root).display()
             ),
         }),
-        several => Err(TactusError::Refused {
+        several => Err(UpstrokeError::Refused {
             message: format!(
                 "that prefix matches {several} questions ({}); use more characters",
                 matches
@@ -305,7 +305,7 @@ pub fn find_question(repo_root: &Path, wanted: &str) -> Result<FoundQuestion, Ta
 ///
 /// Takes the public directory rather than a whole [`RunPaths`] because the
 /// lock lives in the public half by construction. Two callers only ever want
-/// to know whether a run is live — `tactus answer`, and the resume that must
+/// to know whether a run is live — `upstroke answer`, and the resume that must
 /// claim the run *before* it has read where the private half went — and
 /// neither has a private path to offer. Asking them for one invited passing
 /// the public path twice, which would have quietly become wrong the moment
@@ -315,7 +315,7 @@ pub fn lock_file(public: &Path) -> PathBuf {
 }
 
 fn worktree_lock_file(worktree_git_dir: &Path) -> PathBuf {
-    worktree_git_dir.join("tactus-worktree.lock")
+    worktree_git_dir.join("upstroke-worktree.lock")
 }
 
 /// An exclusive lease on the physical worktree shared by every run directory.
@@ -340,7 +340,7 @@ impl WorktreeLock {
     /// the working tree. Kept as the public convenience API for existing
     /// callers; the engine already has the resolved [`Workspace`] and uses
     /// [`Self::acquire_in`] to avoid opening it twice.
-    pub fn acquire(repo_root: &Path) -> Result<Self, TactusError> {
+    pub fn acquire(repo_root: &Path) -> Result<Self, UpstrokeError> {
         let workspace = Workspace::open(repo_root)?;
         let worktree_git_dir = workspace.worktree_git_dir()?;
         Self::acquire_in(workspace.root(), &worktree_git_dir)
@@ -349,9 +349,9 @@ impl WorktreeLock {
     pub(crate) fn acquire_in(
         repo_root: &Path,
         worktree_git_dir: &Path,
-    ) -> Result<Self, TactusError> {
+    ) -> Result<Self, UpstrokeError> {
         let path = worktree_lock_file(worktree_git_dir);
-        let claim = claim_key(worktree_git_dir).join("tactus-worktree.lock");
+        let claim = claim_key(worktree_git_dir).join("upstroke-worktree.lock");
         if !claims().insert(claim.clone()) {
             return Err(worktree_refused(repo_root, &path, Some(std::process::id())));
         }
@@ -361,14 +361,14 @@ impl WorktreeLock {
             .write(true)
             .read(true)
             .open(&path)
-            .map_err(|source| TactusError::Io {
+            .map_err(|source| UpstrokeError::Io {
                 path: path.clone(),
                 source,
             })
             .and_then(|file| match imp::take(&file) {
                 Holder::Nobody => Ok(file),
                 Holder::Someone { pid } => Err(worktree_refused(repo_root, &path, pid)),
-                Holder::Unknown(source) => Err(TactusError::Io {
+                Holder::Unknown(source) => Err(UpstrokeError::Io {
                     path: path.clone(),
                     source,
                 }),
@@ -386,7 +386,7 @@ impl WorktreeLock {
                     .find(|public| cleanup::is_held(public))
                 {
                     release_claim_after_file(Some(file), &claim, || {});
-                    return Err(TactusError::Refused {
+                    return Err(UpstrokeError::Refused {
                         message: format!(
                             "run `{}` is still cleaning agent processes in worktree {}; refusing overlapping engine ownership",
                             cleaning.file_name().unwrap_or_default().to_string_lossy(),
@@ -449,7 +449,7 @@ impl RunLock {
     }
 
     /// Take the lock on a run's public directory, or explain who has it.
-    pub fn acquire(public: &Path) -> Result<Self, TactusError> {
+    pub fn acquire(public: &Path) -> Result<Self, UpstrokeError> {
         let path = lock_file(public);
         let claim = claim_key(public);
         // This process first, and not only as an optimisation: the OS lock
@@ -465,7 +465,7 @@ impl RunLock {
             .write(true)
             .read(true)
             .open(&path)
-            .map_err(|source| TactusError::Io {
+            .map_err(|source| UpstrokeError::Io {
                 path: path.clone(),
                 source,
             })
@@ -475,7 +475,7 @@ impl RunLock {
                 // A lock that cannot be taken is not a lock that was taken. Say
                 // what actually failed rather than blaming an engine that may
                 // not exist.
-                Holder::Unknown(source) => Err(TactusError::Io {
+                Holder::Unknown(source) => Err(UpstrokeError::Io {
                     path: path.clone(),
                     source,
                 }),
@@ -518,14 +518,14 @@ fn release_claim_after_file(file: Option<File>, claim: &Path, after_close: impl 
     claims().remove(claim);
 }
 
-fn refused(public: &Path, path: &Path, pid: Option<u32>) -> TactusError {
+fn refused(public: &Path, path: &Path, pid: Option<u32>) -> UpstrokeError {
     let who = match pid {
         Some(pid) => format!(" (pid {pid})"),
         None => String::new(),
     };
-    TactusError::Refused {
+    UpstrokeError::Refused {
         message: format!(
-            "another tactus process{who} is already driving run `{}` (lock held on {}). Two \
+            "another upstroke process{who} is already driving run `{}` (lock held on {}). Two \
              engines would interleave events and fight over the same branch — wait for it to \
              finish, or stop it first.",
             public.file_name().unwrap_or_default().to_string_lossy(),
@@ -534,14 +534,14 @@ fn refused(public: &Path, path: &Path, pid: Option<u32>) -> TactusError {
     }
 }
 
-fn worktree_refused(repo_root: &Path, path: &Path, pid: Option<u32>) -> TactusError {
+fn worktree_refused(repo_root: &Path, path: &Path, pid: Option<u32>) -> UpstrokeError {
     let who = match pid {
         Some(pid) => format!(" (pid {pid})"),
         None => String::new(),
     };
-    TactusError::Refused {
+    UpstrokeError::Refused {
         message: format!(
-            "another tactus process{who} is already driving worktree {} (lock held on {}). Different run ids still share HEAD, the index, and working-tree bytes; wait for it to finish, or stop it first.",
+            "another upstroke process{who} is already driving worktree {} (lock held on {}). Different run ids still share HEAD, the index, and working-tree bytes; wait for it to finish, or stop it first.",
             repo_root.display(),
             path.display()
         ),
@@ -640,7 +640,7 @@ pub fn is_running(public: &Path) -> bool {
         //
         // So the question is which way to be wrong when the OS refuses to say.
         // Answering "not running" makes `status` settle a working attempt as
-        // cut off and print `state: interrupted … Continue it with: tactus
+        // cut off and print `state: interrupted … Continue it with: upstroke
         // resume <id>`, sending the operator to start a second engine on a
         // live run. Answering "running" costs a `status` that declines to
         // settle and says another process holds the run. One of those invents
@@ -654,7 +654,7 @@ pub fn is_running(public: &Path) -> bool {
 #[cfg(unix)]
 mod cleanup {
     use super::{cleanup_lock_file, refused};
-    use crate::error::TactusError;
+    use crate::error::UpstrokeError;
     use std::cell::RefCell;
     use std::collections::BTreeMap;
     use std::fs::File;
@@ -710,7 +710,7 @@ mod cleanup {
         }
     }
 
-    pub(super) fn take(public: &Path) -> Result<CleanupLease, TactusError> {
+    pub(super) fn take(public: &Path) -> Result<CleanupLease, UpstrokeError> {
         let path = cleanup_lock_file(public);
         let file = File::options()
             .create(true)
@@ -718,7 +718,7 @@ mod cleanup {
             .read(true)
             .write(true)
             .open(&path)
-            .map_err(|source| TactusError::Io {
+            .map_err(|source| UpstrokeError::Io {
                 path: path.clone(),
                 source,
             })?;
@@ -731,7 +731,7 @@ mod cleanup {
             ) {
                 return Err(refused(public, &path, None));
             }
-            return Err(TactusError::Io { path, source });
+            return Err(UpstrokeError::Io { path, source });
         }
         // This probe proves no prior crash reaper remains. Do not retain the
         // lock in the conductor: arbitrary forked children would inherit its
@@ -739,7 +739,7 @@ mod cleanup {
         // primary fcntl lock deliberately avoids. Each cleanup reaper instead
         // reopens `path` and owns an independent shared hold.
         if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_UN) } != 0 {
-            return Err(TactusError::Io {
+            return Err(UpstrokeError::Io {
                 path,
                 source: std::io::Error::last_os_error(),
             });
@@ -772,7 +772,7 @@ mod cleanup {
 
 #[cfg(not(unix))]
 mod cleanup {
-    use crate::error::TactusError;
+    use crate::error::UpstrokeError;
     use std::marker::PhantomData;
     use std::path::Path;
     use std::rc::Rc;
@@ -789,7 +789,7 @@ mod cleanup {
         fn drop(&mut self) {}
     }
 
-    pub(super) fn take(_: &Path) -> Result<CleanupLease, TactusError> {
+    pub(super) fn take(_: &Path) -> Result<CleanupLease, UpstrokeError> {
         Ok(CleanupLease)
     }
 
@@ -1015,7 +1015,8 @@ mod tests {
     use std::time::{Duration, Instant};
 
     fn scratch(tag: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!("tactus-rundir-{tag}-{}", std::process::id()));
+        let dir =
+            std::env::temp_dir().join(format!("upstroke-rundir-{tag}-{}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).expect("scratch dir");
         dir
@@ -1054,7 +1055,10 @@ mod tests {
                 "ops surface stays beside the repo"
             );
         }
-        assert_eq!(paths.events(), repo.join(".tactus/runs/RUN1/events.jsonl"));
+        assert_eq!(
+            paths.events(),
+            repo.join(".upstroke/runs/RUN1/events.jsonl")
+        );
     }
 
     #[test]
@@ -1063,7 +1067,7 @@ mod tests {
         // where an agent can read them.
         let root = default_private_root();
         assert!(
-            root.ends_with(".tactus") || root.ends_with("tactus"),
+            root.ends_with(".upstroke") || root.ends_with("upstroke"),
             "{root:?}"
         );
         assert!(root.is_absolute(), "{root:?}");
@@ -1228,8 +1232,8 @@ mod tests {
     fn the_lock_answers_at_once_rather_than_waiting_to_be_sure() {
         // There was a 500ms contention grace here, and it was paid in full
         // exactly when the answer was yes: a live engine never lets go, so the
-        // retry loop always ran to the deadline. Every `tactus status` and
-        // `tactus answer` against a working run paid it, and `--follow` paid it
+        // retry loop always ran to the deadline. Every `upstroke status` and
+        // `upstroke answer` against a working run paid it, and `--follow` paid it
         // once per idle poll until it was given a cheaper question to ask.
         //
         // The grace existed to disbelieve a `fork` window. The primitive now
@@ -1310,7 +1314,7 @@ mod tests {
     #[test]
     #[ignore = "spawned as a subprocess by a_second_process_is_refused_the_run_lock"]
     fn lock_child_holds_the_run() {
-        let public = PathBuf::from(std::env::var("TACTUS_TEST_LOCK_DIR").expect("run dir"));
+        let public = PathBuf::from(std::env::var("UPSTROKE_TEST_LOCK_DIR").expect("run dir"));
         let _held = RunLock::acquire(&public).expect("the child takes the lock");
         println!("held");
         std::io::Write::flush(&mut std::io::stdout()).expect("flush");
@@ -1320,10 +1324,10 @@ mod tests {
     #[test]
     #[ignore = "spawned as a subprocess by two_run_ids_cannot_drive_one_worktree_concurrently"]
     fn worktree_lock_child_holds_run_a() {
-        let repo = PathBuf::from(std::env::var("TACTUS_TEST_WORKTREE_DIR").expect("repo"));
+        let repo = PathBuf::from(std::env::var("UPSTROKE_TEST_WORKTREE_DIR").expect("repo"));
         let git_dir =
-            PathBuf::from(std::env::var("TACTUS_TEST_WORKTREE_GIT_DIR").expect("git dir"));
-        let public = PathBuf::from(std::env::var("TACTUS_TEST_LOCK_DIR").expect("run dir"));
+            PathBuf::from(std::env::var("UPSTROKE_TEST_WORKTREE_GIT_DIR").expect("git dir"));
+        let public = PathBuf::from(std::env::var("UPSTROKE_TEST_LOCK_DIR").expect("run dir"));
         let _worktree =
             WorktreeLock::acquire_in(&repo, &git_dir).expect("child takes worktree lease");
         let _run = RunLock::acquire(&public).expect("child takes run A lock");
@@ -1351,9 +1355,9 @@ mod tests {
                 "--ignored",
                 "--nocapture",
             ])
-            .env("TACTUS_TEST_WORKTREE_DIR", &repo)
-            .env("TACTUS_TEST_WORKTREE_GIT_DIR", &git_dir)
-            .env("TACTUS_TEST_LOCK_DIR", &run_a.public)
+            .env("UPSTROKE_TEST_WORKTREE_DIR", &repo)
+            .env("UPSTROKE_TEST_WORKTREE_GIT_DIR", &git_dir)
+            .env("UPSTROKE_TEST_LOCK_DIR", &run_a.public)
             .stdout(std::process::Stdio::piped())
             .spawn()
             .expect("spawn run A engine");
@@ -1407,7 +1411,7 @@ mod tests {
                 "--ignored",
                 "--nocapture",
             ])
-            .env("TACTUS_TEST_LOCK_DIR", &paths.public)
+            .env("UPSTROKE_TEST_LOCK_DIR", &paths.public)
             .stdout(std::process::Stdio::piped())
             .spawn()
             .expect("spawn the second engine");

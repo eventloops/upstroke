@@ -34,7 +34,7 @@ use serde::{Deserialize, Serialize};
 use crate::agent::{AgentAdapter, Caps, TaskRun, proc};
 use crate::capacity;
 use crate::config::{self, OnTaskFailure};
-use crate::error::TactusError;
+use crate::error::UpstrokeError;
 use crate::events::{
     self, BindingSummary, ChainSummary, EventBody, EventLog, Feedback, GateSummary, Progress,
     RunState, TaskState,
@@ -84,11 +84,11 @@ const MAX_FEEDBACK_ENTRIES: usize = 6;
 
 /// §12: how a worker flags a decision it should not make alone. The prompt
 /// teaches this marker; nothing else in the engine parses agent prose.
-const QUESTION_MARKER: &str = "TACTUS-QUESTION:";
+const QUESTION_MARKER: &str = "UPSTROKE-QUESTION:";
 
 #[cfg(test)]
 type AfterCandidateCapture =
-    fn(&Workspace, &crate::workspace::CapturedCandidate) -> Result<(), TactusError>;
+    fn(&Workspace, &crate::workspace::CapturedCandidate) -> Result<(), UpstrokeError>;
 
 #[derive(Debug, Clone)]
 pub struct RunOptions {
@@ -105,7 +105,7 @@ pub struct RunOptions {
     pub defer_backoff: Duration,
     pub max_defers: u32,
     /// Where the agent-authored half of the run directory goes (§15 split).
-    /// `None` takes `~/.tactus`; tests point it at a scratch directory so they
+    /// `None` takes `~/.upstroke`; tests point it at a scratch directory so they
     /// never touch the real one.
     pub private_root: Option<PathBuf>,
     /// Override `[interaction] wait_on_block_secs` — how long a detached
@@ -199,7 +199,7 @@ pub enum TaskRunStatus {
     /// Its turn has not come yet, and the run is still going — distinct from
     /// `Skipped`, which means the run ended before this task got a turn.
     Queued,
-    /// A status this build does not know, from a `report.json` a newer tactus
+    /// A status this build does not know, from a `report.json` a newer upstroke
     /// wrote. Never produced by this crate.
     ///
     /// `report.json` is a projection for whoever reads the run afterwards, and
@@ -301,7 +301,7 @@ impl TaskReport {
 /// `Parked` is deliberately not `Halted`: §12 requires CI to tell a clean
 /// completion from one that left questions unanswered. `BudgetExceeded` earns
 /// its own variant for the same reason one step further out — "your ceiling
-/// stopped it" is neither a failure nor a question, and `tactus resume` means
+/// stopped it" is neither a failure nor a question, and `upstroke resume` means
 /// something different after each of the three.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RunOutcome {
@@ -419,11 +419,14 @@ impl RunReport {
     }
 }
 
-pub fn run(opts: &RunOptions) -> Result<RunReport, TactusError> {
+pub fn run(opts: &RunOptions) -> Result<RunReport, UpstrokeError> {
     run_with(opts, &BuiltinAdapters)
 }
 
-pub fn run_with(opts: &RunOptions, adapters: &dyn AdapterSource) -> Result<RunReport, TactusError> {
+pub fn run_with(
+    opts: &RunOptions,
+    adapters: &dyn AdapterSource,
+) -> Result<RunReport, UpstrokeError> {
     run_harness(opts, &Harness::new(adapters))
 }
 
@@ -482,7 +485,7 @@ struct RecordedRouting {
     bindings: Option<Vec<ChainSummary>>,
 }
 
-fn preflight(opts: &RunOptions, harness: &Harness<'_>) -> Result<Preflight, TactusError> {
+fn preflight(opts: &RunOptions, harness: &Harness<'_>) -> Result<Preflight, UpstrokeError> {
     preflight_with_recorded(opts, harness, Recorded::default())
 }
 
@@ -492,7 +495,7 @@ fn preflight(opts: &RunOptions, harness: &Harness<'_>) -> Result<Preflight, Tact
 /// from the record on resume rather than re-derived, for one reason stated
 /// twice: they are facts about the *run*, not about today's machine. A CLI
 /// installed or removed since the run started must not change who judges it,
-/// and a `tactus.toml` edited since — including by an implementer, in the very
+/// and a `upstroke.toml` edited since — including by an implementer, in the very
 /// workspace it edits — must not change what verifies it. A live run already
 /// works this way by construction, holding one analysis in memory for its whole
 /// length; this is what makes a resume the same run rather than a new one
@@ -507,7 +510,7 @@ fn preflight_with_recorded(
     opts: &RunOptions,
     harness: &Harness<'_>,
     recorded: Recorded,
-) -> Result<Preflight, TactusError> {
+) -> Result<Preflight, UpstrokeError> {
     // §14: plan parses cycle-free, config loads, chains resolve.
     let mut analysis = validate::analyze(&ValidateOptions {
         plan_path: opts.plan_path.clone(),
@@ -599,7 +602,7 @@ fn preflight_with_recorded(
     //
     // Reviewers are probed on the same footing as implementers — step-6
     // finding #10 — but in two classes. Everything the config *asked* for is
-    // required. The anti-self-review alternative was tactus's own idea, so a
+    // required. The anti-self-review alternative was upstroke's own idea, so a
     // machine that cannot run it loses the upgrade rather than the run.
     //
     // Resume draws the line in the same place. Requiring the alternative there
@@ -624,9 +627,12 @@ fn preflight_with_recorded(
     agent_ids.dedup();
     let mut caps: BTreeMap<String, Caps> = BTreeMap::new();
     for id in agent_ids {
-        let adapter = harness.adapters.get(id).ok_or_else(|| TactusError::Agent {
-            message: format!("no adapter registered for agent `{id}`"),
-        })?;
+        let adapter = harness
+            .adapters
+            .get(id)
+            .ok_or_else(|| UpstrokeError::Agent {
+                message: format!("no adapter registered for agent `{id}`"),
+            })?;
         caps.insert(id.to_owned(), adapter.probe()?);
     }
     for id in optional {
@@ -636,7 +642,7 @@ fn preflight_with_recorded(
         let probed = harness
             .adapters
             .get(&id)
-            .ok_or_else(|| TactusError::Agent {
+            .ok_or_else(|| UpstrokeError::Agent {
                 message: format!("no adapter registered for agent `{id}`"),
             })
             .and_then(|adapter| adapter.probe());
@@ -716,7 +722,7 @@ fn preflight_with_recorded(
     })
 }
 
-pub fn run_harness(opts: &RunOptions, harness: &Harness<'_>) -> Result<RunReport, TactusError> {
+pub fn run_harness(opts: &RunOptions, harness: &Harness<'_>) -> Result<RunReport, UpstrokeError> {
     run_harness_inner(opts, harness).map(|(report, _)| report)
 }
 
@@ -727,7 +733,7 @@ pub fn run_harness(opts: &RunOptions, harness: &Harness<'_>) -> Result<RunReport
 fn run_harness_inner(
     opts: &RunOptions,
     harness: &Harness<'_>,
-) -> Result<(RunReport, RunState), TactusError> {
+) -> Result<(RunReport, RunState), UpstrokeError> {
     let workspace = Workspace::open(&opts.repo_root)?;
     // Preflight reads the source plan, config, and gate programs from this
     // physical worktree. Own it before taking that snapshot so another run
@@ -750,7 +756,7 @@ fn run_harness_inner(
     workspace.ensure_execution_prerequisites()?;
     workspace.ensure_run_exclusions()?;
     if !workspace.is_clean()? {
-        return Err(TactusError::Git {
+        return Err(UpstrokeError::Git {
             message: "working tree is not clean; commit or stash first (the engine refuses \
                       dirty trees)"
                 .to_owned(),
@@ -760,7 +766,7 @@ fn run_harness_inner(
     let wait_on_block = opts.wait_on_block;
 
     let run_id = ulid::ulid();
-    let branch = format!("tactus/run-{run_id}");
+    let branch = format!("upstroke/run-{run_id}");
     let paths = opts.paths(&run_id);
     paths.create()?;
     // Held for the whole run, released by the OS if this process dies — so a
@@ -770,7 +776,7 @@ fn run_harness_inner(
 
     // Nothing is on the record until the first event lands, so a failure in
     // this window would leave a run directory with no `events.jsonl` in it —
-    // and that husk becomes `latest_run`, so a bare `tactus status` reports
+    // and that husk becomes `latest_run`, so a bare `upstroke status` reports
     // "no event log here" for a run that never began, shadowing the real
     // latest one until someone deletes it by hand. Best-effort: failing to
     // tidy up must not mask the error that actually stopped the run.
@@ -778,19 +784,19 @@ fn run_harness_inner(
     let normalized_plan = normalized_plan_bytes(&analysis.plan, &plan_path)?;
     let normalized_plan_digest = events::normalized_plan_digest(&normalized_plan);
     let opened = fs::write(&plan_path, &normalized_plan)
-        .map_err(|source| TactusError::Io {
+        .map_err(|source| UpstrokeError::Io {
             path: plan_path.clone(),
             source,
         })
         .and_then(|()| {
-            let read_back = fs::read(&plan_path).map_err(|source| TactusError::Io {
+            let read_back = fs::read(&plan_path).map_err(|source| UpstrokeError::Io {
                 path: plan_path.clone(),
                 source,
             })?;
             if read_back != normalized_plan {
-                return Err(TactusError::Refused {
+                return Err(UpstrokeError::Refused {
                     message: format!(
-                        "{} changed while tactus was freezing it; refusing to record a digest for bytes it did not write",
+                        "{} changed while upstroke was freezing it; refusing to record a digest for bytes it did not write",
                         plan_path.display()
                     ),
                 });
@@ -808,7 +814,7 @@ fn run_harness_inner(
     let effort_policy = analysis.config.resolved_effort_policy();
     let started = events::RunStarted {
         schema: events::SCHEMA_VERSION,
-        tactus_version: env!("CARGO_PKG_VERSION").to_owned(),
+        upstroke_version: env!("CARGO_PKG_VERSION").to_owned(),
         run_id: run_id.clone(),
         branch: branch.clone(),
         base_sha,
@@ -896,7 +902,7 @@ fn run_harness_inner(
 fn effective_budgets(
     configured: config::Budgets,
     flag: Option<f64>,
-) -> Result<config::Budgets, TactusError> {
+) -> Result<config::Budgets, UpstrokeError> {
     // Validated through the same check `[budgets]` uses. A flag that overrides
     // a validated key must not be a way around the validation: `--budget 0` and
     // `--budget -5` both stop the run before it spends anything, and
@@ -905,7 +911,7 @@ fn effective_budgets(
     // three at load.
     if let Some(limit) = flag {
         config::check_budget("--budget", limit)
-            .map_err(|message| TactusError::Refused { message })?;
+            .map_err(|message| UpstrokeError::Refused { message })?;
     }
     Ok(config::Budgets {
         run_usd: flag.or(configured.run_usd),
@@ -958,7 +964,7 @@ fn restore_recorded_routing(
     analysis: &mut Analysis,
     recorded: &RecordedRouting,
     warnings: &mut Vec<String>,
-) -> Result<(), TactusError> {
+) -> Result<(), UpstrokeError> {
     let current = chain_summaries(analysis);
     let same_structure = current.len() == recorded.structure.len()
         && current.iter().zip(&recorded.structure).all(|(now, then)| {
@@ -995,7 +1001,7 @@ fn restore_recorded_routing(
         } else {
             moved.join("; ")
         };
-        return Err(TactusError::Resume {
+        return Err(UpstrokeError::Resume {
             run_id: recorded.run_id.clone(),
             message: format!(
                 "routing has changed since this run started, so a recorded rung would now mean a \
@@ -1015,7 +1021,7 @@ fn restore_recorded_routing(
         return Ok(());
     };
     if snapshot.len() != analysis.chains.len() {
-        return Err(TactusError::Resume {
+        return Err(UpstrokeError::Resume {
             run_id: recorded.run_id.clone(),
             message: "the recorded binding snapshot does not align with the run's task chains; \
                       the event log cannot safely identify which model belongs to which task"
@@ -1027,7 +1033,7 @@ fn restore_recorded_routing(
     for ((chain, now), then) in analysis.chains.iter_mut().zip(&current).zip(snapshot) {
         if then.task != now.task || then.tiers != now.tiers || then.attempts_per != now.attempts_per
         {
-            return Err(TactusError::Resume {
+            return Err(UpstrokeError::Resume {
                 run_id: recorded.run_id.clone(),
                 message: format!(
                     "the recorded binding snapshot for `{}` does not match its frozen chain",
@@ -1036,7 +1042,7 @@ fn restore_recorded_routing(
             });
         }
         let Some(bindings) = then.bindings.as_ref() else {
-            return Err(TactusError::Resume {
+            return Err(UpstrokeError::Resume {
                 run_id: recorded.run_id.clone(),
                 message: format!(
                     "the recorded binding snapshot for `{}` is missing its bindings",
@@ -1045,7 +1051,7 @@ fn restore_recorded_routing(
             });
         };
         if bindings.len() != chain.rungs.len() {
-            return Err(TactusError::Resume {
+            return Err(UpstrokeError::Resume {
                 run_id: recorded.run_id.clone(),
                 message: format!(
                     "the recorded binding snapshot for `{}` has {} binding(s) for {} rung(s)",
@@ -1057,7 +1063,7 @@ fn restore_recorded_routing(
         }
         for (rung, binding) in chain.rungs.iter_mut().zip(bindings) {
             if binding.tier != rung.tier {
-                return Err(TactusError::Resume {
+                return Err(UpstrokeError::Resume {
                     run_id: recorded.run_id.clone(),
                     message: format!(
                         "the recorded binding snapshot for `{}` assigns tier `{}` to a `{}` rung",
@@ -1155,14 +1161,14 @@ impl ResumeOptions {
     }
 }
 
-pub fn resume(opts: &ResumeOptions) -> Result<RunReport, TactusError> {
+pub fn resume(opts: &ResumeOptions) -> Result<RunReport, UpstrokeError> {
     resume_with(opts, &BuiltinAdapters)
 }
 
 pub fn resume_with(
     opts: &ResumeOptions,
     adapters: &dyn AdapterSource,
-) -> Result<RunReport, TactusError> {
+) -> Result<RunReport, UpstrokeError> {
     resume_harness(opts, &Harness::new(adapters))
 }
 
@@ -1182,17 +1188,17 @@ pub fn resume_with(
 pub fn resume_harness(
     opts: &ResumeOptions,
     harness: &Harness<'_>,
-) -> Result<RunReport, TactusError> {
+) -> Result<RunReport, UpstrokeError> {
     resume_harness_inner(opts, harness).map(|(report, _)| report)
 }
 
 fn resume_harness_inner(
     opts: &ResumeOptions,
     harness: &Harness<'_>,
-) -> Result<(RunReport, RunState), TactusError> {
+) -> Result<(RunReport, RunState), UpstrokeError> {
     let run_id = rundir::resolve_run_id(&opts.repo_root, &opts.run_id)?;
     let public = rundir::public_dir(&opts.repo_root, &run_id);
-    let refuse = |message: String| TactusError::Resume {
+    let refuse = |message: String| UpstrokeError::Resume {
         run_id: run_id.clone(),
         message,
     };
@@ -1215,7 +1221,7 @@ fn resume_harness_inner(
     let recorded_normalized_plan_digest =
         events::recorded_normalized_plan_digest(&events).map(str::to_owned);
     let frozen_plan_path = public.join("plan.normalized.json");
-    let frozen_plan_bytes = fs::read(&frozen_plan_path).map_err(|source| TactusError::Io {
+    let frozen_plan_bytes = fs::read(&frozen_plan_path).map_err(|source| UpstrokeError::Io {
         path: frozen_plan_path.clone(),
         source,
     })?;
@@ -1775,7 +1781,7 @@ fn resume_harness_inner(
         }
     }
     // A crash between `question_answered` and the payload rewrite leaves a
-    // file that still reads as open, which `tactus answer` would accept a
+    // file that still reads as open, which `upstroke answer` would accept a
     // second answer against — one no engine can ever ingest, because the
     // question is already closed in the log. The log is what is authoritative;
     // make the payloads agree with it again.
@@ -1994,13 +2000,13 @@ fn unrecorded_commit(
     let task = plan.tasks.get(index)?;
     Some((
         task.id.to_string(),
-        format!("[tactus] {}: {}", task.id, task.title),
+        format!("[upstroke] {}: {}", task.id, task.title),
         prepared_commit.as_deref().cloned(),
     ))
 }
 
 fn prepared_pin_ref(run_id: &str, task_index: usize, attempt: u32) -> String {
-    format!("refs/tactus/prepared/{run_id}/{task_index}-{attempt}")
+    format!("refs/upstroke/prepared/{run_id}/{task_index}-{attempt}")
 }
 
 struct Run<'a> {
@@ -2073,14 +2079,14 @@ impl Run<'_> {
     /// past this into `state`, which is what makes a live run and a replay of
     /// its own log the same computation rather than two that agree by
     /// inspection.
-    fn emit(&mut self, body: EventBody) -> Result<(), TactusError> {
+    fn emit(&mut self, body: EventBody) -> Result<(), UpstrokeError> {
         let event = self.log.append(body)?;
         self.state.apply(&event);
         Ok(())
     }
 
     /// Drain, settle, and report.
-    fn drain_and_report(&mut self) -> Result<RunReport, TactusError> {
+    fn drain_and_report(&mut self) -> Result<RunReport, UpstrokeError> {
         if let Err(error) = self.drain() {
             // The log already holds everything that happened, including the
             // attempt this died inside — that is what `resume` reads. The
@@ -2139,7 +2145,7 @@ impl Run<'_> {
     /// question. `an_exhausted_pool_and_a_silent_operator_still_terminate`
     /// holds it to that against an adapter that never succeeds and an operator
     /// who never replies.
-    fn drain(&mut self) -> Result<(), TactusError> {
+    fn drain(&mut self) -> Result<(), UpstrokeError> {
         let mut defer_round = 0u32;
         loop {
             // Invariant 6 in its most useful form: an answer that arrives while
@@ -2227,7 +2233,7 @@ impl Run<'_> {
     /// this loop is what guarantees that.
     ///
     /// Returns whether the task ended deferred.
-    fn step_task(&mut self, index: usize) -> Result<bool, TactusError> {
+    fn step_task(&mut self, index: usize) -> Result<bool, UpstrokeError> {
         // Copied out of `self` so they carry the run's lifetime rather than
         // this method's `&mut self` borrow.
         let analysis = self.analysis;
@@ -2309,7 +2315,7 @@ impl Run<'_> {
             };
             let adapter = adapters
                 .get(&profile.agent)
-                .ok_or_else(|| TactusError::Agent {
+                .ok_or_else(|| UpstrokeError::Agent {
                     message: format!("no adapter registered for agent `{}`", profile.agent),
                 })?;
 
@@ -2509,12 +2515,12 @@ impl Run<'_> {
             // prefix without re-running paid work or trusting the mutable
             // index.
             let prepared_commit = if result.failure.is_none() {
-                let message = format!("[tactus] {}: {}", task.id, task.title);
+                let message = format!("[upstroke] {}: {}", task.id, task.title);
                 let pin_ref = prepared_pin_ref(&self.run_id, index, attempt);
                 let recorded_branch_ref = format!("refs/heads/{}", self.branch);
                 if result.candidate_branch_ref != recorded_branch_ref {
                     let _ = self.workspace.discard_uncommitted();
-                    return Err(TactusError::Git {
+                    return Err(UpstrokeError::Git {
                         message: format!(
                             "candidate was captured from `{}`, not recorded run branch `{recorded_branch_ref}`; refusing publication",
                             result.candidate_branch_ref
@@ -2572,7 +2578,7 @@ impl Run<'_> {
                 // Deleting it here would turn an ambiguous sync error into a
                 // schema-3 settlement whose exact object is no longer durable.
                 if let Err(cleanup) = self.workspace.discard_uncommitted() {
-                    return Err(TactusError::Git {
+                    return Err(UpstrokeError::Git {
                         message: format!(
                             "{error}; additionally failed to clean the unreviewed workspace: {cleanup}"
                         ),
@@ -2587,7 +2593,7 @@ impl Run<'_> {
                     // expose an orphan projection; resume rematerializes the
                     // question from the event before accepting an answer.
                     if let Err(cleanup) = self.workspace.discard_uncommitted() {
-                        return Err(TactusError::Git {
+                        return Err(UpstrokeError::Git {
                             message: format!(
                                 "{error}; additionally failed to clean the unreviewed workspace: {cleanup}"
                             ),
@@ -2684,7 +2690,7 @@ impl Run<'_> {
         &self,
         index: usize,
         implementer: &WorkerProfile,
-    ) -> Result<Vec<Reviewer<'_>>, TactusError> {
+    ) -> Result<Vec<Reviewer<'_>>, UpstrokeError> {
         let running_on = PassBinding::new(implementer.agent.clone(), implementer.model.clone());
         self.review_plan
             .passes_for(index, &running_on)
@@ -2700,7 +2706,7 @@ impl Run<'_> {
                 profile.pool = self.pool_name_for(&profile.agent).unwrap_or_default();
                 Ok(Reviewer {
                     adapter: self.adapters.get(&pass.binding.agent).ok_or_else(|| {
-                        TactusError::Agent {
+                        UpstrokeError::Agent {
                             message: format!(
                                 "the {} pass binds to agent `{}`, which has no adapter in this \
                                  build",
@@ -2732,7 +2738,7 @@ impl Run<'_> {
     fn emit_capacity_snapshot(
         &mut self,
         signals: &BTreeMap<String, Option<String>>,
-    ) -> Result<(), TactusError> {
+    ) -> Result<(), UpstrokeError> {
         // No early return on an empty pools file: "nothing was connected" is
         // exactly as worth recording as a list, and its absence is otherwise
         // indistinguishable from a pre-step-10 log, or from a binary that never
@@ -2859,7 +2865,7 @@ impl Run<'_> {
         implementer: &WorkerProfile,
         reviews: &[events::ReviewRecord],
         failure: &AttemptFailure,
-    ) -> Result<(), TactusError> {
+    ) -> Result<(), UpstrokeError> {
         let (pool, agent) = match failure.origin {
             FailureOrigin::Reviewer => match reviews.last() {
                 Some(review) => (review.pool.clone(), review.agent.clone()),
@@ -2896,9 +2902,9 @@ impl Run<'_> {
         index: usize,
         kind: FailureKind,
         reason: String,
-    ) -> Result<(), TactusError> {
+    ) -> Result<(), UpstrokeError> {
         // The halt policy is resolved here and recorded, not re-derived on
-        // replay: a `tactus.toml` edited between a run and its resume must not
+        // replay: a `upstroke.toml` edited between a run and its resume must not
         // rewrite which task the report blames for stopping.
         let halts_run = self.on_task_failure == OnTaskFailure::Halt;
         self.fail_task_with_policy(index, kind, reason, halts_run)
@@ -2910,7 +2916,7 @@ impl Run<'_> {
         kind: FailureKind,
         reason: String,
         halts_run: bool,
-    ) -> Result<(), TactusError> {
+    ) -> Result<(), UpstrokeError> {
         let task = self.analysis.plan.tasks[index].id.to_string();
         self.emit(EventBody::TaskFailed {
             task,
@@ -2923,7 +2929,7 @@ impl Run<'_> {
     }
 
     /// §12: raise eagerly, park exactly the affected task, tell the notifiers,
-    /// and write the payload where a UI or `tactus answer` can read it.
+    /// and write the payload where a UI or `upstroke answer` can read it.
     /// §12's `ask_before` question: this task is about to escalate onto a
     /// frontier rung, and the run has already reported enough spend that the
     /// operator asked to be consulted first.
@@ -2971,7 +2977,7 @@ impl Run<'_> {
         }
     }
 
-    fn materialize_question(&mut self, question: &Question) -> Result<(), TactusError> {
+    fn materialize_question(&mut self, question: &Question) -> Result<(), UpstrokeError> {
         // Materialize before notifying: a recipient must always be able to open
         // the payload it was told about. The caller decides whether the
         // authoritative event belongs before (atomic settlement parking) or
@@ -2994,13 +3000,13 @@ impl Run<'_> {
         Ok(())
     }
 
-    /// Ingest answers left by `tactus answer` in another process.
+    /// Ingest answers left by `upstroke answer` in another process.
     ///
     /// Returns whether anything changed. This is what makes the answer command
     /// useful while a run is alive rather than only between runs: an operator
     /// answering from a phone at 2am un-parks the task on the next scheduler
     /// turn, with no resume needed.
-    fn sweep_answers(&mut self) -> Result<bool, TactusError> {
+    fn sweep_answers(&mut self) -> Result<bool, UpstrokeError> {
         let open: Vec<QuestionId> = self
             .state
             .open_questions()
@@ -3018,7 +3024,7 @@ impl Run<'_> {
             };
             // Only what actually applied counts as change. A file the engine
             // reads but declines to act on — an `Unanswered` one, say, which
-            // nothing in `tactus answer` will write but a hand-edit can —
+            // nothing in `upstroke answer` will write but a hand-edit can —
             // would otherwise report progress on every turn, and the drain
             // loop would spin on it forever: this branch is only bounded
             // because it closes the question it fires for.
@@ -3032,7 +3038,7 @@ impl Run<'_> {
     /// Record an answer and let it take effect. Returns whether it applied.
     ///
     /// One path for every channel — a terminal reply, a file written by
-    /// `tactus answer`, or an answer picked up on resume — so what an answer
+    /// `upstroke answer`, or an answer picked up on resume — so what an answer
     /// *does* cannot depend on where it came from. The guards below are also
     /// what makes it safe to offer the same answer twice: a question that is
     /// already closed absorbs the second one instead of applying it.
@@ -3041,7 +3047,7 @@ impl Run<'_> {
         id: &QuestionId,
         answer: Answer,
         via: &str,
-    ) -> Result<bool, TactusError> {
+    ) -> Result<bool, UpstrokeError> {
         let Some(record) = self
             .state
             .questions
@@ -3117,7 +3123,7 @@ impl Run<'_> {
     /// This runs only at a hard block, and each question is asked at most
     /// once: an `Unanswered` result marks it unreachable rather than looping
     /// back to a channel that already said nobody is there.
-    fn resolve_one_question(&mut self) -> Result<bool, TactusError> {
+    fn resolve_one_question(&mut self) -> Result<bool, UpstrokeError> {
         let Some(position) = self.state.questions.iter().position(|record| {
             record.is_open() && !self.unanswerable.contains(&record.question.id)
         }) else {
@@ -3478,7 +3484,7 @@ fn question_context(
         let _ = writeln!(
             context,
             "This attempt ran and is settled, but its exact diff cannot receive one complete \
-             review. Tactus parked it instead of paying for an identical automatic retry. {} \
+             review. Upstroke parked it instead of paying for an identical automatic retry. {} \
              The policy failure was:",
             if failure.kind == FailureKind::ReviewInputTooLarge {
                 "Retry only with guidance that produces a smaller diff; because the plan is \
@@ -3558,7 +3564,7 @@ fn spend_question_context(
     let _ = writeln!(
         context,
         "Reported spend so far: ${spent:.4}{qualifier}. This is what the run has already cost, \
-         not an estimate of what the {onto} attempt will cost — tactus measures spend rather than \
+         not an estimate of what the {onto} attempt will cost — upstroke measures spend rather than \
          predicting it (§10)."
     );
     if !task.acceptance.is_empty() {
@@ -3661,7 +3667,7 @@ fn run_attempt(
     cx: &AttemptCx<'_>,
     workspace: &Workspace,
     resume_session: Option<String>,
-) -> Result<AttemptResult, TactusError> {
+) -> Result<AttemptResult, UpstrokeError> {
     let settings_path = cx.adapter.materialize_permissions(
         &cx.profile,
         cx.gate_cmds,
@@ -3834,8 +3840,8 @@ fn run_attempt(
     })
 }
 
-fn normalized_plan_bytes(plan: &Plan, path: &Path) -> Result<Vec<u8>, TactusError> {
-    let mut bytes = serde_json::to_vec_pretty(plan).map_err(|error| TactusError::Parse {
+fn normalized_plan_bytes(plan: &Plan, path: &Path) -> Result<Vec<u8>, UpstrokeError> {
+    let mut bytes = serde_json::to_vec_pretty(plan).map_err(|error| UpstrokeError::Parse {
         message: format!("serializing {}: {error}", path.display()),
     })?;
     bytes.push(b'\n');
@@ -3997,7 +4003,7 @@ fn evaluate_outcome(outcome: &Outcome, output: &proc::ProcessOutput) -> Option<A
                 .with_feedback(
                     "You reported the task complete, but the repository is unchanged. Either make \
                      the change the task asks for, or explain what blocks it using the \
-                     TACTUS-QUESTION marker."
+                     UPSTROKE-QUESTION marker."
                         .to_owned(),
                 ),
             )
@@ -4073,7 +4079,7 @@ fn materialize_prompt(
 
     let mut prompt = String::new();
     prompt.push_str(
-        "You are executing one task from a frozen plan, conducted by the tactus engine.\n\n",
+        "You are executing one task from a frozen plan, conducted by the upstroke engine.\n\n",
     );
     let _ = writeln!(prompt, "# Task: {}\n", task.title);
     if !task.body.is_empty() {
@@ -4140,7 +4146,7 @@ fn materialize_prompt(
          - If a decision genuinely is not yours to make — the task is ambiguous in a way that \
            changes what \"correct\" means, or it turns on a product or policy call you cannot \
            settle from this repository — stop and end your message with a line beginning \
-           `TACTUS-QUESTION:` followed by the decision a person has to make. That pauses this \
+           `UPSTROKE-QUESTION:` followed by the decision a person has to make. That pauses this \
            task and asks them. Do not use it for uncertainty you could resolve by reading the \
            code.\n",
     );
@@ -4347,12 +4353,12 @@ impl RunReport {
                     let _ = writeln!(out, "  {}: queued", task.id);
                 }
                 // Only reachable from a `report.json` written by a newer
-                // tactus. Say that, rather than picking a familiar-looking
+                // upstroke. Say that, rather than picking a familiar-looking
                 // status and being confidently wrong about someone's run.
                 TaskRunStatus::Unknown => {
                     let _ = writeln!(
                         out,
-                        "  {}: status not recognised by this version of tactus",
+                        "  {}: status not recognised by this version of upstroke",
                         task.id
                     );
                 }
@@ -4381,7 +4387,7 @@ impl RunReport {
             let _ = writeln!(
                 out,
                 "  payloads: {}",
-                std::path::Path::new(".tactus")
+                std::path::Path::new(".upstroke")
                     .join("runs")
                     .join(&self.run_id)
                     .join("questions")
@@ -4453,7 +4459,7 @@ impl RunReport {
                 let _ = writeln!(
                     out,
                     "{stopped}. Committed tasks are on {}; raise the ceiling and continue \
-                     with:\n    tactus resume {} --budget <usd>",
+                     with:\n    upstroke resume {} --budget <usd>",
                     self.branch, self.run_id
                 );
             }
@@ -4568,7 +4574,7 @@ impl RunReport {
             let _ = writeln!(
                 out,
                 "  per-pool drain: no pool is connected for the agents this run used — run \
-                 `tactus connect`"
+                 `upstroke connect`"
             );
         } else {
             let _ = writeln!(out, "  per-pool drain:");
@@ -4593,7 +4599,7 @@ impl RunReport {
                 // The ledger annotates; `render` owns the outcome line and the
                 // resume advice. Printing both put two near-identical
                 // paragraphs, formatted to different precision, with two copies
-                // of the same command, back to back in `tactus status` — which
+                // of the same command, back to back in `upstroke status` — which
                 // reads as two things having happened.
                 "  stopped by [budgets] {} = ${:.4} before `{}` (§13)",
                 stop.budget, stop.limit_usd, stop.task
@@ -4709,7 +4715,7 @@ mod tests {
 
     /// Marker the fake's review command prints so `parse` can tell a review
     /// invocation from an implementation one.
-    const REVIEW_MARKER: &str = "TACTUS-FAKE-REVIEW";
+    const REVIEW_MARKER: &str = "UPSTROKE-FAKE-REVIEW";
 
     impl FakeAdapter {
         fn new(effects: Vec<Effect>, reviews: Vec<ReviewBehavior>) -> Self {
@@ -4815,9 +4821,9 @@ mod tests {
             self.id
         }
 
-        fn probe(&self) -> Result<Caps, TactusError> {
+        fn probe(&self) -> Result<Caps, UpstrokeError> {
             if let Some(message) = self.probe_error {
-                return Err(TactusError::Agent {
+                return Err(UpstrokeError::Agent {
                     message: message.to_owned(),
                 });
             }
@@ -4832,7 +4838,7 @@ mod tests {
             })
         }
 
-        fn build(&self, run: &TaskRun) -> Result<std::process::Command, TactusError> {
+        fn build(&self, run: &TaskRun) -> Result<std::process::Command, UpstrokeError> {
             if run.profile.permissions == PermissionMode::ReadOnly {
                 let effect = self
                     .calls
@@ -4846,7 +4852,7 @@ mod tests {
                     })
                     .unwrap_or(Effect::EditFile);
                 let behavior = {
-                    let mut calls = self.calls.lock().map_err(|_| TactusError::Agent {
+                    let mut calls = self.calls.lock().map_err(|_| UpstrokeError::Agent {
                         message: "fake adapter lock poisoned".to_owned(),
                     })?;
                     let index = calls.review + calls.review_spawn_failures;
@@ -4867,11 +4873,11 @@ mod tests {
                         .arg(&run.workspace)
                         .args(["rev-parse", "HEAD^{tree}"])
                         .output()
-                        .map_err(|e| TactusError::Agent {
+                        .map_err(|e| UpstrokeError::Agent {
                             message: format!("fake could not inspect reviewer tree: {e}"),
                         })?;
                     if !tree.status.success() {
-                        return Err(TactusError::Agent {
+                        return Err(UpstrokeError::Agent {
                             message: format!(
                                 "fake could not inspect reviewer tree: {}",
                                 String::from_utf8_lossy(&tree.stderr).trim()
@@ -4879,12 +4885,12 @@ mod tests {
                         });
                     }
                     let contents = fs::read_to_string(run.workspace.join("agent-output.txt"))
-                        .map_err(|e| TactusError::Agent {
+                        .map_err(|e| UpstrokeError::Agent {
                             message: format!("fake could not inspect reviewer candidate: {e}"),
                         })?;
                     self.calls
                         .lock()
-                        .map_err(|_| TactusError::Agent {
+                        .map_err(|_| UpstrokeError::Agent {
                             message: "fake adapter lock poisoned".to_owned(),
                         })?
                         .review_snapshots
@@ -4899,11 +4905,11 @@ mod tests {
                         .arg(&run.workspace)
                         .args(["rev-parse", "--git-common-dir"])
                         .output()
-                        .map_err(|e| TactusError::Agent {
+                        .map_err(|e| UpstrokeError::Agent {
                             message: format!("fake could not inspect git common dir: {e}"),
                         })?;
                     if !common.status.success() {
-                        return Err(TactusError::Agent {
+                        return Err(UpstrokeError::Agent {
                             message: format!(
                                 "fake could not inspect git common dir: {}",
                                 String::from_utf8_lossy(&common.stderr).trim()
@@ -4917,7 +4923,7 @@ mod tests {
                         run.workspace.join(common)
                     };
                     fs::write(common.join("index.lock"), "jam\n").map_err(|e| {
-                        TactusError::Agent {
+                        UpstrokeError::Agent {
                             message: format!("fake could not jam cleanup: {e}"),
                         }
                     })?;
@@ -4927,7 +4933,7 @@ mod tests {
                 return Ok(cmd);
             }
             let index = {
-                let mut calls = self.calls.lock().map_err(|_| TactusError::Agent {
+                let mut calls = self.calls.lock().map_err(|_| UpstrokeError::Agent {
                     message: "fake adapter lock poisoned".to_owned(),
                 })?;
                 let index = calls.worker;
@@ -4975,12 +4981,12 @@ mod tests {
                     }
                     Effect::IgnoredGateInput => {
                         fs::write(run.workspace.join(".gitignore"), "ignored.flag\n").map_err(
-                            |e| TactusError::Agent {
+                            |e| UpstrokeError::Agent {
                                 message: format!("fake ignore rule failed: {e}"),
                             },
                         )?;
                         fs::write(run.workspace.join("ignored.flag"), "gate-only input\n")
-                            .map_err(|e| TactusError::Agent {
+                            .map_err(|e| UpstrokeError::Agent {
                                 message: format!("fake ignored input failed: {e}"),
                             })?;
                         Some(("agent-output.txt", "reviewed edit\n".to_owned()))
@@ -4988,7 +4994,7 @@ mod tests {
                     Effect::NoEdit | Effect::Error | Effect::RateLimited => None,
                 };
             if let Some((name, content)) = edit {
-                fs::write(run.workspace.join(name), content).map_err(|e| TactusError::Agent {
+                fs::write(run.workspace.join(name), content).map_err(|e| UpstrokeError::Agent {
                     message: format!("fake edit failed: {e}"),
                 })?;
             }
@@ -4996,14 +5002,14 @@ mod tests {
                 == Effect::LargeEditQuestionWriteFailure
             {
                 let run_id =
-                    rundir::latest_run(&run.workspace).ok_or_else(|| TactusError::Agent {
+                    rundir::latest_run(&run.workspace).ok_or_else(|| UpstrokeError::Agent {
                         message: "fake could not find the active run".to_owned(),
                     })?;
                 let questions = rundir::public_dir(&run.workspace, &run_id).join("questions");
-                fs::remove_dir(&questions).map_err(|e| TactusError::Agent {
+                fs::remove_dir(&questions).map_err(|e| UpstrokeError::Agent {
                     message: format!("fake could not remove questions directory: {e}"),
                 })?;
-                fs::write(&questions, "not a directory\n").map_err(|e| TactusError::Agent {
+                fs::write(&questions, "not a directory\n").map_err(|e| UpstrokeError::Agent {
                     message: format!("fake could not block question writes: {e}"),
                 })?;
             }
@@ -5020,15 +5026,15 @@ mod tests {
             gate_cmds: &[String],
             dir: &Path,
             stem: &str,
-        ) -> Result<Option<PathBuf>, TactusError> {
+        ) -> Result<Option<PathBuf>, UpstrokeError> {
             crate::agent::claude::ClaudeCodeAdapter
                 .materialize_permissions(profile, gate_cmds, dir, stem)
         }
 
-        fn parse(&self, out: &ProcessOutput) -> Result<Outcome, TactusError> {
+        fn parse(&self, out: &ProcessOutput) -> Result<Outcome, UpstrokeError> {
             if out.stdout.contains(REVIEW_MARKER) {
                 let index = {
-                    let mut calls = self.calls.lock().map_err(|_| TactusError::Agent {
+                    let mut calls = self.calls.lock().map_err(|_| UpstrokeError::Agent {
                         message: "fake adapter lock poisoned".to_owned(),
                     })?;
                     let index = calls.review + calls.review_spawn_failures;
@@ -5098,7 +5104,7 @@ mod tests {
                 Effect::Error => Some("fake adapter error detail".to_owned()),
                 Effect::RateLimited => Some("5-hour limit reached".to_owned()),
                 Effect::AskQuestion => Some(
-                    "I made a start but stopped.\nTACTUS-QUESTION: should cursors be opaque or \
+                    "I made a start but stopped.\nUPSTROKE-QUESTION: should cursors be opaque or \
                      signed?"
                         .to_owned(),
                 ),
@@ -5179,7 +5185,7 @@ mod tests {
             "scripted"
         }
 
-        fn resolve(&self, _question: &Question) -> Result<Answer, TactusError> {
+        fn resolve(&self, _question: &Question) -> Result<Answer, UpstrokeError> {
             Ok(self
                 .answers
                 .lock()
@@ -5240,12 +5246,12 @@ mod tests {
     fn mutate_index_after_candidate_capture(
         workspace: &Workspace,
         candidate: &crate::workspace::CapturedCandidate,
-    ) -> Result<(), TactusError> {
+    ) -> Result<(), UpstrokeError> {
         fs::write(
             workspace.root().join("agent-output.txt"),
             "tampered after capture\n",
         )
-        .map_err(|error| TactusError::Git {
+        .map_err(|error| UpstrokeError::Git {
             message: format!("test could not mutate the captured worktree: {error}"),
         })?;
         let add = Command::new("git")
@@ -5253,11 +5259,11 @@ mod tests {
             .arg(workspace.root())
             .args(["add", "-A"])
             .output()
-            .map_err(|error| TactusError::Git {
+            .map_err(|error| UpstrokeError::Git {
                 message: format!("test could not stage its post-capture mutation: {error}"),
             })?;
         if !add.status.success() {
-            return Err(TactusError::Git {
+            return Err(UpstrokeError::Git {
                 message: format!(
                     "test could not stage its post-capture mutation: {}",
                     String::from_utf8_lossy(&add.stderr).trim()
@@ -5269,11 +5275,11 @@ mod tests {
             .arg(workspace.root())
             .arg("write-tree")
             .output()
-            .map_err(|error| TactusError::Git {
+            .map_err(|error| UpstrokeError::Git {
                 message: format!("test could not inspect its post-capture tree: {error}"),
             })?;
         if !tampered_tree.status.success() {
-            return Err(TactusError::Git {
+            return Err(UpstrokeError::Git {
                 message: format!(
                     "test could not inspect its post-capture tree: {}",
                     String::from_utf8_lossy(&tampered_tree.stderr).trim()
@@ -5284,7 +5290,7 @@ mod tests {
             .trim()
             .to_owned();
         if tampered_tree == candidate.tree_oid {
-            return Err(TactusError::Git {
+            return Err(UpstrokeError::Git {
                 message: "test post-capture mutation did not change the staged tree".to_owned(),
             });
         }
@@ -5295,23 +5301,24 @@ mod tests {
                 candidate.parent_oid, candidate.tree_oid
             ),
         )
-        .map_err(|error| TactusError::Git {
+        .map_err(|error| UpstrokeError::Git {
             message: format!("test could not record its capture identities: {error}"),
         })
     }
 
     fn temp_engine_repo(tag: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!("tactus-engine-{tag}-{}", std::process::id()));
+        let dir =
+            std::env::temp_dir().join(format!("upstroke-engine-{tag}-{}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).expect("create repo dir");
         git_in(&dir, &["init", "-q", "-b", "main"]);
-        git_in(&dir, &["config", "user.email", "test@tactus.local"]);
-        git_in(&dir, &["config", "user.name", "tactus tests"]);
+        git_in(&dir, &["config", "user.email", "test@upstroke.local"]);
+        git_in(&dir, &["config", "user.name", "upstroke tests"]);
         fs::write(dir.join("README.md"), "seed\n").expect("seed");
         fs::write(
             dir.join("plan.md"),
-            "## Implement the widget\n<!-- tactus: id=t1 depends= -->\nMake it.\n\n\
-             ## Document the widget\n<!-- tactus: id=t2 depends=t1 -->\nWrite it up.\n",
+            "## Implement the widget\n<!-- upstroke: id=t1 depends= -->\nMake it.\n\n\
+             ## Document the widget\n<!-- upstroke: id=t2 depends=t1 -->\nWrite it up.\n",
         )
         .expect("plan");
         git_in(&dir, &["add", "-A"]);
@@ -5323,7 +5330,7 @@ mod tests {
     fn seed(repo: &Path, plan: &str, config: Option<&str>) {
         fs::write(repo.join("plan.md"), plan).expect("plan");
         if let Some(config) = config {
-            fs::write(repo.join("tactus.toml"), config).expect("config");
+            fs::write(repo.join("upstroke.toml"), config).expect("config");
         }
         git_in(repo, &["add", "-A"]);
         git_in(repo, &["commit", "-q", "-m", "fixture"]);
@@ -5347,7 +5354,7 @@ mod tests {
     ///
     /// A real, empty file rather than an absent one: an explicit `--pools` that
     /// does not exist is a hard error now, and `None` would reach for the
-    /// operator's real `~/.tactus/pools.toml` — which no test may touch.
+    /// operator's real `~/.upstroke/pools.toml` — which no test may touch.
     /// An empty pools file, created once for the whole test process.
     ///
     /// Every test routes through here, and this used to *rewrite* the file on
@@ -5357,8 +5364,8 @@ mod tests {
     fn no_pools() -> PathBuf {
         static PATH: OnceLock<PathBuf> = OnceLock::new();
         PATH.get_or_init(|| {
-            let dir =
-                std::env::temp_dir().join(format!("tactus-engine-nopools-{}", std::process::id()));
+            let dir = std::env::temp_dir()
+                .join(format!("upstroke-engine-nopools-{}", std::process::id()));
             fs::create_dir_all(&dir).expect("scratch dir");
             let path = dir.join("pools.toml");
             fs::write(
@@ -5372,7 +5379,7 @@ mod tests {
         .clone()
     }
 
-    /// A scratch stand-in for `~/.tactus`, so tests never touch the real one.
+    /// A scratch stand-in for `~/.upstroke`, so tests never touch the real one.
     ///
     /// A *sibling* of the repo, never a directory inside it. That is not
     /// tidiness: §14's rollback is `git clean -fd`, which deletes untracked
@@ -5444,21 +5451,21 @@ mod tests {
         );
 
         let branch = git_in(&repo, &["rev-parse", "--abbrev-ref", "HEAD"]);
-        assert!(branch.trim().starts_with("tactus/run-"), "on run branch");
+        assert!(branch.trim().starts_with("upstroke/run-"), "on run branch");
         let count = git_in(&repo, &["rev-list", "--count", "main..HEAD"]);
         assert_eq!(count.trim(), "2", "one commit per task");
         let log = git_in(&repo, &["log", "--format=%s", "main..HEAD"]);
         assert!(
-            log.contains("[tactus] t1: Implement the widget"),
+            log.contains("[upstroke] t1: Implement the widget"),
             "log: {log}"
         );
-        assert!(log.contains("[tactus] t2: Document the widget"));
+        assert!(log.contains("[upstroke] t2: Document the widget"));
         assert!(
             git_in(&repo, &["status", "--porcelain"]).trim().is_empty(),
             "clean tree after run"
         );
         assert!(
-            repo.join(".tactus").join("runs").exists(),
+            repo.join(".upstroke").join("runs").exists(),
             "run dir written"
         );
     }
@@ -5468,7 +5475,7 @@ mod tests {
         let repo = temp_engine_repo("one-frozen-candidate");
         seed(
             &repo,
-            "## Implement the widget\n<!-- tactus: id=t1 depends= -->\n",
+            "## Implement the widget\n<!-- upstroke: id=t1 depends= -->\n",
             Some(
                 "[interaction]\nmode = \"never\"\n\n\
                  [[gates]]\nname = \"frozen-candidate\"\n\
@@ -5479,7 +5486,7 @@ mod tests {
         let marker = candidate_mutation_marker(&repo);
         let _ = fs::remove_file(&marker);
         let mut opts = options(&repo);
-        opts.config_path = Some(repo.join("tactus.toml"));
+        opts.config_path = Some(repo.join("upstroke.toml"));
         opts.after_candidate_capture = Some(mutate_index_after_candidate_capture);
         let source = fake(Effect::FrozenCandidate);
 
@@ -5553,14 +5560,14 @@ mod tests {
         let repo = temp_engine_repo("oversizedreviewsettlement");
         seed(
             &repo,
-            "## Generate the large fixture\n<!-- tactus: id=t1 kind=implement depends= -->\n",
+            "## Generate the large fixture\n<!-- upstroke: id=t1 kind=implement depends= -->\n",
             Some(
                 "[interaction]\nmode = \"never\"\n\n\
                  [routing]\nimplement = { chain = [\"small\"], attempts_per = 3 }\n",
             ),
         );
         let mut opts = options(&repo);
-        opts.config_path = Some(repo.join("tactus.toml"));
+        opts.config_path = Some(repo.join("upstroke.toml"));
         let source = fake(Effect::LargeEdit);
         let report = run_with(&opts, &source).expect("policy failure is a settled run outcome");
 
@@ -5654,14 +5661,14 @@ mod tests {
         let repo = temp_engine_repo("opaquereviewsettlement");
         seed(
             &repo,
-            "## Generate an opaque artifact\n<!-- tactus: id=t1 kind=implement depends= -->\n",
+            "## Generate an opaque artifact\n<!-- upstroke: id=t1 kind=implement depends= -->\n",
             Some(
                 "[interaction]\nmode = \"never\"\n\n\
                  [routing]\nimplement = { chain = [\"small\"], attempts_per = 3 }\n",
             ),
         );
         let mut opts = options(&repo);
-        opts.config_path = Some(repo.join("tactus.toml"));
+        opts.config_path = Some(repo.join("upstroke.toml"));
         let source = fake(Effect::OpaqueEdit);
         let report = run_with(&opts, &source).expect("opaque evidence parks fail-closed");
 
@@ -5682,14 +5689,14 @@ mod tests {
         let repo = temp_engine_repo("opaquetestprovenance");
         seed(
             &repo,
-            "## Add the regression\n<!-- tactus: id=t1 kind=test depends= -->\n",
+            "## Add the regression\n<!-- upstroke: id=t1 kind=test depends= -->\n",
             Some(
                 "[interaction]\nmode = \"never\"\n\n\
                  [routing]\ntest = { chain = [\"small\"], attempts_per = 3 }\n",
             ),
         );
         let mut opts = options(&repo);
-        opts.config_path = Some(repo.join("tactus.toml"));
+        opts.config_path = Some(repo.join("upstroke.toml"));
         let source = fake(Effect::OpaqueEdit);
         let report = run_with(&opts, &source).expect("opaque evidence parks fail-closed");
 
@@ -5718,14 +5725,14 @@ mod tests {
         let repo = temp_engine_repo("oversizedreviewquestionwrite");
         seed(
             &repo,
-            "## Generate the large fixture\n<!-- tactus: id=t1 kind=implement depends= -->\n",
+            "## Generate the large fixture\n<!-- upstroke: id=t1 kind=implement depends= -->\n",
             Some(
                 "[interaction]\nmode = \"never\"\n\n\
                  [routing]\nimplement = { chain = [\"small\"], attempts_per = 3 }\n",
             ),
         );
         let mut opts = options(&repo);
-        opts.config_path = Some(repo.join("tactus.toml"));
+        opts.config_path = Some(repo.join("upstroke.toml"));
         let source = fake(Effect::LargeEditQuestionWriteFailure);
         let error = run_with(&opts, &source).expect_err("question projection must fail");
         assert!(
@@ -5811,11 +5818,11 @@ mod tests {
             .worktree_git_dir()
             .expect("resolve private git dir");
         assert!(
-            worktree_git_dir.join("tactus-worktree.lock").exists(),
+            worktree_git_dir.join("upstroke-worktree.lock").exists(),
             "the regression must exercise acquisition of the private worktree lease"
         );
         assert!(
-            !repo.join(".tactus").exists(),
+            !repo.join(".upstroke").exists(),
             "a refused preflight must not create working-tree coordinator state"
         );
         assert!(
@@ -5831,12 +5838,12 @@ mod tests {
         let repo = temp_engine_repo("gatepass");
         seed(
             &repo,
-            "## Implement the widget\n<!-- tactus: id=t1 depends= -->\n",
+            "## Implement the widget\n<!-- upstroke: id=t1 depends= -->\n",
             Some("[[gates]]\nname = \"version\"\ncmd = \"git --version\"\n"),
         );
 
         let mut opts = options(&repo);
-        opts.config_path = Some(repo.join("tactus.toml"));
+        opts.config_path = Some(repo.join("upstroke.toml"));
         let source = fake(Effect::EditFile);
         let report = run_with(&opts, &source).expect("run");
         assert_eq!(report.outcome(), RunOutcome::Complete, "report: {report:?}");
@@ -5850,7 +5857,7 @@ mod tests {
         let repo = temp_engine_repo("ignored-gate-input");
         seed(
             &repo,
-            "## Implement the widget\n<!-- tactus: id=t1 depends= -->\n",
+            "## Implement the widget\n<!-- upstroke: id=t1 depends= -->\n",
             Some(
                 "[interaction]\nmode = \"never\"\n\n\
                  [routing]\nimplement = { chain = [\"small\"], attempts_per = 1 }\n\n\
@@ -5859,7 +5866,7 @@ mod tests {
         );
 
         let mut opts = options(&repo);
-        opts.config_path = Some(repo.join("tactus.toml"));
+        opts.config_path = Some(repo.join("upstroke.toml"));
         let source = fake(Effect::IgnoredGateInput);
         let report = run_with(&opts, &source).expect("gate failure settles the task");
 
@@ -5881,12 +5888,12 @@ mod tests {
         let repo = temp_engine_repo("gateresolve");
         seed(
             &repo,
-            "## Implement the widget\n<!-- tactus: id=t1 depends= -->\n",
+            "## Implement the widget\n<!-- upstroke: id=t1 depends= -->\n",
             Some("[[gates]]\nname = \"ghost\"\ncmd = \"definitely-not-a-real-tool-xyz build\"\n"),
         );
 
         let mut opts = options(&repo);
-        opts.config_path = Some(repo.join("tactus.toml"));
+        opts.config_path = Some(repo.join("upstroke.toml"));
         let source = fake(Effect::EditFile);
         let err = run_with(&opts, &source).expect_err("must refuse");
         assert!(err.to_string().contains("not found on PATH"), "got: {err}");
@@ -5899,14 +5906,14 @@ mod tests {
         let repo = temp_engine_repo("provenance");
         seed(
             &repo,
-            "## Test the widget\n<!-- tactus: id=tt depends= -->\nAdd coverage.\n",
+            "## Test the widget\n<!-- upstroke: id=tt depends= -->\nAdd coverage.\n",
             // One rung, one attempt: the provenance failure is what is under
             // test, not the ladder's reaction to it.
             Some("[routing]\ntest = { chain = [\"small\"], attempts_per = 1 }\n"),
         );
 
         let mut opts = options(&repo);
-        opts.config_path = Some(repo.join("tactus.toml"));
+        opts.config_path = Some(repo.join("upstroke.toml"));
         let source = fake(Effect::EditFile);
         let report = run_with(&opts, &source).expect("engine ok");
         let reason = &task(&report, "tt").attempts[0]
@@ -5922,7 +5929,7 @@ mod tests {
         let repo = temp_engine_repo("provenance-ok");
         seed(
             &repo,
-            "## Test the widget\n<!-- tactus: id=tt depends= -->\n",
+            "## Test the widget\n<!-- upstroke: id=tt depends= -->\n",
             None,
         );
 
@@ -5939,12 +5946,12 @@ mod tests {
         // survive the task.
         seed(
             &repo,
-            "## Implement the widget\n<!-- tactus: id=t1 depends= -->\n",
+            "## Implement the widget\n<!-- upstroke: id=t1 depends= -->\n",
             Some("[[gates]]\nname = \"leaky\"\ncmd = \"echo residue> residue.txt\"\n"),
         );
 
         let mut opts = options(&repo);
-        opts.config_path = Some(repo.join("tactus.toml"));
+        opts.config_path = Some(repo.join("upstroke.toml"));
         let source = fake(Effect::EditFile);
         let report = run_with(&opts, &source).expect("run");
         assert_eq!(report.outcome(), RunOutcome::Complete, "report: {report:?}");
@@ -5997,12 +6004,12 @@ mod tests {
         let repo = temp_engine_repo("noreview");
         seed(
             &repo,
-            "## Implement the widget\n<!-- tactus: id=t1 depends= -->\n",
+            "## Implement the widget\n<!-- upstroke: id=t1 depends= -->\n",
             Some("[routing]\nreview = { enabled = false }\n"),
         );
 
         let mut opts = options(&repo);
-        opts.config_path = Some(repo.join("tactus.toml"));
+        opts.config_path = Some(repo.join("upstroke.toml"));
         // A reviewer that would REJECT everything: if review still ran, the
         // task would never commit.
         let source = source(vec![Effect::EditFile], vec![ReviewBehavior::Fail]);
@@ -6033,7 +6040,7 @@ mod tests {
     /// model as the reviewer, and its paths can match a `second_opinion`
     /// override.
     const FRONTIER_AUTH_PLAN: &str = "## Rotate the signing key\n\
-         <!-- tactus: id=t1 kind=implement depends= tier=frontier paths=src/auth/** -->\n\
+         <!-- upstroke: id=t1 kind=implement depends= tier=frontier paths=src/auth/** -->\n\
          Rotate it.\n";
 
     const SECOND_OPINION_CONFIG: &str = "[routing]\n\
@@ -6048,7 +6055,7 @@ mod tests {
 
     fn cross_vendor_opts(repo: &Path) -> RunOptions {
         let mut opts = options(repo);
-        opts.config_path = Some(repo.join("tactus.toml"));
+        opts.config_path = Some(repo.join("upstroke.toml"));
         opts
     }
 
@@ -6173,7 +6180,7 @@ mod tests {
         let repo = temp_engine_repo("noneedtorebind");
         seed(
             &repo,
-            "## Implement the widget\n<!-- tactus: id=t1 kind=implement depends= -->\n",
+            "## Implement the widget\n<!-- upstroke: id=t1 kind=implement depends= -->\n",
             Some("[routing]\nimplement = { chain = [\"mid\"], attempts_per = 1 }\n"),
         );
         let source = cross_vendor(
@@ -6213,7 +6220,7 @@ mod tests {
 
     #[test]
     fn without_a_second_vendor_self_review_warns_rather_than_refusing() {
-        // The implicit rebind is tactus's own idea, not the operator's, so a
+        // The implicit rebind is upstroke's own idea, not the operator's, so a
         // single-vendor machine loses the upgrade rather than the run — but it
         // is told, because a verification property that quietly is not there is
         // exactly what step 6 objected to.
@@ -6305,7 +6312,7 @@ mod tests {
         seed(
             &repo,
             "## Rotate the signing key\n\
-             <!-- tactus: id=t1 kind=implement depends= tier=frontier -->\n",
+             <!-- upstroke: id=t1 kind=implement depends= tier=frontier -->\n",
             Some(
                 "[interaction]\nmode = \"never\"\n\n\
                  [routing]\nimplement = { chain = [\"frontier\"], attempts_per = 1 }\n",
@@ -6338,7 +6345,7 @@ mod tests {
         assert_eq!(recorded.pass_timeout_secs, Some(5400));
 
         fs::write(
-            repo.join("tactus.toml"),
+            repo.join("upstroke.toml"),
             "[interaction]\nmode = \"never\"\n\n\
              [routing]\nimplement = { chain = [\"frontier\"], attempts_per = 1 }\n\
              review = { timeout_secs = 60 }\n",
@@ -6390,7 +6397,7 @@ mod tests {
                         [routing.effort]\nimplementation = \"xhigh\"\nreview = \"max\"\n";
         let (repo, run_id) = parked_run_with_config("resumeeffort", original);
         fs::write(
-            repo.join("tactus.toml"),
+            repo.join("upstroke.toml"),
             "[interaction]\nmode = \"never\"\n\n\
              [routing]\nimplement = { chain = [\"small\"], attempts_per = 1 }\n\n\
              [routing.effort]\nimplementation = \"low\"\nreview = \"high\"\n",
@@ -6442,7 +6449,7 @@ mod tests {
                         [routing]\nimplement = { chain = [\"small\"], attempts_per = 1 }\n";
         let (repo, run_id) = parked_run_with_config("resumebinding", original);
         fs::write(
-            repo.join("tactus.toml"),
+            repo.join("upstroke.toml"),
             "[interaction]\nmode = \"never\"\n\n\
              [routing]\nimplement = { chain = [\"small\"], attempts_per = 1 }\n\n\
              [[pins]]\ntier = \"small\"\nagent = \"copilot\"\nmodel = \"gpt-5-mini\"\n",
@@ -6492,7 +6499,7 @@ mod tests {
         rewrite_run_started_as_schema_one(&paths, &["effort_policy"]);
 
         fs::write(
-            repo.join("tactus.toml"),
+            repo.join("upstroke.toml"),
             "[interaction]\nmode = \"never\"\n\n\
              [routing]\nimplement = { chain = [\"small\"], attempts_per = 1 }\n\n\
              [routing.effort]\nimplementation = \"high\"\nreview = \"xhigh\"\n",
@@ -6531,7 +6538,7 @@ mod tests {
         );
 
         fs::write(
-            repo.join("tactus.toml"),
+            repo.join("upstroke.toml"),
             "[interaction]\nmode = \"never\"\n\n\
              [routing]\nimplement = { chain = [\"small\"], attempts_per = 1 }\n\n\
              [routing.effort]\nimplementation = \"low\"\nreview = \"medium\"\n",
@@ -6601,7 +6608,7 @@ mod tests {
         strip_run_started_field(&paths, "reviews");
 
         fs::write(
-            repo.join("tactus.toml"),
+            repo.join("upstroke.toml"),
             "[interaction]\nmode = \"never\"\n\n\
              [routing]\nimplement = { chain = [\"small\"], attempts_per = 1 }\n\
              review = { timeout_secs = 60 }\n",
@@ -6623,7 +6630,7 @@ mod tests {
         assert_eq!(established.pass_timeout_secs, Some(60));
 
         fs::write(
-            repo.join("tactus.toml"),
+            repo.join("upstroke.toml"),
             "[interaction]\nmode = \"never\"\n\n\
              [routing]\nimplement = { chain = [\"small\"], attempts_per = 1 }\n\
              review = { timeout_secs = 120 }\n",
@@ -6661,7 +6668,7 @@ mod tests {
         let paths = paths_of(&repo, &run_id);
         rewrite_run_started_as_schema_two(&paths);
         fs::write(
-            repo.join("tactus.toml"),
+            repo.join("upstroke.toml"),
             "[interaction]\nmode = \"never\"\n\n\
              [routing]\nimplement = { chain = [\"small\"], attempts_per = 1 }\n\
              review = { timeout_secs = 47 }\n",
@@ -6704,7 +6711,7 @@ mod tests {
         assert_eq!(upgraded_reviews.second_opinion.len(), 1);
 
         fs::write(
-            repo.join("tactus.toml"),
+            repo.join("upstroke.toml"),
             "[interaction]\nmode = \"never\"\n\n\
              [routing]\nimplement = { chain = [\"small\"], attempts_per = 1 }\n\
              review = { timeout_secs = 83 }\n",
@@ -6874,7 +6881,7 @@ mod tests {
         seed(
             &repo,
             "## Rotate the signing key\n\
-             <!-- tactus: id=t1 kind=implement depends= tier=frontier -->\n",
+             <!-- upstroke: id=t1 kind=implement depends= tier=frontier -->\n",
             Some(
                 "[interaction]\nmode = \"never\"\n\n\
                  [routing]\nimplement = { chain = [\"frontier\"], attempts_per = 1 }\n",
@@ -7028,7 +7035,7 @@ mod tests {
         let repo = temp_engine_repo("reviewtrail");
         seed(
             &repo,
-            "## Implement the widget\n<!-- tactus: id=t1 kind=implement depends= -->\n",
+            "## Implement the widget\n<!-- upstroke: id=t1 kind=implement depends= -->\n",
             Some(
                 "[interaction]\nmode = \"never\"\n\n\
                  [routing]\nimplement = { chain = [\"mid\", \"frontier\"], attempts_per = 1 }\n",
@@ -7078,7 +7085,7 @@ mod tests {
         let source = fake(Effect::EditFile);
         let report = run_with(&options(&repo), &source).expect("run");
         let report_path = repo
-            .join(".tactus")
+            .join(".upstroke")
             .join("runs")
             .join(&report.run_id)
             .join("report.json");
@@ -7102,8 +7109,8 @@ mod tests {
         let repo = temp_engine_repo("topo");
         seed(
             &repo,
-            "## Second by dependency\n<!-- tactus: id=late depends=early -->\n\n\
-             ## First by dependency\n<!-- tactus: id=early depends= -->\n",
+            "## Second by dependency\n<!-- upstroke: id=late depends=early -->\n\n\
+             ## First by dependency\n<!-- upstroke: id=early depends= -->\n",
             None,
         );
 
@@ -7210,7 +7217,7 @@ mod tests {
             artifacts_in: Vec::new(),
             artifacts_out: Vec::new(),
         };
-        let run_dir = std::env::temp_dir().join(format!("tactus-prompt-{}", std::process::id()));
+        let run_dir = std::env::temp_dir().join(format!("upstroke-prompt-{}", std::process::id()));
         fs::create_dir_all(run_dir.join("artifacts")).expect("run dir");
         let prompt = materialize_prompt(
             &task,
@@ -7230,7 +7237,8 @@ mod tests {
 
     #[test]
     fn prompt_wires_artifacts_to_real_files() {
-        let run_dir = std::env::temp_dir().join(format!("tactus-artifact-{}", std::process::id()));
+        let run_dir =
+            std::env::temp_dir().join(format!("upstroke-artifact-{}", std::process::id()));
         let _ = fs::remove_dir_all(&run_dir);
         fs::create_dir_all(run_dir.join("artifacts")).expect("run dir");
         let mut task = Task {
@@ -7284,7 +7292,7 @@ mod tests {
         let repo = temp_engine_repo("resume");
         seed(
             &repo,
-            "## Implement the widget\n<!-- tactus: id=t1 kind=implement depends= -->\n",
+            "## Implement the widget\n<!-- upstroke: id=t1 kind=implement depends= -->\n",
             Some(
                 "[routing]\nimplement = { chain = [\"small\"], attempts_per = 2 }\n\n\
                  [[gates]]\nname = \"needs-test\"\ncmd = \"git ls-files --error-unmatch \
@@ -7292,7 +7300,7 @@ mod tests {
             ),
         );
         let mut opts = options(&repo);
-        opts.config_path = Some(repo.join("tactus.toml"));
+        opts.config_path = Some(repo.join("upstroke.toml"));
         let source = source(
             vec![Effect::EditFile, Effect::EditTest],
             vec![ReviewBehavior::Pass],
@@ -7337,11 +7345,11 @@ mod tests {
         let repo = temp_engine_repo("escalate");
         seed(
             &repo,
-            "## Implement the widget\n<!-- tactus: id=t1 kind=implement depends= -->\n",
+            "## Implement the widget\n<!-- upstroke: id=t1 kind=implement depends= -->\n",
             Some("[routing]\nimplement = { chain = [\"small\", \"mid\"], attempts_per = 1 }\n"),
         );
         let mut opts = options(&repo);
-        opts.config_path = Some(repo.join("tactus.toml"));
+        opts.config_path = Some(repo.join("upstroke.toml"));
         let source = source(
             vec![Effect::NoEdit, Effect::EditFile],
             vec![ReviewBehavior::Pass],
@@ -7387,13 +7395,13 @@ mod tests {
         let repo = temp_engine_repo("park");
         seed(
             &repo,
-            "## Doomed\n<!-- tactus: id=t1 kind=implement depends= -->\n\n\
-             ## Depends on the doomed one\n<!-- tactus: id=t2 kind=implement depends=t1 -->\n\n\
-             ## Independent\n<!-- tactus: id=t3 kind=implement depends= -->\n",
+            "## Doomed\n<!-- upstroke: id=t1 kind=implement depends= -->\n\n\
+             ## Depends on the doomed one\n<!-- upstroke: id=t2 kind=implement depends=t1 -->\n\n\
+             ## Independent\n<!-- upstroke: id=t3 kind=implement depends= -->\n",
             Some("[routing]\nimplement = { chain = [\"small\"], attempts_per = 1 }\n"),
         );
         let mut opts = options(&repo);
-        opts.config_path = Some(repo.join("tactus.toml"));
+        opts.config_path = Some(repo.join("upstroke.toml"));
         // t1 fails; every later attempt (t3's) edits and passes.
         let source = source(
             vec![Effect::NoEdit, Effect::EditFile],
@@ -7413,10 +7421,10 @@ mod tests {
         assert_eq!(report.outcome(), RunOutcome::Parked);
         assert_eq!(report.parked_tasks(), ["t1"]);
 
-        // The question is on disk where a notifier, `tactus answer`, or a UI
+        // The question is on disk where a notifier, `upstroke answer`, or a UI
         // can read it — that file is the contract, not the terminal output.
         let path = repo
-            .join(".tactus")
+            .join(".upstroke")
             .join("runs")
             .join(&report.run_id)
             .join("questions")
@@ -7439,11 +7447,11 @@ mod tests {
         let repo = temp_engine_repo("answered");
         seed(
             &repo,
-            "## Implement the widget\n<!-- tactus: id=t1 kind=implement depends= -->\n",
+            "## Implement the widget\n<!-- upstroke: id=t1 kind=implement depends= -->\n",
             Some("[routing]\nimplement = { chain = [\"small\"], attempts_per = 1 }\n"),
         );
         let mut opts = options(&repo);
-        opts.config_path = Some(repo.join("tactus.toml"));
+        opts.config_path = Some(repo.join("upstroke.toml"));
         let source = source(
             vec![Effect::NoEdit, Effect::EditFile],
             vec![ReviewBehavior::Pass],
@@ -7493,12 +7501,12 @@ mod tests {
         let repo = temp_engine_repo("declined");
         seed(
             &repo,
-            "## Doomed\n<!-- tactus: id=t1 kind=implement depends= -->\n\n\
-             ## Independent\n<!-- tactus: id=t3 kind=implement depends= -->\n",
+            "## Doomed\n<!-- upstroke: id=t1 kind=implement depends= -->\n\n\
+             ## Independent\n<!-- upstroke: id=t3 kind=implement depends= -->\n",
             Some("[routing]\nimplement = { chain = [\"small\"], attempts_per = 1 }\n"),
         );
         let mut opts = options(&repo);
-        opts.config_path = Some(repo.join("tactus.toml"));
+        opts.config_path = Some(repo.join("upstroke.toml"));
         let source = source(vec![Effect::NoEdit], vec![ReviewBehavior::Pass]);
         let answers = ScriptedAnswers::new(vec![Answer::Declined]);
         let report = run_harness(
@@ -7533,11 +7541,11 @@ mod tests {
             let repo = temp_engine_repo(&format!("declineprefix-{tag}"));
             seed(
                 &repo,
-                "## Doomed\n<!-- tactus: id=t1 kind=implement depends= -->\n",
+                "## Doomed\n<!-- upstroke: id=t1 kind=implement depends= -->\n",
                 Some("[routing]\nimplement = { chain = [\"small\"], attempts_per = 1 }\n"),
             );
             let mut opts = options(&repo);
-            opts.config_path = Some(repo.join("tactus.toml"));
+            opts.config_path = Some(repo.join("upstroke.toml"));
             let initial = source(vec![Effect::NoEdit], vec![ReviewBehavior::Pass]);
             let answers = ScriptedAnswers::new(vec![Answer::Declined]);
             let report = run_harness(
@@ -7552,7 +7560,7 @@ mod tests {
             let paths = paths_of(&repo, &report.run_id);
             truncate_log_after(&paths, last_durable_event);
             fs::write(
-                repo.join("tactus.toml"),
+                repo.join("upstroke.toml"),
                 "[engine]\non_task_failure = \"continue\"\n\n\
                  [routing]\nimplement = { chain = [\"small\"], attempts_per = 1 }\n",
             )
@@ -7606,11 +7614,11 @@ mod tests {
         let repo = temp_engine_repo("legacydeclinepolicy");
         seed(
             &repo,
-            "## Doomed\n<!-- tactus: id=t1 kind=implement depends= -->\n",
+            "## Doomed\n<!-- upstroke: id=t1 kind=implement depends= -->\n",
             Some("[routing]\nimplement = { chain = [\"small\"], attempts_per = 1 }\n"),
         );
         let mut opts = options(&repo);
-        opts.config_path = Some(repo.join("tactus.toml"));
+        opts.config_path = Some(repo.join("upstroke.toml"));
         let initial = source(vec![Effect::NoEdit], vec![ReviewBehavior::Pass]);
         let answers = ScriptedAnswers::new(vec![Answer::Declined]);
         let report = run_harness(
@@ -7627,7 +7635,7 @@ mod tests {
         rewrite_run_started_as_schema_two(&paths);
         strip_event_data_field(&paths, "question_answered", "decline_halts_run");
         fs::write(
-            repo.join("tactus.toml"),
+            repo.join("upstroke.toml"),
             "[engine]\non_task_failure = \"continue\"\n\n\
              [routing]\nimplement = { chain = [\"small\"], attempts_per = 1 }\n",
         )
@@ -7649,16 +7657,16 @@ mod tests {
         let repo = temp_engine_repo("continue");
         seed(
             &repo,
-            "## Doomed\n<!-- tactus: id=t1 kind=implement depends= -->\n\n\
-             ## Depends on the doomed one\n<!-- tactus: id=t2 kind=implement depends=t1 -->\n\n\
-             ## Independent\n<!-- tactus: id=t3 kind=implement depends= -->\n",
+            "## Doomed\n<!-- upstroke: id=t1 kind=implement depends= -->\n\n\
+             ## Depends on the doomed one\n<!-- upstroke: id=t2 kind=implement depends=t1 -->\n\n\
+             ## Independent\n<!-- upstroke: id=t3 kind=implement depends= -->\n",
             Some(
                 "[engine]\non_task_failure = \"continue\"\n\n\
                  [routing]\nimplement = { chain = [\"small\"], attempts_per = 1 }\n",
             ),
         );
         let mut opts = options(&repo);
-        opts.config_path = Some(repo.join("tactus.toml"));
+        opts.config_path = Some(repo.join("upstroke.toml"));
         let source = source(
             vec![Effect::NoEdit, Effect::EditFile],
             vec![ReviewBehavior::Pass],
@@ -7691,13 +7699,13 @@ mod tests {
         let repo = temp_engine_repo("ratelimit");
         seed(
             &repo,
-            "## Implement the widget\n<!-- tactus: id=t1 kind=implement depends= -->\n",
+            "## Implement the widget\n<!-- upstroke: id=t1 kind=implement depends= -->\n",
             // A single attempt on a single rung: if the rate limit spent it,
             // the task could never commit.
             Some("[routing]\nimplement = { chain = [\"small\"], attempts_per = 1 }\n"),
         );
         let mut opts = options(&repo);
-        opts.config_path = Some(repo.join("tactus.toml"));
+        opts.config_path = Some(repo.join("upstroke.toml"));
         let source = source(
             vec![Effect::RateLimited, Effect::EditFile],
             vec![ReviewBehavior::Pass],
@@ -7740,11 +7748,11 @@ mod tests {
         let repo = temp_engine_repo("ratelimit-forever");
         seed(
             &repo,
-            "## Implement the widget\n<!-- tactus: id=t1 kind=implement depends= -->\n",
+            "## Implement the widget\n<!-- upstroke: id=t1 kind=implement depends= -->\n",
             Some("[routing]\nimplement = { chain = [\"small\", \"mid\"], attempts_per = 2 }\n"),
         );
         let mut opts = options(&repo);
-        opts.config_path = Some(repo.join("tactus.toml"));
+        opts.config_path = Some(repo.join("upstroke.toml"));
         opts.max_defers = 2;
         let source = source(vec![Effect::RateLimited], vec![ReviewBehavior::Pass]);
         let sleeper = RecordingSleeper::default();
@@ -7782,11 +7790,11 @@ mod tests {
         let repo = temp_engine_repo("reviewdown");
         seed(
             &repo,
-            "## Implement the widget\n<!-- tactus: id=t1 kind=implement depends= -->\n",
+            "## Implement the widget\n<!-- upstroke: id=t1 kind=implement depends= -->\n",
             Some("[routing]\nimplement = { chain = [\"small\", \"mid\"], attempts_per = 1 }\n"),
         );
         let mut opts = options(&repo);
-        opts.config_path = Some(repo.join("tactus.toml"));
+        opts.config_path = Some(repo.join("upstroke.toml"));
         let source = source(
             vec![Effect::EditFile],
             vec![ReviewBehavior::RateLimited, ReviewBehavior::Pass],
@@ -7821,11 +7829,11 @@ mod tests {
         let repo = temp_engine_repo("needshuman");
         seed(
             &repo,
-            "## Implement the widget\n<!-- tactus: id=t1 kind=implement depends= -->\n",
+            "## Implement the widget\n<!-- upstroke: id=t1 kind=implement depends= -->\n",
             Some("[routing]\nimplement = { chain = [\"small\", \"mid\"], attempts_per = 2 }\n"),
         );
         let mut opts = options(&repo);
-        opts.config_path = Some(repo.join("tactus.toml"));
+        opts.config_path = Some(repo.join("upstroke.toml"));
         let source = source(vec![Effect::EditFile], vec![ReviewBehavior::NeedsHuman]);
         let report = run_with(&opts, &source).expect("run");
 
@@ -7864,12 +7872,12 @@ mod tests {
         let repo = temp_engine_repo("workerasks");
         seed(
             &repo,
-            "## Implement the widget\n<!-- tactus: id=t1 kind=implement depends= -->\n\n\
-             ## Independent\n<!-- tactus: id=t3 kind=implement depends= -->\n",
+            "## Implement the widget\n<!-- upstroke: id=t1 kind=implement depends= -->\n\n\
+             ## Independent\n<!-- upstroke: id=t3 kind=implement depends= -->\n",
             Some("[routing]\nimplement = { chain = [\"small\", \"mid\"], attempts_per = 2 }\n"),
         );
         let mut opts = options(&repo);
-        opts.config_path = Some(repo.join("tactus.toml"));
+        opts.config_path = Some(repo.join("upstroke.toml"));
         let source = source(
             vec![Effect::AskQuestion, Effect::EditFile],
             vec![ReviewBehavior::Pass],
@@ -7942,16 +7950,16 @@ mod tests {
         let repo = temp_engine_repo("ci");
         seed(
             &repo,
-            "## Doomed\n<!-- tactus: id=t1 kind=implement depends= -->\n\n\
-             ## Depends on the doomed one\n<!-- tactus: id=t2 kind=implement depends=t1 -->\n\n\
-             ## Independent\n<!-- tactus: id=t3 kind=implement depends= -->\n",
+            "## Doomed\n<!-- upstroke: id=t1 kind=implement depends= -->\n\n\
+             ## Depends on the doomed one\n<!-- upstroke: id=t2 kind=implement depends=t1 -->\n\n\
+             ## Independent\n<!-- upstroke: id=t3 kind=implement depends= -->\n",
             Some(
                 "[interaction]\nmode = \"never\"\n\n\
                  [routing]\nimplement = { chain = [\"small\"], attempts_per = 1 }\n",
             ),
         );
         let mut opts = options(&repo);
-        opts.config_path = Some(repo.join("tactus.toml"));
+        opts.config_path = Some(repo.join("upstroke.toml"));
         let source = source(
             vec![Effect::NoEdit, Effect::EditFile],
             vec![ReviewBehavior::Pass],
@@ -7981,11 +7989,11 @@ mod tests {
         let repo = temp_engine_repo("noloop");
         seed(
             &repo,
-            "## Doomed\n<!-- tactus: id=t1 kind=implement depends= -->\n",
+            "## Doomed\n<!-- upstroke: id=t1 kind=implement depends= -->\n",
             Some("[routing]\nimplement = { chain = [\"small\"], attempts_per = 1 }\n"),
         );
         let mut opts = options(&repo);
-        opts.config_path = Some(repo.join("tactus.toml"));
+        opts.config_path = Some(repo.join("upstroke.toml"));
         let source = source(vec![Effect::NoEdit], vec![ReviewBehavior::Pass]);
         let answers = CountingAnswers::default();
         let report = run_harness(
@@ -8021,7 +8029,7 @@ mod tests {
             "counting"
         }
 
-        fn resolve(&self, _question: &Question) -> Result<Answer, TactusError> {
+        fn resolve(&self, _question: &Question) -> Result<Answer, UpstrokeError> {
             if let Ok(mut calls) = self.calls.lock() {
                 *calls += 1;
             }
@@ -8034,11 +8042,11 @@ mod tests {
         let repo = temp_engine_repo("feedback");
         seed(
             &repo,
-            "## Implement the widget\n<!-- tactus: id=t1 kind=implement depends= -->\n",
+            "## Implement the widget\n<!-- upstroke: id=t1 kind=implement depends= -->\n",
             Some("[routing]\nimplement = { chain = [\"small\"], attempts_per = 2 }\n"),
         );
         let mut opts = options(&repo);
-        opts.config_path = Some(repo.join("tactus.toml"));
+        opts.config_path = Some(repo.join("upstroke.toml"));
         let source = source(
             vec![Effect::Error, Effect::EditFile],
             vec![ReviewBehavior::Pass],
@@ -8058,11 +8066,11 @@ mod tests {
         let repo = temp_engine_repo("reviewprose");
         seed(
             &repo,
-            "## Implement the widget\n<!-- tactus: id=t1 kind=implement depends= -->\n",
+            "## Implement the widget\n<!-- upstroke: id=t1 kind=implement depends= -->\n",
             Some("[routing]\nimplement = { chain = [\"small\"], attempts_per = 1 }\n"),
         );
         let mut opts = options(&repo);
-        opts.config_path = Some(repo.join("tactus.toml"));
+        opts.config_path = Some(repo.join("upstroke.toml"));
         let source = source(vec![Effect::EditFile], vec![ReviewBehavior::Unparseable]);
         let report = run_with(&opts, &source).expect("engine ok");
 
@@ -8095,14 +8103,14 @@ mod tests {
         let repo = temp_engine_repo("gatelogs");
         seed(
             &repo,
-            "## Implement the widget\n<!-- tactus: id=t1 kind=implement depends= -->\n",
+            "## Implement the widget\n<!-- upstroke: id=t1 kind=implement depends= -->\n",
             Some(
                 "[routing]\nimplement = { chain = [\"small\"], attempts_per = 1 }\n\n\
                  [[gates]]\nname = \"never\"\ncmd = \"git frobnicate-not-a-command\"\n",
             ),
         );
         let mut opts = options(&repo);
-        opts.config_path = Some(repo.join("tactus.toml"));
+        opts.config_path = Some(repo.join("upstroke.toml"));
         let source = fake(Effect::EditFile);
         let report = run_with(&opts, &source).expect("engine ok");
 
@@ -8168,15 +8176,16 @@ mod tests {
     #[test]
     fn a_worker_question_is_read_from_the_marker_onward() {
         assert_eq!(
-            worker_question(Some("Did some work.\nTACTUS-QUESTION: opaque or signed?")).as_deref(),
+            worker_question(Some("Did some work.\nUPSTROKE-QUESTION: opaque or signed?"))
+                .as_deref(),
             Some("opaque or signed?")
         );
         // Multi-line questions survive, because the prompt asks for it last.
         assert_eq!(
-            worker_question(Some("TACTUS-QUESTION: which store?\nRedis or Postgres?")).as_deref(),
+            worker_question(Some("UPSTROKE-QUESTION: which store?\nRedis or Postgres?")).as_deref(),
             Some("which store?\nRedis or Postgres?")
         );
-        assert_eq!(worker_question(Some("TACTUS-QUESTION:   ")), None);
+        assert_eq!(worker_question(Some("UPSTROKE-QUESTION:   ")), None);
         assert_eq!(worker_question(Some("no marker here")), None);
         assert_eq!(worker_question(None), None);
     }
@@ -8188,9 +8197,9 @@ mod tests {
         // it before asking is the expected shape, not a corner case. Taking
         // the first occurrence would hand the operator the agent's reasoning
         // with the question buried at the end.
-        let reply = "The retry feedback says I can use the TACTUS-QUESTION: marker if I am \
+        let reply = "The retry feedback says I can use the UPSTROKE-QUESTION: marker if I am \
                      blocked. I considered whether this needs one.\n\n\
-                     TACTUS-QUESTION: should cursors be opaque or signed?";
+                     UPSTROKE-QUESTION: should cursors be opaque or signed?";
         assert_eq!(
             worker_question(Some(reply)).as_deref(),
             Some("should cursors be opaque or signed?"),
@@ -8205,7 +8214,7 @@ mod tests {
         // before the status would turn a rate limit into a parked question —
         // silently defeating "RateLimited defers rather than burning an
         // attempt", and losing the timeout's transcript-tail feedback.
-        let quoting = "I will end with the TACTUS-QUESTION: marker if I get stuck.";
+        let quoting = "I will end with the UPSTROKE-QUESTION: marker if I get stuck.";
         let output = crate::agent::ProcessOutput {
             stdout: String::new(),
             stderr: String::new(),
@@ -8228,7 +8237,7 @@ mod tests {
         // A genuine question on a completed run still parks the task.
         let mut asked = fake_outcome(
             OutcomeStatus::Completed,
-            Some("TACTUS-QUESTION: opaque or signed?".to_owned()),
+            Some("UPSTROKE-QUESTION: opaque or signed?".to_owned()),
             "s0",
             None,
             Duration::ZERO,
@@ -8249,12 +8258,12 @@ mod tests {
         let repo = temp_engine_repo("haltpark");
         seed(
             &repo,
-            "## Asks a question\n<!-- tactus: id=t1 kind=implement depends= -->\n\n\
-             ## Exhausts its chain\n<!-- tactus: id=t2 kind=implement depends= -->\n",
+            "## Asks a question\n<!-- upstroke: id=t1 kind=implement depends= -->\n\n\
+             ## Exhausts its chain\n<!-- upstroke: id=t2 kind=implement depends= -->\n",
             Some("[routing]\nimplement = { chain = [\"small\"], attempts_per = 1 }\n"),
         );
         let mut opts = options(&repo);
-        opts.config_path = Some(repo.join("tactus.toml"));
+        opts.config_path = Some(repo.join("upstroke.toml"));
         // t1 asks and parks; t2 changes nothing and parks on chain exhaustion.
         let source = source(
             vec![Effect::AskQuestion, Effect::NoEdit],
@@ -8517,13 +8526,13 @@ mod tests {
             seed(
                 &repo,
                 plan.unwrap_or(
-                    "## Implement the widget\n<!-- tactus: id=t1 kind=implement depends= -->\n\n\
-                     ## Independent\n<!-- tactus: id=t3 kind=implement depends= -->\n",
+                    "## Implement the widget\n<!-- upstroke: id=t1 kind=implement depends= -->\n\n\
+                     ## Independent\n<!-- upstroke: id=t3 kind=implement depends= -->\n",
                 ),
                 Some(config),
             );
             let mut opts = options(&repo);
-            opts.config_path = Some(repo.join("tactus.toml"));
+            opts.config_path = Some(repo.join("upstroke.toml"));
             let cross_vendor_scenario = second_opinion.is_some();
             let source = match second_opinion {
                 Some(second) => cross_vendor(effects, reviews, second),
@@ -8569,11 +8578,11 @@ mod tests {
         let repo = temp_engine_repo("abortlog");
         seed(
             &repo,
-            "## Implement the widget\n<!-- tactus: id=t1 kind=implement depends= -->\n",
+            "## Implement the widget\n<!-- upstroke: id=t1 kind=implement depends= -->\n",
             Some("[routing]\nimplement = { chain = [\"small\"], attempts_per = 1 }\n"),
         );
         let mut opts = options(&repo);
-        opts.config_path = Some(repo.join("tactus.toml"));
+        opts.config_path = Some(repo.join("upstroke.toml"));
         // Run it through, then rewind the log by hand: reproducing a real
         // abort at exactly this point needs a failure the fake adapter cannot
         // raise, and the on-disk shape is what this test is actually about.
@@ -8653,13 +8662,13 @@ mod tests {
         let repo = temp_engine_repo("livestatus");
         seed(
             &repo,
-            "## Implement the widget\n<!-- tactus: id=t1 kind=implement depends= -->\n\n\
-             ## Waits on the widget\n<!-- tactus: id=t2 kind=implement depends=t1 -->\n\n\
-             ## Independent\n<!-- tactus: id=t3 kind=implement depends= -->\n",
+            "## Implement the widget\n<!-- upstroke: id=t1 kind=implement depends= -->\n\n\
+             ## Waits on the widget\n<!-- upstroke: id=t2 kind=implement depends=t1 -->\n\n\
+             ## Independent\n<!-- upstroke: id=t3 kind=implement depends= -->\n",
             Some("[routing]\nimplement = { chain = [\"small\"], attempts_per = 1 }\n"),
         );
         let mut opts = options(&repo);
-        opts.config_path = Some(repo.join("tactus.toml"));
+        opts.config_path = Some(repo.join("upstroke.toml"));
         let report = run_with(&opts, &fake(Effect::EditFile)).expect("run");
         let paths = paths_of(&repo, &report.run_id);
 
@@ -8722,13 +8731,13 @@ mod tests {
         let repo = temp_engine_repo("resumetrunc");
         seed(
             &repo,
-            "## Implement the widget\n<!-- tactus: id=t1 kind=implement depends= -->\n",
+            "## Implement the widget\n<!-- upstroke: id=t1 kind=implement depends= -->\n",
             // One attempt on one rung: if the interrupted attempt had been
             // counted, the task could never commit.
             Some("[routing]\nimplement = { chain = [\"small\"], attempts_per = 1 }\n"),
         );
         let mut opts = options(&repo);
-        opts.config_path = Some(repo.join("tactus.toml"));
+        opts.config_path = Some(repo.join("upstroke.toml"));
         let source = fake(Effect::EditFile);
         let report = run_with(&opts, &source).expect("run");
         let run_id = report.run_id.clone();
@@ -8808,8 +8817,8 @@ mod tests {
         let repo = temp_engine_repo("crashkill");
         seed(
             &repo,
-            "## First\n<!-- tactus: id=t1 kind=implement depends= -->\n\n\
-             ## Second\n<!-- tactus: id=t2 kind=implement depends=t1 -->\n",
+            "## First\n<!-- upstroke: id=t1 kind=implement depends= -->\n\n\
+             ## Second\n<!-- upstroke: id=t2 kind=implement depends=t1 -->\n",
             Some("[routing]\nimplement = { chain = [\"small\"], attempts_per = 1 }\n"),
         );
 
@@ -8822,7 +8831,7 @@ mod tests {
                 "--test-threads",
                 "1",
             ])
-            .env("TACTUS_CRASH_REPO", &repo)
+            .env("UPSTROKE_CRASH_REPO", &repo)
             .output()
             .expect("spawn the child run");
         assert_eq!(
@@ -8855,7 +8864,7 @@ mod tests {
         assert!(before.interrupted_run(), "status calls it interrupted");
         assert_eq!(before.interrupted, 1);
         assert!(
-            crate::status::render(&before).contains(&format!("tactus resume {run_id}")),
+            crate::status::render(&before).contains(&format!("upstroke resume {run_id}")),
             "and tells the operator how to continue it"
         );
 
@@ -8921,12 +8930,12 @@ mod tests {
     #[test]
     #[ignore = "spawned by killing_a_run_mid_attempt_leaves_a_resumable_record"]
     fn crash_child_dies_inside_an_attempt() {
-        let Ok(repo) = std::env::var("TACTUS_CRASH_REPO") else {
+        let Ok(repo) = std::env::var("UPSTROKE_CRASH_REPO") else {
             return;
         };
         let repo = PathBuf::from(repo);
         let mut opts = options(&repo);
-        opts.config_path = Some(repo.join("tactus.toml"));
+        opts.config_path = Some(repo.join("upstroke.toml"));
         // t1 commits; the process dies inside t2's first attempt.
         let source = source(
             vec![Effect::EditFile, Effect::Exit],
@@ -8941,20 +8950,20 @@ mod tests {
     #[test]
     fn a_parked_run_is_answered_out_of_band_and_resumed() {
         // §21's definition-of-done (d) across processes: the run ends parked,
-        // a person answers with `tactus answer` while nothing is running, and
+        // a person answers with `upstroke answer` while nothing is running, and
         // the resume picks the answer up.
         let repo = temp_engine_repo("answerresume");
         seed(
             &repo,
-            "## Doomed\n<!-- tactus: id=t1 kind=implement depends= -->\n\n\
-             ## Depends on it\n<!-- tactus: id=t2 kind=implement depends=t1 -->\n",
+            "## Doomed\n<!-- upstroke: id=t1 kind=implement depends= -->\n\n\
+             ## Depends on it\n<!-- upstroke: id=t2 kind=implement depends=t1 -->\n",
             Some(
                 "[interaction]\nmode = \"never\"\n\n\
                  [routing]\nimplement = { chain = [\"small\"], attempts_per = 1 }\n",
             ),
         );
         let mut opts = options(&repo);
-        opts.config_path = Some(repo.join("tactus.toml"));
+        opts.config_path = Some(repo.join("upstroke.toml"));
         let source = source(vec![Effect::NoEdit], vec![ReviewBehavior::Pass]);
         let report = run_with(&opts, &source).expect("run");
 
@@ -9017,12 +9026,12 @@ mod tests {
         let repo = temp_engine_repo("midrun");
         seed(
             &repo,
-            "## Asks a question\n<!-- tactus: id=t1 kind=implement depends= -->\n\n\
-             ## Independent\n<!-- tactus: id=t3 kind=implement depends= -->\n",
+            "## Asks a question\n<!-- upstroke: id=t1 kind=implement depends= -->\n\n\
+             ## Independent\n<!-- upstroke: id=t3 kind=implement depends= -->\n",
             Some("[routing]\nimplement = { chain = [\"small\"], attempts_per = 2 }\n"),
         );
         let mut opts = options(&repo);
-        opts.config_path = Some(repo.join("tactus.toml"));
+        opts.config_path = Some(repo.join("upstroke.toml"));
         let source = source(
             vec![Effect::AskQuestion, Effect::EditFile],
             vec![ReviewBehavior::Pass],
@@ -9049,7 +9058,7 @@ mod tests {
         );
     }
 
-    /// Stands in for an operator running `tactus answer` in another terminal
+    /// Stands in for an operator running `upstroke answer` in another terminal
     /// while the run is still going: it writes the file and tells the engine
     /// nobody replied, so only the sweep can find it.
     struct AnsweringViaFile {
@@ -9061,7 +9070,7 @@ mod tests {
             "test-file-writer"
         }
 
-        fn resolve(&self, question: &Question) -> Result<Answer, TactusError> {
+        fn resolve(&self, question: &Question) -> Result<Answer, UpstrokeError> {
             let _ = crate::answer::answer(
                 &self.repo,
                 question.id.as_str(),
@@ -9079,16 +9088,16 @@ mod tests {
         let repo = temp_engine_repo("blocked");
         seed(
             &repo,
-            "## Last\n<!-- tactus: id=late kind=implement depends=mid -->\n\n\
-             ## Middle\n<!-- tactus: id=mid kind=implement depends=first -->\n\n\
-             ## First\n<!-- tactus: id=first kind=implement depends= -->\n",
+            "## Last\n<!-- upstroke: id=late kind=implement depends=mid -->\n\n\
+             ## Middle\n<!-- upstroke: id=mid kind=implement depends=first -->\n\n\
+             ## First\n<!-- upstroke: id=first kind=implement depends= -->\n",
             Some(
                 "[interaction]\nmode = \"never\"\n\n\
                  [routing]\nimplement = { chain = [\"small\"], attempts_per = 1 }\n",
             ),
         );
         let mut opts = options(&repo);
-        opts.config_path = Some(repo.join("tactus.toml"));
+        opts.config_path = Some(repo.join("upstroke.toml"));
         let source = source(vec![Effect::NoEdit], vec![ReviewBehavior::Pass]);
         let report = run_with(&opts, &source).expect("run");
 
@@ -9113,16 +9122,16 @@ mod tests {
         let repo = temp_engine_repo("unblock");
         seed(
             &repo,
-            "## Last\n<!-- tactus: id=late kind=implement depends=mid -->\n\n\
-             ## Middle\n<!-- tactus: id=mid kind=implement depends=first -->\n\n\
-             ## First\n<!-- tactus: id=first kind=implement depends= -->\n",
+            "## Last\n<!-- upstroke: id=late kind=implement depends=mid -->\n\n\
+             ## Middle\n<!-- upstroke: id=mid kind=implement depends=first -->\n\n\
+             ## First\n<!-- upstroke: id=first kind=implement depends= -->\n",
             Some(
                 "[interaction]\nmode = \"never\"\n\n\
                  [routing]\nimplement = { chain = [\"small\"], attempts_per = 1 }\n",
             ),
         );
         let mut opts = options(&repo);
-        opts.config_path = Some(repo.join("tactus.toml"));
+        opts.config_path = Some(repo.join("upstroke.toml"));
         let source = source(vec![Effect::NoEdit], vec![ReviewBehavior::Pass]);
         let report = run_with(&opts, &source).expect("run");
         let run_id = report.run_id.clone();
@@ -9151,13 +9160,13 @@ mod tests {
         let repo = temp_engine_repo("terminate");
         seed(
             &repo,
-            "## One\n<!-- tactus: id=t1 kind=implement depends= -->\n\n\
-             ## Two\n<!-- tactus: id=t2 kind=implement depends= -->\n\n\
-             ## After one\n<!-- tactus: id=t3 kind=implement depends=t1 -->\n",
+            "## One\n<!-- upstroke: id=t1 kind=implement depends= -->\n\n\
+             ## Two\n<!-- upstroke: id=t2 kind=implement depends= -->\n\n\
+             ## After one\n<!-- upstroke: id=t3 kind=implement depends=t1 -->\n",
             Some("[routing]\nimplement = { chain = [\"small\", \"mid\"], attempts_per = 2 }\n"),
         );
         let mut opts = options(&repo);
-        opts.config_path = Some(repo.join("tactus.toml"));
+        opts.config_path = Some(repo.join("upstroke.toml"));
         opts.max_defers = 2;
         let source = source(vec![Effect::RateLimited], vec![ReviewBehavior::Pass]);
         let answers = CountingAnswers::default();
@@ -9229,11 +9238,11 @@ mod tests {
         let repo = temp_engine_repo(tag);
         seed(
             &repo,
-            "## Doomed\n<!-- tactus: id=t1 kind=implement depends= -->\n",
+            "## Doomed\n<!-- upstroke: id=t1 kind=implement depends= -->\n",
             Some(config),
         );
         let mut opts = options(&repo);
-        opts.config_path = Some(repo.join("tactus.toml"));
+        opts.config_path = Some(repo.join("upstroke.toml"));
         let source = source(vec![Effect::NoEdit], vec![ReviewBehavior::Pass]);
         let report = run_with(&opts, &source).expect("run");
         assert_eq!(report.outcome(), RunOutcome::Parked);
@@ -9284,7 +9293,7 @@ mod tests {
         let (repo, run_id) = parked_run("planmoved");
         fs::write(
             repo.join("plan.md"),
-            "## Doomed\n<!-- tactus: id=t1 kind=implement depends= -->\nNow with a body.\n",
+            "## Doomed\n<!-- upstroke: id=t1 kind=implement depends= -->\nNow with a body.\n",
         )
         .expect("edit the plan");
 
@@ -9450,7 +9459,7 @@ mod tests {
         let (repo, run_id) = parked_run("source-semantics-digest");
         fs::write(
             repo.join("plan.md"),
-            "## Changed semantics\n<!-- tactus: id=t1 kind=implement depends= -->\nDifferent body.\n",
+            "## Changed semantics\n<!-- upstroke: id=t1 kind=implement depends= -->\nDifferent body.\n",
         )
         .expect("change source plan");
         let new_hash = crate::ir::content_hash(&fs::read(repo.join("plan.md")).expect("plan"));
@@ -9482,7 +9491,7 @@ mod tests {
         // chain would point it at another tier without saying so.
         let (repo, run_id) = parked_run("chainmoved");
         fs::write(
-            repo.join("tactus.toml"),
+            repo.join("upstroke.toml"),
             "[interaction]\nmode = \"never\"\n\n\
              [routing]\nimplement = { chain = [\"mid\", \"frontier\"], attempts_per = 1 }\n",
         )
@@ -9532,7 +9541,7 @@ mod tests {
         // This is the self-hosting hazard from the gate-config record, closed
         // at the point
         // that matters. The workspace an implementer edits contains the very
-        // tactus.toml its gates come from, so an edited gate must not become
+        // upstroke.toml its gates come from, so an edited gate must not become
         // the standard for what follows. Refusing would also have stopped the
         // weakened gate running, but it would have stopped the *run* too, and
         // a legitimately-committed config edit would have left it unresumable.
@@ -9540,7 +9549,7 @@ mod tests {
         // `git` still resolves at pre-flight, so nothing refuses before the
         // gate runs — it just exits non-zero when it does.
         fs::write(
-            repo.join("tactus.toml"),
+            repo.join("upstroke.toml"),
             gate_config("git frobnicate-not-a-command"),
         )
         .expect("edit config");
@@ -9583,7 +9592,7 @@ mod tests {
         let (repo, run_id) = parked_run_with_gate("gatelabel", "git --version");
         // `[[gates]]` deleted, so today's flag would be false and today's
         // derivation empty — the temp repo has no project marker.
-        fs::write(repo.join("tactus.toml"), PARKED_RUN_CONFIG).expect("edit config");
+        fs::write(repo.join("upstroke.toml"), PARKED_RUN_CONFIG).expect("edit config");
 
         let resumed = resume_answering(&repo, &run_id, Effect::EditFile);
         assert_eq!(resumed.gates, ["check"], "the recorded gate ran");
@@ -9721,7 +9730,7 @@ mod tests {
         // Re-derivation must be a real re-derivation, or this test would pass
         // against a resume that ignored today's config entirely.
         fs::write(
-            repo.join("tactus.toml"),
+            repo.join("upstroke.toml"),
             format!(
                 "{PARKED_RUN_CONFIG}\n[[gates]]\nname = \"renamed\"\ncmd = \"git --version\"\n"
             ),
@@ -9785,7 +9794,7 @@ mod tests {
         // would. Under the old behaviour the second resume re-derived and
         // adopted this.
         fs::write(
-            repo.join("tactus.toml"),
+            repo.join("upstroke.toml"),
             gate_config("git frobnicate-not-a-command"),
         )
         .expect("edit config");
@@ -9876,11 +9885,11 @@ mod tests {
         let repo = temp_engine_repo("halted");
         seed(
             &repo,
-            "## Doomed\n<!-- tactus: id=t1 kind=implement depends= -->\n",
+            "## Doomed\n<!-- upstroke: id=t1 kind=implement depends= -->\n",
             Some("[routing]\nimplement = { chain = [\"small\"], attempts_per = 1 }\n"),
         );
         let mut opts = options(&repo);
-        opts.config_path = Some(repo.join("tactus.toml"));
+        opts.config_path = Some(repo.join("upstroke.toml"));
         let source = source(vec![Effect::NoEdit], vec![ReviewBehavior::Pass]);
         let answers = ScriptedAnswers::new(vec![Answer::Declined]);
         let report = run_harness(
@@ -10110,11 +10119,11 @@ mod tests {
         let repo = temp_engine_repo("private");
         seed(
             &repo,
-            "## Implement the widget\n<!-- tactus: id=t1 kind=implement depends= -->\n",
+            "## Implement the widget\n<!-- upstroke: id=t1 kind=implement depends= -->\n",
             Some("[routing]\nimplement = { chain = [\"small\"], attempts_per = 2 }\n"),
         );
         let mut opts = options(&repo);
-        opts.config_path = Some(repo.join("tactus.toml"));
+        opts.config_path = Some(repo.join("upstroke.toml"));
         // The first attempt fails, so a rollback happens before the second.
         let adapters = source(
             vec![Effect::NoEdit, Effect::EditFile],
@@ -10139,7 +10148,7 @@ mod tests {
         assert!(paths.events().starts_with(&repo));
         assert!(paths.questions().starts_with(&repo));
         // And nothing agent-authored is reachable from the repo.
-        let in_repo = repo.join(".tactus").join("runs").join(&report.run_id);
+        let in_repo = repo.join(".upstroke").join("runs").join(&report.run_id);
         for leaked in ["transcripts", "reviews", "settings", "gates"] {
             assert!(
                 !in_repo.join(leaked).exists(),
@@ -10358,11 +10367,11 @@ mod tests {
         let repo = temp_engine_repo("adoptcommit");
         seed(
             &repo,
-            "## Implement the widget\n<!-- tactus: id=t1 kind=implement depends= -->\n",
+            "## Implement the widget\n<!-- upstroke: id=t1 kind=implement depends= -->\n",
             Some("[routing]\nimplement = { chain = [\"small\"], attempts_per = 1 }\n"),
         );
         let mut opts = options(&repo);
-        opts.config_path = Some(repo.join("tactus.toml"));
+        opts.config_path = Some(repo.join("upstroke.toml"));
         let report = run_with(&opts, &fake(Effect::EditFile)).expect("run");
         let run_id = report.run_id.clone();
         let paths = paths_of(&repo, &run_id);
@@ -10420,11 +10429,11 @@ mod tests {
             let repo = temp_engine_repo(tag);
             seed(
                 &repo,
-                "## Implement the widget\n<!-- tactus: id=t1 kind=implement depends= -->\n",
+                "## Implement the widget\n<!-- upstroke: id=t1 kind=implement depends= -->\n",
                 Some("[routing]\nimplement = { chain = [\"small\"], attempts_per = 1 }\n"),
             );
             let mut opts = options(&repo);
-            opts.config_path = Some(repo.join("tactus.toml"));
+            opts.config_path = Some(repo.join("upstroke.toml"));
             let report = run_with(&opts, &fake(Effect::EditFile)).expect("run");
             let paths = paths_of(&repo, &report.run_id);
             let prepared = prepared_commit_of(&paths);
@@ -10474,11 +10483,11 @@ mod tests {
         let repo = temp_engine_repo("prepared-orphan");
         seed(
             &repo,
-            "## Implement the widget\n<!-- tactus: id=t1 kind=implement depends= -->\n",
+            "## Implement the widget\n<!-- upstroke: id=t1 kind=implement depends= -->\n",
             Some("[routing]\nimplement = { chain = [\"small\"], attempts_per = 2 }\n"),
         );
         let mut opts = options(&repo);
-        opts.config_path = Some(repo.join("tactus.toml"));
+        opts.config_path = Some(repo.join("upstroke.toml"));
         let report = run_with(&opts, &fake(Effect::EditFile)).expect("run");
         let paths = paths_of(&repo, &report.run_id);
         let prepared = prepared_commit_of(&paths);
@@ -10521,11 +10530,11 @@ mod tests {
         let repo = temp_engine_repo("prepared-pin-mismatch");
         seed(
             &repo,
-            "## Implement the widget\n<!-- tactus: id=t1 kind=implement depends= -->\n",
+            "## Implement the widget\n<!-- upstroke: id=t1 kind=implement depends= -->\n",
             Some("[routing]\nimplement = { chain = [\"small\"], attempts_per = 1 }\n"),
         );
         let mut opts = options(&repo);
-        opts.config_path = Some(repo.join("tactus.toml"));
+        opts.config_path = Some(repo.join("upstroke.toml"));
         let report = run_with(&opts, &fake(Effect::EditFile)).expect("run");
         let paths = paths_of(&repo, &report.run_id);
         let prepared = prepared_commit_of(&paths);
@@ -10556,11 +10565,11 @@ mod tests {
         let repo = temp_engine_repo("prepared-symbolic-run-ref");
         seed(
             &repo,
-            "## Implement the widget\n<!-- tactus: id=t1 kind=implement depends= -->\n",
+            "## Implement the widget\n<!-- upstroke: id=t1 kind=implement depends= -->\n",
             Some("[routing]\nimplement = { chain = [\"small\"], attempts_per = 1 }\n"),
         );
         let mut opts = options(&repo);
-        opts.config_path = Some(repo.join("tactus.toml"));
+        opts.config_path = Some(repo.join("upstroke.toml"));
         let report = run_with(&opts, &fake(Effect::EditFile)).expect("run");
         let paths = paths_of(&repo, &report.run_id);
         let prepared = prepared_commit_of(&paths);
@@ -10616,11 +10625,11 @@ mod tests {
         let repo = temp_engine_repo("prepared-before-repair");
         seed(
             &repo,
-            "## Implement the widget\n<!-- tactus: id=t1 kind=implement depends= -->\n",
+            "## Implement the widget\n<!-- upstroke: id=t1 kind=implement depends= -->\n",
             Some("[routing]\nimplement = { chain = [\"small\"], attempts_per = 1 }\n"),
         );
         let mut opts = options(&repo);
-        opts.config_path = Some(repo.join("tactus.toml"));
+        opts.config_path = Some(repo.join("upstroke.toml"));
         let report = run_with(&opts, &fake(Effect::EditFile)).expect("run");
         let paths = paths_of(&repo, &report.run_id);
         truncate_log_before(&paths, "task_committed");
@@ -10718,11 +10727,11 @@ mod tests {
         let repo = temp_engine_repo("adoptforeign");
         seed(
             &repo,
-            "## Implement the widget\n<!-- tactus: id=t1 kind=implement depends= -->\n",
+            "## Implement the widget\n<!-- upstroke: id=t1 kind=implement depends= -->\n",
             Some("[routing]\nimplement = { chain = [\"small\"], attempts_per = 1 }\n"),
         );
         let mut opts = options(&repo);
-        opts.config_path = Some(repo.join("tactus.toml"));
+        opts.config_path = Some(repo.join("upstroke.toml"));
         let report = run_with(&opts, &fake(Effect::EditFile)).expect("run");
         truncate_log_before(&paths_of(&repo, &report.run_id), "task_committed");
         let subject = git_in(&repo, &["show", "-s", "--format=%s", "HEAD"]);
@@ -10744,11 +10753,11 @@ mod tests {
         let repo = temp_engine_repo("legacy-subject");
         seed(
             &repo,
-            "## Implement the widget\n<!-- tactus: id=t1 kind=implement depends= -->\n",
+            "## Implement the widget\n<!-- upstroke: id=t1 kind=implement depends= -->\n",
             Some("[routing]\nimplement = { chain = [\"small\"], attempts_per = 1 }\n"),
         );
         let mut opts = options(&repo);
-        opts.config_path = Some(repo.join("tactus.toml"));
+        opts.config_path = Some(repo.join("upstroke.toml"));
         let report = run_with(&opts, &fake(Effect::EditFile)).expect("run");
         let paths = paths_of(&repo, &report.run_id);
         truncate_log_before(&paths, "task_committed");
@@ -10773,11 +10782,11 @@ mod tests {
         let repo = temp_engine_repo("privatedir");
         seed(
             &repo,
-            "## Implement the widget\n<!-- tactus: id=t1 kind=implement depends= -->\n",
+            "## Implement the widget\n<!-- upstroke: id=t1 kind=implement depends= -->\n",
             Some("[routing]\nimplement = { chain = [\"small\"], attempts_per = 1 }\n"),
         );
         let mut opts = options(&repo);
-        opts.config_path = Some(repo.join("tactus.toml"));
+        opts.config_path = Some(repo.join("upstroke.toml"));
         let report = run_with(&opts, &fake(Effect::EditFile)).expect("run");
         let run_id = report.run_id.clone();
         let recorded = paths_of(&repo, &run_id);
@@ -10812,20 +10821,20 @@ mod tests {
     fn resume_makes_a_stale_question_payload_agree_with_the_log() {
         // The engine emits `question_answered` and then rewrites the payload
         // beside it. A crash in between leaves a file that still reads as
-        // open — and `tactus answer` will accept a second answer against it,
+        // open — and `upstroke answer` will accept a second answer against it,
         // one no engine can ever ingest, because the log has already closed
         // the question.
         let repo = temp_engine_repo("stalepayload");
         seed(
             &repo,
-            "## Doomed\n<!-- tactus: id=t1 kind=implement depends= -->\n",
+            "## Doomed\n<!-- upstroke: id=t1 kind=implement depends= -->\n",
             Some(
                 "[interaction]\nmode = \"never\"\n\n\
                  [routing]\nimplement = { chain = [\"small\"], attempts_per = 1 }\n",
             ),
         );
         let mut opts = options(&repo);
-        opts.config_path = Some(repo.join("tactus.toml"));
+        opts.config_path = Some(repo.join("upstroke.toml"));
         let doomed = source(vec![Effect::NoEdit], vec![ReviewBehavior::Pass]);
         let report = run_with(&opts, &doomed).expect("run");
         let run_id = report.run_id.clone();
@@ -10870,21 +10879,21 @@ mod tests {
         // Nothing is on the record until the first event lands. A failure in
         // that window would otherwise leave a run directory with no
         // `events.jsonl`, and since run ids sort newest-last it becomes what a
-        // bare `tactus status` reports on — "no event log here" for a run that
+        // bare `upstroke status` reports on — "no event log here" for a run that
         // never began, shadowing the real latest one.
         let repo = temp_engine_repo("husk");
         seed(
             &repo,
-            "## Implement the widget\n<!-- tactus: id=t1 kind=implement depends= -->\n",
+            "## Implement the widget\n<!-- upstroke: id=t1 kind=implement depends= -->\n",
             Some("[routing]\nimplement = { chain = [\"small\"], attempts_per = 1 }\n"),
         );
-        // Git stores refs as paths, so a branch literally named `tactus` is a
-        // file where `tactus/run-<id>` needs a directory: branch creation
+        // Git stores refs as paths, so a branch literally named `upstroke` is a
+        // file where `upstroke/run-<id>` needs a directory: branch creation
         // cannot succeed.
-        git_in(&repo, &["branch", "tactus"]);
+        git_in(&repo, &["branch", "upstroke"]);
 
         let mut opts = options(&repo);
-        opts.config_path = Some(repo.join("tactus.toml"));
+        opts.config_path = Some(repo.join("upstroke.toml"));
         let source = fake(Effect::EditFile);
         run_with(&opts, &source).expect_err("the run branch cannot be created");
 
@@ -10908,7 +10917,7 @@ mod tests {
             "backlog"
         }
 
-        fn resolve(&self, question: &Question) -> Result<Answer, TactusError> {
+        fn resolve(&self, question: &Question) -> Result<Answer, UpstrokeError> {
             let Ok(mut used) = self.used.lock() else {
                 return Ok(Answer::Unanswered);
             };
@@ -10948,12 +10957,12 @@ mod tests {
         let repo = temp_engine_repo("backlog");
         seed(
             &repo,
-            "## First\n<!-- tactus: id=t1 kind=implement depends= -->\n\n\
-             ## Second\n<!-- tactus: id=t2 kind=implement depends= -->\n",
+            "## First\n<!-- upstroke: id=t1 kind=implement depends= -->\n\n\
+             ## Second\n<!-- upstroke: id=t2 kind=implement depends= -->\n",
             Some("[routing]\nimplement = { chain = [\"small\"], attempts_per = 1 }\n"),
         );
         let mut opts = options(&repo);
-        opts.config_path = Some(repo.join("tactus.toml"));
+        opts.config_path = Some(repo.join("upstroke.toml"));
         // Both tasks fail into a question, then both succeed once released.
         let source = source(
             vec![Effect::NoEdit, Effect::NoEdit, Effect::EditFile],
@@ -10983,21 +10992,21 @@ mod tests {
     fn an_answer_file_that_changes_nothing_does_not_spin_the_scheduler() {
         // `sweep_answers` reports whether anything *changed*, and the drain
         // loop trusts that to mean it made progress. A file the sweep reads
-        // but declines to apply — `unanswered`, which `tactus answer` refuses
+        // but declines to apply — `unanswered`, which `upstroke answer` refuses
         // to write but a hand-edit produces — must not read as progress: that
         // branch terminates only because it closes the question it fires for.
         // A regression here hangs this test rather than failing it.
         let repo = temp_engine_repo("nullanswer");
         seed(
             &repo,
-            "## Doomed\n<!-- tactus: id=t1 kind=implement depends= -->\n",
+            "## Doomed\n<!-- upstroke: id=t1 kind=implement depends= -->\n",
             Some(
                 "[interaction]\nmode = \"never\"\n\n\
                  [routing]\nimplement = { chain = [\"small\"], attempts_per = 1 }\n",
             ),
         );
         let mut opts = options(&repo);
-        opts.config_path = Some(repo.join("tactus.toml"));
+        opts.config_path = Some(repo.join("upstroke.toml"));
         let source = source(vec![Effect::NoEdit], vec![ReviewBehavior::Pass]);
         let report = run_with(&opts, &source).expect("run");
         assert_eq!(report.outcome(), RunOutcome::Parked);
@@ -11091,7 +11100,7 @@ mod tests {
 
     // ---- step 10: pools, budgets, and spend approval (§13) ------------------
 
-    /// A pools file beside the repo — never `~/.tactus`, which is the
+    /// A pools file beside the repo — never `~/.upstroke`, which is the
     /// operator's, and never inside the workspace, where §14's `git clean -fd`
     /// would delete it.
     fn pools_file(repo: &Path, content: &str) -> PathBuf {
@@ -11128,16 +11137,16 @@ mod tests {
         let repo = temp_engine_repo("budgetstop");
         seed(
             &repo,
-            "## One\n<!-- tactus: id=t1 kind=implement depends= -->\n\n\
-             ## Two\n<!-- tactus: id=t2 kind=implement depends= -->\n\n\
-             ## Three\n<!-- tactus: id=t3 kind=implement depends= -->\n",
+            "## One\n<!-- upstroke: id=t1 kind=implement depends= -->\n\n\
+             ## Two\n<!-- upstroke: id=t2 kind=implement depends= -->\n\n\
+             ## Three\n<!-- upstroke: id=t3 kind=implement depends= -->\n",
             Some(
                 "[routing]\nimplement = { chain = [\"small\"], attempts_per = 1 }\n\n\
                  [budgets]\nrun_usd = 0.05\n",
             ),
         );
         let mut opts = options(&repo);
-        opts.config_path = Some(repo.join("tactus.toml"));
+        opts.config_path = Some(repo.join("upstroke.toml"));
         let source = fake(Effect::EditFile);
         let (report, live) = run_harness_inner(
             &opts,
@@ -11180,14 +11189,14 @@ mod tests {
         let repo = temp_engine_repo("taskbudget");
         seed(
             &repo,
-            "## One\n<!-- tactus: id=t1 kind=implement depends= -->\n",
+            "## One\n<!-- upstroke: id=t1 kind=implement depends= -->\n",
             Some(
                 "[routing]\nimplement = { chain = [\"small\", \"mid\"], attempts_per = 1 }\n\n\
                  [budgets]\ntask_usd = 0.005\n",
             ),
         );
         let mut opts = options(&repo);
-        opts.config_path = Some(repo.join("tactus.toml"));
+        opts.config_path = Some(repo.join("upstroke.toml"));
         // Fails on the first rung, so a second attempt is asked for — and
         // refused, because this task has already spent past its own ceiling.
         let source = source(
@@ -11206,7 +11215,7 @@ mod tests {
         );
         let rendered = report.render();
         assert!(rendered.contains("task_usd"), "{rendered}");
-        assert!(rendered.contains("tactus resume"), "{rendered}");
+        assert!(rendered.contains("upstroke resume"), "{rendered}");
     }
 
     #[test]
@@ -11216,12 +11225,12 @@ mod tests {
         let repo = temp_engine_repo("budgetresume");
         seed(
             &repo,
-            "## One\n<!-- tactus: id=t1 kind=implement depends= -->\n\n\
-             ## Two\n<!-- tactus: id=t2 kind=implement depends= -->\n",
+            "## One\n<!-- upstroke: id=t1 kind=implement depends= -->\n\n\
+             ## Two\n<!-- upstroke: id=t2 kind=implement depends= -->\n",
             Some("[routing]\nimplement = { chain = [\"small\"], attempts_per = 1 }\n"),
         );
         let mut opts = options(&repo);
-        opts.config_path = Some(repo.join("tactus.toml"));
+        opts.config_path = Some(repo.join("upstroke.toml"));
         opts.budget_usd = Some(0.05);
         let source = fake(Effect::EditFile);
         let stopped = run_with(&opts, &source).expect("run");
@@ -11253,15 +11262,15 @@ mod tests {
         let repo = temp_engine_repo("budgetresumelow");
         seed(
             &repo,
-            "## One\n<!-- tactus: id=t1 kind=implement depends= -->\n\n\
-             ## Two\n<!-- tactus: id=t2 kind=implement depends= -->\n",
+            "## One\n<!-- upstroke: id=t1 kind=implement depends= -->\n\n\
+             ## Two\n<!-- upstroke: id=t2 kind=implement depends= -->\n",
             Some(
                 "[routing]\nimplement = { chain = [\"small\"], attempts_per = 1 }\n\n\
                  [budgets]\nrun_usd = 0.05\n",
             ),
         );
         let mut opts = options(&repo);
-        opts.config_path = Some(repo.join("tactus.toml"));
+        opts.config_path = Some(repo.join("upstroke.toml"));
         let source = fake(Effect::EditFile);
         let stopped = run_with(&opts, &source).expect("run");
         assert_eq!(stopped.outcome(), RunOutcome::BudgetExceeded);
@@ -11288,14 +11297,14 @@ mod tests {
         let repo = temp_engine_repo("approvespend");
         seed(
             &repo,
-            "## One\n<!-- tactus: id=t1 kind=implement depends= -->\n",
+            "## One\n<!-- upstroke: id=t1 kind=implement depends= -->\n",
             Some(
                 "[routing]\nimplement = { chain = [\"mid\", \"frontier\"], attempts_per = 1 }\n\n\
                  [interaction]\nask_before = { frontier_escalation_over_usd = 0.005 }\n",
             ),
         );
         let mut opts = options(&repo);
-        opts.config_path = Some(repo.join("tactus.toml"));
+        opts.config_path = Some(repo.join("upstroke.toml"));
         let source = source(
             vec![Effect::NoEdit, Effect::EditFile],
             vec![ReviewBehavior::Pass],
@@ -11348,14 +11357,14 @@ mod tests {
         let repo = temp_engine_repo("declinespend");
         seed(
             &repo,
-            "## One\n<!-- tactus: id=t1 kind=implement depends= -->\n",
+            "## One\n<!-- upstroke: id=t1 kind=implement depends= -->\n",
             Some(
                 "[routing]\nimplement = { chain = [\"mid\", \"frontier\"], attempts_per = 1 }\n\n\
                  [interaction]\nask_before = { frontier_escalation_over_usd = 0.005 }\n",
             ),
         );
         let mut opts = options(&repo);
-        opts.config_path = Some(repo.join("tactus.toml"));
+        opts.config_path = Some(repo.join("upstroke.toml"));
         let source = source(
             vec![Effect::NoEdit, Effect::EditFile],
             vec![ReviewBehavior::Pass],
@@ -11396,14 +11405,14 @@ mod tests {
         let repo = temp_engine_repo("frontierstart");
         seed(
             &repo,
-            "## One\n<!-- tactus: id=t1 kind=implement depends= -->\n",
+            "## One\n<!-- upstroke: id=t1 kind=implement depends= -->\n",
             Some(
                 "[routing]\nimplement = { chain = [\"frontier\"], attempts_per = 2 }\n\n\
                  [interaction]\nask_before = { frontier_escalation_over_usd = 0.0 }\n",
             ),
         );
         let mut opts = options(&repo);
-        opts.config_path = Some(repo.join("tactus.toml"));
+        opts.config_path = Some(repo.join("upstroke.toml"));
         let source = source(
             vec![Effect::NoEdit, Effect::EditFile],
             vec![ReviewBehavior::Pass],
@@ -11425,14 +11434,14 @@ mod tests {
         let repo = temp_engine_repo("poolattrib");
         seed(
             &repo,
-            "## One\n<!-- tactus: id=t1 kind=implement depends= -->\n",
+            "## One\n<!-- upstroke: id=t1 kind=implement depends= -->\n",
             Some(
                 "[routing]\nimplement = { chain = [\"small\"], attempts_per = 1 }\n\n\
                  [routing.effort]\nimplementation = \"xhigh\"\nreview = \"max\"\n",
             ),
         );
         let mut opts = options(&repo);
-        opts.config_path = Some(repo.join("tactus.toml"));
+        opts.config_path = Some(repo.join("upstroke.toml"));
         opts.pools_path = Some(pools_file(&repo, CLAUDE_POOL));
         let source = fake(Effect::EditFile);
         let report = run_with(&opts, &source).expect("run");
@@ -11505,7 +11514,7 @@ mod tests {
         let repo = temp_engine_repo("pinorigin");
         seed(
             &repo,
-            "## One\n<!-- tactus: id=t1 kind=implement depends= -->\n",
+            "## One\n<!-- upstroke: id=t1 kind=implement depends= -->\n",
             Some(
                 "[routing]\nimplement = { chain = [\"small\"], attempts_per = 1 }\n\
                  [[pins]]\ntier = \"small\"\nagent = \"claude-code\"\n\
@@ -11513,7 +11522,7 @@ mod tests {
             ),
         );
         let mut opts = options(&repo);
-        opts.config_path = Some(repo.join("tactus.toml"));
+        opts.config_path = Some(repo.join("upstroke.toml"));
         let report = run_with(&opts, &fake(Effect::EditFile)).expect("run");
         let events = events_of(&repo, &report.run_id);
         let started = events
@@ -11534,11 +11543,11 @@ mod tests {
         let repo = temp_engine_repo("poolexhausted");
         seed(
             &repo,
-            "## One\n<!-- tactus: id=t1 kind=implement depends= -->\n",
+            "## One\n<!-- upstroke: id=t1 kind=implement depends= -->\n",
             Some("[routing]\nimplement = { chain = [\"small\"], attempts_per = 1 }\n"),
         );
         let mut opts = options(&repo);
-        opts.config_path = Some(repo.join("tactus.toml"));
+        opts.config_path = Some(repo.join("upstroke.toml"));
         let pools = pools_file(&repo, CLAUDE_POOL);
         opts.pools_path = Some(pools.clone());
         let source = source(
@@ -11634,12 +11643,12 @@ mod tests {
         let repo = temp_engine_repo("budgetflag");
         seed(
             &repo,
-            "## One\n<!-- tactus: id=t1 kind=implement depends= -->\n",
+            "## One\n<!-- upstroke: id=t1 kind=implement depends= -->\n",
             Some("[routing]\nimplement = { chain = [\"small\"], attempts_per = 1 }\n"),
         );
         for bad in [0.0, -5.0, f64::NAN] {
             let mut opts = options(&repo);
-            opts.config_path = Some(repo.join("tactus.toml"));
+            opts.config_path = Some(repo.join("upstroke.toml"));
             opts.budget_usd = Some(bad);
             let source = fake(Effect::EditFile);
             let err = run_with(&opts, &source).expect_err("a meaningless ceiling must refuse");
@@ -11664,14 +11673,14 @@ mod tests {
         let repo = temp_engine_repo("approvalfeedback");
         seed(
             &repo,
-            "## One\n<!-- tactus: id=t1 kind=implement depends= -->\n",
+            "## One\n<!-- upstroke: id=t1 kind=implement depends= -->\n",
             Some(
                 "[routing]\nimplement = { chain = [\"mid\", \"frontier\"], attempts_per = 1 }\n\n\
                  [interaction]\nask_before = { frontier_escalation_over_usd = 0.005 }\n",
             ),
         );
         let mut opts = options(&repo);
-        opts.config_path = Some(repo.join("tactus.toml"));
+        opts.config_path = Some(repo.join("upstroke.toml"));
         let source = source(
             vec![Effect::NoEdit, Effect::EditFile],
             vec![ReviewBehavior::Pass],
@@ -11708,7 +11717,7 @@ mod tests {
     fn picking_an_option_is_an_un_park_and_not_a_decision() {
         // The options a question carries are the engine's instructions to the
         // operator: "retry this task with guidance you type below", "answer in
-        // your own words". `tactus answer <id> --option 1` resolved to that
+        // your own words". `upstroke answer <id> --option 1` resolved to that
         // sentence and pushed it as human feedback — so it reached the
         // implementer framed as "an instruction from a person", and once §12's
         // decisions were routed to the judge as well, it reached the reviewer
@@ -11719,11 +11728,11 @@ mod tests {
         let repo = temp_engine_repo("cannedoption");
         seed(
             &repo,
-            "## One\n<!-- tactus: id=t1 kind=implement depends= -->\n",
+            "## One\n<!-- upstroke: id=t1 kind=implement depends= -->\n",
             Some("[routing]\nimplement = { chain = [\"small\"], attempts_per = 1 }\n"),
         );
         let mut opts = options(&repo);
-        opts.config_path = Some(repo.join("tactus.toml"));
+        opts.config_path = Some(repo.join("upstroke.toml"));
         // Ask, then answer by picking the first option verbatim — what
         // `--option 1` writes.
         let source = source(
@@ -11778,11 +11787,11 @@ mod tests {
         let repo = temp_engine_repo("onesignal");
         seed(
             &repo,
-            "## One\n<!-- tactus: id=t1 kind=implement depends= -->\n",
+            "## One\n<!-- upstroke: id=t1 kind=implement depends= -->\n",
             Some("[routing]\nimplement = { chain = [\"small\"], attempts_per = 1 }\n"),
         );
         let mut opts = options(&repo);
-        opts.config_path = Some(repo.join("tactus.toml"));
+        opts.config_path = Some(repo.join("upstroke.toml"));
         opts.pools_path = Some(pools_file(&repo, CLAUDE_POOL));
         // Down for three attempts, then back.
         let source = source(
@@ -11822,11 +11831,11 @@ mod tests {
         let repo = temp_engine_repo("budgetdirty");
         seed(
             &repo,
-            "## One\n<!-- tactus: id=t1 kind=implement depends= -->\n",
+            "## One\n<!-- upstroke: id=t1 kind=implement depends= -->\n",
             Some("[routing]\nimplement = { chain = [\"small\"], attempts_per = 2 }\n"),
         );
         let mut opts = options(&repo);
-        opts.config_path = Some(repo.join("tactus.toml"));
+        opts.config_path = Some(repo.join("upstroke.toml"));
         // Enough for the first attempt, not for the retry that attempt asks
         // for — so the stop lands exactly between the two.
         opts.budget_usd = Some(0.05);
@@ -12001,7 +12010,7 @@ mod tests {
     }
 
     #[test]
-    fn a_status_from_a_newer_tactus_does_not_fail_the_whole_report() {
+    fn a_status_from_a_newer_upstroke_does_not_fail_the_whole_report() {
         // `report.json` is a projection for whoever reads the run afterwards,
         // and `TaskRunStatus` is `pub` and `Deserialize` because that reader
         // may be someone else's program. Every variant added to a serde-tagged
@@ -12115,11 +12124,11 @@ mod tests {
         let repo = temp_engine_repo("resumewindow");
         seed(
             &repo,
-            "## One\n<!-- tactus: id=t1 kind=implement depends= -->\n",
+            "## One\n<!-- upstroke: id=t1 kind=implement depends= -->\n",
             Some("[routing]\nimplement = { chain = [\"small\"], attempts_per = 2 }\n"),
         );
         let mut opts = options(&repo);
-        opts.config_path = Some(repo.join("tactus.toml"));
+        opts.config_path = Some(repo.join("upstroke.toml"));
         opts.budget_usd = Some(0.05);
         let rejected = source(vec![Effect::EditFile], vec![ReviewBehavior::Fail]);
         let stopped = run_with(&opts, &rejected).expect("run");
@@ -12136,7 +12145,7 @@ mod tests {
         assert!(seen.held, "though a resume does hold it");
         let out = crate::status::render(&seen);
         assert!(out.contains("run stopped at its budget"), "{out}");
-        assert!(out.contains("tactus resume"), "{out}");
+        assert!(out.contains("upstroke resume"), "{out}");
         assert!(out.contains("another process holds this run"), "{out}");
         assert!(!out.contains("run in progress"), "{out}");
     }
@@ -12158,11 +12167,11 @@ mod tests {
         let repo = temp_engine_repo("budgetjam");
         seed(
             &repo,
-            "## One\n<!-- tactus: id=t1 kind=implement depends= -->\n",
+            "## One\n<!-- upstroke: id=t1 kind=implement depends= -->\n",
             Some("[routing]\nimplement = { chain = [\"small\"], attempts_per = 2 }\n"),
         );
         let mut opts = options(&repo);
-        opts.config_path = Some(repo.join("tactus.toml"));
+        opts.config_path = Some(repo.join("upstroke.toml"));
         opts.budget_usd = Some(0.05);
         let rejected = source(
             vec![Effect::JamCleanupAfterReview],
@@ -12200,15 +12209,15 @@ mod tests {
         let repo = temp_engine_repo("budgetdecline");
         seed(
             &repo,
-            "## One\n<!-- tactus: id=t1 kind=implement depends= -->\n\n\
-             ## Two\n<!-- tactus: id=t2 kind=implement depends= -->\n",
+            "## One\n<!-- upstroke: id=t1 kind=implement depends= -->\n\n\
+             ## Two\n<!-- upstroke: id=t2 kind=implement depends= -->\n",
             Some(
                 "[routing]\nimplement = { chain = [\"small\"], attempts_per = 1 }\n\n\
                  [budgets]\nrun_usd = 0.05\n",
             ),
         );
         let mut opts = options(&repo);
-        opts.config_path = Some(repo.join("tactus.toml"));
+        opts.config_path = Some(repo.join("upstroke.toml"));
         let source = fake(Effect::EditFile);
         let report = run_with(&opts, &source).expect("run");
         assert_eq!(report.outcome(), RunOutcome::BudgetExceeded, "{report:?}");

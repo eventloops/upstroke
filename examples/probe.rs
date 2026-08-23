@@ -1,11 +1,11 @@
 //! Probe and discover every registered agent adapter — what pre-flight would
-//! see, and what `tactus connect` would write about it:
+//! see, and what `upstroke connect` would write about it:
 //! `cargo run --example probe`
 //!
 //! Zero spend: `probe()` reads `--version` and `--help`, and `discover()` asks
 //! each vendor's CLI about its own account. Neither runs a model.
 
-use tactus::agent;
+use upstroke::agent;
 
 fn main() {
     for adapter in agent::ADAPTERS {

@@ -18,7 +18,7 @@ use super::bin::{self, Invocation};
 use super::proc::{self, ProcessOutput};
 use super::{AgentAdapter, AuthState, Caps, Discovery, TaskRun, looks_rate_limited};
 use crate::capacity::PoolKind;
-use crate::error::TactusError;
+use crate::error::UpstrokeError;
 use crate::ir::{Effort, Outcome, OutcomeStatus, PermissionMode, Usage, WorkerProfile};
 use crate::util;
 
@@ -55,7 +55,7 @@ impl AgentAdapter for ClaudeCodeAdapter {
         ADAPTER_ID
     }
 
-    fn probe(&self) -> Result<Caps, TactusError> {
+    fn probe(&self) -> Result<Caps, UpstrokeError> {
         let invocation = locate()?;
         let out = proc::run_with_timeout(
             invocation.command(&["--version".to_owned()]),
@@ -63,7 +63,7 @@ impl AgentAdapter for ClaudeCodeAdapter {
             PROBE_TIMEOUT,
         )?;
         if out.output_limited {
-            return Err(TactusError::Agent {
+            return Err(UpstrokeError::Agent {
                 message: format!(
                     "`{}` --version exceeded the output limit",
                     invocation.display()
@@ -71,12 +71,12 @@ impl AgentAdapter for ClaudeCodeAdapter {
             });
         }
         if out.timed_out {
-            return Err(TactusError::Agent {
+            return Err(UpstrokeError::Agent {
                 message: format!("`{}` --version timed out", invocation.display()),
             });
         }
         if out.code != Some(0) {
-            return Err(TactusError::Agent {
+            return Err(UpstrokeError::Agent {
                 message: format!(
                     "`{}` --version exited with {:?}: {}",
                     invocation.display(),
@@ -111,21 +111,21 @@ impl AgentAdapter for ClaudeCodeAdapter {
         })
     }
 
-    fn build(&self, run: &TaskRun) -> Result<Command, TactusError> {
+    fn build(&self, run: &TaskRun) -> Result<Command, UpstrokeError> {
         let invocation = locate()?;
         let mut cmd = invocation.command(&build_args(run));
         cmd.current_dir(&run.workspace);
         Ok(cmd)
     }
 
-    fn parse(&self, out: &ProcessOutput) -> Result<Outcome, TactusError> {
+    fn parse(&self, out: &ProcessOutput) -> Result<Outcome, UpstrokeError> {
         Ok(parse_output(out))
     }
 
     /// `claude auth status --json` — a zero-spend auth probe that handles no
     /// token and reads no credential file: the CLI answers about itself, and
     /// this reads its answer.
-    fn discover(&self, _caps: &Caps) -> Result<Discovery, TactusError> {
+    fn discover(&self, _caps: &Caps) -> Result<Discovery, UpstrokeError> {
         let invocation = locate()?;
         let out = proc::run_with_timeout(
             invocation.command(&["auth".to_owned(), "status".to_owned(), "--json".to_owned()]),
@@ -138,7 +138,7 @@ impl AgentAdapter for ClaudeCodeAdapter {
         // had been confirmed against this machine.
         discovery.notes.push(
             "this CLI offers no non-interactive model listing, so the roster for this agent is \
-             the catalog shipped with tactus, not something confirmed here"
+             the catalog shipped with upstroke, not something confirmed here"
                 .to_owned(),
         );
         Ok(discovery)
@@ -150,28 +150,28 @@ impl AgentAdapter for ClaudeCodeAdapter {
         gate_cmds: &[String],
         dir: &std::path::Path,
         stem: &str,
-    ) -> Result<Option<PathBuf>, TactusError> {
+    ) -> Result<Option<PathBuf>, UpstrokeError> {
         let path = dir.join(format!("{stem}.json"));
         util::write_json(&path, &permission_settings(profile, gate_cmds))?;
         Ok(Some(path))
     }
 }
 
-fn checked_help(program: &str, output: &ProcessOutput) -> Result<String, TactusError> {
+fn checked_help(program: &str, output: &ProcessOutput) -> Result<String, UpstrokeError> {
     if output.output_limited {
-        return Err(TactusError::Agent {
+        return Err(UpstrokeError::Agent {
             message: format!(
                 "`{program}` --help exceeded the output limit; effort support could not be verified"
             ),
         });
     }
     if output.timed_out {
-        return Err(TactusError::Agent {
+        return Err(UpstrokeError::Agent {
             message: format!("`{program}` --help timed out; effort support could not be verified"),
         });
     }
     if output.code != Some(0) {
-        return Err(TactusError::Agent {
+        return Err(UpstrokeError::Agent {
             message: format!(
                 "`{program}` --help exited with {:?}: {}",
                 output.code,
@@ -181,7 +181,7 @@ fn checked_help(program: &str, output: &ProcessOutput) -> Result<String, TactusE
     }
     let text = format!("{}\n{}", output.stdout, output.stderr);
     if text.trim().is_empty() {
-        return Err(TactusError::Agent {
+        return Err(UpstrokeError::Agent {
             message: format!(
                 "`{program}` --help returned no output; effort support could not be verified"
             ),
@@ -190,7 +190,7 @@ fn checked_help(program: &str, output: &ProcessOutput) -> Result<String, TactusE
     Ok(text)
 }
 
-fn validate_help(version: &str, help: &str) -> Result<(), TactusError> {
+fn validate_help(version: &str, help: &str) -> Result<(), UpstrokeError> {
     let missing_flags: Vec<&str> = REQUIRED_FLAGS
         .into_iter()
         .filter(|flag| !super::advertises_flag(help, flag))
@@ -201,17 +201,17 @@ fn validate_help(version: &str, help: &str) -> Result<(), TactusError> {
         )
         .collect();
     if !missing_flags.is_empty() {
-        return Err(TactusError::Agent {
+        return Err(UpstrokeError::Agent {
             message: format!(
                 "claude {version} does not advertise required flag(s): {}. This adapter pins \
-                 known-good behavior per version — upgrade tactus or pin an older claude.",
+                 known-good behavior per version — upgrade upstroke or pin an older claude.",
                 missing_flags.join(", ")
             ),
         });
     }
     let missing_efforts = super::missing_effort_levels(help);
     if !missing_efforts.is_empty() {
-        return Err(TactusError::Agent {
+        return Err(UpstrokeError::Agent {
             message: format!(
                 "claude {version} advertises `--effort` but not required level(s): {}. Refusing \
                  before spend because this run may request any shared effort level.",
@@ -300,7 +300,7 @@ pub fn permission_settings(profile: &WorkerProfile, gate_cmds: &[String]) -> Val
             // .git/ config escalates its own permissions for the rest of the
             // run (invariant 1 and §20).
             //
-            // `.tactus/` joins them now that `events.jsonl` is the source of
+            // `.upstroke/` joins them now that `events.jsonl` is the source of
             // truth: an agent that can append to it could forge a
             // `task_committed`, and one that can truncate it could erase its
             // own failures. Writes there are also never legitimate — the
@@ -323,12 +323,12 @@ pub fn permission_settings(profile: &WorkerProfile, gate_cmds: &[String]) -> Val
                 "Edit(**/.claude/**)",
                 "Write(.git/**)",
                 "Edit(.git/**)",
-                "Write(.tactus/**)",
-                "Edit(.tactus/**)",
-                "Write(**/.tactus/**)",
-                "Edit(**/.tactus/**)",
-                "Read(.tactus/**)",
-                "Read(**/.tactus/**)",
+                "Write(.upstroke/**)",
+                "Edit(.upstroke/**)",
+                "Write(**/.upstroke/**)",
+                "Edit(**/.upstroke/**)",
+                "Read(.upstroke/**)",
+                "Read(**/.upstroke/**)",
             ],
         }
     })
@@ -574,7 +574,7 @@ fn candidate_names() -> &'static [&'static str] {
 /// This adapter's own resolution cache; `bin::locate` fills it once.
 static RESOLVED: OnceLock<Option<Invocation>> = OnceLock::new();
 
-fn locate() -> Result<Invocation, TactusError> {
+fn locate() -> Result<Invocation, UpstrokeError> {
     bin::locate(candidate_names(), &RESOLVED, |tried| {
         format!(
             "claude binary not found on PATH (looked for {}); install Claude Code or adjust PATH",
@@ -752,10 +752,10 @@ mod tests {
             let settings = permission_settings(&profile(permissions), &["cargo test".to_owned()]);
             let deny = settings["permissions"]["deny"].to_string();
             for rule in [
-                "Write(.tactus/**)",
-                "Edit(.tactus/**)",
-                "Write(**/.tactus/**)",
-                "Edit(**/.tactus/**)",
+                "Write(.upstroke/**)",
+                "Edit(.upstroke/**)",
+                "Write(**/.upstroke/**)",
+                "Edit(**/.upstroke/**)",
             ] {
                 assert!(
                     deny.contains(rule),
@@ -765,7 +765,7 @@ mod tests {
             // Defence in depth only — the enforceable half of withholding is
             // §15's split, which puts transcripts outside the workspace where
             // no rule is needed.
-            assert!(deny.contains("Read(.tactus/**)"), "{deny}");
+            assert!(deny.contains("Read(.upstroke/**)"), "{deny}");
         }
     }
 

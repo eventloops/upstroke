@@ -30,7 +30,7 @@ if [[ ! "${GITHUB_REPOSITORY:-}" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]]; then
 fi
 
 pages="$(gh api --paginate --slurp \
-  "repos/$GITHUB_REPOSITORY/commits/$head_sha/check-runs?check_name=tactus-frontier-review&app_id=$expected_app_id&filter=all&per_page=100" \
+  "repos/$GITHUB_REPOSITORY/commits/$head_sha/check-runs?check_name=upstroke-frontier-review&app_id=$expected_app_id&filter=all&per_page=100" \
   -H 'Accept: application/vnd.github+json' \
   -H 'X-GitHub-Api-Version: 2026-03-10')"
 check_runs="$(jq '{check_runs: [.[].check_runs[]]}' <<< "$pages")"
@@ -53,7 +53,7 @@ while IFS= read -r item; do
     --arg head_sha "$head_sha" \
     --argjson expected_app_id "$expected_app_id" \
     '.id == $check_id
-      and .name == "tactus-frontier-review"
+      and .name == "upstroke-frontier-review"
       and .head_sha == $head_sha
       and .app.id == $expected_app_id
       and .status == "completed"

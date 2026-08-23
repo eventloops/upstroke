@@ -2,7 +2,7 @@
 
 **Verdict.** Competitive analysis, kill criteria, positioning, and the enterprise and
 commercial path are maintained in a private companion repository, not in `DESIGN.md` or
-anywhere under `keybindings/tactus`. The public repository carries the engine, its technical
+anywhere under `eventloops/upstroke`. The public repository carries the engine, its technical
 design, its trust model, its process records, and the **engineering consequences** of
 strategy decisions — never the strategy itself. Moved today, from `DESIGN.md` at
 `0cc44d8255620b2c935156e28c6b5bcb080dc0ab`: the §2 "competitive reality" paragraph, the
@@ -18,7 +18,7 @@ documents rely on.
   trust model, the review process, the ledger and the self-hosting receipt
   (`2026-08-11-self-hosting-v02.md`) are only worth anything if a stranger can read them.
   Why the project believes it will win is not part of that contract.
-- **The engine's source is public either way.** `tactus` 0.1.0 is on crates.io and a
+- **The engine's source is public either way.** `upstroke` 0.1.0 is on crates.io and a
   published crate cannot be unpublished. Privacy can still cover the strategy layer, so
   that is the layer that moves.
 - **Taking the whole repository private was weighed and rejected.** Actions minutes become
@@ -46,7 +46,7 @@ documents rely on.
 ## Measured vs assumed
 
 Measured: the repository has no forks (2026-08-22), so nothing already copied is being
-chased; `tactus` 0.1.0 is on crates.io; a warm CI run on this repository costs roughly 35
+chased; `upstroke` 0.1.0 is on crates.io; a warm CI run on this repository costs roughly 35
 billable minute-equivalents at the Windows and macOS multipliers, and the prior seven days
 saw 83 CI runs and 11 attestation reruns. Assumed, and named: that the strategy record is
 what a competitor would copy, and that the engine's ideas are not — they are executed in
@@ -58,7 +58,7 @@ public regardless, so secrecy buys nothing there.
 - **Leave everything public.** The strategy layer has option value in secrecy and no
   auditability value in public.
 - **Strip the engineering consequences along with the strategy.** Rejected: per-seat
-  deployment, the org-shared-pool `Unknown` rule, policy distribution through `tactus.toml`,
+  deployment, the org-shared-pool `Unknown` rule, policy distribution through `upstroke.toml`,
   the refinement metric and the importer's priority are cited by `acceptance/RESULT.md`,
   two decision records and three proposals. They stay in the §23.1 stub, unchanged in
   substance.

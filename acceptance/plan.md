@@ -7,11 +7,11 @@ small, self-contained, and full of real edge cases, so a small model can
 plausibly do the easy half and plausibly fumble the hard half.
 
 Read the annotations, not the prose: the `kind` on each task is what selects its
-chain from `tactus.toml`, and that is where the provocation lives.
+chain from `upstroke.toml`, and that is where the provocation lives.
 
 ## Document the size-parsing API
 
-<!-- tactus: id=readme kind=docs depends= out=size-api -->
+<!-- upstroke: id=readme kind=docs depends= out=size-api -->
 
 Add a `## Parsing sizes` section to `README.md` describing a public function
 `parse_size(input: &str) -> Result<u64, SizeError>` that turns a human-written
@@ -35,7 +35,7 @@ implements.
 
 ## Implement the happy path
 
-<!-- tactus: id=parse-basic kind=implement depends=readme needs=size-api paths=src/** -->
+<!-- upstroke: id=parse-basic kind=implement depends=readme needs=size-api paths=src/** -->
 
 Create `src/size.rs` and wire it into `src/lib.rs`. Implement `parse_size` for
 the cases the README documents: a bare integer is a count of bytes, and the
@@ -62,7 +62,7 @@ Add unit tests covering one example of each unit.
 
 ## Handle the edge cases
 
-<!-- tactus: id=parse-edges kind=fix depends=parse-basic paths=src/** -->
+<!-- upstroke: id=parse-edges kind=fix depends=parse-basic paths=src/** -->
 
 Harden `parse_size` against everything the happy path ignores. Every case below
 must be handled deliberately — a panic, a silent truncation, or a wrong answer
@@ -99,7 +99,7 @@ is a failure, and so is an error type that cannot tell the cases apart.
 
 ## Decide the rendering contract
 
-<!-- tactus: id=format-policy kind=implement depends=parse-edges paths=src/** -->
+<!-- upstroke: id=format-policy kind=implement depends=parse-edges paths=src/** -->
 
 Add the inverse function, `format_size(bytes: u64) -> String`.
 
@@ -125,12 +125,12 @@ contains no precedent to infer from.
 
 <!-- §21(d), first half: this is under-specified in a way that changes what
      correct means and cannot be resolved by reading the code — which is the
-     exact condition the prompt teaches for `TACTUS-QUESTION:`. When the agent
+     exact condition the prompt teaches for `UPSTROKE-QUESTION:`. When the agent
      stops to ask, THIS task parks and nothing else about it is lost. -->
 
 ## Start a changelog
 
-<!-- tactus: id=changelog kind=docs depends= -->
+<!-- upstroke: id=changelog kind=docs depends= -->
 
 Create `CHANGELOG.md` with a `## Unreleased` section, and under it a single
 bullet noting that size parsing was added.
