@@ -42,6 +42,8 @@ pub mod candidate;
 pub mod emit;
 pub mod identity;
 pub mod seams;
+pub mod select;
+pub mod settle;
 pub mod startup;
 
 pub use candidate::{
@@ -58,6 +60,12 @@ pub use identity::{
 pub use seams::{
     HarnessTopologyHooks, IdSource, NoTopologyHooks, RealIds, SystemClock, TimeSource,
     TopologyHooks,
+};
+pub use select::{Admitted, Breach, Ceiling, Spend, Step, checkpoint, select};
+pub use settle::{
+    Deferral, FinishedAttempt, ManagedWorktrees, RetryOutcome, RetryRequest, Settled,
+    WorktreeVerify, close_generation, close_retained, rematerialize_question, retry, run_ending,
+    settle_failed, settle_succeeded,
 };
 pub use startup::{
     BarrierHeld, CensusInputs, FreshCensused, ResumeCensused, RunDirCensusReport, RunDirEntry,

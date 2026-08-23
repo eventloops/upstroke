@@ -3334,6 +3334,10 @@ fn the_stable_prefix_barrier_is_the_only_way_a_log_becomes_a_topology_fold() {
         "src/engine/topology/emit.rs",
         // This funnel: `establish_stable_prefix` is the one place a log becomes
         // a fold.
+        // PR7's selection and settlement halves. Both read a fold; neither
+        // builds one from bytes.
+        "src/engine/topology/select.rs",
+        "src/engine/topology/settle.rs",
         "src/events/log.rs",
         // ST-14's bounded reachability census over fold states.
         "src/topology/census.rs",
