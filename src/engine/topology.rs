@@ -41,6 +41,7 @@
 pub mod emit;
 pub mod identity;
 pub mod seams;
+pub mod startup;
 
 pub use emit::{
     AppendError, AppendOutcome, EmitError, EmitState, FirstAppendDisposition, RunIdentity, emit,
@@ -52,4 +53,8 @@ pub use identity::{
 pub use seams::{
     HarnessTopologyHooks, IdSource, NoTopologyHooks, RealIds, SystemClock, TimeSource,
     TopologyHooks,
+};
+pub use startup::{
+    BarrierHeld, CensusInputs, FreshCensused, ResumeCensused, RunDirCensusReport, RunDirEntry,
+    RunDirOutcome, StartupCensus, WorktreeLocked, resume_census, startup_census,
 };

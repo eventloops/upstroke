@@ -3033,7 +3033,7 @@ fn census_returns_the_only_token_that_reaches_a_consumer() {
         if path == census_module {
             continue;
         }
-        if production.contains("CensusComplete {") {
+        if constructs_the_token(&production) {
             offenders.push(path.display().to_string());
         }
     }
@@ -3065,6 +3065,71 @@ fn census_returns_the_only_token_that_reaches_a_consumer() {
     let complete = harness.census(&fresh(INC_1)).expect("an empty census");
     assert_eq!(complete.report().incarnation, INC_1);
     assert_eq!(complete.report().orphan_window, super::orphan_window());
+}
+
+/// Whether `production` contains a **construction** of the token, as opposed to
+/// a return type whose function body brace follows it.
+///
+/// `CensusComplete {` is also the last sixteen characters of
+/// `-> &CensusComplete {`, and the first legitimate consumer of the token
+/// necessarily has an accessor of that shape — PR7's startup census holds the
+/// token and hands it out. A bare `contains` therefore reports the first real
+/// caller as a forger, which is a scan that has stopped measuring what it
+/// names.
+///
+/// **The exclusion is the arrow, not the ampersand.** Excluding every
+/// `CensusComplete {` preceded by `&` would also excuse `&CensusComplete { .. }`
+/// — a reference to a struct literal, which *is* a construction and is the
+/// shape a forged token takes when it is passed to something that borrows one.
+/// Only a return position can be followed by a body brace, so only a return
+/// position is excused. Every construction shape — `CensusComplete { .. }`,
+/// `&CensusComplete { .. }`, `Ok(CensusComplete { .. }`,
+/// `Self::CensusComplete { .. }` — still matches, and the positive control
+/// above is what keeps that true.
+fn constructs_the_token(production: &str) -> bool {
+    production.match_indices("CensusComplete {").any(|(at, _)| {
+        let before = production[..at].trim_end();
+        let before = before.strip_suffix('&').unwrap_or(before);
+        !before.trim_end().ends_with("->")
+    })
+}
+
+/// The scan's needle classifies a return position and a construction apart,
+/// including the construction that hides behind an ampersand.
+///
+/// A unit test over strings rather than a planted file, because a planted
+/// forgery **does not compile**: `CensusComplete`'s fields are private, so the
+/// type system already refuses one. That makes this scan defence-in-depth for
+/// the day those fields widen — and defence-in-depth that is never exercised is
+/// the thing this project keeps paying for. So the classifier is exercised
+/// directly.
+#[test]
+fn the_token_scan_excuses_a_return_position_and_nothing_else() {
+    for excused in [
+        "fn containers(&self) -> &CensusComplete {",
+        "fn into_inner(self) -> CensusComplete {",
+        "    pub fn report(&self) -> &CensusComplete  {",
+    ] {
+        assert!(
+            !constructs_the_token(excused),
+            "a return position was read as a construction: {excused}"
+        );
+    }
+
+    for construction in [
+        "let token = CensusComplete { report };",
+        // The one lane C's first needle would have missed: a reference to a
+        // struct literal is a construction, and it is the shape a forged token
+        // takes when it is handed to something that borrows one.
+        "consume(&CensusComplete { report });",
+        "Ok(CensusComplete { report })",
+        "Self::CensusComplete { report }",
+    ] {
+        assert!(
+            constructs_the_token(construction),
+            "a construction was excused: {construction}"
+        );
+    }
 }
 
 /// Every `src/**/*.rs`, sorted.
