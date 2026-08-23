@@ -20,7 +20,7 @@ concurrency:
 
 jobs:
   policy:
-    name: tactus-pr-policy
+    name: upstroke-pr-policy
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:

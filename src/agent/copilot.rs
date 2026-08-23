@@ -55,7 +55,7 @@ use serde_json::json;
 use super::bin::{self, Invocation};
 use super::proc::{self, ProcessOutput};
 use super::{AgentAdapter, Caps, Discovery, TaskRun, looks_rate_limited};
-use crate::error::TactusError;
+use crate::error::UpstrokeError;
 use crate::ir::{Effort, Outcome, OutcomeStatus, PermissionMode, WorkerProfile};
 use crate::util;
 
@@ -100,7 +100,7 @@ impl AgentAdapter for CopilotAdapter {
         ADAPTER_ID
     }
 
-    fn probe(&self) -> Result<Caps, TactusError> {
+    fn probe(&self) -> Result<Caps, UpstrokeError> {
         let invocation = locate()?;
         let out = proc::run_with_timeout(
             invocation.command(&["--version".to_owned()]),
@@ -108,7 +108,7 @@ impl AgentAdapter for CopilotAdapter {
             PROBE_TIMEOUT,
         )?;
         if out.output_limited {
-            return Err(TactusError::Agent {
+            return Err(UpstrokeError::Agent {
                 message: format!(
                     "`{}` --version exceeded the output limit",
                     invocation.display()
@@ -116,12 +116,12 @@ impl AgentAdapter for CopilotAdapter {
             });
         }
         if out.timed_out {
-            return Err(TactusError::Agent {
+            return Err(UpstrokeError::Agent {
                 message: format!("`{}` --version timed out", invocation.display()),
             });
         }
         if out.code != Some(0) {
-            return Err(TactusError::Agent {
+            return Err(UpstrokeError::Agent {
                 message: format!(
                     "`{}` --version exited with {:?}: {}",
                     invocation.display(),
@@ -161,14 +161,14 @@ impl AgentAdapter for CopilotAdapter {
         })
     }
 
-    fn build(&self, run: &TaskRun) -> Result<Command, TactusError> {
+    fn build(&self, run: &TaskRun) -> Result<Command, UpstrokeError> {
         let invocation = locate()?;
         let mut cmd = invocation.command(&build_args(run));
         cmd.current_dir(&run.workspace);
         Ok(cmd)
     }
 
-    fn parse(&self, out: &ProcessOutput) -> Result<Outcome, TactusError> {
+    fn parse(&self, out: &ProcessOutput) -> Result<Outcome, UpstrokeError> {
         Ok(parse_output(out))
     }
 
@@ -186,7 +186,7 @@ impl AgentAdapter for CopilotAdapter {
     /// here, and it still is: [`Caps::model_list`] gates any future
     /// enumeration, so the day this CLI grows one, `connect` starts
     /// cross-checking the catalog without another decision being made.
-    fn discover(&self, caps: &Caps) -> Result<Discovery, TactusError> {
+    fn discover(&self, caps: &Caps) -> Result<Discovery, UpstrokeError> {
         // Still located, so `connect` fails this agent the same way pre-flight
         // would rather than writing a pool for a binary that is not there.
         let invocation = locate()?;
@@ -198,7 +198,7 @@ impl AgentAdapter for CopilotAdapter {
         if !caps.model_list {
             discovery.notes.push(
                 "and no model listing either, so the roster for this agent is the catalog \
-                 shipped with tactus, not something confirmed here"
+                 shipped with upstroke, not something confirmed here"
                     .to_owned(),
             );
         }
@@ -222,7 +222,7 @@ impl AgentAdapter for CopilotAdapter {
         gate_cmds: &[String],
         dir: &std::path::Path,
         stem: &str,
-    ) -> Result<Option<PathBuf>, TactusError> {
+    ) -> Result<Option<PathBuf>, UpstrokeError> {
         let path = dir.join(format!("{stem}.json"));
         util::write_json(
             &path,
@@ -238,21 +238,21 @@ impl AgentAdapter for CopilotAdapter {
     }
 }
 
-fn checked_help(program: &str, output: &ProcessOutput) -> Result<String, TactusError> {
+fn checked_help(program: &str, output: &ProcessOutput) -> Result<String, UpstrokeError> {
     if output.output_limited {
-        return Err(TactusError::Agent {
+        return Err(UpstrokeError::Agent {
             message: format!(
                 "`{program}` --help exceeded the output limit; effort support could not be verified"
             ),
         });
     }
     if output.timed_out {
-        return Err(TactusError::Agent {
+        return Err(UpstrokeError::Agent {
             message: format!("`{program}` --help timed out; effort support could not be verified"),
         });
     }
     if output.code != Some(0) {
-        return Err(TactusError::Agent {
+        return Err(UpstrokeError::Agent {
             message: format!(
                 "`{program}` --help exited with {:?}: {}",
                 output.code,
@@ -262,7 +262,7 @@ fn checked_help(program: &str, output: &ProcessOutput) -> Result<String, TactusE
     }
     let text = format!("{}\n{}", output.stdout, output.stderr);
     if text.trim().is_empty() {
-        return Err(TactusError::Agent {
+        return Err(UpstrokeError::Agent {
             message: format!(
                 "`{program}` --help returned no output; effort support could not be verified"
             ),
@@ -271,7 +271,7 @@ fn checked_help(program: &str, output: &ProcessOutput) -> Result<String, TactusE
     Ok(text)
 }
 
-fn validate_help(version: &str, help: &str) -> Result<(), TactusError> {
+fn validate_help(version: &str, help: &str) -> Result<(), UpstrokeError> {
     let missing_flags: Vec<&str> = REQUIRED_FLAGS
         .into_iter()
         .filter(|flag| !super::advertises_flag(help, flag))
@@ -282,17 +282,17 @@ fn validate_help(version: &str, help: &str) -> Result<(), TactusError> {
         )
         .collect();
     if !missing_flags.is_empty() {
-        return Err(TactusError::Agent {
+        return Err(UpstrokeError::Agent {
             message: format!(
                 "copilot {version} does not advertise required flag(s): {}. This adapter pins \
-                 known-good behavior per version — upgrade tactus or pin an older copilot.",
+                 known-good behavior per version — upgrade upstroke or pin an older copilot.",
                 missing_flags.join(", ")
             ),
         });
     }
     let missing_efforts = super::missing_effort_levels(help);
     if !missing_efforts.is_empty() {
-        return Err(TactusError::Agent {
+        return Err(UpstrokeError::Agent {
             message: format!(
                 "copilot {version} advertises `--effort` but not required level(s): {}. Refusing \
                  before spend because this run may request any shared effort level.",
@@ -455,7 +455,7 @@ fn candidate_names() -> &'static [&'static str] {
 /// This adapter's own resolution cache; `bin::locate` fills it once.
 static RESOLVED: OnceLock<Option<Invocation>> = OnceLock::new();
 
-fn locate() -> Result<Invocation, TactusError> {
+fn locate() -> Result<Invocation, UpstrokeError> {
     bin::locate(candidate_names(), &RESOLVED, |tried| {
         format!(
             "copilot binary not found on PATH (looked for {}); install the GitHub Copilot CLI \

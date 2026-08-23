@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
 # =============================================================================
-# tactus-preflight — prove BOTH agent CLIs can actually make a call, right now.
+# upstroke-preflight — prove BOTH agent CLIs can actually make a call, right now.
 # =============================================================================
 #
 # WHY LIVE CALLS AND NOTHING ELSE
-#   File existence lies: ~/.tactus-env can hold a 92-character fragment that
+#   File existence lies: ~/.upstroke-env can hold a 92-character fragment that
 #   looks perfectly plausible and returns 401 on first use. That happened during
 #   this box's build.
 #   `exp` claims lie: refresh tokens rotate, so a token whose expiry is in the
@@ -20,8 +20,8 @@
 #   1  one or more failed  (cron alerts on this)
 #
 # USAGE
-#   tactus-preflight            # run all checks
-#   tactus-preflight --quiet    # only print on failure (used by cron)
+#   upstroke-preflight            # run all checks
+#   upstroke-preflight --quiet    # only print on failure (used by cron)
 # =============================================================================
 
 set -uo pipefail
@@ -29,14 +29,14 @@ set -uo pipefail
 # Non-interactive shells get nothing from ~/.bashrc (it returns early), so the
 # environment must be sourced explicitly. Cron is even more barren than ssh.
 [ -f "$HOME/.cargo/env" ]  && . "$HOME/.cargo/env"
-[ -f "$HOME/.tactus-env" ] && . "$HOME/.tactus-env"
+[ -f "$HOME/.upstroke-env" ] && . "$HOME/.upstroke-env"
 export PATH="$HOME/.local/bin:$HOME/.cargo/bin:/usr/local/bin:/usr/bin:/bin:$PATH"
 
 readonly MARKER="PREFLIGHT_OK_7Q2X"
-readonly STATUS_FILE="$HOME/.tactus-preflight.status"
-readonly LOG_FILE="$HOME/.tactus-preflight.log"
+readonly STATUS_FILE="$HOME/.upstroke-preflight.status"
+readonly LOG_FILE="$HOME/.upstroke-preflight.log"
 readonly CALL_TIMEOUT=240
-readonly GH_REPO="${TACTUS_GH_REPO:-keybindings/tactus}"
+readonly GH_REPO="${UPSTROKE_GH_REPO:-eventloops/upstroke}"
 readonly QUIET="${1:-}"
 
 FAILURES=()
@@ -50,7 +50,7 @@ ok()   { say "  [ ok ] $*"; }
 # cron mail at 3am.
 bad()  { printf '  [FAIL] %s\n' "$*"; FAILURES+=("$*"); }
 
-say "tactus-preflight  $START_TS"
+say "upstroke-preflight  $START_TS"
 say
 
 # ---------------------------------------------------------------------------
@@ -64,7 +64,7 @@ if [ -n "${CLAUDE_CODE_OAUTH_TOKEN:-}" ]; then
     bad "token is suspiciously short (${#CLAUDE_CODE_OAUTH_TOKEN}); a truncated paste looks exactly like this"
   fi
 else
-  bad "CLAUDE_CODE_OAUTH_TOKEN is empty or unset in ~/.tactus-env"
+  bad "CLAUDE_CODE_OAUTH_TOKEN is empty or unset in ~/.upstroke-env"
 fi
 
 # ---------------------------------------------------------------------------
@@ -86,7 +86,7 @@ fi
 #
 # This box has two independent Claude credentials and they can diverge silently:
 #
-#   ~/.tactus-env  CLAUDE_CODE_OAUTH_TOKEN  -- static, cannot refresh itself.
+#   ~/.upstroke-env  CLAUDE_CODE_OAUTH_TOKEN  -- static, cannot refresh itself.
 #                                              Sourced by this script, so [2/8]
 #                                              above exercises THIS path.
 #   ~/.claude/.credentials.json               -- OAuth, auto-refreshing. Used by
@@ -95,7 +95,7 @@ fi
 #                                              workers run without the env var.
 #
 # So [2/8] can pass on a token no worker uses, and a half-completed rotation --
-# `/login` to a new account without rewriting ~/.tactus-env, or the reverse --
+# `/login` to a new account without rewriting ~/.upstroke-env, or the reverse --
 # leaves this script certifying an account nothing runs on. That is the same
 # shape as [4b/8]: a check that exercised a path the real work did not, which
 # reported PASS for seven hours while every codex file read failed.
@@ -111,7 +111,7 @@ if [ $worker_rc -eq 124 ]; then
 elif printf '%s' "$worker_out" | grep -q "$MARKER"; then
   ok "claude -p returned the marker without the env token -- workers can authenticate"
 else
-  bad "claude -p FAILED on the path every worker uses (rc=$worker_rc). [2/8] passing while this fails means ~/.claude/.credentials.json and ~/.tactus-env disagree: $(printf '%s' "$worker_out" | tail -2 | tr '\n' ' ')"
+  bad "claude -p FAILED on the path every worker uses (rc=$worker_rc). [2/8] passing while this fails means ~/.claude/.credentials.json and ~/.upstroke-env disagree: $(printf '%s' "$worker_out" | tail -2 | tr '\n' ' ')"
 fi
 
 # ---------------------------------------------------------------------------
@@ -329,7 +329,7 @@ rm -rf "$agy_dir"
 # ---------------------------------------------------------------------------
 say "[7/8] github: live API round-trip"
 if [ -z "${GH_TOKEN:-}" ]; then
-  bad "GH_TOKEN is empty or unset in ~/.tactus-env"
+  bad "GH_TOKEN is empty or unset in ~/.upstroke-env"
 else
   gh_out="$(timeout 60 gh api "repos/${GH_REPO}" --jq .full_name 2>&1)"
   gh_rc=$?
@@ -384,10 +384,10 @@ fi
 printf '%s FAIL (%s)\n' "$END_TS" "${FAILURES[*]}" >> "$LOG_FILE"
 
 # Alerting. No MTA and no push channel is configured on this box, so this is
-# deliberately local-only: syslog (journalctl -t tactus-preflight) plus a status
+# deliberately local-only: syslog (journalctl -t upstroke-preflight) plus a status
 # file that the login MOTD banner reads. If you want this on your phone, wire a
 # webhook in here -- that needs a URL only you can supply.
-logger -t tactus-preflight -p user.err "PREFLIGHT FAILED: ${FAILURES[*]}" 2>/dev/null || true
+logger -t upstroke-preflight -p user.err "PREFLIGHT FAILED: ${FAILURES[*]}" 2>/dev/null || true
 
 printf '\nFAIL — %d check(s) failed:\n' "${#FAILURES[@]}" >&2
 printf '  - %s\n' "${FAILURES[@]}" >&2

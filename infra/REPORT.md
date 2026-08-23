@@ -9,7 +9,7 @@
 
 ## 0. Final state (updated after Phase 8 restore)
 
-`/srv/tactus` is at **`73cd006`** (fast-forwarded from `df05503`) with the
+`/srv/upstroke` is at **`73cd006`** (fast-forwarded from `df05503`) with the
 in-flight snapshot restored:
 
 ```
@@ -160,8 +160,8 @@ All 7 `test-*.sh` gates pass. All 15 scripts in `.github/scripts/` are
 
    Per-worktree isolation was never the real requirement — cargo's directory lock
    only conflicts between **concurrent** builds. So the fix is a *bounded slot
-   pool*: `~/bin/tactus-build` takes an exclusive `flock` on one of
-   `TACTUS_SLOTS` (default 8) target dirs and runs the command with
+   pool*: `~/bin/upstroke-build` takes an exclusive `flock` on one of
+   `UPSTROKE_SLOTS` (default 8) target dirs and runs the command with
    `CARGO_TARGET_DIR` pointed at it. Full isolation, but paths repeat, so cache
    entries are reused.
 
@@ -181,7 +181,7 @@ All 7 `test-*.sh` gates pass. All 15 scripts in `.github/scripts/` are
    cargo-level hit, which beats an sccache-level hit outright. sccache remains
    useful as the second line, for when cargo *does* have to recompile.
 
-   **A bug in the first version of `tactus-build`, worth recording.** It took the
+   **A bug in the first version of `upstroke-build`, worth recording.** It took the
    slot lock with `flock <lockfile> <command>`, where the lock file lived inside
    the target dir. `flock(1)` passes its open fd through to the command; cargo
    started the **sccache server daemon** under that lock; the daemon inherited
@@ -199,8 +199,8 @@ All 7 `test-*.sh` gates pass. All 15 scripts in `.github/scripts/` are
    target dirs. Verified: three consecutive builds all select `slot1`, only one
    slot directory is created, and no process holds a lock afterwards.
 
-   **Usage:** `tactus-build cargo test --all-targets --all-features`. Never set
-   `CARGO_TARGET_DIR` per worktree. Set `TACTUS_SLOTS` at or above your maximum
+   **Usage:** `upstroke-build cargo test --all-targets --all-features`. Never set
+   `CARGO_TARGET_DIR` per worktree. Set `UPSTROKE_SLOTS` at or above your maximum
    concurrent build count.
 
    Caveat on scale: this was measured on a 60-package, 46k-line project whose
@@ -231,7 +231,7 @@ All 7 `test-*.sh` gates pass. All 15 scripts in `.github/scripts/` are
 
 8. **`git fetch <bundle> 'refs/*:refs/*'` is refused.** The bundle's ref is
    `refs/heads/codex/parallelism-design`, which is the branch checked out at
-   `/srv/tactus`, so git blocks the update. Fetched into `refs/bundle/*` instead —
+   `/srv/upstroke`, so git blocks the update. Fetched into `refs/bundle/*` instead —
    objects present, working tree untouched. Note `git bundle verify` *succeeded*
    here rather than reporting "lacks prerequisite commits", because it was run
    from inside a repo that already has `df05503`.
@@ -304,13 +304,13 @@ All 7 `test-*.sh` gates pass. All 15 scripts in `.github/scripts/` are
 
 16. **`codex login status` exits 0 while printing "Not logged in".** Measured on
     codex-cli 0.147.0. The exit code is worthless as a signal, so
-    `tactus-preflight` string-matches the output *and* does a real `codex exec`
+    `upstroke-preflight` string-matches the output *and* does a real `codex exec`
     round-trip. Same class of lie as the `exp`-claim warning in the brief.
 
 17. **`claude setup-token` prints the token once and saves it nowhere**, and the
     token is long enough to wrap in a standard terminal. Selecting the wrapped
     text by hand silently captured a **92-character fragment** that looked
-    entirely plausible — `~/.tactus-env` was written, the variable was set, the
+    entirely plausible — `~/.upstroke-env` was written, the variable was set, the
     length was non-zero — and returned `401 Invalid bearer token` on first use.
     Captured correctly on the second attempt by running the command under
     `script(1)`, which records the byte stream the program writes rather than the
@@ -363,7 +363,7 @@ All 7 `test-*.sh` gates pass. All 15 scripts in `.github/scripts/` are
     - tmpfs 48 G mounted, swap 32 GiB active (the `/etc/fstab` fix holding)
     - both RAID arrays `[2/2] [UU]`
     - tailnet on the same IP `<tailnet-ip>`, `ufw` active, all services up
-    - `RUSTC_WRAPPER`/`CARGO_INCREMENTAL`/`TACTUS_SLOTS` present in a
+    - `RUSTC_WRAPPER`/`CARGO_INCREMENTAL`/`UPSTROKE_SLOTS` present in a
       non-interactive shell
     - sccache disk cache survived (it lives on `/var/cache`, not the tmpfs)
     - repo at `73cd006` with the in-flight work intact
@@ -408,10 +408,10 @@ All 7 `test-*.sh` gates pass. All 15 scripts in `.github/scripts/` are
 | tmux | `3.4`, `history-limit 200000`, `mouse on` (verified live) |
 | bubblewrap | `0.9.0` at `/usr/bin/bwrap` (system copy, not bundled) |
 | jq | `jq-1.7` |
-| repo | `/srv/tactus` at `df05503`, porcelain clean, `core.autocrlf false` |
+| repo | `/srv/upstroke` at `df05503`, porcelain clean, `core.autocrlf false` |
 | migration bundle | 91/91 hashes OK **after** transfer |
 | design packet | `02bfed75…55df6` — exact match |
-| artifacts | 83 files, 2.4 M at `~/tactus-artifacts/` |
+| artifacts | 83 files, 2.4 M at `~/upstroke-artifacts/` |
 | unpushed commits | fetched to `refs/bundle/codex/parallelism-design`, `73cd006` present, exactly 3 commits |
 
 ## 5b. Access hardening (Phase 1c) — DONE
@@ -446,7 +446,7 @@ Serial-over-LAN.
 
 ## 5c. Preflight (Phase 5) — DONE
 
-`~/bin/tactus-preflight`, 4 checks, all live:
+`~/bin/upstroke-preflight`, 4 checks, all live:
 
 ```
 [1/4] claude: token present        108 chars, sk-ant-oat01-...
@@ -462,8 +462,8 @@ PASS
 - **Cron-tested.** Run under `env -i HOME=... SHELL=... PATH=/usr/bin:/bin` it
   still passes, so it will not silently die at 00:07.
 - **Cron:** `7 */6 * * *`, offset off the hour.
-- **Alerting:** syslog (`journalctl -t tactus-preflight`) + a status file read by
-  `/etc/update-motd.d/99-tactus-preflight`, so a failure is the first thing you
+- **Alerting:** syslog (`journalctl -t upstroke-preflight`) + a status file read by
+  `/etc/update-motd.d/99-upstroke-preflight`, so a failure is the first thing you
   see at login. There is no MTA and no push channel on this box — if you want
   this on your phone, a webhook needs wiring in, and that needs a URL only you
   can supply.
@@ -474,12 +474,12 @@ PASS
 - **Phase 8 step 3** — restoring `in-flight/` overwrites `src/lib.rs` and adds
   two files (`src/topology/mod.rs`, `src/topology/registry.rs`) that exist in no
   commit, no index and no bundle. Not touched.
-- Whether to fast-forward `/srv/tactus` from `df05503` to `73cd006` (a
+- Whether to fast-forward `/srv/upstroke` from `df05503` to `73cd006` (a
   fast-forward — no commits lost).
 - ~~Whether to mirror the ESP~~ — investigated and closed, see #12. Already
   correct, nothing to do.
 - ~~Whether to pursue cross-worktree sccache hits~~ — investigated and **fixed**,
-  see #5. Use `tactus-build`; 8.80 s → 4.62 s on the second worktree.
+  see #5. Use `upstroke-build`; 8.80 s → 4.62 s on the second worktree.
 - Whether to revoke the first Claude token (#17). It is visible in a screenshot
   but truncated by ~28 of 108 characters, so not practically recoverable.
   Console-side; low priority.

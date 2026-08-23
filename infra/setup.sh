@@ -43,9 +43,9 @@
 
 set -euo pipefail
 
-readonly TACTUS_REPO="https://github.com/keybindings/tactus.git"
-readonly TACTUS_DIR="/srv/tactus"
-readonly TACTUS_ENV="$HOME/.tactus-env"
+readonly UPSTROKE_REPO="https://github.com/eventloops/upstroke.git"
+readonly UPSTROKE_DIR="/srv/upstroke"
+readonly UPSTROKE_ENV="$HOME/.upstroke-env"
 readonly RAMTARGET="/mnt/ramtarget"
 readonly RAMTARGET_SIZE="48G"
 readonly SCCACHE_DIR="/var/cache/sccache"
@@ -115,15 +115,15 @@ ensure_line_sudo() {
 # RUSTC_WRAPPER and no CARGO_INCREMENTAL=0 -- i.e. no sccache and a near-zero
 # hit rate, with nothing in the output to tell you. So: PREPEND to .bashrc
 # (above the early return) and also append to .profile for login shells.
-readonly ENV_BLOCK_START='# --- tactus build env (must precede the non-interactive early return) ---'
-readonly ENV_BLOCK_END='# --- end tactus build env ---'
+readonly ENV_BLOCK_START='# --- upstroke build env (must precede the non-interactive early return) ---'
+readonly ENV_BLOCK_END='# --- end upstroke build env ---'
 
 ensure_shell_env() {
   local f block
   block=$(cat <<EOF
 ${ENV_BLOCK_START}
 [ -f "\$HOME/.cargo/env" ]  && . "\$HOME/.cargo/env"
-[ -f "\$HOME/.tactus-env" ] && . "\$HOME/.tactus-env"
+[ -f "\$HOME/.upstroke-env" ] && . "\$HOME/.upstroke-env"
 ${ENV_BLOCK_END}
 EOF
 )
@@ -131,7 +131,7 @@ EOF
     touch "$f"
     # Idempotent: drop any previous block and stray sourcing lines first.
     sed -i "/^${ENV_BLOCK_START}$/,/^${ENV_BLOCK_END}$/d" "$f"
-    sed -i '/\.cargo\/env/d; /tactus-env/d' "$f"
+    sed -i '/\.cargo\/env/d; /upstroke-env/d' "$f"
   done
   # .bashrc must be PREPENDED (early return lives near the top).
   { printf '%s\n' "$block"; cat "$HOME/.bashrc"; } > "$HOME/.bashrc.tmp"
@@ -281,7 +281,7 @@ phase_1c() {
   # precedence over sshd_config. We write it explicitly anyway so that removing
   # that drop-in cannot silently re-enable password login.
   if ! grep -qE '^PasswordAuthentication no' /etc/ssh/sshd_config; then
-    printf '\n# tactus: explicit, redundant with sshd_config.d/60-cloudimg-settings.conf.\nPasswordAuthentication no\nKbdInteractiveAuthentication no\n' \
+    printf '\n# upstroke: explicit, redundant with sshd_config.d/60-cloudimg-settings.conf.\nPasswordAuthentication no\nKbdInteractiveAuthentication no\n' \
       | sudo tee -a /etc/ssh/sshd_config >/dev/null
   fi
   # Validate BEFORE reloading. A bad config plus a reload is how people lose a box.
@@ -307,27 +307,27 @@ phase_1c() {
 # PREFLIGHT — install the token health check and its cron
 # =============================================================================
 #
-# Expects ~/bin/tactus-preflight and 99-tactus-preflight to sit alongside this
+# Expects ~/bin/upstroke-preflight and 99-upstroke-preflight to sit alongside this
 # script (they travel together). Run AFTER phase 5, since the preflight proves
 # tokens with live calls and cannot pass before they exist.
 #
 phase_preflight() {
   phase preflight "token health check + cron"
-  [ -x "$HOME/bin/tactus-preflight" ] || fail "~/bin/tactus-preflight missing"
+  [ -x "$HOME/bin/upstroke-preflight" ] || fail "~/bin/upstroke-preflight missing"
 
-  "$HOME/bin/tactus-preflight" || fail "preflight does not pass -- fix auth before installing cron"
+  "$HOME/bin/upstroke-preflight" || fail "preflight does not pass -- fix auth before installing cron"
 
   # 6-hourly, offset off the hour to avoid the cron stampede.
-  ( crontab -l 2>/dev/null | grep -v 'tactus-preflight'
-    echo "7 */6 * * * $HOME/bin/tactus-preflight --quiet >> $HOME/.tactus-preflight.cron.log 2>&1" ) | crontab -
-  ok "cron installed: $(crontab -l | grep tactus-preflight)"
+  ( crontab -l 2>/dev/null | grep -v 'upstroke-preflight'
+    echo "7 */6 * * * $HOME/bin/upstroke-preflight --quiet >> $HOME/.upstroke-preflight.cron.log 2>&1" ) | crontab -
+  ok "cron installed: $(crontab -l | grep upstroke-preflight)"
 
   # No MTA and no push channel on this box, so failures surface at login.
-  if [ -f "$(dirname "$0")/99-tactus-preflight" ]; then
-    sudo install -m 755 "$(dirname "$0")/99-tactus-preflight" /etc/update-motd.d/99-tactus-preflight
+  if [ -f "$(dirname "$0")/99-upstroke-preflight" ]; then
+    sudo install -m 755 "$(dirname "$0")/99-upstroke-preflight" /etc/update-motd.d/99-upstroke-preflight
     ok "MOTD banner installed"
   else
-    warn "99-tactus-preflight not found alongside setup.sh; MOTD banner skipped"
+    warn "99-upstroke-preflight not found alongside setup.sh; MOTD banner skipped"
   fi
 }
 
@@ -352,7 +352,7 @@ phase_2() {
     ca-certificates gnupg netcat-openbsd
 
   # gh is NOT in Ubuntu's repos; it comes from GitHub's. preflight [7/8] and
-  # review-pr.sh both shell out to it, and tactus-winguest's wait loop needs nc
+  # review-pr.sh both shell out to it, and upstroke-winguest's wait loop needs nc
   # (above) -- without it the guest finishes while the script waits 100 minutes.
   if ! have gh; then
     curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg \
@@ -371,7 +371,7 @@ phase_2() {
 # PHASE tools — put the ops tooling where every later phase expects it
 # =============================================================================
 #
-# Ordered BEFORE `preflight`, which hard-fails without ~/bin/tactus-preflight.
+# Ordered BEFORE `preflight`, which hard-fails without ~/bin/upstroke-preflight.
 # That circularity is why a "fresh rebuild" previously needed a human to copy
 # files in by hand. Everything here travels alongside setup.sh in infra/.
 #
@@ -381,8 +381,8 @@ phase_tools() {
   here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
   mkdir -p "$HOME/bin"
 
-  for f in tactus-build tactus-preflight tactus-watch tactus-session \
-           tactus-claude tactus-grab tactus-winguest; do
+  for f in upstroke-build upstroke-preflight upstroke-watch upstroke-session \
+           upstroke-claude upstroke-grab upstroke-winguest; do
     if [ -f "$here/$f" ]; then
       install -m 755 "$here/$f" "$HOME/bin/$f"
     else
@@ -400,13 +400,13 @@ phase_tools() {
   # The orchestrator session must survive logout, which needs BOTH the user unit
   # and lingering. Without lingering systemd kills the session at logout and the
   # tmux orchestrator dies with it.
-  if [ -f "$here/tactus-session.service" ]; then
+  if [ -f "$here/upstroke-session.service" ]; then
     mkdir -p "$HOME/.config/systemd/user"
-    install -m 644 "$here/tactus-session.service" \
-      "$HOME/.config/systemd/user/tactus-session.service"
+    install -m 644 "$here/upstroke-session.service" \
+      "$HOME/.config/systemd/user/upstroke-session.service"
     systemctl --user daemon-reload 2>/dev/null || true
     sudo loginctl enable-linger "$USER" \
-      && ok "tactus-session unit installed, lingering enabled" \
+      && ok "upstroke-session unit installed, lingering enabled" \
       || warn "lingering NOT enabled -- the orchestrator will die at logout"
   fi
 }
@@ -508,7 +508,7 @@ phase_5() {
      Prints a URL using redirect_uri=platform.claude.com/oauth/code/callback
      &code=true -- a paste-back flow, so no localhost callback and no SSH
      tunnel. It emits a long-lived token that it saves NOWHERE. Put it in
-     ${TACTUS_ENV} (mode 600) as:
+     ${UPSTROKE_ENV} (mode 600) as:
          export CLAUDE_CODE_OAUTH_TOKEN=<token>
 
   2. codex login --device-auth
@@ -579,28 +579,28 @@ phase_6() {
     && ok "fstab validates" \
     || warn "findmnt --verify reported issues -- inspect before rebooting"
 
-  cat > "$TACTUS_ENV.phase6" <<EOF
-# Build caching -- sourced from ${TACTUS_ENV}
+  cat > "$UPSTROKE_ENV.phase6" <<EOF
+# Build caching -- sourced from ${UPSTROKE_ENV}
 export RUSTC_WRAPPER=sccache
 export SCCACHE_DIR=${SCCACHE_DIR}
 export SCCACHE_CACHE_SIZE=${SCCACHE_SIZE}
 # REQUIRED: sccache cannot cache incremental artifacts.
 export CARGO_INCREMENTAL=0
-# Size of the target-dir slot pool used by tactus-build. Set at or above your
+# Size of the target-dir slot pool used by upstroke-build. Set at or above your
 # maximum concurrent build count: too few and builds queue on a slot lock, too
 # many and you dilute cache reuse across more distinct paths.
-export TACTUS_SLOTS=8
-export TACTUS_RAMTARGET=${RAMTARGET}
+export UPSTROKE_SLOTS=8
+export UPSTROKE_RAMTARGET=${RAMTARGET}
 
-# ~/bin holds tactus-build, tactus-preflight, tactus-watch, tactus-claude.
+# ~/bin holds upstroke-build, upstroke-preflight, upstroke-watch, upstroke-claude.
 # Ubuntu puts ~/bin on PATH from .profile, which ONLY LOGIN SHELLS READ. A tmux
 # pane running plain bash does not, and neither does any agent subprocess. The
 # failure is silent and expensive: cargo still works, so a build that cannot
-# find tactus-build just uses a per-invocation target dir and gets zero cache
+# find upstroke-build just uses a per-invocation target dir and gets zero cache
 # reuse. Set it here, where every shell that sources the env picks it up.
 export PATH="\$HOME/bin:\$PATH"
 
-# DO NOT set CARGO_TARGET_DIR per worktree. Use \`tactus-build <cmd>\` instead.
+# DO NOT set CARGO_TARGET_DIR per worktree. Use \`upstroke-build <cmd>\` instead.
 #
 # Measured on this box 2026-08-17 with two worktrees at an identical commit:
 #     source differs, target same   -> 54/55 sccache hits (98.18%)
@@ -613,26 +613,26 @@ export PATH="\$HOME/bin:\$PATH"
 # only conflicts between CONCURRENT builds) while making paths repeat.
 #
 # Wall clock, second worktree, this project: 8.80s -> 4.62s.
-tactus_target() {
-  echo "tactus_target is deprecated -- use: tactus-build cargo <args>" >&2
+upstroke_target() {
+  echo "upstroke_target is deprecated -- use: upstroke-build cargo <args>" >&2
   return 1
 }
 EOF
-  touch "$TACTUS_ENV"; chmod 600 "$TACTUS_ENV"
-  ensure_line "source ${TACTUS_ENV}.phase6" "$TACTUS_ENV"
+  touch "$UPSTROKE_ENV"; chmod 600 "$UPSTROKE_ENV"
+  ensure_line "source ${UPSTROKE_ENV}.phase6" "$UPSTROKE_ENV"
   ensure_shell_env
-  ok "build env written to ${TACTUS_ENV}.phase6"
+  ok "build env written to ${UPSTROKE_ENV}.phase6"
 
   # SOLVED (2026-08-17). Earlier note here said cross-worktree hits were 0% and
   # probably unfixable. A controlled experiment showed otherwise -- see the
-  # comment block in ~/bin/tactus-build. Short version: the cache key is poisoned
+  # comment block in ~/bin/upstroke-build. Short version: the cache key is poisoned
   # by CARGO_TARGET_DIR, NOT by the source path, so a bounded slot pool restores
   # reuse while keeping concurrent builds isolated. 8.80s -> 4.62s on the second
-  # worktree. Use `tactus-build cargo ...`, never a per-worktree CARGO_TARGET_DIR.
-  if [ -x "$HOME/bin/tactus-build" ]; then
-    ok "tactus-build present -- use it instead of setting CARGO_TARGET_DIR"
+  # worktree. Use `upstroke-build cargo ...`, never a per-worktree CARGO_TARGET_DIR.
+  if [ -x "$HOME/bin/upstroke-build" ]; then
+    ok "upstroke-build present -- use it instead of setting CARGO_TARGET_DIR"
   else
-    warn "~/bin/tactus-build missing; it should travel alongside setup.sh"
+    warn "~/bin/upstroke-build missing; it should travel alongside setup.sh"
   fi
 }
 
@@ -646,11 +646,11 @@ EOF
 # same OS as GitHub's windows-latest image, so failures reproduce CI
 # faithfully.
 #
-# The heavy lifting is in tactus-winguest (idempotent subcommands; `up`
+# The heavy lifting is in upstroke-winguest (idempotent subcommands; `up`
 # chains download → ISO repack → unattended install → provisioning → verify).
 # The guest install is fully unattended via autounattend.xml.in; the three
-# guest files (autounattend.xml.in, winguest-provision.ps1, tactus-winguest)
-# travel alongside this script, like tactus-build does.
+# guest files (autounattend.xml.in, winguest-provision.ps1, upstroke-winguest)
+# travel alongside this script, like upstroke-build does.
 #
 phase_7() {
   phase 7 "Windows guest VM (Server 2025 on KVM)"
@@ -662,20 +662,20 @@ phase_7() {
   sudo systemctl enable --now libvirtd
   sudo usermod -aG libvirt,kvm "$USER"
   # sudo, not the libvirt group: on a fresh rebuild the group membership
-  # above is not in this shell's token yet (needs a re-login). tactus-winguest
+  # above is not in this shell's token yet (needs a re-login). upstroke-winguest
   # detects the same and prefixes sudo when the group is missing.
   sudo virsh net-start default 2>/dev/null || true
   sudo virsh net-autostart default >/dev/null
   ok "libvirt up, default NAT network autostarted"
 
-  # Stage the guest sources where tactus-winguest looks for them.
+  # Stage the guest sources where upstroke-winguest looks for them.
   mkdir -p "$HOME/winguest" "$HOME/bin"
   local here f
   here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
   for f in autounattend.xml.in winguest-provision.ps1; do
     if [ -f "$here/$f" ]; then install -m 644 "$here/$f" "$HOME/winguest/$f"; else warn "$f not found next to setup.sh"; fi
   done
-  if [ -f "$here/tactus-winguest" ]; then install -m 755 "$here/tactus-winguest" "$HOME/bin/tactus-winguest"; fi
+  if [ -f "$here/upstroke-winguest" ]; then install -m 755 "$here/upstroke-winguest" "$HOME/bin/upstroke-winguest"; fi
 
   # The ssh alias the whole workflow keys on (phase9's windows leg, and you).
   touch "$HOME/.ssh/config"; chmod 600 "$HOME/.ssh/config"
@@ -684,7 +684,7 @@ phase_7() {
   fi
   ok "ssh alias windowsguest -> 192.168.122.25"
 
-  "$HOME/bin/tactus-winguest" up
+  "$HOME/bin/upstroke-winguest" up
 }
 
 # =============================================================================
@@ -770,7 +770,7 @@ PYEOF
       "Google AI Pro subscription (Gemini 3.1 Pro is a paid-tier model; the" \
       "free tier silently serves Flash instead). Then /quit." \
       "" \
-      "Verify with: tactus-preflight   — checks [5/8], [5b/8] and [6/8]."
+      "Verify with: upstroke-preflight   — checks [5/8], [5b/8] and [6/8]."
     return 0
   fi
   agy models 2>/dev/null | grep -q 'gemini-3.1-pro-high' \

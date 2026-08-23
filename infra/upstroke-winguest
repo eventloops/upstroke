@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
 # =============================================================================
-# tactus-winguest -- Windows Server 2025 guest for the Windows test leg
+# upstroke-winguest -- Windows Server 2025 guest for the Windows test leg
 # =============================================================================
 #
 # Builds and operates the KVM guest that lets
-#     ssh windowsguest 'cd /d C:\tactus && cargo test --all-targets --all-features'
+#     ssh windowsguest 'cd /d C:\upstroke && cargo test --all-targets --all-features'
 # surface Windows-only failures in minutes instead of after a push. CI already
 # covers windows-latest; this exists for SPEED, not coverage -- and Server 2025
 # is the same OS as GitHub's windows-latest image, so failures reproduce CI
@@ -38,7 +38,7 @@
 #   upstream. Uncommitted changes do NOT travel -- commit before running.
 #
 # SECRETS
-#   The admin password is generated once into ~/.tactus-winguest-pass (0600)
+#   The admin password is generated once into ~/.upstroke-winguest-pass (0600)
 #   and substituted into autounattend.xml only inside the generated unattend
 #   ISO, which lives in /var/lib/libvirt/images (root-owned). The template in
 #   the repo carries a placeholder. ssh uses the box's ed25519 key; the
@@ -57,10 +57,10 @@ readonly DISK=$IMAGES/winguest.qcow2
 readonly VM=winguest
 readonly MAC='52:54:00:7a:c7:05'
 readonly IP='192.168.122.25'
-readonly PASSFILE=$HOME/.tactus-winguest-pass
+readonly PASSFILE=$HOME/.upstroke-winguest-pass
 readonly MSRV=1.85.0
 # Template + provision script travel with setup.sh; staged here by phase 7.
-readonly SRC_DIR=${TACTUS_WINGUEST_SRC:-$HOME/winguest}
+readonly SRC_DIR=${UPSTROKE_WINGUEST_SRC:-$HOME/winguest}
 
 readonly C_OK=$'\033[32m' C_ERR=$'\033[31m' C_WARN=$'\033[33m' C_OFF=$'\033[0m'
 ok()   { printf '  %s[ ok ]%s %s\n' "$C_OK" "$C_OFF" "$*"; }
@@ -204,10 +204,10 @@ cmd_verify() {
     || die "toolchain check failed"
   printf '%s\n' "$out" | sed 's/^/    /'
   ok "git / rustc / cargo / MSRV all answer over ssh"
-  if out=$(ssh -o BatchMode=yes "Administrator@$IP" 'cd /d C:\tactus && git rev-parse --short HEAD' 2>/dev/null); then
-    ok 'C:\tactus at '"$out"
+  if out=$(ssh -o BatchMode=yes "Administrator@$IP" 'cd /d C:\upstroke && git rev-parse --short HEAD' 2>/dev/null); then
+    ok 'C:\upstroke at '"$out"
   else
-    warn 'C:\tactus missing'
+    warn 'C:\upstroke missing'
   fi
 }
 

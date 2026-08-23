@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # =============================================================================
-# tactus-grab — pull a long string out of a tmux pane WITHOUT terminal wrapping.
+# upstroke-grab — pull a long string out of a tmux pane WITHOUT terminal wrapping.
 # =============================================================================
 #
 # WHY THIS EXISTS
@@ -23,14 +23,14 @@
 # whitespace BEFORE joining, or the fragments come back space-separated.
 #
 # USAGE
-#   tactus-grab                      # last URL in the orchestrator pane
-#   tactus-grab -t tactus:1          # a different pane
-#   tactus-grab -p 'sk-ant-[^ ]+'    # a different pattern
-#   tactus-grab -b                   # also load into the tmux paste buffer
+#   upstroke-grab                      # last URL in the orchestrator pane
+#   upstroke-grab -t upstroke:1          # a different pane
+#   upstroke-grab -p 'sk-ant-[^ ]+'    # a different pattern
+#   upstroke-grab -b                   # also load into the tmux paste buffer
 # =============================================================================
 set -uo pipefail
 
-PANE="tactus:0"
+PANE="upstroke:0"
 PATTERN='https?://[^[:space:]]+'
 BUFFER=0
 SCROLL=-500
@@ -47,7 +47,7 @@ while [ $# -gt 0 ]; do
 done
 
 if ! tmux has-session -t "${PANE%%:*}" 2>/dev/null; then
-  echo "tactus-grab: no such session: ${PANE%%:*}" >&2
+  echo "upstroke-grab: no such session: ${PANE%%:*}" >&2
   exit 1
 fi
 
@@ -62,7 +62,7 @@ match="$(tmux capture-pane -t "$PANE" -p -J -S "$SCROLL" \
          | tail -1)"
 
 if [ -z "$match" ]; then
-  echo "tactus-grab: nothing matching /$PATTERN/ in $PANE" >&2
+  echo "upstroke-grab: nothing matching /$PATTERN/ in $PANE" >&2
   exit 1
 fi
 

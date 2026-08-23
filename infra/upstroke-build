@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # =============================================================================
-# tactus-build — run a cargo command with CARGO_TARGET_DIR bound to a SLOT.
+# upstroke-build — run a cargo command with CARGO_TARGET_DIR bound to a SLOT.
 # =============================================================================
 #
 # WHY THIS EXISTS
@@ -27,25 +27,25 @@
 #   - repeating paths (slot3 today hashes the same as slot3 yesterday) -> hits
 #
 # USAGE
-#   tactus-build cargo test --all-targets --all-features
-#   tactus-build cargo clippy --all-targets --all-features -- -D warnings
-#   TACTUS_SLOTS=16 tactus-build cargo build      # widen the pool
+#   upstroke-build cargo test --all-targets --all-features
+#   upstroke-build cargo clippy --all-targets --all-features -- -D warnings
+#   UPSTROKE_SLOTS=16 upstroke-build cargo build      # widen the pool
 #
-# Set TACTUS_SLOTS to at least your maximum concurrent build count. Too few and
+# Set UPSTROKE_SLOTS to at least your maximum concurrent build count. Too few and
 # builds queue; too many and you dilute the cache across more distinct paths.
 # =============================================================================
 set -uo pipefail
 
 [ -f "$HOME/.cargo/env" ]  && . "$HOME/.cargo/env"
-[ -f "$HOME/.tactus-env" ] && . "$HOME/.tactus-env"
+[ -f "$HOME/.upstroke-env" ] && . "$HOME/.upstroke-env"
 
-readonly SLOTS="${TACTUS_SLOTS:-8}"
-readonly BASE="${TACTUS_RAMTARGET:-/mnt/ramtarget}"
+readonly SLOTS="${UPSTROKE_SLOTS:-8}"
+readonly BASE="${UPSTROKE_RAMTARGET:-/mnt/ramtarget}"
 readonly LOCKDIR="$BASE/.locks"
 
 if [ $# -eq 0 ]; then
-  echo "usage: tactus-build <command> [args...]" >&2
-  echo "  e.g. tactus-build cargo test --all-targets --all-features" >&2
+  echo "usage: upstroke-build <command> [args...]" >&2
+  echo "  e.g. upstroke-build cargo test --all-targets --all-features" >&2
   exit 2
 fi
 
@@ -84,7 +84,7 @@ for i in $(seq 1 "$SLOTS"); do
   # A lock held on an fd is inherited across exec, so this is the same lock.
   exec {slotfd}>"$lock" 2>/dev/null || continue
   if flock -n "$slotfd"; then
-    [ "${TACTUS_BUILD_QUIET:-}" = "1" ] || echo "tactus-build: slot$i  ($d)" >&2
+    [ "${UPSTROKE_BUILD_QUIET:-}" = "1" ] || echo "upstroke-build: slot$i  ($d)" >&2
     exec env CARGO_TARGET_DIR="$d" "$@"
   fi
   exec {slotfd}>&-   # not ours; release before trying the next slot
@@ -93,5 +93,5 @@ done
 # Every slot busy. Queue on slot1 rather than inventing a new path, which would
 # be a guaranteed cache miss for the entire build.
 d="$BASE/slot1"
-[ "${TACTUS_BUILD_QUIET:-}" = "1" ] || echo "tactus-build: all $SLOTS slots busy, queueing on slot1" >&2
+[ "${UPSTROKE_BUILD_QUIET:-}" = "1" ] || echo "upstroke-build: all $SLOTS slots busy, queueing on slot1" >&2
 exec flock "$LOCKDIR/slot1.lock" env CARGO_TARGET_DIR="$d" "$@"

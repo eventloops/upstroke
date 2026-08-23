@@ -1,5 +1,5 @@
 [Unit]
-Description=tactus long-lived tmux orchestrator session
+Description=upstroke long-lived tmux orchestrator session
 Documentation=file:/home/ubuntu/REPORT.md
 After=network-online.target
 Wants=network-online.target
@@ -11,7 +11,7 @@ Wants=network-online.target
 # reporting dead the instant the command returns.
 Type=oneshot
 RemainAfterExit=yes
-ExecStart=/home/ubuntu/bin/tactus-session
+ExecStart=/home/ubuntu/bin/upstroke-session
 # Do NOT kill the tmux server when the unit stops -- that would take the
 # orchestrator, and any 40-minute worker inside it, down with it.
 ExecStop=/bin/true

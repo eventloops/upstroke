@@ -112,7 +112,7 @@ jobs:
             git -c core.hooksPath=/dev/null -c core.fsmonitor=false \
               fetch --no-tags --unshallow origin
           fi
-          ledger_ref="refs/tactus/ledger/$head_sha"
+          ledger_ref="refs/upstroke/ledger/$head_sha"
           git -c core.hooksPath=/dev/null -c core.fsmonitor=false \
             fetch --no-tags --force origin \
             "refs/pull/$PR_NUMBER/head:$ledger_ref"
@@ -230,8 +230,8 @@ jobs:
           toolchain: stable
       - name: Configure git identity
         run: |
-          git config --global user.email "ci@tactus.local"
-          git config --global user.name "tactus attestation"
+          git config --global user.email "ci@upstroke.local"
+          git config --global user.name "upstroke attestation"
       - run: cargo test --all-targets
 
   attest:
@@ -299,7 +299,7 @@ jobs:
             git -c core.hooksPath=/dev/null -c core.fsmonitor=false \
               fetch --no-tags --unshallow origin
           fi
-          ledger_ref="refs/tactus/ledger/$head_sha"
+          ledger_ref="refs/upstroke/ledger/$head_sha"
           git -c core.hooksPath=/dev/null -c core.fsmonitor=false \
             fetch --no-tags --force origin \
             "refs/pull/$PR_NUMBER/head:$ledger_ref"
@@ -375,22 +375,22 @@ jobs:
         id: app-token
         uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
         with:
-          client-id: ${{ vars.TACTUS_FRONTIER_APP_CLIENT_ID }}
-          private-key: ${{ secrets.TACTUS_FRONTIER_APP_PRIVATE_KEY }}
+          client-id: ${{ vars.UPSTROKE_FRONTIER_APP_CLIENT_ID }}
+          private-key: ${{ secrets.UPSTROKE_FRONTIER_APP_PRIVATE_KEY }}
           permission-checks: write
       - name: Publish and verify the exact-head App check
         shell: bash
         env:
           APP_TOKEN: ${{ steps.app-token.outputs.token }}
           REPOSITORY_TOKEN: ${{ github.token }}
-          EXPECTED_APP_ID: ${{ vars.TACTUS_FRONTIER_APP_ID }}
+          EXPECTED_APP_ID: ${{ vars.UPSTROKE_FRONTIER_APP_ID }}
           METADATA_DIGEST: ${{ steps.live-metadata.outputs.metadata_digest }}
           DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
         run: |
           set -euo pipefail
 
           if [[ ! "$EXPECTED_APP_ID" =~ ^[1-9][0-9]*$ ]]; then
-            echo "TACTUS_FRONTIER_APP_ID must be a positive integer" >&2
+            echo "UPSTROKE_FRONTIER_APP_ID must be a positive integer" >&2
             exit 1
           fi
 
@@ -407,12 +407,12 @@ jobs:
           actual_conclusion="$(jq -r '.conclusion' <<< "$check_run")"
           actual_app_id="$(jq -r '.app.id | tostring' <<< "$check_run")"
           actual_external_id="$(jq -r '.external_id' <<< "$check_run")"
-          expected_external_id="tactus-frontier-review:pr-$PR_NUMBER:$ATTESTED_SHA:$EVIDENCE_DIGEST"
+          expected_external_id="upstroke-frontier-review:pr-$PR_NUMBER:$ATTESTED_SHA:$EVIDENCE_DIGEST"
           if [[ "$ATTESTED_SHA" != "$REVIEWED_SHA" ]]; then
             expected_external_id+=":reviewed:$REVIEWED_SHA"
           fi
 
-          if [[ "$actual_name" != "tactus-frontier-review" ||
+          if [[ "$actual_name" != "upstroke-frontier-review" ||
                 "$actual_sha" != "$ATTESTED_SHA" ||
                 "$actual_status" != "completed" ||
                 "$actual_conclusion" != "success" ||

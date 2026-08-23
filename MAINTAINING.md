@@ -1,4 +1,4 @@
-# Maintaining tactus
+# Maintaining upstroke
 
 This document is the operating contract for changes to the protected default branch, `master`.
 Repository rules enforce the mechanical parts; maintainers are responsible for the semantic review
@@ -12,14 +12,14 @@ contract itself.
 2. Push the branch and open a **draft pull request early**. Use a Conventional Commit title:
    `type(optional-scope): summary`.
 3. Let the inexpensive deterministic gates finish first:
-   - `tactus-pr-policy` gives fast candidate-controlled feedback on the PR title and evidence ledger;
+   - `upstroke-pr-policy` gives fast candidate-controlled feedback on the PR title and evidence ledger;
      it is not a trusted merge boundary because a pull request can edit both workflow and validator.
-   - `tactus-ci` aggregates formatting, Clippy, and the Windows, Linux, and macOS test matrix.
+   - `upstroke-ci` aggregates formatting, Clippy, and the Windows, Linux, and macOS test matrix.
 4. If the branch is behind `master`, update it and wait for both gates again.
 5. Only after both gates are green, give the exact current diff and head SHA to an independent
    frontier-class reviewer at `max` effort. AI-assisted implementation should use a frontier-class
    implementation model at `xhigh` effort or higher. Record the implementation and review model,
-   effort, head SHA, transport, wall-clock limit, and durable review link in the PR. Until Tactus
+   effort, head SHA, transport, wall-clock limit, and durable review link in the PR. Until Upstroke
    owns this supervision natively, allow at least 90 minutes **per frontier review pass** and use
    the review CLI's streaming output. A timeout, transport failure, or missing verdict never passes.
 6. Fix every finding. Any code push creates a new head SHA, so return to step 3 and review the new
@@ -31,7 +31,7 @@ contract itself.
    itself verifies ancestry and the exempt-only diff before attesting the current head, recording
    both SHAs on the published check. Everything else invalidates, deliberately.
 7. Once a review passes, post a dedicated evidence comment containing exactly
-   `TACTUS_FRONTIER_REVIEW: 1`, `VERDICT: PASS`, and `REVIEWED_SHA: <full SHA>` on separate lines,
+   `UPSTROKE_FRONTIER_REVIEW: 1`, `VERDICT: PASS`, and `REVIEWED_SHA: <full SHA>` on separate lines,
    with no other text. Send the `frontier-review` repository dispatch with the PR number, full
    reviewed head SHA, and evidence URL. The default-branch workflow refuses ambiguous or behind
    evidence — and stale evidence, unless the reviewed SHA is an ancestor of the current head with
@@ -39,7 +39,7 @@ contract itself.
    live title/body,
    validates the evidence comment, reruns formatting, Clippy, and
    all three platform test jobs from its trusted default-branch definition, then uses the dedicated
-   `Tactus Frontier Review Gate` GitHub App to publish a successful `tactus-frontier-review` check
+   `Upstroke Frontier Review Gate` GitHub App to publish a successful `upstroke-frontier-review` check
    on the exact head. Editing the PR title or body after that success causes the trusted
    invalidator to turn the same App-owned check into a failure; repeat the frontier review and
    attestation against the current metadata rather than treating an unchanged commit SHA as
@@ -48,7 +48,7 @@ contract itself.
    force-push directly to `master`. Delete the source branch after merge.
 
 Slices of a long-running design land as pull requests **into** their integration branch
-(today `codex/parallelism-design`): they receive `tactus-ci`, `tactus-pr-policy`, and a
+(today `codex/parallelism-design`): they receive `upstroke-ci`, `upstroke-pr-policy`, and a
 single-reviewer frontier review of each head, but **no attestation**. The App check is minted
 only for pull requests into `master`; the integration branch's own pull request is attested
 exactly once, on the head that merges, after its last update from `master`. Merge commits only
@@ -61,14 +61,14 @@ out of every pull-request workflow. A same-named GitHub Actions check therefore 
 rule. The repository owner remains responsible for the truth of the linked semantic review;
 dispatching without a real passing review is a policy violation.
 
-`tactus-pr-policy` deliberately remains a `pull_request` workflow so contributors get immediate,
+`upstroke-pr-policy` deliberately remains a `pull_request` workflow so contributors get immediate,
 unprivileged feedback from the candidate they are editing. Its result is not trusted: the
 default-branch `repository_dispatch` workflow fetches the live title/body and runs its own canonical
 `validate-pr-body.sh` immediately after dispatch validation and again just before App-token minting.
 The separate `pull_request_target` invalidator is deliberately metadata-only: GitHub loads it from
 the default branch, it checks out only `github.sha` from that trusted base, and it never loads or
 executes the pull request. On a title/body edit it uses the dedicated App to PATCH every successful
-`tactus-frontier-review` check from that App on the unchanged head to `failure`. The signing workflow
+`upstroke-frontier-review` check from that App on the unchanged head to `failure`. The signing workflow
 also re-reads metadata after publication and applies the same invalidation if an edit races the
 final API call. Do not add candidate checkout, PR-authored scripts, dependency installation, or
 any command derived from PR content to this privileged invalidator.
@@ -116,7 +116,7 @@ wording must say what enforces it.
 The original `frontier-reviewed` deployment gate failed its stale-SHA canary: GitHub reported a
 pull request mergeable after its head changed even though the deployment existed only on the
 previous SHA. The replacement was introduced without an unprotected interval: the dedicated App
-first emitted `tactus-frontier-review` alongside the old gate, the ruleset then required that check
+first emitted `upstroke-frontier-review` alongside the old gate, the ruleset then required that check
 and bound it to App id `4574301`, and a no-tree-change canary proved that the old App check did not
 follow a new commit identity. Only after that proof were the deployment requirement, writer, and
 `deployments: write` permission retired. The App-owned exact-head check is now the sole semantic
@@ -129,11 +129,11 @@ pr=123
 reviewed_sha="$(gh pr view "$pr" --json headRefOid --jq .headRefOid)"
 # Give this exact full SHA and its diff to the reviewer. After it passes, post
 # one machine record as the entire evidence comment (put prose in another comment):
-evidence_body="$(printf 'TACTUS_FRONTIER_REVIEW: 1\nVERDICT: PASS\nREVIEWED_SHA: %s' \
+evidence_body="$(printf 'UPSTROKE_FRONTIER_REVIEW: 1\nVERDICT: PASS\nREVIEWED_SHA: %s' \
   "$reviewed_sha")"
-review_url="$(gh api --method POST "repos/keybindings/tactus/issues/$pr/comments" \
+review_url="$(gh api --method POST "repos/eventloops/upstroke/issues/$pr/comments" \
   -f "body=$evidence_body" --jq .html_url)"
-gh api --method POST repos/keybindings/tactus/dispatches \
+gh api --method POST repos/eventloops/upstroke/dispatches \
   -f event_type=frontier-review \
   -F "client_payload[pull_request]=$pr" \
   -f "client_payload[reviewed_sha]=$reviewed_sha" \
@@ -145,8 +145,8 @@ gh api --method POST repos/keybindings/tactus/dispatches \
 The default-branch ruleset must:
 
 - require a pull request and an up-to-date branch;
-- require `tactus-ci` and `tactus-pr-policy` on the current head;
-- require `tactus-frontier-review` on the current head, bound to GitHub App id `4574301`;
+- require `upstroke-ci` and `upstroke-pr-policy` on the current head;
+- require `upstroke-frontier-review` on the current head, bound to GitHub App id `4574301`;
 - require all review conversations to be resolved;
 - allow merge commits only;
 - block branch deletion and non-fast-forward updates; and
@@ -159,14 +159,14 @@ bypass. This makes the release tags described below genuinely immutable.
 
 The current repository has one trusted same-repository writer: its owner. GitHub identifies every
 workflow using `GITHUB_TOKEN` as the same GitHub Actions app. A fork can therefore mint successful
-jobs named `tactus-ci`, `tactus-pr-policy`, or anything else without receiving a write token. Those
+jobs named `upstroke-ci`, `upstroke-pr-policy`, or anything else without receiving a write token. Those
 fast checks are required for feedback but are not the security boundary. The default-branch
 attestation workflow independently reruns their substance with no PR-controlled workflow code,
 then requests a repository-scoped installation token for the dedicated App. The App publishes only
 the final exact-SHA check. The ruleset's App binding, rather than the check name alone, is the
 security boundary.
 
-The App is private, installed only on `keybindings/tactus`, and has metadata read plus checks and
+The App is private, installed only on `eventloops/upstroke`, and has metadata read plus checks and
 commit-statuses write. GitHub requires the latter at installation level to make the App eligible as
 an expected required-check source; the workflow never requests it in its token. The private key is
 an environment secret, never a repository secret. Only the final trusted `repository_dispatch` job
@@ -181,43 +181,43 @@ Bootstrap and audit the external configuration through the API. Supply the downl
 so it is never written into a command line, log, tracked file, or pull-request workflow:
 
 ```bash
-gh api --method PUT repos/keybindings/tactus/environments/frontier-check-signer \
+gh api --method PUT repos/eventloops/upstroke/environments/frontier-check-signer \
   -F wait_timer=0 \
   -F 'deployment_branch_policy[protected_branches]=false' \
   -F 'deployment_branch_policy[custom_branch_policies]=true'
 gh api --method POST \
-  repos/keybindings/tactus/environments/frontier-check-signer/deployment-branch-policies \
+  repos/eventloops/upstroke/environments/frontier-check-signer/deployment-branch-policies \
   -f name=master -f type=branch
 
-gh variable set TACTUS_FRONTIER_APP_ID --env frontier-check-signer \
-  --repo keybindings/tactus --body 4574301
-gh variable set TACTUS_FRONTIER_APP_CLIENT_ID --env frontier-check-signer \
-  --repo keybindings/tactus --body Iv23liSwpgxIDc8SN4ED
-gh secret set TACTUS_FRONTIER_APP_PRIVATE_KEY --env frontier-check-signer \
-  --repo keybindings/tactus < tactus-frontier-review-gate.private-key.pem
+gh variable set UPSTROKE_FRONTIER_APP_ID --env frontier-check-signer \
+  --repo eventloops/upstroke --body 4574301
+gh variable set UPSTROKE_FRONTIER_APP_CLIENT_ID --env frontier-check-signer \
+  --repo eventloops/upstroke --body Iv23liSwpgxIDc8SN4ED
+gh secret set UPSTROKE_FRONTIER_APP_PRIVATE_KEY --env frontier-check-signer \
+  --repo eventloops/upstroke < upstroke-frontier-review-gate.private-key.pem
 
 gh api --method PUT \
-  repos/keybindings/tactus/actions/permissions/fork-pr-contributor-approval \
+  repos/eventloops/upstroke/actions/permissions/fork-pr-contributor-approval \
   -H 'X-GitHub-Api-Version: 2026-03-10' \
   -f approval_policy=all_external_contributors
 
-gh api --method PUT repos/keybindings/tactus/immutable-releases \
+gh api --method PUT repos/eventloops/upstroke/immutable-releases \
   -H 'X-GitHub-Api-Version: 2026-03-10'
 
-gh variable set TACTUS_IMMUTABLE_RELEASES_REQUIRED \
-  --repo keybindings/tactus --body true
+gh variable set UPSTROKE_IMMUTABLE_RELEASES_REQUIRED \
+  --repo eventloops/upstroke --body true
 
-gh api repos/keybindings/tactus/environments/frontier-check-signer
+gh api repos/eventloops/upstroke/environments/frontier-check-signer
 gh api \
-  repos/keybindings/tactus/environments/frontier-check-signer/deployment-branch-policies
-gh variable list --env frontier-check-signer --repo keybindings/tactus
-gh secret list --env frontier-check-signer --repo keybindings/tactus
-gh api repos/keybindings/tactus/actions/permissions/fork-pr-contributor-approval \
+  repos/eventloops/upstroke/environments/frontier-check-signer/deployment-branch-policies
+gh variable list --env frontier-check-signer --repo eventloops/upstroke
+gh secret list --env frontier-check-signer --repo eventloops/upstroke
+gh api repos/eventloops/upstroke/actions/permissions/fork-pr-contributor-approval \
   -H 'X-GitHub-Api-Version: 2026-03-10'
-gh api repos/keybindings/tactus/immutable-releases \
+gh api repos/eventloops/upstroke/immutable-releases \
   -H 'X-GitHub-Api-Version: 2026-03-10'
-gh variable get TACTUS_IMMUTABLE_RELEASES_REQUIRED \
-  --repo keybindings/tactus
+gh variable get UPSTROKE_IMMUTABLE_RELEASES_REQUIRED \
+  --repo eventloops/upstroke
 ```
 
 After `gh secret list` confirms the signing-secret name, revoke every active App key whose PEM is
@@ -268,7 +268,7 @@ Release tags use `v*` and are made immutable by the tag ruleset. Repository rele
 a separate mandatory setting: tag protection fixes the commit identity, while release immutability
 prevents published binaries from being replaced under that tag. GitHub applies the setting only to
 future releases, so enable and read it back before creating another tag. The release job's token
-cannot read that administration-scoped setting, so `TACTUS_IMMUTABLE_RELEASES_REQUIRED=true`
+cannot read that administration-scoped setting, so `UPSTROKE_IMMUTABLE_RELEASES_REQUIRED=true`
 records the completed owner readback and makes an incomplete bootstrap fail closed. It is not proof
 against a dishonest owner changing both values; the post-publication signed immutable-release and
 asset checks remain authoritative. Re-read the live setting before every release and in the
@@ -287,13 +287,13 @@ protection does not make arbitrary tags safe by itself.
 Release `v0.1.0` predates repository release immutability and remains the sole legacy exception. Do
 not rerun, replace, or delete its assets. Its preserved GitHub asset digests are:
 
-- `tactus-aarch64-apple-darwin.tar.gz`: `sha256:552302e348273143665d2604130e6c1487647a90b496a8d8f789d30839175289`
-- `tactus-x86_64-pc-windows-msvc.zip`: `sha256:e88206643c07ac5cee418ed27ddbbb7e6bcffc1835e727a68bbd716f876c8871`
-- `tactus-x86_64-unknown-linux-gnu.tar.gz`: `sha256:94447cfd56d0d8ba5eae1ec391c2564a7ddba2fceb15cee35ce537a0ba00d798`
+- `upstroke-aarch64-apple-darwin.tar.gz`: `sha256:552302e348273143665d2604130e6c1487647a90b496a8d8f789d30839175289`
+- `upstroke-x86_64-pc-windows-msvc.zip`: `sha256:e88206643c07ac5cee418ed27ddbbb7e6bcffc1835e727a68bbd716f876c8871`
+- `upstroke-x86_64-unknown-linux-gnu.tar.gz`: `sha256:94447cfd56d0d8ba5eae1ec391c2564a7ddba2fceb15cee35ce537a0ba00d798`
 
 ## High-blast-radius changes
 
-Changes to event or replay schemas, Git/ref handling, agent permissions, `tactus.toml`, `DESIGN.md`,
+Changes to event or replay schemas, Git/ref handling, agent permissions, `upstroke.toml`, `DESIGN.md`,
 CI, release, rules, or frontier-review attestation deserve an especially narrow PR and a focused
 fresh-context review. A PR can edit ordinary Actions workflows, so the independent review is the
 human trust boundary for changes to the gates themselves; the dedicated App remains the machine

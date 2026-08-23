@@ -20,7 +20,7 @@ $GIT_URL    = 'https://github.com/git-for-windows/git/releases/download/v2.50.1.
 $VSBT_URL   = 'https://aka.ms/vs/17/release/vs_buildtools.exe'
 $RUSTUP_URL = 'https://win.rustup.rs/x86_64'
 $MSRV       = '1.85.0'
-$REPO_URL   = 'https://github.com/keybindings/tactus'
+$REPO_URL   = 'https://github.com/eventloops/upstroke'
 
 function Fetch($url, $out) {
   # curl.exe ships with the OS and is far less flaky than Invoke-WebRequest
@@ -104,12 +104,12 @@ Write-Output 'rust toolchains installed'
 # then checks out the sha detached. denyCurrentBranch=ignore covers the case
 # where a pushed ref collides with the checked-out branch.
 $git = "$env:ProgramFiles\Git\cmd\git.exe"
-if (-not (Test-Path C:\tactus)) { & $git clone $REPO_URL C:\tactus }
-& $git -C C:\tactus config receive.denyCurrentBranch ignore
+if (-not (Test-Path C:\upstroke)) { & $git clone $REPO_URL C:\upstroke }
+& $git -C C:\upstroke config receive.denyCurrentBranch ignore
 
 # Defender exclusions for the hot paths: link.exe output and rustc temp churn
 # are exactly the access patterns real-time scanning is slowest at.
-Add-MpPreference -ExclusionPath 'C:\tactus', "$env:USERPROFILE\.cargo", "$env:USERPROFILE\.rustup" `
+Add-MpPreference -ExclusionPath 'C:\upstroke', "$env:USERPROFILE\.cargo", "$env:USERPROFILE\.rustup" `
   -ErrorAction SilentlyContinue
 
 # --- 7. done -----------------------------------------------------------------

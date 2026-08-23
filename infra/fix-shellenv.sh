@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Make the tactus build environment visible to NON-INTERACTIVE shells.
+# Make the upstroke build environment visible to NON-INTERACTIVE shells.
 #
 # Ubuntu's stock ~/.bashrc opens with:
 #     case $- in *i*) ;; *) return;; esac
@@ -8,27 +8,27 @@
 # which means they would inherit NO RUSTC_WRAPPER and NO CARGO_INCREMENTAL=0 --
 # building without sccache at a near-zero hit rate, silently.
 #
-# Fix: source the tactus env from ABOVE that early return, and from ~/.profile.
+# Fix: source the upstroke env from ABOVE that early return, and from ~/.profile.
 set -euo pipefail
 
-BLOCK_START='# --- tactus build env (must precede the non-interactive early return) ---'
-BLOCK_END='# --- end tactus build env ---'
+BLOCK_START='# --- upstroke build env (must precede the non-interactive early return) ---'
+BLOCK_END='# --- end upstroke build env ---'
 
 strip_old() {
   local f="$1"
   [ -f "$f" ] || return 0
-  # Drop any previous tactus block and any bare appended sourcing lines.
+  # Drop any previous upstroke block and any bare appended sourcing lines.
   sed -i "/^${BLOCK_START}$/,/^${BLOCK_END}$/d" "$f"
   sed -i '/\.cargo\/env/d' "$f"
-  sed -i '/tactus-env/d' "$f"
+  sed -i '/upstroke-env/d' "$f"
 }
 
 block() {
   cat <<'EOF'
-# --- tactus build env (must precede the non-interactive early return) ---
+# --- upstroke build env (must precede the non-interactive early return) ---
 [ -f "$HOME/.cargo/env" ]        && . "$HOME/.cargo/env"
-[ -f "$HOME/.tactus-env" ]       && . "$HOME/.tactus-env"
-# --- end tactus build env ---
+[ -f "$HOME/.upstroke-env" ]       && . "$HOME/.upstroke-env"
+# --- end upstroke build env ---
 EOF
 }
 
@@ -51,5 +51,5 @@ bash -lc 'printf "RUSTC_WRAPPER=%s\nSCCACHE_DIR=%s\nSCCACHE_CACHE_SIZE=%s\nCARGO
   "${CARGO_INCREMENTAL:-UNSET}" "$(command -v cargo || echo MISSING)" "$(command -v sccache || echo MISSING)"'
 
 echo
-echo "=== VERIFY: tactus_target helper ==="
-bash -lc 'type tactus_target >/dev/null 2>&1 && echo "tactus_target: defined" || echo "tactus_target: MISSING"'
+echo "=== VERIFY: upstroke_target helper ==="
+bash -lc 'type upstroke_target >/dev/null 2>&1 && echo "upstroke_target: defined" || echo "upstroke_target: MISSING"'

@@ -35,7 +35,7 @@ All from pull request #18, all on 2026-08-20 or the day before. None of it is as
 
 ## The same day's second incident, and the rules it set
 
-The 14:22 review was destroyed twice over. `~/.tactus-env` rotated at 14:28:26, mid-review;
+The 14:22 review was destroyed twice over. `~/.upstroke-env` rotated at 14:28:26, mid-review;
 the post-review head check ran on the stale in-memory token, got `401 Bad credentials`, and
 the script compared that JSON error body to the SHA — concluding "HEAD MOVED" and discarding
 the verdict. **An API failure is not a moved head.** Rules adopted in both drivers, same day:
@@ -100,7 +100,7 @@ widening is a visible, reviewable act with a name on it.
 
 Under this rule, an edit to `reviews/FINDINGS.md` can merge without a frontier review of that
 edit (within its PR; a review of the earlier head still covered everything else). Bounds:
-`tactus-ci` and `tactus-pr-policy` still gate it; the re-attesting dispatch is an explicit
+`upstroke-ci` and `upstroke-pr-policy` still gate it; the re-attesting dispatch is an explicit
 owner act naming exactly that drift; the file governs the review *process*, not build outputs;
 and under the ledger's own authority rule the file records rulings — it does not create them,
 so a hostile edit there claims an authority the process does not grant it. Residual risk:
@@ -109,20 +109,20 @@ carries today. This paragraph is the acceptance, so a future reader knows it was
 
 ## Implemented 2026-08-20 (box-side only; no trust boundary moved)
 
-- `tactus-review-watch` (stage 1): an eligible head whose only difference from an
+- `upstroke-review-watch` (stage 1): an eligible head whose only difference from an
   already-reviewed head is exempt-only **inherits** that review — a state file records the
   inheritance, no duplicate comment is posted, no reviewer is paid. `--check-drift PR OLD NEW`
   exposes the predicate as a diagnostic; it was verified against the incident pair
   (`cab3d042..ff0490a` → exempt-only; a code-bearing pair and the reversed direction →
   refused). §"second incident" rules 1–3 were already in this driver.
-- `tactus-frontier-review`: §"second incident" rules applied (backup kept alongside); a moved
+- `upstroke-frontier-review`: §"second incident" rules applied (backup kept alongside); a moved
   head is now classified `STALE` vs `STALE-EXEMPT-ONLY`, so a human stops discarding verdicts
   that remain valid for the code. It still offers no evidence text for either — exact-head
   attestation holds until the workflow PR lands.
 
 - Review round 1 on the implementing PR (#22) surfaced `DRIFT-RENAME-ENDPOINT` and
   `DRIFT-DIFF-STATUS` in the workflow's first cut, and the same rename hole existed in both
-  box drivers (`tactus-review-watch`'s mirror diff and `tactus-frontier-review`'s compare-API
+  box drivers (`upstroke-review-watch`'s mirror diff and `upstroke-frontier-review`'s compare-API
   classifier, which folds a rename into one destination-named entry). All three now treat
   renames as non-exempt and fail closed on a failed producer; both holes were reproduced
   before being fixed, and the PR's ledger carries the full rows.

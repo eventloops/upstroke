@@ -2,12 +2,12 @@
 <!--
   tactusbox Windows guest: unattended Server 2025 install.
 
-  This is a TEMPLATE. tactus-winguest substitutes @ADMIN_PASSWORD@ (generated
-  once, stored at ~/.tactus-winguest-pass, mode 0600) and burns the result
+  This is a TEMPLATE. upstroke-winguest substitutes @ADMIN_PASSWORD@ (generated
+  once, stored at ~/.upstroke-winguest-pass, mode 0600) and burns the result
   into winguest-unattend.iso. The substituted file is never committed.
 
   Image INDEX 2 is "Windows Server 2025 SERVERSTANDARD" (Standard + Desktop
-  Experience; CORE suffix = no desktop). tactus-winguest asserts this during
+  Experience; CORE suffix = no desktop). upstroke-winguest asserts this during
   `prep`, so a re-spun eval ISO with different ordering fails loudly at build
   time instead of silently installing Server Core.
 
@@ -103,8 +103,8 @@
         <!-- Eval edition: no product key. AcceptEula is what makes it truly
              unattended; without it setup stops at the licence screen. -->
         <AcceptEula>true</AcceptEula>
-        <FullName>tactus</FullName>
-        <Organization>tactus</Organization>
+        <FullName>upstroke</FullName>
+        <Organization>upstroke</Organization>
       </UserData>
     </component>
   </settings>
@@ -152,7 +152,7 @@
       <FirstLogonCommands>
         <SynchronousCommand wcm:action="add">
           <Order>1</Order>
-          <Description>tactus guest provisioning</Description>
+          <Description>upstroke guest provisioning</Description>
           <!-- The unattend CD's letter is unknown at authoring time; probe.
                Plain cmd for-loop: no XML-hostile characters needed. -->
           <CommandLine>cmd /c for %d in (D E F G) do if exist %d:\winguest-provision.ps1 powershell -NoProfile -ExecutionPolicy Bypass -File %d:\winguest-provision.ps1</CommandLine>

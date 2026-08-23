@@ -3,16 +3,16 @@
 #
 # Runs the four cargo gates, the seven bash CI gates, and a timed baseline.
 #
-# Uses `tactus-build` rather than setting CARGO_TARGET_DIR directly. A
+# Uses `upstroke-build` rather than setting CARGO_TARGET_DIR directly. A
 # per-worktree target dir gives 0% sccache reuse and forces a full rebuild in
 # every worktree; the slot pool gives cargo-level artifact reuse instead.
-# See the comment block in ~/bin/tactus-build.
+# See the comment block in ~/bin/upstroke-build.
 set -uo pipefail   # NOT -e: every gate must run and report, not stop at the first failure
 
 [ -f "$HOME/.cargo/env" ]  && . "$HOME/.cargo/env"
-[ -f "$HOME/.tactus-env" ] && . "$HOME/.tactus-env"
+[ -f "$HOME/.upstroke-env" ] && . "$HOME/.upstroke-env"
 
-REPO="${1:-/srv/tactus}"
+REPO="${1:-/srv/upstroke}"
 cd "$REPO" || exit 1
 
 echo "=========================================================="
@@ -45,10 +45,10 @@ gate() {
 }
 
 echo "--- cargo gates (all four must pass) ---"
-gate fmt    tactus-build cargo fmt --check
-gate clippy tactus-build cargo clippy --all-targets --all-features -- -D warnings
-gate test   tactus-build cargo test --all-targets --all-features
-gate msrv   tactus-build cargo +1.85.0 check --locked --all-targets --all-features
+gate fmt    upstroke-build cargo fmt --check
+gate clippy upstroke-build cargo clippy --all-targets --all-features -- -D warnings
+gate test   upstroke-build cargo test --all-targets --all-features
+gate msrv   upstroke-build cargo +1.85.0 check --locked --all-targets --all-features
 echo
 
 echo "--- test counts ---"
@@ -76,13 +76,13 @@ echo "--- windows leg: cargo test on the Server 2025 guest ---"
 # Tests HEAD (the exact sha), not the dirty tree: the leg ships the host's
 # commits to the guest's clone and checks the sha out detached, so UNPUSHED
 # work is covered but UNCOMMITTED changes are not. Commit before running.
-# TACTUS_NO_WINDOWS=1 skips loudly; an unreachable guest FAILS rather than
+# UPSTROKE_NO_WINDOWS=1 skips loudly; an unreachable guest FAILS rather than
 # skips, because a silently-missing gate is exactly how Windows breakage
 # would reach CI unseen again.
-if [ "${TACTUS_NO_WINDOWS:-0}" = "1" ]; then
-  printf '  [ SKIP ] windows  (TACTUS_NO_WINDOWS=1)\n'
+if [ "${UPSTROKE_NO_WINDOWS:-0}" = "1" ]; then
+  printf '  [ SKIP ] windows  (UPSTROKE_NO_WINDOWS=1)\n'
 elif ! ssh -o BatchMode=yes -o ConnectTimeout=5 windowsguest exit >/dev/null 2>&1; then
-  printf '  [ FAIL ] windows  guest unreachable (debug: tactus-winguest status)\n'
+  printf '  [ FAIL ] windows  guest unreachable (debug: upstroke-winguest status)\n'
   RC[win-test]=1
 else
   win_sha=$(git rev-parse HEAD)
@@ -94,7 +94,7 @@ else
   # have no quoting problem and need no server-side config at all.
   git bundle create -q /tmp/phase9-win.bundle HEAD
   scp -q /tmp/phase9-win.bundle windowsguest:C:/phase9-win.bundle
-  gate win-test ssh windowsguest "cd /d C:\tactus && git fetch -f -q C:\phase9-win.bundle HEAD:refs/heads/phase9-under-test && git checkout -q -f $win_sha && cargo test --all-targets --all-features"
+  gate win-test ssh windowsguest "cd /d C:\upstroke && git fetch -f -q C:\phase9-win.bundle HEAD:refs/heads/phase9-under-test && git checkout -q -f $win_sha && cargo test --all-targets --all-features"
   grep -h "test result:" /tmp/phase9_win-test.log 2>/dev/null | sed 's/^/  /'
 fi
 echo
@@ -106,7 +106,7 @@ for s in .github/scripts/*.sh; do bash -n "$s" || { echo "  SYNTAX FAIL: $s"; sy
 echo
 
 echo "--- baseline: time cargo test --all-targets --all-features (warm) ---"
-{ time tactus-build cargo test --all-targets --all-features >/dev/null 2>&1; } 2>&1 | grep -E 'real|user|sys' | sed 's/^/  /'
+{ time upstroke-build cargo test --all-targets --all-features >/dev/null 2>&1; } 2>&1 | grep -E 'real|user|sys' | sed 's/^/  /'
 echo
 
 echo "=========================================================="

@@ -14,7 +14,7 @@ include <tunables/global>
 #   bwrap: setting up uid map: Permission denied
 #
 # Observed 2026-08-17: codex exec -s read-only could not read a 30-line
-# Cargo.toml. Text round-trips worked, which is why ~/bin/tactus-preflight
+# Cargo.toml. Text round-trips worked, which is why ~/bin/upstroke-preflight
 # reported PASS and the gap surfaced only when a reviewer first needed to read
 # a file.
 #
@@ -32,7 +32,7 @@ include <tunables/global>
 #
 # VERIFY
 #   bwrap --ro-bind / / --unshare-net --dev /dev echo ok
-#   codex exec -s read-only -C /srv/tactus "read Cargo.toml and report edition"
+#   codex exec -s read-only -C /srv/upstroke "read Cargo.toml and report edition"
 
 profile bwrap /usr/bin/bwrap flags=(unconfined) {
   userns,

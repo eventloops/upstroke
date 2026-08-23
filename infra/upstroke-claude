@@ -8,7 +8,7 @@
 # So the session is created empty and claude starts when a human is present.
 set -uo pipefail
 [ -f "$HOME/.cargo/env" ]  && . "$HOME/.cargo/env"
-[ -f "$HOME/.tactus-env" ] && . "$HOME/.tactus-env"
-cd "${1:-/srv/tactus}" || exit 1
+[ -f "$HOME/.upstroke-env" ] && . "$HOME/.upstroke-env"
+cd "${1:-/srv/upstroke}" || exit 1
 echo "orchestrator: $(pwd)  |  brief: ~/ORCHESTRATOR-BRIEF.md"
 exec claude

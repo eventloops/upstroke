@@ -5,7 +5,7 @@
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use crate::error::TactusError;
+use crate::error::UpstrokeError;
 
 /// Last `max` bytes of trimmed text, cut on a char boundary, with an ellipsis
 /// marker when truncated.
@@ -121,20 +121,20 @@ pub fn probe_extensions(base: &Path) -> Option<PathBuf> {
     None
 }
 
-/// The user-level `~/.tactus` directory: pools live here (§17), and so do the
+/// The user-level `~/.upstroke` directory: pools live here (§17), and so do the
 /// agent-authored artifacts a run must keep outside the workspace (§15).
 ///
 /// `USERPROFILE` wins on Windows because shells like Git Bash set `HOME` to an
 /// MSYS-style path (`/c/Users/...`) that the Windows file APIs cannot open —
 /// trusting it there would write run artifacts somewhere nothing can read them
 /// back. Elsewhere `HOME` is authoritative and `USERPROFILE` is the fallback.
-pub fn user_tactus_dir() -> Option<PathBuf> {
+pub fn user_upstroke_dir() -> Option<PathBuf> {
     let home = if cfg!(windows) {
         std::env::var_os("USERPROFILE").or_else(|| std::env::var_os("HOME"))
     } else {
         std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE"))
     };
-    Some(PathBuf::from(home?).join(".tactus"))
+    Some(PathBuf::from(home?).join(".upstroke"))
 }
 
 /// Resolve a bare program name against PATH. Empty PATH segments are skipped:
@@ -200,15 +200,15 @@ pub(crate) fn find_program_candidates_on_path(
     found
 }
 
-pub fn write_text(path: &Path, content: &str) -> Result<(), TactusError> {
-    std::fs::write(path, content).map_err(|source| TactusError::Io {
+pub fn write_text(path: &Path, content: &str) -> Result<(), UpstrokeError> {
+    std::fs::write(path, content).map_err(|source| UpstrokeError::Io {
         path: path.to_path_buf(),
         source,
     })
 }
 
-pub fn write_json<T: serde::Serialize>(path: &Path, value: &T) -> Result<(), TactusError> {
-    let json = serde_json::to_string_pretty(value).map_err(|e| TactusError::Parse {
+pub fn write_json<T: serde::Serialize>(path: &Path, value: &T) -> Result<(), UpstrokeError> {
+    let json = serde_json::to_string_pretty(value).map_err(|e| UpstrokeError::Parse {
         message: format!("serializing {}: {e}", path.display()),
     })?;
     write_text(path, &(json + "\n"))
@@ -324,13 +324,13 @@ mod tests {
     #[test]
     fn find_program_resolves_real_tools_and_misses_fake_ones() {
         assert!(find_program("git").is_some(), "git is on PATH in this repo");
-        assert!(find_program("tactus-definitely-not-real-xyz").is_none());
+        assert!(find_program("upstroke-definitely-not-real-xyz").is_none());
     }
 
     #[test]
     fn candidate_resolution_preserves_path_directory_precedence() {
         let root =
-            std::env::temp_dir().join(format!("tactus-util-path-order-{}", std::process::id()));
+            std::env::temp_dir().join(format!("upstroke-util-path-order-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
         let first = root.join("first");
         let second = root.join("second");
@@ -391,7 +391,7 @@ mod tests {
         // The empty-PATH-segment guard in find_program rests on this: a bare
         // name must not resolve against the process CWD. Verified by probing
         // a file that exists in a scratch dir under its bare name.
-        let dir = std::env::temp_dir().join(format!("tactus-util-path-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("upstroke-util-path-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).expect("scratch dir");
         std::fs::write(dir.join("bait.txt"), "").expect("bait");

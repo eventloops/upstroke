@@ -45,30 +45,30 @@ most of a day.
 
 | File | Purpose |
 |---|---|
-| `tactus-preflight` | Proves both agent CLIs can make a **live call**. Cron'd 6-hourly. |
-| `tactus-watch` | Polls the watched branch; runs the full gates on each new commit. |
-| `tactus-build` | Wraps cargo with a slot-pooled `CARGO_TARGET_DIR`. **Use instead of setting it yourself.** |
-| `tactus-winguest` | Builds and operates the Windows Server 2025 guest (`up` = fetch ISOs, repack, unattended install, provision, verify). |
+| `upstroke-preflight` | Proves both agent CLIs can make a **live call**. Cron'd 6-hourly. |
+| `upstroke-watch` | Polls the watched branch; runs the full gates on each new commit. |
+| `upstroke-build` | Wraps cargo with a slot-pooled `CARGO_TARGET_DIR`. **Use instead of setting it yourself.** |
+| `upstroke-winguest` | Builds and operates the Windows Server 2025 guest (`up` = fetch ISOs, repack, unattended install, provision, verify). |
 | `autounattend.xml.in` + `winguest-provision.ps1` | Unattended Windows install + guest bootstrap: OpenSSH, Git, VS Build Tools (MSVC), rustup stable + 1.85.0. Password placeholder is substituted at build time, never committed. |
 | `phase9.sh` | The gate runner: 4 cargo gates, 7 bash CI gates, `bash -n` on all scripts, timed baseline. Exits non-zero on failure. |
-| `tactus-session` + `.service` | Long-lived tmux orchestrator session, started at boot via a lingering systemd user service. |
-| `99-tactus-preflight` | MOTD banner surfacing failing tokens or failing gates at login. |
+| `upstroke-session` + `.service` | Long-lived tmux orchestrator session, started at boot via a lingering systemd user service. |
+| `99-upstroke-preflight` | MOTD banner surfacing failing tokens or failing gates at login. |
 | `fix-shellenv.sh` | Standalone version of the non-interactive-shell fix (also in `setup.sh`). |
 
 ## Windows test leg
 
-`ssh windowsguest 'cd /d C:\tactus && cargo test --all-targets --all-features'`
+`ssh windowsguest 'cd /d C:\upstroke && cargo test --all-targets --all-features'`
 runs the suite on a Server 2025 KVM guest — the same OS as GitHub's
 windows-latest runner — so Windows-only failures surface in minutes, not
 after a push. phase9.sh has a `win-test` gate that ships HEAD (as a git bundle) to the
 guest's clone and tests that exact sha (unpushed commits: covered;
-uncommitted changes: not). `TACTUS_NO_WINDOWS=1` skips the gate loudly;
+uncommitted changes: not). `UPSTROKE_NO_WINDOWS=1` skips the gate loudly;
 an unreachable guest fails it rather than skipping, on purpose.
 
 ## Reviewer CLIs and the preflight
 
 Three reviewer CLIs run on this box: `claude` (Fable/Opus), `codex` (Sol), and
-`agy` (Antigravity CLI, Gemini 3.1 Pro). `tactus-preflight` proves all three
+`agy` (Antigravity CLI, Gemini 3.1 Pro). `upstroke-preflight` proves all three
 live on a 6-hourly cron and is the only thing standing between a broken
 credential and a reviewer that agrees with everything.
 
@@ -119,7 +119,7 @@ original plan. Four are worth knowing before touching any of this:
 identical commit: source path differs / target path same → **98% sccache hits**;
 source path same / target path differs → **0%**. The cache key is poisoned by
 the target directory, not the source. A directory per worktree is an unbounded
-set of paths, so nothing is ever reused. `tactus-build` uses a bounded slot pool
+set of paths, so nothing is ever reused. `upstroke-build` uses a bounded slot pool
 instead — full isolation between concurrent builds, but repeating paths.
 Second-worktree build: **8.82 s → 4.94 s**, 1 crate rebuilt instead of 55.
 

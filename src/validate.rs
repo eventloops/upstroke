@@ -1,4 +1,4 @@
-//! `tactus validate`: parse → config → graph checks → routing preview →
+//! `upstroke validate`: parse → config → graph checks → routing preview →
 //! rendered report. No execution of anything.
 
 use std::collections::BTreeMap;
@@ -8,7 +8,7 @@ use std::path::{Path, PathBuf};
 use crate::agent;
 use crate::capacity;
 use crate::config::{self, Config};
-use crate::error::{TactusError, ValidationErrors};
+use crate::error::{UpstrokeError, ValidationErrors};
 use crate::gates::{self, ShellGate};
 use crate::ir::{Plan, Task, TaskId};
 use crate::plan::{self, Parsed};
@@ -18,13 +18,13 @@ use crate::route::{self, ResolvedChain};
 #[derive(Debug, Clone)]
 pub struct ValidateOptions {
     pub plan_path: PathBuf,
-    /// Explicit `--config` path; `None` looks for `tactus.toml` in
+    /// Explicit `--config` path; `None` looks for `upstroke.toml` in
     /// `config_root`.
     pub config_path: Option<PathBuf>,
     /// Root of the repo the plan targets: config discovery and gate
     /// derivation both resolve here, never against the process CWD.
     pub config_root: PathBuf,
-    /// Pools file override for tests; `None` discovers `~/.tactus/pools.toml`.
+    /// Pools file override for tests; `None` discovers `~/.upstroke/pools.toml`.
     pub pools_path: Option<PathBuf>,
 }
 
@@ -67,8 +67,8 @@ pub struct Analysis {
     pub warnings: Vec<String>,
 }
 
-pub fn analyze(opts: &ValidateOptions) -> Result<Analysis, TactusError> {
-    let raw = fs::read_to_string(&opts.plan_path).map_err(|source| TactusError::Io {
+pub fn analyze(opts: &ValidateOptions) -> Result<Analysis, UpstrokeError> {
+    let raw = fs::read_to_string(&opts.plan_path).map_err(|source| UpstrokeError::Io {
         path: opts.plan_path.clone(),
         source,
     })?;
@@ -86,7 +86,7 @@ pub fn analyze(opts: &ValidateOptions) -> Result<Analysis, TactusError> {
     let config_path = || {
         opts.config_path
             .clone()
-            .unwrap_or_else(|| opts.config_root.join("tactus.toml"))
+            .unwrap_or_else(|| opts.config_root.join("upstroke.toml"))
     };
     check_pin_adapters(&config.pins, builtin_adapter, &config_path())?;
     let chains: Vec<ResolvedChain> = plan
@@ -138,7 +138,7 @@ fn adapter_list() -> String {
 /// and `run`; otherwise the preview promises a binding the run then refuses at
 /// pre-flight (§18).
 ///
-/// Currently unreachable through `tactus.toml` alone — `config::load` rejects
+/// Currently unreachable through `upstroke.toml` alone — `config::load` rejects
 /// any pin whose (agent, model) is absent from the catalog, and every catalog
 /// agent has an adapter as of step 9. It stays because that is a coincidence of
 /// today's table, not a property: §13 says the catalog ships ahead of support
@@ -148,10 +148,10 @@ fn check_pin_adapters(
     pins: &[config::Pin],
     has_adapter: impl Fn(&str) -> bool,
     config_path: &Path,
-) -> Result<(), TactusError> {
+) -> Result<(), UpstrokeError> {
     for pin in pins {
         if !has_adapter(&pin.agent) {
-            return Err(TactusError::Config {
+            return Err(UpstrokeError::Config {
                 path: config_path.to_path_buf(),
                 message: format!(
                     "pin for tier `{}` names agent `{}`, which has no adapter in this build \
@@ -166,7 +166,7 @@ fn check_pin_adapters(
     Ok(())
 }
 
-pub fn run(opts: &ValidateOptions) -> Result<Report, TactusError> {
+pub fn run(opts: &ValidateOptions) -> Result<Report, UpstrokeError> {
     let analysis = analyze(opts)?;
     let mut warnings = analysis.warnings;
     // Zero-spend preview of the §14 gate pre-flight: warn, never refuse.
@@ -251,7 +251,7 @@ fn review_echo(plan: &ReviewPlan) -> String {
 /// `validate` and `--dry-run` **do not probe** (§18): every figure here comes
 /// from files — the pools file, and the latest run's event log in this
 /// repository. That is a real distinction rather than a technicality, and the
-/// block says which side of it each line is on, because `tactus capacity` shows
+/// block says which side of it each line is on, because `upstroke capacity` shows
 /// strictly more by being allowed to spawn the vendors' CLIs.
 ///
 /// The same reason the review line says "if installed": a preview that reads as
@@ -260,7 +260,7 @@ fn capacity_echo(cfg: &Config, obs: &capacity::Observations, run: Option<&str>) 
     use std::fmt::Write as _;
 
     if cfg.pools.is_empty() {
-        return "capacity: not connected — run `tactus connect` to write ~/.tactus/pools.toml"
+        return "capacity: not connected — run `upstroke connect` to write ~/.upstroke/pools.toml"
             .to_owned();
     }
     let estimates = capacity::estimate(&cfg.pools, obs);
@@ -291,7 +291,7 @@ fn capacity_echo(cfg: &Config, obs: &capacity::Observations, run: Option<&str>) 
     }
     let _ = write!(
         out,
-        "  this preview reads files only and never probes (§18) — `tactus capacity` asks the \
+        "  this preview reads files only and never probes (§18) — `upstroke capacity` asks the \
          installed CLIs as well"
     );
     out
@@ -340,7 +340,7 @@ fn latest_run_observations(
 /// Duplicate ids, unknown `depends` targets, then cycles — all collected so a
 /// broken plan reports everything in one run. On a clean graph, artifact
 /// wiring that contradicts the dependency order is surfaced as warnings.
-fn check_graph(plan: &Plan, warnings: &mut Vec<String>) -> Result<(), TactusError> {
+fn check_graph(plan: &Plan, warnings: &mut Vec<String>) -> Result<(), UpstrokeError> {
     let mut problems = Vec::new();
     let mut seen: BTreeMap<&str, usize> = BTreeMap::new();
     for task in &plan.tasks {
@@ -365,7 +365,7 @@ fn check_graph(plan: &Plan, warnings: &mut Vec<String>) -> Result<(), TactusErro
         }
     }
     if !problems.is_empty() {
-        return Err(TactusError::Validation(ValidationErrors(problems)));
+        return Err(UpstrokeError::Validation(ValidationErrors(problems)));
     }
     check_artifact_wiring(plan, warnings);
     Ok(())
@@ -606,11 +606,11 @@ impl Report {
         out
     }
 
-    pub fn write_normalized_json(&self, path: &Path) -> Result<(), TactusError> {
-        let json = serde_json::to_string_pretty(&self.plan).map_err(|e| TactusError::Parse {
+    pub fn write_normalized_json(&self, path: &Path) -> Result<(), UpstrokeError> {
+        let json = serde_json::to_string_pretty(&self.plan).map_err(|e| UpstrokeError::Parse {
             message: format!("serializing normalized plan: {e}"),
         })?;
-        fs::write(path, json + "\n").map_err(|source| TactusError::Io {
+        fs::write(path, json + "\n").map_err(|source| UpstrokeError::Io {
             path: path.to_path_buf(),
             source,
         })
@@ -629,7 +629,7 @@ mod tests {
 
     fn opts(plan: &str) -> ValidateOptions {
         let hermetic_root =
-            env::temp_dir().join(format!("tactus-validate-hermetic-{}", std::process::id()));
+            env::temp_dir().join(format!("upstroke-validate-hermetic-{}", std::process::id()));
         fs::create_dir_all(&hermetic_root).expect("hermetic root");
         ValidateOptions {
             plan_path: PathBuf::from(plan),
@@ -638,13 +638,13 @@ mod tests {
             pools_path: Some({
                 // A real, empty pools file: an explicit `--pools` that does not
                 // exist is a hard error, and `None` would reach for the
-                // operator's own `~/.tactus/pools.toml`.
+                // operator's own `~/.upstroke/pools.toml`.
                 // Created once: identical for every caller, and rewriting one
                 // shared path from parallel tests truncates it under a reader.
                 static PATH: OnceLock<PathBuf> = OnceLock::new();
                 PATH.get_or_init(|| {
                     let dir = env::temp_dir()
-                        .join(format!("tactus-validate-nopools-{}", std::process::id()));
+                        .join(format!("upstroke-validate-nopools-{}", std::process::id()));
                     fs::create_dir_all(&dir).expect("scratch dir");
                     let path = dir.join("pools.toml");
                     fs::write(
@@ -672,7 +672,7 @@ mod tests {
             model: "qwen-3-coder".to_owned(),
             effort: None,
         }];
-        let err = check_pin_adapters(&pins, builtin_adapter, Path::new("tactus.toml"))
+        let err = check_pin_adapters(&pins, builtin_adapter, Path::new("upstroke.toml"))
             .expect_err("preview must not promise a binding run would refuse");
         let message = err.to_string();
         assert!(message.contains("no adapter"), "got: {message}");
@@ -689,7 +689,7 @@ mod tests {
             effort: None,
         }];
         assert!(
-            check_pin_adapters(&pins, builtin_adapter, Path::new("tactus.toml")).is_ok(),
+            check_pin_adapters(&pins, builtin_adapter, Path::new("upstroke.toml")).is_ok(),
             "copilot gained an adapter in step 9"
         );
     }
@@ -699,17 +699,17 @@ mod tests {
         // §18: `validate` and `--dry-run` execute nothing, so they cannot check
         // that a named reviewer is installed. Saying "would be, if installed"
         // is the difference between a plan and a promise.
-        let root = env::temp_dir().join(format!("tactus-validate-review-{}", std::process::id()));
+        let root = env::temp_dir().join(format!("upstroke-validate-review-{}", std::process::id()));
         fs::create_dir_all(&root).expect("root");
         let plan = root.join("plan.md");
         fs::write(
             &plan,
             "## Rotate the signing key\n\
-             <!-- tactus: id=rotate kind=implement depends= paths=src/auth/** -->\n\n\
-             ## Note it down\n<!-- tactus: id=note kind=docs depends=rotate -->\n",
+             <!-- upstroke: id=rotate kind=implement depends= paths=src/auth/** -->\n\n\
+             ## Note it down\n<!-- upstroke: id=note kind=docs depends=rotate -->\n",
         )
         .expect("plan");
-        let cfg = root.join("tactus.toml");
+        let cfg = root.join("upstroke.toml");
         fs::write(
             &cfg,
             "[[routing.overrides]]\npaths = [\"src/auth/**\"]\nsecond_opinion = \
@@ -749,7 +749,7 @@ mod tests {
 
     #[test]
     fn the_preview_echoes_resolved_role_tier_pin_and_disabled_review_effort() {
-        let root = env::temp_dir().join(format!("tactus-validate-effort-{}", std::process::id()));
+        let root = env::temp_dir().join(format!("upstroke-validate-effort-{}", std::process::id()));
         fs::create_dir_all(&root).expect("root");
         let cases = [
             (
@@ -797,7 +797,7 @@ mod tests {
 
     #[test]
     fn the_capacity_block_estimates_without_probing_and_never_reads_unknown_as_full() {
-        let dir = env::temp_dir().join(format!("tactus-validate-pools-{}", std::process::id()));
+        let dir = env::temp_dir().join(format!("upstroke-validate-pools-{}", std::process::id()));
         fs::create_dir_all(&dir).expect("dir");
         let pools = dir.join("pools.toml");
         fs::write(
@@ -843,7 +843,7 @@ mod tests {
 
     #[test]
     fn derived_gates_appear_in_the_preview() {
-        let root = env::temp_dir().join(format!("tactus-validate-gates-{}", std::process::id()));
+        let root = env::temp_dir().join(format!("upstroke-validate-gates-{}", std::process::id()));
         fs::create_dir_all(&root).expect("root");
         fs::write(root.join("Cargo.toml"), "[package]\nname='x'\n").expect("marker");
         let mut o = opts("fixtures/sample-plan.md");
@@ -899,10 +899,10 @@ mod tests {
 
     #[test]
     fn unknown_depends_fails_clearly() {
-        let dir = env::temp_dir().join(format!("tactus-validate-{}", std::process::id()));
+        let dir = env::temp_dir().join(format!("upstroke-validate-{}", std::process::id()));
         fs::create_dir_all(&dir).expect("scratch dir");
         let plan = dir.join("unknown-dep.md");
-        fs::write(&plan, "## One\n<!-- tactus: id=one depends=ghost -->\n").expect("write plan");
+        fs::write(&plan, "## One\n<!-- upstroke: id=one depends=ghost -->\n").expect("write plan");
         let mut o = opts("x");
         o.plan_path = plan;
         let err = run(&o).expect_err("unknown dep must fail");
@@ -912,12 +912,12 @@ mod tests {
 
     #[test]
     fn duplicate_ids_fail() {
-        let dir = env::temp_dir().join(format!("tactus-validate-dup-{}", std::process::id()));
+        let dir = env::temp_dir().join(format!("upstroke-validate-dup-{}", std::process::id()));
         fs::create_dir_all(&dir).expect("scratch dir");
         let plan = dir.join("dup.md");
         fs::write(
             &plan,
-            "## One\n<!-- tactus: id=same -->\n\n## Two\n<!-- tactus: id=same depends= -->\n",
+            "## One\n<!-- upstroke: id=same -->\n\n## Two\n<!-- upstroke: id=same depends= -->\n",
         )
         .expect("write plan");
         let mut o = opts("x");
@@ -936,13 +936,13 @@ mod tests {
 
     #[test]
     fn artifact_needed_from_a_non_dependency_warns() {
-        let dir = env::temp_dir().join(format!("tactus-wiring-{}", std::process::id()));
+        let dir = env::temp_dir().join(format!("upstroke-wiring-{}", std::process::id()));
         fs::create_dir_all(&dir).expect("scratch dir");
         let plan = dir.join("wiring.md");
         fs::write(
             &plan,
-            "## Design\n<!-- tactus: id=d out=contract depends= -->\n\n\
-             ## Build\n<!-- tactus: id=b needs=contract depends= -->\n",
+            "## Design\n<!-- upstroke: id=d out=contract depends= -->\n\n\
+             ## Build\n<!-- upstroke: id=b needs=contract depends= -->\n",
         )
         .expect("write plan");
         let mut o = opts("x");
@@ -964,7 +964,7 @@ mod tests {
 
     #[test]
     fn unrecognized_plan_format_names_available_adapters() {
-        let dir = env::temp_dir().join(format!("tactus-sniff-{}", std::process::id()));
+        let dir = env::temp_dir().join(format!("upstroke-sniff-{}", std::process::id()));
         fs::create_dir_all(&dir).expect("scratch dir");
         let plan = dir.join("plan.json");
         fs::write(&plan, "{\"tasks\": []}\n").expect("write file");
@@ -977,7 +977,7 @@ mod tests {
     #[test]
     fn emit_json_round_trips_through_the_ir() {
         let report = run(&opts("fixtures/sample-plan.md")).expect("sample plan validates");
-        let dir = env::temp_dir().join(format!("tactus-emit-{}", std::process::id()));
+        let dir = env::temp_dir().join(format!("upstroke-emit-{}", std::process::id()));
         fs::create_dir_all(&dir).expect("scratch dir");
         let json_path = dir.join("plan.normalized.json");
         report
