@@ -2927,6 +2927,26 @@ fn the_event_log_is_written_in_exactly_one_module() {
 #[test]
 fn the_stable_prefix_barrier_is_the_only_way_a_log_becomes_a_topology_fold() {
     const FOLD_ENTRIES: &[&str] = &["TopologyFold::replay(", "TopologyFold::parse_log("];
+    /// The control: every production region that names the fold at all, in
+    /// path order.
+    ///
+    /// A **list** rather than a count, because the count was the wrong shape
+    /// for its own job twice over. A wrong number said only "a number moved"
+    /// and left the reader to find which file; and two changes that each add a
+    /// module both set the number to `n + 1`, so a merge of the two produces a
+    /// value that is silently wrong in the direction that weakens the census.
+    /// A list names the file and merges additively.
+    const NAMING_THE_FOLD: &[&str] = &[
+        // The candidate sequence: its journal seam hands back the live fold,
+        // and its recovery classifier reads one. It builds none.
+        "src/engine/topology/candidate.rs",
+        // This funnel.
+        "src/events/log.rs",
+        // The fold's own bounded census.
+        "src/topology/census.rs",
+        // The fold.
+        "src/topology/fold.rs",
+    ];
     let src = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
     let funnel = src.join("events").join("log.rs");
 
@@ -2983,7 +3003,7 @@ fn the_stable_prefix_barrier_is_the_only_way_a_log_becomes_a_topology_fold() {
     );
 
     let mut scanned = 0_usize;
-    let mut mentioning = 0_usize;
+    let mut mentioning: Vec<String> = Vec::new();
     let mut callers: Vec<(PathBuf, &str, usize)> = Vec::new();
     for path in &files {
         if test_modules.contains(path) {
@@ -2998,7 +3018,12 @@ fn the_stable_prefix_barrier_is_the_only_way_a_log_becomes_a_topology_fold() {
         };
         scanned += 1;
         if production.contains("TopologyFold") {
-            mentioning += 1;
+            mentioning.push(
+                path.strip_prefix(src.parent().expect("src has a parent"))
+                    .unwrap_or(path)
+                    .to_string_lossy()
+                    .replace('\\', "/"),
+            );
         }
         for entry in FOLD_ENTRIES {
             let count = production.matches(entry).count();
@@ -3010,10 +3035,10 @@ fn the_stable_prefix_barrier_is_the_only_way_a_log_becomes_a_topology_fold() {
 
     assert!(scanned > 40, "the walk found only {scanned} source files");
     assert_eq!(
-        mentioning, 3,
-        "the control: `TopologyFold` is named in the production half of the fold, its census and \
-         this funnel. A different number means the regions this census scanned are not the ones \
-         it thinks they are, and its zero counts would prove nothing"
+        mentioning, NAMING_THE_FOLD,
+        "the control: these are the production regions that name `TopologyFold` at all. A \
+         different set means the regions this census scanned are not the ones it thinks they \
+         are, and its zero counts would prove nothing"
     );
 
     assert_eq!(
