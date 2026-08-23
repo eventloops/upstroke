@@ -2983,7 +2983,7 @@ fn the_stable_prefix_barrier_is_the_only_way_a_log_becomes_a_topology_fold() {
     );
 
     let mut scanned = 0_usize;
-    let mut mentioning = 0_usize;
+    let mut mentioning: Vec<String> = Vec::new();
     let mut callers: Vec<(PathBuf, &str, usize)> = Vec::new();
     for path in &files {
         if test_modules.contains(path) {
@@ -2998,7 +2998,12 @@ fn the_stable_prefix_barrier_is_the_only_way_a_log_becomes_a_topology_fold() {
         };
         scanned += 1;
         if production.contains("TopologyFold") {
-            mentioning += 1;
+            mentioning.push(
+                path.strip_prefix(&src)
+                    .unwrap_or(path)
+                    .to_string_lossy()
+                    .replace('\\', "/"),
+            );
         }
         for entry in FOLD_ENTRIES {
             let count = production.matches(entry).count();
@@ -3009,11 +3014,30 @@ fn the_stable_prefix_barrier_is_the_only_way_a_log_becomes_a_topology_fold() {
     }
 
     assert!(scanned > 40, "the walk found only {scanned} source files");
+    // The control: which files name the fold at all in their production half.
+    //
+    // A **list**, not a count. Two slices that each add a module naming
+    // `TopologyFold` both write the same larger number, and the merge takes one
+    // of them silently — in the direction that *weakens* this census, because
+    // the count would then be satisfied by a scan that had missed a file and
+    // found an unexpected one. A list conflicts visibly instead.
+    mentioning.sort();
     assert_eq!(
-        mentioning, 3,
-        "the control: `TopologyFold` is named in the production half of the fold, its census and \
-         this funnel. A different number means the regions this census scanned are not the ones \
-         it thinks they are, and its zero counts would prove nothing"
+        mentioning,
+        vec![
+            // Reads a fold it never builds: the schema-4 loop's selection.
+            "engine/topology/select.rs".to_owned(),
+            // Reads a fold it never builds: the schema-4 loop's settlements.
+            "engine/topology/settle.rs".to_owned(),
+            // This funnel, where the barrier builds the one fold there is.
+            "events/log.rs".to_owned(),
+            // The bounded reachability census over fold states.
+            "topology/census.rs".to_owned(),
+            // The fold itself.
+            "topology/fold.rs".to_owned(),
+        ],
+        "the control: a different set means the regions this census scanned are not the ones it \
+         thinks they are, and its zero counts would prove nothing"
     );
 
     assert_eq!(

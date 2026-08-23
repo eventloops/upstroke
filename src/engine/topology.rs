@@ -40,6 +40,8 @@
 
 pub mod identity;
 pub mod seams;
+pub mod select;
+pub mod settle;
 
 pub use identity::{
     AttemptIdentities, InvocationLedger, PreflightIdentities, ReservationKind, Reservations,
@@ -48,4 +50,10 @@ pub use identity::{
 pub use seams::{
     HarnessTopologyHooks, IdSource, NoTopologyHooks, RealIds, SystemClock, TimeSource,
     TopologyHooks,
+};
+pub use select::{Admitted, Breach, Ceiling, Spend, Step, checkpoint, select};
+pub use settle::{
+    Deferral, FinishedAttempt, ManagedWorktrees, RetryOutcome, RetryRequest, Settled,
+    WorktreeVerify, close_generation, close_retained, rematerialize_question, retry, run_ending,
+    settle_failed, settle_succeeded,
 };
