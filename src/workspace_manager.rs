@@ -1040,6 +1040,64 @@ pub struct WorkspaceManager {
     execution_root: PathBuf,
 }
 
+/// `fs::remove_dir_all`, tolerating the window in which a just-killed process's
+/// handles are still closing.
+///
+/// A Windows process that has exited can still hold the last references to files in
+/// its worktree. The kernel answers a delete with `ERROR_SHARING_VIOLATION`, and with
+/// `ERROR_ACCESS_DENIED` once a name is delete-pending — the same shape
+/// `runner::container` already documents for container directories. Both clear on
+/// their own in milliseconds.
+///
+/// This matters because the engine kills agents as ordinary control flow rather than
+/// as an error path: the container runner reclaims on every cancellation, so removal
+/// *races* that closure instead of meeting it occasionally. Without the retry the
+/// engine reports a hard `Io` failure for a condition that was already resolving.
+///
+/// Unix needs none of it — unlinking detaches the name regardless of open descriptors,
+/// so the first attempt succeeds — and the retry is not compiled in there. The bound
+/// is deliberate: a handle held longer than `ATTEMPTS * STEP` is not a closing process
+/// and its error is returned unchanged rather than masked.
+///
+/// **This is not `runner::container::racing_removal`, and the two must not be merged.**
+/// That one resolves a *handoff*: two threads racing on one path, where the loser needs
+/// only the winner's in-flight call to return, which is why it spends
+/// `RACING_ACCESS_ATTEMPTS` cheap `yield_now`s and no wall-clock at all. This one waits
+/// on a *kernel* condition with a millisecond timescale, which no number of yields
+/// reaches. Give either race the other's budget and both stop working: the handoff
+/// would sleep for a microsecond problem, and this would spin through a dead process's
+/// handles long before they closed.
+#[cfg(windows)]
+fn remove_tree_once_handles_close(path: &Path) -> std::io::Result<()> {
+    use windows_sys::Win32::Foundation::{ERROR_ACCESS_DENIED, ERROR_SHARING_VIOLATION};
+
+    const ATTEMPTS: u32 = 40;
+    const STEP: std::time::Duration = std::time::Duration::from_millis(25);
+
+    let mut attempt = 1_u32;
+    loop {
+        let error = match fs::remove_dir_all(path) {
+            Ok(()) => return Ok(()),
+            Err(error) => error,
+        };
+        let closing = matches!(
+            error.raw_os_error(),
+            Some(code)
+                if code == ERROR_SHARING_VIOLATION as i32 || code == ERROR_ACCESS_DENIED as i32
+        );
+        if !closing || attempt >= ATTEMPTS {
+            return Err(error);
+        }
+        attempt += 1;
+        std::thread::sleep(STEP);
+    }
+}
+
+#[cfg(not(windows))]
+fn remove_tree_once_handles_close(path: &Path) -> std::io::Result<()> {
+    fs::remove_dir_all(path)
+}
+
 impl WorkspaceManager {
     /// Derive the execution root of `run_id` from the managed base and the
     /// authorized private root, and refuse every containment condition
@@ -1731,7 +1789,7 @@ impl WorkspaceManager {
         funnel(hooks, slot.remove_site(), || {
             if path.exists() {
                 let contained = self.contained(&path)?;
-                fs::remove_dir_all(&contained).map_err(|source| TactusError::Io {
+                remove_tree_once_handles_close(&contained).map_err(|source| TactusError::Io {
                     path: contained,
                     source,
                 })?;
@@ -3699,6 +3757,98 @@ mod tests {
             !fixture.manager.execution_root().exists(),
             "and perform no effect"
         );
+    }
+
+    /// A process the engine killed can still be closing its handles, and on Windows
+    /// that makes `remove_dir_all` answer `ERROR_SHARING_VIOLATION` for a worktree
+    /// that is about to become removable. `remove_worktree` retries across that
+    /// window rather than reporting a hard `Io` failure.
+    ///
+    /// This is the deterministic form of what the residue sampler hits at random:
+    /// the sampler kills a real `git` child at an unseeded point and *sometimes*
+    /// leaves a handle, so it proves the condition exists but cannot be re-run to
+    /// prove a fix. Here the handle is held on purpose and released on a timer.
+    ///
+    /// The second half is the one that matters. A handle held **past** the retry
+    /// budget must still fail: a retry that waits forever is not a fix, it is a
+    /// hang, and one that swallows the error hides a genuinely locked worktree.
+    #[cfg(windows)]
+    #[test]
+    fn a_worktree_whose_killed_child_is_still_closing_is_removed_not_refused() {
+        use std::os::windows::fs::OpenOptionsExt as _;
+        use std::sync::mpsc;
+
+        use windows_sys::Win32::Storage::FileSystem::FILE_SHARE_READ;
+
+        for (hold, expected_removal) in [
+            (std::time::Duration::from_millis(300), true),
+            (std::time::Duration::MAX, false),
+        ] {
+            let fixture = Fixture::created("closing-handle");
+            let slot = fixture.task("alpha", 1);
+            fixture
+                .manager
+                .write_intent(&mut NoHooks, &slot)
+                .expect("the intent must be durable");
+            fixture
+                .manager
+                .add_worktree(&mut NoHooks, &slot, &fixture.head)
+                .expect("the worktree the killed child was working in");
+
+            // A file inside the worktree, held open with the sharing mode a running
+            // process has. Opened on another thread so the handle outlives this
+            // statement and drops on a timer -- exactly the shape of a process that
+            // has exited while its last handle is still closing.
+            let target = fixture.manager.execution_root().join(slot.relative());
+            let held = target.join("held-by-the-dying-child");
+            fs::write(&held, b"bytes the child had open").expect("plant the file");
+            let (opened, ready) = mpsc::channel();
+            let holder = std::thread::spawn(move || {
+                // `FILE_SHARE_READ` alone, deliberately: Rust's `File::open` asks for
+                // `FILE_SHARE_DELETE` too, and a handle that shares deletion does not
+                // block one -- the first version of this test removed the worktree
+                // happily and proved nothing. A `git` child holds its files without
+                // delete sharing, which is what makes the kernel answer
+                // `ERROR_SHARING_VIOLATION`.
+                let file = fs::OpenOptions::new()
+                    .read(true)
+                    .share_mode(FILE_SHARE_READ)
+                    .open(&held)
+                    .expect("hold the file open the way a git child does");
+                opened.send(()).expect("announce the handle is held");
+                if hold == std::time::Duration::MAX {
+                    // Held for the whole test: the control that proves the retry
+                    // is bounded and still reports a real lock.
+                    std::thread::sleep(std::time::Duration::from_secs(5));
+                } else {
+                    std::thread::sleep(hold);
+                }
+                drop(file);
+            });
+            ready
+                .recv()
+                .expect("the handle is held before removal is attempted");
+
+            let outcome = fixture.manager.remove_worktree(&mut NoHooks, &slot);
+            if expected_removal {
+                outcome.expect("removal retries across the closing handle");
+                assert!(
+                    !target.exists(),
+                    "and the worktree is actually gone, not merely un-refused"
+                );
+            } else {
+                let error = outcome.expect_err(
+                    "a handle held past the retry budget is a locked worktree, not a closing one, \
+                     and must be reported rather than waited on forever",
+                );
+                assert!(
+                    target.exists(),
+                    "and the worktree is still there, which is what the error says: {}",
+                    refusal_of(&error)
+                );
+            }
+            let _ = holder.join();
+        }
     }
 
     /// The Windows half of `expected_failures_refusals[0]`: a **junction** is a
