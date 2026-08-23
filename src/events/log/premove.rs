@@ -12,7 +12,7 @@
 //! mechanical changes and no others:
 //!
 //!   * the type is `PremoveEventLog`, so both writers can be linked at once;
-//!   * `EventBody`, `Event` and `TactusError` are imported rather than in scope.
+//!   * `EventBody`, `Event` and `UpstrokeError` are imported rather than in scope.
 //!
 //! To check that claim without trusting this comment:
 //!
@@ -32,10 +32,10 @@ use std::fs::{File, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
-use crate::error::TactusError;
+use crate::error::UpstrokeError;
 use crate::events::{Event, EventBody};
 
-/// The append-only writer. One per run, held by the engine — `tactus answer`
+/// The append-only writer. One per run, held by the engine — `upstroke answer`
 /// deliberately does not write here (it drops a file the engine ingests), so
 /// the log has exactly one writer and interleaved lines are impossible.
 #[derive(Debug)]
@@ -59,8 +59,8 @@ impl PremoveEventLog {
     /// never finished being written, and no reader could ever have parsed
     /// them — and it keeps "damage anywhere but the end means corruption" a
     /// statement the reader can still trust.
-    pub fn open(path: &Path, warnings: &mut Vec<String>) -> Result<Self, TactusError> {
-        let io = |source| TactusError::Io {
+    pub fn open(path: &Path, warnings: &mut Vec<String>) -> Result<Self, UpstrokeError> {
+        let io = |source| UpstrokeError::Io {
             path: path.to_path_buf(),
             source,
         };
@@ -115,13 +115,13 @@ impl PremoveEventLog {
     /// is recoverable by replaying this file, which is only true if the event
     /// reached the disk before the work it describes carried on. A run emits
     /// tens of events, so the cost is noise beside a single attempt.
-    pub fn append(&mut self, body: EventBody) -> Result<Event, TactusError> {
+    pub fn append(&mut self, body: EventBody) -> Result<Event, UpstrokeError> {
         let event = Event::now(body);
-        let mut line = serde_json::to_string(&event).map_err(|e| TactusError::EventLog {
+        let mut line = serde_json::to_string(&event).map_err(|e| UpstrokeError::EventLog {
             path: self.path.clone(),
             message: format!("serializing {}: {e}", event.body.kind()),
         })?;
-        let written = serde_json::from_str(&line).map_err(|e| TactusError::EventLog {
+        let written = serde_json::from_str(&line).map_err(|e| UpstrokeError::EventLog {
             path: self.path.clone(),
             message: format!(
                 "{} does not survive its own wire format ({e}); the log could not be replayed",
@@ -129,7 +129,7 @@ impl PremoveEventLog {
             ),
         })?;
         line.push('\n');
-        let io = |source| TactusError::Io {
+        let io = |source| UpstrokeError::Io {
             path: self.path.clone(),
             source,
         };

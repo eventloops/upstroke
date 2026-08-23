@@ -8,7 +8,7 @@
 //!
 //! Three things live here that are not in the funnel:
 //!
-//! * **Environment composition** (DESIGN.md:258-264). The Tactus environment is
+//! * **Environment composition** (DESIGN.md:258-264). The Upstroke environment is
 //!   the base; the runner supplies the reserved keys; `CommandSpec.env` is an
 //!   overlay applied last and refused pre-flight if it names a reserved key.
 //! * **The `RunnerPreflight` shell probe** (INV-23). The recorded shell
@@ -37,7 +37,7 @@ use std::time::Duration;
 
 use crate::agent::proc::{self, NoHooks, SpawnHooks};
 use crate::agent::{ProcessOutput, claude, codex, copilot};
-use crate::error::TactusError;
+use crate::error::UpstrokeError;
 use crate::gates::ShellKind;
 use crate::runner::invocation::InvocationId;
 use crate::runner::policy::{host_policy, runner_policy_sha256};
@@ -113,7 +113,7 @@ impl KeyCase {
 /// behavior but may not conflict with runner-reserved keys."
 ///
 /// `USERPROFILE` is here beside `HOME` because on Windows it *is* the home
-/// variable — [`crate::util::user_tactus_dir`] reads it first there and falls
+/// variable — [`crate::util::user_upstroke_dir`] reads it first there and falls
 /// back to `HOME`, precisely because Git Bash sets `HOME` to an MSYS path the
 /// Windows file APIs cannot open. Reserving one and not the other would let an
 /// adapter move the home directory on one platform through the name the other
@@ -186,7 +186,7 @@ pub struct HostEnvironment {
 }
 
 impl HostEnvironment {
-    /// The Tactus process environment, under this platform's name rule.
+    /// The Upstroke process environment, under this platform's name rule.
     #[must_use]
     pub fn from_process() -> Self {
         Self {
@@ -219,7 +219,7 @@ impl HostEnvironment {
     /// absent variable to the empty string is a different environment from not
     /// setting it, and several CLIs read "set but empty" as an instruction.
     ///
-    /// DESIGN.md:259-262 — "the host runner starts from the Tactus environment
+    /// DESIGN.md:259-262 — "the host runner starts from the Upstroke environment
     /// and the container runner from the image environment; **each** supplies
     /// role-scoped `HOME`, `PATH`, and credential locations" — resolved for
     /// `host-v1` as follows, and the split is deliberate:
@@ -256,7 +256,7 @@ impl HostEnvironment {
     ///
     ///   The value comes from the base rather than from anything this runner
     ///   invents, because the same decision says where the base is (:321-322):
-    ///   "**The host base starts from the Tactus process environment**, while
+    ///   "**The host base starts from the Upstroke process environment**, while
     ///   the container base starts from the image environment." A process
     ///   environment carries one value per key under [`KeyCase`] — so one
     ///   value is what a correct `host-v1` *produces*, not a narrowing this
@@ -303,7 +303,7 @@ impl HostEnvironment {
     /// runner supplies them, and that is what makes "role-scoped" a property
     /// of the child's environment rather than of a vector nothing reads.
     /// Cloning the base and then upserting would leave every credential
-    /// location the Tactus process happens to carry in a gate's environment —
+    /// location the Upstroke process happens to carry in a gate's environment —
     /// a gate is repository-controlled code, and `CODEX_HOME` reaching it is
     /// exactly the thing [`supplies_credentials`] exists to prevent. It would
     /// also make this step *output-equivalent to deleting it*, because
@@ -313,7 +313,7 @@ impl HostEnvironment {
     ///
     /// # Errors
     ///
-    /// [`TactusError::Refused`] naming the key when the overlay names a
+    /// [`UpstrokeError::Refused`] naming the key when the overlay names a
     /// reserved one. That is the contract's `expected_failures_refusals[0]`,
     /// "reserved env conflict -> pre-flight error", and it is refused by
     /// **key**: `invariants_introduced[0]` says "reserved keys refused
@@ -325,7 +325,7 @@ impl HostEnvironment {
         role: &ExecutionRole,
         agent: Option<&AgentId>,
         overlay: &[(String, String)],
-    ) -> Result<Vec<(OsString, OsString)>, TactusError> {
+    ) -> Result<Vec<(OsString, OsString)>, UpstrokeError> {
         self.preflight(overlay)?;
         let mut composed = self.base.clone();
         for reserved in reserved_keys() {
@@ -350,15 +350,15 @@ impl HostEnvironment {
     ///
     /// # Errors
     ///
-    /// [`TactusError::Refused`] naming the offending key and the reserved key
+    /// [`UpstrokeError::Refused`] naming the offending key and the reserved key
     /// it collides with.
-    pub fn preflight(&self, overlay: &[(String, String)]) -> Result<(), TactusError> {
+    pub fn preflight(&self, overlay: &[(String, String)]) -> Result<(), UpstrokeError> {
         for (key, _) in overlay {
             if let Some(reserved) = reserved_keys()
                 .into_iter()
                 .find(|reserved| self.case.same_key(OsStr::new(key), OsStr::new(reserved)))
             {
-                return Err(TactusError::Refused {
+                return Err(UpstrokeError::Refused {
                     message: format!(
                         "the command overlay sets `{key}`, which is reserved by the host runner \
                          (`{reserved}`). An adapter may select a profile or change CLI behaviour, \
@@ -560,10 +560,10 @@ impl HostRunner {
     ///
     /// # Errors
     ///
-    /// [`TactusError::Refused`] with a diagnostic when the ambient job cannot
+    /// [`UpstrokeError::Refused`] with a diagnostic when the ambient job cannot
     /// be created or joined. The caller refuses the write command before any
     /// effect.
-    pub fn start_write_command(&self) -> Result<Contained, TactusError> {
+    pub fn start_write_command(&self) -> Result<Contained, UpstrokeError> {
         let mut hooks = self.hooks.lock().unwrap_or_else(PoisonError::into_inner);
         contain_write_command(&mut **hooks)
     }
@@ -572,14 +572,14 @@ impl HostRunner {
     ///
     /// # Errors
     ///
-    /// [`TactusError::Refused`] when the recorded shell cannot be spawned, is
+    /// [`UpstrokeError::Refused`] when the recorded shell cannot be spawned, is
     /// killed by the probe timeout, or does not exit 0.
     pub fn shell_probe(
         &self,
         shell: ShellKind,
         workspace: &Path,
         invocation: InvocationId,
-    ) -> Result<(), TactusError> {
+    ) -> Result<(), UpstrokeError> {
         run_shell_probe(self, shell, workspace.to_path_buf(), invocation)
     }
 
@@ -598,7 +598,7 @@ impl HostRunner {
     /// **A refusal is remembered too.** Fail-closed: a run whose pre-flight
     /// could not find `claude` on the `PATH` it composes does not silently find
     /// it at the third attempt because something installed one meanwhile. The
-    /// stored value is the refusal's message, and [`TactusError::Refused`]
+    /// stored value is the refusal's message, and [`UpstrokeError::Refused`]
     /// displays as exactly its message, so the replayed error is the first
     /// one byte for byte —
     /// `a_refused_name_is_refused_identically_without_asking_the_filesystem_again`
@@ -613,13 +613,13 @@ impl HostRunner {
     ///
     /// # Errors
     ///
-    /// [`TactusError::Refused`] — [`resolve_program`]'s, first-hand or
+    /// [`UpstrokeError::Refused`] — [`resolve_program`]'s, first-hand or
     /// replayed.
     fn program_for(
         &self,
         program: &str,
         composed: &[(OsString, OsString)],
-    ) -> Result<PathBuf, TactusError> {
+    ) -> Result<PathBuf, UpstrokeError> {
         RESOLUTIONS.with(|count| count.set(count.get() + 1));
         let case = self.environment.case();
         let question = ProgramQuestion {
@@ -631,7 +631,7 @@ impl HostRunner {
         if let Some(answer) = resolved.get(&question) {
             return answer
                 .clone()
-                .map_err(|message| TactusError::Refused { message });
+                .map_err(|message| UpstrokeError::Refused { message });
         }
         let answer = resolve_program(program, composed, case, ProgramNaming::current());
         resolved.insert(
@@ -646,7 +646,7 @@ impl HostRunner {
 }
 
 impl Runner for HostRunner {
-    fn run(&self, request: &RunnerRequest) -> Result<ProcessOutput, TactusError> {
+    fn run(&self, request: &RunnerRequest) -> Result<ProcessOutput, UpstrokeError> {
         let composed = self.environment.compose(
             &request.role,
             request.agent.as_ref(),
@@ -1024,7 +1024,7 @@ fn composed_value<'a>(
 ///
 /// # Errors
 ///
-/// [`TactusError::Refused`] naming the program, the boundary and the `PATH` it
+/// [`UpstrokeError::Refused`] naming the program, the boundary and the `PATH` it
 /// searched, when a bare name matches nothing. Fail-closed on purpose: the
 /// alternative is handing the name to `Command` anyway and letting the spawn
 /// fail with a bare `NotFound` that names no boundary, which on Windows is
@@ -1034,7 +1034,7 @@ fn resolve_program(
     composed: &[(OsString, OsString)],
     case: KeyCase,
     naming: ProgramNaming,
-) -> Result<PathBuf, TactusError> {
+) -> Result<PathBuf, UpstrokeError> {
     SEARCHES.with(|count| count.set(count.get() + 1));
     if !naming.is_bare_name(program) {
         // A location, used as given — no probing, no extension, nothing this
@@ -1089,7 +1089,7 @@ fn resolve_program(
             }
         }
     }
-    Err(TactusError::Refused {
+    Err(UpstrokeError::Refused {
         message: format!(
             "the host runner cannot execute `{program}`: nothing of that name is on the PATH \
              this runner composes ({searched} director{} searched{}, as {}). The runner resolves \
@@ -1214,10 +1214,10 @@ pub fn containment_establishments() -> u64 {
 ///
 /// # Errors
 ///
-/// [`TactusError::Refused`] with a diagnostic when the ambient job cannot be
+/// [`UpstrokeError::Refused`] with a diagnostic when the ambient job cannot be
 /// created or joined. On Unix this cannot fail: containment there is the
 /// per-invocation reaper and the isolated process group.
-pub fn contain_write_command(hooks: &mut dyn SpawnHooks) -> Result<Contained, TactusError> {
+pub fn contain_write_command(hooks: &mut dyn SpawnHooks) -> Result<Contained, UpstrokeError> {
     proc::join_ambient_job(hooks).map(|()| Contained::new())
 }
 
@@ -1231,13 +1231,13 @@ pub fn contain_write_command(hooks: &mut dyn SpawnHooks) -> Result<Contained, Ta
 /// It carries the observer through for the same reason [`contain_write_command`]
 /// takes one: this is the entry point the CLI's whole write side depends on,
 /// and a body that dropped the refusal — `let _ = contain_write_command(hooks);
-/// Ok(())` — would leave every `tactus run` on Windows dispatching with no
+/// Ok(())` — would leave every `upstroke run` on Windows dispatching with no
 /// ambient job and the suite green.
 ///
 /// # Errors
 ///
 /// Whatever [`contain_write_command`] refuses.
-pub fn start_write_command(hooks: &mut dyn SpawnHooks) -> Result<(), TactusError> {
+pub fn start_write_command(hooks: &mut dyn SpawnHooks) -> Result<(), UpstrokeError> {
     contain_write_command(hooks).map(|_contained| ())
 }
 
@@ -1282,7 +1282,7 @@ pub fn shell_probe_request(
 ///
 /// # Errors
 ///
-/// [`TactusError::Refused`]. The contract's `expected_failures_refusals[3]`:
+/// [`UpstrokeError::Refused`]. The contract's `expected_failures_refusals[3]`:
 /// "a failing shell probe -> returned pre-flight error to the caller
 /// (TopologyRun classifies it: creator error before P5b on a fresh run;
 /// refusal before any recovery event on resume)". Classification is the
@@ -1292,16 +1292,18 @@ pub fn run_shell_probe(
     shell: ShellKind,
     workspace: PathBuf,
     invocation: InvocationId,
-) -> Result<(), TactusError> {
+) -> Result<(), UpstrokeError> {
     let request = shell_probe_request(shell, workspace, invocation);
-    let output = runner.run(&request).map_err(|error| TactusError::Refused {
-        message: format!(
-            "pre-flight: the recorded shell `{}` could not be run through the runner: {error}",
-            shell.program()
-        ),
-    })?;
+    let output = runner
+        .run(&request)
+        .map_err(|error| UpstrokeError::Refused {
+            message: format!(
+                "pre-flight: the recorded shell `{}` could not be run through the runner: {error}",
+                shell.program()
+            ),
+        })?;
     if output.timed_out {
-        return Err(TactusError::Refused {
+        return Err(UpstrokeError::Refused {
             message: format!(
                 "pre-flight: the recorded shell `{}` did not finish `{SHELL_PROBE_COMMAND}` \
                  within {:?}",
@@ -1320,7 +1322,7 @@ pub fn run_shell_probe(
     // shell that printed 16 MiB in answer to `exit 0` is not the shell this
     // pre-flight is certifying either way.
     if output.output_limited {
-        return Err(TactusError::Refused {
+        return Err(UpstrokeError::Refused {
             message: format!(
                 "pre-flight: the recorded shell `{}` exceeded the bounded output allowance \
                  running `{SHELL_PROBE_COMMAND}` and its process tree was terminated",
@@ -1329,7 +1331,7 @@ pub fn run_shell_probe(
         });
     }
     if output.code != Some(0) {
-        return Err(TactusError::Refused {
+        return Err(UpstrokeError::Refused {
             message: format!(
                 "pre-flight: the recorded shell `{}` ran `{SHELL_PROBE_COMMAND}` and exited {}; \
                  stderr: {}",
@@ -1421,13 +1423,13 @@ mod tests {
     fn synthetic_base() -> Vec<(OsString, OsString)> {
         vec![
             (os("PATH"), os("/usr/bin:/bin")),
-            (os("HOME"), os("/home/tactus")),
-            (os("USERPROFILE"), os("C:\\Users\\tactus")),
-            (os("CLAUDE_CONFIG_DIR"), os("/home/tactus/.claude")),
-            (os("COPILOT_HOME"), os("/home/tactus/.copilot")),
-            (os("CODEX_HOME"), os("/home/tactus/.codex")),
+            (os("HOME"), os("/home/upstroke")),
+            (os("USERPROFILE"), os("C:\\Users\\upstroke")),
+            (os("CLAUDE_CONFIG_DIR"), os("/home/upstroke/.claude")),
+            (os("COPILOT_HOME"), os("/home/upstroke/.copilot")),
+            (os("CODEX_HOME"), os("/home/upstroke/.codex")),
             (os("LANG"), os("C.UTF-8")),
-            (os("TACTUS_RUN"), os("01ABCDEF")),
+            (os("UPSTROKE_RUN"), os("01ABCDEF")),
         ]
     }
 
@@ -1449,7 +1451,7 @@ mod tests {
 
     fn scratch(tag: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!(
-            "tactus-pr4-{tag}-{}-{}",
+            "upstroke-pr4-{tag}-{}-{}",
             std::process::id(),
             crate::ulid::ulid()
         ));
@@ -1498,9 +1500,9 @@ mod tests {
                 overlay: Vec::new(),
                 expect: vec![
                     ("PATH", Some("/usr/bin:/bin")),
-                    ("HOME", Some("/home/tactus")),
+                    ("HOME", Some("/home/upstroke")),
                     ("LANG", Some("C.UTF-8")),
-                    ("TACTUS_RUN", Some("01ABCDEF")),
+                    ("UPSTROKE_RUN", Some("01ABCDEF")),
                     // The base carries all three; a gate is repository code
                     // and receives none of them.
                     ("CLAUDE_CONFIG_DIR", None),
@@ -1530,7 +1532,7 @@ mod tests {
                 )],
                 expect: vec![
                     ("CLAUDE_CODE_MAX_OUTPUT_TOKENS", Some("8000")),
-                    ("CLAUDE_CONFIG_DIR", Some("/home/tactus/.claude")),
+                    ("CLAUDE_CONFIG_DIR", Some("/home/upstroke/.claude")),
                     ("PATH", Some("/usr/bin:/bin")),
                     // A claude-code worker is not told where codex's or
                     // copilot's credentials live.
@@ -1545,14 +1547,14 @@ mod tests {
                 overlay: vec![("LANG".to_owned(), "en_GB.UTF-8".to_owned())],
                 expect: vec![
                     ("LANG", Some("en_GB.UTF-8")),
-                    ("CODEX_HOME", Some("/home/tactus/.codex")),
+                    ("CODEX_HOME", Some("/home/upstroke/.codex")),
                     ("CLAUDE_CONFIG_DIR", None),
                     ("COPILOT_HOME", None),
                     // A reviewer runs an agent CLI, so it is supplied the
                     // unscoped values too.
                     ("PATH", Some("/usr/bin:/bin")),
-                    ("HOME", Some("/home/tactus")),
-                    ("USERPROFILE", Some("C:\\Users\\tactus")),
+                    ("HOME", Some("/home/upstroke")),
+                    ("USERPROFILE", Some("C:\\Users\\upstroke")),
                 ],
             },
             Fixture {
@@ -1562,7 +1564,7 @@ mod tests {
                 overlay: Vec::new(),
                 expect: vec![
                     ("PATH", Some("/usr/bin:/bin")),
-                    ("HOME", Some("/home/tactus")),
+                    ("HOME", Some("/home/upstroke")),
                     ("LANG", Some("C.UTF-8")),
                     ("CODEX_HOME", None),
                     ("CLAUDE_CONFIG_DIR", None),
@@ -1575,7 +1577,7 @@ mod tests {
                 agent: Some(AgentId::new(copilot::ADAPTER_ID)),
                 overlay: vec![("COPILOT_MODEL".to_owned(), "gpt-x".to_owned())],
                 expect: vec![
-                    ("COPILOT_HOME", Some("/home/tactus/.copilot")),
+                    ("COPILOT_HOME", Some("/home/upstroke/.copilot")),
                     ("COPILOT_MODEL", Some("gpt-x")),
                     ("CODEX_HOME", None),
                     ("CLAUDE_CONFIG_DIR", None),
@@ -1715,7 +1717,7 @@ mod tests {
     /// first, two interior, and last.
     #[test]
     fn a_reserved_key_is_refused_at_every_position_in_the_overlay() {
-        const HARMLESS: [&str; 3] = ["TACTUS_ALPHA", "TACTUS_BETA", "TACTUS_GAMMA"];
+        const HARMLESS: [&str; 3] = ["UPSTROKE_ALPHA", "UPSTROKE_BETA", "UPSTROKE_GAMMA"];
         let agent = AgentId::new(claude::ADAPTER_ID);
         let mut refusals = 0_usize;
         for case in KeyCase::ALL {
@@ -1724,7 +1726,7 @@ mod tests {
             // the reserved key and not the shape of the overlay.
             let harmless: Vec<(String, String)> = HARMLESS
                 .iter()
-                .chain(std::iter::once(&"TACTUS_DELTA"))
+                .chain(std::iter::once(&"UPSTROKE_DELTA"))
                 .map(|key| ((*key).to_owned(), "harmless".to_owned()))
                 .collect();
             environment
@@ -1876,7 +1878,7 @@ mod tests {
     #[test]
     #[ignore = "subprocess helper"]
     fn environment_dump_helper() {
-        if std::env::var_os("TACTUS_ENV_DUMP").is_none() {
+        if std::env::var_os("UPSTROKE_ENV_DUMP").is_none() {
             return;
         }
         let mut entries: Vec<String> = std::env::vars_os()
@@ -1930,7 +1932,7 @@ mod tests {
     fn a_probe_child_and_an_execution_child_of_one_adapter_carry_the_same_environment() {
         let agent = AgentId::new(claude::ADAPTER_ID);
         let mut base = synthetic_base();
-        base.push((os("TACTUS_BASE_SENTINEL"), os("base-only-value")));
+        base.push((os("UPSTROKE_BASE_SENTINEL"), os("base-only-value")));
         let runner = HostRunner::new()
             .with_environment(HostEnvironment::with_base(base, KeyCase::current()));
         let command = CommandSpec {
@@ -1944,9 +1946,9 @@ mod tests {
                 "--nocapture".to_owned(),
             ],
             env: vec![
-                ("TACTUS_ENV_DUMP".to_owned(), "1".to_owned()),
+                ("UPSTROKE_ENV_DUMP".to_owned(), "1".to_owned()),
                 (
-                    "TACTUS_OVERLAY_SENTINEL".to_owned(),
+                    "UPSTROKE_OVERLAY_SENTINEL".to_owned(),
                     "overlay-only-value".to_owned(),
                 ),
             ],
@@ -1980,11 +1982,11 @@ mod tests {
             ("execution", &execution_environment),
         ] {
             assert!(
-                environment.contains(&"TACTUS_BASE_SENTINEL=base-only-value".to_owned()),
+                environment.contains(&"UPSTROKE_BASE_SENTINEL=base-only-value".to_owned()),
                 "the {label} child did not inherit the runner's base: {environment:?}"
             );
             assert!(
-                environment.contains(&"TACTUS_OVERLAY_SENTINEL=overlay-only-value".to_owned()),
+                environment.contains(&"UPSTROKE_OVERLAY_SENTINEL=overlay-only-value".to_owned()),
                 "the {label} child did not receive the adapter's overlay: {environment:?}"
             );
             assert!(
@@ -2027,7 +2029,7 @@ mod tests {
     fn every_credential_supplied_role_composes_one_environment_per_binding() {
         let workspace = scratch("binding-parity");
         let mut base = synthetic_base();
-        base.push((os("TACTUS_BASE_SENTINEL"), os("base-only-value")));
+        base.push((os("UPSTROKE_BASE_SENTINEL"), os("base-only-value")));
         // A credential location already in the base, which is the failure
         // sequence's own starting state: composition strips reserved keys, and
         // only the agent binding can put the value back.
@@ -2048,9 +2050,9 @@ mod tests {
                 "--nocapture".to_owned(),
             ],
             env: vec![
-                ("TACTUS_ENV_DUMP".to_owned(), "1".to_owned()),
+                ("UPSTROKE_ENV_DUMP".to_owned(), "1".to_owned()),
                 (
-                    "TACTUS_OVERLAY_SENTINEL".to_owned(),
+                    "UPSTROKE_OVERLAY_SENTINEL".to_owned(),
                     "overlay-only-value".to_owned(),
                 ),
             ],
@@ -2103,11 +2105,12 @@ mod tests {
                 );
                 let environment = dumped_environment(&runner, &request);
                 assert!(
-                    environment.contains(&"TACTUS_BASE_SENTINEL=base-only-value".to_owned()),
+                    environment.contains(&"UPSTROKE_BASE_SENTINEL=base-only-value".to_owned()),
                     "{id}/{role}: the base did not reach the child: {environment:?}"
                 );
                 assert!(
-                    environment.contains(&"TACTUS_OVERLAY_SENTINEL=overlay-only-value".to_owned()),
+                    environment
+                        .contains(&"UPSTROKE_OVERLAY_SENTINEL=overlay-only-value".to_owned()),
                     "{id}/{role}: the overlay did not reach the child: {environment:?}"
                 );
                 // The binding's own contribution. `key` is a reserved key, so a
@@ -2164,7 +2167,7 @@ mod tests {
     ///   availability is checked inside the same boundary") over
     ///   `probe(shell)` and `gate`.
     /// * **The value is the host boundary's own.** `decisions/2026-08-12-…:321`
-    ///   — "the host base starts from the Tactus process environment". The
+    ///   — "the host base starts from the Upstroke process environment". The
     ///   expected values are read out of the base vector *this fixture wrote*,
     ///   never out of [`HostEnvironment::lookup`]: `reserved_values` calls
     ///   `lookup` too, and a function used as its own oracle asserts nothing.
@@ -2330,7 +2333,7 @@ mod tests {
     ///
     /// `reserved_values` is what the runner *supplies*; `compose` is what the
     /// process *gets*, and until this test the two were only related by
-    /// inspection: `compose` cloned the whole Tactus base first, so a
+    /// inspection: `compose` cloned the whole Upstroke base first, so a
     /// `CODEX_HOME` in the coordinator's own environment reached a gate
     /// whatever `supplies_credentials` said. DESIGN.md:258-264 scopes the
     /// credential location by role, and the role a variable is scoped to is
@@ -2344,9 +2347,9 @@ mod tests {
     #[test]
     fn compose_gives_a_child_the_credential_location_of_its_own_agent_and_no_other() {
         let all_credentials = [
-            ("claude-code", "CLAUDE_CONFIG_DIR", "/home/tactus/.claude"),
-            ("copilot", "COPILOT_HOME", "/home/tactus/.copilot"),
-            ("codex", "CODEX_HOME", "/home/tactus/.codex"),
+            ("claude-code", "CLAUDE_CONFIG_DIR", "/home/upstroke/.claude"),
+            ("copilot", "COPILOT_HOME", "/home/upstroke/.copilot"),
+            ("codex", "CODEX_HOME", "/home/upstroke/.codex"),
         ];
         // Written from what each role executes, exactly as
         // `credential_locations_are_role_scoped` writes it.
@@ -2398,8 +2401,8 @@ mod tests {
                     // for the passages that decide that).
                     for (key, expected) in [
                         ("PATH", "/usr/bin:/bin"),
-                        ("HOME", "/home/tactus"),
-                        ("USERPROFILE", "C:\\Users\\tactus"),
+                        ("HOME", "/home/upstroke"),
+                        ("USERPROFILE", "C:\\Users\\upstroke"),
                     ] {
                         assert_eq!(
                             value(&composed, key, *case).map(|v| v.to_string_lossy().into_owned()),
@@ -2408,7 +2411,7 @@ mod tests {
                         );
                     }
                     // Nothing else was dropped on the way through.
-                    for (key, expected) in [("LANG", "C.UTF-8"), ("TACTUS_RUN", "01ABCDEF")] {
+                    for (key, expected) in [("LANG", "C.UTF-8"), ("UPSTROKE_RUN", "01ABCDEF")] {
                         assert_eq!(
                             value(&composed, key, *case).map(|v| v.to_string_lossy().into_owned()),
                             Some(expected.to_owned()),
@@ -2428,11 +2431,11 @@ mod tests {
         );
     }
 
-    /// The composed base **is** the Tactus process environment, entry for
+    /// The composed base **is** the Upstroke process environment, entry for
     /// entry.
     ///
     /// DESIGN.md:258-259: "`CommandSpec.env` overlays a runner-owned base
-    /// rather than replacing it. The host runner starts from the Tactus
+    /// rather than replacing it. The host runner starts from the Upstroke
     /// environment". `run` calls `env_clear()` before installing the composed
     /// block, so anything `from_process` fails to collect is not merely
     /// unscoped — it is *gone* from every child, and nothing else in the suite
@@ -2455,8 +2458,8 @@ mod tests {
     /// entry-for-entry equality below is the general statement; this is the
     /// named guard for the one mutation that motivated it.
     const BASE_WITNESS: &[(&str, &str)] = &[
-        ("TACTUS_PR4_BASE_WITNESS", "café=;value"),
-        ("TACTUS_PR4_DRIVE_CWD_SENTINEL", "=D:=D:\\base;café"),
+        ("UPSTROKE_PR4_BASE_WITNESS", "café=;value"),
+        ("UPSTROKE_PR4_DRIVE_CWD_SENTINEL", "=D:=D:\\base;café"),
     ];
 
     /// The child half of [`the_base_of_a_process_environment_is_the_process_environment`].
@@ -2511,11 +2514,11 @@ mod tests {
         }
     }
 
-    /// The composed base **is** the Tactus process environment, entry for
+    /// The composed base **is** the Upstroke process environment, entry for
     /// entry.
     ///
     /// DESIGN.md:258-259: "`CommandSpec.env` overlays a runner-owned base
-    /// rather than replacing it. The host runner starts from the Tactus
+    /// rather than replacing it. The host runner starts from the Upstroke
     /// environment". `run` calls `env_clear()` before installing the composed
     /// block, so anything `from_process` fails to collect is not merely
     /// unscoped — it is *gone* from every child, and until this test nothing
@@ -2584,9 +2587,9 @@ mod tests {
         // An independent table: adapter id -> the vendor's config-directory
         // variable (capacity.rs:36-37 for two of the three).
         for (agent, key, expected) in [
-            ("claude-code", "CLAUDE_CONFIG_DIR", "/home/tactus/.claude"),
-            ("copilot", "COPILOT_HOME", "/home/tactus/.copilot"),
-            ("codex", "CODEX_HOME", "/home/tactus/.codex"),
+            ("claude-code", "CLAUDE_CONFIG_DIR", "/home/upstroke/.claude"),
+            ("copilot", "COPILOT_HOME", "/home/upstroke/.copilot"),
+            ("codex", "CODEX_HOME", "/home/upstroke/.codex"),
         ] {
             let agent = AgentId::new(agent);
             assert_eq!(credential_location(&agent), Some(key));
@@ -2997,9 +3000,9 @@ mod tests {
         let shim = transparency_shim(
             &root,
             if cfg!(windows) {
-                "tactus-transparency.cmd"
+                "upstroke-transparency.cmd"
             } else {
-                "tactus-transparency"
+                "upstroke-transparency"
             },
         );
         let runner = HostRunner::new();
@@ -3229,7 +3232,7 @@ mod tests {
         let mut direct = Command::new(&exe);
         direct
             .args(helper_args)
-            .env("TACTUS_EXCESSIVE_OUTPUT_HELPER", &budget);
+            .env("UPSTROKE_EXCESSIVE_OUTPUT_HELPER", &budget);
         let started = std::time::Instant::now();
         let direct = proc::run_with_timeout(direct, "", Duration::from_secs(120))
             .expect("direct supervision of a noisy child");
@@ -3244,7 +3247,10 @@ mod tests {
                 // Not a reserved key: the helper reads it to decide it is the
                 // helper rather than an ordinary test run, and to size its
                 // output.
-                env: vec![("TACTUS_EXCESSIVE_OUTPUT_HELPER".to_owned(), budget.clone())],
+                env: vec![(
+                    "UPSTROKE_EXCESSIVE_OUTPUT_HELPER".to_owned(),
+                    budget.clone(),
+                )],
                 stdin: Vec::new(),
             },
             workspace: workspace.clone(),
@@ -3327,9 +3333,9 @@ mod tests {
         let workspace = scratch("overlay");
         let shell = native();
         let script = if cfg!(windows) {
-            "echo [%TACTUS_OVERLAY_PROBE%]"
+            "echo [%UPSTROKE_OVERLAY_PROBE%]"
         } else {
-            "echo \"[$TACTUS_OVERLAY_PROBE]\""
+            "echo \"[$UPSTROKE_OVERLAY_PROBE]\""
         };
         let template = shell.command(script);
         let spec = CommandSpec {
@@ -3338,7 +3344,7 @@ mod tests {
                 .get_args()
                 .map(|arg| arg.to_string_lossy().into_owned())
                 .collect(),
-            env: vec![("TACTUS_OVERLAY_PROBE".to_owned(), "reached".to_owned())],
+            env: vec![("UPSTROKE_OVERLAY_PROBE".to_owned(), "reached".to_owned())],
             stdin: Vec::new(),
         };
         let request = RunnerRequest {
@@ -3425,9 +3431,9 @@ mod tests {
         // `sh` prints nothing. Both are "not set to a credential directory",
         // and neither is the value the base carries.
         for value in [
-            "/home/tactus/.codex",
-            "/home/tactus/.claude",
-            "/home/tactus/.copilot",
+            "/home/upstroke/.codex",
+            "/home/upstroke/.claude",
+            "/home/upstroke/.copilot",
         ] {
             assert!(
                 !gate.stdout.contains(value),
@@ -3447,11 +3453,11 @@ mod tests {
             .expect("worker runs");
         assert_eq!(worker.code, Some(0), "{worker:?}");
         assert!(
-            worker.stdout.contains("/home/tactus/.codex"),
+            worker.stdout.contains("/home/upstroke/.codex"),
             "the worker was not told where its own credentials live: {:?}",
             worker.stdout
         );
-        for value in ["/home/tactus/.claude", "/home/tactus/.copilot"] {
+        for value in ["/home/upstroke/.claude", "/home/upstroke/.copilot"] {
             assert!(
                 !worker.stdout.contains(value),
                 "a codex worker was told where another agent's credentials live: {:?}",
@@ -3468,10 +3474,10 @@ mod tests {
     /// A runner that never spawns, so the probe's *classification* of a
     /// failure can be tested on a machine where every `ShellKind` happens to
     /// be installed.
-    struct StubRunner(Box<dyn Fn() -> Result<ProcessOutput, TactusError> + Send + Sync>);
+    struct StubRunner(Box<dyn Fn() -> Result<ProcessOutput, UpstrokeError> + Send + Sync>);
 
     impl Runner for StubRunner {
-        fn run(&self, _request: &RunnerRequest) -> Result<ProcessOutput, TactusError> {
+        fn run(&self, _request: &RunnerRequest) -> Result<ProcessOutput, UpstrokeError> {
             (self.0)()
         }
     }
@@ -3603,7 +3609,7 @@ mod tests {
 
     /// Set by the parent test on the helper it spawns, so the helper is inert
     /// when `cargo test -- --ignored` runs it directly.
-    const MISSING_SHELL_MARKER: &str = "TACTUS_MISSING_SHELL_PROBE";
+    const MISSING_SHELL_MARKER: &str = "UPSTROKE_MISSING_SHELL_PROBE";
 
     /// Printed by the helper after it has asserted, so the parent can tell "the
     /// helper ran and refused" from "the helper never ran".
@@ -3883,7 +3889,7 @@ mod tests {
         assert!(error.to_string().contains("bash"), "{error}");
 
         let exploding = StubRunner(Box::new(|| {
-            Err(TactusError::Agent {
+            Err(UpstrokeError::Agent {
                 message: "failed to spawn `bash`".to_owned(),
             })
         }));
@@ -4382,7 +4388,7 @@ mod tests {
 
     /// A filter that matches no test in this binary, so the child below runs
     /// nothing and exits 0.
-    const NO_SUCH_TEST: &str = "tactus_pr4_role_grid_matches_no_test";
+    const NO_SUCH_TEST: &str = "upstroke_pr4_role_grid_matches_no_test";
 
     /// The child of a role whose production program is **an agent CLI**: the
     /// worker, the reviewer and the agent probe, all of which execute the
@@ -4507,14 +4513,14 @@ mod tests {
             shapes.push(ProgramShape {
                 what: "an absolute `.cmd` batch shim — how npm installs `claude`, `codex` \
                        and `copilot` on Windows",
-                command: agent_cli_command_at(&forwarding_shim(root, "tactus-shim.cmd"), stdin),
+                command: agent_cli_command_at(&forwarding_shim(root, "upstroke-shim.cmd"), stdin),
                 reports: true,
             });
             shapes.push(ProgramShape {
                 what: "an absolute `.cmd` batch shim whose path contains a space — \
                        `C:\\Users\\John Smith\\npm\\copilot.cmd`, verbatim",
                 command: agent_cli_command_at(
-                    &forwarding_shim(&root.join(A_DIRECTORY_WITH_A_SPACE), "tactus-shim.cmd"),
+                    &forwarding_shim(&root.join(A_DIRECTORY_WITH_A_SPACE), "upstroke-shim.cmd"),
                     stdin,
                 ),
                 reports: true,
@@ -4522,20 +4528,20 @@ mod tests {
             shapes.push(ProgramShape {
                 what: "an absolute `.bat` batch shim — the other batch extension \
                        `CreateProcessW` routes through an interpreter",
-                command: agent_cli_command_at(&forwarding_shim(root, "tactus-shim.bat"), stdin),
+                command: agent_cli_command_at(&forwarding_shim(root, "upstroke-shim.bat"), stdin),
                 reports: true,
             });
         } else {
             shapes.push(ProgramShape {
                 what: "an absolute shebang script with no extension — how npm installs a \
                        CLI on Unix",
-                command: agent_cli_command_at(&forwarding_shim(root, "tactus-shim"), stdin),
+                command: agent_cli_command_at(&forwarding_shim(root, "upstroke-shim"), stdin),
                 reports: true,
             });
             shapes.push(ProgramShape {
                 what: "an absolute shebang script whose path contains a space",
                 command: agent_cli_command_at(
-                    &forwarding_shim(&root.join(A_DIRECTORY_WITH_A_SPACE), "tactus-shim"),
+                    &forwarding_shim(&root.join(A_DIRECTORY_WITH_A_SPACE), "upstroke-shim"),
                     stdin,
                 ),
                 reports: true,
@@ -4624,7 +4630,7 @@ mod tests {
     fn production_request(
         role: &ExecutionRole,
         workspace: &Path,
-    ) -> Result<RunnerRequest, TactusError> {
+    ) -> Result<RunnerRequest, UpstrokeError> {
         Ok(match role {
             ExecutionRole::Probe(ProbeTarget::Shell) => {
                 shell_probe_request(native(), workspace.to_path_buf(), shell_probe_invocation())
@@ -4673,7 +4679,7 @@ mod tests {
         runner: &HostRunner,
         role: &ExecutionRole,
         workspace: &Path,
-    ) -> Result<(), TactusError> {
+    ) -> Result<(), UpstrokeError> {
         if matches!(role, ExecutionRole::Probe(ProbeTarget::Shell)) {
             return runner.shell_probe(native(), workspace, shell_probe_invocation());
         }
@@ -5353,9 +5359,9 @@ mod tests {
         let shim = forwarding_shim(
             &root,
             if cfg!(windows) {
-                "tactus-role-shim.cmd"
+                "upstroke-role-shim.cmd"
             } else {
-                "tactus-role-shim"
+                "upstroke-role-shim"
             },
         );
         let workspace = scratch("shim-role-workspace");
@@ -5579,7 +5585,7 @@ mod tests {
     // -----------------------------------------------------------------------
 
     /// Which containment point the kill helper is to die at.
-    const SPAWN_KILL_POINT: &str = "TACTUS_SPAWN_KILL_POINT";
+    const SPAWN_KILL_POINT: &str = "UPSTROKE_SPAWN_KILL_POINT";
 
     /// A hook that kills the funnel at one named point and nowhere else.
     struct KillAtPoint(SubEffectPoint);
@@ -6134,7 +6140,7 @@ mod tests {
     /// Ok(Contained::new())
     /// ```
     ///
-    /// left the whole suite green while every facade run and every `tactus run`
+    /// left the whole suite green while every facade run and every `upstroke run`
     /// on Windows dispatched with **no ambient job** — and a coordinator killed
     /// between `CreateProcessW` and private-job assignment then leaves a
     /// suspended stub with no owner, which is the one thing the ambient job
@@ -6226,7 +6232,7 @@ mod tests {
 
     /// Where the join-ordering helper writes what it saw.
     #[cfg(windows)]
-    const JOIN_RECORD: &str = "TACTUS_PR4_JOIN_RECORD";
+    const JOIN_RECORD: &str = "UPSTROKE_PR4_JOIN_RECORD";
 
     /// Records, at each consultation of `Spawn.AmbientJobJoined`, whether the
     /// ambient job existed *at that instant*. The kernel is the oracle: the
@@ -6327,7 +6333,7 @@ mod tests {
 
     /// Set for the child that is to carry a **real** memoised ambient failure.
     #[cfg(windows)]
-    const POISON_AMBIENT: &str = "TACTUS_POISON_AMBIENT";
+    const POISON_AMBIENT: &str = "UPSTROKE_POISON_AMBIENT";
 
     /// The child half of
     /// [`a_real_memoised_ambient_failure_refuses_the_write_command`].
@@ -6429,7 +6435,7 @@ mod tests {
     /// Where the coordinator helper writes the identity of the stub it created
     /// before it dies.
     #[cfg(windows)]
-    const STUB_RECORD: &str = "TACTUS_PR4_STUB_RECORD";
+    const STUB_RECORD: &str = "UPSTROKE_PR4_STUB_RECORD";
 
     #[cfg(windows)]
     #[derive(Debug)]
@@ -7079,7 +7085,7 @@ mod tests {
                 pairs.push(("PATH", value));
             }
             resolve_program(
-                "tactus-no-such-program",
+                "upstroke-no-such-program",
                 &composed(&pairs),
                 KeyCase::current(),
                 naming,
@@ -7106,7 +7112,7 @@ mod tests {
         ] {
             let message = refuse(path);
             assert!(
-                message.contains("tactus-no-such-program"),
+                message.contains("upstroke-no-such-program"),
                 "{what}: the refusal must name the program: {message}"
             );
             assert!(
@@ -7133,7 +7139,7 @@ mod tests {
             found
         );
         let message = resolve_program(
-            "tactus-no-such-program",
+            "upstroke-no-such-program",
             &composed(&[("PATH", &mixed)]),
             KeyCase::current(),
             naming,
@@ -7188,7 +7194,7 @@ mod tests {
         // guest: with `second & argument` the `.bat` shim exits 1 with
         // "'argument' is not recognized", and the `.cmd` shim beside it — same
         // resolution, benign argument — passes.
-        let stem = format!("tactus-d1-{}", crate::ulid::ulid());
+        let stem = format!("upstroke-d1-{}", crate::ulid::ulid());
         let cases = [
             (format!("{stem}-c"), "cmd", "CMDSHIM", "hello world"),
             (format!("{stem}-b"), "bat", "BATSHIM", "second argument"),
@@ -7273,7 +7279,7 @@ mod tests {
         let root = scratch("resolve-two-runners");
         let workspace = root.join("ws");
         std::fs::create_dir_all(&workspace).expect("a workspace");
-        let name = format!("tactus-d1-{}", crate::ulid::ulid());
+        let name = format!("upstroke-d1-{}", crate::ulid::ulid());
         let file = shim_file_name(&name);
 
         let left_dir = root.join("left");
@@ -7320,7 +7326,7 @@ mod tests {
         let root = scratch("resolve-absolute");
         let workspace = root.join("ws");
         std::fs::create_dir_all(&workspace).expect("a workspace");
-        let name = format!("tactus-d1-{}", crate::ulid::ulid());
+        let name = format!("upstroke-d1-{}", crate::ulid::ulid());
         let file = shim_file_name(&name);
 
         let on_path = root.join("on-path");
@@ -7416,7 +7422,7 @@ mod tests {
         let root = scratch("resolve-once");
         let workspace = root.join("ws");
         std::fs::create_dir_all(&workspace).expect("a workspace");
-        let name = format!("tactus-d1-{}", crate::ulid::ulid());
+        let name = format!("upstroke-d1-{}", crate::ulid::ulid());
         let bin = root.join("bin");
         let shim = marker_shim(&bin, &shim_file_name(&name), "ONCE");
         let absolute = shim
@@ -7781,7 +7787,7 @@ mod tests {
         let root = scratch("one-executable");
         let workspace = root.join("ws");
         std::fs::create_dir_all(&workspace).expect("a workspace");
-        let name = format!("tactus-d2-{}", crate::ulid::ulid());
+        let name = format!("upstroke-d2-{}", crate::ulid::ulid());
         let file = shim_file_name(&name);
 
         let first_dir = root.join("first");
@@ -7902,7 +7908,7 @@ mod tests {
         let root = scratch("searched-once");
         let workspace = root.join("ws");
         std::fs::create_dir_all(&workspace).expect("a workspace");
-        let name = format!("tactus-d2-{}", crate::ulid::ulid());
+        let name = format!("upstroke-d2-{}", crate::ulid::ulid());
         let bin = root.join("bin");
         marker_shim(&bin, &shim_file_name(&name), "ONE");
 
@@ -7914,7 +7920,7 @@ mod tests {
         let case = on_path.case();
         let mut base = on_path.base().to_vec();
         base.retain(|(key, _)| !case.same_key(key, OsStr::new("CLAUDE_CONFIG_DIR")));
-        base.push((os("CLAUDE_CONFIG_DIR"), os("/home/tactus/.claude")));
+        base.push((os("CLAUDE_CONFIG_DIR"), os("/home/upstroke/.claude")));
         let environment = HostEnvironment::with_base(base, case);
 
         let requests: Vec<(String, RunnerRequest)> = ExecutionRole::all()
@@ -8000,7 +8006,7 @@ mod tests {
     #[test]
     fn a_resolution_question_is_the_program_and_the_environment_that_answers_it() {
         let root = scratch("memo-key");
-        let name = format!("tactus-d2-{}", crate::ulid::ulid());
+        let name = format!("upstroke-d2-{}", crate::ulid::ulid());
         let file = shim_file_name(&name);
         let left_dir = root.join("left");
         let right_dir = root.join("right");
@@ -8080,7 +8086,7 @@ mod tests {
     ///
     /// The replayed error is required to be the first one **byte for byte**,
     /// which is what makes storing the refusal as its message safe:
-    /// [`TactusError::Refused`] displays as exactly its message, and if that
+    /// [`UpstrokeError::Refused`] displays as exactly its message, and if that
     /// ever stops being true this row says so.
     #[test]
     fn a_refused_name_is_refused_identically_without_asking_the_filesystem_again() {
@@ -8089,7 +8095,7 @@ mod tests {
         let bin = root.join("bin");
         std::fs::create_dir_all(&workspace).expect("a workspace");
         std::fs::create_dir_all(&bin).expect("an empty installation directory");
-        let name = format!("tactus-d2-{}", crate::ulid::ulid());
+        let name = format!("upstroke-d2-{}", crate::ulid::ulid());
         let environment = || environment_on_path(&[&bin], Some(REAL_PATHEXT));
 
         let runner = HostRunner::new().with_environment(environment());
@@ -8099,7 +8105,7 @@ mod tests {
             .run(&named_request(&name, "arg", &workspace))
             .expect_err("nothing of that name is installed");
         assert!(
-            matches!(first, TactusError::Refused { .. }),
+            matches!(first, UpstrokeError::Refused { .. }),
             "an unresolvable name is a refusal: {first:?}"
         );
         let first = first.to_string();
@@ -8429,7 +8435,7 @@ mod tests {
                 "`{entry}`: this platform disagrees with the table"
             );
             let message = resolve_program(
-                "tactus-no-such-program",
+                "upstroke-no-such-program",
                 &composed(&[("PATH", OsStr::new(entry))]),
                 KeyCase::current(),
                 naming,
@@ -8516,7 +8522,7 @@ mod tests {
         let installed_dir = root.join("installed");
         let empty_dir = root.join("empty");
         std::fs::create_dir_all(&empty_dir).expect("an installation directory with nothing in it");
-        let name = format!("tactus-d2-{}", crate::ulid::ulid());
+        let name = format!("upstroke-d2-{}", crate::ulid::ulid());
         let file = shim_file_name(&name);
         // Repository content, under automation: the workspace's own copy.
         marker_shim(&workspace, &file, "WORKSPACE");
@@ -8556,7 +8562,7 @@ mod tests {
         let mut divergent = 0_usize;
         for (what, path, raw_expected, runner_expected) in &rows {
             let environment = HostEnvironment::with_base(
-                vec![(os("PATH"), os(path)), (os("HOME"), os("/home/tactus"))],
+                vec![(os("PATH"), os(path)), (os("HOME"), os("/home/upstroke"))],
                 KeyCase::current(),
             );
             let composed_env = environment
@@ -8650,7 +8656,7 @@ mod tests {
     fn a_relative_path_entry_is_refused_even_when_it_names_a_real_directory() {
         let root = scratch("relative-path-entry");
         let bin = root.join("bin");
-        let name = format!("tactus-d2-{}", crate::ulid::ulid());
+        let name = format!("upstroke-d2-{}", crate::ulid::ulid());
         let file = shim_file_name(&name);
         let absolute = marker_shim(&bin, &file, "RELATIVE");
 

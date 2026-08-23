@@ -23,7 +23,7 @@
 //!   function of the tuple. Nothing here reads a clock, a pid, or a random
 //!   source. This is load-bearing beyond fidelity: `crash_reconstruction`
 //!   builds container names as
-//!   `tactus-<repo_key>-<run_id>-<incarnation>-<invocation-hash>` "so
+//!   `upstroke-<repo_key>-<run_id>-<incarnation>-<invocation-hash>` "so
 //!   **deterministic** InvocationIds never collide across incarnations and no
 //!   earlier ownership evidence is overwritten".
 //!
@@ -37,7 +37,7 @@ use std::fmt;
 use serde::de::Error as _;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
-use crate::error::TactusError;
+use crate::error::UpstrokeError;
 use crate::runner::{AgentId, ProbeTarget};
 use crate::topology::events::{AttemptNumber, GenerationId, SequenceId};
 use crate::topology::registry::TaskKey;
@@ -259,11 +259,11 @@ impl InvocationId {
     ///
     /// # Errors
     ///
-    /// [`TactusError::Refused`] when the target names an agent whose id
+    /// [`UpstrokeError::Refused`] when the target names an agent whose id
     /// carries a character outside `[0-9A-Za-z_-]`, or is long enough to push
     /// the rendering past [`MAX_LEN`]. Every other form is infallible: its
     /// fields are integers, and their longest rendering *is* [`MAX_LEN`].
-    pub fn probe(target: ProbeTarget, ordinal: u32) -> Result<Self, TactusError> {
+    pub fn probe(target: ProbeTarget, ordinal: u32) -> Result<Self, UpstrokeError> {
         // The *component*, not only the whole rendering. `.` is inside the
         // charset the whole value is checked against, so an agent named
         // `claude.code` would render a value that passes `validate` and yet
@@ -271,7 +271,7 @@ impl InvocationId {
         if let ProbeTarget::Agent(agent) = &target {
             let name = agent.as_str();
             if name.is_empty() {
-                return Err(TactusError::Refused {
+                return Err(UpstrokeError::Refused {
                     message: "a probe target names an agent, and an agent id is never empty"
                         .to_owned(),
                 });
@@ -280,7 +280,7 @@ impl InvocationId {
                 .chars()
                 .find(|c| !(c.is_ascii_alphanumeric() || matches!(c, '_' | '-')))
             {
-                return Err(TactusError::Refused {
+                return Err(UpstrokeError::Refused {
                     message: format!(
                         "agent id `{name}` carries `{bad}`; a probe identity renders it as one \
                          field of `p.agent-<id>.o<n>`, so it may not carry the `{SEPARATOR}` \
@@ -348,10 +348,10 @@ impl InvocationId {
     ///
     /// # Errors
     ///
-    /// [`TactusError::Refused`] when `value` is not the rendering of any tuple.
-    pub fn parse(value: &str) -> Result<Self, TactusError> {
+    /// [`UpstrokeError::Refused`] when `value` is not the rendering of any tuple.
+    pub fn parse(value: &str) -> Result<Self, UpstrokeError> {
         validate(value)?;
-        parse_forms(value).ok_or_else(|| TactusError::Refused {
+        parse_forms(value).ok_or_else(|| UpstrokeError::Refused {
             message: format!(
                 "`{value}` is not an invocation id: the identity is (key, generation, attempt, \
                  role, ordinal), (sequence, role, ordinal), or (probe, target, ordinal) \
@@ -378,15 +378,15 @@ impl InvocationId {
 }
 
 /// Refuse a rendering no funnel could have written.
-fn validate(value: &str) -> Result<(), TactusError> {
+fn validate(value: &str) -> Result<(), UpstrokeError> {
     if value.is_empty() {
-        return Err(TactusError::Refused {
+        return Err(UpstrokeError::Refused {
             message: "an invocation id is never empty: every Runner process carries one (INV-20)"
                 .to_owned(),
         });
     }
     if value.len() > MAX_LEN {
-        return Err(TactusError::Refused {
+        return Err(UpstrokeError::Refused {
             message: format!(
                 "invocation id `{value}` is {} bytes; the limit is {MAX_LEN}, the longest value \
                  the identity's own enumeration can render, and the value names a container and \
@@ -399,7 +399,7 @@ fn validate(value: &str) -> Result<(), TactusError> {
         .chars()
         .find(|c| !(c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-')))
     {
-        return Err(TactusError::Refused {
+        return Err(UpstrokeError::Refused {
             message: format!(
                 "invocation id `{value}` carries `{bad}`, which is outside [0-9A-Za-z._-]; the \
                  value names a container and an intent file, so it may not carry a path \

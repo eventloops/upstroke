@@ -2,7 +2,7 @@
 //! from a different model family that costs nothing on the first one.
 //!
 //! §13's capacity engine is built around several subscriptions with independent
-//! windows, and until this adapter there was one that tactus could actually
+//! windows, and until this adapter there was one that upstroke could actually
 //! drive on its own: Copilot reaches OpenAI models, but through GitHub's
 //! harness and GitHub's billing.
 //!
@@ -25,7 +25,7 @@
 //! `codex exec resume` accept *different* flag sets: resume takes no `-s`, no
 //! `-C`, no `--profile`. That is not a gap to work around. The sandbox is a
 //! property of the session, fixed when it is created and inherited by every
-//! resumed turn — which is exactly tactus's model, where a same-rung retry has
+//! resumed turn — which is exactly upstroke's model, where a same-rung retry has
 //! the same profile by definition (§11.4). Observed 2026-08-11 against
 //! codex-cli 0.147.0: a resume with no sandbox flag ran under the policy its
 //! session recorded.
@@ -57,7 +57,7 @@
 //!
 //! `codex review` runs a code review non-interactively, and adopting it would
 //! swap the standard. §11.3's second opinion is *the same standard, a
-//! different judge*: tactus's review prompt carries the task's acceptance
+//! different judge*: upstroke's review prompt carries the task's acceptance
 //! criteria, the anti-sycophancy framing, the `DATA UNDER REVIEW` fencing and
 //! the operator's decisions (§12). A verdict from OpenAI's own rubric applied
 //! to a bare diff is not comparable with one from the Claude reviewer, and a
@@ -105,7 +105,7 @@ use super::{
 };
 use crate::capacity::PoolKind;
 use crate::catalog;
-use crate::error::TactusError;
+use crate::error::UpstrokeError;
 use crate::ir::{Effort, Outcome, OutcomeStatus, PermissionMode, Usage, WorkerProfile};
 use crate::runner::{CommandSpec, Runner};
 use crate::util;
@@ -120,8 +120,8 @@ const PROBE_TIMEOUT: Duration = Duration::from_secs(60);
 /// The strict-config control must be rejected before the missing-schema guard.
 /// If it is not, a CLI has stopped enforcing the parser contract this probe
 /// relies on and an apparently successful effort-key check would mean nothing.
-const CONFIG_PROBE_UNKNOWN_KEY: &str = "tactus_probe_deliberately_unknown";
-const CONFIG_PROBE_SCHEMA_FILE: &str = "tactus-output-schema-must-not-exist.json";
+const CONFIG_PROBE_UNKNOWN_KEY: &str = "upstroke_probe_deliberately_unknown";
+const CONFIG_PROBE_SCHEMA_FILE: &str = "upstroke-output-schema-must-not-exist.json";
 const CONFIG_PROBE_RESUME_ID: &str = "00000000-0000-0000-0000-000000000000";
 
 /// Flags `exec` must still advertise, checked at pre-flight.
@@ -201,7 +201,7 @@ impl AgentAdapter for CodexAdapter {
         ADAPTER_ID
     }
 
-    fn probe(&self, runner: &dyn Runner) -> Result<Caps, TactusError> {
+    fn probe(&self, runner: &dyn Runner) -> Result<Caps, UpstrokeError> {
         let invocation = cli();
         let out = runner
             .run(&probe_request(
@@ -212,7 +212,7 @@ impl AgentAdapter for CodexAdapter {
             )?)
             .map_err(|cause| bin::boundary_refused(CLI, INSTALL_HINT, &cause))?;
         if out.output_limited {
-            return Err(TactusError::Agent {
+            return Err(UpstrokeError::Agent {
                 message: format!(
                     "`{}` --version exceeded the output limit",
                     invocation.display()
@@ -220,12 +220,12 @@ impl AgentAdapter for CodexAdapter {
             });
         }
         if out.timed_out {
-            return Err(TactusError::Agent {
+            return Err(UpstrokeError::Agent {
                 message: format!("`{}` --version timed out", invocation.display()),
             });
         }
         if out.code != Some(0) {
-            return Err(TactusError::Agent {
+            return Err(UpstrokeError::Agent {
                 message: format!(
                     "`{}` --version exited with {:?}: {}",
                     invocation.display(),
@@ -279,7 +279,7 @@ impl AgentAdapter for CodexAdapter {
             // returned the same `thread_id` and recalled the prior exchange.
             session_resume: true,
             // Tokens, not dollars. See the module header — this is a decision
-            // about what tactus is willing to claim, not a missing feature.
+            // about what upstroke is willing to claim, not a missing feature.
             cost_reporting: false,
             read_only_mode: true,
             // The CLI has `mcp-server` and `app-server`, neither of which is
@@ -291,7 +291,7 @@ impl AgentAdapter for CodexAdapter {
         })
     }
 
-    fn build(&self, run: &TaskRun) -> Result<CommandSpec, TactusError> {
+    fn build(&self, run: &TaskRun) -> Result<CommandSpec, UpstrokeError> {
         if let Some(refusal) = edit_refusal(&run.profile) {
             return Err(refusal);
         }
@@ -309,7 +309,7 @@ impl AgentAdapter for CodexAdapter {
         cli().spec(&build_args(run))
     }
 
-    fn parse(&self, out: &ProcessOutput) -> Result<Outcome, TactusError> {
+    fn parse(&self, out: &ProcessOutput) -> Result<Outcome, UpstrokeError> {
         Ok(parse_output(out))
     }
 
@@ -320,9 +320,9 @@ impl AgentAdapter for CodexAdapter {
     /// `Logged in using ChatGPT` or `Not logged in` (observed 2026-08-11).
     /// Copilot's adapter has to report [`AuthState::Unknown`] because GitHub
     /// documents no such query; here the honest answer is a real one, so
-    /// `tactus connect` writes a pool an operator can trust rather than a
+    /// `upstroke connect` writes a pool an operator can trust rather than a
     /// shrug.
-    fn discover(&self, runner: &dyn Runner, _caps: &Caps) -> Result<Discovery, TactusError> {
+    fn discover(&self, runner: &dyn Runner, _caps: &Caps) -> Result<Discovery, UpstrokeError> {
         let invocation = cli();
         let out = runner
             .run(&probe_request(
@@ -362,7 +362,7 @@ impl AgentAdapter for CodexAdapter {
         _gate_cmds: &[String],
         dir: &std::path::Path,
         stem: &str,
-    ) -> Result<Option<PathBuf>, TactusError> {
+    ) -> Result<Option<PathBuf>, UpstrokeError> {
         let path = dir.join(format!("{stem}.json"));
         util::write_json(
             &path,
@@ -382,16 +382,16 @@ fn checked_help(
     program: &str,
     surface: &str,
     output: &ProcessOutput,
-) -> Result<String, TactusError> {
+) -> Result<String, UpstrokeError> {
     if output.output_limited {
-        return Err(TactusError::Agent {
+        return Err(UpstrokeError::Agent {
             message: format!(
                 "`{program} {surface} --help` exceeded the output limit; reasoning configuration support could not be verified"
             ),
         });
     }
     if output.timed_out {
-        return Err(TactusError::Agent {
+        return Err(UpstrokeError::Agent {
             message: format!(
                 "`{program} {surface} --help` timed out; reasoning configuration support could \
                  not be verified"
@@ -399,7 +399,7 @@ fn checked_help(
         });
     }
     if output.code != Some(0) {
-        return Err(TactusError::Agent {
+        return Err(UpstrokeError::Agent {
             message: format!(
                 "`{program} {surface} --help` exited with {:?}: {}",
                 output.code,
@@ -409,7 +409,7 @@ fn checked_help(
     }
     let text = format!("{}\n{}", output.stdout, output.stderr);
     if text.trim().is_empty() {
-        return Err(TactusError::Agent {
+        return Err(UpstrokeError::Agent {
             message: format!(
                 "`{program} {surface} --help` returned no output; reasoning configuration \
                  support could not be verified"
@@ -423,7 +423,7 @@ fn validate_probe_contract(
     version: &str,
     fresh_help: &str,
     resume_help: &str,
-) -> Result<(), TactusError> {
+) -> Result<(), UpstrokeError> {
     for (surface, help, required) in [
         ("exec", fresh_help, REQUIRED_EXEC_FLAGS.as_slice()),
         ("exec resume", resume_help, REQUIRED_RESUME_FLAGS.as_slice()),
@@ -434,11 +434,11 @@ fn validate_probe_contract(
             .filter(|flag| !super::advertises_flag(help, flag))
             .collect();
         if !missing.is_empty() {
-            return Err(TactusError::Agent {
+            return Err(UpstrokeError::Agent {
                 message: format!(
                     "codex {version} does not advertise required `{surface}` flag(s): {}. The \
                      reasoning override must work on both fresh and resumed attempts — upgrade \
-                     tactus or pin an older codex.",
+                     upstroke or pin an older codex.",
                     missing.join(", ")
                 ),
             });
@@ -480,10 +480,12 @@ struct MissingOutputSchema {
 }
 
 impl MissingOutputSchema {
-    fn create() -> Result<Self, TactusError> {
-        let dir =
-            std::env::temp_dir().join(format!("tactus-codex-config-probe-{}", crate::ulid::ulid()));
-        std::fs::create_dir(&dir).map_err(|source| TactusError::Agent {
+    fn create() -> Result<Self, UpstrokeError> {
+        let dir = std::env::temp_dir().join(format!(
+            "upstroke-codex-config-probe-{}",
+            crate::ulid::ulid()
+        ));
+        std::fs::create_dir(&dir).map_err(|source| UpstrokeError::Agent {
             message: format!(
                 "could not create Codex configuration probe directory `{}`: {source}",
                 dir.display()
@@ -507,7 +509,7 @@ fn validate_effort_config_key(
     runner: &dyn Runner,
     invocation: &Invocation,
     version: &str,
-) -> Result<(), TactusError> {
+) -> Result<(), UpstrokeError> {
     let schema = MissingOutputSchema::create()?;
     for surface in [ConfigProbeSurface::Fresh, ConfigProbeSurface::Resume] {
         let base = probe_ordinal::CONFIG_BASE + surface.index() * probe_ordinal::CONFIG_PER_SURFACE;
@@ -521,7 +523,7 @@ fn validate_effort_config_key(
         )?;
         validate_unknown_config_control(version, surface, &control)?;
 
-        // These are the two policy values Tactus promises for the roles this
+        // These are the two policy values Upstroke promises for the roles this
         // feature introduced. Model catalogs validate the remaining shared
         // values separately; accepting either assignment here proves the exact
         // key, while checking both catches a provider-side enum regression.
@@ -548,7 +550,7 @@ fn run_config_parser_probe(
     assignment: &str,
     schema_path: &std::path::Path,
     ordinal: u32,
-) -> Result<ProcessOutput, TactusError> {
+) -> Result<ProcessOutput, UpstrokeError> {
     runner.run(&probe_request(
         ADAPTER_ID,
         invocation.spec(&config_probe_args(surface, assignment, schema_path))?,
@@ -573,7 +575,7 @@ fn config_probe_args(
         assignment.to_owned(),
         "--output-schema".to_owned(),
         schema_path.to_string_lossy().into_owned(),
-        "tactus-config-parser-probe".to_owned(),
+        "upstroke-config-parser-probe".to_owned(),
     ]);
     args
 }
@@ -582,9 +584,9 @@ fn validate_unknown_config_control(
     version: &str,
     surface: ConfigProbeSurface,
     output: &ProcessOutput,
-) -> Result<(), TactusError> {
+) -> Result<(), UpstrokeError> {
     if output.output_limited {
-        return Err(TactusError::Agent {
+        return Err(UpstrokeError::Agent {
             message: format!(
                 "codex {version} `{}` strict-config control exceeded the output limit; truncated output cannot prove local parser behavior",
                 surface.label()
@@ -601,7 +603,7 @@ fn validate_unknown_config_control(
     {
         return Ok(());
     }
-    Err(TactusError::Agent {
+    Err(UpstrokeError::Agent {
         message: format!(
             "codex {version} `{}` did not reject the strict-config control before the local \
              missing-schema guard; exact reasoning-key support cannot be proven without spend \
@@ -619,9 +621,9 @@ fn validate_effort_config_probe(
     surface: ConfigProbeSurface,
     effort: Effort,
     output: &ProcessOutput,
-) -> Result<(), TactusError> {
+) -> Result<(), UpstrokeError> {
     if output.output_limited {
-        return Err(TactusError::Agent {
+        return Err(UpstrokeError::Agent {
             message: format!(
                 "codex {version} `{}` reasoning-key probe exceeded the output limit; truncated output cannot prove `model_reasoning_effort={}`",
                 surface.label(),
@@ -637,7 +639,7 @@ fn validate_effort_config_probe(
     {
         return Ok(());
     }
-    Err(TactusError::Agent {
+    Err(UpstrokeError::Agent {
         message: format!(
             "codex {version} `{}` did not accept exact local override \
              `model_reasoning_effort={}` before the zero-spend missing-schema guard (exit {:?}, \
@@ -655,16 +657,16 @@ fn config_probe_text(output: &ProcessOutput) -> String {
     format!("{}\n{}", output.stdout, output.stderr)
 }
 
-fn checked_model_catalog(program: &str, output: &ProcessOutput) -> Result<String, TactusError> {
+fn checked_model_catalog(program: &str, output: &ProcessOutput) -> Result<String, UpstrokeError> {
     if output.timed_out {
-        return Err(TactusError::Agent {
+        return Err(UpstrokeError::Agent {
             message: format!(
                 "`{program} debug models` timed out; model effort support could not be verified"
             ),
         });
     }
     if output.code != Some(0) {
-        return Err(TactusError::Agent {
+        return Err(UpstrokeError::Agent {
             message: format!(
                 "`{program} debug models` exited with {:?}: {}",
                 output.code,
@@ -673,7 +675,7 @@ fn checked_model_catalog(program: &str, output: &ProcessOutput) -> Result<String
         });
     }
     if output.stdout.trim().is_empty() {
-        return Err(TactusError::Agent {
+        return Err(UpstrokeError::Agent {
             message: format!(
                 "`{program} debug models` returned no catalog; model effort support could not be \
                  verified"
@@ -683,19 +685,19 @@ fn checked_model_catalog(program: &str, output: &ProcessOutput) -> Result<String
     Ok(output.stdout.clone())
 }
 
-fn parse_debug_models(text: &str) -> Result<DebugModels, TactusError> {
-    serde_json::from_str(text).map_err(|error| TactusError::Agent {
+fn parse_debug_models(text: &str) -> Result<DebugModels, UpstrokeError> {
+    serde_json::from_str(text).map_err(|error| UpstrokeError::Agent {
         message: format!("`codex debug models` returned an unreadable catalog: {error}"),
     })
 }
 
-fn validate_model_efforts(version: &str, models: &DebugModels) -> Result<(), TactusError> {
+fn validate_model_efforts(version: &str, models: &DebugModels) -> Result<(), UpstrokeError> {
     for slug in catalog::known_models(ADAPTER_ID) {
         let model = models
             .models
             .iter()
             .find(|model| model.slug == slug)
-            .ok_or_else(|| TactusError::Agent {
+            .ok_or_else(|| UpstrokeError::Agent {
                 message: format!(
                     "codex {version}'s local model catalog does not contain known model `{slug}`; \
                      refusing before a configured `--model` fails at runtime"
@@ -711,7 +713,7 @@ fn validate_model_efforts(version: &str, models: &DebugModels) -> Result<(), Tac
             .filter(|effort| !supported.contains(effort))
             .collect();
         if !missing.is_empty() {
-            return Err(TactusError::Agent {
+            return Err(UpstrokeError::Agent {
                 message: format!(
                     "codex {version} model `{slug}` does not advertise required reasoning \
                      level(s): {}. Refusing before `model_reasoning_effort` can fail an attempt.",
@@ -798,13 +800,13 @@ fn sandbox_mode(profile: &WorkerProfile) -> &'static str {
 /// The platform gate, kept out of [`AgentAdapter::build`] so it is testable on
 /// a machine with no codex installed — the same reason [`build_args`] is its
 /// own function.
-fn edit_refusal(profile: &WorkerProfile) -> Option<TactusError> {
+fn edit_refusal(profile: &WorkerProfile) -> Option<UpstrokeError> {
     (cfg!(windows) && profile.permissions == PermissionMode::Edit)
         .then(|| refuse_edit_profile(profile))
 }
 
-fn refuse_edit_profile(profile: &WorkerProfile) -> TactusError {
-    TactusError::Refused {
+fn refuse_edit_profile(profile: &WorkerProfile) -> UpstrokeError {
+    UpstrokeError::Refused {
         message: format!(
             "codex cannot run `{}` as an implementer on Windows: this CLI's sandbox is an \
              external helper that does not exist here (`codex doctor` reports `linux helper: \
@@ -1175,7 +1177,7 @@ mod tests {
 
     #[test]
     fn exact_key_probe_uses_strict_local_guards_on_both_cli_surfaces() {
-        let schema = std::path::Path::new(r"C:\missing\tactus-output-schema-must-not-exist.json");
+        let schema = std::path::Path::new(r"C:\missing\upstroke-output-schema-must-not-exist.json");
         for surface in [ConfigProbeSurface::Fresh, ConfigProbeSurface::Resume] {
             let args = config_probe_args(surface, "model_reasoning_effort=xhigh", schema);
             assert!(
@@ -1213,7 +1215,7 @@ mod tests {
         let rejected = output(
             1,
             "",
-            "error: unknown configuration key `tactus_probe_deliberately_unknown`",
+            "error: unknown configuration key `upstroke_probe_deliberately_unknown`",
         );
         validate_unknown_config_control("0.147.0", ConfigProbeSurface::Fresh, &rejected)
             .expect("strict parsing is active");
@@ -1221,7 +1223,7 @@ mod tests {
         let skipped = output(
             1,
             "",
-            "failed to read output schema tactus-output-schema-must-not-exist.json",
+            "failed to read output schema upstroke-output-schema-must-not-exist.json",
         );
         let error =
             validate_unknown_config_control("0.147.0", ConfigProbeSurface::Resume, &skipped)
@@ -1235,7 +1237,7 @@ mod tests {
         let mut truncated = output(
             1,
             "",
-            "error: unknown configuration key `tactus_probe_deliberately_unknown`",
+            "error: unknown configuration key `upstroke_probe_deliberately_unknown`",
         );
         truncated.output_limited = true;
         let error =
@@ -1251,7 +1253,7 @@ mod tests {
         let accepted = output(
             1,
             "",
-            "error reading output schema C:\\missing\\tactus-output-schema-must-not-exist.json",
+            "error reading output schema C:\\missing\\upstroke-output-schema-must-not-exist.json",
         );
         for surface in [ConfigProbeSurface::Fresh, ConfigProbeSurface::Resume] {
             for effort in [Effort::XHigh, Effort::Max] {
@@ -1294,7 +1296,7 @@ mod tests {
         let mut truncated = output(
             1,
             "",
-            "error reading output schema tactus-output-schema-must-not-exist.json",
+            "error reading output schema upstroke-output-schema-must-not-exist.json",
         );
         truncated.output_limited = true;
         let error = validate_effort_config_probe(
@@ -1339,7 +1341,7 @@ mod tests {
     fn model_catalog_requires_every_effort_for_each_known_codex_model() {
         let complete = debug_models_json(&["low", "medium", "high", "xhigh", "max", "ultra"]);
         let parsed = parse_debug_models(&complete).expect("realistic catalog");
-        validate_model_efforts("0.147.0", &parsed).expect("all Tactus levels are present");
+        validate_model_efforts("0.147.0", &parsed).expect("all Upstroke levels are present");
 
         for (missing, levels) in [
             ("xhigh", ["low", "medium", "high", "max"]),
@@ -1575,7 +1577,7 @@ mod tests {
         assert_eq!(usage.output_tokens, Some(102));
         assert_eq!(usage.cache_read_input_tokens, Some(22016));
         assert_eq!(usage.num_turns, Some(1));
-        // Tokens, never a price: this route reports no dollars and tactus does
+        // Tokens, never a price: this route reports no dollars and upstroke does
         // not own a rate table.
         assert_eq!(outcome.cost_usd, None);
     }
@@ -1713,7 +1715,7 @@ mod tests {
         fn run(
             &self,
             request: &crate::runner::RunnerRequest,
-        ) -> Result<ProcessOutput, TactusError> {
+        ) -> Result<ProcessOutput, UpstrokeError> {
             self.seen
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)

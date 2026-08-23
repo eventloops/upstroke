@@ -482,7 +482,7 @@ path = "src/connect.rs"
 allows = ["clippy::disallowed_methods", "clippy::disallowed_macros"]
 packet = "effect_site_inventory.mechanism (2): and any other module the PR5 review enumerates"
 legacy_effect = """
-LEGACY-EFFECT: `connect` writes the user's own `tactus.toml` region and creates \
+LEGACY-EFFECT: `connect` writes the user's own `upstroke.toml` region and creates \
 its parent directory, outside any run and outside every resource row — it is a \
 setup command, not an engine path."""
 shrinks_when = "never, on current reading: the file it writes belongs to the operator, not to a run."

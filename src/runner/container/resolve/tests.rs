@@ -51,12 +51,12 @@ use crate::runner::policy::{canonical_bytes, runner_policy_sha256};
 // Fixtures
 // ---------------------------------------------------------------------------
 
-const REFERENCE: &str = "tactus/ci:3.2";
+const REFERENCE: &str = "upstroke/ci:3.2";
 const IMAGE_ID: &str = "sha256:1111111111111111111111111111111111111111111111111111111111111111";
 const OTHER_ID: &str = "sha256:2222222222222222222222222222222222222222222222222222222222222222";
 const MANIFEST: &str = "sha256:3333333333333333333333333333333333333333333333333333333333333333";
-const CLAUDE_VOLUME: &str = "tactus-creds-claude-code";
-const CODEX_VOLUME: &str = "tactus-creds-codex";
+const CLAUDE_VOLUME: &str = "upstroke-creds-claude-code";
+const CODEX_VOLUME: &str = "upstroke-creds-codex";
 
 /// The two credential volumes, as an independent table.
 ///
@@ -149,14 +149,14 @@ impl RecordingPreflight {
 }
 
 impl RunnerPreflight for RecordingPreflight {
-    fn certify(&self, policy: &RunnerPolicy) -> Result<(), TactusError> {
+    fn certify(&self, policy: &RunnerPolicy) -> Result<(), UpstrokeError> {
         self.calls
             .lock()
             .expect("preflight log")
             .push((policy.clone(), self.trace.rendered()));
         match &self.refuse {
             None => Ok(()),
-            Some(message) => Err(TactusError::Refused {
+            Some(message) => Err(UpstrokeError::Refused {
                 message: message.clone(),
             }),
         }
@@ -222,8 +222,8 @@ fn the_resolved_container_policy_is_the_record_inv23_describes() {
 fn the_recorded_reference_is_the_operators_and_never_the_runtimes() {
     let (runtime, _trace) = ready_runtime();
     // The same image, additionally tagged twice under names nobody configured.
-    runtime.tag("mirror.example/tactus:latest", IMAGE_ID);
-    runtime.tag("aaa-sorts-first/tactus:1", IMAGE_ID);
+    runtime.tag("mirror.example/upstroke:latest", IMAGE_ID);
+    runtime.tag("aaa-sorts-first/upstroke:1", IMAGE_ID);
 
     let inspection = runtime
         .image_by_reference(REFERENCE)
@@ -974,7 +974,7 @@ fn a_config_that_differs_warns_naming_the_field_that_moved() {
     ] {
         assert!(
             !named.contains(&unreachable.to_string()),
-            "`{unreachable}` is not a field `tactus.toml` can move"
+            "`{unreachable}` is not a field `upstroke.toml` can move"
         );
     }
 }
@@ -1432,7 +1432,7 @@ fn legacy_container_selection_refused_before_effects() {
                  credential_volumes = {{ claude-code = \"{CLAUDE_VOLUME}\" }}\n"
             )
         };
-        fs::write(repo.join("tactus.toml"), &config).expect("config");
+        fs::write(repo.join("upstroke.toml"), &config).expect("config");
         git(&repo, &["add", "-A"]);
         git(&repo, &["commit", "-q", "-m", "config"]);
         // One seeded run per legacy schema: `EngineLimits::for_resume` reads the
@@ -1482,13 +1482,13 @@ fn legacy_container_selection_refused_before_effects() {
                 let error = outcome.expect_err("the lease is held, so nothing can proceed");
                 if kind == HOST_TOML {
                     assert!(
-                        matches!(&error, TactusError::Refused { message }
+                        matches!(&error, UpstrokeError::Refused { message }
                             if message.contains("already driving worktree")),
                         "{command}: the control did not reach the worktree lock, so the \
                          container cell's failure to reach it proves nothing: {error}"
                     );
                 } else {
-                    let TactusError::Config { message, .. } = &error else {
+                    let UpstrokeError::Config { message, .. } = &error else {
                         panic!(
                             "{command}: refused as {error:?} — a container selection reached the \
                              worktree lock before it was refused"
@@ -1533,7 +1533,7 @@ fn legacy_container_selection_refused_before_effects() {
              have been spawned",
             adapters.asked()
         );
-        let runs = repo.join(".tactus").join("runs");
+        let runs = repo.join(".upstroke").join("runs");
         let mut ids: Vec<String> = fs::read_dir(&runs)
             .expect("runs root")
             .map(|entry| entry.expect("entry").file_name().to_string_lossy().into())
@@ -1563,7 +1563,7 @@ fn legacy_container_selection_refused_before_effects() {
             Command::new("git")
                 .arg("-C")
                 .arg(&repo)
-                .args(["branch", "--list", "tactus/*"])
+                .args(["branch", "--list", "upstroke/*"])
                 .output()
                 .expect("git branch")
                 .stdout,
@@ -1596,13 +1596,13 @@ fn every_engine_limits_reading_refuses_a_container_selection() {
     let mut refused = 0;
     for limits in all {
         fs::write(
-            dir.join("tactus.toml"),
+            dir.join("upstroke.toml"),
             format!("[runner]\nkind = \"container\"\nimage = \"{REFERENCE}\"\n"),
         )
         .expect("config");
         let mut warnings = Vec::new();
         let error = crate::config::load_limits(
-            Some(&dir.join("tactus.toml")),
+            Some(&dir.join("upstroke.toml")),
             &dir,
             Some(&empty_pools(&dir)),
             limits,
@@ -1610,7 +1610,7 @@ fn every_engine_limits_reading_refuses_a_container_selection() {
         )
         .expect_err("a container selection is refused");
         assert!(
-            matches!(&error, TactusError::Config { message, .. }
+            matches!(&error, UpstrokeError::Config { message, .. }
                 if message.contains("[runner] `kind = \"container\"` is refused")),
             "{limits:?}: {error}"
         );
@@ -1618,9 +1618,9 @@ fn every_engine_limits_reading_refuses_a_container_selection() {
 
         // The control, byte-identical apart from the kind: the same reading
         // accepts a host selection, so the refusal is about the value.
-        fs::write(dir.join("tactus.toml"), "[runner]\nkind = \"host\"\n").expect("config");
+        fs::write(dir.join("upstroke.toml"), "[runner]\nkind = \"host\"\n").expect("config");
         let config = crate::config::load_limits(
-            Some(&dir.join("tactus.toml")),
+            Some(&dir.join("upstroke.toml")),
             &dir,
             Some(&empty_pools(&dir)),
             limits,
@@ -1931,7 +1931,7 @@ impl AdapterSource for RecordingAdapters {
 
 fn scratch(tag: &str) -> PathBuf {
     let dir = std::env::temp_dir().join(format!(
-        "tactus-resolve-{tag}-{}-{:?}",
+        "upstroke-resolve-{tag}-{}-{:?}",
         std::process::id(),
         std::thread::current().id()
     ));
@@ -1958,12 +1958,12 @@ fn git(repo: &Path, args: &[&str]) {
 fn temp_repo(tag: &str) -> PathBuf {
     let dir = scratch(tag);
     git(&dir, &["init", "-q", "-b", "main"]);
-    git(&dir, &["config", "user.email", "test@tactus.local"]);
-    git(&dir, &["config", "user.name", "tactus tests"]);
+    git(&dir, &["config", "user.email", "test@upstroke.local"]);
+    git(&dir, &["config", "user.name", "upstroke tests"]);
     fs::write(dir.join("README.md"), "seed\n").expect("seed");
     fs::write(
         dir.join("plan.md"),
-        "## Implement the widget\n<!-- tactus: id=t1 depends= -->\nMake it.\n",
+        "## Implement the widget\n<!-- upstroke: id=t1 depends= -->\nMake it.\n",
     )
     .expect("plan");
     git(&dir, &["add", "-A"]);
@@ -2002,12 +2002,12 @@ fn seed_legacy_run(repo: &Path, run_id: &str, private: &Path, schema: u32) {
     .expect("utf-8");
     let started = crate::events::RunStarted {
         schema,
-        tactus_version: env!("CARGO_PKG_VERSION").to_owned(),
+        upstroke_version: env!("CARGO_PKG_VERSION").to_owned(),
         run_id: run_id.to_owned(),
-        branch: format!("tactus/run-{run_id}"),
+        branch: format!("upstroke/run-{run_id}"),
         base_sha: head.trim().to_owned(),
         plan_path: "plan.md".to_owned(),
-        config_path: Some("tactus.toml".to_owned()),
+        config_path: Some("upstroke.toml".to_owned()),
         plan_hash: "unused-by-the-refusal".to_owned(),
         // Both required by `ensure_supported_schema` for a schema-3 header,
         // which runs *before* `validate_inputs` — so without them a schema-3

@@ -15,7 +15,7 @@ use std::time::Duration;
 use serde::{Deserialize, Serialize};
 
 use crate::capacity::PoolKind;
-use crate::error::TactusError;
+use crate::error::UpstrokeError;
 use crate::ir::{Effort, Outcome, WorkerProfile};
 use crate::runner::invocation::InvocationId;
 use crate::runner::{AgentId, CommandSpec, ExecutionRole, ProbeTarget, Runner, RunnerRequest};
@@ -25,7 +25,7 @@ pub use proc::ProcessOutput;
 /// Whether the vendor's CLI says it is signed in.
 ///
 /// Three states, not two. "Could not tell" must never render as "not
-/// connected": `tactus connect` writes a file an operator then trusts, and a
+/// connected": `upstroke connect` writes a file an operator then trusts, and a
 /// confident *wrong* "you are not logged in" sends them to re-authenticate an
 /// account that was fine.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -172,14 +172,14 @@ pub fn probe_workspace() -> PathBuf {
 ///
 /// # Errors
 ///
-/// [`TactusError::Refused`] when the adapter id cannot appear in an invocation
+/// [`UpstrokeError::Refused`] when the adapter id cannot appear in an invocation
 /// identity — see [`InvocationId::probe`]. Every shipped id is `[a-z-]`.
 pub fn probe_request(
     agent: &str,
     command: CommandSpec,
     ordinal: u32,
     timeout: Duration,
-) -> Result<RunnerRequest, TactusError> {
+) -> Result<RunnerRequest, UpstrokeError> {
     let agent = AgentId::new(agent);
     Ok(RunnerRequest {
         command,
@@ -207,7 +207,7 @@ pub trait AgentAdapter: Send + Sync {
     ///
     /// A missing or unusable binary, a CLI that has dropped a required flag,
     /// or a runner refusal.
-    fn probe(&self, runner: &dyn Runner) -> Result<Caps, TactusError>;
+    fn probe(&self, runner: &dyn Runner) -> Result<Caps, UpstrokeError>;
     /// Turn one attempt into a **data-only** [`CommandSpec`].
     ///
     /// DESIGN.md:117: an adapter "does not decide where the process runs". A
@@ -221,15 +221,15 @@ pub trait AgentAdapter: Send + Sync {
     ///
     /// A refusal to run this profile at all (§19/§20), or a binary that cannot
     /// be located.
-    fn build(&self, run: &TaskRun) -> Result<CommandSpec, TactusError>;
+    fn build(&self, run: &TaskRun) -> Result<CommandSpec, UpstrokeError>;
     /// Read one attempt's process output as an [`Outcome`].
     ///
     /// # Errors
     ///
     /// Output this adapter cannot interpret at all.
-    fn parse(&self, out: &ProcessOutput) -> Result<Outcome, TactusError>;
+    fn parse(&self, out: &ProcessOutput) -> Result<Outcome, UpstrokeError>;
 
-    /// §13's `tactus connect`: ask this agent's CLI about the account behind
+    /// §13's `upstroke connect`: ask this agent's CLI about the account behind
     /// it — signed in or not, what shape its quota is, which models it offers.
     ///
     /// Subprocesses the vendor's own CLI and parses what came back. No HTTP, no
@@ -252,7 +252,7 @@ pub trait AgentAdapter: Send + Sync {
     ///
     /// Whatever asking this CLI about its account failed with. The default
     /// never fails: it asks nothing.
-    fn discover(&self, _runner: &dyn Runner, _caps: &Caps) -> Result<Discovery, TactusError> {
+    fn discover(&self, _runner: &dyn Runner, _caps: &Caps) -> Result<Discovery, UpstrokeError> {
         Ok(Discovery::unknown())
     }
 
@@ -271,7 +271,7 @@ pub trait AgentAdapter: Send + Sync {
         _gate_cmds: &[String],
         _dir: &std::path::Path,
         _stem: &str,
-    ) -> Result<Option<PathBuf>, TactusError> {
+    ) -> Result<Option<PathBuf>, UpstrokeError> {
         Ok(None)
     }
 }
@@ -772,7 +772,7 @@ mod built_program_tests {
     }
 
     impl Runner for Boundary {
-        fn run(&self, request: &RunnerRequest) -> Result<ProcessOutput, TactusError> {
+        fn run(&self, request: &RunnerRequest) -> Result<ProcessOutput, UpstrokeError> {
             self.seen
                 .lock()
                 .unwrap_or_else(PoisonError::into_inner)
@@ -789,7 +789,7 @@ mod built_program_tests {
                     output_limited: false,
                 });
             }
-            Err(TactusError::Agent {
+            Err(UpstrokeError::Agent {
                 message: format!(
                     "`{}` is not present inside this boundary; the agent CLI here is `{}`",
                     request.command.program, self.installed
@@ -874,18 +874,19 @@ mod built_program_tests {
         // transcribed here rather than read from that adapter's private
         // constants, so a renamed probe key fails this fixture loudly instead
         // of silently agreeing with itself.
-        if joined.contains("tactus_probe_deliberately_unknown") {
+        if joined.contains("upstroke_probe_deliberately_unknown") {
             return (
                 2,
                 String::new(),
-                "error: unknown key `tactus_probe_deliberately_unknown` in -c override".to_owned(),
+                "error: unknown key `upstroke_probe_deliberately_unknown` in -c override"
+                    .to_owned(),
             );
         }
         if joined.contains("model_reasoning_effort=") {
             return (
                 2,
                 String::new(),
-                "error: output schema `tactus-output-schema-must-not-exist.json` does not exist"
+                "error: output schema `upstroke-output-schema-must-not-exist.json` does not exist"
                     .to_owned(),
             );
         }

@@ -11,7 +11,7 @@ use std::time::Duration;
 use crate::agent::{AdapterSource, Caps};
 use crate::capacity;
 use crate::config::{self, OnTaskFailure};
-use crate::error::TactusError;
+use crate::error::UpstrokeError;
 use crate::events::{
     self, AttemptRecord, EventBody, EventLog, FailureRecord, Progress, RunState, TaskState,
 };
@@ -51,7 +51,7 @@ use super::report::{
 pub(super) fn run_harness_inner(
     opts: &RunOptions,
     harness: &Harness<'_>,
-) -> Result<(RunReport, RunState), TactusError> {
+) -> Result<(RunReport, RunState), UpstrokeError> {
     let contained = crate::runner::host::contain_write_command(&mut crate::agent::proc::NoHooks)?;
     run_harness_inner_on(
         opts,
@@ -78,7 +78,7 @@ pub(super) fn run_harness_inner_on(
     harness: &Harness<'_>,
     runner: &dyn Runner,
     _contained: &crate::runner::host::Contained,
-) -> Result<(RunReport, RunState), TactusError> {
+) -> Result<(RunReport, RunState), UpstrokeError> {
     // Every read-only refusal precedes every lock: the plan, the config, and
     // `[engine]`'s ceilings are checked here, where nothing has been created
     // yet, so a config this engine cannot honour cannot leave a git-dir lock
@@ -112,7 +112,7 @@ pub(super) fn run_harness_inner_on(
     workspace.ensure_execution_prerequisites()?;
     workspace.ensure_run_exclusions()?;
     if !workspace.is_clean()? {
-        return Err(TactusError::Git {
+        return Err(UpstrokeError::Git {
             message: "working tree is not clean; commit or stash first (the engine refuses \
                       dirty trees)"
                 .to_owned(),
@@ -122,7 +122,7 @@ pub(super) fn run_harness_inner_on(
     let wait_on_block = opts.wait_on_block;
 
     let run_id = ulid::ulid();
-    let branch = format!("tactus/run-{run_id}");
+    let branch = format!("upstroke/run-{run_id}");
     let paths = opts.paths(&run_id);
     paths.create()?;
     // Held for the whole run, released by the OS if this process dies — so a
@@ -132,7 +132,7 @@ pub(super) fn run_harness_inner_on(
 
     // Nothing is on the record until the first event lands, so a failure in
     // this window would leave a run directory with no `events.jsonl` in it —
-    // and that husk becomes `latest_run`, so a bare `tactus status` reports
+    // and that husk becomes `latest_run`, so a bare `upstroke status` reports
     // "no event log here" for a run that never began, shadowing the real
     // latest one until someone deletes it by hand. Best-effort: failing to
     // tidy up must not mask the error that actually stopped the run.
@@ -141,14 +141,14 @@ pub(super) fn run_harness_inner_on(
     let normalized_plan_digest = events::normalized_plan_digest(&normalized_plan);
     let opened = rundir::write_plan(&paths.public, &normalized_plan, &mut rundir::NoHooks)
         .and_then(|()| {
-            let read_back = fs::read(&plan_path).map_err(|source| TactusError::Io {
+            let read_back = fs::read(&plan_path).map_err(|source| UpstrokeError::Io {
                 path: plan_path.clone(),
                 source,
             })?;
             if read_back != normalized_plan {
-                return Err(TactusError::Refused {
+                return Err(UpstrokeError::Refused {
                     message: format!(
-                        "{} changed while tactus was freezing it; refusing to record a digest for bytes it did not write",
+                        "{} changed while upstroke was freezing it; refusing to record a digest for bytes it did not write",
                         plan_path.display()
                     ),
                 });
@@ -166,7 +166,7 @@ pub(super) fn run_harness_inner_on(
     let effort_policy = analysis.config.resolved_effort_policy();
     let started = events::RunStarted {
         schema: events::SCHEMA_VERSION,
-        tactus_version: env!("CARGO_PKG_VERSION").to_owned(),
+        upstroke_version: env!("CARGO_PKG_VERSION").to_owned(),
         run_id: run_id.clone(),
         branch: branch.clone(),
         base_sha,
@@ -248,7 +248,7 @@ pub(super) fn run_harness_inner_on(
 }
 
 pub(super) fn prepared_pin_ref(run_id: &str, task_index: usize, attempt: u32) -> String {
-    format!("refs/tactus/prepared/{run_id}/{task_index}-{attempt}")
+    format!("refs/upstroke/prepared/{run_id}/{task_index}-{attempt}")
 }
 
 pub(super) struct Run<'a> {
@@ -366,7 +366,7 @@ impl Run<'_> {
     /// past this into `state`, which is what makes a live run and a replay of
     /// its own log the same computation rather than two that agree by
     /// inspection.
-    pub(super) fn emit(&mut self, body: EventBody) -> Result<(), TactusError> {
+    pub(super) fn emit(&mut self, body: EventBody) -> Result<(), UpstrokeError> {
         let site = EventSite::LegacyAppend;
         let event = self
             .log
@@ -376,7 +376,7 @@ impl Run<'_> {
     }
 
     /// Drain, settle, and report.
-    pub(super) fn drain_and_report(&mut self) -> Result<RunReport, TactusError> {
+    pub(super) fn drain_and_report(&mut self) -> Result<RunReport, UpstrokeError> {
         if let Err(error) = self.drain() {
             // The log already holds everything that happened, including the
             // attempt this died inside — that is what `resume` reads. The
@@ -435,7 +435,7 @@ impl Run<'_> {
     /// question. `an_exhausted_pool_and_a_silent_operator_still_terminate`
     /// holds it to that against an adapter that never succeeds and an operator
     /// who never replies.
-    fn drain(&mut self) -> Result<(), TactusError> {
+    fn drain(&mut self) -> Result<(), UpstrokeError> {
         let mut defer_round = 0u32;
         loop {
             // Invariant 6 in its most useful form: an answer that arrives while
@@ -523,7 +523,7 @@ impl Run<'_> {
     /// this loop is what guarantees that.
     ///
     /// Returns whether the task ended deferred.
-    fn step_task(&mut self, index: usize) -> Result<bool, TactusError> {
+    fn step_task(&mut self, index: usize) -> Result<bool, UpstrokeError> {
         // Copied out of `self` so they carry the run's lifetime rather than
         // this method's `&mut self` borrow.
         let analysis = self.analysis;
@@ -605,7 +605,7 @@ impl Run<'_> {
             };
             let adapter = adapters
                 .get(&profile.agent)
-                .ok_or_else(|| TactusError::Agent {
+                .ok_or_else(|| UpstrokeError::Agent {
                     message: format!("no adapter registered for agent `{}`", profile.agent),
                 })?;
 
@@ -810,12 +810,12 @@ impl Run<'_> {
             // prefix without re-running paid work or trusting the mutable
             // index.
             let prepared_commit = if result.failure.is_none() {
-                let message = format!("[tactus] {}: {}", task.id, task.title);
+                let message = format!("[upstroke] {}: {}", task.id, task.title);
                 let pin_ref = prepared_pin_ref(&self.run_id, index, attempt);
                 let recorded_branch_ref = format!("refs/heads/{}", self.branch);
                 if result.candidate_branch_ref != recorded_branch_ref {
                     let _ = self.workspace.discard_uncommitted();
-                    return Err(TactusError::Git {
+                    return Err(UpstrokeError::Git {
                         message: format!(
                             "candidate was captured from `{}`, not recorded run branch `{recorded_branch_ref}`; refusing publication",
                             result.candidate_branch_ref
@@ -873,7 +873,7 @@ impl Run<'_> {
                 // Deleting it here would turn an ambiguous sync error into a
                 // schema-3 settlement whose exact object is no longer durable.
                 if let Err(cleanup) = self.workspace.discard_uncommitted() {
-                    return Err(TactusError::Git {
+                    return Err(UpstrokeError::Git {
                         message: format!(
                             "{error}; additionally failed to clean the unreviewed workspace: {cleanup}"
                         ),
@@ -888,7 +888,7 @@ impl Run<'_> {
                     // expose an orphan projection; resume rematerializes the
                     // question from the event before accepting an answer.
                     if let Err(cleanup) = self.workspace.discard_uncommitted() {
-                        return Err(TactusError::Git {
+                        return Err(UpstrokeError::Git {
                             message: format!(
                                 "{error}; additionally failed to clean the unreviewed workspace: {cleanup}"
                             ),
@@ -985,7 +985,7 @@ impl Run<'_> {
         &self,
         index: usize,
         implementer: &WorkerProfile,
-    ) -> Result<Vec<Reviewer<'_>>, TactusError> {
+    ) -> Result<Vec<Reviewer<'_>>, UpstrokeError> {
         let running_on = PassBinding::new(implementer.agent.clone(), implementer.model.clone());
         self.review_plan
             .passes_for(index, &running_on)
@@ -1001,7 +1001,7 @@ impl Run<'_> {
                 profile.pool = self.pool_name_for(&profile.agent).unwrap_or_default();
                 Ok(Reviewer {
                     adapter: self.adapters.get(&pass.binding.agent).ok_or_else(|| {
-                        TactusError::Agent {
+                        UpstrokeError::Agent {
                             message: format!(
                                 "the {} pass binds to agent `{}`, which has no adapter in this \
                                  build",
@@ -1033,7 +1033,7 @@ impl Run<'_> {
     pub(super) fn emit_capacity_snapshot(
         &mut self,
         signals: &BTreeMap<String, Option<String>>,
-    ) -> Result<(), TactusError> {
+    ) -> Result<(), UpstrokeError> {
         // No early return on an empty pools file: "nothing was connected" is
         // exactly as worth recording as a list, and its absence is otherwise
         // indistinguishable from a pre-step-10 log, or from a binary that never
@@ -1160,7 +1160,7 @@ impl Run<'_> {
         implementer: &WorkerProfile,
         reviews: &[events::ReviewRecord],
         failure: &AttemptFailure,
-    ) -> Result<(), TactusError> {
+    ) -> Result<(), UpstrokeError> {
         let (pool, agent) = match failure.origin {
             FailureOrigin::Reviewer => match reviews.last() {
                 Some(review) => (review.pool.clone(), review.agent.clone()),
@@ -1197,9 +1197,9 @@ impl Run<'_> {
         index: usize,
         kind: FailureKind,
         reason: String,
-    ) -> Result<(), TactusError> {
+    ) -> Result<(), UpstrokeError> {
         // The halt policy is resolved here and recorded, not re-derived on
-        // replay: a `tactus.toml` edited between a run and its resume must not
+        // replay: a `upstroke.toml` edited between a run and its resume must not
         // rewrite which task the report blames for stopping.
         let halts_run = self.on_task_failure == OnTaskFailure::Halt;
         self.fail_task_with_policy(index, kind, reason, halts_run)
@@ -1211,7 +1211,7 @@ impl Run<'_> {
         kind: FailureKind,
         reason: String,
         halts_run: bool,
-    ) -> Result<(), TactusError> {
+    ) -> Result<(), UpstrokeError> {
         let task = self.analysis.plan.tasks[index].id.to_string();
         self.emit(EventBody::TaskFailed {
             task,
@@ -1224,7 +1224,7 @@ impl Run<'_> {
     }
 
     /// §12: raise eagerly, park exactly the affected task, tell the notifiers,
-    /// and write the payload where a UI or `tactus answer` can read it.
+    /// and write the payload where a UI or `upstroke answer` can read it.
     /// §12's `ask_before` question: this task is about to escalate onto a
     /// frontier rung, and the run has already reported enough spend that the
     /// operator asked to be consulted first.
@@ -1272,7 +1272,7 @@ impl Run<'_> {
         }
     }
 
-    fn materialize_question(&mut self, question: &Question) -> Result<(), TactusError> {
+    fn materialize_question(&mut self, question: &Question) -> Result<(), UpstrokeError> {
         // Materialize before notifying: a recipient must always be able to open
         // the payload it was told about. The caller decides whether the
         // authoritative event belongs before (atomic settlement parking) or
@@ -1295,13 +1295,13 @@ impl Run<'_> {
         Ok(())
     }
 
-    /// Ingest answers left by `tactus answer` in another process.
+    /// Ingest answers left by `upstroke answer` in another process.
     ///
     /// Returns whether anything changed. This is what makes the answer command
     /// useful while a run is alive rather than only between runs: an operator
     /// answering from a phone at 2am un-parks the task on the next scheduler
     /// turn, with no resume needed.
-    fn sweep_answers(&mut self) -> Result<bool, TactusError> {
+    fn sweep_answers(&mut self) -> Result<bool, UpstrokeError> {
         let open: Vec<QuestionId> = self
             .state
             .open_questions()
@@ -1319,7 +1319,7 @@ impl Run<'_> {
             };
             // Only what actually applied counts as change. A file the engine
             // reads but declines to act on — an `Unanswered` one, say, which
-            // nothing in `tactus answer` will write but a hand-edit can —
+            // nothing in `upstroke answer` will write but a hand-edit can —
             // would otherwise report progress on every turn, and the drain
             // loop would spin on it forever: this branch is only bounded
             // because it closes the question it fires for.
@@ -1333,7 +1333,7 @@ impl Run<'_> {
     /// Record an answer and let it take effect. Returns whether it applied.
     ///
     /// One path for every channel — a terminal reply, a file written by
-    /// `tactus answer`, or an answer picked up on resume — so what an answer
+    /// `upstroke answer`, or an answer picked up on resume — so what an answer
     /// *does* cannot depend on where it came from. The guards below are also
     /// what makes it safe to offer the same answer twice: a question that is
     /// already closed absorbs the second one instead of applying it.
@@ -1342,7 +1342,7 @@ impl Run<'_> {
         id: &QuestionId,
         answer: Answer,
         via: &str,
-    ) -> Result<bool, TactusError> {
+    ) -> Result<bool, UpstrokeError> {
         let Some(record) = self
             .state
             .questions
@@ -1418,7 +1418,7 @@ impl Run<'_> {
     /// This runs only at a hard block, and each question is asked at most
     /// once: an `Unanswered` result marks it unreachable rather than looping
     /// back to a channel that already said nobody is there.
-    fn resolve_one_question(&mut self) -> Result<bool, TactusError> {
+    fn resolve_one_question(&mut self) -> Result<bool, UpstrokeError> {
         let Some(position) = self.state.questions.iter().position(|record| {
             record.is_open() && !self.unanswerable.contains(&record.question.id)
         }) else {
@@ -1489,7 +1489,7 @@ fn question_context(
         let _ = writeln!(
             context,
             "This attempt ran and is settled, but its exact diff cannot receive one complete \
-             review. Tactus parked it instead of paying for an identical automatic retry. {} \
+             review. Upstroke parked it instead of paying for an identical automatic retry. {} \
              The policy failure was:",
             if failure.kind == FailureKind::ReviewInputTooLarge {
                 "Retry only with guidance that produces a smaller diff; because the plan is \
@@ -1569,7 +1569,7 @@ fn spend_question_context(
     let _ = writeln!(
         context,
         "Reported spend so far: ${spent:.4}{qualifier}. This is what the run has already cost, \
-         not an estimate of what the {onto} attempt will cost — tactus measures spend rather than \
+         not an estimate of what the {onto} attempt will cost — upstroke measures spend rather than \
          predicting it (§10)."
     );
     if !task.acceptance.is_empty() {

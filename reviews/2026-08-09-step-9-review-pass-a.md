@@ -27,7 +27,7 @@ That distinction mattered. Against the naive shim, `--allow-tool=shell(echo "hi"
 & whoami)` **executed `whoami`** — which reads exactly like argument injection.
 Against the npm-shape shim it does not reproduce: the argument arrives intact.
 The injection was the *test harness's* flaw (a batch line that expands `%~1` and
-then re-parses it), not tactus's. Reported here because the negative result is
+then re-parses it), not upstroke's. Reported here because the negative result is
 worth as much as the positive one — the CVE-2024-24576 / "BatBadBut" class is
 exactly what this code path looks like it should be vulnerable to, and it isn't.
 

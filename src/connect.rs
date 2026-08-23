@@ -1,5 +1,5 @@
-//! `tactus connect` (DESIGN.md §13, §18): discover the agent CLIs on this
-//! machine and write `~/.tactus/pools.toml`.
+//! `upstroke connect` (DESIGN.md §13, §18): discover the agent CLIs on this
+//! machine and write `~/.upstroke/pools.toml`.
 //!
 //! **Invariant 2 is the one to watch here.** Connect subprocesses the vendors'
 //! own CLIs and parses what they print. No HTTP, no token ever handled, no
@@ -32,12 +32,12 @@ use std::path::PathBuf;
 
 use crate::agent::{AdapterSource, BuiltinAdapters, Discovery};
 use crate::capacity::{Pool, PoolKind, Source};
-use crate::error::TactusError;
+use crate::error::UpstrokeError;
 use crate::util;
 
 #[derive(Debug, Clone, Default)]
 pub struct ConnectOptions {
-    /// Where to write. `None` takes `~/.tactus/pools.toml`; tests always set
+    /// Where to write. `None` takes `~/.upstroke/pools.toml`; tests always set
     /// it, so no test can reach the operator's real pools file.
     pub pools_path: Option<PathBuf>,
     /// Overwrite an existing file that differs.
@@ -81,7 +81,7 @@ pub struct AgentReport {
 }
 
 /// Discover, render, and write — the whole command.
-pub fn run(opts: &ConnectOptions) -> Result<ConnectReport, TactusError> {
+pub fn run(opts: &ConnectOptions) -> Result<ConnectReport, UpstrokeError> {
     run_with(
         opts,
         &BuiltinAdapters,
@@ -96,15 +96,16 @@ pub fn run_with<'a>(
     opts: &ConnectOptions,
     adapters: &dyn AdapterSource,
     ids: impl IntoIterator<Item = &'a str>,
-) -> Result<ConnectReport, TactusError> {
+) -> Result<ConnectReport, UpstrokeError> {
     let path = match &opts.pools_path {
         Some(path) => path.clone(),
-        None => util::user_tactus_dir()
+        None => util::user_upstroke_dir()
             .map(|dir| dir.join("pools.toml"))
-            .ok_or_else(|| TactusError::Refused {
-                message: "cannot find a home directory to write ~/.tactus/pools.toml into — pass \
+            .ok_or_else(|| UpstrokeError::Refused {
+                message:
+                    "cannot find a home directory to write ~/.upstroke/pools.toml into — pass \
                           --pools <path> to say where it should go"
-                    .to_owned(),
+                        .to_owned(),
             })?,
     };
 
@@ -153,7 +154,7 @@ pub fn run_with<'a>(
                     warnings.push(format!(
                         "{id} does not advertise catalogued model(s): {}. Cross-family review \
                          binds to catalogued names, so one this CLI rejects fails at runtime — \
-                         upgrade tactus or pin a model it lists.",
+                         upgrade upstroke or pin a model it lists.",
                         missing.join(", ")
                     ));
                 }
@@ -197,7 +198,7 @@ pub fn run_with<'a>(
         Some(existing) if stable_content(existing) == stable_content(&content) => Wrote::Unchanged,
         _ => {
             if let Some(parent) = path.parent() {
-                fs::create_dir_all(parent).map_err(|source| TactusError::Io {
+                fs::create_dir_all(parent).map_err(|source| UpstrokeError::Io {
                     path: parent.to_path_buf(),
                     source,
                 })?;
@@ -266,7 +267,7 @@ fn strip_comment(line: &str) -> String {
 /// current, so it belongs in the comparison that decides whether to rewrite.
 fn stable_content(text: &str) -> Vec<&str> {
     text.lines()
-        .filter(|line| !line.starts_with("# Written by `tactus connect`"))
+        .filter(|line| !line.starts_with("# Written by `upstroke connect`"))
         .collect()
 }
 
@@ -380,17 +381,17 @@ fn render(agents: &[AgentReport]) -> String {
     let mut out = String::new();
     let _ = writeln!(
         out,
-        "# Written by `tactus connect` v{} on {}.\n\
+        "# Written by `upstroke connect` v{} on {}.\n\
          #\n\
          # Pools are user-level (§17): they describe YOUR subscriptions, not this repo. The file\n\
-         # is hand-editable and `tactus connect` will not overwrite your edits without --force.\n\
+         # is hand-editable and `upstroke connect` will not overwrite your edits without --force.\n\
          #\n\
          # Model roster provenance: catalog {}, the static capability table shipped with this\n\
          # binary. Neither agent CLI offers non-interactive model enumeration as of this writing,\n\
          # so nothing here was cross-checked against what your installed CLI actually accepts.\n\
          #\n\
          # `profile` selects between several accounts on one vendor (§13). It is parsed, shown by\n\
-         # `tactus capacity`, and acted on by nothing in v0.1 — add it when v0.2 wires it up.",
+         # `upstroke capacity`, and acted on by nothing in v0.1 — add it when v0.2 wires it up.",
         env!("CARGO_PKG_VERSION"),
         util::rfc3339_utc_now(),
         env!("CARGO_PKG_VERSION"),
@@ -542,9 +543,9 @@ mod tests {
             self.id
         }
 
-        fn probe(&self, _runner: &dyn crate::runner::Runner) -> Result<Caps, TactusError> {
+        fn probe(&self, _runner: &dyn crate::runner::Runner) -> Result<Caps, UpstrokeError> {
             if self.discovery.is_none() {
-                return Err(TactusError::Agent {
+                return Err(UpstrokeError::Agent {
                     message: "binary not found on PATH".to_owned(),
                 });
             }
@@ -559,11 +560,11 @@ mod tests {
             })
         }
 
-        fn build(&self, _run: &TaskRun) -> Result<CommandSpec, TactusError> {
+        fn build(&self, _run: &TaskRun) -> Result<CommandSpec, UpstrokeError> {
             unreachable!("connect never spawns an attempt")
         }
 
-        fn parse(&self, _out: &ProcessOutput) -> Result<Outcome, TactusError> {
+        fn parse(&self, _out: &ProcessOutput) -> Result<Outcome, UpstrokeError> {
             unreachable!("connect never parses an attempt")
         }
 
@@ -571,8 +572,8 @@ mod tests {
             &self,
             _runner: &dyn crate::runner::Runner,
             _caps: &Caps,
-        ) -> Result<Discovery, TactusError> {
-            self.discovery.clone().ok_or_else(|| TactusError::Agent {
+        ) -> Result<Discovery, UpstrokeError> {
+            self.discovery.clone().ok_or_else(|| UpstrokeError::Agent {
                 message: "binary not found on PATH".to_owned(),
             })
         }
@@ -613,7 +614,8 @@ mod tests {
     }
 
     fn scratch(tag: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!("tactus-connect-{tag}-{}", std::process::id()));
+        let dir =
+            std::env::temp_dir().join(format!("upstroke-connect-{tag}-{}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).expect("scratch dir");
         dir.join("pools.toml")
@@ -656,7 +658,7 @@ mod tests {
     #[test]
     fn what_connect_writes_parses_back_into_the_pools_it_describes() {
         // The round trip is the whole contract: a file this command writes must
-        // be one `config::load` accepts, or `tactus capacity` reports on
+        // be one `config::load` accepts, or `upstroke capacity` reports on
         // something `connect` cannot produce.
         let path = scratch("roundtrip");
         connect(&path, false);

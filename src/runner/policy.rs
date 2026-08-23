@@ -29,14 +29,14 @@
 
 use sha2::{Digest, Sha256};
 
-use crate::error::TactusError;
+use crate::error::UpstrokeError;
 use crate::topology::events::{RunnerContract, RunnerKind, RunnerPolicy};
 
 /// The version tag the canonical encoding opens with.
 ///
 /// Part of the digested bytes, so a future encoding change is a different
 /// digest rather than the same digest over different bytes.
-pub const CANONICAL_VERSION: &str = "tactus.runner-policy.v1";
+pub const CANONICAL_VERSION: &str = "upstroke.runner-policy.v1";
 
 /// The host runner's resolved policy: `RunnerPolicy{kind: Host, policy:
 /// host-v1, image: None, credential_volumes: None}`.
@@ -72,12 +72,12 @@ pub fn host_policy() -> RunnerPolicy {
 ///
 /// # Errors
 ///
-/// [`TactusError::Refused`] if the resolved record is not complete.
-pub fn resolve_host() -> Result<RunnerPolicy, TactusError> {
+/// [`UpstrokeError::Refused`] if the resolved record is not complete.
+pub fn resolve_host() -> Result<RunnerPolicy, UpstrokeError> {
     let policy = host_policy();
     policy
         .completeness()
-        .map_err(|defect| TactusError::Refused {
+        .map_err(|defect| UpstrokeError::Refused {
             message: format!("the host runner resolved an unusable RunnerPolicy: {defect}"),
         })?;
     Ok(policy)
@@ -89,7 +89,7 @@ pub fn resolve_host() -> Result<RunnerPolicy, TactusError> {
 /// reproduce them by hand:
 ///
 /// ```text
-/// f("tactus.runner-policy.v1")
+/// f("upstroke.runner-policy.v1")
 /// f(kind)                  "host" | "container"
 /// f(policy)                "host-v1" | "container-v1"
 /// b(image.is_some)
@@ -207,10 +207,10 @@ mod tests {
     /// Not produced by `canonical_bytes` and not round-tripped: a suite that
     /// consumes its own canonical output cannot see a symmetric rename, which
     /// is `PR3-WIRE-PINNING`.
-    const HOST_CANONICAL: &[u8] = b"23:tactus.runner-policy.v1;4:host;7:host-v1;1:0;1:0;";
+    const HOST_CANONICAL: &[u8] = b"25:upstroke.runner-policy.v1;4:host;7:host-v1;1:0;1:0;";
 
-    const CONTAINER_CANONICAL: &[u8] = b"23:tactus.runner-policy.v1;9:container;12:container-v1;\
-                                         1:1;13:tactus/ci:3.2;8:sha256:a;1:1;8:sha256:b;1:1;1:2;\
+    const CONTAINER_CANONICAL: &[u8] = b"25:upstroke.runner-policy.v1;9:container;12:container-v1;\
+                                         1:1;15:upstroke/ci:3.2;8:sha256:a;1:1;8:sha256:b;1:1;1:2;\
                                          11:claude-code;8:creds-cc;5:codex;8:creds-cx;";
 
     fn container_fixture() -> RunnerPolicy {
@@ -221,7 +221,7 @@ mod tests {
             kind: RunnerKind::Container,
             policy: RunnerContract::ContainerV1,
             image: Some(ImageIdentity {
-                reference: "tactus/ci:3.2".to_owned(),
+                reference: "upstroke/ci:3.2".to_owned(),
                 id: "sha256:a".to_owned(),
                 digest: Some("sha256:b".to_owned()),
             }),
@@ -268,7 +268,7 @@ mod tests {
         // kind, contract, image-absent, volumes-present, zero entries.
         assert_eq!(
             canonical_bytes(&empty),
-            b"23:tactus.runner-policy.v1;4:host;7:host-v1;1:0;1:1;1:0;",
+            b"25:upstroke.runner-policy.v1;4:host;7:host-v1;1:0;1:1;1:0;",
             "the empty-map encoding is not the one the field list describes"
         );
 
@@ -278,7 +278,7 @@ mod tests {
         // that had acquired an image agree with one that had not.
         let mut mislabelled = host_policy();
         mislabelled.image = Some(ImageIdentity {
-            reference: "tactus/ci:3.2".to_owned(),
+            reference: "upstroke/ci:3.2".to_owned(),
             id: "sha256:a".to_owned(),
             digest: None,
         });
@@ -349,7 +349,7 @@ mod tests {
         let mut dropped_volumes = base.clone();
         let mut swapped_volume_values = base.clone();
 
-        moved_reference.image.as_mut().expect("image").reference = "tactus/ci:3.3".to_owned();
+        moved_reference.image.as_mut().expect("image").reference = "upstroke/ci:3.3".to_owned();
         moved_id.image.as_mut().expect("image").id = "sha256:z".to_owned();
         moved_digest.image.as_mut().expect("image").digest = Some("sha256:c".to_owned());
         dropped_digest.image.as_mut().expect("image").digest = None;
@@ -410,7 +410,11 @@ mod tests {
             .collect();
         assert_eq!(kinds.len(), 2, "kind takes both values");
         assert_eq!(contracts.len(), 2, "policy version takes both values");
-        assert_eq!(references.len(), 3, "absent, tactus/ci:3.2, tactus/ci:3.3");
+        assert_eq!(
+            references.len(),
+            3,
+            "absent, upstroke/ci:3.2, upstroke/ci:3.3"
+        );
         assert_eq!(ids.len(), 3, "absent, sha256:a, sha256:z");
         assert_eq!(digests.len(), 3, "absent, sha256:b, sha256:c");
         assert_eq!(
@@ -469,7 +473,7 @@ mod tests {
         let mut upper_volume_value = base.clone();
         let mut upper_volume_agent = base.clone();
 
-        upper_reference.image.as_mut().expect("image").reference = "Tactus/CI:3.2".to_owned();
+        upper_reference.image.as_mut().expect("image").reference = "Upstroke/CI:3.2".to_owned();
         upper_id.image.as_mut().expect("image").id = "SHA256:A".to_owned();
         upper_digest.image.as_mut().expect("image").digest = Some("SHA256:B".to_owned());
         upper_volume_value
@@ -542,7 +546,7 @@ mod tests {
         };
         assert_eq!(
             canonical_bytes(&upper_host),
-            b"23:tactus.runner-policy.v1;9:container;12:container-v1;1:1;1:R;2:ID;1:0;1:0;",
+            b"25:upstroke.runner-policy.v1;9:container;12:container-v1;1:1;1:R;2:ID;1:0;1:0;",
             "an uppercase field did not survive canonicalisation byte for byte"
         );
     }
@@ -766,12 +770,12 @@ mod tests {
         // Written out with the file's own line-continuation idiom, which strips
         // the newline *and* the leading indentation, so the literal is the
         // bytes and nothing else.
-        const DIGEST_ABSENT: &[u8] = b"23:tactus.runner-policy.v1;9:container;12:container-v1;\
-                                       1:1;13:tactus/ci:3.2;8:sha256:a;1:0;1:1;1:2;\
+        const DIGEST_ABSENT: &[u8] = b"25:upstroke.runner-policy.v1;9:container;12:container-v1;\
+                                       1:1;15:upstroke/ci:3.2;8:sha256:a;1:0;1:1;1:2;\
                                        11:claude-code;8:creds-cc;5:codex;8:creds-cx;";
         // The same, with digest-present and a zero-length value.
-        const DIGEST_EMPTY: &[u8] = b"23:tactus.runner-policy.v1;9:container;12:container-v1;\
-                                      1:1;13:tactus/ci:3.2;8:sha256:a;1:1;0:;1:1;1:2;\
+        const DIGEST_EMPTY: &[u8] = b"25:upstroke.runner-policy.v1;9:container;12:container-v1;\
+                                      1:1;15:upstroke/ci:3.2;8:sha256:a;1:1;0:;1:1;1:2;\
                                       11:claude-code;8:creds-cc;5:codex;8:creds-cx;";
         assert_eq!(
             canonical_bytes(&absent),
@@ -915,7 +919,7 @@ mod tests {
 
         let image = || {
             Some(ImageIdentity {
-                reference: "tactus/ci:3.2".to_owned(),
+                reference: "upstroke/ci:3.2".to_owned(),
                 id: "sha256:a".to_owned(),
                 digest: None,
             })

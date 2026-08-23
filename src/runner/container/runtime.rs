@@ -89,7 +89,7 @@ pub enum RuntimeOp {
     /// `pr_sequence[7].scope`: "per-agent credential volume names present by
     /// **volume inspection**".
     InspectVolume,
-    /// `crash_reconstruction`: "docker ps by `tactus.private_root`". Discovery
+    /// `crash_reconstruction`: "docker ps by `upstroke.private_root`". Discovery
     /// returns names **and labels**, because a labeled container without an
     /// intent is classified from its labels alone.
     ListByLabel,
@@ -326,11 +326,11 @@ impl Mount {
 /// from one by accident.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CreateSpec {
-    /// The container's name. `tactus-<repo_key>-<run_id>-<incarnation>-<invocation-hash>`.
+    /// The container's name. `upstroke-<repo_key>-<run_id>-<incarnation>-<invocation-hash>`.
     pub name: String,
     /// The **recorded immutable image id**.
     pub image_id: String,
-    /// The five `tactus.*` labels.
+    /// The five `upstroke.*` labels.
     pub labels: BTreeMap<String, String>,
     pub mounts: Vec<Mount>,
     /// The runner-owned base environment plus the adapter's overlay

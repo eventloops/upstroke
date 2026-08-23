@@ -5,7 +5,7 @@
 //! droppable:
 //!
 //! > `CommandSpec.env` **overlays a runner-owned base rather than replacing
-//! > it**. The host runner starts from the Tactus environment and **the
+//! > it**. The host runner starts from the Upstroke environment and **the
 //! > container runner from the image environment**; each supplies role-scoped
 //! > `HOME`, `PATH`, and credential locations. Adapter overrides may select
 //! > profiles or CLI behavior but **may not conflict with runner-reserved
@@ -61,7 +61,7 @@
 
 use std::collections::BTreeMap;
 
-use crate::error::TactusError;
+use crate::error::UpstrokeError;
 use crate::runner::host::{KeyCase, credential_location, reserved_keys};
 use crate::runner::{AgentId, ExecutionRole, ProbeTarget};
 
@@ -97,10 +97,10 @@ impl BoundaryLayout {
     /// DESIGN.md:400: "A container receives **only its role's one worktree
     /// mount**". One path, so a second worktree would need a second target and
     /// there is nowhere to put it.
-    pub const DEFAULT_WORKSPACE: &'static str = "/tactus/workspace";
+    pub const DEFAULT_WORKSPACE: &'static str = "/upstroke/workspace";
 
     /// Under which each agent's credential volume is mounted.
-    pub const DEFAULT_CREDENTIALS: &'static str = "/tactus/credentials";
+    pub const DEFAULT_CREDENTIALS: &'static str = "/upstroke/credentials";
 
     /// Where the disposable Git view is mounted.
     ///
@@ -115,7 +115,7 @@ impl BoundaryLayout {
     /// therefore an overlay rather than a redirection: a tool that opens
     /// `<workspace>/.git` finds the disposable view, not the real repository,
     /// with no environment variable involved.
-    pub const DEFAULT_GIT_VIEW: &'static str = "/tactus/gitview";
+    pub const DEFAULT_GIT_VIEW: &'static str = "/upstroke/gitview";
 
     /// Where the repository's object store is mounted, **read-only**.
     ///
@@ -125,7 +125,7 @@ impl BoundaryLayout {
     /// write. Mounting the borrowed store *over* `<view>/objects` would make
     /// `git add`, `git stash` and `git write-tree` fail hard inside every
     /// container.
-    pub const DEFAULT_GIT_OBJECTS: &'static str = "/tactus/gitobjects";
+    pub const DEFAULT_GIT_OBJECTS: &'static str = "/upstroke/gitobjects";
 
     /// The ephemeral scratch surface, and the working directory of a role that
     /// has no worktree.
@@ -517,19 +517,19 @@ impl ContainerEnvironment {
     ///
     /// # Errors
     ///
-    /// [`TactusError::Refused`] naming the key when the overlay names a
+    /// [`UpstrokeError::Refused`] naming the key when the overlay names a
     /// reserved one — refused by **key**, not by value, exactly as `host-v1`
     /// refuses it: an overlay permitted to restate `PATH` today because the
     /// value happens to match is an overlay that breaks silently the day the
     /// runner's value changes.
     ///
-    /// [`TactusError::Refused`] also when the composed environment does not
+    /// [`UpstrokeError::Refused`] also when the composed environment does not
     /// supply an absolute-only `PATH` — see [`Self::certify_path`].
     pub fn compose(
         &self,
         scope: &RoleScope<'_>,
         overlay: &[(String, String)],
-    ) -> Result<Vec<(String, String)>, TactusError> {
+    ) -> Result<Vec<(String, String)>, UpstrokeError> {
         self.preflight(overlay)?;
         let mut composed = self.base.clone();
         for reserved in reserved_keys() {
@@ -573,13 +573,13 @@ impl ContainerEnvironment {
     ///
     /// # Errors
     ///
-    /// [`TactusError::Refused`], naming the offending components.
-    pub fn certify_path(&self, composed: &[(String, String)]) -> Result<(), TactusError> {
+    /// [`UpstrokeError::Refused`], naming the offending components.
+    pub fn certify_path(&self, composed: &[(String, String)]) -> Result<(), UpstrokeError> {
         let Some((_, value)) = composed
             .iter()
             .find(|(name, _)| self.case.same_key(name.as_ref(), "PATH".as_ref()))
         else {
-            return Err(TactusError::Refused {
+            return Err(UpstrokeError::Refused {
                 message: "the container runner composed an environment that names no `PATH`, so \
                           the recorded image's own would decide which binary every bare program \
                           name resolves to. DESIGN.md:260 has the runner supply role-scoped \
@@ -593,7 +593,7 @@ impl ContainerEnvironment {
         if relative.is_empty() {
             return Ok(());
         }
-        Err(TactusError::Refused {
+        Err(UpstrokeError::Refused {
             message: format!(
                 "the container runner was given `PATH={value}`, whose component(s) {relative:?} \
                  resolve against the working directory. A probe has no worktree and an attempt \
@@ -611,15 +611,15 @@ impl ContainerEnvironment {
     ///
     /// # Errors
     ///
-    /// [`TactusError::Refused`] naming the offending key and the reserved key
+    /// [`UpstrokeError::Refused`] naming the offending key and the reserved key
     /// it collides with.
-    pub fn preflight(&self, overlay: &[(String, String)]) -> Result<(), TactusError> {
+    pub fn preflight(&self, overlay: &[(String, String)]) -> Result<(), UpstrokeError> {
         for (key, _) in overlay {
             if let Some(reserved) = reserved_keys()
                 .into_iter()
                 .find(|reserved| self.case.same_key(key.as_ref(), reserved.as_ref()))
             {
-                return Err(TactusError::Refused {
+                return Err(UpstrokeError::Refused {
                     message: format!(
                         "the command overlay sets `{key}`, which is reserved by the container \
                          runner (`{reserved}`). An adapter may select a profile or change CLI \
@@ -665,9 +665,9 @@ mod tests {
     /// The three shipped adapters, and a volume name per adapter. Every value
     /// distinct, so a swap between two of them is visible.
     const VOLUMES: &[(&str, &str)] = &[
-        ("claude-code", "tactus-creds-claude"),
-        ("copilot", "tactus-creds-copilot"),
-        ("codex", "tactus-creds-codex"),
+        ("claude-code", "upstroke-creds-claude"),
+        ("copilot", "upstroke-creds-copilot"),
+        ("codex", "upstroke-creds-codex"),
     ];
 
     fn volumes() -> BTreeMap<String, String> {
@@ -684,7 +684,7 @@ mod tests {
             ("PATH", "/usr/local/sbin:/usr/local/bin:/usr/bin:/bin"),
             ("HOME", "/root"),
             ("LANG", "C.UTF-8"),
-            ("TACTUS_IMAGE_MARKER", "image-environment-v1"),
+            ("UPSTROKE_IMAGE_MARKER", "image-environment-v1"),
         ]
         .into_iter()
         .map(|(key, value)| (key.to_owned(), value.to_owned()))
@@ -800,7 +800,7 @@ mod tests {
                 refused += 1;
             }
             environment
-                .compose(&scope, &[("TACTUS_OVERLAY".to_owned(), "1".to_owned())])
+                .compose(&scope, &[("UPSTROKE_OVERLAY".to_owned(), "1".to_owned())])
                 .expect("a non-reserved overlay key composes");
             allowed += 1;
         }
@@ -824,7 +824,7 @@ mod tests {
                 &scope,
                 &[
                     // (b) an overlay key the base does not carry lands
-                    ("TACTUS_NEW".to_owned(), "landed".to_owned()),
+                    ("UPSTROKE_NEW".to_owned(), "landed".to_owned()),
                     // (c) a collision between base and overlay resolves to the
                     // overlay
                     ("LANG".to_owned(), "en_GB.UTF-8".to_owned()),
@@ -834,11 +834,11 @@ mod tests {
 
         // (a) a base key with no overlay survives
         assert_eq!(
-            value(&composed, "TACTUS_IMAGE_MARKER"),
+            value(&composed, "UPSTROKE_IMAGE_MARKER"),
             Some("image-environment-v1"),
             "the image environment is the base, and a key nobody touched survives it"
         );
-        assert_eq!(value(&composed, "TACTUS_NEW"), Some("landed"));
+        assert_eq!(value(&composed, "UPSTROKE_NEW"), Some("landed"));
         assert_eq!(value(&composed, "LANG"), Some("en_GB.UTF-8"));
 
         // One entry per key: an overlay that appended rather than upserted
@@ -1150,13 +1150,13 @@ mod tests {
     #[test]
     fn the_boundary_layout_derives_every_path_from_its_own_root() {
         let layout = BoundaryLayout::new();
-        assert_eq!(layout.workspace(), "/tactus/workspace");
-        assert_eq!(layout.git_view(), "/tactus/gitview");
-        assert_eq!(layout.git_objects(), "/tactus/gitobjects");
-        assert_eq!(layout.git_pointer(), "/tactus/workspace/.git");
+        assert_eq!(layout.workspace(), "/upstroke/workspace");
+        assert_eq!(layout.git_view(), "/upstroke/gitview");
+        assert_eq!(layout.git_objects(), "/upstroke/gitobjects");
+        assert_eq!(layout.git_pointer(), "/upstroke/workspace/.git");
         assert_eq!(
             layout.credentials(&AgentId::new("codex")),
-            "/tactus/credentials/codex"
+            "/upstroke/credentials/codex"
         );
         // `git_pointer` is where a tool looks, so it is inside the workspace;
         // the view and the borrowed store are not, because a directory cannot

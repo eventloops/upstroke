@@ -61,7 +61,7 @@ use thiserror::Error;
 
 use super::runtime::{ContainerRuntime, ImageInspection, RuntimeError, RuntimeOp};
 use crate::config::RunnerSelection;
-use crate::error::TactusError;
+use crate::error::UpstrokeError;
 use crate::topology::events::{
     ImageIdentity, RunnerContract, RunnerField, RunnerKind, RunnerPolicy, RunnerRecordDefect,
 };
@@ -155,7 +155,7 @@ impl InspectionRefusal {
     }
 }
 
-impl From<InspectionRefusal> for TactusError {
+impl From<InspectionRefusal> for UpstrokeError {
     fn from(refusal: InspectionRefusal) -> Self {
         Self::Refused {
             message: refusal.to_string(),
@@ -179,7 +179,7 @@ pub enum RebuildRefusal {
     /// Refused by the RunnerPreflight probe spawns — the only observation of
     /// shell and CLI availability inside the boundary.
     #[error("the recorded container runner's RunnerPreflight refused: {0}")]
-    Preflight(#[source] TactusError),
+    Preflight(#[source] UpstrokeError),
 }
 
 impl RebuildRefusal {
@@ -190,7 +190,7 @@ impl RebuildRefusal {
     }
 }
 
-impl From<RebuildRefusal> for TactusError {
+impl From<RebuildRefusal> for UpstrokeError {
     fn from(refusal: RebuildRefusal) -> Self {
         Self::Refused {
             message: refusal.to_string(),
@@ -221,10 +221,10 @@ pub trait RunnerPreflight {
     ///
     /// # Errors
     ///
-    /// [`TactusError::Refused`] when a probe does not come back clean. The
+    /// [`UpstrokeError::Refused`] when a probe does not come back clean. The
     /// caller classifies it; `rebuild_from_record` turns it into
     /// [`RebuildRefusal::Preflight`], which is the arm that did spawn.
-    fn certify(&self, policy: &RunnerPolicy) -> Result<(), TactusError>;
+    fn certify(&self, policy: &RunnerPolicy) -> Result<(), UpstrokeError>;
 }
 
 // There is deliberately no `SkipPreflight` implementation here. A caller that
@@ -506,7 +506,7 @@ static EMPTY: BTreeMap<String, String> = BTreeMap::new();
 /// (**kind, image reference, or credential volumes**) warns naming the
 /// difference"*. Those are the three a config can move; the immutable image id
 /// and the manifest digest are the runtime's answers and are not written in
-/// `tactus.toml` at all.
+/// `upstroke.toml` at all.
 ///
 /// So the comparison is the record with the config's three fields overlaid, and
 /// [`RunnerPolicy::difference`] — PR3's, which *"names **which** field moved

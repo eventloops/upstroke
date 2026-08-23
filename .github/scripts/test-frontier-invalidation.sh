@@ -16,11 +16,11 @@ checks="$(jq -n \
   --arg other_sha "$other_sha" \
   --argjson app_id "$app_id" \
   '{check_runs: [
-    {id: 101, name: "tactus-frontier-review", head_sha: $head_sha,
+    {id: 101, name: "upstroke-frontier-review", head_sha: $head_sha,
      status: "completed", conclusion: "success", app: {id: $app_id}},
-    {id: 102, name: "tactus-frontier-review", head_sha: $head_sha,
+    {id: 102, name: "upstroke-frontier-review", head_sha: $head_sha,
      status: "completed", conclusion: "success", app: {id: 15368}},
-    {id: 103, name: "tactus-frontier-review", head_sha: $other_sha,
+    {id: 103, name: "upstroke-frontier-review", head_sha: $other_sha,
      status: "completed", conclusion: "success", app: {id: $app_id}},
     {id: 104, name: "unrelated", head_sha: $head_sha,
      status: "completed", conclusion: "success", app: {id: $app_id}}
@@ -50,12 +50,12 @@ jq -e \
   --arg head_sha "$head_sha" \
   --argjson app_id "$app_id" \
   '[.check_runs[] | select(
-     .name == "tactus-frontier-review"
+     .name == "upstroke-frontier-review"
      and .head_sha == $head_sha
      and .app.id == $app_id
    )] == [{
      id: 101,
-     name: "tactus-frontier-review",
+     name: "upstroke-frontier-review",
      head_sha: $head_sha,
      status: "completed",
      conclusion: "failure",

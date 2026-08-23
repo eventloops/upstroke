@@ -67,7 +67,7 @@ use std::path::{Path, PathBuf};
 
 use sha2::{Digest, Sha256};
 
-use crate::error::TactusError;
+use crate::error::UpstrokeError;
 use crate::topology::effects::ContainerSite;
 
 use super::intent::{
@@ -109,7 +109,7 @@ pub fn view_path(private_root: &Path, name: &ContainerName) -> PathBuf {
     private_root.join(VIEWS_DIR).join(name.as_str())
 }
 
-/// The value of the `tactus.private_root` label for this root.
+/// The value of the `upstroke.private_root` label for this root.
 ///
 /// **One definition, in the module that owns [`LABEL_PRIVATE_ROOT`]**, rather
 /// than the rendering re-derived here and pinned to the funnel's by a test. The
@@ -222,15 +222,15 @@ impl StablePrefixBarrier {
     ///
     /// # Errors
     ///
-    /// [`TactusError::Refused`] when the boundary moved, the bytes changed, the
+    /// [`UpstrokeError::Refused`] when the boundary moved, the bytes changed, the
     /// prefix is not durable to its boundary, or the replay was of other bytes.
     pub fn establish(
         sync: PrefixSync,
         reread: &PrefixReread,
         replay: &PrefixReplay,
-    ) -> Result<Self, TactusError> {
+    ) -> Result<Self, UpstrokeError> {
         if reread.first.len != reread.second.len {
-            return Err(TactusError::Refused {
+            return Err(UpstrokeError::Refused {
                 message: format!(
                     "the surviving event-log prefix was {} bytes and rereading it found {}; \
                      recovery step (a1) proves the prefix's bytes AND boundary unchanged before \
@@ -241,7 +241,7 @@ impl StablePrefixBarrier {
             });
         }
         if reread.first.sha256 != reread.second.sha256 {
-            return Err(TactusError::Refused {
+            return Err(UpstrokeError::Refused {
                 message: format!(
                     "the surviving event-log prefix hashed `{}` and rereading the same {} bytes \
                      hashed `{}`; recovery step (a1) proves the prefix stable before the census",
@@ -250,7 +250,7 @@ impl StablePrefixBarrier {
             });
         }
         if sync.synced_len < reread.first.len {
-            return Err(TactusError::Refused {
+            return Err(UpstrokeError::Refused {
                 message: format!(
                     "recovery step (a1) synced {} bytes of the event log and the prefix the \
                      census would decide from is {} bytes; a reclaim decided from a prefix that \
@@ -260,7 +260,7 @@ impl StablePrefixBarrier {
             });
         }
         if replay.replayed != reread.first {
-            return Err(TactusError::Refused {
+            return Err(UpstrokeError::Refused {
                 message: format!(
                     "recovery step (a1) checked-replayed {} bytes hashing `{}` and the prefix \
                      proven stable is {} bytes hashing `{}`; the replay must consume exactly the \
@@ -305,13 +305,13 @@ impl StablePrefixBarrier {
 /// to arm (ii), while a resume has one and owes recovery step (a1) first.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CensusStart {
-    /// `tactus run`: the worktree lock is held, no run lock is, and the run id
+    /// `upstroke run`: the worktree lock is held, no run lock is, and the run id
     /// has not been used for creation yet.
     FreshRun {
         /// This process's per-process ULID.
         incarnation: String,
     },
-    /// `tactus resume`: this process holds `run_id`'s run lock and has
+    /// `upstroke resume`: this process holds `run_id`'s run lock and has
     /// established recovery step (a1).
     Resume {
         run_id: String,
@@ -540,7 +540,7 @@ pub fn classify_ownership(
 ///
 /// "discovery at every write-command start **scans the whole namespace
 /// `<R>/containers`** of the command's authorized private root **and** docker ps
-/// by `tactus.private_root`" — two halves, and a container may be in either or
+/// by `upstroke.private_root`" — two halves, and a container may be in either or
 /// both. `{intent present} × {container present}` is a 2×2 grid and every cell
 /// is a real state: intent-only is a crash after the intent write and before
 /// `docker create`, or a Unix reaper that already killed and removed the
@@ -550,7 +550,7 @@ pub fn classify_ownership(
 pub enum DiscoveredBy {
     /// A record in `<R>/containers` with no container in the runtime.
     IntentOnly,
-    /// A container carrying `tactus.private_root` with no record.
+    /// A container carrying `upstroke.private_root` with no record.
     LabelOnly,
     /// Both halves agree it exists.
     IntentAndLabel,
@@ -602,9 +602,9 @@ impl Boundary {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Candidate {
     pub name: ContainerName,
-    /// Owner run id — from the record, or from `tactus.run`.
+    /// Owner run id — from the record, or from `upstroke.run`.
     pub run_id: String,
-    /// Owning incarnation — from the record, or from `tactus.incarnation`.
+    /// Owning incarnation — from the record, or from `upstroke.incarnation`.
     pub incarnation: String,
     /// The owner's **public** run directory, which is what the lock probe is
     /// asked about.
@@ -860,7 +860,7 @@ pub struct Census<'a> {
 /// 1. scan `<R>/containers` — no runtime needed, and an absent directory is an
 ///    empty namespace;
 /// 2. decide whether the runtime is required, and refuse or proceed;
-/// 3. `docker ps` by `tactus.private_root`, and merge the two halves;
+/// 3. `docker ps` by `upstroke.private_root`, and merge the two halves;
 /// 4. classify **every** candidate, and refuse **before any effect** if any
 ///    classification refuses or cannot be made;
 /// 5. reclaim every dead candidate through [`super::reclaim`], in name order;
@@ -873,14 +873,14 @@ pub struct Census<'a> {
 ///
 /// # Errors
 ///
-/// [`TactusError::Refused`] when the runtime is required and cannot be reached,
+/// [`UpstrokeError::Refused`] when the runtime is required and cannot be reached,
 /// when an intent names this process's own incarnation, when a labeled
 /// container's ownership cannot be established, or when a dead container cannot
-/// be observed terminated. [`TactusError::Io`] from the namespace scan.
+/// be observed terminated. [`UpstrokeError::Io`] from the namespace scan.
 pub fn run_startup_census(
     hooks: &mut dyn ContainerHooks,
     census: &Census<'_>,
-) -> Result<CensusComplete, TactusError> {
+) -> Result<CensusComplete, UpstrokeError> {
     let private_root = census.private_root;
     let intents = list_intents(private_root)?;
     // `PR6-ACCT-007`: the staged half of the namespace, read in the same scan
@@ -930,7 +930,7 @@ pub fn run_startup_census(
             census.liveness,
         );
         if ownership.refuses() {
-            return Err(TactusError::Refused {
+            return Err(UpstrokeError::Refused {
                 message: format!(
                     "the container intent `{}` names run `{}` and incarnation `{}`, which is this \
                      process's own run and its own incarnation; an intent naming this process's \
@@ -1047,14 +1047,14 @@ fn discover_by_label(
     runtime: &dyn ContainerRuntime,
     private_root: &Path,
     intents: &[FoundIntent],
-) -> Result<(Vec<super::runtime::DiscoveredContainer>, RuntimeUse), TactusError> {
+) -> Result<(Vec<super::runtime::DiscoveredContainer>, RuntimeUse), UpstrokeError> {
     let label = private_root_label(private_root);
     let error = match runtime.containers_with_label(LABEL_PRIVATE_ROOT, &label) {
         Ok(found) => return Ok((found, RuntimeUse::Consulted)),
         Err(error) => error,
     };
     if !proceeds_without(&error) {
-        return Err(TactusError::Refused {
+        return Err(UpstrokeError::Refused {
             message: format!(
                 "the container runtime was reached and refused `{}` under `{}`: {error}. \
                  A runtime that answers and will not list cannot prove that no labeled \
@@ -1066,7 +1066,7 @@ fn discover_by_label(
         });
     }
     if !intents.is_empty() {
-        return Err(TactusError::Refused {
+        return Err(UpstrokeError::Refused {
             message: format!(
                 "{} container intent(s) exist under `{}` and the container runtime cannot be \
                  reached for `{}`: {error}. The runtime is required only when an intent exists \
@@ -1088,7 +1088,7 @@ fn discover_by_label(
 /// its owner is not something this census may pick a winner for.
 ///
 /// The container **name** is ownership evidence too — it is
-/// `tactus-<repo_key>-<run_id>-<incarnation>-<invocation-hash>` — so its
+/// `upstroke-<repo_key>-<run_id>-<incarnation>-<invocation-hash>` — so its
 /// components are checked against the record's fields. A name and a record that
 /// disagree about the incarnation would mean classifying on one value and
 /// killing a container named for another.
@@ -1096,7 +1096,7 @@ fn merge(
     private_root: &Path,
     intents: Vec<FoundIntent>,
     discovered: Vec<super::runtime::DiscoveredContainer>,
-) -> Result<Vec<Candidate>, TactusError> {
+) -> Result<Vec<Candidate>, UpstrokeError> {
     let mut by_name: BTreeMap<String, Candidate> = BTreeMap::new();
     for found in intents {
         by_name.insert(
@@ -1123,7 +1123,7 @@ fn merge(
 /// directory is decoded and checked rooted here, and the name is checked against
 /// the record's fields, whichever half of the namespace the record came from
 /// (`PR6-ACCT-007`).
-fn candidate_from_intent(found: FoundIntent) -> Result<Candidate, TactusError> {
+fn candidate_from_intent(found: FoundIntent) -> Result<Candidate, UpstrokeError> {
     check_name_against_record(&found)?;
     // Decoded and checked rooted here, not turned into a `PathBuf` by
     // assumption: this is the directory arm (ii) probes a `run.lock` in,
@@ -1145,10 +1145,10 @@ fn candidate_from_intent(found: FoundIntent) -> Result<Candidate, TactusError> {
 fn from_labels_alone(
     private_root: &Path,
     container: &super::runtime::DiscoveredContainer,
-) -> Result<Candidate, TactusError> {
-    let name = ContainerName::rebuild(&container.name).map_err(|error| TactusError::Refused {
+) -> Result<Candidate, UpstrokeError> {
+    let name = ContainerName::rebuild(&container.name).map_err(|error| UpstrokeError::Refused {
         message: format!(
-            "the container `{}` carries `{LABEL_PRIVATE_ROOT}={}` and its name is not a tactus \
+            "the container `{}` carries `{LABEL_PRIVATE_ROOT}={}` and its name is not a upstroke \
              container name ({error}); a container claiming this private root that no funnel \
              could have named cannot be reclaimed through the funnel or observed terminated, \
              and an unreclaimable labeled container blocks admission",
@@ -1159,7 +1159,7 @@ fn from_labels_alone(
     let mut fields = Vec::new();
     for key in [LABEL_RUN, LABEL_INCARNATION, LABEL_RUN_DIR] {
         let Some(value) = container.label(key) else {
-            return Err(TactusError::Refused {
+            return Err(UpstrokeError::Refused {
                 message: format!(
                     "the container `{}` carries `{LABEL_PRIVATE_ROOT}` and not `{key}`, so its \
                      labeled run and incarnation cannot be established; a labeled container \
@@ -1172,10 +1172,10 @@ fn from_labels_alone(
         };
         fields.push(value.to_owned());
     }
-    // `PR6-CORRECTNESS-016`: a *present* `tactus.run_dir` still has to say
+    // `PR6-CORRECTNESS-016`: a *present* `upstroke.run_dir` still has to say
     // where its owner's lock is. The missing-key arm above and this one are
     // separate predicates — the shipped code held only the first, so a label
-    // set that varied which key was absent passed while `tactus.run_dir=`
+    // set that varied which key was absent passed while `upstroke.run_dir=`
     // reached the probe as `./run.lock`.
     let run_dir = super::intent::owner_run_dir(&fields[2], "container's labels")?;
     let candidate = Candidate {
@@ -1197,7 +1197,7 @@ fn from_labels_alone(
 }
 
 /// The record's own name must be the name its fields build.
-fn check_name_against_record(found: &FoundIntent) -> Result<(), TactusError> {
+fn check_name_against_record(found: &FoundIntent) -> Result<(), UpstrokeError> {
     check_name_against(
         &found.name,
         &found.record.run_id,
@@ -1206,10 +1206,10 @@ fn check_name_against_record(found: &FoundIntent) -> Result<(), TactusError> {
     )?;
     let parts = ContainerName::parse(found.name.as_str())?;
     if parts.repo_key != found.record.repo_key {
-        return Err(TactusError::Refused {
+        return Err(UpstrokeError::Refused {
             message: format!(
                 "the container intent `{}` is named for repo key `{}` and its record says `{}`; \
-                 the name is `tactus-<repo_key>-<run_id>-<incarnation>-<invocation-hash>` and a \
+                 the name is `upstroke-<repo_key>-<run_id>-<incarnation>-<invocation-hash>` and a \
                  record that disagrees with its own name is not ownership evidence this census \
                  may act on",
                 found.name, parts.repo_key, found.record.repo_key
@@ -1225,10 +1225,10 @@ fn check_name_against(
     run_id: &str,
     incarnation: &str,
     source: &str,
-) -> Result<(), TactusError> {
+) -> Result<(), UpstrokeError> {
     let parts = ContainerName::parse(name.as_str())?;
     if parts.run_id != run_id {
-        return Err(TactusError::Refused {
+        return Err(UpstrokeError::Refused {
             message: format!(
                 "the container `{name}` is named for run `{}` and its {source} says `{run_id}`; \
                  the liveness rule classifies on the owner run, and a name that disagrees would \
@@ -1238,7 +1238,7 @@ fn check_name_against(
         });
     }
     if parts.incarnation != incarnation {
-        return Err(TactusError::Refused {
+        return Err(UpstrokeError::Refused {
             message: format!(
                 "the container `{name}` is named for incarnation `{}` and its {source} says \
                  `{incarnation}`; the incarnation is the component that keeps deterministic \
@@ -1255,7 +1255,7 @@ fn check_name_against(
 fn check_labels_against_record(
     candidate: &Candidate,
     container: &super::runtime::DiscoveredContainer,
-) -> Result<(), TactusError> {
+) -> Result<(), UpstrokeError> {
     for (key, recorded) in [
         (LABEL_RUN, candidate.run_id.as_str()),
         (LABEL_INCARNATION, candidate.incarnation.as_str()),
@@ -1264,7 +1264,7 @@ fn check_labels_against_record(
             continue;
         };
         if labeled != recorded {
-            return Err(TactusError::Refused {
+            return Err(UpstrokeError::Refused {
                 message: format!(
                     "the container `{}` carries `{key}={labeled}` and its intent record says \
                      `{recorded}`; the labels are derived from the record when a container is \
@@ -1293,7 +1293,7 @@ const LABEL_FILTER: &str = "label=";
 /// kills the dead coordinator's labeled containers**, closing the orphan
 /// window".
 ///
-/// **The selector is the incarnation, not the private root.** `tactus.private_
+/// **The selector is the incarnation, not the private root.** `upstroke.private_
 /// root` alone names every container of every run under `<R>`, including a
 /// **live** coordinator's — and "a live incarnation's containers must not be
 /// touched" (`T-CONTAINER.authoritative_state`). The incarnation is a
@@ -1327,7 +1327,7 @@ impl ReaperContainerScope {
     ///
     /// # Errors
     ///
-    /// [`TactusError::Refused`] when the incarnation is empty or when either
+    /// [`UpstrokeError::Refused`] when the incarnation is empty or when either
     /// label value carries a byte that would end the argument or start another
     /// filter — a newline, a comma, or an `=`. The reaper cannot report a
     /// malformed selector: it has no error channel and no allocator, so the
@@ -1336,14 +1336,14 @@ impl ReaperContainerScope {
         program: impl Into<PathBuf>,
         private_root: &Path,
         incarnation: &str,
-    ) -> Result<Self, TactusError> {
+    ) -> Result<Self, UpstrokeError> {
         let root = private_root_label(private_root);
         for (what, value) in [
             ("private root", root.as_str()),
             ("incarnation", incarnation),
         ] {
             if value.is_empty() {
-                return Err(TactusError::Refused {
+                return Err(UpstrokeError::Refused {
                     message: format!(
                         "the Unix reaper's container scope has an empty {what}; a filter that \
                          matches everything would kill a live coordinator's containers"
@@ -1351,7 +1351,7 @@ impl ReaperContainerScope {
                 });
             }
             if let Some(bad) = value.chars().find(|c| matches!(c, '\n' | '\r' | ',' | '=')) {
-                return Err(TactusError::Refused {
+                return Err(UpstrokeError::Refused {
                     message: format!(
                         "the Unix reaper's container scope {what} carries `{}`, which would \
                          change what `{LABEL_FILTER}` selects",

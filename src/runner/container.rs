@@ -97,7 +97,7 @@ use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use crate::error::TactusError;
+use crate::error::UpstrokeError;
 use crate::topology::effects::{ContainerSite, EffectSiteId, HookPhase, Injection};
 use crate::util;
 
@@ -145,11 +145,11 @@ impl ContainerHooks for NoHooks {
 }
 
 /// Turn a hook's answer into what the funnel must do at that point.
-fn apply(injection: Injection, site: EffectSiteId, phase: HookPhase) -> Result<(), TactusError> {
+fn apply(injection: Injection, site: EffectSiteId, phase: HookPhase) -> Result<(), UpstrokeError> {
     match injection {
         Injection::Proceed => Ok(()),
         Injection::Kill => std::process::abort(),
-        Injection::Error => Err(TactusError::Refused {
+        Injection::Error => Err(UpstrokeError::Refused {
             message: format!("the container funnel was made to fail at `{site}` ({phase})"),
         }),
     }
@@ -163,8 +163,8 @@ fn apply(injection: Injection, site: EffectSiteId, phase: HookPhase) -> Result<(
 fn funnel<T>(
     hooks: &mut dyn ContainerHooks,
     site: ContainerSite,
-    primitive: impl FnOnce() -> Result<T, TactusError>,
-) -> Result<T, TactusError> {
+    primitive: impl FnOnce() -> Result<T, UpstrokeError>,
+) -> Result<T, UpstrokeError> {
     let id = EffectSiteId::Container(site);
     let trace = hooks.trace();
     trace.site(site, TracePhase::Before);
@@ -213,11 +213,11 @@ const fn operation_of(site: ContainerSite) -> Operation {
 }
 
 /// Refuse a site that does not name this operation.
-fn expect_site(site: ContainerSite, wanted: Operation) -> Result<(), TactusError> {
+fn expect_site(site: ContainerSite, wanted: Operation) -> Result<(), UpstrokeError> {
     if operation_of(site) == wanted {
         return Ok(());
     }
-    Err(TactusError::Refused {
+    Err(UpstrokeError::Refused {
         message: format!(
             "the container funnel was asked to perform {wanted:?} under site \
              `Container.{}`; every effectful funnel API takes its group's site by value \
@@ -267,16 +267,16 @@ pub trait GitView: Send + Sync {
     ///
     /// # Errors
     ///
-    /// [`TactusError::Io`] when the view cannot be materialised.
-    fn materialize(&self, request: &GitViewRequest) -> Result<PathBuf, TactusError>;
+    /// [`UpstrokeError::Io`] when the view cannot be materialised.
+    fn materialize(&self, request: &GitViewRequest) -> Result<PathBuf, UpstrokeError>;
 
     /// Remove it. **Idempotent**: an orphan view is reclaimed by whichever
     /// process gets there first, and reclaim converges.
     ///
     /// # Errors
     ///
-    /// [`TactusError::Io`] when the view exists and cannot be removed.
-    fn discard(&self, path: &Path) -> Result<(), TactusError>;
+    /// [`UpstrokeError::Io`] when the view exists and cannot be removed.
+    fn discard(&self, path: &Path) -> Result<(), UpstrokeError>;
 }
 
 /// The directory half of the view: create it, remove it.
@@ -297,8 +297,8 @@ impl DisposableDirView {
 }
 
 impl GitView for DisposableDirView {
-    fn materialize(&self, request: &GitViewRequest) -> Result<PathBuf, TactusError> {
-        fs::create_dir_all(&request.path).map_err(|source| TactusError::Io {
+    fn materialize(&self, request: &GitViewRequest) -> Result<PathBuf, UpstrokeError> {
+        fs::create_dir_all(&request.path).map_err(|source| UpstrokeError::Io {
             path: request.path.clone(),
             source,
         })?;
@@ -306,7 +306,7 @@ impl GitView for DisposableDirView {
         Ok(request.path.clone())
     }
 
-    fn discard(&self, path: &Path) -> Result<(), TactusError> {
+    fn discard(&self, path: &Path) -> Result<(), UpstrokeError> {
         // R19's half of "every step idempotent and tolerant of already-gone so
         // two concurrent reclaimers converge". The errno is not the question —
         // see [`RACING_ACCESS_ATTEMPTS`], and the Windows guest measurement that
@@ -366,8 +366,8 @@ pub const RACING_ACCESS_ATTEMPTS: usize = 64;
 ///
 /// # Errors
 ///
-/// [`TactusError::Refused`] when `site` does not name this operation,
-/// [`TactusError::Io`] on any filesystem failure, [`TactusError::Git`] when the
+/// [`UpstrokeError::Refused`] when `site` does not name this operation,
+/// [`UpstrokeError::Io`] on any filesystem failure, [`UpstrokeError::Git`] when the
 /// record will not serialize.
 pub fn write_intent(
     hooks: &mut dyn ContainerHooks,
@@ -375,13 +375,13 @@ pub fn write_intent(
     private_root: &Path,
     name: &ContainerName,
     record: &ContainerIntent,
-) -> Result<IntentWritten, TactusError> {
+) -> Result<IntentWritten, UpstrokeError> {
     expect_site(site, Operation::WriteIntent)?;
     let path = name.intent_path(private_root);
     let trace = hooks.trace();
     let root = private_root.to_path_buf();
     funnel(hooks, site, || {
-        let bytes = serde_json::to_vec(record).map_err(|error| TactusError::Git {
+        let bytes = serde_json::to_vec(record).map_err(|error| UpstrokeError::Git {
             message: format!("serializing the container intent for `{name}`: {error}"),
         })?;
         write_synced(&path, &bytes, &trace)?;
@@ -428,7 +428,7 @@ pub fn write_intent(
 ///
 /// # Errors
 ///
-/// [`TactusError::Refused`] when `site` does not name this operation, when
+/// [`UpstrokeError::Refused`] when `site` does not name this operation, when
 /// `intent` does not name `spec.name`, when a named volume the spec mounts is
 /// absent or cannot be inspected, or when the runtime refuses.
 pub fn create_container(
@@ -437,7 +437,7 @@ pub fn create_container(
     runtime: &dyn ContainerRuntime,
     intent: &IntentWritten,
     spec: &CreateSpec,
-) -> Result<CreatedContainer, TactusError> {
+) -> Result<CreatedContainer, UpstrokeError> {
     expect_site(site, Operation::Create)?;
     expect_intent_for(intent, &spec.name, "created")?;
     expect_mounted_volumes_present(runtime, spec)?;
@@ -450,14 +450,14 @@ pub fn create_container(
 fn expect_mounted_volumes_present(
     runtime: &dyn ContainerRuntime,
     spec: &CreateSpec,
-) -> Result<(), TactusError> {
+) -> Result<(), UpstrokeError> {
     for mount in &spec.mounts {
         let runtime::Mount::Volume { name, target, .. } = mount else {
             continue;
         };
         let present = runtime
             .volume_present(name)
-            .map_err(|error| TactusError::Refused {
+            .map_err(|error| UpstrokeError::Refused {
                 message: format!(
                     "the container runtime could not be asked whether the credential volume \
                      `{name}` exists before creating `{}`: {error}. A named volume that \
@@ -469,7 +469,7 @@ fn expect_mounted_volumes_present(
                 ),
             })?;
         if !present {
-            return Err(TactusError::Refused {
+            return Err(UpstrokeError::Refused {
                 message: format!(
                     "the credential volume `{name}`, which `{}` mounts at `{target}`, is not \
                      present in the container runtime. R20 credential volumes are \
@@ -496,14 +496,14 @@ fn expect_mounted_volumes_present(
 ///
 /// # Errors
 ///
-/// [`TactusError::Refused`] when `site` does not name this operation or the
+/// [`UpstrokeError::Refused`] when `site` does not name this operation or the
 /// runtime refuses.
 pub fn start_container(
     hooks: &mut dyn ContainerHooks,
     site: ContainerSite,
     runtime: &dyn ContainerRuntime,
     intent: &IntentWritten,
-) -> Result<(), TactusError> {
+) -> Result<(), UpstrokeError> {
     expect_site(site, Operation::Start)?;
     let name = intent.name().as_str().to_owned();
     funnel(hooks, site, || runtime.start(&name).map_err(refused))
@@ -515,11 +515,11 @@ pub fn start_container(
 /// stops "an intent was written" from standing in for "**this** container's
 /// intent was written". Fail-closed: a mismatch refuses before the effect
 /// rather than proceeding on evidence about something else.
-fn expect_intent_for(intent: &IntentWritten, name: &str, verb: &str) -> Result<(), TactusError> {
+fn expect_intent_for(intent: &IntentWritten, name: &str, verb: &str) -> Result<(), UpstrokeError> {
     if intent.name().as_str() == name {
         return Ok(());
     }
-    Err(TactusError::Refused {
+    Err(UpstrokeError::Refused {
         message: format!(
             "`{name}` cannot be {verb} under the intent record of `{}`; every container \
              invocation writes its own synced intent in `<R>/containers` \
@@ -535,14 +535,14 @@ fn expect_intent_for(intent: &IntentWritten, name: &str, verb: &str) -> Result<(
 ///
 /// # Errors
 ///
-/// [`TactusError::Refused`] when `site` does not name this operation, or
+/// [`UpstrokeError::Refused`] when `site` does not name this operation, or
 /// whatever the projection returns.
 pub fn mount_git_view(
     hooks: &mut dyn ContainerHooks,
     site: ContainerSite,
     view: &dyn GitView,
     request: &GitViewRequest,
-) -> Result<PathBuf, TactusError> {
+) -> Result<PathBuf, UpstrokeError> {
     expect_site(site, Operation::MountGitView)?;
     funnel(hooks, site, || view.materialize(request))
 }
@@ -552,7 +552,7 @@ pub fn mount_git_view(
 ///
 /// # Errors
 ///
-/// [`TactusError::Refused`] when `site` does not name this operation or the
+/// [`UpstrokeError::Refused`] when `site` does not name this operation or the
 /// runtime refuses.
 pub fn stop_container(
     hooks: &mut dyn ContainerHooks,
@@ -560,7 +560,7 @@ pub fn stop_container(
     runtime: &dyn ContainerRuntime,
     name: &ContainerName,
     mode: StopMode,
-) -> Result<(), TactusError> {
+) -> Result<(), UpstrokeError> {
     expect_site(site, Operation::Stop)?;
     funnel(hooks, site, || {
         runtime.stop(name.as_str(), mode).map_err(refused)
@@ -571,14 +571,14 @@ pub fn stop_container(
 ///
 /// # Errors
 ///
-/// [`TactusError::Refused`] when `site` does not name this operation or the
+/// [`UpstrokeError::Refused`] when `site` does not name this operation or the
 /// runtime refuses.
 pub fn remove_container(
     hooks: &mut dyn ContainerHooks,
     site: ContainerSite,
     runtime: &dyn ContainerRuntime,
     name: &ContainerName,
-) -> Result<(), TactusError> {
+) -> Result<(), UpstrokeError> {
     expect_site(site, Operation::Remove)?;
     funnel(hooks, site, || {
         runtime.remove(name.as_str()).map_err(refused)
@@ -589,14 +589,14 @@ pub fn remove_container(
 ///
 /// # Errors
 ///
-/// [`TactusError::Refused`] when `site` does not name this operation, or
+/// [`UpstrokeError::Refused`] when `site` does not name this operation, or
 /// whatever the projection returns.
 pub fn unmount_git_view(
     hooks: &mut dyn ContainerHooks,
     site: ContainerSite,
     view: &dyn GitView,
     path: &Path,
-) -> Result<(), TactusError> {
+) -> Result<(), UpstrokeError> {
     expect_site(site, Operation::UnmountGitView)?;
     funnel(hooks, site, || view.discard(path))
 }
@@ -605,14 +605,14 @@ pub fn unmount_git_view(
 ///
 /// # Errors
 ///
-/// [`TactusError::Refused`] when `site` does not name this operation,
-/// [`TactusError::Io`] when the record exists and cannot be removed.
+/// [`UpstrokeError::Refused`] when `site` does not name this operation,
+/// [`UpstrokeError::Io`] when the record exists and cannot be removed.
 pub fn remove_intent(
     hooks: &mut dyn ContainerHooks,
     site: ContainerSite,
     private_root: &Path,
     name: &ContainerName,
-) -> Result<(), TactusError> {
+) -> Result<(), UpstrokeError> {
     expect_site(site, Operation::RemoveIntent)?;
     let path = name.intent_path(private_root);
     let trace = hooks.trace();
@@ -682,7 +682,7 @@ pub struct Launched {
 ///
 /// ```text
 /// the container runtime refused `create`: Error response from daemon: invalid
-/// mount config for type "bind": bind source path does not exist: …/views/tactus-…
+/// mount config for type "bind": bind source path does not exist: …/views/upstroke-…
 /// ```
 ///
 /// — so that order cannot produce a working container for any `Implement`,
@@ -718,14 +718,14 @@ pub struct Launched {
 ///
 /// # Errors
 ///
-/// [`TactusError::Refused`] when the reported image id differs from the record,
+/// [`UpstrokeError::Refused`] when the reported image id differs from the record,
 /// or whatever a step returns.
 pub fn launch(
     hooks: &mut dyn ContainerHooks,
     runtime: &dyn ContainerRuntime,
     view: &dyn GitView,
     plan: &LaunchPlan,
-) -> Result<Launched, TactusError> {
+) -> Result<Launched, UpstrokeError> {
     let written = write_intent(
         hooks,
         ContainerSite::WriteIntent,
@@ -745,7 +745,7 @@ pub fn launch(
             &plan.name,
             Some(&view_path),
         );
-        return Err(TactusError::Refused {
+        return Err(UpstrokeError::Refused {
             message: format!(
                 "the container runtime created `{}` and reports image id `{}`, and the run's \
                  recorded image id is `{}`; a created container whose reported image id \
@@ -902,14 +902,14 @@ fn render_residue(residue: &[String]) -> String {
 ///
 /// # Errors
 ///
-/// [`TactusError::Refused`] naming every step that failed.
+/// [`UpstrokeError::Refused`] naming every step that failed.
 pub fn release(
     hooks: &mut dyn ContainerHooks,
     runtime: &dyn ContainerRuntime,
     view: &dyn GitView,
     private_root: &Path,
     launched: &Launched,
-) -> Result<(), TactusError> {
+) -> Result<(), UpstrokeError> {
     let residue = cancel_reached(
         hooks,
         runtime,
@@ -922,7 +922,7 @@ pub fn release(
     if residue.is_empty() {
         return Ok(());
     }
-    Err(TactusError::Refused {
+    Err(UpstrokeError::Refused {
         message: format!(
             "the release of `{}` could not complete every step, so this run's R19/R26 ledgers \
              do not balance and a census will find the residue: {}",
@@ -952,7 +952,7 @@ pub const TERMINATION_OBSERVATIONS: usize = 8;
 ///
 /// # Errors
 ///
-/// [`TactusError::Refused`] when the container cannot be observed terminated
+/// [`UpstrokeError::Refused`] when the container cannot be observed terminated
 /// within [`TERMINATION_OBSERVATIONS`] observations, or whatever a step
 /// returns.
 pub fn reclaim(
@@ -962,7 +962,7 @@ pub fn reclaim(
     private_root: &Path,
     name: &ContainerName,
     view_path: Option<&Path>,
-) -> Result<(), TactusError> {
+) -> Result<(), UpstrokeError> {
     stop_container(hooks, ContainerSite::Stop, runtime, name, StopMode::Kill)?;
     observe_terminated(runtime, name)?;
     remove_container(hooks, ContainerSite::Remove, runtime, name)?;
@@ -977,19 +977,19 @@ pub fn reclaim(
 ///
 /// # Errors
 ///
-/// [`TactusError::Refused`] when the container is still running after
+/// [`UpstrokeError::Refused`] when the container is still running after
 /// [`TERMINATION_OBSERVATIONS`] observations, or when the runtime refuses.
 pub fn observe_terminated(
     runtime: &dyn ContainerRuntime,
     name: &ContainerName,
-) -> Result<Liveness, TactusError> {
+) -> Result<Liveness, UpstrokeError> {
     for _ in 0..TERMINATION_OBSERVATIONS {
         let state = runtime.observe(name.as_str()).map_err(refused)?;
         if state.is_terminated() {
             return Ok(state);
         }
     }
-    Err(TactusError::Refused {
+    Err(UpstrokeError::Refused {
         message: format!(
             "`{name}` is still running after {TERMINATION_OBSERVATIONS} observations and \
              cannot be observed terminated; a dead owner's or dead incarnation's labeled \
@@ -1026,7 +1026,7 @@ pub enum OrphanWindow {
     /// `cfg(unix)`: the per-invocation cleanup reaper outlives the coordinator
     /// and kills its labeled containers.
     ClosedByTheUnixReaper,
-    /// Windows: nothing runs between the death and the next `tactus` write
+    /// Windows: nothing runs between the death and the next `upstroke` write
     /// command, so the containers survive until its startup census.
     UntilNextWriteCommandStart,
 }
@@ -1077,14 +1077,14 @@ pub struct FoundIntent {
 ///
 /// # Errors
 ///
-/// [`TactusError::Io`] when the file cannot be read, [`TactusError::Refused`]
+/// [`UpstrokeError::Io`] when the file cannot be read, [`UpstrokeError::Refused`]
 /// when it is not a `ContainerIntent`.
-pub fn read_intent(path: &Path) -> Result<ContainerIntent, TactusError> {
-    let bytes = fs::read(path).map_err(|source| TactusError::Io {
+pub fn read_intent(path: &Path) -> Result<ContainerIntent, UpstrokeError> {
+    let bytes = fs::read(path).map_err(|source| UpstrokeError::Io {
         path: path.to_path_buf(),
         source,
     })?;
-    serde_json::from_slice(&bytes).map_err(|error| TactusError::Refused {
+    serde_json::from_slice(&bytes).map_err(|error| UpstrokeError::Refused {
         message: format!("`{}` is not a container intent: {error}", path.display()),
     })
 }
@@ -1100,20 +1100,20 @@ pub fn read_intent(path: &Path) -> Result<ContainerIntent, TactusError> {
 ///
 /// # Errors
 ///
-/// [`TactusError::Refused`] when the file is not a `ContainerIntent`,
-/// [`TactusError::Io`] when it is still there and still unreadable after
+/// [`UpstrokeError::Refused`] when the file is not a `ContainerIntent`,
+/// [`UpstrokeError::Io`] when it is still there and still unreadable after
 /// [`RACING_ACCESS_ATTEMPTS`] attempts.
-fn read_racing(path: &Path) -> Result<Option<ContainerIntent>, TactusError> {
+fn read_racing(path: &Path) -> Result<Option<ContainerIntent>, UpstrokeError> {
     let mut last = None;
     for _ in 0..RACING_ACCESS_ATTEMPTS {
         match read_intent(path) {
             Ok(record) => return Ok(Some(record)),
-            Err(TactusError::Io { source, .. })
+            Err(UpstrokeError::Io { source, .. })
                 if source.kind() == std::io::ErrorKind::NotFound =>
             {
                 return Ok(None);
             }
-            Err(TactusError::Io { source, .. }) => {
+            Err(UpstrokeError::Io { source, .. }) => {
                 last = Some(source);
                 std::thread::yield_now();
             }
@@ -1122,7 +1122,7 @@ fn read_racing(path: &Path) -> Result<Option<ContainerIntent>, TactusError> {
             Err(other) => return Err(other),
         }
     }
-    Err(TactusError::Io {
+    Err(UpstrokeError::Io {
         path: path.to_path_buf(),
         source: last.unwrap_or_else(|| {
             std::io::Error::other("the record could not be read and reported no reason")
@@ -1134,7 +1134,7 @@ fn read_racing(path: &Path) -> Result<Option<ContainerIntent>, TactusError> {
 ///
 /// "discovery at every write-command start **scans the whole namespace
 /// `<R>/containers`** of the command's authorized private root **and** docker
-/// ps by `tactus.private_root`" — this is the first half; the second is
+/// ps by `upstroke.private_root`" — this is the first half; the second is
 /// [`runtime::ContainerRuntime::containers_with_label`]. A missing directory is
 /// an empty namespace, not an error: a run that has never launched a container
 /// has none.
@@ -1144,18 +1144,18 @@ fn read_racing(path: &Path) -> Result<Option<ContainerIntent>, TactusError> {
 ///
 /// # Errors
 ///
-/// [`TactusError::Io`] when the directory cannot be read, or whatever
+/// [`UpstrokeError::Io`] when the directory cannot be read, or whatever
 /// [`read_intent`] returns.
-pub fn list_intents(private_root: &Path) -> Result<Vec<FoundIntent>, TactusError> {
+pub fn list_intents(private_root: &Path) -> Result<Vec<FoundIntent>, UpstrokeError> {
     let dir = containers_dir(private_root);
     let entries = match fs::read_dir(&dir) {
         Ok(entries) => entries,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
-        Err(source) => return Err(TactusError::Io { path: dir, source }),
+        Err(source) => return Err(UpstrokeError::Io { path: dir, source }),
     };
     let mut found = Vec::new();
     for entry in entries {
-        let entry = entry.map_err(|source| TactusError::Io {
+        let entry = entry.map_err(|source| UpstrokeError::Io {
             path: dir.clone(),
             source,
         })?;
@@ -1229,21 +1229,21 @@ pub struct StagedIntent {
 ///
 /// # Errors
 ///
-/// [`TactusError::Io`] when the directory or a file cannot be read,
-/// [`TactusError::Refused`] when a staged file's stem is not a well-formed
+/// [`UpstrokeError::Io`] when the directory or a file cannot be read,
+/// [`UpstrokeError::Refused`] when a staged file's stem is not a well-formed
 /// container name — the same refusal [`list_intents`] gives a malformed
 /// published one, for the same reason: an unreadable name in this namespace is
 /// evidence the census could not classify, not evidence it may ignore.
-pub fn list_staged_intents(private_root: &Path) -> Result<Vec<StagedIntent>, TactusError> {
+pub fn list_staged_intents(private_root: &Path) -> Result<Vec<StagedIntent>, UpstrokeError> {
     let dir = containers_dir(private_root);
     let entries = match fs::read_dir(&dir) {
         Ok(entries) => entries,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
-        Err(source) => return Err(TactusError::Io { path: dir, source }),
+        Err(source) => return Err(UpstrokeError::Io { path: dir, source }),
     };
     let mut found = Vec::new();
     for entry in entries {
-        let entry = entry.map_err(|source| TactusError::Io {
+        let entry = entry.map_err(|source| UpstrokeError::Io {
             path: dir.clone(),
             source,
         })?;
@@ -1262,7 +1262,7 @@ pub fn list_staged_intents(private_root: &Path) -> Result<Vec<StagedIntent>, Tac
         let record = match fs::read(&path) {
             Ok(bytes) => serde_json::from_slice::<ContainerIntent>(&bytes).ok(),
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
-            Err(source) => return Err(TactusError::Io { path, source }),
+            Err(source) => return Err(UpstrokeError::Io { path, source }),
         };
         found.push(StagedIntent { name, path, record });
     }
@@ -1286,7 +1286,7 @@ pub fn remove_staged_intent(
     site: ContainerSite,
     private_root: &Path,
     name: &ContainerName,
-) -> Result<(), TactusError> {
+) -> Result<(), UpstrokeError> {
     remove_intent(hooks, site, private_root, name)
 }
 
@@ -1295,8 +1295,8 @@ pub fn remove_staged_intent(
 // ---------------------------------------------------------------------------
 
 /// A runtime failure, as the engine's error type.
-fn refused(error: RuntimeError) -> TactusError {
-    TactusError::Refused {
+fn refused(error: RuntimeError) -> UpstrokeError {
+    UpstrokeError::Refused {
         message: error.to_string(),
     }
 }
@@ -1315,36 +1315,36 @@ fn staged_path(path: &Path) -> PathBuf {
 /// [`util::fsync_file`] and [`util::fsync_dir`] — the one call each that
 /// `effects::tests::every_file_durability_barrier_in_a_funnel_module_goes_through_one_call`
 /// censuses — rather than a `sync_all` of this module's own.
-fn write_synced(path: &Path, bytes: &[u8], trace: &ContainerTrace) -> Result<(), TactusError> {
-    let parent = path.parent().ok_or_else(|| TactusError::Git {
+fn write_synced(path: &Path, bytes: &[u8], trace: &ContainerTrace) -> Result<(), UpstrokeError> {
+    let parent = path.parent().ok_or_else(|| UpstrokeError::Git {
         message: format!("{} has no parent directory", path.display()),
     })?;
-    fs::create_dir_all(parent).map_err(|source| TactusError::Io {
+    fs::create_dir_all(parent).map_err(|source| UpstrokeError::Io {
         path: parent.to_path_buf(),
         source,
     })?;
     let staged = staged_path(path);
     {
-        let mut file = fs::File::create(&staged).map_err(|source| TactusError::Io {
+        let mut file = fs::File::create(&staged).map_err(|source| UpstrokeError::Io {
             path: staged.clone(),
             source,
         })?;
-        file.write_all(bytes).map_err(|source| TactusError::Io {
+        file.write_all(bytes).map_err(|source| UpstrokeError::Io {
             path: staged.clone(),
             source,
         })?;
-        util::fsync_file(&file).map_err(|source| TactusError::Io {
+        util::fsync_file(&file).map_err(|source| UpstrokeError::Io {
             path: staged.clone(),
             source,
         })?;
     }
     trace.durable(DurableStep::Synced, &staged);
-    fs::rename(&staged, path).map_err(|source| TactusError::Io {
+    fs::rename(&staged, path).map_err(|source| UpstrokeError::Io {
         path: path.to_path_buf(),
         source,
     })?;
     trace.durable(DurableStep::Renamed, path);
-    util::fsync_dir(parent).map_err(|source| TactusError::Io {
+    util::fsync_dir(parent).map_err(|source| UpstrokeError::Io {
         path: parent.to_path_buf(),
         source,
     })?;
@@ -1354,7 +1354,7 @@ fn write_synced(path: &Path, bytes: &[u8], trace: &ContainerTrace) -> Result<(),
 
 /// Remove a file that may not be there, or may be going away under another
 /// reclaimer.
-fn remove_if_present(path: &Path, trace: &ContainerTrace) -> Result<(), TactusError> {
+fn remove_if_present(path: &Path, trace: &ContainerTrace) -> Result<(), UpstrokeError> {
     if racing_removal(path, || fs::remove_file(path))? {
         trace.durable(DurableStep::Removed, path);
     }
@@ -1370,12 +1370,12 @@ fn remove_if_present(path: &Path, trace: &ContainerTrace) -> Result<(), TactusEr
 ///
 /// # Errors
 ///
-/// [`TactusError::Io`] when the path is still there, and still refusing, after
+/// [`UpstrokeError::Io`] when the path is still there, and still refusing, after
 /// [`RACING_ACCESS_ATTEMPTS`] attempts.
 fn racing_removal(
     path: &Path,
     mut remove: impl FnMut() -> Result<(), std::io::Error>,
-) -> Result<bool, TactusError> {
+) -> Result<bool, UpstrokeError> {
     let mut last = None;
     for _ in 0..RACING_ACCESS_ATTEMPTS {
         match remove() {
@@ -1387,7 +1387,7 @@ fn racing_removal(
             }
         }
     }
-    Err(TactusError::Io {
+    Err(UpstrokeError::Io {
         path: path.to_path_buf(),
         source: last.unwrap_or_else(|| {
             std::io::Error::other("the path could not be removed and reported no reason")
@@ -1592,16 +1592,16 @@ const PS_FIELD_SEPARATOR: char = '\u{1f}';
 /// `{{.Labels}}` renders every label of a container as an **unescaped
 /// comma-joined `key=value` string**, and a label value may itself contain
 /// commas and `=`. Measured on this box, `docker` 29.7.2, a container labelled
-/// `tactus.run=RUN1` and `tactus.run_dir=/a,b=c`:
+/// `upstroke.run=RUN1` and `upstroke.run_dir=/a,b=c`:
 ///
 /// ```text
-/// --format '{{.Names}}|{{.Labels}}'      -> r2probe|tactus.run=RUN1,tactus.run_dir=/a,b=c
-/// --format '{{.Label "tactus.run_dir"}}' -> /a,b=c
+/// --format '{{.Names}}|{{.Labels}}'      -> r2probe|upstroke.run=RUN1,upstroke.run_dir=/a,b=c
+/// --format '{{.Label "upstroke.run_dir"}}' -> /a,b=c
 /// ```
 ///
-/// The first is ambiguous *in the daemon's own output* — `tactus.run_dir=/a`
+/// The first is ambiguous *in the daemon's own output* — `upstroke.run_dir=/a`
 /// and a label `b=c` is an equally good reading of those bytes, and it is the
-/// reading the shipped `split(',')` took. For `tactus.run_dir` that truncation
+/// reading the shipped `split(',')` took. For `upstroke.run_dir` that truncation
 /// sends arm (ii)'s probe to a shorter, different directory, finds no
 /// `run.lock`, and reclaims a **live** owner's container (`PR6-RECOV-002`). So
 /// this asks the daemon for each field on its own, which is the one rendering
@@ -1611,9 +1611,9 @@ const PS_FIELD_SEPARATOR: char = '\u{1f}';
 /// All five labels, not the three the census reads today: the discovered
 /// container's map is the same shape it always was, so a later reader is not
 /// silently handed a map that lost the two nobody happened to need.
-const PS_FORMAT: &str = "{{.Names}}\u{1f}{{.Label \"tactus.private_root\"}}\
-     \u{1f}{{.Label \"tactus.run\"}}\u{1f}{{.Label \"tactus.run_dir\"}}\
-     \u{1f}{{.Label \"tactus.incarnation\"}}\u{1f}{{.Label \"tactus.invocation\"}}";
+const PS_FORMAT: &str = "{{.Names}}\u{1f}{{.Label \"upstroke.private_root\"}}\
+     \u{1f}{{.Label \"upstroke.run\"}}\u{1f}{{.Label \"upstroke.run_dir\"}}\
+     \u{1f}{{.Label \"upstroke.incarnation\"}}\u{1f}{{.Label \"upstroke.invocation\"}}";
 
 /// The labels [`PS_FORMAT`] asks for, in the order it asks for them.
 ///
@@ -1692,7 +1692,7 @@ fn parse_ps_output(text: &str) -> Result<Vec<DiscoveredContainer>, RuntimeError>
 /// by *this* process is the ordinary configuration, not a fault, and every
 /// diagnostic below is one this engine must proceed past when it holds no
 /// container evidence. Getting it wrong the other way — classifying "cannot
-/// reach" as "reached and refused" — makes `tactus run` refuse to start at all
+/// reach" as "reached and refused" — makes `upstroke run` refuse to start at all
 /// on a machine that has no container work to do (`PR6-RECOV-005`).
 ///
 /// **Measured, not recalled.** Every entry was produced on this project's build

@@ -576,7 +576,7 @@ impl ContainerHooks for RecordingHooks {
 /// could not run" failure this project keeps paying for. On a machine with
 /// Docker the suite is run **with this set**, so a skip is a red test; CI and
 /// the Windows guest have no container runtime and run without it.
-pub(crate) const REQUIRE_DOCKER: &str = "TACTUS_REQUIRE_DOCKER";
+pub(crate) const REQUIRE_DOCKER: &str = "UPSTROKE_REQUIRE_DOCKER";
 
 /// Every Docker-gated test in this slice, by name.
 ///

@@ -21,9 +21,9 @@ The coordinator alone writes the event log and Git refs.
 2. A successful attempt is committed to an engine-owned internal candidate ref.
    It becomes `AwaitingMerge`, not `Done`; there is no intermediate state that
    satisfies dependencies.
-3. The public `tactus/run-<ulid>` ref is the integration head. It must not be
+3. The public `upstroke/run-<ulid>` ref is the integration head. It must not be
    checked out in any worktree while the run is live; operators inspect it
-   through a detached checkout, and tactus refuses to publish while Git reports
+   through a detached checkout, and upstroke refuses to publish while Git reports
    it checked out. A single merge queue applies candidates in
    `task_candidate_created` event order, skipping only candidates held behind an
    active repair-path lease.
@@ -70,10 +70,10 @@ integration head is both misleading and unsafe for dependency readiness.
 The run owns these Git identities:
 
 ```text
-refs/heads/tactus/run-<run-id>                         integration head
-refs/tactus/runs/<run-id>/candidate-prepared/<task>/<gen>  protected, non-authoritative commit
-refs/tactus/runs/<run-id>/candidates/<task>/<gen>     immutable candidate
-refs/tactus/runs/<run-id>/prepared/<sequence>          proposed integration commit
+refs/heads/upstroke/run-<run-id>                         integration head
+refs/upstroke/runs/<run-id>/candidate-prepared/<task>/<gen>  protected, non-authoritative commit
+refs/upstroke/runs/<run-id>/candidates/<task>/<gen>     immutable candidate
+refs/upstroke/runs/<run-id>/prepared/<sequence>          proposed integration commit
 ```
 
 `<task>` above is an engine-issued numeric task key, not the user-authored task
@@ -85,7 +85,7 @@ paths, and artifact stems use the key so hostile ids and two ids that sanitize
 alike cannot traverse or alias storage.
 
 Task and merge worktrees are detached checkouts under a stable execution root
-recorded by `run_started` (default `~/.tactus/workspaces/<repo-key>/<run-id>`).
+recorded by `run_started` (default `~/.upstroke/workspaces/<repo-key>/<run-id>`).
 They are separate from private transcripts and from the user's checkout. A
 container sees only the one workspace mounted for its role; sibling worktrees,
 the event log, and private artifacts are not mounted.
@@ -175,7 +175,7 @@ Schema 3 records at least:
   fold appends that task to the registry, assigns its key, moves the rejected
   task to `AwaitingRepair`, and puts the repair in `Pending` or `AwaitingInput`.
   A human-required admission is also the authoritative question record for
-  status, notifiers, and `tactus answer`; no duplicate `question_raised` is
+  status, notifiers, and `upstroke answer`; no duplicate `question_raised` is
   emitted. When verification ran, this event also contains its complete failed
   terminal record; no separate `merge_verification_finished` is emitted.
   Infrastructure outcomes use their unavailable/interrupted events and ordinary
@@ -318,7 +318,7 @@ parsing, session resume, and rate-limit recognition; runners do not interpret
 agent output.
 
 `CommandSpec.env` overlays a runner-defined base; it is never a replacement for
-the process environment. The host base starts from the Tactus process
+the process environment. The host base starts from the Upstroke process
 environment, while the container base starts from the image environment. The
 runner then supplies role-scoped `HOME`, `PATH`, and credential locations before
 applying non-reserved adapter overrides. An adapter that conflicts with a

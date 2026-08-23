@@ -73,7 +73,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 
-use crate::error::TactusError;
+use crate::error::UpstrokeError;
 use crate::topology::effects::{
     EffectSiteId, HookHarness, HookPhase, Injection, InjectionMode, ObjectResidue, ObjectSite,
     RefSite, ResidueElement, ResourceRow, SnapshotSite, SubEffectPoint, WorktreeSite,
@@ -178,11 +178,11 @@ impl EffectHooks for HarnessEffects {
 /// [`crate::agent::proc`] already gives: the claim under test is what a
 /// coordinator that dies **without running any cleanup** leaves durable, and
 /// both `panic!` and `std::process::exit` run destructors.
-fn apply(injection: Injection, site: EffectSiteId, phase: HookPhase) -> Result<(), TactusError> {
+fn apply(injection: Injection, site: EffectSiteId, phase: HookPhase) -> Result<(), UpstrokeError> {
     match injection {
         Injection::Proceed => Ok(()),
         Injection::Kill => std::process::abort(),
-        Injection::Error => Err(TactusError::Refused {
+        Injection::Error => Err(UpstrokeError::Refused {
             message: format!("the `{site}` funnel was made to fail at its `{phase}` phase"),
         }),
     }
@@ -193,9 +193,9 @@ fn funnel<T, F>(
     hooks: &mut dyn EffectHooks,
     site: EffectSiteId,
     primitive: F,
-) -> Result<T, TactusError>
+) -> Result<T, UpstrokeError>
 where
-    F: FnOnce() -> Result<T, TactusError>,
+    F: FnOnce() -> Result<T, UpstrokeError>,
 {
     apply(
         hooks.phase(site, HookPhase::Before),
@@ -219,7 +219,7 @@ fn point(
     hooks: &mut dyn EffectHooks,
     site: EffectSiteId,
     at: SubEffectPoint,
-) -> Result<(), TactusError> {
+) -> Result<(), UpstrokeError> {
     let mut decision = Injection::Proceed;
     for mode in at.modes() {
         let answer = hooks.phase(
@@ -432,7 +432,7 @@ pub enum Refusal {
     },
 }
 
-impl From<Refusal> for TactusError {
+impl From<Refusal> for UpstrokeError {
     fn from(refusal: Refusal) -> Self {
         Self::Refused {
             message: refusal.to_string(),
@@ -447,8 +447,8 @@ impl From<Refusal> for TactusError {
 /// The domain-separation prefix of `repo_key` v1.
 ///
 /// `decisions.workspace_candidates.execution_root`: "repo_key v1 =
-/// hex16(sha256('tactus-repo-key-v1' NUL canonical common git dir bytes))".
-const REPO_KEY_V1_DOMAIN: &[u8] = b"tactus-repo-key-v1";
+/// hex16(sha256('upstroke-repo-key-v1' NUL canonical common git dir bytes))".
+const REPO_KEY_V1_DOMAIN: &[u8] = b"upstroke-repo-key-v1";
 
 /// How many hex characters `hex16` keeps.
 ///
@@ -535,7 +535,7 @@ fn is_reparse_point(metadata: &fs::Metadata) -> bool {
 /// Only components that exist are inspected: a root that has not been created
 /// yet has an absent leaf, and refusing on absence would refuse every first
 /// run.
-fn reparse_point_below(anchor: &Path, path: &Path) -> Result<Option<PathBuf>, TactusError> {
+fn reparse_point_below(anchor: &Path, path: &Path) -> Result<Option<PathBuf>, UpstrokeError> {
     let Ok(relative) = path.strip_prefix(anchor) else {
         return Ok(None);
     };
@@ -553,7 +553,7 @@ fn reparse_point_below(anchor: &Path, path: &Path) -> Result<Option<PathBuf>, Ta
             }
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
             Err(source) => {
-                return Err(TactusError::Io {
+                return Err(UpstrokeError::Io {
                     path: walked,
                     source,
                 });
@@ -565,7 +565,7 @@ fn reparse_point_below(anchor: &Path, path: &Path) -> Result<Option<PathBuf>, Ta
 
 /// Refuse `path` when a component of its chain below `anchor` is a reparse
 /// point.
-fn refuse_reparse_points(anchor: &Path, path: &Path) -> Result<(), TactusError> {
+fn refuse_reparse_points(anchor: &Path, path: &Path) -> Result<(), UpstrokeError> {
     if let Some(at) = reparse_point_below(anchor, path)? {
         return Err(Refusal::ReparsePointOnChain {
             chain: path.to_path_buf(),
@@ -578,8 +578,8 @@ fn refuse_reparse_points(anchor: &Path, path: &Path) -> Result<(), TactusError> 
 
 /// The leaf clause of `execution_root`: "the managed base is a **real
 /// directory**".
-fn refuse_unreal_directory(path: &Path) -> Result<(), TactusError> {
-    let metadata = fs::symlink_metadata(path).map_err(|source| TactusError::Io {
+fn refuse_unreal_directory(path: &Path) -> Result<(), UpstrokeError> {
+    let metadata = fs::symlink_metadata(path).map_err(|source| UpstrokeError::Io {
         path: path.to_path_buf(),
         source,
     })?;
@@ -643,7 +643,7 @@ fn strip_verbatim(path: PathBuf) -> PathBuf {
 ///
 /// `fs::canonicalize` needs the whole path to exist; an execution root is
 /// compared for containment before it does.
-fn canonical_prefix(path: &Path) -> Result<PathBuf, TactusError> {
+fn canonical_prefix(path: &Path) -> Result<PathBuf, UpstrokeError> {
     if let Ok(canonical) = fs::canonicalize(path) {
         return Ok(strip_verbatim(canonical));
     }
@@ -1131,7 +1131,7 @@ impl WorkspaceManager {
         private_root: &Path,
         run_id: &str,
         incarnation: &str,
-    ) -> Result<Self, TactusError> {
+    ) -> Result<Self, UpstrokeError> {
         refuse_unreal_directory(base)?;
         refuse_unreal_directory(private_root)?;
 
@@ -1212,7 +1212,7 @@ impl WorkspaceManager {
     /// # Errors
     ///
     /// The containment refusals, or a Git error reading the worktree list.
-    pub fn revalidate(&self) -> Result<(), TactusError> {
+    pub fn revalidate(&self) -> Result<(), UpstrokeError> {
         refuse_unreal_directory(&self.base)?;
         refuse_reparse_points(&self.private_root, &self.execution_root)?;
         let root = canonical_prefix(&self.execution_root)?;
@@ -1274,7 +1274,7 @@ impl WorkspaceManager {
     /// # Errors
     ///
     /// [`Refusal::SlotName`].
-    fn slot_target(&self, slot: &Slot) -> Result<PathBuf, TactusError> {
+    fn slot_target(&self, slot: &Slot) -> Result<PathBuf, UpstrokeError> {
         slot.validate()?;
         Ok(self.slot_path(slot))
     }
@@ -1284,7 +1284,7 @@ impl WorkspaceManager {
     /// `transaction_fault_matrix[T-SCRUB].refusal_condition` is "path outside
     /// execution root", and it is the whole of what makes the forced removals
     /// safe: they delete a directory tree.
-    fn contained(&self, path: &Path) -> Result<PathBuf, TactusError> {
+    fn contained(&self, path: &Path) -> Result<PathBuf, UpstrokeError> {
         let root = canonical_prefix(&self.execution_root)?;
         let candidate = canonical_prefix(path)?;
         if candidate == root || !candidate.starts_with(&root) {
@@ -1306,7 +1306,7 @@ impl WorkspaceManager {
     /// # Errors
     ///
     /// The containment refusals, or an I/O error creating the directories.
-    pub fn create_execution_root(&self, hooks: &mut dyn EffectHooks) -> Result<(), TactusError> {
+    pub fn create_execution_root(&self, hooks: &mut dyn EffectHooks) -> Result<(), UpstrokeError> {
         self.revalidate()?;
         let ledger = hooks.durability_ledger();
         funnel(
@@ -1321,7 +1321,7 @@ impl WorkspaceManager {
                     self.execution_root.join("snapshots"),
                     self.hooks_dir(),
                 ] {
-                    fs::create_dir_all(&directory).map_err(|source| TactusError::Io {
+                    fs::create_dir_all(&directory).map_err(|source| UpstrokeError::Io {
                         path: directory,
                         source,
                     })?;
@@ -1340,7 +1340,10 @@ impl WorkspaceManager {
     /// # Errors
     ///
     /// The containment refusals, or an I/O error.
-    pub fn remove_execution_root(&self, hooks: &mut dyn EffectHooks) -> Result<bool, TactusError> {
+    pub fn remove_execution_root(
+        &self,
+        hooks: &mut dyn EffectHooks,
+    ) -> Result<bool, UpstrokeError> {
         self.revalidate()?;
         funnel(
             hooks,
@@ -1363,7 +1366,7 @@ impl WorkspaceManager {
                 if !directory_is_empty(&self.execution_root)? {
                     return Ok(false);
                 }
-                fs::remove_dir(&self.execution_root).map_err(|source| TactusError::Io {
+                fs::remove_dir(&self.execution_root).map_err(|source| UpstrokeError::Io {
                     path: self.execution_root.clone(),
                     source,
                 })?;
@@ -1401,7 +1404,7 @@ impl WorkspaceManager {
         &self,
         hooks: &mut dyn EffectHooks,
         slot: &Slot,
-    ) -> Result<(), TactusError> {
+    ) -> Result<(), UpstrokeError> {
         slot.validate()?;
         self.revalidate()?;
         let path = self.intent_path(slot);
@@ -1413,7 +1416,7 @@ impl WorkspaceManager {
         };
         let ledger = hooks.durability_ledger();
         funnel(hooks, slot.write_intent_site(), || {
-            let bytes = serde_json::to_vec(&record).map_err(|error| TactusError::Git {
+            let bytes = serde_json::to_vec(&record).map_err(|error| UpstrokeError::Git {
                 message: format!("serializing the {} intent: {error}", slot.kind()),
             })?;
             write_synced(&path, &bytes, &ledger)
@@ -1433,7 +1436,7 @@ impl WorkspaceManager {
         &self,
         hooks: &mut dyn EffectHooks,
         slot: &Slot,
-    ) -> Result<(), TactusError> {
+    ) -> Result<(), UpstrokeError> {
         slot.validate()?;
         self.revalidate()?;
         let path = self.intent_path(slot);
@@ -1442,7 +1445,7 @@ impl WorkspaceManager {
             match fs::remove_file(&path) {
                 Ok(()) => sync_directory(path.parent().unwrap_or(&self.execution_root), &ledger),
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
-                Err(source) => Err(TactusError::Io { path, source }),
+                Err(source) => Err(UpstrokeError::Io { path, source }),
             }
         })
     }
@@ -1452,13 +1455,13 @@ impl WorkspaceManager {
     /// # Errors
     ///
     /// An I/O error, or an intent file whose name no slot renders.
-    pub fn intents(&self) -> Result<Vec<Slot>, TactusError> {
+    pub fn intents(&self) -> Result<Vec<Slot>, UpstrokeError> {
         let directory = self.execution_root.join("intents");
         let entries = match fs::read_dir(&directory) {
             Ok(entries) => entries,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
             Err(source) => {
-                return Err(TactusError::Io {
+                return Err(UpstrokeError::Io {
                     path: directory,
                     source,
                 });
@@ -1466,15 +1469,15 @@ impl WorkspaceManager {
         };
         let mut slots = Vec::new();
         for entry in entries {
-            let entry = entry.map_err(|source| TactusError::Io {
+            let entry = entry.map_err(|source| UpstrokeError::Io {
                 path: directory.clone(),
                 source,
             })?;
             let name = entry.file_name();
-            let name = name.to_str().ok_or_else(|| TactusError::Git {
+            let name = name.to_str().ok_or_else(|| UpstrokeError::Git {
                 message: format!("intent {} has a non-UTF-8 name", entry.path().display()),
             })?;
-            let slot = Slot::from_intent_name(name).ok_or_else(|| TactusError::Git {
+            let slot = Slot::from_intent_name(name).ok_or_else(|| UpstrokeError::Git {
                 message: format!(
                     "unexpected file `{name}` in the intent directory of {}",
                     self.execution_root.display()
@@ -1501,7 +1504,7 @@ impl WorkspaceManager {
     /// # Errors
     ///
     /// The containment refusals or a Git or I/O error.
-    pub fn reclaim_intents(&self, hooks: &mut dyn EffectHooks) -> Result<Vec<Slot>, TactusError> {
+    pub fn reclaim_intents(&self, hooks: &mut dyn EffectHooks) -> Result<Vec<Slot>, UpstrokeError> {
         self.revalidate()?;
         let slots = self.intents()?;
         for slot in &slots {
@@ -1563,7 +1566,7 @@ impl WorkspaceManager {
         hooks: &mut dyn EffectHooks,
         slot: &Slot,
         commit: &str,
-    ) -> Result<PathBuf, TactusError> {
+    ) -> Result<PathBuf, UpstrokeError> {
         let path = self.slot_target(slot)?;
         self.revalidate()?;
         let intent = self.intent_path(slot);
@@ -1585,7 +1588,7 @@ impl WorkspaceManager {
             // scaffolding directory was removed, the refusal arrived and the
             // directory existed.
             if let Some(parent) = path.parent() {
-                fs::create_dir_all(parent).map_err(|source| TactusError::Io {
+                fs::create_dir_all(parent).map_err(|source| UpstrokeError::Io {
                     path: parent.to_path_buf(),
                     source,
                 })?;
@@ -1615,7 +1618,7 @@ impl WorkspaceManager {
         hooks: &mut dyn EffectHooks,
         slot: &Slot,
         expected: &Quiescence,
-    ) -> Result<Result<(), VerifyFailure>, TactusError> {
+    ) -> Result<Result<(), VerifyFailure>, UpstrokeError> {
         self.revalidate()?;
         let path = self.slot_target(slot)?;
         funnel(hooks, EffectSiteId::Worktree(WorktreeSite::Verify), || {
@@ -1633,7 +1636,7 @@ impl WorkspaceManager {
         &self,
         path: &Path,
         expected: &Quiescence,
-    ) -> Result<Result<(), VerifyFailure>, TactusError> {
+    ) -> Result<Result<(), VerifyFailure>, UpstrokeError> {
         let Some(record) = self.worktree_record(path)? else {
             return Ok(Err(VerifyFailure::NotRegistered));
         };
@@ -1709,7 +1712,7 @@ impl WorkspaceManager {
     /// # Errors
     ///
     /// A Git error other than "the index differs" or "the tree is absent".
-    fn index_differs_from(&self, path: &Path, tree: &str) -> Result<Option<String>, TactusError> {
+    fn index_differs_from(&self, path: &Path, tree: &str) -> Result<Option<String>, UpstrokeError> {
         const READ_ONLY: &str = "--no-optional-locks";
         let quiet = read_only_git(
             path,
@@ -1724,7 +1727,7 @@ impl WorkspaceManager {
                     &[READ_ONLY, "cat-file", "-e", &format!("{tree}^{{tree}}")],
                 )?;
                 if present.status.success() {
-                    return Err(TactusError::Git {
+                    return Err(UpstrokeError::Git {
                         message: format!(
                             "git diff-index against {tree} failed in {}: {}",
                             path.display(),
@@ -1800,13 +1803,13 @@ impl WorkspaceManager {
         &self,
         hooks: &mut dyn EffectHooks,
         slot: &Slot,
-    ) -> Result<(), TactusError> {
+    ) -> Result<(), UpstrokeError> {
         self.revalidate()?;
         let path = self.slot_target(slot)?;
         funnel(hooks, slot.remove_site(), || {
             if path.exists() {
                 let contained = self.contained(&path)?;
-                remove_tree_once_handles_close(&contained).map_err(|source| TactusError::Io {
+                remove_tree_once_handles_close(&contained).map_err(|source| UpstrokeError::Io {
                     path: contained,
                     source,
                 })?;
@@ -1817,7 +1820,7 @@ impl WorkspaceManager {
                     Ok(()) => {}
                     Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
                     Err(source) => {
-                        return Err(TactusError::Io {
+                        return Err(UpstrokeError::Io {
                             path: locked,
                             source,
                         });
@@ -1859,7 +1862,7 @@ impl WorkspaceManager {
         hooks: &mut dyn EffectHooks,
         name: &SnapshotName,
         input: &SnapshotInput,
-    ) -> Result<Snapshot, TactusError> {
+    ) -> Result<Snapshot, UpstrokeError> {
         let slot = Slot::Snapshot { name: name.clone() };
         let (head, ephemeral) = match input {
             SnapshotInput::Commit(commit) => (commit.clone(), None),
@@ -1887,7 +1890,7 @@ impl WorkspaceManager {
         &self,
         hooks: &mut dyn EffectHooks,
         snapshot: &Snapshot,
-    ) -> Result<(), TactusError> {
+    ) -> Result<(), UpstrokeError> {
         self.remove_worktree(hooks, &snapshot.slot)?;
         self.remove_intent(hooks, &snapshot.slot)
     }
@@ -1911,7 +1914,7 @@ impl WorkspaceManager {
         site: RefSite,
         refname: &str,
         new: &str,
-    ) -> Result<(), TactusError> {
+    ) -> Result<(), UpstrokeError> {
         self.refuse_symbolic(refname)?;
         refuse_malformed_object_id(refname, "new", new)?;
         funnel(hooks, EffectSiteId::Ref(site), || {
@@ -1932,7 +1935,7 @@ impl WorkspaceManager {
         refname: &str,
         old: &str,
         new: &str,
-    ) -> Result<(), TactusError> {
+    ) -> Result<(), UpstrokeError> {
         self.assert_publishable(refname)?;
         refuse_malformed_object_id(refname, "new", new)?;
         refuse_expected_old(refname, old)?;
@@ -1953,7 +1956,7 @@ impl WorkspaceManager {
         site: RefSite,
         refname: &str,
         old: &str,
-    ) -> Result<(), TactusError> {
+    ) -> Result<(), UpstrokeError> {
         self.refuse_symbolic(refname)?;
         refuse_expected_old(refname, old)?;
         funnel(hooks, EffectSiteId::Ref(site), || {
@@ -1967,7 +1970,7 @@ impl WorkspaceManager {
     /// # Errors
     ///
     /// [`Refusal::SymbolicRef`] or [`Refusal::CheckedOutRef`].
-    pub fn assert_publishable(&self, refname: &str) -> Result<(), TactusError> {
+    pub fn assert_publishable(&self, refname: &str) -> Result<(), UpstrokeError> {
         self.refuse_symbolic(refname)?;
         for record in self.worktree_records()? {
             if record.branch.as_deref() == Some(refname) {
@@ -1986,7 +1989,7 @@ impl WorkspaceManager {
     /// # Errors
     ///
     /// [`Refusal::SymbolicRef`], or a Git error.
-    pub fn direct_ref_target(&self, refname: &str) -> Result<Option<String>, TactusError> {
+    pub fn direct_ref_target(&self, refname: &str) -> Result<Option<String>, UpstrokeError> {
         self.refuse_symbolic(refname)?;
         let output = self.git(
             &self.base,
@@ -2012,7 +2015,7 @@ impl WorkspaceManager {
     /// # Errors
     ///
     /// A Git error.
-    pub fn refs_under(&self, namespace: &str) -> Result<Vec<(String, String)>, TactusError> {
+    pub fn refs_under(&self, namespace: &str) -> Result<Vec<(String, String)>, UpstrokeError> {
         let output = self.git_ok(
             &self.base,
             &[
@@ -2021,7 +2024,7 @@ impl WorkspaceManager {
                 OsString::from(namespace),
             ],
         )?;
-        let listing = String::from_utf8(output).map_err(|error| TactusError::Git {
+        let listing = String::from_utf8(output).map_err(|error| UpstrokeError::Git {
             message: format!("`git for-each-ref {namespace}` returned non-UTF-8 output: {error}"),
         })?;
         Ok(listing
@@ -2043,7 +2046,7 @@ impl WorkspaceManager {
         &self,
         namespace: &str,
         expected: &[String],
-    ) -> Result<(), TactusError> {
+    ) -> Result<(), UpstrokeError> {
         for (refname, _) in self.refs_under(namespace)? {
             if !expected.contains(&refname) {
                 return Err(Refusal::UnexpectedRefUnderNamespace {
@@ -2057,7 +2060,7 @@ impl WorkspaceManager {
     }
 
     /// Refuse a symbolic ref without touching it.
-    fn refuse_symbolic(&self, refname: &str) -> Result<(), TactusError> {
+    fn refuse_symbolic(&self, refname: &str) -> Result<(), UpstrokeError> {
         let output = self.git(
             &self.base,
             &[
@@ -2077,7 +2080,7 @@ impl WorkspaceManager {
         Ok(())
     }
 
-    fn update_ref(&self, args: &[&str]) -> Result<(), TactusError> {
+    fn update_ref(&self, args: &[&str]) -> Result<(), UpstrokeError> {
         let mut argv = vec![OsString::from("update-ref")];
         argv.extend(args.iter().map(OsString::from));
         self.git_ok(&self.base, &argv)?;
@@ -2100,7 +2103,7 @@ impl WorkspaceManager {
         &self,
         hooks: &mut dyn EffectHooks,
         slot: &Slot,
-    ) -> Result<(), TactusError> {
+    ) -> Result<(), UpstrokeError> {
         self.revalidate()?;
         let path = self.slot_target(slot)?;
         funnel(
@@ -2128,7 +2131,7 @@ impl WorkspaceManager {
         &self,
         hooks: &mut dyn EffectHooks,
         slot: &Slot,
-    ) -> Result<String, TactusError> {
+    ) -> Result<String, UpstrokeError> {
         self.revalidate()?;
         let path = self.slot_target(slot)?;
         funnel(
@@ -2152,13 +2155,13 @@ impl WorkspaceManager {
         hooks: &mut dyn EffectHooks,
         tree: &str,
         parent: &str,
-    ) -> Result<String, TactusError> {
+    ) -> Result<String, UpstrokeError> {
         self.commit_tree(
             hooks,
             EffectSiteId::Object(ObjectSite::SnapshotCommitTree),
             tree,
             parent,
-            "tactus: ephemeral snapshot input",
+            "upstroke: ephemeral snapshot input",
         )
     }
 
@@ -2176,7 +2179,7 @@ impl WorkspaceManager {
         tree: &str,
         parent: &str,
         message: &str,
-    ) -> Result<String, TactusError> {
+    ) -> Result<String, UpstrokeError> {
         self.commit_tree(
             hooks,
             EffectSiteId::Object(ObjectSite::CandidateCommitTree),
@@ -2205,7 +2208,7 @@ impl WorkspaceManager {
         tree: &str,
         parent: &str,
         message: &str,
-    ) -> Result<String, TactusError> {
+    ) -> Result<String, UpstrokeError> {
         apply(
             hooks.phase(site, HookPhase::Before),
             site,
@@ -2223,7 +2226,7 @@ impl WorkspaceManager {
             ],
         )?;
         if !output.status.success() {
-            return Err(TactusError::Git {
+            return Err(UpstrokeError::Git {
                 message: format!(
                     "`git commit-tree` failed: {}",
                     String::from_utf8_lossy(&output.stderr).trim()
@@ -2234,7 +2237,7 @@ impl WorkspaceManager {
         // recorded. This is the whole of `IdUnread`.
         point(hooks, site, SubEffectPoint::IdUnread)?;
         let id = String::from_utf8(output.stdout)
-            .map_err(|error| TactusError::Git {
+            .map_err(|error| UpstrokeError::Git {
                 message: format!("`git commit-tree` printed a non-UTF-8 id: {error}"),
             })?
             .trim()
@@ -2259,7 +2262,7 @@ impl WorkspaceManager {
         hooks: &mut dyn EffectHooks,
         slot: &Slot,
         commit: &str,
-    ) -> Result<String, TactusError> {
+    ) -> Result<String, UpstrokeError> {
         self.revalidate()?;
         let path = self.slot_target(slot)?;
         funnel(
@@ -2293,7 +2296,7 @@ impl WorkspaceManager {
         hooks: &mut dyn EffectHooks,
         slot: &Slot,
         commit: &str,
-    ) -> Result<(), TactusError> {
+    ) -> Result<(), UpstrokeError> {
         self.revalidate()?;
         let path = self.slot_target(slot)?;
         funnel(
@@ -2352,7 +2355,7 @@ impl WorkspaceManager {
     /// # Errors
     ///
     /// The containment refusals or a Git error.
-    pub fn changed_paths(&self, slot: &Slot, base: &str) -> Result<PathSet, TactusError> {
+    pub fn changed_paths(&self, slot: &Slot, base: &str) -> Result<PathSet, UpstrokeError> {
         self.revalidate()?;
         let path = self.slot_target(slot)?;
         let output = self.git_ok(
@@ -2374,10 +2377,10 @@ impl WorkspaceManager {
     // -----------------------------------------------------------------------
 
     /// Run Git in `cwd` with every repository hook and the fsmonitor disabled.
-    fn git(&self, cwd: &Path, args: &[OsString]) -> Result<Output, TactusError> {
+    fn git(&self, cwd: &Path, args: &[OsString]) -> Result<Output, UpstrokeError> {
         self.command(cwd, args)
             .output()
-            .map_err(|error| TactusError::Git {
+            .map_err(|error| UpstrokeError::Git {
                 message: format!("failed to run git: {error}"),
             })
     }
@@ -2398,27 +2401,27 @@ impl WorkspaceManager {
         command
     }
 
-    fn git_with_identity(&self, cwd: &Path, args: &[OsString]) -> Result<Output, TactusError> {
+    fn git_with_identity(&self, cwd: &Path, args: &[OsString]) -> Result<Output, UpstrokeError> {
         self.command(cwd, args)
             // Environment identity overrides repository and global config and
             // any inherited GIT_AUTHOR_*/GIT_COMMITTER_*, so a commit-tree is a
             // function of its inputs and not of the machine.
-            .env("GIT_AUTHOR_NAME", "tactus")
-            .env("GIT_AUTHOR_EMAIL", "tactus@tactus.local")
+            .env("GIT_AUTHOR_NAME", "upstroke")
+            .env("GIT_AUTHOR_EMAIL", "upstroke@upstroke.local")
             .env("GIT_AUTHOR_DATE", "@0 +0000")
-            .env("GIT_COMMITTER_NAME", "tactus")
-            .env("GIT_COMMITTER_EMAIL", "tactus@tactus.local")
+            .env("GIT_COMMITTER_NAME", "upstroke")
+            .env("GIT_COMMITTER_EMAIL", "upstroke@upstroke.local")
             .env("GIT_COMMITTER_DATE", "@0 +0000")
             .output()
-            .map_err(|error| TactusError::Git {
+            .map_err(|error| UpstrokeError::Git {
                 message: format!("failed to run git: {error}"),
             })
     }
 
-    fn git_ok(&self, cwd: &Path, args: &[OsString]) -> Result<Vec<u8>, TactusError> {
+    fn git_ok(&self, cwd: &Path, args: &[OsString]) -> Result<Vec<u8>, UpstrokeError> {
         let output = self.git(cwd, args)?;
         if !output.status.success() {
-            return Err(TactusError::Git {
+            return Err(UpstrokeError::Git {
                 message: format!(
                     "git {} failed in {}: {}",
                     args.iter()
@@ -2433,10 +2436,10 @@ impl WorkspaceManager {
         Ok(output.stdout)
     }
 
-    fn git_line(&self, cwd: &Path, args: &[&str]) -> Result<String, TactusError> {
+    fn git_line(&self, cwd: &Path, args: &[&str]) -> Result<String, UpstrokeError> {
         let argv: Vec<OsString> = args.iter().map(OsString::from).collect();
         let output = self.git_ok(cwd, &argv)?;
-        let text = String::from_utf8(output).map_err(|error| TactusError::Git {
+        let text = String::from_utf8(output).map_err(|error| UpstrokeError::Git {
             message: format!("git {} returned non-UTF-8 output: {error}", args.join(" ")),
         })?;
         Ok(text.trim().to_owned())
@@ -2447,7 +2450,7 @@ impl WorkspaceManager {
     /// # Errors
     ///
     /// A Git error.
-    pub fn worktree_records(&self) -> Result<Vec<WorktreeRecord>, TactusError> {
+    pub fn worktree_records(&self) -> Result<Vec<WorktreeRecord>, UpstrokeError> {
         let output = self.git_ok(
             &self.base,
             &[
@@ -2460,7 +2463,7 @@ impl WorkspaceManager {
         Ok(parse_worktree_records(&output))
     }
 
-    fn worktree_record(&self, path: &Path) -> Result<Option<WorktreeRecord>, TactusError> {
+    fn worktree_record(&self, path: &Path) -> Result<Option<WorktreeRecord>, UpstrokeError> {
         let wanted = canonical_prefix(path)?;
         for record in self.worktree_records()? {
             if canonical_prefix(&record.path)? == wanted {
@@ -2471,13 +2474,13 @@ impl WorkspaceManager {
     }
 
     /// The per-worktree administrative directory of a linked worktree.
-    fn worktree_git_dir(&self, path: &Path) -> Result<Option<PathBuf>, TactusError> {
+    fn worktree_git_dir(&self, path: &Path) -> Result<Option<PathBuf>, UpstrokeError> {
         let pointer = path.join(".git");
         let text = match fs::read_to_string(&pointer) {
             Ok(text) => text,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
             Err(source) => {
-                return Err(TactusError::Io {
+                return Err(UpstrokeError::Io {
                     path: pointer,
                     source,
                 });
@@ -2492,7 +2495,7 @@ impl WorkspaceManager {
     /// The administrative directory Git keeps for a registered worktree, found
     /// without trusting the checkout, so a removal can clear the
     /// `initializing` lock of a worktree whose directory is already gone.
-    fn registered_admin_dir(&self, path: &Path) -> Result<Option<PathBuf>, TactusError> {
+    fn registered_admin_dir(&self, path: &Path) -> Result<Option<PathBuf>, UpstrokeError> {
         if self.worktree_record(path)?.is_none() {
             return Ok(None);
         }
@@ -2501,7 +2504,7 @@ impl WorkspaceManager {
             Ok(entries) => entries,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
             Err(source) => {
-                return Err(TactusError::Io {
+                return Err(UpstrokeError::Io {
                     path: worktrees,
                     source,
                 });
@@ -2509,7 +2512,7 @@ impl WorkspaceManager {
         };
         let wanted = canonical_prefix(path)?;
         for entry in entries {
-            let entry = entry.map_err(|source| TactusError::Io {
+            let entry = entry.map_err(|source| UpstrokeError::Io {
                 path: worktrees.clone(),
                 source,
             })?;
@@ -2681,15 +2684,15 @@ pub fn residue_classified_sites() -> Vec<EffectSiteId> {
 ///
 /// # Errors
 ///
-/// A Git or I/O error, or [`TactusError::Refused`] for a site the frozen enums
+/// A Git or I/O error, or [`UpstrokeError::Refused`] for a site the frozen enums
 /// register no residue class for — the classifier is total over its domain and
 /// silent outside it, rather than answering `None` for a question nobody asked.
 pub fn classify_object_residue(
     site: EffectSiteId,
     target: &ResidueTarget<'_>,
-) -> Result<ObjectResidue, TactusError> {
+) -> Result<ObjectResidue, UpstrokeError> {
     if site.residue_classes().is_empty() {
-        return Err(TactusError::Refused {
+        return Err(UpstrokeError::Refused {
             message: format!(
                 "`{site}` registers no residue class, so classify_object_residue has nothing to \
                  be total over there"
@@ -2709,7 +2712,7 @@ pub fn classify_object_residue(
 fn after_reference_present(
     site: EffectSiteId,
     target: &ResidueTarget<'_>,
-) -> Result<bool, TactusError> {
+) -> Result<bool, UpstrokeError> {
     let worktree = target.worktree;
     let repository = target.repository;
     match site {
@@ -2781,7 +2784,7 @@ fn after_reference_present(
             }
             index_differs_from_head(worktree)
         }
-        other => Err(TactusError::Refused {
+        other => Err(UpstrokeError::Refused {
             message: format!("`{other}` has no after-phase reference the classifier knows"),
         }),
     }
@@ -2791,7 +2794,7 @@ fn after_reference_present(
 fn internal_residue_present(
     site: EffectSiteId,
     target: &ResidueTarget<'_>,
-) -> Result<bool, TactusError> {
+) -> Result<bool, UpstrokeError> {
     Ok(!observed_residue_elements(site, target)?.is_empty())
 }
 
@@ -2809,7 +2812,7 @@ fn internal_residue_present(
 pub fn observed_residue_elements(
     site: EffectSiteId,
     target: &ResidueTarget<'_>,
-) -> Result<Vec<ResidueElement>, TactusError> {
+) -> Result<Vec<ResidueElement>, UpstrokeError> {
     let worktree = target.worktree;
     let repository = target.repository;
     let mut present = Vec::new();
@@ -2896,7 +2899,7 @@ pub const fn element_breaks_quiescence(element: ResidueElement) -> bool {
 /// `git rebase` all write one in the ordinary course of events, so reading it
 /// as evidence of an interrupted command would close generations that are
 /// perfectly reusable. Recorded rather than silently dropped.
-fn administrative_residue_at(git_dir: &Path) -> Result<Vec<ResidueElement>, TactusError> {
+fn administrative_residue_at(git_dir: &Path) -> Result<Vec<ResidueElement>, UpstrokeError> {
     let mut present = Vec::new();
     for (name, element) in [
         ("index.lock", ResidueElement::IndexLock),
@@ -2915,20 +2918,20 @@ fn administrative_residue_at(git_dir: &Path) -> Result<Vec<ResidueElement>, Tact
     Ok(present)
 }
 
-fn git_dir_of(worktree: &Path) -> Result<Option<PathBuf>, TactusError> {
+fn git_dir_of(worktree: &Path) -> Result<Option<PathBuf>, UpstrokeError> {
     let pointer = worktree.join(".git");
     match fs::metadata(&pointer) {
         Ok(metadata) if metadata.is_dir() => return Ok(Some(pointer)),
         Ok(_) => {}
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(source) => {
-            return Err(TactusError::Io {
+            return Err(UpstrokeError::Io {
                 path: pointer,
                 source,
             });
         }
     }
-    let text = fs::read_to_string(&pointer).map_err(|source| TactusError::Io {
+    let text = fs::read_to_string(&pointer).map_err(|source| UpstrokeError::Io {
         path: pointer.clone(),
         source,
     })?;
@@ -2938,7 +2941,7 @@ fn git_dir_of(worktree: &Path) -> Result<Option<PathBuf>, TactusError> {
         .map(|target| PathBuf::from(target.trim())))
 }
 
-fn read_only_git(cwd: &Path, args: &[&str]) -> Result<Output, TactusError> {
+fn read_only_git(cwd: &Path, args: &[&str]) -> Result<Output, UpstrokeError> {
     Command::new("git")
         .arg("-C")
         .arg(cwd)
@@ -2946,15 +2949,15 @@ fn read_only_git(cwd: &Path, args: &[&str]) -> Result<Output, TactusError> {
         .args(args)
         .stdin(Stdio::null())
         .output()
-        .map_err(|error| TactusError::Git {
+        .map_err(|error| UpstrokeError::Git {
             message: format!("failed to run git: {error}"),
         })
 }
 
-fn read_only_git_ok(cwd: &Path, args: &[&str]) -> Result<Vec<u8>, TactusError> {
+fn read_only_git_ok(cwd: &Path, args: &[&str]) -> Result<Vec<u8>, UpstrokeError> {
     let output = read_only_git(cwd, args)?;
     if !output.status.success() {
-        return Err(TactusError::Git {
+        return Err(UpstrokeError::Git {
             message: format!(
                 "git {} failed in {}: {}",
                 args.join(" "),
@@ -2971,7 +2974,7 @@ fn read_only_git_ok(cwd: &Path, args: &[&str]) -> Result<Vec<u8>, TactusError> {
 /// # Errors
 ///
 /// A Git error.
-pub fn unreachable_objects(worktree: &Path) -> Result<Vec<String>, TactusError> {
+pub fn unreachable_objects(worktree: &Path) -> Result<Vec<String>, UpstrokeError> {
     let output = read_only_git(
         worktree,
         &[
@@ -3000,7 +3003,7 @@ pub fn unreachable_objects(worktree: &Path) -> Result<Vec<String>, TactusError> 
 /// # Errors
 ///
 /// A Git or I/O error.
-pub fn temporary_object_files(worktree: &Path) -> Result<bool, TactusError> {
+pub fn temporary_object_files(worktree: &Path) -> Result<bool, UpstrokeError> {
     let object_dir = object_directory(worktree)?;
     for (directory, prefix) in [
         (object_dir.clone(), "tmp_obj_"),
@@ -3010,14 +3013,14 @@ pub fn temporary_object_files(worktree: &Path) -> Result<bool, TactusError> {
             Ok(entries) => entries,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
             Err(source) => {
-                return Err(TactusError::Io {
+                return Err(UpstrokeError::Io {
                     path: directory,
                     source,
                 });
             }
         };
         for entry in entries {
-            let entry = entry.map_err(|source| TactusError::Io {
+            let entry = entry.map_err(|source| UpstrokeError::Io {
                 path: directory.clone(),
                 source,
             })?;
@@ -3034,7 +3037,7 @@ pub fn temporary_object_files(worktree: &Path) -> Result<bool, TactusError> {
 /// # Errors
 ///
 /// A Git error.
-pub fn object_directory(worktree: &Path) -> Result<PathBuf, TactusError> {
+pub fn object_directory(worktree: &Path) -> Result<PathBuf, UpstrokeError> {
     let output = read_only_git_ok(
         worktree,
         &[
@@ -3044,18 +3047,18 @@ pub fn object_directory(worktree: &Path) -> Result<PathBuf, TactusError> {
             "objects",
         ],
     )?;
-    let text = String::from_utf8(output).map_err(|error| TactusError::Git {
+    let text = String::from_utf8(output).map_err(|error| UpstrokeError::Git {
         message: format!("`git rev-parse --git-path objects` returned non-UTF-8: {error}"),
     })?;
     Ok(PathBuf::from(text.trim()))
 }
 
-fn object_exists(worktree: &Path, object: &str) -> Result<bool, TactusError> {
+fn object_exists(worktree: &Path, object: &str) -> Result<bool, UpstrokeError> {
     let output = read_only_git(worktree, &["cat-file", "-e", &format!("{object}^{{}}")])?;
     Ok(output.status.success())
 }
 
-fn head_commit(worktree: &Path) -> Result<Option<String>, TactusError> {
+fn head_commit(worktree: &Path) -> Result<Option<String>, UpstrokeError> {
     let output = read_only_git(worktree, &["rev-parse", "--verify", "--quiet", "HEAD"])?;
     if !output.status.success() {
         return Ok(None);
@@ -3065,12 +3068,12 @@ fn head_commit(worktree: &Path) -> Result<Option<String>, TactusError> {
     ))
 }
 
-fn index_lock_present(worktree: &Path) -> Result<bool, TactusError> {
+fn index_lock_present(worktree: &Path) -> Result<bool, UpstrokeError> {
     Ok(git_dir_of(worktree)?.is_some_and(|dir| dir.join("index.lock").exists()))
 }
 
 /// Whether anything in the working tree is not yet in the index.
-fn worktree_has_unstaged_changes(worktree: &Path) -> Result<bool, TactusError> {
+fn worktree_has_unstaged_changes(worktree: &Path) -> Result<bool, UpstrokeError> {
     // `--no-renames` is load-bearing, not tidiness: `status --porcelain -z`
     // detects renames by default and then emits `R  <new>\0<old>\0`, so the
     // *old path* arrives as a bare field whose second byte is a path character
@@ -3098,7 +3101,7 @@ fn worktree_has_unstaged_changes(worktree: &Path) -> Result<bool, TactusError> {
 }
 
 /// Whether the index has anything staged against HEAD.
-fn index_differs_from_head(worktree: &Path) -> Result<bool, TactusError> {
+fn index_differs_from_head(worktree: &Path) -> Result<bool, UpstrokeError> {
     let output = read_only_git(worktree, &["diff", "--cached", "--quiet"])?;
     Ok(!output.status.success())
 }
@@ -3110,7 +3113,7 @@ fn index_differs_from_head(worktree: &Path) -> Result<bool, TactusError> {
 /// exist, and asking a directory that is not there — or asking its parent, which
 /// is inside the execution root and is not a repository at all — would answer
 /// "nothing is registered" for exactly the residue this is here to see.
-fn record_for(repository: &Path, worktree: &Path) -> Result<Option<WorktreeRecord>, TactusError> {
+fn record_for(repository: &Path, worktree: &Path) -> Result<Option<WorktreeRecord>, UpstrokeError> {
     let output = read_only_git(repository, &["worktree", "list", "--porcelain", "-z"])?;
     if !output.status.success() {
         return Ok(None);
@@ -3140,7 +3143,7 @@ fn refuse_malformed_object_id(
     refname: &str,
     role: &'static str,
     value: &str,
-) -> Result<(), TactusError> {
+) -> Result<(), UpstrokeError> {
     if is_object_id(value) {
         return Ok(());
     }
@@ -3153,7 +3156,7 @@ fn refuse_malformed_object_id(
 }
 
 /// The expected-old side of every move and delete: a well-formed, non-null id.
-fn refuse_expected_old(refname: &str, old: &str) -> Result<(), TactusError> {
+fn refuse_expected_old(refname: &str, old: &str) -> Result<(), UpstrokeError> {
     refuse_malformed_object_id(refname, "expected-old", old)?;
     if is_null_object_id(old) {
         return Err(Refusal::NullExpectedOld {
@@ -3318,27 +3321,27 @@ fn decode_git_path(bytes: &[u8]) -> PathBuf {
 /// evidence with it. The residual boundary is the same one the Event lane
 /// states in writing: deleting the `sync_all` line *inside* the fused helper is
 /// still undetectable by any test on a machine that does not lose power.
-fn write_synced(path: &Path, bytes: &[u8], ledger: &DurabilityLedger) -> Result<(), TactusError> {
-    let parent = path.parent().ok_or_else(|| TactusError::Git {
+fn write_synced(path: &Path, bytes: &[u8], ledger: &DurabilityLedger) -> Result<(), UpstrokeError> {
+    let parent = path.parent().ok_or_else(|| UpstrokeError::Git {
         message: format!("{} has no parent directory", path.display()),
     })?;
-    fs::create_dir_all(parent).map_err(|source| TactusError::Io {
+    fs::create_dir_all(parent).map_err(|source| UpstrokeError::Io {
         path: parent.to_path_buf(),
         source,
     })?;
     let staged = path.with_extension("tmp");
     {
-        let mut file = fs::File::create(&staged).map_err(|source| TactusError::Io {
+        let mut file = fs::File::create(&staged).map_err(|source| UpstrokeError::Io {
             path: staged.clone(),
             source,
         })?;
-        file.write_all(bytes).map_err(|source| TactusError::Io {
+        file.write_all(bytes).map_err(|source| UpstrokeError::Io {
             path: staged.clone(),
             source,
         })?;
         sync_file_recorded(&file, &staged, ledger)?;
     }
-    fs::rename(&staged, path).map_err(|source| TactusError::Io {
+    fs::rename(&staged, path).map_err(|source| UpstrokeError::Io {
         path: path.to_path_buf(),
         source,
     })?;
@@ -3355,8 +3358,8 @@ fn sync_file_recorded(
     file: &fs::File,
     path: &Path,
     ledger: &DurabilityLedger,
-) -> Result<(), TactusError> {
-    let io = |source| TactusError::Io {
+) -> Result<(), UpstrokeError> {
+    let io = |source| UpstrokeError::Io {
         path: path.to_path_buf(),
         source,
     };
@@ -3370,8 +3373,8 @@ fn sync_file_recorded(
 ///
 /// The barrier itself is [`crate::util::fsync_dir`], shared with the run-directory
 /// and Event funnels so that the one Win32 recipe there is is written once.
-fn sync_directory(path: &Path, ledger: &DurabilityLedger) -> Result<(), TactusError> {
-    crate::util::fsync_dir(path).map_err(|source| TactusError::Io {
+fn sync_directory(path: &Path, ledger: &DurabilityLedger) -> Result<(), UpstrokeError> {
+    crate::util::fsync_dir(path).map_err(|source| UpstrokeError::Io {
         path: path.to_path_buf(),
         source,
     })?;
@@ -3379,11 +3382,11 @@ fn sync_directory(path: &Path, ledger: &DurabilityLedger) -> Result<(), TactusEr
     Ok(())
 }
 
-fn directory_is_empty(path: &Path) -> Result<bool, TactusError> {
+fn directory_is_empty(path: &Path) -> Result<bool, UpstrokeError> {
     match fs::read_dir(path) {
         Ok(mut entries) => Ok(entries.next().is_none()),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(true),
-        Err(source) => Err(TactusError::Io {
+        Err(source) => Err(UpstrokeError::Io {
             path: path.to_path_buf(),
             source,
         }),
@@ -3391,18 +3394,18 @@ fn directory_is_empty(path: &Path) -> Result<bool, TactusError> {
 }
 
 /// The repository's canonical common git dir.
-fn common_git_dir(inside: &Path) -> Result<PathBuf, TactusError> {
+fn common_git_dir(inside: &Path) -> Result<PathBuf, UpstrokeError> {
     let output = read_only_git_ok(
         inside,
         &["rev-parse", "--path-format=absolute", "--git-common-dir"],
     )?;
-    let text = String::from_utf8(output).map_err(|error| TactusError::Git {
+    let text = String::from_utf8(output).map_err(|error| UpstrokeError::Git {
         message: format!("`git rev-parse --git-common-dir` returned non-UTF-8: {error}"),
     })?;
     let path = PathBuf::from(text.trim());
     fs::canonicalize(&path)
         .map(strip_verbatim)
-        .map_err(|source| TactusError::Io { path, source })
+        .map_err(|source| UpstrokeError::Io { path, source })
 }
 
 #[cfg(test)]
@@ -3427,8 +3430,10 @@ mod tests {
     /// would each measure the other's Git repository.
     fn scratch(tag: &str) -> PathBuf {
         let ordinal = SCRATCH.fetch_add(1, Ordering::SeqCst);
-        let dir =
-            std::env::temp_dir().join(format!("tactus-wm-{tag}-{}-{ordinal}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!(
+            "upstroke-wm-{tag}-{}-{ordinal}",
+            std::process::id()
+        ));
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).expect("create the scratch directory");
         dir
@@ -3477,8 +3482,8 @@ mod tests {
             fs::create_dir_all(&private).expect("private root");
 
             git(&base, &["init", "-q", "-b", "main"]);
-            git(&base, &["config", "user.email", "tests@tactus.local"]);
-            git(&base, &["config", "user.name", "tactus tests"]);
+            git(&base, &["config", "user.email", "tests@upstroke.local"]);
+            git(&base, &["config", "user.name", "upstroke tests"]);
             // `git worktree add` writes a reflog entry; keep the repository
             // self-contained so nothing depends on a global config.
             git(&base, &["config", "core.logAllRefUpdates", "true"]);
@@ -3553,7 +3558,7 @@ mod tests {
         (HarnessEffects::new(Arc::clone(&shared)), shared)
     }
 
-    fn refusal_of(error: &TactusError) -> String {
+    fn refusal_of(error: &UpstrokeError) -> String {
         error.to_string()
     }
 
@@ -3582,26 +3587,26 @@ mod tests {
     /// from the packet's formula, so the function is never its own oracle.
     ///
     /// `decisions.workspace_candidates.execution_root`: "repo_key v1 =
-    /// hex16(sha256('tactus-repo-key-v1' NUL canonical common git dir bytes))".
+    /// hex16(sha256('upstroke-repo-key-v1' NUL canonical common git dir bytes))".
     ///
     /// Independently computed with:
     /// `python3 -c "import hashlib;
-    ///  print(hashlib.sha256(b'tactus-repo-key-v1\x00' + P).hexdigest()[:16])"`
+    ///  print(hashlib.sha256(b'upstroke-repo-key-v1\x00' + P).hexdigest()[:16])"`
     #[test]
     fn the_repo_key_is_the_packets_digest_and_not_a_neighbouring_one() {
         assert_eq!(
-            repo_key_v1(Path::new("/srv/tactus/.git")),
-            "75953321a59371e0",
+            repo_key_v1(Path::new("/srv/upstroke/.git")),
+            "fb0df4eb6c4a32c7",
             "the digest of the packet's own formula"
         );
         assert_eq!(
-            repo_key_v1(Path::new("/srv/tactus/.git/")),
-            "b79724b7e665f59c",
+            repo_key_v1(Path::new("/srv/upstroke/.git/")),
+            "8d01d05e9d96ec4b",
             "a trailing separator is different bytes and must be a different key"
         );
         assert_eq!(
-            repo_key_v1(Path::new(r"C:\repos\tactus\.git")),
-            "7d8548c4abb7eb31",
+            repo_key_v1(Path::new(r"C:\repos\upstroke\.git")),
+            "a6a151c73796e709",
             "a Windows-shaped path hashes its own bytes on either platform"
         );
 
@@ -3609,23 +3614,23 @@ mod tests {
         // domain prefix dropped, and the NUL separator dropped. Neither may be
         // what the function computes.
         assert_ne!(
-            repo_key_v1(Path::new("/srv/tactus/.git")),
+            repo_key_v1(Path::new("/srv/upstroke/.git")),
             "85185d58540dc79c",
             "the NUL separator is part of the formula"
         );
         assert_ne!(
-            repo_key_v1(Path::new("/srv/tactus/.git")),
+            repo_key_v1(Path::new("/srv/upstroke/.git")),
             "c2ed95c96b45a16d",
-            "the domain prefix is `tactus-repo-key-v1`"
+            "the domain prefix is `upstroke-repo-key-v1`"
         );
 
         // hex16 is sixteen hexadecimal characters, and it is a prefix of the
         // full digest rather than a fold of it.
-        let key = repo_key_v1(Path::new("/srv/tactus/.git"));
+        let key = repo_key_v1(Path::new("/srv/upstroke/.git"));
         assert_eq!(key.len(), 16);
         assert!(key.bytes().all(|byte| byte.is_ascii_hexdigit()));
         assert!(
-            "75953321a59371e05b6a8adf8ad24da6752f85b84a984a0ac8b89163527c849d".starts_with(&key)
+            "fb0df4eb6c4a32c75b6a8adf8ad24da6752f85b84a984a0ac8b89163527c849d".starts_with(&key)
         );
     }
 
@@ -3636,7 +3641,7 @@ mod tests {
         let path = PathBuf::from(OsString::from_vec(b"/tmp/\xff\xfe/.git".to_vec()));
         assert_eq!(
             repo_key_v1(&path),
-            "1a9063bc0e2cb2e1",
+            "d43422329d1de7f3",
             "a repository path is bytes on Unix, and the key is over those bytes"
         );
     }
@@ -4691,7 +4696,7 @@ mod tests {
         let manager = &fixture.manager;
         let head = fixture.head.clone();
 
-        type Call<'a> = Box<dyn Fn(&Slot) -> Result<(), TactusError> + 'a>;
+        type Call<'a> = Box<dyn Fn(&Slot) -> Result<(), UpstrokeError> + 'a>;
         let primitives: Vec<(&str, Call<'_>)> = vec![
             (
                 "write_intent",
@@ -4923,7 +4928,7 @@ mod tests {
         let fixture = Fixture::created("symbolic-ref");
         git(
             &fixture.base,
-            &["symbolic-ref", "refs/tactus/sym", "refs/heads/main"],
+            &["symbolic-ref", "refs/upstroke/sym", "refs/heads/main"],
         );
         let before = git(&fixture.base, &["rev-parse", "refs/heads/main"]);
 
@@ -4931,13 +4936,13 @@ mod tests {
             fixture.manager.create_ref_zero_old(
                 &mut NoHooks,
                 RefSite::CreateCandidates,
-                "refs/tactus/sym",
+                "refs/upstroke/sym",
                 &fixture.head,
             ),
             fixture.manager.delete_ref_expected_old(
                 &mut NoHooks,
                 RefSite::DeleteCandidatesRef,
-                "refs/tactus/sym",
+                "refs/upstroke/sym",
                 &fixture.head,
             ),
             // The CAS arm, which `ref_rules` names beside the other two and
@@ -4948,7 +4953,7 @@ mod tests {
             fixture.manager.compare_and_swap_ref(
                 &mut NoHooks,
                 RefSite::CompareAndSwapIntegration,
-                "refs/tactus/sym",
+                "refs/upstroke/sym",
                 &fixture.head,
                 &fixture.seed,
             ),
@@ -4965,7 +4970,7 @@ mod tests {
             "and the victim is untouched"
         );
         assert_eq!(
-            git(&fixture.base, &["symbolic-ref", "refs/tactus/sym"]),
+            git(&fixture.base, &["symbolic-ref", "refs/upstroke/sym"]),
             "refs/heads/main",
             "and the symbolic ref itself is untouched"
         );
@@ -4986,7 +4991,7 @@ mod tests {
         );
         fixture
             .manager
-            .assert_publishable("refs/heads/tactus/run-1")
+            .assert_publishable("refs/heads/upstroke/run-1")
             .expect("a ref no worktree has checked out is publishable");
     }
 
@@ -5005,7 +5010,7 @@ mod tests {
     #[test]
     fn a_compare_and_swap_refuses_a_ref_substituted_since_the_caller_recorded_it() {
         let fixture = Fixture::created("cas-substituted");
-        let name = "refs/tactus/runs/run-1/integration";
+        let name = "refs/upstroke/runs/run-1/integration";
         fixture
             .manager
             .create_ref_zero_old(
@@ -5075,8 +5080,8 @@ mod tests {
     #[test]
     fn a_symbolic_ref_that_resolves_to_the_expected_object_is_still_refused() {
         let fixture = Fixture::created("symbolic-reader");
-        let direct = "refs/tactus/runs/run-1/candidates/kalpha/1";
-        let symbolic = "refs/tactus/runs/run-1/integration";
+        let direct = "refs/upstroke/runs/run-1/candidates/kalpha/1";
+        let symbolic = "refs/upstroke/runs/run-1/integration";
         fixture
             .manager
             .create_ref_zero_old(
@@ -5114,7 +5119,7 @@ mod tests {
     #[test]
     fn refs_are_created_zero_old_and_moved_or_deleted_only_expected_old() {
         let fixture = Fixture::created("ref-rules");
-        let name = "refs/tactus/runs/run-1/candidates/kalpha/1";
+        let name = "refs/upstroke/runs/run-1/candidates/kalpha/1";
         fixture
             .manager
             .create_ref_zero_old(&mut NoHooks, RefSite::CreateCandidates, name, &fixture.head)
@@ -5172,7 +5177,7 @@ mod tests {
     #[test]
     fn the_null_object_id_is_never_an_expected_old_value() {
         let fixture = Fixture::created("null-old");
-        let name = "refs/tactus/runs/run-1/candidate-prepared/kalpha/1";
+        let name = "refs/upstroke/runs/run-1/candidate-prepared/kalpha/1";
         fixture
             .manager
             .create_ref_zero_old(
@@ -5230,7 +5235,7 @@ mod tests {
                     .create_ref_zero_old(
                         &mut NoHooks,
                         RefSite::CreateIntegration,
-                        "refs/heads/tactus/run-1",
+                        "refs/heads/upstroke/run-1",
                         hostile,
                     )
                     .expect_err("a malformed object id refuses"),
@@ -5243,7 +5248,7 @@ mod tests {
         assert_eq!(
             fixture
                 .manager
-                .direct_ref_target("refs/heads/tactus/run-1")
+                .direct_ref_target("refs/heads/upstroke/run-1")
                 .expect("read"),
             None
         );
@@ -5252,8 +5257,8 @@ mod tests {
     #[test]
     fn an_unexpected_ref_under_the_run_namespace_refuses() {
         let fixture = Fixture::created("unexpected-refs");
-        let namespace = "refs/tactus/runs/run-1/";
-        let mine = "refs/tactus/runs/run-1/candidates/kalpha/1".to_owned();
+        let namespace = "refs/upstroke/runs/run-1/";
+        let mine = "refs/upstroke/runs/run-1/candidates/kalpha/1".to_owned();
         fixture
             .manager
             .create_ref_zero_old(
@@ -5272,7 +5277,7 @@ mod tests {
             &fixture.base,
             &[
                 "update-ref",
-                "refs/tactus/runs/run-1/stowaway",
+                "refs/upstroke/runs/run-1/stowaway",
                 &fixture.seed,
             ],
         );
@@ -5302,8 +5307,8 @@ mod tests {
     #[test]
     fn a_packed_or_nested_unexpected_ref_refuses_too() {
         let fixture = Fixture::created("packed-refs");
-        let namespace = "refs/tactus/runs/run-1/";
-        let mine = "refs/tactus/runs/run-1/candidates/kalpha/1".to_owned();
+        let namespace = "refs/upstroke/runs/run-1/";
+        let mine = "refs/upstroke/runs/run-1/candidates/kalpha/1".to_owned();
         fixture
             .manager
             .create_ref_zero_old(
@@ -5314,7 +5319,7 @@ mod tests {
             )
             .expect("create");
 
-        let nested = "refs/tactus/runs/run-1/candidates/kalpha/deeper/still/1";
+        let nested = "refs/upstroke/runs/run-1/candidates/kalpha/deeper/still/1";
         git(&fixture.base, &["update-ref", nested, &fixture.seed]);
         git(&fixture.base, &["pack-refs", "--all"]);
         assert!(
@@ -5374,8 +5379,8 @@ mod tests {
     #[test]
     fn an_integration_ref_checked_out_in_a_second_worktree_is_refused() {
         let fixture = Fixture::created("checked-out-elsewhere");
-        let refname = "refs/heads/tactus/run-1";
-        git(&fixture.base, &["branch", "tactus/run-1", &fixture.head]);
+        let refname = "refs/heads/upstroke/run-1";
+        git(&fixture.base, &["branch", "upstroke/run-1", &fixture.head]);
         fixture
             .manager
             .assert_publishable(refname)
@@ -5389,7 +5394,7 @@ mod tests {
                 "add",
                 "-q",
                 &elsewhere.to_string_lossy(),
-                "tactus/run-1",
+                "upstroke/run-1",
             ],
         );
         assert_eq!(
@@ -6547,7 +6552,7 @@ mod tests {
                             hooks,
                             &("0".repeat(39) + "1"),
                             &fixture.head,
-                            "tactus: candidate",
+                            "upstroke: candidate",
                         )
                         .is_err()
                 }),
@@ -6715,8 +6720,8 @@ mod tests {
         let foreign = fixture.root.join("foreign");
         fs::create_dir_all(&foreign).expect("foreign repo");
         git(&foreign, &["init", "-q", "-b", "main"]);
-        git(&foreign, &["config", "user.email", "tests@tactus.local"]);
-        git(&foreign, &["config", "user.name", "tactus tests"]);
+        git(&foreign, &["config", "user.email", "tests@upstroke.local"]);
+        git(&foreign, &["config", "user.name", "upstroke tests"]);
         git(
             &foreign,
             &["fetch", "-q", &fixture.base.to_string_lossy(), "main"],
@@ -6865,7 +6870,7 @@ mod tests {
                 "candidate",
                 fixture
                     .manager
-                    .candidate_commit_tree(&mut NoHooks, &tree, &recorded, "tactus: candidate")
+                    .candidate_commit_tree(&mut NoHooks, &tree, &recorded, "upstroke: candidate")
                     .expect("the candidate commit"),
             ),
         ] {
@@ -7144,7 +7149,7 @@ mod tests {
             .create_ref_zero_old(
                 &mut NoHooks,
                 RefSite::PinCandidatePrepared,
-                "refs/tactus/runs/run-1/candidate-prepared/kalpha/1",
+                "refs/upstroke/runs/run-1/candidate-prepared/kalpha/1",
                 &candidate,
             )
             .expect("pin");
@@ -7240,7 +7245,7 @@ mod tests {
             .delete_ref_expected_old(
                 &mut NoHooks,
                 RefSite::DeleteCandidatePin,
-                "refs/tactus/runs/run-1/candidate-prepared/kalpha/1",
+                "refs/upstroke/runs/run-1/candidate-prepared/kalpha/1",
                 &candidate,
             )
             .expect("prune the pin expected-old");
@@ -7417,7 +7422,7 @@ mod tests {
     }
 
     /// Where the helper tells its parent which repository to inspect.
-    const ID_UNREAD_RECORD: &str = "TACTUS_PR5A_ID_UNREAD_RECORD";
+    const ID_UNREAD_RECORD: &str = "UPSTROKE_PR5A_ID_UNREAD_RECORD";
 
     /// Spawned by `a_kill_at_id_unread_aborts_before_the_id_is_recorded`.
     #[test]
@@ -8363,7 +8368,7 @@ mod tests {
                     "site": site.name(),
                     "n": record.n,
                     // The timescale the kill ladder was cut from. A red run's
-                    // artifact carries it, and `TACTUS_RESIDUE_BUDGET_US` feeds it
+                    // artifact carries it, and `UPSTROKE_RESIDUE_BUDGET_US` feeds it
                     // back -- which is what makes this sampler reproducible, since
                     // it has no seed and this duration is the only variance a
                     // replay can pin. Wake times, Git's own progress, cache state
@@ -8423,7 +8428,7 @@ mod tests {
     struct SamplingRun {
         record: SamplingRecord,
         /// The timescale the kill ladder was cut from, and whether it was measured
-        /// on this machine or replayed from `TACTUS_RESIDUE_BUDGET_US`. This is the
+        /// on this machine or replayed from `UPSTROKE_RESIDUE_BUDGET_US`. This is the
         /// only variance a replay can pin -- see [`measure_budget`] -- so it is the
         /// most a recorded run can offer. It is not *all* the variance: actual wake
         /// times, Git's progress, cache state and scheduling still differ, so a
@@ -8706,7 +8711,7 @@ mod tests {
         EffectSiteId::Worktree(WorktreeSite::Add),
     ];
 
-    /// Why a `TACTUS_RESIDUE_BUDGET_US` spec was refused.
+    /// Why a `UPSTROKE_RESIDUE_BUDGET_US` spec was refused.
     #[derive(Debug, PartialEq, Eq)]
     enum BudgetSpecError {
         /// An entry with no `=`.
@@ -8807,14 +8812,14 @@ mod tests {
             Ok(raw) => raw,
             Err(std::env::VarError::NotPresent) => return None,
             Err(std::env::VarError::NotUnicode(raw)) => panic!(
-                "TACTUS_RESIDUE_BUDGET_US is set but is not valid UTF-8 ({raw:?}), so it \
+                "UPSTROKE_RESIDUE_BUDGET_US is set but is not valid UTF-8 ({raw:?}), so it \
                  cannot be parsed. It will not be treated as unset."
             ),
         };
         match parse_budget_spec(&raw, site) {
             Ok(found) => found,
             Err(error) => panic!(
-                "TACTUS_RESIDUE_BUDGET_US is not a spec this run can honour: {error:?}. \
+                "UPSTROKE_RESIDUE_BUDGET_US is not a spec this run can honour: {error:?}. \
                  Fix the spec or unset it; it will not be silently ignored."
             ),
         }
@@ -8823,7 +8828,7 @@ mod tests {
     /// The environment read itself, kept to one line so nothing but the read is
     /// untestable.
     fn replayed_budget(site: EffectSiteId) -> Option<std::time::Duration> {
-        budget_from_var(std::env::var("TACTUS_RESIDUE_BUDGET_US"), site)
+        budget_from_var(std::env::var("UPSTROKE_RESIDUE_BUDGET_US"), site)
     }
 
     /// Enough work in the worktree that the sampled command has a middle to be
@@ -9084,10 +9089,10 @@ mod tests {
         let fixture = Fixture::created("grand-tour");
         let (mut hooks, shared) = harness();
         let manager = &fixture.manager;
-        let integration = "refs/heads/tactus/run-1";
-        let candidates = "refs/tactus/runs/run-1/candidates/kalpha/1";
-        let pin = "refs/tactus/runs/run-1/candidate-prepared/kalpha/1";
-        let prepared = "refs/tactus/runs/run-1/prepared/1";
+        let integration = "refs/heads/upstroke/run-1";
+        let candidates = "refs/upstroke/runs/run-1/candidates/kalpha/1";
+        let pin = "refs/upstroke/runs/run-1/candidate-prepared/kalpha/1";
+        let prepared = "refs/upstroke/runs/run-1/prepared/1";
 
         // The execution root already exists (Fixture::created), so run the site
         // again: it is idempotent and this is the tour's first observation.

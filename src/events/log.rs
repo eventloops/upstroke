@@ -50,7 +50,7 @@ use std::sync::{Arc, Mutex};
 use sha2::{Digest, Sha256};
 
 use super::{Event, EventBody};
-use crate::error::TactusError;
+use crate::error::UpstrokeError;
 use crate::topology::effects::{
     EffectSiteId, EventSite, HookHarness, HookPhase, Injection, InjectionMode, SubEffectPoint,
 };
@@ -234,7 +234,7 @@ fn apply(
     site: EventSite,
     point: SubEffectPoint,
     path: &Path,
-) -> Result<(), TactusError> {
+) -> Result<(), UpstrokeError> {
     match injection {
         Injection::Proceed => Ok(()),
         Injection::Kill => std::process::abort(),
@@ -244,13 +244,13 @@ fn apply(
 
 /// The `Err` an error-return injection produces.
 ///
-/// Deliberately *not* [`TactusError::Io`]: a real write/flush/sync failure keeps
+/// Deliberately *not* [`UpstrokeError::Io`]: a real write/flush/sync failure keeps
 /// the exact error value the pre-move writer returned, which is the whole of
 /// "the legacy engine's handling of a returned append error is unchanged", so a
 /// simulated one must be distinguishable from it. Same reasoning as
 /// [`crate::agent::proc::AMBIENT_REFUSAL_SIMULATED`].
-fn injected(site: EventSite, point: SubEffectPoint, path: &Path) -> TactusError {
-    TactusError::EventLog {
+fn injected(site: EventSite, point: SubEffectPoint, path: &Path) -> UpstrokeError {
+    UpstrokeError::EventLog {
         path: path.to_path_buf(),
         message: format!(
             "{INJECTED_PREFIX}`{}` was made to return an error at its `{}` point",
@@ -268,7 +268,7 @@ pub const INJECTED_PREFIX: &str = "simulated fault: ";
 // The writer
 // ---------------------------------------------------------------------------
 
-/// The append-only writer. One per run, held by the engine — `tactus answer`
+/// The append-only writer. One per run, held by the engine — `upstroke answer`
 /// deliberately does not write here (it drops a file the engine ingests), so
 /// the log has exactly one writer and interleaved lines are impossible.
 ///
@@ -290,8 +290,8 @@ pub const INJECTED_PREFIX: &str = "simulated fault: ";
 ///
 /// ```compile_fail,E0616
 /// use std::path::Path;
-/// use tactus::events::EventLog;
-/// use tactus::topology::effects::EventSite;
+/// use upstroke::events::EventLog;
+/// use upstroke::topology::effects::EventSite;
 ///
 /// let mut warnings = Vec::new();
 /// let log = EventLog::open(EventSite::OpenLog, Path::new("events.jsonl"), &mut warnings)
@@ -303,9 +303,9 @@ pub const INJECTED_PREFIX: &str = "simulated fault: ";
 ///
 /// ```compile_fail,E0308
 /// use std::path::Path;
-/// use tactus::events::EventLog;
-/// use tactus::topology::effects::EventSite;
-/// use tactus::topology::events::{DeferWaitElapsed4, TopologyEvent, TopologyEventBody};
+/// use upstroke::events::EventLog;
+/// use upstroke::topology::effects::EventSite;
+/// use upstroke::topology::events::{DeferWaitElapsed4, TopologyEvent, TopologyEventBody};
 ///
 /// let event = TopologyEvent {
 ///     ts: "2026-08-20T09:41:02Z".to_owned(),
@@ -362,7 +362,7 @@ impl EventLog {
         site: EventSite,
         path: &Path,
         warnings: &mut Vec<String>,
-    ) -> Result<Self, TactusError> {
+    ) -> Result<Self, UpstrokeError> {
         Self::open_hooked(site, path, warnings, &mut NoEventHooks)
     }
 
@@ -376,7 +376,7 @@ impl EventLog {
         path: &Path,
         warnings: &mut Vec<String>,
         hooks: &mut dyn EventHooks,
-    ) -> Result<Self, TactusError> {
+    ) -> Result<Self, UpstrokeError> {
         Self::open_with_prefix(site, path, warnings, hooks).map(|(log, _)| log)
     }
 
@@ -390,7 +390,7 @@ impl EventLog {
         path: &Path,
         warnings: &mut Vec<String>,
         hooks: &mut dyn EventHooks,
-    ) -> Result<(Self, Vec<u8>), TactusError> {
+    ) -> Result<(Self, Vec<u8>), UpstrokeError> {
         match site {
             EventSite::OpenLog => {
                 hooks.phase(site, HookPhase::Before);
@@ -431,8 +431,8 @@ impl EventLog {
         site: EventSite,
         path: &Path,
         warnings: &mut Vec<String>,
-    ) -> Result<(Self, Vec<u8>), TactusError> {
-        let io = |source| TactusError::Io {
+    ) -> Result<(Self, Vec<u8>), UpstrokeError> {
+        let io = |source| UpstrokeError::Io {
             path: path.to_path_buf(),
             source,
         };
@@ -490,11 +490,11 @@ impl EventLog {
         path: &Path,
         warnings: &mut Vec<String>,
         hooks: &mut dyn EventHooks,
-    ) -> Result<(Self, Vec<u8>), (BarrierStep, TactusError)> {
+    ) -> Result<(Self, Vec<u8>), (BarrierStep, UpstrokeError)> {
         let io = |source| {
             (
                 BarrierStep::OpenLog,
-                TactusError::Io {
+                UpstrokeError::Io {
                     path: path.to_path_buf(),
                     source,
                 },
@@ -628,7 +628,7 @@ impl EventLog {
     /// (before the append is entered, so the handle stays usable); and any
     /// write, flush, or sync failure (after it is entered, so the handle is
     /// poisoned).
-    pub fn append(&mut self, site: EventSite, body: EventBody) -> Result<Event, TactusError> {
+    pub fn append(&mut self, site: EventSite, body: EventBody) -> Result<Event, UpstrokeError> {
         self.append_hooked(site, body, &mut NoEventHooks)
     }
 
@@ -642,7 +642,7 @@ impl EventLog {
         site: EventSite,
         body: EventBody,
         hooks: &mut dyn EventHooks,
-    ) -> Result<Event, TactusError> {
+    ) -> Result<Event, UpstrokeError> {
         if site != EventSite::LegacyAppend {
             return Err(wrong_site(
                 site,
@@ -659,11 +659,11 @@ impl EventLog {
         // that never happened, and `emit`'s contract is "a FoldError aborts
         // before any write".
         let event = Event::now(body);
-        let mut line = serde_json::to_string(&event).map_err(|e| TactusError::EventLog {
+        let mut line = serde_json::to_string(&event).map_err(|e| UpstrokeError::EventLog {
             path: self.path.clone(),
             message: format!("serializing {}: {e}", event.body.kind()),
         })?;
-        let written = serde_json::from_str(&line).map_err(|e| TactusError::EventLog {
+        let written = serde_json::from_str(&line).map_err(|e| UpstrokeError::EventLog {
             path: self.path.clone(),
             message: format!(
                 "{} does not survive its own wire format ({e}); the log could not be replayed",
@@ -692,7 +692,7 @@ impl EventLog {
         &mut self,
         site: EventSite,
         line: &TopologyLine,
-    ) -> Result<(), TactusError> {
+    ) -> Result<(), UpstrokeError> {
         self.append_topology_hooked(site, line, &mut NoEventHooks)
     }
 
@@ -706,7 +706,7 @@ impl EventLog {
         site: EventSite,
         line: &TopologyLine,
         hooks: &mut dyn EventHooks,
-    ) -> Result<(), TactusError> {
+    ) -> Result<(), UpstrokeError> {
         if !TOPOLOGY_APPEND_SITES.contains(&site) {
             return Err(wrong_site(
                 site,
@@ -717,7 +717,7 @@ impl EventLog {
         }
         self.check_scope(site)?;
         if line.site() != site {
-            return Err(TactusError::EventLog {
+            return Err(UpstrokeError::EventLog {
                 path: self.path.clone(),
                 message: format!(
                     "`{}` belongs at `Event.{}`, not `Event.{}`; filing it under the wrong site \
@@ -746,7 +746,7 @@ impl EventLog {
         site: EventSite,
         bytes: &[u8],
         hooks: &mut dyn EventHooks,
-    ) -> Result<(), TactusError> {
+    ) -> Result<(), UpstrokeError> {
         // (e-w): "write_all failed after a partial write". The funnel performs
         // the partial write itself, because an injection mode is defined as
         // returning Err "after performing or partially performing the
@@ -829,7 +829,7 @@ impl EventLog {
         site: EventSite,
         point: SubEffectPoint,
         mode: InjectionMode,
-    ) -> Result<(), TactusError> {
+    ) -> Result<(), UpstrokeError> {
         let answer = hooks.point(site, point, mode);
         if answer == Injection::Proceed {
             return Ok(());
@@ -838,12 +838,12 @@ impl EventLog {
         apply(answer, site, point, &self.path)
     }
 
-    /// A real write, flush, or sync failure keeps [`TactusError::Io`] — the
+    /// A real write, flush, or sync failure keeps [`UpstrokeError::Io`] — the
     /// exact value the pre-move writer returned — so a legacy caller's handling
     /// of it is unchanged. The point it reached is recorded on the handle, and
     /// the *next* append through the handle is the error that names it.
-    fn io(&self, source: std::io::Error) -> TactusError {
-        TactusError::Io {
+    fn io(&self, source: std::io::Error) -> UpstrokeError {
+        UpstrokeError::Io {
             path: self.path.clone(),
             source,
         }
@@ -855,7 +855,7 @@ impl EventLog {
         bytes: &[u8],
         point: SubEffectPoint,
         ledger: &DurabilityLedger,
-    ) -> Result<(), TactusError> {
+    ) -> Result<(), UpstrokeError> {
         let written = self.file.write_all(bytes);
         // Recorded whatever it returned, so "exactly one primitive attempt and
         // one error" is a countable claim rather than a description
@@ -868,13 +868,13 @@ impl EventLog {
         Ok(())
     }
 
-    fn check_scope(&self, site: EventSite) -> Result<(), TactusError> {
+    fn check_scope(&self, site: EventSite) -> Result<(), UpstrokeError> {
         let legacy_handle = self.opened_at == EventSite::LegacyOpenLog;
         let legacy_append = site == EventSite::LegacyAppend;
         if legacy_handle == legacy_append {
             return Ok(());
         }
-        Err(TactusError::EventLog {
+        Err(UpstrokeError::EventLog {
             path: self.path.clone(),
             message: format!(
                 "a handle opened at `Event.{}` does not accept `Event.{}`: mixing the scopes would \
@@ -886,13 +886,13 @@ impl EventLog {
         })
     }
 
-    fn check_poison(&self) -> Result<(), TactusError> {
+    fn check_poison(&self) -> Result<(), UpstrokeError> {
         match self.poisoned {
             None => Ok(()),
             // The **stored** coordinate, never the one now being attempted:
             // the message identifies where the outcome became unknown, and the
             // later attempt is not that place.
-            Some((site, point)) => Err(TactusError::EventLog {
+            Some((site, point)) => Err(UpstrokeError::EventLog {
                 path: self.path.clone(),
                 message: format!(
                     "{POISONED_PREFIX}an append returned an error at `Event.{}`'s `{}` point, so \
@@ -966,8 +966,13 @@ pub fn site_for(body: &TopologyEventBody) -> EventSite {
     }
 }
 
-fn wrong_site(site: EventSite, path: &Path, expected: &str, allowed: &[EventSite]) -> TactusError {
-    TactusError::EventLog {
+fn wrong_site(
+    site: EventSite,
+    path: &Path,
+    expected: &str,
+    allowed: &[EventSite],
+) -> UpstrokeError {
+    UpstrokeError::EventLog {
         path: path.to_path_buf(),
         message: format!(
             "`Event.{}` is not {expected} ({})",
@@ -1024,8 +1029,8 @@ fn sync_log_file(
     path: &Path,
     hooks: &mut dyn EventHooks,
     site: EventSite,
-) -> Result<(), TactusError> {
-    let io = |source| TactusError::Io {
+) -> Result<(), UpstrokeError> {
+    let io = |source| UpstrokeError::Io {
         path: path.to_path_buf(),
         source,
     };
@@ -1062,14 +1067,14 @@ fn sync_directory(
     hooks: &mut dyn EventHooks,
     site: EventSite,
     point: SubEffectPoint,
-) -> Result<(), TactusError> {
+) -> Result<(), UpstrokeError> {
     let Some(parent) = path
         .parent()
         .filter(|parent| !parent.as_os_str().is_empty())
     else {
         return Ok(());
     };
-    crate::util::fsync_dir(parent).map_err(|source| TactusError::Io {
+    crate::util::fsync_dir(parent).map_err(|source| UpstrokeError::Io {
         path: parent.to_path_buf(),
         source,
     })?;
@@ -1104,8 +1109,8 @@ fn sync_directory(
 /// fixture pins which error says so:
 ///
 /// ```compile_fail,E0451
-/// use tactus::events::log::TopologyLine;
-/// use tactus::topology::effects::EventSite;
+/// use upstroke::events::log::TopologyLine;
+/// use upstroke::topology::effects::EventSite;
 ///
 /// let line = TopologyLine {
 ///     committed: "{\"ts\":\"now\"}\n".to_owned(),
@@ -1127,16 +1132,16 @@ impl TopologyLine {
     ///
     /// # Errors
     ///
-    /// [`TactusError::EventLog`] if the value cannot be serialized or does not
+    /// [`UpstrokeError::EventLog`] if the value cannot be serialized or does not
     /// round-trip.
-    pub fn round_trip(event: &TopologyEvent) -> Result<(Self, TopologyEvent), TactusError> {
+    pub fn round_trip(event: &TopologyEvent) -> Result<(Self, TopologyEvent), UpstrokeError> {
         let kind = event.body.kind();
-        let line = serde_json::to_string(event).map_err(|e| TactusError::EventLog {
+        let line = serde_json::to_string(event).map_err(|e| UpstrokeError::EventLog {
             path: PathBuf::new(),
             message: format!("serializing {kind}: {e}"),
         })?;
         let written: TopologyEvent =
-            serde_json::from_str(&line).map_err(|e| TactusError::EventLog {
+            serde_json::from_str(&line).map_err(|e| UpstrokeError::EventLog {
                 path: PathBuf::new(),
                 message: format!(
                     "{kind} does not survive its own wire format ({e}); the log could not be \
@@ -1253,7 +1258,7 @@ impl fmt::Display for BarrierError {
 
 impl std::error::Error for BarrierError {}
 
-impl From<BarrierError> for TactusError {
+impl From<BarrierError> for UpstrokeError {
     fn from(error: BarrierError) -> Self {
         Self::EventLog {
             path: error.path.clone(),
@@ -1459,8 +1464,8 @@ pub fn establish_stable_prefix(
 ///
 /// # Errors
 ///
-/// [`TactusError::EventLog`] for a rewritten log; [`TactusError::Io`] otherwise.
-pub fn read_all(path: &Path, warnings: &mut Vec<String>) -> Result<Vec<Event>, TactusError> {
+/// [`UpstrokeError::EventLog`] for a rewritten log; [`UpstrokeError::Io`] otherwise.
+pub fn read_all(path: &Path, warnings: &mut Vec<String>) -> Result<Vec<Event>, UpstrokeError> {
     let bytes = read_bytes(path)?;
     let parsed = parse_bytes(path, &bytes)?;
     warnings.extend(parsed.torn_tail_warning);
@@ -1477,18 +1482,18 @@ pub fn read_all(path: &Path, warnings: &mut Vec<String>) -> Result<Vec<Event>, T
 /// source that never reaches end of file, and a log path is a path in a run
 /// directory rather than a value this crate chose. The bound is the file's own
 /// length, so a real log of any size is still read in full.
-pub(crate) fn read_bytes(path: &Path) -> Result<Vec<u8>, TactusError> {
+pub(crate) fn read_bytes(path: &Path) -> Result<Vec<u8>, UpstrokeError> {
     match crate::util::read_file_bounded(path) {
         Ok(bytes) => Ok(bytes),
         Err(source) if source.kind() == std::io::ErrorKind::NotFound => {
-            Err(TactusError::EventLog {
+            Err(UpstrokeError::EventLog {
                 path: path.to_path_buf(),
                 message: "no event log here — this run never started, or its directory was \
                           removed"
                     .to_owned(),
             })
         }
-        Err(source) => Err(TactusError::Io {
+        Err(source) => Err(UpstrokeError::Io {
             path: path.to_path_buf(),
             source,
         }),
@@ -1503,7 +1508,7 @@ pub(crate) struct ParsedLines {
     pub torn_tail_warning: Option<String>,
 }
 
-pub(crate) fn parse_bytes(path: &Path, bytes: &[u8]) -> Result<ParsedLines, TactusError> {
+pub(crate) fn parse_bytes(path: &Path, bytes: &[u8]) -> Result<ParsedLines, UpstrokeError> {
     // EventLog::append writes the newline after the JSON bytes. EventLog::open
     // likewise discards everything after the last newline before resuming, so
     // whole-log readers must use the same boundary: even syntactically complete
@@ -1527,7 +1532,7 @@ pub(crate) fn parse_bytes(path: &Path, bytes: &[u8]) -> Result<ParsedLines, Tact
             .filter(|byte| **byte == b'\n')
             .count()
             + 1;
-        TactusError::EventLog {
+        UpstrokeError::EventLog {
             path: path.to_path_buf(),
             message: format!(
                 "line {line} contains invalid UTF-8 in a committed event ({error}). This is not a \
@@ -1542,14 +1547,15 @@ pub(crate) fn parse_bytes(path: &Path, bytes: &[u8]) -> Result<ParsedLines, Tact
         if line.trim().is_empty() {
             continue;
         }
-        let event = serde_json::from_str::<Event>(line).map_err(|error| TactusError::EventLog {
-            path: path.to_path_buf(),
-            message: format!(
-                "line {} is not a valid event ({error}). This is not a torn tail — the log has \
+        let event =
+            serde_json::from_str::<Event>(line).map_err(|error| UpstrokeError::EventLog {
+                path: path.to_path_buf(),
+                message: format!(
+                    "line {} is not a valid event ({error}). This is not a torn tail — the log has \
                  been rewritten, and state derived from what is left would be confidently wrong.",
-                position + 1
-            ),
-        })?;
+                    position + 1
+                ),
+            })?;
         events.push(event);
     }
     Ok(ParsedLines {
@@ -1585,10 +1591,10 @@ impl LogTail {
     ///
     /// # Errors
     ///
-    /// [`TactusError::Io`] if the log cannot be read; [`TactusError::EventLog`]
+    /// [`UpstrokeError::Io`] if the log cannot be read; [`UpstrokeError::EventLog`]
     /// for a rewritten log.
-    pub fn poll(&mut self, warnings: &mut Vec<String>) -> Result<Vec<Event>, TactusError> {
-        let io = |source| TactusError::Io {
+    pub fn poll(&mut self, warnings: &mut Vec<String>) -> Result<Vec<Event>, UpstrokeError> {
+        let io = |source| UpstrokeError::Io {
             path: self.path.clone(),
             source,
         };

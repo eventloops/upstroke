@@ -26,7 +26,7 @@
 //! `&`, `|`, `%`, embedded quotes, `^`, spaces, and the empty argument.
 //!
 //! Copilot is what made that matter. Its permission surface is argv, so gate
-//! commands — strings a user writes in `tactus.toml` — now reach a Windows
+//! commands — strings a user writes in `upstroke.toml` — now reach a Windows
 //! command line, and a mangled `--allow-tool=shell(<gate>)` is a permission
 //! grant that no longer matches the command it is meant to authorize. The
 //! module comment used to argue that two copies of the quoting logic would be
@@ -38,7 +38,7 @@
 
 use std::path::PathBuf;
 
-use crate::error::TactusError;
+use crate::error::UpstrokeError;
 use crate::runner::CommandSpec;
 use crate::util;
 
@@ -127,10 +127,10 @@ impl Invocation {
     ///
     /// # Errors
     ///
-    /// [`TactusError::Refused`] when the resolved path is not valid Unicode.
-    pub fn spec(&self, args: &[String]) -> Result<CommandSpec, TactusError> {
+    /// [`UpstrokeError::Refused`] when the resolved path is not valid Unicode.
+    pub fn spec(&self, args: &[String]) -> Result<CommandSpec, UpstrokeError> {
         let Some(program) = self.path.to_str() else {
-            return Err(TactusError::Refused {
+            return Err(UpstrokeError::Refused {
                 message: format!(
                     "the agent binary resolved to `{}`, a path that is not valid Unicode. \
                      A CommandSpec carries its program as a String (DESIGN.md:222), and \
@@ -168,7 +168,7 @@ impl Invocation {
 /// refused**, and only to say which of the two situations the operator is in.
 /// Nothing it returns decides what runs. `install_hint` is the adapter's own
 /// sentence about how its CLI is installed.
-pub fn boundary_refused(name: &str, install_hint: &str, cause: &TactusError) -> TactusError {
+pub fn boundary_refused(name: &str, install_hint: &str, cause: &UpstrokeError) -> UpstrokeError {
     let on_this_host = match util::find_program(name) {
         Some(path) => format!(
             "this coordinator host has `{name}` at `{}`, so the boundary this run executes in is \
@@ -177,7 +177,7 @@ pub fn boundary_refused(name: &str, install_hint: &str, cause: &TactusError) -> 
         ),
         None => format!("this coordinator host has no `{name}` on PATH either"),
     };
-    TactusError::Agent {
+    UpstrokeError::Agent {
         message: format!(
             "`{name}` could not be executed by the runner this run uses: {cause}. It must be \
              installed inside the boundary that executes it — on PATH for the host runner, in the \
@@ -202,7 +202,7 @@ pub fn extract_version(stdout: &str) -> String {
         // Trailing punctuation is not part of a version. The Copilot CLI ends
         // its line with a full stop — `GitHub Copilot CLI 1.0.78.` — which
         // otherwise rides along into `Caps.version` and out through every
-        // message that quotes it (`tactus capacity`, and the probe refusal that
+        // message that quotes it (`upstroke capacity`, and the probe refusal that
         // names the version an adapter would not support).
         .map(|t| {
             t.trim_start_matches('v')
@@ -372,19 +372,23 @@ mod tests {
     /// has the CLI — the two are different situations with different fixes.
     ///
     /// Both branches, and both asserted rather than whichever this machine
-    /// happens to take: `tactus-definitely-not-a-real-binary` is absent
+    /// happens to take: `upstroke-definitely-not-a-real-binary` is absent
     /// everywhere by construction, and the present branch is driven with a
     /// program every machine of each family has.
     #[test]
     fn a_boundary_refusal_says_where_the_cli_is_missing() {
-        let cause = TactusError::Agent {
+        let cause = UpstrokeError::Agent {
             message: "no such file or directory".to_owned(),
         };
 
-        let absent = boundary_refused("tactus-definitely-not-a-real-binary", "install it.", &cause)
-            .to_string();
+        let absent = boundary_refused(
+            "upstroke-definitely-not-a-real-binary",
+            "install it.",
+            &cause,
+        )
+        .to_string();
         assert!(
-            absent.contains("tactus-definitely-not-a-real-binary"),
+            absent.contains("upstroke-definitely-not-a-real-binary"),
             "{absent}"
         );
         assert!(absent.contains("no such file or directory"), "{absent}");
@@ -393,7 +397,7 @@ mod tests {
             "{absent}"
         );
         assert!(
-            absent.contains("no `tactus-definitely-not-a-real-binary` on PATH either"),
+            absent.contains("no `upstroke-definitely-not-a-real-binary` on PATH either"),
             "{absent}"
         );
 
@@ -419,9 +423,9 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn a_batch_shim_runs_and_receives_its_argument() {
-        let dir = std::env::temp_dir().join(format!("tactus-bin-shim-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("upstroke-bin-shim-{}", std::process::id()));
         std::fs::create_dir_all(&dir).expect("scratch dir");
-        let shim = dir.join("tactus-test-shim.cmd");
+        let shim = dir.join("upstroke-test-shim.cmd");
         // `%~1` strips the quotes the child got; a benign argument keeps this
         // about plumbing rather than about batch re-parsing.
         std::fs::write(&shim, "@echo off\r\necho GOT:%~1\r\n").expect("write shim");
@@ -454,23 +458,23 @@ mod tests {
         #[cfg(unix)]
         let (path, rendered) = {
             use std::os::unix::ffi::OsStringExt;
-            let mut bytes = b"/opt/tactus-".to_vec();
+            let mut bytes = b"/opt/upstroke-".to_vec();
             bytes.push(0xff);
             bytes.extend_from_slice(b"/claude");
             (
                 PathBuf::from(std::ffi::OsString::from_vec(bytes)),
-                "/opt/tactus-\u{fffd}/claude",
+                "/opt/upstroke-\u{fffd}/claude",
             )
         };
         #[cfg(windows)]
         let (path, rendered) = {
             use std::os::windows::ffi::OsStringExt;
-            let mut units: Vec<u16> = r"C:\tactus-".encode_utf16().collect();
+            let mut units: Vec<u16> = r"C:\upstroke-".encode_utf16().collect();
             units.push(0xd800);
             units.extend(r"\claude.cmd".encode_utf16());
             (
                 PathBuf::from(std::ffi::OsString::from_wide(&units)),
-                "C:\\tactus-\u{fffd}\\claude.cmd",
+                "C:\\upstroke-\u{fffd}\\claude.cmd",
             )
         };
 
@@ -508,7 +512,7 @@ mod tests {
         // valid Unicode at all, and the ordinary fixture's path carries no
         // marker. This is the one input on which "refuse" and "substitute"
         // still disagree after the refusal is in place.
-        let literal = "/opt/tactus-\u{fffd}/claude";
+        let literal = "/opt/upstroke-\u{fffd}/claude";
         assert!(
             literal.contains(char::REPLACEMENT_CHARACTER),
             "the fixture lost its marker, so it witnesses nothing"

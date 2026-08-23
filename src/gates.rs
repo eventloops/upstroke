@@ -20,7 +20,7 @@ use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 
-use crate::error::TactusError;
+use crate::error::UpstrokeError;
 use crate::runner::invocation::InvocationId;
 use crate::runner::{CommandSpec, Runner};
 use crate::util;
@@ -166,7 +166,7 @@ pub trait Gate {
         runner: &dyn Runner,
         invocation: InvocationId,
         ws: &Workspace,
-    ) -> Result<GateResult, TactusError>;
+    ) -> Result<GateResult, UpstrokeError>;
 }
 
 #[derive(Debug, Clone)]
@@ -204,7 +204,7 @@ impl Gate for ShellGate {
         runner: &dyn Runner,
         invocation: InvocationId,
         ws: &Workspace,
-    ) -> Result<GateResult, TactusError> {
+    ) -> Result<GateResult, UpstrokeError> {
         // A spawn failure here is an environment problem (missing shell),
         // not a task failure — propagate per §19.
         //
@@ -281,7 +281,7 @@ pub fn run_all(
     log_dir: &Path,
     stem: &str,
     attempt: u32,
-) -> Result<Option<GateFailure>, TactusError> {
+) -> Result<Option<GateFailure>, UpstrokeError> {
     for (index, gate) in gates.iter().enumerate() {
         // The identity comes from the caller, keyed by this gate's position in
         // the list the run recorded: the packet's role set is
@@ -320,11 +320,11 @@ pub fn run_all(
 
 /// §14 pre-flight: the configured shell itself must exist before any agent
 /// tokens are spent.
-pub fn shell_available(shell: ShellKind) -> Result<(), TactusError> {
+pub fn shell_available(shell: ShellKind) -> Result<(), UpstrokeError> {
     if find_program(shell.program()).is_some() {
         Ok(())
     } else {
-        Err(TactusError::Gate {
+        Err(UpstrokeError::Gate {
             message: format!(
                 "configured shell `{}` not found on PATH; fix [engine].shell or install it",
                 shell.program()
@@ -347,13 +347,13 @@ pub fn resolve_programs(
     gates: &[ShellGate],
     workspace_root: &Path,
     warnings: &mut Vec<String>,
-) -> Result<(), TactusError> {
+) -> Result<(), UpstrokeError> {
     for gate in gates {
         match resolution(gate, workspace_root)? {
             Resolution::Ok | Resolution::SkippedComplex => {}
             Resolution::Missing(program) => {
                 if gate.shell.resolves_via_path() {
-                    return Err(TactusError::Gate {
+                    return Err(UpstrokeError::Gate {
                         message: format!(
                             "gate `{}` command `{program}` not found on PATH; fix the gate or \
                              install the tool",
@@ -377,17 +377,17 @@ pub fn preview_resolution(gates: &[ShellGate], workspace_root: &Path, warnings: 
     for gate in gates {
         if let Ok(Resolution::Missing(program)) = resolution(gate, workspace_root) {
             warnings.push(format!(
-                "gate `{}` command `{program}` not found on PATH — `tactus run` will refuse it",
+                "gate `{}` command `{program}` not found on PATH — `upstroke run` will refuse it",
                 gate.name
             ));
         }
     }
 }
 
-fn resolution(gate: &ShellGate, workspace_root: &Path) -> Result<Resolution, TactusError> {
+fn resolution(gate: &ShellGate, workspace_root: &Path) -> Result<Resolution, UpstrokeError> {
     let cmd = gate.cmd.trim();
     let Some(first) = cmd.split_whitespace().next() else {
-        return Err(TactusError::Gate {
+        return Err(UpstrokeError::Gate {
             message: format!("gate `{}` has an empty command", gate.name),
         });
     };
@@ -589,7 +589,7 @@ mod tests {
     use std::process::Command as StdCommand;
 
     fn temp_dir(tag: &str) -> PathBuf {
-        let dir = env::temp_dir().join(format!("tactus-gates-{tag}-{}", std::process::id()));
+        let dir = env::temp_dir().join(format!("upstroke-gates-{tag}-{}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).expect("scratch dir");
         dir
@@ -757,7 +757,7 @@ mod tests {
         /// What the process did.
         Output(Box<crate::agent::ProcessOutput>),
         /// What a spawn failure looks like: `agent::proc` maps a failed
-        /// `ProcessTree::spawn` to `TactusError::Agent { "failed to spawn …" }`.
+        /// `ProcessTree::spawn` to `UpstrokeError::Agent { "failed to spawn …" }`.
         SpawnFailure,
     }
 
@@ -781,14 +781,14 @@ mod tests {
         fn run(
             &self,
             request: &crate::runner::RunnerRequest,
-        ) -> Result<crate::agent::ProcessOutput, TactusError> {
+        ) -> Result<crate::agent::ProcessOutput, UpstrokeError> {
             self.seen
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .push(request.clone());
             match &self.answer {
                 Scripted::Output(out) => Ok((**out).clone()),
-                Scripted::SpawnFailure => Err(TactusError::Agent {
+                Scripted::SpawnFailure => Err(UpstrokeError::Agent {
                     message: "failed to spawn `sh`: No such file or directory (os error 2)"
                         .to_owned(),
                 }),

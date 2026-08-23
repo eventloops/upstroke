@@ -3,7 +3,7 @@ set -euo pipefail
 
 script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 builder="$script_dir/frontier-check-payload.sh"
-repository="keybindings/tactus"
+repository="eventloops/upstroke"
 attested_sha="0123456789abcdef0123456789abcdef01234567"
 reviewed_sha="fedcba9876543210fedcba9876543210fedcba98"
 stale_sha="89abcdef0123456789abcdef0123456789abcdef"
@@ -21,12 +21,12 @@ jq -e \
   --arg url "$review_url" \
   --arg digest "$evidence_digest" \
   '. == {
-    name: "tactus-frontier-review",
+    name: "upstroke-frontier-review",
     head_sha: $sha,
     status: "completed",
     conclusion: "success",
     details_url: $url,
-    external_id: ("tactus-frontier-review:pr-8:" + $sha + ":" + $digest),
+    external_id: ("upstroke-frontier-review:pr-8:" + $sha + ":" + $digest),
     output: {
       title: "Independent frontier review passed",
       summary: ("PR #8 passed independent frontier review for exact head `" + $sha + "`.\n\nEvidence SHA-256: `" + $digest + "`."),
@@ -46,12 +46,12 @@ jq -e \
   --arg url "$review_url" \
   --arg digest "$evidence_digest" \
   '. == {
-    name: "tactus-frontier-review",
+    name: "upstroke-frontier-review",
     head_sha: $attested,
     status: "completed",
     conclusion: "success",
     details_url: $url,
-    external_id: ("tactus-frontier-review:pr-8:" + $attested + ":" + $digest + ":reviewed:" + $reviewed),
+    external_id: ("upstroke-frontier-review:pr-8:" + $attested + ":" + $digest + ":reviewed:" + $reviewed),
     output: {
       title: "Independent frontier review passed",
       summary: ("PR #8 passed independent frontier review at `" + $reviewed + "`. Attested for head `" + $attested + "`: the trusted workflow verified the intervening diff is confined to the exempt set (`reviews/FINDINGS.md`).\n\nEvidence SHA-256: `" + $digest + "`."),

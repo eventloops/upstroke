@@ -1,5 +1,5 @@
 //! Probe and discover every registered agent adapter — what pre-flight would
-//! see, and what `tactus connect` would write about it:
+//! see, and what `upstroke connect` would write about it:
 //! `cargo run --example probe`
 //!
 //! Zero spend: `probe()` reads `--version` and `--help`, and `discover()` asks
@@ -9,8 +9,8 @@
 // under which the section shrinks. `decisions.effect_site_inventory.mechanism` (2).
 #![allow(clippy::disallowed_macros)]
 
-use tactus::agent;
-use tactus::runner::host::HostRunner;
+use upstroke::agent;
+use upstroke::runner::host::HostRunner;
 
 fn main() {
     // Every CLI process goes through a Runner (PR4). `probe` is a host

@@ -42,7 +42,7 @@ pub enum TaskRunStatus {
     /// Its turn has not come yet, and the run is still going — distinct from
     /// `Skipped`, which means the run ended before this task got a turn.
     Queued,
-    /// A status this build does not know, from a `report.json` a newer tactus
+    /// A status this build does not know, from a `report.json` a newer upstroke
     /// wrote. Never produced by this crate.
     ///
     /// `report.json` is a projection for whoever reads the run afterwards, and
@@ -144,7 +144,7 @@ impl TaskReport {
 /// `Parked` is deliberately not `Halted`: §12 requires CI to tell a clean
 /// completion from one that left questions unanswered. `BudgetExceeded` earns
 /// its own variant for the same reason one step further out — "your ceiling
-/// stopped it" is neither a failure nor a question, and `tactus resume` means
+/// stopped it" is neither a failure nor a question, and `upstroke resume` means
 /// something different after each of the three.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RunOutcome {
@@ -692,12 +692,12 @@ impl RunReport {
                     let _ = writeln!(out, "  {}: queued", task.id);
                 }
                 // Only reachable from a `report.json` written by a newer
-                // tactus. Say that, rather than picking a familiar-looking
+                // upstroke. Say that, rather than picking a familiar-looking
                 // status and being confidently wrong about someone's run.
                 TaskRunStatus::Unknown => {
                     let _ = writeln!(
                         out,
-                        "  {}: status not recognised by this version of tactus",
+                        "  {}: status not recognised by this version of upstroke",
                         task.id
                     );
                 }
@@ -726,7 +726,7 @@ impl RunReport {
             let _ = writeln!(
                 out,
                 "  payloads: {}",
-                std::path::Path::new(".tactus")
+                std::path::Path::new(".upstroke")
                     .join("runs")
                     .join(&self.run_id)
                     .join("questions")
@@ -798,7 +798,7 @@ impl RunReport {
                 let _ = writeln!(
                     out,
                     "{stopped}. Committed tasks are on {}; raise the ceiling and continue \
-                     with:\n    tactus resume {} --budget <usd>",
+                     with:\n    upstroke resume {} --budget <usd>",
                     self.branch, self.run_id
                 );
             }
@@ -913,7 +913,7 @@ impl RunReport {
             let _ = writeln!(
                 out,
                 "  per-pool drain: no pool is connected for the agents this run used — run \
-                 `tactus connect`"
+                 `upstroke connect`"
             );
         } else {
             let _ = writeln!(out, "  per-pool drain:");
@@ -938,7 +938,7 @@ impl RunReport {
                 // The ledger annotates; `render` owns the outcome line and the
                 // resume advice. Printing both put two near-identical
                 // paragraphs, formatted to different precision, with two copies
-                // of the same command, back to back in `tactus status` — which
+                // of the same command, back to back in `upstroke status` — which
                 // reads as two things having happened.
                 "  stopped by [budgets] {} = ${:.4} before `{}` (§13)",
                 stop.budget, stop.limit_usd, stop.task

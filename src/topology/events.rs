@@ -340,7 +340,7 @@ pub struct CandidateRef {
     pub generation: GenerationId,
     /// The immutable commit the gates and reviewers judged.
     pub commit_sha: CommitSha,
-    /// `refs/tactus/runs/<id>/candidates/<key>/<gen>` — the authoritative ref
+    /// `refs/upstroke/runs/<id>/candidates/<key>/<gen>` — the authoritative ref
     /// that keeps it reachable and is the protected source a repair is
     /// materialized from.
     pub candidate_ref: GitRef,
@@ -601,7 +601,7 @@ pub struct RunStarted4 {
     /// Always [`TOPOLOGY_SCHEMA`]. First field of the first line, and the only
     /// thing a reader is entitled to look at before choosing a fold.
     pub schema: u32,
-    pub tactus_version: String,
+    pub upstroke_version: String,
     pub run_id: String,
     /// The coordinator process that created the run.
     pub incarnation: IncarnationId,
@@ -668,7 +668,7 @@ impl RunStarted4 {
     pub fn registry_record(&self) -> RunStarted {
         RunStarted {
             schema: self.schema,
-            tactus_version: self.tactus_version.clone(),
+            upstroke_version: self.upstroke_version.clone(),
             run_id: self.run_id.clone(),
             branch: self.branch.clone(),
             base_sha: self.base_sha.0.clone(),
@@ -708,7 +708,7 @@ pub struct RunResumed4 {
     pub runner: RunnerPolicy,
     /// What this incarnation's pre-flight probes found.
     pub probed_agents: Vec<String>,
-    pub tactus_version: String,
+    pub upstroke_version: String,
 }
 
 /// `run_finished` for a parallel-topology run.
@@ -861,7 +861,7 @@ pub struct QuestionAnswered4 {
     pub key: TaskKey,
     pub question: QuestionId,
     pub answer: Answer4,
-    /// Which channel produced it — a terminal, an out-of-band `tactus answer`,
+    /// Which channel produced it — a terminal, an out-of-band `upstroke answer`,
     /// or a resume picking up an answer written while the run was dead.
     pub via: String,
 }
@@ -1327,10 +1327,10 @@ pub struct CandidatePrepared {
     pub tree_sha: CommitSha,
     pub commit_sha: CommitSha,
     pub message: String,
-    /// `refs/tactus/runs/<id>/candidate-prepared/<key>/<gen>` — the pin that
+    /// `refs/upstroke/runs/<id>/candidate-prepared/<key>/<gen>` — the pin that
     /// keeps the commit reachable until the authoritative ref exists.
     pub prepared_ref: GitRef,
-    /// `refs/tactus/runs/<id>/candidates/<key>/<gen>` — created next.
+    /// `refs/upstroke/runs/<id>/candidates/<key>/<gen>` — created next.
     pub candidate_ref: GitRef,
     /// The region the diff actually touched.
     #[serde(deserialize_with = "strict::field")]
@@ -1385,7 +1385,7 @@ pub enum VerificationBasis {
     /// A stale candidate was cherry-picked onto the current head and the
     /// resulting proposal is under judgement.
     StaleClean {
-        /// `refs/tactus/runs/<id>/prepared/<seq>` — the proposal pin.
+        /// `refs/upstroke/runs/<id>/prepared/<seq>` — the proposal pin.
         prepared_ref: GitRef,
     },
     /// The cherry-pick was empty: the change is already in the head, and the
@@ -2207,7 +2207,7 @@ mod tests {
             kind: RunnerKind::Container,
             policy: RunnerContract::ContainerV1,
             image: Some(ImageIdentity {
-                reference: "ghcr.io/Example-Org/tactus-Runner:v2.1-Ünicode".to_owned(),
+                reference: "ghcr.io/Example-Org/upstroke-Runner:v2.1-Ünicode".to_owned(),
                 id: "sha256:11223344556677889900aabbccddeeff11223344556677889900aabbccddeeff"
                     .to_owned(),
                 digest: Some(
@@ -2216,8 +2216,8 @@ mod tests {
                 ),
             }),
             credential_volumes: Some(volumes(&[
-                ("zeta-agent", "tactus-creds-Zeta"),
-                ("alpha-agent", "tactus-creds-ALPHA  "),
+                ("zeta-agent", "upstroke-creds-Zeta"),
+                ("alpha-agent", "upstroke-creds-ALPHA  "),
             ])),
         }
     }
@@ -2331,7 +2331,7 @@ mod tests {
     fn run_started(plan: &Plan) -> RunStarted4 {
         RunStarted4 {
             schema: TOPOLOGY_SCHEMA,
-            tactus_version: "0.2.0-Ünicode".to_owned(),
+            upstroke_version: "0.2.0-Ünicode".to_owned(),
             run_id: RUN_ID.to_owned(),
             incarnation: IncarnationId("01J8ZQKB2M7NC5PQR0TVWXYZ12".to_owned()),
             runner: container_runner(),
@@ -2340,17 +2340,17 @@ mod tests {
                 "claude-code".to_owned(),
                 "copilot".to_owned(),
             ],
-            branch: format!("tactus/run-{RUN_ID}"),
+            branch: format!("upstroke/run-{RUN_ID}"),
             // Deliberately not derived from `branch`, `private_dir` or the run
             // id: a projection that reached for the wrong one of the four
             // resource identities would still agree with itself if they shared
             // text.
             integration_ref: GitRef::from("refs/heads/Ünïcode/Integration Target"),
             base_sha: CommitSha::from(SHA_BASE),
-            execution_root: "  D:\\Tactus Roots\\exec ünïcode  ".to_owned(),
-            private_dir: "/var/lib/Tactus/private runs".to_owned(),
+            execution_root: "  D:\\Upstroke Roots\\exec ünïcode  ".to_owned(),
+            private_dir: "/var/lib/Upstroke/private runs".to_owned(),
             plan_path: "docs/Plan Ünicode.md".to_owned(),
-            config_path: Some("tactus.toml".to_owned()),
+            config_path: Some("upstroke.toml".to_owned()),
             plan_hash: plan.source.hash.clone(),
             normalized_plan_digest:
                 "sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef".to_owned(),
@@ -2505,7 +2505,7 @@ mod tests {
             key: task_key(2),
             generation: GenerationId(4),
             commit_sha: CommitSha::from(SHA_CANDIDATE),
-            candidate_ref: GitRef::from(&format!("refs/tactus/runs/{RUN_ID}/candidates/2/4")[..]),
+            candidate_ref: GitRef::from(&format!("refs/upstroke/runs/{RUN_ID}/candidates/2/4")[..]),
         }
     }
 
@@ -2564,9 +2564,9 @@ mod tests {
             commit_sha: CommitSha::from(SHA_CANDIDATE),
             message: "  zeta: repair the Ünicode path  ".to_owned(),
             prepared_ref: GitRef::from(
-                &format!("refs/tactus/runs/{RUN_ID}/candidate-prepared/2/4")[..],
+                &format!("refs/upstroke/runs/{RUN_ID}/candidate-prepared/2/4")[..],
             ),
-            candidate_ref: GitRef::from(&format!("refs/tactus/runs/{RUN_ID}/candidates/2/4")[..]),
+            candidate_ref: GitRef::from(&format!("refs/upstroke/runs/{RUN_ID}/candidates/2/4")[..]),
             actual_paths: hostile_paths(),
             lease_effect: CandidateLeaseEffect::WidensLineage {
                 root: task_key(0),
@@ -2590,7 +2590,7 @@ mod tests {
                     incarnation: IncarnationId("01J8ZQKC3N8PD6QRS1UVWXYZ34".to_owned()),
                     runner: container_runner(),
                     probed_agents: vec!["codex".to_owned(), "claude-code".to_owned()],
-                    tactus_version: "0.2.1-Ünicode".to_owned(),
+                    upstroke_version: "0.2.1-Ünicode".to_owned(),
                 }),
             },
             TopologyEventBody::TaskSpawned {
@@ -2603,7 +2603,7 @@ mod tests {
                     key: task_key(5),
                     generation: GenerationId(2),
                     base_sha: CommitSha::from(SHA_HEAD),
-                    worktree_path: "/var/lib/Tactus/work trees/zeta-2".to_owned(),
+                    worktree_path: "/var/lib/Upstroke/work trees/zeta-2".to_owned(),
                     lease: LeaseGrant::Predicted {
                         paths: hostile_paths(),
                     },
@@ -2677,7 +2677,7 @@ mod tests {
                     candidate: candidate_ref(),
                     basis: VerificationBasis::StaleClean {
                         prepared_ref: GitRef::from(
-                            &format!("refs/tactus/runs/{RUN_ID}/prepared/6")[..],
+                            &format!("refs/upstroke/runs/{RUN_ID}/prepared/6")[..],
                         ),
                     },
                     expected_head: CommitSha::from(SHA_HEAD),
@@ -2745,7 +2745,7 @@ mod tests {
                             effort: Effort::XHigh,
                         }),
                     },
-                    via: "  tactus answer  ".to_owned(),
+                    via: "  upstroke answer  ".to_owned(),
                 },
             },
             TopologyEventBody::BudgetExceeded {
@@ -3238,7 +3238,7 @@ mod tests {
             }),
             (RunnerField::ImageReference, |policy| {
                 if let Some(image) = policy.image.as_mut() {
-                    image.reference = "ghcr.io/Example-Org/tactus-Runner:v2.2".to_owned();
+                    image.reference = "ghcr.io/Example-Org/upstroke-Runner:v2.2".to_owned();
                 }
             }),
             (RunnerField::ImageId, |policy| {
@@ -3258,9 +3258,9 @@ mod tests {
             }),
             (RunnerField::CredentialVolumes, |policy| {
                 policy.credential_volumes = Some(volumes(&[
-                    ("zeta-agent", "tactus-creds-Zeta"),
-                    ("alpha-agent", "tactus-creds-ALPHA  "),
-                    ("mid-agent", "tactus-creds-Mid"),
+                    ("zeta-agent", "upstroke-creds-Zeta"),
+                    ("alpha-agent", "upstroke-creds-ALPHA  "),
+                    ("mid-agent", "upstroke-creds-Mid"),
                 ]));
             }),
         ];
@@ -3310,8 +3310,8 @@ mod tests {
         let forwards = container_runner();
         let mut backwards = container_runner();
         backwards.credential_volumes = Some(volumes(&[
-            ("alpha-agent", "tactus-creds-ALPHA  "),
-            ("zeta-agent", "tactus-creds-Zeta"),
+            ("alpha-agent", "upstroke-creds-ALPHA  "),
+            ("zeta-agent", "upstroke-creds-Zeta"),
         ]));
         assert_eq!(forwards.difference(&backwards), None);
         assert_eq!(forwards, backwards);
@@ -3320,14 +3320,14 @@ mod tests {
         // one, and a renamed volume for the same agent are all differences.
         for changed in [
             volumes(&[
-                ("zeta-agent", "tactus-creds-Zeta"),
-                ("alpha-agent", "tactus-creds-ALPHA  "),
-                ("mid-agent", "tactus-creds-Mid"),
+                ("zeta-agent", "upstroke-creds-Zeta"),
+                ("alpha-agent", "upstroke-creds-ALPHA  "),
+                ("mid-agent", "upstroke-creds-Mid"),
             ]),
-            volumes(&[("zeta-agent", "tactus-creds-Zeta")]),
+            volumes(&[("zeta-agent", "upstroke-creds-Zeta")]),
             volumes(&[
-                ("zeta-agent", "tactus-creds-Zeta"),
-                ("alpha-agent", "tactus-creds-alpha"),
+                ("zeta-agent", "upstroke-creds-Zeta"),
+                ("alpha-agent", "upstroke-creds-alpha"),
             ]),
             BTreeMap::new(),
         ] {
@@ -3389,7 +3389,7 @@ mod tests {
     /// would pass it.
     fn image_grid() -> Vec<Option<ImageIdentity>> {
         let mut images = vec![None];
-        for reference in ["ghcr.io/Example-Org/tactus-Runner:v2.1", ""] {
+        for reference in ["ghcr.io/Example-Org/upstroke-Runner:v2.1", ""] {
             for id in ["sha256:1122", ""] {
                 for digest in [None, Some("sha256:ffee".to_owned())] {
                     images.push(Some(ImageIdentity {
@@ -3466,7 +3466,7 @@ mod tests {
                 kind: RunnerKind::Container,
                 policy: RunnerContract::ContainerV1,
                 image: Some(ImageIdentity {
-                    reference: "ghcr.io/Example-Org/tactus-Runner:v2.1".to_owned(),
+                    reference: "ghcr.io/Example-Org/upstroke-Runner:v2.1".to_owned(),
                     id: "sha256:1122".to_owned(),
                     digest: Some("sha256:ffee".to_owned()),
                 }),
@@ -3603,7 +3603,7 @@ mod tests {
         // the keys, the cardinality and the pairing identical and changes one
         // property of one value, so a comparison that lower-cased, trimmed, or
         // compared lengths fails on exactly the mover that isolates it.
-        let base = "tactus-creds-Zeta";
+        let base = "upstroke-creds-Zeta";
         let movers: [(&str, String); 6] = [
             ("ASCII case only", base.to_ascii_lowercase()),
             ("trailing whitespace only", format!("{base}  ")),
@@ -3617,7 +3617,7 @@ mod tests {
             let mut other = container_runner();
             other.credential_volumes = Some(volumes(&[
                 ("zeta-agent", moved.as_str()),
-                ("alpha-agent", "tactus-creds-ALPHA  "),
+                ("alpha-agent", "upstroke-creds-ALPHA  "),
             ]));
             assert_eq!(
                 container_runner().difference(&other),
@@ -3792,7 +3792,7 @@ mod tests {
         // text at all: a fixture whose execution root contained its private
         // directory would hide a projection that reached for the wrong one.
         // The branch and the run id are excluded deliberately — the branch *is*
-        // `tactus/run-<id>` by construction, which is why
+        // `upstroke/run-<id>` by construction, which is why
         // `canonical_trace_projection` drops ref names containing the run id.
         let independent = [
             started.integration_ref.as_str(),
@@ -3985,7 +3985,7 @@ mod tests {
         let pins = [
             None,
             Some(GitRef::from(
-                &format!("refs/tactus/runs/{RUN_ID}/prepared/6")[..],
+                &format!("refs/upstroke/runs/{RUN_ID}/prepared/6")[..],
             )),
         ];
         // Three proposals: the candidate's commit, the expected head, and a
@@ -4040,7 +4040,7 @@ mod tests {
                                     generation: GenerationId(4),
                                     candidate_sha: candidate_sha.clone(),
                                     candidate_ref: GitRef::from(
-                                        &format!("refs/tactus/runs/{RUN_ID}/candidates/2/4")[..],
+                                        &format!("refs/upstroke/runs/{RUN_ID}/candidates/2/4")[..],
                                     ),
                                     prepared_ref: pin.clone(),
                                     verification_source: source.clone(),
@@ -4899,7 +4899,7 @@ mod tests {
         assert_eq!(projected.gates, started.gates);
         assert_eq!(projected.gates_from_config, started.gates_from_config);
         assert_eq!(projected.interaction_mode, started.interaction_mode);
-        assert_eq!(projected.tactus_version, started.tactus_version);
+        assert_eq!(projected.upstroke_version, started.upstroke_version);
 
         let registry = TaskRegistry::originals(&plan, &projected).expect("registry derives");
         assert_eq!(registry.len(), plan.tasks.len());
@@ -4977,14 +4977,14 @@ mod tests {
             "kind": "container",
             "policy": "container-v1",
             "image": {
-                "reference": "ghcr.io/Example-Org/tactus-Runner:v2.1-Ünicode",
+                "reference": "ghcr.io/Example-Org/upstroke-Runner:v2.1-Ünicode",
                 "id": "sha256:11223344556677889900aabbccddeeff11223344556677889900aabbccddeeff",
                 "digest":
                     "sha256:ffeeddccbbaa00998877665544332211ffeeddccbbaa00998877665544332211",
             },
             "credential_volumes": {
-                "alpha-agent": "tactus-creds-ALPHA  ",
-                "zeta-agent": "tactus-creds-Zeta",
+                "alpha-agent": "upstroke-creds-ALPHA  ",
+                "zeta-agent": "upstroke-creds-Zeta",
             },
         })
     }
@@ -4994,7 +4994,7 @@ mod tests {
             "key": 2,
             "generation": 4,
             "commit_sha": SHA_CANDIDATE,
-            "candidate_ref": format!("refs/tactus/runs/{RUN_ID}/candidates/2/4"),
+            "candidate_ref": format!("refs/upstroke/runs/{RUN_ID}/candidates/2/4"),
         })
     }
 
@@ -5110,18 +5110,18 @@ mod tests {
                 "run_started",
                 serde_json::json!({
                     "schema": 4,
-                    "tactus_version": "0.2.0-Ünicode",
+                    "upstroke_version": "0.2.0-Ünicode",
                     "run_id": RUN_ID,
                     "incarnation": "01J8ZQKB2M7NC5PQR0TVWXYZ12",
                     "runner": canonical_runner(),
                     "probed_agents": ["codex", "claude-code", "copilot"],
-                    "branch": format!("tactus/run-{RUN_ID}"),
+                    "branch": format!("upstroke/run-{RUN_ID}"),
                     "integration_ref": "refs/heads/Ünïcode/Integration Target",
                     "base_sha": SHA_BASE,
-                    "execution_root": "  D:\\Tactus Roots\\exec ünïcode  ",
-                    "private_dir": "/var/lib/Tactus/private runs",
+                    "execution_root": "  D:\\Upstroke Roots\\exec ünïcode  ",
+                    "private_dir": "/var/lib/Upstroke/private runs",
                     "plan_path": "docs/Plan Ünicode.md",
-                    "config_path": "tactus.toml",
+                    "config_path": "upstroke.toml",
                     "plan_hash": "frozen-Ünicode-hash",
                     "normalized_plan_digest":
                         "sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
@@ -5152,7 +5152,7 @@ mod tests {
                     "incarnation": "01J8ZQKC3N8PD6QRS1UVWXYZ34",
                     "runner": canonical_runner(),
                     "probed_agents": ["codex", "claude-code"],
-                    "tactus_version": "0.2.1-Ünicode",
+                    "upstroke_version": "0.2.1-Ünicode",
                 }),
             ),
             envelope(
@@ -5165,7 +5165,7 @@ mod tests {
                     "key": 5,
                     "generation": 2,
                     "base_sha": SHA_HEAD,
-                    "worktree_path": "/var/lib/Tactus/work trees/zeta-2",
+                    "worktree_path": "/var/lib/Upstroke/work trees/zeta-2",
                     "lease": {"lease": "predicted", "paths": canonical_hostile_paths()},
                     "source_candidate": canonical_candidate(),
                 }),
@@ -5237,8 +5237,8 @@ mod tests {
                     "tree_sha": SHA_TREE,
                     "commit_sha": SHA_CANDIDATE,
                     "message": "  zeta: repair the Ünicode path  ",
-                    "prepared_ref": format!("refs/tactus/runs/{RUN_ID}/candidate-prepared/2/4"),
-                    "candidate_ref": format!("refs/tactus/runs/{RUN_ID}/candidates/2/4"),
+                    "prepared_ref": format!("refs/upstroke/runs/{RUN_ID}/candidate-prepared/2/4"),
+                    "candidate_ref": format!("refs/upstroke/runs/{RUN_ID}/candidates/2/4"),
                     "actual_paths": canonical_hostile_paths(),
                     "lease_effect": {
                         "lease_effect": "widens_lineage",
@@ -5258,7 +5258,7 @@ mod tests {
                     "candidate": canonical_candidate(),
                     "basis": {
                         "basis": "stale_clean",
-                        "prepared_ref": format!("refs/tactus/runs/{RUN_ID}/prepared/6"),
+                        "prepared_ref": format!("refs/upstroke/runs/{RUN_ID}/prepared/6"),
                     },
                     "expected_head": SHA_HEAD,
                     "proposed_sha": SHA_THIRD,
@@ -5289,7 +5289,7 @@ mod tests {
                     "key": 2,
                     "generation": 4,
                     "candidate_sha": SHA_CANDIDATE,
-                    "candidate_ref": format!("refs/tactus/runs/{RUN_ID}/candidates/2/4"),
+                    "candidate_ref": format!("refs/upstroke/runs/{RUN_ID}/candidates/2/4"),
                     "prepared_ref": null,
                     "verification_source": {
                         "source": "candidate_prepared",
@@ -5345,7 +5345,7 @@ mod tests {
                             "effort": "xhigh",
                         },
                     },
-                    "via": "  tactus answer  ",
+                    "via": "  upstroke answer  ",
                 }),
             ),
             envelope(

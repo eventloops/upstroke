@@ -538,7 +538,7 @@ mod tests {
     }
 
     fn git_ref(name: &str) -> GitRef {
-        GitRef(format!("refs/tactus/census/{RUN_ID}/{name}"))
+        GitRef(format!("refs/upstroke/census/{RUN_ID}/{name}"))
     }
 
     fn task_of(id: &str, deps: &[&str], hint: &str) -> Task {
@@ -638,7 +638,7 @@ mod tests {
     fn run_started_unauthenticated() -> RunStarted4 {
         RunStarted4 {
             schema: TOPOLOGY_SCHEMA,
-            tactus_version: "0.2.0-census".to_owned(),
+            upstroke_version: "0.2.0-census".to_owned(),
             run_id: RUN_ID.to_owned(),
             incarnation: IncarnationId("01J8ZQKB2M7NC5PQR0TVWXYZ77".to_owned()),
             runner: RunnerPolicy {
@@ -657,20 +657,23 @@ mod tests {
                     [
                         (
                             "aleph-Mid-agent".to_owned(),
-                            "tactus-creds-Ünicode".to_owned(),
+                            "upstroke-creds-Ünicode".to_owned(),
                         ),
-                        ("  Codex-CLI  ".to_owned(), "tactus-creds-codex".to_owned()),
+                        (
+                            "  Codex-CLI  ".to_owned(),
+                            "upstroke-creds-codex".to_owned(),
+                        ),
                     ]
                     .into_iter()
                     .collect(),
                 ),
             },
             probed_agents: probed_agents(),
-            branch: format!("tactus/run-{RUN_ID}"),
+            branch: format!("upstroke/run-{RUN_ID}"),
             integration_ref: git_ref("integration"),
             base_sha: sha("base"),
-            execution_root: "/var/lib/Tactus/census execution roots".to_owned(),
-            private_dir: "/var/lib/Tactus/census private".to_owned(),
+            execution_root: "/var/lib/Upstroke/census execution roots".to_owned(),
+            private_dir: "/var/lib/Upstroke/census private".to_owned(),
             plan_path: "docs/Census Plan.md".to_owned(),
             config_path: None,
             plan_hash: "census-frozen-hash".to_owned(),

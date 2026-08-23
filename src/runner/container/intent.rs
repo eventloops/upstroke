@@ -11,10 +11,10 @@
 //! > id, and `runner_policy_sha256`; the coordinator incarnation id is a
 //! > per-process ULID recorded in `run_started(4)`/`run_resumed(4)` and is never
 //! > read from lock-file contents …; the container name is
-//! > `tactus-<repo_key>-<run_id>-<incarnation>-<invocation-hash>`, so
+//! > `upstroke-<repo_key>-<run_id>-<incarnation>-<invocation-hash>`, so
 //! > deterministic `InvocationId`s never collide across incarnations and no
-//! > earlier ownership evidence is overwritten; labels `tactus.private_root`,
-//! > `tactus.run`, `tactus.run_dir`, `tactus.incarnation`, `tactus.invocation`
+//! > earlier ownership evidence is overwritten; labels `upstroke.private_root`,
+//! > `upstroke.run`, `upstroke.run_dir`, `upstroke.incarnation`, `upstroke.invocation`
 //!
 //! Nothing here performs an effect. The write and the removal are funnel APIs
 //! in `src/runner/container.rs`, under `ContainerSite::WriteIntent` and
@@ -63,7 +63,7 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-use crate::error::TactusError;
+use crate::error::UpstrokeError;
 use crate::runner::InvocationId;
 
 /// The directory of the global namespace, under the run's recorded private
@@ -78,7 +78,7 @@ pub const INTENT_SUFFIX: &str = ".intent";
 pub const INTENT_STAGED_SUFFIX: &str = ".intent.tmp";
 
 /// The name's fixed prefix.
-pub const NAME_PREFIX: &str = "tactus";
+pub const NAME_PREFIX: &str = "upstroke";
 
 /// The separator between the name's components.
 ///
@@ -91,7 +91,7 @@ pub const NAME_SEPARATOR: char = '-';
 /// Domain-separated so the same bytes hashed for another purpose are a
 /// different value, in the idiom of `workspace_manager::repo_key_v1` and
 /// `runner::policy::CANONICAL_VERSION`.
-pub const INVOCATION_HASH_DOMAIN: &str = "tactus.container-invocation.v1";
+pub const INVOCATION_HASH_DOMAIN: &str = "upstroke.container-invocation.v1";
 
 /// How many hex characters of the invocation digest the name carries.
 ///
@@ -111,24 +111,24 @@ pub const MAX_COMPONENT_LEN: usize = 64;
 /// The longest whole name.
 ///
 /// Docker's own limit is far higher; the engine's own longest name is
-/// `tactus`(6) + 4 separators + 16 + 26 + 26 + 16 = 94.
+/// `upstroke`(6) + 4 separators + 16 + 26 + 26 + 16 = 94.
 pub const MAX_NAME_LEN: usize = 200;
 
 // ---------------------------------------------------------------------------
 // The five labels
 // ---------------------------------------------------------------------------
 
-/// `tactus.private_root` — the canonical path of `<R>`. Discovery is `docker
+/// `upstroke.private_root` — the canonical path of `<R>`. Discovery is `docker
 /// ps` by this label.
-pub const LABEL_PRIVATE_ROOT: &str = "tactus.private_root";
-/// `tactus.run` — the owner run id.
-pub const LABEL_RUN: &str = "tactus.run";
-/// `tactus.run_dir` — the owner's **public** run directory.
-pub const LABEL_RUN_DIR: &str = "tactus.run_dir";
-/// `tactus.incarnation` — the owning coordinator incarnation.
-pub const LABEL_INCARNATION: &str = "tactus.incarnation";
-/// `tactus.invocation` — the rendered [`InvocationId`], in full.
-pub const LABEL_INVOCATION: &str = "tactus.invocation";
+pub const LABEL_PRIVATE_ROOT: &str = "upstroke.private_root";
+/// `upstroke.run` — the owner run id.
+pub const LABEL_RUN: &str = "upstroke.run";
+/// `upstroke.run_dir` — the owner's **public** run directory.
+pub const LABEL_RUN_DIR: &str = "upstroke.run_dir";
+/// `upstroke.incarnation` — the owning coordinator incarnation.
+pub const LABEL_INCARNATION: &str = "upstroke.incarnation";
+/// `upstroke.invocation` — the rendered [`InvocationId`], in full.
+pub const LABEL_INVOCATION: &str = "upstroke.invocation";
 
 /// The five labels, in the packet's order.
 ///
@@ -163,12 +163,12 @@ const HEX: &[u8; 16] = b"0123456789ABCDEF";
 /// was designed for injectivity — its components are `[0-9A-Za-z_]` only, so
 /// the parse on `-` is unambiguous — because `crash_reconstruction` says
 /// "different private roots are **disjoint worlds**". A label is the other half
-/// of that sentence: `tactus.private_root` is the value
-/// `docker ps --filter label=tactus.private_root=…` selects on, so two distinct
+/// of that sentence: `upstroke.private_root` is the value
+/// `docker ps --filter label=upstroke.private_root=…` selects on, so two distinct
 /// roots that render to one label are one world, and a census authorized for
 /// either queries — and reclaims — the containers of the other.
 ///
-/// **`tactus.run_dir` is the same function for a sharper reason.** It is the
+/// **`upstroke.run_dir` is the same function for a sharper reason.** It is the
 /// owner's public run directory, and arm (ii) of the liveness rule *probes that
 /// directory's `run.lock`*: "free -> dead owner -> reclaim; held -> live owner
 /// -> never touched". A rendering that maps two directories onto one string
@@ -217,7 +217,7 @@ pub fn path_label(path: &Path) -> String {
     label
 }
 
-/// The value of the `tactus.private_root` label for a root.
+/// The value of the `upstroke.private_root` label for a root.
 ///
 /// A name for one use of [`path_label`], kept because the private root is the
 /// value a `docker ps --filter` argument is built from and the call sites read
@@ -245,12 +245,12 @@ pub fn private_root_label(private_root: &Path) -> String {
 ///
 /// # Errors
 ///
-/// [`TactusError::Refused`] when `value` carries a malformed escape, or when
+/// [`UpstrokeError::Refused`] when `value` carries a malformed escape, or when
 /// the decoded bytes are not a path this platform can name.
-pub fn decode_path_label(value: &str) -> Result<PathBuf, TactusError> {
-    let refuse = |why: &str| TactusError::Refused {
+pub fn decode_path_label(value: &str) -> Result<PathBuf, UpstrokeError> {
+    let refuse = |why: &str| UpstrokeError::Refused {
         message: format!(
-            "the label value `{value}` is not a tactus path label ({why}); a path label is its \
+            "the label value `{value}` is not a upstroke path label ({why}); a path label is its \
              bytes with everything outside `[0-9A-Za-z]` and `{}` percent-encoded, and a value \
              this engine could not have written is not evidence a census may probe a lock from",
             String::from_utf8_lossy(LABEL_UNRESERVED)
@@ -311,7 +311,7 @@ pub struct ContainerIntent {
     /// Run directory — the **public** path, canonical, as a [`path_label`].
     ///
     /// **Encoded, and the record and the label carry one spelling.** The
-    /// `tactus.run_dir` label is this field verbatim, so a second rendering
+    /// `upstroke.run_dir` label is this field verbatim, so a second rendering
     /// would be a second thing to keep in step; and the census reaches the
     /// owner's `run.lock` through [`Self::run_dir_path`], which is
     /// [`decode_path_label`] and the rooted check in one place. Build the
@@ -364,7 +364,7 @@ impl ContainerIntent {
     /// # Errors
     ///
     /// As [`owner_run_dir`].
-    pub fn run_dir_path(&self) -> Result<PathBuf, TactusError> {
+    pub fn run_dir_path(&self) -> Result<PathBuf, UpstrokeError> {
         owner_run_dir(&self.run_dir, "intent record")
     }
 
@@ -376,7 +376,7 @@ impl ContainerIntent {
     /// through this API — `labeled_orphan_without_intent_reclaimed` is about a
     /// container with **no** record, which is a different thing.
     ///
-    /// `tactus.private_root` is the one label with no field of its own: the
+    /// `upstroke.private_root` is the one label with no field of its own: the
     /// record's *location* is inside `<R>`, so the root is what the census
     /// already knows when it reads one.
     #[must_use]
@@ -421,11 +421,11 @@ impl ContainerIntent {
 ///
 /// # Errors
 ///
-/// [`TactusError::Refused`] when `value` does not decode, is empty, or is not
+/// [`UpstrokeError::Refused`] when `value` does not decode, is empty, or is not
 /// rooted.
-pub fn owner_run_dir(value: &str, source: &str) -> Result<PathBuf, TactusError> {
+pub fn owner_run_dir(value: &str, source: &str) -> Result<PathBuf, UpstrokeError> {
     if value.is_empty() {
-        return Err(TactusError::Refused {
+        return Err(UpstrokeError::Refused {
             message: format!(
                 "the {source} carries an empty `{LABEL_RUN_DIR}`; the liveness rule probes \
                  `<run_dir>/run.lock` non-blocking and an empty owner directory would probe \
@@ -439,11 +439,11 @@ pub fn owner_run_dir(value: &str, source: &str) -> Result<PathBuf, TactusError> 
     // Wrapped, not propagated: a census refusal that did not name the field
     // would leave an operator reading a decoder's complaint with no way to know
     // which piece of evidence carried it.
-    let path = decode_path_label(value).map_err(|error| TactusError::Refused {
+    let path = decode_path_label(value).map_err(|error| UpstrokeError::Refused {
         message: format!("the {source}'s `{LABEL_RUN_DIR}` is unreadable: {error}"),
     })?;
     if !path.has_root() {
-        return Err(TactusError::Refused {
+        return Err(UpstrokeError::Refused {
             message: format!(
                 "the {source} carries `{LABEL_RUN_DIR}={value}`, which is a relative path; the \
                  owner's run directory is the **public** path and the liveness rule probes \
@@ -498,18 +498,18 @@ impl IntentWritten {
     ///
     /// # Errors
     ///
-    /// [`TactusError::Io`] when the record is absent or unreadable —
+    /// [`UpstrokeError::Io`] when the record is absent or unreadable —
     /// `ErrorKind::NotFound` is the "no intent" case and is a refusal, not an
-    /// absence to tolerate — and [`TactusError::Refused`] when the bytes are
+    /// absence to tolerate — and [`UpstrokeError::Refused`] when the bytes are
     /// not a [`ContainerIntent`].
-    pub fn certify(private_root: &Path, name: &ContainerName) -> Result<Self, TactusError> {
+    pub fn certify(private_root: &Path, name: &ContainerName) -> Result<Self, UpstrokeError> {
         let path = name.intent_path(private_root);
-        let bytes = fs::read(&path).map_err(|source| TactusError::Io {
+        let bytes = fs::read(&path).map_err(|source| UpstrokeError::Io {
             path: path.clone(),
             source,
         })?;
         let record: ContainerIntent =
-            serde_json::from_slice(&bytes).map_err(|error| TactusError::Refused {
+            serde_json::from_slice(&bytes).map_err(|error| UpstrokeError::Refused {
                 message: format!(
                     "`{}` is not a container intent, so it is not evidence that `{name}` is \
                      owned: {error}",
@@ -546,7 +546,7 @@ impl IntentWritten {
 // The name
 // ---------------------------------------------------------------------------
 
-/// `tactus-<repo_key>-<run_id>-<incarnation>-<invocation-hash>`.
+/// `upstroke-<repo_key>-<run_id>-<incarnation>-<invocation-hash>`.
 ///
 /// **Injective by construction.** No component may contain
 /// [`NAME_SEPARATOR`], so a rendered name splits into exactly five fields and
@@ -576,7 +576,7 @@ impl ContainerName {
     ///
     /// # Errors
     ///
-    /// [`TactusError::Refused`] when a component is empty, carries a character
+    /// [`UpstrokeError::Refused`] when a component is empty, carries a character
     /// outside `[0-9A-Za-z_]`, is longer than [`MAX_COMPONENT_LEN`], or when
     /// the whole name would exceed [`MAX_NAME_LEN`].
     pub fn new(
@@ -584,7 +584,7 @@ impl ContainerName {
         run_id: &str,
         incarnation: &str,
         invocation: &InvocationId,
-    ) -> Result<Self, TactusError> {
+    ) -> Result<Self, UpstrokeError> {
         Self::from_parts(repo_key, run_id, incarnation, &invocation_hash(invocation))
     }
 
@@ -603,14 +603,14 @@ impl ContainerName {
         run_id: &str,
         incarnation: &str,
         invocation_hash: &str,
-    ) -> Result<Self, TactusError> {
+    ) -> Result<Self, UpstrokeError> {
         validate_component("repo key", repo_key)?;
         validate_component("run id", run_id)?;
         validate_component("incarnation", incarnation)?;
         validate_component("invocation hash", invocation_hash)?;
         let rendered = format!("{NAME_PREFIX}-{repo_key}-{run_id}-{incarnation}-{invocation_hash}");
         if rendered.len() > MAX_NAME_LEN {
-            return Err(TactusError::Refused {
+            return Err(UpstrokeError::Refused {
                 message: format!(
                     "the container name `{rendered}` is {} bytes; the limit is {MAX_NAME_LEN}",
                     rendered.len()
@@ -642,12 +642,12 @@ impl ContainerName {
     ///
     /// # Errors
     ///
-    /// [`TactusError::Refused`] when `value` is not `tactus-` followed by
+    /// [`UpstrokeError::Refused`] when `value` is not `upstroke-` followed by
     /// exactly four separator-free components.
-    pub fn parse(value: &str) -> Result<ContainerNameParts, TactusError> {
-        let refuse = || TactusError::Refused {
+    pub fn parse(value: &str) -> Result<ContainerNameParts, UpstrokeError> {
+        let refuse = || UpstrokeError::Refused {
             message: format!(
-                "`{value}` is not a tactus container name: the name is \
+                "`{value}` is not a upstroke container name: the name is \
                  `{NAME_PREFIX}{NAME_SEPARATOR}<repo_key>{NAME_SEPARATOR}<run_id>\
                  {NAME_SEPARATOR}<incarnation>{NAME_SEPARATOR}<invocation-hash>` \
                  (decisions.admission_and_leases.permits.crash_reconstruction)"
@@ -679,7 +679,7 @@ impl ContainerName {
     /// # Errors
     ///
     /// As [`Self::parse`] and [`Self::from_parts`].
-    pub fn rebuild(value: &str) -> Result<Self, TactusError> {
+    pub fn rebuild(value: &str) -> Result<Self, UpstrokeError> {
         let parts = Self::parse(value)?;
         Self::from_parts(
             &parts.repo_key,
@@ -694,8 +694,8 @@ impl ContainerName {
     ///
     /// # Errors
     ///
-    /// [`TactusError::Refused`] when the stem is not a well-formed name.
-    pub fn from_intent_file_name(file_name: &str) -> Result<Option<Self>, TactusError> {
+    /// [`UpstrokeError::Refused`] when the stem is not a well-formed name.
+    pub fn from_intent_file_name(file_name: &str) -> Result<Option<Self>, UpstrokeError> {
         match file_name.strip_suffix(INTENT_SUFFIX) {
             Some(stem) => Self::rebuild(stem).map(Some),
             None => Ok(None),
@@ -746,14 +746,14 @@ pub fn invocation_hash(invocation: &InvocationId) -> String {
 /// [`ContainerName::parse`]'s injectivity rests on — and `.`, which is the
 /// separator inside a rendered [`InvocationId`] and the boundary of the
 /// `.intent` suffix.
-fn validate_component(what: &str, value: &str) -> Result<(), TactusError> {
+fn validate_component(what: &str, value: &str) -> Result<(), UpstrokeError> {
     if value.is_empty() {
-        return Err(TactusError::Refused {
+        return Err(UpstrokeError::Refused {
             message: format!("a container name's {what} component is never empty"),
         });
     }
     if value.len() > MAX_COMPONENT_LEN {
-        return Err(TactusError::Refused {
+        return Err(UpstrokeError::Refused {
             message: format!(
                 "a container name's {what} component is {} bytes; the limit is \
                  {MAX_COMPONENT_LEN}",
@@ -765,7 +765,7 @@ fn validate_component(what: &str, value: &str) -> Result<(), TactusError> {
         .chars()
         .find(|c| !(c.is_ascii_alphanumeric() || *c == '_'))
     {
-        return Err(TactusError::Refused {
+        return Err(UpstrokeError::Refused {
             message: format!(
                 "a container name's {what} component carries `{bad}`, which is outside \
                  [0-9A-Za-z_]; the name joins four components with `{NAME_SEPARATOR}` and \

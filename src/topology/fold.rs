@@ -3560,7 +3560,7 @@ mod tests {
     }
 
     fn git_ref(name: &str) -> GitRef {
-        GitRef(format!("refs/tactus/runs/{RUN_ID}/{name}"))
+        GitRef(format!("refs/upstroke/runs/{RUN_ID}/{name}"))
     }
 
     /// The agents this run's pre-flight probed: padded, mixed case, multi-byte
@@ -3703,7 +3703,7 @@ mod tests {
             kind: RunnerKind::Container,
             policy: RunnerContract::ContainerV1,
             image: Some(ImageIdentity {
-                reference: "ghcr.io/example/Tactus-Runner:2.1".to_owned(),
+                reference: "ghcr.io/example/Upstroke-Runner:2.1".to_owned(),
                 id: "sha256:1111111111111111111111111111111111111111111111111111111111111111"
                     .to_owned(),
                 digest: Some(
@@ -3713,8 +3713,14 @@ mod tests {
             }),
             credential_volumes: Some(
                 [
-                    ("claude-code".to_owned(), "tactus-creds-Ünicode".to_owned()),
-                    ("  Codex-CLI  ".to_owned(), "tactus-creds-codex".to_owned()),
+                    (
+                        "claude-code".to_owned(),
+                        "upstroke-creds-Ünicode".to_owned(),
+                    ),
+                    (
+                        "  Codex-CLI  ".to_owned(),
+                        "upstroke-creds-codex".to_owned(),
+                    ),
                 ]
                 .into_iter()
                 .collect(),
@@ -3813,18 +3819,18 @@ mod tests {
         let plan = plan();
         RunStarted4 {
             schema: TOPOLOGY_SCHEMA,
-            tactus_version: "0.2.0-Ünicode".to_owned(),
+            upstroke_version: "0.2.0-Ünicode".to_owned(),
             run_id: RUN_ID.to_owned(),
             incarnation: IncarnationId("01J8ZQKB2M7NC5PQR0TVWXYZ12".to_owned()),
             runner: container_runner(),
             probed_agents: probed_agents(),
-            branch: format!("tactus/run-{RUN_ID}"),
+            branch: format!("upstroke/run-{RUN_ID}"),
             integration_ref: git_ref("integration"),
             base_sha: sha("base"),
-            execution_root: "/var/lib/Tactus/execution roots".to_owned(),
-            private_dir: "/var/lib/Tactus/private runs".to_owned(),
+            execution_root: "/var/lib/Upstroke/execution roots".to_owned(),
+            private_dir: "/var/lib/Upstroke/private runs".to_owned(),
             plan_path: "docs/Plan Ünicode.md".to_owned(),
-            config_path: Some("tactus.toml".to_owned()),
+            config_path: Some("upstroke.toml".to_owned()),
             plan_hash: plan.source.hash.clone(),
             normalized_plan_digest: NORMALIZED_DIGEST.to_owned(),
             registry_digest: String::new(),
@@ -4309,7 +4315,7 @@ mod tests {
             }),
             ("credential volumes", "credential volume set", |runner| {
                 if let Some(volumes) = runner.credential_volumes.as_mut() {
-                    volumes.insert("copilot".to_owned(), "tactus-creds-copilot".to_owned());
+                    volumes.insert("copilot".to_owned(), "upstroke-creds-copilot".to_owned());
                 }
             }),
         ];
@@ -4341,7 +4347,7 @@ mod tests {
                 incarnation: IncarnationId("01J9AAAAAAAAAAAAAAAAAAAAAA".to_owned()),
                 runner,
                 probed_agents: probed_agents(),
-                tactus_version: "0.2.1-Ünicode".to_owned(),
+                upstroke_version: "0.2.1-Ünicode".to_owned(),
             }),
         })
     }
@@ -4364,17 +4370,20 @@ mod tests {
         let renamed = || {
             let mut runner = container_runner();
             if let Some(volumes) = runner.credential_volumes.as_mut() {
-                volumes.insert("claude-code".to_owned(), "tactus-creds-renamed".to_owned());
+                volumes.insert(
+                    "claude-code".to_owned(),
+                    "upstroke-creds-renamed".to_owned(),
+                );
             }
             runner
         };
         let swapped = || {
             let mut runner = container_runner();
             if let Some(volumes) = runner.credential_volumes.as_mut() {
-                volumes.insert("claude-code".to_owned(), "tactus-creds-codex".to_owned());
+                volumes.insert("claude-code".to_owned(), "upstroke-creds-codex".to_owned());
                 volumes.insert(
                     "  Codex-CLI  ".to_owned(),
-                    "tactus-creds-Ünicode".to_owned(),
+                    "upstroke-creds-Ünicode".to_owned(),
                 );
             }
             runner
@@ -7997,7 +8006,7 @@ mod tests {
                 key,
                 question: QuestionId::from(id),
                 answer,
-                via: "  tactus answer  ".to_owned(),
+                via: "  upstroke answer  ".to_owned(),
             },
         })
     }
@@ -9502,7 +9511,7 @@ mod tests {
                 );
                 let mut moved = data.clone();
                 if let Some(volumes) = moved.runner.credential_volumes.as_mut() {
-                    volumes.insert("claude-code".to_owned(), "tactus-creds-codex".to_owned());
+                    volumes.insert("claude-code".to_owned(), "upstroke-creds-codex".to_owned());
                 }
                 case(
                     "runner.credential_volumes",

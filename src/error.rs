@@ -19,7 +19,7 @@ impl fmt::Display for ValidationErrors {
 }
 
 #[derive(Debug, Error)]
-pub enum TactusError {
+pub enum UpstrokeError {
     #[error("failed to read {}: {source}", .path.display())]
     Io {
         path: PathBuf,
@@ -36,7 +36,7 @@ pub enum TactusError {
     #[error(
         "pin references unknown model `{model}` for agent `{agent}`; known models for that agent: \
          {known}. The capability catalog is static data shipped with the binary — fix the pin in \
-         tactus.toml or upgrade tactus."
+         upstroke.toml or upgrade upstroke."
     )]
     UnknownPinnedModel {
         agent: String,

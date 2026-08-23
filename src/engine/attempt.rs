@@ -9,7 +9,7 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use crate::agent::{AgentAdapter, TaskRun, proc};
-use crate::error::TactusError;
+use crate::error::UpstrokeError;
 use crate::events::{self, Feedback};
 use crate::gates::{self, ShellGate};
 use crate::ir::{Outcome, OutcomeStatus, Task, TaskKind, WorkerProfile};
@@ -32,7 +32,7 @@ const MAX_FEEDBACK_ENTRIES: usize = 6;
 
 /// §12: how a worker flags a decision it should not make alone. The prompt
 /// teaches this marker; nothing else in the engine parses agent prose.
-pub(super) const QUESTION_MARKER: &str = "TACTUS-QUESTION:";
+pub(super) const QUESTION_MARKER: &str = "UPSTROKE-QUESTION:";
 
 /// A `WorkerProfile.pool` as the log records it: `None` rather than `""` when
 /// no pool is configured, so a reader can tell "no pools file" from "a pool
@@ -148,7 +148,7 @@ pub(super) fn run_attempt(
     cx: &AttemptCx<'_>,
     workspace: &Workspace,
     resume_session: Option<String>,
-) -> Result<AttemptResult, TactusError> {
+) -> Result<AttemptResult, UpstrokeError> {
     let settings_path = cx.adapter.materialize_permissions(
         &cx.profile,
         cx.gate_cmds,
@@ -505,7 +505,7 @@ pub(super) fn evaluate_outcome(
                 .with_feedback(
                     "You reported the task complete, but the repository is unchanged. Either make \
                      the change the task asks for, or explain what blocks it using the \
-                     TACTUS-QUESTION marker."
+                     UPSTROKE-QUESTION marker."
                         .to_owned(),
                 ),
             )
@@ -581,7 +581,7 @@ pub(super) fn materialize_prompt(
 
     let mut prompt = String::new();
     prompt.push_str(
-        "You are executing one task from a frozen plan, conducted by the tactus engine.\n\n",
+        "You are executing one task from a frozen plan, conducted by the upstroke engine.\n\n",
     );
     let _ = writeln!(prompt, "# Task: {}\n", task.title);
     if !task.body.is_empty() {
@@ -648,7 +648,7 @@ pub(super) fn materialize_prompt(
          - If a decision genuinely is not yours to make — the task is ambiguous in a way that \
            changes what \"correct\" means, or it turns on a product or policy call you cannot \
            settle from this repository — stop and end your message with a line beginning \
-           `TACTUS-QUESTION:` followed by the decision a person has to make. That pauses this \
+           `UPSTROKE-QUESTION:` followed by the decision a person has to make. That pauses this \
            task and asks them. Do not use it for uncertainty you could resolve by reading the \
            code.\n",
     );

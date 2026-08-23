@@ -53,7 +53,7 @@ static SCRATCH: AtomicU32 = AtomicU32::new(0);
 fn scratch(tag: &str) -> PathBuf {
     let n = SCRATCH.fetch_add(1, Ordering::Relaxed);
     let dir = std::env::temp_dir().join(format!(
-        "tactus-event-funnel-{tag}-{}-{n}",
+        "upstroke-event-funnel-{tag}-{}-{n}",
         std::process::id()
     ));
     let _ = fs::remove_dir_all(&dir);
@@ -65,17 +65,17 @@ fn log_path(tag: &str) -> PathBuf {
     scratch(tag).join("events.jsonl")
 }
 
-/// The **message** a `TactusError::EventLog` carries, without its rendering.
+/// The **message** a `UpstrokeError::EventLog` carries, without its rendering.
 ///
-/// `TactusError::EventLog`'s Display is `event log {path}: {message}`, so
+/// `UpstrokeError::EventLog`'s Display is `event log {path}: {message}`, so
 /// `error.to_string().contains(x)` is satisfied by the *path* as readily as by
 /// anything the funnel decided to say. Two catalogue mutations lived in that
 /// gap, because the fixtures named their scratch directories after the very
 /// point they then looked for (`PR5-EVENTS-045`, `PR5-EVENTS-046`). Assertions
 /// about what an error *says* go through here.
-fn event_log_message(error: &TactusError) -> &str {
+fn event_log_message(error: &UpstrokeError) -> &str {
     match error {
-        TactusError::EventLog { message, .. } => message,
+        UpstrokeError::EventLog { message, .. } => message,
         other => panic!("not an event-log error: {other}"),
     }
 }
@@ -196,7 +196,7 @@ fn run_started_event() -> TopologyEvent {
         body: TopologyEventBody::RunStarted {
             data: Box::new(RunStarted4 {
                 schema: TOPOLOGY_SCHEMA,
-                tactus_version: "0.1.0".to_owned(),
+                upstroke_version: "0.1.0".to_owned(),
                 run_id: "01J8ZQKB2M7NC5PQR0TVWXYZ12".to_owned(),
                 incarnation: IncarnationId("01J8ZQKB2M7NC5PQR0TVWXYZ13".to_owned()),
                 runner: RunnerPolicy {
@@ -206,13 +206,13 @@ fn run_started_event() -> TopologyEvent {
                     credential_volumes: None,
                 },
                 probed_agents: vec!["claude-code".to_owned()],
-                branch: "tactus/run-01J8ZQKB2M7NC5PQR0TVWXYZ12".to_owned(),
-                integration_ref: GitRef::from("refs/tactus/integration"),
+                branch: "upstroke/run-01J8ZQKB2M7NC5PQR0TVWXYZ12".to_owned(),
+                integration_ref: GitRef::from("refs/upstroke/integration"),
                 base_sha: CommitSha::from("0f5c1c4"),
-                execution_root: "/var/lib/tactus/roots".to_owned(),
-                private_dir: "/var/lib/tactus/private".to_owned(),
+                execution_root: "/var/lib/upstroke/roots".to_owned(),
+                private_dir: "/var/lib/upstroke/private".to_owned(),
                 plan_path: "docs/plan.md".to_owned(),
-                config_path: Some("tactus.toml".to_owned()),
+                config_path: Some("upstroke.toml".to_owned()),
                 plan_hash: "frozen-hash".to_owned(),
                 normalized_plan_digest: inputs().normalized_plan_digest,
                 registry_digest:
@@ -970,9 +970,9 @@ fn the_legacy_append_is_byte_identical_to_the_pre_move_writer() {
 /// The **error contract** of the legacy open is the pre-move writer's too.
 ///
 /// `invariants_preserved[0]` is "EventLog semantics unchanged for legacy
-/// callers", and an error *variant* is semantics: `TactusError::Io` carries the
+/// callers", and an error *variant* is semantics: `UpstrokeError::Io` carries the
 /// `std::io::Error` a caller can match `kind()` on, while
-/// `TactusError::EventLog` carries a rendered string and loses it.
+/// `UpstrokeError::EventLog` carries a rendered string and loses it.
 /// `PR5-SEAMS-004` is exactly that swap inside `open_legacy`, and the
 /// differential grid could not see it because every one of its thirteen shapes
 /// **opens successfully** — it varies the file's bytes, and a failing open is a
@@ -1039,19 +1039,19 @@ fn a_legacy_open_that_fails_fails_the_way_the_pre_move_writer_did() {
         assert_eq!(
             std::mem::discriminant(moved_error),
             std::mem::discriminant(premove_error),
-            "{name}: the moved writer returns a different TactusError variant \
+            "{name}: the moved writer returns a different UpstrokeError variant \
              than the pre-move one did ({moved_error:?} vs {premove_error:?})"
         );
         // The variant is `Io`, and it is asserted positively as well as
         // relatively: a mutation applied to *both* sides would keep the
         // discriminants equal.
         assert!(
-            matches!(premove_error, TactusError::Io { .. }),
-            "{name}: the frozen oracle's legacy open contract is TactusError::Io: \
+            matches!(premove_error, UpstrokeError::Io { .. }),
+            "{name}: the frozen oracle's legacy open contract is UpstrokeError::Io: \
              {premove_error:?}"
         );
         assert!(
-            matches!(moved_error, TactusError::Io { .. }),
+            matches!(moved_error, UpstrokeError::Io { .. }),
             "{name}: the moved writer must keep it: {moved_error:?}"
         );
         // And the same path is named, with the two directories folded away —
@@ -1465,7 +1465,7 @@ fn a_real_write_failure_is_attempted_once_poisons_the_handle_and_is_not_retried(
         .append_hooked(EventSite::LegacyAppend, commit("a", "first"), &mut witness)
         .expect_err("every write to /dev/full returns ENOSPC");
     assert!(
-        matches!(error, TactusError::Io { .. }),
+        matches!(error, UpstrokeError::Io { .. }),
         "a real failure keeps the exact error the pre-move writer returned: {error}"
     );
 
@@ -1818,7 +1818,7 @@ fn every_error_return_case_leaves_its_tabled_shape_names_its_point_and_poisons_t
             let site = *site;
             // **The scratch name carries no point and no site**
             // (`PR5-EVENTS-045`). It used to be `err-<point>-<site>`, and
-            // `TactusError::EventLog`'s Display renders its path — so
+            // `UpstrokeError::EventLog`'s Display renders its path — so
             // `error.to_string().contains(point.name())` was satisfied by the
             // *directory name* whatever the message said, and a funnel that
             // reported a `Synced` injection as `Written` passed this grid.
@@ -2303,8 +2303,8 @@ fn kill_at(case: &str, point: SubEffectPoint, path: &Path) -> Vec<u8> {
     fs::read(path).expect("the log the killed process left")
 }
 
-const KILL_CASE_ENV: &str = "TACTUS_EVENT_FUNNEL_KILL";
-const KILL_LOG_ENV: &str = "TACTUS_EVENT_FUNNEL_KILL_LOG";
+const KILL_CASE_ENV: &str = "UPSTROKE_EVENT_FUNNEL_KILL";
+const KILL_LOG_ENV: &str = "UPSTROKE_EVENT_FUNNEL_KILL_LOG";
 
 /// The child half of the kill tests.
 ///
@@ -3143,7 +3143,7 @@ fn crate_under_test() -> (PathBuf, PathBuf) {
         .filter_map(|entry| {
             let path = entry.ok()?.path();
             let name = path.file_name()?.to_str()?;
-            (name.starts_with("libtactus-") && name.ends_with(".rlib")).then(|| {
+            (name.starts_with("libupstroke-") && name.ends_with(".rlib")).then(|| {
                 let stamp = path
                     .metadata()
                     .and_then(|meta| meta.modified())
@@ -3157,7 +3157,7 @@ fn crate_under_test() -> (PathBuf, PathBuf) {
         .pop()
         .unwrap_or_else(|| {
             panic!(
-                "no libtactus-*.rlib beside the test executable in {}",
+                "no libupstroke-*.rlib beside the test executable in {}",
                 deps.display()
             )
         })
@@ -3187,7 +3187,7 @@ fn typecheck(dir: &Path, name: &str, body: &str) -> (bool, String) {
         .arg("-L")
         .arg(format!("dependency={}", deps.display()))
         .arg("--extern")
-        .arg(format!("tactus={}", rlib.display()))
+        .arg(format!("upstroke={}", rlib.display()))
         .arg(&source)
         .output()
         .expect("rustc runs; it is the compiler that built this test");
@@ -3233,7 +3233,7 @@ fn error_codes(stderr: &str) -> BTreeSet<String> {
 ///
 /// The fixtures are compiled against the rlib cargo built beside this test
 /// binary, so they see the crate as an external consumer does. Under the gate
-/// command that rlib is always current — `--all-targets` builds the `tactus`
+/// command that rlib is always current — `--all-targets` builds the `upstroke`
 /// binary, which links it. Under a bare `cargo test --lib` after a visibility
 /// change, cargo has no reason to rebuild the rlib, and a fixture could then
 /// refuse against yesterday's API. That is not guarded here on purpose: every
@@ -3268,8 +3268,8 @@ fn every_declared_build_refusal_fails_for_the_reason_it_declares() {
         &dir,
         "control",
         "use std::path::Path;\n\
-         use tactus::events::{EventLog, LogTail, read_all};\n\
-         use tactus::topology::effects::EventSite;\n\
+         use upstroke::events::{EventLog, LogTail, read_all};\n\
+         use upstroke::topology::effects::EventSite;\n\
          let mut warnings = Vec::new();\n\
          let log = EventLog::open(EventSite::OpenLog, Path::new(\"events.jsonl\"), &mut warnings)\n\
          .expect(\"open\");\n\

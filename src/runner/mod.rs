@@ -36,7 +36,7 @@ use std::time::Duration;
 
 use crate::agent::ProcessOutput;
 use crate::agent::proc::SpawnHooks;
-use crate::error::TactusError;
+use crate::error::UpstrokeError;
 use crate::topology::effects::{
     EffectSiteId, HookHarness, HookPhase, Injection, InjectionMode, ProcessSite, SubEffectPoint,
 };
@@ -344,7 +344,7 @@ pub trait Runner: Send + Sync {
     /// A pre-flight refusal (a reserved environment key in the overlay, a
     /// failing shell probe) or a spawn/supervision failure. A non-zero exit is
     /// not an error: it is a [`ProcessOutput`].
-    fn run(&self, request: &RunnerRequest) -> Result<ProcessOutput, TactusError>;
+    fn run(&self, request: &RunnerRequest) -> Result<ProcessOutput, UpstrokeError>;
 }
 
 // ---------------------------------------------------------------------------
@@ -468,7 +468,7 @@ mod tests {
     fn each_role_builder_binds_what_its_role_binds() {
         let spec = CommandSpec::new("prog")
             .arg("--go")
-            .env("TACTUS_OVERLAY", "1")
+            .env("UPSTROKE_OVERLAY", "1")
             .stdin(b"payload".to_vec());
         let workspace = PathBuf::from("/tmp/ws");
         let agent = AgentId::new("claude-code");
@@ -928,14 +928,14 @@ mod tests {
             },
         ];
 
-        /// Echo `$TACTUS_PARITY_PAYLOAD` and exit `code`, in the recorded
+        /// Echo `$UPSTROKE_PARITY_PAYLOAD` and exit `code`, in the recorded
         /// shell's own dialect. The payload is never in the command line, so
         /// nothing here depends on either shell's quoting.
         fn script(code: i32) -> String {
             if cfg!(windows) {
-                format!("echo %TACTUS_PARITY_PAYLOAD%& exit {code}")
+                format!("echo %UPSTROKE_PARITY_PAYLOAD%& exit {code}")
             } else {
-                format!("printf '%s\\n' \"$TACTUS_PARITY_PAYLOAD\"; exit {code}")
+                format!("printf '%s\\n' \"$UPSTROKE_PARITY_PAYLOAD\"; exit {code}")
             }
         }
 
@@ -946,7 +946,7 @@ mod tests {
                 let adapter = crate::agent::by_id(fixture.adapter).expect("a shipped adapter");
                 let command = crate::gates::ShellKind::native()
                     .spec(&script(fixture.code))
-                    .env("TACTUS_PARITY_PAYLOAD", fixture.payload);
+                    .env("UPSTROKE_PARITY_PAYLOAD", fixture.payload);
                 let output = runner
                     .run(&RunnerRequest {
                         command,

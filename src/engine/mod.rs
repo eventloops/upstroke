@@ -31,7 +31,7 @@ mod report;
 mod resume;
 
 use crate::agent::proc::NoHooks;
-use crate::error::TactusError;
+use crate::error::UpstrokeError;
 use crate::runner::Runner;
 use crate::runner::host::{Contained, HostRunner, contain_write_command};
 
@@ -46,15 +46,18 @@ pub use crate::agent::{AdapterSource, BuiltinAdapters};
 pub use crate::events::{AttemptRecord, FailureRecord};
 pub use crate::ladder::{AttemptFailure, FailureKind, FailureOrigin};
 
-pub fn run(opts: &RunOptions) -> Result<RunReport, TactusError> {
+pub fn run(opts: &RunOptions) -> Result<RunReport, UpstrokeError> {
     run_with(opts, &BuiltinAdapters)
 }
 
-pub fn run_with(opts: &RunOptions, adapters: &dyn AdapterSource) -> Result<RunReport, TactusError> {
+pub fn run_with(
+    opts: &RunOptions,
+    adapters: &dyn AdapterSource,
+) -> Result<RunReport, UpstrokeError> {
     run_harness(opts, &Harness::new(adapters))
 }
 
-pub fn run_harness(opts: &RunOptions, harness: &Harness<'_>) -> Result<RunReport, TactusError> {
+pub fn run_harness(opts: &RunOptions, harness: &Harness<'_>) -> Result<RunReport, UpstrokeError> {
     run_harness_on(opts, harness, &HostRunner::new())
 }
 
@@ -84,7 +87,7 @@ fn run_harness_on(
     opts: &RunOptions,
     harness: &Harness<'_>,
     runner: &dyn Runner,
-) -> Result<RunReport, TactusError> {
+) -> Result<RunReport, UpstrokeError> {
     // `NoHooks` is what production passes the process funnel, and the
     // containment step is threaded the same way: the observer exists so the
     // step has a drivable failure path (`runner::host::contain_write_command`),
@@ -118,20 +121,20 @@ fn run_contained(
     opts: &RunOptions,
     harness: &Harness<'_>,
     runner: &dyn Runner,
-    contain: impl FnOnce() -> Result<Contained, TactusError>,
-) -> Result<RunReport, TactusError> {
+    contain: impl FnOnce() -> Result<Contained, UpstrokeError>,
+) -> Result<RunReport, UpstrokeError> {
     let contained = contain()?;
     coordinator::run_harness_inner_on(opts, harness, runner, &contained).map(|(report, _)| report)
 }
 
-pub fn resume(opts: &ResumeOptions) -> Result<RunReport, TactusError> {
+pub fn resume(opts: &ResumeOptions) -> Result<RunReport, UpstrokeError> {
     resume_with(opts, &BuiltinAdapters)
 }
 
 pub fn resume_with(
     opts: &ResumeOptions,
     adapters: &dyn AdapterSource,
-) -> Result<RunReport, TactusError> {
+) -> Result<RunReport, UpstrokeError> {
     resume_harness(opts, &Harness::new(adapters))
 }
 
@@ -151,7 +154,7 @@ pub fn resume_with(
 pub fn resume_harness(
     opts: &ResumeOptions,
     harness: &Harness<'_>,
-) -> Result<RunReport, TactusError> {
+) -> Result<RunReport, UpstrokeError> {
     resume_harness_on(opts, harness, &HostRunner::new())
 }
 
@@ -165,7 +168,7 @@ fn resume_harness_on(
     opts: &ResumeOptions,
     harness: &Harness<'_>,
     runner: &dyn Runner,
-) -> Result<RunReport, TactusError> {
+) -> Result<RunReport, UpstrokeError> {
     resume_contained(opts, harness, runner, || {
         contain_write_command(&mut NoHooks)
     })
@@ -178,8 +181,8 @@ fn resume_contained(
     opts: &ResumeOptions,
     harness: &Harness<'_>,
     runner: &dyn Runner,
-    contain: impl FnOnce() -> Result<Contained, TactusError>,
-) -> Result<RunReport, TactusError> {
+    contain: impl FnOnce() -> Result<Contained, UpstrokeError>,
+) -> Result<RunReport, UpstrokeError> {
     let contained = contain()?;
     resume::resume_harness_inner_on(opts, harness, runner, &contained).map(|(report, _)| report)
 }

@@ -1,4 +1,4 @@
-// tactus — headless orchestration engine for AI coding agents.
+// upstroke — headless orchestration engine for AI coding agents.
 // Copyright (C) 2026 Cameron Lambert. Licensed under the GNU AGPL v3 only;
 // see LICENSE, or <https://www.gnu.org/licenses/>. Commercial licences are
 // available for use the AGPL does not permit — see README.md.
@@ -18,15 +18,15 @@ use std::time::Duration;
 
 use anyhow::Context;
 use clap::{Parser, Subcommand, ValueEnum};
-use tactus::answer::{self, Reply};
-use tactus::capacity;
-use tactus::connect;
-use tactus::engine::{self, RunOutcome};
-use tactus::error::TactusError;
-use tactus::export::{self, Format as ExportFormat};
-use tactus::interaction::{InteractionMode, RealSleeper};
-use tactus::status;
-use tactus::validate::{self, ValidateOptions};
+use upstroke::answer::{self, Reply};
+use upstroke::capacity;
+use upstroke::connect;
+use upstroke::engine::{self, RunOutcome};
+use upstroke::error::UpstrokeError;
+use upstroke::export::{self, Format as ExportFormat};
+use upstroke::interaction::{InteractionMode, RealSleeper};
+use upstroke::status;
+use upstroke::validate::{self, ValidateOptions};
 
 /// §12: a run that ends with tasks parked on unanswered questions completed
 /// neither cleanly nor in error. CI has to be able to tell the difference, so
@@ -35,12 +35,12 @@ const EXIT_PARKED: u8 = 2;
 
 /// §13: a run stopped by its own budget completed neither cleanly, in error,
 /// nor waiting on a human. CI has to tell "your ceiling stopped it" from "a task
-/// failed" without parsing prose — and `tactus resume --budget` is what it does
+/// failed" without parsing prose — and `upstroke resume --budget` is what it does
 /// about it, which is different from what it does about either of the others.
 const EXIT_BUDGET: u8 = 3;
 
 #[derive(Parser)]
-#[command(name = "tactus", version, about = "Conductor for AI coding agents")]
+#[command(name = "upstroke", version, about = "Conductor for AI coding agents")]
 struct Cli {
     #[command(subcommand)]
     command: Command,
@@ -48,22 +48,22 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
-    /// Discover installed agent CLIs and write ~/.tactus/pools.toml
+    /// Discover installed agent CLIs and write ~/.upstroke/pools.toml
     Connect {
         /// Replace an existing pools file that differs from what this would
         /// write. Without it, connect prints the difference and refuses.
         #[arg(long)]
         force: bool,
-        /// Pools file path (default: ~/.tactus/pools.toml)
+        /// Pools file path (default: ~/.upstroke/pools.toml)
         #[arg(long)]
         pools: Option<PathBuf>,
     },
     /// Show every pool: remaining estimate, resets, and what each strategy would do
     Capacity {
-        /// Repo config path (default: ./tactus.toml, optional)
+        /// Repo config path (default: ./upstroke.toml, optional)
         #[arg(long)]
         config: Option<PathBuf>,
-        /// Pools file path (default: ~/.tactus/pools.toml)
+        /// Pools file path (default: ~/.upstroke/pools.toml)
         #[arg(long)]
         pools: Option<PathBuf>,
     },
@@ -74,7 +74,7 @@ enum Command {
         /// Write plan.normalized.json (the IR) to the current directory
         #[arg(long)]
         emit_json: bool,
-        /// Repo config path (default: ./tactus.toml, optional)
+        /// Repo config path (default: ./upstroke.toml, optional)
         #[arg(long)]
         config: Option<PathBuf>,
     },
@@ -86,7 +86,7 @@ enum Command {
         /// zero spend
         #[arg(long)]
         dry_run: bool,
-        /// Repo config path (default: ./tactus.toml, optional)
+        /// Repo config path (default: ./upstroke.toml, optional)
         #[arg(long)]
         config: Option<PathBuf>,
         /// Override [interaction] mode; `never` is the CI setting — questions
@@ -145,7 +145,7 @@ enum Command {
 }
 
 /// CLI spelling of [`InteractionMode`], so CI does not have to edit
-/// `tactus.toml` to stop a run waiting on a human.
+/// `upstroke.toml` to stop a run waiting on a human.
 #[derive(Clone, Copy, ValueEnum)]
 enum Interaction {
     Never,
@@ -231,7 +231,7 @@ const fn command_class(command: &Command) -> CommandClass {
 /// than a convention a later edit can quietly reverse.
 mod containment {
     use super::{Command, CommandClass, command_class};
-    use tactus::error::TactusError;
+    use upstroke::error::UpstrokeError;
 
     /// Proof that this process performed its write-command containment
     /// startup. Unit-like with a private field: only [`establish`] can make
@@ -244,7 +244,7 @@ mod containment {
     /// per-invocation reaper and the isolated process group.
     pub fn establish(
         command: &Command,
-        join_ambient_job: impl FnOnce() -> Result<(), TactusError>,
+        join_ambient_job: impl FnOnce() -> Result<(), UpstrokeError>,
     ) -> anyhow::Result<Contained> {
         match command_class(command) {
             CommandClass::Write => join_ambient_job()?,
@@ -276,7 +276,7 @@ fn validate_options(plan: PathBuf, config: Option<PathBuf>) -> anyhow::Result<Va
         pools_path: None,
         // Both callers are previewing a run that does not exist yet, so both
         // want the reading a fresh run gets — including its refusals.
-        engine_limits: tactus::config::EngineLimits::Fresh,
+        engine_limits: upstroke::config::EngineLimits::Fresh,
     })
 }
 
@@ -284,9 +284,9 @@ fn run() -> anyhow::Result<ExitCode> {
     // `NoHooks` is what production passes the process funnel, and the ambient
     // join is threaded the same way: the observer is there so the step has a
     // failure path a test can drive on the platform where it is real
-    // (`tactus::runner::host::contain_write_command`), and production arms
+    // (`upstroke::runner::host::contain_write_command`), and production arms
     // nothing.
-    run_wired(Cli::parse().command, &mut tactus::agent::proc::NoHooks)
+    run_wired(Cli::parse().command, &mut upstroke::agent::proc::NoHooks)
 }
 
 /// The CLI's own composition of containment and dispatch — the two statements
@@ -301,10 +301,10 @@ fn run() -> anyhow::Result<ExitCode> {
 /// the **wiring between them** was a closure no test ever called, so
 ///
 /// ```text
-/// || { let _ = tactus::runner::host::start_write_command(&mut tactus::agent::proc::NoHooks); Ok(()) }
+/// || { let _ = upstroke::runner::host::start_write_command(&mut upstroke::agent::proc::NoHooks); Ok(()) }
 /// ```
 ///
-/// left `tactus run … --dry-run` succeeding on a Windows host whose ambient job
+/// left `upstroke run … --dry-run` succeeding on a Windows host whose ambient job
 /// could not be established, against the slice `scope`'s "refusal with
 /// diagnostic if it cannot", with the whole suite green.
 ///
@@ -318,9 +318,11 @@ fn run() -> anyhow::Result<ExitCode> {
 /// assert.
 fn run_wired(
     command: Command,
-    hooks: &mut dyn tactus::agent::proc::SpawnHooks,
+    hooks: &mut dyn upstroke::agent::proc::SpawnHooks,
 ) -> anyhow::Result<ExitCode> {
-    dispatch(command, || tactus::runner::host::start_write_command(hooks))
+    dispatch(command, || {
+        upstroke::runner::host::start_write_command(hooks)
+    })
 }
 
 /// Establish containment, then execute. The ambient join is a parameter so a
@@ -328,7 +330,7 @@ fn run_wired(
 /// ordering between the two is testable rather than merely written down.
 fn dispatch(
     command: Command,
-    join_ambient_job: impl FnOnce() -> Result<(), TactusError>,
+    join_ambient_job: impl FnOnce() -> Result<(), UpstrokeError>,
 ) -> anyhow::Result<ExitCode> {
     let contained = containment::establish(&command, join_ambient_job)?;
     execute(command, contained)
@@ -461,7 +463,7 @@ fn execute(command: Command, _contained: Contained) -> anyhow::Result<ExitCode> 
                 (Some(choice), _, _) => Reply::Option(choice),
                 (_, Some(text), _) => Reply::Text(text),
                 // Nothing given: show the question and read one line, so the
-                // common case is `tactus answer <id>` and then just type.
+                // common case is `upstroke answer <id>` and then just type.
                 (None, None, false) => Reply::Text(prompt_for_answer(&repo_root, &question_id)?),
             };
             let recorded = answer::answer(&repo_root, &question_id, reply)?;
@@ -473,7 +475,7 @@ fn execute(command: Command, _contained: Contained) -> anyhow::Result<ExitCode> 
                 println!("that run is live; it will pick this up and un-park the task");
             } else {
                 println!(
-                    "continue the run with:\n    tactus resume {}",
+                    "continue the run with:\n    upstroke resume {}",
                     recorded.run_id
                 );
             }
@@ -552,35 +554,39 @@ mod tests {
     /// [`every_dispatch_arm_is_classified_by_the_packets_rule`] — the list that
     /// rots is replaced by a list that is checked.
     const DISPATCH: &[(&str, &[&str], CommandClass)] = &[
-        ("connect", &["tactus", "connect"], CommandClass::ReadOnly),
-        ("capacity", &["tactus", "capacity"], CommandClass::ReadOnly),
+        ("connect", &["upstroke", "connect"], CommandClass::ReadOnly),
         (
-            "validate",
-            &["tactus", "validate", "plan.md"],
+            "capacity",
+            &["upstroke", "capacity"],
             CommandClass::ReadOnly,
         ),
-        ("run", &["tactus", "run", "plan.md"], CommandClass::Write),
+        (
+            "validate",
+            &["upstroke", "validate", "plan.md"],
+            CommandClass::ReadOnly,
+        ),
+        ("run", &["upstroke", "run", "plan.md"], CommandClass::Write),
         (
             "resume",
-            &["tactus", "resume", "01ABCDEF"],
+            &["upstroke", "resume", "01ABCDEF"],
             CommandClass::Write,
         ),
-        ("status", &["tactus", "status"], CommandClass::ReadOnly),
+        ("status", &["upstroke", "status"], CommandClass::ReadOnly),
         (
             "export-decisions",
-            &["tactus", "export-decisions", "01ABCDEF"],
+            &["upstroke", "export-decisions", "01ABCDEF"],
             CommandClass::ReadOnly,
         ),
         (
             "answer",
-            &["tactus", "answer", "q1", "--decline"],
+            &["upstroke", "answer", "q1", "--decline"],
             CommandClass::ReadOnly,
         ),
     ];
 
     /// A plan path that exists on no machine, so the dispatch arm that reads it
     /// fails in a way nothing else produces.
-    const ABSENT_PLAN: &str = "/tactus-pr4-no-such-plan-33f1a9/plan.md";
+    const ABSENT_PLAN: &str = "/upstroke-pr4-no-such-plan-33f1a9/plan.md";
 
     /// The whole point of the table: a new subcommand cannot reach the dispatch
     /// without a classification, and cannot be classified in production without
@@ -636,9 +642,9 @@ mod tests {
     /// the widening cannot become invisible.
     #[test]
     fn the_dry_run_preview_is_classified_with_its_arm() {
-        let dry = Cli::try_parse_from(["tactus", "run", "plan.md", "--dry-run"]).expect("parse");
+        let dry = Cli::try_parse_from(["upstroke", "run", "plan.md", "--dry-run"]).expect("parse");
         assert_eq!(command_class(&dry.command), CommandClass::Write);
-        let wet = Cli::try_parse_from(["tactus", "run", "plan.md"]).expect("parse");
+        let wet = Cli::try_parse_from(["upstroke", "run", "plan.md"]).expect("parse");
         assert_eq!(command_class(&wet.command), CommandClass::Write);
     }
 
@@ -674,10 +680,10 @@ mod tests {
     /// the plan's error instead.
     #[test]
     fn a_write_command_refuses_before_any_effect_when_containment_fails() {
-        let argv = ["tactus", "run", ABSENT_PLAN, "--dry-run"];
+        let argv = ["upstroke", "run", ABSENT_PLAN, "--dry-run"];
 
         let refused = dispatch(Cli::try_parse_from(argv).expect("parse").command, || {
-            Err(TactusError::Refused {
+            Err(UpstrokeError::Refused {
                 message: "the ambient Job Object could not be established (simulated failure)"
                     .to_owned(),
             })
@@ -733,7 +739,7 @@ mod tests {
             .collect();
         // The preview shares its arm's class, and the arm is what joins.
         argvs.push((
-            vec!["tactus", "run", "plan.md", "--dry-run"],
+            vec!["upstroke", "run", "plan.md", "--dry-run"],
             CommandClass::Write,
         ));
         assert_eq!(argvs.len(), 9, "eight subcommands and the dry-run preview");
@@ -767,7 +773,7 @@ mod tests {
             // never calls it.
             let command = Cli::try_parse_from(argv).expect("parse").command;
             let outcome = containment::establish(&command, || {
-                Err(TactusError::Refused {
+                Err(UpstrokeError::Refused {
                     message: "the ambient Job Object could not be established (simulated)"
                         .to_owned(),
                 })
@@ -797,13 +803,13 @@ mod tests {
     /// containment at all — cannot move it.
     #[test]
     fn the_cli_write_path_runs_the_real_containment_step() {
-        use tactus::runner::host::containment_establishments;
+        use upstroke::runner::host::containment_establishments;
 
         let before = containment_establishments();
-        let write = Cli::try_parse_from(["tactus", "run", ABSENT_PLAN, "--dry-run"])
+        let write = Cli::try_parse_from(["upstroke", "run", ABSENT_PLAN, "--dry-run"])
             .expect("parse")
             .command;
-        let reached = run_wired(write, &mut tactus::agent::proc::NoHooks)
+        let reached = run_wired(write, &mut upstroke::agent::proc::NoHooks)
             .expect_err("the arm then fails on its own, on the plan");
         assert_eq!(
             containment_establishments(),
@@ -820,10 +826,10 @@ mod tests {
 
         // The other side of the classification, through the same wiring.
         let mark = containment_establishments();
-        let read_only = Cli::try_parse_from(["tactus", "validate", ABSENT_PLAN])
+        let read_only = Cli::try_parse_from(["upstroke", "validate", ABSENT_PLAN])
             .expect("parse")
             .command;
-        let _ = run_wired(read_only, &mut tactus::agent::proc::NoHooks);
+        let _ = run_wired(read_only, &mut upstroke::agent::proc::NoHooks);
         assert_eq!(
             containment_establishments(),
             mark,
@@ -849,8 +855,8 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn a_cli_write_command_refuses_when_the_real_containment_step_refuses() {
-        use tactus::agent::proc::SpawnHooks;
-        use tactus::topology::effects::{Injection, SubEffectPoint};
+        use upstroke::agent::proc::SpawnHooks;
+        use upstroke::topology::effects::{Injection, SubEffectPoint};
 
         struct RefuseAmbientJoin;
         impl SpawnHooks for RefuseAmbientJoin {
@@ -863,7 +869,7 @@ mod tests {
             }
         }
 
-        let write = Cli::try_parse_from(["tactus", "run", ABSENT_PLAN, "--dry-run"])
+        let write = Cli::try_parse_from(["upstroke", "run", ABSENT_PLAN, "--dry-run"])
             .expect("parse")
             .command;
         let refused = run_wired(write, &mut RefuseAmbientJoin)
@@ -947,7 +953,7 @@ mod tests {
             .collect::<Vec<_>>()
             .join("\n");
         assert!(
-            !code.contains("let _ = tactus::runner::host::start_write_command"),
+            !code.contains("let _ = upstroke::runner::host::start_write_command"),
             "the comment strip left a doc comment's text in the code region"
         );
 
@@ -984,8 +990,8 @@ mod tests {
     #[test]
     fn a_read_only_command_does_not_join_the_ambient_job() {
         for argv in [
-            vec!["tactus", "validate", ABSENT_PLAN],
-            vec!["tactus", "capacity", "--config", ABSENT_PLAN],
+            vec!["upstroke", "validate", ABSENT_PLAN],
+            vec!["upstroke", "capacity", "--config", ABSENT_PLAN],
         ] {
             let command = Cli::try_parse_from(&argv).expect("parse").command;
             assert_eq!(command_class(&command), CommandClass::ReadOnly);
@@ -1001,7 +1007,7 @@ mod tests {
 
     /// Where the ambient-latch helper writes what it observed.
     #[cfg(windows)]
-    const AMBIENT_LATCH_RECORD: &str = "TACTUS_PR4_CLI_LATCH_RECORD";
+    const AMBIENT_LATCH_RECORD: &str = "UPSTROKE_PR4_CLI_LATCH_RECORD";
 
     /// The child half of
     /// [`a_write_command_establishes_the_ambient_job_and_a_read_only_command_does_not`]:
@@ -1020,7 +1026,7 @@ mod tests {
         fn note(stage: &str, record: &std::path::Path, observed: &mut Vec<String>) {
             observed.push(format!(
                 "{stage} {}",
-                i32::from(tactus::agent::proc::ambient_job_established())
+                i32::from(upstroke::agent::proc::ambient_job_established())
             ));
             std::fs::write(record, observed.join("\n")).expect("record the observation");
         }
@@ -1035,16 +1041,16 @@ mod tests {
         // `run_wired` rather than `dispatch` with a join of our own: it is the
         // composition `run` uses, so the child exercises the CLI's real path to
         // the join instead of a reassembly of it.
-        let read_only = Cli::try_parse_from(["tactus", "validate", ABSENT_PLAN])
+        let read_only = Cli::try_parse_from(["upstroke", "validate", ABSENT_PLAN])
             .expect("parse")
             .command;
-        let _ = run_wired(read_only, &mut tactus::agent::proc::NoHooks);
+        let _ = run_wired(read_only, &mut upstroke::agent::proc::NoHooks);
         note("read-only", &record, &mut observed);
 
-        let write = Cli::try_parse_from(["tactus", "run", ABSENT_PLAN, "--dry-run"])
+        let write = Cli::try_parse_from(["upstroke", "run", ABSENT_PLAN, "--dry-run"])
             .expect("parse")
             .command;
-        let _ = run_wired(write, &mut tactus::agent::proc::NoHooks);
+        let _ = run_wired(write, &mut upstroke::agent::proc::NoHooks);
         note("write", &record, &mut observed);
     }
 
@@ -1082,7 +1088,7 @@ mod tests {
     #[test]
     fn a_write_command_establishes_the_ambient_job_and_a_read_only_command_does_not() {
         let record = std::env::temp_dir().join(format!(
-            "tactus-pr4-cli-ambient-latch-{}",
+            "upstroke-pr4-cli-ambient-latch-{}",
             std::process::id()
         ));
         let _ = std::fs::remove_file(&record);

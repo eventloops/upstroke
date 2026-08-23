@@ -4,7 +4,7 @@ use std::time::Duration;
 
 use crate::agent::Caps;
 use crate::config;
-use crate::error::TactusError;
+use crate::error::UpstrokeError;
 use crate::events::{self, BindingSummary, ChainSummary, GateSummary};
 use crate::gates::{self, ShellGate};
 use crate::interaction::{self, InteractionMode, Notifier};
@@ -103,7 +103,7 @@ pub(super) struct Validated {
 pub(super) fn validate_inputs(
     opts: &RunOptions,
     limits: config::EngineLimits,
-) -> Result<Validated, TactusError> {
+) -> Result<Validated, UpstrokeError> {
     let validate_opts = ValidateOptions {
         plan_path: opts.plan_path.clone(),
         config_path: opts.config_path.clone(),
@@ -156,7 +156,7 @@ impl Validated {
         self,
         opts: &RunOptions,
         limits: config::EngineLimits,
-    ) -> Result<Analysis, TactusError> {
+    ) -> Result<Analysis, UpstrokeError> {
         const ATTEMPTS: usize = 3;
         // The pre-lock analysis is deliberately dropped rather than returned on
         // agreement: it answered "may this start", out of a worktree that was
@@ -175,9 +175,9 @@ impl Validated {
             inputs = confirmed.inputs;
             validated_for = limits;
         }
-        Err(TactusError::Refused {
+        Err(UpstrokeError::Refused {
             message: format!(
-                "{} kept changing while tactus was reading them; refusing to run inputs it \
+                "{} kept changing while upstroke was reading them; refusing to run inputs it \
                  could not check and then hold still",
                 inputs
                     .paths()
@@ -195,7 +195,7 @@ pub(super) fn preflight(
     harness: &Harness<'_>,
     runner: &dyn Runner,
     analysis: Analysis,
-) -> Result<Preflight, TactusError> {
+) -> Result<Preflight, UpstrokeError> {
     preflight_with_recorded(opts, harness, runner, analysis, Recorded::default())
 }
 
@@ -205,7 +205,7 @@ pub(super) fn preflight(
 /// from the record on resume rather than re-derived, for one reason stated
 /// twice: they are facts about the *run*, not about today's machine. A CLI
 /// installed or removed since the run started must not change who judges it,
-/// and a `tactus.toml` edited since — including by an implementer, in the very
+/// and a `upstroke.toml` edited since — including by an implementer, in the very
 /// workspace it edits — must not change what verifies it. A live run already
 /// works this way by construction, holding one analysis in memory for its whole
 /// length; this is what makes a resume the same run rather than a new one
@@ -226,7 +226,7 @@ pub(super) fn preflight_with_recorded(
     runner: &dyn Runner,
     mut analysis: Analysis,
     recorded: Recorded,
-) -> Result<Preflight, TactusError> {
+) -> Result<Preflight, UpstrokeError> {
     let mut warnings = analysis.warnings.clone();
 
     // Bindings are execution identity just like reviewers and gates. Restore
@@ -310,7 +310,7 @@ pub(super) fn preflight_with_recorded(
     //
     // Reviewers are probed on the same footing as implementers — step-6
     // finding #10 — but in two classes. Everything the config *asked* for is
-    // required. The anti-self-review alternative was tactus's own idea, so a
+    // required. The anti-self-review alternative was upstroke's own idea, so a
     // machine that cannot run it loses the upgrade rather than the run.
     //
     // Resume draws the line in the same place. Requiring the alternative there
@@ -335,9 +335,12 @@ pub(super) fn preflight_with_recorded(
     agent_ids.dedup();
     let mut caps: BTreeMap<String, Caps> = BTreeMap::new();
     for id in agent_ids {
-        let adapter = harness.adapters.get(id).ok_or_else(|| TactusError::Agent {
-            message: format!("no adapter registered for agent `{id}`"),
-        })?;
+        let adapter = harness
+            .adapters
+            .get(id)
+            .ok_or_else(|| UpstrokeError::Agent {
+                message: format!("no adapter registered for agent `{id}`"),
+            })?;
         caps.insert(id.to_owned(), adapter.probe(runner)?);
     }
     for id in optional {
@@ -347,7 +350,7 @@ pub(super) fn preflight_with_recorded(
         let probed = harness
             .adapters
             .get(&id)
-            .ok_or_else(|| TactusError::Agent {
+            .ok_or_else(|| UpstrokeError::Agent {
                 message: format!("no adapter registered for agent `{id}`"),
             })
             .and_then(|adapter| adapter.probe(runner));
@@ -436,7 +439,7 @@ pub(super) fn preflight_with_recorded(
 fn effective_budgets(
     configured: config::Budgets,
     flag: Option<f64>,
-) -> Result<config::Budgets, TactusError> {
+) -> Result<config::Budgets, UpstrokeError> {
     // Validated through the same check `[budgets]` uses. A flag that overrides
     // a validated key must not be a way around the validation: `--budget 0` and
     // `--budget -5` both stop the run before it spends anything, and
@@ -445,7 +448,7 @@ fn effective_budgets(
     // three at load.
     if let Some(limit) = flag {
         config::check_budget("--budget", limit)
-            .map_err(|message| TactusError::Refused { message })?;
+            .map_err(|message| UpstrokeError::Refused { message })?;
     }
     Ok(config::Budgets {
         run_usd: flag.or(configured.run_usd),
@@ -498,7 +501,7 @@ fn restore_recorded_routing(
     analysis: &mut Analysis,
     recorded: &RecordedRouting,
     warnings: &mut Vec<String>,
-) -> Result<(), TactusError> {
+) -> Result<(), UpstrokeError> {
     let current = chain_summaries(analysis);
     let same_structure = current.len() == recorded.structure.len()
         && current.iter().zip(&recorded.structure).all(|(now, then)| {
@@ -535,7 +538,7 @@ fn restore_recorded_routing(
         } else {
             moved.join("; ")
         };
-        return Err(TactusError::Resume {
+        return Err(UpstrokeError::Resume {
             run_id: recorded.run_id.clone(),
             message: format!(
                 "routing has changed since this run started, so a recorded rung would now mean a \
@@ -555,7 +558,7 @@ fn restore_recorded_routing(
         return Ok(());
     };
     if snapshot.len() != analysis.chains.len() {
-        return Err(TactusError::Resume {
+        return Err(UpstrokeError::Resume {
             run_id: recorded.run_id.clone(),
             message: "the recorded binding snapshot does not align with the run's task chains; \
                       the event log cannot safely identify which model belongs to which task"
@@ -567,7 +570,7 @@ fn restore_recorded_routing(
     for ((chain, now), then) in analysis.chains.iter_mut().zip(&current).zip(snapshot) {
         if then.task != now.task || then.tiers != now.tiers || then.attempts_per != now.attempts_per
         {
-            return Err(TactusError::Resume {
+            return Err(UpstrokeError::Resume {
                 run_id: recorded.run_id.clone(),
                 message: format!(
                     "the recorded binding snapshot for `{}` does not match its frozen chain",
@@ -576,7 +579,7 @@ fn restore_recorded_routing(
             });
         }
         let Some(bindings) = then.bindings.as_ref() else {
-            return Err(TactusError::Resume {
+            return Err(UpstrokeError::Resume {
                 run_id: recorded.run_id.clone(),
                 message: format!(
                     "the recorded binding snapshot for `{}` is missing its bindings",
@@ -585,7 +588,7 @@ fn restore_recorded_routing(
             });
         };
         if bindings.len() != chain.rungs.len() {
-            return Err(TactusError::Resume {
+            return Err(UpstrokeError::Resume {
                 run_id: recorded.run_id.clone(),
                 message: format!(
                     "the recorded binding snapshot for `{}` has {} binding(s) for {} rung(s)",
@@ -597,7 +600,7 @@ fn restore_recorded_routing(
         }
         for (rung, binding) in chain.rungs.iter_mut().zip(bindings) {
             if binding.tier != rung.tier {
-                return Err(TactusError::Resume {
+                return Err(UpstrokeError::Resume {
                     run_id: recorded.run_id.clone(),
                     message: format!(
                         "the recorded binding snapshot for `{}` assigns tier `{}` to a `{}` rung",
@@ -768,8 +771,8 @@ fn changes_between(recorded: &GateSummary, now: &GateSummary) -> String {
     parts.join(", and ")
 }
 
-pub(super) fn normalized_plan_bytes(plan: &Plan, path: &Path) -> Result<Vec<u8>, TactusError> {
-    let mut bytes = serde_json::to_vec_pretty(plan).map_err(|error| TactusError::Parse {
+pub(super) fn normalized_plan_bytes(plan: &Plan, path: &Path) -> Result<Vec<u8>, UpstrokeError> {
+    let mut bytes = serde_json::to_vec_pretty(plan).map_err(|error| UpstrokeError::Parse {
         message: format!("serializing {}: {error}", path.display()),
     })?;
     bytes.push(b'\n');

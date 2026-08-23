@@ -1,6 +1,6 @@
 //! Run directory layout (DESIGN.md §15) and run discovery.
 //!
-//! §15 draws the whole run directory under `.tactus/runs/<run-id>/`. This
+//! §15 draws the whole run directory under `.upstroke/runs/<run-id>/`. This
 //! module splits it in two, and the reason is enforcement rather than tidiness.
 //!
 //! A reviewer is a read-only agent pointed at the workspace, so every path
@@ -35,7 +35,7 @@ use std::sync::{Arc, Mutex};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-use crate::error::TactusError;
+use crate::error::UpstrokeError;
 use crate::runner::policy::runner_policy_sha256;
 use crate::topology::effects::{
     AnswerSite, EffectSiteId, HookHarness, HookPhase, Injection, LockSite, RunDirSite,
@@ -59,11 +59,11 @@ const PRIVATE_DIRS: [&str; 5] = [
 /// Where one run's files live, split by who is allowed to read them.
 #[derive(Debug, Clone)]
 pub struct RunPaths {
-    /// `<repo>/.tactus/runs/<run-id>` — `events.jsonl`, the frozen plan,
+    /// `<repo>/.upstroke/runs/<run-id>` — `events.jsonl`, the frozen plan,
     /// artifacts, questions, answers, the lock. Git-ignored, but present
     /// beside the repository it describes.
     pub public: PathBuf,
-    /// `~/.tactus/runs/<run-id>` — transcripts, review verdicts, gate logs,
+    /// `~/.upstroke/runs/<run-id>` — transcripts, review verdicts, gate logs,
     /// and the per-attempt permission settings that define each sandbox.
     pub private: PathBuf,
 }
@@ -75,7 +75,7 @@ impl RunPaths {
     }
 
     /// Layout with an explicit private root — how tests stay out of the real
-    /// `~/.tactus`, and how a caller pins the location deliberately.
+    /// `~/.upstroke`, and how a caller pins the location deliberately.
     pub fn with_private_root(repo_root: &Path, run_id: &str, private_root: &Path) -> Self {
         Self {
             public: public_dir(repo_root, run_id),
@@ -96,13 +96,13 @@ impl RunPaths {
     /// Behaviour-neutral relative to the `create_dir_all` loop this replaced —
     /// the same directories, in the same order — but now through the two sites
     /// that own them, so the effect is inventoried rather than ambient.
-    pub fn create(&self) -> Result<(), TactusError> {
+    pub fn create(&self) -> Result<(), UpstrokeError> {
         self.create_hooked(&mut NoHooks)
     }
 
     /// The same creation, observed: `RunDir.CreatePublicDir` (P0) then
     /// `RunDir.CreatePrivateDir` (P2/P3), each followed by its skeleton.
-    pub fn create_hooked(&self, hooks: &mut dyn RunDirHooks) -> Result<(), TactusError> {
+    pub fn create_hooked(&self, hooks: &mut dyn RunDirHooks) -> Result<(), UpstrokeError> {
         create_public_dir(&self.public, hooks)?;
         for name in PUBLIC_DIRS {
             create_dir(&self.public.join(name))?;
@@ -139,7 +139,7 @@ impl RunPaths {
         self.public.join("questions")
     }
 
-    /// Where `tactus answer` drops an answer for the engine to ingest.
+    /// Where `upstroke answer` drops an answer for the engine to ingest.
     pub fn answers(&self) -> PathBuf {
         self.public.join("answers")
     }
@@ -172,23 +172,23 @@ impl RunPaths {
     }
 }
 
-/// `~/.tactus`, or a temp-dir equivalent when no home resolves.
+/// `~/.upstroke`, or a temp-dir equivalent when no home resolves.
 ///
 /// The fallback is deliberately still outside the workspace. Falling back to
 /// the repo would keep runs working on a machine with no `HOME` while silently
 /// dropping the isolation this module exists for — a security property that
 /// degrades quietly is worse than one that was never claimed.
 pub fn default_private_root() -> PathBuf {
-    util::user_tactus_dir().unwrap_or_else(|| std::env::temp_dir().join("tactus"))
+    util::user_upstroke_dir().unwrap_or_else(|| std::env::temp_dir().join("upstroke"))
 }
 
-/// `<repo>/.tactus/runs/<run-id>` — §15's documented location.
+/// `<repo>/.upstroke/runs/<run-id>` — §15's documented location.
 pub fn public_dir(repo_root: &Path, run_id: &str) -> PathBuf {
     runs_root(repo_root).join(run_id)
 }
 
 pub fn runs_root(repo_root: &Path) -> PathBuf {
-    repo_root.join(".tactus").join("runs")
+    repo_root.join(".upstroke").join("runs")
 }
 
 // ===========================================================================
@@ -305,11 +305,11 @@ impl RunDirHooks for HarnessHooks {
 /// reason [`crate::agent::proc`] aborts: the claim under test is what a
 /// coordinator that runs **no** cleanup leaves behind, and both of the other
 /// two run destructors.
-fn apply(injection: Injection, site: EffectSiteId, phase: HookPhase) -> Result<(), TactusError> {
+fn apply(injection: Injection, site: EffectSiteId, phase: HookPhase) -> Result<(), UpstrokeError> {
     match injection {
         Injection::Proceed => Ok(()),
         Injection::Kill => std::process::abort(),
-        Injection::Error => Err(TactusError::Refused {
+        Injection::Error => Err(UpstrokeError::Refused {
             message: format!("the run-directory funnel was made to fail at `{site}` ({phase})"),
         }),
     }
@@ -323,8 +323,8 @@ fn apply(injection: Injection, site: EffectSiteId, phase: HookPhase) -> Result<(
 fn funnel<T>(
     hooks: &mut dyn RunDirHooks,
     site: EffectSiteId,
-    primitive: impl FnOnce() -> Result<T, TactusError>,
-) -> Result<T, TactusError> {
+    primitive: impl FnOnce() -> Result<T, UpstrokeError>,
+) -> Result<T, UpstrokeError> {
     apply(hooks.hook(site, HookPhase::Before), site, HookPhase::Before)?;
     let produced = primitive()?;
     apply(hooks.hook(site, HookPhase::After), site, HookPhase::After)?;
@@ -413,7 +413,7 @@ pub struct CommitRecord {
 /// This repository's identity, as the marker and both private records carry it.
 ///
 /// `workspace_candidates.execution_root`: "repo_key v1 = hex16(sha256(
-/// 'tactus-repo-key-v1' NUL canonical common git dir bytes))". `hex16` is read
+/// 'upstroke-repo-key-v1' NUL canonical common git dir bytes))". `hex16` is read
 /// as sixteen hex characters — the first eight bytes of the digest — because
 /// the same passage uses the key as a path component of the execution root and
 /// a 64-character component is not what "key" describes there.
@@ -429,7 +429,7 @@ impl RepoKey {
     #[must_use]
     pub fn v1(canonical_common_git_dir: &Path) -> Self {
         let mut hasher = Sha256::new();
-        hasher.update(b"tactus-repo-key-v1");
+        hasher.update(b"upstroke-repo-key-v1");
         hasher.update([0u8]);
         hasher.update(canonical_common_git_dir.as_os_str().as_encoded_bytes());
         let digest = format!("{:x}", hasher.finalize());
@@ -443,12 +443,12 @@ impl RepoKey {
     /// otherwise a run created in the main checkout and a census run from a
     /// linked one would each call the other foreign. A main worktree's git dir
     /// is already the common one.
-    pub fn for_worktree_git_dir(worktree_git_dir: &Path) -> Result<Self, TactusError> {
+    pub fn for_worktree_git_dir(worktree_git_dir: &Path) -> Result<Self, UpstrokeError> {
         Ok(Self::v1(&canonical(common_git_dir(worktree_git_dir))?))
     }
 
     /// The v1 key for the repository `repo_root` is a worktree of.
-    pub fn for_repo(repo_root: &Path) -> Result<Self, TactusError> {
+    pub fn for_repo(repo_root: &Path) -> Result<Self, UpstrokeError> {
         let workspace = Workspace::open(repo_root)?;
         Self::for_worktree_git_dir(&workspace.worktree_git_dir()?)
     }
@@ -488,8 +488,8 @@ fn common_git_dir(worktree_git_dir: &Path) -> PathBuf {
     }
 }
 
-fn canonical(path: PathBuf) -> Result<PathBuf, TactusError> {
-    fs::canonicalize(&path).map_err(|source| TactusError::Io { path, source })
+fn canonical(path: PathBuf) -> Result<PathBuf, UpstrokeError> {
+    fs::canonicalize(&path).map_err(|source| UpstrokeError::Io { path, source })
 }
 
 // ---------------------------------------------------------------------------
@@ -505,12 +505,12 @@ fn stage_json<T: Serialize>(
     path: &Path,
     value: &T,
     ledger: &DurabilityLedger,
-) -> Result<(), TactusError> {
-    let mut json = serde_json::to_string_pretty(value).map_err(|error| TactusError::Parse {
+) -> Result<(), UpstrokeError> {
+    let mut json = serde_json::to_string_pretty(value).map_err(|error| UpstrokeError::Parse {
         message: format!("serializing {}: {error}", path.display()),
     })?;
     json.push('\n');
-    let io = |source| TactusError::Io {
+    let io = |source| UpstrokeError::Io {
         path: path.to_path_buf(),
         source,
     };
@@ -532,8 +532,8 @@ fn sync_file_recorded(
     file: &File,
     path: &Path,
     ledger: &DurabilityLedger,
-) -> Result<(), TactusError> {
-    let io = |source| TactusError::Io {
+) -> Result<(), UpstrokeError> {
+    let io = |source| UpstrokeError::Io {
         path: path.to_path_buf(),
         source,
     };
@@ -545,8 +545,12 @@ fn sync_file_recorded(
 
 /// Rename the staged file onto its published name and make the directory entry
 /// durable.
-fn publish(staged: &Path, published: &Path, ledger: &DurabilityLedger) -> Result<(), TactusError> {
-    fs::rename(staged, published).map_err(|source| TactusError::Io {
+fn publish(
+    staged: &Path,
+    published: &Path,
+    ledger: &DurabilityLedger,
+) -> Result<(), UpstrokeError> {
+    fs::rename(staged, published).map_err(|source| UpstrokeError::Io {
         path: published.to_path_buf(),
         source,
     })?;
@@ -569,8 +573,8 @@ fn publish(staged: &Path, published: &Path, ledger: &DurabilityLedger) -> Result
 /// "fsync the directory" carries no platform exception — so
 /// [`crate::util::fsync_dir`] performs it and this function stays what it always
 /// was: the site's ledger entry beside the barrier.
-fn sync_dir(dir: &Path, ledger: &DurabilityLedger) -> Result<(), TactusError> {
-    util::fsync_dir(dir).map_err(|source| TactusError::Io {
+fn sync_dir(dir: &Path, ledger: &DurabilityLedger) -> Result<(), UpstrokeError> {
+    util::fsync_dir(dir).map_err(|source| UpstrokeError::Io {
         path: dir.to_path_buf(),
         source,
     })?;
@@ -579,8 +583,8 @@ fn sync_dir(dir: &Path, ledger: &DurabilityLedger) -> Result<(), TactusError> {
 }
 
 /// Create a directory and everything above it.
-fn create_dir(dir: &Path) -> Result<(), TactusError> {
-    fs::create_dir_all(dir).map_err(|source| TactusError::Io {
+fn create_dir(dir: &Path) -> Result<(), UpstrokeError> {
+    fs::create_dir_all(dir).map_err(|source| UpstrokeError::Io {
         path: dir.to_path_buf(),
         source,
     })
@@ -591,7 +595,7 @@ fn create_dir(dir: &Path) -> Result<(), TactusError> {
 // ---------------------------------------------------------------------------
 
 /// P0 — `RunDir.CreatePublicDir`.
-pub fn create_public_dir(public: &Path, hooks: &mut dyn RunDirHooks) -> Result<(), TactusError> {
+pub fn create_public_dir(public: &Path, hooks: &mut dyn RunDirHooks) -> Result<(), UpstrokeError> {
     funnel(
         hooks,
         EffectSiteId::RunDir(RunDirSite::CreatePublicDir),
@@ -604,7 +608,7 @@ pub fn stage_marker(
     public: &Path,
     marker: &CreatingMarker,
     hooks: &mut dyn RunDirHooks,
-) -> Result<(), TactusError> {
+) -> Result<(), UpstrokeError> {
     let ledger = hooks.durability_ledger();
     funnel(hooks, EffectSiteId::RunDir(RunDirSite::StageMarker), || {
         stage_json(&public.join(MARKER_STAGED), marker, &ledger)
@@ -612,7 +616,7 @@ pub fn stage_marker(
 }
 
 /// P1b — `RunDir.PublishMarker`. The atomic rename onto `<public>/.creating`.
-pub fn publish_marker(public: &Path, hooks: &mut dyn RunDirHooks) -> Result<(), TactusError> {
+pub fn publish_marker(public: &Path, hooks: &mut dyn RunDirHooks) -> Result<(), UpstrokeError> {
     let ledger = hooks.durability_ledger();
     funnel(
         hooks,
@@ -626,7 +630,7 @@ pub fn publish_marker(public: &Path, hooks: &mut dyn RunDirHooks) -> Result<(), 
 /// Idempotent: a census and the owning resume both remove a stale marker, and
 /// `resource_accounting` has a stale marker removed "by a census with the lock
 /// free **or** by its owner on resume".
-pub fn remove_marker(public: &Path, hooks: &mut dyn RunDirHooks) -> Result<(), TactusError> {
+pub fn remove_marker(public: &Path, hooks: &mut dyn RunDirHooks) -> Result<(), UpstrokeError> {
     funnel(
         hooks,
         EffectSiteId::RunDir(RunDirSite::RemoveMarker),
@@ -638,7 +642,10 @@ pub fn remove_marker(public: &Path, hooks: &mut dyn RunDirHooks) -> Result<(), T
 }
 
 /// P2/P3 — `RunDir.CreatePrivateDir`.
-pub fn create_private_dir(private: &Path, hooks: &mut dyn RunDirHooks) -> Result<(), TactusError> {
+pub fn create_private_dir(
+    private: &Path,
+    hooks: &mut dyn RunDirHooks,
+) -> Result<(), UpstrokeError> {
     funnel(
         hooks,
         EffectSiteId::RunDir(RunDirSite::CreatePrivateDir),
@@ -651,7 +658,7 @@ pub fn stage_owner_record(
     private: &Path,
     owner: &OwnerRecord,
     hooks: &mut dyn RunDirHooks,
-) -> Result<(), TactusError> {
+) -> Result<(), UpstrokeError> {
     let ledger = hooks.durability_ledger();
     funnel(
         hooks,
@@ -664,7 +671,7 @@ pub fn stage_owner_record(
 pub fn publish_owner_record(
     private: &Path,
     hooks: &mut dyn RunDirHooks,
-) -> Result<(), TactusError> {
+) -> Result<(), UpstrokeError> {
     let ledger = hooks.durability_ledger();
     funnel(
         hooks,
@@ -684,7 +691,7 @@ pub fn stage_commit_record(
     private: &Path,
     record: &CommitRecord,
     hooks: &mut dyn RunDirHooks,
-) -> Result<(), TactusError> {
+) -> Result<(), UpstrokeError> {
     let ledger = hooks.durability_ledger();
     funnel(
         hooks,
@@ -703,7 +710,7 @@ pub fn stage_commit_record(
 pub fn publish_commit_record(
     private: &Path,
     hooks: &mut dyn RunDirHooks,
-) -> Result<(), TactusError> {
+) -> Result<(), UpstrokeError> {
     let ledger = hooks.durability_ledger();
     funnel(
         hooks,
@@ -764,10 +771,10 @@ pub fn write_plan(
     public: &Path,
     normalized: &[u8],
     hooks: &mut dyn RunDirHooks,
-) -> Result<(), TactusError> {
+) -> Result<(), UpstrokeError> {
     funnel(hooks, EffectSiteId::RunDir(RunDirSite::WritePlan), || {
         let path = public.join(PLAN);
-        fs::write(&path, normalized).map_err(|source| TactusError::Io { path, source })
+        fs::write(&path, normalized).map_err(|source| UpstrokeError::Io { path, source })
     })
 }
 
@@ -776,7 +783,7 @@ pub fn write_report<T: Serialize>(
     public: &Path,
     report: &T,
     hooks: &mut dyn RunDirHooks,
-) -> Result<(), TactusError> {
+) -> Result<(), UpstrokeError> {
     funnel(hooks, EffectSiteId::RunDir(RunDirSite::WriteReport), || {
         util::write_json(&public.join("report.json"), report)
     })
@@ -788,7 +795,7 @@ pub fn write_question_payload<T: Serialize>(
     component: &str,
     payload: &T,
     hooks: &mut dyn RunDirHooks,
-) -> Result<(), TactusError> {
+) -> Result<(), UpstrokeError> {
     funnel(
         hooks,
         EffectSiteId::RunDir(RunDirSite::WriteQuestionPayload),
@@ -802,7 +809,7 @@ pub fn write_question_payload<T: Serialize>(
 /// last … so a kill mid-census leaves a husk the next census completes".
 /// Removing the marker first would leave a marker-less husk carrying content,
 /// which the next census retains rather than finishes.
-pub fn remove_public_husk(public: &Path, hooks: &mut dyn RunDirHooks) -> Result<(), TactusError> {
+pub fn remove_public_husk(public: &Path, hooks: &mut dyn RunDirHooks) -> Result<(), UpstrokeError> {
     funnel(
         hooks,
         EffectSiteId::RunDir(RunDirSite::RemovePublicHusk),
@@ -817,10 +824,10 @@ pub fn remove_public_husk(public: &Path, hooks: &mut dyn RunDirHooks) -> Result<
                 } else {
                     fs::remove_file(&path)
                 };
-                removed.map_err(|source| TactusError::Io { path, source })?;
+                removed.map_err(|source| UpstrokeError::Io { path, source })?;
             }
             remove_file_if_present(&public.join(MARKER))?;
-            fs::remove_dir(public).map_err(|source| TactusError::Io {
+            fs::remove_dir(public).map_err(|source| UpstrokeError::Io {
                 path: public.to_path_buf(),
                 source,
             })
@@ -838,13 +845,13 @@ pub fn remove_public_husk(public: &Path, hooks: &mut dyn RunDirHooks) -> Result<
 pub fn remove_private_husk(
     proof: PrivateHalfProof,
     hooks: &mut dyn RunDirHooks,
-) -> Result<(), TactusError> {
+) -> Result<(), UpstrokeError> {
     funnel(
         hooks,
         EffectSiteId::RunDir(RunDirSite::RemovePrivateHusk),
         || {
             let target = proof.target();
-            fs::remove_dir_all(target).map_err(|source| TactusError::Io {
+            fs::remove_dir_all(target).map_err(|source| UpstrokeError::Io {
                 path: target.to_path_buf(),
                 source,
             })
@@ -852,11 +859,11 @@ pub fn remove_private_husk(
     )
 }
 
-fn remove_file_if_present(path: &Path) -> Result<(), TactusError> {
+fn remove_file_if_present(path: &Path) -> Result<(), UpstrokeError> {
     match fs::remove_file(path) {
         Ok(()) => Ok(()),
         Err(source) if source.kind() == io::ErrorKind::NotFound => Ok(()),
-        Err(source) => Err(TactusError::Io {
+        Err(source) => Err(UpstrokeError::Io {
             path: path.to_path_buf(),
             source,
         }),
@@ -886,7 +893,7 @@ pub fn stage_answer<T: Serialize>(
     component: &str,
     answer: &T,
     hooks: &mut dyn RunDirHooks,
-) -> Result<(), TactusError> {
+) -> Result<(), UpstrokeError> {
     funnel(hooks, EffectSiteId::Answer(AnswerSite::StageWrite), || {
         util::write_json(&answers.join(format!("{component}.json.partial")), answer)
     })
@@ -897,14 +904,14 @@ pub fn publish_answer(
     answers: &Path,
     component: &str,
     hooks: &mut dyn RunDirHooks,
-) -> Result<(), TactusError> {
+) -> Result<(), UpstrokeError> {
     funnel(
         hooks,
         EffectSiteId::Answer(AnswerSite::PublishRename),
         || {
             let staged = answers.join(format!("{component}.json.partial"));
             let published = answers.join(format!("{component}.json"));
-            fs::rename(&staged, &published).map_err(|source| TactusError::Io {
+            fs::rename(&staged, &published).map_err(|source| UpstrokeError::Io {
                 path: published,
                 source,
             })
@@ -921,13 +928,13 @@ pub fn ingest_answer(
     answers: &Path,
     component: &str,
     hooks: &mut dyn RunDirHooks,
-) -> Result<Option<String>, TactusError> {
+) -> Result<Option<String>, UpstrokeError> {
     funnel(hooks, EffectSiteId::Answer(AnswerSite::Ingest), || {
         let path = answers.join(format!("{component}.json"));
         match fs::read_to_string(&path) {
             Ok(text) => Ok(Some(text)),
             Err(source) if source.kind() == io::ErrorKind::NotFound => Ok(None),
-            Err(source) => Err(TactusError::Io { path, source }),
+            Err(source) => Err(UpstrokeError::Io { path, source }),
         }
     })
 }
@@ -936,7 +943,7 @@ pub fn ingest_answer(
 // Classification
 // ===========================================================================
 
-/// What a directory under `<repo>/.tactus/runs` is.
+/// What a directory under `<repo>/.upstroke/runs` is.
 ///
 /// `sequential_substrate.startup_census`: "every entry is classified by
 /// `rundir::classify_run_dir` as **Committed** (`events.jsonl` exists and its
@@ -1659,7 +1666,7 @@ pub fn list_runs(repo_root: &Path) -> Vec<String> {
     runs
 }
 
-/// Every directory under `<repo>/.tactus/runs`, committed or not, oldest first.
+/// Every directory under `<repo>/.upstroke/runs`, committed or not, oldest first.
 ///
 /// Not a reader in `startup_census`'s sense and deliberately not filtered by
 /// commitment: this is the enumeration a census walks and the one the worktree
@@ -1680,7 +1687,7 @@ pub fn run_dir_names(repo_root: &Path) -> Vec<String> {
     runs
 }
 
-/// Every husk under `<repo>/.tactus/runs`, oldest first.
+/// Every husk under `<repo>/.upstroke/runs`, oldest first.
 #[must_use]
 pub fn list_husks(repo_root: &Path) -> Vec<String> {
     run_dir_names(repo_root)
@@ -1785,7 +1792,7 @@ pub fn husk_report(
     }
 }
 
-/// The most recent run — what `tactus status` reports when given no id.
+/// The most recent run — what `upstroke status` reports when given no id.
 pub fn latest_run(repo_root: &Path) -> Option<String> {
     list_runs(repo_root).pop()
 }
@@ -1796,7 +1803,7 @@ pub fn latest_run(repo_root: &Path) -> Option<String> {
 /// An exact match wins outright rather than being treated as one candidate
 /// among several: a full id is never ambiguous, even if some other run happens
 /// to extend it.
-pub fn resolve_run_id(repo_root: &Path, wanted: &str) -> Result<String, TactusError> {
+pub fn resolve_run_id(repo_root: &Path, wanted: &str) -> Result<String, UpstrokeError> {
     let runs = list_runs(repo_root);
     let wanted_upper = wanted.to_ascii_uppercase();
     // The entry as it exists on disk, not the uppercased input. The comparison
@@ -1812,14 +1819,14 @@ pub fn resolve_run_id(repo_root: &Path, wanted: &str) -> Result<String, TactusEr
         .collect();
     match matches.as_slice() {
         [only] => Ok((*only).clone()),
-        [] => Err(TactusError::Refused {
+        [] => Err(UpstrokeError::Refused {
             message: match husk_matching(repo_root, wanted) {
                 // A directory is there, and it holds no committed `run_started`.
                 // Saying "no run matches that id" of a directory the operator
                 // can see is the answer that sends them looking for a bug.
                 Some(husk) => format!(
                     "`{husk}` never recorded a committed run_started, so there is no run to open \
-                     there — ask `tactus status {husk}` for what it is and what happens to it"
+                     there — ask `upstroke status {husk}` for what it is and what happens to it"
                 ),
                 None if runs.is_empty() => {
                     format!("no runs found under {}", runs_root(repo_root).display())
@@ -1827,7 +1834,7 @@ pub fn resolve_run_id(repo_root: &Path, wanted: &str) -> Result<String, TactusEr
                 None => format!("no run matches that id; known runs: {}", runs.join(", ")),
             },
         }),
-        several => Err(TactusError::Refused {
+        several => Err(UpstrokeError::Refused {
             message: format!(
                 "that prefix matches {} runs ({}); use more characters",
                 several.len(),
@@ -1863,7 +1870,7 @@ fn husk_matching(repo_root: &Path, wanted: &str) -> Option<String> {
 #[derive(Debug)]
 pub struct FoundQuestion {
     pub run_id: String,
-    /// The run's public directory — everything `tactus answer` touches.
+    /// The run's public directory — everything `upstroke answer` touches.
     pub public: PathBuf,
     /// The full question id, expanded from whatever prefix was typed.
     pub question_id: String,
@@ -1874,7 +1881,7 @@ pub struct FoundQuestion {
 /// Scans every run rather than requiring the operator to remember which one
 /// asked: the notifier hands them a question id, not a run id, so a question
 /// id is what the command has to accept.
-pub fn find_question(repo_root: &Path, wanted: &str) -> Result<FoundQuestion, TactusError> {
+pub fn find_question(repo_root: &Path, wanted: &str) -> Result<FoundQuestion, UpstrokeError> {
     let wanted_upper = wanted.to_ascii_uppercase();
     let mut exact: Option<FoundQuestion> = None;
     let mut matches: Vec<FoundQuestion> = Vec::new();
@@ -1904,16 +1911,16 @@ pub fn find_question(repo_root: &Path, wanted: &str) -> Result<FoundQuestion, Ta
         return Ok(found);
     }
     match matches.len() {
-        1 => matches.pop().ok_or_else(|| TactusError::Refused {
+        1 => matches.pop().ok_or_else(|| UpstrokeError::Refused {
             message: "question vanished while resolving it".to_owned(),
         }),
-        0 => Err(TactusError::Refused {
+        0 => Err(UpstrokeError::Refused {
             message: format!(
                 "no question with that id under {}",
                 runs_root(repo_root).display()
             ),
         }),
-        several => Err(TactusError::Refused {
+        several => Err(UpstrokeError::Refused {
             message: format!(
                 "that prefix matches {several} questions ({}); use more characters",
                 matches
@@ -1930,7 +1937,7 @@ pub fn find_question(repo_root: &Path, wanted: &str) -> Result<FoundQuestion, Ta
 ///
 /// Takes the public directory rather than a whole [`RunPaths`] because the
 /// lock lives in the public half by construction. Two callers only ever want
-/// to know whether a run is live — `tactus answer`, and the resume that must
+/// to know whether a run is live — `upstroke answer`, and the resume that must
 /// claim the run *before* it has read where the private half went — and
 /// neither has a private path to offer. Asking them for one invited passing
 /// the public path twice, which would have quietly become wrong the moment
@@ -1940,7 +1947,7 @@ pub fn lock_file(public: &Path) -> PathBuf {
 }
 
 fn worktree_lock_file(worktree_git_dir: &Path) -> PathBuf {
-    worktree_git_dir.join("tactus-worktree.lock")
+    worktree_git_dir.join("upstroke-worktree.lock")
 }
 
 /// An exclusive lease on the physical worktree shared by every run directory.
@@ -1965,7 +1972,7 @@ impl WorktreeLock {
     /// the working tree. Kept as the public convenience API for existing
     /// callers; the engine already has the resolved [`Workspace`] and uses
     /// [`Self::acquire_in`] to avoid opening it twice.
-    pub fn acquire(repo_root: &Path) -> Result<Self, TactusError> {
+    pub fn acquire(repo_root: &Path) -> Result<Self, UpstrokeError> {
         let workspace = Workspace::open(repo_root)?;
         let worktree_git_dir = workspace.worktree_git_dir()?;
         Self::acquire_in(workspace.root(), &worktree_git_dir)
@@ -1974,7 +1981,7 @@ impl WorktreeLock {
     pub(crate) fn acquire_in(
         repo_root: &Path,
         worktree_git_dir: &Path,
-    ) -> Result<Self, TactusError> {
+    ) -> Result<Self, UpstrokeError> {
         Self::acquire_in_hooked(repo_root, worktree_git_dir, &mut NoHooks)
     }
 
@@ -1992,9 +1999,9 @@ impl WorktreeLock {
         repo_root: &Path,
         worktree_git_dir: &Path,
         hooks: &mut dyn RunDirHooks,
-    ) -> Result<Self, TactusError> {
+    ) -> Result<Self, UpstrokeError> {
         let path = worktree_lock_file(worktree_git_dir);
-        let claim = claim_key(worktree_git_dir).join("tactus-worktree.lock");
+        let claim = claim_key(worktree_git_dir).join("upstroke-worktree.lock");
         if !claims().insert(claim.clone()) {
             return Err(worktree_refused(repo_root, &path, Some(std::process::id())));
         }
@@ -2008,7 +2015,7 @@ impl WorktreeLock {
                     .write(true)
                     .read(true)
                     .open(&path)
-                    .map_err(|source| TactusError::Io {
+                    .map_err(|source| UpstrokeError::Io {
                         path: path.clone(),
                         source,
                     })
@@ -2021,7 +2028,7 @@ impl WorktreeLock {
                 || match imp::take(&file) {
                     Holder::Nobody => Ok(()),
                     Holder::Someone { pid } => Err(worktree_refused(repo_root, &path, pid)),
-                    Holder::Unknown(source) => Err(TactusError::Io {
+                    Holder::Unknown(source) => Err(UpstrokeError::Io {
                         path: path.clone(),
                         source,
                     }),
@@ -2048,7 +2055,7 @@ impl WorktreeLock {
                     .find(|public| observe_cleanup_hold(public, hooks))
                 {
                     release_claim_after_file(Some(file), &claim, || {});
-                    return Err(TactusError::Refused {
+                    return Err(UpstrokeError::Refused {
                         message: format!(
                             "run `{}` is still cleaning agent processes in worktree {}; refusing overlapping engine ownership",
                             cleaning.file_name().unwrap_or_default().to_string_lossy(),
@@ -2111,14 +2118,17 @@ impl RunLock {
     }
 
     /// Take the lock on a run's public directory, or explain who has it.
-    pub fn acquire(public: &Path) -> Result<Self, TactusError> {
+    pub fn acquire(public: &Path) -> Result<Self, UpstrokeError> {
         Self::acquire_hooked(public, &mut NoHooks)
     }
 
     /// The same lock, observed. `Lock.AcquireRun` (R17) around the hold, and
     /// `Lock.ProbeCleanupExclusive` (R17, Unix) around the momentary exclusive
     /// probe that refuses while a surviving reaper still holds R28.
-    pub fn acquire_hooked(public: &Path, hooks: &mut dyn RunDirHooks) -> Result<Self, TactusError> {
+    pub fn acquire_hooked(
+        public: &Path,
+        hooks: &mut dyn RunDirHooks,
+    ) -> Result<Self, UpstrokeError> {
         let path = lock_file(public);
         let claim = claim_key(public);
         // This process first, and not only as an optimisation: the OS lock
@@ -2135,7 +2145,7 @@ impl RunLock {
                 .write(true)
                 .read(true)
                 .open(&path)
-                .map_err(|source| TactusError::Io {
+                .map_err(|source| UpstrokeError::Io {
                     path: path.clone(),
                     source,
                 })
@@ -2145,7 +2155,7 @@ impl RunLock {
                     // A lock that cannot be taken is not a lock that was taken.
                     // Say what actually failed rather than blaming an engine
                     // that may not exist.
-                    Holder::Unknown(source) => Err(TactusError::Io {
+                    Holder::Unknown(source) => Err(UpstrokeError::Io {
                         path: path.clone(),
                         source,
                     }),
@@ -2182,7 +2192,7 @@ impl RunLock {
     pub fn release(mut self, hooks: &mut dyn RunDirHooks) {
         let _ = funnel(hooks, EffectSiteId::Lock(LockSite::Release), || {
             self.release_file_then(|| {});
-            Ok::<(), TactusError>(())
+            Ok::<(), UpstrokeError>(())
         });
     }
 
@@ -2213,7 +2223,7 @@ pub fn observe_cleanup_hold(public: &Path, hooks: &mut dyn RunDirHooks) -> bool 
     funnel(
         hooks,
         EffectSiteId::Lock(LockSite::ObserveCleanupHold),
-        || Ok::<bool, TactusError>(cleanup::is_held(public)),
+        || Ok::<bool, UpstrokeError>(cleanup::is_held(public)),
     )
     .unwrap_or(
         // An observation that was made to fail is not an observation that
@@ -2232,14 +2242,14 @@ fn release_claim_after_file(file: Option<File>, claim: &Path, after_close: impl 
     claims().remove(claim);
 }
 
-fn refused(public: &Path, path: &Path, pid: Option<u32>) -> TactusError {
+fn refused(public: &Path, path: &Path, pid: Option<u32>) -> UpstrokeError {
     let who = match pid {
         Some(pid) => format!(" (pid {pid})"),
         None => String::new(),
     };
-    TactusError::Refused {
+    UpstrokeError::Refused {
         message: format!(
-            "another tactus process{who} is already driving run `{}` (lock held on {}). Two \
+            "another upstroke process{who} is already driving run `{}` (lock held on {}). Two \
              engines would interleave events and fight over the same branch — wait for it to \
              finish, or stop it first.",
             public.file_name().unwrap_or_default().to_string_lossy(),
@@ -2248,14 +2258,14 @@ fn refused(public: &Path, path: &Path, pid: Option<u32>) -> TactusError {
     }
 }
 
-fn worktree_refused(repo_root: &Path, path: &Path, pid: Option<u32>) -> TactusError {
+fn worktree_refused(repo_root: &Path, path: &Path, pid: Option<u32>) -> UpstrokeError {
     let who = match pid {
         Some(pid) => format!(" (pid {pid})"),
         None => String::new(),
     };
-    TactusError::Refused {
+    UpstrokeError::Refused {
         message: format!(
-            "another tactus process{who} is already driving worktree {} (lock held on {}). Different run ids still share HEAD, the index, and working-tree bytes; wait for it to finish, or stop it first.",
+            "another upstroke process{who} is already driving worktree {} (lock held on {}). Different run ids still share HEAD, the index, and working-tree bytes; wait for it to finish, or stop it first.",
             repo_root.display(),
             path.display()
         ),
@@ -2354,7 +2364,7 @@ pub fn is_running(public: &Path) -> bool {
         //
         // So the question is which way to be wrong when the OS refuses to say.
         // Answering "not running" makes `status` settle a working attempt as
-        // cut off and print `state: interrupted … Continue it with: tactus
+        // cut off and print `state: interrupted … Continue it with: upstroke
         // resume <id>`, sending the operator to start a second engine on a
         // live run. Answering "running" costs a `status` that declines to
         // settle and says another process holds the run. One of those invents
@@ -2368,7 +2378,7 @@ pub fn is_running(public: &Path) -> bool {
 #[cfg(unix)]
 mod cleanup {
     use super::{cleanup_lock_file, refused};
-    use crate::error::TactusError;
+    use crate::error::UpstrokeError;
     use std::cell::RefCell;
     use std::collections::BTreeMap;
     use std::fs::File;
@@ -2424,7 +2434,7 @@ mod cleanup {
         }
     }
 
-    pub(super) fn take(public: &Path) -> Result<CleanupLease, TactusError> {
+    pub(super) fn take(public: &Path) -> Result<CleanupLease, UpstrokeError> {
         let path = cleanup_lock_file(public);
         let file = File::options()
             .create(true)
@@ -2432,7 +2442,7 @@ mod cleanup {
             .read(true)
             .write(true)
             .open(&path)
-            .map_err(|source| TactusError::Io {
+            .map_err(|source| UpstrokeError::Io {
                 path: path.clone(),
                 source,
             })?;
@@ -2445,7 +2455,7 @@ mod cleanup {
             ) {
                 return Err(refused(public, &path, None));
             }
-            return Err(TactusError::Io { path, source });
+            return Err(UpstrokeError::Io { path, source });
         }
         // This probe proves no prior crash reaper remains. Do not retain the
         // lock in the conductor: arbitrary forked children would inherit its
@@ -2453,7 +2463,7 @@ mod cleanup {
         // primary fcntl lock deliberately avoids. Each cleanup reaper instead
         // reopens `path` and owns an independent shared hold.
         if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_UN) } != 0 {
-            return Err(TactusError::Io {
+            return Err(UpstrokeError::Io {
                 path,
                 source: std::io::Error::last_os_error(),
             });
@@ -2486,7 +2496,7 @@ mod cleanup {
 
 #[cfg(not(unix))]
 mod cleanup {
-    use crate::error::TactusError;
+    use crate::error::UpstrokeError;
     use std::marker::PhantomData;
     use std::path::Path;
     use std::rc::Rc;
@@ -2503,7 +2513,7 @@ mod cleanup {
         fn drop(&mut self) {}
     }
 
-    pub(super) fn take(_: &Path) -> Result<CleanupLease, TactusError> {
+    pub(super) fn take(_: &Path) -> Result<CleanupLease, UpstrokeError> {
         Ok(CleanupLease)
     }
 
@@ -2729,7 +2739,8 @@ mod tests {
     use std::time::{Duration, Instant};
 
     fn scratch(tag: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!("tactus-rundir-{tag}-{}", std::process::id()));
+        let dir =
+            std::env::temp_dir().join(format!("upstroke-rundir-{tag}-{}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).expect("scratch dir");
         dir
@@ -2752,11 +2763,11 @@ mod tests {
         format!(
             "{{\"ts\":\"2026-08-20T00:00:00Z\",\"event\":\"run_started\",\
              \"data\":{{\"schema\":{schema},\"run_id\":\"{run_id}\",\
-             \"branch\":\"tactus/run-{run_id}\"}}}}"
+             \"branch\":\"upstroke/run-{run_id}\"}}}}"
         )
     }
 
-    /// Make `<repo>/.tactus/runs/<run_id>` a committed run.
+    /// Make `<repo>/.upstroke/runs/<run_id>` a committed run.
     fn commit_run(repo: &Path, run_id: &str) -> PathBuf {
         let public = public_dir(repo, run_id);
         fs::create_dir_all(&public).expect("run dir");
@@ -2797,7 +2808,10 @@ mod tests {
                 "ops surface stays beside the repo"
             );
         }
-        assert_eq!(paths.events(), repo.join(".tactus/runs/RUN1/events.jsonl"));
+        assert_eq!(
+            paths.events(),
+            repo.join(".upstroke/runs/RUN1/events.jsonl")
+        );
     }
 
     #[test]
@@ -2806,7 +2820,7 @@ mod tests {
         // where an agent can read them.
         let root = default_private_root();
         assert!(
-            root.ends_with(".tactus") || root.ends_with("tactus"),
+            root.ends_with(".upstroke") || root.ends_with("upstroke"),
             "{root:?}"
         );
         assert!(root.is_absolute(), "{root:?}");
@@ -2971,8 +2985,8 @@ mod tests {
     fn the_lock_answers_at_once_rather_than_waiting_to_be_sure() {
         // There was a 500ms contention grace here, and it was paid in full
         // exactly when the answer was yes: a live engine never lets go, so the
-        // retry loop always ran to the deadline. Every `tactus status` and
-        // `tactus answer` against a working run paid it, and `--follow` paid it
+        // retry loop always ran to the deadline. Every `upstroke status` and
+        // `upstroke answer` against a working run paid it, and `--follow` paid it
         // once per idle poll until it was given a cheaper question to ask.
         //
         // The grace existed to disbelieve a `fork` window. The primitive now
@@ -3053,7 +3067,7 @@ mod tests {
     #[test]
     #[ignore = "spawned as a subprocess by a_second_process_is_refused_the_run_lock"]
     fn lock_child_holds_the_run() {
-        let public = PathBuf::from(std::env::var("TACTUS_TEST_LOCK_DIR").expect("run dir"));
+        let public = PathBuf::from(std::env::var("UPSTROKE_TEST_LOCK_DIR").expect("run dir"));
         let _held = RunLock::acquire(&public).expect("the child takes the lock");
         println!("held");
         std::io::Write::flush(&mut std::io::stdout()).expect("flush");
@@ -3063,10 +3077,10 @@ mod tests {
     #[test]
     #[ignore = "spawned as a subprocess by two_run_ids_cannot_drive_one_worktree_concurrently"]
     fn worktree_lock_child_holds_run_a() {
-        let repo = PathBuf::from(std::env::var("TACTUS_TEST_WORKTREE_DIR").expect("repo"));
+        let repo = PathBuf::from(std::env::var("UPSTROKE_TEST_WORKTREE_DIR").expect("repo"));
         let git_dir =
-            PathBuf::from(std::env::var("TACTUS_TEST_WORKTREE_GIT_DIR").expect("git dir"));
-        let public = PathBuf::from(std::env::var("TACTUS_TEST_LOCK_DIR").expect("run dir"));
+            PathBuf::from(std::env::var("UPSTROKE_TEST_WORKTREE_GIT_DIR").expect("git dir"));
+        let public = PathBuf::from(std::env::var("UPSTROKE_TEST_LOCK_DIR").expect("run dir"));
         let _worktree =
             WorktreeLock::acquire_in(&repo, &git_dir).expect("child takes worktree lease");
         let _run = RunLock::acquire(&public).expect("child takes run A lock");
@@ -3094,9 +3108,9 @@ mod tests {
                 "--ignored",
                 "--nocapture",
             ])
-            .env("TACTUS_TEST_WORKTREE_DIR", &repo)
-            .env("TACTUS_TEST_WORKTREE_GIT_DIR", &git_dir)
-            .env("TACTUS_TEST_LOCK_DIR", &run_a.public)
+            .env("UPSTROKE_TEST_WORKTREE_DIR", &repo)
+            .env("UPSTROKE_TEST_WORKTREE_GIT_DIR", &git_dir)
+            .env("UPSTROKE_TEST_LOCK_DIR", &run_a.public)
             .stdout(std::process::Stdio::piped())
             .spawn()
             .expect("spawn run A engine");
@@ -3150,7 +3164,7 @@ mod tests {
                 "--ignored",
                 "--nocapture",
             ])
-            .env("TACTUS_TEST_LOCK_DIR", &paths.public)
+            .env("UPSTROKE_TEST_LOCK_DIR", &paths.public)
             .stdout(std::process::Stdio::piped())
             .spawn()
             .expect("spawn the second engine");
@@ -3910,11 +3924,11 @@ mod tests {
     }
 
     /// Where [`endless_log_classification_helper`] is pointed.
-    const ENDLESS_LOG_DIR: &str = "TACTUS_ENDLESS_LOG_DIR";
+    const ENDLESS_LOG_DIR: &str = "UPSTROKE_ENDLESS_LOG_DIR";
 
     /// Set when the helper may also *open* the log itself and measure
     /// [`first_line`]'s bound over it — true of a device, false of a fifo.
-    const ENDLESS_LOG_PROBE: &str = "TACTUS_ENDLESS_LOG_PROBE";
+    const ENDLESS_LOG_PROBE: &str = "UPSTROKE_ENDLESS_LOG_PROBE";
 
     /// The child half of
     /// [`a_run_directory_whose_log_never_ends_is_still_classified`].
@@ -4603,7 +4617,7 @@ mod tests {
         let mut policy = crate::runner::policy::host_policy();
         policy.credential_volumes = Some(std::collections::BTreeMap::from([(
             "claude-code".to_owned(),
-            "tactus-creds".to_owned(),
+            "upstroke-creds".to_owned(),
         )]));
         policy
     }
@@ -4928,7 +4942,7 @@ mod tests {
             worktree_lock_file(Path::new("g"))
                 .file_name()
                 .expect("name"),
-            "tactus-worktree.lock"
+            "upstroke-worktree.lock"
         );
     }
 
@@ -5577,8 +5591,8 @@ mod tests {
     #[test]
     #[ignore = "spawned as a subprocess by a_kill_between_stage_and_rename_leaves_only_the_tmp"]
     fn publication_kill_child() {
-        let dir = PathBuf::from(std::env::var("TACTUS_TEST_KILL_DIR").expect("dir"));
-        let which = std::env::var("TACTUS_TEST_KILL_SITE").expect("site");
+        let dir = PathBuf::from(std::env::var("UPSTROKE_TEST_KILL_DIR").expect("dir"));
+        let which = std::env::var("UPSTROKE_TEST_KILL_SITE").expect("site");
         fs::create_dir_all(&dir).expect("dir");
         let policy = crate::runner::policy::host_policy();
         let mut hooks = Observer::default();
@@ -5652,8 +5666,8 @@ mod tests {
                     "--ignored",
                     "--nocapture",
                 ])
-                .env("TACTUS_TEST_KILL_DIR", &dir)
-                .env("TACTUS_TEST_KILL_SITE", which)
+                .env("UPSTROKE_TEST_KILL_DIR", &dir)
+                .env("UPSTROKE_TEST_KILL_SITE", which)
                 .stdout(std::process::Stdio::null())
                 .stderr(std::process::Stdio::null())
                 .status()
@@ -5747,7 +5761,7 @@ mod tests {
     #[ignore = "spawned as a subprocess by a_surviving_reaper_hold_refuses_the_next_coordinator_until_released"]
     fn cleanup_hold_child() {
         use std::os::fd::AsRawFd as _;
-        let public = PathBuf::from(std::env::var("TACTUS_TEST_CLEANUP_DIR").expect("run dir"));
+        let public = PathBuf::from(std::env::var("UPSTROKE_TEST_CLEANUP_DIR").expect("run dir"));
         let path = cleanup_lock_file(&public);
         let file = File::options()
             .create(true)
@@ -5802,7 +5816,7 @@ mod tests {
                 "--ignored",
                 "--nocapture",
             ])
-            .env("TACTUS_TEST_CLEANUP_DIR", &husk)
+            .env("UPSTROKE_TEST_CLEANUP_DIR", &husk)
             .stdout(std::process::Stdio::piped())
             .spawn()
             .expect("spawn the surviving reaper");
@@ -5873,11 +5887,11 @@ mod tests {
     /// The fixture that must compile, so a refusal below is a refusal rather
     /// than a broken rustc invocation.
     const CONTROL: &str = r#"
-        extern crate tactus;
+        extern crate upstroke;
         use std::path::Path;
-        pub fn control(public: &Path, hooks: &mut tactus::rundir::NoHooks) {
-            let _ = tactus::rundir::classify_run_dir(public);
-            let _ = tactus::rundir::remove_public_husk(public, hooks);
+        pub fn control(public: &Path, hooks: &mut upstroke::rundir::NoHooks) {
+            let _ = upstroke::rundir::classify_run_dir(public);
+            let _ = upstroke::rundir::remove_public_husk(public, hooks);
         }
 "#;
 
@@ -5895,9 +5909,9 @@ mod tests {
             BuildRefusal {
                 name: "no-proof",
                 source: r#"
-        extern crate tactus;
-        pub fn delete(hooks: &mut tactus::rundir::NoHooks) {
-            let _ = tactus::rundir::remove_private_husk(hooks);
+        extern crate upstroke;
+        pub fn delete(hooks: &mut upstroke::rundir::NoHooks) {
+            let _ = upstroke::rundir::remove_private_husk(hooks);
         }
 "#,
                 codes: &["E0061"],
@@ -5906,10 +5920,10 @@ mod tests {
             BuildRefusal {
                 name: "wrong-token",
                 source: r#"
-        extern crate tactus;
+        extern crate upstroke;
         use std::path::PathBuf;
-        pub fn delete(hooks: &mut tactus::rundir::NoHooks) {
-            let _ = tactus::rundir::remove_private_husk(PathBuf::from("/tmp/x"), hooks);
+        pub fn delete(hooks: &mut upstroke::rundir::NoHooks) {
+            let _ = upstroke::rundir::remove_private_husk(PathBuf::from("/tmp/x"), hooks);
         }
 "#,
                 codes: &["E0308"],
@@ -5918,10 +5932,10 @@ mod tests {
             BuildRefusal {
                 name: "forged-token",
                 source: r#"
-        extern crate tactus;
+        extern crate upstroke;
         use std::path::PathBuf;
-        pub fn forge() -> tactus::rundir::PrivateHalfProof {
-            tactus::rundir::PrivateHalfProof {
+        pub fn forge() -> upstroke::rundir::PrivateHalfProof {
+            upstroke::rundir::PrivateHalfProof {
                 target: PathBuf::new(),
                 public: PathBuf::new(),
                 run_id: String::new(),
@@ -5934,8 +5948,8 @@ mod tests {
             BuildRefusal {
                 name: "cloned-token",
                 source: r#"
-        extern crate tactus;
-        pub fn twice(proof: tactus::rundir::PrivateHalfProof) -> tactus::rundir::PrivateHalfProof {
+        extern crate upstroke;
+        pub fn twice(proof: upstroke::rundir::PrivateHalfProof) -> upstroke::rundir::PrivateHalfProof {
             let copy = proof.clone();
             copy
         }
@@ -5946,9 +5960,9 @@ mod tests {
             BuildRefusal {
                 name: "defaulted-token",
                 source: r#"
-        extern crate tactus;
-        pub fn out_of_nothing() -> tactus::rundir::PrivateHalfProof {
-            tactus::rundir::PrivateHalfProof::default()
+        extern crate upstroke;
+        pub fn out_of_nothing() -> upstroke::rundir::PrivateHalfProof {
+            upstroke::rundir::PrivateHalfProof::default()
         }
 "#,
                 codes: &["E0599"],
@@ -5957,10 +5971,10 @@ mod tests {
             BuildRefusal {
                 name: "spent-token",
                 source: r#"
-        extern crate tactus;
-        pub fn twice(proof: tactus::rundir::PrivateHalfProof, hooks: &mut tactus::rundir::NoHooks) {
-            let _ = tactus::rundir::remove_private_husk(proof, hooks);
-            let _ = tactus::rundir::remove_private_husk(proof, hooks);
+        extern crate upstroke;
+        pub fn twice(proof: upstroke::rundir::PrivateHalfProof, hooks: &mut upstroke::rundir::NoHooks) {
+            let _ = upstroke::rundir::remove_private_husk(proof, hooks);
+            let _ = upstroke::rundir::remove_private_husk(proof, hooks);
         }
 "#,
                 codes: &["E0382"],
@@ -5974,7 +5988,7 @@ mod tests {
         let mut best: Option<(std::time::SystemTime, PathBuf)> = None;
         for entry in fs::read_dir(deps).expect("the deps directory").flatten() {
             let name = entry.file_name().to_string_lossy().into_owned();
-            if !name.starts_with("libtactus-") || !name.ends_with(".rlib") {
+            if !name.starts_with("libupstroke-") || !name.ends_with(".rlib") {
                 continue;
             }
             let when = entry
@@ -6008,7 +6022,7 @@ mod tests {
                 "metadata",
             ])
             .arg("--extern")
-            .arg(format!("tactus={}", rlib.display()))
+            .arg(format!("upstroke={}", rlib.display()))
             .arg("-L")
             .arg(format!("dependency={}", deps.display()))
             .args(["--error-format", "json"])
@@ -6071,14 +6085,14 @@ mod tests {
     #[test]
     fn the_repo_key_is_the_construction_the_packet_states() {
         // `workspace_candidates.execution_root`: "repo_key v1 =
-        // hex16(sha256('tactus-repo-key-v1' NUL canonical common git dir
+        // hex16(sha256('upstroke-repo-key-v1' NUL canonical common git dir
         // bytes))". The expected value is computed from that sentence here,
         // and for a fixed path it is a literal computed outside this program
         // entirely — a function may not be its own oracle.
         let dir = scratch("repokey").join("git-dir");
         fs::create_dir_all(&dir).expect("git dir");
         let canonical = fs::canonicalize(&dir).expect("canonical");
-        let mut bytes = b"tactus-repo-key-v1".to_vec();
+        let mut bytes = b"upstroke-repo-key-v1".to_vec();
         bytes.push(0);
         bytes.extend_from_slice(canonical.as_os_str().as_encoded_bytes());
         let expected: String = format!("{:x}", Sha256::digest(&bytes))
@@ -6091,8 +6105,8 @@ mod tests {
         #[cfg(unix)]
         assert_eq!(
             RepoKey::v1(Path::new("/srv/repo/.git")).as_str(),
-            "de053b372aab425c",
-            "sha256(b'tactus-repo-key-v1\\x00/srv/repo/.git')[:16], computed elsewhere"
+            "e43114efb48428eb",
+            "sha256(b'upstroke-repo-key-v1\\x00/srv/repo/.git')[:16], computed elsewhere"
         );
 
         // Distinguishing, which is the whole job: two repositories, two keys.
@@ -6189,7 +6203,7 @@ mod tests {
         serde_json::json!({
             "run_id": "01RUN",
             "repo_key": "0123456789abcdef",
-            "public_dir": "/repo/.tactus/runs/01RUN",
+            "public_dir": "/repo/.upstroke/runs/01RUN",
             "incarnation": "01INC",
             "runner": {
                 "kind": "host",
@@ -6204,7 +6218,7 @@ mod tests {
         serde_json::json!({
             "run_id": "01RUN",
             "repo_key": "0123456789abcdef",
-            "public_dir": "/repo/.tactus/runs/01RUN",
+            "public_dir": "/repo/.upstroke/runs/01RUN",
             "incarnation": "01INC",
             "run_started_sha256": "sha256:bb"
         })

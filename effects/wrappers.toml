@@ -33,11 +33,11 @@
 # end by `effects::tests::no_topology_module_calls_a_funnel_in_production`.
 #
 # Regenerate the membership (never the classification) with
-# TACTUS_REGENERATE_EFFECT_ARTIFACTS=1 cargo test -p tactus effects::
+# UPSTROKE_REGENERATE_EFFECT_ARTIFACTS=1 cargo test -p upstroke effects::
 
 [[module]]
 path = "src/workspace_manager.rs"
-crate_path = "tactus::workspace_manager"
+crate_path = "upstroke::workspace_manager"
 funnel = [
     "add_site",
     "add_worktree",
@@ -120,7 +120,7 @@ effect_free = [
 
 [[module]]
 path = "src/rundir.rs"
-crate_path = "tactus::rundir"
+crate_path = "upstroke::rundir"
 funnel = [
     "acquire_hooked",
     "acquire_in_hooked",
@@ -212,7 +212,7 @@ effect_free = [
 
 [[module]]
 path = "src/interaction.rs"
-crate_path = "tactus::interaction"
+crate_path = "upstroke::interaction"
 funnel = []
 effectful = [
     "write_question",
@@ -245,7 +245,7 @@ effect_free = [
 
 [[module]]
 path = "src/util.rs"
-crate_path = "tactus::util"
+crate_path = "upstroke::util"
 funnel = []
 effectful = [
     "fsync_dir",
@@ -279,12 +279,12 @@ effect_free = [
     "serialize",
     "steps",
     "tail",
-    "user_tactus_dir",
+    "user_upstroke_dir",
 ]
 
 [[module]]
 path = "src/events/log.rs"
-crate_path = "tactus::events::log"
+crate_path = "upstroke::events::log"
 funnel = [
     "append",
     "append_hooked",
@@ -333,7 +333,7 @@ effect_free = [
 
 [[module]]
 path = "src/runner/host.rs"
-crate_path = "tactus::runner::host"
+crate_path = "upstroke::runner::host"
 funnel = []
 effectful = [
     "build_command",
@@ -382,7 +382,7 @@ effect_free = [
 # here.
 [[module]]
 path = "src/runner/container.rs"
-crate_path = "tactus::runner::container"
+crate_path = "upstroke::runner::container"
 funnel = [
     "write_intent",
     "create_container",
@@ -441,7 +441,7 @@ effect_free = [
 
 [[module]]
 path = "src/runner/invocation.rs"
-crate_path = "tactus::runner::invocation"
+crate_path = "upstroke::runner::invocation"
 funnel = []
 effectful = []
 effectful_unnameable = []
@@ -501,7 +501,7 @@ effect_free = [
 
 [[module]]
 path = "src/workspace.rs"
-crate_path = "tactus::workspace"
+crate_path = "upstroke::workspace"
 funnel = []
 effectful = [
     "Workspace::run_git_with_private_hooks",
@@ -549,7 +549,7 @@ effect_free = [
 
 [[module]]
 path = "src/gates.rs"
-crate_path = "tactus::gates"
+crate_path = "upstroke::gates"
 funnel = []
 effectful = [
     "ShellKind::command",
@@ -574,7 +574,7 @@ effect_free = [
 
 [[module]]
 path = "src/review.rs"
-crate_path = "tactus::review"
+crate_path = "upstroke::review"
 funnel = []
 effectful = [
     "run_review",
@@ -601,7 +601,7 @@ effect_free = [
 
 [[module]]
 path = "src/agent/proc.rs"
-crate_path = "tactus::agent::proc"
+crate_path = "upstroke::agent::proc"
 funnel = []
 effectful = []
 effectful_unnameable = []
@@ -643,7 +643,7 @@ effect_free = [
 
 [[module]]
 path = "src/agent/claude.rs"
-crate_path = "tactus::agent::claude"
+crate_path = "upstroke::agent::claude"
 funnel = []
 effectful = []
 effectful_unnameable = []
@@ -651,7 +651,7 @@ effect_free = []
 
 [[module]]
 path = "src/agent/codex.rs"
-crate_path = "tactus::agent::codex"
+crate_path = "upstroke::agent::codex"
 funnel = []
 effectful = []
 effectful_unnameable = []
@@ -659,7 +659,7 @@ effect_free = []
 
 [[module]]
 path = "src/agent/copilot.rs"
-crate_path = "tactus::agent::copilot"
+crate_path = "upstroke::agent::copilot"
 funnel = []
 effectful = []
 effectful_unnameable = []
@@ -667,7 +667,7 @@ effect_free = []
 
 [[module]]
 path = "src/capacity.rs"
-crate_path = "tactus::capacity"
+crate_path = "upstroke::capacity"
 funnel = []
 effectful = []
 effectful_unnameable = []
@@ -692,7 +692,7 @@ effect_free = [
 
 [[module]]
 path = "src/export.rs"
-crate_path = "tactus::export"
+crate_path = "upstroke::export"
 funnel = []
 effectful = []
 effectful_unnameable = []
@@ -714,7 +714,7 @@ effect_free = [
 
 [[module]]
 path = "src/answer.rs"
-crate_path = "tactus::answer"
+crate_path = "upstroke::answer"
 funnel = []
 effectful = [
     "answer",
@@ -726,7 +726,7 @@ effect_free = [
 
 [[module]]
 path = "src/config.rs"
-crate_path = "tactus::config"
+crate_path = "upstroke::config"
 funnel = []
 effectful = []
 effectful_unnameable = []
@@ -757,7 +757,7 @@ effect_free = [
 
 [[module]]
 path = "src/connect.rs"
-crate_path = "tactus::connect"
+crate_path = "upstroke::connect"
 funnel = []
 effectful = [
     "run_with",
@@ -771,7 +771,7 @@ effect_free = [
 
 [[module]]
 path = "src/route.rs"
-crate_path = "tactus::route"
+crate_path = "upstroke::route"
 funnel = []
 effectful = []
 effectful_unnameable = []
@@ -782,7 +782,7 @@ effect_free = [
 
 [[module]]
 path = "src/status.rs"
-crate_path = "tactus::status"
+crate_path = "upstroke::status"
 funnel = []
 effectful = []
 effectful_unnameable = []
@@ -797,7 +797,7 @@ effect_free = [
 
 [[module]]
 path = "src/validate.rs"
-crate_path = "tactus::validate"
+crate_path = "upstroke::validate"
 funnel = []
 effectful = []
 effectful_unnameable = []
@@ -814,7 +814,7 @@ effect_free = [
 
 [[module]]
 path = "src/events/mod.rs"
-crate_path = "tactus::events"
+crate_path = "upstroke::events"
 funnel = []
 effectful = []
 effectful_unnameable = []
@@ -863,7 +863,7 @@ effect_free = [
 
 [[module]]
 path = "src/agent/bin.rs"
-crate_path = "tactus::agent::bin"
+crate_path = "upstroke::agent::bin"
 funnel = []
 effectful = []
 effectful_unnameable = []

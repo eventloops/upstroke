@@ -5,7 +5,7 @@
 **Inputs:** the PR3 slice run on the dedicated build box (three implementation
 calls, a 196-finding review round, a repair round, and a `CHANGES_REQUIRED`
 final confirmation); `~/.codex/models_cache.json` as shipped with codex-cli
-0.147.0; the workflow brief `tactus-workflow-brief.md`; and `HANDOVER.md`, whose
+0.147.0; the workflow brief `upstroke-workflow-brief.md`; and `HANDOVER.md`, whose
 "vocabulary trap" note this record corrects. Decision: project owner, on the
 measured cost and yield below.
 

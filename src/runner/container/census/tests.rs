@@ -43,7 +43,7 @@ use super::{
     PrefixBytes, PrefixReplay, PrefixReread, PrefixSync, StablePrefixBarrier, WriteCommand,
     private_root_label, run_startup_census, view_path,
 };
-use crate::error::TactusError;
+use crate::error::UpstrokeError;
 use crate::runner::container::intent::{
     ContainerIntent, ContainerName, LABEL_INCARNATION, LABEL_PRIVATE_ROOT, LABEL_RUN,
     LABEL_RUN_DIR, containers_dir, decode_path_label, owner_run_dir, path_label,
@@ -66,7 +66,7 @@ use crate::topology::effects::ContainerSite;
 /// [`concurrent_reclaimers_converge`] runs two of these at once.
 fn scratch(tag: &str) -> PathBuf {
     let dir = std::env::temp_dir().join(format!(
-        "tactus-census-{tag}-{}-{:?}",
+        "upstroke-census-{tag}-{}-{:?}",
         std::process::id(),
         std::thread::current().id()
     ));
@@ -114,7 +114,7 @@ impl Owner {
             run_id,
             incarnation,
             repo_key,
-            run_dir: PathBuf::from(format!("/repo/.tactus/runs/{run_id}")),
+            run_dir: PathBuf::from(format!("/repo/.upstroke/runs/{run_id}")),
             policy: POLICY_A,
         }
     }
@@ -408,7 +408,7 @@ impl Harness {
         }
     }
 
-    fn census(&self, start: &CensusStart) -> Result<CensusComplete, TactusError> {
+    fn census(&self, start: &CensusStart) -> Result<CensusComplete, UpstrokeError> {
         let mut hooks = RecordingHooks::new(self.trace.clone());
         self.run_with(&mut hooks, start)
     }
@@ -417,7 +417,7 @@ impl Harness {
         &self,
         hooks: &mut dyn ContainerHooks,
         start: &CensusStart,
-    ) -> Result<CensusComplete, TactusError> {
+    ) -> Result<CensusComplete, UpstrokeError> {
         run_startup_census(
             hooks,
             &Census {
@@ -453,9 +453,9 @@ fn at(trace: &ContainerTrace, needle: &str) -> usize {
     })
 }
 
-fn refusal(error: &TactusError) -> String {
+fn refusal(error: &UpstrokeError) -> String {
     match error {
-        TactusError::Refused { message } => message.clone(),
+        UpstrokeError::Refused { message } => message.clone(),
         other => panic!("expected a refusal, got {other:?}"),
     }
 }
@@ -491,8 +491,8 @@ fn refusal(error: &TactusError) -> String {
 #[test]
 fn the_liveness_rule_classifies_every_cell_of_owner_run_by_incarnation_by_lock() {
     let liveness = RecordingLiveness::new();
-    let live_dir = PathBuf::from("/repo/.tactus/runs/live");
-    let dead_dir = PathBuf::from("/repo/.tactus/runs/dead");
+    let live_dir = PathBuf::from("/repo/.upstroke/runs/live");
+    let dead_dir = PathBuf::from("/repo/.upstroke/runs/dead");
     liveness.set_live(&live_dir);
 
     let mine = resume(RUN_A, INC_1);
@@ -715,8 +715,8 @@ fn the_liveness_rule_classifies_every_cell_of_owner_run_by_incarnation_by_lock()
 /// is only whether that owner's lock is held.
 #[test]
 fn the_owner_lock_is_probed_exactly_once_per_candidate() {
-    let held = PathBuf::from("/repo/.tactus/runs/held");
-    let free = PathBuf::from("/repo/.tactus/runs/free");
+    let held = PathBuf::from("/repo/.upstroke/runs/held");
+    let free = PathBuf::from("/repo/.upstroke/runs/free");
     for (what, owner_dir, expected) in [
         ("held", &held, Ownership::ForeignRunLiveOwner),
         ("free", &free, Ownership::ForeignRunDeadOwner),
@@ -845,8 +845,8 @@ fn a_live_runs_dead_earlier_incarnation_is_untouched_by_a_foreign_census() {
 #[test]
 fn arm_two_gives_one_answer_whatever_the_incarnation_that_reaches_it() {
     let liveness = RecordingLiveness::new();
-    let held = PathBuf::from("/repo/.tactus/runs/held");
-    let free = PathBuf::from("/repo/.tactus/runs/free");
+    let held = PathBuf::from("/repo/.upstroke/runs/held");
+    let free = PathBuf::from("/repo/.upstroke/runs/free");
     liveness.set_live(&held);
     let me = resume(RUN_A, INC_1);
     let incarnations = [INC_2, INC_3, "01KZTDDDDDDDDDDDDDDDDDDDDD", INC_1];
@@ -1154,7 +1154,7 @@ fn live_owner_untouched_while_dead_orphan_reclaimed() {
 ///
 /// `crash_reconstruction`: "a labeled container **without an intent** is treated
 /// as an orphan of its **labeled** run and incarnation under the same rule".
-/// Its ownership therefore comes from `tactus.run` and `tactus.incarnation`, and
+/// Its ownership therefore comes from `upstroke.run` and `upstroke.incarnation`, and
 /// the census must reach the same verdict it would have reached from a record.
 ///
 /// Second field held constant: the same owner, the same name and the same
@@ -2359,7 +2359,7 @@ fn a_dead_foreign_owners_container_naming_this_incarnation_is_reclaimed() {
 /// cannot be established, is one this census cannot take through
 /// kill/observe/rm — so it refuses rather than proceeding past it.
 ///
-/// Second field held constant: every case carries a valid `tactus.private_root`
+/// Second field held constant: every case carries a valid `upstroke.private_root`
 /// label under the censused root, so what is under test is only what is missing
 /// beside it.
 #[test]
@@ -2378,7 +2378,7 @@ fn a_labeled_container_this_census_cannot_own_blocks_admission() {
             "a name no funnel could have written",
             "someone-elses-container",
             None,
-            "not a tactus container name",
+            "not a upstroke container name",
         ),
         (
             LABEL_RUN,
@@ -2410,7 +2410,10 @@ fn a_labeled_container_this_census_cannot_own_blocks_admission() {
         );
         labels.insert(LABEL_RUN.to_owned(), RUN_B.to_owned());
         labels.insert(LABEL_INCARNATION.to_owned(), INC_1.to_owned());
-        labels.insert(LABEL_RUN_DIR.to_owned(), "/repo/.tactus/runs/x".to_owned());
+        labels.insert(
+            LABEL_RUN_DIR.to_owned(),
+            "/repo/.upstroke/runs/x".to_owned(),
+        );
         if let Some(key) = withheld {
             labels.remove(key);
         }
@@ -2446,7 +2449,7 @@ fn a_labeled_container_this_census_cannot_own_blocks_admission() {
 
 /// A name and its ownership evidence that disagree refuse.
 ///
-/// The name is `tactus-<repo_key>-<run_id>-<incarnation>-<invocation-hash>`, so
+/// The name is `upstroke-<repo_key>-<run_id>-<incarnation>-<invocation-hash>`, so
 /// its components **are** ownership evidence. A record that says one incarnation
 /// while its own file name says another would mean classifying on one value and
 /// reclaiming a container named for the other.
@@ -2696,7 +2699,7 @@ fn the_stable_prefix_barrier_refuses_each_of_its_four_predicates_independently()
 /// {container present}` is classified.
 ///
 /// "discovery at every write-command start scans the whole namespace
-/// `<R>/containers` … **and** docker ps by `tactus.private_root`". A census that
+/// `<R>/containers` … **and** docker ps by `upstroke.private_root`". A census that
 /// read only the namespace misses a labeled orphan whose record was already
 /// removed; one that read only `docker ps` misses an intent whose container the
 /// Unix reaper already killed and removed — which is the *ordinary* state after
@@ -2789,7 +2792,7 @@ fn the_private_root_label_this_census_filters_on_is_the_one_the_intent_writes() 
     // Computed with `python3 -c` from the rule "percent-encode every byte
     // outside [A-Za-z0-9/:.-_]", not by calling the function under test.
     const EXPECTED: &[(&str, &str)] = &[
-        ("/srv/tactus/private", "/srv/tactus/private"),
+        ("/srv/upstroke/private", "/srv/upstroke/private"),
         ("/tmp/a b/c", "/tmp/a%20b/c"),
         ("/srv/a;b", "/srv/a%3Bb"),
         ("/srv/a,b", "/srv/a%2Cb"),
@@ -2840,7 +2843,7 @@ fn the_private_root_label_this_census_filters_on_is_the_one_the_intent_writes() 
 /// `crash_reconstruction` says it in those words, and the container **name**
 /// was designed for it: its components are `[0-9A-Za-z_]` only, so the parse on
 /// `-` is unambiguous. The **label** is the other half — it is what `docker ps
-/// --filter label=tactus.private_root=…` selects on — and the rendering that
+/// --filter label=upstroke.private_root=…` selects on — and the rendering that
 /// shipped, `to_string_lossy().replace('\\', "/")`, was not injective. On Unix a
 /// backslash is an ordinary filename byte, so `<base>/a\b` and `<base>/a/b` are
 /// **different directories** that rendered to one label, and a census
@@ -3126,7 +3129,7 @@ fn r20_is_persistent_output_in_every_at_run_end_outcome_and_no_census_path_touch
 
     let harness = Harness::new("r20-untouched");
     let dead = Owner::new(RUN_B, INC_1, REPO_KEY_A);
-    harness.runtime.add_volume("tactus-claude-code");
+    harness.runtime.add_volume("upstroke-claude-code");
     for invocation in [shell_probe(), agent_probe()] {
         seed(
             &harness.root,
@@ -3147,7 +3150,7 @@ fn r20_is_persistent_output_in_every_at_run_end_outcome_and_no_census_path_touch
     assert!(
         harness
             .runtime
-            .volume_present("tactus-claude-code")
+            .volume_present("upstroke-claude-code")
             .expect("ask the runtime"),
         "the volume this census reclaimed containers around is still there"
     );
@@ -3310,7 +3313,7 @@ fn a_container_that_never_terminates_exhausts_the_bounded_observation_and_refuse
 /// rendering independently.
 ///
 /// `os_matrix`: the reaper "kills the **dead coordinator's** labeled
-/// containers". `tactus.private_root` alone names every container of every run
+/// containers". `upstroke.private_root` alone names every container of every run
 /// under `<R>`, including a **live** coordinator's — which
 /// `T-CONTAINER.authoritative_state` forbids in as many words ("a live
 /// incarnation's containers must not be touched"). The incarnation is a
@@ -3398,7 +3401,7 @@ fn the_reapers_container_selector_names_the_incarnation_and_not_the_root_alone()
 #[test]
 fn a_reaper_scope_whose_label_value_could_widen_the_filter_cannot_reach_the_reaper() {
     let good_root = Path::new("/srv/private");
-    let hostile = ["", "01KZ\nlabel=tactus.run", "a,b", "a=b"];
+    let hostile = ["", "01KZ\nlabel=upstroke.run", "a,b", "a=b"];
     assert_eq!(
         hostile.iter().collect::<BTreeSet<_>>().len(),
         4,
@@ -3419,7 +3422,7 @@ fn a_reaper_scope_whose_label_value_could_widen_the_filter_cannot_reach_the_reap
         super::ReaperContainerScope::new("docker", Path::new(""), INC_1).is_err(),
         "an empty private root renders an empty filter value"
     );
-    for value in ["01KZ\nlabel=tactus.run", "a,b", "a=b"] {
+    for value in ["01KZ\nlabel=upstroke.run", "a,b", "a=b"] {
         let scope = super::ReaperContainerScope::new("docker", Path::new(value), INC_1)
             .unwrap_or_else(|error| {
                 panic!("`{value}` is a legal directory name and was refused: {error}")
@@ -3494,7 +3497,7 @@ fn real_docker_census_reclaims_a_dead_owner_and_spares_a_live_one() {
     let Some(image) = image else {
         assert!(
             std::env::var_os(crate::runner::container::fake::REQUIRE_DOCKER).is_none(),
-            "TACTUS_REQUIRE_DOCKER is set and the runtime holds none of the images these \
+            "UPSTROKE_REQUIRE_DOCKER is set and the runtime holds none of the images these \
              tests may use; they never pull (non_goals[1])"
         );
         return;
@@ -3744,18 +3747,18 @@ fn colliding_run_dir_pairs() -> Vec<(&'static str, PathBuf, PathBuf)> {
     pairs.extend([
         (
             "a colon, which the reviewer's mutation rewrote next",
-            PathBuf::from("/repo/.tactus/runs/A:B"),
-            PathBuf::from("/repo/.tactus/runs/A/B"),
+            PathBuf::from("/repo/.upstroke/runs/A:B"),
+            PathBuf::from("/repo/.upstroke/runs/A/B"),
         ),
         (
             "a comma beside its own escape: `%` must escape itself",
-            PathBuf::from("/repo/a,b/.tactus/runs/X"),
-            PathBuf::from("/repo/a%2Cb/.tactus/runs/X"),
+            PathBuf::from("/repo/a,b/.upstroke/runs/X"),
+            PathBuf::from("/repo/a%2Cb/.upstroke/runs/X"),
         ),
         (
             "a literal percent beside its escape",
-            PathBuf::from("/repo/a%b/.tactus/runs/X"),
-            PathBuf::from("/repo/a%25b/.tactus/runs/X"),
+            PathBuf::from("/repo/a%b/.upstroke/runs/X"),
+            PathBuf::from("/repo/a%25b/.upstroke/runs/X"),
         ),
     ]);
     // Unix only, and each for a stated reason. A backslash is an **ordinary
@@ -3771,23 +3774,23 @@ fn colliding_run_dir_pairs() -> Vec<(&'static str, PathBuf, PathBuf)> {
         pairs.extend([
             (
                 "a backslash is an ordinary filename byte on Unix",
-                PathBuf::from(r"/repo\a/.tactus/runs/X"),
-                PathBuf::from("/repo/a/.tactus/runs/X"),
+                PathBuf::from(r"/repo\a/.upstroke/runs/X"),
+                PathBuf::from("/repo/a/.upstroke/runs/X"),
             ),
             (
                 "and so is a backslash in the run id's own component",
-                PathBuf::from(r"/repo/.tactus/runs/A\B"),
-                PathBuf::from("/repo/.tactus/runs/A/B"),
+                PathBuf::from(r"/repo/.upstroke/runs/A\B"),
+                PathBuf::from("/repo/.upstroke/runs/A/B"),
             ),
             (
                 "two ill-formed byte sequences, both `U+FFFD` under to_string_lossy",
-                PathBuf::from(OsStr::from_bytes(b"/repo/.tactus/runs/\xff")),
-                PathBuf::from(OsStr::from_bytes(b"/repo/.tactus/runs/\xfe")),
+                PathBuf::from(OsStr::from_bytes(b"/repo/.upstroke/runs/\xff")),
+                PathBuf::from(OsStr::from_bytes(b"/repo/.upstroke/runs/\xfe")),
             ),
             (
                 "an ill-formed sequence and a literal replacement character",
-                PathBuf::from(OsStr::from_bytes(b"/repo/.tactus/runs/\xff")),
-                PathBuf::from("/repo/.tactus/runs/\u{fffd}"),
+                PathBuf::from(OsStr::from_bytes(b"/repo/.upstroke/runs/\xff")),
+                PathBuf::from("/repo/.upstroke/runs/\u{fffd}"),
             ),
         ]);
     }
@@ -3877,8 +3880,8 @@ fn the_recorded_run_directory_distinguishes_directories_a_lossy_rendering_merged
 /// under a hostile path is not killed.
 ///
 /// The end of `PR6-RECOV-001`'s failure sequence, as a runtime state rather than
-/// as a string comparison. Live run B holds the lock of `/repo\a/.tactus/runs/B`
-/// and a foreign census runs; the neighbouring directory `/repo/a/.tactus/runs/B`
+/// as a string comparison. Live run B holds the lock of `/repo\a/.upstroke/runs/B`
+/// and a foreign census runs; the neighbouring directory `/repo/a/.upstroke/runs/B`
 /// is deliberately **free**, so a census that probes the lossy rendering
 /// classifies B dead and kills its container.
 ///
@@ -3889,8 +3892,8 @@ fn the_recorded_run_directory_distinguishes_directories_a_lossy_rendering_merged
 #[cfg(unix)]
 fn a_live_owner_under_a_hostile_run_directory_is_probed_where_it_actually_is() {
     let harness = Harness::new("hostile-run-dir-live-owner");
-    let real = PathBuf::from(r"/repo\a/.tactus/runs/B");
-    let lossy = PathBuf::from("/repo/a/.tactus/runs/B");
+    let real = PathBuf::from(r"/repo\a/.upstroke/runs/B");
+    let lossy = PathBuf::from("/repo/a/.upstroke/runs/B");
     assert_ne!(real, lossy);
 
     let live = Owner::new(RUN_B, INC_2, REPO_KEY_A).with_run_dir(real.clone());
@@ -3951,7 +3954,7 @@ fn a_live_owner_under_a_hostile_run_directory_is_probed_where_it_actually_is() {
 #[cfg(unix)]
 fn a_label_only_container_under_a_hostile_run_directory_reaches_the_same_lock() {
     let harness = Harness::new("hostile-run-dir-label-only");
-    let real = PathBuf::from(r"/repo\a/.tactus/runs/B");
+    let real = PathBuf::from(r"/repo\a/.upstroke/runs/B");
     let live = Owner::new(RUN_B, INC_2, REPO_KEY_A).with_run_dir(real.clone());
     harness.liveness.set_live(&real);
     let held = seed(
@@ -3992,7 +3995,7 @@ fn a_path_label_decodes_exactly_or_refuses() {
     // by hand rather than taken from `path_label`, which is the function under
     // test's own inverse.
     let exact: &[(&str, &str)] = &[
-        ("/repo/.tactus/runs/X", "/repo/.tactus/runs/X"),
+        ("/repo/.upstroke/runs/X", "/repo/.upstroke/runs/X"),
         ("/repo%5Ca/runs/X", r"/repo\a/runs/X"),
         ("/repo/a%2Cb", "/repo/a,b"),
         ("/repo/a%3Db", "/repo/a=b"),
@@ -4051,8 +4054,8 @@ fn a_path_label_decodes_exactly_or_refuses() {
 /// lock is blocks admission, from **either** evidence source.
 ///
 /// `expected_failures_refusals[8]`: "an unreclaimable labeled container blocks
-/// admission". The shipped code refused a *missing* `tactus.run_dir` and
-/// accepted `tactus.run_dir=`, which joined to `run.lock` — a path relative to
+/// admission". The shipped code refused a *missing* `upstroke.run_dir` and
+/// accepted `upstroke.run_dir=`, which joined to `run.lock` — a path relative to
 /// this process's working directory, where there is no lock — so a live foreign
 /// owner was classified dead and its container killed.
 ///
@@ -4142,7 +4145,7 @@ fn a_run_directory_that_names_no_lock_blocks_admission_from_either_source() {
     // simply "refuse everything". `has_root` and not `is_absolute`: on Windows
     // `is_absolute` additionally wants a prefix, and `/repo/...` is the shape
     // every fixture and every Unix-written record carries.
-    for good in ["/repo/.tactus/runs/B", "/repo/a%5Cb/runs/B"] {
+    for good in ["/repo/.upstroke/runs/B", "/repo/a%5Cb/runs/B"] {
         owner_run_dir(good, "test").unwrap_or_else(|error| panic!("`{good}`: {error}"));
     }
 }
@@ -4952,7 +4955,7 @@ fn a_view_removal_that_never_succeeds_blocks_admission() {
         .census(&resume(RUN_A, INC_2))
         .expect_err("a census that could not prune an orphan view must not hand out its token");
     assert!(
-        matches!(error, TactusError::Io { .. }),
+        matches!(error, UpstrokeError::Io { .. }),
         "the refusal must carry the IO error that stopped it, after the retry bound: {error:?}"
     );
     assert!(

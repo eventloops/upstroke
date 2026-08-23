@@ -30,7 +30,7 @@ use std::time::Duration;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-use crate::error::TactusError;
+use crate::error::UpstrokeError;
 use crate::interaction::QuestionRecord;
 use crate::ir::{Answer, Effort, Question, QuestionId, ResolvedEffortPolicy, Tier};
 use crate::ladder::{FailureKind, FailureOrigin};
@@ -313,7 +313,7 @@ impl EventBody {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct RunStarted {
     pub schema: u32,
-    pub tactus_version: String,
+    pub upstroke_version: String,
     pub run_id: String,
     pub branch: String,
     /// Full sha of the commit the run branched from — the expected HEAD until
@@ -359,11 +359,11 @@ pub struct RunStarted {
     ///
     /// A live run is snapshot-safe by construction: config is parsed once into
     /// the analysis and gates execute from memory, so a mid-run edit to
-    /// `tactus.toml` cannot change what a running task is verified against.
+    /// `upstroke.toml` cannot change what a running task is verified against.
     /// Resume honours the same snapshot by rebuilding these gates and running
     /// them, which is what makes every `task_committed` in one log mean the
     /// same thing. Re-deriving from today's config instead would let the
-    /// workspace an implementer edits — which contains the very `tactus.toml`
+    /// workspace an implementer edits — which contains the very `upstroke.toml`
     /// the gates come from — set the standard for the tasks that follow.
     ///
     /// This is the `reviews` contract below, applied to the other half of §14's
@@ -577,7 +577,7 @@ pub struct AttemptRecord {
     ///
     /// Kept beside `cost_usd` rather than folded into it, because dollars and
     /// tokens are different claims and only the vendor gets to make the first
-    /// one. Claude Code computes its own api-equivalent cost and tactus records
+    /// one. Claude Code computes its own api-equivalent cost and upstroke records
     /// it; Codex reports usage and no price. Pricing those tokens here would
     /// mean shipping a rate table inside a published binary, where it goes
     /// stale silently and — on subscription auth, where the marginal dollar is
@@ -811,7 +811,7 @@ pub struct QuestionAnswered {
     /// legacy answer whose older writer did not record the policy.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub decline_halts_run: Option<bool>,
-    /// Which channel produced it — a terminal, an out-of-band `tactus answer`,
+    /// Which channel produced it — a terminal, an out-of-band `upstroke answer`,
     /// or a resume picking up an answer written while the run was dead.
     pub via: String,
 }
@@ -1124,7 +1124,7 @@ impl RunState {
                 // work wakes: it describes a *ceiling a previous process was
                 // working under*, and the resume has just re-read the ceiling
                 // from today's config and flags (§13/D4). Leaving it folded in
-                // would make `tactus resume --budget` a command that changes
+                // would make `upstroke resume --budget` a command that changes
                 // nothing — the run would replay straight back into the stop it
                 // was resumed to get past. If the new ceiling is still too low,
                 // the very next `step_task` records a fresh stop and says so.
@@ -1403,7 +1403,7 @@ impl RunState {
             // The same objection applies to any canned option, whatever the
             // kind, and for a reason the first version of this missed: the
             // options are the engine's instructions *to the operator*, not the
-            // operator's instructions to anyone. `tactus answer <id> --option
+            // operator's instructions to anyone. `upstroke answer <id> --option
             // 1` on an unblock question resolves to "retry this task with
             // guidance you type below" — a sentence about where to type, which
             // then reached the implementer as binding guidance and, since §12's
@@ -1634,14 +1634,14 @@ pub fn recorded_chains(events: &[Event]) -> Option<&Vec<ChainSummary>> {
 }
 
 /// The `run_started` a log opens with — how a run describes itself.
-pub fn started_of<'a>(events: &'a [Event], path: &Path) -> Result<&'a RunStarted, TactusError> {
+pub fn started_of<'a>(events: &'a [Event], path: &Path) -> Result<&'a RunStarted, UpstrokeError> {
     events
         .iter()
         .find_map(|event| match &event.body {
             EventBody::RunStarted { data } => Some(&**data),
             _ => None,
         })
-        .ok_or_else(|| TactusError::EventLog {
+        .ok_or_else(|| UpstrokeError::EventLog {
             path: path.to_path_buf(),
             message: "no run_started event — this log never recorded how the run began, so \
                       there is nothing to verify a resume against"
@@ -1658,7 +1658,7 @@ pub fn replay(
     events: Vec<Event>,
     task_ids: Vec<String>,
     path: &Path,
-) -> Result<Replay, TactusError> {
+) -> Result<Replay, UpstrokeError> {
     let started = started_of(&events, path)?.clone();
     ensure_supported_schema(&started, &events, path)?;
 
@@ -1685,14 +1685,14 @@ pub(crate) fn ensure_supported_schema(
     started: &RunStarted,
     events: &[Event],
     path: &Path,
-) -> Result<u32, TactusError> {
+) -> Result<u32, UpstrokeError> {
     let mut effective = started.schema;
     for event in events {
         let EventBody::RunSchemaUpgraded { data } = &event.body else {
             continue;
         };
         if data.from != effective || data.to <= data.from {
-            return Err(TactusError::EventLog {
+            return Err(UpstrokeError::EventLog {
                 path: path.to_path_buf(),
                 message: format!(
                     "invalid schema transition {} -> {} while the log was at schema {}",
@@ -1703,10 +1703,10 @@ pub(crate) fn ensure_supported_schema(
         effective = data.to;
     }
     if effective > SCHEMA_VERSION {
-        return Err(TactusError::EventLog {
+        return Err(UpstrokeError::EventLog {
             path: path.to_path_buf(),
             message: format!(
-                "written by a newer tactus (event schema {}, this binary understands {}). \
+                "written by a newer upstroke (event schema {}, this binary understands {}). \
                  Upgrade rather than interpret it — reading a log we only half understand would \
                  derive the wrong state silently.",
                 effective, SCHEMA_VERSION
@@ -1736,7 +1736,7 @@ pub(crate) fn ensure_supported_schema(
                     continue;
                 }
                 _ => {
-                    return Err(TactusError::EventLog {
+                    return Err(UpstrokeError::EventLog {
                         path: path.to_path_buf(),
                         message: format!(
                             "event schema 3 requires the successful settlement for `{task}` to \
@@ -1758,33 +1758,33 @@ pub(crate) fn ensure_supported_schema(
             } => {
                 let failed = data.failure.is_some();
                 if data.attempt != *attempt {
-                    return Err(TactusError::EventLog {
+                    return Err(UpstrokeError::EventLog {
                         path: path.to_path_buf(),
                         message: "event schema 3 attempt_finished envelope and record disagree on the attempt number".to_owned(),
                     });
                 }
                 let decided = parking.is_some() || transition.is_some();
                 if failed != decided {
-                    return Err(TactusError::EventLog {
+                    return Err(UpstrokeError::EventLog {
                         path: path.to_path_buf(),
                         message: "event schema 3 requires every failed attempt_finished to carry its ladder/parking decision, and forbids one on a successful attempt".to_owned(),
                     });
                 }
                 match (failed, prepared_commit.as_deref()) {
                     (true, Some(_)) => {
-                        return Err(TactusError::EventLog {
+                        return Err(UpstrokeError::EventLog {
                             path: path.to_path_buf(),
                             message: "event schema 3 forbids a failed attempt_finished from carrying a prepared commit".to_owned(),
                         });
                     }
                     (false, None) => {
-                        return Err(TactusError::EventLog {
+                        return Err(UpstrokeError::EventLog {
                             path: path.to_path_buf(),
                             message: "event schema 3 requires every successful attempt_finished to bind the exact prepared commit".to_owned(),
                         });
                     }
                     (false, Some(prepared)) if !valid_prepared_commit_shape(prepared) => {
-                        return Err(TactusError::EventLog {
+                        return Err(UpstrokeError::EventLog {
                             path: path.to_path_buf(),
                             message: "event schema 3 successful attempt_finished carries an invalid prepared commit identity".to_owned(),
                         });
@@ -1793,7 +1793,7 @@ pub(crate) fn ensure_supported_schema(
                         let Some(task_index) =
                             started.chains.iter().position(|chain| chain.task == *task)
                         else {
-                            return Err(TactusError::EventLog {
+                            return Err(UpstrokeError::EventLog {
                                 path: path.to_path_buf(),
                                 message: format!(
                                     "event schema 3 successful settlement names unknown task `{task}`"
@@ -1801,16 +1801,16 @@ pub(crate) fn ensure_supported_schema(
                             });
                         };
                         let expected_pin = format!(
-                            "refs/tactus/prepared/{}/{task_index}-{}",
+                            "refs/upstroke/prepared/{}/{task_index}-{}",
                             started.run_id, attempt
                         );
                         let expected_branch = format!("refs/heads/{}", started.branch);
-                        let expected_prefix = format!("[tactus] {task}: ");
+                        let expected_prefix = format!("[upstroke] {task}: ");
                         if prepared.branch_ref != expected_branch
                             || prepared.pin_ref != expected_pin
                             || !prepared.message.starts_with(&expected_prefix)
                         {
-                            return Err(TactusError::EventLog {
+                            return Err(UpstrokeError::EventLog {
                                 path: path.to_path_buf(),
                                 message: format!(
                                     "event schema 3 successful settlement for `{task}` carries a \
@@ -1830,7 +1830,7 @@ pub(crate) fn ensure_supported_schema(
                         parking.as_deref(),
                     )
                 {
-                    return Err(TactusError::EventLog {
+                    return Err(UpstrokeError::EventLog {
                         path: path.to_path_buf(),
                         message: "event schema 3 attempt_finished carries a ladder/parking decision inconsistent with its failure".to_owned(),
                     });
@@ -1839,13 +1839,13 @@ pub(crate) fn ensure_supported_schema(
             EventBody::QuestionAnswered { data }
                 if data.answer == Answer::Declined && data.decline_halts_run.is_none() =>
             {
-                return Err(TactusError::EventLog {
+                return Err(UpstrokeError::EventLog {
                     path: path.to_path_buf(),
                     message: "event schema 3 requires a declined question_answered to record its contemporaneous halt policy".to_owned(),
                 });
             }
             EventBody::TaskCommitted { task, .. } => {
-                return Err(TactusError::EventLog {
+                return Err(UpstrokeError::EventLog {
                     path: path.to_path_buf(),
                     message: format!(
                         "event schema 3 task_committed for `{task}` has no immediately preceding \
@@ -1862,25 +1862,25 @@ pub(crate) fn ensure_supported_schema(
             .as_deref()
             .is_some_and(valid_normalized_plan_digest)
         {
-            return Err(TactusError::EventLog {
+            return Err(UpstrokeError::EventLog {
                 path: path.to_path_buf(),
                 message: "event schema 3 requires run_started.normalized_plan_digest to bind the exact frozen plan bytes".to_owned(),
             });
         }
-        let plan = started.reviews.as_ref().ok_or_else(|| TactusError::EventLog {
+        let plan = started.reviews.as_ref().ok_or_else(|| UpstrokeError::EventLog {
             path: path.to_path_buf(),
             message: "event schema 3 requires run_started.reviews; refusing to re-derive a missing verification identity".to_owned(),
         })?;
         match plan.pass_timeout_secs {
             Some(seconds) if seconds > 0 => {}
             Some(_) => {
-                return Err(TactusError::EventLog {
+                return Err(UpstrokeError::EventLog {
                     path: path.to_path_buf(),
                     message: "event schema 3 requires run_started.reviews.pass_timeout_secs to be positive".to_owned(),
                 });
             }
             None => {
-                return Err(TactusError::EventLog {
+                return Err(UpstrokeError::EventLog {
                     path: path.to_path_buf(),
                     message: "event schema 3 requires run_started.reviews.pass_timeout_secs to be present; refusing to inherit a binary default".to_owned(),
                 });
@@ -1899,19 +1899,19 @@ pub(crate) fn ensure_supported_schema(
                         .as_deref()
                         .is_some_and(valid_normalized_plan_digest)
                     {
-                        return Err(TactusError::EventLog {
+                        return Err(UpstrokeError::EventLog {
                             path: path.to_path_buf(),
                             message: "the first schema-3 run_resumed must record the exact normalized-plan byte digest".to_owned(),
                         });
                     }
-                    let plan = data.reviews.as_ref().ok_or_else(|| TactusError::EventLog {
+                    let plan = data.reviews.as_ref().ok_or_else(|| UpstrokeError::EventLog {
                         path: path.to_path_buf(),
                         message: "the first schema-3 run_resumed must record the complete review identity".to_owned(),
                     })?;
                     match plan.pass_timeout_secs {
                         Some(seconds) if seconds > 0 => {}
                         _ => {
-                            return Err(TactusError::EventLog {
+                            return Err(UpstrokeError::EventLog {
                                 path: path.to_path_buf(),
                                 message: "the first schema-3 run_resumed requires a positive recorded review timeout".to_owned(),
                             });
@@ -1951,7 +1951,7 @@ fn valid_prepared_commit_shape(prepared: &PreparedCommit) -> bool {
         && !prepared.message.trim().is_empty()
         && !prepared.message.contains('\r')
         && !prepared.message.contains('\n')
-        && prepared.pin_ref.starts_with("refs/tactus/prepared/")
+        && prepared.pin_ref.starts_with("refs/upstroke/prepared/")
         && !prepared.pin_ref.contains("..")
         && prepared
             .pin_ref
@@ -2078,13 +2078,13 @@ pub(crate) fn validate_review_identity(
     plan: &crate::review::ReviewPlan,
     task_count: usize,
     path: &Path,
-) -> Result<(), TactusError> {
-    let enabled = plan.enabled.ok_or_else(|| TactusError::EventLog {
+) -> Result<(), UpstrokeError> {
+    let enabled = plan.enabled.ok_or_else(|| UpstrokeError::EventLog {
         path: path.to_path_buf(),
         message: "event schema 3 requires reviews.enabled; refusing to infer whether verification was intentionally disabled".to_owned(),
     })?;
     if enabled != plan.primary.is_some() {
-        return Err(TactusError::EventLog {
+        return Err(UpstrokeError::EventLog {
             path: path.to_path_buf(),
             message: "event schema 3 reviews.enabled does not match the recorded primary reviewer"
                 .to_owned(),
@@ -2092,18 +2092,18 @@ pub(crate) fn validate_review_identity(
     }
     let alternative_available =
         plan.alternative_available
-            .ok_or_else(|| TactusError::EventLog {
+            .ok_or_else(|| UpstrokeError::EventLog {
                 path: path.to_path_buf(),
                 message: "event schema 3 requires reviews.alternative_available; refusing to infer a missing reviewer binding".to_owned(),
             })?;
     if alternative_available != plan.alternative.is_some() {
-        return Err(TactusError::EventLog {
+        return Err(UpstrokeError::EventLog {
             path: path.to_path_buf(),
             message: "event schema 3 reviews.alternative_available does not match the recorded alternative reviewer".to_owned(),
         });
     }
     if enabled && plan.second_opinion.len() != task_count {
-        return Err(TactusError::EventLog {
+        return Err(UpstrokeError::EventLog {
             path: path.to_path_buf(),
             message: format!(
                 "event schema 3 records {task_count} task chains but {} second-opinion slots; refusing a misaligned review identity",
@@ -2112,7 +2112,7 @@ pub(crate) fn validate_review_identity(
         });
     }
     if !enabled && (plan.alternative.is_some() || plan.second_opinion.iter().any(Option::is_some)) {
-        return Err(TactusError::EventLog {
+        return Err(UpstrokeError::EventLog {
             path: path.to_path_buf(),
             message: "event schema 3 disables review but still records review-pass bindings"
                 .to_owned(),
@@ -2216,15 +2216,15 @@ mod tests {
         EventBody::RunStarted {
             data: Box::new(RunStarted {
                 schema: SCHEMA_VERSION,
-                tactus_version: "0.0.1".to_owned(),
+                upstroke_version: "0.0.1".to_owned(),
                 run_id: "01RUN".to_owned(),
-                branch: "tactus/run-01RUN".to_owned(),
+                branch: "upstroke/run-01RUN".to_owned(),
                 base_sha: "abc123".to_owned(),
                 plan_path: "plan.md".to_owned(),
                 config_path: None,
                 plan_hash: "deadbeef".to_owned(),
                 normalized_plan_digest: Some(format!("sha256:{}", "0".repeat(64))),
-                private_dir: "/home/x/.tactus/runs/01RUN".to_owned(),
+                private_dir: "/home/x/.upstroke/runs/01RUN".to_owned(),
                 gates: vec!["check".to_owned()],
                 gates_from_config: true,
                 reviews: Some(crate::review::ReviewPlan::default()),
@@ -2298,12 +2298,12 @@ mod tests {
             parking: None,
             transition: None,
             prepared_commit: Some(Box::new(PreparedCommit {
-                branch_ref: "refs/heads/tactus/run-01RUN".to_owned(),
+                branch_ref: "refs/heads/upstroke/run-01RUN".to_owned(),
                 parent_sha: "1".repeat(40),
                 tree_sha: "2".repeat(40),
                 commit_sha: "3".repeat(40),
-                message: "[tactus] t1: task".to_owned(),
-                pin_ref: format!("refs/tactus/prepared/01RUN/0-{attempt}"),
+                message: "[upstroke] t1: task".to_owned(),
+                pin_ref: format!("refs/upstroke/prepared/01RUN/0-{attempt}"),
             })),
             data: Box::new(AttemptRecord {
                 attempt,
@@ -2332,7 +2332,8 @@ mod tests {
     }
 
     fn scratch(tag: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!("tactus-events-{tag}-{}", std::process::id()));
+        let dir =
+            std::env::temp_dir().join(format!("upstroke-events-{tag}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).expect("scratch dir");
         dir
@@ -2437,7 +2438,7 @@ mod tests {
                 task: "t1".to_owned(),
                 data: TaskCommitted {
                     sha: "abc123".to_owned(),
-                    message: "[tactus] t1: do it".to_owned(),
+                    message: "[upstroke] t1: do it".to_owned(),
                 },
             },
             EventBody::TaskFailed {
@@ -3293,7 +3294,7 @@ mod tests {
             panic!("still a run_started");
         };
         assert_eq!(read_back.gate_cmds, recorded_gates);
-        // And the shell spells the same way in the log as in `tactus.toml`, so
+        // And the shell spells the same way in the log as in `upstroke.toml`, so
         // an operator comparing the two is comparing like with like.
         let recorded = read_back.gate_cmds.expect("gates");
         assert_eq!(

@@ -644,7 +644,7 @@ const PACKET_PRIMITIVES: &[&str] = &[
     "libc::execvp",
     "windows_sys::Win32::Storage::FileSystem::LockFileEx",
     "windows_sys::Win32::Storage::FileSystem::UnlockFileEx",
-    "tactus::util::write_json",
+    "upstroke::util::write_json",
 ];
 
 /// The types and the macro list the same sentence names.
@@ -695,7 +695,8 @@ fn the_denylist_names_every_primitive_the_packet_enumerates() {
     // author deletes.
     for entry in denied.all() {
         assert!(
-            entry.reason.starts_with("TACTUS-EFFECT") || entry.reason.starts_with("TACTUS-WRAPPER"),
+            entry.reason.starts_with("UPSTROKE-EFFECT")
+                || entry.reason.starts_with("UPSTROKE-WRAPPER"),
             "{} has no classified reason: {}",
             entry.path,
             entry.reason
@@ -771,12 +772,12 @@ fn the_denylist_names_every_primitive_the_packet_enumerates() {
     // actual requirement: the six effectful operations of the two seams the
     // Container sites are primitives of.
     for helper in [
-        "tactus::runner::container::runtime::ContainerRuntime::create",
-        "tactus::runner::container::runtime::ContainerRuntime::start",
-        "tactus::runner::container::runtime::ContainerRuntime::stop",
-        "tactus::runner::container::runtime::ContainerRuntime::remove",
-        "tactus::runner::container::GitView::materialize",
-        "tactus::runner::container::GitView::discard",
+        "upstroke::runner::container::runtime::ContainerRuntime::create",
+        "upstroke::runner::container::runtime::ContainerRuntime::start",
+        "upstroke::runner::container::runtime::ContainerRuntime::stop",
+        "upstroke::runner::container::runtime::ContainerRuntime::remove",
+        "upstroke::runner::container::GitView::materialize",
+        "upstroke::runner::container::GitView::discard",
     ] {
         assert!(
             methods.contains(helper),
@@ -816,7 +817,7 @@ fn every_denied_path_this_host_can_resolve_does_resolve() {
     let with_typo = format!("{stripped}\n[[extra]]\n",).replace("[[extra]]\n", "");
     let with_typo = with_typo.replace(
         "disallowed-methods = [",
-        "disallowed-methods = [\n    { path = \"std::fs::wrrite\", reason = \"TACTUS-EFFECT: control\" },",
+        "disallowed-methods = [\n    { path = \"std::fs::wrrite\", reason = \"UPSTROKE-EFFECT: control\" },",
     );
     fs::write(scratch.join(CLIPPY_TOML), with_typo).expect("the control config");
     let control = unresolved_paths(&scratch, "control");
@@ -883,7 +884,7 @@ fn unresolved_paths(dir: &Path, tag: &str) -> BTreeSet<String> {
         .arg("-L")
         .arg(format!("dependency={}", deps.display()))
         .arg("--extern")
-        .arg(format!("tactus={}", rlib.display()));
+        .arg(format!("upstroke={}", rlib.display()));
     for (name, path) in extern_dependencies(&deps) {
         command
             .arg("--extern")
@@ -927,7 +928,7 @@ fn extern_dependencies(deps: &Path) -> Vec<(String, PathBuf)> {
         let Some((crate_name, _)) = stem.rsplit_once('-') else {
             continue;
         };
-        if crate_name == "tactus" {
+        if crate_name == "upstroke" {
             continue;
         }
         let stamp = path
@@ -1137,7 +1138,7 @@ fn lint_fixture(dir: &Path, tag: &str, body: &str) -> (bool, Vec<(String, String
         .arg("-L")
         .arg(format!("dependency={}", deps.display()))
         .arg("--extern")
-        .arg(format!("tactus={}", rlib.display()));
+        .arg(format!("upstroke={}", rlib.display()));
     for (name, path) in extern_dependencies(&deps) {
         command
             .arg("--extern")
@@ -1260,7 +1261,7 @@ fn the_workflow_that_runs_these_tests_installs_the_compiler_they_need() {
 /// in `src/topology/paths.rs`: **unconditional** it fails Ubuntu clippy with
 /// `use of a disallowed method`; under `#[cfg(windows)]` it passes Ubuntu clippy,
 /// the `test` job on all three platforms and the `msrv` job on all three
-/// platforms, and is refused by MSVC clippy with the `TACTUS-EFFECT R21/R18`
+/// platforms, and is refused by MSVC clippy with the `UPSTROKE-EFFECT R21/R18`
 /// note. `expected_failures_refusals[5]` and `[6]` were therefore undischarged
 /// for that half of the tree.
 ///
@@ -1398,7 +1399,7 @@ fn crate_under_test() -> (PathBuf, PathBuf) {
         .filter_map(|entry| {
             let path = entry.ok()?.path();
             let name = path.file_name()?.to_str()?;
-            (name.starts_with("libtactus-") && name.ends_with(".rlib")).then(|| {
+            (name.starts_with("libupstroke-") && name.ends_with(".rlib")).then(|| {
                 let stamp = path
                     .metadata()
                     .and_then(|meta| meta.modified())
@@ -1412,7 +1413,7 @@ fn crate_under_test() -> (PathBuf, PathBuf) {
         .pop()
         .unwrap_or_else(|| {
             panic!(
-                "no libtactus-*.rlib beside the test executable in {}",
+                "no libupstroke-*.rlib beside the test executable in {}",
                 deps.display()
             )
         })
@@ -1421,7 +1422,7 @@ fn crate_under_test() -> (PathBuf, PathBuf) {
 }
 
 fn scratch_dir(tag: &str) -> PathBuf {
-    let dir = std::env::temp_dir().join(format!("tactus-effects-{tag}-{}", std::process::id()));
+    let dir = std::env::temp_dir().join(format!("upstroke-effects-{tag}-{}", std::process::id()));
     let _ = fs::remove_dir_all(&dir);
     fs::create_dir_all(&dir).expect("a scratch directory");
     dir
@@ -1535,7 +1536,7 @@ fn every_effectful_wrapper_is_on_the_disallowed_list() {
     assert!(named >= 10, "only {named} wrappers were checked");
 
     // The other direction: every crate-internal denial is a row somebody
-    // classified. A `tactus::…` entry nobody classified is a denial with no
+    // classified. A `upstroke::…` entry nobody classified is a denial with no
     // review behind it.
     let classified: BTreeSet<String> = record
         .module
@@ -1548,7 +1549,7 @@ fn every_effectful_wrapper_is_on_the_disallowed_list() {
         })
         .collect();
     for entry in denylist().all() {
-        if !entry.path.starts_with("tactus::") {
+        if !entry.path.starts_with("upstroke::") {
             continue;
         }
         assert!(

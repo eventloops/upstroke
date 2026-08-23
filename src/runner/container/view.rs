@@ -19,7 +19,7 @@
 //! |---|---|---|
 //! | exact detached HEAD | `HEAD` holds the resolved commit id, never `ref: …` | the coordinator's branch name, and a checkout that moves when the coordinator moves it |
 //! | exact index | the worktree's `index` is copied in, byte for byte | an empty index, so `git status` reports the whole tree as added |
-//! | no engine refs | `refs/heads` and `refs/tags` are created empty and no `packed-refs` is written | `refs/tactus/**` — every candidate, pin and integration ref of every run |
+//! | no engine refs | `refs/heads` and `refs/tags` are created empty and no `packed-refs` is written | `refs/upstroke/**` — every candidate, pin and integration ref of every run |
 //! | read-only objects | `objects/info/alternates` names the object store, which Git **borrows and never writes to**, and the runner mounts that store `:ro` besides | a writable object store shared with the coordinator |
 //! | disposable | the whole directory is [`GitView::discard`]ed at release, and every object Git writes lands in the view's own `objects/` | mutations in the coordinator's repository |
 //!
@@ -57,7 +57,7 @@ use std::fs;
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
 
-use crate::error::TactusError;
+use crate::error::UpstrokeError;
 
 use super::runtime::{ContainerTrace, ViewAction};
 use super::{GitView, GitViewRequest};
@@ -151,15 +151,15 @@ pub struct GitLayout {
 ///
 /// # Errors
 ///
-/// [`TactusError::Io`] when `<workspace>/.git` exists and cannot be read, or
-/// [`TactusError::Git`] when it is a `gitdir:` file naming nothing.
-pub fn resolve(workspace: &Path) -> Result<Option<GitLayout>, TactusError> {
+/// [`UpstrokeError::Io`] when `<workspace>/.git` exists and cannot be read, or
+/// [`UpstrokeError::Git`] when it is a `gitdir:` file naming nothing.
+pub fn resolve(workspace: &Path) -> Result<Option<GitLayout>, UpstrokeError> {
     let dot_git = workspace.join(DOT_GIT);
     let metadata = match fs::symlink_metadata(&dot_git) {
         Ok(metadata) => metadata,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(source) => {
-            return Err(TactusError::Io {
+            return Err(UpstrokeError::Io {
                 path: dot_git,
                 source,
             });
@@ -170,12 +170,12 @@ pub fn resolve(workspace: &Path) -> Result<Option<GitLayout>, TactusError> {
     let git_dir = if metadata.is_dir() {
         dot_git
     } else {
-        let text = fs::read_to_string(&dot_git).map_err(|source| TactusError::Io {
+        let text = fs::read_to_string(&dot_git).map_err(|source| UpstrokeError::Io {
             path: dot_git.clone(),
             source,
         })?;
         let Some(target) = text.trim().strip_prefix(GITDIR_PREFIX) else {
-            return Err(TactusError::Git {
+            return Err(UpstrokeError::Git {
                 message: format!(
                     "`{}` is neither a Git directory nor a `{GITDIR_PREFIX}` link",
                     dot_git.display()
@@ -203,7 +203,7 @@ pub fn resolve(workspace: &Path) -> Result<Option<GitLayout>, TactusError> {
         }
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => git_dir.clone(),
         Err(source) => {
-            return Err(TactusError::Io {
+            return Err(UpstrokeError::Io {
                 path: git_dir.join(COMMONDIR),
                 source,
             });
@@ -267,12 +267,12 @@ fn normalized(path: &Path) -> PathBuf {
 ///
 /// # Errors
 ///
-/// [`TactusError::Git`] when `HEAD` is missing, names a ref nothing resolves,
+/// [`UpstrokeError::Git`] when `HEAD` is missing, names a ref nothing resolves,
 /// or does not resolve to an object id.
-pub fn detached_head(layout: &GitLayout) -> Result<String, TactusError> {
+pub fn detached_head(layout: &GitLayout) -> Result<String, UpstrokeError> {
     let head_path = layout.git_dir.join("HEAD");
     let head = fs::read_to_string(&head_path)
-        .map_err(|source| TactusError::Io {
+        .map_err(|source| UpstrokeError::Io {
             path: head_path.clone(),
             source,
         })?
@@ -291,7 +291,7 @@ pub fn detached_head(layout: &GitLayout) -> Result<String, TactusError> {
             Ok(text) => return object_id(text.trim(), &base.join(name)),
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
             Err(source) => {
-                return Err(TactusError::Io {
+                return Err(UpstrokeError::Io {
                     path: base.join(name),
                     source,
                 });
@@ -314,7 +314,7 @@ pub fn detached_head(layout: &GitLayout) -> Result<String, TactusError> {
         }
     }
 
-    Err(TactusError::Git {
+    Err(UpstrokeError::Git {
         message: format!(
             "`{}` names `{name}`, and nothing under `{}` or `{}` resolves it",
             head_path.display(),
@@ -329,11 +329,11 @@ pub fn detached_head(layout: &GitLayout) -> Result<String, TactusError> {
 /// Forty characters for `sha1` and sixty-four for `sha256`, because
 /// [`config_for`] carries the repository's `[extensions]` across and a
 /// `sha256` repository is a thing this view has to be able to project.
-fn object_id(value: &str, from: &Path) -> Result<String, TactusError> {
+fn object_id(value: &str, from: &Path) -> Result<String, UpstrokeError> {
     if matches!(value.len(), 40 | 64) && value.chars().all(|c| c.is_ascii_hexdigit()) {
         return Ok(value.to_owned());
     }
-    Err(TactusError::Git {
+    Err(UpstrokeError::Git {
         message: format!(
             "`{}` holds `{value}`, which is not a Git object id; the container's Git view \
              carries an exact detached HEAD (DESIGN.md:612)",
@@ -439,7 +439,7 @@ pub const PROJECTED_ENTRIES: &[&str] = &[
 pub const WITHHELD_ENTRIES: &[&str] = &[COMMONDIR, "gitdir", "worktrees", "packed-refs"];
 
 impl GitView for RoleGitView {
-    fn materialize(&self, request: &GitViewRequest) -> Result<PathBuf, TactusError> {
+    fn materialize(&self, request: &GitViewRequest) -> Result<PathBuf, UpstrokeError> {
         create_dir(&request.path)?;
 
         if let Some(layout) = resolve(&request.workspace)? {
@@ -480,7 +480,7 @@ impl GitView for RoleGitView {
     /// [`super::racing_removal`] retries and then **fails**, which is the
     /// fail-closed shape: a delete-pending name disappears within a few
     /// attempts, and a protected one still refuses after all of them.
-    fn discard(&self, path: &Path) -> Result<(), TactusError> {
+    fn discard(&self, path: &Path) -> Result<(), UpstrokeError> {
         super::racing_removal(path, || fs::remove_dir_all(path))?;
         self.trace.view(ViewAction::Discarded, path);
         Ok(())
@@ -493,7 +493,7 @@ fn project(
     layout: &GitLayout,
     head: &str,
     reader: &ReaderPaths,
-) -> Result<(), TactusError> {
+) -> Result<(), UpstrokeError> {
     // Exact detached HEAD: an id, never a name.
     write_file(&view.join("HEAD"), format!("{head}\n").as_bytes())?;
 
@@ -507,7 +507,7 @@ fn project(
         Ok(bytes) => write_file(&view.join("index"), &bytes)?,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
         Err(source) => {
-            return Err(TactusError::Io {
+            return Err(UpstrokeError::Io {
                 path: layout.git_dir.join("index"),
                 source,
             });
@@ -557,13 +557,13 @@ fn project(
 ///
 /// # Errors
 ///
-/// [`TactusError::Io`] when the Git directory or a shared index cannot be read.
-fn copy_shared_indexes(git_dir: &Path, view: &Path) -> Result<Vec<String>, TactusError> {
+/// [`UpstrokeError::Io`] when the Git directory or a shared index cannot be read.
+fn copy_shared_indexes(git_dir: &Path, view: &Path) -> Result<Vec<String>, UpstrokeError> {
     let entries = match fs::read_dir(git_dir) {
         Ok(entries) => entries,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
         Err(source) => {
-            return Err(TactusError::Io {
+            return Err(UpstrokeError::Io {
                 path: git_dir.to_path_buf(),
                 source,
             });
@@ -571,7 +571,7 @@ fn copy_shared_indexes(git_dir: &Path, view: &Path) -> Result<Vec<String>, Tactu
     };
     let mut copied = Vec::new();
     for entry in entries {
-        let entry = entry.map_err(|source| TactusError::Io {
+        let entry = entry.map_err(|source| UpstrokeError::Io {
             path: git_dir.to_path_buf(),
             source,
         })?;
@@ -586,7 +586,7 @@ fn copy_shared_indexes(git_dir: &Path, view: &Path) -> Result<Vec<String>, Tactu
             // this view carries names the one that is there, and a shared index
             // that went away under the scan was not it.
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
-            Err(source) => return Err(TactusError::Io { path: from, source }),
+            Err(source) => return Err(UpstrokeError::Io { path: from, source }),
         };
         write_file(&view.join(&name), &bytes)?;
         copied.push(name);
@@ -605,13 +605,13 @@ fn copy_shared_indexes(git_dir: &Path, view: &Path) -> Result<Vec<String>, Tactu
 /// borrows: a `sha256` repository read as `sha1` is a repository read wrong,
 /// and an unknown extension declared is a Git that refuses loudly instead of
 /// one that misreads.
-fn config_for(layout: &GitLayout) -> Result<String, TactusError> {
+fn config_for(layout: &GitLayout) -> Result<String, UpstrokeError> {
     let mut config = String::from("[core]\n\tbare = false\n\tlogallrefupdates = false\n");
     let source = match fs::read_to_string(layout.common_dir.join("config")) {
         Ok(text) => text,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => String::new(),
         Err(source) => {
-            return Err(TactusError::Io {
+            return Err(UpstrokeError::Io {
                 path: layout.common_dir.join("config"),
                 source,
             });
@@ -647,22 +647,22 @@ fn config_for(layout: &GitLayout) -> Result<String, TactusError> {
     Ok(config)
 }
 
-fn create_dir(path: &Path) -> Result<(), TactusError> {
-    fs::create_dir_all(path).map_err(|source| TactusError::Io {
+fn create_dir(path: &Path) -> Result<(), UpstrokeError> {
+    fs::create_dir_all(path).map_err(|source| UpstrokeError::Io {
         path: path.to_path_buf(),
         source,
     })
 }
 
-fn write_file(path: &Path, bytes: &[u8]) -> Result<(), TactusError> {
+fn write_file(path: &Path, bytes: &[u8]) -> Result<(), UpstrokeError> {
     if let Some(parent) = path.parent() {
         create_dir(parent)?;
     }
-    let mut file = fs::File::create(path).map_err(|source| TactusError::Io {
+    let mut file = fs::File::create(path).map_err(|source| UpstrokeError::Io {
         path: path.to_path_buf(),
         source,
     })?;
-    file.write_all(bytes).map_err(|source| TactusError::Io {
+    file.write_all(bytes).map_err(|source| UpstrokeError::Io {
         path: path.to_path_buf(),
         source,
     })
@@ -716,7 +716,7 @@ pub(crate) mod fixtures {
     /// A scratch directory, in the idiom of `runner::container::tests::scratch`.
     pub(crate) fn scratch(tag: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!(
-            "tactus-view-{tag}-{}-{:?}",
+            "upstroke-view-{tag}-{}-{:?}",
             std::process::id(),
             std::thread::current().id()
         ));
@@ -733,9 +733,9 @@ pub(crate) mod fixtures {
         // with no identity configured can still build a fixture.
         for fixed in [
             "-c",
-            "user.name=tactus-test",
+            "user.name=upstroke-test",
             "-c",
-            "user.email=tactus@example.invalid",
+            "user.email=upstroke@example.invalid",
             "-c",
             "commit.gpgsign=false",
             "-c",
@@ -813,9 +813,9 @@ pub(crate) mod fixtures {
     /// Engine refs, of the shape `src/workspace_manager.rs` writes.
     pub(crate) fn engine_refs(repo: &Path, commit: &str) -> Vec<String> {
         let names = vec![
-            "refs/tactus/runs/01RUN/candidates/k0/1".to_owned(),
-            "refs/tactus/runs/01RUN/integration".to_owned(),
-            "refs/tactus/prepared/01RUN/0-1".to_owned(),
+            "refs/upstroke/runs/01RUN/candidates/k0/1".to_owned(),
+            "refs/upstroke/runs/01RUN/integration".to_owned(),
+            "refs/upstroke/prepared/01RUN/0-1".to_owned(),
         ];
         for name in &names {
             git_ok(repo, &["update-ref", name, commit]);
@@ -1374,7 +1374,7 @@ mod tests {
         // A container's reader: the in-container mount targets.
         let container_view = root.join("view-container");
         RoleGitView::new(ContainerTrace::off())
-            .for_reader("/tactus/gitview", "/tactus/gitobjects")
+            .for_reader("/upstroke/gitview", "/upstroke/gitobjects")
             .materialize(&GitViewRequest {
                 path: container_view.clone(),
                 workspace,
@@ -1385,13 +1385,13 @@ mod tests {
             std::fs::read_to_string(container_view.join(ALTERNATES))
                 .expect("alternates")
                 .trim(),
-            "/tactus/gitobjects"
+            "/upstroke/gitobjects"
         );
         assert_eq!(
             std::fs::read_to_string(container_view.join(WORKTREE_GITFILE))
                 .expect("gitfile")
                 .trim(),
-            "gitdir: /tactus/gitview"
+            "gitdir: /upstroke/gitview"
         );
         assert_ne!(
             host_alternate,

@@ -111,7 +111,7 @@ pub const FUNNEL_MODULES_JSON: &str = "effects/funnel-modules.json";
 /// A generated artifact that is only ever *compared* rots into a chore nobody
 /// can discharge; one that is only ever *written* proves nothing. Both, keyed on
 /// this, is the ordinary resolution.
-pub const REGENERATE: &str = "TACTUS_REGENERATE_EFFECT_ARTIFACTS";
+pub const REGENERATE: &str = "UPSTROKE_REGENERATE_EFFECT_ARTIFACTS";
 
 // ---------------------------------------------------------------------------
 // (2) The governed lints and where an allow of one may live
@@ -718,7 +718,7 @@ pub const CLASSIFIED_MODULES: &[&str] = &[
     // added by PR6. It is here rather than only in the allowlist because it
     // denies six of its own paths — the "docker invocation helpers" the same
     // sentence enumerates — and `every_effectful_wrapper_is_on_the_disallowed_list`
-    // requires a `tactus::` denial to be a row somebody classified.
+    // requires a `upstroke::` denial to be a row somebody classified.
     "src/runner/container.rs",
     // legacy
     "src/engine/coordinator.rs",
@@ -956,10 +956,10 @@ pub const DENIAL_FIXTURES: &[DenialFixture] = &[
     DenialFixture {
         shape: "legacy-wrapper call",
         source: "pub fn go(p: &std::path::Path) {\n\
-                 \x20   let _ = tactus::util::write_text(p, \"x\");\n\
+                 \x20   let _ = upstroke::util::write_text(p, \"x\");\n\
                  }\n",
         lint: "clippy::disallowed_methods",
-        resolves_to: "tactus::util::write_text",
+        resolves_to: "upstroke::util::write_text",
     },
     DenialFixture {
         shape: "method call",
@@ -992,7 +992,7 @@ pub const DENIAL_FIXTURES: &[DenialFixture] = &[
 /// difference between "the compiler refused this" and "the compiler could not
 /// find a crate to refuse it against".
 pub const DENIAL_CONTROL: &str = "pub fn go(p: &std::path::Path) -> bool {\n\
-                                  \x20   let _ = tactus::util::tail(\"x\", 1);\n\
+                                  \x20   let _ = upstroke::util::tail(\"x\", 1);\n\
                                   \x20   p.exists()\n\
                                   }\n";
 

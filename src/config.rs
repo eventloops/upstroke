@@ -1,8 +1,8 @@
 //! Config loading (DESIGN.md §17 subset for `validate`).
 //!
-//! Two optional files: repo-level `tactus.toml` (routing overrides, pins,
-//! strategy) and user-level `~/.tactus/pools.toml` (capacity pools, normally
-//! written by `tactus connect`). Both missing is the normal fresh-repo case
+//! Two optional files: repo-level `upstroke.toml` (routing overrides, pins,
+//! strategy) and user-level `~/.upstroke/pools.toml` (capacity pools, normally
+//! written by `upstroke connect`). Both missing is the normal fresh-repo case
 //! and falls back to derived defaults silently.
 // LEGACY-EFFECT: this module is in the **frozen legacy section** of
 // `effects/allowlist.toml`, which carries its justification and the condition
@@ -20,7 +20,7 @@ use serde::Deserialize;
 
 use crate::capacity::{self, Allowance, Pool, PoolKind, Source};
 use crate::catalog;
-use crate::error::TactusError;
+use crate::error::UpstrokeError;
 use crate::gates::ShellKind;
 use crate::interaction::InteractionMode;
 use crate::ir::{Effort, ResolvedEffortPolicy, TaskKind, Tier};
@@ -402,7 +402,7 @@ pub const LAST_SEQUENTIAL_SCHEMA: u32 = 3;
 /// recorded sequential ceiling, and continues.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EngineLimits {
-    /// A run about to be created, or a preview of one (`tactus validate`).
+    /// A run about to be created, or a preview of one (`upstroke validate`).
     Fresh,
     /// A resume of a run a sequential engine recorded.
     SequentialResume,
@@ -500,7 +500,7 @@ pub struct Config {
     pub overrides: Vec<CompiledOverride>,
     pub pins: Vec<Pin>,
     pub strategy: Strategy,
-    /// `~/.tactus/pools.toml`, in file order — which is preference order for
+    /// `~/.upstroke/pools.toml`, in file order — which is preference order for
     /// [`crate::capacity::pool_for`].
     pub pools: Vec<Pool>,
     /// `[budgets]` (§17); both keys optional, both meaning unlimited when absent.
@@ -655,17 +655,17 @@ pub fn default_chain(kind: TaskKind) -> Vec<Tier> {
 /// Load effective config.
 ///
 /// `repo_config`: explicit `--config` path (missing file = error) or `None`
-/// to look for `tactus.toml` in `discover_in` (missing = silent defaults).
+/// to look for `upstroke.toml` in `discover_in` (missing = silent defaults).
 /// `discover_in` is the repo root the run targets — never the process CWD,
 /// which can differ and would load another repo's config.
 /// `pools_file`: explicit pools path (tests) or `None` to discover
-/// `~/.tactus/pools.toml` (missing = silent).
+/// `~/.upstroke/pools.toml` (missing = silent).
 pub fn load(
     repo_config: Option<&Path>,
     discover_in: &Path,
     pools_file: Option<&Path>,
     warnings: &mut Vec<String>,
-) -> Result<Config, TactusError> {
+) -> Result<Config, UpstrokeError> {
     load_limits(
         repo_config,
         discover_in,
@@ -686,7 +686,7 @@ pub fn load_limits(
     pools_file: Option<&Path>,
     limits: EngineLimits,
     warnings: &mut Vec<String>,
-) -> Result<Config, TactusError> {
+) -> Result<Config, UpstrokeError> {
     load_with(
         repo_config,
         discover_in,
@@ -713,7 +713,7 @@ pub fn load_with(
     has_adapter: &dyn Fn(&str) -> bool,
     limits: EngineLimits,
     warnings: &mut Vec<String>,
-) -> Result<Config, TactusError> {
+) -> Result<Config, UpstrokeError> {
     load_captured_with(
         &CapturedConfig::capture(repo_config, discover_in, pools_file),
         has_adapter,
@@ -732,7 +732,7 @@ pub fn load_captured(
     captured: &CapturedConfig,
     limits: EngineLimits,
     warnings: &mut Vec<String>,
-) -> Result<Config, TactusError> {
+) -> Result<Config, UpstrokeError> {
     load_captured_with(
         captured,
         &|agent| crate::agent::by_id(agent).is_some(),
@@ -747,7 +747,7 @@ pub fn load_captured_with(
     has_adapter: &dyn Fn(&str) -> bool,
     limits: EngineLimits,
     warnings: &mut Vec<String>,
-) -> Result<Config, TactusError> {
+) -> Result<Config, UpstrokeError> {
     let (raw, repo_path) = read_repo_config(&captured.repo)?;
 
     let mut chains: BTreeMap<TaskKind, KindChain> = TaskKind::ALL
@@ -778,7 +778,7 @@ pub fn load_captured_with(
     if let Some(routing) = raw.routing {
         if let Some(value) = routing.effort {
             let policy: RawRoleEffort =
-                value.try_into().map_err(|e| TactusError::Config {
+                value.try_into().map_err(|e| UpstrokeError::Config {
                     path: repo_path.clone(),
                     message: format!(
                         "[routing.effort]: {e} (expected optional `implementation` and `review` effort strings)"
@@ -799,15 +799,16 @@ pub fn load_captured_with(
                 // warning users off their own documented config; the reviewer
                 // consumes it in step 6.
                 if key == "review" {
-                    let rr: RawKindRouting = value.try_into().map_err(|e| TactusError::Config {
-                        path: repo_path.clone(),
-                        message: format!(
-                            "routing entry `review`: {e} (expected `tier`, `timeout_secs`, or \
+                    let rr: RawKindRouting =
+                        value.try_into().map_err(|e| UpstrokeError::Config {
+                            path: repo_path.clone(),
+                            message: format!(
+                                "routing entry `review`: {e} (expected `tier`, `timeout_secs`, or \
                              `enabled = false` to run without review)"
-                        ),
-                    })?;
+                            ),
+                        })?;
                     if rr.attempts_per.is_some() {
-                        return Err(TactusError::Config {
+                        return Err(UpstrokeError::Config {
                             path: repo_path.clone(),
                             message:
                                 "[routing] `review`: attempts_per applies only to task-kind roles"
@@ -819,7 +820,7 @@ pub fn load_captured_with(
                         .tier
                         .or_else(|| rr.chain.and_then(|c| c.first().copied()));
                     if rr.timeout_secs == Some(0) {
-                        return Err(TactusError::Config {
+                        return Err(UpstrokeError::Config {
                             path: repo_path.clone(),
                             message: "[routing] `review`: timeout_secs must be at least 1; omit it for the default of 5400 seconds".to_owned(),
                         });
@@ -836,12 +837,12 @@ pub fn load_captured_with(
                 ));
                 continue;
             };
-            let kr: RawKindRouting = value.try_into().map_err(|e| TactusError::Config {
+            let kr: RawKindRouting = value.try_into().map_err(|e| UpstrokeError::Config {
                 path: repo_path.clone(),
                 message: format!("routing entry `{key}`: {e}"),
             })?;
             if kr.attempts_per == Some(0) {
-                return Err(TactusError::Config {
+                return Err(UpstrokeError::Config {
                     path: repo_path.clone(),
                     message: format!(
                         "[routing] `{key}`: attempts_per must be at least 1 — omit it for the \
@@ -850,7 +851,7 @@ pub fn load_captured_with(
                 });
             }
             if kr.timeout_secs.is_some() {
-                return Err(TactusError::Config {
+                return Err(UpstrokeError::Config {
                     path: repo_path.clone(),
                     message: format!(
                         "[routing] `{key}`: timeout_secs applies only to the `review` role"
@@ -858,7 +859,7 @@ pub fn load_captured_with(
                 });
             }
             if kr.enabled.is_some() {
-                return Err(TactusError::Config {
+                return Err(UpstrokeError::Config {
                     path: repo_path.clone(),
                     message: format!(
                         "[routing] `{key}`: enabled applies only to the `review` role"
@@ -893,7 +894,7 @@ pub fn load_captured_with(
             let second_opinion = match ov.second_opinion.as_deref() {
                 None => None,
                 Some(raw) => Some(SecondOpinion::parse(raw).ok_or_else(|| {
-                    TactusError::Config {
+                    UpstrokeError::Config {
                         path: repo_path.clone(),
                         message: format!(
                             "[[routing.overrides]] entry {n}: `second_opinion = \"{raw}\"` is not \
@@ -907,7 +908,7 @@ pub fn load_captured_with(
             // nothing and asks for nothing does nothing — and reads exactly
             // like one whose key was misspelled into oblivion.
             if ov.start_at.is_none() && second_opinion.is_none() {
-                return Err(TactusError::Config {
+                return Err(UpstrokeError::Config {
                     path: repo_path.clone(),
                     message: format!(
                         "[[routing.overrides]] entry {n} has neither `start_at` nor \
@@ -918,13 +919,13 @@ pub fn load_captured_with(
             }
             let mut builder = GlobSetBuilder::new();
             for pattern in &ov.paths {
-                let glob = Glob::new(pattern).map_err(|e| TactusError::Config {
+                let glob = Glob::new(pattern).map_err(|e| UpstrokeError::Config {
                     path: repo_path.clone(),
                     message: format!("invalid glob `{pattern}` in [[routing.overrides]]: {e}"),
                 })?;
                 builder.add(glob);
             }
-            let globs = builder.build().map_err(|e| TactusError::Config {
+            let globs = builder.build().map_err(|e| UpstrokeError::Config {
                 path: repo_path.clone(),
                 message: format!("building glob set for [[routing.overrides]]: {e}"),
             })?;
@@ -961,7 +962,7 @@ pub fn load_captured_with(
             } else {
                 known.join(", ")
             };
-            return Err(TactusError::UnknownPinnedModel {
+            return Err(UpstrokeError::UnknownPinnedModel {
                 agent: pin.agent,
                 model: pin.model,
                 known,
@@ -981,7 +982,7 @@ pub fn load_captured_with(
         // config error. Same posture as the pinned-model check above.
         let effort = match pin.effort.as_deref().map(Effort::parse) {
             Some(None) => {
-                return Err(TactusError::Config {
+                return Err(UpstrokeError::Config {
                     path: repo_path.clone(),
                     message: format!(
                         "pin for tier `{}` sets effort `{}`, which is not one of: {}",
@@ -1056,15 +1057,18 @@ fn parse_runner(
     raw: Option<toml::Value>,
     repo_path: &Path,
     limits: EngineLimits,
-) -> Result<RunnerSelection, TactusError> {
+) -> Result<RunnerSelection, UpstrokeError> {
     let selection = read_runner(raw, repo_path)?;
     refuse_legacy_container_selection(&selection, repo_path, limits)?;
     Ok(selection)
 }
 
 /// `[runner]` as written, with no policy applied.
-fn read_runner(raw: Option<toml::Value>, repo_path: &Path) -> Result<RunnerSelection, TactusError> {
-    let config_error = |message: String| TactusError::Config {
+fn read_runner(
+    raw: Option<toml::Value>,
+    repo_path: &Path,
+) -> Result<RunnerSelection, UpstrokeError> {
+    let config_error = |message: String| UpstrokeError::Config {
         path: repo_path.to_path_buf(),
         message,
     };
@@ -1218,12 +1222,12 @@ fn read_runner(raw: Option<toml::Value>, repo_path: &Path) -> Result<RunnerSelec
 ///
 /// # Errors
 ///
-/// [`TactusError::Config`] when `selection` is a container selection.
+/// [`UpstrokeError::Config`] when `selection` is a container selection.
 fn refuse_legacy_container_selection(
     selection: &RunnerSelection,
     repo_path: &Path,
     limits: EngineLimits,
-) -> Result<(), TactusError> {
+) -> Result<(), UpstrokeError> {
     if selection.kind != RunnerKind::Container {
         return Ok(());
     }
@@ -1234,7 +1238,7 @@ fn refuse_legacy_container_selection(
              with"
         }
     };
-    Err(TactusError::Config {
+    Err(UpstrokeError::Config {
         path: repo_path.to_path_buf(),
         message: format!(
             "[runner] `kind = \"container\"` is refused: {reading}, and that engine's pre-flight \
@@ -1253,11 +1257,11 @@ fn parse_role_effort(
     raw: Option<&str>,
     role: &str,
     repo_path: &Path,
-) -> Result<Option<Effort>, TactusError> {
+) -> Result<Option<Effort>, UpstrokeError> {
     let Some(raw) = raw else { return Ok(None) };
     Effort::parse(raw)
         .map(Some)
-        .ok_or_else(|| TactusError::Config {
+        .ok_or_else(|| UpstrokeError::Config {
             path: repo_path.to_path_buf(),
             message: format!(
                 "[routing.effort] `{role} = \"{raw}\"` is not recognized (accepted: {})",
@@ -1269,11 +1273,11 @@ fn parse_role_effort(
 /// `[budgets]` (§17). A ceiling that is zero, negative, or not a number is a
 /// hard error: every one of those readings would either stop the run before it
 /// began or be ignored, and which of the two happened must not be a surprise.
-fn parse_budgets(raw: Option<toml::Value>, repo_path: &Path) -> Result<Budgets, TactusError> {
+fn parse_budgets(raw: Option<toml::Value>, repo_path: &Path) -> Result<Budgets, UpstrokeError> {
     let Some(value) = raw else {
         return Ok(Budgets::default());
     };
-    let budgets: Budgets = value.try_into().map_err(|e| TactusError::Config {
+    let budgets: Budgets = value.try_into().map_err(|e| UpstrokeError::Config {
         path: repo_path.to_path_buf(),
         message: format!(
             "[budgets]: {e} (expected optional `run_usd` and `task_usd` numbers, in \
@@ -1282,7 +1286,7 @@ fn parse_budgets(raw: Option<toml::Value>, repo_path: &Path) -> Result<Budgets, 
     })?;
     for (name, limit) in [("run_usd", budgets.run_usd), ("task_usd", budgets.task_usd)] {
         let Some(limit) = limit else { continue };
-        check_budget(name, limit).map_err(|message| TactusError::Config {
+        check_budget(name, limit).map_err(|message| UpstrokeError::Config {
             path: repo_path.to_path_buf(),
             message: format!("[budgets] {message}"),
         })?;
@@ -1295,8 +1299,8 @@ fn parse_budgets(raw: Option<toml::Value>, repo_path: &Path) -> Result<Budgets, 
 fn parse_gates(
     raw: Option<toml::Value>,
     repo_path: &Path,
-) -> Result<Option<Vec<GateConfig>>, TactusError> {
-    let config_error = |message: String| TactusError::Config {
+) -> Result<Option<Vec<GateConfig>>, UpstrokeError> {
+    let config_error = |message: String| UpstrokeError::Config {
         path: repo_path.to_path_buf(),
         message,
     };
@@ -1368,8 +1372,8 @@ fn parse_engine(
     repo_path: &Path,
     limits: EngineLimits,
     warnings: &mut Vec<String>,
-) -> Result<EngineSettings, TactusError> {
-    let config_error = |message: String| TactusError::Config {
+) -> Result<EngineSettings, UpstrokeError> {
+    let config_error = |message: String| UpstrokeError::Config {
         path: repo_path.to_path_buf(),
         message,
     };
@@ -1422,7 +1426,7 @@ fn parse_engine(
     // Zero has two readings — "no ceiling" and "nothing may run" — and which one
     // happened must never be a surprise. The rule `attempts_per` and every
     // `timeout_secs` already follow.
-    let limit = |key: &str, configured: Option<u32>, default: u32| -> Result<u32, TactusError> {
+    let limit = |key: &str, configured: Option<u32>, default: u32| -> Result<u32, UpstrokeError> {
         match configured {
             Some(0) => Err(config_error(format!(
                 "[engine] `{key} = 0` is not a limit — omit it for the default of {default}, or \
@@ -1512,7 +1516,7 @@ fn parse_engine(
 fn parse_interaction(
     raw: Option<toml::Value>,
     repo_path: &Path,
-) -> Result<InteractionSettings, TactusError> {
+) -> Result<InteractionSettings, UpstrokeError> {
     let default_notify = || vec!["cli".to_owned()];
     let Some(value) = raw else {
         return Ok(InteractionSettings {
@@ -1522,7 +1526,7 @@ fn parse_interaction(
             ask_before: AskBefore::default(),
         });
     };
-    let interaction: RawInteraction = value.try_into().map_err(|e| TactusError::Config {
+    let interaction: RawInteraction = value.try_into().map_err(|e| UpstrokeError::Config {
         path: repo_path.to_path_buf(),
         message: format!(
             "[interaction]: {e} (expected optional `mode`, `notify` list, \
@@ -1535,7 +1539,7 @@ fn parse_interaction(
     // consulted about. Same reasoning as `second_opinion`.
     let ask_before = match interaction.ask_before {
         None => AskBefore::default(),
-        Some(value) => value.try_into().map_err(|e| TactusError::Config {
+        Some(value) => value.try_into().map_err(|e| UpstrokeError::Config {
             path: repo_path.to_path_buf(),
             message: format!(
                 "[interaction] ask_before: {e} (accepted: {})",
@@ -1545,7 +1549,7 @@ fn parse_interaction(
     };
     if let Some(threshold) = ask_before.frontier_escalation_over_usd {
         if !threshold.is_finite() || threshold < 0.0 {
-            return Err(TactusError::Config {
+            return Err(UpstrokeError::Config {
                 path: repo_path.to_path_buf(),
                 message: format!(
                     "[interaction] ask_before `frontier_escalation_over_usd = {threshold}` is not a \
@@ -1557,7 +1561,7 @@ fn parse_interaction(
     let mode = match interaction.mode {
         None => InteractionMode::default(),
         Some(requested) => {
-            InteractionMode::parse(&requested).ok_or_else(|| TactusError::Config {
+            InteractionMode::parse(&requested).ok_or_else(|| UpstrokeError::Config {
                 path: repo_path.to_path_buf(),
                 message: format!(
                     "[interaction] mode `{requested}` is not recognized (expected `never`, \
@@ -1580,13 +1584,13 @@ fn parse_interaction(
 /// an error.
 ///
 /// Split out because [`CapturedConfig::capture`] has to capture *the same* file
-/// the load reads: two copies of "explicit path, else `tactus.toml` beside the
+/// the load reads: two copies of "explicit path, else `upstroke.toml` beside the
 /// repo" would be two chances for a pre-lock check to validate a file the run
 /// then does not load.
 fn repo_config_location(repo_config: Option<&Path>, discover_in: &Path) -> (PathBuf, bool) {
     match repo_config {
         Some(p) => (p.to_path_buf(), true),
-        None => (discover_in.join("tactus.toml"), false),
+        None => (discover_in.join("upstroke.toml"), false),
     }
 }
 
@@ -1635,9 +1639,9 @@ impl FileSnapshot {
     /// The captured bytes as text, or `None` if the file was not there.
     ///
     /// Fails the way the read it replaces would have: an unreadable file, or one
-    /// whose bytes are not UTF-8, is a [`TactusError::Io`] against this path.
-    pub fn text(&self) -> Result<Option<String>, TactusError> {
-        let io_error = |source| TactusError::Io {
+    /// whose bytes are not UTF-8, is a [`UpstrokeError::Io`] against this path.
+    pub fn text(&self) -> Result<Option<String>, UpstrokeError> {
+        let io_error = |source| UpstrokeError::Io {
             path: self.path.clone(),
             source,
         };
@@ -1681,7 +1685,7 @@ pub fn snapshot_file(path: &Path, required: bool) -> FileSnapshot {
 pub struct CapturedConfig {
     repo: FileSnapshot,
     /// Absent when this load has no pools file to read at all — no `--pools`
-    /// and no `~/.tactus/pools.toml` — which is silence rather than emptiness.
+    /// and no `~/.upstroke/pools.toml` — which is silence rather than emptiness.
     pools: Option<FileSnapshot>,
 }
 
@@ -1707,25 +1711,25 @@ impl CapturedConfig {
     }
 }
 
-fn read_repo_config(snapshot: &FileSnapshot) -> Result<(RawRepoConfig, PathBuf), TactusError> {
+fn read_repo_config(snapshot: &FileSnapshot) -> Result<(RawRepoConfig, PathBuf), UpstrokeError> {
     let path = snapshot.path().to_path_buf();
     let Some(text) = snapshot.text()? else {
         if snapshot.required {
-            return Err(TactusError::Config {
+            return Err(UpstrokeError::Config {
                 path,
                 message: "file not found".to_owned(),
             });
         }
         return Ok((RawRepoConfig::default(), path));
     };
-    let raw = toml::from_str(&text).map_err(|e| TactusError::Config {
+    let raw = toml::from_str(&text).map_err(|e| UpstrokeError::Config {
         path: path.clone(),
         message: e.to_string(),
     })?;
     Ok((raw, path))
 }
 
-/// Read `~/.tactus/pools.toml` into typed pools (§17).
+/// Read `~/.upstroke/pools.toml` into typed pools (§17).
 ///
 /// Temperament matches the rest of this file: anything that would silently
 /// change what the estimator does is an error, and anything that only degrades
@@ -1744,28 +1748,28 @@ fn read_repo_config(snapshot: &FileSnapshot) -> Result<(RawRepoConfig, PathBuf),
 /// An **explicit** `--pools` path that does not exist is an error, the way an
 /// explicit `--config` is in [`read_repo_config`]: a path someone typed and
 /// that is not there is a typo, and answering it with "no pools connected —
-/// run `tactus connect`" sends them to regenerate a file that was never the
+/// run `upstroke connect`" sends them to regenerate a file that was never the
 /// problem. A *discovered* one that is absent is the normal fresh case and
 /// stays silent.
 fn read_pools(
     pools: Option<&FileSnapshot>,
     has_adapter: &dyn Fn(&str) -> bool,
     warnings: &mut Vec<String>,
-) -> Result<Vec<Pool>, TactusError> {
+) -> Result<Vec<Pool>, UpstrokeError> {
     let Some(snapshot) = pools else {
         return Ok(Vec::new());
     };
     let path = snapshot.path().to_path_buf();
     let Some(text) = snapshot.text()? else {
         if snapshot.required {
-            return Err(TactusError::Config {
+            return Err(UpstrokeError::Config {
                 path,
                 message: "pools file not found".to_owned(),
             });
         }
         return Ok(Vec::new());
     };
-    let raw: RawPools = toml::from_str(&text).map_err(|e| TactusError::Config {
+    let raw: RawPools = toml::from_str(&text).map_err(|e| UpstrokeError::Config {
         path: path.clone(),
         message: e.to_string(),
     })?;
@@ -1792,8 +1796,8 @@ fn parse_pool(
     path: &Path,
     has_adapter: &dyn Fn(&str) -> bool,
     warnings: &mut Vec<String>,
-) -> Result<Pool, TactusError> {
-    let config_error = |message: String| TactusError::Config {
+) -> Result<Pool, UpstrokeError> {
+    let config_error = |message: String| UpstrokeError::Config {
         path: path.to_path_buf(),
         message,
     };
@@ -1856,7 +1860,7 @@ fn parse_pool(
         }
     }
 
-    let fraction = |field: &str, value: Option<f64>, default: f64| -> Result<f64, TactusError> {
+    let fraction = |field: &str, value: Option<f64>, default: f64| -> Result<f64, UpstrokeError> {
         let Some(value) = value else {
             return Ok(default);
         };
@@ -1931,7 +1935,7 @@ fn parse_pool(
 }
 
 fn discovered_pools_path() -> Option<PathBuf> {
-    Some(util::user_tactus_dir()?.join("pools.toml"))
+    Some(util::user_upstroke_dir()?.join("pools.toml"))
 }
 
 #[cfg(test)]
@@ -1941,7 +1945,7 @@ mod tests {
     use std::sync::OnceLock;
 
     fn scratch(name: &str, content: &str) -> PathBuf {
-        let dir = env::temp_dir().join(format!("tactus-config-tests-{}", std::process::id()));
+        let dir = env::temp_dir().join(format!("upstroke-config-tests-{}", std::process::id()));
         fs::create_dir_all(&dir).expect("create scratch dir");
         let path = dir.join(name);
         fs::write(&path, content).expect("write scratch file");
@@ -1953,14 +1957,15 @@ mod tests {
     /// A real, empty file rather than an absent one: an explicit `--pools` that
     /// does not exist is now a hard error (a path someone typed and that is not
     /// there is a typo), and passing `None` here would reach for the operator's
-    /// real `~/.tactus/pools.toml` — which no test may touch.
+    /// real `~/.upstroke/pools.toml` — which no test may touch.
     fn missing() -> PathBuf {
         // Created once: the file is identical for every caller, and rewriting
         // one shared path from parallel tests means truncating it under a
         // reader.
         static PATH: OnceLock<PathBuf> = OnceLock::new();
         PATH.get_or_init(|| {
-            let dir = env::temp_dir().join(format!("tactus-config-nopools-{}", std::process::id()));
+            let dir =
+                env::temp_dir().join(format!("upstroke-config-nopools-{}", std::process::id()));
             fs::create_dir_all(&dir).expect("scratch dir");
             let path = dir.join("pools.toml");
             fs::write(
@@ -1974,9 +1979,9 @@ mod tests {
         .clone()
     }
 
-    /// Empty discovery root so tests never pick up a real tactus.toml.
+    /// Empty discovery root so tests never pick up a real upstroke.toml.
     fn hermetic() -> PathBuf {
-        let dir = env::temp_dir().join(format!("tactus-config-hermetic-{}", std::process::id()));
+        let dir = env::temp_dir().join(format!("upstroke-config-hermetic-{}", std::process::id()));
         fs::create_dir_all(&dir).expect("hermetic dir");
         dir
     }
@@ -2003,11 +2008,11 @@ mod tests {
     fn explicit_config_path_must_exist() {
         let mut warnings = Vec::new();
         let absent = env::temp_dir()
-            .join("tactus-definitely-missing")
-            .join("tactus.toml");
+            .join("upstroke-definitely-missing")
+            .join("upstroke.toml");
         let err = load(Some(&absent), &hermetic(), Some(&missing()), &mut warnings)
             .expect_err("missing --config errors");
-        assert!(matches!(err, TactusError::Config { .. }));
+        assert!(matches!(err, UpstrokeError::Config { .. }));
     }
 
     #[test]
@@ -2335,7 +2340,7 @@ effort = "low"
     #[test]
     fn the_repository_self_host_policy_is_frontier_only_with_fixed_role_effort() {
         let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-        let path = root.join("tactus.toml");
+        let path = root.join("upstroke.toml");
         let mut warnings = Vec::new();
         let cfg = load(Some(&path), &root, Some(&missing()), &mut warnings)
             .expect("the checked-in self-host config loads");
@@ -2658,7 +2663,7 @@ monthly_allowance = 300
         let repo_root = root.join("discovery-repo");
         fs::create_dir_all(&repo_root).expect("repo root");
         fs::write(
-            repo_root.join("tactus.toml"),
+            repo_root.join("upstroke.toml"),
             "[[gates]]\nname = \"only-here\"\ncmd = \"git --version\"\n",
         )
         .expect("write config");
@@ -2903,9 +2908,9 @@ pool_fraction = 0.5
     fn an_explicit_pools_path_that_does_not_exist_is_a_typo_not_an_empty_machine() {
         // Same rule `--config` has had: a path someone typed and that is not
         // there is a mistake, and answering it with "no pools connected — run
-        // `tactus connect`" sends them to regenerate a file that was fine.
+        // `upstroke connect`" sends them to regenerate a file that was fine.
         let absent = env::temp_dir()
-            .join("tactus-definitely-missing")
+            .join("upstroke-definitely-missing")
             .join("pools.toml");
         let mut warnings = Vec::new();
         let err = load(None, &hermetic(), Some(&absent), &mut warnings)
@@ -3338,7 +3343,7 @@ agent = \"copilot\"
         let raw: toml::Value = toml::from_str(
             r#"
 kind = "container"
-image = "tactus/ci:3.2"
+image = "upstroke/ci:3.2"
 credential_volumes = { claude-code = "creds-cc", codex = "creds-cx" }
 mounts = [
   { source = "/opt/toolchain", target = "/opt/toolchain" },
@@ -3347,10 +3352,10 @@ mounts = [
 "#,
         )
         .expect("fixture parses as toml");
-        let selection = read_runner(Some(raw), Path::new("tactus.toml")).expect("parses");
+        let selection = read_runner(Some(raw), Path::new("upstroke.toml")).expect("parses");
 
         assert_eq!(selection.kind, RunnerKind::Container);
-        assert_eq!(selection.image.as_deref(), Some("tactus/ci:3.2"));
+        assert_eq!(selection.image.as_deref(), Some("upstroke/ci:3.2"));
         assert_eq!(
             selection.credential_volumes,
             [
@@ -3413,7 +3418,7 @@ mounts = [
             ),
             (
                 "host with an image",
-                "kind = \"host\"\nimage = \"tactus/ci:3.2\"\n",
+                "kind = \"host\"\nimage = \"upstroke/ci:3.2\"\n",
                 "[runner] `kind = \"host\"` with `image`",
             ),
             (
@@ -3467,9 +3472,9 @@ mounts = [
             } else {
                 toml::from_str(body).expect("fixture parses as toml")
             };
-            let error = read_runner(Some(raw), Path::new("tactus.toml"))
+            let error = read_runner(Some(raw), Path::new("upstroke.toml"))
                 .expect_err("this shape is refused");
-            let TactusError::Config { message, .. } = &error else {
+            let UpstrokeError::Config { message, .. } = &error else {
                 panic!("`{label}`: refused as {error:?}, not as a config error");
             };
             assert!(
@@ -3483,11 +3488,11 @@ mounts = [
         // The control: the shape these are all variations on is accepted, so
         // the refusals above are about what each cell changed.
         let ok: toml::Value =
-            toml::from_str("kind = \"container\"\nimage = \"tactus/ci:3.2\"\n").expect("toml");
-        read_runner(Some(ok), Path::new("tactus.toml")).expect("the base shape is accepted");
+            toml::from_str("kind = \"container\"\nimage = \"upstroke/ci:3.2\"\n").expect("toml");
+        read_runner(Some(ok), Path::new("upstroke.toml")).expect("the base shape is accepted");
     }
 
-    /// The `[runner]` a `tactus.toml` writes is the value resolution consumes,
+    /// The `[runner]` a `upstroke.toml` writes is the value resolution consumes,
     /// end to end.
     ///
     /// PR12's activation is one call — `refuse_legacy_container_selection` in
@@ -3507,21 +3512,21 @@ mounts = [
         let raw: toml::Value = toml::from_str(
             r#"
 kind = "container"
-image = "tactus/ci:3.2"
+image = "upstroke/ci:3.2"
 credential_volumes = { claude-code = "creds-cc" }
 "#,
         )
         .expect("toml");
-        let selection = read_runner(Some(raw), Path::new("tactus.toml")).expect("parses");
+        let selection = read_runner(Some(raw), Path::new("upstroke.toml")).expect("parses");
 
         let runtime = FakeRuntime::new(ContainerTrace::off());
         runtime.add_image("sha256:abc", Some("sha256:def"));
-        runtime.tag("tactus/ci:3.2", "sha256:abc");
+        runtime.tag("upstroke/ci:3.2", "sha256:abc");
         runtime.add_volume("creds-cc");
 
         let policy = resolve_container(&runtime, &selection).expect("resolves");
         let image = policy.image.as_ref().expect("image");
-        assert_eq!(image.reference, "tactus/ci:3.2", "from the TOML");
+        assert_eq!(image.reference, "upstroke/ci:3.2", "from the TOML");
         assert_eq!(image.id, "sha256:abc", "from the runtime");
         assert_eq!(image.digest.as_deref(), Some("sha256:def"));
         assert_eq!(
@@ -3551,7 +3556,7 @@ credential_volumes = { claude-code = "creds-cc" }
         for limits in [EngineLimits::Fresh, EngineLimits::SequentialResume] {
             let container = RunnerSelection {
                 kind: RunnerKind::Container,
-                image: Some("tactus/ci:3.2".to_owned()),
+                image: Some("upstroke/ci:3.2".to_owned()),
                 credential_volumes: BTreeMap::new(),
                 mounts: Vec::new(),
                 from_config: true,
@@ -3570,9 +3575,9 @@ credential_volumes = { claude-code = "creds-cc" }
             );
 
             let error =
-                refuse_legacy_container_selection(&container, Path::new("tactus.toml"), limits)
+                refuse_legacy_container_selection(&container, Path::new("upstroke.toml"), limits)
                     .expect_err("a container selection is refused");
-            let TactusError::Config { message, .. } = &error else {
+            let UpstrokeError::Config { message, .. } = &error else {
                 panic!("{limits:?}: refused as {error:?}");
             };
             assert!(
@@ -3586,7 +3591,7 @@ credential_volumes = { claude-code = "creds-cc" }
                 EngineLimits::SequentialResume => "keeps the boundary it started with",
             };
             assert!(message.contains(expected), "{limits:?}: {message}");
-            refuse_legacy_container_selection(&host, Path::new("tactus.toml"), limits)
+            refuse_legacy_container_selection(&host, Path::new("upstroke.toml"), limits)
                 .expect("a host selection is not refused");
         }
     }

@@ -175,7 +175,7 @@ pub enum ResourceRow {
     R23,
     /// Exact gate/review snapshot worktree + its intent.
     R24,
-    /// The repository-scoped `tactus-worktree.lock` file itself.
+    /// The repository-scoped `upstroke-worktree.lock` file itself.
     R25,
     /// Container invocation: the container, its labels, and its global intent.
     R26,
@@ -2362,7 +2362,7 @@ impl EventSite {
     }
 }
 
-/// The answer funnel: the `tactus answer` command's two writes, and the
+/// The answer funnel: the `upstroke answer` command's two writes, and the
 /// coordinator's read-only ingestion.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum AnswerSite {
@@ -2453,14 +2453,14 @@ impl AnswerSite {
 pub enum LockSite {
     /// The run-scoped `run.lock` exclusive hold.
     AcquireRun,
-    /// The repository-scoped `tactus-worktree.lock` exclusive hold — the first
+    /// The repository-scoped `upstroke-worktree.lock` exclusive hold — the first
     /// effect of every write command, after its read-only refusals.
     AcquireWorktree,
     /// The momentary exclusive `cleanup.lock` probe (Unix).
     ProbeCleanupExclusive,
     /// Releasing a hold this process took.
     Release,
-    /// Creating the `tactus-worktree.lock` file itself (R25), which spans runs
+    /// Creating the `upstroke-worktree.lock` file itself (R25), which spans runs
     /// and is never removed by one.
     CreateWorktreeLockFile,
     /// Observing a surviving reaper's shared cleanup hold (R28). Never owned,
@@ -11699,7 +11699,7 @@ mod tests {
                 .pointer_mut(pointer)
                 .and_then(serde_json::Value::as_object_mut)
                 .expect("an object pointer addresses an object")
-                .insert("tactus_unknown_probe".to_owned(), serde_json::json!(1));
+                .insert("upstroke_unknown_probe".to_owned(), serde_json::json!(1));
             assert!(
                 serde_json::from_value::<Vec<EffectSiteExport>>(document).is_err(),
                 "effect_sites.json accepted an unknown field at `{pointer}`"
@@ -11733,7 +11733,7 @@ mod tests {
                 .pointer_mut(pointer)
                 .and_then(serde_json::Value::as_object_mut)
                 .expect("an object pointer addresses an object")
-                .insert("tactus_unknown_probe".to_owned(), serde_json::json!(1));
+                .insert("upstroke_unknown_probe".to_owned(), serde_json::json!(1));
             assert!(
                 serde_json::from_value::<Vec<RegistryEntry>>(document).is_err(),
                 "registry.json accepted an unknown field at `{pointer}`"
@@ -11760,7 +11760,7 @@ mod tests {
                 .pointer_mut(pointer)
                 .and_then(serde_json::Value::as_object_mut)
                 .expect("an object pointer addresses an object")
-                .insert("tactus_unknown_probe".to_owned(), serde_json::json!(1));
+                .insert("upstroke_unknown_probe".to_owned(), serde_json::json!(1));
             assert!(
                 serde_json::from_value::<Vec<Observation>>(document).is_err(),
                 "the coverage record accepted an unknown field at `{pointer}`"

@@ -60,7 +60,7 @@ requirements on the panel, not history:
 
 1. **The full packet, queried and never dumped.** The reviewer receives the slice's
    frozen contract, the 645 KB design packet
-   (`tactus-parallel-design-neutral-v16.json`, sha256
+   (`upstroke-parallel-design-neutral-v16.json`, sha256
    `02bfed758c72a0ccdd91c11a6aaf9a59683a6e1f914356ab0153ec341a455df6`), `DESIGN.md`, and
    `reviews/FINDINGS.md`. The instruction to read it with `python3 -c` and never `cat` is
    load-bearing: dumping it exhausts the context the review needs.
@@ -136,17 +136,17 @@ grants `python3` and `git`, so reviewed content can induce file writes, credenti
 within the running user, and network calls. **Reviewed content is hostile input.** That
 is the premise, and it is measured, not defensive drafting.
 
-The response is a separate identity. `tactus-review` (uid 1001, home `0700`, reachable
-as `ssh tactus-review@tactusbox`) holds its **own** credentials for all three reviewer
-CLIs, verified live. It cannot read `/home/ubuntu/.tactus-env` or `ubuntu`'s Claude
+The response is a separate identity. `upstroke-review` (uid 1001, home `0700`, reachable
+as `ssh upstroke-review@tactusbox`) holds its **own** credentials for all three reviewer
+CLIs, verified live. It cannot read `/home/ubuntu/.upstroke-env` or `ubuntu`'s Claude
 credentials — verified denied in both directions. It has **no `GH_TOKEN`**, which is the
 property that matters most: the account that reads hostile input cannot reach the GitHub
-API at all. There is deliberately no `ubuntu` → `tactus-review` SSH key, so that path
+API at all. There is deliberately no `ubuntu` → `upstroke-review` SSH key, so that path
 does not exist.
 
 **The isolation is advisory, not enforced, and a future reader must not infer otherwise.**
 `/etc/sudoers.d/90-cloud-init-users` grants `ubuntu ALL=(ALL) NOPASSWD:ALL` (verified
-2026-08-20). `ubuntu` can therefore `sudo -u tactus-review` at will, and nothing in the
+2026-08-20). `ubuntu` can therefore `sudo -u upstroke-review` at will, and nothing in the
 current configuration prevents it. What the separation buys today is **blast-radius
 containment against the reviewer**, not containment of `ubuntu`: a prompt injection that
 captures the reviewer process lands in an account with no GitHub token and no sudo. It
@@ -161,11 +161,11 @@ this, and it is not proposed here.
 Stages 4 and 5 are the reason this record exists rather than a commit message.
 
 Today the chain from "a model approves" to "code is on `master`" is broken in one
-specific place: `frontier-review.yml` requires the `TACTUS_FRONTIER_REVIEW` evidence
+specific place: `frontier-review.yml` requires the `UPSTROKE_FRONTIER_REVIEW` evidence
 comment to be authored by the **repository owner**. The box's GitHub token *is* the
 owner's. So the only thing preventing an agent from landing its own work is that no
 automated process posts that comment — a convention, enforced by the deliberate
-omission of one `gh api` call in `tactus-frontier-review`, which prints the text for a
+omission of one `gh api` call in `upstroke-frontier-review`, which prints the text for a
 human instead of posting it.
 
 **Auto-merge closes that loop.** Once a process can post the evidence comment, the
@@ -236,11 +236,11 @@ attestation into the trusted workflow *before* anything automated can attest at 
 
 ## 9. Scaffolding and the self-hosting horizon (added before landing, 2026-08-20)
 
-MAINTAINING.md step 5 already says it: "**Until Tactus owns this supervision natively**…".
-The gate this record builds is tactus's own core loop, performed by hand, and
+MAINTAINING.md step 5 already says it: "**Until Upstroke owns this supervision natively**…".
+The gate this record builds is upstroke's own core loop, performed by hand, and
 [2026-08-11 — self-hosting v0.2](2026-08-11-self-hosting-v02.md) commits the project to
 closing that loop through the engine. This record's machinery therefore divides in two, and
-every stage-2+ proposal takes one test first: **would this code be deleted the day tactus
+every stage-2+ proposal takes one test first: **would this code be deleted the day upstroke
 self-hosts the review? Then it is scaffolding — build the dumbest interim that works, or
 build it in the engine instead.**
 

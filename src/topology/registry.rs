@@ -624,7 +624,7 @@ impl TaskRegistry {
     /// written and did *not* take a new tag. It is not an extension: it is part
     /// of what an entry has always been (`decisions.task_registry.task_entry`),
     /// deferred by one slice on the explicit ruling that no digest is recorded
-    /// in between. Nothing has ever written a `tactus.registry.v1` value
+    /// in between. Nothing has ever written a `upstroke.registry.v1` value
     /// without it, so there is no reader for which the two versions differ, and
     /// a second tag would claim a compatibility history this format does not
     /// have. The next field to arrive will be a real extension and takes v2.
@@ -653,7 +653,7 @@ impl TaskRegistry {
     fn encode(&self, entries: usize) -> Vec<u8> {
         let entries = &self.entries[..entries.min(self.entries.len())];
         let mut out = Vec::new();
-        field(&mut out, "tactus.registry.v1");
+        field(&mut out, "upstroke.registry.v1");
         count(&mut out, entries.len());
         for entry in entries {
             encode_entry(&mut out, entry);
@@ -1019,12 +1019,12 @@ mod tests {
     fn started_for(plan: &Plan) -> RunStarted {
         RunStarted {
             schema: 2,
-            tactus_version: "0.1.0".to_owned(),
+            upstroke_version: "0.1.0".to_owned(),
             run_id: RUN_ID.to_owned(),
-            branch: format!("tactus/run-{RUN_ID}"),
+            branch: format!("upstroke/run-{RUN_ID}"),
             base_sha: "a".repeat(40),
             plan_path: "plan.md".to_owned(),
-            config_path: Some("tactus.toml".to_owned()),
+            config_path: Some("upstroke.toml".to_owned()),
             plan_hash: plan.source.hash.clone(),
             normalized_plan_digest: None,
             private_dir: "/private/runs".to_owned(),
@@ -2512,7 +2512,7 @@ mod tests {
     /// implementation of the documented encoding rather than copied out of this
     /// one, so it pins the format and not merely today's output.
     const SAMPLE_DIGEST: &str =
-        "sha256:02b5b9f120fb1b0499698e98849d5da3f7cadc35ba69da6f11e3f89464d3845d";
+        "sha256:4a08825ac234223cb53bd79736f240f8869369d4c07c3eeced3760632d594eb6";
 
     /// The length of the exact bytes [`SAMPLE_DIGEST`] is taken over.
     ///
@@ -2520,7 +2520,12 @@ mod tests {
     /// mismatch says something moved, and the byte count says whether the
     /// encoding grew, shrank, or merely rearranged. Re-derived from the
     /// documented framing at the same time as the digest.
-    const SAMPLE_CANONICAL_BYTES: usize = 2520;
+    // 2520 before the rename, 2522 after. `upstroke` is exactly two characters
+    // longer than `tactus`, and the delta is exactly two -- so precisely one
+    // renamed string sits inside the canonical encoding (the domain field) and
+    // nothing else about the serialization moved. Any other change would not
+    // land exactly on the rename's length difference.
+    const SAMPLE_CANONICAL_BYTES: usize = 2522;
 
     #[test]
     fn the_registry_digest_is_its_frozen_vector() {
@@ -3201,7 +3206,7 @@ mod tests {
                     task: "alpha".to_owned(),
                     data: TaskCommitted {
                         sha: "b".repeat(40),
-                        message: "[tactus] alpha: alpha title".to_owned(),
+                        message: "[upstroke] alpha: alpha title".to_owned(),
                     },
                 },
             ),
@@ -3387,8 +3392,8 @@ mod tests {
         /// thing that differs between the two projections is the plan, which is
         /// exactly the claim.
         fn new(tag: &str, plan: &Plan, log: &[Event]) -> Self {
-            let root =
-                std::env::temp_dir().join(format!("tactus-registry-{tag}-{}", std::process::id()));
+            let root = std::env::temp_dir()
+                .join(format!("upstroke-registry-{tag}-{}", std::process::id()));
             let public = crate::rundir::public_dir(&root, RUN_ID);
             let hooks = &mut crate::rundir::NoHooks;
             crate::rundir::create_public_dir(&public, hooks).expect("run directory");

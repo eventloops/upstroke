@@ -7,7 +7,7 @@
 //! direct child is `cmd.exe`, so every invocation is placed in a private Job
 //! Object before its suspended primary thread is allowed to execute. Closing
 //! that handle kills ordinary descendants even when the direct child exits
-//! successfully or Tactus is terminated. Explicit cleanup uses the same job
+//! successfully or Upstroke is terminated. Explicit cleanup uses the same job
 //! and a bounded wait; it never shells out to a PID-based tree walker. Any
 //! process that inherited a pipe handle must not be able to stall the drain —
 //! readers accumulate into shared buffers that are snapshotted after a bounded
@@ -22,7 +22,7 @@
 //! suspension/continuation. It waits out any spawn-registration race, blocks
 //! launches across a suspension transition, and uses a descriptor-scrubbed
 //! guard process to close the last signal-to-stop race. A separate cleanup
-//! reaper survives even an uncatchable Tactus SIGKILL. Together the monitor and
+//! reaper survives even an uncatchable Upstroke SIGKILL. Together the monitor and
 //! reaper stop and clean every active process group before ownership is
 //! released. A host runner does not claim to contain code that deliberately
 //! leaves that group with `setsid`/`setpgid`; the external/container runner
@@ -48,7 +48,7 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use crate::error::TactusError;
+use crate::error::UpstrokeError;
 use crate::topology::effects::{Injection, InjectionMode, SubEffectPoint};
 
 /// The parent-side containment steps of one spawn, told to whoever is watching.
@@ -113,11 +113,11 @@ impl SpawnHooks for NoHooks {
 /// running any cleanup** still leaves no host process, and both of those run
 /// destructors — including the one that closes the very job handle whose
 /// close-on-death is the mechanism.
-fn apply(injection: Injection, point: SubEffectPoint) -> Result<(), TactusError> {
+fn apply(injection: Injection, point: SubEffectPoint) -> Result<(), UpstrokeError> {
     match injection {
         Injection::Proceed => Ok(()),
         Injection::Kill => std::process::abort(),
-        Injection::Error => Err(TactusError::Refused {
+        Injection::Error => Err(UpstrokeError::Refused {
             message: format!(
                 "the process funnel was made to fail at its `{point}` containment step"
             ),
@@ -231,10 +231,10 @@ impl ProcessTree {
     /// members, so terminate and observe the job empty before returning its
     /// status. Unix process-group settlement is owned by `termination`.
     #[cfg(windows)]
-    fn finish_direct_exit(&mut self) -> Result<(), TactusError> {
+    fn finish_direct_exit(&mut self) -> Result<(), UpstrokeError> {
         self.job
             .terminate_and_wait()
-            .map_err(|error| TactusError::Agent {
+            .map_err(|error| UpstrokeError::Agent {
                 message: format!("settling the Windows agent job after direct-child exit: {error}"),
             })?;
         Ok(())
@@ -268,7 +268,7 @@ pub fn run_with_timeout(
     command: Command,
     stdin_data: &str,
     timeout: Duration,
-) -> Result<ProcessOutput, TactusError> {
+) -> Result<ProcessOutput, UpstrokeError> {
     run_with_timeout_hooked(command, stdin_data.as_bytes(), timeout, &mut NoHooks)
 }
 
@@ -288,7 +288,7 @@ pub fn run_with_timeout_hooked(
     stdin_data: &[u8],
     timeout: Duration,
     hooks: &mut dyn SpawnHooks,
-) -> Result<ProcessOutput, TactusError> {
+) -> Result<ProcessOutput, UpstrokeError> {
     run_with_timeout_and_limit(command, stdin_data, timeout, OUTPUT_LIMIT_BYTES, hooks)
 }
 
@@ -298,7 +298,7 @@ fn run_with_timeout_and_limit(
     timeout: Duration,
     output_limit: usize,
     hooks: &mut dyn SpawnHooks,
-) -> Result<ProcessOutput, TactusError> {
+) -> Result<ProcessOutput, UpstrokeError> {
     command
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -306,7 +306,7 @@ fn run_with_timeout_and_limit(
 
     // Enter before `spawn`: if an interrupt arrives in the narrow interval
     // between creating the child and learning its pid, the signal monitor
-    // waits for this registration rather than terminating Tactus first and
+    // waits for this registration rather than terminating Upstroke first and
     // orphaning the new process group.
     #[cfg(unix)]
     let mut termination = termination::Supervisor::begin()?;
@@ -323,7 +323,7 @@ fn run_with_timeout_and_limit(
     termination.prepare(&mut command);
 
     let started = Instant::now();
-    let mut child = ProcessTree::spawn(&mut command, hooks).map_err(|e| TactusError::Agent {
+    let mut child = ProcessTree::spawn(&mut command, hooks).map_err(|e| UpstrokeError::Agent {
         message: format!(
             "failed to spawn `{}`: {e}",
             command.get_program().to_string_lossy()
@@ -417,7 +417,7 @@ fn run_with_timeout_and_limit(
                     let _ = child.wait();
                     return Err(error);
                 }
-                let status = child.wait().map_err(|e| TactusError::Agent {
+                let status = child.wait().map_err(|e| UpstrokeError::Agent {
                     message: format!("reaping agent process: {e}"),
                 })?;
                 break status.code();
@@ -451,7 +451,7 @@ fn run_with_timeout_and_limit(
                 let _ = child.kill();
                 let _ = child.wait();
                 cleanup?;
-                return Err(TactusError::Agent {
+                return Err(UpstrokeError::Agent {
                     message: format!("waiting on agent process: {e}"),
                 });
             }
@@ -478,7 +478,7 @@ fn run_with_timeout_and_limit(
             }
             Err(e) => {
                 kill_tree(&mut child)?;
-                return Err(TactusError::Agent {
+                return Err(UpstrokeError::Agent {
                     message: format!("waiting on agent process: {e}"),
                 });
             }
@@ -524,13 +524,13 @@ fn drain_limit_exceeded(stdout: &Option<Drain>, stderr: &Option<Drain>) -> bool 
 /// Kill the whole process tree. Killing only the direct child is not enough
 /// when it is a `cmd.exe` shim: the real agent process would survive, keep
 /// running, and keep the pipes open.
-fn kill_tree(child: &mut ProcessTree) -> Result<(), TactusError> {
+fn kill_tree(child: &mut ProcessTree) -> Result<(), UpstrokeError> {
     #[cfg(windows)]
     {
         let cleanup = child.job.terminate_and_wait();
         let _ = child.kill();
         let _ = child.wait();
-        cleanup.map_err(|error| TactusError::Agent {
+        cleanup.map_err(|error| UpstrokeError::Agent {
             message: format!("terminating the Windows agent job: {error}"),
         })
     }
@@ -596,10 +596,10 @@ pub(crate) fn child_leads_its_own_group(pid: u32) -> bool {
 ///
 /// # Errors
 ///
-/// [`TactusError::Refused`] with a diagnostic when the job cannot be created
+/// [`UpstrokeError::Refused`] with a diagnostic when the job cannot be created
 /// or joined. The caller refuses the write command before any effect.
 #[cfg(windows)]
-pub fn join_ambient_job(hooks: &mut dyn SpawnHooks) -> Result<(), TactusError> {
+pub fn join_ambient_job(hooks: &mut dyn SpawnHooks) -> Result<(), UpstrokeError> {
     join_ambient_job_with(hooks, windows_job::join_ambient)
 }
 
@@ -617,12 +617,12 @@ pub fn join_ambient_job(hooks: &mut dyn SpawnHooks) -> Result<(), TactusError> {
 ///
 /// # Errors
 ///
-/// [`TactusError::Refused`] carrying `join`'s own diagnostic.
+/// [`UpstrokeError::Refused`] carrying `join`'s own diagnostic.
 #[cfg(windows)]
 fn join_ambient_job_with(
     hooks: &mut dyn SpawnHooks,
     join: impl FnOnce() -> Result<(), String>,
-) -> Result<(), TactusError> {
+) -> Result<(), UpstrokeError> {
     // The error-return coordinate is *before* the join: the point's error
     // contract is "failure refuses the write command", so an injected failure
     // stands in place of establishing the job rather than following a job that
@@ -632,10 +632,10 @@ fn join_ambient_job_with(
         hooks.point_mode(SubEffectPoint::AmbientJobJoined, InjectionMode::ErrorReturn),
         SubEffectPoint::AmbientJobJoined,
     )
-    .map_err(|_| TactusError::Refused {
+    .map_err(|_| UpstrokeError::Refused {
         message: AMBIENT_REFUSAL_PREFIX.to_owned() + AMBIENT_REFUSAL_SIMULATED,
     })?;
-    join().map_err(|message| TactusError::Refused {
+    join().map_err(|message| UpstrokeError::Refused {
         message: format!("{AMBIENT_REFUSAL_PREFIX}{message}. No process was spawned"),
     })?;
     // The kill coordinate is *after* it, because that is where the point's own
@@ -655,7 +655,7 @@ fn join_ambient_job_with(
 ///
 /// Never on Unix.
 #[cfg(not(windows))]
-pub fn join_ambient_job(_hooks: &mut dyn SpawnHooks) -> Result<(), TactusError> {
+pub fn join_ambient_job(_hooks: &mut dyn SpawnHooks) -> Result<(), UpstrokeError> {
     Ok(())
 }
 
@@ -752,7 +752,7 @@ pub(crate) fn poison_ambient_for_tests(message: &str) -> bool {
 /// rendered strings carry an interior NUL.
 pub fn set_container_reclaim_scope(
     scope: Option<&crate::runner::container::census::ReaperContainerScope>,
-) -> Result<(), TactusError> {
+) -> Result<(), UpstrokeError> {
     #[cfg(unix)]
     {
         termination::set_container_reclaim_scope(scope)
@@ -1641,7 +1641,7 @@ mod termination {
     use std::thread;
     use std::time::Duration;
 
-    use crate::error::TactusError;
+    use crate::error::UpstrokeError;
 
     static PENDING_TERMINATION: AtomicI32 = AtomicI32::new(0);
     static SUSPEND_REQUESTED: AtomicBool = AtomicBool::new(false);
@@ -1673,7 +1673,7 @@ mod termination {
     const REAPER_OK: u8 = 0x84;
     const REAPER_FAIL: u8 = 0x85;
     const REAPER_CANCEL: u8 = 0x86;
-    // The job-control guard briefly continues only Tactus every 250 ms while
+    // The job-control guard briefly continues only Upstroke every 250 ms while
     // probing for a PID-directed termination. The cleanup reaper must not
     // mistake that internal pulse for an operator resume and continue agents.
     // Genuine SIGCONT is forwarded immediately by the monitor; this bounded
@@ -1808,17 +1808,17 @@ mod termination {
     }
 
     impl Supervisor {
-        pub(super) fn begin() -> Result<Self, TactusError> {
+        pub(super) fn begin() -> Result<Self, UpstrokeError> {
             Self::begin_with_state(shared_state()?)
         }
 
-        fn begin_with_state(state: Arc<Mutex<State>>) -> Result<Self, TactusError> {
+        fn begin_with_state(state: Arc<Mutex<State>>) -> Result<Self, UpstrokeError> {
             claim_launch(&state)?;
             let reaper = match spawn_reaper() {
                 Ok(reaper) => reaper,
                 Err(message) => {
                     release_launch(&state);
-                    return Err(TactusError::Agent { message });
+                    return Err(UpstrokeError::Agent { message });
                 }
             };
             Ok(Self {
@@ -1851,8 +1851,8 @@ mod termination {
             }
         }
 
-        pub(super) fn register(&mut self, pid: u32) -> Result<(), TactusError> {
-            let pgid = i32::try_from(pid).map_err(|_| TactusError::Agent {
+        pub(super) fn register(&mut self, pid: u32) -> Result<(), UpstrokeError> {
+            let pgid = i32::try_from(pid).map_err(|_| UpstrokeError::Agent {
                 message: format!("agent pid {pid} cannot be represented as a Unix process group"),
             })?;
             let mut locked = self
@@ -1868,7 +1868,7 @@ mod termination {
             Ok(())
         }
 
-        pub(super) fn finish(&mut self) -> Result<(), TactusError> {
+        pub(super) fn finish(&mut self) -> Result<(), UpstrokeError> {
             let Phase::Group(pgid) = self.phase else {
                 return Ok(());
             };
@@ -1884,7 +1884,7 @@ mod termination {
                     Ordering::SeqCst,
                     Ordering::SeqCst,
                 );
-                return Err(TactusError::Agent {
+                return Err(UpstrokeError::Agent {
                     message: format!(
                         "Unix cleanup reaper failed while settling process group {pgid}"
                     ),
@@ -1907,13 +1907,13 @@ mod termination {
         }
     }
 
-    fn claim_launch(state: &Arc<Mutex<State>>) -> Result<(), TactusError> {
+    fn claim_launch(state: &Arc<Mutex<State>>) -> Result<(), UpstrokeError> {
         loop {
             let mut locked = state
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
             if locked.terminating || PENDING_TERMINATION.load(Ordering::SeqCst) != 0 {
-                return Err(TactusError::Agent {
+                return Err(UpstrokeError::Agent {
                     message: "process launch interrupted by a termination signal".to_owned(),
                 });
             }
@@ -1969,10 +1969,10 @@ mod termination {
         }
     }
 
-    fn shared_state() -> Result<Arc<Mutex<State>>, TactusError> {
+    fn shared_state() -> Result<Arc<Mutex<State>>, UpstrokeError> {
         match STATE.get_or_init(install) {
             Ok(state) => Ok(Arc::clone(state)),
-            Err(message) => Err(TactusError::Agent {
+            Err(message) => Err(UpstrokeError::Agent {
                 message: message.clone(),
             }),
         }
@@ -2030,7 +2030,7 @@ mod termination {
         let monitored = Arc::clone(&state);
         let (monitor_ready, monitor_started) = std::sync::mpsc::sync_channel(1);
         let monitor = thread::Builder::new()
-            .name("tactus-signal-monitor".to_owned())
+            .name("upstroke-signal-monitor".to_owned())
             .spawn(move || match prepare_monitor_signal_mask(policy) {
                 Ok(()) => {
                     let _ = monitor_ready.send(Ok(()));
@@ -2113,7 +2113,7 @@ mod termination {
         }
 
         // An embedding host may have blocked SIGCONT on the thread that first
-        // called Tactus, and new threads inherit that mask. SIGCONT still wakes
+        // called Upstroke, and new threads inherit that mask. SIGCONT still wakes
         // a stopped process when blocked, but its handler cannot run, so the
         // isolated agent groups would remain stopped forever. Give only the
         // private monitor thread an unblocked SIGCONT; every host thread keeps
@@ -2199,7 +2199,7 @@ mod termination {
         }
 
         // A stopped process cannot execute a caught termination handler. The
-        // external guard periodically resumes only Tactus so this handler can
+        // external guard periodically resumes only Upstroke so this handler can
         // inspect/deliver a PID-directed pending signal; supervised agent
         // groups remain stopped. With no such signal, stop again from inside
         // the handler before returning to ordinary parent code.
@@ -2290,7 +2290,7 @@ mod termination {
 
                 // SAFETY: all isolated children have been synchronously sent
                 // SIGKILL. Restore the ordinary terminal semantics and
-                // terminate Tactus with the original signal; `_exit` is a
+                // terminate Upstroke with the original signal; `_exit` is a
                 // defensive fallback if a platform returns from `raise`.
                 unsafe {
                     libc::signal(terminating, libc::SIG_DFL);
@@ -2306,7 +2306,7 @@ mod termination {
                     continue;
                 };
                 // SIGSTOP cannot be caught or ignored, so a vendor process
-                // cannot keep spending while its visibly foreground Tactus
+                // cannot keep spending while its visibly foreground Upstroke
                 // parent is suspended. SIGCONT below releases the same groups.
                 if !stop_groups(&groups) {
                     let groups = end_suspend(&state);
@@ -2316,7 +2316,7 @@ mod termination {
                     continue;
                 }
 
-                // The guard remains runnable while Tactus is stopped. It
+                // The guard remains runnable while Upstroke is stopped. It
                 // serializes a late continuation/termination with the actual
                 // SIGSTOP and acknowledges only after a genuine resume. That
                 // closes the final flag-check-to-stop interval.
@@ -2538,7 +2538,7 @@ mod termination {
             })
             .collect::<Result<Vec<_>, _>>()?;
         #[cfg(test)]
-        let cleanup_delay_ms = std::env::var("TACTUS_TEST_CLEANUP_DELAY_MS")
+        let cleanup_delay_ms = std::env::var("UPSTROKE_TEST_CLEANUP_DELAY_MS")
             .ok()
             .and_then(|value| value.parse::<u64>().ok())
             .unwrap_or(0);
@@ -2586,7 +2586,7 @@ mod termination {
             close_fd(command[1]);
             close_fd(ack[0]);
             // A separate process group is the crucial boundary: an
-            // uncatchable kill of Tactus's foreground job must not also kill
+            // uncatchable kill of Upstroke's foreground job must not also kill
             // the process that owns its final agent cleanup.
             if unsafe { libc::setpgid(0, 0) } != 0 {
                 unsafe { libc::_exit(1) };
@@ -2635,7 +2635,7 @@ mod termination {
             return Err("Unix cleanup reaper did not initialize".to_owned());
         }
         #[cfg(test)]
-        if let Some(path) = std::env::var_os("TACTUS_TEST_REAPER_PID_PATH") {
+        if let Some(path) = std::env::var_os("UPSTROKE_TEST_REAPER_PID_PATH") {
             if let Err(error) = std::fs::write(&path, pid.to_string()) {
                 reaper.cancel();
                 return Err(format!(
@@ -3231,7 +3231,7 @@ mod termination {
             // While the parent is SIGSTOPped, a signal sent only to its PID
             // cannot run a caught handler. Periodically resume only the parent;
             // its SA_SIGINFO SIGCONT handler recognizes this guard as sender,
-            // delivers any pending Tactus-owned termination, or immediately
+            // delivers any pending Upstroke-owned termination, or immediately
             // re-stops. Agent groups remain stopped throughout.
             let timeout_ms = if armed && stopping { 250 } else { -1 };
             let polled = unsafe { libc::poll(poll_fds.as_mut_ptr(), 2, timeout_ms) };
@@ -3278,7 +3278,7 @@ mod termination {
                             }
                             // PID reuse must never redirect a late stop to an
                             // unrelated process. Reparenting proves the
-                            // original Tactus process is gone.
+                            // original Upstroke process is gone.
                             if unsafe { libc::getppid() } != parent {
                                 unsafe { libc::_exit(0) };
                             }
@@ -3307,12 +3307,12 @@ mod termination {
             }
             if armed && stopping && wake {
                 // PID reuse must never redirect a late guard wake to an
-                // unrelated process. Reparenting proves the original Tactus
+                // unrelated process. Reparenting proves the original Upstroke
                 // process is gone even if its numeric pid has been reused.
                 if unsafe { libc::getppid() } != parent {
                     unsafe { libc::_exit(0) };
                 }
-                // SAFETY: a positive pid targets only the Tactus parent. A
+                // SAFETY: a positive pid targets only the Upstroke parent. A
                 // generated SIGCONT resumes it even while blocked or caught.
                 if unsafe { libc::kill(parent, libc::SIGCONT) } != 0 {
                     unsafe { libc::_exit(0) };
@@ -3416,7 +3416,7 @@ mod termination {
                 return false;
             }
             // A library host may have blocked these signals on the thread
-            // that first invoked Tactus. The guard is an isolated relay, not
+            // that first invoked Upstroke. The guard is an isolated relay, not
             // host code: clear its inherited mask so it can always wake a
             // parent that it previously stopped.
             let mut empty: libc::sigset_t = std::mem::zeroed();
@@ -3436,7 +3436,7 @@ mod termination {
                 }
             } else {
                 // Job-control callbacks and defaults belong to the embedding
-                // parent when Tactus cannot safely proxy the pair. The private
+                // parent when Upstroke cannot safely proxy the pair. The private
                 // guard must neither run fork-copied host code nor stop itself.
                 if libc::signal(libc::SIGTSTP, libc::SIG_IGN) == libc::SIG_ERR
                     || libc::signal(libc::SIGCONT, libc::SIG_IGN) == libc::SIG_ERR
@@ -3449,7 +3449,7 @@ mod termination {
                     // Custom callbacks belong to the embedding parent. Never
                     // run a fork-copied callback against the guard's private
                     // memory; translate it into the same self-pipe wake as a
-                    // default Tactus-owned termination signal instead.
+                    // default Upstroke-owned termination signal instead.
                     if libc::signal(
                         signal,
                         record_guard_signal as *const () as libc::sighandler_t,
@@ -3572,7 +3572,7 @@ mod termination {
                 }
                 (Some(true), Some(true)) => {
                     return Err(
-                        "Unix parent-state scanner reported the running Tactus process as stopped"
+                        "Unix parent-state scanner reported the running Upstroke process as stopped"
                             .to_owned(),
                     );
                 }
@@ -3871,8 +3871,9 @@ mod termination {
         // FIFO inside an atomic, private mkdtemp directory: each endpoint is
         // opened with O_CLOEXEC in the syscall that creates its descriptor,
         // then the name and directory are removed before this function returns.
-        let template =
-            std::env::temp_dir().join(format!(".tactus-pipe-{}-XXXXXX", unsafe { libc::getpid() }));
+        let template = std::env::temp_dir().join(format!(".upstroke-pipe-{}-XXXXXX", unsafe {
+            libc::getpid()
+        }));
         let mut template = std::ffi::CString::new(template.as_os_str().as_bytes())
             .map_err(|_| std::io::Error::from_raw_os_error(libc::EINVAL))?
             .into_bytes_with_nul();
@@ -3938,7 +3939,7 @@ mod termination {
 
     fn set_nonblocking(fd: libc::c_int) -> bool {
         // Signal handlers may write this descriptor. Nonblocking mode makes a
-        // dead or unresponsive guard fail closed instead of wedging Tactus in
+        // dead or unresponsive guard fail closed instead of wedging Upstroke in
         // async-signal context.
         unsafe {
             let flags = libc::fcntl(fd, libc::F_GETFL);
@@ -3960,7 +3961,7 @@ mod termination {
         for pgid in groups {
             // SAFETY: every registered child was created with
             // `process_group(0)`, so its pid is its private group id. A
-            // negative id targets that group and never Tactus's group.
+            // negative id targets that group and never Upstroke's group.
             let _ = unsafe { libc::kill(-*pgid, signal) };
         }
     }
@@ -3990,7 +3991,7 @@ mod termination {
         // `/proc/<pid>/stat` is a kernel interface and remains available on
         // distributions such as NixOS that intentionally have no `/bin/ps`.
         // It observes every descendant in the process group, not only the
-        // direct child that Tactus can wait on.
+        // direct child that Upstroke can wait on.
         let entries = match std::fs::read_dir("/proc") {
             Ok(entries) => entries,
             Err(_) => return false,
@@ -4144,7 +4145,7 @@ mod termination {
     /// [`super::set_container_reclaim_scope`].
     pub(super) fn set_container_reclaim_scope(
         scope: Option<&crate::runner::container::census::ReaperContainerScope>,
-    ) -> Result<(), TactusError> {
+    ) -> Result<(), UpstrokeError> {
         // Rendered here so a scope that cannot be turned into argv is refused
         // by the caller that set it, rather than silently doing nothing inside
         // a reaper that has no error channel.
@@ -4182,12 +4183,12 @@ mod termination {
     /// one `runner::container::DockerCli::available` asks when it decides the
     /// runtime is present, so the reaper execs the binary the rest of the engine
     /// means by `docker`.
-    fn resolve_reaper_program(program: &std::path::Path) -> Result<PathBuf, TactusError> {
+    fn resolve_reaper_program(program: &std::path::Path) -> Result<PathBuf, UpstrokeError> {
         use std::os::unix::ffi::OsStrExt as _;
         if program.as_os_str().as_bytes().contains(&b'/') {
             return Ok(program.to_path_buf());
         }
-        let refused = |why: &str| TactusError::Refused {
+        let refused = |why: &str| UpstrokeError::Refused {
             message: format!(
                 "the Unix reaper's container scope names the program `{}`, which {why}; a reaper \
                  is a fork-only child restricted to async-signal-safe calls, so it must be handed \
@@ -4207,8 +4208,8 @@ mod termination {
     /// The argument vectors for `scope`, or why they cannot be built.
     fn render_container_argv(
         scope: &crate::runner::container::census::ReaperContainerScope,
-    ) -> Result<ReaperContainers, TactusError> {
-        let nul = |value: &str| TactusError::Refused {
+    ) -> Result<ReaperContainers, UpstrokeError> {
+        let nul = |value: &str| UpstrokeError::Refused {
             message: format!(
                 "the Unix reaper's container scope renders `{value}`, which carries an interior \
                  NUL and cannot be an argument to `{}`",
@@ -4571,7 +4572,7 @@ mod termination {
             use std::os::unix::ffi::OsStrExt;
 
             let path = std::env::temp_dir().join(format!(
-                "tactus-r28-shared-{}-{}.lock",
+                "upstroke-r28-shared-{}-{}.lock",
                 std::process::id(),
                 crate::ulid::ulid()
             ));
@@ -4645,7 +4646,7 @@ mod termination {
         #[test]
         #[ignore = "subprocess helper"]
         fn sigchld_reaper_host_helper() {
-            if std::env::var_os("TACTUS_SIGCHLD_REAPER_HELPER").is_none() {
+            if std::env::var_os("UPSTROKE_SIGCHLD_REAPER_HELPER").is_none() {
                 return;
             }
             REAPED_CHILD_STOP.store(false, Ordering::SeqCst);
@@ -4686,7 +4687,7 @@ mod termination {
             let mut command = Command::new(std::env::current_exe().expect("test executable"));
             command
                 .args(["sigchld_reaper_host_helper", "--ignored", "--nocapture"])
-                .env("TACTUS_SIGCHLD_REAPER_HELPER", "1")
+                .env("UPSTROKE_SIGCHLD_REAPER_HELPER", "1")
                 .process_group(0)
                 .stdout(Stdio::null())
                 .stderr(Stdio::null());
@@ -4711,7 +4712,7 @@ mod termination {
         #[test]
         #[ignore = "subprocess helper"]
         fn linux_close_range_fd_zero_helper() {
-            if std::env::var_os("TACTUS_CLOSE_RANGE_FD_ZERO_HELPER").is_none() {
+            if std::env::var_os("UPSTROKE_CLOSE_RANGE_FD_ZERO_HELPER").is_none() {
                 return;
             }
 
@@ -4755,7 +4756,7 @@ mod termination {
                     "--ignored",
                     "--nocapture",
                 ])
-                .env("TACTUS_CLOSE_RANGE_FD_ZERO_HELPER", "1")
+                .env("UPSTROKE_CLOSE_RANGE_FD_ZERO_HELPER", "1")
                 .stdin(Stdio::null())
                 .stdout(Stdio::piped())
                 .stderr(Stdio::piped());
@@ -4961,7 +4962,7 @@ mod termination {
             use std::os::unix::ffi::OsStrExt as _;
             use std::path::Path;
 
-            const ROOT: &str = "/srv/tactus-reaper-resolve/private";
+            const ROOT: &str = "/srv/upstroke-reaper-resolve/private";
             const INCARNATION: &str = "01KZTBBBBBBBBBBBBBBBBBBBBB";
 
             fn scope(program: &str) -> ReaperContainerScope {
@@ -5001,13 +5002,14 @@ mod termination {
 
             // (2) A bare name `PATH` cannot resolve is refused, while there is
             // still somewhere to report it: a reaper has no error channel.
-            let absent = scope("tactus-definitely-not-a-real-docker");
+            let absent = scope("upstroke-definitely-not-a-real-docker");
             let message = match render_container_argv(&absent) {
                 Ok(_) => panic!("an unresolvable bare program was accepted"),
                 Err(error) => error.to_string(),
             };
             assert!(
-                message.contains("PATH") && message.contains("tactus-definitely-not-a-real-docker"),
+                message.contains("PATH")
+                    && message.contains("upstroke-definitely-not-a-real-docker"),
                 "{message}"
             );
             // And the refusal reaches the caller that arms the reaper, which is the
@@ -5031,7 +5033,7 @@ mod termination {
         fn reaper_stub(tag: &str, script: &str) -> (std::path::PathBuf, ReaperContainers) {
             use std::os::unix::fs::PermissionsExt as _;
             let dir = std::env::temp_dir().join(format!(
-                "tactus-reaper-rounds-{tag}-{}-{}",
+                "upstroke-reaper-rounds-{tag}-{}-{}",
                 std::process::id(),
                 crate::ulid::ulid()
             ));
@@ -5046,7 +5048,7 @@ mod termination {
             // two of these may run concurrently.
             let scope = crate::runner::container::census::ReaperContainerScope::new(
                 &stub,
-                std::path::Path::new("/srv/tactus-reaper-rounds/private"),
+                std::path::Path::new("/srv/upstroke-reaper-rounds/private"),
                 "01KZTAAAAAAAAAAAAAAAAAAAAA",
             )
             .expect("a scope");
@@ -5384,7 +5386,7 @@ mod tests {
         assert!(!out.output_limited);
     }
 
-    /// Writes `TACTUS_EXCESSIVE_OUTPUT_HELPER` bytes to stdout, then exits.
+    /// Writes `UPSTROKE_EXCESSIVE_OUTPUT_HELPER` bytes to stdout, then exits.
     ///
     /// **Bounded, and the bound is the point.** This used to be `loop { write }`,
     /// which is harmless while the funnel bounds capture: the parent stops
@@ -5409,7 +5411,7 @@ mod tests {
     #[test]
     #[ignore = "subprocess helper"]
     fn excessive_output_helper() {
-        let Some(budget) = std::env::var_os("TACTUS_EXCESSIVE_OUTPUT_HELPER") else {
+        let Some(budget) = std::env::var_os("UPSTROKE_EXCESSIVE_OUTPUT_HELPER") else {
             return;
         };
         let budget: usize = budget
@@ -5420,7 +5422,7 @@ mod tests {
         // Which stream, because the allowance is **per stream** and every
         // fixture used to fill only one of them: a check that never looked at
         // stderr was indistinguishable from this one.
-        let on_stderr = std::env::var_os("TACTUS_EXCESSIVE_OUTPUT_STREAM")
+        let on_stderr = std::env::var_os("UPSTROKE_EXCESSIVE_OUTPUT_STREAM")
             .is_some_and(|stream| stream == "stderr");
         let mut stdout = std::io::stdout().lock();
         let mut stderr = std::io::stderr().lock();
@@ -5462,7 +5464,7 @@ mod tests {
         command
             .args(["excessive_output_helper", "--ignored", "--nocapture"])
             .env(
-                "TACTUS_EXCESSIVE_OUTPUT_HELPER",
+                "UPSTROKE_EXCESSIVE_OUTPUT_HELPER",
                 EXCESSIVE_OUTPUT_BUDGET.to_string(),
             );
 
@@ -5522,10 +5524,10 @@ mod tests {
         command
             .args(["excessive_output_helper", "--ignored", "--nocapture"])
             .env(
-                "TACTUS_EXCESSIVE_OUTPUT_HELPER",
+                "UPSTROKE_EXCESSIVE_OUTPUT_HELPER",
                 EXCESSIVE_OUTPUT_BUDGET.to_string(),
             )
-            .env("TACTUS_EXCESSIVE_OUTPUT_STREAM", "stderr");
+            .env("UPSTROKE_EXCESSIVE_OUTPUT_STREAM", "stderr");
         let started = Instant::now();
         let out = run_with_timeout_and_limit(
             command,
@@ -5579,7 +5581,7 @@ mod tests {
     #[test]
     #[ignore = "subprocess helper"]
     fn stdin_hex_helper() {
-        if std::env::var_os("TACTUS_STDIN_HEX").is_none() {
+        if std::env::var_os("UPSTROKE_STDIN_HEX").is_none() {
             return;
         }
         let mut received = Vec::new();
@@ -5608,7 +5610,7 @@ mod tests {
         let mut command = Command::new(std::env::current_exe().expect("test executable"));
         command
             .args(["stdin_hex_helper", "--ignored", "--nocapture"])
-            .env("TACTUS_STDIN_HEX", "1");
+            .env("UPSTROKE_STDIN_HEX", "1");
         let out = run_with_timeout_hooked(command, &payload, Duration::from_secs(60), &mut NoHooks)
             .expect("supervise the stdin helper");
         let expected: String = payload.iter().map(|byte| format!("{byte:02x}")).collect();
@@ -5629,7 +5631,7 @@ mod tests {
     #[test]
     #[ignore = "subprocess helper"]
     fn timeout_transcript_helper() {
-        if std::env::var_os("TACTUS_TIMEOUT_TRANSCRIPT").is_none() {
+        if std::env::var_os("UPSTROKE_TIMEOUT_TRANSCRIPT").is_none() {
             return;
         }
         print!("OUT-BEFORE-TIMEOUT");
@@ -5644,7 +5646,7 @@ mod tests {
         let mut command = Command::new(std::env::current_exe().expect("test executable"));
         command
             .args(["timeout_transcript_helper", "--ignored", "--nocapture"])
-            .env("TACTUS_TIMEOUT_TRANSCRIPT", "1");
+            .env("UPSTROKE_TIMEOUT_TRANSCRIPT", "1");
         let out = run_with_timeout(command, "", Duration::from_secs(3))
             .expect("supervise the transcript helper");
         assert!(out.timed_out, "{out:?}");
@@ -5779,14 +5781,14 @@ mod tests {
     #[test]
     fn timeout_kills_a_background_grandchild_before_it_can_escape() {
         let marker = std::env::temp_dir().join(format!(
-            "tactus-proc-tree-{}-{}.marker",
+            "upstroke-proc-tree-{}-{}.marker",
             std::process::id(),
             std::thread::current().name().unwrap_or("unnamed")
         ));
         let _ = std::fs::remove_file(&marker);
 
-        let mut command = shell("(sleep 1; printf leaked > \"$TACTUS_MARKER\") & wait");
-        command.env("TACTUS_MARKER", &marker);
+        let mut command = shell("(sleep 1; printf leaked > \"$UPSTROKE_MARKER\") & wait");
+        command.env("UPSTROKE_MARKER", &marker);
         let out = run_with_timeout(command, "", Duration::from_millis(200)).expect("spawn shell");
         assert!(out.timed_out);
 
@@ -5856,15 +5858,15 @@ mod tests {
         use std::os::unix::process::CommandExt;
 
         let scratch = std::env::temp_dir().join(format!(
-            "tactus-kill-tree-{}-{}",
+            "upstroke-kill-tree-{}-{}",
             std::process::id(),
             crate::ulid::ulid()
         ));
         std::fs::create_dir_all(&scratch).expect("scratch directory");
         let ready = scratch.join("ready");
-        let mut command = shell("sh -c 'printf ready > \"$TACTUS_READY\"; sleep 60' & sleep 60");
+        let mut command = shell("sh -c 'printf ready > \"$UPSTROKE_READY\"; sleep 60' & sleep 60");
         command
-            .env("TACTUS_READY", &ready)
+            .env("UPSTROKE_READY", &ready)
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::piped());
@@ -6045,7 +6047,7 @@ mod tests {
         // to take. Without one `lock_cleanup_paths` is handed an empty list and
         // the hold this test is about does not exist.
         let public = std::env::temp_dir().join(format!(
-            "tactus-r28-points-{}-{}",
+            "upstroke-r28-points-{}-{}",
             std::process::id(),
             crate::ulid::ulid()
         ));
@@ -6193,11 +6195,13 @@ mod tests {
     #[ignore = "subprocess helper"]
     #[allow(clippy::zombie_processes)]
     fn unix_reaper_reparent_helper() {
-        if std::env::var_os("TACTUS_UNIX_REPARENT").is_none() {
+        if std::env::var_os("UPSTROKE_UNIX_REPARENT").is_none() {
             return;
         }
-        let ready = std::path::PathBuf::from(std::env::var_os("TACTUS_READY").expect("ready path"));
-        let agent = std::path::PathBuf::from(std::env::var_os("TACTUS_AGENT").expect("agent path"));
+        let ready =
+            std::path::PathBuf::from(std::env::var_os("UPSTROKE_READY").expect("ready path"));
+        let agent =
+            std::path::PathBuf::from(std::env::var_os("UPSTROKE_AGENT").expect("agent path"));
         let mut supervisor = termination::Supervisor::begin().expect("start a private reaper");
         let mut command = Command::new("/bin/sh");
         command
@@ -6262,7 +6266,7 @@ mod tests {
         }
 
         let scratch = std::env::temp_dir().join(format!(
-            "tactus-reparent-{}-{}",
+            "upstroke-reparent-{}-{}",
             std::process::id(),
             crate::ulid::ulid()
         ));
@@ -6271,9 +6275,9 @@ mod tests {
         let agent = scratch.join("agent");
         let mut coordinator = Command::new(std::env::current_exe().expect("test executable"))
             .args(["unix_reaper_reparent_helper", "--ignored", "--nocapture"])
-            .env("TACTUS_UNIX_REPARENT", "1")
-            .env("TACTUS_READY", &ready)
-            .env("TACTUS_AGENT", &agent)
+            .env("UPSTROKE_UNIX_REPARENT", "1")
+            .env("UPSTROKE_READY", &ready)
+            .env("UPSTROKE_AGENT", &agent)
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null())
@@ -6350,7 +6354,7 @@ mod tests {
             "a real failure was reported as the injected one: {message}"
         );
         assert!(
-            matches!(error, TactusError::Refused { .. }),
+            matches!(error, UpstrokeError::Refused { .. }),
             "a refusal, not an agent error: {error:?}"
         );
 
@@ -6363,9 +6367,9 @@ mod tests {
         let mut command = Command::new(std::env::current_exe().expect("test executable"));
         command
             .args(["windows_delayed_marker_helper", "--ignored", "--nocapture"])
-            .env("TACTUS_WINDOWS_DESCENDANT", "1")
-            .env("TACTUS_READY", ready)
-            .env("TACTUS_MARKER", marker)
+            .env("UPSTROKE_WINDOWS_DESCENDANT", "1")
+            .env("UPSTROKE_READY", ready)
+            .env("UPSTROKE_MARKER", marker)
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null());
@@ -6375,7 +6379,7 @@ mod tests {
     #[cfg(windows)]
     fn windows_tree_scratch(tag: &str) -> std::path::PathBuf {
         let scratch = std::env::temp_dir().join(format!(
-            "tactus-windows-job-{tag}-{}-{}",
+            "upstroke-windows-job-{tag}-{}-{}",
             std::process::id(),
             crate::ulid::ulid()
         ));
@@ -6396,11 +6400,11 @@ mod tests {
     #[test]
     #[ignore = "subprocess helper"]
     fn windows_delayed_marker_helper() {
-        if std::env::var_os("TACTUS_WINDOWS_DESCENDANT").is_none() {
+        if std::env::var_os("UPSTROKE_WINDOWS_DESCENDANT").is_none() {
             return;
         }
-        let ready = std::env::var_os("TACTUS_READY").expect("ready path");
-        let marker = std::env::var_os("TACTUS_MARKER").expect("marker path");
+        let ready = std::env::var_os("UPSTROKE_READY").expect("ready path");
+        let marker = std::env::var_os("UPSTROKE_MARKER").expect("marker path");
         std::fs::write(ready, b"ready").expect("announce descendant start");
         thread::sleep(Duration::from_secs(1));
         std::fs::write(marker, b"leaked").expect("write delayed marker");
@@ -6411,12 +6415,13 @@ mod tests {
     #[ignore = "subprocess helper"]
     #[allow(clippy::zombie_processes)]
     fn windows_direct_exit_parent_helper() {
-        if std::env::var_os("TACTUS_WINDOWS_DIRECT_PARENT").is_none() {
+        if std::env::var_os("UPSTROKE_WINDOWS_DIRECT_PARENT").is_none() {
             return;
         }
-        let ready = std::path::PathBuf::from(std::env::var_os("TACTUS_READY").expect("ready path"));
+        let ready =
+            std::path::PathBuf::from(std::env::var_os("UPSTROKE_READY").expect("ready path"));
         let marker =
-            std::path::PathBuf::from(std::env::var_os("TACTUS_MARKER").expect("marker path"));
+            std::path::PathBuf::from(std::env::var_os("UPSTROKE_MARKER").expect("marker path"));
         windows_descendant_command(&ready, &marker)
             .spawn()
             .expect("spawn ordinary descendant");
@@ -6438,9 +6443,9 @@ mod tests {
                 "--ignored",
                 "--nocapture",
             ])
-            .env("TACTUS_WINDOWS_DIRECT_PARENT", "1")
-            .env("TACTUS_READY", &ready)
-            .env("TACTUS_MARKER", &marker);
+            .env("UPSTROKE_WINDOWS_DIRECT_PARENT", "1")
+            .env("UPSTROKE_READY", &ready)
+            .env("UPSTROKE_MARKER", &marker);
 
         let output = run_with_timeout(command, "", Duration::from_secs(20))
             .expect("supervise direct-exit tree");
@@ -6459,12 +6464,13 @@ mod tests {
     #[test]
     #[ignore = "subprocess helper"]
     fn windows_job_owner_helper() {
-        if std::env::var_os("TACTUS_WINDOWS_JOB_OWNER").is_none() {
+        if std::env::var_os("UPSTROKE_WINDOWS_JOB_OWNER").is_none() {
             return;
         }
-        let ready = std::path::PathBuf::from(std::env::var_os("TACTUS_READY").expect("ready path"));
+        let ready =
+            std::path::PathBuf::from(std::env::var_os("UPSTROKE_READY").expect("ready path"));
         let marker =
-            std::path::PathBuf::from(std::env::var_os("TACTUS_MARKER").expect("marker path"));
+            std::path::PathBuf::from(std::env::var_os("UPSTROKE_MARKER").expect("marker path"));
         let command = windows_descendant_command(&ready, &marker);
         let _ = run_with_timeout(command, "", Duration::from_secs(30));
     }
@@ -6477,9 +6483,9 @@ mod tests {
         let marker = scratch.join("marker");
         let mut owner = Command::new(std::env::current_exe().expect("test executable"))
             .args(["windows_job_owner_helper", "--ignored", "--nocapture"])
-            .env("TACTUS_WINDOWS_JOB_OWNER", "1")
-            .env("TACTUS_READY", &ready)
-            .env("TACTUS_MARKER", &marker)
+            .env("UPSTROKE_WINDOWS_JOB_OWNER", "1")
+            .env("UPSTROKE_READY", &ready)
+            .env("UPSTROKE_MARKER", &marker)
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .spawn()
@@ -6530,7 +6536,7 @@ mod tests {
         }
     }
 
-    /// A grandchild that reports the moment it outlives the process Tactus
+    /// A grandchild that reports the moment it outlives the process Upstroke
     /// waits on.
     ///
     /// It announces its own identity, then polls for the direct child's death
@@ -6547,15 +6553,15 @@ mod tests {
     fn windows_escape_watcher_helper() {
         use std::io::Write;
 
-        if std::env::var_os("TACTUS_WINDOWS_WATCHER").is_none() {
+        if std::env::var_os("UPSTROKE_WINDOWS_WATCHER").is_none() {
             return;
         }
-        let ready = std::env::var_os("TACTUS_READY").expect("ready path");
-        let parent: u32 = std::env::var("TACTUS_PARENT_PID")
+        let ready = std::env::var_os("UPSTROKE_READY").expect("ready path");
+        let parent: u32 = std::env::var("UPSTROKE_PARENT_PID")
             .expect("parent pid")
             .parse()
             .expect("parent pid");
-        let created: u64 = std::env::var("TACTUS_PARENT_CREATED")
+        let created: u64 = std::env::var("UPSTROKE_PARENT_CREATED")
             .expect("parent creation time")
             .parse()
             .expect("parent creation time");
@@ -6588,25 +6594,26 @@ mod tests {
     fn windows_escape_parent_helper() {
         use std::io::Write;
 
-        if std::env::var_os("TACTUS_WINDOWS_ESCAPE_PARENT").is_none() {
+        if std::env::var_os("UPSTROKE_WINDOWS_ESCAPE_PARENT").is_none() {
             return;
         }
-        let ready = std::path::PathBuf::from(std::env::var_os("TACTUS_READY").expect("ready path"));
+        let ready =
+            std::path::PathBuf::from(std::env::var_os("UPSTROKE_READY").expect("ready path"));
         let pid = std::process::id();
         let created = process_creation_time(pid).expect("own creation time");
         Command::new(std::env::current_exe().expect("test executable"))
             .args(["windows_escape_watcher_helper", "--ignored", "--nocapture"])
-            .env("TACTUS_WINDOWS_WATCHER", "1")
-            .env("TACTUS_READY", &ready)
-            .env("TACTUS_PARENT_PID", pid.to_string())
-            .env("TACTUS_PARENT_CREATED", created.to_string())
+            .env("UPSTROKE_WINDOWS_WATCHER", "1")
+            .env("UPSTROKE_READY", &ready)
+            .env("UPSTROKE_PARENT_PID", pid.to_string())
+            .env("UPSTROKE_PARENT_CREATED", created.to_string())
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::inherit())
             .spawn()
             .expect("spawn the escape watcher");
         wait_for_marker(&ready, Duration::from_secs(20));
-        if std::env::var_os("TACTUS_MODE").is_some_and(|mode| mode == "flood") {
+        if std::env::var_os("UPSTROKE_MODE").is_some_and(|mode| mode == "flood") {
             let block = vec![b'x'; 8192];
             let mut out = std::io::stdout();
             while out.write_all(&block).is_ok() && out.flush().is_ok() {}
@@ -6643,9 +6650,9 @@ mod tests {
         let mut command = Command::new(std::env::current_exe().expect("test executable"));
         command
             .args(["windows_escape_parent_helper", "--ignored", "--nocapture"])
-            .env("TACTUS_WINDOWS_ESCAPE_PARENT", "1")
-            .env("TACTUS_READY", ready)
-            .env("TACTUS_MODE", mode);
+            .env("UPSTROKE_WINDOWS_ESCAPE_PARENT", "1")
+            .env("UPSTROKE_READY", ready)
+            .env("UPSTROKE_MODE", mode);
         command
     }
 
@@ -7004,7 +7011,7 @@ mod tests {
     #[test]
     fn successful_direct_exit_still_kills_detached_group_members() {
         let marker = std::env::temp_dir().join(format!(
-            "tactus-proc-detached-{}-{}.marker",
+            "upstroke-proc-detached-{}-{}.marker",
             std::process::id(),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -7013,10 +7020,10 @@ mod tests {
         ));
         let _ = std::fs::remove_file(&marker);
         let mut command = shell(
-            "(sleep 1; printf leaked > \"$TACTUS_MARKER\") \
+            "(sleep 1; printf leaked > \"$UPSTROKE_MARKER\") \
              </dev/null >/dev/null 2>&1 & exit 0",
         );
-        command.env("TACTUS_MARKER", &marker);
+        command.env("UPSTROKE_MARKER", &marker);
         let output = run_with_timeout(command, "", Duration::from_secs(10)).expect("spawn shell");
         assert_eq!(output.code, Some(0));
 
@@ -7033,12 +7040,12 @@ mod tests {
     #[test]
     #[ignore = "subprocess helper"]
     fn terminal_progress_worker_helper() {
-        if std::env::var_os("TACTUS_SIGNAL_WORKER").is_none() {
+        if std::env::var_os("UPSTROKE_SIGNAL_WORKER").is_none() {
             return;
         }
-        let ready = std::env::var_os("TACTUS_READY").expect("ready path");
-        let marker = std::env::var_os("TACTUS_MARKER").expect("marker path");
-        let finish = std::env::var_os("TACTUS_FINISH").expect("finish path");
+        let ready = std::env::var_os("UPSTROKE_READY").expect("ready path");
+        let marker = std::env::var_os("UPSTROKE_MARKER").expect("marker path");
+        let finish = std::env::var_os("UPSTROKE_FINISH").expect("finish path");
         let pid = unsafe { libc::getpid() };
         let pgid = unsafe { libc::getpgrp() };
         std::fs::write(ready, format!("{pid} {pgid} {pid} {pgid}")).expect("worker ready");
@@ -7054,7 +7061,7 @@ mod tests {
     #[test]
     fn a_stopped_child_is_not_mistaken_for_an_exited_child() {
         let scratch = std::env::temp_dir().join(format!(
-            "tactus-stopped-child-{}-{}",
+            "upstroke-stopped-child-{}-{}",
             std::process::id(),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -7071,10 +7078,10 @@ mod tests {
                 "--ignored",
                 "--nocapture",
             ])
-            .env("TACTUS_SIGNAL_WORKER", "1")
-            .env("TACTUS_READY", &ready)
-            .env("TACTUS_MARKER", &marker)
-            .env("TACTUS_FINISH", &finish)
+            .env("UPSTROKE_SIGNAL_WORKER", "1")
+            .env("UPSTROKE_READY", &ready)
+            .env("UPSTROKE_MARKER", &marker)
+            .env("UPSTROKE_FINISH", &finish)
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .spawn()
@@ -7124,7 +7131,7 @@ mod tests {
     #[test]
     #[ignore = "subprocess helper"]
     fn terminal_interrupt_helper() {
-        if std::env::var_os("TACTUS_SIGNAL_HELPER").is_none() {
+        if std::env::var_os("UPSTROKE_SIGNAL_HELPER").is_none() {
             return;
         }
         // SIGQUIT normally requests a core dump. Disable it in this disposable
@@ -7137,7 +7144,7 @@ mod tests {
         // SAFETY: this changes only the current disposable helper before it
         // launches either the signal monitor or the supervised command.
         assert_eq!(unsafe { libc::setrlimit(libc::RLIMIT_CORE, &no_core) }, 0);
-        let _cleanup_lock = std::env::var_os("TACTUS_CLEANUP_PUBLIC").map(|public| {
+        let _cleanup_lock = std::env::var_os("UPSTROKE_CLEANUP_PUBLIC").map(|public| {
             let public = std::path::PathBuf::from(public);
             std::fs::create_dir_all(&public).expect("cleanup-lock run directory");
             crate::rundir::RunLock::acquire(&public).expect("cleanup-lock helper takes run")
@@ -7145,9 +7152,9 @@ mod tests {
         let _cleanup_scope = _cleanup_lock
             .as_ref()
             .map(crate::rundir::RunLock::enter_cleanup_scope);
-        if let Some(blocked_signal) = std::env::var_os("TACTUS_BLOCK_SIGNAL") {
+        if let Some(blocked_signal) = std::env::var_os("UPSTROKE_BLOCK_SIGNAL") {
             // SAFETY: this disposable process deliberately models an embedding
-            // host that blocked the selected signal before Tactus initialized
+            // host that blocked the selected signal before Upstroke initialized
             // supervision.
             let blocked_signal = blocked_signal
                 .to_string_lossy()
@@ -7163,7 +7170,7 @@ mod tests {
                 );
             }
         }
-        let custom_handler = std::env::var_os("TACTUS_CUSTOM_SIGNAL_HANDLER").is_some();
+        let custom_handler = std::env::var_os("UPSTROKE_CUSTOM_SIGNAL_HANDLER").is_some();
         if custom_handler {
             CUSTOM_SIGNAL_SEEN.store(false, std::sync::atomic::Ordering::SeqCst);
             assert_ne!(
@@ -7176,7 +7183,7 @@ mod tests {
                 libc::SIG_ERR
             );
         }
-        let custom_job_control = std::env::var_os("TACTUS_CUSTOM_JOB_CONTROL_HANDLER").is_some();
+        let custom_job_control = std::env::var_os("UPSTROKE_CUSTOM_JOB_CONTROL_HANDLER").is_some();
         if custom_job_control {
             CUSTOM_JOB_CONTROL_SEEN.store(false, std::sync::atomic::Ordering::SeqCst);
             CUSTOM_PARENT_PID.store(
@@ -7193,7 +7200,7 @@ mod tests {
                 libc::SIG_ERR
             );
         }
-        if std::env::var_os("TACTUS_CUSTOM_CONTINUE_HANDLER").is_some() {
+        if std::env::var_os("UPSTROKE_CUSTOM_CONTINUE_HANDLER").is_some() {
             assert_ne!(
                 unsafe {
                     libc::signal(
@@ -7204,7 +7211,7 @@ mod tests {
                 libc::SIG_ERR
             );
         }
-        let custom_aux_signal = std::env::var_os("TACTUS_CUSTOM_AUX_SIGNAL_HANDLER").is_some();
+        let custom_aux_signal = std::env::var_os("UPSTROKE_CUSTOM_AUX_SIGNAL_HANDLER").is_some();
         if custom_aux_signal {
             CUSTOM_AUX_SIGNAL_SEEN.store(false, std::sync::atomic::Ordering::SeqCst);
             CUSTOM_PARENT_PID.store(
@@ -7221,7 +7228,7 @@ mod tests {
                 libc::SIG_ERR
             );
         }
-        let progress_loop = std::env::var_os("TACTUS_SIGNAL_PROGRESS_LOOP").is_some();
+        let progress_loop = std::env::var_os("UPSTROKE_SIGNAL_PROGRESS_LOOP").is_some();
         let mut command = if progress_loop {
             let mut command = Command::new(std::env::current_exe().expect("test executable"));
             command.args([
@@ -7229,29 +7236,29 @@ mod tests {
                 "--ignored",
                 "--nocapture",
             ]);
-            command.env("TACTUS_SIGNAL_WORKER", "1");
+            command.env("UPSTROKE_SIGNAL_WORKER", "1");
             command
         } else {
-            let script = "(sleep 1; printf leaked > \"$TACTUS_MARKER\") & worker=$!; \
+            let script = "(sleep 1; printf leaked > \"$UPSTROKE_MARKER\") & worker=$!; \
              shell_pgid=$(ps -o pgid= -p $$ | tr -d ' '); \
              worker_pgid=$(ps -o pgid= -p $worker | tr -d ' '); \
-             printf '%s %s %s %s' $$ $shell_pgid $worker $worker_pgid > \"$TACTUS_READY\"; \
+             printf '%s %s %s %s' $$ $shell_pgid $worker $worker_pgid > \"$UPSTROKE_READY\"; \
              wait";
             shell(script)
         };
         command.env(
-            "TACTUS_READY",
-            std::env::var_os("TACTUS_READY").expect("ready path"),
+            "UPSTROKE_READY",
+            std::env::var_os("UPSTROKE_READY").expect("ready path"),
         );
         command.env(
-            "TACTUS_MARKER",
-            std::env::var_os("TACTUS_MARKER").expect("marker path"),
+            "UPSTROKE_MARKER",
+            std::env::var_os("UPSTROKE_MARKER").expect("marker path"),
         );
-        if let Some(finish) = std::env::var_os("TACTUS_FINISH") {
-            command.env("TACTUS_FINISH", finish);
+        if let Some(finish) = std::env::var_os("UPSTROKE_FINISH") {
+            command.env("UPSTROKE_FINISH", finish);
         }
         let result = run_with_timeout(command, "", Duration::from_secs(30));
-        if std::env::var_os("TACTUS_EXPECT_JOB_CONTROL_REFUSAL").is_some() {
+        if std::env::var_os("UPSTROKE_EXPECT_JOB_CONTROL_REFUSAL").is_some() {
             let error = result.expect_err("host-owned SIGCONT must refuse default stop proxying");
             assert!(
                 error
@@ -7262,19 +7269,19 @@ mod tests {
             return;
         }
         let output = result.expect("signal helper command");
-        if std::env::var_os("TACTUS_SIGNAL_HELPER_EXPECT_RETURN").is_some() {
+        if std::env::var_os("UPSTROKE_SIGNAL_HELPER_EXPECT_RETURN").is_some() {
             assert_eq!(output.code, Some(0), "supervised output: {output:?}");
             if custom_handler {
                 assert_eq!(unsafe { libc::raise(libc::SIGTERM) }, 0);
                 assert!(
                     CUSTOM_SIGNAL_SEEN.load(std::sync::atomic::Ordering::SeqCst),
-                    "Tactus replaced the embedding host's custom SIGTERM handler"
+                    "Upstroke replaced the embedding host's custom SIGTERM handler"
                 );
             }
             if custom_job_control {
                 assert!(
                     CUSTOM_JOB_CONTROL_SEEN.load(std::sync::atomic::Ordering::SeqCst),
-                    "Tactus replaced the embedding host's custom SIGTSTP handler"
+                    "Upstroke replaced the embedding host's custom SIGTSTP handler"
                 );
             }
             if custom_aux_signal {
@@ -7390,7 +7397,7 @@ mod tests {
         use std::os::unix::process::CommandExt;
 
         let scratch = std::env::temp_dir().join(format!(
-            "tactus-proc-{tag}-{}-{}-{}",
+            "upstroke-proc-{tag}-{}-{}-{}",
             std::process::id(),
             std::thread::current().name().unwrap_or("unnamed"),
             std::time::SystemTime::now()
@@ -7413,11 +7420,11 @@ mod tests {
         let mut helper = Command::new(std::env::current_exe().expect("test executable"));
         helper
             .args(["terminal_interrupt_helper", "--ignored", "--nocapture"])
-            .env("TACTUS_SIGNAL_HELPER", "1")
-            .env("TACTUS_READY", &ready)
-            .env("TACTUS_MARKER", &marker)
-            .env("TACTUS_FINISH", &finish)
-            .env("TACTUS_TEST_REAPER_PID_PATH", &reaper_pid_path)
+            .env("UPSTROKE_SIGNAL_HELPER", "1")
+            .env("UPSTROKE_READY", &ready)
+            .env("UPSTROKE_MARKER", &marker)
+            .env("UPSTROKE_FINISH", &finish)
+            .env("UPSTROKE_TEST_REAPER_PID_PATH", &reaper_pid_path)
             // Keep a broken child-group setup inside the disposable helper's
             // group. A regression must fail the test, never suspend the test
             // runner that is responsible for reporting and cleaning it up.
@@ -7425,10 +7432,10 @@ mod tests {
             .stdout(Stdio::from(diagnostic_stdout))
             .stderr(Stdio::from(diagnostic_stderr));
         if expect_return {
-            helper.env("TACTUS_SIGNAL_HELPER_EXPECT_RETURN", "1");
+            helper.env("UPSTROKE_SIGNAL_HELPER_EXPECT_RETURN", "1");
         }
         if tag.starts_with("job-control") || tag == "crash-lease" {
-            helper.env("TACTUS_SIGNAL_PROGRESS_LOOP", "1");
+            helper.env("UPSTROKE_SIGNAL_PROGRESS_LOOP", "1");
         }
         if ignore_sighup {
             // SAFETY: `pre_exec` performs only the async-signal-safe `signal`
@@ -7444,13 +7451,13 @@ mod tests {
             }
         }
         if matches!(tag, "custom-handler" | "job-control-custom") {
-            helper.env("TACTUS_CUSTOM_SIGNAL_HANDLER", "1");
+            helper.env("UPSTROKE_CUSTOM_SIGNAL_HANDLER", "1");
         }
         if tag == "custom-job-control" {
-            helper.env("TACTUS_CUSTOM_JOB_CONTROL_HANDLER", "1");
+            helper.env("UPSTROKE_CUSTOM_JOB_CONTROL_HANDLER", "1");
         }
         if tag == "custom-aux-signal" {
-            helper.env("TACTUS_CUSTOM_AUX_SIGNAL_HANDLER", "1");
+            helper.env("UPSTROKE_CUSTOM_AUX_SIGNAL_HANDLER", "1");
         }
         let blocked_signal = if tag == "job-control-cont-blocked" {
             Some(libc::SIGCONT)
@@ -7460,7 +7467,7 @@ mod tests {
             None
         };
         if let Some(blocked_signal) = blocked_signal {
-            helper.env("TACTUS_BLOCK_SIGNAL", blocked_signal.to_string());
+            helper.env("UPSTROKE_BLOCK_SIGNAL", blocked_signal.to_string());
             // Block before exec so every thread subsequently created by the
             // Rust test harness inherits the host policy. Blocking only in the
             // selected test thread would leave another harness thread able to
@@ -7481,8 +7488,8 @@ mod tests {
         }
         if tag == "crash-lease" {
             helper
-                .env("TACTUS_CLEANUP_PUBLIC", scratch.join("run"))
-                .env("TACTUS_TEST_CLEANUP_DELAY_MS", "700");
+                .env("UPSTROKE_CLEANUP_PUBLIC", scratch.join("run"))
+                .env("UPSTROKE_TEST_CLEANUP_DELAY_MS", "700");
         }
         let child = helper.spawn().expect("spawn signal helper");
         let mut helper = SignalHelper {
@@ -7630,7 +7637,7 @@ mod tests {
         helper.complete();
         assert!(
             !leaked,
-            "signal {signal} terminated Tactus but left its isolated agent tree alive"
+            "signal {signal} terminated Upstroke but left its isolated agent tree alive"
         );
     }
 
@@ -7692,7 +7699,7 @@ mod tests {
         use std::os::unix::process::CommandExt;
 
         let scratch = std::env::temp_dir().join(format!(
-            "tactus-proc-custom-cont-{}-{}",
+            "upstroke-proc-custom-cont-{}-{}",
             std::process::id(),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -7703,12 +7710,12 @@ mod tests {
         let ready = scratch.join("ready");
         let output = Command::new(std::env::current_exe().expect("test executable"))
             .args(["terminal_interrupt_helper", "--ignored", "--nocapture"])
-            .env("TACTUS_SIGNAL_HELPER", "1")
-            .env("TACTUS_CUSTOM_CONTINUE_HANDLER", "1")
-            .env("TACTUS_EXPECT_JOB_CONTROL_REFUSAL", "1")
-            .env("TACTUS_READY", &ready)
-            .env("TACTUS_MARKER", scratch.join("marker"))
-            .env("TACTUS_FINISH", scratch.join("finish"))
+            .env("UPSTROKE_SIGNAL_HELPER", "1")
+            .env("UPSTROKE_CUSTOM_CONTINUE_HANDLER", "1")
+            .env("UPSTROKE_EXPECT_JOB_CONTROL_REFUSAL", "1")
+            .env("UPSTROKE_READY", &ready)
+            .env("UPSTROKE_MARKER", scratch.join("marker"))
+            .env("UPSTROKE_FINISH", scratch.join("finish"))
             .process_group(0)
             .output()
             .expect("run custom-SIGCONT policy helper");
@@ -7755,7 +7762,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn sigkill_of_tactus_job_still_reaps_the_isolated_agent_group() {
+    fn sigkill_of_upstroke_job_still_reaps_the_isolated_agent_group() {
         let mut helper = spawn_signal_helper("job-control", true, false);
         let helper_pgid = helper.pid();
         let agent_pgid = helper.supervised_pgid.expect("supervised group");
@@ -7778,7 +7785,7 @@ mod tests {
         helper.complete();
         assert!(
             stopped,
-            "the isolated agent kept running after an uncatchable Tactus SIGKILL"
+            "the isolated agent kept running after an uncatchable Upstroke SIGKILL"
         );
     }
 
@@ -7826,7 +7833,7 @@ mod tests {
         assert_eq!(unsafe { libc::kill(-pid, signal) }, 0);
         assert!(
             wait_for_stop(pid, Duration::from_secs(10)),
-            "Tactus did not stop for signal {signal}"
+            "Upstroke did not stop for signal {signal}"
         );
 
         let before = settled_progress_after_stop(&helper.marker, &format!("signal {signal}"));
@@ -7835,7 +7842,7 @@ mod tests {
             .unwrap_or_else(|error| panic!("progress after signal {signal}: {error}"));
         assert_eq!(
             after, before,
-            "the isolated agent kept making progress while Tactus was stopped by signal {signal}"
+            "the isolated agent kept making progress while Upstroke was stopped by signal {signal}"
         );
 
         std::fs::write(&helper.finish, "finish").expect("release supervised worker");
@@ -7877,7 +7884,7 @@ mod tests {
 
         assert!(
             wait_for_stop(pid, Duration::from_secs(10)),
-            "Tactus did not enter a stopped job-control state"
+            "Upstroke did not enter a stopped job-control state"
         );
 
         let before = settled_progress_after_stop(&helper.marker, "suspend interval");
@@ -7886,7 +7893,7 @@ mod tests {
             std::fs::read_to_string(&helper.marker).expect("progress after suspend interval");
         assert_eq!(
             after, before,
-            "the isolated agent kept making progress while Tactus was suspended"
+            "the isolated agent kept making progress while Upstroke was suspended"
         );
 
         std::fs::write(&helper.finish, "finish").expect("release supervised worker after continue");
@@ -7900,7 +7907,10 @@ mod tests {
         let diagnostic = helper.diagnostic();
         helper.complete();
         assert!(status.success(), "helper status: {status}\n{diagnostic}");
-        assert!(resumed, "the isolated agent was not continued with Tactus");
+        assert!(
+            resumed,
+            "the isolated agent was not continued with Upstroke"
+        );
     }
 
     #[cfg(unix)]
@@ -7912,7 +7922,7 @@ mod tests {
         assert_eq!(unsafe { libc::kill(-pid, libc::SIGTSTP) }, 0);
         assert!(
             wait_for_stop(pid, Duration::from_secs(10)),
-            "Tactus did not enter a stopped job-control state"
+            "Upstroke did not enter a stopped job-control state"
         );
 
         let before = settled_progress_after_stop(&helper.marker, "blocked SIGCONT");
@@ -7921,13 +7931,13 @@ mod tests {
             std::fs::read_to_string(&helper.marker).expect("progress after blocked SIGCONT");
         assert_eq!(
             after, before,
-            "the isolated agent kept making progress while Tactus was suspended"
+            "the isolated agent kept making progress while Upstroke was suspended"
         );
 
         std::fs::write(&helper.finish, "finish").expect("release supervised worker");
         assert_eq!(unsafe { libc::kill(-pid, libc::SIGCONT) }, 0);
         let status = wait_for_exit(&mut helper.child, Duration::from_secs(10))
-            .expect("blocked SIGCONT stranded Tactus or its isolated agent tree");
+            .expect("blocked SIGCONT stranded Upstroke or its isolated agent tree");
         let diagnostic = helper.diagnostic();
         helper.complete();
         assert!(status.success(), "helper status: {status}\n{diagnostic}");
@@ -7941,7 +7951,7 @@ mod tests {
         assert_eq!(unsafe { libc::kill(-pid, libc::SIGTSTP) }, 0);
         assert!(
             wait_for_stop(pid, Duration::from_secs(10)),
-            "Tactus did not enter a stopped job-control state"
+            "Upstroke did not enter a stopped job-control state"
         );
 
         assert_eq!(unsafe { libc::kill(-pid, libc::SIGTERM) }, 0);
@@ -7961,7 +7971,7 @@ mod tests {
         assert_eq!(unsafe { libc::kill(-pid, libc::SIGTSTP) }, 0);
         assert!(
             wait_for_stop(pid, Duration::from_secs(10)),
-            "Tactus did not enter a stopped job-control state"
+            "Upstroke did not enter a stopped job-control state"
         );
 
         assert_eq!(unsafe { libc::kill(-pid, libc::SIGTERM) }, 0);
@@ -7982,7 +7992,7 @@ mod tests {
         assert_eq!(unsafe { libc::kill(-pid, libc::SIGTSTP) }, 0);
         assert!(
             wait_for_stop(pid, Duration::from_secs(10)),
-            "Tactus did not enter a stopped job-control state"
+            "Upstroke did not enter a stopped job-control state"
         );
         let before = settled_progress_after_stop(&helper.marker, "ignored SIGHUP");
         assert_eq!(unsafe { libc::kill(-pid, libc::SIGHUP) }, 0);
@@ -8012,7 +8022,7 @@ mod tests {
 
         let status =
             wait_for_exit(&mut helper.child, Duration::from_secs(10)).unwrap_or_else(|| {
-                panic!("a continue racing with suspend stranded Tactus or its agent tree");
+                panic!("a continue racing with suspend stranded Upstroke or its agent tree");
             });
         let diagnostic = helper.diagnostic();
         helper.complete();
@@ -8029,7 +8039,7 @@ mod tests {
         // runnable and wakes a parent that SIGSTOP may already have committed.
         assert_eq!(unsafe { libc::kill(-pid, libc::SIGTERM) }, 0);
         if wait_for_exit(&mut helper.child, Duration::from_secs(10)).is_none() {
-            panic!("termination racing with suspend did not terminate Tactus");
+            panic!("termination racing with suspend did not terminate Upstroke");
         }
         thread::sleep(Duration::from_millis(1300));
         let leaked = helper.marker.exists();
@@ -8045,16 +8055,16 @@ mod tests {
         assert_eq!(unsafe { libc::kill(-pid, libc::SIGTSTP) }, 0);
         assert!(
             wait_for_stop(pid, Duration::from_secs(10)),
-            "Tactus did not enter a stopped job-control state"
+            "Upstroke did not enter a stopped job-control state"
         );
 
-        // Target only Tactus, not its foreground group and therefore not the
+        // Target only Upstroke, not its foreground group and therefore not the
         // external guard. No external SIGCONT follows: the guard's bounded
-        // probe must expose the pending signal to Tactus's handler, then let
+        // probe must expose the pending signal to Upstroke's handler, then let
         // the ordinary monitor/reaper path settle the whole tree.
         assert_eq!(unsafe { libc::kill(pid, libc::SIGTERM) }, 0);
         wait_for_exit(&mut helper.child, Duration::from_secs(10))
-            .expect("PID-directed termination did not release the stopped Tactus process");
+            .expect("PID-directed termination did not release the stopped Upstroke process");
         thread::sleep(Duration::from_millis(1300));
         let leaked = helper.marker.exists();
         helper.complete();
@@ -8066,7 +8076,7 @@ mod tests {
 
     #[test]
     fn missing_binary_is_a_spawn_error() {
-        let cmd = Command::new("tactus-definitely-not-a-real-binary");
+        let cmd = Command::new("upstroke-definitely-not-a-real-binary");
         let err = run_with_timeout(cmd, "", Duration::from_secs(1)).expect_err("must fail");
         assert!(err.to_string().contains("failed to spawn"));
     }
@@ -8088,13 +8098,14 @@ mod tests {
     #[ignore = "subprocess helper"]
     #[allow(clippy::zombie_processes)]
     fn unix_reaper_container_helper() {
-        if std::env::var_os("TACTUS_REAPER_CONTAINERS").is_none() {
+        if std::env::var_os("UPSTROKE_REAPER_CONTAINERS").is_none() {
             return;
         }
-        let stub = std::path::PathBuf::from(std::env::var_os("TACTUS_STUB").expect("stub path"));
-        let root = std::path::PathBuf::from(std::env::var_os("TACTUS_ROOT").expect("root"));
-        let incarnation = std::env::var("TACTUS_INCARNATION").expect("incarnation");
-        let agent = std::path::PathBuf::from(std::env::var_os("TACTUS_AGENT").expect("agent path"));
+        let stub = std::path::PathBuf::from(std::env::var_os("UPSTROKE_STUB").expect("stub path"));
+        let root = std::path::PathBuf::from(std::env::var_os("UPSTROKE_ROOT").expect("root"));
+        let incarnation = std::env::var("UPSTROKE_INCARNATION").expect("incarnation");
+        let agent =
+            std::path::PathBuf::from(std::env::var_os("UPSTROKE_AGENT").expect("agent path"));
 
         let scope =
             crate::runner::container::census::ReaperContainerScope::new(stub, &root, &incarnation)
@@ -8114,7 +8125,7 @@ mod tests {
             .register(child.id())
             .expect("register the agent group");
         std::fs::write(&agent, child.id().to_string()).expect("record the agent pid");
-        if std::env::var_os("TACTUS_REAPER_CONTAINERS_CLEAN_EXIT").is_some() {
+        if std::env::var_os("UPSTROKE_REAPER_CONTAINERS_CLEAN_EXIT").is_some() {
             // The **live**-coordinator half: the invocation is settled the
             // ordinary way and this process exits without dying.
             drop(supervisor);
@@ -8133,8 +8144,8 @@ mod tests {
     ///
     /// Four claims, each separately droppable, and each asserted:
     ///
-    /// 1. the selector names **both** `tactus.private_root` and
-    ///    `tactus.incarnation`, with two distinct values — a reaper that
+    /// 1. the selector names **both** `upstroke.private_root` and
+    ///    `upstroke.incarnation`, with two distinct values — a reaper that
     ///    filtered on the private root alone would kill every container of every
     ///    run under `<R>`, including a **live** coordinator's, which is exactly
     ///    what `authoritative_state` forbids;
@@ -8156,12 +8167,12 @@ mod tests {
     fn unix_reaper_kills_labeled_containers() {
         const CONTAINER_ID: &str =
             "c0ffee0000000000000000000000000000000000000000000000000000000001";
-        const PRIVATE_ROOT: &str = "/srv/tactus-reaper-fixture/private";
+        const PRIVATE_ROOT: &str = "/srv/upstroke-reaper-fixture/private";
         const INCARNATION: &str = "01KZTAAAAAAAAAAAAAAAAAAAAA";
 
         fn scratch(tag: &str) -> std::path::PathBuf {
             let dir = std::env::temp_dir().join(format!(
-                "tactus-reaper-containers-{tag}-{}-{}",
+                "upstroke-reaper-containers-{tag}-{}-{}",
                 std::process::id(),
                 crate::ulid::ulid()
             ));
@@ -8214,7 +8225,7 @@ mod tests {
         // clean-exit path the reaper execs nothing at all, so the spelling
         // cannot discriminate there and the cell would assert the same absent
         // log as the one beside it.
-        const STUB_NAME: &str = "tactus-reaper-docker-stub";
+        const STUB_NAME: &str = "upstroke-reaper-docker-stub";
         for (bare, coordinator_dies) in [(true, true), (false, true), (false, false)] {
             let cell = match (bare, coordinator_dies) {
                 (true, true) => "bare-dies",
@@ -8232,11 +8243,11 @@ mod tests {
                 &stub,
                 format!(
                     "#!/bin/sh\n\
-                     printf '%s\\n' \"$*\" >> \"$TACTUS_STUB_DIR/argv.log\"\n\
+                     printf '%s\\n' \"$*\" >> \"$UPSTROKE_STUB_DIR/argv.log\"\n\
                      case \"$1\" in\n\
-                     ps) [ -f \"$TACTUS_STUB_DIR/removed\" ] || printf '%s\\n' '{CONTAINER_ID}' ;;\n\
-                     kill) : > \"$TACTUS_STUB_DIR/killing\"; sleep 1 ;;\n\
-                     rm) : > \"$TACTUS_STUB_DIR/removed\" ;;\n\
+                     ps) [ -f \"$UPSTROKE_STUB_DIR/removed\" ] || printf '%s\\n' '{CONTAINER_ID}' ;;\n\
+                     kill) : > \"$UPSTROKE_STUB_DIR/killing\"; sleep 1 ;;\n\
+                     rm) : > \"$UPSTROKE_STUB_DIR/removed\" ;;\n\
                      esac\n\
                      exit 0\n"
                 )
@@ -8260,13 +8271,13 @@ mod tests {
             let mut coordinator = Command::new(std::env::current_exe().expect("test executable"));
             coordinator
                 .args(["unix_reaper_container_helper", "--ignored", "--nocapture"])
-                .env("TACTUS_REAPER_CONTAINERS", "1")
-                .env("TACTUS_STUB", &named)
-                .env("TACTUS_STUB_DIR", &dir)
-                .env("TACTUS_ROOT", PRIVATE_ROOT)
-                .env("TACTUS_INCARNATION", INCARNATION)
-                .env("TACTUS_AGENT", &agent_path)
-                .env("TACTUS_TEST_REAPER_PID_PATH", &reaper_path)
+                .env("UPSTROKE_REAPER_CONTAINERS", "1")
+                .env("UPSTROKE_STUB", &named)
+                .env("UPSTROKE_STUB_DIR", &dir)
+                .env("UPSTROKE_ROOT", PRIVATE_ROOT)
+                .env("UPSTROKE_INCARNATION", INCARNATION)
+                .env("UPSTROKE_AGENT", &agent_path)
+                .env("UPSTROKE_TEST_REAPER_PID_PATH", &reaper_path)
                 .stdin(Stdio::null())
                 .stdout(Stdio::null())
                 .stderr(Stdio::null());
@@ -8283,7 +8294,7 @@ mod tests {
                 );
             }
             if !coordinator_dies {
-                coordinator.env("TACTUS_REAPER_CONTAINERS_CLEAN_EXIT", "1");
+                coordinator.env("UPSTROKE_REAPER_CONTAINERS_CLEAN_EXIT", "1");
             }
             let mut coordinator = coordinator.spawn().expect("spawn a disposable coordinator");
 
@@ -8378,12 +8389,12 @@ mod tests {
             assert!(
                 filters
                     .iter()
-                    .any(|filter| *filter == format!("label=tactus.private_root={PRIVATE_ROOT}"))
+                    .any(|filter| *filter == format!("label=upstroke.private_root={PRIVATE_ROOT}"))
             );
             assert!(
                 filters
                     .iter()
-                    .any(|filter| *filter == format!("label=tactus.incarnation={INCARNATION}"))
+                    .any(|filter| *filter == format!("label=upstroke.incarnation={INCARNATION}"))
             );
             assert_eq!(
                 filters

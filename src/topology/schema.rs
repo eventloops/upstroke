@@ -105,10 +105,10 @@ const _: () = assert!(TOPOLOGY_SCHEMA == LATEST_LEGACY_SCHEMA + 1);
 /// Separate from the read ceiling on purpose. Reading is about what a binary
 /// can be handed; writing is about what it chooses to create, and a binary that
 /// could read schema 4 still writes schema 3 for every ordinary run until the
-/// topology is what `tactus run` means.
+/// topology is what `upstroke run` means.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum WriterSelector {
-    /// What `tactus run` creates.
+    /// What `upstroke run` creates.
     Production,
     /// What a deliberate topology preview creates.
     TopologyPreview,
@@ -234,8 +234,8 @@ pub fn probe_header(bytes: &[u8]) -> Result<LogHeader, SchemaRefusal> {
 pub fn select_for_schema(schema: u32, ceiling: u32) -> Result<ReaderSelection, SchemaRefusal> {
     if schema > ceiling {
         // Two refusals, because they are two different situations for the
-        // person reading them: one is fixed by upgrading tactus, the other by
-        // upgrading tactus *and* knowing that this log will never be a legacy
+        // person reading them: one is fixed by upgrading upstroke, the other by
+        // upgrading upstroke *and* knowing that this log will never be a legacy
         // run no matter what reads it.
         if schema == TOPOLOGY_SCHEMA {
             return Err(SchemaRefusal::TopologyLogUnreadable { schema, ceiling });
@@ -324,13 +324,13 @@ pub enum SchemaRefusal {
     #[error(
         "the event log's `run_started` records no schema, so there is no way to tell which \
          execution model the rest of the file describes. Every writer records one; a record \
-         without it was not written by tactus."
+         without it was not written by upstroke."
     )]
     HeaderWithoutSchema,
 
     #[error(
         "this log is a parallel-execution-topology run (event schema {schema}); this binary \
-         reads up to schema {ceiling}, which is sequential runs only. Upgrade tactus to read \
+         reads up to schema {ceiling}, which is sequential runs only. Upgrade upstroke to read \
          it. It will never become a schema-{ceiling} run: the topology is a different \
          execution model — a merge queue, per-task worktrees, and a recorded runner identity — \
          and no upgrade path into or out of it exists."
@@ -338,7 +338,7 @@ pub enum SchemaRefusal {
     TopologyLogUnreadable { schema: u32, ceiling: u32 },
 
     #[error(
-        "this log was written by a newer tactus (event schema {schema}); this binary reads up \
+        "this log was written by a newer upstroke (event schema {schema}); this binary reads up \
          to schema {ceiling}. Upgrade rather than interpret it — deriving state from a log we \
          only half understand would be confidently wrong."
     )]
@@ -372,7 +372,7 @@ mod tests {
             None => String::new(),
         };
         format!(
-            r#"{{"ts":"2026-08-17T03:04:05.678Z","event":"{event}","data":{{"branch":" Ünïcode/BrÄnch  ","run_id":"01ARZ3NDEKTSV4RRFFQ69G5FAV",{schema_field}"tactus_version":"0.0.1-Ünicode"}}}}"#
+            r#"{{"ts":"2026-08-17T03:04:05.678Z","event":"{event}","data":{{"branch":" Ünïcode/BrÄnch  ","run_id":"01ARZ3NDEKTSV4RRFFQ69G5FAV",{schema_field}"upstroke_version":"0.0.1-Ünicode"}}}}"#
         )
     }
 
@@ -1204,7 +1204,7 @@ mod tests {
         // A committed first line that will not parse is a rewritten log,
         // whatever recognizable text it contains. Scanning it for a `schema`
         // token would let corruption choose the reader — and would report a
-        // newer-schema refusal, sending the operator to upgrade tactus for a
+        // newer-schema refusal, sending the operator to upgrade upstroke for a
         // file that is damaged.
         let damaged: [&[u8]; 4] = [
             b"{\"event\":\"run_started\",\"data\":{\"schema\":9},BROKEN\n",

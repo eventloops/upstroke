@@ -59,8 +59,8 @@ jobs:
       # git but no identity, and several tests commit.
       - name: Configure git identity
         run: |
-          git config --global user.email "ci@tactus.local"
-          git config --global user.name "tactus CI"
+          git config --global user.email "ci@upstroke.local"
+          git config --global user.name "upstroke CI"
 
       - run: cargo test --all-targets --all-features
 
@@ -85,7 +85,7 @@ jobs:
   # a `#[cfg(windows)]` body at all. Measured (`PR5-CONF-014`): a raw
   # `std::fs::write` in a non-allowlisted module passes Ubuntu clippy, the test
   # job on all three platforms and the msrv job on all three platforms when it is
-  # placed under `#[cfg(windows)]`, and is refused with the `TACTUS-EFFECT R21/R18`
+  # placed under `#[cfg(windows)]`, and is refused with the `UPSTROKE-EFFECT R21/R18`
   # note by MSVC clippy. So without this job `expected_failures_refusals[5]` and
   # `[6]` are undischarged for the Windows half of the tree.
   #
@@ -132,7 +132,7 @@ jobs:
   # names. `always()` makes a failed or cancelled dependency produce a failed
   # aggregate instead of a missing required check that never settles.
   merge-gate:
-    name: tactus-ci
+    name: upstroke-ci
     if: always()
     needs: [lint, lint-windows, msrv, test]
     runs-on: ubuntu-latest

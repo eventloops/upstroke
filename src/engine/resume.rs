@@ -9,7 +9,7 @@ use std::path::PathBuf;
 
 use crate::capacity;
 use crate::config;
-use crate::error::TactusError;
+use crate::error::UpstrokeError;
 use crate::events::{self, EventBody, EventLog, RunState, TaskState};
 use crate::interaction::{self, RealSleeper};
 use crate::ir::{Answer, Plan, QuestionId, ResolvedEffortPolicy};
@@ -32,7 +32,7 @@ use crate::topology::effects::EventSite;
 pub(super) fn resume_harness_inner(
     opts: &ResumeOptions,
     harness: &Harness<'_>,
-) -> Result<(RunReport, RunState), TactusError> {
+) -> Result<(RunReport, RunState), UpstrokeError> {
     let contained = crate::runner::host::contain_write_command(&mut crate::agent::proc::NoHooks)?;
     resume_harness_inner_on(
         opts,
@@ -51,10 +51,10 @@ pub(super) fn resume_harness_inner_on(
     harness: &Harness<'_>,
     runner: &dyn Runner,
     _contained: &crate::runner::host::Contained,
-) -> Result<(RunReport, RunState), TactusError> {
+) -> Result<(RunReport, RunState), UpstrokeError> {
     let run_id = rundir::resolve_run_id(&opts.repo_root, &opts.run_id)?;
     let public = rundir::public_dir(&opts.repo_root, &run_id);
-    let refuse = |message: String| TactusError::Resume {
+    let refuse = |message: String| UpstrokeError::Resume {
         run_id: run_id.clone(),
         message,
     };
@@ -142,7 +142,7 @@ pub(super) fn resume_harness_inner_on(
     let recorded_normalized_plan_digest =
         events::recorded_normalized_plan_digest(&events).map(str::to_owned);
     let frozen_plan_path = public.join("plan.normalized.json");
-    let frozen_plan_bytes = fs::read(&frozen_plan_path).map_err(|source| TactusError::Io {
+    let frozen_plan_bytes = fs::read(&frozen_plan_path).map_err(|source| UpstrokeError::Io {
         path: frozen_plan_path.clone(),
         source,
     })?;
@@ -687,7 +687,7 @@ pub(super) fn resume_harness_inner_on(
         }
     }
     // A crash between `question_answered` and the payload rewrite leaves a
-    // file that still reads as open, which `tactus answer` would accept a
+    // file that still reads as open, which `upstroke answer` would accept a
     // second answer against — one no engine can ever ingest, because the
     // question is already closed in the log. The log is what is authoritative;
     // make the payloads agree with it again.
@@ -786,7 +786,7 @@ fn unrecorded_commit(
     let task = plan.tasks.get(index)?;
     Some((
         task.id.to_string(),
-        format!("[tactus] {}: {}", task.id, task.title),
+        format!("[upstroke] {}: {}", task.id, task.title),
         prepared_commit.as_deref().cloned(),
     ))
 }

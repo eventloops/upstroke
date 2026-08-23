@@ -53,7 +53,7 @@ use super::{
     observe_terminated, parse_ps_output, read_intent, reclaim, release, remove_container,
     remove_intent, start_container, stop_container, unmount_git_view, write_intent,
 };
-use crate::error::TactusError;
+use crate::error::UpstrokeError;
 use crate::runner::{AgentId, CommandSpec, InvocationId, ProbeTarget, host};
 use crate::topology::effects::{
     Adjacent, ContainerSite, DurableEvent, EffectSiteId, FaultRow, ResourceRow, SiteScope,
@@ -66,7 +66,7 @@ use crate::topology::effects::{
 /// A scratch private root, in the idiom of `effects::tests::scratch_dir`.
 fn scratch(tag: &str) -> PathBuf {
     let dir = std::env::temp_dir().join(format!(
-        "tactus-container-{tag}-{}-{:?}",
+        "upstroke-container-{tag}-{}-{:?}",
         std::process::id(),
         std::thread::current().id()
     ));
@@ -87,7 +87,7 @@ const INCARNATION_2: &str = "01KZTBBBBBBBBBBBBBBBBBBBBB";
 const IMAGE_ID: &str = "sha256:1111111111111111111111111111111111111111111111111111111111111111";
 const OTHER_IMAGE_ID: &str =
     "sha256:2222222222222222222222222222222222222222222222222222222222222222";
-const IMAGE_REFERENCE: &str = "ghcr.io/example/tactus-runner:v1";
+const IMAGE_REFERENCE: &str = "ghcr.io/example/upstroke-runner:v1";
 const MANIFEST_DIGEST: &str =
     "sha256:3333333333333333333333333333333333333333333333333333333333333333";
 const POLICY_DIGEST: &str =
@@ -145,7 +145,7 @@ fn spec_for(
             target: "/work".to_owned(),
             read_only: false,
         }],
-        env: vec![("HOME".to_owned(), "/home/tactus".to_owned())],
+        env: vec![("HOME".to_owned(), "/home/upstroke".to_owned())],
         command: vec!["/bin/sh".to_owned(), "-c".to_owned(), "exit 0".to_owned()],
         workdir: Some("/work".to_owned()),
         read_only_root: true,
@@ -354,7 +354,7 @@ fn the_fake_can_report_an_image_id_that_differs_from_the_one_create_asked_for() 
     let runtime = FakeRuntime::new(trace);
     runtime.add_image(IMAGE_ID, None);
     let spec = CreateSpec {
-        name: "tactus-a-b-c-d".to_owned(),
+        name: "upstroke-a-b-c-d".to_owned(),
         image_id: IMAGE_ID.to_owned(),
         labels: BTreeMap::new(),
         mounts: Vec::new(),
@@ -397,19 +397,31 @@ fn volume_presence_is_a_toggle_and_absence_refuses_a_create() {
     let trace = ContainerTrace::recording();
     let runtime = FakeRuntime::new(trace);
     runtime.add_image(IMAGE_ID, None);
-    assert!(!runtime.volume_present("tactus-claude").expect("reachable"));
-    runtime.add_volume("tactus-claude");
-    assert!(runtime.volume_present("tactus-claude").expect("reachable"));
-    runtime.remove_volume("tactus-claude");
-    assert!(!runtime.volume_present("tactus-claude").expect("reachable"));
+    assert!(
+        !runtime
+            .volume_present("upstroke-claude")
+            .expect("reachable")
+    );
+    runtime.add_volume("upstroke-claude");
+    assert!(
+        runtime
+            .volume_present("upstroke-claude")
+            .expect("reachable")
+    );
+    runtime.remove_volume("upstroke-claude");
+    assert!(
+        !runtime
+            .volume_present("upstroke-claude")
+            .expect("reachable")
+    );
 
     let spec = CreateSpec {
-        name: "tactus-a-b-c-d".to_owned(),
+        name: "upstroke-a-b-c-d".to_owned(),
         image_id: IMAGE_ID.to_owned(),
         labels: BTreeMap::new(),
         mounts: vec![Mount::Volume {
-            name: "tactus-claude".to_owned(),
-            target: "/home/tactus/.claude".to_owned(),
+            name: "upstroke-claude".to_owned(),
+            target: "/home/upstroke/.claude".to_owned(),
             read_only: false,
         }],
         env: Vec::new(),
@@ -419,7 +431,7 @@ fn volume_presence_is_a_toggle_and_absence_refuses_a_create() {
     };
     let refused = runtime.create(&spec).expect_err("an absent volume refuses");
     assert!(!refused.is_unreachable(), "the runtime answered; it failed");
-    runtime.add_volume("tactus-claude");
+    runtime.add_volume("upstroke-claude");
     assert!(runtime.create(&spec).is_ok(), "and present, it creates");
 }
 
@@ -583,7 +595,7 @@ fn the_call_log_is_ordered_and_holds_every_operation() {
     let runtime = FakeRuntime::new(trace.clone());
     runtime.add_image(IMAGE_ID, None);
     let spec = CreateSpec {
-        name: "tactus-a-b-c-d".to_owned(),
+        name: "upstroke-a-b-c-d".to_owned(),
         image_id: IMAGE_ID.to_owned(),
         labels: BTreeMap::new(),
         mounts: Vec::new(),
@@ -735,7 +747,7 @@ fn every_container_sites_row_adjacency_fault_row_and_scope_is_the_packets() {
 /// > death, settles the dead coordinator's process groups while holding R28,
 /// > and **additionally kills the dead coordinator's labeled containers,
 /// > closing the orphan window**; Windows: no reaper; … and **containers are
-/// > reclaimed at the next tactus write-command start (orphan window until
+/// > reclaimed at the next upstroke write-command start (orphan window until
 /// > then; documented; a portable watchdog is deferred)**.
 ///
 /// The window is a **value** and not only a sentence, so the two platforms give
@@ -874,8 +886,8 @@ fn windows_orphan_window_documented() {
     // the platform that has nothing to arm. Nothing is installed on either
     // path, so no other test in this process inherits a scope.
     let unarmable = crate::runner::container::census::ReaperContainerScope::new(
-        "tactus-definitely-not-a-real-docker",
-        Path::new("/srv/tactus-orphan-window/private"),
+        "upstroke-definitely-not-a-real-docker",
+        Path::new("/srv/upstroke-orphan-window/private"),
         "01KZTAAAAAAAAAAAAAAAAAAAAA",
     )
     .expect("a well-formed scope");
@@ -995,7 +1007,7 @@ fn every_container_site_is_taken_by_value_by_a_funnel_that_hooks_both_phases() {
 /// remove, a record to delete, a free name to create — and each asserts three
 /// things:
 ///
-/// 1. the call refused, with [`TactusError::Refused`];
+/// 1. the call refused, with [`UpstrokeError::Refused`];
 /// 2. **the trace is empty**: no site phase, no runtime operation, no view
 ///    action and no durability step, which is the whole observable surface this
 ///    module has and is what "before any effect" means;
@@ -1105,7 +1117,7 @@ fn a_funnel_api_refuses_a_site_that_does_not_name_its_operation() {
                 );
             };
             assert!(
-                matches!(error, TactusError::Refused { .. }),
+                matches!(error, UpstrokeError::Refused { .. }),
                 "{}/{}: {error}",
                 own_site.name(),
                 wrong.name()
@@ -1299,13 +1311,13 @@ fn an_intent_record_with_an_unknown_field_is_refused() {
     )
     .expect("write");
     let error = read_intent(&path).expect_err("an unknown field is refused");
-    assert!(matches!(error, TactusError::Refused { .. }));
+    assert!(matches!(error, UpstrokeError::Refused { .. }));
 }
 
 /// The five labels, each carrying its own field.
 ///
-/// `crash_reconstruction`: "labels tactus.private_root, tactus.run,
-/// tactus.run_dir, tactus.incarnation, tactus.invocation". Written out as
+/// `crash_reconstruction`: "labels upstroke.private_root, upstroke.run,
+/// upstroke.run_dir, upstroke.incarnation, upstroke.invocation". Written out as
 /// literals, and each value asserted against the field it comes from — a label
 /// map with five keys and one value repeated would pass a count and fails here.
 #[test]
@@ -1313,11 +1325,11 @@ fn the_five_labels_are_the_packets_five_and_each_carries_its_own_field() {
     assert_eq!(
         LABELS,
         [
-            "tactus.private_root",
-            "tactus.run",
-            "tactus.run_dir",
-            "tactus.incarnation",
-            "tactus.invocation",
+            "upstroke.private_root",
+            "upstroke.run",
+            "upstroke.run_dir",
+            "upstroke.incarnation",
+            "upstroke.invocation",
         ]
     );
     let root = PathBuf::from("/srv/private");
@@ -1332,7 +1344,7 @@ fn the_five_labels_are_the_packets_five_and_each_carries_its_own_field() {
     let distinct: BTreeSet<&String> = labels.values().collect();
     assert_eq!(distinct.len(), 5, "five labels, five distinct values");
 
-    // Discovery is by `tactus.private_root` and the record's own location is
+    // Discovery is by `upstroke.private_root` and the record's own location is
     // inside that root, so the one label with no field of its own is the one
     // the census already knows.
     assert!(
@@ -1348,31 +1360,31 @@ fn the_five_labels_are_the_packets_five_and_each_carries_its_own_field() {
 
 /// The name is the packet's template, and the expected value is a literal.
 ///
-/// > the container name is `tactus-<repo_key>-<run_id>-<incarnation>-<invocation-hash>`
+/// > the container name is `upstroke-<repo_key>-<run_id>-<incarnation>-<invocation-hash>`
 ///
 /// The invocation hash is pinned against a value computed **out of band**:
 ///
 /// ```text
 /// python3 -c 'import hashlib; print(hashlib.sha256(
-///     b"tactus.container-invocation.v1" + b"\x00" + b"p.shell.o0").hexdigest()[:16])'
-/// c8e75afe1649f987
+///     b"upstroke.container-invocation.v1" + b"\x00" + b"p.shell.o0").hexdigest()[:16])'
+/// 1a8e276b273887c0
 /// ```
 ///
 /// A digest compared only against the code that produced it proves nothing.
 #[test]
 fn the_container_name_is_the_packets_template_and_its_hash_is_pinned() {
-    assert_eq!(invocation_hash(&shell_probe()), "c8e75afe1649f987");
+    assert_eq!(invocation_hash(&shell_probe()), "1a8e276b273887c0");
     assert_eq!(
         invocation_hash(&InvocationId::probe(ProbeTarget::Shell, 1).expect("o1")),
-        "0ba209deb7340f44"
+        "2886ac8ba70021d5"
     );
-    assert_eq!(invocation_hash(&agent_probe()), "dcd71fb456045de6");
+    assert_eq!(invocation_hash(&agent_probe()), "50012b960951553a");
 
     let name = name_for(RUN_A, INCARNATION_1, &shell_probe());
     assert_eq!(
         name.as_str(),
-        "tactus-0123456789abcdef-01KZRN48A4ZK3AEDST3RJ8HMA4-\
-         01KZTAAAAAAAAAAAAAAAAAAAAA-c8e75afe1649f987"
+        "upstroke-0123456789abcdef-01KZRN48A4ZK3AEDST3RJ8HMA4-\
+         01KZTAAAAAAAAAAAAAAAAAAAAA-1a8e276b273887c0"
     );
     assert_eq!(
         name.intent_file_name(),
@@ -1389,7 +1401,7 @@ fn the_container_name_is_the_packets_template_and_its_hash_is_pinned() {
     assert_eq!(parts.repo_key, REPO_KEY);
     assert_eq!(parts.run_id, RUN_A);
     assert_eq!(parts.incarnation, INCARNATION_1);
-    assert_eq!(parts.invocation_hash, "c8e75afe1649f987");
+    assert_eq!(parts.invocation_hash, "1a8e276b273887c0");
 }
 
 /// The parse is injective over a hostile component grid.
@@ -1403,7 +1415,7 @@ fn the_name_is_injective_over_every_component_varied_independently() {
     let repo_keys = ["0123456789abcdef", "fedcba9876543210"];
     let runs = [RUN_A, RUN_B];
     let incarnations = [INCARNATION_1, INCARNATION_2];
-    let hashes = ["c8e75afe1649f987", "0ba209deb7340f44"];
+    let hashes = ["1a8e276b273887c0", "2886ac8ba70021d5"];
 
     let mut names = BTreeSet::new();
     let mut parsed = BTreeSet::new();
@@ -1462,11 +1474,11 @@ fn a_hostile_name_component_is_refused_and_the_refusal_says_why() {
     let mut refusals = BTreeSet::new();
     for bad in hostile {
         for position in 0..4 {
-            let mut parts = [REPO_KEY, RUN_A, INCARNATION_1, "c8e75afe1649f987"];
+            let mut parts = [REPO_KEY, RUN_A, INCARNATION_1, "1a8e276b273887c0"];
             parts[position] = bad;
             let error = ContainerName::from_parts(parts[0], parts[1], parts[2], parts[3])
                 .expect_err("a hostile component is refused");
-            assert!(matches!(error, TactusError::Refused { .. }));
+            assert!(matches!(error, UpstrokeError::Refused { .. }));
             refusals.insert(error.to_string());
         }
     }
@@ -1489,7 +1501,7 @@ fn a_hostile_name_component_is_refused_and_the_refusal_says_why() {
 /// **T-CONTAINER (9)** `probe_name_reuse_across_incarnations_never_collides`.
 ///
 /// `crash_reconstruction`: "the container name is
-/// `tactus-<repo_key>-<run_id>-<incarnation>-<invocation-hash>`, so
+/// `upstroke-<repo_key>-<run_id>-<incarnation>-<invocation-hash>`, so
 /// **deterministic InvocationIds never collide across incarnations and no
 /// earlier ownership evidence is overwritten**". ST-16 (f) is the same claim
 /// from the other side: "a probe invocation with the same deterministic
@@ -2170,11 +2182,11 @@ fn step_phrase(site: ContainerSite) -> &'static str {
 /// daemon the same question, so the table cannot drift into being its own
 /// oracle.
 const DAEMON_ALREADY_STOPPED: &str = "Error response from daemon: cannot kill container: \
-     tactus-c: container 0079320fdf5654fbf3aa45a154e4d49328c1cc1de3b1af4a6cc24540519ecede \
+     upstroke-c: container 0079320fdf5654fbf3aa45a154e4d49328c1cc1de3b1af4a6cc24540519ecede \
      is not running";
 const DAEMON_ABSENT_ON_KILL: &str =
-    "Error response from daemon: cannot kill container: tactus-c: No such container: tactus-c";
-const DAEMON_ABSENT_ON_STOP: &str = "Error response from daemon: No such container: tactus-c";
+    "Error response from daemon: cannot kill container: upstroke-c: No such container: upstroke-c";
+const DAEMON_ABSENT_ON_STOP: &str = "Error response from daemon: No such container: upstroke-c";
 
 /// A `docker stop` answer meaning "already settled" is tolerated; a real
 /// failure is not.
@@ -2221,9 +2233,9 @@ fn a_stop_answer_meaning_already_settled_is_tolerated_and_a_real_failure_is_not(
     // Real failures stay failures. `--force` removal and a kill the daemon could
     // not deliver are things a reclaimer must NOT report as convergence.
     for detail in [
-        "Error response from daemon: cannot kill container: tactus-c: tried to kill \
+        "Error response from daemon: cannot kill container: upstroke-c: tried to kill \
          container, but did not receive an exit event",
-        "Error response from daemon: cannot stop container: tactus-c: permission denied",
+        "Error response from daemon: cannot stop container: upstroke-c: permission denied",
     ] {
         let error = super::settle_stop(failed(detail)).expect_err("a real failure is a failure");
         assert!(!error.is_unreachable(), "{error}");
@@ -2242,7 +2254,7 @@ fn a_stop_answer_meaning_already_settled_is_tolerated_and_a_real_failure_is_not(
     assert!(unreachable.is_unreachable(), "{unreachable}");
 
     // The control: a stop that simply worked.
-    assert_eq!(super::settle_stop(Ok("tactus-c\n".to_owned())), Ok(()));
+    assert_eq!(super::settle_stop(Ok("upstroke-c\n".to_owned())), Ok(()));
 }
 
 /// A runtime whose `stop` answers the way the daemon does, settled through the
@@ -2572,7 +2584,7 @@ fn a_failed_operation_and_an_unreachable_one_are_different_answers() {
 fn a_containers_exit_status_and_streams_come_back_through_the_seam() {
     let runtime = FakeRuntime::new(ContainerTrace::recording());
     runtime.seed_container(
-        "tactus-a-b-c-d",
+        "upstroke-a-b-c-d",
         BTreeMap::new(),
         IMAGE_ID,
         IMAGE_ID,
@@ -2581,14 +2593,14 @@ fn a_containers_exit_status_and_streams_come_back_through_the_seam() {
     let mut seen = BTreeSet::new();
     for code in [Some(0), Some(17), None] {
         runtime.set_execution(
-            "tactus-a-b-c-d",
+            "upstroke-a-b-c-d",
             ContainerExecution {
                 exit_code: code,
                 stdout: b"out".to_vec(),
                 stderr: b"err".to_vec(),
             },
         );
-        let collected = runtime.collect("tactus-a-b-c-d").expect("collected");
+        let collected = runtime.collect("upstroke-a-b-c-d").expect("collected");
         assert_eq!(collected.exit_code, code);
         assert_eq!(collected.stdout, b"out");
         assert_eq!(collected.stderr, b"err");
@@ -2602,9 +2614,9 @@ fn a_containers_exit_status_and_streams_come_back_through_the_seam() {
 
     // Liveness is a separate axis from the exit status: a container can be
     // observed running while carrying an exit value from its previous state.
-    runtime.set_container_state("tactus-a-b-c-d", Liveness::Exited);
+    runtime.set_container_state("upstroke-a-b-c-d", Liveness::Exited);
     assert_eq!(
-        runtime.observe("tactus-a-b-c-d").expect("observed"),
+        runtime.observe("upstroke-a-b-c-d").expect("observed"),
         Liveness::Exited
     );
     assert!(!Liveness::Running.is_terminated());
@@ -2721,7 +2733,7 @@ fn the_namespace_scan_reads_every_record_and_skips_the_staged_half() {
     // Residue a reader must ignore: a staged half, and a file that is not an
     // intent at all.
     let dir = containers_dir(&fixture.root);
-    fs::write(dir.join("tactus-a-b-c-d.intent.tmp"), b"{}").expect("staged");
+    fs::write(dir.join("upstroke-a-b-c-d.intent.tmp"), b"{}").expect("staged");
     fs::write(dir.join("README"), b"not an intent").expect("stray");
 
     let found: Vec<FoundIntent> = list_intents(&fixture.root).expect("scanned");
@@ -3145,7 +3157,7 @@ fn real_docker_refuses_a_reference_it_does_not_hold_without_pulling() {
         Ok(docker) => docker,
         Err(reason) => return skipped(&reason),
     };
-    let absent = "ghcr.io/tactus-does-not-exist/nothing:v0";
+    let absent = "ghcr.io/upstroke-does-not-exist/nothing:v0";
     assert_eq!(
         docker.image_by_reference(absent).expect("reachable"),
         None,
@@ -3159,7 +3171,7 @@ fn real_docker_refuses_a_reference_it_does_not_hold_without_pulling() {
     );
     assert!(
         !docker
-            .volume_present("tactus-volume-that-does-not-exist")
+            .volume_present("upstroke-volume-that-does-not-exist")
             .expect("reachable")
     );
 }
@@ -3227,7 +3239,7 @@ fn real_docker_creates_from_an_id_reports_it_and_reclaims_idempotently() {
             // created, and it is what makes this test able to see the ordering.
             mounts: vec![Mount::Path {
                 source: view_path.clone(),
-                target: "/tactus/gitview".to_owned(),
+                target: "/upstroke/gitview".to_owned(),
                 read_only: false,
             }],
             env: Vec::new(),
@@ -3261,7 +3273,7 @@ fn real_docker_creates_from_an_id_reports_it_and_reclaims_idempotently() {
     assert_eq!(launched.reported_image_id, image.id);
     assert!(launched.intent_path.exists());
 
-    // Discovery finds it by `tactus.private_root`, with its five labels.
+    // Discovery finds it by `upstroke.private_root`, with its five labels.
     let discovered = docker
         .containers_with_label(LABEL_PRIVATE_ROOT, &private_root_label(&root))
         .expect("reachable");
@@ -3324,7 +3336,7 @@ fn real_docker_kill_on_an_already_exited_container_is_tolerated() {
         Err(reason) => return no_image(&reason),
     };
 
-    let name = "tactus-f1-already-exited";
+    let name = "upstroke-f1-already-exited";
     let spec = CreateSpec {
         name: name.to_owned(),
         image_id: image.id.clone(),
@@ -3399,7 +3411,7 @@ fn real_docker_returns_both_streams_of_a_container_separately() {
         Err(reason) => return no_image(&reason),
     };
 
-    let name = "tactus-f1-two-streams";
+    let name = "upstroke-f1-two-streams";
     let spec = CreateSpec {
         name: name.to_owned(),
         image_id: image.id.clone(),
@@ -3481,8 +3493,8 @@ fn real_docker_removing_a_container_reclaims_its_anonymous_volumes() {
         Err(reason) => return no_image(&reason),
     };
 
-    let name = "tactus-f1-anonymous-volume";
-    let named = "tactus-f1-operator-owned";
+    let name = "upstroke-f1-anonymous-volume";
+    let named = "upstroke-f1-operator-owned";
     let _ = docker.remove(name);
     // R20's half: a NAMED volume the operator owns, mounted into the same
     // container. `--volumes` must not touch it.
@@ -3508,9 +3520,9 @@ fn real_docker_removing_a_container_reclaims_its_anonymous_volumes() {
                 // one because it requires a name, which is why this goes through
                 // the test-only raw accessor.
                 "--volume",
-                "/tactus-anonymous",
+                "/upstroke-anonymous",
                 "--volume",
-                &format!("{named}:/tactus-named"),
+                &format!("{named}:/upstroke-named"),
                 &image.id,
                 "/bin/sh",
                 "-c",
@@ -3578,7 +3590,7 @@ fn real_docker_removing_a_container_reclaims_its_anonymous_volumes() {
 /// The format string asks for exactly the labels the parser names, in order.
 ///
 /// Two lists that must agree; the failure mode if they drift is a field read
-/// under the wrong name, which for `tactus.run_dir` is a probe of another run's
+/// under the wrong name, which for `upstroke.run_dir` is a probe of another run's
 /// lock. The oracle is the format string's own text, scanned for `{{.Label
 /// "…"}}` — an independent derivation from `PS_LABELS`, not a restatement.
 #[test]
@@ -3628,20 +3640,20 @@ fn the_ps_format_asks_for_exactly_the_labels_the_parser_names() {
 /// checked against the live daemon.
 ///
 /// Second field held constant: every line carries the same container name and
-/// the same four other labels; only `tactus.run_dir`'s bytes move, across
+/// the same four other labels; only `upstroke.run_dir`'s bytes move, across
 /// values that are and are not hostile to a comma-joined format.
 #[test]
 fn a_label_value_carrying_a_comma_or_an_equals_is_read_whole() {
     let sep = PS_FIELD_SEPARATOR;
     let values = [
-        "/repo/.tactus/runs/B",
-        "/repo/a%2Cb/.tactus/runs/B",
+        "/repo/.upstroke/runs/B",
+        "/repo/a%2Cb/.upstroke/runs/B",
         // Not values `path_label` emits — a foreign container may carry
         // anything, and the parser must still read the field it was given
         // rather than the prefix before the first comma.
-        "/repo/a,b/.tactus/runs/B",
-        "/repo/a=b/.tactus/runs/B",
-        "/repo/a,tactus.run=IMPOSTOR/.tactus/runs/B",
+        "/repo/a,b/.upstroke/runs/B",
+        "/repo/a=b/.upstroke/runs/B",
+        "/repo/a,upstroke.run=IMPOSTOR/.upstroke/runs/B",
     ];
     assert_eq!(
         values.iter().collect::<BTreeSet<_>>().len(),
@@ -3649,11 +3661,12 @@ fn a_label_value_carrying_a_comma_or_an_equals_is_read_whole() {
         "five distinct run directories"
     );
     for value in values {
-        let line =
-            format!("tactus-k-r-i-h{sep}/srv/private{sep}RUNB{sep}{value}{sep}INC2{sep}p.shell.o0");
+        let line = format!(
+            "upstroke-k-r-i-h{sep}/srv/private{sep}RUNB{sep}{value}{sep}INC2{sep}p.shell.o0"
+        );
         let found = parse_ps_output(&line).expect("one container");
         assert_eq!(found.len(), 1, "`{value}`");
-        assert_eq!(found[0].name, "tactus-k-r-i-h", "`{value}`");
+        assert_eq!(found[0].name, "upstroke-k-r-i-h", "`{value}`");
         assert_eq!(
             found[0].label(LABEL_RUN_DIR),
             Some(value),
@@ -3843,7 +3856,7 @@ fn the_two_docker_diagnostic_tables_never_claim_one_message() {
 /// not.
 ///
 /// `PR6-RECOV-002`'s premise, checked against `docker` rather than against a
-/// transcription of it: a container is created whose `tactus.run_dir` contains
+/// transcription of it: a container is created whose `upstroke.run_dir` contains
 /// a comma, and the two renderings are compared. The comma-joined one is
 /// **asserted to be ambiguous** — it is byte-identical to what a container with
 /// an extra label would print — and the census's own path is asserted to give
@@ -3867,8 +3880,8 @@ fn real_docker_renders_a_comma_bearing_label_value_whole() {
     };
 
     let root = format!("/srv/private/r2-labels-{}", std::process::id());
-    let hostile = "/repo/a,b=c/.tactus/runs/RUNB";
-    let name = format!("tactus-r2labels-{}", std::process::id());
+    let hostile = "/repo/a,b=c/.upstroke/runs/RUNB";
+    let name = format!("upstroke-r2labels-{}", std::process::id());
     let mut labels = BTreeMap::new();
     labels.insert(LABEL_PRIVATE_ROOT.to_owned(), root.clone());
     labels.insert(LABEL_RUN.to_owned(), "RUNB".to_owned());
@@ -3981,7 +3994,7 @@ fn real_docker_prints_the_transcribed_unreachable_diagnostics() {
     #[cfg(unix)]
     let denied = {
         use std::os::unix::fs::PermissionsExt as _;
-        let dir = std::env::temp_dir().join(format!("tactus-r2-denied-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("upstroke-r2-denied-{}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).expect("a scratch directory");
         fs::set_permissions(&dir, fs::Permissions::from_mode(0o000)).expect("chmod 000");
@@ -4052,8 +4065,8 @@ fn real_docker_prints_the_transcribed_unreachable_diagnostics() {
 #[test]
 #[ignore = "spawned as a subprocess by the_production_lock_probe_sees_a_lock_another_process_holds"]
 fn container_lock_probe_child_holds_the_run() {
-    let public = PathBuf::from(std::env::var("TACTUS_TEST_LOCK_DIR").expect("run dir"));
-    let ready = PathBuf::from(std::env::var("TACTUS_TEST_READY").expect("readiness path"));
+    let public = PathBuf::from(std::env::var("UPSTROKE_TEST_LOCK_DIR").expect("run dir"));
+    let ready = PathBuf::from(std::env::var("UPSTROKE_TEST_READY").expect("readiness path"));
     let _held = crate::rundir::RunLock::acquire(&public).expect("the child takes the run lock");
     fs::write(&ready, b"held").expect("say the lock is held");
     std::thread::sleep(std::time::Duration::from_secs(30));
@@ -4106,8 +4119,8 @@ fn the_production_lock_probe_sees_a_lock_another_process_holds() {
         .arg("runner::container::tests::container_lock_probe_child_holds_the_run")
         .arg("--ignored");
     let mut child = host::build_command(&spec)
-        .env("TACTUS_TEST_LOCK_DIR", &paths.public)
-        .env("TACTUS_TEST_READY", &ready)
+        .env("UPSTROKE_TEST_LOCK_DIR", &paths.public)
+        .env("UPSTROKE_TEST_READY", &ready)
         .spawn()
         .expect("spawn the owner process");
 
@@ -4256,7 +4269,7 @@ fn discarding_a_role_view_twice_converges() {
     let trace = ContainerTrace::recording();
     let view: &dyn GitView = &super::view::RoleGitView::new(trace.clone());
     let root = scratch("role-view-twice");
-    let path = root.join("views").join("tactus-k-r-i-h");
+    let path = root.join("views").join("upstroke-k-r-i-h");
     fs::create_dir_all(path.join("objects").join("pack")).expect("a view with depth");
     fs::write(path.join("HEAD"), b"0000\n").expect("a file in it");
 
@@ -4292,7 +4305,7 @@ fn a_role_view_that_cannot_be_removed_refuses_and_records_nothing() {
     let view: &dyn GitView = &super::view::RoleGitView::new(trace.clone());
     let root = scratch("role-view-protected");
     let parent = root.join("views");
-    let path = parent.join("tactus-k-r-i-h");
+    let path = parent.join("upstroke-k-r-i-h");
     fs::create_dir_all(&path).expect("the view");
     fs::write(path.join("HEAD"), b"0000\n").expect("a file in it");
     fs::set_permissions(&parent, fs::Permissions::from_mode(0o500)).expect("clear the write bit");
@@ -4307,7 +4320,7 @@ fn a_role_view_that_cannot_be_removed_refuses_and_records_nothing() {
         .discard(&path)
         .expect_err("a view that is still there must not be reported discarded");
     assert!(
-        matches!(error, TactusError::Io { .. }),
+        matches!(error, UpstrokeError::Io { .. }),
         "the refusal must carry the IO error that stopped it: {error:?}"
     );
     assert!(
@@ -4358,9 +4371,9 @@ fn a_create_whose_named_volume_is_absent_is_refused_before_any_effect() {
     /// Three agents, three volume names — all distinct, so a check that
     /// inspected the wrong one is visible.
     const CREDENTIALS: &[(&str, &str)] = &[
-        ("claude-code", "tactus-creds-claude"),
-        ("copilot", "tactus-creds-copilot"),
-        ("codex", "tactus-creds-codex"),
+        ("claude-code", "upstroke-creds-claude"),
+        ("copilot", "upstroke-creds-copilot"),
+        ("codex", "upstroke-creds-codex"),
     ];
 
     let mut refusals = BTreeSet::new();
@@ -4387,7 +4400,7 @@ fn a_create_whose_named_volume_is_absent_is_refused_before_any_effect() {
             let mut spec = fixture.plan.spec.clone();
             spec.mounts.push(Mount::Volume {
                 name: (*volume).to_owned(),
-                target: format!("/tactus/credentials/{agent}"),
+                target: format!("/upstroke/credentials/{agent}"),
                 read_only: false,
             });
             if !reachable {
@@ -4494,8 +4507,8 @@ fn real_docker_creates_an_absent_named_volume_rather_than_refusing() {
         Err(reason) => return no_image(&reason),
     };
 
-    let name = "tactus-r3b-implicit-volume";
-    let volume = "tactus-r3b-absent-credential-volume";
+    let name = "upstroke-r3b-implicit-volume";
+    let volume = "upstroke-r3b-absent-credential-volume";
     let _ = docker.remove(name);
     let _ = docker.raw(
         RuntimeOp::InspectVolume,
@@ -4516,7 +4529,7 @@ fn real_docker_creates_an_absent_named_volume_rather_than_refusing() {
             "--name",
             name,
             "--mount",
-            &format!("type=volume,source={volume},target=/tactus/credentials/codex"),
+            &format!("type=volume,source={volume},target=/upstroke/credentials/codex"),
             &image.id,
             "/bin/sh",
             "-c",
@@ -4560,7 +4573,7 @@ fn real_docker_creates_an_absent_named_volume_rather_than_refusing() {
 /// [`real_docker_prints_the_transcribed_removal_in_progress_diagnostic`] asks
 /// the live daemon the same question so the table cannot become its own oracle.
 const DAEMON_REMOVAL_IN_PROGRESS: &str =
-    "Error response from daemon: removal of container tactus-c is already in progress";
+    "Error response from daemon: removal of container upstroke-c is already in progress";
 
 /// A `docker rm` answer meaning "somebody else is already removing it" is
 /// tolerated; a real failure is not.
@@ -4596,7 +4609,7 @@ fn a_removal_answer_meaning_already_in_progress_is_tolerated_and_a_real_failure_
     let tolerated = [
         DAEMON_REMOVAL_IN_PROGRESS,
         DAEMON_ABSENT_ON_STOP,
-        "Error response from daemon: No such object: tactus-c",
+        "Error response from daemon: No such object: upstroke-c",
     ];
     for detail in tolerated {
         assert_eq!(
@@ -4625,8 +4638,8 @@ fn a_removal_answer_meaning_already_in_progress_is_tolerated_and_a_real_failure_
     ));
 
     for detail in [
-        "Error response from daemon: cannot remove container: tactus-c: permission denied",
-        "Error response from daemon: You cannot remove a running container tactus-c",
+        "Error response from daemon: cannot remove container: upstroke-c: permission denied",
+        "Error response from daemon: You cannot remove a running container upstroke-c",
     ] {
         let error = super::settle_remove(failed(detail)).expect_err("a real failure is a failure");
         assert!(!error.is_unreachable(), "{error}");
@@ -4645,7 +4658,7 @@ fn a_removal_answer_meaning_already_in_progress_is_tolerated_and_a_real_failure_
     assert!(super::stop_already_settled(DAEMON_REMOVAL_IN_PROGRESS));
 
     // The control: a removal that simply worked.
-    assert_eq!(super::settle_remove(Ok("tactus-c\n".to_owned())), Ok(()));
+    assert_eq!(super::settle_remove(Ok("upstroke-c\n".to_owned())), Ok(()));
 }
 
 /// The live daemon really does answer overlapping removals that way.
@@ -4677,7 +4690,7 @@ fn real_docker_prints_the_transcribed_removal_in_progress_diagnostic() {
         Err(reason) => return no_image(&reason),
     };
 
-    let name = "tactus-r3b-removal-race";
+    let name = "upstroke-r3b-removal-race";
     let mut observed: Option<String> = None;
     // A few attempts: the race is real and a machine may serve one removal
     // before the others are issued.

@@ -74,7 +74,7 @@ use std::sync::{Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
 use crate::agent::ProcessOutput;
-use crate::error::TactusError;
+use crate::error::UpstrokeError;
 use crate::rundir::RunPaths;
 use crate::runner::policy::runner_policy_sha256;
 use crate::runner::{AgentId, ExecutionRole, InvocationId, Runner, RunnerRequest};
@@ -183,7 +183,7 @@ pub const fn receives_a_worktree(role: &ExecutionRole) -> bool {
 /// later has to name its passage here.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum Withheld {
-    /// `<repo>/.tactus/runs/<run-id>` — `events.jsonl`, the frozen plan,
+    /// `<repo>/.upstroke/runs/<run-id>` — `events.jsonl`, the frozen plan,
     /// questions, answers, artifacts.
     PublicLog,
     /// Every other role's worktree of this run, and the integration staging
@@ -389,11 +389,11 @@ fn worktree_namespaces(execution_root: &Path) -> Vec<PathBuf> {
 ///
 /// # Errors
 ///
-/// [`TactusError::Refused`] when the policy is not a container policy or
+/// [`UpstrokeError::Refused`] when the policy is not a container policy or
 /// records no image.
-pub fn recorded_image_id(policy: &RunnerPolicy) -> Result<&str, TactusError> {
+pub fn recorded_image_id(policy: &RunnerPolicy) -> Result<&str, UpstrokeError> {
     if policy.kind != RunnerKind::Container || policy.policy != RunnerContract::ContainerV1 {
-        return Err(TactusError::Refused {
+        return Err(UpstrokeError::Refused {
             message: format!(
                 "the container runner was given a `{:?}`/`{:?}` RunnerPolicy; \
                  `container-v1` is the mount, environment, Git-view and supervision \
@@ -403,7 +403,7 @@ pub fn recorded_image_id(policy: &RunnerPolicy) -> Result<&str, TactusError> {
         });
     }
     let Some(image) = &policy.image else {
-        return Err(TactusError::Refused {
+        return Err(UpstrokeError::Refused {
             message: "the recorded RunnerPolicy is a container policy with no image; INV-23 \
                       records `image: {reference, id, digest}` and every container is created \
                       from the recorded id"
@@ -411,7 +411,7 @@ pub fn recorded_image_id(policy: &RunnerPolicy) -> Result<&str, TactusError> {
         });
     };
     if image.id.trim().is_empty() {
-        return Err(TactusError::Refused {
+        return Err(UpstrokeError::Refused {
             message: "the recorded RunnerPolicy carries an empty image id".to_owned(),
         });
     }
@@ -546,7 +546,7 @@ impl ContainerRunner {
     ///
     /// # Errors
     ///
-    /// [`TactusError::Refused`] when `policy` is not a usable container policy
+    /// [`UpstrokeError::Refused`] when `policy` is not a usable container policy
     /// — see [`recorded_image_id`].
     pub fn new(
         policy: RunnerPolicy,
@@ -554,7 +554,7 @@ impl ContainerRunner {
         repo_root: &Path,
         environment: ContainerEnvironment,
         runtime: Box<dyn ContainerRuntime>,
-    ) -> Result<Self, TactusError> {
+    ) -> Result<Self, UpstrokeError> {
         let image_id = recorded_image_id(&policy)?.to_owned();
         let digest = runner_policy_sha256(&policy);
         let volumes = recorded_volumes(&policy);
@@ -692,10 +692,10 @@ impl ContainerRunner {
     ///
     /// # Errors
     ///
-    /// [`TactusError::Refused`] when the overlay names a reserved key, when the
+    /// [`UpstrokeError::Refused`] when the overlay names a reserved key, when the
     /// container name cannot be built from the request's identity, or when the
     /// mount plan would hand the container a withheld path.
-    pub fn plan(&self, request: &RunnerRequest) -> Result<InvocationPlan, TactusError> {
+    pub fn plan(&self, request: &RunnerRequest) -> Result<InvocationPlan, UpstrokeError> {
         let name = ContainerName::new(
             &self.identity.repo_key,
             &self.identity.run_id,
@@ -734,7 +734,7 @@ impl ContainerRunner {
         }
         let violations = confinement.violations(&mounts);
         if !violations.is_empty() {
-            return Err(TactusError::Refused {
+            return Err(UpstrokeError::Refused {
                 message: format!(
                     "the container for `{}` would receive a path this run withholds: {}",
                     request.invocation.render(),
@@ -965,13 +965,13 @@ impl ContainerRunner {
     ///
     /// # Errors
     ///
-    /// [`TactusError::Refused`] when the reported image id differs from the
+    /// [`UpstrokeError::Refused`] when the reported image id differs from the
     /// record, or whatever a step returns.
     fn launch(
         &self,
         hooks: &mut dyn ContainerHooks,
         plan: &LaunchPlan,
-    ) -> Result<Launched, TactusError> {
+    ) -> Result<Launched, UpstrokeError> {
         // The **fifth** exit (`PR6-ACCT-003`). R1's table began at
         // `MountGitView` because a `write_intent` that fails has written
         // nothing — which is true only of a failure at the `Before` phase. The
@@ -1107,14 +1107,14 @@ impl ContainerRunner {
         &self,
         hooks: &mut dyn ContainerHooks,
         plan: &LaunchPlan,
-        cause: TactusError,
+        cause: UpstrokeError,
         reached: Reached,
-    ) -> TactusError {
+    ) -> UpstrokeError {
         let residue = self.cancel(hooks, &plan.private_root, &plan.name, &reached);
         if residue.is_empty() {
             return cause;
         }
-        TactusError::Refused {
+        UpstrokeError::Refused {
             message: format!(
                 "{cause}. The cancel could not release everything the failed launch created, \
                  so this run's R19/R26 ledgers do not balance and a census will find the \
@@ -1169,13 +1169,13 @@ impl ContainerRunner {
     ///
     /// # Errors
     ///
-    /// [`TactusError::Refused`] naming every step that could not be completed.
+    /// [`UpstrokeError::Refused`] naming every step that could not be completed.
     fn release(
         &self,
         hooks: &mut dyn ContainerHooks,
         private_root: &Path,
         launched: &Launched,
-    ) -> Result<(), TactusError> {
+    ) -> Result<(), UpstrokeError> {
         super::release(
             hooks,
             self.runtime.as_ref(),
@@ -1190,7 +1190,7 @@ impl ContainerRunner {
     /// "timeout or shutdown stops and removes the container"
     /// (`slice_contract.cancellation`). The stop and the removal are the
     /// caller's [`super::release`]; this decides *which* disposition.
-    fn supervise(&self, name: &ContainerName, deadline: Instant) -> Result<bool, TactusError> {
+    fn supervise(&self, name: &ContainerName, deadline: Instant) -> Result<bool, UpstrokeError> {
         loop {
             let state = self
                 .runtime
@@ -1225,7 +1225,7 @@ impl ContainerRunner {
 /// (`UnavailableOutcome::Deferred` — "an outage never fails a task on its
 /// own").
 ///
-/// The shipped code returned one [`TactusError::Refused`] for both, so a caller
+/// The shipped code returned one [`UpstrokeError::Refused`] for both, so a caller
 /// could not tell the two phases apart and the mid-run half of the clause was
 /// unreachable — `PR6-CORRECTNESS-001`. The *settlement event* is PR7's
 /// (`invariants_introduced`: the container transition is "test-only until PR7
@@ -1268,13 +1268,13 @@ impl ImageIdMismatch {
     ///
     /// **The variant is the classification**, not a substring of the message: a
     /// caller that had to grep prose to tell a refusal from an outage would be
-    /// reading an oracle nobody can keep stable. [`TactusError::Agent`] is this
+    /// reading an oracle nobody can keep stable. [`UpstrokeError::Agent`] is this
     /// engine's existing channel for "the runner could not produce a usable
     /// process" — `agent::proc` returns it for a failed spawn and
     /// `gates::Scripted::SpawnFailure` returns it — which is the shape
     /// `InfrastructureKind::RunnerSpawnFailure` settles.
     #[must_use]
-    pub fn error(self, name: &ContainerName, reported: &str, recorded: &str) -> TactusError {
+    pub fn error(self, name: &ContainerName, reported: &str, recorded: &str) -> UpstrokeError {
         let message = format!(
             "the container runtime created `{name}` and reports image id `{reported}`, and the \
              run's recorded image id is `{recorded}`; a created container whose reported image \
@@ -1289,8 +1289,8 @@ impl ImageIdMismatch {
             }
         );
         match self {
-            Self::RefusedBeforeStart => TactusError::Refused { message },
-            Self::SpawnFailureOutage => TactusError::Agent { message },
+            Self::RefusedBeforeStart => UpstrokeError::Refused { message },
+            Self::SpawnFailureOutage => UpstrokeError::Agent { message },
         }
     }
 
@@ -1341,7 +1341,7 @@ pub fn view_dir(private_root: &Path, name: &ContainerName) -> PathBuf {
 }
 
 impl Runner for ContainerRunner {
-    fn run(&self, request: &RunnerRequest) -> Result<ProcessOutput, TactusError> {
+    fn run(&self, request: &RunnerRequest) -> Result<ProcessOutput, UpstrokeError> {
         let plan = self.plan(request)?;
         let started = Instant::now();
         let deadline = started + request.timeout;
@@ -1374,7 +1374,7 @@ impl ContainerRunner {
         launched: &Launched,
         started: Instant,
         deadline: Instant,
-    ) -> Result<ProcessOutput, TactusError> {
+    ) -> Result<ProcessOutput, UpstrokeError> {
         let timed_out = self.supervise(&launched.name, deadline)?;
         // Collected **before** the release: `docker logs` answers for a running
         // container and not for a removed one, so a timed-out invocation still
@@ -1400,8 +1400,8 @@ impl ContainerRunner {
 }
 
 /// A runtime failure, as the engine's error type.
-fn refused_by_runtime(error: RuntimeError) -> TactusError {
-    TactusError::Refused {
+fn refused_by_runtime(error: RuntimeError) -> UpstrokeError {
+    UpstrokeError::Refused {
         message: error.to_string(),
     }
 }
@@ -1475,13 +1475,13 @@ mod tests {
         "sha256:1111111111111111111111111111111111111111111111111111111111111111";
     const OTHER_IMAGE_ID: &str =
         "sha256:2222222222222222222222222222222222222222222222222222222222222222";
-    const IMAGE_REFERENCE: &str = "ghcr.io/example/tactus-runner:v1";
+    const IMAGE_REFERENCE: &str = "ghcr.io/example/upstroke-runner:v1";
     const MANIFEST_DIGEST: &str =
         "sha256:3333333333333333333333333333333333333333333333333333333333333333";
     const VOLUMES: &[(&str, &str)] = &[
-        ("claude-code", "tactus-creds-claude"),
-        ("copilot", "tactus-creds-copilot"),
-        ("codex", "tactus-creds-codex"),
+        ("claude-code", "upstroke-creds-claude"),
+        ("copilot", "upstroke-creds-copilot"),
+        ("codex", "upstroke-creds-codex"),
     ];
     /// Written into the run's public log, so a container that could read it
     /// would be caught by content rather than by the absence of a file.
@@ -1494,7 +1494,7 @@ mod tests {
     /// one with a working-directory-relative component, refuses every
     /// invocation (`PR6-CORRECTNESS-006`). The value is the one every image
     /// this suite discovers actually carries, read off `docker image inspect`
-    /// for `tactus-test/git:v1`, `alpine:3.20` and `busybox:latest`.
+    /// for `upstroke-test/git:v1`, `alpine:3.20` and `busybox:latest`.
     const IMAGE_PATH: &str = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin";
 
     /// A `PATH` whose second component is the working directory.
@@ -1514,7 +1514,7 @@ mod tests {
             [
                 ("PATH", IMAGE_PATH),
                 ("HOME", "/root"),
-                ("TACTUS_IMAGE_MARKER", IMAGE_MARKER_VALUE),
+                ("UPSTROKE_IMAGE_MARKER", IMAGE_MARKER_VALUE),
             ]
             .into_iter()
             .map(|(key, value)| (key.to_owned(), value.to_owned()))
@@ -1995,22 +1995,22 @@ mod tests {
         assert_eq!(
             targets,
             vec![
-                "/tactus/workspace",
-                "/tactus/gitview",
-                "/tactus/gitobjects",
-                "/tactus/workspace/.git",
-                "/tactus/credentials/claude-code",
+                "/upstroke/workspace",
+                "/upstroke/gitview",
+                "/upstroke/gitobjects",
+                "/upstroke/workspace/.git",
+                "/upstroke/credentials/claude-code",
                 "/tmp",
             ],
             "the mount set moved"
         );
         assert_eq!(
-            target_of(mounts, "/tactus/gitobjects").map(Mount::read_only),
+            target_of(mounts, "/upstroke/gitobjects").map(Mount::read_only),
             Some(true),
             "the borrowed object store is read-only (DESIGN.md:612)"
         );
         assert_eq!(
-            target_of(mounts, "/tactus/workspace").map(Mount::read_only),
+            target_of(mounts, "/upstroke/workspace").map(Mount::read_only),
             Some(false),
             "an implementer writes to its worktree"
         );
@@ -2168,7 +2168,7 @@ mod tests {
         let mut without = Vec::new();
         for request in requests(&fixture.task_a) {
             let plan = runner.plan(&request).expect("plans");
-            match target_of(plan.mounts(), "/tactus/workspace") {
+            match target_of(plan.mounts(), "/upstroke/workspace") {
                 Some(mount) if mount.read_only() => read_only.push(request.role.label()),
                 Some(_) => writable.push(request.role.label()),
                 None => without.push(request.role.label()),
@@ -2300,7 +2300,7 @@ mod tests {
             assert!(
                 fixture
                     .runtime
-                    .volume_present("tactus-creds-claude")
+                    .volume_present("upstroke-creds-claude")
                     .expect("reachable"),
                 "the volume this role must not receive does not exist"
             );
@@ -2341,7 +2341,7 @@ mod tests {
         );
         assert_eq!(
             volume_names,
-            BTreeSet::from(["tactus-creds-claude".to_owned()]),
+            BTreeSet::from(["upstroke-creds-claude".to_owned()]),
             "the volume is the one the record names for that agent"
         );
     }
@@ -2424,7 +2424,7 @@ mod tests {
     /// `expected_failures_refusals[3]` gives the mismatch two outcomes: "refused
     /// before start (**pre-flight/rebuild**)" or "settled as a
     /// **`RunnerSpawnFailure` outage** (mid-run)". The shipped code returned one
-    /// `TactusError::Refused` for both, so the mid-run half was unreachable to
+    /// `UpstrokeError::Refused` for both, so the mid-run half was unreachable to
     /// any caller — `PR6-CORRECTNESS-001`, whose surviving mutation was to
     /// change the variant and keep the message, because the test checked only
     /// `expect_err`, substrings, `Start`'s absence and cleanup.
@@ -2514,12 +2514,12 @@ mod tests {
             );
             match expected {
                 ImageIdMismatch::RefusedBeforeStart => assert!(
-                    matches!(refusal, TactusError::Refused { .. }),
+                    matches!(refusal, UpstrokeError::Refused { .. }),
                     "{phase}: a pre-flight mismatch must be a refusal before any spend: \
                      {refusal:?}"
                 ),
                 ImageIdMismatch::SpawnFailureOutage => assert!(
-                    matches!(refusal, TactusError::Agent { .. }),
+                    matches!(refusal, UpstrokeError::Agent { .. }),
                     "{phase}: a mid-run mismatch reached the caller as the same generic refusal a \
                      pre-flight one does, so the RunnerSpawnFailure outage settlement the \
                      contract requires is unreachable: {refusal:?}"
@@ -2616,7 +2616,7 @@ mod tests {
                 ContainerName::new(REPO_KEY, RUN_ID, INCARNATION_1, invocation).expect("a name");
             let error = got.error(&name, OTHER_IMAGE_ID, IMAGE_ID);
             assert_eq!(
-                matches!(error, TactusError::Refused { .. }),
+                matches!(error, UpstrokeError::Refused { .. }),
                 *expected == ImageIdMismatch::RefusedBeforeStart,
                 "{what}: {error:?}"
             );
@@ -2789,7 +2789,7 @@ mod tests {
     /// a nonzero `ProcessOutput`, which is not what the clause says: the shell
     /// cell reaches its refusal through `host::run_shell_probe`, and the agent
     /// half's equivalent is [`AgentAdapter::probe`], which is where a nonzero
-    /// `--version` becomes a `TactusError`. Deleting that refusal left this
+    /// `--version` becomes a `UpstrokeError`. Deleting that refusal left this
     /// named test green, because "the runner returned code 1" was all it
     /// asked. It now drives `ClaudeCodeAdapter::probe` over the container
     /// runner and asserts the **refusal**, so the cell holds
@@ -3075,10 +3075,10 @@ mod tests {
             assert_eq!(
                 difference,
                 BTreeSet::from([
-                    &"/tactus/workspace",
-                    &"/tactus/gitview",
-                    &"/tactus/gitobjects",
-                    &"/tactus/workspace/.git",
+                    &"/upstroke/workspace",
+                    &"/upstroke/gitview",
+                    &"/upstroke/gitobjects",
+                    &"/upstroke/workspace/.git",
                 ]),
                 "{tag}: the probe and the execution differ by something other than the worktree"
             );
@@ -3092,7 +3092,7 @@ mod tests {
     /// base, one name rule, one overlay, and all five `ExecutionRole` values
     /// including both probe targets — `ExecutionRole::all()` returns five for
     /// exactly this reason. The base is explicit rather than each runner's own,
-    /// because the two bases are *supposed* to differ (the Tactus environment
+    /// because the two bases are *supposed* to differ (the Upstroke environment
     /// and the image environment) and a comparison of those would be a
     /// comparison of two fixtures rather than of two composition rules.
     ///
@@ -3107,7 +3107,7 @@ mod tests {
             ("HOME", "/root"),
             ("LANG", "C.UTF-8"),
             ("CLAUDE_CONFIG_DIR", "/host/claude"),
-            ("TACTUS_SHARED", "shared"),
+            ("UPSTROKE_SHARED", "shared"),
         ]
         .into_iter()
         .map(|(key, value)| (key.to_owned(), value.to_owned()))
@@ -3125,7 +3125,7 @@ mod tests {
             .collect();
         let layout = BoundaryLayout::new();
         let overlay = vec![
-            ("TACTUS_OVERLAY".to_owned(), "1".to_owned()),
+            ("UPSTROKE_OVERLAY".to_owned(), "1".to_owned()),
             ("LANG".to_owned(), "en_GB.UTF-8".to_owned()),
         ];
 
@@ -3510,7 +3510,7 @@ mod tests {
     /// re-login" (DESIGN.md:612).
     #[test]
     fn a_credential_volume_is_never_created_or_pruned_by_any_disposition() {
-        let volume = "tactus-creds-claude";
+        let volume = "upstroke-creds-claude";
         /// One way an invocation of this runner can end.
         type Disposition = (&'static str, fn(&Fixture));
         let dispositions: Vec<Disposition> = vec![
@@ -3959,7 +3959,7 @@ mod tests {
              lifecycle sentence names is driven by no outcome"
         );
 
-        let volume = "tactus-creds-claude";
+        let volume = "upstroke-creds-claude";
         for (outcome, r19, r20, r26, mechanism) in OUTCOMES {
             let fixture = Fixture::new(&format!("outcome-{outcome}"), true);
             // R20's premise: the operator's volume is there before anything
@@ -4417,7 +4417,7 @@ mod tests {
     }
 
     impl GitView for IntentPeek {
-        fn materialize(&self, request: &GitViewRequest) -> Result<PathBuf, TactusError> {
+        fn materialize(&self, request: &GitViewRequest) -> Result<PathBuf, UpstrokeError> {
             // The view directory is `<R>/views/<container-name>`, so its file
             // name is the container's.
             let name = request
@@ -4438,7 +4438,7 @@ mod tests {
             self.inner.materialize(request)
         }
 
-        fn discard(&self, path: &Path) -> Result<(), TactusError> {
+        fn discard(&self, path: &Path) -> Result<(), UpstrokeError> {
             self.inner.discard(path)
         }
     }
@@ -4449,13 +4449,13 @@ mod tests {
     struct FailingView;
 
     impl GitView for FailingView {
-        fn materialize(&self, request: &GitViewRequest) -> Result<PathBuf, TactusError> {
-            Err(TactusError::Refused {
+        fn materialize(&self, request: &GitViewRequest) -> Result<PathBuf, UpstrokeError> {
+            Err(UpstrokeError::Refused {
                 message: format!("VIEW-REFUSED for {}", request.path.display()),
             })
         }
 
-        fn discard(&self, _path: &Path) -> Result<(), TactusError> {
+        fn discard(&self, _path: &Path) -> Result<(), UpstrokeError> {
             Ok(())
         }
     }
@@ -4819,7 +4819,7 @@ mod tests {
         assert!(
             matches!(
                 &refusal,
-                TactusError::Io { source, .. } if source.kind() == std::io::ErrorKind::NotFound
+                UpstrokeError::Io { source, .. } if source.kind() == std::io::ErrorKind::NotFound
             ),
             "a missing record must refuse as a missing file: {refusal}"
         );
@@ -4833,7 +4833,10 @@ mod tests {
             .expect("a malformed record");
         let refusal = crate::runner::container::intent::IntentWritten::certify(&root, &mine)
             .expect_err("a malformed record is not evidence");
-        assert!(matches!(refusal, TactusError::Refused { .. }), "{refusal}");
+        assert!(
+            matches!(refusal, UpstrokeError::Refused { .. }),
+            "{refusal}"
+        );
 
         // The control: a real record certifies, so (1a) and (1b) are about the
         // record and not about `certify` never succeeding.
@@ -5110,9 +5113,9 @@ mod tests {
         assert_eq!(
             seen,
             BTreeMap::from([
-                ("implement".to_owned(), "/tactus/workspace".to_owned()),
-                ("gate".to_owned(), "/tactus/workspace".to_owned()),
-                ("review".to_owned(), "/tactus/workspace".to_owned()),
+                ("implement".to_owned(), "/upstroke/workspace".to_owned()),
+                ("gate".to_owned(), "/upstroke/workspace".to_owned()),
+                ("review".to_owned(), "/upstroke/workspace".to_owned()),
                 ("probe(shell)".to_owned(), "/tmp".to_owned()),
                 ("probe(claude-code)".to_owned(), "/tmp".to_owned()),
             ]),
@@ -5276,12 +5279,12 @@ mod tests {
     /// **These tests never pull.** `non_goals[1]` is "implicit image pull", and
     /// a fixture that pulled would exercise the behaviour the slice forbids on
     /// the very runtime the refusal is meant to be proven against. So the image
-    /// is *discovered* among what the machine already holds. `tactus-test/git:v1`
+    /// is *discovered* among what the machine already holds. `upstroke-test/git:v1`
     /// is first because it is the only local image carrying both a shell and
-    /// `git`, and because its `TACTUS_IMAGE_MARKER` is how "the container runner
+    /// `git`, and because its `UPSTROKE_IMAGE_MARKER` is how "the container runner
     /// starts from the **image** environment" is measured rather than asserted.
     const PREFERRED_IMAGES: &[&str] = &[
-        "tactus-test/git:v1",
+        "upstroke-test/git:v1",
         "alpine:3.20",
         "busybox:latest",
         "debian:stable-slim",
@@ -5297,10 +5300,10 @@ mod tests {
     /// `PR6A-ANONYMOUS-VOLUMES-LEAK`. A fallback that breaks
     /// `DOCKER-SUBSTRATE.md`'s "leave the daemon as you found it" on somebody
     /// else's machine is worse than a loud, counted absence.
-    const GIT_IMAGES: &[&str] = &["tactus-test/git:v1"];
+    const GIT_IMAGES: &[&str] = &["upstroke-test/git:v1"];
 
     /// The image whose environment carries a marker this suite can recognise.
-    const MARKER_IMAGE: &str = "tactus-test/git:v1";
+    const MARKER_IMAGE: &str = "upstroke-test/git:v1";
     const IMAGE_MARKER_VALUE: &str = "image-environment-v1";
 
     /// The image whose **own environment** sets credential-location variables.
@@ -5310,7 +5313,7 @@ mod tests {
     /// environment, so a key the runner omits is a key the image supplies.
     /// `DOCKER-SUBSTRATE.md` records how it is built, from a base the machine
     /// already holds and with no network.
-    const CREDENTIAL_ENV_IMAGE: &str = "tactus-test/credenv:v1";
+    const CREDENTIAL_ENV_IMAGE: &str = "upstroke-test/credenv:v1";
 
     /// The image variable that is **not** a credential location, so "the
     /// withheld keys were overridden" is distinguishable from "the image
@@ -5440,7 +5443,7 @@ mod tests {
     /// A `RunIdentity` for a gated test, under a scratch private root.
     ///
     /// `run_id` is a **parameter** because the container name is
-    /// `tactus-<repo_key>-<run_id>-<incarnation>-<invocation-hash>` and carries
+    /// `upstroke-<repo_key>-<run_id>-<incarnation>-<invocation-hash>` and carries
     /// no private root: two gated tests sharing a run id and an invocation
     /// ordinal produce the same container name, and `cargo test` runs them
     /// concurrently. Measured: the first version of this suite failed with
@@ -5475,7 +5478,7 @@ mod tests {
         ("parity", "01KZGATEDE000000000000000E"),
         // Repair R1. The ids carry the round rather than continuing the
         // `…GATED<letter>` sequence, and that is not cosmetic: a container name
-        // is `tactus-<repo_key>-<run_id>-<incarnation>-<invocation-hash>` and
+        // is `upstroke-<repo_key>-<run_id>-<incarnation>-<invocation-hash>` and
         // carries no worktree, so two *trees* whose gated suites pick the same
         // run id and invocation ordinal fight over one container name on a
         // shared daemon. Measured: repair round R3 added a gated test with
@@ -5543,7 +5546,7 @@ mod tests {
     /// * the runner **supplies** `PATH` — DESIGN.md:260, "each supplies
     ///   role-scoped `HOME`, `PATH`, and credential locations" — and the value
     ///   the child sees is the one the runner named. A key the runner did *not*
-    ///   name and the image did (`TACTUS_IMAGE_MARKER`) reaches the child
+    ///   name and the image did (`UPSTROKE_IMAGE_MARKER`) reaches the child
     ///   anyway, which is what "overlays a runner-owned base rather than
     ///   replacing it" means and is the half a `PATH` assertion alone cannot
     ///   make.
@@ -5603,11 +5606,11 @@ mod tests {
             ShellKind::Sh
                 .spec(
                     "printf 'PATH=%s\\n' \"$PATH\"; \
-                 printf 'OVERLAY=%s\\n' \"$TACTUS_OVERLAY\"; \
-                 printf 'MARKER=%s\\n' \"$TACTUS_IMAGE_MARKER\"; \
+                 printf 'OVERLAY=%s\\n' \"$UPSTROKE_OVERLAY\"; \
+                 printf 'MARKER=%s\\n' \"$UPSTROKE_IMAGE_MARKER\"; \
                  printf 'PWD=%s\\n' \"$(pwd)\"",
                 )
-                .env("TACTUS_OVERLAY", "landed"),
+                .env("UPSTROKE_OVERLAY", "landed"),
             workspace.clone(),
             Duration::from_secs(60),
             gate_id(0),
@@ -5633,7 +5636,7 @@ mod tests {
             !plan
                 .env()
                 .iter()
-                .any(|(key, _)| key == "TACTUS_IMAGE_MARKER"),
+                .any(|(key, _)| key == "UPSTROKE_IMAGE_MARKER"),
             "the runner named the image's own key, so the overlay claim below is vacuous: {:?}",
             plan.env()
         );
@@ -5656,7 +5659,7 @@ mod tests {
              certify which binary an attempt resolves (DESIGN.md:612)"
         );
         assert_eq!(line("OVERLAY="), "landed", "the overlay did not land");
-        assert_eq!(line("PWD="), "/tactus/workspace");
+        assert_eq!(line("PWD="), "/upstroke/workspace");
         if reference == MARKER_IMAGE {
             assert_eq!(
                 line("MARKER="),
@@ -5739,8 +5742,8 @@ mod tests {
             // that is a repairable defect in the CLI adapter rather than a
             // property of the runtime — and this test does not depend on
             // either way.
-            let spec =
-                ShellKind::Sh.spec("( echo tactus-wrote-this > /tactus/workspace/probe.txt ) 2>&1");
+            let spec = ShellKind::Sh
+                .spec("( echo upstroke-wrote-this > /upstroke/workspace/probe.txt ) 2>&1");
             let request = if role_is_review {
                 review_request(
                     spec,
@@ -5766,7 +5769,7 @@ mod tests {
             };
             let plan = runner.plan(&request).expect("plans");
             assert_eq!(
-                target_of(plan.mounts(), "/tactus/workspace").map(Mount::read_only),
+                target_of(plan.mounts(), "/upstroke/workspace").map(Mount::read_only),
                 Some(role_is_review),
                 "{tag}: the mount disposition"
             );
@@ -5804,7 +5807,7 @@ mod tests {
             std::fs::read_to_string(root.join("ws-implement").join("probe.txt"))
                 .expect("the control's file")
                 .trim(),
-            "tactus-wrote-this"
+            "upstroke-wrote-this"
         );
     }
 
@@ -5880,14 +5883,14 @@ mod tests {
         .expect("a container policy")
         .with_poll(Duration::from_millis(10));
 
-        let mut script = String::from("cat /tactus/workspace/mine.txt;");
+        let mut script = String::from("cat /upstroke/workspace/mine.txt;");
         for (_, path) in &withheld {
             let path = path.to_string_lossy().replace('\\', "/");
             script.push_str(&format!(
                 " printf 'READ {path}: '; cat '{path}' 2>&1 | head -1; \
                  printf 'WRITE {path}: '; \
                  ( mkdir -p \"$(dirname '{path}')\" && \
-                   echo tactus-container-wrote-this > '{path}' ) 2>&1 && echo WROTE || echo FAILED;"
+                   echo upstroke-container-wrote-this > '{path}' ) 2>&1 && echo WROTE || echo FAILED;"
             ));
         }
         let request = gate_request(
@@ -5954,7 +5957,7 @@ mod tests {
     /// The hostile paths are chosen to cover the three shapes a write can take:
     /// the root of the container filesystem, a directory the image itself
     /// populates, and — the interesting one — a **sibling of the role's own
-    /// mount**, `/tactus/escape`, which a naive "only paths under the mount
+    /// mount**, `/upstroke/escape`, which a naive "only paths under the mount
     /// targets are writable" implementation would let through.
     #[test]
     fn real_docker_a_gate_write_outside_every_declared_mount_fails() {
@@ -5998,10 +6001,10 @@ mod tests {
         // Outside every declared mount, and inside the two that are writable.
         const OUTSIDE: &[&str] = &[
             "/outside-role-mount",
-            "/etc/tactus-escaped",
-            "/usr/local/bin/tactus-escaped",
+            "/etc/upstroke-escaped",
+            "/usr/local/bin/upstroke-escaped",
             // A sibling of the role's own mount target.
-            "/tactus/escape",
+            "/upstroke/escape",
         ];
         let inside: Vec<String> = vec![
             format!("{}/written-by-the-gate", BoundaryLayout::DEFAULT_WORKSPACE),
@@ -6479,7 +6482,7 @@ mod tests {
         // `safe.directory` because the host paths are owned by the coordinator's
         // user and the container's process is not it — an ownership check, not a
         // confinement one.
-        let git = "git -c safe.directory='*' -C /tactus/workspace";
+        let git = "git -c safe.directory='*' -C /upstroke/workspace";
         let leak = &planted[0];
         let script = format!(
             "{git} rev-parse HEAD | sed 's/^/HEAD=/'; \

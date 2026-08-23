@@ -3,7 +3,7 @@ use std::time::Duration;
 
 use crate::agent::AdapterSource;
 #[cfg(test)]
-use crate::error::TactusError;
+use crate::error::UpstrokeError;
 use crate::interaction::{self, AnswerSource, InteractionMode, Sleeper};
 use crate::rundir::RunPaths;
 #[cfg(test)]
@@ -28,7 +28,7 @@ pub const DEFAULT_MAX_DEFERS: u32 = 3;
 
 #[cfg(test)]
 pub(super) type AfterCandidateCapture =
-    fn(&Workspace, &crate::workspace::CapturedCandidate) -> Result<(), TactusError>;
+    fn(&Workspace, &crate::workspace::CapturedCandidate) -> Result<(), UpstrokeError>;
 
 #[derive(Debug, Clone)]
 pub struct RunOptions {
@@ -45,7 +45,7 @@ pub struct RunOptions {
     pub defer_backoff: Duration,
     pub max_defers: u32,
     /// Where the agent-authored half of the run directory goes (§15 split).
-    /// `None` takes `~/.tactus`; tests point it at a scratch directory so they
+    /// `None` takes `~/.upstroke`; tests point it at a scratch directory so they
     /// never touch the real one.
     pub private_root: Option<PathBuf>,
     /// Override `[interaction] wait_on_block_secs` — how long a detached
