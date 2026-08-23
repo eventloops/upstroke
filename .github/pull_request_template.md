@@ -29,8 +29,7 @@ Passing review evidence URL:
 - [ ] `upstroke-ci` and `upstroke-pr-policy` passed before frontier review began
 - [ ] The independent frontier review used `max` effort on the exact current head
 - [ ] Every actionable finding is fixed; follow-ups contain only non-blocking suggestions or feature ideas
-- [ ] The evidence comment contains only `UPSTROKE_FRONTIER_REVIEW: 1`, `VERDICT: PASS`, and `REVIEWED_SHA: <full SHA>`
-- [ ] The App-owned `upstroke-frontier-review` check succeeded on the current head
+- [ ] `Reviewed head SHA` above is the head being merged, or differs from it by an exempt-only diff
 - [ ] Every review conversation is resolved
 
 ## Risk and rollback

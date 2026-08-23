@@ -61,3 +61,8 @@ artifacts (§15); records promoted here are the durable subset.
   competitive analysis, kill criteria, positioning and the commercial path are
   maintained privately; `DESIGN.md` keeps stubs plus the engineering consequences;
   promotion is demand-driven, by the pull request that first needs to cite a document.
+- [2026-08-23 — retire the App-signed attestation gate](2026-08-23-retire-app-attestation.md):
+  the `upstroke-frontier-review` App check, its two privileged workflows and the
+  signing environment are retired; the ruleset requires `upstroke-ci` and
+  `upstroke-pr-policy` only. The review obligation is unchanged and the owner's
+  merge is the attestation; 2026-08-20 §5 remains the bar for any automated return.
