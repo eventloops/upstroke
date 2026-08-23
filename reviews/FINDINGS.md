@@ -862,3 +862,38 @@ constraint behind it: the reaper runs post-`fork`, pre-`exec`, and `execvp` is n
 None was visible from the others and none from reading; twelve green local gates said nothing about any
 of them. The first was **predicted** by a catalogue entry naming a function that did not exist
 (`HostRunner::resolve_program`) and then measured on the guest.
+
+### The test suite leaks a temp directory per fixture, and it exhausted the build box
+
+Found while re-measuring the catalogue, when the box stopped being able to create files with **237 GB
+free**. Inodes were at **100%** — 58,466,304 used, 0 available. `/tmp` held **1,639,765** `tactus-*`
+fixture directories, enough that the directory entry itself was 114 MB.
+
+The mechanism is one line, in `src/rundir.rs`:
+
+```rust
+fn scratch(tag: &str) -> PathBuf {
+    let dir = std::env::temp_dir().join(format!("tactus-rundir-{tag}-{}", std::process::id()));
+    let _ = fs::remove_dir_all(&dir);
+```
+
+The `remove_dir_all` runs at **creation**, not at drop, and the name is keyed by `{tag}-{pid}`. It makes
+a fixture idempotent *within* one process. It never removes anything after a test, and the next test
+process has a different pid and therefore a different name, so the previous run's directories are not
+merely left behind — they are unreachable by that cleanup for the rest of the machine's life.
+
+Measured on the shipping tree, immune to a concurrent cleanup by counting only entries newer than a
+marker: **66 tests executed, 117 fixture directories left behind.** A full run of the current 1385-test
+suite leaks on the order of 2,400. The box had accumulated 1.6 million.
+
+`pre_existing` — the helper dates to `dc56475` (2026-08-09) and PR6 changes `src/rundir.rs` in zero
+files. It is recorded here rather than repaired here because it is project-wide and outside this slice's
+contract, and because the repair is a judgement call: a `Drop` guard is the obvious fix, but tests that
+deliberately inspect a fixture after a panic would lose their evidence.
+
+> **A cleanup that runs at setup is not a cleanup. It is a retry.** The distinction is invisible while
+> disk is measured in bytes and fatal once it is measured in inodes.
+
+Two operational notes for whoever picks this up. `df -h` reports the box healthy at 72% while every
+write fails — only `df -i` shows it. And the failure does not announce itself as a disk problem: it
+surfaced as four mutation entries aborting mid-measurement.
