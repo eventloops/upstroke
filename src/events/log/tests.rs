@@ -3279,6 +3279,17 @@ fn the_event_log_is_written_in_exactly_one_module() {
     );
 }
 
+/// One scanned path, as `FOLD_MENTIONS` writes it: relative to the manifest
+/// directory and slash-separated, so one literal reads on every platform.
+fn relative_slashed(path: &Path) -> String {
+    path.strip_prefix(env!("CARGO_MANIFEST_DIR"))
+        .unwrap_or(path)
+        .components()
+        .map(|component| component.as_os_str().to_string_lossy())
+        .collect::<Vec<_>>()
+        .join("/")
+}
+
 /// The barrier is the **only** path by which a topology write command obtains a
 /// fold from an existing log.
 ///
@@ -3296,6 +3307,37 @@ fn the_event_log_is_written_in_exactly_one_module() {
 #[test]
 fn the_stable_prefix_barrier_is_the_only_way_a_log_becomes_a_topology_fold() {
     const FOLD_ENTRIES: &[&str] = &["TopologyFold::replay(", "TopologyFold::parse_log("];
+
+    // The control: every production region that **names** the fold at all.
+    //
+    // A list rather than a count, and the reason is a merge hazard rather than
+    // a readability one. As a count, each module that starts naming the fold
+    // bumped the same number — so two independent changes that each add one
+    // module both write the same new value, the merge takes it once, and the
+    // census silently ends up expecting fewer regions than it scans. That is
+    // wrong in the direction that **weakens** the control: a scan whose regions
+    // collapsed would then be indistinguishable from a correct one, and its
+    // zero counts below would prove nothing. A list merges additively, and when
+    // it does disagree it names the file.
+    //
+    // Slash-separated and relative to the manifest directory, so the literals
+    // read the same on Windows, where the walk produces `\`.
+    //
+    // Sorted, asserted sorted, and asserted duplicate-free: an entry appended in
+    // the wrong place, or twice by two merges, fails here rather than passing.
+    const FOLD_MENTIONS: &[&str] = &[
+        // PR7's emit path. It holds a fold and appends to a log and builds
+        // neither from bytes — it obtains one from `establish_stable_prefix` —
+        // so it names the type without adding to `callers` below.
+        "src/engine/topology/emit.rs",
+        // This funnel: `establish_stable_prefix` is the one place a log becomes
+        // a fold.
+        "src/events/log.rs",
+        // ST-14's bounded reachability census over fold states.
+        "src/topology/census.rs",
+        // The fold itself.
+        "src/topology/fold.rs",
+    ];
     let src = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
     let funnel = src.join("events").join("log.rs");
 
@@ -3352,7 +3394,7 @@ fn the_stable_prefix_barrier_is_the_only_way_a_log_becomes_a_topology_fold() {
     );
 
     let mut scanned = 0_usize;
-    let mut mentioning = 0_usize;
+    let mut mentioning: Vec<String> = Vec::new();
     let mut callers: Vec<(PathBuf, &str, usize)> = Vec::new();
     for path in &files {
         if test_modules.contains(path) {
@@ -3367,7 +3409,7 @@ fn the_stable_prefix_barrier_is_the_only_way_a_log_becomes_a_topology_fold() {
         };
         scanned += 1;
         if production.contains("TopologyFold") {
-            mentioning += 1;
+            mentioning.push(relative_slashed(path));
         }
         for entry in FOLD_ENTRIES {
             let count = production.matches(entry).count();
@@ -3378,13 +3420,34 @@ fn the_stable_prefix_barrier_is_the_only_way_a_log_becomes_a_topology_fold() {
     }
 
     assert!(scanned > 40, "the walk found only {scanned} source files");
+
+    let mut sorted = FOLD_MENTIONS.to_vec();
+    sorted.sort_unstable();
     assert_eq!(
-        mentioning, 4,
-        "the control: `TopologyFold` is named in the production half of the fold, its census, this \
-         funnel, and PR7's emit path — which holds a fold and appends to a log but builds neither \
-         from bytes, so it adds nothing to `callers` below. A different number means the regions \
-         this census scanned are not the ones it thinks they are, and its zero counts would prove \
-         nothing"
+        FOLD_MENTIONS,
+        &sorted[..],
+        "`FOLD_MENTIONS` is compared sorted, so it has to be written sorted"
+    );
+    let repeated: Vec<&&str> = FOLD_MENTIONS
+        .iter()
+        .filter(|path| FOLD_MENTIONS.iter().filter(|other| other == path).count() > 1)
+        .collect();
+    assert!(
+        repeated.is_empty(),
+        "`FOLD_MENTIONS` names {repeated:?} twice — the shape two merges of the same addition \
+         produce, and the one a length comparison would report as a bare number"
+    );
+    mentioning.sort();
+    assert_eq!(
+        mentioning,
+        FOLD_MENTIONS
+            .iter()
+            .map(|path| (*path).to_owned())
+            .collect::<Vec<_>>(),
+        "the control: exactly these production regions name `TopologyFold`. A module missing from \
+         the list is one nobody classified; a module in the list that no longer appears means the \
+         regions this census scanned are not the ones it thinks they are, and its zero counts \
+         below would prove nothing"
     );
 
     assert_eq!(
