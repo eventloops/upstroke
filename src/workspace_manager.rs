@@ -1040,6 +1040,81 @@ pub struct WorkspaceManager {
     execution_root: PathBuf,
 }
 
+/// `fs::remove_dir_all`, tolerating the window in which a just-killed process's
+/// handles are still closing.
+///
+/// A Windows process that has exited can still hold the last references to files in
+/// its worktree. The kernel answers a delete with `ERROR_SHARING_VIOLATION`, and with
+/// `ERROR_ACCESS_DENIED` once a name is delete-pending — the same shape
+/// `runner::container` already documents for container directories. Both clear on
+/// their own in milliseconds.
+///
+/// This matters because the engine kills agents as ordinary control flow rather than
+/// as an error path: the container runner reclaims on every cancellation, so removal
+/// *races* that closure instead of meeting it occasionally. Without the retry the
+/// engine reports a hard `Io` failure for a condition that was already resolving.
+///
+/// Unix needs none of it — unlinking detaches the name regardless of open descriptors,
+/// so the first attempt succeeds — and the retry is not compiled in there. The bound
+/// is deliberate: a handle held longer than `ATTEMPTS * STEP` is not a closing process,
+/// and the **last attempt's** error is returned rather than masked. It is not necessarily
+/// the first attempt's — a permanent ACL denial and a closing handle both answer error 5,
+/// and only the passage of `ATTEMPTS * STEP` tells them apart.
+///
+/// **This is not `runner::container::racing_removal`, and the two must not be merged.**
+/// That one resolves a *handoff*: two threads racing on one path, where the loser needs
+/// only the winner's in-flight call to return, which is why it spends
+/// `RACING_ACCESS_ATTEMPTS` cheap `yield_now`s and no wall-clock at all. This one waits
+/// on a *kernel* condition with a millisecond timescale, which no number of yields
+/// reaches. Give either race the other's budget and both stop working: the handoff
+/// would sleep for a microsecond problem, and this would spin through a dead process's
+/// handles long before they closed.
+#[cfg(windows)]
+fn remove_tree_once_handles_close(path: &Path) -> std::io::Result<()> {
+    use windows_sys::Win32::Foundation::{ERROR_ACCESS_DENIED, ERROR_SHARING_VIOLATION};
+
+    const ATTEMPTS: u32 = 40;
+    const STEP: std::time::Duration = std::time::Duration::from_millis(25);
+
+    let mut attempt = 1_u32;
+    loop {
+        let error = match fs::remove_dir_all(path) {
+            Ok(()) => return Ok(()),
+            // The path is gone, which for a *removal* is the requested outcome.
+            // On Windows this is exactly how a delete-pending name resolves: an
+            // earlier attempt answered `ERROR_ACCESS_DENIED`, the last handle
+            // closed, and the name went away — with no second actor involved, so
+            // the sequence arises on its own rather than needing a race with
+            // another remover. Reporting failure there would skip the Git-admin
+            // cleanup below for a tree that is already deleted.
+            // `runner::container::racing_removal` treats `NotFound` the same way.
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(error) => error,
+        };
+        let closing = matches!(
+            error.raw_os_error(),
+            Some(code)
+                if code == ERROR_SHARING_VIOLATION as i32 || code == ERROR_ACCESS_DENIED as i32
+        );
+        if !closing || attempt >= ATTEMPTS {
+            return Err(error);
+        }
+        attempt += 1;
+        std::thread::sleep(STEP);
+    }
+}
+
+#[cfg(not(windows))]
+fn remove_tree_once_handles_close(path: &Path) -> std::io::Result<()> {
+    match fs::remove_dir_all(path) {
+        // Same convergence rule as the Windows arm, so the two agree on what a
+        // removal *means*. Unix reaches it only by racing another remover rather
+        // than by delete-pending, but the answer is the same: the path is gone.
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        other => other,
+    }
+}
+
 impl WorkspaceManager {
     /// Derive the execution root of `run_id` from the managed base and the
     /// authorized private root, and refuse every containment condition
@@ -1731,7 +1806,7 @@ impl WorkspaceManager {
         funnel(hooks, slot.remove_site(), || {
             if path.exists() {
                 let contained = self.contained(&path)?;
-                fs::remove_dir_all(&contained).map_err(|source| TactusError::Io {
+                remove_tree_once_handles_close(&contained).map_err(|source| TactusError::Io {
                     path: contained,
                     source,
                 })?;
@@ -3699,6 +3774,478 @@ mod tests {
             !fixture.manager.execution_root().exists(),
             "and perform no effect"
         );
+    }
+
+    /// `PR28-REPLAY-FAILS-OPEN`. A misspelled site name is byte-for-byte
+    /// indistinguishable from "this site was deliberately left to measure", so a
+    /// parser that only looks for the site it wants cannot tell them apart. It
+    /// returned `None`, the run measured fresh, and an operator who asked to
+    /// replay a red run got a green one that replayed nothing.
+    ///
+    /// Measured before the fix: `Object.CandidateStgae=44365` produced
+    /// `budget=39916us` with no `replayed` marker.
+    #[test]
+    fn a_replay_spec_naming_an_unknown_site_is_refused_rather_than_ignored() {
+        let stage = EffectSiteId::Object(ObjectSite::CandidateStage);
+        assert_eq!(
+            parse_budget_spec("Object.CandidateStgae=44365", stage),
+            Err(BudgetSpecError::UnknownSite(
+                "Object.CandidateStgae".to_owned()
+            )),
+        );
+        // The control that makes the assertion mean something: the *correctly*
+        // spelled name is accepted, so the refusal is about the typo and not
+        // about the parser rejecting everything.
+        assert_eq!(
+            parse_budget_spec("Object.CandidateStage=44365", stage),
+            Ok(Some(std::time::Duration::from_micros(44365))),
+        );
+    }
+
+    /// `PR28-REPLAY-FAILS-OPEN`, second shape. The old parser took the **first**
+    /// entry matching the site and then tried to parse it; a malformed first
+    /// entry produced `None` and a later valid duplicate was never reached.
+    ///
+    /// Measured before the fix: `...=abc,...=44365` produced `budget=40971us`
+    /// with no `replayed` marker, while `...=44365,...=abc` replayed at 44365 —
+    /// so which entry won depended on order, which is reason enough to refuse
+    /// duplicates outright.
+    #[test]
+    fn a_duplicated_site_is_refused_rather_than_resolved_by_order() {
+        let stage = EffectSiteId::Object(ObjectSite::CandidateStage);
+        assert_eq!(
+            parse_budget_spec(
+                "Object.CandidateStage=abc,Object.CandidateStage=44365",
+                stage
+            ),
+            Err(BudgetSpecError::NotAPositiveInteger(
+                "Object.CandidateStage=abc".to_owned()
+            )),
+        );
+        assert_eq!(
+            parse_budget_spec("Object.CandidateStage=1,Object.CandidateStage=2", stage),
+            Err(BudgetSpecError::Duplicate(
+                "Object.CandidateStage".to_owned()
+            )),
+        );
+    }
+
+    /// `PR28-REPLAY-UNBOUNDED`. `u64::MAX` parsed happily. Measured before the
+    /// fix: the printed ladder's first rung asked for 2_049_638_230_412_172_119
+    /// microseconds — about **64,949 years** — and `kill_git_child` sleeps
+    /// unconditionally, so the run would have ended at CI's job timeout rather
+    /// than at any assertion.
+    #[test]
+    fn a_replay_budget_past_the_ceiling_is_refused() {
+        let stage = EffectSiteId::Object(ObjectSite::CandidateStage);
+        assert_eq!(
+            parse_budget_spec("Object.CandidateStage=18446744073709551615", stage),
+            Err(BudgetSpecError::AboveCeiling {
+                site: "Object.CandidateStage".to_owned(),
+                micros: u64::MAX,
+            }),
+        );
+        // The boundary itself is allowed, so the ceiling is a limit and not an
+        // off-by-one that silently narrows what a replay may ask for.
+        assert_eq!(
+            parse_budget_spec(
+                &format!("Object.CandidateStage={MAX_REPLAY_BUDGET_US}"),
+                stage
+            ),
+            Ok(Some(std::time::Duration::from_micros(MAX_REPLAY_BUDGET_US))),
+        );
+    }
+
+    /// The legitimate partial replay this must not break: pin some sites, leave
+    /// the rest to measure. Witnessed by hand while building the feature — two
+    /// sites replayed and two measured in the same run — and pinned here so the
+    /// validation added above cannot quietly turn "unmentioned" into an error.
+    #[test]
+    fn a_spec_that_omits_a_site_leaves_that_site_to_be_measured() {
+        assert_eq!(
+            parse_budget_spec(
+                "Object.CandidateStage=44365",
+                EffectSiteId::Object(ObjectSite::ProposalCherryPick)
+            ),
+            Ok(None),
+        );
+        assert_eq!(
+            parse_budget_spec("", EffectSiteId::Object(ObjectSite::CandidateStage)),
+            Ok(None),
+        );
+    }
+
+    /// A malformed entry is refused even when it names no site this run asks
+    /// about, because the operator's intent was to replay and half a spec cannot
+    /// deliver it.
+    #[test]
+    fn a_malformed_entry_is_refused_even_for_a_site_this_run_does_not_want() {
+        assert_eq!(
+            parse_budget_spec(
+                "Object.ProposalCherryPick",
+                EffectSiteId::Object(ObjectSite::CandidateStage)
+            ),
+            Err(BudgetSpecError::Malformed(
+                "Object.ProposalCherryPick".to_owned()
+            )),
+        );
+    }
+
+    /// `PR28-NOTFOUND-NOT-CONVERGENCE`. A removal whose path is already gone has
+    /// achieved what it was asked to achieve. Before the fix this returned
+    /// `Err(NotFound)`, and `remove_worktree` would then skip the Git-admin
+    /// cleanup that follows it for a tree that was already deleted.
+    ///
+    /// On Windows the sequence needs no second actor: an attempt answers
+    /// `ERROR_ACCESS_DENIED` for a delete-pending name, the last handle closes,
+    /// and the next attempt finds nothing. Verified red before the fix by a
+    /// scratch test on the guest, which asserted `is_err()` and passed.
+    #[test]
+    fn removing_a_path_that_is_already_gone_is_convergence_not_failure() {
+        let root = scratch("already-gone");
+        fs::create_dir_all(&root).expect("fixture root");
+        let absent = root.join("no-such-tree");
+        assert!(!absent.exists(), "the fixture must not create it");
+        assert!(
+            remove_tree_once_handles_close(&absent).is_ok(),
+            "a path that is already gone is the outcome a removal wanted"
+        );
+        // And the ordinary case still works, so the arm above has not been
+        // widened into "every error is success".
+        let present = root.join("a-tree");
+        fs::create_dir_all(present.join("nested")).expect("a tree to remove");
+        assert!(remove_tree_once_handles_close(&present).is_ok());
+        assert!(!present.exists(), "and it is actually gone");
+        // `scratch` has no `Drop` guard, so a test that does not remove its own
+        // root leaves one empty directory in the temp dir per process, forever.
+        // Three had already accumulated from this test alone before it was
+        // noticed -- the same leak recorded against `rundir.rs::scratch` in
+        // `reviews/FINDINGS.md`, reintroduced by the test that reported it.
+        fs::remove_dir_all(&root).expect("this test cleans up after itself");
+    }
+
+    /// Run `body`, returning its panic message if it panicked.
+    ///
+    /// **The panic hook is deliberately left alone.** An earlier version took it,
+    /// installed a no-op and restored it afterwards, to keep intentional panics
+    /// out of the test output. The hook is process-global and these tests run in
+    /// parallel, so two of them interleaving —
+    /// `A` takes `H` installs `a`; `B` takes `a` installs `b`; `A` restores `H`;
+    /// `B` restores `a` — leaves the process running with a no-op hook for good,
+    /// and every later panic anywhere in the suite loses its message and
+    /// backtrace. Tidy output is not worth that: the noise below is a few lines,
+    /// and the alternative silently disarms the diagnostics of every other test.
+    fn panic_message(body: impl FnOnce()) -> Option<String> {
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(body))
+            .err()
+            .map(|payload| {
+                payload
+                    .downcast_ref::<String>()
+                    .cloned()
+                    .or_else(|| payload.downcast_ref::<&str>().map(|s| (*s).to_owned()))
+                    .unwrap_or_else(|| "<non-string panic payload>".to_owned())
+            })
+    }
+
+    /// The refusal `sampled_command` gives for a site it does not handle. Matched
+    /// rather than assumed, so a panic for any *other* reason is not silently read
+    /// as absence — see [`has_sampling_command`].
+    const NO_SAMPLING_COMMAND: &str = "is not one of the four commands the contract samples";
+
+    /// Whether `sampled_command` handles `site`, distinguishing "does not handle
+    /// it" from "blew up for some other reason".
+    ///
+    /// Treating *every* panic as absence was a real hole: an arm added to
+    /// `sampled_command` but omitted from `SAMPLED_SITES` — validating its slot
+    /// and panicking because the test supplies a task slot — read as absent, which
+    /// matched its absence from the list, and the drift went undetected. Measured.
+    fn has_sampling_command(site: EffectSiteId, fixture: &Fixture, slot: &Slot) -> bool {
+        match panic_message(|| {
+            let _unused = sampled_command(site, fixture, slot);
+        }) {
+            None => true,
+            Some(message) if message.contains(NO_SAMPLING_COMMAND) => false,
+            Some(message) => panic!(
+                "`{}` panicked for a reason other than being unsampled, so this test cannot \
+                 tell whether it has a command: {message}",
+                site.name()
+            ),
+        }
+    }
+
+    /// The partition itself, over **every** real site rather than one example.
+    ///
+    /// An earlier version of this test named `Object.CandidateCommitTree` alone,
+    /// which asserted an instance and not the property: replacing the
+    /// `SAMPLED_SITES` membership check with `named == CandidateCommitTree`
+    /// special-cased that one site, left every other unsampled site failing open,
+    /// and the whole suite stayed green. Measured.
+    #[test]
+    fn every_real_site_is_either_replayable_or_refused_as_unsampled() {
+        let all = EffectSiteId::all();
+        assert!(
+            all.len() > SAMPLED_SITES.len(),
+            "there must be unsampled sites, or this test asserts nothing"
+        );
+        for site in all {
+            let spec = format!("{}=1000", site.name());
+            let got = parse_budget_spec(&spec, site);
+            if SAMPLED_SITES.contains(&site) {
+                assert_eq!(
+                    got,
+                    Ok(Some(std::time::Duration::from_micros(1000))),
+                    "{} is sampled and must be replayable",
+                    site.name()
+                );
+            } else {
+                assert_eq!(
+                    got,
+                    Err(BudgetSpecError::NotSampled(site.name().to_owned())),
+                    "{} is a real site this sampler never drives, so naming it must \
+                     refuse rather than fall through to a fresh measurement",
+                    site.name()
+                );
+            }
+        }
+    }
+
+    /// `SAMPLED_SITES` and the command table are two statements of one fact.
+    /// Nothing but this test makes them agree: adding an arm to `sampled_command`
+    /// without adding the site here would leave the new arm unreachable through a
+    /// replay and unobserved by any other test.
+    #[test]
+    fn the_replayable_site_list_matches_the_commands_that_exist() {
+        let fixture = Fixture::created("site-list-agreement");
+        let slot = fixture.task("agree", 0);
+        for site in EffectSiteId::all() {
+            let has_command = has_sampling_command(site, &fixture, &slot);
+            assert_eq!(
+                has_command,
+                SAMPLED_SITES.contains(&site),
+                "{} has a sampling command but is not in SAMPLED_SITES (or the reverse); \
+                 the two lists have drifted",
+                site.name()
+            );
+        }
+    }
+
+    /// **Every** refusal must reach the operator through the environment edge,
+    /// not merely the one an earlier test happened to use.
+    ///
+    /// With only `UnknownSite` covered, `Err(BudgetSpecError::NotSampled(_)) => None`
+    /// survived: the direct parser test still saw `NotSampled`, the edge test still
+    /// panicked for its typo, and a real-but-unsampled spec fell through to four
+    /// fresh measurements. Asserting the variant name appears also pins the
+    /// `{error:?}` in the message, whose removal would hide the distinction the
+    /// two errors exist to draw.
+    #[test]
+    fn every_refusal_reaches_the_operator_through_the_environment_edge() {
+        let stage = EffectSiteId::Object(ObjectSite::CandidateStage);
+        for (spec, variant) in [
+            ("Object.CandidateStgae=1", "UnknownSite"),
+            ("Object.CandidateCommitTree=1", "NotSampled"),
+            ("Object.CandidateStage", "Malformed"),
+            ("Object.CandidateStage=abc", "NotAPositiveInteger"),
+            ("Object.CandidateStage=99999999", "AboveCeiling"),
+            (
+                "Object.CandidateStage=1,Object.CandidateStage=2",
+                "Duplicate",
+            ),
+        ] {
+            let message = panic_message(|| {
+                let _unused: Option<std::time::Duration> =
+                    budget_from_var(Ok(spec.to_owned()), stage);
+            })
+            .unwrap_or_else(|| {
+                panic!("`{spec}` must be refused at the edge, not silently measured")
+            });
+            assert!(
+                message.contains(variant),
+                "the refusal for `{spec}` must name {variant} so the operator can tell \
+                 the refusals apart; got: {message}"
+            );
+        }
+    }
+
+    /// The repair's own blind spot. Validating against the whole `EffectSiteId`
+    /// registry accepted any *real* site, including the many this sampler never
+    /// drives — so `Object.CandidateCommitTree` parsed, matched none of the four
+    /// sampled sites, and every one of them fell through to a fresh measurement
+    /// while the run reported success.
+    ///
+    /// Measured on the unfixed repair: zero `replayed` markers, four fresh
+    /// budgets, `test result: ok`. No mutation was needed to expose it.
+    #[test]
+    fn a_real_site_this_sampler_never_drives_is_refused() {
+        let stage = EffectSiteId::Object(ObjectSite::CandidateStage);
+        assert_eq!(
+            parse_budget_spec("Object.CandidateCommitTree=44365", stage),
+            Err(BudgetSpecError::NotSampled(
+                "Object.CandidateCommitTree".to_owned()
+            )),
+        );
+        // Every site the sampler *does* drive is still accepted, so the new check
+        // narrows the domain to exactly the replayable set and no further.
+        for site in SAMPLED_SITES {
+            assert_eq!(
+                parse_budget_spec(&format!("{}=1000", site.name()), site),
+                Ok(Some(std::time::Duration::from_micros(1000))),
+                "{} is sampled and must be replayable",
+                site.name()
+            );
+        }
+    }
+
+    /// `std::env::var` reports `NotPresent` and `NotUnicode` as different errors.
+    /// Collapsing them made a spec that was set but not valid UTF-8 look exactly
+    /// like no spec at all — every site measuring fresh, against the adjacent
+    /// promise that an unhonourable spec is refused.
+    ///
+    /// This tests the environment *edge* rather than the parser. All the other
+    /// replay tests call `parse_budget_spec` directly, so before this existed the
+    /// panic arm could be replaced with `Err(_) => None` and the whole suite
+    /// stayed green.
+    #[test]
+    fn an_absent_variable_is_absence_and_a_present_one_is_not() {
+        let stage = EffectSiteId::Object(ObjectSite::CandidateStage);
+        assert_eq!(
+            budget_from_var(Err(std::env::VarError::NotPresent), stage),
+            None,
+            "no spec means measure, which is the ordinary case"
+        );
+        assert_eq!(
+            budget_from_var(Ok("Object.CandidateStage=44365".to_owned()), stage),
+            Some(std::time::Duration::from_micros(44365)),
+        );
+    }
+
+    /// The edge must refuse a spec the parser rejects, not just an unreadable
+    /// variable. Without this, replacing the parse-error arm with
+    /// `Err(_) => None` leaves every other replay test green: they all call
+    /// `parse_budget_spec` directly and never exercise what the edge does with
+    /// its answer.
+    #[test]
+    #[should_panic(expected = "not a spec this run can honour")]
+    fn a_spec_the_parser_rejects_is_refused_at_the_environment_edge() {
+        let _ = budget_from_var(
+            Ok("Object.CandidateStgae=44365".to_owned()),
+            EffectSiteId::Object(ObjectSite::CandidateStage),
+        );
+    }
+
+    /// The other half of the edge: a value that is present but unusable must not
+    /// be mistaken for absence.
+    #[test]
+    #[should_panic(expected = "not valid UTF-8")]
+    fn a_present_but_non_unicode_variable_is_refused_not_treated_as_unset() {
+        let invalid = {
+            #[cfg(unix)]
+            {
+                use std::os::unix::ffi::OsStringExt as _;
+                std::ffi::OsString::from_vec(vec![0x66, 0x6f, 0x80, 0x6f])
+            }
+            #[cfg(not(unix))]
+            {
+                use std::os::windows::ffi::OsStringExt as _;
+                std::ffi::OsString::from_wide(&[0x66, 0x6f, 0xD800, 0x6f])
+            }
+        };
+        let _ = budget_from_var(
+            Err(std::env::VarError::NotUnicode(invalid)),
+            EffectSiteId::Object(ObjectSite::CandidateStage),
+        );
+    }
+
+    /// A process the engine killed can still be closing its handles, and on Windows
+    /// that makes `remove_dir_all` answer `ERROR_SHARING_VIOLATION` for a worktree
+    /// that is about to become removable. `remove_worktree` retries across that
+    /// window rather than reporting a hard `Io` failure.
+    ///
+    /// This is the deterministic form of what the residue sampler hits at random:
+    /// the sampler kills a real `git` child at an unseeded point and *sometimes*
+    /// leaves a handle, so it proves the condition exists but cannot be re-run to
+    /// prove a fix. Here the handle is held on purpose and released on a timer.
+    ///
+    /// The second half is the one that matters. A handle held **past** the retry
+    /// budget must still fail: a retry that waits forever is not a fix, it is a
+    /// hang, and one that swallows the error hides a genuinely locked worktree.
+    #[cfg(windows)]
+    #[test]
+    fn a_worktree_whose_killed_child_is_still_closing_is_removed_not_refused() {
+        use std::os::windows::fs::OpenOptionsExt as _;
+        use std::sync::mpsc;
+
+        use windows_sys::Win32::Storage::FileSystem::FILE_SHARE_READ;
+
+        for (hold, expected_removal) in [
+            (std::time::Duration::from_millis(300), true),
+            (std::time::Duration::MAX, false),
+        ] {
+            let fixture = Fixture::created("closing-handle");
+            let slot = fixture.task("alpha", 1);
+            fixture
+                .manager
+                .write_intent(&mut NoHooks, &slot)
+                .expect("the intent must be durable");
+            fixture
+                .manager
+                .add_worktree(&mut NoHooks, &slot, &fixture.head)
+                .expect("the worktree the killed child was working in");
+
+            // A file inside the worktree, held open with the sharing mode a running
+            // process has. Opened on another thread so the handle outlives this
+            // statement and drops on a timer -- exactly the shape of a process that
+            // has exited while its last handle is still closing.
+            let target = fixture.manager.execution_root().join(slot.relative());
+            let held = target.join("held-by-the-dying-child");
+            fs::write(&held, b"bytes the child had open").expect("plant the file");
+            let (opened, ready) = mpsc::channel();
+            let holder = std::thread::spawn(move || {
+                // `FILE_SHARE_READ` alone, deliberately: Rust's `File::open` asks for
+                // `FILE_SHARE_DELETE` too, and a handle that shares deletion does not
+                // block one -- the first version of this test removed the worktree
+                // happily and proved nothing. A `git` child holds its files without
+                // delete sharing, which is what makes the kernel answer
+                // `ERROR_SHARING_VIOLATION`.
+                let file = fs::OpenOptions::new()
+                    .read(true)
+                    .share_mode(FILE_SHARE_READ)
+                    .open(&held)
+                    .expect("hold the file open the way a git child does");
+                opened.send(()).expect("announce the handle is held");
+                if hold == std::time::Duration::MAX {
+                    // Held for the whole test: the control that proves the retry
+                    // is bounded and still reports a real lock.
+                    std::thread::sleep(std::time::Duration::from_secs(5));
+                } else {
+                    std::thread::sleep(hold);
+                }
+                drop(file);
+            });
+            ready
+                .recv()
+                .expect("the handle is held before removal is attempted");
+
+            let outcome = fixture.manager.remove_worktree(&mut NoHooks, &slot);
+            if expected_removal {
+                outcome.expect("removal retries across the closing handle");
+                assert!(
+                    !target.exists(),
+                    "and the worktree is actually gone, not merely un-refused"
+                );
+            } else {
+                let error = outcome.expect_err(
+                    "a handle held past the retry budget is a locked worktree, not a closing one, \
+                     and must be reported rather than waited on forever",
+                );
+                assert!(
+                    target.exists(),
+                    "and the worktree is still there, which is what the error says: {}",
+                    refusal_of(&error)
+                );
+            }
+            let _ = holder.join();
+        }
     }
 
     /// The Windows half of `expected_failures_refusals[0]`: a **junction** is a
@@ -7524,12 +8071,7 @@ mod tests {
     #[test]
     fn sampled_git_child_kills_every_residue_classified_and_recovered() {
         let mut records = Vec::new();
-        for site in [
-            EffectSiteId::Object(ObjectSite::CandidateStage),
-            EffectSiteId::Object(ObjectSite::CandidateWriteTree),
-            EffectSiteId::Object(ObjectSite::ProposalCherryPick),
-            EffectSiteId::Worktree(WorktreeSite::Add),
-        ] {
+        for site in SAMPLED_SITES {
             let run = sample_site(site);
             let record = run.record;
             println!(
@@ -7588,7 +8130,7 @@ mod tests {
                 record.recovered,
                 "every sample recovered by its classified action"
             );
-            records.push((site, record));
+            records.push((site, record, run.budget, run.replayed));
         }
         assert_eq!(
             records.len(),
@@ -7817,9 +8359,17 @@ mod tests {
             "sampling_n": SAMPLING_N,
             "sites": records
                 .iter()
-                .map(|(site, record)| serde_json::json!({
+                .map(|(site, record, budget, replayed)| serde_json::json!({
                     "site": site.name(),
                     "n": record.n,
+                    // The timescale the kill ladder was cut from. A red run's
+                    // artifact carries it, and `TACTUS_RESIDUE_BUDGET_US` feeds it
+                    // back -- which is what makes this sampler reproducible, since
+                    // it has no seed and this duration is the only variance a
+                    // replay can pin. Wake times, Git's own progress, cache state
+                    // and scheduling still vary between runs.
+                    "budget_us": u64::try_from(budget.as_micros()).unwrap_or(u64::MAX),
+                    "budget_replayed": replayed,
                     "none": record.histogram.none,
                     "internal": record.histogram.internal,
                     "after": record.histogram.after,
@@ -7836,7 +8386,7 @@ mod tests {
                 .expect("the emitted histogram parses");
         let sites = back["sites"].as_array().expect("a sites array");
         assert_eq!(sites.len(), 4, "one histogram per sampled site");
-        for (entry, (site, record)) in sites.iter().zip(&records) {
+        for (entry, (site, record, budget, _)) in sites.iter().zip(&records) {
             assert_eq!(
                 entry["site"],
                 site.name(),
@@ -7852,6 +8402,12 @@ mod tests {
                 "{site}: the written histogram accounts for every sample"
             );
             assert_eq!(entry["unclassified"], record.unclassified);
+            assert_eq!(
+                entry["budget_us"].as_u64(),
+                u64::try_from(budget.as_micros()).ok(),
+                "{site}: the artifact must carry the timescale a replay needs, or a \
+                 red CI run cannot be reproduced from it"
+            );
         }
     }
 
@@ -7866,6 +8422,14 @@ mod tests {
     /// by something that is not the code under test.
     struct SamplingRun {
         record: SamplingRecord,
+        /// The timescale the kill ladder was cut from, and whether it was measured
+        /// on this machine or replayed from `TACTUS_RESIDUE_BUDGET_US`. This is the
+        /// only variance a replay can pin -- see [`measure_budget`] -- so it is the
+        /// most a recorded run can offer. It is not *all* the variance: actual wake
+        /// times, Git's progress, cache state and scheduling still differ, so a
+        /// replay reproduces the nominal ladder rather than the original run.
+        budget: std::time::Duration,
+        replayed: bool,
         /// What `classify_object_residue` answered for each sample, in order.
         /// `None` is a sample it could not classify at all.
         observed: Vec<Option<ObjectResidue>>,
@@ -7952,7 +8516,23 @@ mod tests {
         let tag = format!("sample-{}", site.variant().to_lowercase());
         let fixture = Fixture::created(&tag);
         let base = fixture.base.clone();
-        let budget = measure_budget(site, &fixture);
+        let measured = measure_budget(site, &fixture);
+        let replayed = replayed_budget(site);
+        let budget = replayed.unwrap_or(measured);
+        println!(
+            "residue sampling {site}: budget={}us{} ladder={:?}",
+            budget.as_micros(),
+            if replayed.is_some() {
+                format!(" (replayed; measured {}us)", measured.as_micros())
+            } else {
+                String::new()
+            },
+            (0..SAMPLING_N)
+                .map(|run| budget
+                    .mul_f64(f64::from(run + 1) / f64::from(SAMPLING_N + 1))
+                    .as_micros())
+                .collect::<Vec<_>>()
+        );
         let mut observed: Vec<Option<ObjectResidue>> = Vec::new();
         let mut recovered = true;
 
@@ -7984,6 +8564,8 @@ mod tests {
 
         let (histogram, unclassified) = tally(&observed);
         SamplingRun {
+            budget,
+            replayed: replayed.is_some(),
             record: SamplingRecord {
                 n: SAMPLING_N,
                 histogram,
@@ -8090,6 +8672,158 @@ mod tests {
             .remove_intent(&mut NoHooks, &probe)
             .expect("remove the probe intent");
         elapsed.max(std::time::Duration::from_micros(200))
+    }
+
+    /// A recorded timescale to replay instead of measuring one.
+    ///
+    /// **There is no random number generator in this sampler and nothing to seed.**
+    /// The kill ladder is a fixed set of fractions — `(run + 1) / (SAMPLING_N + 1)` —
+    /// of a single duration, and that duration is how long one real `git` took on
+    /// this machine at this moment. Load, page cache and disk move it; the fractions
+    /// never move. So the measured budget is the only variance a replay can pin,
+    /// and pinning it is the nearest thing to a reproducible failure available here
+    /// -- the ladder becomes identical, though the wake times it produces and Git's
+    /// own progress against them still vary run to run.
+    ///
+    /// A fixed default would be worse than the status quo: the point of re-measuring
+    /// on every run is that the ladder lands in different places on different
+    /// machines, which is how a sampler with `SAMPLING_N = 8` covers more than eight
+    /// kill points over its lifetime. The measurement stays; it is merely recorded,
+    /// and overridable when replaying one specific red run.
+    /// The sites this sampler drives, and therefore the only sites a replay spec
+    /// may name.
+    ///
+    /// Shared with [`parse_budget_spec`] so the two cannot disagree. Validating
+    /// against the whole `EffectSiteId` registry was not enough: it accepted
+    /// `Object.CandidateCommitTree` — a real site nothing here samples — whereupon
+    /// every site fell through to a fresh measurement and the run reported success
+    /// having replayed nothing. That is the same fail-open the strictness was added
+    /// to remove, wearing a name that passes validation.
+    const SAMPLED_SITES: [EffectSiteId; 4] = [
+        EffectSiteId::Object(ObjectSite::CandidateStage),
+        EffectSiteId::Object(ObjectSite::CandidateWriteTree),
+        EffectSiteId::Object(ObjectSite::ProposalCherryPick),
+        EffectSiteId::Worktree(WorktreeSite::Add),
+    ];
+
+    /// Why a `TACTUS_RESIDUE_BUDGET_US` spec was refused.
+    #[derive(Debug, PartialEq, Eq)]
+    enum BudgetSpecError {
+        /// An entry with no `=`.
+        Malformed(String),
+        /// A site name no `EffectSiteId` answers to. Almost always a typo — and a
+        /// typo is **indistinguishable from "leave this site to measure"** unless
+        /// every entry is validated, which is why this is an error rather than a
+        /// miss.
+        UnknownSite(String),
+        /// A real site that this sampler never drives. Distinct from
+        /// [`Self::UnknownSite`] because the fix is different: the name is spelled
+        /// correctly and simply cannot be replayed, which the message should say
+        /// rather than claiming it does not exist.
+        NotSampled(String),
+        /// A value that is not a positive whole number of microseconds.
+        NotAPositiveInteger(String),
+        /// A value past [`MAX_REPLAY_BUDGET_US`].
+        AboveCeiling { site: String, micros: u64 },
+        /// The same site named twice, where which one wins would depend on order.
+        Duplicate(String),
+    }
+
+    /// The largest replay budget a spec may ask for.
+    ///
+    /// Four sites each sleep a ladder summing to about four budgets, so the whole
+    /// sampling costs roughly `16 x budget`. At five seconds that is 80 seconds of
+    /// sleeping — generous, since the largest budget ever *measured* here is about
+    /// 45 ms, and bounded, which unbounded input was not: `u64::MAX` parsed happily
+    /// and asked its first rung to sleep about 64,949 years, ending only at CI's
+    /// job timeout.
+    const MAX_REPLAY_BUDGET_US: u64 = 5_000_000;
+
+    /// Parse a replay spec, validating **every** entry, and return the budget for
+    /// `site` if the spec names it.
+    ///
+    /// Takes the spec as an argument rather than reading the environment, so it can
+    /// be unit tested without mutating process-global state that parallel tests
+    /// share. [`replayed_budget`] does the environment read at the edge.
+    fn parse_budget_spec(
+        raw: &str,
+        site: EffectSiteId,
+    ) -> Result<Option<std::time::Duration>, BudgetSpecError> {
+        let mut found = None;
+        let mut seen: Vec<String> = Vec::new();
+        for entry in raw
+            .split(',')
+            .map(str::trim)
+            .filter(|entry| !entry.is_empty())
+        {
+            let (name, micros) = entry
+                .split_once('=')
+                .ok_or_else(|| BudgetSpecError::Malformed(entry.to_owned()))?;
+            let (name, micros) = (name.trim(), micros.trim());
+            // Validated against the real site registry, not a list of the four this
+            // test samples, so a name that is merely misspelled is caught the same
+            // way as one that does not exist at all.
+            let named = EffectSiteId::from_name(name)
+                .map_err(|_| BudgetSpecError::UnknownSite(name.to_owned()))?;
+            if !SAMPLED_SITES.contains(&named) {
+                return Err(BudgetSpecError::NotSampled(name.to_owned()));
+            }
+            if seen.iter().any(|already| already == name) {
+                return Err(BudgetSpecError::Duplicate(name.to_owned()));
+            }
+            seen.push(name.to_owned());
+            let value = micros
+                .parse::<u64>()
+                .ok()
+                .filter(|value| *value > 0)
+                .ok_or_else(|| BudgetSpecError::NotAPositiveInteger(entry.to_owned()))?;
+            if value > MAX_REPLAY_BUDGET_US {
+                return Err(BudgetSpecError::AboveCeiling {
+                    site: name.to_owned(),
+                    micros: value,
+                });
+            }
+            if named == site {
+                found = Some(std::time::Duration::from_micros(value));
+            }
+        }
+        Ok(found)
+    }
+
+    /// Decide a replay from what the environment gave us.
+    ///
+    /// Takes the [`std::env::var`] result rather than reading it, so the three
+    /// cases can be tested without mutating process-global state that parallel
+    /// tests share. The distinction matters: `var` reports **`NotPresent` and
+    /// `NotUnicode` as different errors**, and collapsing them made a spec that
+    /// was present but not valid UTF-8 look exactly like no spec at all — every
+    /// site measuring fresh while the adjacent promise says an unhonourable spec
+    /// is refused.
+    fn budget_from_var(
+        var: Result<String, std::env::VarError>,
+        site: EffectSiteId,
+    ) -> Option<std::time::Duration> {
+        let raw = match var {
+            Ok(raw) => raw,
+            Err(std::env::VarError::NotPresent) => return None,
+            Err(std::env::VarError::NotUnicode(raw)) => panic!(
+                "TACTUS_RESIDUE_BUDGET_US is set but is not valid UTF-8 ({raw:?}), so it \
+                 cannot be parsed. It will not be treated as unset."
+            ),
+        };
+        match parse_budget_spec(&raw, site) {
+            Ok(found) => found,
+            Err(error) => panic!(
+                "TACTUS_RESIDUE_BUDGET_US is not a spec this run can honour: {error:?}. \
+                 Fix the spec or unset it; it will not be silently ignored."
+            ),
+        }
+    }
+
+    /// The environment read itself, kept to one line so nothing but the read is
+    /// untestable.
+    fn replayed_budget(site: EffectSiteId) -> Option<std::time::Duration> {
+        budget_from_var(std::env::var("TACTUS_RESIDUE_BUDGET_US"), site)
     }
 
     /// Enough work in the worktree that the sampled command has a middle to be
