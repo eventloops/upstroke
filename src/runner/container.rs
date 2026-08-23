@@ -96,9 +96,10 @@ use std::fs;
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::{Arc, Mutex, PoisonError};
 
 use crate::error::UpstrokeError;
-use crate::topology::effects::{ContainerSite, EffectSiteId, HookPhase, Injection};
+use crate::topology::effects::{ContainerSite, EffectSiteId, HookHarness, HookPhase, Injection};
 use crate::util;
 
 use crate::runner::InvocationId;
@@ -141,6 +142,65 @@ pub struct NoHooks;
 impl ContainerHooks for NoHooks {
     fn phase(&mut self, _site: EffectSiteId, _phase: HookPhase) -> Injection {
         Injection::Proceed
+    }
+}
+
+/// Wires this funnel onto PR3's [`HookHarness`], the way
+/// [`crate::rundir::HarnessHooks`], [`crate::workspace_manager::HarnessEffects`],
+/// [`crate::events::log::HarnessEventHooks`] and [`crate::runner::HarnessHooks`]
+/// wire the other four families onto it.
+///
+/// The Container group was the one family without such an adapter. Its only
+/// observer was `fake::RecordingHooks`, which records into a
+/// [`ContainerTrace`] — an ordered log of *runtime operations*, which is a
+/// different thing from the *site coverage* `HookHarness` accumulates.
+/// `check_bijection` reads `HookHarness` alone, so a coverage pass that drove
+/// the container funnel through `RecordingHooks` would produce an evidence
+/// table with eight sites missing and nothing to say they were missing.
+#[derive(Debug, Clone, Default)]
+pub struct HarnessHooks {
+    harness: Arc<Mutex<HookHarness>>,
+    trace: ContainerTrace,
+}
+
+impl HarnessHooks {
+    /// Observe through `harness`.
+    #[must_use]
+    pub fn new(harness: Arc<Mutex<HookHarness>>) -> Self {
+        Self {
+            harness,
+            trace: ContainerTrace::off(),
+        }
+    }
+
+    /// The harness this observer records into.
+    #[must_use]
+    pub fn harness(&self) -> &Arc<Mutex<HookHarness>> {
+        &self.harness
+    }
+
+    /// Also keep the funnel's ordered record of runtime operations.
+    ///
+    /// The two are complementary and neither replaces the other: the harness
+    /// answers "was this site's phase executed", the trace answers "in what
+    /// order did the daemon see these calls".
+    #[must_use]
+    pub fn recording_trace(mut self, trace: ContainerTrace) -> Self {
+        self.trace = trace;
+        self
+    }
+}
+
+impl ContainerHooks for HarnessHooks {
+    fn phase(&mut self, site: EffectSiteId, phase: HookPhase) -> Injection {
+        self.harness
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .hook(site, phase)
+    }
+
+    fn trace(&self) -> ContainerTrace {
+        self.trace.clone()
     }
 }
 

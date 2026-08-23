@@ -29,6 +29,14 @@ mod options;
 mod preflight;
 mod report;
 mod resume;
+/// The schema-4 run lifecycle.
+///
+/// `pub` where its siblings are private, and deliberately: the capability
+/// types in here carry compile-fail fixtures that build out-of-process
+/// against the public path. Behind a private `mod` every one of those
+/// refusals would collapse to `E0603` — a compile-fail test passing because
+/// the module is unreachable, not because the token did its job.
+pub mod topology;
 
 use crate::agent::proc::NoHooks;
 use crate::error::UpstrokeError;

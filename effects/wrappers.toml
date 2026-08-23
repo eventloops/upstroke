@@ -423,6 +423,11 @@ effect_free = [
     "closed_by_a_reaper",
     "collect",
     "containers_with_label",
+    # `HarnessHooks`'s two accessors, the pair `src/rundir.rs`'s own
+    # `HarnessHooks` already classifies here by the same names. Both hand back a
+    # handle the caller already owns -- the shared `HookHarness`, and the
+    # `ContainerTrace` the funnel writes into. Neither reaches the daemon.
+    "harness",
     "image_by_id",
     "image_by_reference",
     "list_intents",
@@ -436,6 +441,7 @@ effect_free = [
     "phase",
     "probe",
     "read_intent",
+    "recording_trace",
     "volume_present",
 ]
 
