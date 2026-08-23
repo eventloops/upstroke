@@ -49,3 +49,12 @@ pub use seams::{
     HarnessTopologyHooks, IdSource, NoTopologyHooks, RealIds, SystemClock, TimeSource,
     TopologyHooks,
 };
+
+pub mod preflight;
+pub mod recover;
+
+pub use preflight::{Probed, RunPreflight};
+pub use recover::{
+    BarrierHeld, EmitContext, LocksHeld, PreflightCertified, RecordsVerified, ResumeCensused,
+    Resumed, RootDerived, RunnerRebuilt,
+};

@@ -649,6 +649,28 @@ impl InvocationLedger {
         self.duplicates
     }
 
+    /// How many registrations settled as **completed**.
+    ///
+    /// Kept apart from [`Self::cancelled`] because R3 keeps them apart:
+    /// "requested: released on **cancel**" and "granted: released on complete
+    /// **or** cancel" are two rows, so a ledger that reported only "settled"
+    /// could not tell a process that ran from one that never started, and a
+    /// caller that completed a refused spawn would balance and be wrong.
+    #[must_use]
+    pub fn completed(&self) -> usize {
+        self.count(Registration::Completed)
+    }
+
+    /// How many registrations settled as **cancelled**.
+    #[must_use]
+    pub fn cancelled(&self) -> usize {
+        self.count(Registration::Cancelled)
+    }
+
+    fn count(&self, state: Registration) -> usize {
+        self.entries.values().filter(|seen| **seen == state).count()
+    }
+
     /// Whether every registration was settled — the process-end condition.
     #[must_use]
     pub fn balances(&self) -> bool {

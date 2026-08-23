@@ -2982,8 +2982,20 @@ fn the_stable_prefix_barrier_is_the_only_way_a_log_becomes_a_topology_fold() {
         "this file is declared `#[cfg(test)] mod tests;` and the scan has to know it: {test_modules:?}"
     );
 
+    // The control names the files rather than counting them. A count is a
+    // number every lane that adds a fold-naming module has to bump, and two
+    // lanes that each add one both write the same next number — so the merge
+    // resolves silently in the direction that *weakens* the census. A list
+    // merges additively, and when it disagrees it names the offending file
+    // instead of two integers.
+    const MENTIONING: &[&str] = &[
+        "events/log.rs",
+        "engine/topology/recover.rs",
+        "topology/census.rs",
+        "topology/fold.rs",
+    ];
     let mut scanned = 0_usize;
-    let mut mentioning = 0_usize;
+    let mut mentioning: Vec<String> = Vec::new();
     let mut callers: Vec<(PathBuf, &str, usize)> = Vec::new();
     for path in &files {
         if test_modules.contains(path) {
@@ -2998,7 +3010,12 @@ fn the_stable_prefix_barrier_is_the_only_way_a_log_becomes_a_topology_fold() {
         };
         scanned += 1;
         if production.contains("TopologyFold") {
-            mentioning += 1;
+            mentioning.push(
+                path.strip_prefix(&src)
+                    .unwrap_or(path)
+                    .to_string_lossy()
+                    .replace('\\', "/"),
+            );
         }
         for entry in FOLD_ENTRIES {
             let count = production.matches(entry).count();
@@ -3009,11 +3026,15 @@ fn the_stable_prefix_barrier_is_the_only_way_a_log_becomes_a_topology_fold() {
     }
 
     assert!(scanned > 40, "the walk found only {scanned} source files");
+    let mut expected: Vec<String> = MENTIONING.iter().map(|entry| (*entry).to_owned()).collect();
+    expected.sort();
+    mentioning.sort();
     assert_eq!(
-        mentioning, 3,
-        "the control: `TopologyFold` is named in the production half of the fold, its census and \
-         this funnel. A different number means the regions this census scanned are not the ones \
-         it thinks they are, and its zero counts would prove nothing"
+        mentioning, expected,
+        "the control: `TopologyFold` is named in the production half of the fold, its census, this \
+         funnel, and the recovery order that holds the barrier. A different set means the regions \
+         this census scanned are not the ones it thinks they are, and its zero counts would prove \
+         nothing"
     );
 
     assert_eq!(
