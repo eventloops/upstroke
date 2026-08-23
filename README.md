@@ -1,5 +1,10 @@
 # upstroke
 
+> Formerly `tactus`. Named for the upstroke — the conductor's preparatory beat, the upward
+> motion of the baton that tells every player when to come in. In engines and in flight the
+> upstroke is the recovery stroke, the one that doesn't deliver the power; in conducting
+> that's the point. It's the preparation that makes the downbeat land together.
+
 [![CI](https://github.com/eventloops/upstroke/actions/workflows/ci.yml/badge.svg)](https://github.com/eventloops/upstroke/actions/workflows/ci.yml)
 [![crates.io](https://img.shields.io/crates/v/upstroke.svg)](https://crates.io/crates/upstroke)
 [![license](https://img.shields.io/crates/l/upstroke.svg)](LICENSE)
