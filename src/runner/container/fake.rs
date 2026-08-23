@@ -658,3 +658,61 @@ pub(crate) fn docker_gate(test: &str, trace: ContainerTrace) -> Result<Box<Docke
     );
     Err(reason)
 }
+
+/// Reclaim the container names a gated test is about to create, before it
+/// creates them.
+///
+/// `reviews/FINDINGS.md` §16. Two gated tests went red on a head whose only
+/// change was a documentation edit, and passed in isolation minutes later:
+/// four containers from an earlier run this session had been **SIGKILLed** when
+/// the box exhausted its inodes — two `Exited (137)`, two still `Created` —
+/// and their names were the deterministic ones those tests recreate, so
+/// `docker create` answered `Conflict. The container name … is already in use`.
+///
+/// Both tests already clean up after themselves, one with a closure on every
+/// exit path and one with a `LeaveNoResidue` guard. Both are correct and
+/// neither can help: **no in-process cleanup runs when the process is
+/// SIGKILLed.** The only cleanup that survives is one the *next* run performs.
+///
+/// The idiom is correct here **only because the names are deterministic**:
+///
+/// > A pre-clean removes the previous run's residue exactly when the name
+/// > recurs. Keyed by something unique per process — a pid, a ULID — it can
+/// > never name anything an earlier run created, and it degrades into an
+/// > unconditional retry that cleans nothing.
+///
+/// So this takes the exact names the caller is about to use, and callers must
+/// build them from their own fixed constants. A caller that passes a pid-keyed
+/// or ULID-keyed name gets a no-op that looks like protection.
+///
+/// This goes through [`super::reclaim`] rather than calling `stop`/`remove`
+/// directly. That is not ceremony: `fake.rs` **re-denies** the effect lints at
+/// its own module level (`PR6-LANEF-004` — a lint level is scoped by the module
+/// tree, so every out-of-line child of `runner::container` had been silently
+/// inheriting the funnel's allow), so a raw primitive here does not compile.
+/// The funnel is also the right answer on its merits: it is the packet's own
+/// reclaim order, every step idempotent and tolerant of already-gone.
+///
+/// `view_path` is `None` because a previous run's Git view lives under **its**
+/// scratch root, which was keyed by that run's pid and is unreachable from
+/// this one. The container name is the only part of the residue that is global
+/// to the daemon, and it is the only part that can collide.
+///
+/// # Panics
+///
+/// When a name cannot be reclaimed for any reason other than its absence —
+/// a pre-clean that fails quietly leaves the conflict it exists to prevent,
+/// and the test then fails somewhere far less informative.
+pub(crate) fn preclean_names(
+    runtime: &dyn ContainerRuntime,
+    view: &dyn super::GitView,
+    private_root: &Path,
+    names: &[&super::intent::ContainerName],
+) {
+    for name in names {
+        super::reclaim(&mut super::NoHooks, runtime, view, private_root, name, None)
+            .unwrap_or_else(|error| {
+                panic!("pre-clean could not reclaim a possibly-stranded `{name}`: {error}")
+            });
+    }
+}

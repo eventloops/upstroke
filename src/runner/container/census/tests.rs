@@ -3518,6 +3518,21 @@ fn real_docker_census_reclaims_a_dead_owner_and_spares_a_live_one() {
     let liveness = RecordingLiveness::new();
     liveness.set_live(&live.run_dir);
 
+    // Pre-clean before the first `docker create`, not after the last teardown.
+    //
+    // `reviews/FINDINGS.md` §16: this test's own cleanup is correct and cannot
+    // help, because no in-process cleanup runs when the process is SIGKILLed.
+    // These two names are built from the three constants above, so the name a
+    // previous SIGKILLed run left is exactly the name this run is about to ask
+    // for. That recurrence is what makes a pre-clean meaningful rather than an
+    // unconditional retry.
+    crate::runner::container::fake::preclean_names(
+        docker.as_ref(),
+        &DisposableDirView::new(ContainerTrace::off()),
+        &root,
+        &[&live.name(&shell_probe()), &dead.name(&shell_probe())],
+    );
+
     let mut names = Vec::new();
     for owner in [&live, &dead] {
         let name = owner.name(&shell_probe());

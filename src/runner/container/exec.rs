@@ -6140,6 +6140,25 @@ mod tests {
         let plan = runner.plan(&request).expect("plans");
         let name = plan.launch.name.clone();
 
+        // Pre-clean before the create, not after the teardown.
+        //
+        // `reviews/FINDINGS.md` §16: `LeaveNoResidue` above is correct and
+        // cannot help, because no in-process cleanup runs when the process is
+        // SIGKILLed. Every component of this name is fixed — `REPO_KEY`, the
+        // run id from `GATED_RUNS`, `INCARNATION_1`, and `gate_id(0)`'s
+        // deterministic invocation hash — so the name a previous SIGKILLed run
+        // left behind is exactly the name this `docker create` is about to ask
+        // for. The recurrence is what makes the pre-clean meaningful.
+        crate::runner::container::fake::preclean_names(
+            docker.as_ref(),
+            &RoleGitView::new(ContainerTrace::off()).for_reader(
+                BoundaryLayout::DEFAULT_GIT_VIEW,
+                BoundaryLayout::DEFAULT_GIT_OBJECTS,
+            ),
+            &identity.private_root,
+            &[&name],
+        );
+
         // Write the intent, materialise the view, create — and stop there.
         // The view is the runner's own projection rather than a bare directory:
         // a linked worktree's `.git` pointer file is a bind **source** of the
