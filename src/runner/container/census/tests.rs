@@ -3033,7 +3033,7 @@ fn census_returns_the_only_token_that_reaches_a_consumer() {
         if path == census_module {
             continue;
         }
-        if production.contains("CensusComplete {") {
+        if constructs_the_token(&production) {
             offenders.push(path.display().to_string());
         }
     }
@@ -3065,6 +3065,29 @@ fn census_returns_the_only_token_that_reaches_a_consumer() {
     let complete = harness.census(&fresh(INC_1)).expect("an empty census");
     assert_eq!(complete.report().incarnation, INC_1);
     assert_eq!(complete.report().orphan_window, super::orphan_window());
+}
+
+/// Whether `production` contains a **construction** of the token, as opposed to
+/// a reference to its type.
+///
+/// `CensusComplete {` is also the last sixteen characters of
+/// `-> &CensusComplete {`, and the first legitimate consumer of the token
+/// necessarily has an accessor of that shape — PR7's startup census holds the
+/// token and hands it out. A bare `contains` therefore reports the first real
+/// caller as a forger, which is a scan that has stopped measuring what it
+/// names. The needle is narrowed by exactly one character: a `CensusComplete {`
+/// whose preceding non-space character is `&` is a reference type. Every
+/// construction shape — `CensusComplete { .. }`, `Ok(CensusComplete { .. }`,
+/// `Self::CensusComplete { .. }` — still matches, and the positive control above
+/// is what keeps that true.
+fn constructs_the_token(production: &str) -> bool {
+    production.match_indices("CensusComplete {").any(|(at, _)| {
+        production[..at]
+            .trim_end()
+            .chars()
+            .next_back()
+            .is_none_or(|previous| previous != '&')
+    })
 }
 
 /// Every `src/**/*.rs`, sorted.
