@@ -138,13 +138,16 @@ use crate::runner::container::GitView;
 use crate::runner::container::resolve::RunnerPreflight;
 use crate::runner::container::runtime::{ContainerRuntime, OwnerLiveness};
 use crate::topology::events::{
-    AttemptInterrupted4, AttemptNumber, GenerationCloseReason, GenerationClosed, GenerationId,
-    IncarnationId, LeaseDisposition, RunResumed4, RunStarted4, TopologyEventBody,
+    AttemptInterrupted4, AttemptNumber, CommitSha, GenerationCloseReason, GenerationClosed,
+    GenerationId, IncarnationId, LeaseDisposition, RunResumed4, RunStarted4, TopologyEventBody,
 };
 use crate::topology::fold::{FrozenInputs, GenerationClass, TopologyFold};
+use crate::topology::leases::{GenerationLease, LeaseOwner};
 use crate::topology::registry::TaskKey;
+use crate::workspace_manager::WorkspaceManager;
 
 use super::create::{IntegrationRefs, ensure_integration_ref};
+use super::dispatch::{DispatchKind, Dispatched, Reuse, resume_open_no_attempt, task_slot};
 use super::emit::{EmitState, RunIdentity};
 use super::identity::{InvocationLedger, Reservations};
 use super::seams::{TimeSource, TopologyHooks};
@@ -1312,7 +1315,158 @@ pub struct ResumeSeams<'a> {
     /// stand up a real repository to reach the ref could not be written here at
     /// all.
     pub refs: &'a dyn IntegrationRefs,
+    /// The workspace manager step (g) rebuilds worktrees through. Every Git
+    /// effect of the recovery order that is not an append goes through it.
+    pub manager: &'a WorkspaceManager,
     pub clock: &'a dyn TimeSource,
+}
+
+/// One step of `decisions.sequential_substrate.recovery_order`, as the packet
+/// names it.
+///
+/// **This type is the reason the order can be checked for completeness.** The
+/// packet names eleven steps in one sentence, and a step that no code performs
+/// is invisible to every technique this project runs: a mutation catalogue
+/// measures whether existing code is pinned, and **omission has nothing to
+/// mutate**. Step (g) was absent from this module for the whole of PR7's
+/// implementation and two review rounds, with 117 named tests passing and every
+/// gate green, because no test read the packet's list.
+///
+/// So the list is a type. Adding a step to the packet means adding a variant,
+/// and a variant with no arm does not compile. Removing a step's call leaves a
+/// hole in [`Recovered::steps`] that
+/// `the_recovery_order_performs_every_step_the_packet_names` fails on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum RecoveryStep {
+    /// Read-only root derivation, before any lock.
+    A0,
+    /// The two locks, the two records, the census and the residue reclaim.
+    A,
+    /// The stable-prefix barrier.
+    A1,
+    /// Complete or Halted: terminal finalization then refuse continuation.
+    B,
+    /// Rebuild the recorded Runner, then its pre-flight probes.
+    C,
+    /// Settle every in-flight identity interrupted.
+    D,
+    /// Close every `RetainedIdle` generation.
+    E,
+    /// Complete `Promoting` promotions and authorized publications.
+    F,
+    /// Recreate `OpenNoAttempt` worktrees at their bases.
+    G,
+    /// Append `run_resumed(4)`.
+    H,
+    /// Admission.
+    I,
+}
+
+/// Which part of the system performs a step.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Performer {
+    /// [`run_recovery_order`] itself.
+    ThisOrder,
+    /// The caller, before the order is entered — `(a0)` is read-only and
+    /// precedes every lock, so it cannot be inside a function that has already
+    /// taken one.
+    CallerBefore,
+    /// The loop, after the order returns.
+    LoopAfter,
+}
+
+impl RecoveryStep {
+    /// The eleven steps, in the packet's order.
+    ///
+    /// Transcribed from `decisions.sequential_substrate.recovery_order`. The
+    /// order of this array **is** the claim; a test compares the trace against
+    /// it rather than against a second list written from memory.
+    pub const ALL: [Self; 11] = [
+        Self::A0,
+        Self::A,
+        Self::A1,
+        Self::B,
+        Self::C,
+        Self::D,
+        Self::E,
+        Self::F,
+        Self::G,
+        Self::H,
+        Self::I,
+    ];
+
+    /// The packet's own label for this step.
+    #[must_use]
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::A0 => "a0",
+            Self::A => "a",
+            Self::A1 => "a1",
+            Self::B => "b",
+            Self::C => "c",
+            Self::D => "d",
+            Self::E => "e",
+            Self::F => "f",
+            Self::G => "g",
+            Self::H => "h",
+            Self::I => "i",
+        }
+    }
+
+    /// The live clause that moves this step out of the packet's sequence
+    /// position, where one does.
+    ///
+    /// **A deviation with a reason is not the same thing as a step in the wrong
+    /// place, and the difference has to be stated somewhere a test can read.**
+    /// Left implicit, an argued reordering and an accidental one look
+    /// identical — which is how a slice ends up with a comment claiming "steps
+    /// (a) through (h), in the packet's order" over a body that performs nine
+    /// of ten in a different one.
+    #[must_use]
+    pub const fn position_override(self) -> Option<&'static str> {
+        match self {
+            // `checkpoint_refusals`: "an intermediate build refuses, **before
+            // any append**, any operation whose terminals it does not
+            // implement". PR7's (f) is a refusal — it does not complete a
+            // promotion, it declines to — and a refusal taken after (d) and
+            // (e) is a refusal after two appends, which that sentence forbids.
+            // So (f) runs before them, and the authorized publication it does
+            // perform (the recorded integration ref) rides with it for the same
+            // reason: the ref is created before the first append of the resume,
+            // which `kill_after_run_started_creates_integration_ref` asserts by
+            // reading the log at the funnel's entry.
+            Self::F => Some("decisions.sequential_substrate.checkpoint_refusals"),
+            _ => None,
+        }
+    }
+
+    /// Who performs it, and — for the two this order does not — why.
+    ///
+    /// The two exceptions are stated here rather than left implicit, because
+    /// "this module does not do that one" is exactly the sentence that hid step
+    /// (g): a reader who accepts it without a reason cannot tell a delegated
+    /// step from a missing one.
+    #[must_use]
+    pub const fn performer(self) -> Performer {
+        match self {
+            // Read-only and before `Lock.AcquireWorktree`, so no R17 hold is
+            // taken and no R25 lock file is created by a refusal here. A
+            // function that has already taken the locks cannot perform it.
+            Self::A0 => Performer::CallerBefore,
+            Self::A
+            | Self::A1
+            | Self::B
+            | Self::C
+            | Self::D
+            | Self::E
+            | Self::F
+            | Self::G
+            | Self::H => Performer::ThisOrder,
+            // `checkpoint_refusals` gives the loop's refusals to `select.rs`,
+            // and admission is the loop's first act, not recovery's last.
+            Self::I => Performer::LoopAfter,
+        }
+    }
 }
 
 /// What one completed recovery did.
@@ -1322,6 +1476,17 @@ pub struct Recovered {
     pub interrupted: usize,
     /// (e): how many `RetainedIdle` generations were closed.
     pub retained_closed: usize,
+    /// (g): every `OpenNoAttempt` generation rebuilt, and whether its worktree
+    /// verified or had to be recreated. A value rather than a count, because
+    /// "the step ran" and "the step ran and found nothing to do" are the two
+    /// states a test of an ordered sequence has to tell apart.
+    pub recreated: Vec<(TaskKey, GenerationId, Reuse)>,
+    /// Every step this order performed, in the order it performed them.
+    ///
+    /// Pushed as each step returns `Ok`, so a step whose call is deleted
+    /// disappears from the trace. That is what makes
+    /// [`RecoveryStep`]'s list checkable against something other than itself.
+    pub steps: Vec<RecoveryStep>,
     /// (h): what `run_resumed` established.
     pub resumed: Resumed,
     /// (c): the config drift and moved-reference warnings, in order.
@@ -1364,6 +1529,7 @@ pub fn run_recovery_order(
         hooks.rundir(),
     )?;
     let records = RecordsVerified::verify(locks, seams.repo_key)?;
+    let mut steps = vec![RecoveryStep::A];
 
     // (a1) the barrier, before every fold-derived effect of every later step.
     let log_path = records.locks().root().log_path();
@@ -1376,6 +1542,7 @@ pub fn run_recovery_order(
         hooks.events(),
     )?;
     let barrier = BarrierHeld::from(records, prefix)?;
+    steps.push(RecoveryStep::A1);
 
     // (a) the census, under the barrier and never before it.
     let censused = ResumeCensused::census(
@@ -1393,12 +1560,14 @@ pub fn run_recovery_order(
 
     // (b) Complete or Halted: finalize then refuse. PR7 refuses.
     refuse_if_finished(&censused)?;
+    steps.push(RecoveryStep::B);
 
     // (c) the recorded Runner by inspection, then its probes.
     let rebuilt = RunnerRebuilt::rebuild(censused, seams.today, Some(seams.runtime))?;
     let drift: Vec<String> = rebuilt.warnings().to_vec();
     warnings.extend(drift.iter().cloned());
     let mut certified = PreflightCertified::certify(rebuilt, seams.preflight)?;
+    steps.push(RecoveryStep::C);
 
     // (f) the terminals this build does not implement, refused before any
     // append — which is why it precedes (d) and (e) rather than sitting in its
@@ -1412,6 +1581,7 @@ pub fn run_recovery_order(
     // ref still sitting at the recorded base, and "present == base continue"
     // would adopt it under a transaction this build cannot resolve.
     ensure_recorded_integration_ref(&certified, seams.refs, hooks)?;
+    steps.push(RecoveryStep::F);
 
     // The append-error protocol's two ledgers. The recovery order takes no
     // provisional reservation and registers no invocation of its own — (c)'s
@@ -1431,13 +1601,25 @@ pub fn run_recovery_order(
     };
     // (d), (e) — recovery events, every one of them before (h).
     let interrupted = settle_interrupted(&mut certified, &mut context)?;
+    steps.push(RecoveryStep::D);
     let retained_closed = close_retained_idle(&mut certified, &mut context)?;
+    steps.push(RecoveryStep::E);
+
+    // (g) — after (e) and before (h), the packet's own position. A worktree
+    // effect and not an append, so it takes no `EmitContext`; the borrow of
+    // `hooks` that `context` holds ends here for the same reason the step must
+    // run before (h): `run_resumed` consumes the witness this step reads.
+    let recreated = recreate_open_no_attempt(&certified, seams.manager, context.hooks)?;
+    steps.push(RecoveryStep::G);
 
     // (h) — and the witness is consumed here.
     let resumed = run_resumed(certified, &mut context, seams.incarnation)?;
+    steps.push(RecoveryStep::H);
     Ok(Recovered {
         interrupted,
         retained_closed,
+        recreated,
+        steps,
         resumed,
         warnings: drift,
     })
@@ -1843,6 +2025,127 @@ fn started_of(certified: &PreflightCertified) -> &RunStarted4 {
         .locks()
         .root()
         .started()
+}
+
+/// **(g)** Recreate `OpenNoAttempt` worktrees at their bases.
+///
+/// `decisions.sequential_substrate.recovery_order`: "(g) recreate
+/// `OpenNoAttempt` worktrees at their bases (through `Worktree.Verify` or
+/// forced recreate)". It is one of the order's eleven steps and it was the one
+/// this module did not perform — the omission that `resume_open_no_attempt`,
+/// written and tested by the dispatch lane, had no production caller for.
+///
+/// **The recovery this step performs is not chosen here.**
+/// `decisions.workspace_candidates.generation` gives a failed verification two
+/// different recoveries and says which applies is a property of the
+/// generation's *class*: an `OpenNoAttempt` or repair worktree "is removed with
+/// force and recreated", a `RetainedIdle` generation "is closed". This step
+/// enumerates one class and hands each member to the single function that
+/// implements that class's recovery. The retained class is (e)'s and reaches
+/// `Worktree.Verify` through its own seam, so no retained worktree can arrive
+/// here to be handed the recreate branch.
+///
+/// **Every field of the reconstructed dispatch is read off the proven prefix,
+/// not invented.** `base` is the generation's recorded `base_sha`; the slot is
+/// [`task_slot`], which derives it from `{key, generation}` so no two callers
+/// can disagree about which worktree a generation owns; the path is
+/// `slot_path`, the same derivation `dispatch` records into
+/// `task_dispatched.worktree_path`; and the predicted region comes from the
+/// lease table, which is the only place it survives a restart.
+///
+/// # Errors
+///
+/// [`UpstrokeError::Refused`] for a generation whose lease is an inherited
+/// lineage — a repair, whose resume action is to re-materialize its source
+/// candidate, and whose source the fold does not retain. `checkpoint_refusals`
+/// gives repair execution to PR8, so this build refuses rather than
+/// reconstructing a materialization it cannot prove. **The arm is unreachable
+/// in this slice and both walls are measured** by
+/// `a_repair_generation_cannot_reach_step_g_in_this_slice`: the fold refuses an
+/// inherited lease on an ordinary task at the barrier's checked replay, and
+/// `TaskRegistry::originals_with_agents` gives every entry `lineage: None`, so
+/// there is no task the lease would be legal on. That test fails the day a
+/// slice admits repairs, which is when this arm becomes reachable. Also
+/// refused when a generation holding its lease has no recorded region, which
+/// is a fold that disagrees with itself rather than a state to guess at.
+/// Otherwise the containment refusals or a Git error from
+/// [`resume_open_no_attempt`].
+pub fn recreate_open_no_attempt(
+    certified: &PreflightCertified,
+    manager: &WorkspaceManager,
+    hooks: &mut dyn TopologyHooks,
+) -> Result<Vec<(TaskKey, GenerationId, Reuse)>, UpstrokeError> {
+    let mut rebuilt = Vec::new();
+    for (key, generation, base, kind) in open_no_attempt(fold_of(certified))? {
+        let slot = task_slot(key, generation);
+        let dispatched = Dispatched {
+            key,
+            generation,
+            base,
+            worktree: manager.slot_path(&slot),
+            slot,
+            kind,
+        };
+        let reuse = resume_open_no_attempt(manager, hooks, &dispatched)?;
+        rebuilt.push((key, generation, reuse));
+    }
+    Ok(rebuilt)
+}
+
+/// Every `OpenNoAttempt` generation the proven prefix records, with what a
+/// rebuild of it needs.
+///
+/// Sibling of [`retained_idle`] and [`in_flight`], and deliberately shaped like
+/// them: one enumerator per generation class, so "which class does this step
+/// act on" is a property of the function the step calls rather than of a
+/// predicate the step re-derives. Two rules that can disagree is the shape this
+/// slice has paid for repeatedly.
+fn open_no_attempt(
+    fold: &TopologyFold,
+) -> Result<Vec<(TaskKey, GenerationId, CommitSha, DispatchKind)>, UpstrokeError> {
+    let mut found = Vec::new();
+    for key in task_keys(fold) {
+        let Some(task) = fold.task(key) else { continue };
+        for generation in &task.generations {
+            if !matches!(generation.class, GenerationClass::OpenNoAttempt) {
+                continue;
+            }
+            let root = match generation.lease {
+                GenerationLease::Own => None,
+                GenerationLease::InheritedLineage { root } => Some(root),
+            };
+            if let Some(root) = root {
+                return Err(UpstrokeError::Refused {
+                    message: format!(
+                        "task {} generation {} is a repair executing inside lineage {}'s lease,                          and its resume action is to re-materialize the candidate it was                          dispatched from, which the fold does not record; repair execution is                          not implemented by this build",
+                        key.0, generation.id.0, root.0
+                    ),
+                });
+            }
+            let owner = LeaseOwner::Generation {
+                key,
+                generation: generation.id,
+            };
+            let Some(paths) = fold.leases().and_then(|table| table.held_paths(owner)) else {
+                return Err(UpstrokeError::Refused {
+                    message: format!(
+                        "task {} generation {} is open with no attempt and holds its lease, \
+                         but the lease table records no region for it",
+                        key.0, generation.id.0
+                    ),
+                });
+            };
+            found.push((
+                key,
+                generation.id,
+                generation.base_sha.clone(),
+                DispatchKind::Ordinary {
+                    paths: paths.clone(),
+                },
+            ));
+        }
+    }
+    Ok(found)
 }
 
 /// Every task key the registry holds.

@@ -120,6 +120,9 @@ fn mkdir(path: &Path) {
 /// nine-argument builder call would hide which.
 struct Fixture {
     root: PathBuf,
+    /// The seed commit every fixture's repository holds — the base a step (g)
+    /// worktree is cut at.
+    base_sha: CommitSha,
     repo_root: PathBuf,
     git_dir: PathBuf,
     private_root: PathBuf,
@@ -147,15 +150,59 @@ struct Damage {
     host_runner: bool,
     /// Extra events, appended after `run_started` in order.
     extra: Vec<TopologyEventBody>,
+    /// Leave one generation **open with no attempt** — the state a crash
+    /// between `task_dispatched` and `attempt_started` leaves, and the only
+    /// state recovery step (g) has anything to do in.
+    open_generation: bool,
 }
 
 impl Fixture {
+    /// The manager recovery step (g) rebuilds worktrees through.
+    ///
+    /// Derived from the fixture's own repository and private root rather than
+    /// stubbed: (g)'s whole subject is a real `Worktree.Verify` against a real
+    /// checkout, and a manager that could not reach one would make every
+    /// assertion about the step vacuous.
+    fn manager(&self) -> crate::workspace_manager::WorkspaceManager {
+        crate::workspace_manager::WorkspaceManager::derive(
+            &self.repo_root,
+            &self.private_root,
+            &self.started.run_id,
+            &self.started.incarnation.0,
+        )
+        .expect("the fixture's repository and private root are real directories")
+    }
+
     fn build(tag: &str, damage: Damage) -> Self {
         let root = fixture_root(tag);
         let repo_root = root.join("repo");
         let git_dir = repo_root.join(".git");
         let private_root = root.join("private");
-        mkdir(&git_dir);
+        mkdir(&repo_root);
+        // A **real** repository, not a `.git` directory made with `mkdir`.
+        // Recovery step (g) rebuilds worktrees through a `WorkspaceManager`,
+        // and `WorkspaceManager::derive` asks Git where the common dir is — so
+        // a fixture whose `.git` is an empty directory cannot express the step
+        // at all, and every assertion about it would be vacuous.
+        crate::workspace_manager::fixture::git(&repo_root, &["init", "-q", "-b", "main"]);
+        // A seed commit, so the repository has a real base a worktree can be
+        // cut at. Step (g) recreates `OpenNoAttempt` worktrees "at their bases",
+        // and a base that names no object makes the step's own funnel fail for
+        // a reason that has nothing to do with what is being tested.
+        for setting in [
+            ["config", "user.email", "tests@upstroke.local"],
+            ["config", "user.name", "upstroke tests"],
+            ["config", "core.logAllRefUpdates", "true"],
+        ] {
+            crate::workspace_manager::fixture::git(&repo_root, &setting);
+        }
+        crate::workspace_manager::fixture::write_file(&repo_root.join("seed.txt"), b"seed\n");
+        crate::workspace_manager::fixture::git(&repo_root, &["add", "-A"]);
+        crate::workspace_manager::fixture::git(&repo_root, &["commit", "-q", "-m", "seed"]);
+        let base_sha = CommitSha(crate::workspace_manager::fixture::git(
+            &repo_root,
+            &["rev-parse", "HEAD"],
+        ));
         mkdir(&private_root);
         let repo_key = RepoKey::v1(&std::fs::canonicalize(&git_dir).expect("the git dir exists"));
 
@@ -212,7 +259,12 @@ impl Fixture {
         log.append_topology(EventSite::AppendFirst, &line)
             .expect("the commitment boundary");
         let first_line = line.committed_bytes()[..line.committed_bytes().len() - 1].to_vec();
-        for body in &damage.extra {
+        let mut later: Vec<TopologyEventBody> = Vec::new();
+        if damage.open_generation {
+            later.push(dispatched_at(&base_sha));
+        }
+        later.extend(damage.extra.iter().cloned());
+        for body in &later {
             let site = crate::events::log::site_for(body);
             let (line, _) =
                 TopologyLine::round_trip(&event(body.clone())).expect("a valid later event");
@@ -253,6 +305,7 @@ impl Fixture {
 
         Self {
             root,
+            base_sha,
             repo_root,
             git_dir,
             private_root,
@@ -1073,6 +1126,7 @@ fn resume_with(
     let liveness = FakeOwnerLiveness::new();
     let view = DisposableDirView::new(ContainerTrace::default());
     let incarnation = IncarnationId(RESUMER.to_owned());
+    let manager = fixture.manager();
     let mut warnings = Vec::new();
     let outcome = fixture
         .derive(given.explicit_root.as_deref())
@@ -1091,6 +1145,7 @@ fn resume_with(
                     view: &view,
                     preflight: given.preflight,
                     refs: &given.refs,
+                    manager: &manager,
                     clock: &Frozen,
                 },
                 hooks,
@@ -1616,6 +1671,19 @@ fn resume_refuses_before_any_fold_derived_effect_when_prefix_sync_fails() {
 
 const ALPHA: TaskKey = TaskKey(0);
 const GEN: GenerationId = GenerationId(0);
+
+/// [`dispatched`], at a base that names a real object.
+///
+/// The constant-SHA version is enough for every test whose subject is the
+/// fold, because the fold does not resolve a base. Step (g) does — it cuts a
+/// worktree at it — so its fixture has to name the repository's own commit.
+fn dispatched_at(base: &CommitSha) -> TopologyEventBody {
+    let TopologyEventBody::TaskDispatched { mut data } = dispatched() else {
+        unreachable!("`dispatched` builds a `TaskDispatched`")
+    };
+    data.base_sha = base.clone();
+    TopologyEventBody::TaskDispatched { data }
+}
 
 fn dispatched() -> TopologyEventBody {
     TopologyEventBody::TaskDispatched {
@@ -3648,6 +3716,17 @@ fn recovery_kill_child() {
 
     let root = RootDerived::derive_with(&repo_root, RUN_ID, None, TOPOLOGY_SCHEMA)
         .expect("(a0) derives in the child");
+    // Step (g)'s manager, derived from the root (a0) just computed rather than
+    // from an env var the parent would have to pass: the private root is the
+    // one thing (a0) exists to establish, and taking it from anywhere else
+    // would let the child rebuild worktrees under a root the order refused.
+    let manager = crate::workspace_manager::WorkspaceManager::derive(
+        &repo_root,
+        root.private_root(),
+        RUN_ID,
+        RESUMER,
+    )
+    .expect("the child's repository and private root are real directories");
     let _ = run_recovery_order(
         root,
         &ResumeSeams {
@@ -3665,6 +3744,7 @@ fn recovery_kill_child() {
             view: &view,
             preflight: &certifies,
             refs: &refs,
+            manager: &manager,
             clock: &Frozen,
         },
         &mut hooks,
@@ -3908,5 +3988,260 @@ fn the_barrier_is_the_only_topology_route_from_a_proven_prefix_to_an_append_hand
         vec![("engine/topology/recover.rs".to_owned(), 1)],
         "a proven prefix becomes an append handle in exactly one production place in the topology \
          engine, and that place is `BarrierHeld::from`"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// The order's completeness against the packet's own list
+// ---------------------------------------------------------------------------
+
+/// **The recovery order performs every step `recovery_order` names.**
+///
+/// This is the test that did not exist while step (g) did not exist. For the
+/// whole of PR7's implementation and two review rounds, `run_recovery_order`
+/// performed nine of the ten steps it owns, with all 117 named tests passing,
+/// every gate green on three platforms, and its own doc comment claiming
+/// "steps (a) through (h)". Nothing could see it: a mutation catalogue measures
+/// whether existing code is pinned, and **omission has nothing to mutate**.
+///
+/// So the assertion is against [`RecoveryStep::ALL`], which is the packet's
+/// sentence transcribed into a type, and not against a second list written from
+/// the implementation. Two steps are excluded **by name and with a reason**
+/// rather than by being quietly absent — see [`RecoveryStep::performer`].
+#[test]
+fn the_recovery_order_performs_every_step_the_packet_names() {
+    let fixture = Fixture::healthy("every-step");
+    let harness = harness();
+    let runtime = runtime_holding_the_record();
+    let certifies = AlwaysCertifies;
+    let given = Given::healthy(&fixture, &runtime, &certifies);
+
+    let (outcome, _) = resume(&fixture, &harness, &given);
+    let recovered = outcome.expect("the healthy resume completes");
+
+    let owed: Vec<RecoveryStep> = RecoveryStep::ALL
+        .into_iter()
+        .filter(|step| step.performer() == Performer::ThisOrder)
+        .collect();
+
+    // Completeness first, and it is the half this test exists for: every step
+    // the packet gives this order was performed, exactly once. Sorted, so a
+    // step that moved for a stated reason cannot fail the completeness claim —
+    // that is the next assertion's subject and it is a different question.
+    let mut performed = recovered.steps.clone();
+    performed.sort_unstable();
+    let mut expected = owed.clone();
+    expected.sort_unstable();
+    assert_eq!(
+        performed,
+        expected,
+        "the order performed {:?} and the packet names {:?} for it; a step in \
+         the second list and not the first is a step no code performs, which \
+         is the defect this test exists for",
+        recovered
+            .steps
+            .iter()
+            .map(|step| step.label())
+            .collect::<Vec<_>>(),
+        owed.iter().map(|step| step.label()).collect::<Vec<_>>()
+    );
+
+    // Then the order, for every step whose position the packet alone decides.
+    // `(f)` is excluded **by a named live clause**, not by being skipped: see
+    // `RecoveryStep::position_override`.
+    let packet_order: Vec<RecoveryStep> = owed
+        .iter()
+        .copied()
+        .filter(|step| step.position_override().is_none())
+        .collect();
+    let performed_order: Vec<RecoveryStep> = recovered
+        .steps
+        .iter()
+        .copied()
+        .filter(|step| step.position_override().is_none())
+        .collect();
+    assert_eq!(
+        performed_order, packet_order,
+        "the steps the packet alone positions ran out of order; a step that \
+         must move carries the clause that moves it"
+    );
+
+    // And the one that does move, moved for its reason and not by accident:
+    // (f) is a refusal in this build, and `checkpoint_refusals` puts a refusal
+    // before any append, so it must precede (d) and (e), which append.
+    let at = |step: RecoveryStep| {
+        recovered
+            .steps
+            .iter()
+            .position(|performed| *performed == step)
+            .expect("every owed step was performed")
+    };
+    assert!(
+        at(RecoveryStep::F) < at(RecoveryStep::D) && at(RecoveryStep::F) < at(RecoveryStep::E),
+        "(f) refuses, and `checkpoint_refusals` puts a refusal before any \
+         append; (d) and (e) append"
+    );
+}
+
+/// The transcribed list is the packet's list — eleven steps, these labels, in
+/// this order.
+///
+/// The companion to the test above, and it guards the *other* direction. That
+/// one proves the implementation covers [`RecoveryStep::ALL`]; this one proves
+/// `ALL` is still the packet's sentence, because a variant deleted from `ALL`
+/// would make the first test pass by asking for less.
+#[test]
+fn the_transcribed_recovery_steps_are_the_packets_eleven() {
+    assert_eq!(
+        RecoveryStep::ALL
+            .iter()
+            .map(|step| step.label())
+            .collect::<Vec<_>>(),
+        vec!["a0", "a", "a1", "b", "c", "d", "e", "f", "g", "h", "i"],
+        "transcribed from `decisions.sequential_substrate.recovery_order`"
+    );
+    assert_eq!(
+        RecoveryStep::ALL
+            .iter()
+            .filter(|step| step.performer() != Performer::ThisOrder)
+            .map(|step| (step.label(), step.performer()))
+            .collect::<Vec<_>>(),
+        vec![("a0", Performer::CallerBefore), ("i", Performer::LoopAfter)],
+        "exactly two steps are delegated, and each is delegated to a named \
+         performer with a reason: a step whose performer nobody states is \
+         indistinguishable from a step nobody performs"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// (g) — recreate `OpenNoAttempt` worktrees at their bases
+// ---------------------------------------------------------------------------
+
+/// **The step does work, and the work is a worktree at the recorded base.**
+///
+/// The companion to `the_recovery_order_performs_every_step_the_packet_names`,
+/// and it is the half that test cannot give: over a healthy fixture (g) runs
+/// and finds nothing, so "the step ran" and "the step is a no-op" are the same
+/// observation. This fixture leaves the one state (g) exists for — a generation
+/// dispatched and never attempted, which is what a crash between
+/// `task_dispatched` and `attempt_started` leaves.
+#[test]
+fn resume_recreates_an_open_no_attempt_worktree_at_its_base() {
+    let fixture = Fixture::build(
+        "step-g-recreate",
+        Damage {
+            open_generation: true,
+            ..Damage::default()
+        },
+    );
+    let harness = harness();
+    let runtime = runtime_holding_the_record();
+    let certifies = AlwaysCertifies;
+    let given = Given::healthy(&fixture, &runtime, &certifies);
+
+    let manager = fixture.manager();
+    let slot = crate::engine::topology::dispatch::task_slot(ALPHA, GEN);
+    let worktree = manager.slot_path(&slot);
+    assert!(
+        !worktree.exists(),
+        "the fixture leaves the generation open with no worktree, which is what \
+         the kill leaves and what (g) has to answer"
+    );
+
+    let (outcome, _) = resume(&fixture, &harness, &given);
+    let recovered = outcome.expect("the resume completes");
+
+    assert_eq!(
+        recovered
+            .recreated
+            .iter()
+            .map(|(key, generation, _)| (*key, *generation))
+            .collect::<Vec<_>>(),
+        vec![(ALPHA, GEN)],
+        "(g) acts on exactly the open generation, and on nothing else"
+    );
+    assert!(
+        worktree.exists(),
+        "(g) recreates the worktree the generation records; without it the \
+         resumed loop has a dispatched generation whose checkout does not exist"
+    );
+    assert_eq!(
+        crate::workspace_manager::fixture::git(&worktree, &["rev-parse", "HEAD"]),
+        fixture.base_sha.0,
+        "at its **base** — `recovery_order` (g) says where, and a worktree cut \
+         anywhere else silently changes what the next attempt starts from"
+    );
+}
+
+/// A repair generation cannot reach step (g) in this slice, and the reason is
+/// measured rather than asserted.
+///
+/// (g) refuses a generation whose lease is an inherited lineage: `T-DISPATCH`'s
+/// resume action for a repair is to re-run the recorded materialization, whose
+/// source candidate the fold does not retain, and `checkpoint_refusals` gives
+/// repair execution to PR8. That arm is **unreachable here**, and this test
+/// pins both walls that make it so, because "unreachable" written in a comment
+/// is the same sentence as "I did not check".
+///
+/// The wall this test will lose first is the second one: the day a slice admits
+/// repairs, `TaskRegistry::from_plan` starts producing entries with a lineage,
+/// this test fails, and (g)'s arm becomes reachable — which is precisely when
+/// someone should be made to look at it.
+#[test]
+fn a_repair_generation_cannot_reach_step_g_in_this_slice() {
+    // Wall one: the fold refuses an inherited lease on an ordinary task, at the
+    // barrier's checked replay — so the event never becomes fold state at all.
+    let repair = {
+        let TopologyEventBody::TaskDispatched { mut data } = dispatched() else {
+            unreachable!("`dispatched` builds a `TaskDispatched`")
+        };
+        data.lease = LeaseGrant::InheritedLineage { root: TaskKey(1) };
+        TopologyEventBody::TaskDispatched { data }
+    };
+    let fixture = Fixture::build(
+        "step-g-repair",
+        Damage {
+            extra: vec![repair],
+            ..Damage::default()
+        },
+    );
+    let harness = harness();
+    let runtime = runtime_holding_the_record();
+    let certifies = AlwaysCertifies;
+    let given = Given::healthy(&fixture, &runtime, &certifies);
+
+    let (outcome, _) = resume(&fixture, &harness, &given);
+    let text = outcome
+        .expect_err("the fold refuses the shape before any step sees it")
+        .to_string();
+    assert!(
+        text.contains("an ordinary task belongs to no lineage and cannot inherit one's lease"),
+        "the refusal is the fold's, at the replay, and not step (g)'s: {text}"
+    );
+    assert!(
+        text.contains("stable-prefix barrier"),
+        "and it lands at the barrier, so nothing fold-derived was acted on: {text}"
+    );
+
+    // Wall two: and there is no task it *would* be legal on, because this
+    // slice's registry gives every entry `lineage: None`.
+    let registry = TaskRegistry::originals_with_agents(
+        &fixture.plan,
+        &fixture.started.registry_record(),
+        &fixture.started.probed_agents,
+    )
+    .expect("the fixture's plan registers");
+    assert!(
+        !registry.entries().is_empty(),
+        "a registry with no entries would satisfy the next assertion by having \
+         nothing to check"
+    );
+    assert!(
+        registry
+            .entries()
+            .iter()
+            .all(|entry| entry.lineage.is_none()),
+        "no entry this slice can build descends from a lineage, so no \
+         `task_dispatched` carrying an inherited lease can be valid"
     );
 }
