@@ -38,7 +38,7 @@ use super::{
     EFFECT_SITES_JSON, FROZEN_LEGACY_ALLOWLIST, FUNNEL_MODULES_JSON, REGENERATE,
     RESIDUE_CLASSES_JSON, TOPOLOGY_MODULES, USED_GOVERNED_LINTS, WRAPPERS_TOML, blank_comments,
     blank_comments_and_strings, externally_reachable_fns, governed_allows, legacy_growth,
-    normalize_lint, production_region, topology_modules_among,
+    normalize_lint, production_code, production_region, topology_modules_among,
 };
 use crate::topology::effects::{EffectSiteId, effect_sites, effect_sites_json};
 
@@ -2733,28 +2733,187 @@ fn the_view_directory_has_one_definition_in_the_tree() {
     );
 }
 
-/// The **domain-deciding** function is written three times, and the three
-/// disagree.
+/// [`production_code`] removes the item and keeps the file.
+///
+/// Every shape here is one this tree actually contains, and each is a way a
+/// truncating region loses production code. The censuses that use this helper
+/// count over the whole tree, so a shape it mishandles is a hole nobody would
+/// see: the count would simply be lower.
+#[test]
+fn the_production_code_region_removes_a_configured_item_and_keeps_the_rest() {
+    // A `mod tests;` declaration. Thirteen files in this tree end with one, and
+    // everything below it used to be outside every region that truncates.
+    let region = production_code("fn above() {}\n#[cfg(test)]\nmod tests;\nfn below() {}\n");
+    assert!(region.contains("fn above()"), "{region:?}");
+    assert!(region.contains("fn below()"), "{region:?}");
+    assert!(!region.contains("mod tests;"), "{region:?}");
+    assert_eq!(
+        region.lines().count(),
+        4,
+        "the item is blanked in place, so line numbers survive: {region:?}"
+    );
+
+    // A `mod tests { … }` block, brace-matched rather than indentation-matched.
+    let region = production_code(
+        "fn above() {}\n#[cfg(test)]\nmod tests {\n    fn inner() { let _ = 1; }\n}\nfn below() {}\n",
+    );
+    assert!(region.contains("fn above()") && region.contains("fn below()"));
+    assert!(!region.contains("fn inner()"), "{region:?}");
+
+    // A `#[cfg(test)] use`, which truncates `production_region` and is the
+    // shape `src/engine/coordinator.rs` carries on line 36 of 1599.
+    let region = production_code("use a::b;\n#[cfg(test)]\nuse c::d;\nfn below() {}\n");
+    assert!(region.contains("use a::b;") && region.contains("fn below()"));
+    assert!(!region.contains("use c::d;"), "{region:?}");
+
+    // A braced `use`, whose item ends at `}` and takes the `;` with it.
+    let region = production_code("#[cfg(test)]\nuse a::{b, c};\nfn below() {}\n");
+    assert!(region.contains("fn below()"));
+    assert!(!region.contains("a::"), "{region:?}");
+    assert!(
+        !region.contains(';'),
+        "the trailing `;` goes with the item: {region:?}"
+    );
+
+    // A test-only `const` whose value is a string, and a test-only `fn`.
+    let region = production_code(
+        "#[cfg(test)]\npub const ALL: &str = \"x\";\n#[cfg(test)]\npub(super) fn f() { g(); }\nfn below() {}\n",
+    );
+    assert!(region.contains("fn below()"));
+    assert!(
+        !region.contains("ALL") && !region.contains("g();"),
+        "{region:?}"
+    );
+
+    // A struct field, which ends at its comma rather than at the struct's brace
+    // (`src/engine/options.rs` has three).
+    let region = production_code(
+        "struct S {\n    kept: u8,\n    #[cfg(test)]\n    gone: Option<u8>,\n    also_kept: u8,\n}\n",
+    );
+    assert!(region.contains("kept: u8,") && region.contains("also_kept: u8,"));
+    assert!(!region.contains("gone"), "{region:?}");
+
+    // Attributes stacked on one item belong to that item.
+    let region = production_code("#[cfg(test)]\n#[allow(dead_code)]\nmod tests;\nfn below() {}\n");
+    assert!(region.contains("fn below()"));
+    assert!(!region.contains("mod tests;"), "{region:?}");
+}
+
+/// A `#[cfg(test)]` that is prose neither cuts nor is removed.
+///
+/// The two attacks the `//`-only strip this replaced could not see, both
+/// measured against the barrier census: with either one planted as line 1 of a
+/// production file, a second `TopologyFold::parse_log` route in the same file
+/// became invisible and the census passed.
+#[test]
+fn a_configured_attribute_in_prose_removes_nothing() {
+    for prose in [
+        "/* a fixture in prose: #[cfg(test)] opens a test module */\nfn kept() {}\n",
+        "const CFG_TEST_ATTR: &str = \"#[cfg(test)]\";\nfn kept() {}\n",
+        "//! prose naming #[cfg(test)]\nfn kept() {}\n",
+        "/// a doc comment naming #[cfg(test)]\nfn kept() {}\n",
+    ] {
+        let region = production_code(prose);
+        assert!(
+            region.contains("fn kept()"),
+            "a `#[cfg(test)]` in prose removed the item after it: {prose:?} -> {region:?}"
+        );
+        assert!(
+            !region.contains("#[cfg(test)]"),
+            "the attribute survived the blanking: {region:?}"
+        );
+    }
+    // And a real attribute beside prose that quotes one is still found.
+    let region = production_code(
+        "// prose: #[cfg(test)] mod tests;\n#[cfg(test)]\nmod tests;\nfn kept() {}\n",
+    );
+    assert!(region.contains("fn kept()"), "{region:?}");
+    assert!(!region.contains("mod tests;"), "{region:?}");
+}
+
+/// The region is a superset of [`production_region`]'s, file by file, over the
+/// tree.
+///
+/// The repair must make every census that adopted it detect **more**, never
+/// less, and this is that sentence executed rather than argued: for each file,
+/// every byte of code the truncating region keeps is kept here too. Comments
+/// and string literals are blanked in both, so the comparison is over code.
+#[test]
+fn the_production_code_region_contains_the_truncated_one() {
+    let mut compared = 0_usize;
+    let mut strictly_larger = 0_usize;
+    let mut gained: BTreeSet<String> = BTreeSet::new();
+    for (path, source) in scanned_sources() {
+        let truncated = blank_comments_and_strings(&production_region(&source));
+        let whole = production_code(&source);
+        let prefix = &whole[..truncated.len().min(whole.len())];
+        assert_eq!(
+            prefix.replace(' ', ""),
+            truncated.replace(' ', ""),
+            "{path}: the truncating region keeps code this one does not"
+        );
+        compared += 1;
+        if whole.trim().len() > truncated.trim().len() {
+            strictly_larger += 1;
+            gained.insert(path);
+        }
+    }
+    assert!(compared > 40, "only {compared} files were compared");
+    // And it is a *strict* superset somewhere, or the two regions are the same
+    // function and the comparison above proves nothing. Eleven files gain today,
+    // and they are the ones holding code below their first `#[cfg(test)]`: the
+    // eight `every_production_region_that_stops_early_stops_at_a_module` pins
+    // that still have code under the cut, plus the three test files carrying a
+    // `#[cfg(test)] mod this_file_is_test_only {}` marker whose whole purpose
+    // was to zero the truncating region.
+    assert!(
+        strictly_larger >= 8,
+        "only {strictly_larger} files gained anything, so the two regions are the same \
+         function and this comparison proves nothing"
+    );
+    assert!(
+        gained.contains("src/engine/coordinator.rs"),
+        "the legacy coordinator — 35 of 1599 lines under the truncating region — must be one \
+         of the files that gains, or the census that adopted this helper still cannot see it"
+    );
+}
+
+/// The **domain-deciding** function was written three times, the three
+/// disagreed, and two of them are gone.
 ///
 /// `PR5-R1-CFG-TEST-SHRINKS-THE-DOMAIN`, `PR6B-PRODUCTION-REGION-CUT-AT-A-CFG-\
 /// TEST-USE`, and the class `PR5D-VISIBILITY-CHECK-DUPLICATED` names: a value
 /// two places both maintain by hand disagree eventually, and the one that
 /// disagrees silently is the one that decides what a census is allowed to see.
-/// Measured across the tree by PR6 lane E, this crate has **three**
-/// `production_region` implementations with three different semantics:
+/// Measured across the tree by PR6 lane E, this crate had **three**
+/// `production_region` implementations with three different semantics, and each
+/// carried a hazard the other two did not:
 ///
-/// | where | what it removes | the hazard it carries |
+/// | where | what it removed | the hazard it carried |
 /// |---|---|---|
 /// | [`production_region`] (`src/effects.rs`, `pub`) | everything from the **first** `#[cfg(test)]`, whatever it attaches to | a `#[cfg(test)] use` truncates the file |
-/// | `runner::tests::production_region` (private) | only `#[cfg(test)] mod … { … }` **blocks** | none of the above; it does not blank comments |
-/// | `events::log::tests::production_region` (private) | from the first `#[cfg(test)]` in the **raw** source | `PR4-CENSUS-COMMENT-ORACLE`: a `#[cfg(test)]` in a comment truncates |
+/// | `runner::tests::production_region` (private, **removed**) | only `#[cfg(test)] mod … { … }` **blocks** | it did not blank comments, so its counts included prose |
+/// | `events::log::tests::production_region` (private, still here) | from the first `#[cfg(test)]` in the **raw** source | `PR4-CENSUS-COMMENT-ORACLE`: a `#[cfg(test)]` in a comment truncates |
 ///
 /// They were measured against each other rather than assumed: a `run_with_\
 /// timeout` planted at the **last line** of `src/agent/claude.rs` — a file the
 /// `effects.rs` region truncates to its first 66 of 1064 lines — is **seen** by
 /// `runner::tests::every_production_process_start_is_classified`, because that
-/// census uses the second implementation. Two censuses in one crate, both
+/// census used the second implementation. Two censuses in one crate, both
 /// answering "every production X is classified", over two different domains.
+///
+/// PR7's census repair removed the second and left **two**, which is what the
+/// count at the bottom now pins. Every whole-tree census that asks a
+/// *prohibition* question — the barrier census, the four censuses in
+/// `runner::tests`, the container token census — now shares
+/// [`crate::effects::production_code`]: the whole file, comments and string
+/// literals blanked, every `#[cfg(test)]` **item** removed rather than the file
+/// truncated at the first one. It is a fourth semantics and deliberately not a
+/// fourth `production_region`: truncation is right for a *domain* question and
+/// wrong for a prohibition, and the two names say which is which.
+/// `events::log::tests::production_region` survives because two censuses in that
+/// file ask about one named file each and assert their own strip removed
+/// something before counting.
 ///
 /// # What this test pins
 ///
@@ -2872,10 +3031,11 @@ fn every_production_region_that_stops_early_stops_at_a_module() {
         "only {at_a_module} file(s) cut at a module; the scan is not reading the tree"
     );
 
-    // The three implementations are all still there. If one is deleted or
-    // unified, this table is stale and the doc comment above is a lie — which is
-    // the failure `PR5D-CI-COMPONENT-CENSUS-COMMENT-ORACLE` is about, one level
-    // out. Counted in code, not asserted from prose.
+    // Both surviving implementations are still there, and no third has been
+    // added. If one is deleted, unified or duplicated, this table is stale and
+    // the doc comment above is a lie — which is the failure
+    // `PR5D-CI-COMPONENT-CENSUS-COMMENT-ORACLE` is about, one level out.
+    // Counted in code, not asserted from prose.
     let definitions: usize = scanned_sources()
         .iter()
         .map(|(_, source)| {
@@ -2885,10 +3045,25 @@ fn every_production_region_that_stops_early_stops_at_a_module() {
         })
         .sum();
     assert_eq!(
-        definitions, 3,
-        "this crate no longer has exactly three `production_region` \
+        definitions, 2,
+        "this crate no longer has exactly two `production_region` \
          implementations; the divergence table in this test's doc comment \
          describes a tree that no longer exists"
+    );
+    // And the shared prohibition region has exactly one definition, which is
+    // the whole point of having removed the third `production_region`.
+    let shared: usize = scanned_sources()
+        .iter()
+        .map(|(_, source)| {
+            blank_comments_and_strings(source)
+                .matches("fn production_code(")
+                .count()
+        })
+        .sum();
+    assert_eq!(
+        shared, 1,
+        "`production_code` is the one region every whole-tree prohibition census \
+         shares; a second definition is the divergence this table exists to count"
     );
 }
 

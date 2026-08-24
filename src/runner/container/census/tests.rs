@@ -3019,17 +3019,42 @@ fn every_topology_write_command_performs_the_census() {
 /// *which file* and there is no other field to pin. What replaces a second axis
 /// here is the positive control — a scan whose needle stopped matching would
 /// otherwise report an empty offender set and pass.
+///
+/// **The region is the whole file, and the floor is over bytes.** Two repairs,
+/// both measured on this tree:
+///
+/// * The region was `effects::production_region`, which truncates a file at its
+///   first `#[cfg(test)]`. Ten files stop at something that is not a module —
+///   `src/engine/coordinator.rs` at a `#[cfg(test)] use` on line 36 of 1599 —
+///   so a `struct CensusComplete { forged: () }` at the **bottom** of that file
+///   passed while the identical five lines above the cut failed.
+/// * The floor was `scanned > 20` with `scanned += 1` unconditional, so it
+///   counted files walked rather than regions read: it would have passed with
+///   every region empty, which is exactly the state the previous point put ten
+///   of them in. It is a byte floor now, and every region is asserted non-empty
+///   by name.
 #[test]
 fn census_returns_the_only_token_that_reaches_a_consumer() {
     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     let census_module = root.join("src/runner/container/census.rs");
     let mut offenders = Vec::new();
     let mut scanned = 0;
+    let mut scanned_bytes = 0_usize;
     for path in walk(&root.join("src")) {
         let source = fs::read_to_string(&path).expect("read source");
-        let production =
-            crate::effects::blank_comments_and_strings(&crate::effects::production_region(&source));
+        let production = crate::effects::production_code(&source);
+        let dense = production
+            .as_bytes()
+            .iter()
+            .filter(|byte| !byte.is_ascii_whitespace())
+            .count();
+        assert!(
+            dense > 0,
+            "{}'s region is empty, so it contributes nothing to the count below",
+            path.display()
+        );
         scanned += 1;
+        scanned_bytes += dense;
         if path == census_module {
             continue;
         }
@@ -3039,14 +3064,18 @@ fn census_returns_the_only_token_that_reaches_a_consumer() {
     }
     assert!(scanned > 20, "the walk found the tree: {scanned}");
     assert!(
+        scanned_bytes > 1_000_000,
+        "the {scanned} regions hold {scanned_bytes} non-whitespace bytes between them; a file \
+         count passes with every region empty and this is what does not"
+    );
+    assert!(
         offenders.is_empty(),
         "`CensusComplete` is constructed outside the census: {offenders:#?}"
     );
 
-    let production =
-        crate::effects::blank_comments_and_strings(&crate::effects::production_region(
-            &fs::read_to_string(&census_module).expect("the census module"),
-        ));
+    let production = crate::effects::production_code(
+        &fs::read_to_string(&census_module).expect("the census module"),
+    );
     // The positive control. `CensusComplete {` appears three times here — the
     // declaration, the `impl` header and the one construction — so the control
     // needle is the construction shape alone, and the scan above would find it

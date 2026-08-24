@@ -3299,11 +3299,29 @@ fn relative_slashed(path: &Path) -> String {
 /// that entitlement a convention rather than a mechanism. This is that sentence
 /// as a count over the whole crate.
 ///
-/// Two hazards are handled rather than tripped over. `PR4-CENSUS-COMMENT-ORACLE`:
-/// comments are stripped, and the strip is asserted to have removed something.
-/// And a census whose regions collapse to nothing counts zero and reads as
-/// "nobody does this", so the control below asserts the scan really did reach
-/// the files that mention the fold at all.
+/// Four hazards are handled rather than tripped over, and each has an assertion
+/// of its own in the body rather than a sentence here — a docstring that claims
+/// a control is not a control, which is what this paragraph used to be.
+///
+/// * `PR4-CENSUS-COMMENT-ORACLE`. The regions come from
+///   [`crate::effects::production_code`], which blanks comments **and string
+///   literals**, and `the_blanking_this_census_depends_on_is_live` below asserts
+///   that the blanking removed prose naming the very token counted here. The
+///   `//`-only strip this census used before saw neither a `/* … */` nor a
+///   `const CFG_TEST_ATTR: &str = "#[cfg(test)]";`, and either one collapsed a
+///   whole production file's region to nothing.
+/// * **A region that stops at `#[cfg(test)] mod tests;`.** Thirteen files in
+///   this tree declare their tests that way, and everything below such a
+///   declaration is legal production code that a truncating region cannot see.
+///   `production_code` removes the item and keeps the rest of the file.
+/// * **A skip derived from prose.** The whole-file test modules are read out of
+///   the **blanked** source, and every declaration is asserted to resolve to a
+///   file that exists: a `// … #[cfg(test)] mod policy;` in a comment otherwise
+///   derives a skip for a real production module.
+/// * **A scan that collapses.** The control below asserts the scan really did
+///   reach the files that mention the fold at all, and a floor on the total
+///   non-whitespace bytes scanned catches the case where every region is empty
+///   and the file count alone still passes.
 #[test]
 fn the_stable_prefix_barrier_is_the_only_way_a_log_becomes_a_topology_fold() {
     const FOLD_ENTRIES: &[&str] = &["TopologyFold::replay(", "TopologyFold::parse_log("];
@@ -3370,42 +3388,42 @@ fn the_stable_prefix_barrier_is_the_only_way_a_log_becomes_a_topology_fold() {
     // Whole files the crate declares under `#[cfg(test)]` are test code with no
     // production half at all, and treating them as production would count a
     // fixture as a second path. The set is read out of the declarations rather
-    // than guessed from a filename convention.
-    let test_modules: BTreeSet<PathBuf> = files
-        .iter()
-        .flat_map(|path| {
-            let source = fs::read_to_string(path).expect("a source file");
-            let parent = path.parent().expect("a source file has a directory");
-            let stem = path.file_stem().expect("a source file has a name");
-            let dir = if stem == "mod" || stem == "lib" || stem == "main" {
-                parent.to_path_buf()
-            } else {
-                parent.join(stem)
-            };
-            source
-                .split("#[cfg(test)]")
-                .skip(1)
-                .filter_map(|rest| {
-                    let declaration = rest.trim_start();
-                    let name = declaration.strip_prefix("mod ")?;
-                    let name = name.split(';').next()?.trim();
-                    (!name.is_empty() && !name.contains('{')).then(|| {
-                        [
-                            dir.join(format!("{name}.rs")),
-                            dir.join(name).join("mod.rs"),
-                        ]
-                    })
-                })
-                .flatten()
-                .collect::<Vec<_>>()
-        })
-        .collect();
+    // than guessed from a filename convention — and out of the **blanked**
+    // source, because a declaration written inside a comment is prose. Measured
+    // on this tree before the repair: the raw split derived 50 skip paths of
+    // which 34 named no file at all, and one `//` line was enough to remove a
+    // real production module from this census's domain.
+    let declarations = declared_whole_file_test_modules(&files);
+    assert!(
+        declarations.len() >= 13,
+        "only {} `#[cfg(test)] mod …;` declarations were derived; the derivation is \
+         finding nothing",
+        declarations.len()
+    );
+    let mut test_modules: BTreeSet<PathBuf> = BTreeSet::new();
+    for (declared_in, name, candidates) in &declarations {
+        let present: Vec<&PathBuf> = candidates
+            .iter()
+            .filter(|candidate| candidate.is_file())
+            .collect();
+        assert_eq!(
+            present.len(),
+            1,
+            "`{}` declares `#[cfg(test)] mod {name};` and {} of {candidates:?} exist. A skip \
+             path naming no file is a skip that has stopped meaning anything, and one naming \
+             two is a skip whose target nobody chose",
+            declared_in.display(),
+            present.len()
+        );
+        test_modules.insert(present[0].clone());
+    }
     assert!(
         test_modules.contains(&src.join("events").join("log").join("tests.rs")),
         "this file is declared `#[cfg(test)] mod tests;` and the scan has to know it: {test_modules:?}"
     );
 
     let mut scanned = 0_usize;
+    let mut scanned_bytes = 0_usize;
     let mut mentioning: Vec<String> = Vec::new();
     let mut callers: Vec<(PathBuf, &str, usize)> = Vec::new();
     for path in &files {
@@ -3413,13 +3431,15 @@ fn the_stable_prefix_barrier_is_the_only_way_a_log_becomes_a_topology_fold() {
             continue;
         }
         let source = fs::read_to_string(path).expect("a source file");
-        let stripped = strip_comments(&source);
-        // A file with no inline `#[cfg(test)]` is production in full.
-        let production = match stripped.find("#[cfg(test)]") {
-            Some(end) => &stripped[..end],
-            None => stripped.as_str(),
-        };
+        // The whole file, comments and string literals blanked and every
+        // `#[cfg(test)]` item removed — not a truncation at the first one.
+        let production = crate::effects::production_code(&source);
         scanned += 1;
+        scanned_bytes += production
+            .as_bytes()
+            .iter()
+            .filter(|byte| !byte.is_ascii_whitespace())
+            .count();
         if production.contains("TopologyFold") {
             mentioning.push(relative_slashed(path));
         }
@@ -3432,6 +3452,14 @@ fn the_stable_prefix_barrier_is_the_only_way_a_log_becomes_a_topology_fold() {
     }
 
     assert!(scanned > 40, "the walk found only {scanned} source files");
+    // And the regions were not empty. A file count alone passes with every
+    // region collapsed to nothing, which is precisely what a `#[cfg(test)]` in a
+    // comment used to do to one.
+    assert!(
+        scanned_bytes > 750_000,
+        "the {scanned} regions hold {scanned_bytes} non-whitespace bytes between them, so the \
+         counts below are over almost nothing"
+    );
 
     let mut sorted = FOLD_MENTIONS.to_vec();
     sorted.sort_unstable();
@@ -3472,13 +3500,27 @@ fn the_stable_prefix_barrier_is_the_only_way_a_log_becomes_a_topology_fold() {
     );
 
     // And that one place is inside the barrier, not merely inside this file.
-    let barrier = {
-        let source = strip_comments(&fs::read_to_string(&funnel).expect("the funnel"));
-        let start = source
-            .find("pub fn establish_stable_prefix(")
-            .expect("the barrier is still here");
-        source[start..].to_owned()
-    };
+    //
+    // The slice ends at the barrier's own closing brace. It used to run to end
+    // of file, which also covered `read_all`, `read_bytes`, `parse_bytes` and
+    // `impl LogTail` — so the parse could be lifted into a private helper
+    // *below* the barrier and this check would still count one. Measured: it
+    // did, and the census stayed green.
+    let funnel_code =
+        crate::effects::production_code(&fs::read_to_string(&funnel).expect("the funnel"));
+    let barrier = fn_body(&funnel_code, "pub fn establish_stable_prefix(");
+    // The bound is real: the readers below the barrier are outside it.
+    for below in ["pub fn read_all(", "impl LogTail {"] {
+        assert!(
+            funnel_code.contains(below),
+            "`{below}` left the funnel, so the bound below proves nothing"
+        );
+        assert!(
+            !barrier.contains(below),
+            "the barrier slice reaches `{below}`, so it is a suffix of the file rather than \
+             the function"
+        );
+    }
     for entry in FOLD_ENTRIES {
         assert_eq!(
             barrier.matches(entry).count(),
@@ -3486,6 +3528,132 @@ fn the_stable_prefix_barrier_is_the_only_way_a_log_becomes_a_topology_fold() {
             "`{entry}` is in the funnel but not in `establish_stable_prefix`"
         );
     }
+}
+
+/// The blanking every source census in this file depends on is doing something.
+///
+/// `PR4-CENSUS-COMMENT-ORACLE` in its live form: this tree's prose names
+/// `#[cfg(test)]` 104 times outside code and `TopologyFold` far more often than
+/// its code does, so a blanking that silently stopped working would not make the
+/// censuses fail — it would make them count prose and pass.
+#[test]
+fn the_blanking_this_census_depends_on_is_live() {
+    let src = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+    let mut raw_attributes = 0_usize;
+    let mut code_attributes = 0_usize;
+    let mut raw_folds = 0_usize;
+    let mut code_folds = 0_usize;
+    let mut files = 0_usize;
+    let mut stack = vec![src];
+    while let Some(dir) = stack.pop() {
+        for entry in fs::read_dir(&dir).expect("src is readable") {
+            let path = entry.expect("a directory entry").path();
+            if path.is_dir() {
+                stack.push(path);
+                continue;
+            }
+            if !path.extension().is_some_and(|ext| ext == "rs") {
+                continue;
+            }
+            let source = fs::read_to_string(&path).expect("a source file");
+            let blanked = crate::effects::blank_comments_and_strings(&source);
+            files += 1;
+            raw_attributes += source.matches("#[cfg(test)]").count();
+            code_attributes += blanked.matches("#[cfg(test)]").count();
+            raw_folds += source.matches("TopologyFold").count();
+            code_folds += crate::effects::production_code(&source)
+                .matches("TopologyFold")
+                .count();
+        }
+    }
+    assert!(files > 40, "the walk found only {files} source files");
+    assert!(
+        code_attributes < raw_attributes,
+        "the tree names `#[cfg(test)]` {raw_attributes} times and the blanking left \
+         {code_attributes} of them; a `#[cfg(test)]` quoted in prose is what collapses a \
+         production region to nothing"
+    );
+    assert!(
+        code_folds < raw_folds,
+        "the tree names `TopologyFold` {raw_folds} times and the production regions hold \
+         {code_folds}; the census above counts this token, so a blanking that removed no \
+         prose would be counting sentences"
+    );
+    assert!(
+        code_folds > 0,
+        "and it removed everything, which is the other way for a census to prove nothing"
+    );
+}
+
+/// Every `#[cfg(test)] mod <name>;` the crate declares, as
+/// `(declaring file, name, [flat candidate, nested candidate])`.
+///
+/// Read out of the **blanked** source: a declaration quoted in a comment is
+/// prose, and deriving a skip from prose removes a real production file from a
+/// census's domain.
+fn declared_whole_file_test_modules(files: &[PathBuf]) -> Vec<(PathBuf, String, [PathBuf; 2])> {
+    let mut found = Vec::new();
+    for path in files {
+        let blanked = crate::effects::blank_comments_and_strings(
+            &fs::read_to_string(path).expect("a source file"),
+        );
+        let parent = path.parent().expect("a source file has a directory");
+        let stem = path.file_stem().expect("a source file has a name");
+        let dir = if stem == "mod" || stem == "lib" || stem == "main" {
+            parent.to_path_buf()
+        } else {
+            parent.join(stem)
+        };
+        for rest in blanked.split("#[cfg(test)]").skip(1) {
+            let Some(name) = rest.trim_start().strip_prefix("mod ") else {
+                continue;
+            };
+            let Some(name) = name.split(';').next().map(str::trim) else {
+                continue;
+            };
+            if name.is_empty() || name.contains('{') {
+                continue;
+            }
+            found.push((
+                path.clone(),
+                name.to_owned(),
+                [
+                    dir.join(format!("{name}.rs")),
+                    dir.join(name).join("mod.rs"),
+                ],
+            ));
+        }
+    }
+    found
+}
+
+/// The body of the item whose declaration begins with `header`, brace-matched.
+///
+/// A suffix slice to end of file is not a function: it is the function plus
+/// everything the file happens to declare after it.
+fn fn_body(source: &str, header: &str) -> String {
+    let start = source
+        .find(header)
+        .unwrap_or_else(|| panic!("`{header}` is still here"));
+    let mut depth = 0_usize;
+    let mut opened = false;
+    for (offset, byte) in source.as_bytes().iter().enumerate().skip(start) {
+        match byte {
+            b'{' => {
+                depth += 1;
+                opened = true;
+            }
+            b'}' => {
+                assert!(opened, "`{header}` closes a brace it never opened");
+                depth -= 1;
+                if depth == 0 {
+                    return source[start..=offset].to_owned();
+                }
+            }
+            _ => {}
+        }
+    }
+    panic!("`{header}` never closes its body");
 }
 
 /// Everything before the `#[cfg(test)]` submodules.
@@ -3496,8 +3664,16 @@ fn production_region(source: &str) -> &str {
     &source[..end]
 }
 
-/// Remove `//` line comments. Enough for this census: the strings the census
-/// counts never contain `//`.
+/// Remove `//` line comments.
+///
+/// Enough for its two remaining callers — `the_event_log_is_written_in_exactly_
+/// one_module` and `the_legacy_engine_reports_and_stops_on_a_returned_append_
+/// error` — which count primitives no string literal in those two files spells,
+/// and which assert that this strip shortened the text before counting anything.
+/// It is **not** enough for a census over the whole tree: it sees neither a
+/// `/* … */` nor a string literal, and either can carry a `#[cfg(test)]` that
+/// collapses a file's region. Whole-tree censuses use
+/// [`crate::effects::production_code`].
 fn strip_comments(source: &str) -> String {
     source
         .lines()
