@@ -272,7 +272,24 @@ impl FoldedEmitter {
 }
 
 impl EventEmitter for FoldedEmitter {
-    fn emit(&mut self, body: TopologyEventBody) -> Result<(), UpstrokeError> {
+    /// **`_hooks` is ignored, and that is the divergence rather than an
+    /// oversight.** This emitter's own `EventHooks` is a `TimelineEvents`,
+    /// which records each `(site, phase)` into the ordering timeline as well as
+    /// into the harness. The shared bundle's `events` family is a bare
+    /// `HarnessEventHooks` and does not. Using the parameter here would
+    /// silently drop every append out of the timeline, and the ordering
+    /// assertions that read it would go green having stopped observing the
+    /// thing they order.
+    ///
+    /// The repair is to give the shared bundle the timeline wrapper, not to
+    /// take it away from here — but that is a change to test infrastructure
+    /// every topology test depends on, which is the shape PR5's round 7 was
+    /// reverted for. Recorded instead.
+    fn emit(
+        &mut self,
+        body: TopologyEventBody,
+        _hooks: &mut dyn super::seams::TopologyHooks,
+    ) -> Result<(), UpstrokeError> {
         let event = TopologyEvent {
             ts: <super::seams::SystemClock as super::seams::TimeSource>::now_rfc3339(&self.clock),
             body,
@@ -656,9 +673,12 @@ impl Run {
         };
         let started = run_started(&run.fixture);
         run.emitter
-            .emit(TopologyEventBody::RunStarted {
-                data: Box::new(started),
-            })
+            .emit(
+                TopologyEventBody::RunStarted {
+                    data: Box::new(started),
+                },
+                &mut run.hooks,
+            )
             .expect("run_started");
         run.runner.watching(run.emitter.log.path());
         run
@@ -874,15 +894,18 @@ impl Run {
             index: 1,
         });
         self.emitter
-            .emit(TopologyEventBody::TaskSpawned {
-                data: Box::new(TaskSpawned {
-                    spawn: FrozenSpawn {
-                        key,
-                        entry,
-                        admission: SpawnAdmission::Runnable,
-                    },
-                }),
-            })
+            .emit(
+                TopologyEventBody::TaskSpawned {
+                    data: Box::new(TaskSpawned {
+                        spawn: FrozenSpawn {
+                            key,
+                            entry,
+                            admission: SpawnAdmission::Runnable,
+                        },
+                    }),
+                },
+                &mut self.hooks,
+            )
             .expect("task_spawned");
         key
     }
@@ -962,30 +985,33 @@ impl Run {
     /// the fold allows.
     pub(super) fn retain(&mut self, key: TaskKey, generation: GenerationId, attempt: u32) {
         self.emitter
-            .emit(TopologyEventBody::AttemptFinished {
-                data: Box::new(AttemptFinished4 {
-                    key,
-                    generation,
-                    attempt: AttemptNumber(attempt),
-                    record: Box::new(AttemptRecord {
-                        attempt,
-                        tier: "mid".to_owned(),
-                        model: "alpha-mid-model".to_owned(),
-                        pool: Some("scaffold-pool".to_owned()),
-                        resumed: false,
-                        duration: Duration::from_millis(7),
-                        cost_usd: None,
-                        reviews: Vec::new(),
-                        session_id: Some(RETAINED_SESSION.to_owned()),
-                        usage: None,
-                        failure: None,
+            .emit(
+                TopologyEventBody::AttemptFinished {
+                    data: Box::new(AttemptFinished4 {
+                        key,
+                        generation,
+                        attempt: AttemptNumber(attempt),
+                        record: Box::new(AttemptRecord {
+                            attempt,
+                            tier: "mid".to_owned(),
+                            model: "alpha-mid-model".to_owned(),
+                            pool: Some("scaffold-pool".to_owned()),
+                            resumed: false,
+                            duration: Duration::from_millis(7),
+                            cost_usd: None,
+                            reviews: Vec::new(),
+                            session_id: Some(RETAINED_SESSION.to_owned()),
+                            usage: None,
+                            failure: None,
+                        }),
+                        settlement: AttemptSettlement::Retained {
+                            retained_session: SessionId(RETAINED_SESSION.to_owned()),
+                            retained_incarnation: Epoch(0),
+                        },
                     }),
-                    settlement: AttemptSettlement::Retained {
-                        retained_session: SessionId(RETAINED_SESSION.to_owned()),
-                        retained_incarnation: Epoch(0),
-                    },
-                }),
-            })
+                },
+                &mut self.hooks,
+            )
             .expect("attempt_finished(retained)");
     }
 }

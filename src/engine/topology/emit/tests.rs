@@ -1780,3 +1780,56 @@ fn the_harness_event_observer_can_ask_for_the_torn_written_shape() {
     assert_eq!(default_bytes, torn_bytes);
     assert!(default_bytes.ends_with(b"\n"));
 }
+
+// ---------------------------------------------------------------------------
+// The production emitter is this protocol, not a second copy of it
+// ---------------------------------------------------------------------------
+
+/// [`super::super::run::RunEmitter`] reaches the append-error protocol.
+///
+/// **The assertion is that the forwarder forwards.** `EventEmitter` had one
+/// implementation in this tree before the driver existed, and it was
+/// `scaffold::FoldedEmitter` — which re-implements the append and therefore
+/// runs none of the protocol's obligations. Every dispatch, attempt, settle and
+/// candidate test drives through it, so "the pipeline's appends are protected
+/// by the protocol" was a claim nothing checked.
+///
+/// So this drives the *production* emitter over an armed append and asks the
+/// protocol's first obligation: is the fold poisoned. A `RunEmitter` that had
+/// grown its own append path — the duplication shape this slice has paid for
+/// four times — would fail here.
+#[test]
+fn the_production_emitter_reaches_the_append_error_protocol() {
+    use super::super::dispatch::EventEmitter;
+    use super::super::run::RunEmitter;
+
+    let mut fixture = Fixture::started("run-emitter-forwards");
+    fixture.arm(
+        EventSite::Append,
+        SubEffectPoint::WrittenFull,
+        InjectionMode::ErrorReturn,
+    );
+
+    let outcome = {
+        let mut emitter = RunEmitter {
+            identity: &fixture.identity,
+            state: EmitState {
+                fold: &mut fixture.fold,
+                log: &mut fixture.log,
+                reservations: &mut fixture.reservations,
+                invocations: &mut fixture.invocations,
+                warnings: &mut fixture.warnings,
+            },
+            clock: &fixture.clock,
+        };
+        emitter.emit(budget_body(), &mut fixture.hooks)
+    };
+
+    outcome.expect_err("the flush was made to fail");
+    assert!(
+        fixture.fold.is_poisoned(),
+        "the protocol's first obligation. An emitter that appended for itself \
+         would leave the fold live here, and every effect after it would be \
+         derived from state this process cannot vouch for"
+    );
+}

@@ -318,18 +318,21 @@ impl AttemptContext<'_> {
         dispatched: &Dispatched,
         plan: &AttemptPlan,
     ) -> Result<AttemptRun, UpstrokeError> {
-        self.emitter.emit(TopologyEventBody::AttemptStarted {
-            data: AttemptStarted4 {
-                key: dispatched.key,
-                generation: dispatched.generation,
-                attempt: plan.attempt,
-                rung: plan.rung,
-                binding: plan.binding.clone(),
-                pool: plan.pool.clone(),
-                resume_session: plan.resume_session.clone(),
-                materialization_observed: plan.materialization_observed,
+        self.emitter.emit(
+            TopologyEventBody::AttemptStarted {
+                data: AttemptStarted4 {
+                    key: dispatched.key,
+                    generation: dispatched.generation,
+                    attempt: plan.attempt,
+                    rung: plan.rung,
+                    binding: plan.binding.clone(),
+                    pool: plan.pool.clone(),
+                    resume_session: plan.resume_session.clone(),
+                    materialization_observed: plan.materialization_observed,
+                },
             },
-        })?;
+            self.hooks,
+        )?;
 
         let identities =
             AttemptIdentities::new(dispatched.key, dispatched.generation, plan.attempt);
@@ -517,15 +520,18 @@ impl AttemptContext<'_> {
         attempt: AttemptNumber,
         outcome: AttemptOutcome,
     ) -> Result<(), UpstrokeError> {
-        self.emitter.emit(TopologyEventBody::AttemptInterrupted {
-            data: AttemptInterrupted4 {
-                key: dispatched.key,
-                generation: dispatched.generation,
-                attempt,
-                lease: dispatched.closing_disposition(),
-                detail: outcome.detail().to_owned(),
+        self.emitter.emit(
+            TopologyEventBody::AttemptInterrupted {
+                data: AttemptInterrupted4 {
+                    key: dispatched.key,
+                    generation: dispatched.generation,
+                    attempt,
+                    lease: dispatched.closing_disposition(),
+                    detail: outcome.detail().to_owned(),
+                },
             },
-        })?;
+            self.hooks,
+        )?;
         self.discard_residue(dispatched)
     }
 

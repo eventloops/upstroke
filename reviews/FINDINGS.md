@@ -1107,3 +1107,47 @@ implements — extended by the observation that these are not independent one-to
 cause, and repairing them one slice at a time means three separate unreviewed edits to the layer every
 other module's enforcement depends on, which is the shape that made PR5's round 7 a revert. Section 2
 carries all three under one owner so the pass that takes them finds them together.
+
+### The test emitter is a fourth implementation of the append path
+
+`EventEmitter` had **one implementation in the whole tree** before PR7's driver existed, and it was
+`#[cfg(test)]`: `scaffold::FoldedEmitter`. Same root cause as the missing driver — the seam was
+written for a caller nobody built.
+
+And it does not call `emit::emit`. It re-implements the append: round-trip, `plan_transition`,
+`append_topology_hooked`, `apply_delta`. So it runs **none of the append-error protocol's five
+obligations** — no explicit poison, no reservation cancellation, no in-flight invocation
+cancellation, no reopen, no present/absent/undetermined report. Every dispatch, attempt, settle and
+candidate test drives through it.
+
+Measured rather than argued: transplanting `FoldedEmitter`'s shape into the production `RunEmitter`
+leaves the fold **unpoisoned** on an armed append failure, and
+`the_production_emitter_reaches_the_append_error_protocol` goes red on exactly that.
+
+> **A test double that re-implements the thing under test is not a double, it is a second
+> implementation** — and this slice found three others of the same protocol in production code. The
+> production emitter is a forwarder and deliberately nothing else, so there is one implementation and
+> `emit::emit` is it.
+
+**Recorded, not repaired.** It is `#[cfg(test)]`, so no shipped behaviour is wrong; what is wrong is
+that the pipeline's protocol coverage is thinner than the suite's size suggests. Routing
+`FoldedEmitter` through `emit::emit` is a change to test infrastructure every topology test depends
+on, which is the shape PR5's round 7 was reverted for. Owner: the slice that next touches the
+scaffold.
+
+### And the two emitters observe different funnels
+
+`FoldedEmitter`'s `EventHooks` is a `TimelineEvents`, which records each `(site, phase)` into the
+ordering timeline **and** the harness. The shared bundle's `events` family is a bare
+`HarnessEventHooks`, which records only into the harness.
+
+So an append made through the scaffold is visible to a timeline ordering assertion and an append made
+through `emit::emit` is not — **two observation surfaces for one kind of event, decided by which
+emitter ran.** Nothing is broken today, because each test reads the observer its own path populates;
+what is not possible is writing a timeline-ordering assertion about the recovery path.
+
+This is why `EventEmitter::emit` taking `hooks` as a parameter is not by itself a guarantee. It makes
+the bundle the caller's choice — as every Git funnel in this tree already does — and
+`every_family_of_the_harness_bundle_records_into_the_same_harness` is the assertion that the choice
+was right. The repair is to give the shared bundle the timeline wrapper, not to take it from the
+scaffold. Same owner as above.

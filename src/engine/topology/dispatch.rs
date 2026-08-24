@@ -71,13 +71,39 @@ use super::seams::TopologyHooks;
 pub trait EventEmitter {
     /// Emit one durable event, or fail.
     ///
+    /// **The hooks are a parameter, which is how every other funnel in this
+    /// tree takes them.** `WorkspaceManager::write_intent`, `add_worktree`,
+    /// `verify_worktree`, `remove_worktree`, `candidate_stage`,
+    /// `repair_materialize` and `EventLog::append_topology_hooked` all take
+    /// `hooks` per call rather than at construction, and an append is an
+    /// effect like any of them. Taking them at construction would also
+    /// conflict with the caller, which holds the same bundle for its own
+    /// effects and cannot lend it for an emitter's whole lifetime.
+    ///
+    /// **What this does not do is force one bundle.** A caller may hand over a
+    /// different one, exactly as it may for any Git funnel, and the tree
+    /// already contains an instance: `scaffold::FoldedEmitter` keeps its own
+    /// `EventHooks`, because that one wraps the harness in a timeline recorder
+    /// the shared bundle's `events` family does not have. So appends made
+    /// through the scaffold are observable in the ordering timeline and appends
+    /// made through `emit::emit` are not — two observation surfaces for one
+    /// kind of event, decided by which emitter ran. That is a real divergence,
+    /// it is recorded in `reviews/FINDINGS.md`, and it is why this parameter is
+    /// not by itself a guarantee of anything: it makes the bundle the caller's
+    /// choice, and `every_family_of_the_harness_bundle_records_into_the_same_harness`
+    /// is the assertion that the choice was the right one.
+    ///
     /// # Errors
     ///
     /// Whatever the emitter's append protocol returns. A caller here never
     /// interprets it: an emit that failed means the fold is poisoned and the
     /// coordinator is ending, and the effect that would have followed this
     /// event must not run.
-    fn emit(&mut self, body: TopologyEventBody) -> Result<(), UpstrokeError>;
+    fn emit(
+        &mut self,
+        body: TopologyEventBody,
+        hooks: &mut dyn TopologyHooks,
+    ) -> Result<(), UpstrokeError>;
 }
 
 // ---------------------------------------------------------------------------
@@ -337,19 +363,22 @@ pub fn dispatch(
     let worktree = manager.slot_path(&slot);
 
     // (1) The event. First, and by itself.
-    emitter.emit(TopologyEventBody::TaskDispatched {
-        data: TaskDispatched {
-            key: request.key,
-            generation: request.generation,
-            base_sha: request.base.clone(),
-            // The string a later process compares and re-derives. A platform
-            // path type here would make a log written on one operating system a
-            // question on another — `TaskDispatched::worktree_path` says so.
-            worktree_path: worktree.to_string_lossy().into_owned(),
-            lease: request.kind.grant(),
-            source_candidate: request.kind.source_candidate(),
+    emitter.emit(
+        TopologyEventBody::TaskDispatched {
+            data: TaskDispatched {
+                key: request.key,
+                generation: request.generation,
+                base_sha: request.base.clone(),
+                // The string a later process compares and re-derives. A platform
+                // path type here would make a log written on one operating system a
+                // question on another — `TaskDispatched::worktree_path` says so.
+                worktree_path: worktree.to_string_lossy().into_owned(),
+                lease: request.kind.grant(),
+                source_candidate: request.kind.source_candidate(),
+            },
         },
-    })?;
+        hooks,
+    )?;
 
     // (2) The intent, synced. (3) The add, which refuses without it.
     let mut dispatched = Dispatched {
@@ -677,14 +706,17 @@ pub fn close_at_run_end(
     dispatched: &Dispatched,
     outcome: RunOutcome,
 ) -> Result<(), UpstrokeError> {
-    emitter.emit(TopologyEventBody::GenerationClosed {
-        data: GenerationClosed {
-            key: dispatched.key,
-            generation: dispatched.generation,
-            reason: GenerationCloseReason::RunEnding { outcome },
-            lease: dispatched.kind.closing_disposition(),
+    emitter.emit(
+        TopologyEventBody::GenerationClosed {
+            data: GenerationClosed {
+                key: dispatched.key,
+                generation: dispatched.generation,
+                reason: GenerationCloseReason::RunEnding { outcome },
+                lease: dispatched.kind.closing_disposition(),
+            },
         },
-    })?;
+        hooks,
+    )?;
     scrub(manager, hooks, &dispatched.slot)
 }
 

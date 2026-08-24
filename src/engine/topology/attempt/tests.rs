@@ -806,7 +806,10 @@ fn a_retry_whose_retained_worktree_fails_verification_closes_and_destroys_nothin
 
     // The recovery itself, through the fold that has to accept it.
     run.emitter
-        .emit(TopologyEventBody::GenerationClosed { data: closed })
+        .emit(
+            TopologyEventBody::GenerationClosed { data: closed },
+            &mut run.hooks,
+        )
         .expect("`generation_closed{WorktreeMissing}` is the tabled recovery");
     assert!(
         matches!(

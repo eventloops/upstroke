@@ -36,8 +36,69 @@
 //! whole difference between debt and an omission.
 
 use crate::error::UpstrokeError;
+use crate::topology::events::TopologyEventBody;
 
+use super::dispatch::EventEmitter;
+use super::emit::{EmitState, RunIdentity, emit};
+use super::seams::{TimeSource, TopologyHooks};
 use super::select::Step;
+
+// ---------------------------------------------------------------------------
+// The production emitter
+// ---------------------------------------------------------------------------
+
+/// The one emitter a run's appends go through.
+///
+/// **Before this, `EventEmitter` had a single implementation in the whole tree
+/// and it was `#[cfg(test)]`.** Same root cause as the missing driver: the seam
+/// was written for a caller nobody built. And that test emitter re-implements
+/// the append — round-trip, `plan_transition`, append, `apply_delta` — rather
+/// than calling [`emit`], so it **does not run the append-error protocol's five
+/// obligations**: no explicit poison, no reservation cancellation, no
+/// in-flight invocation cancellation, no reopen, and no
+/// present/absent/undetermined report. Every dispatch, attempt, settle and
+/// candidate test drives through it, which is why the protocol's coverage over
+/// the pipeline is thinner than the suite's size suggests.
+///
+/// This type exists so the production path does not inherit that. It is a
+/// forwarder and deliberately nothing else — there is **one** implementation of
+/// the protocol and it is [`emit`]. A slice whose dominant finding class is
+/// duplication does not get a second one.
+pub struct RunEmitter<'a> {
+    /// What every refusal names, and what the checked replay is derived
+    /// against.
+    pub identity: &'a RunIdentity,
+    /// The fold, the append handle, the two ledgers, and the warnings — the
+    /// five things one append touches.
+    pub state: EmitState<'a>,
+    /// Where the event's timestamp comes from.
+    pub clock: &'a dyn TimeSource,
+}
+
+impl EventEmitter for RunEmitter<'_> {
+    /// [`emit`], and nothing before or after it.
+    ///
+    /// The event it returns is discarded because no caller of this trait has
+    /// ever wanted it: what a caller needs to know is whether the effect that
+    /// follows the append may run, and that is the `Result`. `emit` itself
+    /// hands the round-tripped event to `plan_transition`, so the value has
+    /// already done its work by the time it reaches here.
+    ///
+    /// # Errors
+    ///
+    /// Whatever [`emit`] returns, converted at the boundary. Every variant
+    /// means the same thing to a caller — the following effect must not run —
+    /// and they differ only in whether the log was touched, which
+    /// `EmitError::wrote_nothing` answers for a reader that cares.
+    fn emit(
+        &mut self,
+        body: TopologyEventBody,
+        hooks: &mut dyn TopologyHooks,
+    ) -> Result<(), UpstrokeError> {
+        emit(self.identity, &mut self.state, self.clock, body, hooks)?;
+        Ok(())
+    }
+}
 
 // ---------------------------------------------------------------------------
 // The loop's branches, as the packet names them
