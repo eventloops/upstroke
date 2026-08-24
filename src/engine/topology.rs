@@ -88,8 +88,8 @@ pub use settle::{
     settle_failed, settle_succeeded,
 };
 pub use startup::{
-    CensusInputs, FreshCensused, RunDirCensusReport, RunDirEntry, RunDirOutcome, StartupCensus,
-    WorktreeLocked, startup_census,
+    CensusInputs, FailedStep, FreshCensused, RunDirCensusReport, RunDirEntry, RunDirOutcome,
+    StartupCensus, WorktreeLocked, startup_census,
 };
 
 /// The schema-4 run that `dispatch.rs` and `attempt.rs` are tested against.

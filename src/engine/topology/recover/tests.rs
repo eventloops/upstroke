@@ -44,7 +44,8 @@ use crate::runner::policy::runner_policy_sha256;
 use crate::runner::{CommandSpec, Runner, RunnerRequest};
 use crate::topology::effects::EventSite;
 use crate::topology::effects::{
-    EffectSiteId, HookHarness, HookPhase, InjectionMode, LockSite, RunDirSite, SubEffectPoint,
+    EffectSiteId, HookHarness, HookPhase, Injection, InjectionMode, LockSite, RunDirSite,
+    SubEffectPoint,
 };
 use crate::topology::events::{
     AttemptFinished4, AttemptSettlement, AttemptStarted4, BudgetExceeded4, CommitSha, Epoch,
@@ -58,10 +59,11 @@ use crate::topology::paths::{PathGrammar, PathPolicy, PathPolicyVersion};
 use crate::topology::registry::{TaskKey, TaskRegistry};
 use crate::topology::schema::TOPOLOGY_SCHEMA;
 
-use crate::engine::topology::RunDirOutcome;
 use crate::engine::topology::identity::{InvocationLedger, ReservationKind, Reservations};
 use crate::engine::topology::preflight::RunPreflight;
 use crate::engine::topology::seams::{HarnessTopologyHooks, TimeSource};
+use crate::engine::topology::startup::FailedStep;
+use crate::engine::topology::{RunDirOutcome, TopologyHooks};
 
 // ---------------------------------------------------------------------------
 // Fixed identities
@@ -700,6 +702,88 @@ fn container_selection() -> RunnerSelection {
 }
 
 // ---------------------------------------------------------------------------
+// A funnel that refuses, inside the whole recovery order
+// ---------------------------------------------------------------------------
+
+/// [`HarnessTopologyHooks`] with its run-directory family replaced by one that
+/// returns [`Injection::Error`] at a nominated `(site, phase, nth)`, and records
+/// into the same [`HookHarness`] the other four families do.
+///
+/// Module-local, because `HookHarness::arm` takes a [`SubEffectPoint`] and
+/// `hook()` answers `Proceed` to `Before`/`After` unconditionally, so a
+/// `RunDir` site's two phases are not armable through it.
+struct ArmedHooks {
+    inner: HarnessTopologyHooks,
+    rundir: ArmedRunDir,
+}
+
+struct ArmedRunDir {
+    harness: Arc<Mutex<HookHarness>>,
+    site: RunDirSite,
+    phase: HookPhase,
+    nth: usize,
+    seen: usize,
+}
+
+impl ArmedHooks {
+    fn new(
+        harness: &Arc<Mutex<HookHarness>>,
+        (site, phase, nth): (RunDirSite, HookPhase, usize),
+    ) -> Self {
+        Self {
+            inner: HarnessTopologyHooks::new(Arc::clone(harness)),
+            rundir: ArmedRunDir {
+                harness: Arc::clone(harness),
+                site,
+                phase,
+                nth,
+                seen: 0,
+            },
+        }
+    }
+}
+
+impl rundir::RunDirHooks for ArmedRunDir {
+    fn hook(&mut self, site: EffectSiteId, phase: HookPhase) -> Injection {
+        self.harness
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .hook(site, phase);
+        if site != EffectSiteId::RunDir(self.site) || phase != self.phase {
+            return Injection::Proceed;
+        }
+        self.seen += 1;
+        if self.seen == self.nth {
+            Injection::Error
+        } else {
+            Injection::Proceed
+        }
+    }
+}
+
+impl TopologyHooks for ArmedHooks {
+    fn effects(&mut self) -> &mut dyn crate::workspace_manager::EffectHooks {
+        self.inner.effects()
+    }
+
+    fn rundir(&mut self) -> &mut dyn rundir::RunDirHooks {
+        &mut self.rundir
+    }
+
+    fn events(&mut self) -> &mut dyn crate::events::log::EventHooks {
+        self.inner.events()
+    }
+
+    fn container(&mut self) -> &mut dyn crate::runner::container::ContainerHooks {
+        self.inner.container()
+    }
+
+    fn spawn(&mut self) -> &mut dyn crate::agent::proc::SpawnHooks {
+        self.inner.spawn()
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Driving one resume
 // ---------------------------------------------------------------------------
 
@@ -737,6 +821,15 @@ fn resume(
     given: &Given<'_>,
 ) -> (Result<Recovered, UpstrokeError>, Vec<String>) {
     let mut hooks = HarnessTopologyHooks::new(Arc::clone(harness)).recording_durability();
+    resume_with(fixture, &mut hooks, given)
+}
+
+/// [`resume`], with the hook bundle supplied — so a test can arm one.
+fn resume_with(
+    fixture: &Fixture,
+    hooks: &mut dyn TopologyHooks,
+    given: &Given<'_>,
+) -> (Result<Recovered, UpstrokeError>, Vec<String>) {
     let liveness = FakeOwnerLiveness::new();
     let view = DisposableDirView::new(ContainerTrace::default());
     let incarnation = IncarnationId(RESUMER.to_owned());
@@ -759,7 +852,7 @@ fn resume(
                     preflight: given.preflight,
                     clock: &Frozen,
                 },
-                &mut hooks,
+                hooks,
                 &mut warnings,
             )
         });
@@ -1168,10 +1261,15 @@ fn resume_refuses_digest_mismatch() {
 ///
 /// The ordering is asserted over the harness's first-observation order, which
 /// is what makes this a claim about the *sequence* rather than about
-/// possession. `RunDir.RemoveMarker` is the census's own write and is the
-/// earliest fold-derived effect this order performs, so it is the anchor: if
-/// the barrier's three sites do not all precede it, the resume decided
-/// something from a prefix it had not proven.
+/// possession. `RunDir.RemoveMarker` is the census's own write and, **in this
+/// fixture**, the earliest fold-derived effect the order performs — the runs
+/// tree holds this run's directory and nothing else, so no husk reclaim can
+/// precede it. That is a property of the fixture rather than of the order: a
+/// husk sorting before this run's id would put `RunDir.RemovePrivateHusk`
+/// first, and the census walks in ascending run-id order. So the fixture's
+/// emptiness is asserted rather than assumed, and the anchor is the census's
+/// first effect *here*: if the barrier's three sites do not all precede it, the
+/// resume decided something from a prefix it had not proven.
 #[test]
 fn resume_establishes_stable_prefix_barrier_before_any_fold_derived_effect() {
     let fixture = Fixture::healthy("barrier-order");
@@ -1179,6 +1277,16 @@ fn resume_establishes_stable_prefix_barrier_before_any_fold_derived_effect() {
     let runtime = runtime_holding_the_record();
     let certifies = AlwaysCertifies;
     let given = Given::healthy(&fixture, &runtime, &certifies);
+
+    // Asserted **before** the resume, because the resume reclaims what it walks:
+    // afterwards a husk that had preceded this run in the walk is gone and the
+    // same assertion passes vacuously.
+    assert_eq!(
+        rundir::run_dir_names(&fixture.repo_root),
+        vec![RUN_ID.to_owned()],
+        "the anchor is the census's first effect only while this run's \
+         directory is the only one in the tree"
+    );
 
     let (outcome, _) = resume(&fixture, &harness, &given);
     outcome.expect("the healthy resume completes");
@@ -1637,6 +1745,16 @@ fn chain_to_census(
     incarnation: &IncarnationId,
 ) -> Result<ResumeCensused, UpstrokeError> {
     let mut hooks = HarnessTopologyHooks::new(Arc::clone(harness));
+    chain_to_census_with(fixture, &mut hooks, runtime, incarnation)
+}
+
+/// [`chain_to_census`], with the hook bundle supplied — so a test can arm one.
+fn chain_to_census_with(
+    fixture: &Fixture,
+    hooks: &mut dyn TopologyHooks,
+    runtime: &dyn ContainerRuntime,
+    incarnation: &IncarnationId,
+) -> Result<ResumeCensused, UpstrokeError> {
     let liveness = FakeOwnerLiveness::new();
     let view = DisposableDirView::new(ContainerTrace::default());
     let mut warnings = Vec::new();
@@ -1663,7 +1781,7 @@ fn chain_to_census(
             liveness: &liveness,
             view: &view,
         },
-        &mut hooks,
+        hooks,
     )
 }
 
@@ -1851,6 +1969,144 @@ fn resume_reclaims_a_provable_husk_beside_the_run_and_retains_a_possibly_committ
     );
     assert!(!fixture.public().join(rundir::MARKER).exists());
     assert!(fixture.log().exists(), "and the run itself is untouched");
+}
+
+/// **A husk this resume cannot reclaim does not fail this resume.**
+///
+/// Before the census was shared, the resume's run-directory half was
+/// `list_husks` + `husk_report` — both infallible — plus one `remove_marker`.
+/// Sharing the reclaiming census moved a command-fatal error path onto the
+/// resume: one dead run whose private half the filesystem will not release
+/// (`EACCES`, `EPERM`, `EBUSY`, or on Windows any still-open handle) made
+/// `upstroke resume <id>` fail for **every** run in the repository, on every
+/// attempt, for a different run's residue. T-RESUME enumerates its refusals and
+/// this is not among them, and `startup_census` and INV-15 answer "cannot be
+/// reclaimed" with *retain and report* everywhere else.
+///
+/// The husk sorts **before** this run's id, which is what makes the second claim
+/// worth making: `run_dir_names` sorts ascending, so a census that stopped at
+/// the failure never reached this run's own directory at all — and recovery step
+/// (a1) gives this run's stale-marker repair to its owner, which is this
+/// process. So the repair was collateral damage of a different run's residue.
+#[test]
+fn resume_completes_past_a_husk_whose_private_half_cannot_be_removed() {
+    const STUCK: &str = "01AAAASTUCK000000000000000";
+    assert!(STUCK < RUN_ID, "the husk must sort before this run's id");
+
+    let fixture = Fixture::healthy("husk-unreclaimable");
+    let harness = harness();
+    let runtime = runtime_holding_the_record();
+    let certifies = AlwaysCertifies;
+    let given = Given::healthy(&fixture, &runtime, &certifies);
+
+    let stuck = plant_husk(&fixture, STUCK, false);
+    let before = tree_bytes(&stuck.private);
+    assert!(
+        !before.is_empty(),
+        "the husk must have a private half, or its comparison proves nothing"
+    );
+    assert!(
+        fixture.public().join(rundir::MARKER).exists(),
+        "this run's own stale marker must be there, or the second claim is vacuous"
+    );
+
+    let mut hooks = ArmedHooks::new(
+        &harness,
+        (RunDirSite::RemovePrivateHusk, HookPhase::Before, 1),
+    );
+    let (outcome, _) = resume_with(&fixture, &mut hooks, &given);
+
+    outcome.expect("a husk beside the run cannot end the resume");
+
+    // The husk: retained where it was, with the locator the next census needs.
+    assert!(stuck.public.exists(), "the public half was removed anyway");
+    assert!(
+        stuck.public.join(rundir::MARKER).exists(),
+        "`.creating` is the private half's only locator and it is gone"
+    );
+    assert_eq!(
+        tree_bytes(&stuck.private),
+        before,
+        "the arming is `Before`, so the removal never ran"
+    );
+
+    // And this run's own stale marker, which sorts after the failure, was still
+    // repaired by its owner.
+    assert!(
+        !fixture.public().join(rundir::MARKER).exists(),
+        "the own-run stale-marker repair was skipped because a husk sorting \
+         earlier could not be reclaimed"
+    );
+    let seen = harness.lock().unwrap_or_else(PoisonError::into_inner);
+    assert!(
+        seen.touched(EffectSiteId::RunDir(RunDirSite::RemoveMarker)),
+        "recovery step (a1)'s own repair never reached its funnel"
+    );
+    assert!(
+        !seen.touched(EffectSiteId::RunDir(RunDirSite::RemovePublicHusk)),
+        "the public half was removed after the private removal refused, which \
+         orphans the private half permanently"
+    );
+}
+
+/// The same husk, from the report's side: an entry naming the step that refused
+/// and carrying its error, beside the own run's completed repair.
+///
+/// The sibling above asserts the **tree** and that the command survived; this
+/// asserts that the census *said* what happened rather than merely surviving
+/// it. INV-15's answer is retained **and reported**, and a census that swallowed
+/// the failure into a `Skipped` or an `Ok` with no entry would pass the sibling.
+#[test]
+fn the_resume_census_reports_the_husk_it_could_not_reclaim() {
+    const STUCK: &str = "01AAAASTUCK000000000000000";
+
+    let fixture = Fixture::healthy("husk-unreclaimable-report");
+    let harness = harness();
+    let runtime = runtime_holding_the_record();
+    let stuck = plant_husk(&fixture, STUCK, false);
+
+    let mut hooks = ArmedHooks::new(
+        &harness,
+        (RunDirSite::RemovePrivateHusk, HookPhase::Before, 1),
+    );
+    let censused = chain_to_census_with(
+        &fixture,
+        &mut hooks,
+        &runtime,
+        &IncarnationId(RESUMER.to_owned()),
+    )
+    .expect("the census completes over a husk it could not reclaim");
+    let report = censused.run_dirs();
+
+    let entry = report.of(STUCK).expect("the husk is still an entry");
+    let RunDirOutcome::Unreclaimable { step, detail } = &entry.outcome else {
+        panic!("the failure is not an outcome: {:?}", entry.outcome);
+    };
+    assert_eq!(*step, FailedStep::PrivateHalf);
+    assert!(!detail.is_empty(), "the error was dropped");
+    assert!(
+        !entry.outcome.deleted_a_private_half(),
+        "a removal that returned an error claims the half is gone"
+    );
+    assert!(
+        entry.outcome.may_have_deleted_a_private_half(),
+        "a removal that may have emptied the tree reports it untouched"
+    );
+    assert_eq!(
+        entry.locator.as_deref(),
+        Some(stuck.private.as_path()),
+        "retained and reported **with its locator**"
+    );
+    assert_eq!(report.unreclaimable().len(), 1);
+
+    // And the entry after it: this run's own repair, performed.
+    assert_eq!(
+        report
+            .of(RUN_ID)
+            .expect("the resuming run is censused too")
+            .outcome,
+        RunDirOutcome::RepairedStaleMarker,
+    );
 }
 
 // ===========================================================================

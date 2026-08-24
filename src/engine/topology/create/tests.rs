@@ -1387,21 +1387,54 @@ fn creator_error_after_commit_record_present_removes_nothing_and_reports_possibl
 /// `status` and no `upstroke runs prune` could ever reach it again. It is the
 /// one shape in this module that no later pass can repair.
 ///
-/// Both error windows, because `remove_dir_all`'s error does not say which one
-/// it is: `Before` is the removal that never ran and `After` is the removal that
-/// ran and then returned `Err`. What each leaves is different and **both
-/// converge** — the pair is still provable when the private half survived, and
-/// the marker's target is absent when it did not — which is the argument for
-/// short-circuiting rather than for guessing.
+/// **Three** error windows, because `remove_dir_all`'s error does not say which
+/// one it is. `Before` is the removal that never ran; `After` is the removal
+/// that ran and then returned `Err`; and the third — the window the arm exists
+/// for — is the one an unwritable parent or a Windows handle on the directory
+/// itself leaves: **every child removed and the directory not**.
+///
+/// The three do not converge the same way, and the report must not say they do.
+/// The first two are finished by a later reclaim — the pair is still provable
+/// when the private half survived, and the marker's target is absent when it did
+/// not. The third is finished by being **reported**: the marker's target exists
+/// with no `owner.json` in it, so the proof answers `OwnerRecordMissing` and the
+/// census retains both halves for the deferred prune. What all three share, and
+/// what the short-circuit is actually for, is that none of them orphans
+/// anything.
+///
+/// The third row is **planted**, not injected. `Injection::Error` is all or
+/// nothing at a phase boundary, so no arming can produce a half-removed
+/// directory; and this is a `TOPOLOGY_MODULE`, where the only deletions a test
+/// can reach are `RunDir.RemovePublicHusk` and the proof-token funnel, neither
+/// of which empties a directory without removing it. So the row runs the `After`
+/// window — the same funnel, the same error, the same `Disposition` — and then
+/// re-creates the private directory through `RunDir.CreatePrivateDir`, which
+/// leaves the byte-for-byte shape a partial `remove_dir_all` leaves. The claim
+/// under test is what the **next census** does with that shape, and the census
+/// reads the disk, not the history.
 #[test]
 fn a_failed_private_half_removal_keeps_the_public_half_that_names_it() {
-    for (tag, phase, private_survives, census) in [
-        ("rm-private-before", HookPhase::Before, true, "both-halves"),
+    for (tag, phase, private_survives, plant_partial, census) in [
+        (
+            "rm-private-before",
+            HookPhase::Before,
+            true,
+            false,
+            "both-halves",
+        ),
         (
             "rm-private-after",
             HookPhase::After,
             false,
+            false,
             "public-only:target-absent",
+        ),
+        (
+            "rm-private-partial",
+            HookPhase::After,
+            false,
+            true,
+            "retained:owner-record-missing",
         ),
     ] {
         let fixture = Fixture::new(tag);
@@ -1473,13 +1506,39 @@ fn a_failed_private_half_removal_keeps_the_public_half_that_names_it() {
         assert_eq!(private, &fixture.private(), "{tag}");
         assert_eq!(public, &fixture.public(), "{tag}");
         assert!(!detail.is_empty(), "{tag}: the removal error was dropped");
+        // The three questions, and the point of there being three. A failed
+        // removal completed nothing, so `removed_anything` is `false` — the same
+        // answer `Retained` gives — and what separates it from a retention is
+        // the epistemic predicate: the tree may have been emptied on the way to
+        // the error. Answering `removed_anything` `true` here made this arm
+        // indistinguishable from `PublicHalfRemoved`, whose public half is gone
+        // and whose private half never existed.
         assert!(
-            refused.disposition.removed_anything(),
-            "{tag}: a removal that may have emptied the tree reports it untouched"
+            !refused.disposition.removed_anything(),
+            "{tag}: a removal that returned an error claims a reclaim completed"
         );
         assert!(
             !refused.disposition.removed_the_private_half(),
             "{tag}: a removal that returned an error claims the half is gone"
+        );
+        assert!(
+            refused.disposition.may_have_removed_the_private_half(),
+            "{tag}: a removal that may have emptied the tree reports it untouched"
+        );
+        let public_only = Disposition::PublicHalfRemoved(UnboundShape::Bare);
+        assert_ne!(
+            (
+                refused.disposition.removed_anything(),
+                refused.disposition.removed_the_private_half(),
+                refused.disposition.may_have_removed_the_private_half(),
+            ),
+            (
+                public_only.removed_anything(),
+                public_only.removed_the_private_half(),
+                public_only.may_have_removed_the_private_half(),
+            ),
+            "{tag}: the arm whose public half is deliberately on disk answers \
+             every predicate exactly as the arm whose public half is gone"
         );
         let sentence = refused.disposition.describe();
         assert!(
@@ -1502,14 +1561,38 @@ fn a_failed_private_half_removal_keeps_the_public_half_that_names_it() {
             );
         }
 
-        // And both shapes converge: the next census reclaims the pair when the
-        // private half survived, and the public husk alone when it did not.
+        // The third window: every child gone, the directory not. Planted here
+        // rather than injected, for the reason the doc comment gives.
+        if plant_partial {
+            create_private_dir(&fixture.private(), &mut NoRunDirHooks)
+                .expect("the partially-removed private directory");
+            assert!(
+                !fixture.private().join(OWNER_RECORD).exists(),
+                "{tag}: the planted shape must have lost its records, or it is \
+                 the first window with extra steps"
+            );
+            assert_eq!(
+                std::fs::read_dir(fixture.private())
+                    .expect("the planted directory reads")
+                    .count(),
+                0,
+                "{tag}: the planted directory is not empty"
+            );
+        }
+
+        // And all three shapes are ones a later pass finishes: the first two by
+        // reclaiming, the third by retaining and reporting for the deferred
+        // prune. None of them is unreachable.
         assert_eq!(
             describe_disposition(&fixture.husk().disposition),
             census,
             "{tag}: the shape left behind is not one the next census finishes \
              ({:?})",
             fixture.husk().disposition
+        );
+        assert!(
+            fixture.public().join(MARKER).is_file(),
+            "{tag}: the locator the next census needs is gone"
         );
     }
 }
@@ -2109,6 +2192,58 @@ fn kill_after_run_started_creates_integration_ref() {
         refs.created().len(),
         1,
         "the ref was created twice; `no spend repeats` is not held"
+    );
+}
+
+/// The `Committed { stale_marker: false }` sentence may not promise an action no
+/// module performs.
+///
+/// This arm has now had two wrong sentences. The first promised a stale-marker
+/// repair for a marker P7 had already removed; its replacement promised that
+/// "the resume creates the integration ref zero-old at the recorded base", and
+/// no code does that either — [`ensure_integration_ref`] has exactly one caller
+/// in the crate, P8, in this module, and `src/engine/topology/recover.rs` names
+/// `integration_ref` nowhere at all.
+///
+/// So the check is not on the words alone. It reads the resume module's own
+/// **production code** — comments and string literals blanked, `#[cfg(test)]`
+/// items removed, so a mention in prose or in a test cannot satisfy it — and
+/// pairs "does the resume touch the integration ref" with "does the sentence say
+/// it does". Implementing the P7/P8 recovery step is what makes this test ask
+/// for the sentence back.
+#[test]
+fn the_p8_report_does_not_promise_a_resume_action_no_module_performs() {
+    let resume = crate::effects::production_code(include_str!("../recover.rs"));
+    assert!(
+        resume.contains("run_recovery_order"),
+        "the production region of the resume module is empty, so this test \
+         proves nothing"
+    );
+    let performs_it = resume.contains("integration_ref");
+    assert!(
+        !performs_it,
+        "the resume now names the integration ref: the P8 sentence may promise \
+         the action again, and this assertion is what says so"
+    );
+
+    let sentence = Disposition::Committed {
+        stale_marker: false,
+    }
+    .describe();
+    for promise in [
+        "creates the integration ref",
+        "zero-old",
+        "at the recorded base",
+    ] {
+        assert!(
+            !sentence.contains(promise),
+            "the operator is promised `{promise}`, which nothing in this build \
+             performs: {sentence}"
+        );
+    }
+    assert!(
+        sentence.contains("integration ref"),
+        "the operator is not told which step did not complete: {sentence}"
     );
 }
 
@@ -3538,13 +3673,20 @@ fn the_deletion_boundary_falls_between_p5_and_p5b() {
     assert!(!Prefix::P5.is_past_the_deletion_boundary());
     assert!(Prefix::P5b.is_past_the_deletion_boundary());
 
-    // And the two questions a report answers about what is on disk.
+    // And the **three** questions a report answers about what is on disk. Two
+    // alethic — did a reclaim complete, is the private half known gone — and one
+    // epistemic, which is the only one a failed removal can answer `true` to.
     let removed = Disposition::BothHalvesRemoved {
         private: PathBuf::from("/private/runs/x"),
     };
     assert!(removed.removed_anything() && removed.removed_the_private_half());
+    assert!(removed.may_have_removed_the_private_half());
     let public_only = Disposition::PublicHalfRemoved(UnboundShape::Bare);
     assert!(public_only.removed_anything() && !public_only.removed_the_private_half());
+    assert!(
+        !public_only.may_have_removed_the_private_half(),
+        "nothing private existed by ordering on this arm"
+    );
 
     // A removal that returned an error decided nothing: `remove_dir_all` is not
     // atomic, so the arm may claim neither that the tree is untouched nor that
@@ -3555,12 +3697,53 @@ fn the_deletion_boundary_falls_between_p5_and_p5b() {
         detail: "permission denied".to_owned(),
     };
     assert!(
-        failed.removed_anything(),
-        "a failed removal may not report the tree as untouched"
+        !failed.removed_anything(),
+        "a removal that returned an error claims a reclaim completed"
     );
     assert!(
         !failed.removed_the_private_half(),
         "a failed removal may not report the private half as reclaimed"
+    );
+    assert!(
+        failed.may_have_removed_the_private_half(),
+        "a failed removal may not report the tree as untouched"
+    );
+
+    // The pair the third predicate exists for. These two trees are opposite —
+    // the public half gone with nothing private ever bound, against a public
+    // half deliberately on disk with a private half in an unobserved state — so
+    // no two of the predicates may answer them the same way.
+    let answers = |disposition: &Disposition| {
+        (
+            disposition.removed_anything(),
+            disposition.removed_the_private_half(),
+            disposition.may_have_removed_the_private_half(),
+        )
+    };
+    assert_ne!(
+        answers(&failed),
+        answers(&public_only),
+        "a caller reading the predicates cannot tell the public half went from \
+         the public half being deliberately kept"
+    );
+    // And it is the *new* question that separates them: without it the two arms
+    // are one answer.
+    assert_eq!(
+        (failed.removed_anything(), failed.removed_the_private_half()),
+        (
+            Disposition::Retained {
+                reason: RetainReason::OwnerRecordMissing,
+                locator: PathBuf::from("/private/runs/x"),
+            }
+            .removed_anything(),
+            Disposition::Retained {
+                reason: RetainReason::OwnerRecordMissing,
+                locator: PathBuf::from("/private/runs/x"),
+            }
+            .removed_the_private_half(),
+        ),
+        "the two alethic predicates alone cannot tell a failed removal from a \
+         retention, which is why the epistemic one exists"
     );
 
     // Finding 5's pair: the two committed shapes are one variant and two
@@ -3608,6 +3791,10 @@ fn the_deletion_boundary_falls_between_p5_and_p5b() {
         assert!(
             !kept.removed_anything() && !kept.removed_the_private_half(),
             "{kept:?} claims to have removed something"
+        );
+        assert!(
+            !kept.may_have_removed_the_private_half(),
+            "{kept:?} left the tree untouched and will not say so"
         );
         assert!(!kept.describe().is_empty());
     }

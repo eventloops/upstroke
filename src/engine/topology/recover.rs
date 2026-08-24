@@ -873,12 +873,23 @@ pub mod chain {
             /// process holds its own run's lock, so its own directory is refused
             /// there whatever shape its log is in.
             ///
+            /// **A husk beside this run cannot end this resume.** A reclaim that
+            /// the filesystem refuses is that directory's
+            /// [`crate::engine::topology::startup::RunDirOutcome::Unreclaimable`]
+            /// entry and the census carries on: one dead run's unremovable
+            /// residue used to fail `upstroke resume`
+            /// for every run in the repository, on every attempt, and — because
+            /// the walk is in ascending run-id order — took this run's own
+            /// stale-marker repair with it whenever the husk sorted first.
+            ///
             /// # Errors
             ///
             /// [`UpstrokeError::Refused`] from the container census — an
             /// unreachable runtime with intents present, an intent naming this
             /// process's own incarnation, an unreclaimable dead owner — or
-            /// [`UpstrokeError::Io`] from a reclaim or the marker repair.
+            /// [`UpstrokeError::Io`] when `<repo>/.upstroke/runs` exists and
+            /// cannot be enumerated, which is the run-directory half reporting
+            /// that it did not happen rather than that it found nothing.
             pub fn census(
                 barrier: BarrierHeld,
                 seams: &CensusSeams<'_>,
@@ -936,7 +947,9 @@ pub mod chain {
                 // (ii) Run directories: classified, then reclaimed under the
                 // ownership proof — private half through the proof-token funnel
                 // first, public directory with the marker last — and this run's
-                // own stale marker repaired by its owner.
+                // own stale marker repaired by its owner. `own_run` is also what
+                // guarantees this run's directory is walked at all, whatever the
+                // enumeration of the runs tree returned.
                 let run_dirs = census_run_dirs(hooks.rundir(), &inputs, Some(&run_id))?;
 
                 Ok(Self {

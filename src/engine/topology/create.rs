@@ -54,9 +54,17 @@
 //!   `<public>/.creating` with it. So a `RunDir.RemovePrivateHusk` that returns
 //!   `Err` short-circuits — removing the public half anyway would delete the
 //!   private half's only locator on exactly the path where the private half may
-//!   still be there. Retained, the pair converges either way: the next census
-//!   proves the pair and reclaims both if the private half survived, and
-//!   reclaims the public husk alone (`TargetAbsent`) if it did not.
+//!   still be there. Retained, the pair is reachable in **all three** shapes a
+//!   failed `remove_dir_all` can leave, which is what the short-circuit buys:
+//!   the next census proves the pair and reclaims both if the private half
+//!   survived intact; reclaims the public husk alone (`TargetAbsent`) if the
+//!   whole private half went and the error came on the way out; and — the shape
+//!   the arm exists for, an unwritable parent or a Windows handle on the
+//!   directory itself — **retains the pair, reported**, when every child was
+//!   removed and the directory was not, because the marker's target then exists
+//!   with no `owner.json` in it and the proof answers `OwnerRecordMissing`. Two
+//!   of the three converge by reclaiming and the third by reporting; none of
+//!   them orphans anything, which is the property the short-circuit is for.
 //! * **From the moment `committed.json` exists the creator deletes nothing**,
 //!   including when `publish_commit_record` returned `Err` and a read-only stat
 //!   shows the record present, and including when the stat cannot answer.
@@ -879,30 +887,56 @@ pub enum Disposition {
 }
 
 impl Disposition {
-    /// Whether this disposition removed, or may have removed, anything at all.
+    /// Whether a reclaim this creator drove **completed**: the private half went
+    /// through the proof-token funnel, or nothing private was bound and the
+    /// public half alone was reclaimed.
     ///
-    /// [`Self::PrivateHalfRemovalFailed`] answers `true`. `remove_dir_all` is
-    /// not atomic and its error is the same value whether it removed nothing,
-    /// part of the tree, or all of it and then failed on the way out — so the
-    /// one thing this may not answer on that arm is that the tree is untouched.
+    /// **Alethic**, and [`Self::PrivateHalfRemovalFailed`] answers `false` for
+    /// that reason. It used to answer `true`, which gave it the identical pair
+    /// of answers to [`Self::PublicHalfRemoved`] — `(true, false)` — for the
+    /// opposite tree: on that arm the public half is gone and nothing private
+    /// ever existed, on this one the public half is **deliberately still on
+    /// disk** and the private half is in a state nobody observed. A caller
+    /// reading both concluded "the public half went", which is exactly wrong.
+    ///
+    /// Mixing an epistemic reading into one of two sibling predicates is what
+    /// made the arms indistinguishable, so both siblings are alethic and
+    /// [`Self::may_have_removed_the_private_half`] carries what this arm
+    /// actually knows.
     #[must_use]
     pub const fn removed_anything(&self) -> bool {
         matches!(
             self,
-            Self::PublicHalfRemoved(_)
-                | Self::BothHalvesRemoved { .. }
-                | Self::PrivateHalfRemovalFailed { .. }
+            Self::PublicHalfRemoved(_) | Self::BothHalvesRemoved { .. }
         )
     }
 
     /// Whether the private half is **known** to have been removed.
     ///
-    /// [`Self::PrivateHalfRemovalFailed`] answers `false`, for the same reason
-    /// its sibling answers `true`: a failed removal's outcome is not decided by
-    /// its error, so nothing here may claim the half is gone either.
+    /// [`Self::PrivateHalfRemovalFailed`] answers `false`: a failed removal's
+    /// outcome is not decided by its error, so nothing here may claim the half
+    /// is gone.
     #[must_use]
     pub const fn removed_the_private_half(&self) -> bool {
         matches!(self, Self::BothHalvesRemoved { .. })
+    }
+
+    /// Whether the private half **may** have been removed, in whole or in part.
+    ///
+    /// The epistemic sibling of [`Self::removed_the_private_half`], and the one
+    /// question [`Self::PrivateHalfRemovalFailed`] can answer `true` to.
+    /// `remove_dir_all` is not atomic and its error is the same value whether it
+    /// removed nothing, every child, or the whole tree and then failed on the
+    /// way out — so "is the private half gone" and "is there residue nobody
+    /// observed" are two questions, and this is the second one. No arm that left
+    /// the tree untouched answers `true` here, which is what separates this arm
+    /// from [`Self::Retained`] and [`Self::PossiblyCommitted`].
+    #[must_use]
+    pub const fn may_have_removed_the_private_half(&self) -> bool {
+        matches!(
+            self,
+            Self::BothHalvesRemoved { .. } | Self::PrivateHalfRemovalFailed { .. }
+        )
     }
 
     /// The operator-facing sentence.
@@ -932,9 +966,12 @@ impl Disposition {
                 "the private half at {} could not be removed ({detail}), so the public directory \
                  at {} was left in place with its marker: `.creating` is that private half's only \
                  locator, and removing it would orphan a directory no census, no `status` and no \
-                 deferred `upstroke runs prune` could ever reach again. The next census reclaims \
-                 the pair if the private half is still there, and the public husk alone if it is \
-                 not",
+                 deferred `upstroke runs prune` could ever reach again. A removal that returns an \
+                 error decides nothing, so the next census finishes whichever of three shapes is \
+                 there: it reclaims the pair if the private half is still whole, the public husk \
+                 alone if the private half is gone, and — if the removal emptied the private \
+                 directory without removing the directory itself — it reports the pair as \
+                 retained and deletes neither half",
                 private.display(),
                 public.display()
             ),
@@ -965,8 +1002,10 @@ impl Disposition {
             }
             Self::Committed {
                 stale_marker: false,
-            } => "the run exists and is resumable; P7 already removed its marker, and the resume \
-                  creates the integration ref zero-old at the recorded base"
+            } => "the run exists and is resumable; P7 already removed its `.creating`, so a \
+                  resume has nothing there to repair. Its integration ref is what P8 did not \
+                  establish, and this build establishes one nowhere else: `ensure_integration_ref` \
+                  is P8's body and P8 is its only caller, so the ref stays as this refusal left it"
                 .to_owned(),
             Self::RetainedPossiblyCommittedHusk { locator } => format!(
                 "the proven prefix has no committed first line, so this is a retained, possibly \
@@ -1109,10 +1148,18 @@ fn stat_after_error(aborted: &mut Aborted, hooks: &mut dyn TopologyHooks) -> Dis
             // over `<repo>/.upstroke/runs`, nothing enumerates `<R>/runs`, and a
             // private half no marker names is one no census, no `status` and no
             // deferred prune can ever reach again. So a failed private removal
-            // returns here rather than falling through — and what it leaves
-            // converges either way: the next census proves the pair and reclaims
-            // both if the private half survived, and reclaims the public husk
-            // alone (`TargetAbsent`) if it did not.
+            // returns here rather than falling through — and every shape it can
+            // leave is one a later pass can still act on. `remove_dir_all` has
+            // three outcomes behind one error value, not two: nothing removed,
+            // so the next census proves the pair and reclaims both; everything
+            // removed and the error raised on the way out, so the marker names
+            // an absent target and the next census reclaims the public husk
+            // alone (`TargetAbsent`); and every child removed but not the
+            // directory — an unwritable parent, or on Windows a handle on the
+            // directory — so the target exists with no `owner.json` in it and
+            // the next census **retains the pair and reports it**
+            // (`OwnerRecordMissing`), which is the deferred prune's shape rather
+            // than a reclaim. Nothing is orphaned in any of the three.
             if let Err(error) = remove_private_husk(token, hooks.rundir()) {
                 return Disposition::PrivateHalfRemovalFailed {
                     private: target,
@@ -1728,6 +1775,13 @@ fn p8_create_integration_ref(
 /// implementations of "if present == base continue" are two places for a run
 /// that was killed between P6 and P8 to be treated differently from one that
 /// was not.
+///
+/// **The recovery caller does not exist in this build.** P8 is this function's
+/// only caller in the crate, and [`super::recover`] names no integration ref at
+/// all; `create::tests::kill_after_run_started_creates_integration_ref` drives
+/// the recovery step by calling this directly. So the sentence above is a claim
+/// about the body a resume would use, not about a step a resume performs, and
+/// [`Disposition::Committed`]'s report says so rather than promising the action.
 ///
 /// # Errors
 ///
