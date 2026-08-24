@@ -133,7 +133,7 @@ use std::path::Path;
 use crate::config::RunnerSelection;
 use crate::error::UpstrokeError;
 use crate::events::RunOutcome;
-use crate::rundir::RepoKey;
+use crate::rundir::{RepoKey, RunLock, WorktreeLock};
 use crate::runner::container::GitView;
 use crate::runner::container::resolve::RunnerPreflight;
 use crate::runner::container::runtime::{ContainerRuntime, OwnerLiveness};
@@ -527,6 +527,22 @@ pub mod chain {
             pub fn root(&self) -> &RootDerived {
                 &self.root
             }
+
+            /// Consume the witness and hand out the two lock guards, still
+            /// held.
+            ///
+            /// The fields are `_run` and `_worktree` because nothing reads
+            /// them — they exist to be dropped, in declaration order, so the
+            /// run lock is released before the worktree lease. **Handing them
+            /// out keeps that property and moves it**: the guards outlive this
+            /// call, drop in the same order at the end of the loop, and are
+            /// still unreadable. What changes is *when* they die, and the whole
+            /// reason a loop can exist is that it is no longer at the end of
+            /// the recovery order.
+            #[must_use]
+            pub fn into_guards(self) -> (RunLock, WorktreeLock, RootDerived) {
+                (self._run, self._worktree, self.root)
+            }
         }
     }
 
@@ -663,6 +679,22 @@ pub mod chain {
             #[must_use]
             pub fn locks(&self) -> &LocksHeld {
                 &self.locks
+            }
+
+            /// Consume this witness and hand on the one it was built from.
+            ///
+            /// **Mints nothing.** §2's rule is that a witness is constructible
+            /// only by its own constructor from its own predecessor, and this
+            /// goes the other way: it takes a witness apart, it does not put
+            /// one together. Walking backwards by reference was already
+            /// possible through the accessor above; what this adds is
+            /// *ownership*, which the run loop needs and a reference cannot
+            /// give — at the bottom of the chain the parts are the append
+            /// handle and the two locks, and a borrowed lock is a lock this
+            /// process is about to drop.
+            #[must_use]
+            pub fn into_locks(self) -> LocksHeld {
+                self.locks
             }
 
             /// The verified owner record.
@@ -826,6 +858,23 @@ pub mod chain {
             #[must_use]
             pub fn records(&self) -> &RecordsVerified {
                 &self.records
+            }
+
+            /// Consume the barrier and hand out the run's own state.
+            ///
+            /// **The append handle and the fold are one pair, and this is the
+            /// only way to own them.** The log is the handle the barrier
+            /// entitled this command to; the fold is built from *exactly* the
+            /// bytes the barrier synced, reread, proved and replayed. A caller
+            /// that reopened the log to get a handle would be appending to a
+            /// prefix its own barrier never proved, which is the whole of what
+            /// (a1) exists to prevent — so the pair leaves together or not at
+            /// all.
+            #[must_use]
+            pub fn into_log_fold_and_records(
+                self,
+            ) -> (crate::events::log::EventLog, TopologyFold, RecordsVerified) {
+                (self.log, self.fold, self.records)
             }
 
             /// The fold built from exactly the proven bytes.
@@ -1028,6 +1077,22 @@ pub mod chain {
                 &self.barrier
             }
 
+            /// Consume this witness and hand on the one it was built from.
+            ///
+            /// **Mints nothing.** §2's rule is that a witness is constructible
+            /// only by its own constructor from its own predecessor, and this
+            /// goes the other way: it takes a witness apart, it does not put
+            /// one together. Walking backwards by reference was already
+            /// possible through the accessor above; what this adds is
+            /// *ownership*, which the run loop needs and a reference cannot
+            /// give — at the bottom of the chain the parts are the append
+            /// handle and the two locks, and a borrowed lock is a lock this
+            /// process is about to drop.
+            #[must_use]
+            pub fn into_barrier(self) -> BarrierHeld {
+                self.barrier
+            }
+
             /// The barrier, mutably — the append handle lives inside it.
             pub(in crate::engine::topology::recover) fn barrier_mut(&mut self) -> &mut BarrierHeld {
                 &mut self.barrier
@@ -1177,6 +1242,22 @@ pub mod chain {
                 &self.censused
             }
 
+            /// Consume this witness and hand on the one it was built from.
+            ///
+            /// **Mints nothing.** §2's rule is that a witness is constructible
+            /// only by its own constructor from its own predecessor, and this
+            /// goes the other way: it takes a witness apart, it does not put
+            /// one together. Walking backwards by reference was already
+            /// possible through the accessor above; what this adds is
+            /// *ownership*, which the run loop needs and a reference cannot
+            /// give — at the bottom of the chain the parts are the append
+            /// handle and the two locks, and a borrowed lock is a lock this
+            /// process is about to drop.
+            #[must_use]
+            pub fn into_censused(self) -> ResumeCensused {
+                self.censused
+            }
+
             /// The census, mutably.
             pub(in crate::engine::topology::recover) fn censused_mut(
                 &mut self,
@@ -1259,6 +1340,22 @@ pub mod chain {
             #[must_use]
             pub fn rebuilt(&self) -> &RunnerRebuilt {
                 &self.rebuilt
+            }
+
+            /// Consume this witness and hand on the one it was built from.
+            ///
+            /// **Mints nothing.** §2's rule is that a witness is constructible
+            /// only by its own constructor from its own predecessor, and this
+            /// goes the other way: it takes a witness apart, it does not put
+            /// one together. Walking backwards by reference was already
+            /// possible through the accessor above; what this adds is
+            /// *ownership*, which the run loop needs and a reference cannot
+            /// give — at the bottom of the chain the parts are the append
+            /// handle and the two locks, and a borrowed lock is a lock this
+            /// process is about to drop.
+            #[must_use]
+            pub fn into_rebuilt(self) -> RunnerRebuilt {
+                self.rebuilt
             }
 
             /// The rebuilt runner, mutably — the append handle is under it.
@@ -1520,7 +1617,7 @@ pub fn run_recovery_order(
     seams: &ResumeSeams<'_>,
     hooks: &mut dyn TopologyHooks,
     warnings: &mut Vec<String>,
-) -> Result<Recovered, UpstrokeError> {
+) -> Result<(Recovered, RunHandle), UpstrokeError> {
     // (a) the two locks, then the two records — before any private write.
     let locks = LocksHeld::take(
         root,
@@ -1613,16 +1710,19 @@ pub fn run_recovery_order(
     steps.push(RecoveryStep::G);
 
     // (h) — and the witness is consumed here.
-    let resumed = run_resumed(certified, &mut context, seams.incarnation)?;
+    let (resumed, handle) = run_resumed(certified, &mut context, seams.incarnation)?;
     steps.push(RecoveryStep::H);
-    Ok(Recovered {
-        interrupted,
-        retained_closed,
-        recreated,
-        steps,
-        resumed,
-        warnings: drift,
-    })
+    Ok((
+        Recovered {
+            interrupted,
+            retained_closed,
+            recreated,
+            steps,
+            resumed,
+            warnings: drift,
+        },
+        handle,
+    ))
 }
 
 // ---------------------------------------------------------------------------
@@ -1899,7 +1999,7 @@ pub fn run_resumed(
     mut certified: PreflightCertified,
     context: &mut EmitContext<'_>,
     incarnation: &IncarnationId,
-) -> Result<Resumed, UpstrokeError> {
+) -> Result<(Resumed, RunHandle), UpstrokeError> {
     let body = TopologyEventBody::RunResumed {
         data: Box::new(RunResumed4 {
             incarnation: incarnation.clone(),
@@ -1910,10 +2010,81 @@ pub fn run_resumed(
     };
     emit(&mut certified, context, body)?;
     let fold = fold_of(&certified);
-    Ok(Resumed {
+    let resumed = Resumed {
         epoch: fold.epoch().map_or(0, |epoch| epoch.0),
         budget_stop_cleared: fold.budget_stop().is_none(),
-    })
+    };
+
+    // The witness is spent; what it was carrying is not. Unwound rather than
+    // dropped, because everything below it is the run's own state and the loop
+    // is the thing that needs it — see [`RunHandle`].
+    let (log, fold, records) = certified
+        .into_rebuilt()
+        .into_censused()
+        .into_barrier()
+        .into_log_fold_and_records();
+    let (run_lock, worktree_lock, root) = records.into_locks().into_guards();
+    Ok((
+        resumed,
+        RunHandle {
+            started: root.started().clone(),
+            log,
+            fold,
+            _run: run_lock,
+            _worktree: worktree_lock,
+        },
+    ))
+}
+
+/// The run's own state, handed from a completed start to the loop that drives
+/// it.
+///
+/// **Every field of this was being dropped at the end of the recovery order**,
+/// and that is the mechanical reason `TopologyRun` could not exist. Not a
+/// missing function — a missing *value*. `run_resumed` consumed the last
+/// witness and returned a two-field summary, so the append handle the barrier
+/// had just entitled the command to, the fold built from exactly the proven
+/// bytes, and both locks died with it.
+///
+/// Each of the three matters for a different reason:
+///
+/// - **The log** is the handle `(a1)` proved. A loop that reopened the log
+///   would append to a prefix its own barrier never proved, which is the whole
+///   of what the barrier exists to prevent.
+/// - **The fold** is derived from exactly the bytes the barrier synced, reread
+///   and replayed. Rebuilding it anywhere else is a second derivation that can
+///   disagree with the first.
+/// - **The locks** make this process the run's only writer. A loop that had to
+///   retake them would be racing itself, and `run_creation` requires the
+///   worktree lock held "across the startup census **and the whole run**".
+///
+/// The lock fields keep their `_` names and stay private: nothing reads them,
+/// they exist to be dropped, and they drop in declaration order so the run lock
+/// is released before the worktree lease. All this changes is *when* — the end
+/// of the loop rather than the end of recovery.
+pub struct RunHandle {
+    /// The append handle the stable-prefix barrier entitled this command to.
+    pub log: crate::events::log::EventLog,
+    /// The fold built from exactly the barrier-proven bytes.
+    pub fold: TopologyFold,
+    /// The record the run started from, which the loop's emitter stamps from.
+    pub started: RunStarted4,
+    _run: RunLock,
+    _worktree: WorktreeLock,
+}
+
+impl std::fmt::Debug for RunHandle {
+    /// Names the run and says nothing about the locks.
+    ///
+    /// A derived `Debug` would print two guards whose whole contract is that
+    /// nothing reads them, and a lock that appears in a log line is a lock
+    /// someone will eventually reason about.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RunHandle")
+            .field("run_id", &self.started.run_id)
+            .field("poisoned", &self.fold.is_poisoned())
+            .finish_non_exhaustive()
+    }
 }
 
 /// What (h) established, for the caller that reports it.

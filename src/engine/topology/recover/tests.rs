@@ -1113,6 +1113,20 @@ fn resume(
     harness: &Arc<Mutex<HookHarness>>,
     given: &Given<'_>,
 ) -> (Result<Recovered, UpstrokeError>, Vec<String>) {
+    let (outcome, warnings) = resume_holding(fixture, harness, given);
+    // The handle is dropped here, which releases the run lock and then the
+    // worktree lease — the same thing that happened at the end of the recovery
+    // order before the loop existed to hold them. A test that needs them alive
+    // takes [`resume_holding`].
+    (outcome.map(|(recovered, _handle)| recovered), warnings)
+}
+
+/// [`resume`], keeping the [`RunHandle`] the order hands back.
+fn resume_holding(
+    fixture: &Fixture,
+    harness: &Arc<Mutex<HookHarness>>,
+    given: &Given<'_>,
+) -> (Result<(Recovered, RunHandle), UpstrokeError>, Vec<String>) {
     let mut hooks = HarnessTopologyHooks::new(Arc::clone(harness)).recording_durability();
     resume_with(fixture, &mut hooks, given)
 }
@@ -1122,7 +1136,7 @@ fn resume_with(
     fixture: &Fixture,
     hooks: &mut dyn TopologyHooks,
     given: &Given<'_>,
-) -> (Result<Recovered, UpstrokeError>, Vec<String>) {
+) -> (Result<(Recovered, RunHandle), UpstrokeError>, Vec<String>) {
     let liveness = FakeOwnerLiveness::new();
     let view = DisposableDirView::new(ContainerTrace::default());
     let incarnation = IncarnationId(RESUMER.to_owned());
@@ -4244,4 +4258,59 @@ fn a_repair_generation_cannot_reach_step_g_in_this_slice() {
         "no entry this slice can build descends from a lineage, so no \
          `task_dispatched` carrying an inherited lease can be valid"
     );
+}
+
+/// **The recovery order hands its state on rather than dropping it.**
+///
+/// This is the assertion that did not exist while `TopologyRun` did not exist.
+/// `run_resumed` consumed the last witness and returned a two-field summary, so
+/// the append handle `(a1)` had just proved, the fold built from exactly those
+/// bytes, and both locks were destroyed at the end of the order. A loop cannot
+/// be written against a function that ends by throwing the run away — so the
+/// missing driver was not only a missing function, it was a missing *value*.
+///
+/// What is asserted is that the three survive and are the *same* three, not
+/// replacements: the log still appends to the proven prefix, the fold is the
+/// one the barrier replayed, and the locks are still held.
+#[test]
+fn the_recovery_order_hands_the_run_on_rather_than_dropping_it() {
+    let fixture = Fixture::healthy("hand-on");
+    let harness = harness();
+    let runtime = runtime_holding_the_record();
+    let certifies = AlwaysCertifies;
+    let given = Given::healthy(&fixture, &runtime, &certifies);
+
+    let (outcome, _) = resume_holding(&fixture, &harness, &given);
+    let (recovered, handle) = outcome.expect("the healthy resume completes");
+
+    assert_eq!(
+        handle.started.run_id, RUN_ID,
+        "the handle names the run the order recovered"
+    );
+    assert!(
+        !handle.fold.is_poisoned(),
+        "and hands on a fold that may still be transitioned"
+    );
+    assert_eq!(
+        handle.fold.epoch().map(|epoch| epoch.0),
+        Some(recovered.resumed.epoch),
+        "the fold in the handle is the one `(h)` incremented, not a second \
+         derivation of the same log — a rebuilt fold is a rule that can \
+         disagree with the one the barrier proved"
+    );
+
+    // The run lock is still held, which is the property that lets a loop run
+    // at all. Measured by asking for it: a second acquisition must be refused
+    // while the handle is alive.
+    let contested = rundir::RunLock::acquire(&rundir::public_dir(&fixture.repo_root, RUN_ID));
+    assert!(
+        contested.is_err(),
+        "the run lock is still held by the handle; a loop that had to retake \
+         it would be racing itself"
+    );
+
+    // And released when the handle dies, in declaration order.
+    drop(handle);
+    rundir::RunLock::acquire(&rundir::public_dir(&fixture.repo_root, RUN_ID))
+        .expect("dropping the handle releases the run lock");
 }
