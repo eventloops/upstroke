@@ -69,6 +69,49 @@
 //!   reparse-point checks alone.** Every one of those answers is a
 //!   [`HuskDisposition::Retained`], and the retain arm of [`apply`] performs no
 //!   effect at all.
+//!
+//! # A failed reclaim is an outcome, not a refusal
+//!
+//! [`apply`] is infallible. Every way a `RunDir` funnel can refuse becomes a
+//! [`RunDirOutcome::Unreclaimable`] naming the [`FailedStep`], and the census
+//! carries on to the next directory.
+//!
+//! That is the same answer INV-15 and `startup_census` give everywhere else:
+//! "cannot be reclaimed" is *retained and reported*, never a command-fatal
+//! error. It matters most on the resume path, where this function is the whole
+//! of the run-directory half. A dead run that left a provable husk whose private
+//! half cannot be removed — `EACCES`, `EPERM`, `EBUSY`, or on Windows any
+//! still-open handle — used to make `upstroke resume <id>` fail for **every**
+//! run in the repository, on every attempt, because of a different run's
+//! residue. `run_dir_names` sorts ascending, so a husk id sorting before the
+//! resuming run's also took the own-run stale-marker repair with it.
+//!
+//! The census's own run is not an exception, and that is deliberate. The only
+//! effect the `own_run` licence reaches is [`rundir::remove_marker`] on a
+//! Committed directory — the husk arms are gated on the run lock, which a resume
+//! holds for its own directory — and a marker that outlives its repair is
+//! residue, not state: nothing on the resume path reads `.creating`, the removal
+//! is documented idempotent, and the next write command repairs it. A
+//! `RunDir.RemoveMarker` failure is also a poor predictor of anything wider: an
+//! unwritable public directory fails the log append too, with a message naming
+//! the step that actually stopped the run, and a Windows handle held on the
+//! marker file says nothing about the log. Refusing here would replace a precise
+//! later error with an imprecise earlier one, and would put a second policy in
+//! the one function whose two callers are supposed to differ in `own_run` and
+//! nothing else.
+//!
+//! The one error [`census_run_dirs`] keeps is the opposite question: not "this
+//! census could not finish one directory", which is an outcome, but "**no
+//! census happened**", which no per-directory report can express. See
+//! [`enumerate`]. Both halves of that policy have to be read together — a
+//! reclaim that refuses is reported, and an enumeration that refuses is not
+//! reportable at all.
+//!
+//! A caller that reports what the census did therefore reads
+//! [`RunDirCensusReport::unreclaimable`] as well as
+//! [`RunDirCensusReport::retained`]: the two are siblings, and a report that
+//! printed only the second would hide exactly the directories an operator has to
+//! act on by hand.
 
 use std::path::{Path, PathBuf};
 
@@ -132,6 +175,83 @@ impl std::fmt::Debug for CensusInputs<'_> {
 // The report
 // ---------------------------------------------------------------------------
 
+/// Which of the census's four effects returned an error.
+///
+/// Carried by [`RunDirOutcome::Unreclaimable`], and four values rather than one
+/// because the residue each leaves is different and two of them are opposite.
+/// [`Self::PublicHalfAfterPrivate`] is the only failure on which a private half
+/// **is** gone, and [`Self::PrivateHalf`] is the only one on which nothing about
+/// the private half is known.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FailedStep {
+    /// `RunDir.RemovePublicHusk` on a directory with nothing private bound.
+    /// Nothing private existed by ordering, so nothing private is at risk.
+    PublicHalf,
+    /// `RunDir.RemovePrivateHusk` under the proof token. **The public half is
+    /// deliberately left where it is**, marker and all: `.creating` is the
+    /// private half's only locator, and the census does not know whether that
+    /// half is still there — `remove_dir_all` is not atomic and its error is the
+    /// same value whether it removed nothing, every child, or the whole tree and
+    /// then failed on the way out.
+    PrivateHalf,
+    /// `RunDir.RemovePublicHusk` **after** the private half went through the
+    /// proof-token funnel. The private half is gone; the public husk survives
+    /// carrying a marker whose target is absent, which the next census reclaims
+    /// public-only.
+    PublicHalfAfterPrivate,
+    /// `RunDir.RemoveMarker` on a committed run's stale `.creating`. The run
+    /// itself is untouched; the marker is residue the next census with the lock
+    /// free, or the owner's next resume, removes.
+    StaleMarker,
+}
+
+impl FailedStep {
+    /// Every step, as a closed set.
+    pub const ALL: &'static [Self] = &[
+        Self::PublicHalf,
+        Self::PrivateHalf,
+        Self::PublicHalfAfterPrivate,
+        Self::StaleMarker,
+    ];
+
+    /// This step's name, for a report and for a test's table.
+    #[must_use]
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::PublicHalf => "public-half",
+            Self::PrivateHalf => "private-half",
+            Self::PublicHalfAfterPrivate => "public-half-after-private",
+            Self::StaleMarker => "stale-marker",
+        }
+    }
+
+    /// The operator-facing clause: what could not be done, and what that leaves.
+    #[must_use]
+    pub const fn what_failed(self) -> &'static str {
+        match self {
+            Self::PublicHalf => {
+                "the public half could not be reclaimed; no private half existed by ordering, so \
+                 nothing private is at risk"
+            }
+            Self::PrivateHalf => {
+                "the private half could not be removed, so the public directory was left in place \
+                 with its marker — `.creating` is that private half's only locator, and removing \
+                 it would orphan a directory no census, no `status` and no deferred \
+                 `upstroke runs prune` could ever reach again"
+            }
+            Self::PublicHalfAfterPrivate => {
+                "the private half went through the proof-token funnel and the public directory \
+                 could not be removed after it, so a husk whose marker names an absent target is \
+                 left, which the next census reclaims public-only"
+            }
+            Self::StaleMarker => {
+                "the stale `.creating` marker could not be removed; the run itself is untouched \
+                 and the marker is residue the next census repairs"
+            }
+        }
+    }
+}
+
 /// What the census did with one run directory, and why.
 ///
 /// The set is closed and mirrors `startup_census`'s own enumeration: arms (i)
@@ -166,6 +286,28 @@ pub enum RunDirOutcome {
     /// same sentence's other half for a Committed directory whose live owner
     /// "removes it in recovery step (a)".
     Skipped,
+    /// The reclaim or the repair this census planned returned an error, so the
+    /// directory is **retained with the error recorded** and the census carries
+    /// on to the next one.
+    ///
+    /// Not a refusal, and that is the whole point of the arm. `startup_census`
+    /// and INV-15 answer "cannot be reclaimed" with *retain and report*; the
+    /// census "never establishes authority", so its failure to reclaim one
+    /// directory may not withhold one from the command. Before this arm the
+    /// error propagated, and one husk whose private half could not be removed —
+    /// `EACCES`, `EPERM`, `EBUSY`, or on Windows any still-open handle — made
+    /// `upstroke resume <id>` fail for **every** run in the repository, on every
+    /// attempt, because of a different run's residue.
+    ///
+    /// [`super::create::Disposition::PrivateHalfRemovalFailed`] is the creator's
+    /// side of the same answer, and states the same policy: "it is not a second
+    /// error to report over the one that stopped the run".
+    Unreclaimable {
+        /// Which effect refused, and therefore what is left on disk.
+        step: FailedStep,
+        /// The error, as the operator sees it.
+        detail: String,
+    },
 }
 
 impl RunDirOutcome {
@@ -183,6 +325,7 @@ impl RunDirOutcome {
         "repaired-stale-marker",
         "committed",
         "skipped",
+        "unreclaimable",
     ];
 
     /// This outcome's kind. Exhaustive by construction.
@@ -195,27 +338,72 @@ impl RunDirOutcome {
             Self::RepairedStaleMarker => "repaired-stale-marker",
             Self::Committed => "committed",
             Self::Skipped => "skipped",
+            Self::Unreclaimable { .. } => "unreclaimable",
         }
     }
 
-    /// Whether anything at all was deleted for this outcome.
+    /// Whether a deletion **completed** for this outcome.
+    ///
+    /// Alethic, and [`FailedStep`] is what makes that word load-bearing. A
+    /// `RunDir.RemovePublicHusk` that returned an error may have removed every
+    /// entry of the directory, some of them, or none — `remove_dir_all` and this
+    /// funnel's entry loop are not atomic and the error is the same value in all
+    /// three cases — so [`FailedStep::PublicHalf`] answers `false` here rather
+    /// than claim a reclaim that may not have happened.
+    /// [`FailedStep::PublicHalfAfterPrivate`] answers `true`, because on that
+    /// one the private half went through the proof-token funnel and the funnel
+    /// returned `Ok`.
     #[must_use]
     pub const fn reclaimed_anything(&self) -> bool {
         matches!(
             self,
-            Self::ReclaimedPublicOnly(_) | Self::ReclaimedBothHalves
+            Self::ReclaimedPublicOnly(_)
+                | Self::ReclaimedBothHalves
+                | Self::Unreclaimable {
+                    step: FailedStep::PublicHalfAfterPrivate,
+                    ..
+                }
         )
     }
 
-    /// Whether the **private** half was deleted.
+    /// Whether the **private** half is known to have been deleted.
     ///
-    /// True for exactly one arm. `startup_census`'s "nothing private is ever
-    /// deleted on shape, marker parse, basename, or reparse-point checks alone"
-    /// is a statement about which arm a shape reaches, and this is the predicate
-    /// a test states it with.
+    /// `startup_census`'s "nothing private is ever deleted on shape, marker
+    /// parse, basename, or reparse-point checks alone" is a statement about
+    /// which arm a shape reaches, and this is the predicate a test states it
+    /// with — so it stays alethic. [`FailedStep::PrivateHalf`] answers `false`
+    /// and [`Self::may_have_deleted_a_private_half`] is where it answers `true`.
     #[must_use]
     pub const fn deleted_a_private_half(&self) -> bool {
-        matches!(self, Self::ReclaimedBothHalves)
+        matches!(
+            self,
+            Self::ReclaimedBothHalves
+                | Self::Unreclaimable {
+                    step: FailedStep::PublicHalfAfterPrivate,
+                    ..
+                }
+        )
+    }
+
+    /// Whether the private half **may** have been deleted, in whole or in part.
+    ///
+    /// The epistemic sibling of [`Self::deleted_a_private_half`], and the pair
+    /// exists so that "is the private half gone" and "is there residue nobody
+    /// observed" are two questions with two answers.
+    /// [`FailedStep::PrivateHalf`] is the arm that answers them differently:
+    /// `false` to the first, because a failed `remove_dir_all` decides nothing,
+    /// and `true` here, because it may have emptied the directory on the way to
+    /// its error.
+    #[must_use]
+    pub const fn may_have_deleted_a_private_half(&self) -> bool {
+        matches!(
+            self,
+            Self::ReclaimedBothHalves
+                | Self::Unreclaimable {
+                    step: FailedStep::PrivateHalf | FailedStep::PublicHalfAfterPrivate,
+                    ..
+                }
+        )
     }
 }
 
@@ -298,6 +486,10 @@ impl RunDirEntry {
             RunDirOutcome::Skipped => {
                 "skipped: its `run.lock` is held by a live process".to_owned()
             }
+            RunDirOutcome::Unreclaimable { step, detail } => format!(
+                "retained with the error recorded, and the census carried on: {} ({detail})",
+                step.what_failed()
+            ),
         };
         match &self.locator {
             Some(locator) => format!(
@@ -374,6 +566,17 @@ impl RunDirCensusReport {
         self.with(|outcome| matches!(outcome, RunDirOutcome::Skipped))
     }
 
+    /// Every directory whose planned reclaim or repair returned an error.
+    ///
+    /// A sibling of [`Self::retained`] rather than a subset of it: these carry
+    /// no [`RetainReason`], because nothing was *classified* as unremovable —
+    /// the plan was to remove and the funnel refused. A caller that wants
+    /// "everything still on disk after this census" asks both.
+    #[must_use]
+    pub fn unreclaimable(&self) -> Vec<&RunDirEntry> {
+        self.with(|outcome| matches!(outcome, RunDirOutcome::Unreclaimable { .. }))
+    }
+
     fn with(&self, keep: impl Fn(&RunDirOutcome) -> bool) -> Vec<&RunDirEntry> {
         self.entries
             .iter()
@@ -438,7 +641,9 @@ impl StartupCensus {
 /// Whatever half (a) refuses with — an unreachable runtime with intents present,
 /// an intent naming this process's own incarnation, a labeled container whose
 /// ownership cannot be established, a dead container that cannot be observed
-/// terminated — and [`UpstrokeError::Io`] from a reclaim or a repair in half (b).
+/// terminated — and [`UpstrokeError::Io`] from half (b) when the runs directory
+/// exists and cannot be enumerated. A reclaim or a repair that fails in half (b)
+/// is a [`RunDirOutcome::Unreclaimable`] entry and not an error.
 pub fn startup_census(
     locked: WorktreeLocked,
     hooks: &mut dyn TopologyHooks,
@@ -496,23 +701,31 @@ fn both_halves(
 /// worktree lock is held across both phases, so nothing else can move a
 /// directory between them.
 ///
+/// **Phase 2 never stops.** A funnel that refuses on one directory is that
+/// directory's [`RunDirOutcome::Unreclaimable`], not the command's error: see
+/// that arm. So the one error this function has left is the one that means *no
+/// census happened at all* — the runs directory could not be enumerated.
+///
 /// # Errors
 ///
-/// [`UpstrokeError::Io`] from whichever `RunDir` funnel a reclaim or a repair
-/// drives. Phase 1 is read-only and cannot fail.
+/// [`UpstrokeError::Io`] when `<repo>/.upstroke/runs` exists and cannot be read.
+/// [`rundir::run_dir_names`] swallows that failure into an empty vector, and a
+/// census that reported success having scanned nothing would convert INV-15's
+/// "reclaims pre-run husks at write-command start" from an unproven claim into
+/// an apparently-proven one. Phase 1 is otherwise read-only and cannot fail.
 pub(crate) fn census_run_dirs(
     hooks: &mut dyn RunDirHooks,
     inputs: &CensusInputs<'_>,
     own_run: Option<&str>,
 ) -> Result<RunDirCensusReport, UpstrokeError> {
-    let scanned: Vec<Scanned> = rundir::run_dir_names(inputs.repo_root)
-        .into_iter()
-        .map(|run_id| scan(&run_id, inputs, own_run))
+    let scanned: Vec<Scanned> = enumerate(inputs.repo_root)?
+        .iter()
+        .map(|run_id| scan(run_id, inputs, own_run))
         .collect();
 
     let mut entries = Vec::with_capacity(scanned.len());
     for item in scanned {
-        let outcome = apply(hooks, &item.public, item.plan)?;
+        let outcome = apply(hooks, &item.public, item.plan);
         entries.push(RunDirEntry {
             run_id: item.run_id,
             public: item.public,
@@ -522,6 +735,43 @@ pub(crate) fn census_run_dirs(
         });
     }
     Ok(RunDirCensusReport { entries })
+}
+
+/// Which run ids this census walks, in run-id order.
+///
+/// [`rundir::run_dir_names`] with the one thing it cannot say added: **an empty
+/// answer is two answers.** It opens the runs directory with
+/// `let Ok(entries) = fs::read_dir(…) else { return Vec::new() }`, so "there is
+/// nothing there" and "this process could not read it" are the same value. Only
+/// the first is a census: the second reports success having scanned nothing,
+/// which turns INV-15's "reclaims pre-run husks at write-command start" from an
+/// unproven claim into an apparently-proven one, and — because the walk is now
+/// the only way this census reaches a directory — silently skips the resuming
+/// run's own stale-marker repair as well.
+///
+/// So an empty answer is checked rather than believed. The probe runs *only*
+/// then, because an empty vector is the only shape the swallow can produce, and
+/// a runs directory that does not exist yet is a real emptiness — the shape the
+/// first write command in a repository sees.
+///
+/// Refusing rather than reporting is deliberate, and it is not the refusal
+/// [`RunDirOutcome::Unreclaimable`] removes: that one is "this census could not
+/// finish one directory", which retains and reports; this one is "no census
+/// happened", which no report can express. The enumeration is not forked to
+/// close it — `status` and `rundir::list_husks` walk the same
+/// `rundir::run_dir_names`, and a census that enumerated differently from what
+/// an operator reads would drift from it.
+fn enumerate(repo_root: &Path) -> Result<Vec<String>, UpstrokeError> {
+    let names = rundir::run_dir_names(repo_root);
+    if names.is_empty() {
+        let runs = rundir::runs_root(repo_root);
+        match std::fs::read_dir(&runs) {
+            Ok(_) => {}
+            Err(source) if source.kind() == std::io::ErrorKind::NotFound => {}
+            Err(source) => return Err(UpstrokeError::Io { path: runs, source }),
+        }
+    }
+    Ok(names)
 }
 
 /// One directory, classified and decided. Read-only from end to end.
@@ -642,38 +892,55 @@ fn scan(run_id: &str, inputs: &CensusInputs<'_>, own_run: Option<&str>) -> Scann
 
 /// Perform one plan. The only place in this module that has an effect.
 ///
-/// # Errors
-///
-/// Whatever the funnel it drives returns.
-fn apply(
-    hooks: &mut dyn RunDirHooks,
-    public: &Path,
-    plan: Planned,
-) -> Result<RunDirOutcome, UpstrokeError> {
+/// **Infallible, by type.** Every way a funnel can refuse is a
+/// [`RunDirOutcome::Unreclaimable`] naming the [`FailedStep`], so one
+/// directory's residue cannot end the command that censused it. The retain arm
+/// keeps a second guarantee it had before: it reaches no funnel at all, which is
+/// now visible in the signature as well as in the body.
+fn apply(hooks: &mut dyn RunDirHooks, public: &Path, plan: Planned) -> RunDirOutcome {
     match plan {
-        Planned::ReclaimPublicOnly(shape) => {
-            rundir::remove_public_husk(public, hooks)?;
-            Ok(RunDirOutcome::ReclaimedPublicOnly(shape))
-        }
+        Planned::ReclaimPublicOnly(shape) => match rundir::remove_public_husk(public, hooks) {
+            Ok(()) => RunDirOutcome::ReclaimedPublicOnly(shape),
+            Err(error) => unreclaimable(FailedStep::PublicHalf, &error),
+        },
         Planned::ReclaimBothHalves(proof) => {
             // The order is load-bearing: "the census reclaims the private half
             // through the proof-token funnel, **then** the public directory with
             // the marker last … so a kill mid-census leaves a husk the next
             // census completes". Reversed, a kill between the two would leave a
             // private half no marker names and no census can ever prove.
-            rundir::remove_private_husk(proof, hooks)?;
-            rundir::remove_public_husk(public, hooks)?;
-            Ok(RunDirOutcome::ReclaimedBothHalves)
+            //
+            // And **the public half goes only if the private one went**: a
+            // private removal that returned an error returns here rather than
+            // falling through, because `remove_public_husk` deletes `.creating`
+            // with the directory and that marker is the private half's only
+            // locator. The creator states the identical rule at its own
+            // `RunDir.RemovePrivateHusk`; this is the census's half of it.
+            if let Err(error) = rundir::remove_private_husk(proof, hooks) {
+                return unreclaimable(FailedStep::PrivateHalf, &error);
+            }
+            match rundir::remove_public_husk(public, hooks) {
+                Ok(()) => RunDirOutcome::ReclaimedBothHalves,
+                Err(error) => unreclaimable(FailedStep::PublicHalfAfterPrivate, &error),
+            }
         }
         // Arm (iii). No effect, by construction rather than by discipline:
         // there is no funnel call on this path at all.
-        Planned::Retain(reason) => Ok(RunDirOutcome::Retained(reason)),
-        Planned::RepairStaleMarker => {
-            rundir::remove_marker(public, hooks)?;
-            Ok(RunDirOutcome::RepairedStaleMarker)
-        }
-        Planned::Committed => Ok(RunDirOutcome::Committed),
-        Planned::Skip => Ok(RunDirOutcome::Skipped),
+        Planned::Retain(reason) => RunDirOutcome::Retained(reason),
+        Planned::RepairStaleMarker => match rundir::remove_marker(public, hooks) {
+            Ok(()) => RunDirOutcome::RepairedStaleMarker,
+            Err(error) => unreclaimable(FailedStep::StaleMarker, &error),
+        },
+        Planned::Committed => RunDirOutcome::Committed,
+        Planned::Skip => RunDirOutcome::Skipped,
+    }
+}
+
+/// One failed effect, as the outcome that replaces it.
+fn unreclaimable(step: FailedStep, error: &UpstrokeError) -> RunDirOutcome {
+    RunDirOutcome::Unreclaimable {
+        step,
+        detail: error.to_string(),
     }
 }
 

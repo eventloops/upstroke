@@ -34,8 +34,8 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use super::{
-    CensusInputs, Planned, RunDirCensusReport, RunDirEntry, RunDirOutcome, WorktreeLocked, apply,
-    census_run_dirs, startup_census,
+    CensusInputs, FailedStep, Planned, RunDirCensusReport, RunDirEntry, RunDirOutcome,
+    WorktreeLocked, apply, census_run_dirs, startup_census,
 };
 use crate::error::UpstrokeError;
 use crate::events::log::EventLog;
@@ -51,7 +51,9 @@ use crate::runner::container::runtime::{
 };
 use crate::runner::container::{GitView, GitViewRequest};
 use crate::runner::policy::{host_policy, runner_policy_sha256};
-use crate::topology::effects::{EffectSiteId, EventSite, HookHarness, HookPhase, RunDirSite};
+use crate::topology::effects::{
+    EffectSiteId, EventSite, HookHarness, HookPhase, Injection, RunDirSite,
+};
 use crate::topology::events::RunnerPolicy;
 
 // ===========================================================================
@@ -147,6 +149,22 @@ impl Fixture {
         (report, seen)
     }
 
+    /// The census, with one `(site, phase)` armed to return `Err` on its `n`-th
+    /// call and every `RunDir` funnel call still recorded on the shared
+    /// harness.
+    fn run_census_armed(
+        &self,
+        own_run: Option<&str>,
+        armed: (RunDirSite, HookPhase, usize),
+    ) -> (RunDirCensusReport, HookHarness) {
+        let harness = Arc::new(Mutex::new(HookHarness::new()));
+        let mut hooks = ArmedRunDir::new(Arc::clone(&harness), armed);
+        let report = census_run_dirs(&mut hooks, &self.inputs(), own_run)
+            .expect("a funnel that refuses is an outcome, not the census's error");
+        let seen = harness.lock().expect("harness").clone();
+        (report, seen)
+    }
+
     /// The worktree lock this repository's write commands hold.
     ///
     /// `acquire_in` rather than `acquire`: the public convenience API opens a
@@ -155,6 +173,64 @@ impl Fixture {
     /// to open.
     fn worktree_lock(&self) -> WorktreeLock {
         WorktreeLock::acquire_in(&self.repo, &self.git_dir).expect("the worktree lock")
+    }
+}
+
+// ---------------------------------------------------------------------------
+// A funnel that refuses
+// ---------------------------------------------------------------------------
+
+/// A [`rundir::RunDirHooks`] that records into the shared [`HookHarness`] and
+/// returns [`Injection::Error`] at one `(site, phase)`, on one nominated call.
+///
+/// Module-local because `HookHarness::arm` takes a [`SubEffectPoint`] and
+/// `hook()` answers `Proceed` to `Before`/`After` unconditionally, so a
+/// `RunDir` site's two phases are not armable through it. The recording still
+/// goes to the shared harness, so an armed census contributes to the same
+/// coverage evidence an unarmed one does.
+///
+/// The **nth** call is what makes it usable in a census over many directories:
+/// `RunDir.RemovePublicHusk` runs for every reclaim, and a test that wants one
+/// of them to refuse needs to say which. Run ids sort ascending, so "the first
+/// call" is the first directory in run-id order that reaches the site.
+struct ArmedRunDir {
+    harness: Arc<Mutex<HookHarness>>,
+    site: RunDirSite,
+    phase: HookPhase,
+    nth: usize,
+    seen: usize,
+}
+
+impl ArmedRunDir {
+    fn new(
+        harness: Arc<Mutex<HookHarness>>,
+        (site, phase, nth): (RunDirSite, HookPhase, usize),
+    ) -> Self {
+        Self {
+            harness,
+            site,
+            phase,
+            nth,
+            seen: 0,
+        }
+    }
+}
+
+impl rundir::RunDirHooks for ArmedRunDir {
+    fn hook(&mut self, site: EffectSiteId, phase: HookPhase) -> Injection {
+        self.harness
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .hook(site, phase);
+        if site != EffectSiteId::RunDir(self.site) || phase != self.phase {
+            return Injection::Proceed;
+        }
+        self.seen += 1;
+        if self.seen == self.nth {
+            Injection::Error
+        } else {
+            Injection::Proceed
+        }
     }
 }
 
@@ -921,8 +997,10 @@ fn locator_through_reparse_point_retained() {
 
     let harness = Arc::new(Mutex::new(HookHarness::new()));
     let mut hooks = rundir::HarnessHooks::new(Arc::clone(&harness));
-    let outcome = apply(&mut hooks, &husk.public(), Planned::Retain(reason.clone()))
-        .expect("retaining is infallible: it performs no effect");
+    // `apply` returns a `RunDirOutcome` and not a `Result`: "retaining performs
+    // no effect" is now a property of the signature, so there is no `Ok` left to
+    // assert.
+    let outcome = apply(&mut hooks, &husk.public(), Planned::Retain(reason.clone()));
 
     assert_eq!(outcome, RunDirOutcome::Retained(reason));
     assert_eq!(
@@ -962,8 +1040,7 @@ fn every_retain_reason_kind_deletes_nothing() {
     for reason in every_retain_reason() {
         let harness = Arc::new(Mutex::new(HookHarness::new()));
         let mut hooks = rundir::HarnessHooks::new(Arc::clone(&harness));
-        let outcome = apply(&mut hooks, &husk.public(), Planned::Retain(reason.clone()))
-            .expect("retaining performs no effect");
+        let outcome = apply(&mut hooks, &husk.public(), Planned::Retain(reason.clone()));
         assert_eq!(outcome, RunDirOutcome::Retained(reason.clone()));
         assert!(!outcome.reclaimed_anything());
         assert!(!outcome.deleted_a_private_half());
@@ -1382,8 +1459,15 @@ fn the_census_answer_is_total_and_covers_every_outcome_kind() {
         .create_private()
         .publish_owner();
     let lock = RunLock::acquire(&locked.public()).expect("the run lock");
+    // unreclaimable. Sorted **first**, so arming the first
+    // `RunDir.RemovePublicHusk` call reaches this directory and not `bare`'s —
+    // and so the census's "it did not stop at the first failure" is exercised by
+    // every other row of this test.
+    let stuck = "010000STUCK000000000000000";
+    let stuck_husk = Husk::at_p0(&fixture, stuck);
 
-    let report = fixture.run_census();
+    let (report, _) =
+        fixture.run_census_armed(None, (RunDirSite::RemovePublicHusk, HookPhase::Before, 1));
 
     let ids: Vec<&str> = report
         .entries()
@@ -1392,8 +1476,20 @@ fn the_census_answer_is_total_and_covers_every_outcome_kind() {
         .collect();
     assert_eq!(
         ids,
-        vec![bare, bound, retained, repaired, committed, skipped],
+        vec![stuck, bare, bound, retained, repaired, committed, skipped],
         "one entry per directory, in run-id order"
+    );
+    assert_eq!(
+        report
+            .of(stuck)
+            .expect("the refusing directory is an entry")
+            .outcome
+            .kind(),
+        "unreclaimable"
+    );
+    assert!(
+        exists(&stuck_husk.public()),
+        "the arming is `Before`, so the directory is still there"
     );
 
     let mut kinds: Vec<&str> = report
@@ -1413,7 +1509,13 @@ fn the_census_answer_is_total_and_covers_every_outcome_kind() {
     assert_eq!(report.retained().len(), 1);
     assert_eq!(report.repaired().len(), 1);
     assert_eq!(report.skipped().len(), 1);
+    assert_eq!(report.unreclaimable().len(), 1);
     assert!(report.possibly_committed().is_empty());
+    assert!(
+        report.retained().iter().all(|entry| entry.run_id != stuck),
+        "an unreclaimable directory is a sibling of the retentions, not one of \
+         them: it carries no `RetainReason`"
+    );
     for entry in report.entries() {
         assert!(
             !entry.describe().is_empty(),
@@ -1421,6 +1523,249 @@ fn the_census_answer_is_total_and_covers_every_outcome_kind() {
         );
     }
     drop(lock);
+}
+
+/// **One directory the filesystem will not let go of does not end the census.**
+///
+/// The census's answer to "cannot be reclaimed" is INV-15's everywhere else:
+/// retained and reported. It has to be here too, because this is the same
+/// function `upstroke resume` calls: a dead run that left a provable husk whose
+/// private half cannot be removed — `EACCES`, `EPERM`, `EBUSY`, or on Windows
+/// any still-open handle — used to make `upstroke resume <id>` fail for every
+/// run in the repository, on every attempt, for a different run's residue.
+///
+/// Three claims, and the third is what makes the first two mean anything:
+///
+/// * the census returns `Ok` and the failing directory is an entry naming the
+///   step that refused and carrying the error;
+/// * **the public half is still there, marker and all** — `.creating` is the
+///   private half's only locator, so a private removal that refused must not be
+///   followed by the public one;
+/// * the directory sorting **after** it was still censused and still reclaimed.
+///   A census that returned early would leave that one on disk and every
+///   assertion about the first one green.
+#[test]
+fn a_husk_whose_private_half_cannot_be_removed_is_reported_and_the_census_continues() {
+    let fixture = Fixture::new("unreclaimable");
+    // Sorted: the refusing husk first, so "the census continued" is a claim
+    // about the one after it.
+    let stuck = "01AAAASTUCK000000000000000";
+    let after = "01ZZZZAFTER000000000000000";
+    let stuck_husk = Husk::at_p0(&fixture, stuck)
+        .stage_marker()
+        .publish_marker()
+        .create_private()
+        .publish_owner();
+    let after_husk = Husk::at_p0(&fixture, after)
+        .stage_marker()
+        .publish_marker()
+        .create_private()
+        .publish_owner();
+    let stuck_private = tree_bytes(&stuck_husk.private());
+    assert!(!stuck_private.is_empty());
+
+    let (report, seen) =
+        fixture.run_census_armed(None, (RunDirSite::RemovePrivateHusk, HookPhase::Before, 1));
+
+    let entry = report
+        .of(stuck)
+        .expect("the refusing directory is an entry");
+    let RunDirOutcome::Unreclaimable { step, detail } = &entry.outcome else {
+        panic!("the failure is not an outcome: {:?}", entry.outcome);
+    };
+    assert_eq!(*step, FailedStep::PrivateHalf);
+    assert!(!detail.is_empty(), "the error was dropped");
+    assert_eq!(report.unreclaimable().len(), 1);
+    assert!(
+        entry.describe().contains("only locator"),
+        "the operator is not told why the public half was kept: {}",
+        entry.describe()
+    );
+
+    // The public half, marker and all.
+    assert!(exists(&stuck_husk.public()), "the public half is gone");
+    assert!(
+        exists(&stuck_husk.public().join(MARKER)),
+        "the private half's only locator is gone"
+    );
+    assert_eq!(
+        tree_bytes(&stuck_husk.private()),
+        stuck_private,
+        "the arming is `Before`, so the removal never ran"
+    );
+
+    // And the census did not stop.
+    assert_eq!(
+        report
+            .of(after)
+            .expect("the next directory is censused")
+            .outcome,
+        RunDirOutcome::ReclaimedBothHalves,
+        "the census returned early and left the directory after the failure"
+    );
+    assert!(!exists(&after_husk.public()));
+    assert!(!exists(&after_husk.private()));
+    assert_eq!(
+        seen.count(
+            EffectSiteId::RunDir(RunDirSite::RemovePrivateHusk),
+            HookPhase::Before
+        ),
+        2,
+        "the proof-token funnel was entered once per provable husk"
+    );
+}
+
+/// The three predicates, over the three failing steps that can leave a private
+/// half in three different states.
+///
+/// `deleted_a_private_half` stays **alethic** — a test that states "nothing
+/// private was deleted" reads it, so it may not answer `true` on a removal that
+/// returned an error. `may_have_deleted_a_private_half` is the epistemic
+/// sibling, and the pair is what tells the two opposite failures apart: the
+/// private removal that refused (nothing known) from the public removal that
+/// refused after the private half went (the private half really is gone).
+#[test]
+fn a_failed_step_answers_the_alethic_and_epistemic_predicates_apart() {
+    let table = [
+        (FailedStep::PublicHalf, false, false, false),
+        (FailedStep::PrivateHalf, false, false, true),
+        (FailedStep::PublicHalfAfterPrivate, true, true, true),
+        (FailedStep::StaleMarker, false, false, false),
+    ];
+    assert_eq!(
+        table.len(),
+        FailedStep::ALL.len(),
+        "a step was added to the closed set and not to this table"
+    );
+    let mut names = Vec::new();
+    for (step, reclaimed, deleted, may_have) in table {
+        let outcome = RunDirOutcome::Unreclaimable {
+            step,
+            detail: "permission denied".to_owned(),
+        };
+        assert_eq!(outcome.reclaimed_anything(), reclaimed, "{}", step.name());
+        assert_eq!(outcome.deleted_a_private_half(), deleted, "{}", step.name());
+        assert_eq!(
+            outcome.may_have_deleted_a_private_half(),
+            may_have,
+            "{}",
+            step.name()
+        );
+        assert_eq!(outcome.kind(), "unreclaimable");
+        assert!(!step.what_failed().is_empty());
+        names.push(step.name());
+    }
+    assert_eq!(
+        names,
+        FailedStep::ALL
+            .iter()
+            .map(|step| step.name())
+            .collect::<Vec<_>>(),
+        "the table must cover the closed set, in its order"
+    );
+
+    // The pair the epistemic predicate exists for: two failures whose private
+    // halves are in opposite states must not answer the two questions alike.
+    let refused = RunDirOutcome::Unreclaimable {
+        step: FailedStep::PrivateHalf,
+        detail: "e".to_owned(),
+    };
+    let after = RunDirOutcome::Unreclaimable {
+        step: FailedStep::PublicHalfAfterPrivate,
+        detail: "e".to_owned(),
+    };
+    assert_ne!(
+        (
+            refused.deleted_a_private_half(),
+            refused.may_have_deleted_a_private_half()
+        ),
+        (
+            after.deleted_a_private_half(),
+            after.may_have_deleted_a_private_half()
+        ),
+    );
+}
+
+/// A public removal that refuses **after** the private half went is the one
+/// failure on which a private half really is gone — and the husk it leaves is
+/// one the next census finishes.
+#[test]
+fn a_public_removal_that_refuses_after_the_private_half_went_says_so() {
+    let fixture = Fixture::new("public-after-private");
+    let run_id = "01AFTERPRIV0000000000000000";
+    let husk = Husk::at_p0(&fixture, run_id)
+        .stage_marker()
+        .publish_marker()
+        .create_private()
+        .publish_owner();
+
+    let (report, _) =
+        fixture.run_census_armed(None, (RunDirSite::RemovePublicHusk, HookPhase::Before, 1));
+
+    let entry = only(&report);
+    assert_eq!(
+        entry.outcome,
+        RunDirOutcome::Unreclaimable {
+            step: FailedStep::PublicHalfAfterPrivate,
+            detail: match &entry.outcome {
+                RunDirOutcome::Unreclaimable { detail, .. } => detail.clone(),
+                other => panic!("{other:?}"),
+            },
+        }
+    );
+    assert!(
+        entry.outcome.deleted_a_private_half(),
+        "the private half went through the proof-token funnel and the report \
+         will not say so"
+    );
+    assert!(!exists(&husk.private()), "the private half is still there");
+    assert!(exists(&husk.public()), "the public husk is gone");
+
+    // What is left is a husk whose marker names an absent target, which the
+    // next census reclaims public-only.
+    let second = fixture.run_census();
+    assert_eq!(
+        only(&second).outcome,
+        RunDirOutcome::ReclaimedPublicOnly(UnboundShape::TargetAbsent)
+    );
+    assert!(!exists(&husk.public()));
+}
+
+/// A runs directory that exists and cannot be enumerated **refuses**.
+///
+/// `rundir::run_dir_names` answers an unreadable runs root and an empty one with
+/// the same empty vector, so a census that believed it would report success
+/// having scanned nothing — and, since the walk is the only way this census
+/// reaches a directory, would silently skip the resuming run's own stale-marker
+/// repair too. That is not a retention: no census happened, and no report can
+/// say so.
+///
+/// The runs root is planted as a **file**, through the `Event` funnel, which is
+/// the one writer of an arbitrary path this module can reach; a permission bit
+/// is not, because `std::fs::set_permissions` is on the effect denylist. A file
+/// gives `ENOTDIR` on Unix and `ERROR_DIRECTORY` on Windows, and neither is
+/// `NotFound` — which is the one error this function is allowed to read as an
+/// emptiness.
+#[test]
+fn an_unreadable_runs_directory_refuses_rather_than_censusing_nothing() {
+    let fixture = Fixture::new("unreadable-runs");
+    let runs = rundir::runs_root(&fixture.repo);
+    rundir::create_private_dir(runs.parent().expect("`.upstroke`"), &mut rundir::NoHooks)
+        .expect("the `.upstroke` directory");
+    append_line(&runs, run_started("01FILEATRUNSROOT0000000000"));
+    assert!(runs.is_file(), "the runs root must be a file for this test");
+
+    assert!(
+        rundir::run_dir_names(&fixture.repo).is_empty(),
+        "the swallow this test is about did not happen"
+    );
+    let error = census_run_dirs(&mut rundir::NoHooks, &fixture.inputs(), None)
+        .expect_err("an unreadable runs directory is not an empty one");
+    let text = error.to_string();
+    assert!(
+        text.contains(&runs.display().to_string()),
+        "the refusal does not name what could not be enumerated: {text}"
+    );
 }
 
 /// `startup_census` consumes the worktree-lock witness and **returns**
@@ -1474,13 +1819,25 @@ fn startup_census_returns_the_witness_and_runs_both_halves() {
 }
 
 /// A census of an empty repository is an empty report, not a failure.
+///
+/// Also the control for
+/// [`an_unreadable_runs_directory_refuses_rather_than_censusing_nothing`]:
+/// without it, "refuses when it cannot enumerate" would be satisfied by
+/// refusing always, and the first write command in a repository would never
+/// run. The absent runs root is asserted rather than assumed, because that is
+/// the shape being distinguished from the unreadable one.
 #[test]
 fn an_empty_runs_directory_censuses_to_an_empty_report() {
     let fixture = Fixture::new("empty");
+    assert!(
+        !rundir::runs_root(&fixture.repo).exists(),
+        "the control must be the absent runs root, not an empty one"
+    );
     let report = fixture.run_census();
     assert!(report.entries().is_empty());
     assert!(report.reclaimed().is_empty());
     assert!(report.retained().is_empty());
+    assert!(report.unreclaimable().is_empty());
 }
 
 /// Half (a) refusing means half (b) never touches the disk.
