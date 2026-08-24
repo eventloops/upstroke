@@ -23,13 +23,22 @@
 #![deny(clippy::disallowed_types, clippy::disallowed_macros)]
 
 // `effects::production_region` cuts a source at its FIRST `#[cfg(test)]`, and
-// several source censuses in this tree scan every `src/**/*.rs` — including
-// this one, which is reached only through `#[cfg(test)] mod tests;` and so has
-// no attribute of its own for them to cut on. The marker below is redundant to
-// the compiler and load-bearing to those censuses: it makes this file's
+// this file is reached only through `#[cfg(test)] mod tests;` so it has no
+// attribute of its own for a scan to cut on. The marker below is redundant to
+// the compiler and load-bearing to every reader that still consults the
+// TRUNCATING region — `effects::externally_reachable_fns` and the three
+// censuses in `src/runner/container/exec.rs` — for which it makes this file's
 // production region empty, so a fixture that names a primitive is not reported
 // as a production offender (`PR5-R1-CFG-TEST-SHRINKS-THE-DOMAIN`, used here in
 // the direction it is wanted).
+//
+// **It does not do that for the four whole-tree censuses.** They read
+// `effects::production_code`, which excises this marker as the configured item
+// it is and then scans the file IN FULL. What keeps this file out of those is
+// not the marker: it is the `#[cfg(test)] mod tests;` declaration in
+// `src/runner/container/census.rs`, which
+// `effects::census_domain::declared_whole_file_test_modules` derives into their
+// skip set.
 #[cfg(test)]
 mod this_file_is_test_only {}
 
@@ -3048,6 +3057,19 @@ fn census_returns_the_only_token_that_reaches_a_consumer() {
             .iter()
             .filter(|byte| !byte.is_ascii_whitespace())
             .count();
+        // Per file, because the byte floor below is a sum: it stands at
+        // 1,000,000 against an actual over 1,500,000, so one file's region can
+        // empty itself and the sum still clears the bar.
+        //
+        // **Necessary, not sufficient**, and this is the assertion most likely
+        // to be mistaken for more than it is. It sees a region that COLLAPSES.
+        // It does not see one that is REPLACED: `PR7-R2C-CHAR-LITERAL-DESYNC`'s
+        // refined form removes exactly the forged lines and adds a probe of the
+        // same size, and was measured at 8525 non-whitespace bytes both with the
+        // attack and without it. No floor, per-file or aggregate, can see a
+        // zero-byte delta. What closes that is `effects::char_literal_end` and
+        // `effects::configured_item_end` returning `start` instead of the file's
+        // length when it cannot find an item's end.
         assert!(
             dense > 0,
             "{}'s region is empty, so it contributes nothing to the count below",

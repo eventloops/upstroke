@@ -669,8 +669,10 @@ fn write_file(path: &Path, bytes: &[u8]) -> Result<(), UpstrokeError> {
 }
 
 // -- test-only declarations ----------------------------------------------
-// At the BOTTOM: `effects::production_region` cuts a source at its first
-// `#[cfg(test)]` (`PR5-R1-CFG-TEST-SHRINKS-THE-DOMAIN`).
+// At the BOTTOM: `effects::production_region`, which
+// `effects::externally_reachable_fns` and the three censuses in `super::exec`
+// still use, cuts a source at its first `#[cfg(test)]`
+// (`PR5-R1-CFG-TEST-SHRINKS-THE-DOMAIN`).
 
 /// Real temporary Git repositories, built through the Runner.
 ///
@@ -686,21 +688,30 @@ fn write_file(path: &Path, bytes: &[u8]) -> Result<(), UpstrokeError> {
 /// `super::exec`'s suite builds the same repositories and two copies of a
 /// fixture are two fixtures that drift.
 ///
-/// **A `pub(crate) mod` is not what `runner::tests::production_region` reads as
-/// a test module** — its predicate is that the line after the cfg attribute
-/// starts with a bare `mod` keyword — so the three source censuses in
-/// `src/runner/mod.rs` scan this block as production. That is why nothing here
-/// constructs a process, a spawn, a timed run, a role literal or a request
-/// literal: every `git` goes through the gate-request builder and the host
-/// runner. `effects::production_region`, which cuts at the first cfg-test
-/// attribute, excludes it either way.
+/// **A `pub(crate) mod` used to read as production to the source censuses in
+/// `src/runner/mod.rs`.** Their region was `runner::tests::production_region`,
+/// whose predicate was that the line after the cfg attribute starts with a bare
+/// `mod` keyword; a visibility qualifier in front of it defeated that, and this
+/// block was scanned as production. **That reader is deleted.** All four
+/// whole-tree censuses now share `effects::production_code`, which finds the
+/// item's extent by delimiter matching rather than by reading a line, so
+/// `#[cfg(test)] pub(crate) mod fixtures { … }` is removed like any other
+/// configured item — measured on this file, which contributes nothing to any of
+/// them.
 ///
-/// **Two of those three censuses do not strip comments** — the open ledger row
-/// is `PR5-R1-PROCESS-START-CENSUS-UNSTRIPPED` — so a doc comment here that
-/// merely *names* one of their needles changes an expected count. Measured
-/// while writing this one: the paragraph above, in its first spelling, added a
-/// phantom row for this file to both of them. That is the sixth occurrence of
-/// `PR4-CENSUS-COMMENT-ORACLE` on this project.
+/// Nothing here constructs a process, a spawn, a timed run, a role literal or a
+/// request literal anyway, and every `git` goes through the gate-request builder
+/// and the host runner. That is now a discipline rather than a requirement, and
+/// it is kept: it is what makes the block safe to read as production if a future
+/// region ever does.
+///
+/// **All four censuses blank comments *and* string literals now**
+/// (`PR5-R1-PROCESS-START-CENSUS-UNSTRIPPED`, closed), so a doc comment here
+/// that names one of their needles no longer changes an expected count. It once
+/// did: the paragraph above, in its first spelling, added a phantom row for this
+/// file to two of them — the sixth occurrence of `PR4-CENSUS-COMMENT-ORACLE` on
+/// this project, and the one that finally moved the blanking into the shared
+/// region instead of into each census.
 #[cfg(test)]
 pub(crate) mod fixtures {
     use std::path::{Path, PathBuf};

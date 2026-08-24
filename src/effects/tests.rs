@@ -2393,6 +2393,204 @@ fn the_comment_blanker_models_raw_strings_and_still_blanks_comments() {
     );
 }
 
+/// A char literal whose scalar is more than one byte does not desync the
+/// tokeniser.
+///
+/// `PR7-R2C-CHAR-LITERAL-DESYNC`. Both blankers decided "is this a char
+/// literal?" with a fixed two-byte lookahead, so `'é'` — whose closing quote is
+/// at `+3` — was classified as **not** one, scanning resumed *on that closing
+/// quote*, and the quote was read as an opening one. From there the pairing is
+/// shifted by one and a `{` that is inside a char literal survives into the
+/// blanked text as visible code.
+///
+/// One unbalanced brace was enough to take a whole file out of every census:
+/// `matching` counts it, `configured_item_end`'s brace arm walks past the item's
+/// real `}`, and giving up used to mean "blank to end of file". The last block
+/// below is that attack, in miniature. Full size, on `src/agent/claude.rs`, the
+/// region measured **8525** non-whitespace bytes with the attack and 8525
+/// without it — a zero-byte delta, invisible to every byte floor in this crate,
+/// which is why the repair is in the tokeniser and in the give-up direction
+/// rather than in a floor. Gate-clean, with the probe written as
+/// `stringify! { ('é','{') }` (rustfmt leaves brace-delimited macro bodies
+/// alone; it rewrites the bare tuple to `('é', '{')`, and the space defuses it)
+/// inside `src/runner/container/view.rs`'s `#[cfg(test)] pub(crate) mod
+/// fixtures`, a forged `RunnerRequest {` builder above that file's real test
+/// module passed `every_production_runner_request_is_built_by_its_roles_builder`
+/// with `cargo fmt --check` and `clippy -D warnings` both at exit 0 — and failed
+/// it by name with the probe removed.
+///
+/// The preconditions are already here: `src/status.rs`, `src/util.rs` (twice on
+/// one line) and `src/engine/tests.rs` hold non-ASCII char literals today. Only
+/// the adjacency was missing.
+///
+/// Two axes: {scalar width} × {what follows the literal}. The controls are the
+/// lifetime rows — a blanker that treated every `'` as a literal would pass the
+/// leak rows and fail those.
+#[test]
+fn a_multi_byte_char_literal_does_not_desync_the_blanker() {
+    // 1. The tokeniser. Nothing inside a char literal reaches the blanked text.
+    for (label, source, leaked) in [
+        (
+            "the reviewer's pair",
+            "const P: (char, char) = ('é','{');\n",
+            "{",
+        ),
+        (
+            "a closing brace",
+            "const P: (char, char) = ('é','}');\n",
+            "}",
+        ),
+        ("a cascade", "const P: [char; 3] = ['é','{','{'];\n", "{"),
+        (
+            "four-byte scalar",
+            "const P: (char, char) = ('😀','{');\n",
+            "{",
+        ),
+        (
+            "three-byte scalar",
+            "const P: (char, char) = ('—','{');\n",
+            "{",
+        ),
+        (
+            "ascii, the shape that already worked",
+            "const P: char = '{';\n",
+            "{",
+        ),
+        (
+            "an escape beside it",
+            "const P: (char, char) = ('\\u{7f}','{');\n",
+            "{",
+        ),
+    ] {
+        let blanked = blank_comments_and_strings(source);
+        assert!(
+            !blanked.contains(leaked),
+            "{label}: a `{leaked}` inside a char literal survived as code: {blanked:?}"
+        );
+        assert_eq!(
+            blanked.len(),
+            source.len(),
+            "{label}: the blanking moved byte offsets, which callers map to lines"
+        );
+        assert!(
+            blanked.contains("const P"),
+            "{label}: the blanking ate the code around the literal: {blanked:?}"
+        );
+    }
+
+    // The controls. A lifetime is not a char literal, and a blanker that said
+    // "yes" to every `'` would blank from the tick to the next one — taking the
+    // signature with it.
+    for lifetime in [
+        "fn f<'a>(x: &'a str) -> &'a str { x }\n",
+        "fn g<'a,'b>(x: &'a str, y: &'b str) -> usize { x.len() + y.len() }\n",
+        "fn h(x: &'_ str) -> &'static str { \"k\" }\n",
+    ] {
+        let blanked = blank_comments_and_strings(lifetime);
+        assert!(
+            blanked.contains("str") && blanked.contains('{'),
+            "a lifetime was read as a char literal and swallowed the code after \
+             it: {lifetime:?} -> {blanked:?}"
+        );
+    }
+    // And its sibling, which KEEPS literals instead of blanking them, is driven
+    // over the same shapes. Its failure mode is the opposite one — it can only
+    // lose bytes — so what it must do is leave a comment-free source alone and
+    // still remove the comment after a multi-byte literal. Measured over all 92
+    // source files, its output is byte-identical before and after this repair;
+    // both blankers consult one scanner, which is what keeps it that way.
+    let kept = "const P: (char, char) = ('é','{');\nlet q = '😀';\nlet r = '—';\n";
+    assert_eq!(
+        blank_comments(kept),
+        kept,
+        "the sibling blanker altered a source that holds no comment at all"
+    );
+    let commented = blank_comments("const P: char = 'é'; // names \"docker\"\n");
+    assert!(
+        commented.starts_with("const P: char = 'é';"),
+        "the sibling blanker lost the literal: {commented:?}"
+    );
+    assert!(
+        !commented.contains("docker"),
+        "the comment after a multi-byte char literal survived: {commented:?}"
+    );
+
+    // 2. The same defect through `production_code`, end to end. Production
+    //    above, an inline test module holding the pair, production below — the
+    //    exact geometry of `src/agent/claude.rs`.
+    let attacked = "fn above() {}\n\
+                    #[cfg(test)]\n\
+                    mod tests {\n\
+                        const P: (char, char) = ('é','{');\n\
+                    }\n\
+                    fn forged_below() {}\n";
+    let region = production_code(attacked);
+    assert!(region.contains("fn above()"), "{region:?}");
+    assert!(
+        region.contains("fn forged_below()"),
+        "the desync blanked from the test module to end of file, so every \
+         production item below it is invisible to every census: {region:?}"
+    );
+    assert!(
+        !region.contains("const P"),
+        "the test module itself must still be removed: {region:?}"
+    );
+}
+
+/// A region that cannot find where an item ends blanks the attribute, not the
+/// file.
+///
+/// The second half of `PR7-R2C-CHAR-LITERAL-DESYNC`, and the half that decides
+/// how much a desync costs. `configured_item_end` has two give-up paths — an
+/// unbalanced brace and an item with no terminator before end of file — and both
+/// used to return `bytes.len()`, which [`production_code`] reads as "the item is
+/// the rest of the file" and blanks. That converts a tokeniser that has lost
+/// phase into **silence**: every production item below the attribute leaves
+/// every census that consults this region, and the census reports zero
+/// offenders.
+///
+/// They return `start` now. The test module reads as production, the counts go
+/// up rather than down, and a census that pins an expected set fails by name.
+/// Neither path is reachable from this tree as it stands — measured, zero
+/// occurrences over all 92 source files — so this drives them with input that
+/// does reach them, which is the only way a give-up path is ever seen.
+#[test]
+fn a_region_that_cannot_find_an_items_end_blanks_the_attribute_not_the_file() {
+    // An unbalanced brace: `mod tests {` never closes.
+    let region = production_code("fn above() {}\n#[cfg(test)]\nmod tests {\nfn below() {}\n");
+    assert!(region.contains("fn above()"), "{region:?}");
+    assert!(
+        region.contains("fn below()"),
+        "an unbalanced brace blanked the rest of the file: {region:?}"
+    );
+    assert!(
+        region.contains("mod tests {"),
+        "the test module must read as production when the region cannot find its \
+         end, so the censuses go loud: {region:?}"
+    );
+    assert!(
+        !region.contains("#[cfg(test)]"),
+        "the attribute itself is still removed: {region:?}"
+    );
+
+    // An item with no terminator before end of file.
+    let region = production_code("fn above() {}\n#[cfg(test)]\nuse a::b\n");
+    assert!(region.contains("fn above()"), "{region:?}");
+    assert!(
+        region.contains("use a::b"),
+        "an unterminated item blanked the rest of the file: {region:?}"
+    );
+    assert!(!region.contains("#[cfg(test)]"), "{region:?}");
+
+    // The control: when the item *does* close, it is still removed in full.
+    let region = production_code("fn above() {}\n#[cfg(test)]\nmod tests {\n}\nfn below() {}\n");
+    assert!(region.contains("fn above()") && region.contains("fn below()"));
+    assert!(
+        !region.contains("mod tests"),
+        "a well-formed item is still removed: {region:?}"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // The T-CONTAINER mechanical checklist
 // ---------------------------------------------------------------------------
@@ -2832,12 +3030,57 @@ fn a_configured_attribute_in_prose_removes_nothing() {
 }
 
 /// The region is a superset of [`production_region`]'s, file by file, over the
-/// tree.
+/// tree — and keeps what the truncating region cannot: the code below the cut.
 ///
-/// The repair must make every census that adopted it detect **more**, never
-/// less, and this is that sentence executed rather than argued: for each file,
-/// every byte of code the truncating region keeps is kept here too. Comments
-/// and string literals are blanked in both, so the comparison is over code.
+/// # What each assertion here is worth, because they are not worth the same
+///
+/// The prefix comparison is a **consistency check on a construction, and it
+/// cannot fail.** [`production_code`] never writes below the index of its first
+/// `#[cfg(test)]` match, [`production_region`] cuts at exactly that index, and
+/// no token straddles a cut that lands on visible code — so the two sides are
+/// the same bytes of the same blanking, and no input separates them. It is kept
+/// because it would start failing if either function's cut point moved, which is
+/// a real regression; it is not the non-weakening proof, and this doc used to
+/// claim it was.
+///
+/// What carries the claim is the rest: `strictly_larger >= 8` and the
+/// `src/engine/coordinator.rs` membership check (a strict gain somewhere, by
+/// name), and the sentinel block below, which is the one property the truncating
+/// region does not have and the one a desync destroys — an item appended *below*
+/// everything the file declares is still in the region. That block fails if
+/// `configured_item_end` ever blanks to end of file again, on any file in the
+/// tree, which is how `PR7-R2C-CHAR-LITERAL-DESYNC` hid a forged item with a
+/// zero-byte region delta.
+///
+/// # The non-weakening measurement, corrected
+///
+/// The commit that introduced this helper claimed that over 15 census needles
+/// and 92 source files the new region "drops 0 occurrences the old line-based
+/// region kept". That is false as written, and the same commit deleted a census
+/// row *because* of the occurrence it drops. Re-measured over the tree **as that
+/// commit left it**, restricted to the 76 files the censuses actually scan
+/// (whole-file test modules excluded, as every census excludes them): **8
+/// (file, needle) pairs drop, 20 occurrences**, and every one of the 20 is prose
+/// or a string literal rather than code —
+///
+/// | pair | occurrences | what they are |
+/// |---|---|---|
+/// | `src/agent/proc.rs` × `run_with_timeout` | 3 | doc comments; the census's expected count was re-derived to 5 |
+/// | `src/effects.rs` × `Command::new(` | 1 | **a string literal**: `DENIAL_FIXTURES`' `source:` field, a fixture that exists to be refused |
+/// | `src/effects.rs` × `run_with_timeout` | 1 | a doc comment in [`production_code`]'s own prose |
+/// | five files × `TopologyFold` | 15 | doc comments; that needle decides *set membership* for `FOLD_MENTIONS` and all five files stay in the set |
+///
+/// So the claim that holds is "drops no occurrence that is **code**". The
+/// string-literal drop is the in-domain one: `Command::new(` is a needle of
+/// `runner::tests::every_production_process_start_is_classified`, `src/effects.rs`
+/// is in that census's domain, and its row there was deleted by the same commit
+/// — which is the counterexample to the sentence twenty lines above it.
+///
+/// The measurement is pinned to that commit's tree deliberately, because it is
+/// not stable under editing: a doc comment written *here* naming
+/// `RunnerRequest {` adds a ninth pair to it, since the old region counted
+/// prose. Under the region this test is about it adds nothing at all, which is
+/// the whole of why the blanking moved into the region.
 #[test]
 fn the_production_code_region_contains_the_truncated_one() {
     let mut compared = 0_usize;
@@ -2875,6 +3118,28 @@ fn the_production_code_region_contains_the_truncated_one() {
         gained.contains("src/engine/coordinator.rs"),
         "the legacy coordinator — 35 of 1599 lines under the truncating region — must be one \
          of the files that gains, or the census that adopted this helper still cannot see it"
+    );
+
+    // The assertion that can fail, and the property the truncating region does
+    // not have: an item appended below everything a file declares is still in
+    // the region. A `configured_item_end` that gives up and blanks to end of
+    // file takes it — silently, and for the whole file — which is how a
+    // desynced tokeniser hides a forged item behind a zero-byte delta.
+    const SENTINEL: &str = "\npub fn sentinel_below_every_configured_item() {}\n";
+    let mut carried = 0_usize;
+    for (path, source) in scanned_sources() {
+        let region = production_code(&format!("{source}{SENTINEL}"));
+        assert!(
+            region.contains("fn sentinel_below_every_configured_item()"),
+            "{path}: an item appended below the whole file is not in its region, so the \
+             region ends somewhere earlier than the file does and everything past that \
+             point is invisible to every census that counts over it"
+        );
+        carried += 1;
+    }
+    assert_eq!(
+        carried, compared,
+        "the sentinel pass and the prefix pass walked different trees"
     );
 }
 
