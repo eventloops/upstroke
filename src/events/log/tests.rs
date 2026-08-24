@@ -3360,6 +3360,11 @@ fn the_stable_prefix_barrier_is_the_only_way_a_log_becomes_a_topology_fold() {
         // builds one from bytes.
         // PR7's recovery order. Reads a fold; builds none from bytes.
         "src/engine/topology/recover.rs",
+        // PR7's driver. Holds the fold `RunHandle` handed it and reads it to
+        // select; builds none from bytes, because the one it holds is the one
+        // the barrier proved and a second derivation would be a rule that can
+        // disagree with the first.
+        "src/engine/topology/run.rs",
         "src/engine/topology/select.rs",
         "src/engine/topology/settle.rs",
         "src/events/log.rs",

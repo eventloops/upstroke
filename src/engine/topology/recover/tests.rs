@@ -4314,3 +4314,81 @@ fn the_recovery_order_hands_the_run_on_rather_than_dropping_it() {
     rundir::RunLock::acquire(&rundir::public_dir(&fixture.repo_root, RUN_ID))
         .expect("dropping the handle releases the run lock");
 }
+
+// ---------------------------------------------------------------------------
+// The driver, taking over from the order
+// ---------------------------------------------------------------------------
+
+/// **`TopologyRun` drives a resumed run, and `Step` finally has a consumer.**
+///
+/// This test lives here rather than beside `run.rs` because the only thing that
+/// produces a real [`RunHandle`] is a real recovery, and the fixture for that
+/// is this file's. Duplicating it there to keep the test adjacent to its
+/// subject would be a second fixture for one state — the duplication shape this
+/// slice has paid for four times.
+///
+/// What it asserts is the seam that did not exist: the order hands the run on,
+/// the driver takes it, and one iteration of `loop` selects a branch and acts.
+/// Before `RunHandle`, there was no value to hand over; before `run.rs`,
+/// nothing outside `select.rs` so much as matched on a `Step`.
+#[test]
+fn the_driver_takes_over_from_the_recovery_order_and_steps() {
+    use crate::engine::topology::run::{RunSeams, TopologyRun};
+    use crate::engine::topology::select::Ceiling;
+
+    let fixture = Fixture::healthy("driver-steps");
+    let harness = harness();
+    let runtime = runtime_holding_the_record();
+    let certifies = AlwaysCertifies;
+    let given = Given::healthy(&fixture, &runtime, &certifies);
+
+    let (outcome, _) = resume_holding(&fixture, &harness, &given);
+    let (_recovered, handle) = outcome.expect("the healthy resume completes");
+
+    let mut run = TopologyRun::resumed(handle, fixture.inputs(), Ceiling::unlimited());
+    let mut hooks = HarnessTopologyHooks::new(Arc::clone(&harness));
+    let sleeper = RecordingSleeper::default();
+    let seams = RunSeams {
+        clock: &Frozen,
+        sleeper: &sleeper,
+    };
+
+    let durable_before = fixture.log_bytes().len();
+    let refusal = run
+        .step(&seams, &mut hooks)
+        .expect_err("this build implements neither of the branches a fresh plan reaches");
+    let text = refusal.to_string();
+
+    // Named exactly, not with an `||`. A hedge here would pass whichever
+    // branch the fixture happened to reach, and a fixture that silently
+    // started reaching a different one would take the assertion with it.
+    assert!(
+        text.contains("ready dispatch"),
+        "a resumed plan with a task registered and nothing dispatched reaches \
+         the ready-dispatch branch, and the refusal names it: {text}"
+    );
+    assert_eq!(
+        fixture.log_bytes().len(),
+        durable_before,
+        "and appended nothing. `checkpoint`'s own two refusals cannot append \
+         — it is a pure function over a `Step` and holds no emitter — so what \
+         this measures is the *driver*: that nothing is appended between \
+         selecting and refusing. Measured: moving one append above the refusal \
+         in this arm fails here"
+    );
+}
+
+/// A sleeper that records rather than sleeps.
+#[derive(Default)]
+struct RecordingSleeper {
+    slept: std::sync::Mutex<Vec<Duration>>,
+}
+
+impl crate::interaction::Sleeper for RecordingSleeper {
+    fn sleep(&self, duration: Duration) {
+        self.slept
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .push(duration);
+    }
+}

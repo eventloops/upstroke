@@ -67,11 +67,12 @@ fn every_branch_states_what_this_build_does_with_it() {
             "ingest answers",
             "ready_retry",
             "ready dispatch",
-            "defer backoff",
             "hard block",
         ],
         "the branches this build has not written. Every one of them is carried \
-         in the type so that no instrument here has to notice its absence"
+         in the type so that no instrument here has to notice its absence. \
+         `defer backoff` left this list when `TopologyRun::step` grew its arm, \
+         which is the shape every entry here is expected to leave by"
     );
 }
 

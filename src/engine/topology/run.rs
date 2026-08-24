@@ -38,10 +38,16 @@
 use crate::error::UpstrokeError;
 use crate::topology::events::TopologyEventBody;
 
+use crate::interaction::Sleeper;
+use crate::topology::fold::{FrozenInputs, TopologyFold};
+
 use super::dispatch::EventEmitter;
 use super::emit::{EmitState, RunIdentity, emit};
+use super::identity::{InvocationLedger, Reservations};
+use super::recover::RunHandle;
 use super::seams::{TimeSource, TopologyHooks};
-use super::select::Step;
+use super::select::{Admitted, Ceiling, Spend, Step, checkpoint, select};
+use super::settle::Deferral;
 
 // ---------------------------------------------------------------------------
 // The production emitter
@@ -184,11 +190,14 @@ impl LoopBranch {
             // of `Step`'s seven variants, so no value reaching the acting half
             // can name either.
             Self::Integration | Self::Closure => Disposition::RefusedByCheckpoint,
-            Self::IngestAnswers
-            | Self::ReadyRetry
-            | Self::ReadyDispatch
-            | Self::DeferBackoff
-            | Self::HardBlock => Disposition::NotYetImplemented,
+            // `Deferral::wait` sleeps the backoff and returns the event;
+            // `TopologyRun::step` appends it. In that order — the event records
+            // a wait that *elapsed*, so appending it first would put a claim in
+            // the log a kill during the sleep would make false.
+            Self::DeferBackoff => Disposition::Performed,
+            Self::IngestAnswers | Self::ReadyRetry | Self::ReadyDispatch | Self::HardBlock => {
+                Disposition::NotYetImplemented
+            }
         }
     }
 
@@ -231,6 +240,196 @@ impl LoopBranch {
                 self.label()
             ),
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The run
+// ---------------------------------------------------------------------------
+
+/// The seams one iteration of the loop needs, and nothing it owns.
+///
+/// Separate from [`TopologyRun`] because these are the *caller's* — a clock, a
+/// sleeper, the hook bundle — while the run owns the fold, the log, the
+/// ledgers and the locks. A driver that owned its clock could not be driven
+/// deterministically by a test, which is the whole of what "with seams from the
+/// start" means here.
+pub struct RunSeams<'a> {
+    /// Where a durable event's timestamp comes from.
+    pub clock: &'a dyn TimeSource,
+    /// What the defer backoff sleeps on.
+    pub sleeper: &'a dyn Sleeper,
+}
+
+/// What one iteration of the loop did.
+///
+/// A value rather than `()` so a test asserts on the branch that ran rather
+/// than on the absence of an error — and so `drive` can tell "made progress"
+/// from "waited", which is the difference between a loop that is working and
+/// one that is spinning.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Progress {
+    /// The defer backoff elapsed and `defer_wait_elapsed` is durable.
+    Waited {
+        /// How long this round slept.
+        waited_ms: u64,
+        /// Which wait it was.
+        round: u32,
+    },
+    /// A ceiling refused the next spawn and `budget_exceeded` is durable.
+    ///
+    /// `loop`: a breach "appends `budget_exceeded` before any effect and
+    /// **proceeds to closure**" — and closure is one of the two terminals this
+    /// build refuses, so the next iteration ends the command. The append and
+    /// the refusal are deliberately two iterations: the record of the breach is
+    /// durable either way, which is what makes the refusal diagnosable.
+    BudgetExceeded,
+}
+
+/// `TopologyRun` — the schema-4 run, driven.
+///
+/// Owns exactly what a run owns: the fold, the append handle, the two locks
+/// (inside [`RunHandle`]), the two provisional ledgers, and the ceiling it was
+/// configured with. Everything else is a seam.
+///
+/// **It does not yet own the slot assertion (R3), and that is deliberate.** The
+/// assertion belongs to the run and `SlotAssertion::balances()` has to be true
+/// at process end — but nothing here acquires a slot until the dispatch and
+/// retry branches exist, and a field nothing reads is a claim the code does not
+/// back. It arrives with the branch that uses it.
+pub struct TopologyRun {
+    handle: RunHandle,
+    identity: RunIdentity,
+    reservations: Reservations,
+    invocations: InvocationLedger,
+    warnings: Vec<String>,
+    ceiling: Ceiling,
+    spend: Spend,
+    deferral: Deferral,
+}
+
+impl TopologyRun {
+    /// Take over a run a completed recovery handed back.
+    ///
+    /// `run_recovery_order` returns the handle beside its summary; this is the
+    /// caller that consumes it. Before the handle existed, the order dropped
+    /// the log, the fold and both locks, and there was nothing for this
+    /// function to take.
+    #[must_use]
+    pub fn resumed(handle: RunHandle, inputs: FrozenInputs, ceiling: Ceiling) -> Self {
+        let identity = RunIdentity {
+            run_id: handle.started.run_id.clone(),
+            inputs,
+            committed_first_line_sha256: None,
+        };
+        Self {
+            handle,
+            identity,
+            reservations: Reservations::new(),
+            invocations: InvocationLedger::new(),
+            warnings: Vec::new(),
+            ceiling,
+            spend: Spend::new(),
+            deferral: Deferral::default_backoff(),
+        }
+    }
+
+    /// The fold this run derives every decision from.
+    #[must_use]
+    pub fn fold(&self) -> &TopologyFold {
+        &self.handle.fold
+    }
+
+    /// Warnings accumulated across the run, in order.
+    #[must_use]
+    pub fn warnings(&self) -> &[String] {
+        &self.warnings
+    }
+
+    /// Which wait the defer backoff is on.
+    #[must_use]
+    pub fn defer_round(&self) -> u32 {
+        self.deferral.round()
+    }
+
+    /// One iteration of `decisions.sequential_substrate.loop`.
+    ///
+    /// **Select, checkpoint, then act — and the order is the guarantee.**
+    /// `select` appends nothing and performs nothing; `checkpoint` refuses on a
+    /// value nothing has acted on, so `checkpoint_refusals`' "before any
+    /// append" holds by construction rather than by this function remembering
+    /// to check early enough.
+    ///
+    /// # Errors
+    ///
+    /// The checkpoint refusals — integration, run end, and a poisoned fold —
+    /// each of which ends the command. Otherwise whatever the branch returns,
+    /// or [`LoopBranch::unimplemented`] for a branch this build has not
+    /// written, which performs nothing and appends nothing.
+    pub fn step(
+        &mut self,
+        seams: &RunSeams<'_>,
+        hooks: &mut dyn TopologyHooks,
+    ) -> Result<Progress, UpstrokeError> {
+        let selected = select(&self.handle.fold, &self.ceiling, &self.spend);
+        let admitted = checkpoint(selected)?;
+        match admitted {
+            // `loop`: "a breach appends `budget_exceeded` before any effect".
+            // The append is the whole of this arm — there is no effect after it
+            // to be before.
+            Admitted::BudgetExceeded(exceeded) => {
+                self.emit(
+                    TopologyEventBody::BudgetExceeded { data: *exceeded },
+                    seams,
+                    hooks,
+                )?;
+                Ok(Progress::BudgetExceeded)
+            }
+            // "sleep the defer backoff and append `defer_wait_elapsed`" — in
+            // that order, and `Deferral::wait` owns it. The sleep is first
+            // because the event records a wait that *elapsed*: appending it
+            // first would put a claim in the log that a kill during the sleep
+            // would make false.
+            Admitted::Backoff => {
+                let elapsed = self.deferral.wait(seams.sleeper);
+                let (waited_ms, round) = (elapsed.waited_ms, elapsed.round);
+                self.emit(
+                    TopologyEventBody::DeferWaitElapsed { data: elapsed },
+                    seams,
+                    hooks,
+                )?;
+                Ok(Progress::Waited { waited_ms, round })
+            }
+            Admitted::Retry { .. } => Err(LoopBranch::ReadyRetry.unimplemented()),
+            Admitted::Dispatch { .. } => Err(LoopBranch::ReadyDispatch.unimplemented()),
+            Admitted::HardBlock { .. } => Err(LoopBranch::HardBlock.unimplemented()),
+        }
+    }
+
+    /// Append one event through the run's own emitter.
+    ///
+    /// Every append this type makes goes through [`RunEmitter`], which is
+    /// [`emit`] and nothing else. There is no second append path in this file
+    /// and there must not be one: three of this slice's findings were a second
+    /// implementation of this protocol.
+    fn emit(
+        &mut self,
+        body: TopologyEventBody,
+        seams: &RunSeams<'_>,
+        hooks: &mut dyn TopologyHooks,
+    ) -> Result<(), UpstrokeError> {
+        let mut emitter = RunEmitter {
+            identity: &self.identity,
+            state: EmitState {
+                fold: &mut self.handle.fold,
+                log: &mut self.handle.log,
+                reservations: &mut self.reservations,
+                invocations: &mut self.invocations,
+                warnings: &mut self.warnings,
+            },
+            clock: seams.clock,
+        };
+        emitter.emit(body, hooks)
     }
 }
 
