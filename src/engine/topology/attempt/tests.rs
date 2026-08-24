@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 use super::*;
 use crate::engine::topology::dispatch::DispatchKind;
 use crate::engine::topology::scaffold::{
-    ALPHA, RETAINED_SESSION, Run, kill_child_and_adopt, kill_child_environment, kill_dir,
+    AGENT, ALPHA, RETAINED_SESSION, Run, kill_child_and_adopt, kill_child_environment, kill_dir,
 };
 use crate::topology::effects::{
     EffectSiteId, EventSite, HookPhase, Injection, InjectionMode, ObjectResidue, ObjectSite,
@@ -15,7 +15,7 @@ use crate::topology::events::{GenerationId, SessionId};
 use crate::topology::fold::{GenerationClass, TaskState};
 use crate::workspace_manager::fixture::Fixture;
 use crate::workspace_manager::fixture::{
-    KillableGitChild, died_by_kill, git, time_git, write_file,
+    KillableGitChild, died_by_kill, git, remove_file, time_git, write_file,
 };
 use crate::workspace_manager::{
     NoHooks, ResidueTarget, classify_object_residue, object_directory, observed_residue_elements,
@@ -202,6 +202,13 @@ fn attempt_started_is_durable_before_any_spawn() {
 /// makes O27 checkable inside this lane at all: `candidate.rs` owns the
 /// commit-tree, so what this module owes is that nothing here reaches it and
 /// that every judgement is finished before anything could.
+///
+/// O26 is asserted **per snapshot**, from a fence that advances past each
+/// one's add. A comparison of first observations would be a comparison of the
+/// gate set's triple and of nothing else — the two reviewer snapshots would
+/// execute unasserted, and a reviewer path that wrote its intent before its
+/// commit would pass. The count check above the loop is what makes the loop
+/// exhaustive rather than merely repeated.
 #[test]
 fn capture_precedes_the_snapshots_and_every_snapshot_commits_before_its_intent() {
     let mut run = Run::started("o25-27");
@@ -216,6 +223,7 @@ fn capture_precedes_the_snapshots_and_every_snapshot_commits_before_its_intent()
     let capture = context!(run, process)
         .capture(&dispatched)
         .expect("capture");
+    let mark = run.mark();
     let judgement = context!(run, process)
         .judge(&dispatched, &started, &capture, &plan)
         .expect("judge");
@@ -224,18 +232,43 @@ fn capture_precedes_the_snapshots_and_every_snapshot_commits_before_its_intent()
     let stage = run.must_order_of(STAGE, HookPhase::Before);
     let write_tree = run.must_order_of(WRITE_TREE, HookPhase::Before);
     let commit = run.must_order_of(SNAPSHOT_COMMIT, HookPhase::Before);
-    let intent = run.must_order_of(SNAPSHOT_INTENT, HookPhase::Before);
-    let add = run.must_order_of(SNAPSHOT_ADD, HookPhase::Before);
     assert!(
         stage < write_tree && write_tree < commit,
         "O25: capture (stage={stage}, write-tree={write_tree}) precedes the snapshots \
          (commit={commit})"
     );
-    // O26: commit-tree, then intent, then add.
-    assert!(
-        commit < intent && intent < add,
-        "O26: the order was commit={commit}, intent={intent}, add={add}"
-    );
+
+    // O26, once per snapshot rather than once per test. Three snapshots are
+    // created here — one for the gate set and one per reviewer — and comparing
+    // *first* observations compares only the gate set's triple: a reviewer
+    // snapshot that wrote its intent before its ephemeral commit would leave
+    // that triple untouched and pass. Each iteration takes its fence past the
+    // previous snapshot's add, so the three positions it compares are that
+    // snapshot's own.
+    let snapshots = 1 + plan.reviewers.len();
+    for (site, what) in [
+        (SNAPSHOT_COMMIT, "ephemeral commit"),
+        (SNAPSHOT_INTENT, "intent"),
+        (SNAPSHOT_ADD, "add"),
+    ] {
+        assert_eq!(
+            run.count_after(mark, site, HookPhase::Before),
+            snapshots,
+            "one {what} per snapshot, and there are {snapshots} of them"
+        );
+    }
+    let mut fence = mark;
+    for index in 0..snapshots {
+        let commit = run.order_after(fence, SNAPSHOT_COMMIT, HookPhase::Before);
+        let intent = run.order_after(fence, SNAPSHOT_INTENT, HookPhase::Before);
+        let add = run.order_after(fence, SNAPSHOT_ADD, HookPhase::Before);
+        assert!(
+            commit < intent && intent < add,
+            "O26, snapshot {index} of {snapshots}: the order was commit={commit}, \
+             intent={intent}, add={add}"
+        );
+        fence = add + 1;
+    }
 
     // O27: everything judged, and nothing here is a commit-tree.
     assert!(judgement.accepted());
@@ -471,11 +504,27 @@ fn a_retry_verifies_the_worktree_then_appends_then_spawns() {
         resume_session: Some(SessionId(RETAINED_SESSION.to_owned())),
         ..run.attempt_plan(ALPHA, 2)
     };
-    let (reuse, started) = context!(run, process)
+    let started = context!(run, process)
         .retry(&dispatched, &retry, &Quiescence::HoldsTree(tree.clone()))
         .expect("the retry starts");
 
-    assert_eq!(reuse, Reuse::Verified, "the retained worktree is reused");
+    // "Reused" as a fact about the worktree rather than as the tag the call
+    // returned. `retry` cannot recreate at all now — INV-06 — so a
+    // `Reuse::Verified` in its result would be a constant compared to itself,
+    // which is the assertion shape this suite has just been audited for. These
+    // two say the same thing about the world and keep saying it if the tag ever
+    // comes back: nothing was removed after the mark, and the cumulative tree
+    // the generation retained is still the one the worktree holds.
+    assert_eq!(
+        run.count_after(mark, SCRUB, HookPhase::Before),
+        0,
+        "the retained worktree is reused, not rebuilt"
+    );
+    assert_eq!(
+        git(&dispatched.worktree, &["write-tree"]),
+        tree,
+        "and it still holds the retained cumulative tree"
+    );
     let verify = run.order_after(mark, VERIFY, HookPhase::Before);
     let append = run.order_after(mark, APPEND, HookPhase::Before);
     assert!(
@@ -515,6 +564,227 @@ fn a_retry_verifies_the_worktree_then_appends_then_spawns() {
         run.runner.ran()[1].invocation
     );
     assert!(process.balances());
+}
+
+/// The git directory of a linked worktree, asked of Git rather than derived.
+///
+/// `<worktree>/.git` is a **file** in a linked worktree and the administrative
+/// directory it points at is elsewhere, so deriving the path here would be a
+/// second implementation of `workspace_manager`'s own `git_dir_of`.
+fn git_dir(worktree: &Path) -> PathBuf {
+    PathBuf::from(git(worktree, &["rev-parse", "--absolute-git-dir"]))
+}
+
+/// **INV-06 / O24.** A retry whose retained worktree fails `Worktree.Verify` is
+/// refused, and the cumulative tree it holds is still there afterwards.
+///
+/// `decisions.workspace_candidates.generation` gives the failure two recoveries
+/// and they are not interchangeable: "failing verification an OpenNoAttempt or
+/// repair worktree is removed with force and recreated, **and a RetainedIdle
+/// generation is closed with `generation_closed{WorktreeMissing}`**". A retry
+/// that took the first branch would force-remove the worktree — and a retained
+/// worktree's whole content is a cumulative tree that **no base can be re-cut
+/// into**, which is what INV-06's "never recreated" protects — and would then
+/// append `attempt_started(retry)` carrying `resume_session`, so the next
+/// worker would run against an empty tree and be gated as if it were the
+/// retained work. The append is durable before any caller sees the outcome, so
+/// there is no later place to catch it.
+///
+/// Four assertions, and each one is a different way the destructive branch
+/// shows: nothing was removed, nothing was appended, no process was asked for,
+/// and the tree the worktree holds is byte-for-byte the tree it held. The last
+/// is the one that cannot be satisfied by a recreate — a rebuilt worktree is at
+/// the base, and the base's tree is deliberately different here.
+///
+/// The residue planted is `index.lock`, which is exactly what the interrupted
+/// Git command in the failure sequence leaves, and it is the cheapest way into
+/// a failing verify that does not itself disturb the thing being protected.
+#[test]
+fn a_retry_whose_retained_worktree_fails_verification_refuses_and_destroys_nothing() {
+    let mut run = Run::started("inv06");
+    let dispatched = run.dispatch(ALPHA, 0);
+    let mut process = Process::new();
+
+    let plan = run.attempt_plan(ALPHA, 1);
+    context!(run, process)
+        .start(&dispatched, &plan)
+        .expect("the first attempt");
+    let tree = retained_tree(&dispatched.worktree);
+    let base_tree = git(
+        &run.fixture.base,
+        &["rev-parse", &format!("{}^{{tree}}", dispatched.base.0)],
+    );
+    assert_ne!(
+        tree, base_tree,
+        "the retained tree must differ from the base's, or a recreate at the base would          reproduce it and this test could not tell the two apart"
+    );
+    run.retain(ALPHA, GENERATION, 1);
+
+    // An interrupted Git command, which is the case `Worktree.Verify` exists
+    // for and the one the failure sequence describes.
+    let lock = git_dir(&dispatched.worktree).join("index.lock");
+    write_file(&lock, b"");
+
+    let durable_before = run.emitter.durable_kinds();
+    let mark = run.mark();
+    let retry = AttemptPlan {
+        attempt: crate::topology::events::AttemptNumber(2),
+        resume_session: Some(SessionId(RETAINED_SESSION.to_owned())),
+        ..run.attempt_plan(ALPHA, 2)
+    };
+    let error = context!(run, process)
+        .retry(&dispatched, &retry, &Quiescence::HoldsTree(tree.clone()))
+        .expect_err("a retained worktree that does not verify is not retried into");
+
+    let message = error.to_string();
+    assert!(
+        message.contains("INV-06") && message.contains("WorktreeMissing"),
+        "the refusal must name the invariant it is keeping and the closure that belongs to          this failure, and said: {message}"
+    );
+    assert!(
+        message.contains("IndexLock"),
+        "and what `Worktree.Verify` actually observed: {message}"
+    );
+
+    // It looked, which is what stops every assertion below being about a
+    // function that returned without doing anything.
+    assert_eq!(
+        run.count_after(mark, VERIFY, HookPhase::Before),
+        1,
+        "the retry verified exactly once"
+    );
+    assert_eq!(
+        run.count_after(mark, SCRUB, HookPhase::Before),
+        0,
+        "INV-06: a retained worktree is never removed by a retry"
+    );
+    assert_eq!(
+        run.count_after(mark, APPEND, HookPhase::Before),
+        0,
+        "O24: nothing durable follows a verification that failed"
+    );
+    assert_eq!(
+        run.emitter.durable_kinds(),
+        durable_before,
+        "and in particular no `attempt_started(retry)` claiming the retained session"
+    );
+    assert_eq!(
+        run.emitter.generation_class(ALPHA, GENERATION),
+        GenerationClass::RetainedIdle {
+            session: SessionId(RETAINED_SESSION.to_owned()),
+            incarnation: crate::topology::events::Epoch(0),
+        },
+        "the generation is still retained: closing it is `settle::retry`'s decision"
+    );
+    assert_eq!(
+        run.runner.ran().len(),
+        1,
+        "only the first attempt's worker ever ran; the retry asked for no process"
+    );
+
+    // The work itself. The lock is what `Worktree.Verify` refused for, so it
+    // comes off before the index can be written out — removing it is this
+    // test's own act and not part of what `retry` did.
+    assert!(
+        dispatched.worktree.is_dir(),
+        "the retained worktree is still there"
+    );
+    remove_file(&lock);
+    assert_eq!(
+        git(&dispatched.worktree, &["write-tree"]),
+        tree,
+        "and it still holds the cumulative tree the generation retained, byte for byte"
+    );
+    assert!(process.balances());
+}
+
+/// **R4 / `permits.protocol`.** A slot acquisition the assertion refuses must
+/// not leave the invocation registered.
+///
+/// "The invocation ledger records registered/completed/cancelled exactly once
+/// and **balances at process end**", and [`InvocationLedger::balances`] states
+/// that as "no entry is `Running`". The register happens before the pair is
+/// asked for, so a refused acquisition that propagated straight out would
+/// abandon a `Running` entry — and at process end that entry is
+/// *indistinguishable* from a process this coordinator genuinely lost. A leak
+/// check that cannot tell a bookkeeping mistake from a lost process reports
+/// both or neither.
+///
+/// The refusal is driven the way a real one arrives: a pair is already held.
+/// At `max_parallel = 1` [`SlotAssertion`] refuses rather than queues, which is
+/// its whole purpose, so this is the refusal the substrate actually produces
+/// rather than a synthetic error injected at the seam.
+///
+/// The held pair is deliberately **not** registered in the ledger, so the
+/// ledger's own balance is a statement about the worker alone: after the
+/// refusal nothing is running, one entry is cancelled, and none is completed.
+#[test]
+fn a_refused_slot_acquisition_settles_the_registration_it_took() {
+    let mut run = Run::started("slotrefusal");
+    let dispatched = run.dispatch(ALPHA, 0);
+    let plan = run.attempt_plan(ALPHA, 1);
+    let mut process = Process::new();
+
+    // Something else holds the one pair. `cancel_all_running` is not involved:
+    // this invocation is in the slot table and not in the ledger.
+    let squatter = AttemptIdentities::new(ALPHA, GenerationId(9), AttemptNumber(9)).worker();
+    process
+        .slots
+        .acquire(
+            &squatter,
+            SlotPair {
+                agent: AGENT.to_owned(),
+                pool: Some("scaffold-pool".to_owned()),
+            },
+        )
+        .expect("the pair a worker's role takes");
+
+    let worker = AttemptIdentities::new(dispatched.key, dispatched.generation, plan.attempt)
+        .worker()
+        .render();
+    let error = context!(run, process)
+        .start(&dispatched, &plan)
+        .expect_err("a second slotted invocation is refused at max_parallel = 1");
+    assert!(
+        error.to_string().contains("asked for a slot pair while"),
+        "the refusal must be the slot assertion's, and said: {error}"
+    );
+
+    assert!(
+        !process.ledger.running().contains(&worker.as_str()),
+        "the worker's registration was abandoned `Running`: {:?}",
+        process.ledger.running()
+    );
+    assert!(
+        process.ledger.balances(),
+        "and the ledger no longer balances, so a real leak would be indistinguishable from \
+         this: {:?}",
+        process.ledger.running()
+    );
+    assert_eq!(
+        process.ledger.cancelled(),
+        1,
+        "cancelled, not completed: no process ran"
+    );
+    assert_eq!(process.ledger.completed(), 0);
+    assert_eq!(
+        process.ledger.duplicates(),
+        0,
+        "and it was settled exactly once"
+    );
+
+    // What actually happened, so the assertions above are about the state this
+    // test claims to have driven: O23's append is durable and no process was
+    // ever asked for.
+    assert_eq!(
+        run.emitter.durable_kinds().last().copied(),
+        Some("attempt_started"),
+        "the refusal is after O23's append, which is where the register sits"
+    );
+    assert!(
+        run.runner.ran().is_empty(),
+        "and the Runner was never reached"
+    );
 }
 
 // ---------------------------------------------------------------------------

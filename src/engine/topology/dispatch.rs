@@ -247,8 +247,24 @@ pub fn dispatch(
 ) -> Result<Dispatched, UpstrokeError> {
     // Before the append, because a refusal after it would leave an open
     // generation whose worktree can never be built. `T-DISPATCH` lists "source
-    // candidate object missing" beside the containment refusals, and the
-    // containment refusals also fire before anything durable is written.
+    // candidate object missing" beside the containment refusals, so both are
+    // here and both are ahead of the event.
+    //
+    // The containment half needs this call to be true of it at all.
+    // `execution_root` says "every create/reclaim/delete revalidates", and
+    // `write_intent` and `add_worktree` each do — but that is *after* this
+    // function has appended, so without the line below the sentence above
+    // would be a claim about the two effects rather than about the dispatch.
+    // The three conditions are filesystem facts about the world and not about
+    // this request: a foreign worktree created inside the execution root, a
+    // reparse point planted on the chain, or a managed base that stopped being
+    // a real directory can each start being true between `run_started` and
+    // this call. It costs one read-only `git worktree list`; what it buys is
+    // that the `OpenNoAttempt` generation this event opens is never one whose
+    // worktree the very next line refuses to build — which is exactly what
+    // hoisting `refuse_absent_source` above the append avoids for the other
+    // half of the same `refusal_condition`.
+    manager.revalidate()?;
     if let DispatchKind::Repair { source, .. } = &request.kind {
         refuse_absent_source(manager, source)?;
     }
@@ -272,7 +288,7 @@ pub fn dispatch(
     })?;
 
     // (2) The intent, synced. (3) The add, which refuses without it.
-    let dispatched = Dispatched {
+    let mut dispatched = Dispatched {
         key: request.key,
         generation: request.generation,
         base: request.base.clone(),
@@ -280,7 +296,15 @@ pub fn dispatch(
         worktree,
         kind: request.kind.clone(),
     };
-    create_worktree(manager, hooks, &dispatched)?;
+    // The add's own answer replaces the derivation. `Dispatched::worktree` is
+    // documented as "the checkout, as `Worktree.Add` reported it", and until it
+    // was that value the field and the event's `worktree_path` were one local
+    // under two names — so a test comparing them compared a value to itself and
+    // could only fail on a lossy conversion. The event's string is necessarily
+    // the pre-add derivation, because O21 puts the append first; this field is
+    // the post-add observation. Keeping them distinct is what makes their
+    // agreement a fact about the funnel rather than an identity.
+    dispatched.worktree = create_worktree(manager, hooks, &dispatched)?;
 
     // (4) A repair's materialization, which `ObjectSite::RepairMaterialize`
     // itself places `Adjacent::After(DurableEvent::TaskDispatched)`.
@@ -314,14 +338,17 @@ pub struct DispatchRequest {
 /// `Refusal::AddWithoutIntent` enforces it at the add site, so this order is
 /// checked rather than merely intended — an add whose intent is not already
 /// durable creates a worktree `reclaim_intents` can never find.
+///
+/// The path returned is `Worktree.Add`'s, not a re-derivation of it. A caller
+/// that wants to record where the checkout landed has one source for it, and
+/// it is the funnel's.
 fn create_worktree(
     manager: &WorkspaceManager,
     hooks: &mut dyn TopologyHooks,
     dispatched: &Dispatched,
-) -> Result<(), UpstrokeError> {
+) -> Result<PathBuf, UpstrokeError> {
     manager.write_intent(hooks.effects(), &dispatched.slot)?;
-    manager.add_worktree(hooks.effects(), &dispatched.slot, &dispatched.base.0)?;
-    Ok(())
+    manager.add_worktree(hooks.effects(), &dispatched.slot, &dispatched.base.0)
 }
 
 /// Refuse a repair whose protected source is not in this repository.
@@ -414,6 +441,12 @@ impl Reuse {
 /// generation was opened. [`Dispatched::quiescence`] is the `OpenNoAttempt`
 /// answer and is what [`resume_open_no_attempt`] passes.
 ///
+/// [`Quiescence::HoldsTree`] does **not** belong to this function, and that is
+/// not a matter of taste: it is `RetainedIdle`'s form of the check, and a
+/// retained generation is closed rather than recreated (INV-06). The retained
+/// caller takes [`verify_reuse`] instead, which has no recreate branch to
+/// reach.
+///
 /// # The intent is re-written rather than removed and re-written
 ///
 /// The reclaim order elsewhere is *worktree then intent*, because an intent that
@@ -433,8 +466,7 @@ pub fn verify_or_recreate(
     dispatched: &Dispatched,
     quiescence: &Quiescence,
 ) -> Result<Reuse, UpstrokeError> {
-    let verdict = manager.verify_worktree(hooks.effects(), &dispatched.slot, quiescence)?;
-    match verdict {
+    match verify_reuse(manager, hooks, dispatched, quiescence)? {
         Ok(()) => Ok(Reuse::Verified),
         Err(failure) => {
             manager.remove_worktree(hooks.effects(), &dispatched.slot)?;
@@ -442,6 +474,41 @@ pub fn verify_or_recreate(
             Ok(Reuse::Recreated { failure })
         }
     }
+}
+
+/// **O22's observation, with no branch on it.** `Worktree.Verify` the recorded
+/// worktree and report what it saw.
+///
+/// `decisions.workspace_candidates.generation` gives the failure two different
+/// recoveries, and which one applies is a property of the generation's class,
+/// not of the observation: "failing verification an OpenNoAttempt or repair
+/// worktree is removed with force and recreated, and a **RetainedIdle
+/// generation is closed** with `generation_closed{WorktreeMissing}`". INV-06
+/// states the same thing as a prohibition — a retained generation "is never
+/// recreated" — because what its worktree holds is a cumulative tree that no
+/// base can be re-cut into, so a forced removal there destroys work
+/// irrecoverably rather than costing a rebuild.
+///
+/// So the observation is one function and the recovery is the caller's.
+/// [`verify_or_recreate`] is the rebuilding half and is for the two classes
+/// that may be rebuilt; [`super::attempt::AttemptContext::retry`] is the other
+/// caller and refuses, because the closure that belongs to its class is
+/// `settle::retry`'s and there is exactly one of it. A single function with a
+/// flag would put the destructive branch one mistaken argument away from a
+/// retained worktree, which is the shape this split exists to remove.
+///
+/// # Errors
+///
+/// The containment refusals, or a Git error. A worktree that merely fails its
+/// quiescence check is `Ok(Err(VerifyFailure))` — that is an observation, not a
+/// failure.
+pub fn verify_reuse(
+    manager: &WorkspaceManager,
+    hooks: &mut dyn TopologyHooks,
+    dispatched: &Dispatched,
+    quiescence: &Quiescence,
+) -> Result<Result<(), VerifyFailure>, UpstrokeError> {
+    manager.verify_worktree(hooks.effects(), &dispatched.slot, quiescence)
 }
 
 /// Re-run a repair's recorded materialization in a verified or fresh worktree.

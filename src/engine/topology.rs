@@ -60,7 +60,7 @@ pub use candidate::{
 };
 pub use dispatch::{
     DispatchKind, DispatchRequest, Dispatched, EventEmitter, Reuse, close_at_run_end, dispatch,
-    materialize_repair, resume_open_no_attempt, task_slot, verify_or_recreate,
+    materialize_repair, resume_open_no_attempt, task_slot, verify_or_recreate, verify_reuse,
 };
 pub use emit::{
     AppendError, AppendOutcome, EmitError, EmitState, FirstAppendDisposition, RunIdentity, emit,

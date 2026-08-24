@@ -128,7 +128,10 @@ fn task_dispatched_is_durable_before_the_intent_and_the_add() {
     assert_eq!(
         PathBuf::from(&data.worktree_path),
         dispatched.worktree,
-        "the recorded worktree path is the one the add returned"
+        "the recorded worktree path is the one the add returned: the event's string is derived \
+         from the slot before the append, because O21 puts the append first, and this field is \
+         what `Worktree.Add` itself answered — two provenances, so their agreement is a fact \
+         about the funnel rather than a local compared to itself"
     );
     assert!(
         data.source_candidate.is_none(),
@@ -147,6 +150,91 @@ fn task_dispatched_is_durable_before_the_intent_and_the_add() {
         run.emitter.generation_class(ALPHA, dispatched.generation),
         GenerationClass::OpenNoAttempt
     );
+}
+
+/// **`T-DISPATCH`'s `refusal_condition`, the containment half.** A containment
+/// condition that starts failing *during* a run refuses before the append.
+///
+/// `T-DISPATCH` lists "worktree path outside execution root or on a reparse
+/// point" beside "source candidate object missing", and the reason
+/// [`refuse_absent_source`] is hoisted above the append applies identically to
+/// them: an event written for a generation whose worktree can never be built
+/// leaves an `OpenNoAttempt` generation that every later resume tries and fails
+/// to recover.
+///
+/// The three conditions are facts about the filesystem rather than about the
+/// request — `execution_root` requires "the canonical root is inside no
+/// repository worktree, **and no repository worktree is inside it**" — so they
+/// can hold at `run_started` and fail by the time a dispatch runs. That is what
+/// is constructed here: a worktree this manager never registered, created
+/// inside its execution root after the run started.
+///
+/// `write_intent` and `add_worktree` each revalidate, so this refusal fires
+/// with or without the pre-check. What the pre-check decides is **which side of
+/// the append** it fires on, and that is the whole of what is asserted: the
+/// durable log is unchanged and no append ran after the mark.
+#[test]
+fn a_containment_condition_that_fails_mid_run_refuses_before_the_append() {
+    let mut run = Run::started("containment");
+    let durable_before = run.emitter.durable_kinds();
+
+    let foreign = run.manager().execution_root().join("foreign");
+    let foreign_arg = foreign.to_string_lossy().into_owned();
+    let head = run.fixture.head.clone();
+    git(
+        &run.fixture.base,
+        &[
+            "worktree",
+            "add",
+            "--detach",
+            "--quiet",
+            &foreign_arg,
+            &head,
+        ],
+    );
+
+    let mark = run.mark();
+    let error = run
+        .try_dispatch(ALPHA, 0)
+        .expect_err("a foreign worktree inside the execution root is a containment refusal");
+    assert!(
+        error.to_string().contains("is inside it"),
+        "the refusal must be the containment one, and said: {error}"
+    );
+
+    assert_eq!(
+        run.count_after(mark, APPEND, HookPhase::Before),
+        0,
+        "the refusal must arrive before `task_dispatched`, not after it"
+    );
+    assert_eq!(
+        run.emitter.durable_kinds(),
+        durable_before,
+        "so the log carries no generation whose worktree can never be built"
+    );
+    assert!(
+        !run.observed(INTENT, HookPhase::Before),
+        "and nothing on disk was attempted either"
+    );
+
+    // The control: with the foreign worktree gone the same dispatch is
+    // accepted, so the refusal above is about containment and not about the
+    // request being malformed in some other way.
+    git(
+        &run.fixture.base,
+        &["worktree", "remove", "--force", &foreign_arg],
+    );
+    let dispatched = run.dispatch(ALPHA, 0);
+    assert_eq!(
+        run.emitter.durable_kinds().len(),
+        durable_before.len() + 1,
+        "the control dispatch appends exactly one event"
+    );
+    assert!(healthy_at(
+        &run.fixture.manager,
+        &dispatched.worktree,
+        &dispatched.base.0
+    ));
 }
 
 /// **O22, the half that is easiest to get backwards.** A fresh dispatch does
