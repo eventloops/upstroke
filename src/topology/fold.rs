@@ -896,6 +896,30 @@ impl TopologyFold {
     /// The ids themselves are [`Self::open_questions`]; this is the predicate
     /// `derived_outcome` decides `Parked` with, exposed so that the hard-block
     /// branch and the derived outcome cannot disagree about what "open" means.
+    /// The region an ordinary dispatch of `key` predicts.
+    ///
+    /// **The tenth reader, and it exists because the alternative was a second
+    /// authority.** `dispatch_lease_check` decides whether a task is `ready` at
+    /// all by computing this region and asking the lease table what it
+    /// overlaps. A caller that then recorded a *different* region in
+    /// `task_dispatched` would have the fold admitting on one answer and the
+    /// log holding another — and the log's is the one the lease table keeps.
+    ///
+    /// That is not hypothetical. It was written: a driver that took the plan's
+    /// hints literally recorded `src/auth/*.rs` as a **prefix**, which overlaps
+    /// nothing, while the fold had admitted the dispatch on `src/auth`. At
+    /// `max_parallel = 1` nothing can collide and the disagreement is
+    /// invisible; at the first width above one it is two tasks editing the same
+    /// files.
+    ///
+    /// `None` when the run has no registry yet, which is before `run_started`.
+    #[must_use]
+    pub fn predicted_region(&self, key: TaskKey) -> Option<PathSet> {
+        self.registry()
+            .and_then(|registry| registry.get(key))
+            .map(predicted_region)
+    }
+
     #[must_use]
     pub fn questions_open(&self) -> bool {
         self.run.as_ref().is_some_and(RunState::questions_open)

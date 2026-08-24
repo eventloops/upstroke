@@ -169,39 +169,3 @@ fn a_refusal_names_the_branch_and_says_whether_anything_happened() {
          durable by the time this is returned: {partial}"
     );
 }
-
-/// A task with no path hints predicts the **repo-wide** region, not an empty
-/// one.
-///
-/// The two are opposites and only one of them is safe. `PathSet::RepoWide` is
-/// the packet's classification for an absent answer, and it serializes this
-/// task against every other. An empty `Prefixes` overlaps nothing, so the
-/// predicted lease protects nothing and every task is free to run against every
-/// other.
-///
-/// **This is untestable through a dispatch fixture**, which is why it is a
-/// function: every fixture plan in the tree gives its tasks hints, so the
-/// empty-hint branch is never reached and a mutation that removed it went green
-/// through the driver's own test. Measured — that is how this test came to
-/// exist.
-#[test]
-fn a_task_with_no_hints_predicts_the_repo_wide_region() {
-    assert_eq!(
-        predicted_region(&[]),
-        PathSet::RepoWide,
-        "an absent answer is repo-wide; an empty prefix set would overlap \
-         nothing and protect nothing"
-    );
-    assert!(
-        predicted_region(&[]).is_repo_wide(),
-        "and answers the predicate the lease table asks"
-    );
-    assert_eq!(
-        predicted_region(&["src/auth".to_owned(), "src/db".to_owned()]),
-        PathSet::Prefixes {
-            paths: vec![GitPath("src/auth".to_owned()), GitPath("src/db".to_owned())],
-        },
-        "and hints are carried through in order, not sorted or deduplicated \
-         here — the region is the plan's answer, not this function's opinion"
-    );
-}

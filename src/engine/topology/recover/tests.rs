@@ -4396,6 +4396,35 @@ fn the_driver_takes_over_from_the_recovery_order_and_steps() {
         "exactly one event, and it is the dispatch"
     );
 
+    // **The recorded region is the fold's, not a second derivation.**
+    // `dispatch_lease_check` admits this task by computing the region and
+    // asking the lease table what it overlaps; the log then holds whatever the
+    // dispatch recorded, and the lease table keeps the log's. Two derivations
+    // means the fold admits on one answer and the run is protected by another.
+    //
+    // The fixture's hint is a glob (`src/alpha/*.rs`), which is what makes this
+    // assertion able to fail: the fold strips it to the literal prefix
+    // `src/alpha`, and a driver taking hints literally would record a prefix
+    // that overlaps nothing. Measured — that shipped, for one commit.
+    let recorded = TopologyFold::parse_log(&fixture.log_bytes())
+        .expect("the log parses")
+        .into_iter()
+        .find_map(|event| match event.body {
+            TopologyEventBody::TaskDispatched { data } => Some(data.lease),
+            _ => None,
+        })
+        .expect("the dispatch is durable");
+    let LeaseGrant::Predicted { paths: recorded } = recorded else {
+        panic!("an ordinary dispatch takes a predicted lease")
+    };
+    assert_eq!(
+        Some(recorded),
+        run.fold().predicted_region(ALPHA),
+        "the region in the log is the one the fold admitted on. Compared \
+         against the fold rather than against a literal, because a literal \
+         would agree with whichever derivation this test happened to use"
+    );
+
     // And the provisional reservation did not leak. O24 converts it AT the
     // append; a refusal after that must not leave an entitlement held, or the
     // next selection at width 1 sees a full pipeline forever.

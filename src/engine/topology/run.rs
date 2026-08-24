@@ -41,7 +41,6 @@ use crate::topology::events::TopologyEventBody;
 use crate::interaction::Sleeper;
 use crate::topology::events::GenerationId;
 use crate::topology::fold::{FrozenInputs, TopologyFold};
-use crate::topology::paths::{GitPath, PathSet};
 use crate::topology::registry::TaskKey;
 use crate::workspace_manager::WorkspaceManager;
 
@@ -541,25 +540,29 @@ impl TopologyRun {
         key: TaskKey,
         generation: GenerationId,
     ) -> Result<DispatchRequest, UpstrokeError> {
-        let entry = self
-            .handle
-            .fold
-            .registry()
-            .and_then(|registry| registry.entries().get(key.0 as usize))
-            .ok_or_else(|| UpstrokeError::Refused {
+        // **The fold's answer, not a second one.** `dispatch_lease_check`
+        // admitted this task by computing the region and asking the lease table
+        // what it overlaps; recording a different region here would leave the
+        // fold admitting on one answer and the log holding another, and the
+        // log's is the one the lease table keeps. This module derived it
+        // independently for exactly one commit, and took the plan's hints
+        // literally where the fold strips globs to a literal prefix — so a hint
+        // of `src/auth/*.rs` became a prefix that overlaps nothing while the
+        // fold had admitted on `src/auth`.
+        let paths = self.handle.fold.predicted_region(key).ok_or_else(|| {
+            UpstrokeError::Refused {
                 message: format!(
                     "the fold selected task {} for dispatch and the frozen registry has no such \
                      entry; the two disagree and nothing is dispatched",
                     key.0
                 ),
-            })?;
+            }
+        })?;
         Ok(DispatchRequest {
             key,
             generation,
             base: self.handle.started.base_sha.clone(),
-            kind: DispatchKind::Ordinary {
-                paths: predicted_region(&entry.spec.path_hints),
-            },
+            kind: DispatchKind::Ordinary { paths },
         })
     }
 
@@ -587,30 +590,6 @@ impl TopologyRun {
             clock: seams.clock,
         };
         emitter.emit(body, hooks)
-    }
-}
-
-/// The predicted region a task's path hints imply.
-///
-/// **An empty hint list is `RepoWide`, not an empty prefix set**, and the
-/// difference is the whole reason this is a function rather than three lines at
-/// the call site. `PathSet::RepoWide` is documented as "the classification for
-/// an absent, unsafe, unparsable, or undecodable answer", and a task that gave
-/// no hints has given an absent one. An empty `Prefixes` is the opposite: a
-/// region that overlaps *nothing*, so `overlaps_another` is false against every
-/// other task and the predicted lease this dispatch takes protects nothing.
-///
-/// At `max_parallel = 1` that is invisible — one generation runs at a time and
-/// nothing can collide with it. It becomes a live defect at the first width
-/// above one, which is PR11, by which time the dispatch that wrote it is many
-/// slices old.
-fn predicted_region(hints: &[String]) -> PathSet {
-    if hints.is_empty() {
-        PathSet::RepoWide
-    } else {
-        PathSet::Prefixes {
-            paths: hints.iter().map(|hint| GitPath(hint.clone())).collect(),
-        }
     }
 }
 
