@@ -17,7 +17,12 @@
 //! occasions exactly — "a worktree is reused across a process boundary or after
 //! an interrupted Git command (OpenNoAttempt recreate-or-verify, repair
 //! materialization, retry verification) **only after** Worktree.Verify" — and
-//! all three are recovery, never the first create. Putting `Verify` in front of
+//! all three are recovery, never the first create. **Two** of them are this
+//! module's — [`verify_or_recreate`] and, through it,
+//! [`resume_open_no_attempt`]. The third, the retry verification, is
+//! [`super::settle::retry`]'s, because a retained worktree that fails is
+//! *closed* rather than recreated (INV-06) and the closure lives with the
+//! reservation it has to cancel. Putting `Verify` in front of
 //! a fresh add would make
 //! `residue_carrying_worktree_fails_verify_and_is_recreated` inexpressible:
 //! there would be no state in which a worktree exists, carries residue, and is
@@ -159,7 +164,9 @@ pub struct Dispatched {
     pub base: CommitSha,
     /// The slot the worktree occupies.
     pub slot: Slot,
-    /// The checkout, as `Worktree.Add` reported it.
+    /// The checkout, at the path `Worktree.Add` returned for it — the slot
+    /// target the funnel validated and handed to Git, not a reading of where
+    /// Git put it.
     pub worktree: PathBuf,
     /// The lease relationship, and for a repair the candidate to materialize.
     pub kind: DispatchKind,
@@ -296,14 +303,21 @@ pub fn dispatch(
         worktree,
         kind: request.kind.clone(),
     };
-    // The add's own answer replaces the derivation. `Dispatched::worktree` is
-    // documented as "the checkout, as `Worktree.Add` reported it", and until it
-    // was that value the field and the event's `worktree_path` were one local
-    // under two names — so a test comparing them compared a value to itself and
-    // could only fail on a lossy conversion. The event's string is necessarily
-    // the pre-add derivation, because O21 puts the append first; this field is
-    // the post-add observation. Keeping them distinct is what makes their
-    // agreement a fact about the funnel rather than an identity.
+    // The add's own answer replaces the derivation, and what that buys is
+    // narrow enough to be worth stating exactly. Until this line the field and
+    // the event's `worktree_path` were one local under two names, so a test
+    // comparing them compared a value to itself and could only fail on a lossy
+    // conversion. Now the event's string is the pre-append derivation — O21
+    // puts the append first, so it can be nothing else — and the field is what
+    // `Worktree.Add` returned, which is the target the funnel validated and
+    // handed to `git worktree add`.
+    //
+    // So their agreement says the durable event names the directory the add was
+    // told to create. It is **not** an observation of where Git put the
+    // checkout: `WorkspaceManager::add_worktree` answers with `slot_target`,
+    // which is the same `slot_path` rule the string above came from, and
+    // nothing reads the location back. A second, independent provenance would
+    // have to come from `git worktree list`; it is owed, not claimed here.
     dispatched.worktree = create_worktree(manager, hooks, &dispatched)?;
 
     // (4) A repair's materialization, which `ObjectSite::RepairMaterialize`
@@ -339,9 +353,11 @@ pub struct DispatchRequest {
 /// checked rather than merely intended — an add whose intent is not already
 /// durable creates a worktree `reclaim_intents` can never find.
 ///
-/// The path returned is `Worktree.Add`'s, not a re-derivation of it. A caller
-/// that wants to record where the checkout landed has one source for it, and
-/// it is the funnel's.
+/// The path returned is the funnel's answer rather than a derivation made
+/// beside it, so a caller that records the checkout's path has one source for
+/// it. That source is [`WorkspaceManager::add_worktree`], whose answer is the
+/// validated slot target it gave `git worktree add` — where the checkout was
+/// *asked* to go. Nothing here reads back where Git put it.
 fn create_worktree(
     manager: &WorkspaceManager,
     hooks: &mut dyn TopologyHooks,
@@ -443,9 +459,10 @@ impl Reuse {
 ///
 /// [`Quiescence::HoldsTree`] does **not** belong to this function, and that is
 /// not a matter of taste: it is `RetainedIdle`'s form of the check, and a
-/// retained generation is closed rather than recreated (INV-06). The retained
-/// caller takes [`verify_reuse`] instead, which has no recreate branch to
-/// reach.
+/// retained generation is closed rather than recreated (INV-06). No retained
+/// worktree reaches this module at all — [`super::settle::retry`] performs the
+/// retained `Worktree.Verify` through its own `WorktreeVerify` seam and writes
+/// the closure itself — so nothing here has one to hand the recreate branch.
 ///
 /// # The intent is re-written rather than removed and re-written
 ///
@@ -491,11 +508,17 @@ pub fn verify_or_recreate(
 ///
 /// So the observation is one function and the recovery is the caller's.
 /// [`verify_or_recreate`] is the rebuilding half and is for the two classes
-/// that may be rebuilt; [`super::attempt::AttemptContext::retry`] is the other
-/// caller and refuses, because the closure that belongs to its class is
-/// `settle::retry`'s and there is exactly one of it. A single function with a
-/// flag would put the destructive branch one mistaken argument away from a
-/// retained worktree, which is the shape this split exists to remove.
+/// that may be rebuilt. The retained class's recovery is
+/// [`super::settle::retry`]'s and there is exactly one of it — it reaches
+/// `Worktree.Verify` through its own `WorktreeVerify` seam rather than through
+/// this function, so a retained worktree never arrives here to be handed the
+/// recreate branch.
+///
+/// That leaves this function with one caller today, and it stays a separate
+/// function rather than being folded back into [`verify_or_recreate`] because
+/// what it separates is the *branch*, not the caller: the observation and the
+/// destructive recovery are named apart, so a future retained-class reader in
+/// this module has something to take that has no `remove_worktree` beyond it.
 ///
 /// # Errors
 ///

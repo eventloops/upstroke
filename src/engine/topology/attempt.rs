@@ -13,13 +13,21 @@
 //!   `T-ATTEMPT`'s `authoritative_state` is "unknown spend, nothing judged", and
 //!   unknown spend is recoverable only because the event precedes the spend.
 //! * **O24 — retry: reservation, worktree verification, `attempt_started`
-//!   (retry), spawn.** The verification is O22's `Worktree.Verify` again, on its
-//!   third occasion — and only the observation, never the recreate branch
-//!   beside it: a retry runs in a `RetainedIdle` generation, which
-//!   `decisions.workspace_candidates.generation` closes with
-//!   `generation_closed{WorktreeMissing}` rather than rebuilds, and INV-06
-//!   says such a generation "is never recreated". That closure is
-//!   [`super::settle::retry`]'s, so what a failed verify does here is refuse.
+//!   (retry), spawn.** A clause with two owners, and this module owns the
+//!   second half only. The reservation and the verification are
+//!   [`super::settle::retry`]'s: it takes the `{pipeline}` reservation, runs
+//!   O22's `Worktree.Verify` against the retained cumulative tree, and on a
+//!   failure cancels that reservation and closes the generation with
+//!   `generation_closed{WorktreeMissing}` — which is what INV-06 requires,
+//!   because a `RetainedIdle` worktree "is never recreated". What it hands
+//!   back is the `attempt_started(retry)` it authorized, and
+//!   [`AttemptContext::start`] appends exactly that event and spawns.
+//!
+//!   There is deliberately **no retry entry point on this side**. One would
+//!   have to re-observe a worktree `settle::retry` has already passed, and a
+//!   refusal from that second look would strand the reservation the first one
+//!   took: the branch that cancels it is `settle::retry`'s failure branch, and
+//!   that branch was not taken. One observation, one recovery, one owner each.
 //! * **O25 — capture before snapshots.** `Object.CandidateStage` then
 //!   `Object.CandidateWriteTree`, whose objects are referenced by the task
 //!   worktree's index (R9). A snapshot taken before the capture would be a
@@ -67,9 +75,7 @@ use crate::topology::events::{
     AttemptInterrupted4, AttemptNumber, AttemptStarted4, Materialization, RungBinding, SessionId,
     TopologyEventBody,
 };
-use crate::workspace_manager::{
-    Quiescence, Slot, Snapshot, SnapshotInput, SnapshotName, WorkspaceManager,
-};
+use crate::workspace_manager::{Slot, Snapshot, SnapshotInput, SnapshotName, WorkspaceManager};
 
 use super::dispatch::{self, Dispatched, EventEmitter};
 use super::identity::{AttemptIdentities, InvocationLedger, SlotAssertion, SlotPair, is_slotted};
@@ -275,7 +281,8 @@ pub struct AttemptContext<'a> {
 }
 
 impl AttemptContext<'_> {
-    /// **O23.** Append `attempt_started`, then spawn the worker.
+    /// **O23, and O24's second half.** Append `attempt_started`, then spawn the
+    /// worker.
     ///
     /// The append is first and the spawn is second, and nothing sits between
     /// them: `T-ATTEMPT`'s boundary is "`attempt_started` (first or retry)
@@ -283,6 +290,23 @@ impl AttemptContext<'_> {
     /// capture". A spawn that preceded the append would put a paid-for process
     /// outside the log entirely, and the recovering process would find a
     /// generation with no attempt and dispatch over the top of it.
+    ///
+    /// # A retry appends through here too
+    ///
+    /// The boundary says "first **or retry**", and one function serves both
+    /// because there is one event: a retry's `attempt_started` is one whose
+    /// `resume_session` is `Some` and whose [`AttemptPlan::attempt`] is a new
+    /// number, and `plan` carries both. What makes it a retry is the decision
+    /// taken *before* it — [`super::settle::retry`]'s reservation and
+    /// `Worktree.Verify` — and this function does not re-take it. O24's
+    /// "converted at `attempt_started(retry)`" is the caller's conversion of
+    /// that same reservation at this append.
+    ///
+    /// A `retry` method here would be this function plus a second verification
+    /// of a worktree that has already been verified, and its refusal branch
+    /// would return while the reservation `settle::retry` took was still held —
+    /// never converted, and never cancelled, because cancellation lives in the
+    /// failure branch that the first, passing, verify did not take.
     ///
     /// # Errors
     ///
@@ -319,77 +343,6 @@ impl AttemptContext<'_> {
         );
         let worker = self.execute(&request, plan.pool.clone())?;
         Ok(AttemptRun { identities, worker })
-    }
-
-    /// **O24.** Verify the worktree, then `attempt_started(retry)`, then spawn.
-    ///
-    /// The reservation is the first of the clause's four steps and is
-    /// `select.rs`'s: `ready_retry` is what decides a retry is admissible, and
-    /// `permits.provisional_reservations` has the retry's reservation
-    /// "converted at `attempt_started(retry)`" — which is this function's
-    /// append, so the conversion is the caller's statement made with the same
-    /// `(key, kind)` it reserved under.
-    ///
-    /// What this function owns is the other three, in order. The verification is
-    /// [`dispatch::verify_reuse`], the third of `Worktree.Verify`'s three tabled
-    /// occasions — "OpenNoAttempt recreate-or-verify, repair materialization,
-    /// **retry verification**" — and `quiescence` is [`Quiescence::HoldsTree`]:
-    /// the generation a retry re-enters settled `RetainedIdle` holding a
-    /// cumulative tree, which is the only class `ready_retry` ever admits and
-    /// the only class [`super::settle::retry`] will run. The value stays a
-    /// parameter because it names the tree, and the tree is the fold's.
-    ///
-    /// # A failed verification does not reach a worktree here
-    ///
-    /// It is a refusal, and the recovery it refuses into is one that lives in
-    /// exactly one place. `decisions.workspace_candidates.generation` splits
-    /// the failure by class — "failing verification an OpenNoAttempt or repair
-    /// worktree is removed with force and recreated, **and a RetainedIdle
-    /// generation is closed with `generation_closed{WorktreeMissing}`**" — and
-    /// [`super::settle::retry`] implements the second half, cancelling the
-    /// reservation and returning `RetryOutcome::Close`. This function is the
-    /// attempt-side half of the same clause, so if it also decided what a
-    /// failed verify means there would be two implementations of O24 free to
-    /// disagree, which is the duplication class this crate has already paid
-    /// for.
-    ///
-    /// The disagreement is not academic. [`dispatch::verify_or_recreate`]'s one
-    /// failure branch is force-remove then recreate: applied to a retained
-    /// worktree it deletes the cumulative tree — INV-06's "never recreated",
-    /// because no base can be re-cut into it — and then appends
-    /// `attempt_started(retry)` carrying `resume_session`, so the worker runs
-    /// against an empty tree and its output is gated as if it were the retained
-    /// work. By the time a caller saw the outcome the append would already be
-    /// durable.
-    ///
-    /// # Errors
-    ///
-    /// As [`Self::start`], plus the containment refusals of the verification,
-    /// plus [`UpstrokeError::Refused`] when the retained worktree does not
-    /// verify. The refusal is this module declining to act, not the closure: a
-    /// caller that holds the fold routes the same failure through
-    /// [`super::settle::retry`], which is where the terminal is built.
-    pub fn retry(
-        &mut self,
-        dispatched: &Dispatched,
-        plan: &AttemptPlan,
-        quiescence: &Quiescence,
-    ) -> Result<AttemptRun, UpstrokeError> {
-        if let Err(failure) =
-            dispatch::verify_reuse(self.manager, self.hooks, dispatched, quiescence)?
-        {
-            return Err(UpstrokeError::Refused {
-                message: format!(
-                    "refusing to retry generation {} of task {}: its worktree did not verify \
-                     ({failure}), and a retained generation is never recreated (INV-06) — what \
-                     it holds is a cumulative tree no base can be re-cut into. This failure \
-                     closes the generation with `generation_closed{{WorktreeMissing}}`, which is \
-                     `settle::retry`'s decision and not this module's",
-                    dispatched.generation.0, dispatched.key
-                ),
-            });
-        }
-        self.start(dispatched, plan)
     }
 
     /// **O25.** `Object.CandidateStage` then `Object.CandidateWriteTree`, in the

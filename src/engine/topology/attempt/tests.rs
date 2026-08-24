@@ -4,22 +4,24 @@ use std::path::{Path, PathBuf};
 
 use super::*;
 use crate::engine::topology::dispatch::DispatchKind;
+use crate::engine::topology::identity::{ReservationKind, Reservations};
 use crate::engine::topology::scaffold::{
     AGENT, ALPHA, RETAINED_SESSION, Run, kill_child_and_adopt, kill_child_environment, kill_dir,
 };
+use crate::engine::topology::settle::{self, ManagedWorktrees, RetryOutcome, RetryRequest};
 use crate::topology::effects::{
     EffectSiteId, EventSite, HookPhase, Injection, InjectionMode, ObjectResidue, ObjectSite,
     ResidueElement, SnapshotSite, SubEffectPoint, WorktreeSite,
 };
-use crate::topology::events::{GenerationId, SessionId};
+use crate::topology::events::{GenerationCloseReason, GenerationId, SessionId};
 use crate::topology::fold::{GenerationClass, TaskState};
 use crate::workspace_manager::fixture::Fixture;
 use crate::workspace_manager::fixture::{
     KillableGitChild, died_by_kill, git, remove_file, time_git, write_file,
 };
 use crate::workspace_manager::{
-    NoHooks, ResidueTarget, classify_object_residue, object_directory, observed_residue_elements,
-    temporary_object_files, unreachable_objects,
+    NoHooks, ResidueTarget, VerifyFailure, classify_object_residue, object_directory,
+    observed_residue_elements, temporary_object_files, unreachable_objects,
 };
 
 const APPEND: EffectSiteId = EffectSiteId::Event(EventSite::Append);
@@ -460,20 +462,86 @@ fn retained_tree(worktree: &Path) -> String {
     git(worktree, &["write-tree"])
 }
 
-/// **O24.** A retry verifies the worktree, then appends
-/// `attempt_started(retry)`, then spawns.
+/// The first two steps of O24, which are [`settle::retry`]'s: the provisional
+/// `{pipeline}` reservation and the **one** `Worktree.Verify` against the
+/// retained cumulative tree.
 ///
-/// The order is asserted as three positions in the one harness list plus the
-/// runner's own log, because the clause is the *sequence*: a verify after the
-/// append would let a retry start against a worktree it had not yet looked at,
+/// Driven through the production seam — [`ManagedWorktrees`] over the run's
+/// real [`WorkspaceManager`] — rather than through a double, because the join
+/// between the clause's two owners is the thing under test. `attempt.rs` has no
+/// retry entry point of its own, so a test that reached the append without
+/// going through here would be covering a composition no coordinator can take.
+fn settle_retry(
+    run: &mut Run,
+    reservations: &mut Reservations,
+    dispatched: &Dispatched,
+    retained: &str,
+) -> RetryOutcome {
+    let plan = run.attempt_plan(ALPHA, 2);
+    let request = RetryRequest {
+        key: ALPHA,
+        slot: dispatched.slot.clone(),
+        retained_tree: retained.to_owned(),
+        binding: plan.binding.clone(),
+        rung: plan.rung,
+        pool: plan.pool.clone(),
+        materialization: None,
+    };
+    settle::retry(
+        run.emitter.fold(),
+        reservations,
+        &ManagedWorktrees::new(&run.fixture.manager),
+        run.hooks.effects(),
+        &request,
+    )
+    .expect("a worktree that does not verify is a decision, not an error")
+}
+
+/// The plan this module appends, built from the event `settle::retry`
+/// authorized.
+///
+/// Every field the fold checks is taken from that event rather than written as
+/// a literal beside it. A plan that disagreed with the authorization would then
+/// be the fold's refusal at the append, which is the whole point of the two
+/// halves naming the same attempt.
+fn authorized_plan(run: &Run, authorized: &AttemptStarted4) -> AttemptPlan {
+    AttemptPlan {
+        attempt: authorized.attempt,
+        rung: authorized.rung,
+        binding: authorized.binding.clone(),
+        pool: authorized.pool.clone(),
+        resume_session: authorized.resume_session.clone(),
+        materialization_observed: authorized.materialization_observed,
+        ..run.attempt_plan(ALPHA, authorized.attempt.0)
+    }
+}
+
+/// **O24, across both of its owners.** A retry verifies **once**, then appends
+/// exactly the event that verification authorized, then spawns.
+///
+/// The clause is "reservation, worktree verification, `attempt_started`
+/// (retry), spawn" and it has two owners. [`settle::retry`] takes the
+/// `{pipeline}` reservation and performs the single `Worktree.Verify`;
+/// [`AttemptContext::start`] appends and spawns. There is no retry entry point
+/// on this side, so this test drives the join, and the order is asserted as
+/// positions in the one harness list plus the runner's own log — a verify after
+/// the append would let a retry start against a worktree nothing had looked at,
 /// and a spawn before the append would put a paid-for process outside the log.
 ///
-/// The quiescence is [`Quiescence::HoldsTree`], which is the retained
-/// generation's form of the check — "or, for RetainedIdle, the worktree holds
-/// the retained cumulative tree". Passing `AtBase` would also succeed here,
-/// which is why the tree is deliberately made to differ from the base's.
+/// **The count of verifications is an assertion, not a detail.** A second
+/// observation on the attempt side would be a second implementation of O24's
+/// verification, and its refusal would be a pre-append failure — which
+/// `permits.provisional_reservations` requires to cancel the reservation. But
+/// the cancellation lives in the *first* verify's failure branch, and that
+/// verify passed, so the branch is not taken: the reservation would be neither
+/// converted nor cancelled. One observation is what makes the reservation's two
+/// outcomes exhaustive, and `count_after(VERIFY)` is where that is checked.
+///
+/// The quiescence is `HoldsTree`, the retained generation's form of the check,
+/// and the tree is deliberately made to differ from the base's so a
+/// verification against `AtBase` could not pass in its place.
 #[test]
-fn a_retry_verifies_the_worktree_then_appends_then_spawns() {
+fn a_retry_verifies_once_then_appends_then_spawns() {
     let mut run = Run::started("o24");
     let dispatched = run.dispatch(ALPHA, 0);
     let mut process = Process::new();
@@ -498,23 +566,46 @@ fn a_retry_verifies_the_worktree_then_appends_then_spawns() {
         GenerationClass::RetainedIdle { .. }
     ));
 
+    // Steps one and two, which are `settle::retry`'s.
     let mark = run.mark();
-    let retry = AttemptPlan {
-        attempt: crate::topology::events::AttemptNumber(2),
-        resume_session: Some(SessionId(RETAINED_SESSION.to_owned())),
-        ..run.attempt_plan(ALPHA, 2)
+    let mut reservations = Reservations::new();
+    let outcome = settle_retry(&mut run, &mut reservations, &dispatched, &tree);
+    let RetryOutcome::Start(authorized) = outcome else {
+        panic!("a retained worktree that verifies starts the attempt");
     };
-    let started = context!(run, process)
-        .retry(&dispatched, &retry, &Quiescence::HoldsTree(tree.clone()))
-        .expect("the retry starts");
+    assert!(
+        !reservations.is_empty(),
+        "`permits.provisional_reservations` calls the reservation the bridge between the \
+         selection and its first append, and nothing is holding it"
+    );
+    assert_eq!(
+        run.count_after(mark, VERIFY, HookPhase::Before),
+        1,
+        "the retry observed the worktree exactly once"
+    );
 
-    // "Reused" as a fact about the worktree rather than as the tag the call
-    // returned. `retry` cannot recreate at all now — INV-06 — so a
-    // `Reuse::Verified` in its result would be a constant compared to itself,
-    // which is the assertion shape this suite has just been audited for. These
-    // two say the same thing about the world and keep saying it if the tag ever
-    // comes back: nothing was removed after the mark, and the cumulative tree
-    // the generation retained is still the one the worktree holds.
+    // Steps three and four, which are this module's.
+    let retry = authorized_plan(&run, &authorized);
+    let started = context!(run, process)
+        .start(&dispatched, &retry)
+        .expect("the retry starts");
+    reservations
+        .convert(ALPHA, ReservationKind::Retry)
+        .expect("converted at `attempt_started(retry)`");
+    assert!(
+        reservations.balances(),
+        "the reservation was taken once and settled once"
+    );
+
+    assert_eq!(
+        run.count_after(mark, VERIFY, HookPhase::Before),
+        1,
+        "and still exactly once after the append: the second half of O24 re-observes nothing"
+    );
+
+    // "Reused" as a fact about the worktree rather than as a tag any call
+    // returned: nothing was removed after the mark, and the cumulative tree the
+    // generation retained is still the one the worktree holds.
     assert_eq!(
         run.count_after(mark, SCRUB, HookPhase::Before),
         0,
@@ -525,6 +616,7 @@ fn a_retry_verifies_the_worktree_then_appends_then_spawns() {
         tree,
         "and it still holds the retained cumulative tree"
     );
+
     let verify = run.order_after(mark, VERIFY, HookPhase::Before);
     let append = run.order_after(mark, APPEND, HookPhase::Before);
     assert!(
@@ -537,10 +629,32 @@ fn a_retry_verifies_the_worktree_then_appends_then_spawns() {
         1,
         "exactly one append for the retry"
     );
+
+    // The two owners named the same attempt. This module builds its
+    // `attempt_started` from `dispatched` and the plan, and `settle::retry`
+    // built its own from the fold; the bytes on disk are what says they agree.
+    let durable = run.emitter.durable_events();
     assert_eq!(
-        run.emitter.durable_kinds().last().copied(),
-        Some("attempt_started")
+        durable.last().map(|event| &event.body),
+        Some(
+            &crate::topology::events::TopologyEventBody::AttemptStarted {
+                data: (*authorized).clone(),
+            }
+        ),
+        "the appended event is not the one the verification authorized"
     );
+    assert_eq!(authorized.generation, GENERATION);
+    assert_eq!(
+        authorized.attempt,
+        crate::topology::events::AttemptNumber(2),
+        "a retry is a new attempt number"
+    );
+    assert_eq!(
+        authorized.resume_session,
+        Some(SessionId(RETAINED_SESSION.to_owned())),
+        "and it resumes the session the generation retained"
+    );
+
     assert_eq!(
         run.runner.ran().len(),
         2,
@@ -575,8 +689,8 @@ fn git_dir(worktree: &Path) -> PathBuf {
     PathBuf::from(git(worktree, &["rev-parse", "--absolute-git-dir"]))
 }
 
-/// **INV-06 / O24.** A retry whose retained worktree fails `Worktree.Verify` is
-/// refused, and the cumulative tree it holds is still there afterwards.
+/// **INV-06 / O24.** A retry whose retained worktree fails `Worktree.Verify`
+/// closes the generation, cancels its reservation, and destroys nothing.
 ///
 /// `decisions.workspace_candidates.generation` gives the failure two recoveries
 /// and they are not interchangeable: "failing verification an OpenNoAttempt or
@@ -590,17 +704,25 @@ fn git_dir(worktree: &Path) -> PathBuf {
 /// retained work. The append is durable before any caller sees the outcome, so
 /// there is no later place to catch it.
 ///
-/// Four assertions, and each one is a different way the destructive branch
-/// shows: nothing was removed, nothing was appended, no process was asked for,
-/// and the tree the worktree holds is byte-for-byte the tree it held. The last
-/// is the one that cannot be satisfied by a recreate — a rebuilt worktree is at
-/// the base, and the base's tree is deliberately different here.
+/// The recovery is driven end to end here rather than only observed: the
+/// closure `settle::retry` builds is appended through the same fold-checked
+/// emitter every other event uses, so "the generation closes" is a transition
+/// the fold accepted and not a struct this test looked at.
+///
+/// Six assertions, and each is a different way the destructive branch or a
+/// stranded reservation would show: nothing was removed, nothing was appended
+/// before the closure, no process was asked for, the tree the worktree holds is
+/// byte-for-byte the tree it held, the generation ends `Closed` rather than
+/// rebuilt, and the `{pipeline}` reservation is **cancelled** —
+/// `permits.provisional_reservations` requires "cancellation on any pre-append
+/// failure", and a retry entry point that refused *after* this verify passed
+/// would leave it held with nobody to settle it.
 ///
 /// The residue planted is `index.lock`, which is exactly what the interrupted
 /// Git command in the failure sequence leaves, and it is the cheapest way into
 /// a failing verify that does not itself disturb the thing being protected.
 #[test]
-fn a_retry_whose_retained_worktree_fails_verification_refuses_and_destroys_nothing() {
+fn a_retry_whose_retained_worktree_fails_verification_closes_and_destroys_nothing() {
     let mut run = Run::started("inv06");
     let dispatched = run.dispatch(ALPHA, 0);
     let mut process = Process::new();
@@ -616,7 +738,8 @@ fn a_retry_whose_retained_worktree_fails_verification_refuses_and_destroys_nothi
     );
     assert_ne!(
         tree, base_tree,
-        "the retained tree must differ from the base's, or a recreate at the base would          reproduce it and this test could not tell the two apart"
+        "the retained tree must differ from the base's, or a recreate at the base would \
+         reproduce it and this test could not tell the two apart"
     );
     run.retain(ALPHA, GENERATION, 1);
 
@@ -627,23 +750,23 @@ fn a_retry_whose_retained_worktree_fails_verification_refuses_and_destroys_nothi
 
     let durable_before = run.emitter.durable_kinds();
     let mark = run.mark();
-    let retry = AttemptPlan {
-        attempt: crate::topology::events::AttemptNumber(2),
-        resume_session: Some(SessionId(RETAINED_SESSION.to_owned())),
-        ..run.attempt_plan(ALPHA, 2)
-    };
-    let error = context!(run, process)
-        .retry(&dispatched, &retry, &Quiescence::HoldsTree(tree.clone()))
-        .expect_err("a retained worktree that does not verify is not retried into");
+    let mut reservations = Reservations::new();
+    let outcome = settle_retry(&mut run, &mut reservations, &dispatched, &tree);
 
-    let message = error.to_string();
-    assert!(
-        message.contains("INV-06") && message.contains("WorktreeMissing"),
-        "the refusal must name the invariant it is keeping and the closure that belongs to          this failure, and said: {message}"
+    let RetryOutcome::Close { closed, failure } = outcome else {
+        panic!("a retained worktree that does not verify is not retried into");
+    };
+    assert_eq!(
+        failure,
+        VerifyFailure::Residue(ResidueElement::IndexLock),
+        "what `Worktree.Verify` actually observed"
     );
+    assert_eq!(closed.reason, GenerationCloseReason::WorktreeMissing);
+    assert_eq!(closed.key, ALPHA);
+    assert_eq!(closed.generation, GENERATION);
     assert!(
-        message.contains("IndexLock"),
-        "and what `Worktree.Verify` actually observed: {message}"
+        reservations.is_empty() && reservations.balances(),
+        "a pre-append failure left the provisional `{{pipeline}}` reservation held"
     );
 
     // It looked, which is what stops every assertion below being about a
@@ -674,17 +797,33 @@ fn a_retry_whose_retained_worktree_fails_verification_refuses_and_destroys_nothi
             session: SessionId(RETAINED_SESSION.to_owned()),
             incarnation: crate::topology::events::Epoch(0),
         },
-        "the generation is still retained: closing it is `settle::retry`'s decision"
+        "the generation closes at the closure's append and not before it"
+    );
+    assert!(
+        run.runner.ran().len() == 1,
+        "only the first attempt's worker ever ran; the retry asked for no process"
+    );
+
+    // The recovery itself, through the fold that has to accept it.
+    run.emitter
+        .emit(TopologyEventBody::GenerationClosed { data: closed })
+        .expect("`generation_closed{WorktreeMissing}` is the tabled recovery");
+    assert!(
+        matches!(
+            run.emitter.generation_class(ALPHA, GENERATION),
+            GenerationClass::Closed
+        ),
+        "the retained generation is closed, not rebuilt"
     );
     assert_eq!(
-        run.runner.ran().len(),
-        1,
-        "only the first attempt's worker ever ran; the retry asked for no process"
+        run.count_after(mark, SCRUB, HookPhase::Before),
+        0,
+        "and closing it removed nothing either"
     );
 
     // The work itself. The lock is what `Worktree.Verify` refused for, so it
     // comes off before the index can be written out — removing it is this
-    // test's own act and not part of what `retry` did.
+    // test's own act and not part of what the retry did.
     assert!(
         dispatched.worktree.is_dir(),
         "the retained worktree is still there"
@@ -818,18 +957,25 @@ fn attempt_kill_child() {
     }
 
     if which == "retry" {
-        // The retry's own in-flight prefix, in the generation that retained.
+        // The retry's own in-flight prefix, in the generation that retained,
+        // built through both owners of O24 exactly as the parent test's
+        // non-kill sibling does.
         let tree = retained_tree(&dispatched.worktree);
         run.retain(ALPHA, GENERATION, 1);
-        let retry = AttemptPlan {
-            attempt: crate::topology::events::AttemptNumber(2),
-            resume_session: Some(SessionId(RETAINED_SESSION.to_owned())),
-            ..run.attempt_plan(ALPHA, 2)
+        let mut reservations = Reservations::new();
+        let RetryOutcome::Start(authorized) =
+            settle_retry(&mut run, &mut reservations, &dispatched, &tree)
+        else {
+            panic!("the retained worktree of this prefix verifies");
         };
+        let retry = authorized_plan(&run, &authorized);
         run.arm(STAGE, HookPhase::Before, Injection::Kill);
         context!(run, process)
-            .retry(&dispatched, &retry, &Quiescence::HoldsTree(tree))
+            .start(&dispatched, &retry)
             .expect("the retry starts");
+        reservations
+            .convert(ALPHA, ReservationKind::Retry)
+            .expect("converted at `attempt_started(retry)`");
         // In flight, and now killed inside it: the arming is at the capture
         // because `retry` itself must succeed for the generation to be
         // `InFlight { attempt: 2 }` when the coordinator dies.

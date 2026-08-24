@@ -130,8 +130,10 @@ fn task_dispatched_is_durable_before_the_intent_and_the_add() {
         dispatched.worktree,
         "the recorded worktree path is the one the add returned: the event's string is derived \
          from the slot before the append, because O21 puts the append first, and this field is \
-         what `Worktree.Add` itself answered — two provenances, so their agreement is a fact \
-         about the funnel rather than a local compared to itself"
+         what `Worktree.Add` answered — two derivations rather than one local compared to \
+         itself, so a dispatch that named one directory and created another fails here. What \
+         it does not catch is Git creating a third: both sides re-derive from the slot, and \
+         nothing reads the checkout's location back"
     );
     assert!(
         data.source_candidate.is_none(),
