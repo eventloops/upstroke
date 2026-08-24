@@ -212,3 +212,22 @@ nothing.
 6. If the honest answer is *"the freeze is fine and the implementer should have used better
    judgement"*, say so. The advocacy's author considers it the single most likely way this argument
    is wrong.
+
+---
+
+## Postscript, 2026-08-24 — adjudicated
+
+**This request is closed.** The Status line above says it awaits adjudication; it no longer does.
+
+The project owner ruled on 2026-08-24, after an independent adversarial review of `3c09f6e`. The
+ruling is recorded in `reviews/FINDINGS.md` **§3**, first entry, which is authoritative — this
+postscript points at it and does not restate it.
+
+In outline: PR7's `fold.rs` footprint is **accepted as a disclosed deviation** through `3362f65`; the
+**standing rule proposed by Claim 5 is rejected**, and `frozen_rung_binding` is the last fold reader
+outside a dedicated pass; a **freeze charter** replaces the ad-hoc reading, with the deferred work
+scheduled as a **G2 PR3-layer pass** running after PR7 merges and before PR8.
+
+Appended rather than rewritten, per this project's convention for settled records: the argument above
+stands as it was filed, including the parts the adjudication did not accept, so that a later reader
+can see what was argued and not merely what was decided.

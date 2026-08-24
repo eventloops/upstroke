@@ -154,10 +154,49 @@ a sound finding whose *fix* had a hole, caught only by a later independent pass.
 A reviewer appends here; the implementer adjudicates. New evidence only — a failure sequence the
 disposition did not address, and a mutation the current suite would not catch.
 
-*(none yet — but see §2 for the mechanism working in the other direction: **PR3's** second
-confirmation was asked a direct question about scope and answered it as a disposition, which is
-now settled in §1. This is a claim about the PR3 round, not about PR4's second confirmation, whose
-two findings — `PR4-CONF-003` and `PR4-CONF-004` — were both accepted and repaired in round 5.)*
+*(See §2 for the mechanism working in the other direction: **PR3's** second confirmation was asked a
+direct question about scope and answered it as a disposition, which is now settled in §1. This is a
+claim about the PR3 round, not about PR4's second confirmation, whose two findings —
+`PR4-CONF-003` and `PR4-CONF-004` — were both accepted and repaired in round 5.)*
+
+### 2026-08-24 — the PR7 unfreeze challenge, adjudicated
+
+**Challenge.** `reviews/2026-08-24-unfreeze-challenge-request.md`, filed by the PR7 implementer
+against the 2026-08-20 ruling carried on `PR4-SPAWN-SITE-PROBE-CONTEXT` and
+`PR4-PROGRAM-PATH-NOT-UNICODE`. It argued that the ruling's two named things —
+`src/topology/effects.rs` and `DESIGN.md:222` — do not cover a **public reader** that delegates to
+logic already in a frozen file, and proposed a standing rule making such readers always permissible.
+Its new evidence was `PR7-REGION-SECOND-DERIVATION`: a private, load-bearing derivation
+(`fold::predicted_region`, which `dispatch_lease_check` uses to decide a task is `ready` at all), a
+second derivation written in the engine to avoid touching that file, and the two disagreeing — the
+fold admitting a dispatch on `src/alpha` while the log recorded `src/alpha/*.rs`, a prefix that
+overlaps nothing. Shipped green in `199dc1d`; repaired in `84a3978`.
+
+**Adjudicated by the project owner, 2026-08-24**, after an independent adversarial review of
+`3c09f6e`. Three parts:
+
+1. **The footprint is accepted**, as a **disclosed deviation**, through `3362f65` — the ten readers,
+   the `pipeline_reservable` conjunct, and the eleventh reader. It stays. See
+   `PR7-FOLD-ACCESSORS-IN-PR3-LAYER` in §2 for the measurement.
+2. **The standing rule is rejected.** "Readers to frozen files are always fine" does not become
+   policy. `frozen_rung_binding` is the **last fold reader outside a dedicated pass**.
+3. **A freeze charter replaces the ad-hoc reading**, landing as
+   `decisions/2026-08-24-pr3-layer-freeze-charter.md`, with the work itself scheduled as
+   `proposals/2026-08-24-v0.2-g2-pr3-layer-pass.md` — a slice that runs **after PR7 merges and before
+   PR8**. Every further `src/topology/**` change goes there, including the three findings §2 already
+   carries for it and `TASK-DISPATCHED-REGION-UNVALIDATED` below.
+
+**What this settles for the rest of PR7.** No further edits to `src/topology/**` or `DESIGN.md:222`
+from this slice. A lane that finds it needs a twelfth reader or a new derivation **stops and writes
+the need up as an owner question** — it does not work around it with a driver-side re-derivation,
+which is the defect `84a3978` repaired and this slice's dominant class.
+
+**Why the challenge succeeded on evidence and failed on rule.** The evidence cleared the authority
+rule's bar: a concrete failure sequence the 2026-08-20 disposition did not address, and a mutation
+that demonstrably survived the whole suite. What it did not establish is that a *category* of change
+is safe. One slice is one data point, and the reviewer's strongest objection stands — that eleven new
+public methods is a claim about `TopologyFold`'s original surface, and answering it by widening the
+surface one reader at a time is the redesign the ruling forbids, performed slowly.
 
 ## 4. Recurrence watch
 
