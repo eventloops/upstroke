@@ -1697,11 +1697,25 @@ fn no_module_outside_the_container_runner_writes_a_container_intent() {
         // survived all 1324 tests). It writes no intent and constructs no
         // container. The exclusion is by exact path rather than by prefix, so
         // it cannot widen to a sibling.
+        //
+        // `src/engine/topology/recover/tests.rs` is the fifth, added by PR7
+        // lane E. It is the `mod tests;` of `src/engine/topology/recover.rs`,
+        // declared under a test configuration and never reachable from
+        // production, and it names these types for one reason: recovery step
+        // (a)'s row is "containers **incl. every earlier incarnation of this
+        // run** under `<R>/containers`", so
+        // `resume_of_nondefault_root_run_reclaims_earlier_incarnation_intents_in_recorded_root`
+        // has to *plant* a dead incarnation's intent for the census to find,
+        // and it plants it through this very funnel rather than with `fs`. A
+        // fixture that writes an intent for the census to reclaim is the same
+        // category as `src/runner/container/census/tests.rs` above. The
+        // exclusion is by exact path, so it cannot widen to a sibling.
         if relative.starts_with("src/runner/container/tests")
             || relative.starts_with("src/runner/container/census/tests")
             || relative.starts_with("src/runner/container/resolve/tests")
             || relative == "src/runner/container/fake.rs"
             || relative == "src/effects/tests.rs"
+            || relative == "src/engine/topology/recover/tests.rs"
         {
             continue;
         }

@@ -71,6 +71,14 @@ pub use seams::{
     HarnessTopologyHooks, IdSource, NoTopologyHooks, RealIds, SystemClock, TimeSource,
     TopologyHooks,
 };
+pub mod preflight;
+pub mod recover;
+
+pub use preflight::{Probed, RunPreflight};
+pub use recover::{
+    BarrierHeld, EmitContext, LocksHeld, PreflightCertified, RecordsVerified, ResumeCensused,
+    Resumed, RootDerived, RunnerRebuilt,
+};
 pub use select::{Admitted, Breach, Ceiling, Spend, Step, checkpoint, select};
 pub use settle::{
     Deferral, FinishedAttempt, ManagedWorktrees, RetryOutcome, RetryRequest, Settled,
@@ -78,8 +86,8 @@ pub use settle::{
     settle_failed, settle_succeeded,
 };
 pub use startup::{
-    BarrierHeld, CensusInputs, FreshCensused, ResumeCensused, RunDirCensusReport, RunDirEntry,
-    RunDirOutcome, StartupCensus, WorktreeLocked, resume_census, startup_census,
+    CensusInputs, FreshCensused, RunDirCensusReport, RunDirEntry, RunDirOutcome, StartupCensus,
+    WorktreeLocked, resume_census, startup_census,
 };
 
 /// The schema-4 run that `dispatch.rs` and `attempt.rs` are tested against.
