@@ -14,7 +14,12 @@
 //!   unknown spend is recoverable only because the event precedes the spend.
 //! * **O24 — retry: reservation, worktree verification, `attempt_started`
 //!   (retry), spawn.** The verification is O22's `Worktree.Verify` again, on its
-//!   third occasion.
+//!   third occasion — and only the observation, never the recreate branch
+//!   beside it: a retry runs in a `RetainedIdle` generation, which
+//!   `decisions.workspace_candidates.generation` closes with
+//!   `generation_closed{WorktreeMissing}` rather than rebuilds, and INV-06
+//!   says such a generation "is never recreated". That closure is
+//!   [`super::settle::retry`]'s, so what a failed verify does here is refuse.
 //! * **O25 — capture before snapshots.** `Object.CandidateStage` then
 //!   `Object.CandidateWriteTree`, whose objects are referenced by the task
 //!   worktree's index (R9). A snapshot taken before the capture would be a
@@ -66,7 +71,7 @@ use crate::workspace_manager::{
     Quiescence, Slot, Snapshot, SnapshotInput, SnapshotName, WorkspaceManager,
 };
 
-use super::dispatch::{self, Dispatched, EventEmitter, Reuse};
+use super::dispatch::{self, Dispatched, EventEmitter};
 use super::identity::{AttemptIdentities, InvocationLedger, SlotAssertion, SlotPair, is_slotted};
 use super::seams::TopologyHooks;
 
@@ -326,26 +331,65 @@ impl AttemptContext<'_> {
     /// `(key, kind)` it reserved under.
     ///
     /// What this function owns is the other three, in order. The verification is
-    /// [`dispatch::verify_or_recreate`], the third of `Worktree.Verify`'s three
-    /// tabled occasions — "OpenNoAttempt recreate-or-verify, repair
-    /// materialization, **retry verification**" — and `quiescence` is
-    /// [`Quiescence::HoldsTree`] for a generation that settled `RetainedIdle`
-    /// holding a cumulative tree, [`Quiescence::AtBase`] otherwise. The packet
-    /// gives both in one sentence and the choice belongs to the fold state the
-    /// caller holds, not to this function.
+    /// [`dispatch::verify_reuse`], the third of `Worktree.Verify`'s three tabled
+    /// occasions — "OpenNoAttempt recreate-or-verify, repair materialization,
+    /// **retry verification**" — and `quiescence` is [`Quiescence::HoldsTree`]:
+    /// the generation a retry re-enters settled `RetainedIdle` holding a
+    /// cumulative tree, which is the only class `ready_retry` ever admits and
+    /// the only class [`super::settle::retry`] will run. The value stays a
+    /// parameter because it names the tree, and the tree is the fold's.
+    ///
+    /// # A failed verification does not reach a worktree here
+    ///
+    /// It is a refusal, and the recovery it refuses into is one that lives in
+    /// exactly one place. `decisions.workspace_candidates.generation` splits
+    /// the failure by class — "failing verification an OpenNoAttempt or repair
+    /// worktree is removed with force and recreated, **and a RetainedIdle
+    /// generation is closed with `generation_closed{WorktreeMissing}`**" — and
+    /// [`super::settle::retry`] implements the second half, cancelling the
+    /// reservation and returning `RetryOutcome::Close`. This function is the
+    /// attempt-side half of the same clause, so if it also decided what a
+    /// failed verify means there would be two implementations of O24 free to
+    /// disagree, which is the duplication class this crate has already paid
+    /// for.
+    ///
+    /// The disagreement is not academic. [`dispatch::verify_or_recreate`]'s one
+    /// failure branch is force-remove then recreate: applied to a retained
+    /// worktree it deletes the cumulative tree — INV-06's "never recreated",
+    /// because no base can be re-cut into it — and then appends
+    /// `attempt_started(retry)` carrying `resume_session`, so the worker runs
+    /// against an empty tree and its output is gated as if it were the retained
+    /// work. By the time a caller saw the outcome the append would already be
+    /// durable.
     ///
     /// # Errors
     ///
-    /// As [`Self::start`], plus the containment refusals of the verification.
+    /// As [`Self::start`], plus the containment refusals of the verification,
+    /// plus [`UpstrokeError::Refused`] when the retained worktree does not
+    /// verify. The refusal is this module declining to act, not the closure: a
+    /// caller that holds the fold routes the same failure through
+    /// [`super::settle::retry`], which is where the terminal is built.
     pub fn retry(
         &mut self,
         dispatched: &Dispatched,
         plan: &AttemptPlan,
         quiescence: &Quiescence,
-    ) -> Result<(Reuse, AttemptRun), UpstrokeError> {
-        let reuse = dispatch::verify_or_recreate(self.manager, self.hooks, dispatched, quiescence)?;
-        let run = self.start(dispatched, plan)?;
-        Ok((reuse, run))
+    ) -> Result<AttemptRun, UpstrokeError> {
+        if let Err(failure) =
+            dispatch::verify_reuse(self.manager, self.hooks, dispatched, quiescence)?
+        {
+            return Err(UpstrokeError::Refused {
+                message: format!(
+                    "refusing to retry generation {} of task {}: its worktree did not verify \
+                     ({failure}), and a retained generation is never recreated (INV-06) — what \
+                     it holds is a cumulative tree no base can be re-cut into. This failure \
+                     closes the generation with `generation_closed{{WorktreeMissing}}`, which is \
+                     `settle::retry`'s decision and not this module's",
+                    dispatched.generation.0, dispatched.key
+                ),
+            });
+        }
+        self.start(dispatched, plan)
     }
 
     /// **O25.** `Object.CandidateStage` then `Object.CandidateWriteTree`, in the
@@ -384,6 +428,24 @@ impl AttemptContext<'_> {
     /// [`SnapshotName`] rather than of this loop's discipline — and each
     /// snapshot is removed before the next is created, so a reviewer cannot
     /// inherit the previous one's checkout even by mistake.
+    ///
+    /// # What the name does not carry, and where that is owed
+    ///
+    /// The **task key**. [`SnapshotName::gates`] is `g<gen>-a<attempt>-gates`
+    /// and [`SnapshotName::review`] is `g<gen>-a<attempt>-review<pass>`, so two
+    /// *different tasks* at the same generation and attempt name the same slot.
+    /// "Never reused" is therefore a property of the name **within** a task and
+    /// a property of the substrate **across** tasks: at `max_parallel = 1` one
+    /// attempt runs to completion before the next begins, so no two live
+    /// snapshots can collide and the claim above holds exactly.
+    ///
+    /// This is the same PR11 debt [`Self::settle_interrupted`] records for the
+    /// reclaim scope, reached from the other side — that one would remove a
+    /// sibling's snapshot, this one would hand a sibling the same slot to
+    /// create. A wider substrate owes the name a key; it is recorded here
+    /// rather than approximated, because a snapshot name is what
+    /// `WorkspaceManager` derives a path from and two tasks deriving one path
+    /// is a collision no assertion in this module could see.
     ///
     /// O26 lives inside [`WorkspaceManager::add_snapshot`], which for a
     /// tree-only input performs commit-tree → intent → add in that order. This
@@ -568,12 +630,70 @@ impl AttemptContext<'_> {
     /// complete(invocation_id) releasing any slots". Nothing waits here: at
     /// `max_parallel = 1` a second concurrent slotted acquisition is a leaked
     /// hold rather than contention, and [`SlotAssertion`] refuses it.
+    ///
+    /// # The registration is settled on every path out
+    ///
+    /// The register is here and the pair, the run and the release are in
+    /// [`Self::run_registered`], which is the whole reason the two are separate
+    /// functions. `permits.protocol` settles an invocation "exactly once", and
+    /// [`InvocationLedger::balances`] states that as "no entry is `Running`" —
+    /// so a `?` between the register and the settlement would abandon a
+    /// `Running` entry that at process end is **indistinguishable** from a
+    /// process this coordinator genuinely lost. A slot pair the assertion
+    /// refuses is not a lost process; it is a process that never started, and
+    /// reporting it as a leak would spend a real signal on a bookkeeping
+    /// mistake.
     fn execute(
         &mut self,
         request: &RunnerRequest,
         pool: Option<String>,
     ) -> Result<ProcessOutput, UpstrokeError> {
         self.ledger.register(&request.invocation)?;
+        match self.run_registered(request, pool) {
+            // `permits.protocol` settles an invocation exactly once, and the
+            // two settlements are not interchangeable: a process the Runner
+            // could not start or supervise never completed, and recording it as
+            // completed would put a failure in the ledger under the name of a
+            // success.
+            Ok(output) => {
+                if output.is_ok() {
+                    self.ledger.complete(&request.invocation)?;
+                } else {
+                    self.ledger.cancel(&request.invocation)?;
+                }
+                output
+            }
+            Err(error) => {
+                // Cancelled, not completed: the protocol failed before the
+                // Runner answered, so nothing ran. It cannot itself fail —
+                // `cancel` refuses only an identity that was never registered,
+                // and the line above registered this one — and the failure that
+                // brought us here is the one worth reporting either way.
+                drop(self.ledger.cancel(&request.invocation));
+                Err(error)
+            }
+        }
+    }
+
+    /// Everything between the registration and its settlement: the pair, the
+    /// run, and the release.
+    ///
+    /// The nesting keeps the two failures apart, the way
+    /// [`WorkspaceManager::verify_worktree`] keeps its two apart. The **outer**
+    /// error is a protocol failure — a slotted request naming no agent, a pair
+    /// the assertion refuses, a release that did not match — and means no
+    /// process ran, so [`Self::execute`] cancels the registration. The
+    /// **inner** one is the Runner's own answer about a process it could not
+    /// start or supervise, and is what decides `complete` against `cancel`.
+    ///
+    /// Every early return here is therefore safe: this function may fail
+    /// anywhere and the ledger entry is still settled exactly once, by its
+    /// caller.
+    fn run_registered(
+        &mut self,
+        request: &RunnerRequest,
+        pool: Option<String>,
+    ) -> Result<Result<ProcessOutput, UpstrokeError>, UpstrokeError> {
         let slotted = is_slotted(&request.invocation);
         if slotted {
             let agent = request
@@ -598,16 +718,7 @@ impl AttemptContext<'_> {
         if slotted {
             self.slots.release(&request.invocation)?;
         }
-        // `permits.protocol` settles an invocation exactly once, and the two
-        // settlements are not interchangeable: a process the Runner could not
-        // start or supervise never completed, and recording it as completed
-        // would put a failure in the ledger under the name of a success.
-        if output.is_ok() {
-            self.ledger.complete(&request.invocation)?;
-        } else {
-            self.ledger.cancel(&request.invocation)?;
-        }
-        output
+        Ok(output)
     }
 
     /// [`Self::execute`], reduced to what a judgement records.
