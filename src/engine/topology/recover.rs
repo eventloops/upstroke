@@ -138,16 +138,16 @@ use crate::runner::container::GitView;
 use crate::runner::container::resolve::RunnerPreflight;
 use crate::runner::container::runtime::{ContainerRuntime, OwnerLiveness};
 use crate::topology::events::{
-    AttemptInterrupted4, AttemptNumber, CommitSha, GenerationCloseReason, GenerationClosed,
-    GenerationId, IncarnationId, LeaseDisposition, RunResumed4, RunStarted4, TopologyEventBody,
+    AttemptInterrupted4, AttemptNumber, GenerationCloseReason, GenerationClosed, GenerationId,
+    IncarnationId, LeaseDisposition, RunResumed4, RunStarted4, TopologyEventBody,
 };
 use crate::topology::fold::{FrozenInputs, GenerationClass, TopologyFold};
-use crate::topology::leases::{GenerationLease, LeaseOwner};
+use crate::topology::leases::GenerationLease;
 use crate::topology::registry::TaskKey;
 use crate::workspace_manager::WorkspaceManager;
 
 use super::create::{IntegrationRefs, ensure_integration_ref};
-use super::dispatch::{DispatchKind, Dispatched, Reuse, resume_open_no_attempt, task_slot};
+use super::dispatch::{OpenGeneration, Reuse, resume_open_no_attempt, task_slot};
 use super::emit::{EmitState, RunIdentity};
 use super::identity::{InvocationLedger, Reservations};
 use super::seams::{TimeSource, TopologyHooks};
@@ -2216,13 +2216,16 @@ fn started_of(certified: &PreflightCertified) -> &RunStarted4 {
 /// `Worktree.Verify` through its own seam, so no retained worktree can arrive
 /// here to be handed the recreate branch.
 ///
-/// **Every field of the reconstructed dispatch is read off the proven prefix,
-/// not invented.** `base` is the generation's recorded `base_sha`; the slot is
-/// [`task_slot`], which derives it from `{key, generation}` so no two callers
-/// can disagree about which worktree a generation owns; the path is
-/// `slot_path`, the same derivation `dispatch` records into
-/// `task_dispatched.worktree_path`; and the predicted region comes from the
-/// lease table, which is the only place it survives a restart.
+/// **Every field is read off the proven prefix, not invented — and the value
+/// asks for nothing else.** `base` is the generation's recorded `base_sha`, and
+/// the slot is [`task_slot`], which derives it from `{key, generation}` so no
+/// two callers can disagree about which worktree a generation owns. There is no
+/// third field to get wrong, and that is deliberate: the rebuild family takes
+/// [`OpenGeneration`] rather than a full `Dispatched` precisely so recovery
+/// never has to reconstruct a predicted region the fold does not hand back.
+/// Inventing one would be a field that lies about a lease; reaching into
+/// `src/topology/`'s lease table for the real one would be an edit to PR3's
+/// layer for a value no path below this one reads.
 ///
 /// # Errors
 ///
@@ -2247,18 +2250,9 @@ pub fn recreate_open_no_attempt(
     hooks: &mut dyn TopologyHooks,
 ) -> Result<Vec<(TaskKey, GenerationId, Reuse)>, UpstrokeError> {
     let mut rebuilt = Vec::new();
-    for (key, generation, base, kind) in open_no_attempt(fold_of(certified))? {
-        let slot = task_slot(key, generation);
-        let dispatched = Dispatched {
-            key,
-            generation,
-            base,
-            worktree: manager.slot_path(&slot),
-            slot,
-            kind,
-        };
-        let reuse = resume_open_no_attempt(manager, hooks, &dispatched)?;
-        rebuilt.push((key, generation, reuse));
+    for open in open_no_attempt(fold_of(certified))? {
+        let reuse = resume_open_no_attempt(manager, hooks, &open)?;
+        rebuilt.push((open.key, open.generation, reuse));
     }
     Ok(rebuilt)
 }
@@ -2271,9 +2265,7 @@ pub fn recreate_open_no_attempt(
 /// act on" is a property of the function the step calls rather than of a
 /// predicate the step re-derives. Two rules that can disagree is the shape this
 /// slice has paid for repeatedly.
-fn open_no_attempt(
-    fold: &TopologyFold,
-) -> Result<Vec<(TaskKey, GenerationId, CommitSha, DispatchKind)>, UpstrokeError> {
+fn open_no_attempt(fold: &TopologyFold) -> Result<Vec<OpenGeneration>, UpstrokeError> {
     let mut found = Vec::new();
     for key in task_keys(fold) {
         let Some(task) = fold.task(key) else { continue };
@@ -2281,39 +2273,29 @@ fn open_no_attempt(
             if !matches!(generation.class, GenerationClass::OpenNoAttempt) {
                 continue;
             }
-            let root = match generation.lease {
-                GenerationLease::Own => None,
-                GenerationLease::InheritedLineage { root } => Some(root),
-            };
-            if let Some(root) = root {
+            if let GenerationLease::InheritedLineage { root } = generation.lease {
                 return Err(UpstrokeError::Refused {
                     message: format!(
-                        "task {} generation {} is a repair executing inside lineage {}'s lease,                          and its resume action is to re-materialize the candidate it was                          dispatched from, which the fold does not record; repair execution is                          not implemented by this build",
+                        "task {} generation {} is a repair executing inside lineage {}'s lease, \
+                         and its resume action is to re-materialize the candidate it was \
+                         dispatched from, which the fold does not record; repair execution is \
+                         not implemented by this build",
                         key.0, generation.id.0, root.0
                     ),
                 });
             }
-            let owner = LeaseOwner::Generation {
+            found.push(OpenGeneration {
                 key,
                 generation: generation.id,
-            };
-            let Some(paths) = fold.leases().and_then(|table| table.held_paths(owner)) else {
-                return Err(UpstrokeError::Refused {
-                    message: format!(
-                        "task {} generation {} is open with no attempt and holds its lease, \
-                         but the lease table records no region for it",
-                        key.0, generation.id.0
-                    ),
-                });
-            };
-            found.push((
-                key,
-                generation.id,
-                generation.base_sha.clone(),
-                DispatchKind::Ordinary {
-                    paths: paths.clone(),
-                },
-            ));
+                base: generation.base_sha.clone(),
+                slot: task_slot(key, generation.id),
+                // `None` is not a guess. An ordinary generation has no
+                // materialization to reproduce, and the repair case returned
+                // above rather than reaching here — so the field is decided by
+                // the same match that decided the refusal, and there is no
+                // third path that could leave it wrong.
+                source: None,
+            });
         }
     }
     Ok(found)

@@ -186,23 +186,6 @@ impl LeaseTable {
         }
     }
 
-    /// The region `owner` holds, where it holds one.
-    ///
-    /// The read half of [`Self::holds`], which answers the same question and
-    /// discards the answer's content. Recovery step (g) needs the content:
-    /// `decisions.sequential_substrate.recovery_order` says "recreate
-    /// `OpenNoAttempt` worktrees at their bases", and rebuilding one means
-    /// reconstructing the dispatch it was opened by — whose predicted region
-    /// is recorded here and nowhere else. The alternative was a reconstructed
-    /// dispatch carrying a `PathSet` invented at the call site, which is a
-    /// field that lies about a lease.
-    pub fn held_paths(&self, owner: LeaseOwner) -> Option<&PathSet> {
-        match owner {
-            LeaseOwner::Lineage { root } => self.lineage(root).map(|lease| &lease.paths),
-            _ => self.held.get(&owner),
-        }
-    }
-
     pub fn lineage(&self, root: TaskKey) -> Option<&LineageLease> {
         self.lineages.iter().find(|lease| lease.root == root)
     }

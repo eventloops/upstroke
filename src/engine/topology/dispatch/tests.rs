@@ -263,7 +263,7 @@ fn a_fresh_dispatch_never_verifies_a_worktree_it_is_about_to_create() {
     verify_or_recreate(
         &run.fixture.manager,
         &mut run.hooks,
-        &dispatched,
+        &dispatched.open_generation(),
         &dispatched.quiescence(),
     )
     .expect("reuse");
@@ -311,7 +311,7 @@ fn residue_carrying_worktree_fails_verify_and_is_recreated() {
         let reuse = verify_or_recreate(
             &run.fixture.manager,
             &mut run.hooks,
-            &dispatched,
+            &dispatched.open_generation(),
             &dispatched.quiescence(),
         )
         .expect("recreate converges");
@@ -344,7 +344,7 @@ fn residue_carrying_worktree_fails_verify_and_is_recreated() {
     let reuse = verify_or_recreate(
         &run.fixture.manager,
         &mut run.hooks,
-        &dispatched,
+        &dispatched.open_generation(),
         &dispatched.quiescence(),
     )
     .expect("recreate converges");
@@ -371,7 +371,7 @@ fn residue_carrying_worktree_fails_verify_and_is_recreated() {
     let reuse = verify_or_recreate(
         &run.fixture.manager,
         &mut run.hooks,
-        &dispatched,
+        &dispatched.open_generation(),
         &dispatched.quiescence(),
     )
     .expect("recreate converges");
@@ -413,7 +413,7 @@ fn a_quiescent_worktree_is_reused_rather_than_rebuilt() {
     let reuse = verify_or_recreate(
         &run.fixture.manager,
         &mut run.hooks,
-        &dispatched,
+        &dispatched.open_generation(),
         &dispatched.quiescence(),
     )
     .expect("verify succeeds");
@@ -513,8 +513,12 @@ fn kill_after_dispatch_recreates_worktree_without_spend() {
             "`{site}`: the child left the wrong prefix on disk"
         );
 
-        let reuse = resume_open_no_attempt(&run.fixture.manager, &mut run.hooks, &dispatched)
-            .expect("recover");
+        let reuse = resume_open_no_attempt(
+            &run.fixture.manager,
+            &mut run.hooks,
+            &dispatched.open_generation(),
+        )
+        .expect("recover");
         assert_eq!(
             reuse.reused(),
             site == "after_add",
@@ -662,8 +666,12 @@ fn repair_materialization_reproduced_after_kill() {
             },
         };
 
-        resume_open_no_attempt(&run.fixture.manager, &mut run.hooks, &dispatched)
-            .expect("`{site}`: the repair's resume converges");
+        resume_open_no_attempt(
+            &run.fixture.manager,
+            &mut run.hooks,
+            &dispatched.open_generation(),
+        )
+        .expect("`{site}`: the repair's resume converges");
 
         // The independent oracle: the same candidate, materialized once, in a
         // worktree nothing ever killed.
@@ -688,8 +696,12 @@ fn repair_materialization_reproduced_after_kill() {
             .manager
             .add_worktree(run.hooks.effects(), &control.slot, &control.base.0)
             .expect("control worktree");
-        materialize_repair(&run.fixture.manager, &mut run.hooks, &control)
-            .expect("control materialize");
+        materialize_repair(
+            &run.fixture.manager,
+            &mut run.hooks,
+            &control.open_generation(),
+        )
+        .expect("control materialize");
 
         assert_eq!(
             git(&dispatched.worktree, &["write-tree"]),
@@ -800,8 +812,12 @@ fn a_repair_whose_source_candidate_is_missing_is_refused_before_any_append() {
 fn reproducing_a_materialization_an_ordinary_dispatch_never_had_is_refused() {
     let mut run = Run::started("nomaterialize");
     let dispatched = run.dispatch(ALPHA, 0);
-    let error = materialize_repair(&run.fixture.manager, &mut run.hooks, &dispatched)
-        .expect_err("an ordinary dispatch materializes nothing");
+    let error = materialize_repair(
+        &run.fixture.manager,
+        &mut run.hooks,
+        &dispatched.open_generation(),
+    )
+    .expect_err("an ordinary dispatch materializes nothing");
     assert!(
         error.to_string().contains("no recorded materialization"),
         "{error}"

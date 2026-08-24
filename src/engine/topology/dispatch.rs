@@ -183,6 +183,22 @@ impl Dispatched {
         Quiescence::AtBase(self.base.0.clone())
     }
 
+    /// The narrower value the rebuild family takes.
+    ///
+    /// One conversion, at the two call sites that hold a `Dispatched`, so the
+    /// rebuild path has a single parameter type and recovery does not need to
+    /// build a dispatch it cannot prove.
+    #[must_use]
+    pub fn open_generation(&self) -> OpenGeneration {
+        OpenGeneration {
+            key: self.key,
+            generation: self.generation,
+            base: self.base.clone(),
+            slot: self.slot.clone(),
+            source: self.source().cloned(),
+        }
+    }
+
     /// What a settlement that **closes** this generation records about the
     /// lease.
     ///
@@ -203,6 +219,47 @@ impl Dispatched {
             DispatchKind::Ordinary { .. } => None,
             DispatchKind::Repair { source, .. } => Some(source),
         }
+    }
+}
+
+/// What **rebuilding** an open generation needs, which is less than a dispatch.
+///
+/// [`Dispatched`] additionally carries the checkout path and the lease grant,
+/// and no path below [`resume_open_no_attempt`] reads either: the rebuild
+/// family asks the manager for `slot`, `base`, and — for a repair — the source
+/// candidate, and nothing else.
+///
+/// **The narrowing is not tidiness, it is what lets recovery step (g) exist
+/// without inventing a field.** A `Dispatched` reconstructed from the fold
+/// would have to carry a `LeaseGrant`, whose predicted region the fold does not
+/// hand back; a region invented at that call site is a field that lies about a
+/// lease, and reaching into `src/topology/`'s lease table for the real one is
+/// an edit to a frozen layer for a value the operation never reads. Asking for
+/// what is used removes the question.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OpenGeneration {
+    /// The task.
+    pub key: TaskKey,
+    /// Its generation.
+    pub generation: GenerationId,
+    /// The commit the worktree was created at, and is recreated at.
+    pub base: CommitSha,
+    /// The slot the worktree occupies.
+    pub slot: Slot,
+    /// For a repair, the protected candidate the worktree is materialized
+    /// from. `None` for an ordinary generation.
+    pub source: Option<CandidateRef>,
+}
+
+impl OpenGeneration {
+    /// The quiescence a reuse of this worktree is checked against.
+    ///
+    /// [`Quiescence::AtBase`] and not [`Quiescence::HoldsTree`]: this
+    /// generation has no attempt and therefore no cumulative tree.
+    /// `HoldsTree` is `RetainedIdle`'s, and `settle.rs` owns that.
+    #[must_use]
+    pub fn quiescence(&self) -> Quiescence {
+        Quiescence::AtBase(self.base.0.clone())
     }
 }
 
@@ -318,12 +375,12 @@ pub fn dispatch(
     // which is the same `slot_path` rule the string above came from, and
     // nothing reads the location back. A second, independent provenance would
     // have to come from `git worktree list`; it is owed, not claimed here.
-    dispatched.worktree = create_worktree(manager, hooks, &dispatched)?;
+    dispatched.worktree = create_worktree(manager, hooks, &dispatched.open_generation())?;
 
     // (4) A repair's materialization, which `ObjectSite::RepairMaterialize`
     // itself places `Adjacent::After(DurableEvent::TaskDispatched)`.
     if dispatched.source().is_some() {
-        materialize_repair(manager, hooks, &dispatched)?;
+        materialize_repair(manager, hooks, &dispatched.open_generation())?;
     }
     Ok(dispatched)
 }
@@ -361,10 +418,10 @@ pub struct DispatchRequest {
 fn create_worktree(
     manager: &WorkspaceManager,
     hooks: &mut dyn TopologyHooks,
-    dispatched: &Dispatched,
+    open: &OpenGeneration,
 ) -> Result<PathBuf, UpstrokeError> {
-    manager.write_intent(hooks.effects(), &dispatched.slot)?;
-    manager.add_worktree(hooks.effects(), &dispatched.slot, &dispatched.base.0)
+    manager.write_intent(hooks.effects(), &open.slot)?;
+    manager.add_worktree(hooks.effects(), &open.slot, &open.base.0)
 }
 
 /// Refuse a repair whose protected source is not in this repository.
@@ -480,14 +537,14 @@ impl Reuse {
 pub fn verify_or_recreate(
     manager: &WorkspaceManager,
     hooks: &mut dyn TopologyHooks,
-    dispatched: &Dispatched,
+    open: &OpenGeneration,
     quiescence: &Quiescence,
 ) -> Result<Reuse, UpstrokeError> {
-    match verify_reuse(manager, hooks, dispatched, quiescence)? {
+    match verify_reuse(manager, hooks, open, quiescence)? {
         Ok(()) => Ok(Reuse::Verified),
         Err(failure) => {
-            manager.remove_worktree(hooks.effects(), &dispatched.slot)?;
-            create_worktree(manager, hooks, dispatched)?;
+            manager.remove_worktree(hooks.effects(), &open.slot)?;
+            create_worktree(manager, hooks, open)?;
             Ok(Reuse::Recreated { failure })
         }
     }
@@ -528,10 +585,10 @@ pub fn verify_or_recreate(
 pub fn verify_reuse(
     manager: &WorkspaceManager,
     hooks: &mut dyn TopologyHooks,
-    dispatched: &Dispatched,
+    open: &OpenGeneration,
     quiescence: &Quiescence,
 ) -> Result<Result<(), VerifyFailure>, UpstrokeError> {
-    manager.verify_worktree(hooks.effects(), &dispatched.slot, quiescence)
+    manager.verify_worktree(hooks.effects(), &open.slot, quiescence)
 }
 
 /// Re-run a repair's recorded materialization in a verified or fresh worktree.
@@ -551,18 +608,18 @@ pub fn verify_reuse(
 pub fn materialize_repair(
     manager: &WorkspaceManager,
     hooks: &mut dyn TopologyHooks,
-    dispatched: &Dispatched,
+    open: &OpenGeneration,
 ) -> Result<(), UpstrokeError> {
-    let Some(source) = dispatched.source() else {
+    let Some(source) = open.source.as_ref() else {
         return Err(UpstrokeError::Refused {
             message: format!(
                 "task {} generation {} is an ordinary dispatch and has no recorded \
                  materialization to reproduce",
-                dispatched.key, dispatched.generation.0
+                open.key, open.generation.0
             ),
         });
     };
-    manager.repair_materialize(hooks.effects(), &dispatched.slot, &source.commit_sha.0)
+    manager.repair_materialize(hooks.effects(), &open.slot, &source.commit_sha.0)
 }
 
 /// The whole of `T-DISPATCH`'s resume action for a live process, in order.
@@ -583,11 +640,11 @@ pub fn materialize_repair(
 pub fn resume_open_no_attempt(
     manager: &WorkspaceManager,
     hooks: &mut dyn TopologyHooks,
-    dispatched: &Dispatched,
+    open: &OpenGeneration,
 ) -> Result<Reuse, UpstrokeError> {
-    let reuse = verify_or_recreate(manager, hooks, dispatched, &dispatched.quiescence())?;
-    if dispatched.source().is_some() {
-        materialize_repair(manager, hooks, dispatched)?;
+    let reuse = verify_or_recreate(manager, hooks, open, &open.quiescence())?;
+    if open.source.is_some() {
+        materialize_repair(manager, hooks, open)?;
     }
     Ok(reuse)
 }
