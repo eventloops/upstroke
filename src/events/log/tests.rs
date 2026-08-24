@@ -3401,18 +3401,6 @@ fn the_stable_prefix_barrier_is_the_only_way_a_log_becomes_a_topology_fold() {
         "this file is declared `#[cfg(test)] mod tests;` and the scan has to know it: {test_modules:?}"
     );
 
-    // The control names the files rather than counting them. A count is a
-    // number every lane that adds a fold-naming module has to bump, and two
-    // lanes that each add one both write the same next number — so the merge
-    // resolves silently in the direction that *weakens* the census. A list
-    // merges additively, and when it disagrees it names the offending file
-    // instead of two integers.
-    const MENTIONING: &[&str] = &[
-        "events/log.rs",
-        "engine/topology/recover.rs",
-        "topology/census.rs",
-        "topology/fold.rs",
-    ];
     let mut scanned = 0_usize;
     let mut mentioning: Vec<String> = Vec::new();
     let mut callers: Vec<(PathBuf, &str, usize)> = Vec::new();
