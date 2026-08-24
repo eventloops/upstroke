@@ -48,6 +48,15 @@
 //!   production `read_dir` over a runs root is `rundir::run_dir_names` over
 //!   `<repo>/.upstroke/runs` and the private half is reachable only through the
 //!   marker inside the public husk.
+//! * **The public half goes only if the private one went.** The same argument
+//!   one step later: on the proven path the removal is ordered private-half
+//!   first and public directory last, and `remove_public_husk` deletes
+//!   `<public>/.creating` with it. So a `RunDir.RemovePrivateHusk` that returns
+//!   `Err` short-circuits — removing the public half anyway would delete the
+//!   private half's only locator on exactly the path where the private half may
+//!   still be there. Retained, the pair converges either way: the next census
+//!   proves the pair and reclaims both if the private half survived, and
+//!   reclaims the public husk alone (`TargetAbsent`) if it did not.
 //! * **From the moment `committed.json` exists the creator deletes nothing**,
 //!   including when `publish_commit_record` returned `Err` and a read-only stat
 //!   shows the record present, and including when the stat cannot answer.
@@ -74,12 +83,12 @@ use crate::events::log::{
 };
 use crate::gates::ShellKind;
 use crate::rundir::{
-    CommitRecord, CommitRecordPresence, CreatingMarker, OwnerRecord, PrivateHalfOwnership, RepoKey,
-    RetainReason, RunLock, RunPaths, UnboundShape, commit_record_after_error, create_private_dir,
-    create_private_skeleton, create_public_dir, prove_private_half_ownership,
-    publish_commit_record, publish_marker, publish_owner_record, remove_marker,
-    remove_private_husk, remove_public_husk, stage_commit_record, stage_marker, stage_owner_record,
-    write_plan,
+    CommitRecord, CommitRecordPresence, CreatingMarker, MARKER_STAGED, OWNER_RECORD_STAGED,
+    OwnerRecord, PrivateHalfOwnership, RepoKey, RetainReason, RunLock, RunPaths, UnboundShape,
+    commit_record_after_error, create_private_dir, create_private_skeleton, create_public_dir,
+    prove_private_half_ownership, publish_commit_record, publish_marker, publish_owner_record,
+    remove_marker, remove_private_husk, remove_public_husk, stage_commit_record, stage_marker,
+    stage_owner_record, write_plan,
 };
 use crate::runner::{InvocationId, Runner};
 use crate::topology::effects::EventSite;
@@ -818,6 +827,21 @@ pub enum Disposition {
     /// through the proof-token funnel, then the public directory with the marker
     /// last.
     BothHalvesRemoved { private: PathBuf },
+    /// The ownership proof held and `RunDir.RemovePrivateHusk` returned an
+    /// error, so **the public half was deliberately left where it is**.
+    ///
+    /// Distinct from [`Self::Retained`] because nothing about it was observed:
+    /// the owner record is present (the proof that minted the spent token read
+    /// it), the retention is a consequence of a failed removal rather than of an
+    /// unprovable shape, and a removal was attempted.
+    PrivateHalfRemovalFailed {
+        /// The private half the spent token named.
+        private: PathBuf,
+        /// The public husk, marker and all, still on disk.
+        public: PathBuf,
+        /// The removal error, as the operator sees it.
+        detail: String,
+    },
     /// Retained and reported, nothing deleted. P3a is this, and so is every
     /// unprovable shape.
     Retained {
@@ -832,9 +856,17 @@ pub enum Disposition {
         undecidable: Option<String>,
     },
     /// The append-error protocol's proven prefix contains the committed first
-    /// line: the run exists and is resumable, and its stale marker is repaired
-    /// by the resume. Also what a P7 or P8 failure reports.
-    Committed,
+    /// line: the run exists and is resumable. Also what a P7 or P8 failure
+    /// reports.
+    Committed {
+        /// Whether `.creating` is still on disk.
+        ///
+        /// True at P5b and at P6, where nothing has removed it yet. **False at
+        /// P7**, which is the step that removes it — so a P8 failure has no
+        /// stale marker for a resume to repair, and the sentence must not
+        /// promise one.
+        stale_marker: bool,
+    },
     /// The proven prefix does not contain it: a retained, possibly committed
     /// husk that the deferred prune removes.
     RetainedPossiblyCommittedHusk { locator: PathBuf },
@@ -847,16 +879,27 @@ pub enum Disposition {
 }
 
 impl Disposition {
-    /// Whether this disposition removed anything at all.
+    /// Whether this disposition removed, or may have removed, anything at all.
+    ///
+    /// [`Self::PrivateHalfRemovalFailed`] answers `true`. `remove_dir_all` is
+    /// not atomic and its error is the same value whether it removed nothing,
+    /// part of the tree, or all of it and then failed on the way out — so the
+    /// one thing this may not answer on that arm is that the tree is untouched.
     #[must_use]
     pub const fn removed_anything(&self) -> bool {
         matches!(
             self,
-            Self::PublicHalfRemoved(_) | Self::BothHalvesRemoved { .. }
+            Self::PublicHalfRemoved(_)
+                | Self::BothHalvesRemoved { .. }
+                | Self::PrivateHalfRemovalFailed { .. }
         )
     }
 
-    /// Whether it removed the private half.
+    /// Whether the private half is **known** to have been removed.
+    ///
+    /// [`Self::PrivateHalfRemovalFailed`] answers `false`, for the same reason
+    /// its sibling answers `true`: a failed removal's outcome is not decided by
+    /// its error, so nothing here may claim the half is gone either.
     #[must_use]
     pub const fn removed_the_private_half(&self) -> bool {
         matches!(self, Self::BothHalvesRemoved { .. })
@@ -881,6 +924,20 @@ impl Disposition {
                  funnel, then the public directory with the marker last",
                 private.display()
             ),
+            Self::PrivateHalfRemovalFailed {
+                private,
+                public,
+                detail,
+            } => format!(
+                "the private half at {} could not be removed ({detail}), so the public directory \
+                 at {} was left in place with its marker: `.creating` is that private half's only \
+                 locator, and removing it would orphan a directory no census, no `status` and no \
+                 deferred `upstroke runs prune` could ever reach again. The next census reclaims \
+                 the pair if the private half is still there, and the public husk alone if it is \
+                 not",
+                private.display(),
+                public.display()
+            ),
             Self::Retained { reason, locator } => format!(
                 "both halves are retained and reported, with nothing deleted: {reason}. The \
                  private half is at {}; the deferred `upstroke runs prune` is the only path that \
@@ -902,10 +959,15 @@ impl Disposition {
                     locator.display()
                 ),
             },
-            Self::Committed => {
+            Self::Committed { stale_marker: true } => {
                 "the run exists and is resumable; its stale marker is repaired by the resume"
                     .to_owned()
             }
+            Self::Committed {
+                stale_marker: false,
+            } => "the run exists and is resumable; P7 already removed its marker, and the resume \
+                  creates the integration ref zero-old at the recorded base"
+                .to_owned(),
             Self::RetainedPossiblyCommittedHusk { locator } => format!(
                 "the proven prefix has no committed first line, so this is a retained, possibly \
                  committed husk with its private half at {}; nothing was deleted",
@@ -998,6 +1060,19 @@ fn stat_after_error(aborted: &mut Aborted, hooks: &mut dyn TopologyHooks) -> Dis
     let private = aborted.paths.private.clone();
     let public = aborted.paths.public.clone();
 
+    // The run lock goes back **through its funnel**, and it goes back before
+    // anything else: `run.lock` lives inside the public directory, and on
+    // Windows an open handle without `FILE_SHARE_DELETE` refuses that unlink
+    // outright. Ahead of the stat rather than after the proof, so that every
+    // path out of this function has named `Lock.Release` — the two possibly
+    // committed ones included. They are the paths the rationale is *about*: the
+    // creating process is ending either way, and a husk whose lock is still
+    // held is one the next census **skips** rather than reports, and these are
+    // the answers that end in a reported husk.
+    if let Some(lock) = aborted.lock.take() {
+        lock.release(hooks.rundir());
+    }
+
     // (1) The stat, fail-closed. `Unknown` is not an answer, and it is treated
     // as `Present`, because the cost of being wrong is asymmetric: a retained
     // husk is reported until an operator prunes it, and a deleted committed run
@@ -1021,34 +1096,35 @@ fn stat_after_error(aborted: &mut Aborted, hooks: &mut dyn TopologyHooks) -> Dis
     // (2) The proof.
     let proof = prove_private_half_ownership(&public, &aborted.repo_key, &aborted.private_root);
 
-    // The run lock goes back **through its funnel** before anything is removed:
-    // `run.lock` lives inside the public directory, and on Windows an open
-    // handle without `FILE_SHARE_DELETE` refuses that unlink outright. Released
-    // on the retained path too — the creating process is ending either way, and
-    // a husk whose lock is still held is one the next census **skips** rather
-    // than reports.
-    if let Some(lock) = aborted.lock.take() {
-        lock.release(hooks.rundir());
-    }
-
     // (3) The spend, in the census's own order: the private half through the
     // token funnel, then the public directory **with the marker last**, so a
     // kill inside the removal leaves a husk the next census completes.
     match proof {
         PrivateHalfOwnership::Proven(token) => {
             let target = token.target().to_path_buf();
-            let private_removed = remove_private_husk(token, hooks.rundir());
-            let public_removed = remove_public_husk(&public, hooks.rundir());
-            if private_removed.is_err() {
-                // Best-effort, as today: a removal that failed leaves a husk the
-                // next census classifies again, and it is not a second error to
-                // report over the one that stopped the run.
-                return Disposition::Retained {
-                    reason: RetainReason::OwnerRecordMissing,
-                    locator: target,
+            // **The public half goes only if the private one went.**
+            // `remove_public_husk` deletes `<public>` including `.creating`, and
+            // that marker is the private half's only locator: the sole
+            // production `read_dir` over a runs root is `rundir::run_dir_names`
+            // over `<repo>/.upstroke/runs`, nothing enumerates `<R>/runs`, and a
+            // private half no marker names is one no census, no `status` and no
+            // deferred prune can ever reach again. So a failed private removal
+            // returns here rather than falling through — and what it leaves
+            // converges either way: the next census proves the pair and reclaims
+            // both if the private half survived, and reclaims the public husk
+            // alone (`TargetAbsent`) if it did not.
+            if let Err(error) = remove_private_husk(token, hooks.rundir()) {
+                return Disposition::PrivateHalfRemovalFailed {
+                    private: target,
+                    public,
+                    detail: error.to_string(),
                 };
             }
-            let _ = public_removed;
+            // Best-effort, as today: a public removal that failed leaves a husk
+            // whose marker names an absent target, which the next census
+            // reclaims public-only, and it is not a second error to report over
+            // the one that stopped the run.
+            let _ = remove_public_husk(&public, hooks.rundir());
             Disposition::BothHalvesRemoved { private: target }
         }
         PrivateHalfOwnership::NothingBound(shape) => {
@@ -1199,7 +1275,12 @@ fn p1_publish_marker(
         runner_policy_sha256: facts.checked().runner_policy_sha256().to_owned(),
     };
     if let Err(error) = stage_marker(&public, &marker, hooks.rundir()) {
-        return Err(p0.abort(Prefix::P0, error));
+        let reached = if staged(&public.join(MARKER_STAGED)) {
+            Prefix::P1Staged
+        } else {
+            Prefix::P0
+        };
+        return Err(p0.abort(reached, error));
     }
     if let Err(error) = publish_marker(&public, hooks.rundir()) {
         return Err(p0.abort(Prefix::P1Staged, error));
@@ -1252,7 +1333,12 @@ fn p3b_publish_owner_record(
         runner: facts.checked().runner_policy().clone(),
     };
     if let Err(error) = stage_owner_record(&private, &owner, hooks.rundir()) {
-        return Err(p3a.abort(Prefix::P3a, error));
+        let reached = if staged(&private.join(OWNER_RECORD_STAGED)) {
+            Prefix::P3aStaged
+        } else {
+            Prefix::P3a
+        };
+        return Err(p3a.abort(reached, error));
     }
     if let Err(error) = publish_owner_record(&private, hooks.rundir()) {
         return Err(p3a.abort(Prefix::P3aStaged, error));
@@ -1567,7 +1653,9 @@ fn append_error_protocol(
         }
     };
     match first_line_digest(prefix.bytes()) {
-        Some(actual) if actual == expected => Disposition::Committed,
+        // P7 has not run, so `.creating` is still there for the resume to
+        // repair.
+        Some(actual) if actual == expected => Disposition::Committed { stale_marker: true },
         None => Disposition::RetainedPossiblyCommittedHusk {
             locator: private.to_path_buf(),
         },
@@ -1594,7 +1682,9 @@ fn p7_remove_marker(
         // by the next census with the lock free, or by the owner on resume.
         return Err(Refused {
             reached: Prefix::P6,
-            disposition: Box::new(Disposition::Committed),
+            // P7 is the step that just failed, so the marker it was removing is
+            // still on disk.
+            disposition: Box::new(Disposition::Committed { stale_marker: true }),
             error: Box::new(error),
             run_id,
         });
@@ -1620,7 +1710,11 @@ fn p8_create_integration_ref(
         Ok(()) => Ok(Started::new(p7)),
         Err(error) => Err(Refused {
             reached: Prefix::P7,
-            disposition: Box::new(Disposition::Committed),
+            // P7 returned, so the marker is **gone**: this is the one committed
+            // disposition with nothing stale left for a resume to repair.
+            disposition: Box::new(Disposition::Committed {
+                stale_marker: false,
+            }),
             error: Box::new(error),
             run_id: p7.facts().checked().run_id().to_owned(),
         }),
@@ -1659,6 +1753,26 @@ pub fn ensure_integration_ref(
             ),
         }),
     }
+}
+
+/// Whether a staging file is on disk — the one label a `RunDir.Stage*` error
+/// cannot decide on its own.
+///
+/// `stage_json` creates the `.tmp`, writes it, and *then* fsyncs it, so a
+/// staging error is the second error in this sequence — `PublishCommitRecord`'s
+/// is the first — whose residue is not a function of its value: nothing when the
+/// create failed, a staging file when the sync did. The prefix is the coordinate
+/// the operator is given and it is the census's own vocabulary (`P1Staged` is
+/// reclaimable, `P3aStaged` is retained and **not** content-free), so it is
+/// stat-ed rather than assumed. Read-only, and it deletes nothing: it decides a
+/// name, not a disposition.
+///
+/// `symlink_metadata`, so a staging file that is a dangling symlink still reads
+/// as residue — `startup::stale_marker_present` reads the marker the same way. A
+/// stat that cannot answer reads as absent, which is what the census's own
+/// `read_dir` of that directory would report for the same path.
+fn staged(path: &Path) -> bool {
+    std::fs::symlink_metadata(path).is_ok()
 }
 
 /// A path as the records spell it: canonical when the filesystem can say, and
