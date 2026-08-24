@@ -1221,107 +1221,82 @@ mod tests {
         }
     }
 
-    /// The file minus every `#[cfg(test)] mod … { … }` block.
+    /// Every source file the crate declares as `#[cfg(test)] mod <name>;`, as
+    /// `(declaring file, name, [flat candidate, nested candidate])`.
     ///
-    /// Sound because `cargo fmt --check` is a gate, so a module's closing brace
-    /// is the first line at exactly the module's own indentation.
-    /// `src/engine/tests.rs` is a whole test module (`engine/mod.rs`:
-    /// `#[cfg(test)] mod tests;`) and is excluded as one by every caller.
-    ///
-    /// **A visibility qualifier does not make a test module production.** The
-    /// predicate read the line after the attribute as `starts_with("mod ")`, so
-    /// a `#[cfg(test)] pub(crate) mod` — the shape a test module that another
-    /// module's tests must reach has to take — was kept whole and its
-    /// `Command::new` counted as a production process start. Measured: PR7's
-    /// `workspace_manager::fixture`, which exists precisely because a topology
-    /// module's tests cannot name `Command` themselves. This does not widen
-    /// what counts as test code: the block is still `#[cfg(test)]`-gated, which
-    /// is the whole of what "not production" means here.
-    fn production_region(source: &str) -> String {
-        /// Whether `line` declares a module, with or without a visibility
-        /// qualifier in front of it.
-        fn declares_module(line: &str) -> bool {
-            let line = line.trim_start();
-            let rest = match line.find("mod ") {
-                Some(0) => return true,
-                Some(at) => &line[..at],
-                None => return false,
-            };
-            // Only a visibility qualifier may precede it: `pub`, `pub(crate)`,
-            // `pub(super)`, `pub(in …)`. Anything else — a `use` naming a
-            // module, a comment — is not a declaration.
-            rest.trim_end().starts_with("pub") && !rest.contains('=')
-        }
-
-        let lines: Vec<&str> = source.lines().collect();
-        let mut kept = String::new();
-        let mut index = 0;
-        while index < lines.len() {
-            let line = lines[index];
-            let is_test_mod = line.trim() == "#[cfg(test)]"
-                && lines
-                    .get(index + 1)
-                    .is_some_and(|next| declares_module(next));
-            if !is_test_mod {
-                kept.push_str(line);
-                kept.push('\n');
-                index += 1;
-                continue;
-            }
-            let header = lines[index + 1];
-            let indent = &header[..header.len() - header.trim_start().len()];
-            let closing = format!("{indent}}}");
-            index += 2;
-            while index < lines.len() && lines[index] != closing {
-                index += 1;
-            }
-            index += 1;
-        }
-        kept
-    }
-
-    /// Every source file the crate declares as `#[cfg(test)] mod <name>;`.
-    ///
-    /// Such a file is test code end to end, and [`production_region`] — which
-    /// cuts a file at its first *inline* `#[cfg(test)]` — has nothing to cut in
-    /// one, so it would count the whole of it as production. The set is read
-    /// out of the declarations rather than listed by hand: it was
+    /// Such a file is test code end to end, and a region function has nothing to
+    /// remove in one, so it would count the whole of it as production. The set is
+    /// read out of the declarations rather than listed by hand: it was
     /// `src/engine/tests.rs` alone until PR5 moved the Event funnel into
     /// `src/events/log.rs` with two test modules of its own, and the census
     /// failed on the first file the hand-maintained list did not know about.
-    fn whole_file_test_modules(files: &[PathBuf]) -> std::collections::BTreeSet<PathBuf> {
-        files
-            .iter()
-            .flat_map(|path| {
-                let source = std::fs::read_to_string(path).expect("read source");
-                let parent = path.parent().expect("a source file has a directory");
-                let stem = path.file_stem().expect("a source file has a name");
-                let dir = if stem == "mod" || stem == "lib" || stem == "main" {
-                    parent.to_path_buf()
-                } else {
-                    parent.join(stem)
+    ///
+    /// **Read out of the blanked source, and every candidate checked.** The split
+    /// was over the raw text, so a `//` line containing `#[cfg(test)] mod policy;`
+    /// derived a skip for `src/runner/policy.rs` and removed that file from every
+    /// census below — measured, with a `git push` planted in it that the census
+    /// then did not see. The doc comment on this very function used to do exactly
+    /// that for a `src/runner/tests.rs` that does not exist. Over the whole tree
+    /// the raw split derived 50 skip paths of which **34 named no file at all**,
+    /// and a skip path naming no file is a skip that has stopped meaning
+    /// anything, so [`production_sources`] asserts each declaration resolves.
+    fn whole_file_test_module_declarations(
+        files: &[PathBuf],
+    ) -> Vec<(PathBuf, String, [PathBuf; 2])> {
+        let mut found = Vec::new();
+        for path in files {
+            let blanked = crate::effects::blank_comments_and_strings(
+                &std::fs::read_to_string(path).expect("read source"),
+            );
+            let parent = path.parent().expect("a source file has a directory");
+            let stem = path.file_stem().expect("a source file has a name");
+            let dir = if stem == "mod" || stem == "lib" || stem == "main" {
+                parent.to_path_buf()
+            } else {
+                parent.join(stem)
+            };
+            for rest in blanked.split("#[cfg(test)]").skip(1) {
+                let Some(name) = rest.trim_start().strip_prefix("mod ") else {
+                    continue;
                 };
-                source
-                    .split("#[cfg(test)]")
-                    .skip(1)
-                    .filter_map(|rest| {
-                        let name = rest.trim_start().strip_prefix("mod ")?;
-                        let name = name.split(';').next()?.trim();
-                        (!name.is_empty() && !name.contains('{')).then(|| {
-                            [
-                                dir.join(format!("{name}.rs")),
-                                dir.join(name).join("mod.rs"),
-                            ]
-                        })
-                    })
-                    .flatten()
-                    .collect::<Vec<_>>()
-            })
-            .collect()
+                let Some(name) = name.split(';').next().map(str::trim) else {
+                    continue;
+                };
+                if name.is_empty() || name.contains('{') {
+                    continue;
+                }
+                found.push((
+                    path.clone(),
+                    name.to_owned(),
+                    [
+                        dir.join(format!("{name}.rs")),
+                        dir.join(name).join("mod.rs"),
+                    ],
+                ));
+            }
+        }
+        found
     }
 
-    /// Every `src/**/*.rs`, as `(repo-relative path, production region)`, with
+    /// Every `src/**/*.rs`, as `(repo-relative path, production code)`, with
     /// whole-file test modules left out.
+    ///
+    /// The region is [`crate::effects::production_code`]: the whole file with
+    /// comments and string literals blanked and every `#[cfg(test)]` item
+    /// removed. Every census below counts over it, and each of the three
+    /// properties is load-bearing:
+    ///
+    /// * **Blanked**, because a count over raw text counts prose.
+    ///   `src/agent/proc.rs` names `run_with_timeout` eight times, five in code
+    ///   and three in doc comments, and a real `run_with_timeout_unbounded`
+    ///   bypassing `OUTPUT_LIMIT_BYTES` could be paid for by deleting two
+    ///   sentences in the same file. Measured — it was.
+    /// * **The whole file**, because the previous region dropped everything
+    ///   between a `#[cfg(test)] mod tests;` declaration and the next line that
+    ///   is exactly `}`. Thirteen files declare their tests that way, and a
+    ///   `Command::new("git").arg("push")` appended after one was invisible
+    ///   while the identical lines above it failed the census.
+    /// * **Item-wise removal**, not truncation, for the same reason.
     fn production_sources() -> Vec<(String, String)> {
         fn walk(dir: &std::path::Path, into: &mut Vec<PathBuf>) {
             let mut entries: Vec<_> = std::fs::read_dir(dir)
@@ -1342,14 +1317,44 @@ mod tests {
         let mut files = Vec::new();
         walk(&root.join("src"), &mut files);
         assert!(files.len() > 20, "the walk found the tree: {}", files.len());
-        let test_modules = whole_file_test_modules(&files);
+        let declarations = whole_file_test_module_declarations(&files);
+        assert!(
+            declarations.len() >= 13,
+            "only {} `#[cfg(test)] mod …;` declarations were derived; the derivation is \
+             finding nothing",
+            declarations.len()
+        );
+        let mut test_modules = std::collections::BTreeSet::new();
+        for (declared_in, name, candidates) in &declarations {
+            let present: Vec<&PathBuf> = candidates
+                .iter()
+                .filter(|candidate| candidate.is_file())
+                .collect();
+            assert_eq!(
+                present.len(),
+                1,
+                "`{}` declares `#[cfg(test)] mod {name};` and {} of {candidates:?} exist. A \
+                 skip path naming no file is a skip that has stopped meaning anything",
+                declared_in.display(),
+                present.len()
+            );
+            test_modules.insert(present[0].clone());
+        }
         // The control: a derivation that found nothing would silently count
         // every test file as production, which is the failure this replaces.
         assert!(
             test_modules.contains(&root.join("src").join("engine").join("tests.rs")),
             "the `#[cfg(test)] mod tests;` derivation found no engine test module: {test_modules:?}"
         );
-        files
+        fn dense(text: &str) -> usize {
+            text.as_bytes()
+                .iter()
+                .filter(|byte| !byte.is_ascii_whitespace())
+                .count()
+        }
+
+        let mut raw_bytes = 0_usize;
+        let sources: Vec<(String, String)> = files
             .into_iter()
             .filter_map(|path| {
                 if test_modules.contains(&path) {
@@ -1361,9 +1366,32 @@ mod tests {
                     .to_string_lossy()
                     .replace('\\', "/");
                 let source = std::fs::read_to_string(&path).expect("read source");
-                Some((relative, production_region(&source)))
+                raw_bytes += dense(&source);
+                Some((relative, crate::effects::production_code(&source)))
             })
-            .collect()
+            .collect();
+        // The two controls every census below shares, both of
+        // `PR4-CENSUS-COMMENT-ORACLE`'s class.
+        //
+        // The regions are not empty: a count over nothing is zero, which reads
+        // as "nobody does this".
+        let region_bytes: usize = sources.iter().map(|(_, code)| dense(code)).sum();
+        assert!(
+            region_bytes > 750_000,
+            "the {} regions hold {region_bytes} non-whitespace bytes between them, so every \
+             count below is over almost nothing",
+            sources.len()
+        );
+        // And the blanking removed something. A blanking that silently stopped
+        // working would put every doc comment and string literal back into the
+        // counts, which is how a real ninth `run_with_timeout` entry point was
+        // paid for by deleting two sentences.
+        assert!(
+            region_bytes < raw_bytes,
+            "the sources hold {raw_bytes} non-whitespace bytes and the regions hold \
+             {region_bytes}; the blanking removed nothing, so the counts below are over prose"
+        );
+        sources
     }
 
     /// Every `RunnerRequest` production builds is built by the builder for its
@@ -1469,15 +1497,22 @@ mod tests {
                 "src/agent/proc.rs",
                 1,
                 2,
-                8,
+                5,
                 "the process funnel itself: two `command.spawn()` (Unix and \
-                 Windows), the `run_with_timeout*` entry points — the plain \
-                 one now *delegates* to the hooked one rather than calling \
-                 the private limit-taking entry beside it, which is the eighth \
-                 mention and the reason there is one bounded-capture value \
-                 rather than two — and one `/bin/ps` on macOS that asks the \
-                 kernel whether a process group has settled: a kernel query \
-                 inside the reaper, not a CLI or a gate",
+                 Windows), the `run_with_timeout*` entry points — five \
+                 mentions in CODE: `run_with_timeout` and its delegation to \
+                 `run_with_timeout_hooked`, `run_with_timeout_hooked` and its \
+                 delegation to `run_with_timeout_and_limit` (the plain entry \
+                 delegates rather than calling the private limit-taking one \
+                 beside it, so there is one bounded-capture value rather than \
+                 two), and that private entry's own declaration — and one \
+                 `/bin/ps` on macOS that asks the kernel whether a process \
+                 group has settled: a kernel query inside the reaper, not a \
+                 CLI or a gate. It was **eight** while this census counted \
+                 unblanked text: three of the eight are doc comments, and a \
+                 real `run_with_timeout_unbounded` bypassing \
+                 `OUTPUT_LIMIT_BYTES` could be paid for by deleting two \
+                 sentences in this file. Measured — it was",
             ),
             (
                 "src/runner/host.rs",
@@ -1531,22 +1566,6 @@ mod tests {
                  worktrees, snapshots, refs and Git objects behind these \
                  funnels; nothing here is a CLI, a gate, or a reviewer",
             ),
-            (
-                "src/effects.rs",
-                1,
-                0,
-                0,
-                "NOT a process start at all: the one `Command::new(` is inside \
-                 `DENIAL_FIXTURES`, a string constant whose whole purpose is to \
-                 be REFUSED. `effects::tests::every_declared_effect_denial_\
-                 refuses_for_the_reason_it_declares` compiles it against \
-                 `clippy.toml` and asserts it emits `clippy::disallowed_types` \
-                 naming `std::process::Command` — so this row is the denylist's \
-                 own evidence, and if it ever started compiling clean that test \
-                 fails first. This census counts literal occurrences and does \
-                 not strip string literals (`PR4-CENSUS-COMMENT-ORACLE`), which \
-                 is why the row exists rather than the count being zero",
-            ),
         ];
 
         fn count(haystack: &str, needle: &str) -> usize {
@@ -1576,16 +1595,25 @@ mod tests {
              (DESIGN.md:612): route it through the Runner, or say here why it \
              is one of the things that never crosses the boundary"
         );
-        // The table names six files, and it is the *set* that is the claim:
+        // The table names five files, and it is the *set* that is the claim:
         // adapters, gates, review and the engine appear nowhere in it, which
         // is what "every CLI and gate process executes through Runner" means
-        // once the migration has happened. Five of the six really do start a
-        // process; the sixth, `src/effects.rs`, is a fixture that exists to be
-        // refused, and its row says so. PR6's `src/runner/container.rs` is the
-        // newest, and its row says why a `docker` call is one of the things
-        // that never crosses the boundary rather than one that was forgotten.
-        assert_eq!(expected.len(), 6);
+        // once the migration has happened. All five really do start a process.
+        // PR6's `src/runner/container.rs` is the newest, and its row says why a
+        // `docker` call is one of the things that never crosses the boundary
+        // rather than one that was forgotten.
+        //
+        // It was six. The sixth was `src/effects.rs`, whose only
+        // `Command::new(` is inside `DENIAL_FIXTURES` — a string constant whose
+        // whole purpose is to be REFUSED, compiled against `clippy.toml` by
+        // `effects::tests::every_declared_effect_denial_refuses_for_the_reason_
+        // it_declares`. It was a row here only because this census counted
+        // string literals. It counts code now, so a fixture is not a process
+        // start and `src/effects.rs` is named below with the rest of the files
+        // that start none.
+        assert_eq!(expected.len(), 5);
         for name in [
+            "src/effects.rs",
             "src/gates.rs",
             "src/review.rs",
             "src/engine/attempt.rs",
@@ -1636,11 +1664,7 @@ mod tests {
             ),
         ] {
             let source = std::fs::read_to_string(root.join(file)).expect("read the event log");
-            let code: String = production_region(&source)
-                .lines()
-                .filter(|line| !line.trim_start().starts_with("//"))
-                .collect::<Vec<_>>()
-                .join("\n");
+            let code = crate::effects::production_code(&source);
             for token in [
                 "Command::new(",
                 ".spawn()",
@@ -1675,12 +1699,10 @@ mod tests {
         ] {
             let source = std::fs::read_to_string(root.join(adapter)).expect("read adapter");
             // Code, not prose: a doc comment may name the host runner to
-            // explain why something is the way it is, and several do.
-            let code: String = production_region(&source)
-                .lines()
-                .filter(|line| !line.trim_start().starts_with("//"))
-                .collect::<Vec<_>>()
-                .join("\n");
+            // explain why something is the way it is, and several do. The
+            // blanking is what removes them; a `//`-prefixed-line filter left a
+            // trailing `// … HostRunner …` on a code line in place.
+            let code = crate::effects::production_code(&source);
             assert_eq!(
                 count(&code, "HostRunner"),
                 0,
@@ -1750,12 +1772,10 @@ mod tests {
         ];
 
         let mut found: BTreeMap<String, (usize, usize, usize)> = BTreeMap::new();
-        for (relative, production) in production_sources() {
-            let code: String = production
-                .lines()
-                .filter(|line| !line.trim_start().starts_with("//"))
-                .collect::<Vec<_>>()
-                .join("\n");
+        for (relative, code) in production_sources() {
+            // `production_sources` already blanks comments and string literals,
+            // so a doc comment naming either symbol — and two of them do it to
+            // explain this very rule — contributes nothing.
             let counts = (
                 code.matches("proc::join_ambient_job(").count(),
                 code.matches("Contained::new()").count(),
@@ -1882,14 +1902,7 @@ mod tests {
         ];
 
         let mut found: BTreeMap<String, (usize, usize, usize)> = BTreeMap::new();
-        let mut stripped = 0_usize;
-        for (relative, production) in production_sources() {
-            let kept: Vec<&str> = production
-                .lines()
-                .filter(|line| !line.trim_start().starts_with("//"))
-                .collect();
-            stripped += production.lines().count() - kept.len();
-            let code: String = kept.join("\n");
+        for (relative, code) in production_sources() {
             let counts = (
                 code.matches(".stdin(").count(),
                 code.matches(".env(").count(),
@@ -1908,14 +1921,12 @@ mod tests {
                 found.insert(relative, counts);
             }
         }
-        // The comment strip is a census over a file format that has comments,
-        // which is `PR4-CENSUS-COMMENT-ORACLE`'s class. Assert it removed
-        // something: a strip that silently stopped working would put every doc
-        // comment mentioning `.env(` back into the counts.
-        assert!(
-            stripped > 100,
-            "the comment strip removed {stripped} lines, so it is not working"
-        );
+        // `PR4-CENSUS-COMMENT-ORACLE`'s class — a census over a file format that
+        // has comments. The control that the blanking removed something is in
+        // `production_sources`, which every census here shares, rather than
+        // repeated four times: it asserts the regions hold strictly fewer
+        // non-whitespace bytes than the sources they came from, and a floor
+        // beneath which the counts would be over nothing.
 
         let expected: BTreeMap<String, (usize, usize, usize)> = EXPECTED
             .iter()

@@ -469,6 +469,117 @@ pub fn production_region(source: &str) -> String {
     }
 }
 
+/// The production **code** of `source`: comments and string literals blanked,
+/// and every `#[cfg(test)]`-configured item removed.
+///
+/// [`production_region`] answers a different question and keeps its answer: it
+/// *truncates* at the first `#[cfg(test)]`, which is what a **domain** question
+/// wants (everything above the cut is certainly production) and what a
+/// **prohibition** question must not have. Three failures a prohibition census
+/// pays for with a truncating region, all three measured on this tree:
+///
+/// * A file that declares its tests as `#[cfg(test)] mod tests;` — thirteen of
+///   them here — puts every line **below** that declaration outside the region.
+///   The declaration is usually the last item, so the hole is normally empty;
+///   appending to the file fills it. Legal Rust, no comment trick, and it
+///   defeated the barrier census, the process-start census and the container
+///   token census at once.
+/// * A `#[cfg(test)]` inside a block comment or a string literal truncates a
+///   region that a `//`-only strip cannot see. `PR4-CENSUS-COMMENT-ORACLE`,
+///   in the shape a `//`-only strip does not close.
+/// * Counting over unblanked text counts prose. `src/agent/proc.rs` names
+///   `run_with_timeout` eight times, five in code and three in doc comments, so
+///   a real ninth entry point could be paid for by deleting two sentences.
+///
+/// So this returns the **whole file**, blanked, with each `#[cfg(test)]` item
+/// blanked out in place. Newlines survive, so a byte offset still maps to the
+/// line it came from.
+///
+/// The item's extent is found by delimiter matching over the blanked text — a
+/// brace body ends at its matching `}` (and takes a trailing `;` with it, for
+/// `use a::{b, c};`), anything else ends at the first `;` or `,` outside a
+/// nested delimiter, and a closing delimiter that would leave the enclosing
+/// block ends it too. Angle brackets are deliberately not matched: a
+/// `#[cfg(test)] field: BTreeMap<K, V>,` ends at the comma inside the generics
+/// and leaves `V>,` behind. That is the safe direction — a region that is too
+/// **large** can only make a census match more, never less.
+#[must_use]
+pub fn production_code(source: &str) -> String {
+    const ATTR: &[u8] = b"#[cfg(test)]";
+    let blanked = blank_comments_and_strings(source);
+    let bytes = blanked.as_bytes();
+    let mut out = bytes.to_vec();
+    let mut from = 0;
+    // Searched over bytes rather than `str::find`, because a cut offset is not
+    // guaranteed to be a char boundary and slicing one panics.
+    while let Some(at) = bytes
+        .get(from..)
+        .and_then(|rest| rest.windows(ATTR.len()).position(|at| at == ATTR))
+        .map(|found| from + found)
+    {
+        // Any further attributes stacked on the same item belong to it.
+        let mut start = at + ATTR.len();
+        loop {
+            while bytes.get(start).is_some_and(u8::is_ascii_whitespace) {
+                start += 1;
+            }
+            if bytes.get(start) == Some(&b'#') {
+                let open = if bytes.get(start + 1) == Some(&b'!') {
+                    start + 2
+                } else {
+                    start + 1
+                };
+                if bytes.get(open) == Some(&b'[') {
+                    if let Some(close) = matching(bytes, open, b'[', b']') {
+                        start = close + 1;
+                        continue;
+                    }
+                }
+            }
+            break;
+        }
+        let end = configured_item_end(bytes, start);
+        for byte in &mut out[at..end] {
+            if *byte != b'\n' {
+                *byte = b' ';
+            }
+        }
+        from = end.max(at + ATTR.len());
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+/// Where the item beginning at `start` ends, exclusive. See [`production_code`].
+fn configured_item_end(bytes: &[u8], start: usize) -> usize {
+    let mut depth = 0usize;
+    let mut index = start;
+    while index < bytes.len() {
+        match bytes[index] {
+            b'{' if depth == 0 => {
+                let Some(close) = matching(bytes, index, b'{', b'}') else {
+                    return bytes.len();
+                };
+                let mut after = close + 1;
+                while bytes.get(after).is_some_and(u8::is_ascii_whitespace) {
+                    after += 1;
+                }
+                return if bytes.get(after) == Some(&b';') {
+                    after + 1
+                } else {
+                    close + 1
+                };
+            }
+            b'(' | b'[' | b'{' => depth += 1,
+            b')' | b']' | b'}' if depth == 0 => return index,
+            b')' | b']' | b'}' => depth -= 1,
+            b';' | b',' if depth == 0 => return index + 1,
+            _ => {}
+        }
+        index += 1;
+    }
+    bytes.len()
+}
+
 /// Every `allow`/`expect` of a governed lint in `source`, with where it sits.
 ///
 /// Attributes are found in the blanked text and read out of the original, so a
@@ -733,6 +844,15 @@ pub const CLASSIFIED_MODULES: &[&str] = &[
     // sentence enumerates — and `every_effectful_wrapper_is_on_the_disallowed_list`
     // requires a `upstroke::` denial to be a row somebody classified.
     "src/runner/container.rs",
+    // The body of the Container funnel's R19 view, added by PR7's census
+    // repair. It carries `#![allow(clippy::disallowed_methods)]` over its
+    // production region and was the **only** non-test production module in the
+    // tree in that position and absent from this list. The consequence was not
+    // theoretical: with no row here, none of its `pub fn` needed classifying,
+    // so `every_effectful_wrapper_is_on_the_disallowed_list` could never force
+    // one onto the denylist — a module that may reach `fs` under its own allow,
+    // and whose reachable surface nobody had to account for.
+    "src/runner/container/view.rs",
     // legacy
     "src/engine/coordinator.rs",
     "src/engine/resume.rs",

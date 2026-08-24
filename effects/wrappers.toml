@@ -486,6 +486,46 @@ effect_free = [
 ]
 
 [[module]]
+# The body of `Container.MountGitView` / `Container.UnmountGitView` (R19), added
+# to the domain by PR7's census repair. It carries
+# `#![allow(clippy::disallowed_methods)]` over its production region and was the
+# only non-test production module in the tree in that position with no row here,
+# so nothing required its reachable surface to be classified at all -- and
+# `every_effectful_wrapper_is_on_the_disallowed_list` can only force a name onto
+# the denylist for a module that has a row.
+path = "src/runner/container/view.rs"
+crate_path = "upstroke::runner::container::view"
+funnel = []
+effectful = []
+# `RoleGitView`'s two `GitView` methods, and this class rather than `effectful`
+# for the reason the class exists: both reach an effect -- `materialize` creates
+# the view directory and writes every projected entry, `discard` removes the
+# whole of it -- and a trait-dispatched method has no clippy path of its own.
+# What denies them is the trait's own pair,
+# `upstroke::runner::container::GitView::{materialize,discard}`, classified
+# `effectful` by `src/runner/container.rs` above and on the disallowed list as
+# `Container.MountGitView` / `Container.UnmountGitView`. Recorded here so the
+# absence from clippy.toml under THIS module's path is a decision.
+effectful_unnameable = [
+    "discard",
+    "materialize",
+]
+# Two readers and three pure constructors/accessors. `resolve` reads
+# `<workspace>/.git` and `commondir`; `detached_head` reads `HEAD` and the loose
+# ref it may name. Both return values and write nothing, and a read is not an
+# effect on this denylist -- which governs creation, writing, removal, rename
+# and process start. The same answer `src/runner/container.rs` gives
+# `read_intent` and `list_intents`. `new`, `for_reader` and `reader_paths` touch
+# no path at all: they build and read back a `RoleGitView`'s reader projection.
+effect_free = [
+    "detached_head",
+    "for_reader",
+    "new",
+    "reader_paths",
+    "resolve",
+]
+
+[[module]]
 path = "src/engine/coordinator.rs"
 crate_path = ""
 funnel = []
