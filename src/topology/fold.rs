@@ -891,11 +891,6 @@ impl TopologyFold {
         self.run.as_ref().is_some_and(RunState::backoff_pending)
     }
 
-    /// Whether any question is open.
-    ///
-    /// The ids themselves are [`Self::open_questions`]; this is the predicate
-    /// `derived_outcome` decides `Parked` with, exposed so that the hard-block
-    /// branch and the derived outcome cannot disagree about what "open" means.
     /// The binding rung `rung` of `key` is frozen as.
     ///
     /// **The eleventh reader, and it is deliberately only half of the fold's
@@ -954,6 +949,11 @@ impl TopologyFold {
             .map(predicted_region)
     }
 
+    /// Whether any question is open.
+    ///
+    /// The ids themselves are [`Self::open_questions`]; this is the predicate
+    /// `derived_outcome` decides `Parked` with, exposed so that the hard-block
+    /// branch and the derived outcome cannot disagree about what "open" means.
     #[must_use]
     pub fn questions_open(&self) -> bool {
         self.run.as_ref().is_some_and(RunState::questions_open)
