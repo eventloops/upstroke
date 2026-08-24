@@ -143,6 +143,9 @@ a sound finding whose *fix* had a hole, caught only by a later independent pass.
 | PR5-R2-WORKTREE-LOCK-RETENTION | `PR5-RUNDIR-070`. The physical worktree lock is taken before the startup census and held for the whole run (`coordinator.rs:93` fresh, `resume.rs:108` on resume, both `let _worktree_lock = …` to end of scope). Dropping the guard immediately after the census is invisible: the two lease tests take a competing lease **first** and then check the run refuses, which exercises acquisition, not retention | PR6/PR7 implementer (the slice that can pause a run) | **Carried: the killing assertion needs a paused run and nothing in the suite pauses one.** "While run A is paused after census but before termination, a second write command for run B in the same physical worktree is refused; it succeeds only after run A releases its guard" needs a run held open across a second command — a coordinator seam PR5 does not own. `run_creation`'s "only then takes the physical worktree lock … holding it across the startup census and the whole run" is the live passage. Same shape as `PR4-R28-NEXT-COORDINATOR-UNWITNESSED`: a lifetime claim about a guard, unwitnessed because no fixture holds two coordinators |
 | PR5-R2-LEGACY-ENGINE-APPEND-FAILURE | `PR5-EVENTS-054` and `PR5-EVENTS-055`. `Run::emit` swallowing an `EventLog::append` error into `self.warnings` and returning `Ok(())`, and deleting the partial-report construction from `drain_and_report`'s error branch, both survive the whole suite — because no test ever makes a legacy append fail **inside a live `Run`**. Every append-failure fixture operates on an `EventLog` directly | PR7 implementer, or whichever lane plumbs an observer through `engine::Harness` | **Carried, and it is the behavioural half of `PR5-C-LEGACY-APPEND-ERROR-CENSUS` above.** The engine opens its own `EventLog` through `EventLog::open` and takes no observer, and its run directory is created with a generated run id, so neither an injected failure nor a prepared path (a `/dev/full` symlink, which is what made `PR5-EVENTS-044` measurable in the Event lane) can be aimed at it from outside. The live passage is `production_effect` — "the legacy engine's handling of a returned append error is unchanged: it reports and stops" — and the source census that stands in for it is already filed. Both become cheap the moment the coordinator takes an `EventHooks` |
 | PR5-R2-OBJECT-GROUP-TAKES-NO-SITE | `PR5-WORKSPACE-048`. All six Object-group APIs hard-code their `ObjectSite` internally — `candidate_stage`, `candidate_write_tree`, `snapshot_commit_tree`, `candidate_commit_tree`, `proposal_cherry_pick`, `repair_materialize` — while the Ref group takes `site: RefSite`. `manager` says every effect "goes through typed funnel APIs that take a typed site", so the asymmetry is real rather than an artefact of the measurement, and no compile fixture probes it | project owner | **Carried: widening six public signatures and every caller is a design change, not a repair-round edit.** Recorded as `NOT_PRESENT` by the re-measurement — there is no parameter to delete — but the absence is the finding. The tree already owns the mechanism that would prove it: `rundir.rs`'s `build_refusals()` compiles six fixtures against this crate's rlib and asserts rustc's own error **codes** (E0061, E0308, E0451/E0603/E0063, E0599, E0382) against a control that must compile. It has no Object-group case because there is nothing yet to refuse. If the owner reads `manager` as requiring the parameter, the repair is mechanical and the harness is waiting |
+| PR7-WRAPPERS-EMPTY-DOMAIN | `effects::externally_reachable_fns` consults the truncating `production_region`, so for `engine/{attempt,coordinator,resume}.rs` and three siblings cut at a `#[cfg(test)] use` the **classification domain is empty**. Production `pub`-declared functions in classified modules are unclassified — 40 externally-reachable names and 20 `pub` fns across the six modules, and a **working bypass was demonstrated**: a `pub(super) fn` below the cut, called from a live topology module, passes clippy and the whole suite | project owner — **for G2** | **Carried: the repair is shared enforcement machinery whose blast radius is every classified module**, which is the shape that made PR5 round 7 a revert. `mechanism` (3)'s guarantee that a topology module cannot reach an effect through a legacy wrapper **does not hold** today, and that is a live-passage failure, not hardening — it is recorded here rather than repaired because the change is to the classifier every other module's enforcement depends on, and PR7 already spent two rounds on this file. Recorded **with its measurement and its bypass** so the next slice inherits evidence rather than a rumour. This is the **fourth and fifth** occurrence of `PR5-R1-CFG-TEST-SHRINKS-THE-DOMAIN` (§4): PR7 repaired the two census instances by giving `production_code` a comment-and-string blanker, and this one is the same root cause in the function the blanker does not serve |
+| PR7-SCRATCH-FIXTURE-LEAK | `src/rundir.rs`'s `scratch` calls `remove_dir_all` at **creation**, keyed by `{tag}-{pid}` — §16 records it in full. PR7 is the slice that pays for it: the suite grew from 1385 tests to **1644**, and the leak scales with the suite | project owner / whichever slice owns shared test infrastructure | **Carried, unchanged in disposition from §16 and now with a second measurement.** The build box reached **19% of 58.5M inodes**; sweeping leaked fixture directories returned it to **12%** — on the order of **4.1 million inodes** that were leaked test fixtures, roughly a third of everything in use. `df -h` read 31% throughout. Held out of this slice for the reason §16 gives — the repair is a judgement call across 60+ call sites in shared test infrastructure, the PR5-round-7 shape — and mitigated out of tree by a sweeper with a 30-minute age floor so it cannot race a running suite. **PR7 raises the urgency rather than the difficulty**: parallel execution multiplies the fixture count per wall-clock hour |
+| PR7-P3A-CREATOR-RETAINS | A creator that errors at exactly P3a has no owner record, so `prove_private_half_ownership` mints no `PrivateHalfProof`; the creator therefore removes **neither** half, and the startup census retains and reports both. The packet's deletion boundary is satisfied, but an operator sees two retained directories where the failing step created one usable pair | PR7/PR12 implementer | **Accepted risk, and the alternative is worse.** ST-19 tables this shape as content-free by ordering — nothing has been written into either half at P3a — and `creator_error_at_p3a_retains_both_halves_and_reports_them` covers both windows, so the behaviour is asserted rather than incidental. Removing the retention needs a second constructor for `PrivateHalfProof`, and that type's **single-constructor property is compile-fail-tested**: the proof exists precisely so that no path can delete a private half without having proved it owns it. Trading a compile-time guarantee for a tidier failure directory is the wrong direction, and the retained pair is reported, not silent |
 
 ## 3. Challenges to settled entries
 
@@ -162,12 +165,13 @@ Classes seen more than once. Two occurrences is a signal about the method.
 |---|---|---|---|
 | **A surviving mutation named in a round's own prose and carried nowhere durable** | **2** | `PR4-CONF-009` (round 6 §349-352 named the `.cmd` suppression verbatim, did not repair it, and did not file it); `PR4-CONF-008` (round 6 named the `main.rs` wiring hole, filed it, and then deferred it for a process reason) | **A measurement taken and not triaged is worse than one never taken, because it is evidence you already hold that you chose not to act on.** Round 6 found both of round 8's repairable findings and shipped neither. One was named only in a report that lives outside the repository, so the next reviewer had to re-derive it from the source; the other was filed here but deferred on "it arrived after this round's scope was fixed", which is not a reason the contract recognises. **The rule adopted, and it is mechanical:** a repair round that names a surviving mutation in prose and does not repair it must append it to §2 *in the same commit*, with an owner and a live-passage test — and a deferral must quote the passage that makes it out of scope, never the round's own schedule. A finding whose only home is a report file has no home. The reports themselves are not in the repository; this table is |
 | **A boundary drawn narrower than the packet's sentence** | 2 | `PR3-ST14-006` (round 5's trace-ceiling skip); `PR3-ST07-014` (round 4's site-artifact scope) | **Distinct from a fix that introduces a defect, and it should not be counted as one.** In both cases the round documented the boundary, gave a reason, and made it observable — round 5's skip carries its rationale in a comment, counts the skipped states, and asserts `deferred_states > at_ceiling` so the skip cannot grow silently. The finding is still real where a live packet sentence says otherwise (`coverage_assertions` says *every* state), but the failure mode is "narrower than required", not "concealed". **A reviewer must distinguish the two, or every fix generates a finding forever** — each fix draws a boundary and a boundary can always be measured against some sentence |
-| **A fix that introduced a new defect** | **2** | `PR1-ORDER-001-ABA` (PR1); `PR3-ST07-011` and `-012` (PR3 round 3) | **The strongest argument for the independent final confirmation, and the reason round count is itself a risk.** PR1's was a fix *specification* with a hole. PR3's were fixes structurally right and wrong at the boundary: `semantics(Before)` returned empty rows, so the framework refused a packet-correct `[R9]` entry and accepted a false empty one — the exact inversion of its purpose. Guard adopted for round 4: for every change, state what the *new* code could get wrong and write the test that catches it |
+| **A fix that introduced a new defect** | **5** | `PR1-ORDER-001-ABA` (PR1); `PR3-ST07-011` and `-012` (PR3 round 3); **`PR7-BLANKER-DESYNC`**, **`PR7-HUSK-BRICKS-RESUME`** and **`PR7-RETRY-ATBASE-UNGUARDED`** (PR7 round 2, all three from round 1's repairs) | **The strongest argument for the independent final confirmation, and the reason round count is itself a risk.** PR1's was a fix *specification* with a hole. PR3's were fixes structurally right and wrong at the boundary: `semantics(Before)` returned empty rows, so the framework refused a packet-correct `[R9]` entry and accepted a false empty one — the exact inversion of its purpose. Guard adopted for round 4: for every change, state what the *new* code could get wrong and write the test that catches it. **PR7 tripled the class in one slice**, and its worst case landed in a census's own blanker, where a desync failed *open* and hid forged code from every instrument with a zero-byte region delta: when a repair's subject is an instrument, the question is not "does it still detect" but "how does it behave when its own parser loses sync" |
 | Tests satisfied by a correlated field rather than the named one | 11 (PR2) + 11 (PR3/A1) + **2 (PR4)** | PR2 registry tests; A1 fixtures; `PR4-CONF-004`'s role grid (`Implement`/`Review` hand-built with `agent: None` and a gate identity); `PR4-CONF-006`'s role grid again, one field over (`stdin: Vec::new()` on every request, plus the recorded shell and one timeout for all five roles) | Fixtures must vary every independently meaningful field independently; assert hostility as distinct-value **counts**, not prose. **PR4 adds the structural half of the guard**: where production has a builder per role, a fixture that writes its own request is the defect, so the builders are now the only construction points and a census says so. **`PR4-CONF-006` says that half is not enough.** Rounds 4 and 5 each swept the fields their author enumerated and the next confirmation found the one nobody listed — a builder fixes role, binding and identity, and leaves everything it is *handed* to the fixture. The guard adopted in round 6 is the one already required for transcription: derive the field list from the **type**, not from intuition, and report every field marked covered or not, because mutation witnessing cannot detect a dimension nobody varied for the same reason it cannot detect an omitted field |
 | **A guarantee proved for the variant that was looked at** | **4** | `PR4-CONF-002` (`Probe(_)` roles got `NoHooks`); `PR4-CONF-003` (the public facade entries never established containment); `PR4-CONF-005` (the production mint's failure branch unreachable); **`PR5-C-APPEND-SITE-GRID`** (two of three schema-4 append sites never driven) | **Distinct from the correlated-fixture class below, and it needs its own guard.** There the fixture had the right shape and the wrong *values*; here the fixture is right and the *domain* is short — one role, one entry point, one site — and the missing cells are the ones the author already believed were the same. Reading the code and concluding "the site is not consulted anywhere in this function" is exactly the reasoning that failed in `PR4-CONF-002`. **The guard is mechanical and is now used in three places:** derive the domain from the **type** (`EventSite::ALL`, `sub_effects()`, `modes()`, `TOPOLOGY_APPEND_SITES`), drive **every** member, and assert per member that the evidence came back **under that member's own name** — a coordinate recorded under the wrong site is the same defect wearing a passing test |
 | **The thing that was supposed to prove it never ran** | **2** | `PR4-CONTRACT-NAMED-PROOF-TEST-DELETED` (a contract-named proof test deleted; twelve gates and three CI platforms green because none read the contract); **`PR5-C-DOCTEST-FIXTURES-NEVER-RAN`** (three `compile_fail` fixtures for a contract-named build refusal, none of which any gate executes, because `--all-targets` excludes doctests) | **A green suite says nothing about a test that is not in it.** Both were found by asking *which command runs this?* rather than *does this pass?* — and in both the answer was "none", with every gate green. The rule adopted: **when a claim's only evidence is a fixture, name the command that executes it and check that the command is one CI runs.** For build refusals specifically, `compile_fail` doctests are documentation; the executable proof has to live in a run target, and it has to include a positive control, or a broken toolchain invocation makes every fixture "refuse" |
-| **A source census fooled by a comment** | **3** | `PR4-CENSUS-COMMENT-ORACLE` (`every_production_process_start_is_classified` counts literal occurrences, so a doc comment changes an expected number); round 5's second census on the same mechanism (`every_production_runner_request_is_built_by_its_roles_builder`); **`PR5D-CI-COMPONENT-CENSUS-COMMENT-ORACLE`** (a census for the substring `clippy` in a CI job, satisfied by the nine-line comment explaining why the `components: clippy` line exists — so deleting the line left it green) | **The class has now cost a real hole, not just a measurement hazard.** PR4's two are recorded as hardening because the expected count is independently derivable; PR5D's was a *defect*: the census's whole subject was "does the job install the compiler these fixtures need", and it answered yes to a comment. **The guard, from PR4-CONF-008's `run_wired` census and now used a third time:** strip comments before counting, **assert the strip removed something**, and where possible assert on structure (a line that starts with `components:` and contains `clippy`) rather than on a substring anywhere in the file. Any census over a file format that has comments — Rust, YAML, TOML — is in this class |
+| **A source census fooled by a comment** | **5** | `PR4-CENSUS-COMMENT-ORACLE` (`every_production_process_start_is_classified` counts literal occurrences, so a doc comment changes an expected number); round 5's second census on the same mechanism (`every_production_runner_request_is_built_by_its_roles_builder`); **`PR5D-CI-COMPONENT-CENSUS-COMMENT-ORACLE`** (a census for the substring `clippy` in a CI job, satisfied by the nine-line comment explaining why the `components: clippy` line exists — so deleting the line left it green); **`PR7-CENSUS-BLANK-COMMENTS`** and **`PR7-CENSUS-PROSE-COUNTED`** (a `strip_comments` that removed `//` only, and counting censuses that conflated code with prose) | **The class has now cost a real hole, not just a measurement hazard.** PR4's two are recorded as hardening because the expected count is independently derivable; PR5D's was a *defect*: the census's whole subject was "does the job install the compiler these fixtures need", and it answered yes to a comment. **The guard, from PR4-CONF-008's `run_wired` census and now used a third time:** strip comments before counting, **assert the strip removed something**, and where possible assert on structure (a line that starts with `components:` and contains `clippy`) rather than on a substring anywhere in the file. Any census over a file format that has comments — Rust, YAML, TOML — is in this class. **PR7 adds two, and they are the reason the class is now a shared helper rather than a habit**: a block comment *or a string literal* collapsed a whole production region (live in this crate at the reviewed SHA), and a counting census over unblanked text meant **deleting prose bought a real call**. `effects::production_code` is now the one implementation, and it blanks cfg-test *items* in place rather than truncating, because cutting the file at the first attribute is the same defect wearing a parser |
 | **An enforcement artifact no gate validates** | **2** | **`PR5-C-DOCTEST-FIXTURES-NEVER-RAN`** (three `compile_fail` fixtures no command executes); **`PR5D-UNRESOLVED-DENIAL-IS-A-WARNING`** (a `clippy.toml` denial whose path does not resolve enforces nothing, and clippy says so with a bare `warning:` that `-D warnings` does **not** escalate — measured; for a path whose crate is not linked, it says nothing at all) | **Sibling of "the thing that was supposed to prove it never ran", one level out: there the *test* did not run, here the *rule* does not bind, and both are green.** The rule adopted: **an artifact that enforces something must itself be checked by something that runs.** For a denylist that means proving every entry resolves — with a control that injects a typo, because a probe that silently lints nothing reports an empty set and passes |
+| **An element of a packet-named sequence with no implementation at all** | **2** | **`PR7-RECOVERY-STEP-G-MISSING`** (`recovery_order` names steps (a0)–(i); the implementation runs every one but (g), and the function step (g) would call has zero production callers); **`PR7-NO-TOPOLOGY-RUN`** (`engine` and `selection` both name the driver; no such type exists and every top-level entry point is reachable only from its own tests) | **Omission has nothing to mutate, and this class is what that costs at the level of a step rather than a field.** PR3 learned it for event fields — *"mutation witnessing cannot detect omission; transcription slices need a reconciliation table against the packet's named enumerations"* — and the lesson was applied to fields and never to sequences. All 117 named tests passed, every gate was green, and two per-lane review rounds read the lanes that existed. Both were found by asking **which command runs this?** rather than *does this pass?* — the same question that found `PR4-CONTRACT-NAMED-PROOF-TEST-DELETED` and `PR5-C-DOCTEST-FIXTURES-NEVER-RAN`, one level further out: there the test did not run and the rule did not bind; here the **step does not exist**. **The guard, and it is mechanical:** a slice whose contract names an ordered sequence carries a test that enumerates the sequence *from the packet's text* and asserts exactly one implementation per element — presence, not correctness. A step absent, or present twice, fails it, which would also have caught this slice's duplication findings |
 | A function used as its own expected-value oracle | 5 (PR3/A1) | `RunnerContract::kind`, `VerificationRecord::passed`, `GitPath::from` | Expected values come from the packet's text or an independent table, never from the function under test |
 | A grid bounded short of its required domain | 8 (PR3/A1) | upgrade totality `to<=6`, reader selection, `is_topology_schema` | State what bounds each grid and why that bound is sound |
 | Omitted packet-required fields | 7 (PR3/A1) | `RunStarted4.integration_ref`, `.execution_root` | **Mutation witnessing cannot detect omission.** Transcription slices need a reconciliation table against the packet's named enumerations |
@@ -926,3 +930,138 @@ is a guarantee beyond their contract, the trigger was an operator-caused disk ex
 cleared, and an unreviewed change to shared test infrastructure is how PR5's round 7 became a revert.
 It should be repaired before PR7, where parallel runs make a stranger container the normal case rather
 than the aftermath of a crash.
+
+## 17. PR7 — what two review rounds found, and the two things no review was positioned to find
+
+The `TopologyRun` slice ran four per-lane reviews on the implementation and three on the repairs
+themselves, every finding carrying a mutation the reviewer applied and measured. Round 1 produced
+**8 HIGH, 18 MEDIUM, 12 LOW, 6 census findings (3 CRITICAL) and 3 debt items**; round 2, whose
+subject was the five repair commits, produced **1 CRITICAL, 1 HIGH, 6 MEDIUM and 5 LOW**. Severity
+fell between rounds, which is the shape a converging slice has.
+
+This section records what generalises. Per-finding detail is in the slice's own reports.
+
+### The defects lived between the lanes, not inside them
+
+Nine lanes each built a correct component. What the reviews found was almost entirely **duplication
+across lane boundaries**: three implementations of the one append-error protocol, two publicly
+reachable `BarrierHeld` constructors, two censuses of the run directory where the reclaiming one had
+no production caller, and two modules implementing O24's retry rule that **disagreed** — `settle.rs`
+correctly closing a `RetainedIdle` generation, `attempt.rs` destroying its cumulative tree and
+recreating it at base.
+
+Every lane's own tests passed. They had to: each lane tested the implementation it wrote.
+
+> **A per-lane review cannot see a defect whose two halves are in two lanes.** Partitioning a review
+> by code path is still right — PR6 paid 3565 discarded lines to learn that partitioning by finding
+> id is not — but the partition has to be *covered by a pass that owns the seams*, or duplication is
+> structurally invisible: every reviewer reads a correct implementation of the rule, and no reviewer
+> reads both.
+
+The mechanical guard adopted: **for every clause of the packet, count the implementations.** Not
+"does this module implement it correctly" but "how many modules implement it at all". Two is a
+finding regardless of whether both are right, because two can drift and one cannot.
+
+### A fix that introduced a new defect — three times in one slice
+
+`PR7-BLANKER-DESYNC` (P0), `PR7-HUSK-BRICKS-RESUME` (P1) and `PR7-RETRY-ATBASE-UNGUARDED` (P1) were
+all introduced by round 1's repairs and caught by round 2. §4's class stood at 2 occurrences across
+PR1–PR3; this slice alone triples it, and it is the strongest evidence the project has that **a
+repair round is the most dangerous code in a slice**.
+
+The worst of the three deserves its own note, because of *where* it landed. Repairing a census that
+could be fooled by a comment meant writing a blanker, and the blanker recognised a char literal by a
+fixed two-byte lookahead. `'é'` closes at `i+3`. Scanning resumed **on** its closing quote, read it
+as an opening one, desynced, and the item-end matcher then overshot and **failed open by blanking to
+end of file** — hiding forged code from every census, with `fmt`, `clippy -D warnings` and the whole
+suite green, and a **zero-byte** region delta so no floor, per-file or aggregate, could see it.
+
+> **When a repair's subject is an instrument, the repair inherits the instrument's blast radius.**
+> The failure mode to look for is not "does it still detect" but "how does it behave when its own
+> parser loses sync" — and the answer must be *fail loud in the direction of the census*, never
+> return a larger region than it can account for. Both give-up paths now return `start`, not
+> `bytes.len()`.
+
+### Two tests of mine that asserted `!false`
+
+`PR7-POISON-TEST-VACUOUS` and `PR7-BUNDLE-TEST-PARTIAL` were both instruments **the orchestrator
+wrote**, and both passed while asserting nothing. The poison test's fixture was a dependency chain in
+which nothing was admissible even unpoisoned, so four of its five guards were satisfied by the
+fixture rather than by the poison: deleting them individually left the suite green. The bundle test
+drove five hook families and asserted three.
+
+This is the standing rule — *a green suite proves tests pass, not that they still detect* — firing on
+the work of the person holding the rule. The guard is the one already recorded: **kill each guard
+individually and require a distinct failure message for each**, which also proves each predicate was
+independently true before the mutation.
+
+### The two things no review was positioned to find
+
+Both were found by asking *which command runs this?* rather than *does this pass?* — §4's rule, and
+the second time on this project it has caught something a mutation catalogue structurally cannot.
+
+**Recovery step (g) is absent.** `decisions.sequential_substrate.recovery_order` lists step (g),
+"recreate `OpenNoAttempt` worktrees at their bases (through `Worktree.Verify` or forced recreate)".
+`run_recovery_order` implements a0, a, a1, census, (b), (c), (f)-as-refusal, (d), (e) and (h). There
+is no (g), and no comment marking its absence deliberate — unlike (b) and (f), which carry their
+rationale. `dispatch::resume_open_no_attempt` is written, documented and tested, with **zero
+production callers**. Two separate findings had already circled the symptom (an `OpenNoAttempt`
+generation that nothing advances, at the only width production creates) without either reviewer
+identifying that the packet has a step for exactly that case.
+
+**`TopologyRun` does not exist.** The same decision says "`src/engine/topology.rs` TopologyRun drives
+schema 4 at max_parallel = 1 synchronously" and "schema 4 always runs TopologyRun". `create_run`,
+`run_recovery_order`, `select`, `dispatch` and `close_at_run_end` are each reachable **only from
+their own tests**; nothing outside `select.rs` so much as matches on `Step`. The slice built every
+component of the run and never assembled the run.
+
+Neither is detectable by any technique this project currently runs. A mutation catalogue measures
+whether existing code is pinned; **omission has nothing to mutate.** A per-lane review reads the
+lanes that exist. The 117 named tests all pass — they are per-boundary tests, and a driver that
+sequences boundaries is not a boundary. Every gate is green.
+
+> **The census that was missing is the one over the packet's own enumerations.** PR3 learned this for
+> event fields — *"mutation witnessing cannot detect omission; transcription slices need a
+> reconciliation table against the packet's named enumerations"* — and the lesson was applied to
+> fields and never to **steps**. `recovery_order` names its steps (a0) through (i) in one sentence;
+> `loop` names its branches in one sentence. Both are enumerations. Neither had a test that read the
+> packet's list and asserted the implementation covers it.
+
+The guard adopted, and it is mechanical: **a slice whose contract names an ordered sequence must
+carry a test that enumerates the sequence from the packet's text and asserts one implementation per
+element.** Not per-element correctness — presence. A step that is absent, or present twice, fails it.
+
+### A process note: the reconciliation instrument needs its own control
+
+The orchestrator's named-test checklist reported 117 of 117 present. Re-derived from the packet, the
+eleven gated rows name **115 unique tests across 117 mentions**, of which **114 are present** — the
+one absent is annotated *"(with T-PREPARED)"*, a row PR7 does not gate. The figures agree in
+substance, and both intermediate instruments were wrong: the checklist file lost two names in
+extraction, and a later re-check reported three spurious absences because its character class was
+`[a-z0-9_]+` and the packet's names contain capitals that `clippy::non_snake_case` forbids in Rust.
+
+> **A reconciliation table is a census, and every rule this project has learned about censuses
+> applies to it.** Derive it from the source of truth each time rather than from a copy; give it a
+> positive control; and when it reports a discrepancy, confirm the discrepancy before acting on it.
+
+### The build slot pool poisons concurrent agents across worktrees
+
+A reviewer measured `upstroke-build` handing it a slot whose test binary had been compiled with
+`CARGO_MANIFEST_DIR` pointing at **a sibling reviewer's worktree**, while cargo reported *"Finished
+in 0.01s"*. Confirmed with `strings` on the binary. Earlier in the same slice the same mechanism
+produced 53 phantom failures at a green commit and **masked a real compile error**.
+
+Isolated worktrees are not sufficient: **they isolate the source, not the target.** `upstroke-build`'s
+premise — one target dir per concurrent build — holds only while the concurrent builds come from one
+source path. Until it is fixed, an agent building in a worktree must touch every source file before
+its first gate run and must not trust a sub-second "Finished". This entry is the record — the fix is
+to key the slot on the source path as well as the slot index, and it belongs to whoever next touches
+the build-box tooling.
+
+### A review that shares a tree is not four reviews
+
+Round 1's four reviewers mutation-tested the same checkout. One caught another's fault injection
+mid-flight and reported it as a defect. Both were transient and the tree was sound, but the exposure
+was real and the cost is silent: a reviewer measuring against a tree another reviewer is mutating
+cannot distinguish its own control from someone else's attack. Round 2 gave every reviewer its own
+worktree, which is now the rule.
