@@ -653,6 +653,33 @@ pub fn create_private_dir(
     )
 }
 
+/// The private skeleton directories, after the owner record.
+///
+/// `run_creation`: the owner record is published "before any other private
+/// content (`RunDir.StageOwnerRecord`, `RunDir.PublishOwnerRecord`), **then the
+/// private skeleton directories**" — which is why this is a separate call and
+/// not part of [`create_private_dir`]. [`RunPaths::create_hooked`] creates them
+/// *before* the record, which is the ordering O08 refuses and the reason the
+/// schema-4 creator does not use it.
+///
+/// Each directory goes through [`create_private_dir`], because each one **is** a
+/// private directory creation and `RunDir.CreatePrivateDir` is the site that
+/// owns that effect. The pre-move loop used the bare helper and so created five
+/// directories under no site at all.
+///
+/// # Errors
+///
+/// Whatever the funnel returns for the first directory that fails.
+pub fn create_private_skeleton(
+    private: &Path,
+    hooks: &mut dyn RunDirHooks,
+) -> Result<(), UpstrokeError> {
+    for name in PRIVATE_DIRS {
+        create_private_dir(&private.join(name), hooks)?;
+    }
+    Ok(())
+}
+
 /// P3a — `RunDir.StageOwnerRecord`.
 pub fn stage_owner_record(
     private: &Path,
@@ -1386,7 +1413,7 @@ mod ownership {
     use super::{
         COMMIT_RECORD, CreatingMarker, MARKER, MARKER_STAGED, OWNER_RECORD, OwnerField,
         OwnerRecord, Path, PathBuf, PrivateHalfOwnership, RepoKey, RetainReason, UnboundShape, fs,
-        read_dir_names, runner_policy_sha256,
+        io, read_dir_names, runner_policy_sha256,
     };
 
     /// Proof that one private half belongs to one public husk of this
@@ -1567,8 +1594,8 @@ mod ownership {
             }
         }
 
-        // Conjunct 12: and it never crossed P5b.
-        if fs::symlink_metadata(locator.join(COMMIT_RECORD)).is_ok() {
+        // Conjunct 12: and it never crossed P5b, fail-closed.
+        if !commit_record_proves_absence(&fs::symlink_metadata(locator.join(COMMIT_RECORD))) {
             return PrivateHalfOwnership::Retained(RetainReason::PossiblyCommitted);
         }
 
@@ -1577,6 +1604,36 @@ mod ownership {
             public: public.to_path_buf(),
             run_id: basename,
         })
+    }
+
+    /// Conjunct 12, fail-closed: whether a stat of `<target>/committed.json`
+    /// **proves** the private half never crossed P5b.
+    ///
+    /// Only [`io::ErrorKind::NotFound`] is proof of absence. Every other error
+    /// — `EACCES`, `EIO`, a Windows sharing violation — is an answer the
+    /// filesystem declined to give, and the packet's boundary is "the private
+    /// half is never deleted by cleanup once `committed.json` exists (creator
+    /// or census alike)": a record whose presence cannot be ruled out is on the
+    /// wrong side of it.
+    ///
+    /// The conjunct was `fs::symlink_metadata(…).is_ok()`, which took every one
+    /// of those errors as absence and fell through to `Proven` — minting the
+    /// one token [`super::remove_private_husk`] accepts for a private half that
+    /// may carry a commit record. [`super::commit_record_after_error`] already
+    /// answers the same question the other way (`Unknown`, and
+    /// `permits_deletion()` is false for it), so the two paths into the
+    /// deletion boundary disagreed, and this is the half that failed **open**.
+    ///
+    /// A free function rather than an inline `match` because the shape that
+    /// matters — which `io::ErrorKind`s are proof — is not deterministically
+    /// constructible from a single-threaded test through the real filesystem:
+    /// a directory made unreadable refuses conjunct 6's owner-record read
+    /// first, so reaching conjunct 12 with an unreadable stat needs a race.
+    /// Extracting the predicate makes the classification itself assertable,
+    /// and the two reachable shapes (present, absent) are asserted through the
+    /// whole proof.
+    pub(super) fn commit_record_proves_absence(stat: &io::Result<fs::Metadata>) -> bool {
+        matches!(stat, Err(error) if error.kind() == io::ErrorKind::NotFound)
     }
 
     /// A husk with no marker: `startup_census` (i) reclaims "a bare directory
@@ -4963,6 +5020,75 @@ mod tests {
             PrivateHalfOwnership::Retained(RetainReason::PossiblyCommitted) => {}
             other => panic!("a commit record must refuse the token: {other:?}"),
         }
+    }
+
+    /// Conjunct 12 is fail-closed: only `NotFound` proves the record absent.
+    ///
+    /// The conjunct was `fs::symlink_metadata(..).is_ok()`, so every stat error
+    /// that is *not* `NotFound` — `EACCES` on a directory that became
+    /// unreadable between the owner-record read and this stat, `EIO`, a Windows
+    /// sharing violation — read as "absent" and fell through to `Proven`,
+    /// minting the one token `remove_private_husk` accepts for a private half
+    /// whose `committed.json` could not be ruled out.
+    /// `commit_record_after_error` answers the same question the other way
+    /// (`Unknown`, which `permits_deletion()` refuses), so the two paths into
+    /// the one deletion boundary disagreed and this was the open one.
+    ///
+    /// The classification is asserted directly because it is not
+    /// deterministically reachable through the filesystem from one thread: a
+    /// private directory made unreadable refuses at conjunct 6's owner-record
+    /// read, long before this stat. The two shapes that *are* reachable —
+    /// present and absent — are asserted through the whole proof by
+    /// `a_committed_private_half_is_never_provable_however_bound_it_is` and by
+    /// the wiring half below.
+    #[test]
+    fn a_commit_record_stat_that_is_not_not_found_is_not_proof_of_absence() {
+        use std::io::{Error, ErrorKind};
+
+        let husk = BoundHusk::new("conjunct12");
+        husk.publish();
+
+        // (1) The classification, over every shape the stat can produce.
+        assert!(
+            ownership::commit_record_proves_absence(&Err(Error::from(ErrorKind::NotFound))),
+            "`NotFound` is the one answer that proves the record is not there"
+        );
+        for kind in [
+            ErrorKind::PermissionDenied,
+            ErrorKind::Other,
+            ErrorKind::InvalidInput,
+            ErrorKind::TimedOut,
+        ] {
+            assert!(
+                !ownership::commit_record_proves_absence(&Err(Error::from(kind))),
+                "`{kind:?}` is a stat the filesystem declined to answer, not an absence"
+            );
+        }
+        assert!(
+            !ownership::commit_record_proves_absence(&fs::symlink_metadata(&husk.private)),
+            "a successful stat is a record that is present"
+        );
+
+        // (2) The wiring: the predicate is what conjunct 12 consults, so the
+        // reachable shapes go through the real proof.
+        assert!(
+            matches!(husk.prove(), PrivateHalfOwnership::Proven(_)),
+            "an absent record (a real `NotFound`) still proves"
+        );
+        write(&husk.private.join(COMMIT_RECORD), b"{}");
+        assert!(
+            matches!(
+                husk.prove(),
+                PrivateHalfOwnership::Retained(RetainReason::PossiblyCommitted)
+            ),
+            "a present record retains"
+        );
+
+        // (3) And the two paths into the boundary now agree on the third shape.
+        assert!(
+            !CommitRecordPresence::Unknown("io".to_owned()).permits_deletion(),
+            "the creator's stat refuses an unanswerable filesystem"
+        );
     }
 
     #[test]

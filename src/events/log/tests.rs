@@ -3010,10 +3010,12 @@ fn the_stable_prefix_barrier_is_the_only_way_a_log_becomes_a_topology_fold() {
 
     assert!(scanned > 40, "the walk found only {scanned} source files");
     assert_eq!(
-        mentioning, 3,
-        "the control: `TopologyFold` is named in the production half of the fold, its census and \
-         this funnel. A different number means the regions this census scanned are not the ones \
-         it thinks they are, and its zero counts would prove nothing"
+        mentioning, 4,
+        "the control: `TopologyFold` is named in the production half of the fold, its census, \
+         this funnel, and the schema-4 creator — which holds one across P5b and P6 because \
+         `emit` puts `plan_transition` before the commit record and `apply_delta` after the \
+         append. A different number means the regions this census scanned are not the ones it \
+         thinks they are, and its zero counts would prove nothing"
     );
 
     assert_eq!(
