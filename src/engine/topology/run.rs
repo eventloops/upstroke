@@ -39,11 +39,15 @@ use crate::error::UpstrokeError;
 use crate::topology::events::TopologyEventBody;
 
 use crate::interaction::Sleeper;
+use crate::topology::events::GenerationId;
 use crate::topology::fold::{FrozenInputs, TopologyFold};
+use crate::topology::paths::{GitPath, PathSet};
+use crate::topology::registry::TaskKey;
+use crate::workspace_manager::WorkspaceManager;
 
-use super::dispatch::EventEmitter;
+use super::dispatch::{DispatchKind, DispatchRequest, Dispatched, EventEmitter, dispatch};
 use super::emit::{EmitState, RunIdentity, emit};
-use super::identity::{InvocationLedger, Reservations};
+use super::identity::{InvocationLedger, ReservationKind, Reservations};
 use super::recover::RunHandle;
 use super::seams::{TimeSource, TopologyHooks};
 use super::select::{Admitted, Ceiling, Spend, Step, checkpoint, select};
@@ -146,6 +150,20 @@ pub enum Disposition {
     /// **Not written yet.** Carried in the type so it cannot become the kind of
     /// omission this module exists because of.
     NotYetImplemented,
+    /// Partly written, with both halves named **in the branch's own words**.
+    ///
+    /// `loop` states each branch as a sequence of clauses, and a branch can be
+    /// honestly half-built: the ready-dispatch branch's first three clauses are
+    /// a reservation and a dispatch, its last is an entire attempt through the
+    /// Runner. Collapsing that into `Performed` would claim work nobody did,
+    /// and into `NotYetImplemented` would hide a production append that
+    /// genuinely happens. Neither is true, so the type says both.
+    PartlyImplemented {
+        /// The clauses this build performs.
+        performs: &'static str,
+        /// The clauses it refuses by name, having performed the ones above.
+        owes: &'static str,
+    },
 }
 
 impl LoopBranch {
@@ -195,7 +213,20 @@ impl LoopBranch {
             // a wait that *elapsed*, so appending it first would put a claim in
             // the log a kill during the sleep would make false.
             Self::DeferBackoff => Disposition::Performed,
-            Self::IngestAnswers | Self::ReadyRetry | Self::ReadyDispatch | Self::HardBlock => {
+            // The branch reads "ceiling check, provisional dispatch
+            // reservation, dispatch, run one attempt through the Runner and
+            // settle". The first three are here. The fourth is an attempt: a
+            // ladder rung, an adapter-built worker command, a spawn, a capture,
+            // gates, reviews and a settlement — and the state this build leaves
+            // instead is `OpenNoAttempt`, which is a **tabled** state, not a
+            // stuck one: recovery step (g) recreates its worktree at its base,
+            // and `close_at_run_end` closes it. Stopping here leaves the run in
+            // a shape the system already knows how to recover.
+            Self::ReadyDispatch => Disposition::PartlyImplemented {
+                performs: "ceiling check, provisional dispatch reservation, dispatch",
+                owes: "run one attempt through the Runner and settle",
+            },
+            Self::IngestAnswers | Self::ReadyRetry | Self::HardBlock => {
                 Disposition::NotYetImplemented
             }
         }
@@ -233,12 +264,21 @@ impl LoopBranch {
     /// Always [`UpstrokeError::Refused`]; the value exists so the message is
     /// written once.
     pub fn unimplemented(self) -> UpstrokeError {
-        UpstrokeError::Refused {
-            message: format!(
-                "the schema-4 run loop selected its `{}` branch, which this build does not \
-                 implement yet; no effect was performed and no event was appended",
-                self.label()
-            ),
+        match self.disposition() {
+            Disposition::PartlyImplemented { performs, owes } => UpstrokeError::Refused {
+                message: format!(
+                    "the schema-4 run loop's `{}` branch performed {performs}, and this build \
+                     does not {owes}",
+                    self.label()
+                ),
+            },
+            _ => UpstrokeError::Refused {
+                message: format!(
+                    "the schema-4 run loop selected its `{}` branch, which this build does not \
+                     implement yet; no effect was performed and no event was appended",
+                    self.label()
+                ),
+            },
         }
     }
 }
@@ -255,6 +295,9 @@ impl LoopBranch {
 /// deterministically by a test, which is the whole of what "with seams from the
 /// start" means here.
 pub struct RunSeams<'a> {
+    /// The execution root and its Git funnels. Every effect of the loop that is
+    /// not an append goes through it.
+    pub manager: &'a WorkspaceManager,
     /// Where a durable event's timestamp comes from.
     pub clock: &'a dyn TimeSource,
     /// What the defer backoff sleeps on.
@@ -346,6 +389,16 @@ impl TopologyRun {
         &self.warnings
     }
 
+    /// How many pipeline entitlements this run currently holds.
+    ///
+    /// Exposed so a test can assert the provisional ledger is balanced after a
+    /// branch that refused partway. At `max_parallel = 1` a single leaked
+    /// entitlement is a full pipeline, and nothing is ever selected again.
+    #[must_use]
+    pub fn entitlements_held(&self) -> u32 {
+        self.reservations.entitlements_held()
+    }
+
     /// Which wait the defer backoff is on.
     #[must_use]
     pub fn defer_round(&self) -> u32 {
@@ -401,9 +454,113 @@ impl TopologyRun {
                 Ok(Progress::Waited { waited_ms, round })
             }
             Admitted::Retry { .. } => Err(LoopBranch::ReadyRetry.unimplemented()),
-            Admitted::Dispatch { .. } => Err(LoopBranch::ReadyDispatch.unimplemented()),
+            Admitted::Dispatch { key, generation } => {
+                self.dispatch_ready(key, generation, seams, hooks)?;
+                Err(LoopBranch::ReadyDispatch.unimplemented())
+            }
             Admitted::HardBlock { .. } => Err(LoopBranch::HardBlock.unimplemented()),
         }
+    }
+
+    /// The first three clauses of the ready-dispatch branch: reserve, dispatch,
+    /// convert.
+    ///
+    /// **The reservation is provisional and it is converted at the append, not
+    /// after it.** `permits.pipeline` counts unresolved transactions in the
+    /// held count, and O24's "converted at `task_dispatched`" is what stops a
+    /// dispatch that appended from still occupying an entitlement. A conversion
+    /// placed after the worktree effects would hold the entitlement across two
+    /// Git commands for no reason, and one placed before the append would
+    /// release it for a dispatch that never happened.
+    ///
+    /// **And it is cancelled on every failure path**, which is
+    /// `refusals`' "cancellation on any pre-append failure". A leaked
+    /// reservation is not a hypothetical here: it is `PR7-O24-DOUBLE-VERIFICATION`,
+    /// where two verifications of one worktree could leave a generation neither
+    /// closed nor converted.
+    ///
+    /// # Errors
+    ///
+    /// Whatever [`dispatch`] refuses or fails at, with the reservation
+    /// cancelled first. Or [`UpstrokeError::Refused`] when the task is not one
+    /// the registry knows, which is a fold and a registry that disagree.
+    fn dispatch_ready(
+        &mut self,
+        key: TaskKey,
+        generation: GenerationId,
+        seams: &RunSeams<'_>,
+        hooks: &mut dyn TopologyHooks,
+    ) -> Result<Dispatched, UpstrokeError> {
+        let request = self.dispatch_request(key, generation)?;
+
+        // Provisional, before the effect it authorizes.
+        self.reservations.take(key, ReservationKind::Dispatch)?;
+
+        let dispatched = {
+            let mut emitter = RunEmitter {
+                identity: &self.identity,
+                state: EmitState {
+                    fold: &mut self.handle.fold,
+                    log: &mut self.handle.log,
+                    reservations: &mut self.reservations,
+                    invocations: &mut self.invocations,
+                    warnings: &mut self.warnings,
+                },
+                clock: seams.clock,
+            };
+            dispatch(seams.manager, hooks, &mut emitter, &request)
+        };
+
+        match dispatched {
+            Ok(dispatched) => {
+                self.reservations.convert(key, ReservationKind::Dispatch)?;
+                self.deferral.progressed();
+                Ok(dispatched)
+            }
+            Err(error) => {
+                // Cancel before returning, and do not let a cancellation
+                // failure hide the failure that caused it: the first error is
+                // the one an operator needs.
+                let _ = self.reservations.cancel(key, ReservationKind::Dispatch);
+                Err(error)
+            }
+        }
+    }
+
+    /// What a first ordinary dispatch of `key` asks for.
+    ///
+    /// Every field is read from the run's own record or the frozen registry,
+    /// never invented: the base is `run_started(4).base_sha`, and the predicted
+    /// region is the task's `path_hints`. **An empty hint list is `RepoWide`,
+    /// not an empty prefix set** — `PathSet::RepoWide` is documented as the
+    /// classification for an absent answer, and a task with no hints has given
+    /// one. An empty `Prefixes` would be a region that overlaps nothing, which
+    /// would let every task run against every other.
+    fn dispatch_request(
+        &self,
+        key: TaskKey,
+        generation: GenerationId,
+    ) -> Result<DispatchRequest, UpstrokeError> {
+        let entry = self
+            .handle
+            .fold
+            .registry()
+            .and_then(|registry| registry.entries().get(key.0 as usize))
+            .ok_or_else(|| UpstrokeError::Refused {
+                message: format!(
+                    "the fold selected task {} for dispatch and the frozen registry has no such \
+                     entry; the two disagree and nothing is dispatched",
+                    key.0
+                ),
+            })?;
+        Ok(DispatchRequest {
+            key,
+            generation,
+            base: self.handle.started.base_sha.clone(),
+            kind: DispatchKind::Ordinary {
+                paths: predicted_region(&entry.spec.path_hints),
+            },
+        })
     }
 
     /// Append one event through the run's own emitter.
@@ -430,6 +587,30 @@ impl TopologyRun {
             clock: seams.clock,
         };
         emitter.emit(body, hooks)
+    }
+}
+
+/// The predicted region a task's path hints imply.
+///
+/// **An empty hint list is `RepoWide`, not an empty prefix set**, and the
+/// difference is the whole reason this is a function rather than three lines at
+/// the call site. `PathSet::RepoWide` is documented as "the classification for
+/// an absent, unsafe, unparsable, or undecodable answer", and a task that gave
+/// no hints has given an absent one. An empty `Prefixes` is the opposite: a
+/// region that overlaps *nothing*, so `overlaps_another` is false against every
+/// other task and the predicted lease this dispatch takes protects nothing.
+///
+/// At `max_parallel = 1` that is invisible — one generation runs at a time and
+/// nothing can collide with it. It becomes a live defect at the first width
+/// above one, which is PR11, by which time the dispatch that wrote it is many
+/// slices old.
+fn predicted_region(hints: &[String]) -> PathSet {
+    if hints.is_empty() {
+        PathSet::RepoWide
+    } else {
+        PathSet::Prefixes {
+            paths: hints.iter().map(|hint| GitPath(hint.clone())).collect(),
+        }
     }
 }
 

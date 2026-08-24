@@ -223,7 +223,7 @@ impl Fixture {
         } else {
             container_runner()
         };
-        let started = run_started(&plan, &recorded_locator, runner);
+        let started = run_started(&plan, &recorded_locator, runner, &base_sha);
 
         // P1: the `.creating` marker the creator published and never removed,
         // because this run was interrupted between P5b's commit record and P8's
@@ -570,7 +570,17 @@ fn review_plan() -> ReviewPlan {
 /// this record and the probed agents — rather than written as a literal,
 /// because a literal would be a second authority on the same number and the
 /// fixture would drift from the fold the first time either changed.
-fn run_started(plan: &Plan, private_dir: &str, runner: RunnerPolicy) -> RunStarted4 {
+/// `base` is the repository's real seed commit rather than a literal, because
+/// the driver dispatches at it: a recorded base that names no object makes
+/// `git worktree add` fail for a reason that has nothing to do with what is
+/// being tested, and a fixture whose record disagrees with its own repository
+/// is not the shape any real run has.
+fn run_started(
+    plan: &Plan,
+    private_dir: &str,
+    runner: RunnerPolicy,
+    base: &CommitSha,
+) -> RunStarted4 {
     let unauthenticated = RunStarted4 {
         schema: TOPOLOGY_SCHEMA,
         upstroke_version: env!("CARGO_PKG_VERSION").to_owned(),
@@ -580,7 +590,7 @@ fn run_started(plan: &Plan, private_dir: &str, runner: RunnerPolicy) -> RunStart
         probed_agents: vec![AGENT.to_owned()],
         branch: "upstroke/run".to_owned(),
         integration_ref: GitRef(format!("refs/upstroke/runs/{RUN_ID}/integration")),
-        base_sha: CommitSha("a".repeat(40)),
+        base_sha: base.clone(),
         execution_root: "/does/not/matter".to_owned(),
         private_dir: private_dir.to_owned(),
         plan_path: "PLAN.md".to_owned(),
@@ -4348,34 +4358,65 @@ fn the_driver_takes_over_from_the_recovery_order_and_steps() {
     let mut run = TopologyRun::resumed(handle, fixture.inputs(), Ceiling::unlimited());
     let mut hooks = HarnessTopologyHooks::new(Arc::clone(&harness));
     let sleeper = RecordingSleeper::default();
+    let manager = fixture.manager();
     let seams = RunSeams {
+        manager: &manager,
         clock: &Frozen,
         sleeper: &sleeper,
     };
 
-    let durable_before = fixture.log_bytes().len();
+    let kinds_before = durable_kinds(&fixture);
     let refusal = run
         .step(&seams, &mut hooks)
-        .expect_err("this build implements neither of the branches a fresh plan reaches");
+        .expect_err("this build performs three of the branch's four clauses");
     let text = refusal.to_string();
 
     // Named exactly, not with an `||`. A hedge here would pass whichever
     // branch the fixture happened to reach, and a fixture that silently
     // started reaching a different one would take the assertion with it.
     assert!(
-        text.contains("ready dispatch"),
-        "a resumed plan with a task registered and nothing dispatched reaches \
-         the ready-dispatch branch, and the refusal names it: {text}"
+        text.contains("performed ceiling check, provisional dispatch reservation, dispatch"),
+        "the refusal names what the branch DID: {text}"
     );
+    assert!(
+        text.contains("does not run one attempt through the Runner and settle"),
+        "and what it did not, in the branch's own words: {text}"
+    );
+
+    // The dispatch is real and durable. This is the driver's first production
+    // append, and the state it leaves is `OpenNoAttempt` — which is TABLED,
+    // not stuck: recovery step (g) recreates its worktree at its base.
     assert_eq!(
-        fixture.log_bytes().len(),
-        durable_before,
-        "and appended nothing. `checkpoint`'s own two refusals cannot append \
-         — it is a pure function over a `Step` and holds no emitter — so what \
-         this measures is the *driver*: that nothing is appended between \
-         selecting and refusing. Measured: moving one append above the refusal \
-         in this arm fails here"
+        durable_kinds(&fixture),
+        {
+            let mut expected = kinds_before.clone();
+            expected.push("task_dispatched".to_owned());
+            expected
+        },
+        "exactly one event, and it is the dispatch"
     );
+
+    // And the provisional reservation did not leak. O24 converts it AT the
+    // append; a refusal after that must not leave an entitlement held, or the
+    // next selection at width 1 sees a full pipeline forever.
+    assert_eq!(
+        run.entitlements_held(),
+        0,
+        "the dispatch reservation was converted at `task_dispatched`, not left \
+         held across the refusal. A leaked entitlement here is
+         `PR7-INTEGRATION-NO-ENTITLEMENT`'s failure wearing a different hat: at \
+         the only width production creates, one held entitlement is a full \
+         pipeline and nothing is ever selected again"
+    );
+}
+
+/// The kinds in a fixture's durable log, in order.
+fn durable_kinds(fixture: &Fixture) -> Vec<String> {
+    TopologyFold::parse_log(&fixture.log_bytes())
+        .expect("the log parses")
+        .iter()
+        .map(|event| event.body.kind().to_owned())
+        .collect()
 }
 
 /// A sleeper that records rather than sleeps.

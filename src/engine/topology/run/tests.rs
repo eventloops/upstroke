@@ -63,16 +63,25 @@ fn every_branch_states_what_this_build_does_with_it() {
         .collect();
     assert_eq!(
         owed,
-        vec![
-            "ingest answers",
-            "ready_retry",
-            "ready dispatch",
-            "hard block",
-        ],
+        vec!["ingest answers", "ready_retry", "hard block"],
         "the branches this build has not written. Every one of them is carried \
          in the type so that no instrument here has to notice its absence. \
          `defer backoff` left this list when `TopologyRun::step` grew its arm, \
          which is the shape every entry here is expected to leave by"
+    );
+
+    // The half-built one, and both halves in the branch's own words. A branch
+    // that performs a durable append and reports `NotYetImplemented` would be
+    // claiming the log is untouched when it is not; one that reported
+    // `Performed` would be claiming an attempt ran.
+    assert_eq!(
+        LoopBranch::ReadyDispatch.disposition(),
+        Disposition::PartlyImplemented {
+            performs: "ceiling check, provisional dispatch reservation, dispatch",
+            owes: "run one attempt through the Runner and settle",
+        },
+        "`loop` states this branch as four clauses and this build performs \
+         three; the type says which three"
     );
 }
 
@@ -124,20 +133,75 @@ fn every_step_belongs_to_one_branch_or_to_none_for_a_reason() {
     }
 }
 
-/// A not-yet-implemented branch refuses by name, and says nothing happened.
+/// A refusal says which branch, and — this is the part that matters — whether
+/// anything happened.
 ///
-/// A refusal that did not name the branch would send an operator to read the
-/// loop and guess; one that did not say "no effect, no append" would leave them
-/// unable to tell a refusal from a partial run.
+/// **The two messages must not be interchangeable.** A branch that performed
+/// nothing says so, and an operator reading it knows the log is untouched. A
+/// branch that appended and then stopped says what it did, because an operator
+/// told "not implemented" after a durable `task_dispatched` would go looking
+/// for a run directory that does not match the message.
 #[test]
-fn an_unimplemented_branch_refuses_by_name_and_says_nothing_happened() {
-    let text = LoopBranch::ReadyDispatch.unimplemented().to_string();
+fn a_refusal_names_the_branch_and_says_whether_anything_happened() {
+    let untouched = LoopBranch::HardBlock.unimplemented().to_string();
     assert!(
-        text.contains("ready dispatch"),
-        "the refusal names the branch: {text}"
+        untouched.contains("hard block"),
+        "the refusal names the branch: {untouched}"
     );
     assert!(
-        text.contains("no effect was performed") && text.contains("no event was appended"),
-        "and says the run is untouched: {text}"
+        untouched.contains("no effect was performed")
+            && untouched.contains("no event was appended"),
+        "and says the run is untouched: {untouched}"
+    );
+
+    let partial = LoopBranch::ReadyDispatch.unimplemented().to_string();
+    assert!(
+        partial.contains("performed ceiling check, provisional dispatch reservation, dispatch"),
+        "a half-built branch says what it DID: {partial}"
+    );
+    assert!(
+        partial.contains("does not run one attempt through the Runner and settle"),
+        "and what it did not: {partial}"
+    );
+    assert!(
+        !partial.contains("no event was appended"),
+        "and never claims the log is untouched, because `task_dispatched` is \
+         durable by the time this is returned: {partial}"
+    );
+}
+
+/// A task with no path hints predicts the **repo-wide** region, not an empty
+/// one.
+///
+/// The two are opposites and only one of them is safe. `PathSet::RepoWide` is
+/// the packet's classification for an absent answer, and it serializes this
+/// task against every other. An empty `Prefixes` overlaps nothing, so the
+/// predicted lease protects nothing and every task is free to run against every
+/// other.
+///
+/// **This is untestable through a dispatch fixture**, which is why it is a
+/// function: every fixture plan in the tree gives its tasks hints, so the
+/// empty-hint branch is never reached and a mutation that removed it went green
+/// through the driver's own test. Measured — that is how this test came to
+/// exist.
+#[test]
+fn a_task_with_no_hints_predicts_the_repo_wide_region() {
+    assert_eq!(
+        predicted_region(&[]),
+        PathSet::RepoWide,
+        "an absent answer is repo-wide; an empty prefix set would overlap \
+         nothing and protect nothing"
+    );
+    assert!(
+        predicted_region(&[]).is_repo_wide(),
+        "and answers the predicate the lease table asks"
+    );
+    assert_eq!(
+        predicted_region(&["src/auth".to_owned(), "src/db".to_owned()]),
+        PathSet::Prefixes {
+            paths: vec![GitPath("src/auth".to_owned()), GitPath("src/db".to_owned())],
+        },
+        "and hints are carried through in order, not sorted or deduplicated \
+         here — the region is the plan's answer, not this function's opinion"
     );
 }
