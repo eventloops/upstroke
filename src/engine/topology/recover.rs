@@ -56,6 +56,65 @@
 //! prefix that leaves a promotion or an integration transaction unresolved is
 //! refused rather than completed.
 //!
+//! # Where the P7/P8 integration-ref repair sits, and why
+//!
+//! `transaction_fault_matrix[T-RUNSTART].resume_action` gives the resume one
+//! step this order would otherwise not have:
+//!
+//! > **P7/P8: create the ref zero-old at the recorded base if absent; if
+//! > present == base continue (no spend repeats)**
+//!
+//! [`ensure_recorded_integration_ref`] is that step. Its body is
+//! [`super::create::ensure_integration_ref`] — **P8's own body, called, not
+//! copied**: two implementations of "if present == base continue" would be two
+//! places for a run killed between P6 and P8 to be treated differently from one
+//! that was not, which is the duplication that function exists to prevent.
+//! What this module adds is the two arguments, and it takes them from the
+//! record `RootDerived` resolved and `RecordsVerified` authenticated —
+//! `run_started(4).integration_ref` and `run_started(4).base_sha` — never from
+//! today's configuration.
+//!
+//! Its position is between step (f)'s [`refuse_unimplemented_terminals`] and
+//! step (d)'s first append, and every bound on it is a separate clause:
+//!
+//! * **After (a1).** It is a durable effect on a repository ref. O18 puts the
+//!   stable-prefix barrier before the census's fold-derived reclaim, before any
+//!   promotion, cleanup, admission or report, and before any recovery event —
+//!   that is, before every durable thing a resume derives from the record. A
+//!   ref creation is such a thing, so it is not exempt.
+//! * **After (b).** [`refuse_if_finished`] refuses a Complete or Halted run,
+//!   and publishing a finished run's integration ref is continuing it.
+//! * **After (c).** The repository is touched only once the recorded Runner has
+//!   been rebuilt by inspection and its probes have answered, so a resume that
+//!   cannot run at all leaves the object store exactly as it found it.
+//! * **After (f).** This is the bound that is not merely tidy.
+//!   [`refuse_unimplemented_terminals`] refuses a proven prefix that leaves an
+//!   integration transaction unresolved, and an unresolved integration
+//!   transaction is precisely the state in which the integration ref may be
+//!   mid-move. The ref of such a run can still be *at* the recorded base — the
+//!   CAS has not run yet — and "present == base continue" would then silently
+//!   adopt a ref under a transaction this build cannot resolve. That case is
+//!   the one the step's own refusals do not catch, so the checkpoint refusal
+//!   runs first.
+//! * **Before (d).** The step can refuse: a ref at another SHA, a symbolic ref,
+//!   a ref checked out in a worktree. A refusal after `attempt_interrupted`,
+//!   `generation_closed` and `run_resumed` is a resume half-performed — the
+//!   epoch incremented and the generations closed for a command that then
+//!   failed — and the next resume would append the same set again before
+//!   refusing again. [`refuse_unimplemented_terminals`] gives the identical
+//!   reason for its own position: a refusal after two appends is not "before
+//!   any append".
+//!
+//! O15 is "run_started before integration ref", and on a resume it is satisfied
+//! by construction rather than by placement: `run_started(4)` is the committed
+//! first line (a0) read before this order began. Nothing here can put the ref
+//! first.
+//!
+//! It is **not** a recovery event. It appends nothing, so
+//! [`refuse_unimplemented_terminals`] does not gate it as an operation whose
+//! terminal is missing, and it needs no terminal of its own — the effect either
+//! happened or did not, and the next resume decides which by looking at the ref.
+//!
 //! # Nothing here is a production path
 //!
 //! `MAX_READABLE_SCHEMA` is 3 and `TOPOLOGY_ACTIVATION` is `Inactive`, so
@@ -80,11 +139,12 @@ use crate::runner::container::resolve::RunnerPreflight;
 use crate::runner::container::runtime::{ContainerRuntime, OwnerLiveness};
 use crate::topology::events::{
     AttemptInterrupted4, AttemptNumber, GenerationCloseReason, GenerationClosed, GenerationId,
-    IncarnationId, LeaseDisposition, RunResumed4, TopologyEventBody,
+    IncarnationId, LeaseDisposition, RunResumed4, RunStarted4, TopologyEventBody,
 };
 use crate::topology::fold::{FrozenInputs, GenerationClass, TopologyFold};
 use crate::topology::registry::TaskKey;
 
+use super::create::{IntegrationRefs, ensure_integration_ref};
 use super::emit::{EmitState, RunIdentity};
 use super::identity::{InvocationLedger, Reservations};
 use super::seams::{TimeSource, TopologyHooks};
@@ -1242,6 +1302,16 @@ pub struct ResumeSeams<'a> {
     pub liveness: &'a dyn OwnerLiveness,
     pub view: &'a dyn GitView,
     pub preflight: &'a dyn RunnerPreflight,
+    /// P8's ref funnel, for the P7/P8 repair — the same seam the creator is
+    /// given, and [`crate::workspace_manager::WorkspaceManager`] is the
+    /// production implementation of it.
+    ///
+    /// A seam and not a `WorkspaceManager` for the reason [`IntegrationRefs`]
+    /// itself is one: this file is a `TOPOLOGY_MODULE`, in which
+    /// `std::process::Command` is a build error, so a resume test that had to
+    /// stand up a real repository to reach the ref could not be written here at
+    /// all.
+    pub refs: &'a dyn IntegrationRefs,
     pub clock: &'a dyn TimeSource,
 }
 
@@ -1276,8 +1346,10 @@ pub struct Recovered {
 /// hold (a); a missing or disagreeing record (a); a failed sync, unstable
 /// reread or refused replay (a1); a census refusal (a); a Complete or Halted
 /// run (b); an inspection refusal (c, before any spawn); a probe refusal (c,
-/// before any recovery event); or an append error at (d)–(h), after which the
-/// fold is poisoned and the next resume repeats from (a0).
+/// before any recovery event); a recorded integration ref that is symbolic,
+/// checked out, or at a SHA other than the recorded base (the P7/P8 repair,
+/// also before any recovery event); or an append error at (d)–(h), after which
+/// the fold is poisoned and the next resume repeats from (a0).
 pub fn run_recovery_order(
     root: RootDerived,
     seams: &ResumeSeams<'_>,
@@ -1333,6 +1405,13 @@ pub fn run_recovery_order(
     // own numbered position: a refusal after two appends is not "before any
     // append".
     refuse_unimplemented_terminals(&certified)?;
+
+    // T-RUNSTART's P7/P8 repair, after (f) and before the first append. The
+    // module comment argues each bound; the one that is not merely tidy is (f),
+    // because a prefix with an unresolved integration transaction can have its
+    // ref still sitting at the recorded base, and "present == base continue"
+    // would adopt it under a transaction this build cannot resolve.
+    ensure_recorded_integration_ref(&certified, seams.refs, hooks)?;
 
     // The append-error protocol's two ledgers. The recovery order takes no
     // provisional reservation and registers no invocation of its own — (c)'s
@@ -1455,6 +1534,60 @@ pub fn refuse_unimplemented_terminals(certified: &PreflightCertified) -> Result<
         }
     }
     Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// T-RUNSTART's P7/P8 repair — a durable effect, and not an event
+// ---------------------------------------------------------------------------
+
+/// `transaction_fault_matrix[T-RUNSTART].resume_action`: "**P7/P8: create the
+/// ref zero-old at the recorded base if absent; if present == base continue (no
+/// spend repeats)**".
+///
+/// A run killed between P6 and P8 is committed — `run_started(4)` is durable and
+/// `committed.json` names its digest — but has no `integration_ref`. Nothing
+/// else in this build creates one, so without this step such a run resumes into
+/// a namespace its own record describes and the repository does not have.
+///
+/// **The body is P8's, called rather than copied.**
+/// [`super::create::ensure_integration_ref`] answers all three dispositions —
+/// absent, present at the base, present at anything else — and its doc states
+/// why there may be only one of it. This function contributes the two
+/// arguments and nothing else; if it ever grows a comparison of its own,
+/// that is the duplication the shared body exists to prevent.
+///
+/// **Both arguments come from the record.** `run_started(4).integration_ref` and
+/// `run_started(4).base_sha`, reached through the witness chain from the
+/// committed first line (a0) read and (a) authenticated against
+/// `committed.json.run_started_sha256`. Not from today's `[runner]` selection,
+/// not from a `Workspace`, and not from the fold's current view of the run: a
+/// resume that recomputed either would be able to publish a ref the run was
+/// never started against.
+///
+/// Takes `&PreflightCertified` for the same reason
+/// [`refuse_unimplemented_terminals`] does — it is what makes "after (c)"
+/// unstateable as anything else — and returns `()` rather than a witness because
+/// nothing downstream may depend on it having run: it is a repair of a prefix,
+/// not a link in the order.
+///
+/// # Errors
+///
+/// [`UpstrokeError::Refused`] when the recorded ref is symbolic, checked out in
+/// some worktree, or already at any SHA other than the recorded base; a Git
+/// error from the creation itself, including the zero-old failure when the ref
+/// appeared between the read and the write.
+pub fn ensure_recorded_integration_ref(
+    certified: &PreflightCertified,
+    refs: &dyn IntegrationRefs,
+    hooks: &mut dyn TopologyHooks,
+) -> Result<(), UpstrokeError> {
+    let started = started_of(certified);
+    ensure_integration_ref(
+        refs,
+        hooks.effects(),
+        started.integration_ref.as_str(),
+        started.base_sha.as_str(),
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -1693,6 +1826,23 @@ fn emit(
 /// The fold the barrier proved, from any point in the chain below it.
 fn fold_of(certified: &PreflightCertified) -> &TopologyFold {
     certified.rebuilt().censused().barrier().fold()
+}
+
+/// The committed `run_started(4)`, from the same point in the chain.
+///
+/// The record (a0) resolved and (a) authenticated against
+/// `committed.json.run_started_sha256` — reached through the witnesses rather
+/// than re-read, so the bytes a later step publishes a ref from are the bytes
+/// the commit record proved.
+fn started_of(certified: &PreflightCertified) -> &RunStarted4 {
+    certified
+        .rebuilt()
+        .censused()
+        .barrier()
+        .records()
+        .locks()
+        .root()
+        .started()
 }
 
 /// Every task key the registry holds.

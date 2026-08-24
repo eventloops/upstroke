@@ -44,7 +44,7 @@ use crate::runner::policy::runner_policy_sha256;
 use crate::runner::{CommandSpec, Runner, RunnerRequest};
 use crate::topology::effects::EventSite;
 use crate::topology::effects::{
-    EffectSiteId, HookHarness, HookPhase, Injection, InjectionMode, LockSite, RunDirSite,
+    EffectSiteId, HookHarness, HookPhase, Injection, InjectionMode, LockSite, RefSite, RunDirSite,
     SubEffectPoint,
 };
 use crate::topology::events::{
@@ -58,6 +58,8 @@ use crate::topology::paths::{GitPath, PathSet};
 use crate::topology::paths::{PathGrammar, PathPolicy, PathPolicyVersion};
 use crate::topology::registry::{TaskKey, TaskRegistry};
 use crate::topology::schema::TOPOLOGY_SCHEMA;
+
+use crate::workspace_manager::Refusal;
 
 use crate::engine::topology::identity::{InvocationLedger, ReservationKind, Reservations};
 use crate::engine::topology::preflight::RunPreflight;
@@ -401,6 +403,19 @@ fn tree_bytes(root: &Path) -> std::collections::BTreeMap<PathBuf, Vec<u8>> {
     out
 }
 
+/// Every `"event":"<kind>"` in a log, in order.
+fn event_kinds(log: &[u8]) -> Vec<String> {
+    String::from_utf8_lossy(log)
+        .lines()
+        .filter_map(|line| {
+            let at = line.find("\"event\":\"")? + "\"event\":\"".len();
+            let rest = line.get(at..)?;
+            let end = rest.find('"')?;
+            rest.get(..end).map(std::borrow::ToOwned::to_owned)
+        })
+        .collect()
+}
+
 fn canonical(path: &Path) -> String {
     std::fs::canonicalize(path)
         .unwrap_or_else(|_| path.to_path_buf())
@@ -689,6 +704,222 @@ impl RunnerPreflight for AlwaysCertifies {
     }
 }
 
+// ---------------------------------------------------------------------------
+// The integration ref namespace, with no Git behind it
+// ---------------------------------------------------------------------------
+
+/// What `assert_publishable` finds at the recorded ref.
+///
+/// The two refusing shapes are the two `WorkspaceManager::assert_publishable`
+/// has: `refuse_symbolic` first, then a walk of the worktree records. Both are
+/// reproduced with the production [`Refusal`] values rather than with invented
+/// messages, so an assertion on the sentence an operator reads is an assertion
+/// on the sentence the real funnel would have produced.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RefShape {
+    /// A direct ref nothing has checked out. Publishable.
+    Direct,
+    /// A symbolic ref. `INV-17` makes every engine ref direct.
+    Symbolic,
+    /// A direct ref some worktree has checked out.
+    CheckedOut,
+}
+
+/// [`IntegrationRefs`] with no repository behind it, which still enters the
+/// `Ref.CreateIntegration` funnel positions.
+///
+/// **It must enter them.** Every ordering claim in this file reads its evidence
+/// out of the shared [`HookHarness`], and a double that performed the effect
+/// without consulting `hooks.phase` would leave the one durable Git effect of
+/// the whole recovery order invisible to it — a site contributing nothing to
+/// the coverage evidence. `hooks` here is the bundle's own
+/// [`crate::workspace_manager::EffectHooks`], so the recording lands in the same
+/// harness the other four families record into and needs no second wiring.
+///
+/// It also snapshots the run's event log at each entry. The position claim this
+/// file has to make about the P7/P8 step is "the ref was created **before any
+/// recovery event was appended**", and the log's bytes at the instant of the
+/// effect are that claim directly, with no ordering index standing in for it.
+struct RecordingRefs {
+    /// Where this run's `events.jsonl` is, so an entry can snapshot it.
+    log: PathBuf,
+    shape: RefShape,
+    at: Mutex<Option<String>>,
+    created: Mutex<Vec<(String, String)>>,
+    /// How many times `direct_target` was asked. The control half of the
+    /// unpublishable-ref test: `assert_publishable` runs **first**, so a build
+    /// that dropped it would still refuse a symbolic ref — at
+    /// `direct_ref_target`'s own `refuse_symbolic` — and a test that asserted
+    /// only "it refused" would stay green through the loss.
+    targets_read: Mutex<usize>,
+    /// The log's bytes at each entry into `Ref.CreateIntegration`.
+    entered: Mutex<Vec<Vec<u8>>>,
+}
+
+impl RecordingRefs {
+    /// The general constructor, by log path — the kill child has no
+    /// [`Fixture`], only the repository the parent named it.
+    fn with_log(log: &Path, shape: RefShape, at: Option<String>) -> Self {
+        Self {
+            log: log.to_path_buf(),
+            shape,
+            at: Mutex::new(at),
+            created: Mutex::new(Vec::new()),
+            targets_read: Mutex::new(0),
+            entered: Mutex::new(Vec::new()),
+        }
+    }
+
+    /// Nothing is there — a run killed between P6 and P8.
+    fn absent(fixture: &Fixture) -> Self {
+        Self::with_log(&fixture.log(), RefShape::Direct, None)
+    }
+
+    /// A direct ref already at `sha`.
+    fn at(fixture: &Fixture, sha: &str) -> Self {
+        Self::with_log(&fixture.log(), RefShape::Direct, Some(sha.to_owned()))
+    }
+
+    /// Nothing is there, and `assert_publishable` answers `shape`.
+    fn shaped(fixture: &Fixture, shape: RefShape) -> Self {
+        Self::with_log(&fixture.log(), shape, None)
+    }
+
+    /// Every `(refname, sha)` the funnel actually created.
+    fn created(&self) -> Vec<(String, String)> {
+        self.created
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
+    }
+
+    /// The ref's current target.
+    fn target(&self) -> Option<String> {
+        self.at
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
+    }
+
+    /// How many times the ref's target was read.
+    fn targets_read(&self) -> usize {
+        *self
+            .targets_read
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// The log's bytes at each entry into the funnel.
+    fn log_bytes_at_entries(&self) -> Vec<Vec<u8>> {
+        self.entered
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
+    }
+
+    /// The event kinds the log held at each entry into the funnel.
+    ///
+    /// Beside [`Self::log_bytes_at_entries`] and asserted first, because the
+    /// byte comparison's failure output is two `run_started` lines rendered as
+    /// `Vec<u8>` and nobody can read which of them grew. The kinds say it in
+    /// one line, and the bytes still catch a difference the kinds cannot see.
+    fn log_kinds_at_entries(&self) -> Vec<Vec<String>> {
+        self.log_bytes_at_entries()
+            .iter()
+            .map(|bytes| event_kinds(bytes))
+            .collect()
+    }
+}
+
+impl IntegrationRefs for RecordingRefs {
+    fn assert_publishable(&self, refname: &str) -> Result<(), UpstrokeError> {
+        match self.shape {
+            RefShape::Direct => Ok(()),
+            RefShape::Symbolic => Err(Refusal::SymbolicRef {
+                refname: refname.to_owned(),
+                target: "refs/heads/somebody-elses-branch".to_owned(),
+            }
+            .into()),
+            RefShape::CheckedOut => Err(Refusal::CheckedOutRef {
+                refname: refname.to_owned(),
+                worktree: PathBuf::from("worktrees").join("alpha"),
+            }
+            .into()),
+        }
+    }
+
+    fn direct_target(&self, refname: &str) -> Result<Option<String>, UpstrokeError> {
+        *self
+            .targets_read
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) += 1;
+        // `WorkspaceManager::direct_ref_target` opens with `refuse_symbolic`
+        // too, and reproducing that is what makes the symbolic case's
+        // `targets_read` assertion load-bearing rather than decorative: without
+        // it, dropping `assert_publishable` would leave the symbolic arm still
+        // refusing here and nothing would notice which check caught it.
+        if self.shape == RefShape::Symbolic {
+            return Err(Refusal::SymbolicRef {
+                refname: refname.to_owned(),
+                target: "refs/heads/somebody-elses-branch".to_owned(),
+            }
+            .into());
+        }
+        Ok(self.target())
+    }
+
+    fn create_zero_old(
+        &self,
+        hooks: &mut dyn crate::workspace_manager::EffectHooks,
+        refname: &str,
+        new: &str,
+    ) -> Result<(), UpstrokeError> {
+        let site = EffectSiteId::Ref(RefSite::CreateIntegration);
+        self.entered
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .push(crate::util::read_file_bounded(&self.log).unwrap_or_default());
+        injected(
+            hooks.phase(site, HookPhase::Before),
+            site,
+            HookPhase::Before,
+        )?;
+        {
+            let mut at = self.at.lock().unwrap_or_else(PoisonError::into_inner);
+            if at.is_some() {
+                // What `git update-ref --no-deref <ref> <new> ""` answers when
+                // the ref appeared between the read and the write.
+                return Err(UpstrokeError::Git {
+                    message: format!("`{refname}` already exists; zero-old refuses"),
+                });
+            }
+            *at = Some(new.to_owned());
+        }
+        self.created
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .push((refname.to_owned(), new.to_owned()));
+        injected(hooks.phase(site, HookPhase::After), site, HookPhase::After)
+    }
+}
+
+/// `workspace_manager::apply`, which is private to that module — the same three
+/// answers, so an arming at this site does here what it does at every other Git
+/// funnel.
+fn injected(
+    injection: Injection,
+    site: EffectSiteId,
+    phase: HookPhase,
+) -> Result<(), UpstrokeError> {
+    match injection {
+        Injection::Proceed => Ok(()),
+        Injection::Kill => std::process::abort(),
+        Injection::Error => Err(UpstrokeError::Refused {
+            message: format!("the `{site}` funnel was made to fail at its `{phase}` phase"),
+        }),
+    }
+}
+
 fn container_selection() -> RunnerSelection {
     RunnerSelection {
         kind: RunnerKind::Container,
@@ -794,11 +1025,19 @@ struct Given<'a> {
     today: RunnerSelection,
     inputs: FrozenInputs,
     explicit_root: Option<PathBuf>,
+    /// The integration ref namespace the P7/P8 step publishes into.
+    ///
+    /// Owned rather than borrowed, so [`Given::healthy`] can build the
+    /// default — a resume killed between P6 and P8 finds **no** ref, which is
+    /// the shape every other test in this file already implied and none of them
+    /// could say. A test that needs another shape assigns the field.
+    refs: RecordingRefs,
 }
 
 impl<'a> Given<'a> {
     /// The healthy case: the runtime holds the record, the pre-flight
-    /// certifies, and today's config is the recorded one.
+    /// certifies, today's config is the recorded one, and the recorded
+    /// integration ref is not there yet.
     fn healthy(
         fixture: &Fixture,
         runtime: &'a FakeRuntime,
@@ -810,6 +1049,7 @@ impl<'a> Given<'a> {
             today: container_selection(),
             inputs: fixture.inputs(),
             explicit_root: None,
+            refs: RecordingRefs::absent(fixture),
         }
     }
 }
@@ -850,6 +1090,7 @@ fn resume_with(
                     liveness: &liveness,
                     view: &view,
                     preflight: given.preflight,
+                    refs: &given.refs,
                     clock: &Frozen,
                 },
                 hooks,
@@ -2936,6 +3177,427 @@ fn resume_preflight_probe_containers_reclaimed_after_refusal() {
 }
 
 // ===========================================================================
+// T-RUNSTART's P7/P8 repair
+// ===========================================================================
+
+/// The `Ref.CreateIntegration` funnel's `Before` count, which is what "the
+/// funnel was entered" means everywhere below.
+///
+/// Counted rather than tested for presence: "no spend repeats" is a claim about
+/// *how many times* the effect ran, and `touched` would be green for a build
+/// that created the ref, then created it again.
+fn create_ref_entries(harness: &Arc<Mutex<HookHarness>>) -> u32 {
+    harness
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .count(
+            EffectSiteId::Ref(RefSite::CreateIntegration),
+            HookPhase::Before,
+        )
+}
+
+/// `transaction_fault_matrix[T-RUNSTART].resume_action`, first clause:
+/// "**P7/P8: create the ref zero-old at the recorded base if absent**".
+///
+/// The fixture *is* the prefix a kill between P6 and P8 leaves —
+/// `run_started(4)` durable, `committed.json` naming its digest, the creator's
+/// `.creating` still on disk because P7 never ran — and the ref namespace is
+/// empty. A resume over it must leave the ref there.
+///
+/// # What this asserts that calling the function could not
+///
+/// This test used to live in `create::tests` and called
+/// [`super::super::create::ensure_integration_ref`] directly with two literals.
+/// That proved the *function* creates a ref, which was never in doubt. Driving
+/// [`run_recovery_order`] proves the three things that actually were:
+///
+/// 1. **that the recovery order calls it at all** — its only production caller
+///    used to be P8, so a run killed between P6 and P8 resumed with no ref and
+///    nothing to create one;
+/// 2. **with the recorded arguments** — asserted against
+///    `fixture.started.integration_ref` and `fixture.started.base_sha` rather
+///    than against constants, so a resume that published today's configured ref
+///    name, or the fold's current head, fails here;
+/// 3. **at a point before any recovery event** — the funnel snapshots the log
+///    on entry, and the bytes it saw are compared against the committed prefix.
+#[test]
+fn kill_after_run_started_creates_integration_ref() {
+    let fixture = Fixture::healthy("ref-p78-create");
+    let harness = harness();
+    let runtime = runtime_holding_the_record();
+    let certifies = AlwaysCertifies;
+    let given = Given::healthy(&fixture, &runtime, &certifies);
+
+    let committed = fixture.log_bytes();
+    assert_eq!(
+        given.refs.target(),
+        None,
+        "the fixture is the P6/P7 prefix: nothing created the ref"
+    );
+
+    let (result, _) = resume(&fixture, &harness, &given);
+    result.expect("a resume of a run killed before P8 completes");
+
+    assert_eq!(
+        given.refs.created(),
+        vec![(
+            fixture.started.integration_ref.as_str().to_owned(),
+            fixture.started.base_sha.as_str().to_owned(),
+        )],
+        "the ref is created once, at the name and base the record carries"
+    );
+    assert_eq!(
+        create_ref_entries(&harness),
+        1,
+        "and the funnel was entered exactly once"
+    );
+
+    // The position claim, read off the effect itself rather than off an index:
+    // when `Ref.CreateIntegration` ran, the log was still exactly the prefix
+    // the creator committed — no `attempt_interrupted`, no `generation_closed`,
+    // no `run_resumed`.
+    assert_eq!(
+        given.refs.log_kinds_at_entries(),
+        vec![vec!["run_started".to_owned()]],
+        "the ref was created after a recovery event had already been appended"
+    );
+    assert_eq!(
+        given.refs.log_bytes_at_entries(),
+        vec![committed.clone()],
+        "the log the funnel saw was not byte-identical to the committed prefix"
+    );
+    // And the appends did happen — otherwise the assertion above is green for a
+    // resume that never got as far as (d)–(h) at all.
+    let after = fixture.log_bytes();
+    assert!(
+        after.len() > committed.len()
+            && String::from_utf8_lossy(&after).contains("\"run_resumed\""),
+        "the resume did not reach (h), so `before any recovery event` proves nothing"
+    );
+}
+
+/// The second clause: "**if present == base continue (no spend repeats)**".
+///
+/// Two ways in, because they fail differently. A resume that *finds* the ref
+/// already at the recorded base is the ordinary case — some other process, or
+/// an earlier resume, got there first. A **second** resume of the same run is
+/// the idempotence case, and it is the one that would catch a step that
+/// remembered nothing and re-pointed the ref every time.
+///
+/// Both assert the funnel's entry count and not the command's exit status: an
+/// implementation that called `create_zero_old` again would get an `Err` back
+/// from Git ("already exists; zero-old refuses"), and a build that swallowed it
+/// would be green on `result.is_ok()` while having repeated the spend.
+#[test]
+fn a_resume_adopts_an_integration_ref_already_at_the_recorded_base() {
+    // (1) Already there when the resume arrives.
+    {
+        let fixture = Fixture::healthy("ref-p78-adopt");
+        let harness = harness();
+        let runtime = runtime_holding_the_record();
+        let certifies = AlwaysCertifies;
+        let mut given = Given::healthy(&fixture, &runtime, &certifies);
+        given.refs = RecordingRefs::at(&fixture, fixture.started.base_sha.as_str());
+
+        let (result, _) = resume(&fixture, &harness, &given);
+        result.expect("present == base continues");
+
+        assert_eq!(
+            create_ref_entries(&harness),
+            0,
+            "the funnel was entered for a ref that was already at the base"
+        );
+        assert!(
+            given.refs.created().is_empty(),
+            "and nothing was created: {:?}",
+            given.refs.created()
+        );
+        assert_eq!(
+            given.refs.target().as_deref(),
+            Some(fixture.started.base_sha.as_str()),
+            "the ref still names the recorded base"
+        );
+    }
+
+    // (2) Two resumes of one run: the second adopts what the first created.
+    {
+        let fixture = Fixture::healthy("ref-p78-twice");
+        let runtime = runtime_holding_the_record();
+        let certifies = AlwaysCertifies;
+        let given = Given::healthy(&fixture, &runtime, &certifies);
+
+        let first = harness();
+        let (result, _) = resume(&fixture, &first, &given);
+        let opened = result.expect("the first resume completes").resumed.epoch;
+        assert_eq!(create_ref_entries(&first), 1, "the first resume creates it");
+
+        let second = harness();
+        let (result, _) = resume(&fixture, &second, &given);
+        let reopened = result.expect("the second resume completes").resumed.epoch;
+
+        assert_eq!(
+            create_ref_entries(&second),
+            0,
+            "the second resume entered `Ref.CreateIntegration` again; `no spend repeats` is not \
+             held"
+        );
+        assert_eq!(
+            given.refs.created().len(),
+            1,
+            "the ref was created twice: {:?}",
+            given.refs.created()
+        );
+        assert!(
+            reopened > opened,
+            "the second resume did not open an epoch of its own ({opened} then {reopened}), so \
+             it never reached the step this test is about"
+        );
+    }
+}
+
+/// A ref at any other SHA refuses — and refuses **before anything the step
+/// would otherwise have done**.
+///
+/// `ensure_integration_ref`'s third disposition. "It refused" is the weak half
+/// of the claim; the load-bearing half is that the refusal costs nothing:
+/// `Ref.CreateIntegration` is never entered, the ref keeps the target it had,
+/// and the log is byte-identical to the prefix the resume started from. A ref
+/// that already names another commit belongs to something else, and a run is
+/// never made room for by moving it.
+#[test]
+fn a_resume_refuses_an_integration_ref_at_another_sha_before_touching_anything() {
+    let fixture = Fixture::healthy("ref-p78-elsewhere");
+    let harness = harness();
+    let runtime = runtime_holding_the_record();
+    let certifies = AlwaysCertifies;
+    let mut given = Given::healthy(&fixture, &runtime, &certifies);
+    let elsewhere = "b".repeat(40);
+    given.refs = RecordingRefs::at(&fixture, &elsewhere);
+
+    let committed = fixture.log_bytes();
+    let (result, _) = resume(&fixture, &harness, &given);
+
+    let text = message(&result.expect_err("a ref at another commit refuses"));
+    assert!(
+        text.contains(fixture.started.integration_ref.as_str())
+            && text.contains(&elsewhere)
+            && text.contains(fixture.started.base_sha.as_str()),
+        "the refusal names the ref, where it is, and where the record says it should be: {text}"
+    );
+    assert_eq!(
+        create_ref_entries(&harness),
+        0,
+        "the funnel was entered for a ref the step must have refused on sight"
+    );
+    assert!(given.refs.created().is_empty());
+    assert_eq!(
+        given.refs.target().as_deref(),
+        Some(elsewhere.as_str()),
+        "the ref was moved to make room for the run"
+    );
+    assert_eq!(
+        fixture.log_bytes(),
+        committed,
+        "a P7/P8 refusal precedes every recovery event"
+    );
+}
+
+/// A symbolic ref, and a checked-out one, refuse at `assert_publishable` —
+/// before the target is ever read.
+///
+/// Two shapes and not one: they are the two arms of
+/// `WorkspaceManager::assert_publishable`, and `refuse_symbolic` is also the
+/// first statement of `direct_ref_target`, so a symbolic ref has two chances to
+/// be caught and a build that lost the first would still pass a test that only
+/// asserted "it refused". The `direct_target` count is what separates them —
+/// neither shape may reach it.
+#[test]
+fn a_resume_refuses_a_symbolic_or_checked_out_integration_ref() {
+    for (tag, shape, expected) in [
+        ("symbolic", RefShape::Symbolic, "it is a symbolic ref"),
+        (
+            "checked-out",
+            RefShape::CheckedOut,
+            "it is checked out in the worktree",
+        ),
+    ] {
+        let fixture = Fixture::healthy(&format!("ref-p78-{tag}"));
+        let harness = harness();
+        let runtime = runtime_holding_the_record();
+        let certifies = AlwaysCertifies;
+        let mut given = Given::healthy(&fixture, &runtime, &certifies);
+        given.refs = RecordingRefs::shaped(&fixture, shape);
+
+        let committed = fixture.log_bytes();
+        let (result, _) = resume(&fixture, &harness, &given);
+
+        let text = message(&result.expect_err("an unpublishable ref refuses"));
+        assert!(
+            text.contains(expected),
+            "the refusal says which shape it found ({tag}): {text}"
+        );
+        assert!(
+            text.contains(fixture.started.integration_ref.as_str()),
+            "and names the recorded ref ({tag}): {text}"
+        );
+        assert_eq!(
+            create_ref_entries(&harness),
+            0,
+            "the funnel ran for an unpublishable ref ({tag})"
+        );
+        assert_eq!(
+            given.refs.target(),
+            None,
+            "and nothing was written to it ({tag})"
+        );
+        assert_eq!(
+            given.refs.targets_read(),
+            0,
+            "`assert_publishable` did not refuse first: the target was read for an \
+             unpublishable ref ({tag})"
+        );
+        assert_eq!(
+            fixture.log_bytes(),
+            committed,
+            "a P7/P8 refusal precedes every recovery event ({tag})"
+        );
+    }
+}
+
+/// The step's three lower bounds, each asserted by the refusal that must
+/// precede it: **(b)**, **(c)** and **(f)** all leave the ref untouched.
+///
+/// The bounds are stated in this module's own comment and this is what makes
+/// them checkable rather than asserted in prose:
+///
+/// * **(b)** a Complete or Halted run does not continue, and publishing a
+///   finished run's integration ref is continuing it;
+/// * **(c)** the repository is touched only once the recorded Runner has been
+///   rebuilt and its probes have answered, so a resume that cannot run leaves
+///   the object store as it found it;
+/// * **(f)** an unresolved promotion — and, by the same clause, an unresolved
+///   integration transaction — is a prefix whose integration ref may be
+///   mid-move, and "present == base continue" would adopt one under a
+///   transaction this build cannot resolve. This case is also the first
+///   coverage [`refuse_unimplemented_terminals`] has had.
+///
+/// The fourth bound, "**before (d)**", is not here: it is asserted positively by
+/// [`kill_after_run_started_creates_integration_ref`], which reads the log at
+/// the instant the funnel ran.
+#[test]
+fn the_p7_p8_step_runs_after_the_refusals_that_bound_it() {
+    // (b): a Halted run.
+    {
+        let fixture = Fixture::build(
+            "ref-p78-after-b",
+            Damage {
+                extra: vec![
+                    dispatched(),
+                    attempt_started(1),
+                    attempt_finished(
+                        1,
+                        AttemptSettlement::Closed {
+                            transition: SettlementTransition::Failed {
+                                halts_run: true,
+                                reason: "the ladder ran out".to_owned(),
+                            },
+                            lease: LeaseDisposition::PredictedReleased,
+                        },
+                    ),
+                    run_finished(RunOutcome::Halted, Some(ALPHA)),
+                ],
+                ..Damage::default()
+            },
+        );
+        let harness = harness();
+        let runtime = runtime_holding_the_record();
+        let certifies = AlwaysCertifies;
+        let given = Given::healthy(&fixture, &runtime, &certifies);
+
+        let text = message(
+            &resume(&fixture, &harness, &given)
+                .0
+                .expect_err("a finished run does not continue"),
+        );
+        assert!(text.contains("already finished"), "{text}");
+        assert_eq!(
+            create_ref_entries(&harness),
+            0,
+            "(b) refused and the ref was published anyway"
+        );
+        assert_eq!(given.refs.target(), None);
+    }
+
+    // (c): a shell probe that does not answer.
+    {
+        let fixture = Fixture::healthy("ref-p78-after-c");
+        let harness = harness();
+        let runtime = runtime_holding_the_record();
+        let runner = RecordingRunner::failing("bash");
+        let adapters = StubAdapters;
+        let preflight = real_preflight(&runner, &adapters, &fixture);
+        let given = Given::healthy(&fixture, &runtime, &preflight);
+
+        let text = message(
+            &resume(&fixture, &harness, &given)
+                .0
+                .expect_err("a failing probe refuses"),
+        );
+        assert!(text.contains("the recorded shell"), "{text}");
+        assert_eq!(
+            create_ref_entries(&harness),
+            0,
+            "(c) refused and the ref was published anyway"
+        );
+        assert_eq!(given.refs.target(), None);
+    }
+
+    // (f): a generation the log left in promotion.
+    {
+        let fixture = Fixture::build(
+            "ref-p78-after-f",
+            Damage {
+                extra: vec![
+                    dispatched(),
+                    attempt_started(1),
+                    // `Succeeded` is what puts the generation in `Promoting`,
+                    // and PR7 implements no promotion terminal, so step (f)
+                    // refuses the prefix rather than completing it.
+                    attempt_finished(
+                        1,
+                        AttemptSettlement::Closed {
+                            transition: SettlementTransition::Succeeded,
+                            lease: LeaseDisposition::PredictedRetained,
+                        },
+                    ),
+                ],
+                ..Damage::default()
+            },
+        );
+        let harness = harness();
+        let runtime = runtime_holding_the_record();
+        let certifies = AlwaysCertifies;
+        let given = Given::healthy(&fixture, &runtime, &certifies);
+
+        let text = message(
+            &resume(&fixture, &harness, &given)
+                .0
+                .expect_err("an unimplemented terminal refuses"),
+        );
+        assert!(
+            text.contains("generation in promotion"),
+            "the refusal names what it could not finish: {text}"
+        );
+        assert_eq!(
+            create_ref_entries(&harness),
+            0,
+            "(f) refused and the ref was published anyway"
+        );
+        assert_eq!(given.refs.target(), None);
+    }
+}
+
+// ===========================================================================
 // A kill during recovery
 // ===========================================================================
 
@@ -2973,6 +3635,15 @@ fn recovery_kill_child() {
     let certifies = AlwaysCertifies;
     let incarnation = IncarnationId(RESUMER.to_owned());
     let today = container_selection();
+    // The child's ref namespace is process-local and empty, which is what a run
+    // killed before P8 has. The P7/P8 step runs before the first append, so the
+    // child creates it here and then dies at `Event.Append`'s `Written` point —
+    // nothing of it survives, and the parent's assertions are about the disk.
+    let refs = RecordingRefs::with_log(
+        &rundir::public_dir(&repo_root, RUN_ID).join(rundir::EVENT_LOG),
+        RefShape::Direct,
+        None,
+    );
     let mut warnings = Vec::new();
 
     let root = RootDerived::derive_with(&repo_root, RUN_ID, None, TOPOLOGY_SCHEMA)
@@ -2993,6 +3664,7 @@ fn recovery_kill_child() {
             liveness: &liveness,
             view: &view,
             preflight: &certifies,
+            refs: &refs,
             clock: &Frozen,
         },
         &mut hooks,

@@ -1004,8 +1004,9 @@ impl Disposition {
                 stale_marker: false,
             } => "the run exists and is resumable; P7 already removed its `.creating`, so a \
                   resume has nothing there to repair. Its integration ref is what P8 did not \
-                  establish, and this build establishes one nowhere else: `ensure_integration_ref` \
-                  is P8's body and P8 is its only caller, so the ref stays as this refusal left it"
+                  establish, and the resume creates the integration ref zero-old at the recorded \
+                  base — the same `ensure_integration_ref` P8 calls, so a ref already sitting at \
+                  that base is adopted rather than created a second time"
                 .to_owned(),
             Self::RetainedPossiblyCommittedHusk { locator } => format!(
                 "the proven prefix has no committed first line, so this is a retained, possibly \
@@ -1776,12 +1777,14 @@ fn p8_create_integration_ref(
 /// that was killed between P6 and P8 to be treated differently from one that
 /// was not.
 ///
-/// **The recovery caller does not exist in this build.** P8 is this function's
-/// only caller in the crate, and [`super::recover`] names no integration ref at
-/// all; `create::tests::kill_after_run_started_creates_integration_ref` drives
-/// the recovery step by calling this directly. So the sentence above is a claim
-/// about the body a resume would use, not about a step a resume performs, and
-/// [`Disposition::Committed`]'s report says so rather than promising the action.
+/// **Both callers exist.** P8 is one; the other is
+/// [`super::recover::ensure_recorded_integration_ref`], which is the P7/P8
+/// recovery step and supplies `run_started(4).integration_ref` and
+/// `run_started(4).base_sha` from the authenticated record. So the sentence
+/// above is a claim about a step a resume performs, and
+/// [`Disposition::Committed`]'s report promises exactly that action —
+/// `create::tests::the_p8_report_promises_exactly_the_resume_action_the_resume_performs`
+/// keeps the two in correspondence in both directions.
 ///
 /// # Errors
 ///

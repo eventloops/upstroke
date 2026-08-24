@@ -2150,14 +2150,25 @@ fn foreign_integration_ref_refused() {
     assert!(refs.created().is_empty());
 }
 
-/// P7/P8 after a kill: "create the ref zero-old at the recorded base if
-/// absent; if present == base continue (**no spend repeats**)".
+/// The creator's half of the P7/P8 claim: a P7 failure leaves `run_started`
+/// durable, the marker still on disk, and **no** integration ref.
 ///
-/// The recovery step is the same function P8 calls, so a resume cannot
-/// diverge from a fresh run on the one question — whether the ref is
-/// created, adopted, or refused.
+/// This is the prefix, produced by the creator itself rather than assembled —
+/// and it is only half of
+/// `transaction_fault_matrix[T-RUNSTART].resume_action`'s "P7/P8: create the
+/// ref zero-old at the recorded base if absent; if present == base continue
+/// (**no spend repeats**)". The other half is what a *resume* does about it, and
+/// it is
+/// `recover::tests::kill_after_run_started_creates_integration_ref`, which
+/// drives [`super::super::recover::run_recovery_order`] over exactly this shape.
+///
+/// It used to be one test, and the second half of it called
+/// [`ensure_integration_ref`] directly — which proved that the *function*
+/// creates and adopts, and could not prove that any resume ever calls it, with
+/// what arguments, or at what point in the order. The resume-side test proves
+/// all three, so this one keeps the claim it can actually make.
 #[test]
-fn kill_after_run_started_creates_integration_ref() {
+fn p7_error_leaves_run_started_durable_with_no_integration_ref() {
     let fixture = Fixture::new("ref-recovery");
     let probes = RecordingProbes::new(&host_digest());
     let refs = FakeRefs::empty();
@@ -2173,57 +2184,81 @@ fn kill_after_run_started_creates_integration_ref() {
     let refused = driver.run(&mut hooks).expect_err("P7 was made to fail");
     assert_eq!(refused.reached, Prefix::P6);
     assert!(
+        matches!(
+            *refused.disposition,
+            Disposition::Committed { stale_marker: true }
+        ),
+        "P7 did not run, so its `.creating` is still there: {:?}",
+        refused.disposition
+    );
+    assert!(
+        fixture.public().join(MARKER).exists(),
+        "the marker P7 was removing is what a resume repairs at step (a1)"
+    );
+    assert!(
         refs.created().is_empty(),
         "no ref exists after a kill before P8"
     );
-
-    // The recovery step creates it, zero-old, at the recorded base.
-    ensure_integration_ref(&refs, hooks.effects(), INTEGRATION_REF, BASE_SHA)
-        .expect("P7/P8 recovery creates the ref");
     assert_eq!(
-        refs.created(),
-        vec![(INTEGRATION_REF.to_owned(), BASE_SHA.to_owned())]
-    );
-
-    // And repeating it is not a second spend.
-    ensure_integration_ref(&refs, hooks.effects(), INTEGRATION_REF, BASE_SHA)
-        .expect("present == base continues");
-    assert_eq!(
-        refs.created().len(),
-        1,
-        "the ref was created twice; `no spend repeats` is not held"
+        refs.at
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone(),
+        None,
+        "and nothing else put one there either"
     );
 }
 
-/// The `Committed { stale_marker: false }` sentence may not promise an action no
-/// module performs.
+/// The `Committed { stale_marker: false }` sentence promises exactly the resume
+/// action the resume performs — no more, and no less.
 ///
-/// This arm has now had two wrong sentences. The first promised a stale-marker
-/// repair for a marker P7 had already removed; its replacement promised that
-/// "the resume creates the integration ref zero-old at the recorded base", and
-/// no code does that either — [`ensure_integration_ref`] has exactly one caller
-/// in the crate, P8, in this module, and `src/engine/topology/recover.rs` names
-/// `integration_ref` nowhere at all.
+/// This arm has now had three sentences. The first promised a stale-marker
+/// repair for a marker P7 had already removed. The second promised that "the
+/// resume creates the integration ref zero-old at the recorded base" while no
+/// code did that. The third — this one — says the same words, and now
+/// [`super::super::recover::ensure_recorded_integration_ref`] is the step that
+/// performs them.
 ///
-/// So the check is not on the words alone. It reads the resume module's own
-/// **production code** — comments and string literals blanked, `#[cfg(test)]`
-/// items removed, so a mention in prose or in a test cannot satisfy it — and
-/// pairs "does the resume touch the integration ref" with "does the sentence say
-/// it does". Implementing the P7/P8 recovery step is what makes this test ask
-/// for the sentence back.
+/// So the check is not on the words alone, and it is not one-directional
+/// either. It reads the resume module's own **production code** — comments and
+/// string literals blanked, `#[cfg(test)]` items removed, so a mention in prose
+/// or in a test cannot satisfy it — and asserts the **biconditional**: the
+/// sentence promises the action if and only if the resume calls P8's body.
+/// Deleting the caller fails it in one direction; deleting the promise fails it
+/// in the other; and the pair can only be made green together, which is the
+/// property that was actually wanted both times it was got wrong.
 #[test]
-fn the_p8_report_does_not_promise_a_resume_action_no_module_performs() {
+fn the_p8_report_promises_exactly_the_resume_action_the_resume_performs() {
     let resume = crate::effects::production_code(include_str!("../recover.rs"));
     assert!(
         resume.contains("run_recovery_order"),
         "the production region of the resume module is empty, so this test \
          proves nothing"
     );
-    let performs_it = resume.contains("integration_ref");
+    // Read out of the recovery **driver's own body**, not out of the module.
+    // "The module defines a function that would create the ref" is exactly the
+    // state this tree was in when the sentence was wrong the second time: the
+    // step existed as a body and the order never called it. So the window is
+    // `run_recovery_order`'s, and it ends at the next item.
+    let from = resume
+        .find("pub fn run_recovery_order")
+        .expect("the recovery driver is in the production region");
+    let to = resume
+        .find("pub fn refuse_if_finished")
+        .expect("step (b)'s refusal follows the driver, and bounds its body");
     assert!(
-        !performs_it,
-        "the resume now names the integration ref: the P8 sentence may promise \
-         the action again, and this assertion is what says so"
+        from < to,
+        "the driver no longer precedes step (b)'s refusal"
+    );
+    let driver = &resume[from..to];
+    let performs_it = driver.contains("ensure_recorded_integration_ref");
+    // And the step, wherever it is called from, may not carry a second copy of
+    // "if present == base continue": it has to be P8's own body.
+    assert_eq!(
+        performs_it,
+        resume.contains("ensure_integration_ref"),
+        "the resume calls the P7/P8 step but not P8's shared body, or the other \
+         way round: {performs_it}"
     );
 
     let sentence = Disposition::Committed {
@@ -2235,10 +2270,11 @@ fn the_p8_report_does_not_promise_a_resume_action_no_module_performs() {
         "zero-old",
         "at the recorded base",
     ] {
-        assert!(
-            !sentence.contains(promise),
-            "the operator is promised `{promise}`, which nothing in this build \
-             performs: {sentence}"
+        assert_eq!(
+            sentence.contains(promise),
+            performs_it,
+            "the operator is promised `{promise}` and the resume calls P8's body \
+             is `{performs_it}`; the two must agree: {sentence}"
         );
     }
     assert!(
