@@ -44,11 +44,13 @@ estimate and report; nothing routes on it yet.
 The build order is `DESIGN.md` §21 and it is deliberate. Check where the
 project actually is before adding something out of sequence.
 
-**`DESIGN.md` is the only living authority.** `decisions/` are dated, immutable
-records of why; `proposals/` are inputs that bind nothing until a decision
-cites them. When a decision changes the spec, `DESIGN.md` gets the compressed
-edit and the record is cited. Read `decisions/README.md` and
-`proposals/README.md` before adding to either.
+**`DESIGN.md` is the only living authority for product design.**
+`CODING_STANDARDS.md` is normative for implementation quality, and
+`MAINTAINING.md` is authoritative for the change lifecycle. `decisions/` are
+dated, immutable records of why; `proposals/` are inputs that bind nothing
+until a decision cites them. When a decision changes the spec, `DESIGN.md`
+gets the compressed edit and the record is cited. Read `decisions/README.md`
+and `proposals/README.md` before adding to either.
 
 ## Gates
 
@@ -86,6 +88,8 @@ does and the difference never matters. One of the four, `test-release-record.sh`
 needs `jq`.
 
 ## Hard conventions
+
+Read and follow `CODING_STANDARDS.md` before changing Rust. In particular:
 
 - **Edition 2024**, MSRV 1.85.
 - **No panicking `.unwrap()` or `.expect()` outside tests.**
@@ -133,6 +137,7 @@ session has no standing to do it even when it runs on the owner's token.
 | Path | What |
 |---|---|
 | `DESIGN.md` | The design; §4 invariants, §21 build order |
+| `CODING_STANDARDS.md` | Normative Rust implementation and review standard |
 | `MAINTAINING.md` | Full merge lifecycle, trust boundary, release contract |
 | `CONTRIBUTING.md` | Contributor rules and CLA |
 | `decisions/` | Dated, immutable decision records |
