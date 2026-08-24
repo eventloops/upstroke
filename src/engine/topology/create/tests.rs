@@ -348,6 +348,29 @@ impl TestHooks {
             .unwrap_or_else(PoisonError::into_inner)
             .observed(site, phase)
     }
+
+    /// The sites of `of_interest` in the order their funnels **first** ran.
+    ///
+    /// [`Self::observed`] is a membership test: it answers the same for a
+    /// sequence and for every permutation of it, so an ordering claim asserted
+    /// with it is not asserted at all. `HookHarness::coverage` is
+    /// first-observation order, so filtering it preserves the order, records a
+    /// site that runs more than once at its first execution, and leaves a site
+    /// that never ran simply absent — which makes one `assert_eq!` cover
+    /// presence and order together.
+    fn first_execution_order(&self, of_interest: &[EffectSiteId]) -> Vec<EffectSiteId> {
+        let harness = self.harness.lock().unwrap_or_else(PoisonError::into_inner);
+        let mut order: Vec<EffectSiteId> = Vec::new();
+        for seen in harness.coverage() {
+            if seen.phase == HookPhase::Before
+                && of_interest.contains(&seen.site)
+                && !order.contains(&seen.site)
+            {
+                order.push(seen.site);
+            }
+        }
+        order
+    }
 }
 
 impl TopologyHooks for TestHooks {
@@ -882,35 +905,32 @@ fn the_publication_prefixes_run_in_the_packets_order() {
         "a run that started must not hand back a poisoned fold"
     );
 
-    // Every publication site of the sequence was driven through its funnel.
-    for site in [
-        RunDirSite::CreatePublicDir,
-        RunDirSite::StageMarker,
-        RunDirSite::PublishMarker,
-        RunDirSite::CreatePrivateDir,
-        RunDirSite::StageOwnerRecord,
-        RunDirSite::PublishOwnerRecord,
-        RunDirSite::WritePlan,
-        RunDirSite::StageCommitRecord,
-        RunDirSite::PublishCommitRecord,
-        RunDirSite::RemoveMarker,
-    ] {
-        assert!(
-            hooks.observed(EffectSiteId::RunDir(site), HookPhase::Before),
-            "`RunDir.{}` was never reached",
-            site.name()
-        );
-    }
-    assert!(
-        hooks.observed(EffectSiteId::Lock(LockSite::AcquireRun), HookPhase::Before),
-        "P2 did not go through the lock funnel"
-    );
-    assert!(
-        hooks.observed(
-            EffectSiteId::Event(EventSite::AppendFirst),
-            HookPhase::Before
-        ),
-        "P6 did not go through the append funnel"
+    // Every publication site of the sequence was driven through its funnel,
+    // **in `run_creation`'s order** — which is what this test is named for and
+    // what a membership test cannot say. `RunDir.CreatePrivateDir` runs six
+    // times (P3a, then once per private skeleton directory) and is recorded at
+    // its first; sites this order does not own are filtered out rather than
+    // listed, so `Lock.ProbeCleanupExclusive` staying inside P2's acquisition is
+    // P2's business and not this assertion's.
+    const PUBLICATION_ORDER: &[EffectSiteId] = &[
+        EffectSiteId::RunDir(RunDirSite::CreatePublicDir),
+        EffectSiteId::RunDir(RunDirSite::StageMarker),
+        EffectSiteId::RunDir(RunDirSite::PublishMarker),
+        EffectSiteId::Lock(LockSite::AcquireRun),
+        EffectSiteId::RunDir(RunDirSite::CreatePrivateDir),
+        EffectSiteId::RunDir(RunDirSite::StageOwnerRecord),
+        EffectSiteId::RunDir(RunDirSite::PublishOwnerRecord),
+        EffectSiteId::RunDir(RunDirSite::WritePlan),
+        EffectSiteId::Event(EventSite::OpenLog),
+        EffectSiteId::RunDir(RunDirSite::StageCommitRecord),
+        EffectSiteId::RunDir(RunDirSite::PublishCommitRecord),
+        EffectSiteId::Event(EventSite::AppendFirst),
+        EffectSiteId::RunDir(RunDirSite::RemoveMarker),
+    ];
+    assert_eq!(
+        hooks.first_execution_order(PUBLICATION_ORDER),
+        PUBLICATION_ORDER,
+        "the publication sites did not execute in `run_creation`'s order"
     );
 
     // And the run comes apart into the four things the loop drives.
@@ -1010,11 +1030,33 @@ fn run_started_records_runner_policy_resolved_before_worktree_lock() {
 /// half of this test is that assertion.
 #[test]
 fn creator_error_at_p3a_retains_both_halves_and_reports_them() {
-    for (tag, site, residue) in [
-        ("p3a-empty", RunDirSite::StageOwnerRecord, Vec::new()),
+    for (tag, site, phase, reached, residue) in [
+        // The staging file never landed: an empty private half, and P3a.
+        (
+            "p3a-empty",
+            RunDirSite::StageOwnerRecord,
+            HookPhase::Before,
+            Prefix::P3a,
+            Vec::new(),
+        ),
+        // The **same site**, failing after its primitive — which is what a
+        // failing fsync inside `stage_json` leaves, because it creates the
+        // `.tmp` and writes it before it syncs. The residue is `owner.json.tmp`,
+        // so the prefix the operator is given has to be P3a (staged): a private
+        // half holding a staging file is retained and is **not** content-free,
+        // and the two are separate names for exactly that reason.
+        (
+            "p3a-stage-after",
+            RunDirSite::StageOwnerRecord,
+            HookPhase::After,
+            Prefix::P3aStaged,
+            vec![OWNER_RECORD_STAGED.to_owned()],
+        ),
         (
             "p3a-staged",
             RunDirSite::PublishOwnerRecord,
+            HookPhase::Before,
+            Prefix::P3aStaged,
             vec![OWNER_RECORD_STAGED.to_owned()],
         ),
     ] {
@@ -1022,16 +1064,18 @@ fn creator_error_at_p3a_retains_both_halves_and_reports_them() {
         let probes = RecordingProbes::new(&host_digest());
         let refs = FakeRefs::empty();
         let mut hooks = TestHooks::new();
-        hooks.faults().arm_phase(
-            EffectSiteId::RunDir(site),
-            HookPhase::Before,
-            Injection::Error,
-        );
+        hooks
+            .faults()
+            .arm_phase(EffectSiteId::RunDir(site), phase, Injection::Error);
         let mut driver = Driver::new(&fixture, &probes, &refs);
         let refused = driver
             .run(&mut hooks)
             .expect_err("{tag}: the step was made to fail");
 
+        assert_eq!(
+            refused.reached, reached,
+            "{tag}: the prefix reported is not the one the residue is"
+        );
         assert!(
             !refused.disposition.removed_anything(),
             "{tag}: {:?}",
@@ -1278,6 +1322,12 @@ fn commit_record_rename_error_with_record_present_treated_as_published_removes_n
         ),
         "the private-half removal funnel was entered past the deletion boundary"
     );
+    assert!(
+        hooks.observed(EffectSiteId::Lock(LockSite::Release), HookPhase::Before),
+        "the run lock was not released through `Lock.Release` on the possibly \
+         committed answer — the answer whose whole point is a husk the next \
+         census reports rather than skips"
+    );
 }
 
 /// The same crossing, reported: a retained, possibly committed husk that the
@@ -1324,6 +1374,445 @@ fn creator_error_after_commit_record_present_removes_nothing_and_reports_possibl
         "the census disagrees with the creator: {:?}",
         husk.disposition
     );
+}
+
+/// **The public half goes only if the private one went.**
+///
+/// `remove_public_husk` deletes `<public>` **including `.creating`**, and that
+/// marker is the private half's only locator: the only production `read_dir`
+/// over a runs root is `rundir::run_dir_names` over `<repo>/.upstroke/runs`, and
+/// nothing enumerates `<R>/runs`. So a `RunDir.RemovePrivateHusk` that returns
+/// an error must not be followed by the public removal — the private half would
+/// survive at `<R>/runs/<run_id>` with no husk naming it, and no census, no
+/// `status` and no `upstroke runs prune` could ever reach it again. It is the
+/// one shape in this module that no later pass can repair.
+///
+/// Both error windows, because `remove_dir_all`'s error does not say which one
+/// it is: `Before` is the removal that never ran and `After` is the removal that
+/// ran and then returned `Err`. What each leaves is different and **both
+/// converge** — the pair is still provable when the private half survived, and
+/// the marker's target is absent when it did not — which is the argument for
+/// short-circuiting rather than for guessing.
+#[test]
+fn a_failed_private_half_removal_keeps_the_public_half_that_names_it() {
+    for (tag, phase, private_survives, census) in [
+        ("rm-private-before", HookPhase::Before, true, "both-halves"),
+        (
+            "rm-private-after",
+            HookPhase::After,
+            false,
+            "public-only:target-absent",
+        ),
+    ] {
+        let fixture = Fixture::new(tag);
+        let probes = RecordingProbes::new(&host_digest());
+        let refs = FakeRefs::empty();
+        let mut hooks = TestHooks::new();
+        // P5: past the owner record, so the proof holds and the creator is
+        // entitled to remove both halves, and before the deletion boundary, so
+        // it is required to.
+        hooks
+            .faults()
+            .arm_phase(
+                EffectSiteId::RunDir(RunDirSite::WritePlan),
+                HookPhase::Before,
+                Injection::Error,
+            )
+            .arm_phase(
+                EffectSiteId::RunDir(RunDirSite::RemovePrivateHusk),
+                phase,
+                Injection::Error,
+            );
+        let mut driver = Driver::new(&fixture, &probes, &refs);
+        let refused = driver.run(&mut hooks).expect_err("P5 was made to fail");
+        assert_eq!(refused.reached, Prefix::P4, "{tag}");
+
+        assert!(
+            hooks.observed(
+                EffectSiteId::RunDir(RunDirSite::RemovePrivateHusk),
+                HookPhase::Before
+            ),
+            "{tag}: the proof-token funnel was never entered, so the arming \
+             tested nothing"
+        );
+        assert!(
+            !hooks.observed(
+                EffectSiteId::RunDir(RunDirSite::RemovePublicHusk),
+                HookPhase::Before
+            ),
+            "{tag}: the public half was removed after the private removal \
+             failed, which orphans the private half permanently"
+        );
+        assert!(fixture.public().is_dir(), "{tag}: the public half is gone");
+        assert!(
+            fixture.public().join(MARKER).is_file(),
+            "{tag}: the marker that is the private half's only locator is gone"
+        );
+        assert_eq!(
+            fixture.private().is_dir(),
+            private_survives,
+            "{tag}: the private half is not in the state this window leaves it in"
+        );
+        assert!(
+            hooks.observed(EffectSiteId::Lock(LockSite::Release), HookPhase::Before),
+            "{tag}: the run lock was not released through `Lock.Release`"
+        );
+
+        // The report says what happened, not a condition nobody observed. The
+        // owner record is present on the surviving-half window — the proof that
+        // minted the spent token read it — so `OwnerRecordMissing` was a false
+        // statement about the tree and not merely an imprecise one.
+        let Disposition::PrivateHalfRemovalFailed {
+            ref private,
+            ref public,
+            ref detail,
+        } = *refused.disposition
+        else {
+            panic!("{tag}: {:?}", refused.disposition);
+        };
+        assert_eq!(private, &fixture.private(), "{tag}");
+        assert_eq!(public, &fixture.public(), "{tag}");
+        assert!(!detail.is_empty(), "{tag}: the removal error was dropped");
+        assert!(
+            refused.disposition.removed_anything(),
+            "{tag}: a removal that may have emptied the tree reports it untouched"
+        );
+        assert!(
+            !refused.disposition.removed_the_private_half(),
+            "{tag}: a removal that returned an error claims the half is gone"
+        );
+        let sentence = refused.disposition.describe();
+        assert!(
+            sentence.contains("could not be removed"),
+            "{tag}: {sentence}"
+        );
+        assert!(
+            !sentence.contains("owner record"),
+            "{tag}: the report names a condition nobody observed: {sentence}"
+        );
+        assert!(
+            !sentence.contains("both halves are retained"),
+            "{tag}: the report claims a retention that removed something: {sentence}"
+        );
+        if private_survives {
+            assert!(
+                fixture.private().join(OWNER_RECORD).is_file(),
+                "{tag}: the owner record the proof read is missing, which would \
+                 make `OwnerRecordMissing` true after all"
+            );
+        }
+
+        // And both shapes converge: the next census reclaims the pair when the
+        // private half survived, and the public husk alone when it did not.
+        assert_eq!(
+            describe_disposition(&fixture.husk().disposition),
+            census,
+            "{tag}: the shape left behind is not one the next census finishes \
+             ({:?})",
+            fixture.husk().disposition
+        );
+    }
+}
+
+/// The public removal is best-effort — and its two windows are the two shapes
+/// a best-effort removal can leave.
+///
+/// `After` is the removal that ran and then returned `Err`: both halves really
+/// are gone and the error is swallowed, so the run is reported with the error
+/// that stopped it rather than with a second one about the cleanup. `Before` is
+/// the removal that never ran: the private half is gone, the public husk
+/// survives carrying a marker whose target is absent, and the next census
+/// reclaims it public-only. Nothing is orphaned in either — the public half
+/// needs no proof and no locator.
+#[test]
+fn a_failed_public_half_removal_is_best_effort_and_converges() {
+    for (tag, phase, public_survives) in [
+        ("rm-public-after", HookPhase::After, false),
+        ("rm-public-before", HookPhase::Before, true),
+    ] {
+        let fixture = Fixture::new(tag);
+        let probes = RecordingProbes::new(&host_digest());
+        let refs = FakeRefs::empty();
+        let mut hooks = TestHooks::new();
+        hooks
+            .faults()
+            .arm_phase(
+                EffectSiteId::RunDir(RunDirSite::WritePlan),
+                HookPhase::Before,
+                Injection::Error,
+            )
+            .arm_phase(
+                EffectSiteId::RunDir(RunDirSite::RemovePublicHusk),
+                phase,
+                Injection::Error,
+            );
+        let mut driver = Driver::new(&fixture, &probes, &refs);
+        let refused = driver.run(&mut hooks).expect_err("P5 was made to fail");
+
+        assert!(
+            hooks.observed(
+                EffectSiteId::RunDir(RunDirSite::RemovePublicHusk),
+                HookPhase::Before
+            ),
+            "{tag}: the public removal funnel was never entered"
+        );
+        assert!(
+            !fixture.private().exists(),
+            "{tag}: the private half survived a removal that succeeded"
+        );
+        assert_eq!(
+            fixture.public().is_dir(),
+            public_survives,
+            "{tag}: the public half is not in the state this window leaves it in"
+        );
+        // Best-effort: the operator is given the error that stopped the run,
+        // not the one the cleanup hit on the way out.
+        assert!(
+            matches!(*refused.disposition, Disposition::BothHalvesRemoved { .. }),
+            "{tag}: {:?}",
+            refused.disposition
+        );
+        let sentence = refused.into_error().to_string();
+        assert!(
+            sentence.contains(RunDirSite::WritePlan.name()),
+            "{tag}: the refusal does not name the step that stopped the run: \
+             {sentence}"
+        );
+        assert!(
+            !sentence.contains(RunDirSite::RemovePublicHusk.name()),
+            "{tag}: a best-effort cleanup's error was reported over the error \
+             that stopped the run: {sentence}"
+        );
+        // `run_dir_names`, not `list_runs`: the survivor is a husk, and
+        // `list_runs` answers only for committed runs. `run_dir_names` is the
+        // enumeration the census walks, so it is the one that says whether the
+        // next census can still see this directory.
+        let enumerated = crate::rundir::run_dir_names(&fixture.repo);
+        if public_survives {
+            // The survivor needs no proof and no locator: its marker names a
+            // private half that is no longer there.
+            assert_eq!(
+                enumerated,
+                vec![RUN_ID.to_owned()],
+                "{tag}: the surviving husk is invisible to the census's own walk"
+            );
+            assert_eq!(
+                describe_disposition(&fixture.husk().disposition),
+                "public-only:target-absent",
+                "{tag}: {:?}",
+                fixture.husk().disposition
+            );
+        } else {
+            assert!(
+                enumerated.is_empty(),
+                "{tag}: the public half survived a removal that succeeded: \
+                 {enumerated:?}"
+            );
+        }
+    }
+}
+
+/// `RunDir.CreatePublicDir` itself failing: no run directory came to exist, and
+/// there is nothing for cleanup to decide.
+///
+/// The one prefix that returns before the stat, the proof and the lock release,
+/// because there is no half to stat, nothing to prove about and no lock to give
+/// back — `Prefix::Nothing` is the coordinate for exactly that.
+#[test]
+fn create_public_dir_failing_creates_no_run_directory_and_removes_nothing() {
+    let fixture = Fixture::new("p0-none");
+    let probes = RecordingProbes::new(&host_digest());
+    let refs = FakeRefs::empty();
+    let mut hooks = TestHooks::new();
+    hooks.faults().arm_phase(
+        EffectSiteId::RunDir(RunDirSite::CreatePublicDir),
+        HookPhase::Before,
+        Injection::Error,
+    );
+    let mut driver = Driver::new(&fixture, &probes, &refs);
+    let refused = driver.run(&mut hooks).expect_err("P0 was made to fail");
+
+    assert_eq!(refused.reached, Prefix::Nothing);
+    assert!(
+        matches!(*refused.disposition, Disposition::NothingCreated),
+        "{:?}",
+        refused.disposition
+    );
+    assert!(!refused.disposition.removed_anything());
+    assert!(!refused.disposition.removed_the_private_half());
+    assert!(
+        !fixture.public().exists(),
+        "P0 was made to fail and a run directory exists anyway"
+    );
+    assert!(
+        !fixture.private().exists(),
+        "nothing private is created before P3a"
+    );
+    for site in [
+        RunDirSite::RemovePublicHusk,
+        RunDirSite::RemovePrivateHusk,
+        RunDirSite::StageMarker,
+    ] {
+        assert!(
+            !hooks.observed(EffectSiteId::RunDir(site), HookPhase::Before),
+            "`RunDir.{}` ran for a run whose directory was never created",
+            site.name()
+        );
+    }
+    assert!(
+        !hooks.observed(EffectSiteId::Lock(LockSite::AcquireRun), HookPhase::Before),
+        "P2 took a lock inside a directory that does not exist"
+    );
+    let sentence = refused.into_error().to_string();
+    assert!(
+        sentence.contains("no run directory was created"),
+        "{sentence}"
+    );
+    assert!(
+        sentence.contains(Prefix::Nothing.name()),
+        "the report does not name the prefix: {sentence}"
+    );
+}
+
+/// The commit-record stat that **cannot answer**: fail-closed, retained,
+/// nothing deleted — and the run lock still handed back through `Lock.Release`.
+///
+/// `commit_record_after_error` answers `Unknown` when `symlink_metadata` fails
+/// with anything other than `NotFound`, and every caller treats `Unknown` as
+/// `Present`: the cost of being wrong is asymmetric, because a retained husk is
+/// reported until an operator prunes it and a deleted committed run is gone.
+///
+/// Driven through `stat_after_error` with a locator built to make the stat fail,
+/// rather than through `create_run`. The portable way to fail a stat with
+/// anything other than `NotFound` is an interior NUL, which both Unix and
+/// Windows reject with `InvalidInput` before they touch the filesystem — and no
+/// run can be created at such a path in the first place, so there is no
+/// `create_run` that reaches this arm. A permission bit would be the production
+/// shape and is neither portable nor available: `set_permissions` is on the
+/// effect denylist, in tests too.
+#[test]
+fn a_commit_record_stat_that_cannot_answer_retains_both_halves_and_releases_the_lock() {
+    let fixture = Fixture::new("stat-unknown");
+    let mut hooks = TestHooks::new();
+    create_public_dir(&fixture.public(), &mut NoRunDirHooks).expect("the public half");
+    let lock =
+        RunLock::acquire_hooked(&fixture.public(), hooks.rundir()).expect("the run lock is free");
+    let unanswerable = PathBuf::from(std::ffi::OsString::from("private\u{0}runs"));
+    // The fixture's own precondition, asserted rather than assumed: an interior
+    // NUL is rejected by `std` before either platform reaches the filesystem —
+    // Unix's `CString::new` and Windows's `to_u16s` both answer `InvalidInput`,
+    // and neither answers `NotFound`. Asserted here so a platform that ever
+    // disagreed would say *the fixture* stopped working rather than leave the
+    // arm below looking broken.
+    assert!(
+        matches!(
+            crate::rundir::commit_record_after_error(&unanswerable),
+            CommitRecordPresence::Unknown(_)
+        ),
+        "this path no longer produces an unanswerable stat on this platform, so \
+         the arm below is not the thing under test"
+    );
+
+    let mut aborted = Aborted {
+        reached: Prefix::P5,
+        paths: RunPaths::from_parts(fixture.public(), unanswerable.clone()),
+        lock: Some(lock),
+        repo_key: fixture.repo_key.clone(),
+        private_root: fixture.private_root_canonical(),
+        run_id: RUN_ID.to_owned(),
+        error: UpstrokeError::Refused {
+            message: "the step that stopped the run".to_owned(),
+        },
+    };
+    let disposition = stat_after_error(&mut aborted, &mut hooks);
+
+    let Disposition::PossiblyCommitted {
+        ref locator,
+        undecidable: Some(ref detail),
+    } = disposition
+    else {
+        panic!("a stat that cannot answer is not `Absent` and is not `Present`: {disposition:?}");
+    };
+    assert_eq!(locator, &unanswerable);
+    assert!(!detail.is_empty(), "the stat's reason was dropped");
+    assert!(!disposition.removed_anything());
+    assert!(!disposition.removed_the_private_half());
+    for site in [RunDirSite::RemovePublicHusk, RunDirSite::RemovePrivateHusk] {
+        assert!(
+            !hooks.observed(EffectSiteId::RunDir(site), HookPhase::Before),
+            "`RunDir.{}` ran for a run the filesystem would not answer about",
+            site.name()
+        );
+    }
+    assert!(
+        fixture.public().is_dir(),
+        "the public half was removed on an undecidable stat"
+    );
+    assert!(
+        hooks.observed(EffectSiteId::Lock(LockSite::Release), HookPhase::Before),
+        "the run lock was not released through `Lock.Release`, so the next \
+         census would skip this husk instead of reporting it"
+    );
+    let sentence = disposition.describe();
+    assert!(sentence.contains("could not be stat-ed"), "{sentence}");
+    assert!(sentence.contains("nothing was deleted"), "{sentence}");
+}
+
+/// The P1 staging label names the residue, not the sub-step before it.
+///
+/// `stage_json` creates `.creating.tmp`, writes it, and **then** fsyncs, so one
+/// `RunDir.StageMarker` error covers two trees: `Before` is the create that
+/// never happened and leaves the directory bare, `After` is the sync that failed
+/// and leaves the staging file. `P0` and `P1a` are separate names because the
+/// census separates the shapes, so the report has to separate them too.
+///
+/// The witness is independent of the label: `UnboundShape` is computed by
+/// `prove_private_half_ownership` from the tree, by production code that never
+/// sees a `Prefix`, so the two agreeing is evidence and not a restatement.
+#[test]
+fn the_p1_staging_label_names_the_residue_the_stat_finds() {
+    for (tag, phase, reached, shape) in [
+        (
+            "marker-none",
+            HookPhase::Before,
+            Prefix::P0,
+            UnboundShape::Bare,
+        ),
+        (
+            "marker-staged",
+            HookPhase::After,
+            Prefix::P1Staged,
+            UnboundShape::StagedMarkerOnly,
+        ),
+    ] {
+        let fixture = Fixture::new(tag);
+        let probes = RecordingProbes::new(&host_digest());
+        let refs = FakeRefs::empty();
+        let mut hooks = TestHooks::new();
+        hooks.faults().arm_phase(
+            EffectSiteId::RunDir(RunDirSite::StageMarker),
+            phase,
+            Injection::Error,
+        );
+        let mut driver = Driver::new(&fixture, &probes, &refs);
+        let refused = driver.run(&mut hooks).expect_err("P1a was made to fail");
+
+        assert_eq!(
+            refused.reached, reached,
+            "{tag}: the prefix reported is not the one the residue is"
+        );
+        assert!(
+            matches!(*refused.disposition, Disposition::PublicHalfRemoved(seen) if seen == shape),
+            "{tag}: the tree the proof saw disagrees with the prefix reported: {:?}",
+            refused.disposition
+        );
+        assert!(
+            !fixture.public().exists(),
+            "{tag}: nothing private is bound, so the public half is reclaimed"
+        );
+        let sentence = refused.into_error().to_string();
+        assert!(sentence.contains(reached.name()), "{tag}: {sentence}");
+    }
 }
 
 // =======================================================================
@@ -1396,9 +1885,16 @@ fn append_first_flush_error_after_full_line_reports_by_replay_without_retry() {
         .expect_err("the flush returned an error");
 
     assert!(
-        matches!(*refused.disposition, Disposition::Committed),
-        "{:?}",
+        matches!(
+            *refused.disposition,
+            Disposition::Committed { stale_marker: true }
+        ),
+        "P7 has not run, so the marker this run publishes is still there: {:?}",
         refused.disposition
+    );
+    assert!(
+        fixture.public().join(MARKER).is_file(),
+        "the disposition claims a stale marker the tree does not have"
     );
     assert!(!refused.disposition.removed_anything());
     let log = std::fs::read(fixture.public().join(EVENT_LOG)).expect("the log is readable");
@@ -1433,9 +1929,16 @@ fn append_first_sync_error_reports_by_replay_and_never_deletes() {
         .expect_err("the sync returned an error");
 
     assert!(
-        matches!(*refused.disposition, Disposition::Committed),
-        "{:?}",
+        matches!(
+            *refused.disposition,
+            Disposition::Committed { stale_marker: true }
+        ),
+        "P7 has not run, so the marker this run publishes is still there: {:?}",
         refused.disposition
+    );
+    assert!(
+        fixture.public().join(MARKER).is_file(),
+        "the disposition claims a stale marker the tree does not have"
     );
     assert!(fixture.private().join(COMMIT_RECORD).is_file());
     assert!(fixture.private().is_dir());
@@ -1508,7 +2011,26 @@ fn foreign_integration_ref_refused() {
     let mut driver = Driver::new(&fixture, &probes, &refs);
     let refused = driver.run(&mut hooks).expect_err("a foreign ref refuses");
     assert_eq!(refused.reached, Prefix::P7);
-    assert!(matches!(*refused.disposition, Disposition::Committed));
+    assert!(
+        matches!(
+            *refused.disposition,
+            Disposition::Committed {
+                stale_marker: false
+            }
+        ),
+        "P7 returned before P8 ran, so there is no stale marker for a resume to \
+         repair: {:?}",
+        refused.disposition
+    );
+    assert!(
+        !fixture.public().join(MARKER).exists(),
+        "P7 removed the marker, and the disposition has to say so"
+    );
+    assert!(
+        !refused.disposition.describe().contains("stale marker"),
+        "the operator is promised a marker repair that has nothing to repair: {}",
+        refused.disposition.describe()
+    );
     assert!(refs.created().is_empty(), "the foreign ref was overwritten");
     assert_eq!(
         crate::rundir::classify_run_dir(&fixture.public()),
@@ -1531,7 +2053,17 @@ fn foreign_integration_ref_refused() {
     let refused = driver
         .run(&mut hooks)
         .expect_err("a checked-out ref refuses");
-    assert!(matches!(*refused.disposition, Disposition::Committed));
+    assert!(
+        matches!(
+            *refused.disposition,
+            Disposition::Committed {
+                stale_marker: false
+            }
+        ),
+        "{:?}",
+        refused.disposition
+    );
+    assert!(!fixture.public().join(MARKER).exists());
     assert!(refs.created().is_empty());
 }
 
@@ -1595,7 +2127,19 @@ fn committed_run_with_stale_marker_listed_and_repaired_by_resume() {
     );
     let mut driver = Driver::new(&fixture, &probes, &refs);
     let refused = driver.run(&mut hooks).expect_err("P7 was made to fail");
-    assert!(matches!(*refused.disposition, Disposition::Committed));
+    assert!(
+        matches!(
+            *refused.disposition,
+            Disposition::Committed { stale_marker: true }
+        ),
+        "{:?}",
+        refused.disposition
+    );
+    assert!(
+        refused.disposition.describe().contains("stale marker"),
+        "the operator is not told what the resume repairs: {}",
+        refused.disposition.describe()
+    );
 
     assert!(
         fixture.public().join(MARKER).is_file(),
@@ -1952,6 +2496,18 @@ fn kill_at_each_prefix_p0_to_p8_converges() {
         assert_ne!(code, Some(0), "`{which}`: the child must have died");
 
         let public = fixture.public();
+        // Every row of this table is P0 or later, so the public directory
+        // exists — and saying so is what stops the `p0` row passing with
+        // nothing on disk at all. `classify_run_dir` calls a **missing**
+        // directory a `Husk` and `husk_report` calls one
+        // `NothingBound(Bare)`, which is exactly the pair `p0` expects, so a
+        // child that panicked before `create_public_dir` ever ran would be
+        // indistinguishable from one that died after it.
+        assert!(
+            public.is_dir(),
+            "`{which}`: no run directory exists, so the answers below are the \
+             answers for an empty tree rather than for this prefix"
+        );
         match prefix {
             Prefix::P6 | Prefix::P7 | Prefix::P8 => {
                 assert_eq!(
@@ -2989,6 +3545,42 @@ fn the_deletion_boundary_falls_between_p5_and_p5b() {
     assert!(removed.removed_anything() && removed.removed_the_private_half());
     let public_only = Disposition::PublicHalfRemoved(UnboundShape::Bare);
     assert!(public_only.removed_anything() && !public_only.removed_the_private_half());
+
+    // A removal that returned an error decided nothing: `remove_dir_all` is not
+    // atomic, so the arm may claim neither that the tree is untouched nor that
+    // the private half is gone.
+    let failed = Disposition::PrivateHalfRemovalFailed {
+        private: PathBuf::from("/private/runs/x"),
+        public: PathBuf::from("/repo/.upstroke/runs/x"),
+        detail: "permission denied".to_owned(),
+    };
+    assert!(
+        failed.removed_anything(),
+        "a failed removal may not report the tree as untouched"
+    );
+    assert!(
+        !failed.removed_the_private_half(),
+        "a failed removal may not report the private half as reclaimed"
+    );
+
+    // Finding 5's pair: the two committed shapes are one variant and two
+    // sentences, and only one of them promises a marker repair.
+    let stale = Disposition::Committed { stale_marker: true };
+    let repaired = Disposition::Committed {
+        stale_marker: false,
+    };
+    assert!(
+        stale.describe().contains("stale marker"),
+        "{}",
+        stale.describe()
+    );
+    assert!(
+        !repaired.describe().contains("stale marker"),
+        "P8's refusal promises a marker repair with no marker to repair: {}",
+        repaired.describe()
+    );
+    assert_ne!(stale.describe(), repaired.describe());
+
     for kept in [
         Disposition::NothingCreated,
         Disposition::Retained {
@@ -2999,7 +3591,12 @@ fn the_deletion_boundary_falls_between_p5_and_p5b() {
             locator: PathBuf::from("/private/runs/x"),
             undecidable: None,
         },
-        Disposition::Committed,
+        Disposition::PossiblyCommitted {
+            locator: PathBuf::from("/private/runs/x"),
+            undecidable: Some("the filesystem would not say".to_owned()),
+        },
+        stale,
+        repaired,
         Disposition::RetainedPossiblyCommittedHusk {
             locator: PathBuf::from("/private/runs/x"),
         },
