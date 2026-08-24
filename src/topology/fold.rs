@@ -56,10 +56,10 @@ use crate::topology::events::{
     GenerationClosed, GenerationId, GitRef, IncarnationId, LeaseDisposition, LeaseGrant,
     MergeLeaseRelease, MergePrepared, MergeRejected, MergeVerificationInterrupted,
     MergeVerificationStarted, MergeVerificationUnavailable, PreparedDisposition, QuestionAnswered4,
-    RejectionDisposition, RejectionLeaseEffect, RunFinished4, RunResumed4, RunStarted4, SequenceId,
-    SessionId, SettlementTransition, SpawnAdmission, TaskCandidateCreated, TaskDispatched,
-    TaskMerged, TopologyEvent, TopologyEventBody, UnavailableCause, UnavailableOutcome,
-    VerificationBasis, VerificationSource, VerificationVerdict,
+    RejectionDisposition, RejectionLeaseEffect, RunFinished4, RunResumed4, RunStarted4,
+    RungBinding, SequenceId, SessionId, SettlementTransition, SpawnAdmission, TaskCandidateCreated,
+    TaskDispatched, TaskMerged, TopologyEvent, TopologyEventBody, UnavailableCause,
+    UnavailableOutcome, VerificationBasis, VerificationSource, VerificationVerdict,
 };
 use crate::topology::leases::{GenerationLease, LeaseOwner, LeaseTable};
 use crate::topology::paths::{GitPath, PathSet};
@@ -896,6 +896,40 @@ impl TopologyFold {
     /// The ids themselves are [`Self::open_questions`]; this is the predicate
     /// `derived_outcome` decides `Parked` with, exposed so that the hard-block
     /// branch and the derived outcome cannot disagree about what "open" means.
+    /// The binding rung `rung` of `key` is frozen as.
+    ///
+    /// **The eleventh reader, and it is deliberately only half of the fold's
+    /// rule.** `check_attempt_started` accepts a binding that matches the
+    /// human override when one is recorded, and the frozen rung otherwise.
+    /// This returns the frozen rung's, and nothing else, for two reasons.
+    ///
+    /// First, no override is constructible in a run this crate currently
+    /// drives: a `BindingOverride` arrives from an `Answered` event, and the
+    /// loop's answer-ingest branch is not implemented, so the override arm has
+    /// no reachable input. Second, and more important, **the fold's override
+    /// check is partial**: `matches_override` compares agent, model and effort
+    /// and says nothing about `tier` or `pinned`. A caller that built an
+    /// override binding would be choosing those two fields unchallenged, and
+    /// this reader is not the place to invent a rule the packet states
+    /// somewhere the author of this method has not read.
+    ///
+    /// So a caller holding an override must not use this. The intended shape,
+    /// when the answers branch lands, is that this method grows the second arm
+    /// together with the passage that decides those two fields — not that a
+    /// caller composes one from [`Self::binding_override`] and this.
+    ///
+    /// `None` when the run has no registry, the task is not registered, or the
+    /// ladder has no such rung.
+    #[must_use]
+    pub fn frozen_rung_binding(&self, key: TaskKey, rung: u32) -> Option<RungBinding> {
+        let entry = self.registry()?.get(key)?;
+        let frozen = entry.ladder.rungs.get(usize::try_from(rung).ok()?)?;
+        Some(RungBinding::from_frozen(
+            frozen,
+            entry.ladder.effort.implementation_for(frozen.tier),
+        ))
+    }
+
     /// The region an ordinary dispatch of `key` predicts.
     ///
     /// **The tenth reader, and it exists because the alternative was a second
@@ -4238,14 +4272,94 @@ mod tests {
         })
     }
 
+    /// Delegates to the production reader rather than repeating its
+    /// composition.
+    ///
+    /// It used to repeat it, and that made this file hold **two** derivations
+    /// of one value — the validator's, in `check_attempt_started`, and this
+    /// one. Every test that builds an `attempt_started` goes through here, so
+    /// routing it to [`TopologyFold::frozen_rung_binding`] puts that reader
+    /// under the whole existing attempt corpus: if it ever disagrees with the
+    /// validator beside it, dozens of tests fail rather than none.
     fn frozen_binding(fold: &TopologyFold, key: TaskKey, rung: usize) -> RungBinding {
-        let entry = fold
-            .registry()
-            .expect("the run has started")
-            .get(key)
-            .expect("the fixture task");
-        let frozen = &entry.ladder.rungs[rung];
-        RungBinding::from_frozen(frozen, entry.ladder.effort.implementation_for(frozen.tier))
+        fold.frozen_rung_binding(key, u32::try_from(rung).expect("a small fixture rung"))
+            .expect("the run has started and the fixture task has this rung")
+    }
+
+    /// The reader's answer is exactly what the validator accepts.
+    ///
+    /// **Round-tripped against `check_attempt_started`, not compared to a
+    /// literal.** A literal expectation would be a second transcription of the
+    /// same rule, and would agree with this reader for the same reason the
+    /// reader is right or wrong — the self-oracle shape. Feeding the reader's
+    /// output to the validator asks the only question that matters: do the two
+    /// halves of this file agree.
+    ///
+    /// The negative half is what gives it teeth. Perturbing one field of the
+    /// binding must be refused, or the validator is not checking the thing the
+    /// reader produces and the positive half proves nothing.
+    #[test]
+    fn the_frozen_rung_binding_is_what_the_validator_accepts() {
+        let mut fold = started();
+        apply(&mut fold, &dispatch(ALPHA, 0, &sha("base")));
+
+        let binding = fold
+            .frozen_rung_binding(ALPHA, 0)
+            .expect("the fixture task has rung 0");
+
+        let accepted = ev(TopologyEventBody::AttemptStarted {
+            data: AttemptStarted4 {
+                key: ALPHA,
+                generation: GenerationId(0),
+                attempt: AttemptNumber(1),
+                rung: 0,
+                binding: binding.clone(),
+                pool: None,
+                resume_session: None,
+                materialization_observed: None,
+            },
+        });
+        fold.plan_transition(&accepted)
+            .expect("the validator accepts the binding this reader produced");
+
+        for (label, mutate) in [
+            (
+                "model",
+                (|b: &mut RungBinding| b.model.push_str("-x")) as fn(&mut RungBinding),
+            ),
+            ("agent", |b: &mut RungBinding| b.agent.push_str("-x")),
+            ("effort", |b: &mut RungBinding| {
+                b.effort = if b.effort == Effort::High {
+                    Effort::Low
+                } else {
+                    Effort::High
+                }
+            }),
+        ] {
+            let mut wrong = binding.clone();
+            mutate(&mut wrong);
+            let refused = ev(TopologyEventBody::AttemptStarted {
+                data: AttemptStarted4 {
+                    key: ALPHA,
+                    generation: GenerationId(0),
+                    attempt: AttemptNumber(1),
+                    rung: 0,
+                    binding: wrong,
+                    pool: None,
+                    resume_session: None,
+                    materialization_observed: None,
+                },
+            });
+            assert!(
+                matches!(
+                    fold.plan_transition(&refused),
+                    Err(FoldError::BindingMismatch { .. })
+                ),
+                "a binding differing only in `{label}` must be refused, or the \
+                 positive half above is satisfied by a validator that is not \
+                 looking"
+            );
+        }
     }
 
     fn attempt_started(
