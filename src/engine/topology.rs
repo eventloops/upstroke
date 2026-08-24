@@ -75,12 +75,14 @@ pub use seams::{
 };
 pub mod preflight;
 pub mod recover;
+pub mod run;
 
 pub use preflight::{Probed, RunPreflight};
 pub use recover::{
     BarrierHeld, EmitContext, LocksHeld, PreflightCertified, RecordsVerified, ResumeCensused,
     Resumed, RootDerived, RunnerRebuilt,
 };
+pub use run::{Disposition, LoopBranch};
 pub use select::{Admitted, Breach, Ceiling, Spend, Step, checkpoint, select};
 pub use settle::{
     Deferral, FinishedAttempt, ManagedWorktrees, RetryOutcome, RetryRequest, Settled,
