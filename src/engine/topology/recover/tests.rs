@@ -784,11 +784,19 @@ fn resume_derives_private_root_from_record_when_default_changed() {
     let fixture = Fixture::healthy("nondefault-root");
     let root = fixture.derive(None).expect("(a0) derives");
 
+    // Compared canonical-to-canonical, because `authorized_root` is
+    // deliberately **lexical**: it refuses a locator whose shape is not
+    // `<root>/runs/<run_id>` and resolves nothing, so it hands back the root in
+    // whatever form the record wrote. Canonicalising only the right-hand side
+    // compares two spellings of one directory and fails wherever the temporary
+    // directory sits under a symlink — which is macOS, where `TMPDIR` is under
+    // `/var` and `/var` is a link to `/private/var`. Linux's `/tmp` is real, so
+    // this passed there and failed only in CI's macOS leg.
+    let canonical =
+        |path: &std::path::Path| std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
     assert_eq!(
-        root.private_root(),
-        std::fs::canonicalize(&fixture.private_root)
-            .as_deref()
-            .unwrap_or(&fixture.private_root),
+        canonical(root.private_root()),
+        canonical(&fixture.private_root),
         "the authorized root is the one `run_started.private_dir` names"
     );
     assert_ne!(
@@ -1650,10 +1658,16 @@ fn resume_of_nondefault_root_run_reclaims_earlier_incarnation_intents_in_recorde
 #[test]
 fn resume_refused_while_reaper_hold_observed_then_succeeds() {
     let fixture = Fixture::healthy("reaper-hold");
-    let cleanup = fixture.public().join("cleanup.lock");
 
     #[cfg(unix)]
     {
+        // Bound inside the `cfg`, because only the `cfg` uses it. Bound
+        // outside, Windows compiles an unused local and CI's `lint (windows)`
+        // leg refuses it under `-D warnings` — which is exactly the gap
+        // recorded as `windows-gate-lint-level-gap`: a local
+        // `--target x86_64-pc-windows-msvc` check accepts code the guest does
+        // not, because only the guest sets the lint level.
+        let cleanup = fixture.public().join("cleanup.lock");
         mkdir(&cleanup);
         let harness = harness();
         let runtime = runtime_holding_the_record();
