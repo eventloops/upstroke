@@ -1221,63 +1221,6 @@ mod tests {
         }
     }
 
-    /// Every source file the crate declares as `#[cfg(test)] mod <name>;`, as
-    /// `(declaring file, name, [flat candidate, nested candidate])`.
-    ///
-    /// Such a file is test code end to end, and a region function has nothing to
-    /// remove in one, so it would count the whole of it as production. The set is
-    /// read out of the declarations rather than listed by hand: it was
-    /// `src/engine/tests.rs` alone until PR5 moved the Event funnel into
-    /// `src/events/log.rs` with two test modules of its own, and the census
-    /// failed on the first file the hand-maintained list did not know about.
-    ///
-    /// **Read out of the blanked source, and every candidate checked.** The split
-    /// was over the raw text, so a `//` line containing `#[cfg(test)] mod policy;`
-    /// derived a skip for `src/runner/policy.rs` and removed that file from every
-    /// census below — measured, with a `git push` planted in it that the census
-    /// then did not see. The doc comment on this very function used to do exactly
-    /// that for a `src/runner/tests.rs` that does not exist. Over the whole tree
-    /// the raw split derived 50 skip paths of which **34 named no file at all**,
-    /// and a skip path naming no file is a skip that has stopped meaning
-    /// anything, so [`production_sources`] asserts each declaration resolves.
-    fn whole_file_test_module_declarations(
-        files: &[PathBuf],
-    ) -> Vec<(PathBuf, String, [PathBuf; 2])> {
-        let mut found = Vec::new();
-        for path in files {
-            let blanked = crate::effects::blank_comments_and_strings(
-                &std::fs::read_to_string(path).expect("read source"),
-            );
-            let parent = path.parent().expect("a source file has a directory");
-            let stem = path.file_stem().expect("a source file has a name");
-            let dir = if stem == "mod" || stem == "lib" || stem == "main" {
-                parent.to_path_buf()
-            } else {
-                parent.join(stem)
-            };
-            for rest in blanked.split("#[cfg(test)]").skip(1) {
-                let Some(name) = rest.trim_start().strip_prefix("mod ") else {
-                    continue;
-                };
-                let Some(name) = name.split(';').next().map(str::trim) else {
-                    continue;
-                };
-                if name.is_empty() || name.contains('{') {
-                    continue;
-                }
-                found.push((
-                    path.clone(),
-                    name.to_owned(),
-                    [
-                        dir.join(format!("{name}.rs")),
-                        dir.join(name).join("mod.rs"),
-                    ],
-                ));
-            }
-        }
-        found
-    }
-
     /// Every `src/**/*.rs`, as `(repo-relative path, production code)`, with
     /// whole-file test modules left out.
     ///
@@ -1317,7 +1260,7 @@ mod tests {
         let mut files = Vec::new();
         walk(&root.join("src"), &mut files);
         assert!(files.len() > 20, "the walk found the tree: {}", files.len());
-        let declarations = whole_file_test_module_declarations(&files);
+        let declarations = crate::effects::census_domain::declared_whole_file_test_modules(&files);
         assert!(
             declarations.len() >= 13,
             "only {} `#[cfg(test)] mod …;` declarations were derived; the derivation is \
@@ -1370,11 +1313,31 @@ mod tests {
                 Some((relative, crate::effects::production_code(&source)))
             })
             .collect();
-        // The two controls every census below shares, both of
+        // The three controls every census below shares, all of
         // `PR4-CENSUS-COMMENT-ORACLE`'s class.
         //
-        // The regions are not empty: a count over nothing is zero, which reads
-        // as "nobody does this".
+        // The regions are not empty, **file by file**. The aggregate floor below
+        // is the weaker half of this and cannot replace it: it stands at
+        // 750,000 against an actual 926,043, so 176,043 non-whitespace bytes may
+        // vanish before it notices, and the two largest files this walk keeps
+        // hold 146,260 between them — inside that headroom. One file's region
+        // collapsing to nothing is exactly what a `#[cfg(test)]` in a comment
+        // used to do, and it is invisible to a sum.
+        //
+        // **Necessary, not sufficient.** A per-file floor sees a region that
+        // collapses; it does not see one that is *replaced*.
+        // `PR7-R2C-CHAR-LITERAL-DESYNC`'s refined form removes exactly the
+        // forged lines and adds a probe of the same size, and was measured at
+        // 8525 dense bytes both with the attack and without it. What closes that
+        // is `effects::char_literal_end` and `configured_item_end` returning
+        // `start` rather than the file's length — not this.
+        for (relative, code) in &sources {
+            assert!(
+                dense(code) > 0,
+                "{relative}'s region is empty, so it contributes nothing to any count below \
+                 and every prohibition this census states is vacuous for that file"
+            );
+        }
         let region_bytes: usize = sources.iter().map(|(_, code)| dense(code)).sum();
         assert!(
             region_bytes > 750_000,

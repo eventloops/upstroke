@@ -21,9 +21,15 @@
 
 // `effects::production_region` cuts a source at its FIRST `#[cfg(test)]`, and
 // this file is reached only through `#[cfg(test)] mod tests;` so it has no
-// attribute of its own for those censuses to cut on. The marker below is
-// redundant to the compiler and load-bearing to them: it makes this file's
-// production region empty. Same device as
+// attribute of its own to cut on. The marker below is redundant to the compiler
+// and load-bearing to every reader that still consults the TRUNCATING region —
+// `effects::externally_reachable_fns` and the three censuses in
+// `src/runner/container/exec.rs` — for which it makes this file's production
+// region empty. It does **not** do that for the four whole-tree censuses, which
+// read `effects::production_code`: that excises this marker as the configured
+// item it is and scans the file in full, and what keeps this file out of their
+// domain is the `#[cfg(test)] mod tests;` declaration in
+// `src/engine/topology/startup.rs`. Same device, and the same limit, as
 // `src/runner/container/census/tests.rs`.
 #[cfg(test)]
 mod this_file_is_test_only {}

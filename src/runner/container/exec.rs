@@ -1420,20 +1420,29 @@ fn bounded(bytes: &[u8], limit: usize) -> (String, bool) {
 }
 
 // -- test-only declarations ----------------------------------------------
-// At the BOTTOM: `effects::production_region` cuts a source at its first
-// `#[cfg(test)]` (`PR5-R1-CFG-TEST-SHRINKS-THE-DOMAIN`).
+// At the BOTTOM: `effects::production_region`, which
+// `effects::externally_reachable_fns` and the three censuses further down this
+// file still use, cuts a source at its first `#[cfg(test)]`
+// (`PR5-R1-CFG-TEST-SHRINKS-THE-DOMAIN`).
 //
-// **The allow below is written ABOVE `#[cfg(test)]`, and that order is
-// load-bearing.** `runner::tests::production_region` is line-based: it excludes
-// a test module by matching a line that is exactly `#[cfg(test)]` followed by a
-// line starting `mod `, so an attribute between the two makes this whole test
+// **The allow below is written ABOVE `#[cfg(test)]`. That order used to be
+// load-bearing and is now a convention.** The reader that made it load-bearing
+// was `runner::tests::production_region`, which was line-based: it excluded a
+// test module by matching a line that is exactly `#[cfg(test)]` followed by a
+// line starting `mod `, so an attribute between the two made this whole test
 // region read as PRODUCTION and both
 // `every_production_runner_request_is_built_by_its_roles_builder` and
-// `every_production_command_spec_payload_is_classified` fail with these
+// `every_production_command_spec_payload_is_classified` failed with these
 // fixtures counted as production call sites. Measured in repair round F1 and
-// filed as `PR6F1-RUNNER-PRODUCTION-REGION-BREAKS-ON-AN-ATTRIBUTE`;
-// `effects::is_module_level` skips further attributes before requiring `mod`,
-// so this order satisfies both readers.
+// filed as `PR6F1-RUNNER-PRODUCTION-REGION-BREAKS-ON-AN-ATTRIBUTE`.
+//
+// **That reader is deleted.** `effects::production_code`, which those censuses
+// share now, finds the item's extent by delimiter matching, so it removes this
+// module with the attribute in either position — measured both ways on this
+// file. The order is kept because it is the one `effects::is_module_level`
+// reads without relying on its skip-further-attributes step, and because with
+// the allow written below `#[cfg(test)]` it becomes part of the configured
+// item and is blanked along with it.
 //
 // Allowlist placement: the **funnel section** of `effects/allowlist.toml`, by
 // attachment to `src/runner/container.rs`. It covers this file's TEST REGION

@@ -3393,7 +3393,7 @@ fn the_stable_prefix_barrier_is_the_only_way_a_log_becomes_a_topology_fold() {
     // on this tree before the repair: the raw split derived 50 skip paths of
     // which 34 named no file at all, and one `//` line was enough to remove a
     // real production module from this census's domain.
-    let declarations = declared_whole_file_test_modules(&files);
+    let declarations = crate::effects::census_domain::declared_whole_file_test_modules(&files);
     assert!(
         declarations.len() >= 13,
         "only {} `#[cfg(test)] mod …;` declarations were derived; the derivation is \
@@ -3434,12 +3434,29 @@ fn the_stable_prefix_barrier_is_the_only_way_a_log_becomes_a_topology_fold() {
         // The whole file, comments and string literals blanked and every
         // `#[cfg(test)]` item removed — not a truncation at the first one.
         let production = crate::effects::production_code(&source);
-        scanned += 1;
-        scanned_bytes += production
+        let dense = production
             .as_bytes()
             .iter()
             .filter(|byte| !byte.is_ascii_whitespace())
             .count();
+        // Per file, because the aggregate floor below cannot see one region
+        // collapsing: it stands at 750,000 against an actual over 900,000, so a
+        // file may empty itself and the sum still clears the bar. A region that
+        // is empty answers "nobody calls the fold" for that file no matter what
+        // the file contains.
+        //
+        // **Necessary, not sufficient.** It sees a region that collapses, not
+        // one that is replaced: `PR7-R2C-CHAR-LITERAL-DESYNC`'s refined form
+        // removes the forged lines and adds a probe of the same size, and
+        // measured a zero-byte delta. `effects::char_literal_end` and
+        // `configured_item_end`'s give-up direction are what close that.
+        assert!(
+            dense > 0,
+            "{}'s region is empty, so it contributes nothing to the counts below",
+            path.display()
+        );
+        scanned += 1;
+        scanned_bytes += dense;
         if production.contains("TopologyFold") {
             mentioning.push(relative_slashed(path));
         }
@@ -3583,48 +3600,6 @@ fn the_blanking_this_census_depends_on_is_live() {
         code_folds > 0,
         "and it removed everything, which is the other way for a census to prove nothing"
     );
-}
-
-/// Every `#[cfg(test)] mod <name>;` the crate declares, as
-/// `(declaring file, name, [flat candidate, nested candidate])`.
-///
-/// Read out of the **blanked** source: a declaration quoted in a comment is
-/// prose, and deriving a skip from prose removes a real production file from a
-/// census's domain.
-fn declared_whole_file_test_modules(files: &[PathBuf]) -> Vec<(PathBuf, String, [PathBuf; 2])> {
-    let mut found = Vec::new();
-    for path in files {
-        let blanked = crate::effects::blank_comments_and_strings(
-            &fs::read_to_string(path).expect("a source file"),
-        );
-        let parent = path.parent().expect("a source file has a directory");
-        let stem = path.file_stem().expect("a source file has a name");
-        let dir = if stem == "mod" || stem == "lib" || stem == "main" {
-            parent.to_path_buf()
-        } else {
-            parent.join(stem)
-        };
-        for rest in blanked.split("#[cfg(test)]").skip(1) {
-            let Some(name) = rest.trim_start().strip_prefix("mod ") else {
-                continue;
-            };
-            let Some(name) = name.split(';').next().map(str::trim) else {
-                continue;
-            };
-            if name.is_empty() || name.contains('{') {
-                continue;
-            }
-            found.push((
-                path.clone(),
-                name.to_owned(),
-                [
-                    dir.join(format!("{name}.rs")),
-                    dir.join(name).join("mod.rs"),
-                ],
-            ));
-        }
-    }
-    found
 }
 
 /// The body of the item whose declaration begins with `header`, brace-matched.

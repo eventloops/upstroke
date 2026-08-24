@@ -279,22 +279,18 @@ pub fn blank_comments(source: &str) -> String {
                 i = end;
             }
             b'\'' => {
-                // A char literal is `'x'`, `'\n'` or `'\u{1}'`; `'a` is a
-                // lifetime and must be left alone. `'"'` is the one that matters
-                // here: without this arm it opens a string.
-                let is_char = bytes.get(i + 1) == Some(&b'\\')
-                    || (bytes.get(i + 2) == Some(&b'\'') && bytes.get(i + 1).is_some());
-                if is_char {
-                    let start = i;
-                    i += 1;
-                    while i < bytes.len() && bytes[i] != b'\'' {
-                        i += if bytes[i] == b'\\' { 2 } else { 1 };
+                // `'"'` is the one that matters here: without this arm it opens
+                // a string. [`char_literal_end`] decides, so this and its
+                // sibling cannot drift apart.
+                match char_literal_end(bytes, i) {
+                    Some(end) => {
+                        out.extend_from_slice(&bytes[i..end]);
+                        i = end;
                     }
-                    i = (i + 1).min(bytes.len());
-                    out.extend_from_slice(&bytes[start..i]);
-                } else {
-                    out.push(bytes[i]);
-                    i += 1;
+                    None => {
+                        out.push(bytes[i]);
+                        i += 1;
+                    }
                 }
             }
             byte => {
@@ -304,6 +300,82 @@ pub fn blank_comments(source: &str) -> String {
         }
     }
     String::from_utf8_lossy(&out).into_owned()
+}
+
+/// Where the char literal starting at `from` ends, exclusive, or `None` when
+/// `from` does not start one.
+///
+/// A char literal is `'`, then either an escape (`\n`, `\\`, `\'`, `\u{1F600}`)
+/// or **one UTF-8 scalar**, then `'`. The scalar is one to four bytes, and that
+/// is the whole reason this is a scan rather than a lookahead.
+///
+/// ## The desync a fixed lookahead produces, and how far it reaches
+///
+/// Both blankers used to answer the question with two bytes: `'` is a char
+/// literal when the byte at `+2` is a quote. `'é'` closes at `+3`, so it was
+/// classified as **not** a literal, scanning resumed on its closing quote, and
+/// that quote was then read as an *opening* one. From there the tokeniser is out
+/// of phase: in `('é','{')` the pairing shifts by one and the `{` that is inside
+/// a char literal survives into the blanked text as visible **code**.
+///
+/// One unbalanced brace is enough to take a file out of every census that
+/// consults [`production_code`]. [`matching`] counts it, so
+/// [`configured_item_end`]'s brace arm walks past the item's real `}`, finds no
+/// balancing brace and gives up — and giving up used to mean "blank to end of
+/// file".
+///
+/// Measured end to end, twice. On `src/agent/claude.rs`, with the pair inside
+/// that file's `#[cfg(test)] mod tests` and a forged item appended below it, the
+/// region measured **8525** non-whitespace bytes with the attack and 8525
+/// without — a zero-byte delta no floor can see — and every source census was
+/// green. Then gate-clean, because the first form is not: `cargo fmt` rewrites
+/// `('é','{')` to `('é', '{')` and the space defuses it, and
+/// `clippy::items_after_test_module` refuses an item placed below a file's own
+/// `mod tests`. Both are avoidable. `stringify! { ('é','{') }` is left alone by
+/// rustfmt (macro bodies in braces are), and a `#[cfg(test)]` module not named
+/// `tests` is not what that lint looks for. With the probe inside
+/// `src/runner/container/view.rs`'s `#[cfg(test)] pub(crate) mod fixtures` and a
+/// forged `RunnerRequest {` builder above the file's real test module,
+/// `cargo fmt --check` and `cargo clippy --all-targets -- -D warnings` both exit
+/// 0 and `runner::tests::every_production_runner_request_is_built_by_its_roles_\
+/// builder` passes — while the identical forged builder **without** the probe
+/// fails it by name.
+///
+/// The preconditions are already in this tree: `src/status.rs`, `src/util.rs`
+/// (twice on one line) and `src/engine/tests.rs` all hold non-ASCII char
+/// literals. Only the adjacency was missing.
+///
+/// `'a` is a lifetime and is not a char literal; nor is `'_`, nor the `'static`
+/// in `&'static str`. All three are refused by one rule — the byte after the
+/// scalar is not a quote — rather than by a list.
+fn char_literal_end(bytes: &[u8], from: usize) -> Option<usize> {
+    if bytes.get(from) != Some(&b'\'') {
+        return None;
+    }
+    let mut at = from + 1;
+    if bytes.get(at) == Some(&b'\\') {
+        // An escape. The longest Rust spells is `\u{10FFFF}`, which closes at
+        // `from + 11`, so the window is bounded and a runaway scan over the rest
+        // of the file cannot happen.
+        at += 2;
+        let limit = (from + 13).min(bytes.len());
+        while at < limit && bytes[at] != b'\'' {
+            at += 1;
+        }
+        return (bytes.get(at) == Some(&b'\'')).then_some(at + 1);
+    }
+    // One UTF-8 scalar, whose width its lead byte states. A continuation or an
+    // otherwise invalid lead cannot begin one, and `source` is a `&str`, so the
+    // remaining ranges are unreachable rather than merely unhandled.
+    let width = match *bytes.get(at)? {
+        0x00..=0x7F => 1,
+        0xC2..=0xDF => 2,
+        0xE0..=0xEF => 3,
+        0xF0..=0xF4 => 4,
+        _ => return None,
+    };
+    at += width;
+    (bytes.get(at) == Some(&b'\'')).then_some(at + 1)
 }
 
 /// Where the string literal starting at `from` ends, or `None` when `from` does
@@ -435,20 +507,15 @@ pub fn blank_comments_and_strings(source: &str) -> String {
                 code_start = i;
             }
             b'\'' => {
-                // A char literal is `'x'`, `'\n'` or `'\u{1}'`; `'a` is a
-                // lifetime and must be left alone.
-                let is_char = bytes.get(i + 1) == Some(&b'\\')
-                    || (bytes.get(i + 2) == Some(&b'\'') && bytes.get(i + 1).is_some());
-                if is_char {
-                    keep(&mut out, code_start, i);
-                    i += 1;
-                    while i < bytes.len() && bytes[i] != b'\'' {
-                        i += if bytes[i] == b'\\' { 2 } else { 1 };
+                // [`char_literal_end`] decides, so this and its sibling in
+                // [`blank_comments`] cannot drift apart.
+                match char_literal_end(bytes, i) {
+                    Some(end) => {
+                        keep(&mut out, code_start, i);
+                        i = end;
+                        code_start = i;
                     }
-                    i = (i + 1).min(bytes.len());
-                    code_start = i;
-                } else {
-                    i += 1;
+                    None => i += 1,
                 }
             }
             _ => i += 1,
@@ -550,6 +617,20 @@ pub fn production_code(source: &str) -> String {
 }
 
 /// Where the item beginning at `start` ends, exclusive. See [`production_code`].
+///
+/// **The two give-up paths return `start`, not `bytes.len()`.** Both are reached
+/// only when the blanked text does not parse — an unbalanced brace, or an item
+/// with no terminator before end of file — and neither is reachable from this
+/// tree today (measured: zero occurrences over all 92 source files). What
+/// decides the value is the *direction* they fail in. `bytes.len()` reads "the
+/// item is the rest of the file" and blanks it, so a tokeniser that has lost
+/// phase silently removes every production item below the attribute from every
+/// census that consults this region — which is exactly what
+/// [`char_literal_end`]'s desync used to buy. Returning `start` blanks the
+/// attribute and nothing else, so the test module below it reads as production
+/// and the censuses go **loud** instead. The larger region is always the safe
+/// one here, for the same reason the doc above gives for not matching angle
+/// brackets: it can only make a census match more, never less.
 fn configured_item_end(bytes: &[u8], start: usize) -> usize {
     let mut depth = 0usize;
     let mut index = start;
@@ -557,7 +638,7 @@ fn configured_item_end(bytes: &[u8], start: usize) -> usize {
         match bytes[index] {
             b'{' if depth == 0 => {
                 let Some(close) = matching(bytes, index, b'{', b'}') else {
-                    return bytes.len();
+                    return start;
                 };
                 let mut after = close + 1;
                 while bytes.get(after).is_some_and(u8::is_ascii_whitespace) {
@@ -577,7 +658,7 @@ fn configured_item_end(bytes: &[u8], start: usize) -> usize {
         }
         index += 1;
     }
-    bytes.len()
+    start
 }
 
 /// Every `allow`/`expect` of a governed lint in `source`, with where it sits.
@@ -1128,6 +1209,92 @@ pub const DENIAL_CONTROL: &str = "pub fn go(p: &std::path::Path) -> bool {\n\
                                   \x20   let _ = upstroke::util::tail(\"x\", 1);\n\
                                   \x20   p.exists()\n\
                                   }\n";
+
+// -- test-only declarations ----------------------------------------------
+// At the BOTTOM, and a `mod` rather than a bare `fn`: `production_region` cuts a
+// file at its first `#[cfg(test)]`, and
+// `effects::tests::every_production_region_that_stops_early_stops_at_a_module`
+// pins by name the ten files whose cut lands on something that is not a module.
+// This file is not one of them and must not become one.
+
+/// The **domain** every whole-tree census draws, derived once.
+///
+/// `PR5D-VISIBILITY-CHECK-DUPLICATED`: a value two places both maintain by hand
+/// disagree eventually, and the one that disagrees silently is the one that
+/// decides what a census is allowed to see. This derivation was written twice —
+/// `runner::tests::whole_file_test_module_declarations` and
+/// `events::log::tests::declared_whole_file_test_modules`, identical by hand,
+/// each deciding which files four whole-tree censuses skip. It lives beside
+/// [`production_code`] now, which is the region those same censuses count over.
+#[cfg(test)]
+pub(crate) mod census_domain {
+    use std::path::PathBuf;
+
+    /// Every `#[cfg(test)] mod <name>;` the crate declares, as
+    /// `(declaring file, name, [flat candidate, nested candidate])`.
+    ///
+    /// Such a file is test code end to end. A region function has nothing to
+    /// remove in one, so it would count the whole of it as production — a
+    /// fixture that names a census's needle would then read as a production
+    /// offender. The set is read out of the declarations rather than listed by
+    /// hand: it was `src/engine/tests.rs` alone until PR5 moved the Event funnel
+    /// into `src/events/log.rs` with two test modules of its own, and the census
+    /// failed on the first file the hand-maintained list did not know about.
+    ///
+    /// **Read out of the blanked source, and every candidate returned rather
+    /// than assumed.** The split used to be over the raw text, so a `//` line
+    /// containing `#[cfg(test)] mod policy;` derived a skip for
+    /// `src/runner/policy.rs` and removed that file from every census below —
+    /// measured, with a `git push` planted in it that the census then did not
+    /// see. Over the whole tree the raw split derived 50 skip paths of which
+    /// **34 named no file at all**, and a skip path naming no file is a skip
+    /// that has stopped meaning anything, so each caller asserts that exactly
+    /// one of the two candidates exists.
+    ///
+    /// A declaration carrying a visibility qualifier — `#[cfg(test)]
+    /// pub(crate) mod helpers;` — is deliberately **not** matched. Failing to
+    /// derive a skip leaves a test file inside a census's domain, where a
+    /// fixture is reported as an offender and someone looks; deriving one it
+    /// should not removes a real production file, silently. Only the first
+    /// direction is safe, so the predicate stays the narrow one.
+    pub(crate) fn declared_whole_file_test_modules(
+        files: &[PathBuf],
+    ) -> Vec<(PathBuf, String, [PathBuf; 2])> {
+        let mut found = Vec::new();
+        for path in files {
+            let blanked = super::blank_comments_and_strings(
+                &std::fs::read_to_string(path).expect("read source"),
+            );
+            let parent = path.parent().expect("a source file has a directory");
+            let stem = path.file_stem().expect("a source file has a name");
+            let dir = if stem == "mod" || stem == "lib" || stem == "main" {
+                parent.to_path_buf()
+            } else {
+                parent.join(stem)
+            };
+            for rest in blanked.split("#[cfg(test)]").skip(1) {
+                let Some(name) = rest.trim_start().strip_prefix("mod ") else {
+                    continue;
+                };
+                let Some(name) = name.split(';').next().map(str::trim) else {
+                    continue;
+                };
+                if name.is_empty() || name.contains('{') {
+                    continue;
+                }
+                found.push((
+                    path.clone(),
+                    name.to_owned(),
+                    [
+                        dir.join(format!("{name}.rs")),
+                        dir.join(name).join("mod.rs"),
+                    ],
+                ));
+            }
+        }
+        found
+    }
+}
 
 #[cfg(test)]
 mod tests;
