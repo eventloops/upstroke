@@ -1017,6 +1017,16 @@ schema 4 at max_parallel = 1 synchronously" and "schema 4 always runs TopologyRu
 their own tests**; nothing outside `select.rs` so much as matches on `Step`. The slice built every
 component of the run and never assembled the run.
 
+**Measured after the fact, and it is the sharpest number this slice produced.** Six withheld
+catalogues were authored from the packet alone, by readers forbidden to open `src/engine/topology/`:
+265 entries, every `packet_basis` resolving to a live key. **93 of them — 35% — are written against
+`TopologyRun`, its loop, or the production `EventEmitter`**, naming methods like
+`TopologyRun::run_fresh` and `TopologyRun::initialize_slots`. Six independent readers, none of whom
+had seen the implementation, all assumed the driver existed, because the specification describes one
+and nothing in the specification hints that it was skipped. A third of the catalogue is
+**unapplicable** until the driver is written, which is also the cleanest available measure of how much
+of the slice's obligation surface the omission accounts for.
+
 Neither is detectable by any technique this project currently runs. A mutation catalogue measures
 whether existing code is pinned; **omission has nothing to mutate.** A per-lane review reads the
 lanes that exist. The 117 named tests all pass — they are per-boundary tests, and a driver that
