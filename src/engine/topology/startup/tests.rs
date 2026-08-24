@@ -34,13 +34,12 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use super::{
-    BarrierHeld, CensusInputs, Planned, RunDirCensusReport, RunDirEntry, RunDirOutcome,
-    WorktreeLocked, apply, census_run_dirs, resume_census, startup_census,
+    CensusInputs, Planned, RunDirCensusReport, RunDirEntry, RunDirOutcome, WorktreeLocked, apply,
+    census_run_dirs, startup_census,
 };
 use crate::error::UpstrokeError;
-use crate::events::log::{EventLog, NoEventHooks, establish_stable_prefix};
+use crate::events::log::EventLog;
 use crate::events::{EventBody, RunStarted};
-use crate::ir::{Plan, PlanSource};
 use crate::rundir::{
     self, COMMIT_RECORD, CommitRecord, CreatingMarker, MARKER, MARKER_STAGED, OWNER_RECORD,
     OWNER_RECORD_STAGED, OwnerField, OwnerRecord, RepoKey, RetainReason, RunDirClass, RunLock,
@@ -54,7 +53,6 @@ use crate::runner::container::{GitView, GitViewRequest};
 use crate::runner::policy::{host_policy, runner_policy_sha256};
 use crate::topology::effects::{EffectSiteId, EventSite, HookHarness, HookPhase, RunDirSite};
 use crate::topology::events::RunnerPolicy;
-use crate::topology::fold::FrozenInputs;
 
 // ===========================================================================
 // The fixture
@@ -157,35 +155,6 @@ impl Fixture {
     /// to open.
     fn worktree_lock(&self) -> WorktreeLock {
         WorktreeLock::acquire_in(&self.repo, &self.git_dir).expect("the worktree lock")
-    }
-
-    /// A `BarrierHeld` over a real, empty, proven prefix.
-    ///
-    /// `StablePrefix` has exactly one constructor, so this is the only way to
-    /// obtain the witness — which is the provenance argument the type exists
-    /// for, exercised rather than described.
-    fn barrier(&self, name: &str) -> BarrierHeld {
-        let log = self.root.join(format!("{name}.jsonl"));
-        let mut warnings = Vec::new();
-        let prefix = establish_stable_prefix(
-            &log,
-            FrozenInputs {
-                plan: Plan {
-                    source: PlanSource {
-                        adapter: "markdown".to_owned(),
-                        hash: "sha256:00".to_owned(),
-                    },
-                    tasks: Vec::new(),
-                    artifacts: Vec::new(),
-                },
-                normalized_plan_digest: "sha256:00".to_owned(),
-            },
-            None,
-            &mut warnings,
-            &mut NoEventHooks,
-        )
-        .expect("the barrier is established over an empty log");
-        BarrierHeld::from(prefix)
     }
 }
 
@@ -1502,49 +1471,6 @@ fn startup_census_returns_the_witness_and_runs_both_halves() {
     let (locked, census) = censused.into_parts();
     assert_eq!(census.run_dirs().entries().len(), 1);
     drop(locked);
-}
-
-/// `resume_census` consumes the barrier witness, returns `ResumeCensused`, and
-/// threads its own run id into half (b).
-///
-/// The own-run id is what licenses removing this run's stale marker while its
-/// `run.lock` is held by this very process — recovery step (a1)'s "this run's
-/// own stale marker, which the owner removes here". A `resume_census` that
-/// dropped the id on the floor would leave the marker and the test would fail on
-/// the assertion below rather than somewhere unrelated later.
-#[test]
-fn resume_census_consumes_the_barrier_and_repairs_its_own_stale_marker() {
-    let fixture = Fixture::new("resume-witness");
-    let run_id = "01RESUME000000000000000000";
-    let husk = Husk::at_p0(&fixture, run_id)
-        .stage_marker()
-        .publish_marker()
-        .create_private()
-        .publish_owner()
-        .publish_commit_record()
-        .commit_log();
-    let lock = RunLock::acquire(&husk.public()).expect("this resume's own run lock");
-
-    let barrier = fixture.barrier("resume");
-    let mut hooks = crate::engine::topology::NoTopologyHooks::new();
-    let censused =
-        resume_census(barrier, run_id, &mut hooks, &fixture.inputs()).expect("the resume census");
-
-    assert_eq!(
-        censused
-            .census()
-            .run_dirs()
-            .of(run_id)
-            .expect("the own run is censused")
-            .outcome,
-        RunDirOutcome::RepairedStaleMarker,
-    );
-    assert!(!exists(&husk.public().join(MARKER)));
-    // The barrier comes back out: the append handle and the fold it carries are
-    // what the rest of the recovery order runs on.
-    let (barrier, _census) = censused.into_parts();
-    assert_eq!(barrier.barrier().expect("restated").boundary(), 0);
-    drop(lock);
 }
 
 /// A census of an empty repository is an empty report, not a failure.

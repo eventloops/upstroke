@@ -25,7 +25,7 @@ use std::time::Duration;
 use super::*;
 use crate::agent::{AdapterSource, AgentAdapter, Caps, ProcessOutput, TaskRun};
 use crate::config::RunnerSelection;
-use crate::events::log::{BarrierStep, EventLog};
+use crate::events::log::{BarrierStep, EventLog, TopologyLine};
 use crate::events::{AttemptRecord, BindingSummary, BudgetKind, ChainSummary, GateSummary};
 use crate::gates::ShellKind;
 use crate::ir::Outcome;
@@ -34,10 +34,13 @@ use crate::ir::{
     Tier,
 };
 use crate::review::{PassBinding, ReviewPlan};
-use crate::rundir::{self, CommitRecord, NoHooks, OwnerRecord, RepoKey};
+use crate::rundir::{
+    self, CommitRecord, CreatingMarker, NoHooks, OwnerRecord, RepoKey, RetainReason,
+};
 use crate::runner::container::resolve::RunnerPreflight;
 use crate::runner::container::runtime::{ContainerRuntime, ContainerTrace};
 use crate::runner::container::{DisposableDirView, FakeOwnerLiveness, FakeRuntime};
+use crate::runner::policy::runner_policy_sha256;
 use crate::runner::{CommandSpec, Runner, RunnerRequest};
 use crate::topology::effects::EventSite;
 use crate::topology::effects::{
@@ -47,7 +50,7 @@ use crate::topology::events::{
     AttemptFinished4, AttemptSettlement, AttemptStarted4, BudgetExceeded4, CommitSha, Epoch,
     GitRef, ImageIdentity, IncarnationId, LeaseGrant, RunFinished4, RunStarted4, RungBinding,
     RunnerContract, RunnerKind, RunnerPolicy, SessionId, SettlementTransition, TaskDispatched,
-    TopologyLimits,
+    TopologyEvent, TopologyLimits,
 };
 use crate::topology::fold::{FrozenInputs, TaskState};
 use crate::topology::paths::{GitPath, PathSet};
@@ -55,6 +58,8 @@ use crate::topology::paths::{PathGrammar, PathPolicy, PathPolicyVersion};
 use crate::topology::registry::{TaskKey, TaskRegistry};
 use crate::topology::schema::TOPOLOGY_SCHEMA;
 
+use crate::engine::topology::RunDirOutcome;
+use crate::engine::topology::identity::{InvocationLedger, ReservationKind, Reservations};
 use crate::engine::topology::preflight::RunPreflight;
 use crate::engine::topology::seams::{HarnessTopologyHooks, TimeSource};
 
@@ -70,6 +75,10 @@ const IMAGE_REF: &str = "ghcr.io/example/upstroke-runner:1.4";
 const IMAGE_ID: &str = "sha256:1111111111111111111111111111111111111111111111111111111111111111";
 const VOLUME: &str = "upstroke-creds-claude";
 const AGENT: &str = "claude-code";
+/// The pid the creator wrote into its `.creating` marker. Never consulted by
+/// the ownership proof — the marker's pid is not one of the twelve conjuncts —
+/// but a marker is not a marker without one.
+const CREATOR_PID: u32 = 4242;
 
 /// A clock that does not move, so a durable byte can be asserted against a
 /// literal.
@@ -164,6 +173,25 @@ impl Fixture {
             container_runner()
         };
         let started = run_started(&plan, &recorded_locator, runner);
+
+        // P1: the `.creating` marker the creator published and never removed,
+        // because this run was interrupted between P5b's commit record and P8's
+        // `RunDir.RemoveMarker`. That is the shape a resume exists for, and it
+        // is what makes recovery step (a1)'s "this run's own stale marker,
+        // **which the owner removes here**" a removal that removes something.
+        // Without it every "no census effect followed this refusal" assertion
+        // below is vacuously true, and the census's own write has nothing to be
+        // the anchor of.
+        let marker = CreatingMarker {
+            run_id: RUN_ID.to_owned(),
+            repo_key: repo_key.as_str().to_owned(),
+            private_dir: recorded_locator.clone(),
+            incarnation: CREATOR.to_owned(),
+            pid: CREATOR_PID,
+            runner_policy_sha256: runner_policy_sha256(&started.runner),
+        };
+        rundir::stage_marker(&public, &marker, &mut NoHooks).expect("P1a stages the marker");
+        rundir::publish_marker(&public, &mut NoHooks).expect("P1b publishes it");
 
         // The log, through the Event funnel and nothing else.
         let mut warnings = Vec::new();
@@ -276,6 +304,99 @@ impl Drop for Fixture {
         // exhausts inodes on the build box when nothing does.
         let _ = rundir::remove_public_husk(&self.root, &mut NoHooks);
     }
+}
+
+// ---------------------------------------------------------------------------
+// A husk beside the run
+// ---------------------------------------------------------------------------
+
+/// A husk this repository's next write command may reclaim, planted through the
+/// same funnels a creator would have used.
+///
+/// The prefix is a creator that died after P3b and before P5b: a published
+/// `.creating`, the private half it names, and the reciprocal `owner.json` — the
+/// twelve conjuncts of [`rundir::prove_private_half_ownership`] all satisfied,
+/// so [`crate::rundir::PrivateHalfOwnership::Proven`] and both halves
+/// reclaimable. `committed` publishes `committed.json` as well, which fails
+/// conjunct 12 and turns the same shape into a retention: the control half, so
+/// "the census reclaimed it" is a claim about the proof rather than about the
+/// census deleting whatever it walks over.
+struct PlantedHusk {
+    public: PathBuf,
+    private: PathBuf,
+}
+
+fn plant_husk(fixture: &Fixture, run_id: &str, committed: bool) -> PlantedHusk {
+    let public = rundir::public_dir(&fixture.repo_root, run_id);
+    let private = fixture.private_root.join("runs").join(run_id);
+    mkdir(&public);
+    mkdir(&private);
+
+    let runner = container_runner();
+    let marker = CreatingMarker {
+        run_id: run_id.to_owned(),
+        repo_key: fixture.repo_key.as_str().to_owned(),
+        private_dir: private.display().to_string(),
+        incarnation: CREATOR.to_owned(),
+        pid: CREATOR_PID,
+        runner_policy_sha256: runner_policy_sha256(&runner),
+    };
+    rundir::stage_marker(&public, &marker, &mut NoHooks).expect("P1a stages the husk's marker");
+    rundir::publish_marker(&public, &mut NoHooks).expect("P1b publishes it");
+
+    let owner = OwnerRecord {
+        run_id: run_id.to_owned(),
+        repo_key: fixture.repo_key.as_str().to_owned(),
+        public_dir: canonical(&public),
+        incarnation: CREATOR.to_owned(),
+        runner,
+    };
+    rundir::stage_owner_record(&private, &owner, &mut NoHooks)
+        .expect("P3a stages the owner record");
+    rundir::publish_owner_record(&private, &mut NoHooks).expect("P3b publishes it");
+
+    if committed {
+        let record = CommitRecord {
+            run_id: run_id.to_owned(),
+            repo_key: fixture.repo_key.as_str().to_owned(),
+            public_dir: canonical(&public),
+            incarnation: CREATOR.to_owned(),
+            run_started_sha256: rundir::run_started_sha256(b"a first line of its own"),
+        };
+        rundir::stage_commit_record(&private, &record, &mut NoHooks)
+            .expect("P5a stages the commit record");
+        rundir::publish_commit_record(&private, &mut NoHooks).expect("P5b publishes it");
+    }
+
+    PlantedHusk { public, private }
+}
+
+/// Every file under `root`, by relative path, with its bytes.
+///
+/// What a "retained" assertion compares. Byte-identity, not existence: a census
+/// that emptied `owner.json` would leave the directory present and every weaker
+/// assertion green.
+fn tree_bytes(root: &Path) -> std::collections::BTreeMap<PathBuf, Vec<u8>> {
+    let mut out = std::collections::BTreeMap::new();
+    let mut stack = vec![root.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                stack.push(path);
+                continue;
+            }
+            let relative = path.strip_prefix(root).unwrap_or(&path).to_path_buf();
+            out.insert(
+                relative,
+                crate::util::read_file_bounded(&path).unwrap_or_default(),
+            );
+        }
+    }
+    out
 }
 
 fn canonical(path: &Path) -> String {
@@ -1634,6 +1755,104 @@ fn resume_of_nondefault_root_run_reclaims_earlier_incarnation_intents_in_recorde
     );
 }
 
+/// A resume **reclaims** the husks beside the run it is resuming: the private
+/// half first, through the proof-token funnel, then the public directory with
+/// the marker last.
+///
+/// `recovery_order` (a1)'s census is a "run-directory census incl. this run's
+/// own stale marker, which the owner removes here, **and husk reclamation under
+/// the ownership proof**", and INV-15 reclaims pre-run husks "at write-command
+/// start under the worktree lock". A resume is a write command and holds that
+/// lock. A run-directory pass that classified and reported would leave a
+/// provable husk on disk for ever: every later resume would report it again, and
+/// only a fresh `upstroke run` would ever reclaim it.
+///
+/// Three claims, and the third is what makes the first two mean anything:
+///
+/// * the provable husk is gone, both halves, and the report names the arm;
+/// * `RunDir.RemovePrivateHusk` precedes `RunDir.RemovePublicHusk` — reversed, a
+///   kill between the two leaves a private half no marker names and no later
+///   census can ever prove;
+/// * the husk carrying `committed.json` is byte-identical afterwards. A census
+///   that deleted whatever it walked over would pass the first two.
+#[test]
+fn resume_reclaims_a_provable_husk_beside_the_run_and_retains_a_possibly_committed_one() {
+    const RECLAIMED: &str = "01KZTHUSK00000000000000002";
+    const RETAINED: &str = "01KZTKEEP00000000000000003";
+
+    let fixture = Fixture::healthy("husk-beside");
+    let harness = harness();
+    let runtime = runtime_holding_the_record();
+
+    let reclaimed = plant_husk(&fixture, RECLAIMED, false);
+    let retained = plant_husk(&fixture, RETAINED, true);
+    let retained_before = tree_bytes(&retained.private);
+    assert!(
+        !retained_before.is_empty(),
+        "the retained husk must have a private half, or its comparison proves nothing"
+    );
+
+    let censused = chain_to_census(
+        &fixture,
+        &harness,
+        &runtime,
+        &IncarnationId(RESUMER.to_owned()),
+    )
+    .expect("the census completes");
+    let report = censused.run_dirs();
+
+    assert_eq!(
+        report
+            .of(RECLAIMED)
+            .expect("the provable husk is censused")
+            .outcome,
+        RunDirOutcome::ReclaimedBothHalves,
+        "a resume reclaims under the ownership proof; it does not merely report"
+    );
+    assert!(!reclaimed.private.exists(), "the private half is gone");
+    assert!(!reclaimed.public.exists(), "and so is the public directory");
+
+    let private_at = first_observation(
+        &harness,
+        EffectSiteId::RunDir(RunDirSite::RemovePrivateHusk),
+    )
+    .expect("the private half went through the proof-token funnel");
+    let public_at = first_observation(&harness, EffectSiteId::RunDir(RunDirSite::RemovePublicHusk))
+        .expect("and the public directory through its own");
+    assert!(
+        private_at < public_at,
+        "the private half first ({private_at}), the public directory with the marker last \
+         ({public_at})"
+    );
+
+    assert_eq!(
+        report
+            .of(RETAINED)
+            .expect("the retained husk is censused")
+            .outcome,
+        RunDirOutcome::Retained(RetainReason::PossiblyCommitted),
+    );
+    assert_eq!(
+        tree_bytes(&retained.private),
+        retained_before,
+        "nothing private that carries a commit record is deleted by any census"
+    );
+    assert!(retained.public.exists(), "nor is its public half");
+
+    // And the run being resumed: its own stale marker repaired by its owner, and
+    // nothing else. The husk arms are gated on the run lock, which this process
+    // holds for its own directory.
+    assert_eq!(
+        report
+            .of(RUN_ID)
+            .expect("the resuming run is censused too")
+            .outcome,
+        RunDirOutcome::RepairedStaleMarker,
+    );
+    assert!(!fixture.public().join(rundir::MARKER).exists());
+    assert!(fixture.log().exists(), "and the run itself is untouched");
+}
+
 // ===========================================================================
 // (a) — the surviving reaper hold
 // ===========================================================================
@@ -2012,6 +2231,57 @@ fn resume_after_append_error_follows_surviving_prefix() {
         "the line is durable — this is the after-append order of T-APPEND (e-s)"
     );
 
+    // **The protocol ran, and its report is what the command ends with.**
+    // Everything above this point is true of a build that merely poisoned the
+    // fold and returned the funnel's error, which is why none of it can stand
+    // for `append_error_protocol`. Obligation (5) is the observable one: reopen
+    // through `Event.OpenLog` (torn-tail normalization), establish the
+    // stable-prefix barrier, and end "naming the run id, the event kind, and
+    // whether the proven prefix contains the line".
+    assert!(text.contains(RUN_ID), "the report names the run: {text}");
+    assert!(
+        text.contains("run_resumed"),
+        "and the event kind whose outcome is unknown: {text}"
+    );
+    assert!(
+        text.contains("Event.Append"),
+        "and the site it was filed at: {text}"
+    );
+    assert!(
+        text.contains("the proven prefix contains the line"),
+        "and whether the proven prefix contains the line. Present here, and asserted as the \
+         sentence rather than as \"some outcome\": the injection is at `Synced`, after the bytes \
+         reached the file, so a protocol that reported `absent` would be wrong in the direction \
+         that loses a durable transition: {text}"
+    );
+    assert!(
+        text.contains("resumable"),
+        "and the run is reported resumable, which is what makes ending here safe: {text}"
+    );
+
+    let seen = first.lock().unwrap_or_else(PoisonError::into_inner);
+    assert_eq!(
+        seen.count(EffectSiteId::Event(EventSite::OpenLog), HookPhase::Before),
+        2,
+        "`Event.OpenLog` twice: recovery step (a1)'s barrier, then the protocol's reopen after \
+         the failed append. Once means no reopen happened and the outcome was never established."
+    );
+    assert_eq!(
+        seen.count(
+            EffectSiteId::Event(EventSite::ProvePrefixStable),
+            HookPhase::Before
+        ),
+        2,
+        "and the stable-prefix barrier is re-established over the reopened log before anything is \
+         reported"
+    );
+    assert_eq!(
+        seen.count(EffectSiteId::Event(EventSite::Append), HookPhase::Before),
+        1,
+        "and the append itself is never retried"
+    );
+    drop(seen);
+
     // The next resume: a fresh harness, nothing armed, and it follows the
     // surviving prefix.
     let second = harness();
@@ -2026,6 +2296,97 @@ fn resume_after_append_error_follows_surviving_prefix() {
     assert!(
         first_observation(&second, EffectSiteId::Event(EventSite::ProvePrefixStable)).is_some(),
         "and it proved the prefix before acting on it"
+    );
+}
+
+/// An outcome-unknown append during recovery cancels the provisional
+/// reservation and every still-running invocation.
+///
+/// `append_error_protocol` obligations (2) and (3):
+/// [`Reservations::cancel_any`] — `permits`: "cancellation on any pre-append
+/// failure, run end, shutdown, or a poisoned fold" — and
+/// [`InvocationLedger::cancel_all_running`], the ledger half of "in-flight
+/// invocations are cancelled through the Runner".
+///
+/// The recovery order's own ledgers are empty, so on that path both obligations
+/// are satisfied vacuously and no test of `resume` could tell a build that ran
+/// them from one that did not. So this test hands the emitter ledgers that are
+/// **not** empty — one held reservation, one registered running invocation —
+/// which is exactly why they are `EmitContext` fields rather than locals inside
+/// the recovery order. Both ledgers balance afterwards: every entry settled
+/// exactly once, which is the process-end condition R4 states.
+#[test]
+fn an_append_error_during_recovery_cancels_the_reservation_and_every_running_invocation() {
+    let fixture = Fixture::healthy("append-error-ledgers");
+    let harness = harness();
+    harness
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .arm(
+            EffectSiteId::Event(EventSite::Append),
+            SubEffectPoint::Synced,
+            InjectionMode::ErrorReturn,
+        )
+        .expect("the Synced point supports an error return");
+    let runtime = runtime_holding_the_record();
+    let incarnation = IncarnationId(RESUMER.to_owned());
+
+    let censused =
+        chain_to_census(&fixture, &harness, &runtime, &incarnation).expect("the census completes");
+    let rebuilt = RunnerRebuilt::rebuild(censused, &container_selection(), Some(&runtime))
+        .expect("the recorded runner rebuilds by inspection");
+    let certified =
+        PreflightCertified::certify(rebuilt, &AlwaysCertifies).expect("the pre-flight certifies");
+
+    let mut reservations = Reservations::new();
+    reservations
+        .take(ALPHA, ReservationKind::Dispatch)
+        .expect("a provisional reservation is held");
+    let mut invocations = InvocationLedger::new();
+    let invocation = crate::runner::InvocationId::probe(crate::runner::ProbeTarget::Shell, 11)
+        .expect("an invocation identity");
+    invocations
+        .register(&invocation)
+        .expect("and one invocation is running");
+    assert!(
+        !reservations.is_empty() && invocations.running().len() == 1,
+        "the ledgers must be non-empty, or this test proves nothing"
+    );
+
+    let mut hooks = HarnessTopologyHooks::new(Arc::clone(&harness));
+    let mut warnings = Vec::new();
+    let mut context = EmitContext {
+        clock: &Frozen,
+        hooks: &mut hooks,
+        inputs: fixture.inputs(),
+        reservations: &mut reservations,
+        invocations: &mut invocations,
+        warnings: &mut warnings,
+    };
+    let error = run_resumed(certified, &mut context, &incarnation)
+        .expect_err("the injected append error ends the command");
+    let text = message(&error);
+    assert!(
+        text.contains(crate::events::log::INJECTED_PREFIX),
+        "the report carries the funnel's own error as its cause: {text}"
+    );
+
+    assert!(
+        reservations.is_empty(),
+        "obligation (2): whatever reservation was held is cancelled"
+    );
+    assert!(
+        reservations.balances(),
+        "and the reservation ledger balances — taken once, cancelled once"
+    );
+    assert_eq!(
+        invocations.cancelled(),
+        1,
+        "obligation (3): every still-running invocation is cancelled"
+    );
+    assert!(
+        invocations.running().is_empty() && invocations.balances(),
+        "and the invocation ledger balances: no entry is left running"
     );
 }
 
@@ -2470,6 +2831,18 @@ fn kill_during_recovery_repeats_recovery() {
     );
 
     // And the next process repeats the order from (a0).
+    //
+    // The census's evidence has to be something the *repeat* can act on. The
+    // dead child had already censused before it reached the append it died at,
+    // so this run's stale marker is gone and stays gone: `RunDir.RemoveMarker`
+    // would be absent from a build that repeated the census perfectly. A husk
+    // planted now is the evidence instead — another crashed run, arriving
+    // between the two processes — and it is the stronger one, because reclaiming
+    // it is a census *effect* rather than a repair that finds nothing to do.
+    const AFTER_THE_KILL: &str = "01KZTKILL00000000000000004";
+    let husk = plant_husk(&fixture, AFTER_THE_KILL, false);
+    assert!(husk.private.exists() && husk.public.exists());
+
     let harness = harness();
     let runtime = runtime_holding_the_record();
     let certifies = AlwaysCertifies;
@@ -2483,7 +2856,8 @@ fn kill_during_recovery_repeats_recovery() {
         EffectSiteId::Lock(LockSite::AcquireRun),
         EffectSiteId::Event(EventSite::OpenLog),
         EffectSiteId::Event(EventSite::ProvePrefixStable),
-        EffectSiteId::RunDir(RunDirSite::RemoveMarker),
+        EffectSiteId::RunDir(RunDirSite::RemovePrivateHusk),
+        EffectSiteId::RunDir(RunDirSite::RemovePublicHusk),
     ] {
         assert!(
             seen.observed(site, HookPhase::Before),
@@ -2491,6 +2865,11 @@ fn kill_during_recovery_repeats_recovery() {
              checkpoint"
         );
     }
+    drop(seen);
+    assert!(
+        !husk.private.exists() && !husk.public.exists(),
+        "and the repeat's census reclaimed the husk it found, both halves"
+    );
     assert_eq!(
         recovered.resumed.epoch, 2,
         "the killed process's `run_resumed` line survived, so this resume opens the epoch after it"

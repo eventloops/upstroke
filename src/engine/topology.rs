@@ -48,7 +48,7 @@ pub mod prelock;
 pub mod seams;
 pub mod select;
 pub mod settle;
-pub mod startup;
+pub(crate) mod startup;
 
 pub use attempt::{
     AttemptContext, AttemptOutcome, AttemptPlan, AttemptRun, Capture, GatePlan, Judgement,
@@ -89,7 +89,7 @@ pub use settle::{
 };
 pub use startup::{
     CensusInputs, FreshCensused, RunDirCensusReport, RunDirEntry, RunDirOutcome, StartupCensus,
-    WorktreeLocked, resume_census, startup_census,
+    WorktreeLocked, startup_census,
 };
 
 /// The schema-4 run that `dispatch.rs` and `attempt.rs` are tested against.

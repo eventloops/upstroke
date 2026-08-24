@@ -74,18 +74,19 @@ use std::path::Path;
 use crate::config::RunnerSelection;
 use crate::error::UpstrokeError;
 use crate::events::RunOutcome;
-use crate::events::log::TopologyLine;
 use crate::rundir::RepoKey;
 use crate::runner::container::GitView;
 use crate::runner::container::resolve::RunnerPreflight;
 use crate::runner::container::runtime::{ContainerRuntime, OwnerLiveness};
 use crate::topology::events::{
     AttemptInterrupted4, AttemptNumber, GenerationCloseReason, GenerationClosed, GenerationId,
-    IncarnationId, LeaseDisposition, RunResumed4, TopologyEvent, TopologyEventBody,
+    IncarnationId, LeaseDisposition, RunResumed4, TopologyEventBody,
 };
 use crate::topology::fold::{FrozenInputs, GenerationClass, TopologyFold};
 use crate::topology::registry::TaskKey;
 
+use super::emit::{EmitState, RunIdentity};
+use super::identity::{InvocationLedger, Reservations};
 use super::seams::{TimeSource, TopologyHooks};
 
 pub use chain::{
@@ -806,7 +807,7 @@ pub mod chain {
 
         use super::barrier::BarrierHeld;
         use crate::error::UpstrokeError;
-        use crate::rundir::{self, HuskReport, RepoKey};
+        use crate::rundir::RepoKey;
         use crate::runner::container::GitView;
         use crate::runner::container::census::{
             Census, CensusComplete, CensusReport, CensusStart, run_startup_census,
@@ -815,22 +816,8 @@ pub mod chain {
         use crate::topology::events::IncarnationId;
 
         use crate::engine::topology::seams::TopologyHooks;
+        use crate::engine::topology::startup::{CensusInputs, RunDirCensusReport, census_run_dirs};
 
-        /// The census of step (a), and the barrier it was decided under.
-        ///
-        /// **The census returns the witness; it does not get wrapped.** A
-        /// wrapper would prove possession — the holder had a census result and
-        /// a barrier, in either order — and the packet requires the barrier
-        /// *first*: "a resume takes its run lock first, establishes the
-        /// stable-prefix barrier of recovery step (a1), **then** censuses". The
-        /// constructor consuming [`BarrierHeld`] by value is that ordering, as
-        /// a call.
-        ///
-        /// The run-directory half reuses [`rundir::husk_report`], which is
-        /// already what `status` drives. **One classifier, two callers** — the
-        /// packet requires a husk "retained and reported with its locator and
-        /// reason by every census **and by status**", and a second classifier
-        /// would drift from the first.
         /// What the census reads from the world: the four seams and the two
         /// identities it is censusing on behalf of.
         ///
@@ -848,29 +835,50 @@ pub mod chain {
             pub view: &'a dyn GitView,
         }
 
+        /// The census of step (a), and the barrier it was decided under.
+        ///
+        /// **The census returns the witness; it does not get wrapped.** A
+        /// wrapper would prove possession — the holder had a census result and
+        /// a barrier, in either order — and the packet requires the barrier
+        /// *first*: "a resume takes its run lock first, establishes the
+        /// stable-prefix barrier of recovery step (a1), **then** censuses". The
+        /// constructor consuming [`BarrierHeld`] by value is that ordering, as
+        /// a call.
         #[derive(Debug)]
         pub struct ResumeCensused {
             barrier: BarrierHeld,
             containers: CensusComplete,
-            husks: Vec<HuskReport>,
+            run_dirs: RunDirCensusReport,
         }
 
         impl ResumeCensused {
-            /// Census under `barrier`: containers first, then run directories,
-            /// then this run's own stale marker.
+            /// Census under `barrier`: containers first, then the run
+            /// directories — this run's own stale marker among them.
             ///
-            /// The marker removal is the one *write* of this step and it is
-            /// last, because `resource_accounting` has a stale marker removed
-            /// "by a census with the lock free **or** by its owner on resume" —
-            /// this is the owner, and it may only act after the barrier proved
-            /// the prefix that says the run committed.
+            /// **A resume reclaims.** `recovery_order` (a1) is a "startup
+            /// census … run-directory census incl. this run's own stale marker,
+            /// which the owner removes here, **and husk reclamation under the
+            /// ownership proof**", and INV-15 reclaims pre-run husks "at
+            /// write-command start under the worktree lock". A resume is a
+            /// write command and holds that lock, so the run-directory half is
+            /// [`census_run_dirs`] — the same function `upstroke run` calls, not
+            /// a read-only second pass. A pass that classified and reported
+            /// would leave every husk beside the resuming run on disk for ever,
+            /// with only a fresh `upstroke run` able to reclaim it.
+            ///
+            /// `own_run` is this run's id and licenses exactly one thing: the
+            /// stale-marker repair that `resource_accounting` gives to "a census
+            /// with the lock free **or** its owner on resume". It cannot reach
+            /// the husk arms, which are gated on the lock alone — and this
+            /// process holds its own run's lock, so its own directory is refused
+            /// there whatever shape its log is in.
             ///
             /// # Errors
             ///
             /// [`UpstrokeError::Refused`] from the container census — an
             /// unreachable runtime with intents present, an intent naming this
-            /// process's own incarnation, an unreclaimable dead owner — or from
-            /// the marker removal.
+            /// process's own incarnation, an unreclaimable dead owner — or
+            /// [`UpstrokeError::Io`] from a reclaim or the marker repair.
             pub fn census(
                 barrier: BarrierHeld,
                 seams: &CensusSeams<'_>,
@@ -891,42 +899,50 @@ pub mod chain {
                     .root()
                     .private_root()
                     .to_path_buf();
-                let public = barrier.records().locks().root().public_dir().to_path_buf();
+
+                // One value for both halves. `CensusInputs` carries a single
+                // `authorized_root`, so the root half (a) scans and the root
+                // half (b) proves ownership under cannot disagree.
+                let inputs = CensusInputs {
+                    repo_root,
+                    repo_key,
+                    authorized_root: &private_root,
+                    incarnation: incarnation.0.as_str(),
+                    runtime: *runtime,
+                    liveness: *liveness,
+                    view: *view,
+                };
 
                 // (i) Containers, including every earlier incarnation of this
                 // run under `<R>/containers`. The start value carries the
                 // barrier this module derived, so `CensusStart::Resume` cannot
                 // be built here without one.
                 let start = CensusStart::Resume {
-                    run_id,
+                    run_id: run_id.clone(),
                     incarnation: incarnation.0.clone(),
                     barrier: barrier.stable_prefix_barrier(),
                 };
                 let containers = run_startup_census(
                     hooks.container(),
                     &Census {
-                        private_root: &private_root,
+                        private_root: inputs.authorized_root,
                         start: &start,
-                        runtime: *runtime,
-                        liveness: *liveness,
-                        view: *view,
+                        runtime: inputs.runtime,
+                        liveness: inputs.liveness,
+                        view: inputs.view,
                     },
                 )?;
 
-                // (ii) Run directories: every husk classified and reported,
-                // never deleted here.
-                let husks = rundir::list_husks(repo_root)
-                    .into_iter()
-                    .map(|id| rundir::husk_report(repo_root, &id, repo_key, &private_root))
-                    .collect();
-
-                // (iii) This run's own stale marker, removed by its owner.
-                rundir::remove_marker(&public, hooks.rundir())?;
+                // (ii) Run directories: classified, then reclaimed under the
+                // ownership proof — private half through the proof-token funnel
+                // first, public directory with the marker last — and this run's
+                // own stale marker repaired by its owner.
+                let run_dirs = census_run_dirs(hooks.rundir(), &inputs, Some(&run_id))?;
 
                 Ok(Self {
                     barrier,
                     containers,
-                    husks,
+                    run_dirs,
                 })
             }
 
@@ -963,11 +979,17 @@ pub mod chain {
                 self.containers.report()
             }
 
-            /// Every husk, with its locator and its reason. Reported, never
-            /// deleted.
+            /// What the run-directory half found and did: one entry per
+            /// directory under `<repo>/.upstroke/runs`, with its locator, its
+            /// class and its outcome.
+            ///
+            /// Total over the runs directory, so "every husk retained and
+            /// reported with its locator and reason" and "every husk reclaimed
+            /// under the proof" are both read off the one report — and a
+            /// directory this census did nothing to is still an entry.
             #[must_use]
-            pub fn husks(&self) -> &[HuskReport] {
-                &self.husks
+            pub const fn run_dirs(&self) -> &RunDirCensusReport {
+                &self.run_dirs
             }
         }
     }
@@ -1299,9 +1321,21 @@ pub fn run_recovery_order(
     // append".
     refuse_unimplemented_terminals(&certified)?;
 
+    // The append-error protocol's two ledgers. The recovery order takes no
+    // provisional reservation and registers no invocation of its own — (c)'s
+    // probes are the Runner's and are reclaimed there — so on this path both are
+    // empty and the protocol cancels nothing. They exist here rather than inside
+    // `emit` because "nothing was held" has to be an observation the ledgers
+    // make, not an assumption the emitter is written around.
+    let mut reservations = Reservations::new();
+    let mut invocations = InvocationLedger::new();
     let mut context = EmitContext {
         clock: seams.clock,
         hooks,
+        inputs: seams.inputs.clone(),
+        reservations: &mut reservations,
+        invocations: &mut invocations,
+        warnings,
     };
     // (d), (e) — recovery events, every one of them before (h).
     let interrupted = settle_interrupted(&mut certified, &mut context)?;
@@ -1416,9 +1450,17 @@ pub fn refuse_unimplemented_terminals(certified: &PreflightCertified) -> Result<
 
 /// What one recovery event append needs beyond the witness.
 ///
-/// Bundled because the three travel together at every emitter and a signature
-/// that spelled them out four times is four places for one of them to go
-/// missing.
+/// Bundled because they travel together at every emitter and a signature that
+/// spelled them out four times is four places for one of them to go missing.
+///
+/// Everything below `hooks` is here because [`super::emit::emit`] needs it, and
+/// it needs it because the append-error protocol does: the barrier it
+/// establishes at obligation (5) is established over `inputs` and the committed
+/// first line's digest, and obligations (2) and (3) are `cancel_any` and
+/// `cancel_all_running` on these two ledgers. Passing them in rather than
+/// making them here is what lets a caller that *does* hold a reservation or a
+/// running invocation have it cancelled — "recovery holds neither today" is a
+/// fact about today's callers, not a licence to drop the obligation.
 pub struct EmitContext<'a> {
     /// Where a durable event's timestamp comes from. Seamed so a byte-exact
     /// assertion over the log is possible at all.
@@ -1426,6 +1468,19 @@ pub struct EmitContext<'a> {
     /// The five effect-hook families. The Event funnel's are what a
     /// `T-APPEND` fault test arms.
     pub hooks: &'a mut dyn TopologyHooks,
+    /// The frozen plan and its digest. The protocol's reopened barrier is
+    /// established over exactly these — the same two inputs recovery step (a1)
+    /// used — so a protocol that took its own copy could prove a prefix against
+    /// a plan the run was never folded from.
+    pub inputs: FrozenInputs,
+    /// The provisional-reservation ledger. `cancel_any` on any outcome-unknown
+    /// append.
+    pub reservations: &'a mut Reservations,
+    /// The invocation ledger. Every still-running entry is cancelled; the
+    /// Runner half of that is the caller's.
+    pub invocations: &'a mut InvocationLedger,
+    /// Where the protocol's reopen reports a torn-tail normalization.
+    pub warnings: &'a mut Vec<String>,
 }
 
 /// (d) Settle every in-flight identity interrupted.
@@ -1548,62 +1603,74 @@ pub struct Resumed {
 
 /// `coordinator_integration.emit`, for one recovery event.
 ///
-/// > build event -> serialize -> round-trip -> `plan_transition` -> append the
-/// > exact bytes through the Event funnel (written, then synced; the newline is
-/// > the commit marker) -> `apply_delta` **only after** the funnel returned Ok;
-/// > a `FoldError` aborts before any write; an `Err` returned by the funnel
-/// > after the append was entered runs the `append_error_protocol`.
+/// **One line of body, and that is the point.** Every recovery event — (d)'s
+/// `attempt_interrupted`, (e)'s `generation_closed`, (h)'s `run_resumed` — is an
+/// `Event.Append`, and `append_error_protocol` applies to `Event.Append` without
+/// exception: poison the fold, `Reservations::cancel_any`,
+/// `InvocationLedger::cancel_all_running`, no retry and no report from memory,
+/// then reopen through `Event.OpenLog`, establish the stable-prefix barrier, and
+/// end naming the run id, the event kind and **whether the proven prefix
+/// contains the line** — present, absent, or undetermined.
 ///
-/// The round-trip is [`TopologyLine::round_trip`], which is the only way to
-/// make bytes the funnel accepts, so "append the exact bytes" is structural.
-/// [`TopologyFold::poison`] is called explicitly on the error path: after an
-/// append whose outcome is unknown, "every later transition attempt in this
-/// process is refused", and a fold that merely stopped being used would be one
-/// edit away from being used again.
+/// [`super::emit::emit`] is those five obligations and the six steps above them.
+/// This function is the call, and `dispatch.rs` states why it is only the call:
+/// "a module that held the log would hold the append-error protocol with it …
+/// and there would be two implementations of it, which is the duplication class
+/// this crate has already paid for three times". [`super::create`] keeps one of
+/// its own on purpose — `Event.AppendFirst` has to answer *absent first line* as
+/// one of three creator dispositions rather than as a barrier failure — and the
+/// recovery order has no such difference to justify a third.
+///
+/// The two shapes an open-coded version got wrong, recorded because they are
+/// what a reader would otherwise reintroduce:
+///
+/// * a `FoldError` is a **refusal**, not [`UpstrokeError::EventLog`]. Nothing
+///   was written, so an error naming the log file as an I/O path says the wrong
+///   thing about what happened.
+/// * a funnel `Err` **before the append was entered** — a poisoned handle, a
+///   legacy handle, a site that is not this line's — must not poison the fold.
+///   `emit` decides that from `EventLog::poisoned_at()` on both sides of the
+///   call rather than from the error value, so "entered" is decidable and a
+///   wrong-site refusal leaves the fold usable.
 ///
 /// # Errors
 ///
-/// The [`crate::topology::fold::FoldError`] of a transition that does not
-/// apply — before any write — or the Event funnel's error, after which the
-/// fold is poisoned and the command ends.
+/// [`UpstrokeError::Refused`] for a transition the checked fold rejects — before
+/// any write — and for an append that was entered and returned an error, in
+/// which case the protocol has already run and the message carries its report.
+/// [`UpstrokeError::Io`] or [`UpstrokeError::EventLog`] for a refusal the funnel
+/// raised before entry.
 fn emit(
     certified: &mut PreflightCertified,
     context: &mut EmitContext<'_>,
     body: TopologyEventBody,
 ) -> Result<(), UpstrokeError> {
-    let event = TopologyEvent {
-        ts: context.clock.now_rfc3339(),
-        body,
+    // Built before the mutable borrow of the chain below it, and from the
+    // witness rather than from a caller: the run id is the one (a0) resolved and
+    // the digest is the one (a) verified, so the protocol's barrier is the same
+    // barrier over the same two inputs as recovery step (a1)'s.
+    let records = certified.rebuilt().censused().barrier().records();
+    let identity = RunIdentity {
+        run_id: records.locks().root().run_id().to_owned(),
+        inputs: context.inputs.clone(),
+        committed_first_line_sha256: Some(records.commit().run_started_sha256.clone()),
     };
-    let site = crate::events::log::site_for(&event.body);
-    let (line, checked) = TopologyLine::round_trip(&event)?;
+
     let (log, fold) = certified
         .rebuilt_mut()
         .censused_mut()
         .barrier_mut()
         .writer();
-    // A FoldError aborts before any write.
-    let delta = fold
-        .plan_transition(&checked)
-        .map_err(|error| UpstrokeError::EventLog {
-            path: log.path().to_path_buf(),
-            message: error.to_string(),
-        })?;
-    match log.append_topology_hooked(site, &line, context.hooks.events()) {
-        Ok(()) => {
-            fold.apply_delta(delta);
-            Ok(())
-        }
-        Err(error) => {
-            // The append was entered and its outcome is unknown. No
-            // `apply_delta`, no retry, no report from memory: the fold is
-            // poisoned and the command ends. The next resume re-establishes the
-            // barrier over whichever prefix survived and follows the fault row
-            // of that prefix.
-            fold.poison();
-            Err(error)
-        }
-    }
+    let mut state = EmitState {
+        fold,
+        log,
+        reservations: context.reservations,
+        invocations: context.invocations,
+        warnings: context.warnings,
+    };
+    super::emit::emit(&identity, &mut state, context.clock, body, context.hooks)
+        .map(|_| ())
+        .map_err(UpstrokeError::from)
 }
 
 // ---------------------------------------------------------------------------

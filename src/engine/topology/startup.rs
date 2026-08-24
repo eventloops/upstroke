@@ -30,18 +30,31 @@
 //! recomputed at the deletion site, and a second answer that is not `Proven`
 //! wins — it is the one adjacent to the effect.
 //!
+//! # One run-directory census, both write commands
+//!
+//! [`census_run_dirs`] is half (b) and there is exactly one of it.
+//! [`startup_census`] is `upstroke run`'s caller and
+//! [`super::recover::ResumeCensused::census`] is `upstroke resume`'s; the
+//! difference between them is the `own_run` argument and nothing else. INV-15
+//! requires pre-run husks reclaimed "at write-command start under the worktree
+//! lock", and a resume is a write command — a second, read-only run-directory
+//! pass on the resume path would classify and report husks that no command ever
+//! reclaimed.
+//!
 //! # The census returns the witness
 //!
 //! Wrapping a census result in a witness afterwards proves *possession*, not
-//! *order*: the holder had a report and a barrier, in either order. The packet
-//! requires the barrier first — "a resume takes its run lock first, establishes
-//! the stable-prefix barrier of recovery step (a1), **then** censuses" — so the
+//! *order*: the holder had a report and a lock, in either order. So the
 //! predecessor is consumed **by value** by the census call itself and the
-//! ordering *is* the call. [`startup_census`] takes a [`WorktreeLocked`] and
-//! returns a [`FreshCensused`]; [`resume_census`] takes a [`BarrierHeld`] and
-//! returns a [`ResumeCensused`]. Neither witness is constructible from the
-//! other, and neither is constructible from a container [`CensusComplete`],
-//! which proves half (a) alone.
+//! ordering *is* the call: [`FreshCensused::establish`] takes a
+//! [`WorktreeLocked`], performs both halves itself, and returns the witness. It
+//! is not constructible from a container [`CensusComplete`], which proves half
+//! (a) alone, and there is no constructor anywhere that accepts a
+//! [`StartupCensus`] a caller made some other way.
+//!
+//! The recovery chain's own witnesses — including the one `BarrierHeld` this
+//! crate has — live in [`super::recover`], because the ordering they encode is
+//! that chain's. This module defines only the two the creation path needs.
 //!
 //! # The two rules that decide correctness
 //!
@@ -70,7 +83,7 @@ use crate::runner::container::runtime::{ContainerRuntime, OwnerLiveness};
 
 use super::seams::TopologyHooks;
 
-pub use witness::{BarrierHeld, FreshCensused, ResumeCensused, WorktreeLocked};
+pub use witness::{FreshCensused, WorktreeLocked};
 
 // ---------------------------------------------------------------------------
 // Inputs
@@ -402,7 +415,7 @@ impl StartupCensus {
 }
 
 // ---------------------------------------------------------------------------
-// The two entry points
+// The entry point
 // ---------------------------------------------------------------------------
 
 /// `upstroke run`'s census: the worktree lock is held, no run lock is.
@@ -417,6 +430,8 @@ impl StartupCensus {
 /// A fresh run has no own-run arm: `startup_census` puts the census "before …
 /// run-lock acquisition for a fresh run", so every directory in the runs tree
 /// belongs to somebody else and the held-`run.lock` rule governs all of them.
+/// `upstroke resume`'s census is [`super::recover::ResumeCensused::census`],
+/// which passes its own run id to the same [`census_run_dirs`].
 ///
 /// # Errors
 ///
@@ -429,45 +444,7 @@ pub fn startup_census(
     hooks: &mut dyn TopologyHooks,
     inputs: &CensusInputs<'_>,
 ) -> Result<FreshCensused, UpstrokeError> {
-    let start = CensusStart::FreshRun {
-        incarnation: inputs.incarnation.to_owned(),
-    };
-    let census = both_halves(hooks, inputs, &start)?;
-    Ok(FreshCensused::establish(locked, census))
-}
-
-/// `upstroke resume`'s census: the run lock is held and recovery step (a1) is
-/// established.
-///
-/// Consumes the [`BarrierHeld`] witness **by value**, which is what makes the
-/// packet's ordering unrepresentable to get wrong: "a resume takes its run lock
-/// first, establishes the stable-prefix barrier of recovery step (a1), **then**
-/// censuses, so no census reclaim decided from the fold precedes durability of
-/// the prefix it is decided from". The barrier is handed back inside the
-/// [`ResumeCensused`], because the append handle and the fold it carries are
-/// what the rest of the recovery order runs on.
-///
-/// `run_id` is this process's own run. It licenses exactly one thing — removing
-/// that run's own stale marker, which recovery step (a1) says "the owner removes
-/// here" — and it cannot reach the husk arms, which are gated on the lock alone.
-///
-/// # Errors
-///
-/// As [`startup_census`], plus [`UpstrokeError::Refused`] if the barrier's four
-/// predicates cannot be restated (see [`BarrierHeld::barrier`]).
-pub fn resume_census(
-    barrier: BarrierHeld,
-    run_id: &str,
-    hooks: &mut dyn TopologyHooks,
-    inputs: &CensusInputs<'_>,
-) -> Result<ResumeCensused, UpstrokeError> {
-    let start = CensusStart::Resume {
-        run_id: run_id.to_owned(),
-        incarnation: inputs.incarnation.to_owned(),
-        barrier: barrier.barrier()?,
-    };
-    let census = both_halves(hooks, inputs, &start)?;
-    Ok(ResumeCensused::establish(barrier, census))
+    FreshCensused::establish(locked, hooks, inputs)
 }
 
 /// (a) then (b). The order is the packet's and is not an implementation detail.
@@ -504,6 +481,13 @@ fn both_halves(
 
 /// The run-directory census over `<repo>/.upstroke/runs`.
 ///
+/// **Every write command calls this one function.** `upstroke run` reaches it
+/// through [`both_halves`] with no `own_run`; `upstroke resume` reaches it from
+/// [`super::recover::ResumeCensused::census`] with its own run id. INV-15's
+/// "reclaims pre-run husks at write-command start under the worktree lock" is
+/// not satisfied by a second pass that classifies and reports, so there is no
+/// second pass: the two callers differ in `own_run` alone.
+///
 /// Two phases, and the split is deliberate. Every classification and every
 /// ownership proof is read-only and completes **before** the first deletion, so
 /// a census whose plan is wrong about one directory has not already reclaimed
@@ -511,7 +495,12 @@ fn both_halves(
 /// states for itself ("step 4 completes before step 5 begins on purpose"). The
 /// worktree lock is held across both phases, so nothing else can move a
 /// directory between them.
-fn census_run_dirs(
+///
+/// # Errors
+///
+/// [`UpstrokeError::Io`] from whichever `RunDir` funnel a reclaim or a repair
+/// drives. Phase 1 is read-only and cannot fail.
+pub(crate) fn census_run_dirs(
     hooks: &mut dyn RunDirHooks,
     inputs: &CensusInputs<'_>,
     own_run: Option<&str>,
@@ -703,189 +692,129 @@ fn stale_marker_present(public: &Path) -> bool {
 // The witnesses
 // ---------------------------------------------------------------------------
 
-/// The four witnesses this module consumes and mints, alone in a module.
+/// The two witnesses the creation path consumes and mints, **each alone in its
+/// own module**.
 ///
-/// Every field here is private to this module, so no code outside it — inside
-/// `startup` or anywhere else — can name one to build a value. None of the four
-/// derives `Clone`, `Copy` or `Default`: a `Clone` would let one census
+/// A nested module per witness, and not one module holding both: an item private
+/// to a module is visible to that module **and its descendants**, so two types
+/// sharing one module could each build the other out of its parts, and every
+/// function in `startup` — its own tests included — could mint either from
+/// hand-built fields. That is a naming convention, not a type. Siblings see only
+/// what is `pub`, which here is the constructor and the accessors. The same rule
+/// [`super::super::recover::chain`] states for the recovery order's seven, and
+/// for the same reason.
+///
+/// Neither derives `Clone`, `Copy` or `Default`: a `Clone` would let one census
 /// authorise two, and a `Default` would mint evidence out of nothing. The same
-/// device `rundir::ownership` uses for [`PrivateHalfProof`], and for the same
-/// reason.
+/// device `rundir::ownership` uses for [`PrivateHalfProof`].
 ///
-/// **Ownership note.** [`WorktreeLocked`] and [`BarrierHeld`] are *predecessors*
-/// of this module's census — the creation chain's third link and the recovery
-/// chain's fourth. They are defined here because [`startup_census`] and
-/// [`resume_census`] cannot be typed without them; the lanes that own
-/// `prelock.rs`/`create.rs` and `recover.rs` extend them with whatever else
-/// their steps must carry forward.
+/// **Ownership note.** [`WorktreeLocked`] is a *predecessor* of this module's
+/// census — the creation chain's third link — and is defined here because
+/// [`super::startup_census`] cannot be typed without it; the lane that owns
+/// `prelock.rs`/`create.rs` extends it with whatever else its steps carry
+/// forward. The recovery chain's predecessors are **not** restated here.
+/// `BarrierHeld` in particular belongs to [`super::super::recover`], where its
+/// constructor consumes a `RecordsVerified` that consumed a `LocksHeld` that
+/// consumed a `RootDerived`: a second one defined beside this census would be a
+/// barrier reachable with no locks, no records and no bound run id, which is
+/// exactly the hole it was.
 mod witness {
-    use super::StartupCensus;
-    use crate::error::UpstrokeError;
-    use crate::events::log::StablePrefix;
-    use crate::rundir::WorktreeLock;
-    use crate::runner::container::census::{
-        PrefixBytes, PrefixReplay, PrefixReread, PrefixSync, StablePrefixBarrier,
-    };
+    pub use fresh::FreshCensused;
+    pub use locked::WorktreeLocked;
 
-    /// The physical worktree lock is held.
-    ///
-    /// Holds the lock **by value**, so possessing the witness *is* holding the
-    /// lock: `run_creation` takes it "across the startup census and the whole
-    /// run", and a witness that merely remembered an acquisition would outlive
-    /// the exclusion it claims.
-    #[derive(Debug)]
-    pub struct WorktreeLocked {
-        lock: WorktreeLock,
-    }
+    /// The creation chain's third link.
+    mod locked {
+        use crate::rundir::WorktreeLock;
 
-    impl WorktreeLocked {
-        /// The only constructor. Takes the lock by value.
-        #[must_use]
-        pub fn from(lock: WorktreeLock) -> Self {
-            Self { lock }
-        }
-
-        /// The lock this witness is holding.
-        #[must_use]
-        pub const fn lock(&self) -> &WorktreeLock {
-            &self.lock
-        }
-    }
-
-    /// Recovery step (a1) is established: the surviving prefix was synced,
-    /// reread, proven stable and checked-replayed.
-    ///
-    /// Holds a [`StablePrefix`] **by value**, and that is the whole provenance
-    /// argument. `StablePrefix` has private fields, derives no `Clone` and has
-    /// exactly one constructor — `events::log::establish_stable_prefix` — so a
-    /// `BarrierHeld` cannot exist without a barrier having actually been
-    /// established. Deriving the [`StablePrefixBarrier`] *inside* this type,
-    /// rather than accepting one from a caller, closes the other half:
-    /// `PrefixSync`, `PrefixReread` and `PrefixReplay` all have public fields
-    /// and `PrefixBytes::of` is public, so a barrier accepted from a caller is
-    /// three copies of one byte string away from being forged.
-    #[derive(Debug)]
-    pub struct BarrierHeld {
-        prefix: StablePrefix,
-    }
-
-    impl BarrierHeld {
-        /// The only constructor. Takes the proven prefix by value.
-        #[must_use]
-        pub fn from(prefix: StablePrefix) -> Self {
-            Self { prefix }
-        }
-
-        /// The barrier `CensusStart::Resume` needs, derived from the proven
-        /// prefix rather than accepted from a caller.
+        /// The physical worktree lock is held.
         ///
-        /// The four predicates are restated over one measurement of the bytes
-        /// this barrier was established on, so they cannot fail. That
-        /// duplication is deliberate and is the accepted cost of not narrowing
-        /// `StablePrefixBarrier::establish`, which lives in another slice's
-        /// module: what matters is **provenance**, and provenance is carried by
-        /// the `StablePrefix` this type consumed. The signature stays fallible
-        /// rather than panicking on the unreachable branch, because
-        /// `.expect()` outside tests is not permitted in this crate.
+        /// Holds the lock **by value**, so possessing the witness *is* holding
+        /// the lock: `run_creation` takes it "across the startup census and the
+        /// whole run", and a witness that merely remembered an acquisition would
+        /// outlive the exclusion it claims.
+        #[derive(Debug)]
+        pub struct WorktreeLocked {
+            lock: WorktreeLock,
+        }
+
+        impl WorktreeLocked {
+            /// The only constructor. Takes the lock by value.
+            #[must_use]
+            pub fn from(lock: WorktreeLock) -> Self {
+                Self { lock }
+            }
+
+            /// The lock this witness is holding.
+            #[must_use]
+            pub const fn lock(&self) -> &WorktreeLock {
+                &self.lock
+            }
+        }
+    }
+
+    /// A fresh run's completed startup census.
+    mod fresh {
+        use super::super::{CensusInputs, StartupCensus, both_halves};
+        use super::locked::WorktreeLocked;
+        use crate::engine::topology::seams::TopologyHooks;
+        use crate::error::UpstrokeError;
+        use crate::runner::container::census::CensusStart;
+
+        /// A fresh run's startup census completed, under the worktree lock.
         ///
-        /// # Errors
-        ///
-        /// [`UpstrokeError::Refused`] if a predicate refuses, which the
-        /// derivation cannot cause.
-        pub fn barrier(&self) -> Result<StablePrefixBarrier, UpstrokeError> {
-            let measured = PrefixBytes::of(self.prefix.bytes());
-            StablePrefixBarrier::establish(
-                PrefixSync {
-                    synced_len: measured.len,
-                },
-                &PrefixReread {
-                    first: measured.clone(),
-                    second: measured.clone(),
-                },
-                &PrefixReplay { replayed: measured },
-            )
+        /// **The census returns the witness; it does not wrap one.**
+        /// [`Self::establish`] is the only constructor and it runs both halves
+        /// itself, so there is no signature anywhere that accepts a
+        /// [`StartupCensus`] a caller obtained some other way — a hand-built one
+        /// whose run-directory half never ran included. Not constructible from a
+        /// container `CensusComplete` either, which proves half (a) alone.
+        #[derive(Debug)]
+        pub struct FreshCensused {
+            locked: WorktreeLocked,
+            census: StartupCensus,
         }
 
-        /// The proven prefix, for a caller that owns the witness.
-        #[must_use]
-        pub fn into_prefix(self) -> StablePrefix {
-            self.prefix
-        }
-    }
+        impl FreshCensused {
+            /// The only constructor: both halves, under the lock it consumes.
+            ///
+            /// `pub(in …startup)` rather than `pub`, because
+            /// [`super::super::startup_census`] is the entry point and a second
+            /// public one would be a second answer to "what did `upstroke run`
+            /// census".
+            ///
+            /// # Errors
+            ///
+            /// As [`super::super::startup_census`].
+            pub(in crate::engine::topology::startup) fn establish(
+                locked: WorktreeLocked,
+                hooks: &mut dyn TopologyHooks,
+                inputs: &CensusInputs<'_>,
+            ) -> Result<Self, UpstrokeError> {
+                let start = CensusStart::FreshRun {
+                    incarnation: inputs.incarnation.to_owned(),
+                };
+                let census = both_halves(hooks, inputs, &start)?;
+                Ok(Self { locked, census })
+            }
 
-    /// A fresh run's startup census completed, under the worktree lock.
-    ///
-    /// Minted only by [`super::startup_census`], from a [`WorktreeLocked`] it
-    /// consumed and a [`StartupCensus`] only that function can produce. Not
-    /// constructible from a [`ResumeCensused`], and not from a container
-    /// `CensusComplete`, which proves half (a) alone.
-    #[derive(Debug)]
-    pub struct FreshCensused {
-        locked: WorktreeLocked,
-        census: StartupCensus,
-    }
+            /// Both halves' results.
+            #[must_use]
+            pub const fn census(&self) -> &StartupCensus {
+                &self.census
+            }
 
-    impl FreshCensused {
-        /// The only constructor. Consumes the predecessor by value.
-        pub(super) fn establish(locked: WorktreeLocked, census: StartupCensus) -> Self {
-            Self { locked, census }
-        }
+            /// The worktree lock, still held.
+            #[must_use]
+            pub const fn locked(&self) -> &WorktreeLocked {
+                &self.locked
+            }
 
-        /// Both halves' results.
-        #[must_use]
-        pub const fn census(&self) -> &StartupCensus {
-            &self.census
-        }
-
-        /// The worktree lock, still held.
-        #[must_use]
-        pub const fn locked(&self) -> &WorktreeLocked {
-            &self.locked
-        }
-
-        /// Give the lock and the report back to a caller that owns the witness.
-        #[must_use]
-        pub fn into_parts(self) -> (WorktreeLocked, StartupCensus) {
-            (self.locked, self.census)
-        }
-    }
-
-    /// A resume's startup census completed, after the barrier.
-    ///
-    /// Minted only by [`super::resume_census`], from a [`BarrierHeld`] it
-    /// consumed. The barrier comes back out because the append handle and the
-    /// fold it carries are what the rest of the recovery order runs on — and
-    /// because `run_resumed` at step (h) consumes the last witness of the chain,
-    /// so nothing after it can present one.
-    #[derive(Debug)]
-    pub struct ResumeCensused {
-        barrier: BarrierHeld,
-        census: StartupCensus,
-    }
-
-    impl ResumeCensused {
-        /// The only constructor. Consumes the predecessor by value.
-        pub(super) fn establish(barrier: BarrierHeld, census: StartupCensus) -> Self {
-            Self { barrier, census }
-        }
-
-        /// Both halves' results.
-        #[must_use]
-        pub const fn census(&self) -> &StartupCensus {
-            &self.census
-        }
-
-        /// The barrier, still held.
-        #[must_use]
-        pub const fn barrier(&self) -> &BarrierHeld {
-            &self.barrier
-        }
-
-        /// Give the barrier and the report back to a caller that owns the
-        /// witness.
-        #[must_use]
-        pub fn into_parts(self) -> (BarrierHeld, StartupCensus) {
-            (self.barrier, self.census)
+            /// Give the lock and the report back to a caller that owns the
+            /// witness.
+            #[must_use]
+            pub fn into_parts(self) -> (WorktreeLocked, StartupCensus) {
+                (self.locked, self.census)
+            }
         }
     }
 }
