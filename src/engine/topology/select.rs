@@ -26,10 +26,14 @@
 //! [`crate::topology::fold::TopologyFold`] exposes `ready`, `ready_retry`,
 //! `pipeline_reservable`, `structurally_admissible` and
 //! `integration_admissible`, and every one of them is false once the fold is
-//! poisoned. Nothing here re-derives any of them: a second implementation of
-//! "which generation classes hold the pipeline entitlement" is two rules that
-//! can disagree, and `wrong_internal_assumption` is this project's largest
-//! measured root cause by a factor of three.
+//! poisoned. It exposes `run_is_ending`, `backoff_pending` and
+//! `questions_open` beside them — statements about the run rather than
+//! authorisations, which is why those three survive a poisoning and why
+//! `derived_outcome` reads the same three. Nothing here re-derives any of
+//! them: a second implementation of "which generation classes hold the
+//! pipeline entitlement", or of "which tasks are waiting on a wait", is two
+//! rules that can disagree, and `wrong_internal_assumption` is this project's
+//! largest measured root cause by a factor of three.
 //!
 //! What is left for this module is exactly the packet's own division of
 //! labour: **which** eligible item to take, and **whether the ceiling permits
@@ -170,31 +174,39 @@ impl Ceiling {
     /// `run_usd` is checked before `task_usd` because it is the stricter
     /// claim: a run at its overall ceiling is done whatever any individual
     /// task has spent, and naming the run budget is what tells the operator
-    /// which number to raise. The comparison is `>=` rather than `>`: the
-    /// ceiling refuses the *next* spawn, so reaching it is already a refusal.
+    /// which number to raise.
     #[must_use]
     pub fn breach(&self, spend: &Spend, key: TaskKey) -> Option<Breach> {
-        if let Some(limit) = self.run_usd {
-            let spent = spend.run_usd();
-            if spent >= limit {
-                return Some(Breach {
-                    budget: BudgetKind::Run,
-                    limit_usd: limit,
-                    spent_usd: spent,
-                });
-            }
-        }
-        if let Some(limit) = self.task_usd {
-            let spent = spend.task_usd(key);
-            if spent >= limit {
-                return Some(Breach {
-                    budget: BudgetKind::Task,
-                    limit_usd: limit,
-                    spent_usd: spent,
-                });
-            }
-        }
-        None
+        self.run_breach(spend)
+            .or_else(|| self.task_breach(spend, key))
+    }
+
+    /// The run ceiling alone.
+    ///
+    /// Split out because one branch checks this and not [`Self::breach`]: an
+    /// integration spawns no worker and is charged to no task. See
+    /// [`select`]'s integration branch for why that is not an omission.
+    fn run_breach(&self, spend: &Spend) -> Option<Breach> {
+        let limit = self.run_usd?;
+        let spent = spend.run_usd();
+        // `>=` rather than `>`: the ceiling refuses the *next* spawn, so
+        // reaching it is already a refusal.
+        (spent >= limit).then_some(Breach {
+            budget: BudgetKind::Run,
+            limit_usd: limit,
+            spent_usd: spent,
+        })
+    }
+
+    /// One task's ceiling alone, on the same `>=` boundary as the run's.
+    fn task_breach(&self, spend: &Spend, key: TaskKey) -> Option<Breach> {
+        let limit = self.task_usd?;
+        let spent = spend.task_usd(key);
+        (spent >= limit).then_some(Breach {
+            budget: BudgetKind::Task,
+            limit_usd: limit,
+            spent_usd: spent,
+        })
     }
 }
 
@@ -315,9 +327,25 @@ pub fn select(fold: &TopologyFold, ceiling: &Ceiling, spend: &Spend) -> Step {
     };
 
     if let Some(candidate) = eligible_integration(fold) {
-        return ceiling_or(ceiling, spend, epoch, candidate.key, || Step::Integrate {
-            candidate: Box::new(candidate),
-        });
+        // The **run** ceiling, and not the task's. `BudgetExceeded4::key` is
+        // "the task whose next attempt was refused. Not a failed task:
+        // nothing judged it and nothing was spent on it", and an integration
+        // is neither half of that sentence: it is not that task's next
+        // attempt, and money *was* spent on it — the candidate exists because
+        // an attempt succeeded and was paid for. Charging the task ceiling
+        // here would refuse the *merge* of work already bought, permanently:
+        // the candidate can never integrate and the task can never unspend.
+        // An integration also spawns no worker, and the identities its
+        // verification passes carry are `(sequence, role, ordinal)` rather
+        // than a task's. The run ceiling still binds, because `loop` puts the
+        // check inside every admitting branch and a run at its overall
+        // ceiling is done whatever the branch would have been.
+        return match ceiling.run_breach(spend) {
+            Some(breach) => budget_exceeded(epoch, breach, None),
+            None => Step::Integrate {
+                candidate: Box::new(candidate),
+            },
+        };
     }
     if let Some((key, generation, attempt)) = first_ready_retry(fold) {
         return ceiling_or(ceiling, spend, epoch, key, || Step::Retry {
@@ -335,9 +363,10 @@ pub fn select(fold: &TopologyFold, ceiling: &Ceiling, spend: &Spend) -> Step {
     if backoff_pending(fold) {
         return Step::Backoff;
     }
-    let questions = open_questions(fold);
-    if !questions.is_empty() {
-        return Step::HardBlock { questions };
+    if fold.questions_open() {
+        return Step::HardBlock {
+            questions: open_questions(fold),
+        };
     }
     Step::Closure(fold.derived_outcome())
 }
@@ -484,27 +513,20 @@ fn keys(fold: &TopologyFold) -> impl Iterator<Item = TaskKey> + '_ {
 /// `refusals[18]` refuses `defer_wait_elapsed` under either, and `loop` states
 /// the same guard on the branch — so a selector that offered the branch anyway
 /// would hand the loop an append the fold is about to refuse.
+///
+/// Both halves are the fold's. This function is the **conjunction** and
+/// nothing else: an earlier version walked `0..registry.len()` for a
+/// `Deferred` task while `TopologyFold::backoff_pending` walked its own
+/// `tasks`, and `derived_outcome` reads the fold's. Two rules that can
+/// disagree is precisely what this module's header argues against.
 fn backoff_pending(fold: &TopologyFold) -> bool {
-    if fold.halted_at().is_some() {
-        return false;
-    }
-    if fold
-        .budget_stop()
-        .is_some_and(|stop| Some(stop.epoch) == fold.epoch())
-    {
-        return false;
-    }
-    let deferred_task = keys(fold).any(|key| fold.task_state(key) == Some(TaskState::Deferred));
-    let deferred_verification = fold.queue().is_some_and(|queue| {
-        queue
-            .entries()
-            .iter()
-            .any(|entry| entry.verification_deferred)
-    });
-    deferred_task || deferred_verification
+    !fold.run_is_ending() && fold.backoff_pending()
 }
 
 /// The open question ids, in id order.
+///
+/// Whether there are any is [`TopologyFold::questions_open`]; this builds the
+/// payload the branch carries and decides nothing.
 fn open_questions(fold: &TopologyFold) -> Vec<QuestionId> {
     fold.open_questions()
         .map(|questions| questions.keys().cloned().collect())
@@ -525,17 +547,25 @@ fn ceiling_or(
     admitted: impl FnOnce() -> Step,
 ) -> Step {
     match ceiling.breach(spend, key) {
-        Some(breach) => Step::BudgetExceeded(Box::new(BudgetExceeded4 {
-            epoch,
-            budget: breach.budget,
-            limit_usd: breach.limit_usd,
-            spent_usd: breach.spent_usd,
-            // "The task whose next attempt was refused. Not a failed task:
-            // nothing judged it and nothing was spent on it."
-            key: Some(key),
-        })),
+        // "The task whose next attempt was refused. Not a failed task:
+        // nothing judged it and nothing was spent on it."
+        Some(breach) => budget_exceeded(epoch, breach, Some(key)),
         None => admitted(),
     }
+}
+
+/// The stop a breach records.
+///
+/// `key` is `None` where no task's next attempt was refused, which is the
+/// integration branch and only it.
+fn budget_exceeded(epoch: Epoch, breach: Breach, key: Option<TaskKey>) -> Step {
+    Step::BudgetExceeded(Box::new(BudgetExceeded4 {
+        epoch,
+        budget: breach.budget,
+        limit_usd: breach.limit_usd,
+        spent_usd: breach.spent_usd,
+        key,
+    }))
 }
 
 #[cfg(test)]
@@ -545,14 +575,14 @@ mod tests {
     use crate::ladder::Next;
     use crate::topology::events::{
         AttemptSettlement, CandidateLeaseEffect, CandidatePrepared, GitRef, LeaseDisposition,
-        SettlementTransition, TaskCandidateCreated,
+        RunStarted4, SettlementTransition, TaskCandidateCreated, TopologyLimits,
     };
     use crate::topology::fold::TopologyFold;
 
     use super::super::settle;
     use super::super::settle::tests::{
-        ALEPH, BET, GIMEL, apply, ev, finished, in_flight, inputs, label, question_for, record,
-        region, resume_event, retained_generation, settle_into, sha, started,
+        ALEPH, BET, GIMEL, apply, dispatch, ev, finished, in_flight, inputs, label, question_for,
+        record, region, resume_event, retained_generation, settle_into, sha, started,
     };
 
     // -----------------------------------------------------------------------
@@ -643,6 +673,33 @@ mod tests {
         fold
     }
 
+    /// `started()` at a stated pipeline width.
+    ///
+    /// Every other selection fixture runs at `max_parallel = 3`, and the
+    /// comment on that number is right about why: a test that ordered an
+    /// integration ahead of a dispatch because the *entitlement* excluded the
+    /// dispatch would prove nothing about `eligibility_order`. But 3 is a
+    /// width `config` refuses to create a run at — `DEFAULT_MAX_PARALLEL` is 1
+    /// and `[engine] max_parallel` above it is rejected outright — so a suite
+    /// with no fixture below 3 never binds the entitlement clause of any
+    /// predicate, and never asks what selection does at the only width
+    /// production runs.
+    fn started_at_width(max_parallel: u32) -> TopologyFold {
+        let base = settle::tests::run_started();
+        let limits = TopologyLimits {
+            max_parallel,
+            ..base.limits
+        };
+        let mut fold = TopologyFold::new(inputs());
+        apply(
+            &mut fold,
+            &ev(TopologyEventBody::RunStarted {
+                data: Box::new(RunStarted4 { limits, ..base }),
+            }),
+        );
+        fold
+    }
+
     fn no_spend() -> Spend {
         Spend::new()
     }
@@ -710,6 +767,52 @@ mod tests {
             Step::Dispatch {
                 key: ALEPH,
                 generation: GenerationId(0),
+            }
+        );
+    }
+
+    /// At the width production runs, the entitlement decides every branch.
+    ///
+    /// `DEFAULT_MAX_PARALLEL` is 1 and `[engine] max_parallel` above it is
+    /// refused for a fresh run, so one held entitlement is a full pipeline. An
+    /// `OpenNoAttempt` generation is what a crash between `task_dispatched`
+    /// and `attempt_started` leaves holding it, and recovery does not close it
+    /// — so this is the state the resumed loop's first `select` sees.
+    #[test]
+    fn nothing_is_selected_at_width_one_while_the_single_entitlement_is_held() {
+        let mut narrow = started_at_width(1);
+        let candidate = queue_candidate(&mut narrow, GIMEL, 0);
+        assert_eq!(
+            select(&narrow, &Ceiling::unlimited(), &no_spend()),
+            Step::Integrate {
+                candidate: Box::new(candidate.clone())
+            },
+            "an eligible candidate with the slot free is selected"
+        );
+
+        apply(&mut narrow, &dispatch(ALEPH, 0));
+        assert_eq!(narrow.pipeline_held(), 1);
+        assert!(!narrow.pipeline_reservable(), "one of one");
+        assert_eq!(
+            select(&narrow, &Ceiling::unlimited(), &no_spend()),
+            Step::Closure(DerivedOutcome::NotEnding),
+            "selection spent the entitlement a second time"
+        );
+        assert!(
+            checkpoint(select(&narrow, &Ceiling::unlimited(), &no_spend())).is_err(),
+            "and the closure it derives is not one this build performs"
+        );
+
+        // One slot wider, the identical state selects the integration: what
+        // this asserts is the count, not something else about the fixture.
+        let mut wider = started_at_width(2);
+        let candidate = queue_candidate(&mut wider, GIMEL, 0);
+        apply(&mut wider, &dispatch(ALEPH, 0));
+        assert_eq!(wider.pipeline_held(), 1);
+        assert_eq!(
+            select(&wider, &Ceiling::unlimited(), &no_spend()),
+            Step::Integrate {
+                candidate: Box::new(candidate)
             }
         );
     }
@@ -884,6 +987,28 @@ mod tests {
             Some(BudgetKind::Run)
         );
         assert_eq!(Ceiling::unlimited().breach(&exact, ALEPH), None);
+
+        // And on the task arm, which is the same boundary and a separate
+        // comparison. `0.5` and `0.5` are exact in binary, so `>` here admits
+        // the spawn the operator's limit has already refused and `>=` does
+        // not — there is no epsilon in which the two agree.
+        let task_only = Ceiling {
+            run_usd: None,
+            task_usd: Some(0.5),
+        };
+        let mut at_task = Spend::new();
+        at_task.record(BET, &record(1, Some(0.5)));
+        let breach = task_only
+            .breach(&at_task, BET)
+            .expect("reaching the task ceiling is already a refusal");
+        assert_eq!(breach.budget, BudgetKind::Task);
+        assert!((breach.limit_usd - 0.5).abs() < f64::EPSILON);
+        assert!((breach.spent_usd - 0.5).abs() < f64::EPSILON);
+        assert_eq!(
+            task_only.breach(&at_task, GIMEL),
+            None,
+            "one task's spend was charged to another"
+        );
     }
 
     /// The ceiling is consulted only inside an admitting branch: a run with
@@ -994,9 +1119,15 @@ mod tests {
             },
             &spend,
         );
-        assert!(
-            matches!(step, Step::BudgetExceeded(_)),
-            "the ceiling was checked after the integration decision: {step:?}"
+        let Step::BudgetExceeded(exceeded) = step.clone() else {
+            panic!("the ceiling was checked after the integration decision: {step:?}");
+        };
+        assert_eq!(exceeded.budget, BudgetKind::Run);
+        assert!((exceeded.limit_usd - 1.0).abs() < f64::EPSILON);
+        assert!((exceeded.spent_usd - 9.0).abs() < f64::EPSILON);
+        assert_eq!(
+            exceeded.key, None,
+            "no task's next attempt was refused by an integration's stop"
         );
         assert!(checkpoint(step).is_ok());
 
@@ -1056,6 +1187,146 @@ mod tests {
     // -----------------------------------------------------------------------
     // The remaining branches
     // -----------------------------------------------------------------------
+
+    /// The retry branch checks the ceiling before it admits the retry.
+    ///
+    /// Its own branch and not the dispatch branch's: `loop` puts the check
+    /// inside **each** admitting branch, and `ALEPH` is `ready` here, so a
+    /// selector that admitted the retry unconditionally would still have a
+    /// later branch to fall through to and a `BudgetExceeded` to produce from
+    /// it. The assertion is therefore on `key`: only the retry's own check
+    /// names the retained task.
+    #[test]
+    fn the_retry_branch_checks_the_ceiling_and_names_the_retained_task() {
+        let mut fold = started();
+        retained_generation(&mut fold, BET, 0);
+        assert!(fold.ready_retry(BET), "the retry branch is not live");
+        assert!(fold.ready(ALEPH), "the branch below it is live");
+
+        // `BET` is over its own ceiling; `ALEPH` has spent nothing.
+        let ceiling = Ceiling {
+            run_usd: None,
+            task_usd: Some(1.5),
+        };
+        let mut spend = Spend::new();
+        spend.record(BET, &record(1, Some(3.0)));
+
+        let step = select(&fold, &ceiling, &spend);
+        let Step::BudgetExceeded(exceeded) = step.clone() else {
+            panic!("a breached ceiling admitted the retry: {step:?}");
+        };
+        assert_eq!(exceeded.epoch, Epoch(0));
+        assert_eq!(exceeded.budget, BudgetKind::Task);
+        assert!((exceeded.limit_usd - 1.5).abs() < f64::EPSILON);
+        assert!((exceeded.spent_usd - 3.0).abs() < f64::EPSILON);
+        assert_eq!(
+            exceeded.key,
+            Some(BET),
+            "the stop must name the retained task whose next attempt was refused, not the \
+             dispatch that would have run instead"
+        );
+        assert!(checkpoint(step).is_ok(), "a budget stop is not a start");
+
+        // Under the ceiling, the same state runs the retry.
+        assert_eq!(
+            select(
+                &fold,
+                &Ceiling {
+                    run_usd: None,
+                    task_usd: Some(4.0),
+                },
+                &spend
+            ),
+            Step::Retry {
+                key: BET,
+                generation: GenerationId(0),
+                attempt: AttemptNumber(2),
+            }
+        );
+    }
+
+    /// Backoff precedes the hard block, and the two are live at once.
+    ///
+    /// `loop`'s order is fixed, and no other fixture holds a `Deferred` task
+    /// **and** an open question at the same time — so with the two branches
+    /// swapped every one of them still passes. A deferred task is waiting on a
+    /// wait that will elapse on its own; a question waits on a person. Serving
+    /// the person first would park a run that was about to make progress.
+    #[test]
+    fn the_backoff_branch_precedes_the_hard_block_when_both_are_live() {
+        let mut fold = started();
+        in_flight(&mut fold, ALEPH, 0);
+        settle_into(&mut fold, &finished(ALEPH, 0, 1, Next::Defer));
+        assert_eq!(fold.task_state(ALEPH), Some(TaskState::Deferred));
+
+        in_flight(&mut fold, BET, 0);
+        let mut parking = finished(BET, 0, 1, Next::AskHuman(crate::ir::QuestionKind::Unblock));
+        parking.question = Some(question_for(BET));
+        settle_into(&mut fold, &parking);
+
+        in_flight(&mut fold, GIMEL, 0);
+        settle_into(&mut fold, &finished(GIMEL, 0, 1, Next::Fail));
+
+        assert!(fold.backoff_pending(), "the backoff branch is not live");
+        assert!(fold.questions_open(), "the hard-block branch is not live");
+        assert!(
+            !fold.structurally_admissible(),
+            "a branch above both is live, and this asserts nothing about their order"
+        );
+        assert_eq!(
+            select(&fold, &Ceiling::unlimited(), &no_spend()),
+            Step::Backoff,
+            "the hard-block rules were applied to a run that was about to wake"
+        );
+
+        // With the wait elapsed and the woken task run out, the question is
+        // what is left — the other half of the same order.
+        apply(&mut fold, &resume_event());
+        assert!(!fold.backoff_pending(), "the resume woke the deferred task");
+        in_flight(&mut fold, ALEPH, 1);
+        settle_into(&mut fold, &finished(ALEPH, 1, 1, Next::Fail));
+        assert_eq!(
+            select(&fold, &Ceiling::unlimited(), &no_spend()),
+            Step::HardBlock {
+                questions: vec![question_for(BET).id]
+            }
+        );
+    }
+
+    /// An integration is charged to the run and never to the candidate's task.
+    ///
+    /// `BudgetExceeded4::key` is "the task whose next attempt was refused. Not
+    /// a failed task: nothing judged it and nothing was spent on it", and an
+    /// integration is neither half: it is not that task's next attempt, and
+    /// money *was* spent — the candidate exists because an attempt succeeded
+    /// and was paid for. Charging the task ceiling would refuse the merge of
+    /// work already bought, and refuse it permanently: the candidate can never
+    /// integrate and the task can never unspend.
+    #[test]
+    fn an_integration_is_charged_to_the_run_and_never_to_the_candidates_task() {
+        let mut fold = started();
+        let candidate = queue_candidate(&mut fold, GIMEL, 0);
+
+        let mut spend = Spend::new();
+        spend.record(GIMEL, &record(1, Some(9.0)));
+        let task_only = Ceiling {
+            run_usd: None,
+            task_usd: Some(1.0),
+        };
+        assert_eq!(
+            select(&fold, &task_only, &spend),
+            Step::Integrate {
+                candidate: Box::new(candidate)
+            },
+            "a task ceiling refused the merge of work it had already paid for"
+        );
+        // The same ceiling still refuses that task's next *attempt*, which is
+        // what it is a ceiling on.
+        assert_eq!(
+            task_only.breach(&spend, GIMEL).map(|breach| breach.budget),
+            Some(BudgetKind::Task)
+        );
+    }
 
     /// The backoff branch, and the guard that keeps it out from under a halt
     /// or a budget stop.

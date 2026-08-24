@@ -790,10 +790,15 @@ impl TopologyFold {
     // payload is derived from the poisoned fold" would hold in the emit path
     // and leak here. So every predicate below is false once poisoned.
     //
-    // `pipeline_held` is the one exception and stays a count: it is accounting,
-    // not authorisation. Its caller must not derive a report from it after a
-    // poisoned append either, but that is a rule about reports, and answering
-    // `0` would be a false statement about the run rather than a refusal.
+    // The exceptions are the four that state what the run *is* rather than
+    // what it may do: `pipeline_held`, `run_is_ending`, `backoff_pending` and
+    // `questions_open`. They are accounting, not authorisation. A poisoned
+    // fold whose `halted_at` is set is still a halted run, and answering `0`
+    // or `false` there would be a false statement about durable state rather
+    // than a refusal. Their callers must not derive a report from them after a
+    // poisoned append either, but that is a rule about reports and it lives in
+    // the emit path — and nothing selects on them from a poisoned fold in any
+    // case, because selection refuses at the top on `is_poisoned`.
     // -----------------------------------------------------------------------
 
     /// Whether `key` may be dispatched into a fresh generation.
@@ -853,6 +858,47 @@ impl TopologyFold {
                 .run
                 .as_ref()
                 .is_some_and(RunState::integration_admissible)
+    }
+
+    /// Whether this run has already ended in the sense that forbids further
+    /// work: `halted_at` is set, or a `budget_stop` of **this** epoch is.
+    ///
+    /// The epoch is the load-bearing half. A `budget_stop` recorded in an
+    /// earlier incarnation was cleared by the resume that raised the ceiling,
+    /// and a caller that read the field without the epoch would refuse a run
+    /// the operator has already unblocked. It is exposed for the same reason
+    /// `ready` is: `refusals[18]` refuses `defer_wait_elapsed` under either
+    /// condition, so a selector that decided the backoff branch from its own
+    /// copy of this rule would offer the loop an append the fold is about to
+    /// refuse — and the two copies would be free to disagree.
+    #[must_use]
+    pub fn run_is_ending(&self) -> bool {
+        self.run.as_ref().is_some_and(RunState::run_is_ending)
+    }
+
+    /// Whether anything is waiting on a wait: a task in
+    /// [`TaskState::Deferred`], or a queue entry whose verification was
+    /// deferred by an outage.
+    ///
+    /// This is the *pending work* half of the backoff branch and not the
+    /// branch itself — [`Self::run_is_ending`] is the other half, and
+    /// `derived_outcome` consults this one alone. Both halves are here so that
+    /// neither is re-derived: the fold walks its own tasks, and a caller
+    /// walking the registry's keys instead is walking a different sequence the
+    /// moment a repair is registered.
+    #[must_use]
+    pub fn backoff_pending(&self) -> bool {
+        self.run.as_ref().is_some_and(RunState::backoff_pending)
+    }
+
+    /// Whether any question is open.
+    ///
+    /// The ids themselves are [`Self::open_questions`]; this is the predicate
+    /// `derived_outcome` decides `Parked` with, exposed so that the hard-block
+    /// branch and the derived outcome cannot disagree about what "open" means.
+    #[must_use]
+    pub fn questions_open(&self) -> bool {
+        self.run.as_ref().is_some_and(RunState::questions_open)
     }
 
     // -----------------------------------------------------------------------
@@ -2927,8 +2973,18 @@ impl RunState {
             < usize::try_from(self.started.limits.max_parallel).unwrap_or(usize::MAX)
     }
 
+    /// `permits.provisional_reservations` gives integration selection the
+    /// `{pipeline, merge}` pair, and `deadlock_freedom` takes a reservation
+    /// "only when the derived count permits" — so the entitlement is a clause
+    /// of admissibility here for the same reason it is one in [`Self::ready`]
+    /// and [`Self::ready_retry`], and not a check the caller is trusted to
+    /// remember. `permits.pipeline` counts an unresolved integration
+    /// transaction among the held, which is the other half of the same
+    /// statement: a selector that admitted an integration while the count was
+    /// at `max_parallel` would open the entitlement that is already held.
     fn integration_admissible(&self) -> bool {
         self.transaction.is_none()
+            && self.pipeline_reservable()
             && !self.run_is_ending()
             && self
                 .queue
@@ -3629,6 +3685,9 @@ mod tests {
     const ZETA: TaskKey = TaskKey(0);
     const ALPHA: TaskKey = TaskKey(1);
     const MID: TaskKey = TaskKey(2);
+    /// The fourth task of [`wide_plan`] only. `plan()` and `chain_plan()` have
+    /// three, and `region` already answers `src/repairs` for this key.
+    const BETA: TaskKey = TaskKey(3);
 
     // -----------------------------------------------------------------------
     // Fixtures
@@ -3897,6 +3956,85 @@ mod tests {
                 ..unauthenticated
             }),
         })
+    }
+
+    /// Four tasks that wait on nothing and touch four disjoint regions.
+    ///
+    /// `plan()` and `chain_plan()` are both chains, and in a chain at most one
+    /// of `ready`, `ready_retry` and `integration_admissible` can hold at a
+    /// time: everything waits on one task, and that task is pending, open, or
+    /// merged. A predicate that is never independently true is one no guard
+    /// over it can be measured against — which is how four of the five poison
+    /// guards came to be asserted by a test that would have passed without
+    /// them. The three original ids keep their kinds, tiers, hints and
+    /// ladders; only `depends_on` differs, and `beta` is the fourth holder a
+    /// held pipeline entitlement needs.
+    fn wide_plan() -> Plan {
+        Plan {
+            source: PlanSource {
+                adapter: "markdown".to_owned(),
+                hash: "frozen-wide-Ünicode-hash".to_owned(),
+            },
+            tasks: vec![
+                task_of("zeta", &[], &["src/Zebra/"], Some(Tier::Small)),
+                task_of("alpha", &[], &["src/alpha/*.rs"], None),
+                task_of("mid", &[], &["src/mid/", "build.rs"], Some(Tier::Mid)),
+                task_of("beta", &[], &["src/repairs/"], None),
+            ],
+            artifacts: vec![Artifact {
+                id: ArtifactId::from("contract"),
+                produced_by: Some(TaskId::from("alpha")),
+            }],
+        }
+    }
+
+    fn wide_inputs() -> FrozenInputs {
+        FrozenInputs {
+            plan: wide_plan(),
+            normalized_plan_digest: NORMALIZED_DIGEST.to_owned(),
+        }
+    }
+
+    /// The wide plan's `run_started`, authenticated against its own registry,
+    /// at a stated pipeline width.
+    ///
+    /// The width is a parameter because it is the one limit selection reads,
+    /// and because `DEFAULT_MAX_PARALLEL` is 1: a fixture fixed at 3 tests a
+    /// width `config` refuses to create a run at.
+    fn wide_run_started_event(max_parallel: u32) -> TopologyEvent {
+        let plan = wide_plan();
+        let base = run_started_unauthenticated();
+        let limits = TopologyLimits {
+            max_parallel,
+            ..base.limits
+        };
+        let unauthenticated = RunStarted4 {
+            plan_hash: plan.source.hash.clone(),
+            chains: plan.tasks.iter().map(|t| chain(t.id.as_str())).collect(),
+            reviews: review_plan(plan.tasks.len()),
+            limits,
+            ..base
+        };
+        let digest = TaskRegistry::originals_with_agents(
+            &plan,
+            &unauthenticated.registry_record(),
+            &unauthenticated.probed_agents,
+        )
+        .expect("the wide record derives a registry")
+        .digest();
+        ev(TopologyEventBody::RunStarted {
+            data: Box::new(RunStarted4 {
+                registry_digest: digest,
+                ..unauthenticated
+            }),
+        })
+    }
+
+    /// A fold over [`wide_plan`] that has recorded its `run_started`.
+    fn wide_started(max_parallel: u32) -> TopologyFold {
+        let mut fold = TopologyFold::new(wide_inputs());
+        apply(&mut fold, &wide_run_started_event(max_parallel));
+        fold
     }
 
     fn registry_digest() -> String {
@@ -4354,28 +4492,60 @@ mod tests {
     /// state this process can no longer vouch for.
     #[test]
     fn a_poisoned_fold_authorises_nothing_while_still_reporting_what_it_holds() {
-        let mut fold = started();
+        // Every one of the five predicates is **independently true** before
+        // the poison, which is the whole of what makes the five assertions
+        // after it load-bearing: `alpha` waits on nothing and holds no
+        // generation, `zeta` holds a generation this incarnation retained,
+        // `mid`'s candidate is queued and eligible, and `beta` holds one of the
+        // three pipeline entitlements. This test used to poison a fold in
+        // which `alpha` had just been dispatched and the other two waited on
+        // it — nothing was admissible even unpoisoned, and four of the five
+        // guards could be deleted without it going red.
+        let mut fold = wide_started(3);
+        queue_candidate(&mut fold, MID, 0);
+        retained_generation(&mut fold, ZETA, 0);
+        apply(&mut fold, &dispatch(BETA, 0, &sha("base")));
+
         assert!(
-            fold.structurally_admissible(),
-            "`alpha` is dispatchable before anything happens"
+            fold.ready(ALPHA),
+            "`alpha` waits on nothing and holds no generation"
         );
-        apply(&mut fold, &dispatch(ALPHA, 0, &sha("base")));
-        assert_eq!(fold.pipeline_held(), 1);
-        // `alpha` now has an open generation and the other two depend on it,
-        // so nothing is admissible even unpoisoned. Poison it from a state
-        // where the *entitlement* is held, which is what the last assertion
-        // is about.
+        assert!(
+            fold.ready_retry(ZETA),
+            "`zeta` retained a session in this incarnation"
+        );
+        assert!(
+            fold.pipeline_reservable(),
+            "one of three entitlements is held"
+        );
+        assert!(fold.structurally_admissible());
+        assert!(
+            fold.integration_admissible(),
+            "`mid`'s candidate is queued and eligible"
+        );
+        assert_eq!(fold.pipeline_held(), 1, "`beta` holds one");
 
         fold.poison();
 
         assert!(fold.is_poisoned());
-        for key in [ZETA, ALPHA, MID] {
+        assert!(!fold.ready(ALPHA), "a poisoned fold offered a dispatch");
+        assert!(!fold.ready_retry(ZETA), "a poisoned fold offered a retry");
+        assert!(
+            !fold.pipeline_reservable(),
+            "a poisoned fold offered an entitlement"
+        );
+        assert!(
+            !fold.structurally_admissible(),
+            "a poisoned fold called itself admissible"
+        );
+        assert!(
+            !fold.integration_admissible(),
+            "a poisoned fold offered an integration"
+        );
+        for key in [ZETA, ALPHA, MID, BETA] {
             assert!(!fold.ready(key), "a poisoned fold offered a dispatch");
             assert!(!fold.ready_retry(key), "a poisoned fold offered a retry");
         }
-        assert!(!fold.pipeline_reservable());
-        assert!(!fold.structurally_admissible());
-        assert!(!fold.integration_admissible());
 
         // Accounting, not authorisation: answering `0` here would be a false
         // statement about the run rather than a refusal. The rule that keeps a
@@ -4385,6 +4555,213 @@ mod tests {
             fold.pipeline_held(),
             1,
             "the entitlement is still held; only the authorisation is withdrawn"
+        );
+    }
+
+    /// The pipeline entitlement is a clause of `integration_admissible`, and
+    /// at the width production actually runs it is the binding one.
+    ///
+    /// `permits.pipeline` counts an unresolved integration transaction among
+    /// the held, `permits.provisional_reservations` gives integration
+    /// selection `{pipeline, merge}`, and `deadlock_freedom` takes a
+    /// reservation "only when the derived count permits". So an integration is
+    /// admissible only within `max_parallel`, exactly as a dispatch and a
+    /// retry are.
+    ///
+    /// At width 1 — `DEFAULT_MAX_PARALLEL`, and the only width `config`
+    /// accepts for a fresh run — this is reachable rather than theoretical: a
+    /// crash after `task_dispatched` and before `attempt_started` leaves an
+    /// `OpenNoAttempt` generation holding the single slot, and the resumed
+    /// loop's first selection is where an admissibility that ignored the count
+    /// would spend it twice.
+    #[test]
+    fn an_integration_is_inadmissible_while_the_pipeline_entitlement_is_held() {
+        let mut narrow = wide_started(1);
+        queue_candidate(&mut narrow, MID, 0);
+        assert_eq!(narrow.pipeline_held(), 0, "the generation closed");
+        assert!(
+            narrow.integration_admissible(),
+            "an eligible candidate with the slot free is admissible"
+        );
+
+        // `zeta` takes the only slot, and stops where a crash between the
+        // dispatch and the first attempt stops it.
+        apply(&mut narrow, &dispatch(ZETA, 0, &sha("base")));
+        assert_eq!(narrow.pipeline_held(), 1);
+        assert!(!narrow.pipeline_reservable(), "one of one");
+        assert!(
+            !narrow.ready(ALPHA),
+            "a fresh dispatch is refused by the entitlement"
+        );
+        assert!(
+            !narrow.integration_admissible(),
+            "and so is an integration, which would hold one of its own"
+        );
+        assert!(
+            !narrow.structurally_admissible(),
+            "no branch is structurally admissible while the run's one slot is held"
+        );
+
+        // One slot wider, the identical state admits it: the clause under
+        // test is the count and nothing else about this fixture.
+        let mut wider = wide_started(2);
+        queue_candidate(&mut wider, MID, 0);
+        apply(&mut wider, &dispatch(ZETA, 0, &sha("base")));
+        assert_eq!(wider.pipeline_held(), 1);
+        assert!(
+            wider.integration_admissible(),
+            "one of two entitlements held leaves room for the integration's"
+        );
+    }
+
+    /// The three statements the selector delegates rather than re-derives.
+    ///
+    /// Statements about the run and not authorisations, which is why poisoning
+    /// does not flip them: a poisoned fold of a run with a deferred task still
+    /// has one, and `false` there would be a false statement rather than a
+    /// refusal. `pipeline_held` is exempted for the same reason and by the
+    /// same sentence.
+    #[test]
+    fn the_statement_accessors_report_the_run_rather_than_authorising_anything() {
+        let unstarted = TopologyFold::new(inputs());
+        assert!(
+            !unstarted.run_is_ending(),
+            "a run that has recorded nothing has not ended"
+        );
+        assert!(!unstarted.backoff_pending());
+        assert!(!unstarted.questions_open());
+
+        let mut fold = started();
+        assert!(!fold.run_is_ending());
+        assert!(!fold.backoff_pending());
+        assert!(!fold.questions_open());
+
+        apply(&mut fold, &dispatch(ALPHA, 0, &sha("base")));
+        let start = attempt_started(&fold, ALPHA, 0, 1, 0);
+        apply(&mut fold, &start);
+        apply(
+            &mut fold,
+            &settle(
+                ALPHA,
+                0,
+                1,
+                AttemptSettlement::Closed {
+                    transition: SettlementTransition::Deferred {
+                        defers: 1,
+                        reason: "  the pool is down  ".to_owned(),
+                    },
+                    lease: LeaseDisposition::PredictedReleased,
+                },
+            ),
+        );
+        assert!(
+            fold.backoff_pending(),
+            "a deferred task is waiting on a wait"
+        );
+        assert!(!fold.questions_open(), "and a wait is not a question");
+        assert!(!fold.run_is_ending(), "neither ends the run");
+
+        apply(&mut fold, &raised("q-ÜNI-statement", ZETA));
+        assert!(fold.questions_open());
+        assert!(fold.backoff_pending(), "a question is not a wait either");
+        assert!(!fold.run_is_ending());
+
+        let mut poisoned = fold.clone();
+        poisoned.poison();
+        assert!(
+            poisoned.backoff_pending(),
+            "poisoning unsaid a deferred task"
+        );
+        assert!(
+            poisoned.questions_open(),
+            "poisoning unsaid an open question"
+        );
+        assert!(
+            !poisoned.structurally_admissible(),
+            "and it did withdraw the authorisation"
+        );
+
+        // `run_is_ending` is the epoch-aware half, which is why a caller must
+        // not read `budget_stop` for itself: a stop of **this** epoch ends the
+        // run, and the resume that raised the ceiling clears it.
+        let mut stopped = started();
+        apply(&mut stopped, &budget_exceeded(0, Some(MID)));
+        assert!(stopped.run_is_ending(), "a stop of this epoch ends the run");
+        apply(&mut stopped, &resume(container_runner()));
+        assert!(
+            !stopped.run_is_ending(),
+            "the resume raised the ceiling the stop was against"
+        );
+        stopped.poison();
+        assert!(
+            !stopped.run_is_ending(),
+            "poisoning invented an ending the log does not record"
+        );
+
+        // A halt ends it in every epoch, poisoned or not.
+        let mut halted = started();
+        apply(&mut halted, &dispatch(ZETA, 0, &sha("base")));
+        let start = attempt_started(&halted, ZETA, 0, 1, 0);
+        apply(&mut halted, &start);
+        apply(
+            &mut halted,
+            &settle(
+                ZETA,
+                0,
+                1,
+                AttemptSettlement::Closed {
+                    transition: SettlementTransition::Failed {
+                        halts_run: true,
+                        reason: "  the halt policy fired  ".to_owned(),
+                    },
+                    lease: LeaseDisposition::PredictedReleased,
+                },
+            ),
+        );
+        assert_eq!(halted.halted_at(), Some(ZETA));
+        assert!(halted.run_is_ending());
+        halted.poison();
+        assert!(halted.run_is_ending(), "poisoning unsaid a halt");
+    }
+
+    /// Take one task to a **queued** candidate: dispatch, attempt, success,
+    /// prepare, create.
+    ///
+    /// [`merge_task`] minus its last two events. The generation closes at
+    /// `task_candidate_created` and releases the entitlement it held, so a
+    /// fold built this way holds a queued candidate and nothing else.
+    fn queue_candidate(fold: &mut TopologyFold, key: TaskKey, generation: u32) {
+        let base = sha("base");
+        apply(fold, &dispatch(key, generation, &base));
+        let start = attempt_started(fold, key, generation, 1, 0);
+        apply(fold, &start);
+        apply(fold, &succeeded(key, generation, 1));
+        apply(fold, &candidate_prepared(key, generation, &base));
+        apply(fold, &candidate_created(key, generation));
+    }
+
+    /// A generation of `key` retained by the incarnation the fold is in.
+    ///
+    /// The incarnation is read from the fold rather than written as `0`:
+    /// `ready_retry` is false in every incarnation but the retaining one, so a
+    /// fixture that hard-coded the epoch would silently stop being a
+    /// `ready_retry` state the moment it was used after a resume.
+    fn retained_generation(fold: &mut TopologyFold, key: TaskKey, generation: u32) {
+        let epoch = fold.epoch().expect("the run has started");
+        apply(fold, &dispatch(key, generation, &sha("base")));
+        let start = attempt_started(fold, key, generation, 1, 0);
+        apply(fold, &start);
+        apply(
+            fold,
+            &settle(
+                key,
+                generation,
+                1,
+                AttemptSettlement::Retained {
+                    retained_session: SessionId(format!("sess-ÜNI-{}-{generation}", key.0)),
+                    retained_incarnation: epoch,
+                },
+            ),
         );
     }
 

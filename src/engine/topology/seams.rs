@@ -327,7 +327,10 @@ impl IdSource for RealIds {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::topology::effects::{EffectSiteId, HookPhase, Injection, RunDirSite};
+    use crate::runner::SPAWN_SITE;
+    use crate::topology::effects::{
+        EffectSiteId, EventSite, HookPhase, Injection, InjectionMode, RunDirSite, SubEffectPoint,
+    };
 
     /// A fixed clock and fixed identities, so a durable byte can be asserted
     /// against a literal.
@@ -412,9 +415,35 @@ mod tests {
     /// This is the property `check_bijection` depends on. A bundle whose five
     /// adapters each held their own harness would pass every per-family test
     /// and produce an evidence table with four fifths of it missing.
+    ///
+    /// All **five** families are asserted, not the three whose adapters answer
+    /// through `EffectSiteId`. `ProcessSite::Spawn` and `ProcessSite::Terminate`
+    /// are `SiteScope::Topology` rows, so a bundle that gave `SpawnHooks` a
+    /// private harness would lose both of this slice's process sites while
+    /// `check_bijection` still reported success — and a three-family assertion
+    /// is exactly what would not notice.
+    ///
+    /// The spawn family is checked in both directions, because its two
+    /// directions land in different ledgers. An **unarmed** point is
+    /// reachability and `HookHarness::hook` records it into `reached` alone,
+    /// so `Exec` — whose only mode is `Kill`, and arming that aborts the
+    /// process — is asserted through `reached_point`. `AmbientJobJoined` is the
+    /// one containment point with an error contract, so arming it on the
+    /// *shared* harness and reading `Injection::Error` back out of the bundle
+    /// proves the answering direction as well, and puts a `Process.Spawn`
+    /// observation in `coverage`, which is the ledger `check_bijection` reads.
     #[test]
     fn every_family_of_the_harness_bundle_records_into_the_same_harness() {
         let harness = Arc::new(Mutex::new(HookHarness::new()));
+        harness
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .arm(
+                SPAWN_SITE,
+                SubEffectPoint::AmbientJobJoined,
+                InjectionMode::ErrorReturn,
+            )
+            .expect("`Process.Spawn` exposes `AmbientJobJoined` with an error contract");
         let mut hooks = HarnessTopologyHooks::new(Arc::clone(&harness));
 
         let marker = EffectSiteId::RunDir(RunDirSite::PublishMarker);
@@ -422,17 +451,20 @@ mod tests {
         let commit = EffectSiteId::RunDir(RunDirSite::PublishCommitRecord);
         let container = EffectSiteId::Container(crate::topology::effects::ContainerSite::Create);
         let worktree = EffectSiteId::Worktree(crate::topology::effects::WorktreeSite::Add);
+        let append = EffectSiteId::Event(EventSite::AppendFirst);
 
         hooks.rundir().hook(marker, HookPhase::Before);
         hooks.effects().phase(worktree, HookPhase::Before);
         hooks.container().phase(container, HookPhase::After);
-        hooks.events().phase(
-            crate::topology::effects::EventSite::AppendFirst,
-            HookPhase::Before,
-        );
         hooks
-            .spawn()
-            .point(crate::topology::effects::SubEffectPoint::Exec);
+            .events()
+            .phase(EventSite::AppendFirst, HookPhase::Before);
+        hooks.spawn().point(SubEffectPoint::Exec);
+        assert_eq!(
+            hooks.spawn().point(SubEffectPoint::AmbientJobJoined),
+            Injection::Error,
+            "an injection armed on the shared harness did not reach the spawn family"
+        );
 
         let seen = harness
             .lock()
@@ -441,6 +473,14 @@ mod tests {
             (marker, HookPhase::Before),
             (worktree, HookPhase::Before),
             (container, HookPhase::After),
+            (append, HookPhase::Before),
+            (
+                SPAWN_SITE,
+                HookPhase::Point {
+                    point: SubEffectPoint::AmbientJobJoined,
+                    mode: InjectionMode::ErrorReturn,
+                },
+            ),
         ] {
             assert!(
                 seen.observed(site, phase),
@@ -448,12 +488,24 @@ mod tests {
             );
         }
         assert!(
+            seen.reached_point(SPAWN_SITE, SubEffectPoint::Exec, InjectionMode::Kill),
+            "the spawn family's reachability did not reach the shared harness"
+        );
+        assert!(
             !seen.observed(public, HookPhase::Before),
             "a site nothing drove was recorded as observed"
         );
         assert!(
             !seen.observed(commit, HookPhase::Before),
             "a site nothing drove was recorded as observed"
+        );
+        assert!(
+            !seen.observed(EffectSiteId::Event(EventSite::OpenLog), HookPhase::Before),
+            "an event site nothing drove was recorded as observed"
+        );
+        assert!(
+            !seen.reached_point(SPAWN_SITE, SubEffectPoint::Registered, InjectionMode::Kill),
+            "a containment point nothing drove was recorded as reached"
         );
     }
 
