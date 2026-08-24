@@ -2487,7 +2487,7 @@ fn kill_during_recovery_repeats_recovery() {
 // The chain's one entry point, as a source census
 // ===========================================================================
 
-/// `StablePrefix::into_parts` is reached from exactly one production region of
+/// `StablePrefix::into_log_and_fold` is reached from exactly one production region of
 /// the topology engine: [`BarrierHeld::from`].
 ///
 /// # Why this is a census and not a visibility
@@ -2496,7 +2496,7 @@ fn kill_during_recovery_repeats_recovery() {
 /// value**, and `StablePrefix`'s only constructor is
 /// `events::log::establish_stable_prefix` — so barrier *evidence* cannot be
 /// manufactured. What it does not close is the other direction:
-/// `StablePrefix::into_parts` is `pub`, so a topology module could take a
+/// `StablePrefix::into_log_and_fold` is `pub`, so a topology module could take a
 /// proven prefix apart and hold the append handle and the fold **without**
 /// wrapping them in a `BarrierHeld`, and then everything the chain hangs off —
 /// `ResumeCensused`, and through it every recovery emitter — would be reachable
@@ -2511,7 +2511,7 @@ fn kill_during_recovery_repeats_recovery() {
 /// `events::log::tests::the_stable_prefix_barrier_is_the_only_way_a_log_becomes_a_topology_fold`.
 #[test]
 fn the_barrier_is_the_only_topology_route_from_a_proven_prefix_to_an_append_handle() {
-    const ENTRY: &str = "into_parts(";
+    const ENTRY: &str = "into_log_and_fold(";
     let src = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
     let mut stack = vec![src.clone()];
     let mut callers: Vec<(String, usize)> = Vec::new();
@@ -2557,18 +2557,16 @@ fn the_barrier_is_the_only_topology_route_from_a_proven_prefix_to_an_append_hand
                 Some(end) => &source[..end],
                 None => source.as_str(),
             };
-            // Calls, not definitions. `ENTRY` is a bare name, so it also
-            // matches `fn into_parts(` — and a same-named method on an
-            // unrelated type is not a second route from a proven prefix to an
-            // append handle. Measured at integration: `startup.rs` defines
-            // three `into_parts` of its own, on `StartupCensus`,
-            // `FreshCensused` and `ResumeCensused`, and this census reported
-            // all three as routes.
+            // Calls, not definitions — a definition is not a route.
             //
-            // The residual limit, stated rather than hidden: a *call* to a
-            // same-named method on another type would still count. The census
-            // is a claim about this crate's own small surface, and the fix if
-            // that day comes is to rename, not to widen the needle.
+            // The needle used to be the bare `into_parts(`, and at integration
+            // it reported five false routes: three definitions in `startup.rs`
+            // and two calls in `create.rs`, every one of them a typestate
+            // witness of that lane handing back its own fields. The comment
+            // here said the fix was "to rename, not to widen the needle", and
+            // that is what was done: `StablePrefix`'s accessor is
+            // `into_log_and_fold`, a name nothing else in the crate carries,
+            // so the needle now means what it says.
             let count = production
                 .match_indices(ENTRY)
                 .filter(|(at, _)| !production[..*at].trim_end().ends_with("fn"))

@@ -126,6 +126,7 @@ funnel = [
     "acquire_hooked",
     "acquire_in_hooked",
     "create_private_dir",
+    "create_private_skeleton",
     "create_public_dir",
     "ingest_answer",
     "observe_cleanup_hold",
@@ -160,6 +161,10 @@ effect_free = [
     "as_str",
     "classify_run_dir",
     "commit_record_after_error",
+    # Conjunct 12's classification, read-only and total: it takes the stat that
+    # was already performed and answers whether it *proves* the private commit
+    # record absent. Only `NotFound` does.
+    "commit_record_proves_absence",
     "create",
     "create_hooked",
     "default_private_root",
@@ -322,7 +327,7 @@ effect_free = [
     "fold",
     "from",
     "harness",
-    "into_parts",
+    "into_log_and_fold",
     "kind",
     # PR7: `HarnessEventHooks`'s durability read-back. In-memory only.
     "ledger",

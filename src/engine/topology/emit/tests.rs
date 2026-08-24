@@ -320,7 +320,7 @@ impl Fixture {
             hooks.events(),
         )
         .expect("an empty log establishes the barrier trivially");
-        let (log, bytes, fold) = prefix.into_parts();
+        let (log, bytes, fold) = prefix.into_log_and_fold();
         assert!(bytes.is_empty(), "a fresh run has no prefix");
         Self {
             paths,
@@ -1504,7 +1504,7 @@ fn a_refusal_before_the_append_was_entered_does_not_run_the_protocol() {
     // Now un-poison the fold, leaving the handle poisoned. A real coordinator
     // never reaches this state; the point is that if it did, the protocol would
     // not run a second time on an append that was refused at the door.
-    fixture.fold = resume(&fixture.paths).into_parts().2;
+    fixture.fold = resume(&fixture.paths).into_log_and_fold().2;
     let after_reopen = fixture.log_bytes();
     let error = fixture
         .emit(pool_body())

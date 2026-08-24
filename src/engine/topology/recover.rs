@@ -731,7 +731,7 @@ pub mod chain {
                 // append handle from here on, and a `StablePrefix` that both
                 // this value and a caller could reach would be two handles onto
                 // one log.
-                let (log, bytes, fold) = prefix.into_parts();
+                let (log, bytes, fold) = prefix.into_log_and_fold();
                 let measured = PrefixBytes::of(&bytes);
                 let barrier = StablePrefixBarrier::establish(
                     // Every byte the barrier proved is a byte

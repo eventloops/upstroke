@@ -1716,6 +1716,18 @@ fn no_module_outside_the_container_runner_writes_a_container_intent() {
             || relative == "src/runner/container/fake.rs"
             || relative == "src/effects/tests.rs"
             || relative == "src/engine/topology/recover/tests.rs"
+            // The fifth, added by PR7 lane B, on the same terms as the fourth.
+            // `src/engine/topology/create/tests.rs` is the `#[cfg(test)] mod
+            // tests;` of the schema-4 creator. It names `ContainerIntent`,
+            // `ContainerName` and `containers_dir` to **read back** the intent a
+            // containerized probe left after a kill —
+            // `probe_intent_carries_runner_policy_digest_matching_owner_record`
+            // and `kill_during_containerized_probe_...` — and writes none: the
+            // one that exists was written by `ContainerRunner` through the
+            // funnel. The exclusion is by exact path rather than by prefix, so
+            // it cannot widen to `src/engine/topology/create.rs`, which is
+            // production and is scanned.
+            || relative == "src/engine/topology/create/tests.rs"
         {
             continue;
         }

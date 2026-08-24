@@ -1405,7 +1405,7 @@ impl StablePrefix {
 
     /// Take the two halves apart.
     #[must_use]
-    pub fn into_parts(self) -> (EventLog, Vec<u8>, TopologyFold) {
+    pub fn into_log_and_fold(self) -> (EventLog, Vec<u8>, TopologyFold) {
         (self.log, self.bytes, self.fold)
     }
 }

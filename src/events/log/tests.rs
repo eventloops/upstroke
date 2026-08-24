@@ -3328,6 +3328,10 @@ fn the_stable_prefix_barrier_is_the_only_way_a_log_becomes_a_topology_fold() {
     const FOLD_MENTIONS: &[&str] = &[
         // PR7's candidate pipeline. Holds a fold, builds none from bytes.
         "src/engine/topology/candidate.rs",
+        // PR7's schema-4 creator. It holds a fold across P5b and P6 because
+        // `emit` puts `plan_transition` before the commit record and
+        // `apply_delta` after the append.
+        "src/engine/topology/create.rs",
         // PR7's emit path. It holds a fold and appends to a log and builds
         // neither from bytes — it obtains one from `establish_stable_prefix` —
         // so it names the type without adding to `callers` below.
