@@ -5,9 +5,9 @@ assumed named explicitly, rejected options recorded with why.
 
 The contract that keeps this folder safe:
 
-- **DESIGN.md remains the only living authority.** Records here are history, not
-  spec. When a record's outcome changes the spec, DESIGN.md gets the compressed
-  edit at the time of the decision, citing the record.
+- **DESIGN.md remains the only living authority for product design.**
+  Records here are history, not spec. When a record's outcome changes the spec,
+  DESIGN.md gets the compressed edit at the time of the decision, citing the record.
 - **One decision per file**, named `YYYY-MM-DD-<slug>.md`. Do not accumulate
   addenda about unrelated decisions in one file. This is not filing tidiness: an
   append-only ledger in a single file conflicts on every concurrent branch, and

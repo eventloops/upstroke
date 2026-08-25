@@ -279,5 +279,6 @@ In plain terms, for the two things people usually want to know:
 If that doesn't suit — an internal policy that prohibits AGPL, or a product you need to keep
 closed — a **commercial licence** is available. Open an issue or get in touch.
 
-Contributions are welcome under the CLA in [CONTRIBUTING.md](CONTRIBUTING.md), which keeps that
-dual-licensing possible.
+Contributions are welcome under the CLA and workflow in [CONTRIBUTING.md](CONTRIBUTING.md), which
+keeps that dual-licensing possible. Rust changes follow the project's
+[coding standards](CODING_STANDARDS.md).

@@ -9,8 +9,8 @@ proposal  →  council critique  →  decision record  →  implementation  → 
 
 The contract that keeps this folder safe:
 
-- **DESIGN.md remains the only living authority.** A proposal binds nothing.
-  When one survives the council, the verdict lands as a record in
+- **DESIGN.md remains the only living authority for product design.**
+  A proposal binds nothing. When one survives the council, the verdict lands as a record in
   [`decisions/`](../decisions/README.md) citing the proposal and its critiques
   as inputs, and DESIGN.md gets the compressed edit at decision time.
 - **One proposal per file**, named `YYYY-MM-DD-vN.M-<slug>.md`.
