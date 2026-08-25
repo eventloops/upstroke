@@ -1198,7 +1198,13 @@ impl TopologyRun {
 
         let Some(failure) = judgement.failure.as_ref() else {
             self.promote_candidate(site, plan, capture, record, seams, hooks)?;
-            return Ok(true);
+            // Through the authority, not as a literal. `spends_allowance`'s
+            // `None` arm is "the worker ran, and its work was judged and
+            // accepted" — the same sentence, decided in the one place that is
+            // total over `FailureKind`. A `true` here would be a second answer
+            // to a question the ladder already owns, and the next cell someone
+            // changes there would not reach this path.
+            return Ok(crate::ladder::spends_allowance(None));
         };
 
         let policy = self.ladder_policy(site.key)?;

@@ -161,6 +161,28 @@ direct question about scope and answered it as a disposition, which is now settl
 claim about the PR3 round, not about PR4's second confirmation, whose two findings —
 `PR4-CONF-003` and `PR4-CONF-004` — were both accepted and repaired in round 5.)*
 
+### 2026-08-25 — `PR7-APPEND-REPORT-READABLE-UNDISCHARGED`, partially repaired
+
+**A guarantee I asserted that was not true as written.** The commit that moved obligation
+(3) to the caller claimed the append-error report is "unreachable while invocations still
+run, as a compile error". S5 round 1's `emit` lens found the hole: `EmitFailure` and
+`EmitError` both implemented `Display` by delegating to the token's, so
+`failure.to_string()` — the thing every `?` path does on its way to an operator — rendered
+the entire report without discharging anything.
+
+**Repaired for the path that matters.** `EmitFailure::Undischarged` and
+`EmitError::AppendFailed` now render only what a caller may know before discharging: that
+an entered append failed, and at which site. The outcome, the cause and the creator
+disposition arrive with `AppendError`, which still requires the ledger.
+
+**Residue, named rather than closed.** `UncancelledAppend` itself still implements
+`Display`. Removing it is the complete fix and it ripples into six `emit` tests that assert
+the report's operator text directly; doing that hastily is the "a fix that introduced a new
+defect" class, which this project has paid for five times. It is round-2 work, and until
+then the honest claim is narrower than the one the earlier commit made: **the count and the
+discharge cannot be skipped; the prose can still be read by a caller that destructures the
+error deliberately.**
+
 ### 2026-08-25 — `PR7-FOLD-LADDER-POSITION`, per-instance Class B approval
 
 **Disclosure row for a frozen-file change, filed in the commit that makes it.** Raised by

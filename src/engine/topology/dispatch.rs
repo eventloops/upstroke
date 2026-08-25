@@ -172,10 +172,24 @@ impl DispatchKind {
     /// rather than restated: a repair never changes a lineage lease, so every
     /// one of its closures is `LineageHeld`, and an ordinary generation that
     /// closes releases the region it held.
-    const fn closing_disposition(&self) -> LeaseDisposition {
+    fn closing_disposition(&self) -> LeaseDisposition {
+        // **`GenerationLease::expected` is the whole of this rule**, and this
+        // used to restate it: `Ordinary -> PredictedReleased`,
+        // `Repair -> LineageHeld` is exactly what it computes from `Own` and
+        // `InheritedLineage` when the generation does not survive. A second
+        // match is a second authority for a value `check_lease_disposition`
+        // refuses any other answer to, and the two would drift the moment the
+        // vocabulary grew a third lease.
+        self.lease().expected(false)
+    }
+
+    /// The lease relationship this dispatch establishes.
+    const fn lease(&self) -> crate::topology::leases::GenerationLease {
         match self {
-            Self::Ordinary { .. } => LeaseDisposition::PredictedReleased,
-            Self::Repair { .. } => LeaseDisposition::LineageHeld,
+            Self::Ordinary { .. } => crate::topology::leases::GenerationLease::Own,
+            Self::Repair { root, .. } => {
+                crate::topology::leases::GenerationLease::InheritedLineage { root: *root }
+            }
         }
     }
 }
@@ -243,7 +257,7 @@ impl Dispatched {
     /// both against the same rule and two call sites deciding it separately is
     /// two chances to record `PredictedReleased` for a lineage member.
     #[must_use]
-    pub const fn closing_disposition(&self) -> LeaseDisposition {
+    pub fn closing_disposition(&self) -> LeaseDisposition {
         self.kind.closing_disposition()
     }
 

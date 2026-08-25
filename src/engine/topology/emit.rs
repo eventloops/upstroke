@@ -223,7 +223,47 @@ pub struct AppendError {
 
 impl fmt::Display for AppendError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        self.report.fmt(f)
+        write!(
+            f,
+            "run `{}`: the `{}` append at `Event.{}` was entered and returned an error ({}), so \
+             its outcome is unknown. {}. Nothing was retried, no state was derived from this \
+             process's fold, and the run is resumable.",
+            self.report.run_id,
+            self.report.kind,
+            self.report.site.name(),
+            self.report.cause,
+            self.report.outcome.describe()
+        )?;
+        if let Some(disposition) = self.report.creator_disposition() {
+            write!(
+                f,
+                " The run directory is reported as {disposition}; neither half is deleted."
+            )?;
+        }
+        Ok(())
+    }
+}
+
+impl fmt::Display for UncancelledAppend {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "run `{}`: the `{}` append at `Event.{}` was entered and returned an error ({}), so \
+             its outcome is unknown. {}. Nothing was retried, no state was derived from this \
+             process's fold, and the run is resumable.",
+            self.run_id,
+            self.kind,
+            self.site.name(),
+            self.cause,
+            self.outcome.describe()
+        )?;
+        if let Some(disposition) = self.creator_disposition() {
+            write!(
+                f,
+                " The run directory is reported as {disposition}; neither half is deleted."
+            )?;
+        }
+        Ok(())
     }
 }
 
@@ -314,29 +354,6 @@ impl UncancelledAppend {
     }
 }
 
-impl fmt::Display for UncancelledAppend {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(
-            f,
-            "run `{}`: the `{}` append at `Event.{}` was entered and returned an error ({}), so \
-             its outcome is unknown. {}. Nothing was retried, no state was derived from this \
-             process's fold, and the run is resumable.",
-            self.run_id,
-            self.kind,
-            self.site.name(),
-            self.cause,
-            self.outcome.describe()
-        )?;
-        if let Some(disposition) = self.creator_disposition() {
-            write!(
-                f,
-                " The run directory is reported as {disposition}; neither half is deleted."
-            )?;
-        }
-        Ok(())
-    }
-}
-
 /// Why an emit did not apply its transition.
 ///
 /// The first three all mean **nothing was written**, and they are kept apart
@@ -388,7 +405,15 @@ impl fmt::Display for EmitError {
         match self {
             Self::Unserializable(error) | Self::NotEntered(error) => write!(f, "{error}"),
             Self::Refused(error) => write!(f, "{error}"),
-            Self::AppendFailed(error) => write!(f, "{error}"),
+            // Same reason as `EmitFailure`: an outstanding obligation is not
+            // a report and must not read like one.
+            Self::AppendFailed(error) => write!(
+                f,
+                "the `{}` append at `Event.{}` was entered and returned an error, and its \
+                 in-flight invocations have not been cancelled yet",
+                error.kind,
+                error.site.name()
+            ),
         }
     }
 }
@@ -639,7 +664,20 @@ impl fmt::Display for EmitFailure {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Clean(error) => write!(f, "{error}"),
-            Self::Undischarged(append) => write!(f, "{append}"),
+            // **Deliberately not the report.** Rendering it here would be a
+            // second way to read an `AppendError`'s content without the ledger,
+            // which is the whole of what `cancelling` is supposed to gate — and
+            // `to_string()` is the easiest possible bypass. What a caller may
+            // know before discharging is that an entered append failed and at
+            // which site; the outcome, the cause and the creator disposition
+            // arrive with the report.
+            Self::Undischarged(append) => write!(
+                f,
+                "the `{}` append at `Event.{}` was entered and returned an error, and its \
+                 in-flight invocations have not been cancelled yet",
+                append.kind,
+                append.site.name()
+            ),
         }
     }
 }
