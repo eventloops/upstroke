@@ -25,6 +25,7 @@
 
 mod assembly;
 mod attempt;
+mod classify;
 mod coordinator;
 mod options;
 mod preflight;

@@ -1887,6 +1887,95 @@ mod tests {
         );
     }
 
+    /// **An observation about an attempt is classified in one production
+    /// place.**
+    ///
+    /// The companion to `a_command_is_assembled_in_one_production_place_per_role`,
+    /// and it pins the higher-stakes half. A command assembled twice runs the
+    /// wrong process; a *classification* made twice decides the wrong thing
+    /// about a task — `ladder::next_step` reads an `AttemptFailure` and chooses
+    /// retry, escalate, defer, park or fail from it, and **the allowance
+    /// decision is derived from the same field**. Two engines calling one diff
+    /// different things would not surface as a wrong answer. It would surface
+    /// as a task escalating to a pricier tier because the other engine
+    /// disagreed about what its diff was.
+    ///
+    /// Columns count the constructors of the two verdict types: `AttemptFailure`
+    /// and `ReviewRecord`. `src/engine/classify.rs` holds what was inline in
+    /// the legacy verification ladder. `src/engine/attempt.rs` keeps its count
+    /// for `review_failure`, which was **already a function** — a pure move of
+    /// something already callable is churn, not extraction — and `src/ladder.rs`
+    /// keeps its own for the escalation vocabulary it owns.
+    #[test]
+    fn an_observation_about_an_attempt_is_classified_in_one_production_place() {
+        use std::collections::BTreeMap;
+
+        /// (file, `AttemptFailure::new` calls, `ReviewPassOutcome::` uses, why).
+        const EXPECTED: &[(&str, usize, usize, &str)] = &[
+            (
+                "src/capacity.rs",
+                0,
+                1,
+                "reads an outcome to account for it. A reader, not a decider",
+            ),
+            (
+                "src/engine/attempt.rs",
+                9,
+                0,
+                "`review_failure`'s arms, the reviewer-unavailable mapping, \
+                 and the outcome-status classification. Already functions and \
+                 already reachable from the schema-4 driver, so they did not \
+                 move — a pure move of something already callable is churn. \
+                 `review_failure`'s own doc carries the rule the allowance \
+                 derivation rests on: a reviewer asking for a human `must not \
+                 spend an attempt or escalate`",
+            ),
+            (
+                "src/engine/classify.rs",
+                3,
+                3,
+                "what was INLINE in `run_attempt`'s verification ladder: the \
+                 diff's two observations and a failed gate, plus the three \
+                 arms that decide a review pass's outcome. Both engines read \
+                 these, and this is the only production site that CONSTRUCTS \
+                 a `ReviewPassOutcome`",
+            ),
+            (
+                "src/engine/coordinator.rs",
+                0,
+                1,
+                "reads an outcome while reporting. A reader",
+            ),
+            (
+                "src/export.rs",
+                0,
+                3,
+                "reads outcomes to export them. A reader",
+            ),
+        ];
+
+        let mut found: BTreeMap<String, (usize, usize)> = BTreeMap::new();
+        for (path, code) in production_sources() {
+            let failures = code.matches("AttemptFailure::new(").count();
+            let records = code.matches("ReviewPassOutcome::").count();
+            if failures + records > 0 {
+                found.insert(path, (failures, records));
+            }
+        }
+
+        let expected: BTreeMap<String, (usize, usize)> = EXPECTED
+            .iter()
+            .map(|(path, f, r, _)| ((*path).to_owned(), (*f, *r)))
+            .collect();
+        assert_eq!(
+            found, expected,
+            "a production site decides what an observation means about an \
+             attempt. A second site for an observation that already has one is \
+             two rules deciding one task's fate, and `ladder::next_step` and \
+             the allowance derivation both read the answer"
+        );
+    }
+
     #[test]
     fn every_production_command_spec_payload_is_classified() {
         use std::collections::BTreeMap;

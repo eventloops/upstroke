@@ -12,7 +12,7 @@ use crate::agent::{AgentAdapter, proc};
 use crate::error::UpstrokeError;
 use crate::events::{self, Feedback};
 use crate::gates::{self, ShellGate};
-use crate::ir::{Outcome, OutcomeStatus, Task, TaskKind, WorkerProfile};
+use crate::ir::{Outcome, OutcomeStatus, Task, WorkerProfile};
 use crate::ladder::{AttemptFailure, FailureKind};
 use crate::review;
 use crate::rundir::RunPaths;
@@ -202,30 +202,13 @@ pub(super) fn run_attempt(
     // Verification ladder (§11): outcome sanity → cheap static provenance →
     // gates → review. Cheapest and most objective first.
     let mut failure = evaluate_outcome(&outcome, &output);
+    // What the diff alone says, in the legacy order. `engine::classify` is the
+    // one production place that decides it; the schema-4 driver reads the same
+    // answer rather than forming its own, because `ladder::next_step` reads the
+    // result and the allowance decision is derived from it.
     if failure.is_none() {
-        if let Some(error) = review::complete_diff_error(&outcome.diff) {
-            if matches!(error, review::CompleteDiffError::Opaque) || !cx.reviewers.is_empty() {
-                let kind = match error {
-                    review::CompleteDiffError::Opaque => FailureKind::ReviewInputOpaque,
-                    review::CompleteDiffError::TooLarge { .. } => FailureKind::ReviewInputTooLarge,
-                };
-                failure = Some(AttemptFailure::new(kind, error.to_string()).from_reviewer());
-            }
-        }
-    }
-    if failure.is_none() && cx.task.kind == TaskKind::Test && !gates::diff_adds_tests(&outcome.diff)
-    {
-        failure = Some(
-            AttemptFailure::new(
-                FailureKind::TestProvenance,
-                "test provenance: this Test task adds no test code — a Test task that changes no \
-                 tests proves nothing",
-            )
-            .with_feedback(
-                "The diff contains no test code. Add tests that would fail without your change."
-                    .to_owned(),
-            ),
-        );
+        failure =
+            super::classify::diff_failure(&outcome.diff, cx.task.kind, !cx.reviewers.is_empty());
     }
     if failure.is_none() {
         if let Some(problem) = workspace.review_input_problem_for_tree(&candidate.tree_oid)? {
@@ -248,16 +231,7 @@ pub(super) fn run_attempt(
             &cx.stem,
             cx.attempt,
         )? {
-            failure = Some(
-                AttemptFailure::new(
-                    FailureKind::GateFailed,
-                    format!(
-                        "gate `{}` failed: {}",
-                        gate_failure.gate, gate_failure.summary
-                    ),
-                )
-                .with_feedback(gate_failure.log_tail),
-            );
+            failure = Some(super::classify::gate_failure(&gate_failure));
         }
     }
 
@@ -311,21 +285,21 @@ pub(super) fn run_attempt(
             // a judge that said no, and the ledger has to show which happened.
             let unavailable = matches!(review.result, review::ReviewResult::Unavailable { .. });
             failure = review_failure(review.result);
-            reviews.push(events::ReviewRecord {
-                pass: reviewer.lens.name().to_owned(),
-                agent: reviewer.profile.agent.clone(),
-                model: reviewer.profile.model.clone(),
-                adapter: Some(reviewer.adapter.id().to_owned()),
-                preflight_cli_version: reviewer.preflight_cli_version.clone(),
-                effort: reviewer.profile.effort,
-                pool: pool_option(&reviewer.profile.pool),
-                cost_usd,
-                outcome: match (unavailable, failure.is_none()) {
-                    (true, _) => events::ReviewPassOutcome::Unavailable,
-                    (false, true) => events::ReviewPassOutcome::Passed,
-                    (false, false) => events::ReviewPassOutcome::Failed,
-                },
-            });
+            reviews.push(
+                super::classify::ReviewPassFacts {
+                    pass: reviewer.lens.name(),
+                    agent: &reviewer.profile.agent,
+                    model: &reviewer.profile.model,
+                    adapter: reviewer.adapter.id(),
+                    preflight_cli_version: reviewer.preflight_cli_version.clone(),
+                    effort: reviewer.profile.effort,
+                    pool: pool_option(&reviewer.profile.pool),
+                    cost_usd,
+                    unavailable,
+                    failed: failure.is_some(),
+                }
+                .record(),
+            );
             if failure.is_some() {
                 break;
             }
