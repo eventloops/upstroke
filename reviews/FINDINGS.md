@@ -161,6 +161,46 @@ direct question about scope and answered it as a disposition, which is now settl
 claim about the PR3 round, not about PR4's second confirmation, whose two findings —
 `PR4-CONF-003` and `PR4-CONF-004` — were both accepted and repaired in round 5.)*
 
+### 2026-08-25 — `PR7-FOLD-DEFERS-ACCUMULATOR`, per-instance Class B approval
+
+**Disclosure row for a frozen-file change, filed in the commit that makes it.**
+
+**What changed.** `src/topology/fold.rs`: `TaskFold` gains a `defers: u32` field, set from the
+settlement's own number at the `SettlementTransition::Deferred` arm that already handled the
+transition. Read through the **existing** `TopologyFold::task` reader — no twelfth reader. One
+private setter, `set_defers`, assignment not increment.
+
+**Why it could not be avoided.** `ladder::next_step` reads `LadderState::defers` on exactly one
+branch: an outage defers while `defers < max_defers` and parks at it. Schema 4 had no reader for
+that count anywhere. `SettlementTransition::Deferred { defers }` was written into the log and the
+fold never accumulated it: `TaskFold` had no such field, and `TaskState::Deferred` is a unit
+variant. The legacy engine keeps the count in `state.progress[index].defers`, which is in-memory
+schema-3 state; a schema-4 run derives everything by replay.
+
+**Why the fold owns it rather than the driver.** A process-local tally agrees with the log on every
+reading except the one after a resume, and then it reads zero while the log holds three — so a run
+that had already spent its allowance would defer a fourth time, a fifth, and never park. That is
+`PR7-REGION-SECOND-DERIVATION`'s shape with a resume-shaped fuse: two derivations of one number,
+agreeing until they do not. `a_deferral_count_is_derived_by_replay_and_not_by_a_process_local_tally`
+is the witness, and it fails at `left: 0, right: 3` when the accumulation is removed.
+
+**Why the contract owes it.** `pr_sequence[8].scope` is "failed/interrupted/**deferred**
+settlements"; `permitted_transitions` names "failed (Retained | Closed | **Deferred**)" and
+"Deferred -> Pending via defer_wait_elapsed"; `durable_events` lists `defer_wait_elapsed`. **T-FAILED
+is in this slice's `gating` and `replay_recovery` ranges**, its `durable_state` reads "Deferred marks
+the task Deferred", and two of its named proof tests —
+`deferred_task_woken_by_defer_wait_elapsed_or_resume` and
+`deferred_task_does_not_block_halted_or_budget_exceeded_closure` — cannot pass without a deferred
+settlement existing to wake. The backoff branch was already live and nothing could produce a
+deferral for it to wake.
+
+**What did not change.** `max_defers` stays policy, in `ladder::LadderPolicy`, read from
+`run_started(4).limits`. The fold holds the count and only the count. No event, no serialization, no
+transition, and no other reader moved.
+
+**Measured split.** The fold change and this row land together, with the suite at 1667/0 and the
+witness green; the driver consuming the reader and deleting its refusal is the commit after.
+
 ### 2026-08-24 — the PR7 unfreeze challenge, adjudicated
 
 **Challenge.** `reviews/2026-08-24-unfreeze-challenge-request.md`, filed by the PR7 implementer

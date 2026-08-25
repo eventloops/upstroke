@@ -442,6 +442,24 @@ pub struct PreparedCandidate {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TaskFold {
     pub state: TaskState,
+    /// How many times an attempt on this task has settled `Deferred`.
+    ///
+    /// **The fold owns this count because only the fold survives a resume.**
+    /// `ladder::next_step` reads it on exactly one branch — an outage defers
+    /// while `defers < max_defers` and parks at it — and a driver keeping its
+    /// own tally would restart at zero in the next process while the log still
+    /// held the deferrals, so a run that had already exhausted its allowance
+    /// would defer forever. The legacy engine keeps it in
+    /// `state.progress[index].defers`, which is in-memory schema-3 state; a
+    /// schema-4 run derives everything by replay, so this is derived by replay.
+    ///
+    /// Read through the existing [`TopologyFold::task`] reader. It is a field
+    /// rather than a twelfth reader for that reason.
+    ///
+    /// `max_defers` is **not** here: the ceiling is policy and stays in
+    /// `ladder::LadderPolicy`, read from `run_started(4).limits`. This is the
+    /// count, and only the count.
+    pub defers: u32,
     pub generations: Vec<GenerationFold>,
 }
 
@@ -449,6 +467,7 @@ impl TaskFold {
     fn new() -> Self {
         Self {
             state: TaskState::Pending,
+            defers: 0,
             generations: Vec::new(),
         }
     }
@@ -3292,9 +3311,16 @@ impl RunState {
                 SettlementTransition::Retry | SettlementTransition::Escalated { .. } => {
                     self.close_generation(finished.key);
                 }
-                SettlementTransition::Deferred { .. } => {
+                SettlementTransition::Deferred { defers, .. } => {
                     self.close_generation(finished.key);
                     self.set_state(finished.key, TaskState::Deferred);
+                    // The settlement's own number, not this fold's plus one.
+                    // `settle_failed` computed it as `defers.saturating_add(1)`
+                    // and appended it; recomputing here would be a second
+                    // derivation of a value the log already holds, and a replay
+                    // of the same log would then disagree with the process that
+                    // wrote it.
+                    self.set_defers(finished.key, *defers);
                 }
                 SettlementTransition::Parked { question } => {
                     self.close_generation(finished.key);
@@ -3578,6 +3604,17 @@ impl RunState {
     fn set_state(&mut self, key: TaskKey, state: TaskState) {
         if let Some(task) = self.tasks.get_mut(key.index()) {
             task.state = state;
+        }
+    }
+
+    /// Record the deferral count a `Deferred` settlement carried.
+    ///
+    /// Assignment rather than increment: the number is the settlement's, which
+    /// is what makes a replay of the same log reach the same count as the
+    /// process that wrote it.
+    fn set_defers(&mut self, key: TaskKey, defers: u32) {
+        if let Some(task) = self.tasks.get_mut(key.index()) {
+            task.defers = defers;
         }
     }
 
@@ -4749,6 +4786,93 @@ mod tests {
         assert!(
             wider.integration_admissible(),
             "one of two entitlements held leaves room for the integration's"
+        );
+    }
+
+    /// **A deferral count survives the process that wrote it, and a
+    /// driver-side tally does not.**
+    ///
+    /// The witness for why this count is the fold's. `ladder::next_step` reads
+    /// it on exactly one branch — an outage defers while `defers < max_defers`
+    /// and parks at it — so a run that has already spent its allowance must
+    /// park rather than defer again.
+    ///
+    /// A driver keeping its own tally is correct for as long as its process
+    /// lives. This test is the case where that stops being true: the log holds
+    /// three deferrals, the process dies, and the next one replays. The fold
+    /// reaches three. A fresh in-memory counter reaches **zero**, and with
+    /// `max_defers = 3` the run would defer a fourth time, and a fifth, and
+    /// never park — the allowance silently becoming unbounded across a resume.
+    ///
+    /// That is `predicted_region`'s shape with a resume-shaped fuse: two
+    /// derivations of one number, agreeing until the moment they do not.
+    #[test]
+    fn a_deferral_count_is_derived_by_replay_and_not_by_a_process_local_tally() {
+        let base = sha("base");
+        let mut live = started();
+        let mut trace = vec![run_started_event()];
+
+        // Three deferrals of one task, each one a fresh generation the way a
+        // `defer_wait_elapsed` wake produces.
+        for round in 1..=3u32 {
+            for event in [
+                dispatch(ALPHA, round - 1, &base),
+                attempt_started(&live, ALPHA, round - 1, 1, 0),
+            ] {
+                apply(&mut live, &event);
+                trace.push(event);
+            }
+            let settlement = settle(
+                ALPHA,
+                round - 1,
+                1,
+                AttemptSettlement::Closed {
+                    transition: SettlementTransition::Deferred {
+                        defers: round,
+                        reason: "the pool is down".to_owned(),
+                    },
+                    lease: LeaseDisposition::PredictedReleased,
+                },
+            );
+            apply(&mut live, &settlement);
+            trace.push(settlement);
+
+            // `Deferred -> Pending via defer_wait_elapsed`, which is the
+            // transition the contract names and the only way back to a
+            // dispatchable state. The fold refuses a re-dispatch without it.
+            let woken = ev(TopologyEventBody::DeferWaitElapsed {
+                data: DeferWaitElapsed4 {
+                    waited_ms: 30_000,
+                    round,
+                },
+            });
+            apply(&mut live, &woken);
+            trace.push(woken);
+        }
+
+        let live_defers = live.task(ALPHA).expect("the task is registered").defers;
+        assert_eq!(live_defers, 3, "the writing process counted three");
+
+        // Through the wire, because a resume reads bytes and not values.
+        let parsed = TopologyFold::parse_log(&wire(&trace)).expect("the log parses");
+        let replayed = TopologyFold::replay(inputs(), &parsed).expect("the log replays");
+        let replayed_defers = replayed.task(ALPHA).expect("registered").defers;
+
+        assert_eq!(
+            replayed_defers, live_defers,
+            "the count did not survive the process that wrote it, so the next \
+             one would decide the outage branch from a number the log \
+             contradicts"
+        );
+
+        // The tally the driver is forbidden from keeping, shown failing. A new
+        // process starts one at zero: it agrees with the fold on every reading
+        // until a resume, and this is the reading after one.
+        let process_local_tally: u32 = 0;
+        assert_ne!(
+            process_local_tally, replayed_defers,
+            "a process-local tally is only wrong across a resume, which is \
+             exactly when nothing is watching it"
         );
     }
 
