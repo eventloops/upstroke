@@ -63,7 +63,7 @@ fn every_branch_states_what_this_build_does_with_it() {
         .collect();
     assert_eq!(
         owed,
-        vec!["ingest answers", "ready_retry", "hard block"],
+        vec!["ingest answers", "hard block"],
         "the branches this build has not written. Every one of them is carried \
          in the type so that no instrument here has to notice its absence. \
          `defer backoff` left this list when `TopologyRun::step` grew its arm, \
@@ -151,19 +151,22 @@ fn a_refusal_names_the_branch_and_says_whether_anything_happened() {
         "and says the run is untouched: {untouched}"
     );
 
-    // **No branch is `PartlyImplemented` today**, and that is a statement
-    // about this build rather than about the type. `ReadyDispatch` was the
-    // last one, and it became `Performed` when the question builder closed its
-    // final refused case. The variant stays because `ReadyRetry` will be built
-    // in halves the same way, and a test that deleted it would have to
-    // rediscover the shape.
+    // **A half-built branch says what it already did**, because by the time it
+    // refuses, `attempt_started` or `task_dispatched` is durable and an
+    // operator reading "not implemented" would look for a run that had not
+    // started. `ReadyRetry` is the current one.
+    let partial = LoopBranch::ReadyRetry.unimplemented().to_string();
     assert!(
-        LoopBranch::ALL
-            .iter()
-            .all(|branch| !matches!(branch.disposition(), Disposition::PartlyImplemented { .. })),
-        "a branch is partly built again — this test needs its message asserted, \
-         because a half-built branch is the one shape whose refusal has to say \
-         what it already did"
+        partial.contains("performed the {pipeline} reservation, Worktree.Verify"),
+        "a half-built branch says what it DID: {partial}"
+    );
+    assert!(
+        partial.contains("does not run the retried attempt through the Runner and settle it"),
+        "and what it did not, in the branch's own words: {partial}"
+    );
+    assert!(
+        !partial.contains("no event was appended"),
+        "and never claims the log is untouched: {partial}"
     );
 
     // Every refusal names its own branch, whatever its disposition. A message

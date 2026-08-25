@@ -1156,6 +1156,7 @@ impl Run {
             resume_session: None,
             materialization_observed: None,
             agent: AgentId::new(AGENT),
+            session_resume: true,
             worker: CommandSpec::new("worker").arg("--implement"),
             worker_timeout: Duration::from_secs(300),
             // Through the production assembler, not invented here. A fixture

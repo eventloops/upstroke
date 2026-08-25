@@ -35,6 +35,8 @@
 //! has *named* are the same thing to every instrument here; naming it is the
 //! whole difference between debt and an omission.
 
+use std::collections::BTreeMap;
+
 use crate::error::UpstrokeError;
 use crate::review;
 use crate::topology::events::TopologyEventBody;
@@ -56,13 +58,18 @@ use super::candidate::{
     CandidateJournal, JudgedTree, append_candidate_created, append_candidate_prepared,
     create_candidates_ref, pin_candidate, reclaim_after_creation, write_candidate_commit,
 };
-use super::dispatch::{DispatchKind, DispatchRequest, Dispatched, EventEmitter, dispatch};
+use super::dispatch::{
+    DispatchKind, DispatchRequest, Dispatched, EventEmitter, dispatch, task_slot,
+};
 use super::emit::{EmitFailure, EmitState, RunIdentity, emit};
 use super::identity::{InvocationLedger, ReservationKind, Reservations, SlotAssertion};
 use super::recover::RunHandle;
 use super::seams::{IdSource, TimeSource, TopologyHooks};
 use super::select::{Admitted, Ceiling, Spend, Step, checkpoint, select};
-use super::settle::{Deferral, FinishedAttempt, settle_failed, settle_succeeded};
+use super::settle::{
+    Deferral, FinishedAttempt, ManagedWorktrees, RetryOutcome, RetryRequest, retry, settle_failed,
+    settle_succeeded,
+};
 
 // ---------------------------------------------------------------------------
 // The production emitter
@@ -273,9 +280,16 @@ impl LoopBranch {
             // were refusals until `TaskFold::defers` and the question builder
             // existed, and both refusals went with their causes.
             Self::ReadyDispatch => Disposition::Performed,
-            Self::IngestAnswers | Self::ReadyRetry | Self::HardBlock => {
-                Disposition::NotYetImplemented
-            }
+            // "{pipeline} reservation, next attempt in the retained
+            // generation" is here; running that attempt and settling it is the
+            // half still owed, and it is the same machinery the ready-dispatch
+            // branch already runs.
+            Self::ReadyRetry => Disposition::PartlyImplemented {
+                performs: "the {pipeline} reservation, Worktree.Verify, and the retry's \
+                           attempt_started",
+                owes: "run the retried attempt through the Runner and settle it",
+            },
+            Self::IngestAnswers | Self::HardBlock => Disposition::NotYetImplemented,
         }
     }
 
@@ -474,6 +488,7 @@ pub struct TopologyRun {
     spend: Spend,
     deferral: Deferral,
     slots: SlotAssertion,
+    retained: BTreeMap<TaskKey, String>,
 }
 
 impl TopologyRun {
@@ -500,6 +515,7 @@ impl TopologyRun {
             spend: Spend::new(),
             deferral: Deferral::default_backoff(),
             slots: SlotAssertion::new(),
+            retained: BTreeMap::new(),
         }
     }
 
@@ -579,7 +595,12 @@ impl TopologyRun {
                 )?;
                 Ok(Progress::Waited { waited_ms, round })
             }
-            Admitted::Retry { .. } => Err(LoopBranch::ReadyRetry.unimplemented()),
+            Admitted::Retry {
+                key, generation, ..
+            } => {
+                self.retry_ready(key, generation, seams, hooks)?;
+                Err(LoopBranch::ReadyRetry.unimplemented())
+            }
             Admitted::Dispatch { key, generation } => {
                 let dispatched = self.dispatch_ready(key, generation, seams, hooks)?;
                 let (plan, capture, assessed, judgement) =
@@ -668,6 +689,100 @@ impl TopologyRun {
                 Err(error.discharging(&mut self.invocations))
             }
         }
+    }
+
+    /// The first half of the ready-retry branch: **reserve, verify, and start
+    /// the next attempt in the retained generation.**
+    ///
+    /// `loop`: "if a retained generation exists: {pipeline} reservation, next
+    /// attempt in the retained generation". `settle::retry` owns the order and
+    /// every step of it — the reservation before the verify, because
+    /// `permits.provisional_reservations` calls it "the bridge between a
+    /// selection decision and its first append" and the verify is already past
+    /// the decision; then `Worktree.Verify` for a worktree that is present,
+    /// quiescent and still holding the retained tree.
+    ///
+    /// **`Quiescence::HoldsTree`, not `AtBase`.** A retained generation's whole
+    /// point is that the worktree carries the previous attempt's cumulative
+    /// work, so HEAD is still the base and the index is what differs. That tree
+    /// comes from [`Self::retained`] — the note this process made when it
+    /// settled the attempt — and it is process-local on purpose: `T-RETAINED`'s
+    /// resume action is "the retaining incarnation proceeds to T-RETRY; a fresh
+    /// process closes it in recovery", and the fold's
+    /// `RetainedIdle { incarnation }` refuses one that tries otherwise.
+    ///
+    /// A verify failure is not an error: the generation closes, the reservation
+    /// is cancelled, and `generation_closed{WorktreeMissing}` is appended.
+    fn retry_ready(
+        &mut self,
+        key: TaskKey,
+        generation: GenerationId,
+        seams: &RunSeams<'_>,
+        hooks: &mut dyn TopologyHooks,
+    ) -> Result<(), UpstrokeError> {
+        let retained_tree = self.retained.get(&key).cloned().ok_or_else(|| {
+            UpstrokeError::Refused {
+                message: format!(
+                    "task {} has a retained generation this process did not retain, so the tree \
+                     its retry must re-gate is not known here. A fresh process closes a retained \
+                     generation in recovery rather than continuing it",
+                    key.index()
+                ),
+            }
+        })?;
+        let binding = self
+            .handle
+            .fold
+            .frozen_rung_binding(key, Self::FIRST_RUNG)
+            .ok_or_else(|| UpstrokeError::Refused {
+                message: format!(
+                    "task {} has no rung {} in its frozen ladder",
+                    key.index(),
+                    Self::FIRST_RUNG
+                ),
+            })?;
+        let slot = task_slot(key, generation);
+
+        let outcome = {
+            let worktrees = ManagedWorktrees::new(seams.manager);
+            retry(
+                &self.handle.fold,
+                &mut self.reservations,
+                &worktrees,
+                hooks.effects(),
+                &RetryRequest {
+                    key,
+                    slot,
+                    retained_tree,
+                    binding,
+                    rung: Self::FIRST_RUNG,
+                    pool: None,
+                    materialization: None,
+                },
+            )?
+        };
+
+        match outcome {
+            RetryOutcome::Start(started) => {
+                self.emit(
+                    TopologyEventBody::AttemptStarted { data: *started },
+                    seams,
+                    hooks,
+                )?;
+                self.reservations.convert(key, ReservationKind::Retry)?;
+                self.deferral.progressed();
+            }
+            RetryOutcome::Close { closed, .. } => {
+                // The reservation was already cancelled by `retry`.
+                self.emit(
+                    TopologyEventBody::GenerationClosed { data: closed },
+                    seams,
+                    hooks,
+                )?;
+                self.retained.remove(&key);
+            }
+        }
+        Ok(())
     }
 
     /// The fourth clause of the ready-dispatch branch: **run one attempt
@@ -869,7 +984,11 @@ impl TopologyRun {
                 // attempt on its first rung.
                 attempts_on_rung: Self::FIRST_ATTEMPT.0,
                 defers,
-                resumable: false,
+                // Both halves, as `LadderState::resumable` documents: the
+                // agent's CLI advertises `session_resume` and this attempt
+                // actually returned a session to resume. Either alone closes
+                // the generation and retries from a fresh one.
+                resumable: plan.session_resume && assessed.outcome.session_id.is_some(),
             },
             &policy,
         );
@@ -907,6 +1026,17 @@ impl TopologyRun {
         // from the log on resume, so this keeps the in-process copy current
         // for the next iteration's ceiling check rather than being a second
         // source for it.
+        // **The retaining incarnation's own note.** `T-RETAINED`'s resume action
+        // is "the retaining incarnation proceeds to T-RETRY; a fresh process
+        // closes it in recovery", so the tree a retry re-gates is legitimately
+        // process-local: a different process may not use it, and the fold's
+        // `RetainedIdle { incarnation }` is what refuses one that tries.
+        if matches!(
+            settled.event.settlement,
+            crate::topology::events::AttemptSettlement::Retained { .. }
+        ) {
+            self.retained.insert(dispatched.key, capture.tree.clone());
+        }
         self.spend.record(dispatched.key, &settled.event.record);
         self.emit(
             TopologyEventBody::AttemptFinished {

@@ -303,6 +303,13 @@ pub struct AttemptPlan {
     pub materialization_observed: Option<Materialization>,
     /// The agent the worker runs as.
     pub agent: AgentId,
+    /// Whether that agent's CLI can resume a session, as pre-flight probed it.
+    ///
+    /// Half of `LadderState::resumable`; the other half is whether the attempt
+    /// actually returned a session id. Both are required, and the settlement
+    /// reads them together: a `Retained` generation with no session to resume
+    /// is a generation nothing can continue.
+    pub session_resume: bool,
     /// The worker's command.
     pub worker: CommandSpec,
     /// How long the worker may take.

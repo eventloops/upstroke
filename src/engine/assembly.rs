@@ -394,6 +394,11 @@ impl AttemptPlans for FrozenPlans<'_> {
             resume_session: request.resume_session.clone(),
             materialization_observed: request.materialization_observed,
             agent: AgentId::new(&profile.agent),
+            session_resume: self
+                .caps
+                .iter()
+                .find(|(name, _)| name == &profile.agent)
+                .is_some_and(|(_, caps)| caps.session_resume),
             worker,
             worker_timeout: self.worker_timeout,
             gates,
