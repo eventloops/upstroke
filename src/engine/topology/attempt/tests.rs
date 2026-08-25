@@ -1741,6 +1741,13 @@ const HISTOGRAM: &str = "effects/attempt-residue-histogram.json";
 struct Sample {
     argv: Vec<String>,
     after: std::time::Duration,
+    /// The child's **own** duration, when it finished before the kill.
+    ///
+    /// `None` when the kill got there first, which is the case this harness
+    /// wants. When every sample is `Some`, the schedule raced a number that
+    /// does not describe these runs, and these are the durations to rebuild it
+    /// from.
+    ran: Option<std::time::Duration>,
     fired: Option<std::time::Duration>,
     killed: bool,
     failed: Option<i32>,
@@ -1800,37 +1807,105 @@ fn sample_slot(generation: u32) -> crate::workspace_manager::Slot {
 /// command first, and the samples then classify a fixture artefact rather than
 /// a kill — the "environment assumption in a test" class this project has
 /// recorded.
+/// A duration the sampled command plausibly takes, measured **warm**.
+///
+/// **The first invocation is the one that lies.** A cold worktree pays for a
+/// filesystem cache miss and, on Windows CI, for an antivirus scan of files it
+/// has just seen created — so a budget taken from run one is inflated relative
+/// to every run that follows, and a schedule derived from it puts every kill
+/// after its child has already exited. Measured: two consecutive
+/// `test (windows-latest)` legs at `b07b8cc` in which **zero of sixteen**
+/// sampled kills landed, on a commit that changed one line of a Markdown file.
+///
+/// So one run is discarded as warm-up and the median of the next three is
+/// taken. The median rather than the mean because the failure mode is a single
+/// outlier, and a mean carries an outlier's weight into the schedule that a
+/// median discards.
 fn measure_budget(site: EffectSiteId, fixture: &Fixture) -> std::time::Duration {
-    let probe = sample_slot(9_999);
-    fixture
-        .manager
-        .write_intent(&mut NoHooks, &probe)
-        .expect("probe intent");
-    let path = fixture
-        .manager
-        .add_worktree(&mut NoHooks, &probe, &fixture.head)
-        .expect("probe worktree");
-    populate_for(site, &path);
-    let elapsed = time_git(&path, &sampled_argv(site));
-    fixture
-        .manager
-        .remove_worktree(&mut NoHooks, &probe)
-        .expect("remove the probe");
-    fixture
-        .manager
-        .remove_intent(&mut NoHooks, &probe)
-        .expect("remove the probe intent");
-    elapsed.max(std::time::Duration::from_micros(200))
+    /// Slots the probes use, distinct from every sampled run's.
+    const PROBE_SLOTS: [u32; 4] = [9_996, 9_997, 9_998, 9_999];
+
+    let mut measured = Vec::with_capacity(PROBE_SLOTS.len());
+    for slot_id in PROBE_SLOTS {
+        let probe = sample_slot(slot_id);
+        fixture
+            .manager
+            .write_intent(&mut NoHooks, &probe)
+            .expect("probe intent");
+        let path = fixture
+            .manager
+            .add_worktree(&mut NoHooks, &probe, &fixture.head)
+            .expect("probe worktree");
+        populate_for(site, &path);
+        measured.push(time_git(&path, &sampled_argv(site)));
+        fixture
+            .manager
+            .remove_worktree(&mut NoHooks, &probe)
+            .expect("remove the probe");
+        fixture
+            .manager
+            .remove_intent(&mut NoHooks, &probe)
+            .expect("remove the probe intent");
+    }
+    // Discard the warm-up, then the median of what is left.
+    median(&measured[1..])
+}
+
+/// The median of a non-empty slice of durations.
+fn median(durations: &[std::time::Duration]) -> std::time::Duration {
+    let mut sorted = durations.to_vec();
+    sorted.sort_unstable();
+    sorted[sorted.len() / 2].max(std::time::Duration::from_micros(200))
 }
 
 /// Sample one command `SAMPLING_N` times and classify what each kill left.
+///
+/// **Self-healing against an unrepresentative probe, and only against that.**
+/// The schedule races a measured duration, so a budget that does not describe
+/// the runs it schedules puts every kill after its child has exited and the
+/// sampling observes nothing. When that happens the runs themselves are the
+/// better measurement — an unkilled run ran to completion, so its duration is
+/// the true one — and the schedule is rebuilt from their median and retried
+/// **once**.
+///
+/// Bounded at one retry on purpose. A second miss is not an unlucky probe; it
+/// is the kill failing to land at all, which is a defect this harness exists to
+/// report. The caller's vacuity refusal is what reports it, and nothing here
+/// weakens that assertion — this only removes the case where it fires for an
+/// environment rather than for a bug.
 fn sample(site: EffectSiteId) -> Vec<Sample> {
     let fixture = Fixture::created("sampler");
     let budget = measure_budget(site, &fixture);
+    let first = sample_once(site, &fixture, budget, 0);
+    if first.iter().any(|sample| sample.killed) {
+        return first;
+    }
+
+    // Premise failed: no kill landed mid-run. Every run therefore completed, so
+    // every `ran` is a full duration and their median is the budget the probe
+    // should have produced.
+    let observed: Vec<std::time::Duration> = first.iter().filter_map(|sample| sample.ran).collect();
+    if observed.is_empty() {
+        // Nothing landed and nothing finished either: the schedule is not the
+        // explanation, so there is nothing honest to recalibrate from. Hand
+        // back the first pass and let the caller's vacuity refusal report it.
+        return first;
+    }
+    sample_once(site, &fixture, median(&observed), SAMPLING_N)
+}
+
+/// One pass of `SAMPLING_N` runs against `budget`, taking slots from
+/// `slot_base` so a retry never reuses the first pass's worktrees.
+fn sample_once(
+    site: EffectSiteId,
+    fixture: &Fixture,
+    budget: std::time::Duration,
+    slot_base: u32,
+) -> Vec<Sample> {
     let mut samples = Vec::new();
 
     for run in 0..SAMPLING_N {
-        let slot = sample_slot(run);
+        let slot = sample_slot(slot_base + run);
         fixture
             .manager
             .write_intent(&mut NoHooks, &slot)
@@ -1844,7 +1919,25 @@ fn sample(site: EffectSiteId) -> Vec<Sample> {
         let argv = sampled_argv(site);
         let after = budget.mul_f64(f64::from(run + 1) / f64::from(SAMPLING_N + 1));
         let mut child = KillableGitChild::spawn(&path, &argv);
-        std::thread::sleep(after);
+        // Sleep the schedule, but notice if the child finishes first — and
+        // record its OWN duration when it does. Wall time to the reap would
+        // include this sleep, so an over-long schedule would report itself
+        // back as the number it should have been, and the recalibration below
+        // would inherit exactly the error it exists to correct. Measured: it
+        // did, on the first version of this fix.
+        // Poll to the deadline WITHOUT shortening it. Noticing that the child
+        // finished is a measurement; acting on it is not. Breaking out early
+        // and killing there fires the kill sooner than the rung it was aimed
+        // at, which the shape assertions below refuse — measured on the
+        // Windows guest, where a kill fired at 40.3ms against a 48.5ms rung.
+        let deadline = std::time::Instant::now() + after;
+        let mut ran = None;
+        while std::time::Instant::now() < deadline {
+            if ran.is_none() {
+                ran = child.exited();
+            }
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
         child.kill();
         let status = child.wait();
 
@@ -1873,6 +1966,7 @@ fn sample(site: EffectSiteId) -> Vec<Sample> {
         samples.push(Sample {
             argv,
             after,
+            ran,
             fired: child.fired(),
             killed: died_by_kill(&status),
             failed: (!status.success() && !died_by_kill(&status))
@@ -2033,7 +2127,9 @@ fn sampled_git_add_and_write_tree_child_kills_every_residue_classified_and_recov
         landed > 0,
         "not one of the {} sampled Git children died by the kill — this harness then sampled \
          the residue its commands left when they FINISHED, and every other assertion here \
-         accepts that residue",
+         accepts that residue. `sample` has already recalibrated from the durations the runs \
+         actually took and retried once, so this is the kill failing to land rather than an \
+         unrepresentative probe",
         2 * SAMPLING_N
     );
 

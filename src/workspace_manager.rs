@@ -3725,6 +3725,23 @@ pub(crate) mod fixture {
             let _ = outcome;
         }
 
+        /// Whether the child has exited on its own, and how long it took.
+        ///
+        /// The sampler races a measured duration, and when its measurement is
+        /// wrong every kill lands after the child is already gone. Wall time
+        /// from spawn to reap cannot tell it so: that clock includes the
+        /// scheduled sleep, so an over-long schedule reports itself back as the
+        /// duration it should have been. This reports the child's **own** time,
+        /// which is the only number a recalibration can honestly use.
+        ///
+        /// `None` while it is still running.
+        pub(crate) fn exited(&mut self) -> Option<std::time::Duration> {
+            match self.child.try_wait() {
+                Ok(Some(_)) => Some(self.spawned.elapsed()),
+                _ => None,
+            }
+        }
+
         /// Reap it. The wait status is the only thing a kill changes.
         pub(crate) fn wait(&mut self) -> std::process::ExitStatus {
             self.child.wait().expect("reap the sampled git child")
