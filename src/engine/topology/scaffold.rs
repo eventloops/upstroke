@@ -657,6 +657,19 @@ pub(super) struct AnsweringAdapter {
 
 impl AnsweringAdapter {
     /// A reviewer that passes.
+    /// An agent whose CLI reports its own error.
+    ///
+    /// `FailureKind::AgentError` is neither an outage nor a question, so
+    /// `next_step` retries on the same rung while the allowance lasts — and
+    /// `resume: true` when the agent can resume and returned a session, which
+    /// is what makes the generation `Retained` rather than closed.
+    pub(super) const fn erroring(id: &'static str) -> Self {
+        Self {
+            status: crate::ir::OutcomeStatus::AgentError,
+            ..Self::passing(id)
+        }
+    }
+
     /// An agent that stops and asks rather than working.
     ///
     /// `evaluate_outcome` reads `UPSTROKE-QUESTION:` out of the outcome's
@@ -702,9 +715,19 @@ impl crate::agent::AgentAdapter for AnsweringAdapter {
     fn build(&self, run: &crate::agent::TaskRun) -> Result<CommandSpec, UpstrokeError> {
         // A real spec, carrying the prompt, so a test that reads the recorded
         // command sees what was actually asked for.
-        Ok(CommandSpec::new(self.id)
+        //
+        // **And the session, when there is one to resume.** Every real adapter
+        // puts it in argv; one that dropped it here would make a retry that
+        // lost its session indistinguishable from one that kept it, which is a
+        // fixture blind spot rather than a simplification — measured, by a
+        // mutation that survived until this line existed.
+        let spec = CommandSpec::new(self.id)
             .arg("--prompt")
-            .arg(run.prompt.clone()))
+            .arg(run.prompt.clone());
+        match &run.resume_session {
+            Some(session) => Ok(spec.arg("--resume").arg(session.clone())),
+            None => Ok(spec),
+        }
     }
 
     fn parse(
@@ -747,6 +770,14 @@ pub(super) struct ScaffoldAdapters {
 }
 
 impl ScaffoldAdapters {
+    /// The same two agents, with the implementer reporting its own error.
+    pub(super) const fn erroring() -> Self {
+        Self {
+            primary: AnsweringAdapter::erroring(AGENT),
+            second: AnsweringAdapter::passing(REVIEW_AGENT),
+        }
+    }
+
     /// The same two agents, with the implementer stopping to ask.
     pub(super) const fn asking() -> Self {
         Self {

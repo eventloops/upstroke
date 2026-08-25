@@ -139,7 +139,7 @@ fn attempt_started_is_durable_before_any_spawn() {
 
     let mark = run.mark();
     let started = context!(run, process)
-        .start(&dispatched, &plan)
+        .start(dispatched.site(), &plan)
         .expect("the attempt starts");
 
     assert_eq!(
@@ -223,11 +223,11 @@ fn capture_precedes_the_snapshots_and_every_snapshot_commits_before_its_intent()
     let mut process = Process::new();
 
     let started = context!(run, process)
-        .start(&dispatched, &plan)
+        .start(dispatched.site(), &plan)
         .expect("start");
     agent_edits(&dispatched.worktree);
     let capture = context!(run, process)
-        .capture(&dispatched)
+        .capture(dispatched.site())
         .expect("capture");
     let mark = run.mark();
     // Built before the context borrows `run` mutably.
@@ -237,7 +237,7 @@ fn capture_precedes_the_snapshots_and_every_snapshot_commits_before_its_intent()
     // cheap rungs never saw.
     let assessed = context!(run, process)
         .assess(
-            &dispatched,
+            dispatched.site(),
             &plan,
             &started,
             &capture,
@@ -247,7 +247,7 @@ fn capture_precedes_the_snapshots_and_every_snapshot_commits_before_its_intent()
         .expect("the scaffold's adapter parses its own worker output");
     let judgement = context!(run, process)
         .judge(
-            &dispatched,
+            dispatched.site(),
             &plan,
             Judging {
                 run: &started,
@@ -349,11 +349,11 @@ fn gates_and_reviewers_run_on_fresh_exact_snapshots_and_never_in_the_task_worktr
     let mut process = Process::new();
 
     let started = context!(run, process)
-        .start(&dispatched, &plan)
+        .start(dispatched.site(), &plan)
         .expect("start");
     agent_edits(&dispatched.worktree);
     let capture = context!(run, process)
-        .capture(&dispatched)
+        .capture(dispatched.site())
         .expect("capture");
     // Built before the context borrows `run` mutably.
     let review_inputs = run.review_inputs();
@@ -362,7 +362,7 @@ fn gates_and_reviewers_run_on_fresh_exact_snapshots_and_never_in_the_task_worktr
     // cheap rungs never saw.
     let assessed = context!(run, process)
         .assess(
-            &dispatched,
+            dispatched.site(),
             &plan,
             &started,
             &capture,
@@ -372,7 +372,7 @@ fn gates_and_reviewers_run_on_fresh_exact_snapshots_and_never_in_the_task_worktr
         .expect("the scaffold's adapter parses its own worker output");
     let judgement = context!(run, process)
         .judge(
-            &dispatched,
+            dispatched.site(),
             &plan,
             Judging {
                 run: &started,
@@ -475,7 +475,7 @@ fn gates_take_no_slot_and_the_worker_and_reviewers_do() {
     let mut process = Process::new();
 
     let started = context!(run, process)
-        .start(&dispatched, &plan)
+        .start(dispatched.site(), &plan)
         .expect("start");
     assert!(is_slotted(&started.identities.worker()));
     assert!(is_slotted(&started.identities.review_pass(0, 0)));
@@ -498,7 +498,7 @@ fn gates_take_no_slot_and_the_worker_and_reviewers_do() {
 
     agent_edits(&dispatched.worktree);
     let capture = context!(run, process)
-        .capture(&dispatched)
+        .capture(dispatched.site())
         .expect("capture");
     let review_inputs = run.review_inputs();
     // Through the production phase, over the same diff the reviewers are
@@ -506,7 +506,7 @@ fn gates_take_no_slot_and_the_worker_and_reviewers_do() {
     // cheap rungs never saw.
     let assessed = context!(run, process)
         .assess(
-            &dispatched,
+            dispatched.site(),
             &plan,
             &started,
             &capture,
@@ -516,7 +516,7 @@ fn gates_take_no_slot_and_the_worker_and_reviewers_do() {
         .expect("the scaffold's adapter parses its own worker output");
     context!(run, process)
         .judge(
-            &dispatched,
+            dispatched.site(),
             &plan,
             Judging {
                 run: &started,
@@ -660,7 +660,7 @@ fn a_retry_verifies_once_then_appends_then_spawns() {
 
     let plan = run.attempt_plan(ALPHA, 1);
     context!(run, process)
-        .start(&dispatched, &plan)
+        .start(dispatched.site(), &plan)
         .expect("the first attempt");
     let tree = retained_tree(&dispatched.worktree);
     assert_ne!(
@@ -699,7 +699,7 @@ fn a_retry_verifies_once_then_appends_then_spawns() {
     // Steps three and four, which are this module's.
     let retry = authorized_plan(&run, &authorized);
     let started = context!(run, process)
-        .start(&dispatched, &retry)
+        .start(dispatched.site(), &retry)
         .expect("the retry starts");
     reservations
         .convert(ALPHA, ReservationKind::Retry)
@@ -841,7 +841,7 @@ fn a_retry_whose_retained_worktree_fails_verification_closes_and_destroys_nothin
 
     let plan = run.attempt_plan(ALPHA, 1);
     context!(run, process)
-        .start(&dispatched, &plan)
+        .start(dispatched.site(), &plan)
         .expect("the first attempt");
     let tree = retained_tree(&dispatched.worktree);
     let base_tree = git(
@@ -997,7 +997,7 @@ fn a_refused_slot_acquisition_settles_the_registration_it_took() {
         .worker()
         .render();
     let error = context!(run, process)
-        .start(&dispatched, &plan)
+        .start(dispatched.site(), &plan)
         .expect_err("a second slotted invocation is refused at max_parallel = 1");
     assert!(
         error.to_string().contains("asked for a slot pair while"),
@@ -1061,13 +1061,13 @@ fn attempt_kill_child() {
     let plan = run.attempt_plan(ALPHA, 1);
     let mut process = Process::new();
     let started = context!(run, process)
-        .start(&dispatched, &plan)
+        .start(dispatched.site(), &plan)
         .expect("start");
 
     if which == "in_attempt" {
         // Sub-prefix (a): the worker ran and no capture has begun.
         run.arm(STAGE, HookPhase::Before, Injection::Kill);
-        let _ = context!(run, process).capture(&dispatched);
+        let _ = context!(run, process).capture(dispatched.site());
         unreachable!("the kill must have taken this process");
     }
 
@@ -1086,7 +1086,7 @@ fn attempt_kill_child() {
         let retry = authorized_plan(&run, &authorized);
         run.arm(STAGE, HookPhase::Before, Injection::Kill);
         context!(run, process)
-            .start(&dispatched, &retry)
+            .start(dispatched.site(), &retry)
             .expect("the retry starts");
         reservations
             .convert(ALPHA, ReservationKind::Retry)
@@ -1094,7 +1094,7 @@ fn attempt_kill_child() {
         // In flight, and now killed inside it: the arming is at the capture
         // because `retry` itself must succeed for the generation to be
         // `InFlight { attempt: 2 }` when the coordinator dies.
-        let _ = context!(run, process).capture(&dispatched);
+        let _ = context!(run, process).capture(dispatched.site());
         unreachable!("the kill must have taken this process");
     }
 
@@ -1103,12 +1103,12 @@ fn attempt_kill_child() {
         // Sub-prefix (b): the staged blob and tree objects exist and are
         // referenced only by the task worktree's index.
         run.arm(WRITE_TREE, HookPhase::After, Injection::Kill);
-        let _ = context!(run, process).capture(&dispatched);
+        let _ = context!(run, process).capture(dispatched.site());
         unreachable!("the kill must have taken this process");
     }
 
     let capture = context!(run, process)
-        .capture(&dispatched)
+        .capture(dispatched.site())
         .expect("capture");
     match which.as_str() {
         // Sub-prefix (c), the after phase: the id was read and nothing durable
@@ -1134,7 +1134,7 @@ fn attempt_kill_child() {
     // cheap rungs never saw.
     let assessed = context!(run, process)
         .assess(
-            &dispatched,
+            dispatched.site(),
             &plan,
             &started,
             &capture,
@@ -1143,7 +1143,7 @@ fn attempt_kill_child() {
         )
         .expect("the scaffold's adapter parses its own worker output");
     let _ = context!(run, process).judge(
-        &dispatched,
+        dispatched.site(),
         &plan,
         Judging {
             run: &started,
@@ -1576,7 +1576,7 @@ fn halt_cancels_in_flight_attempt() {
     let mut process = Process::new();
 
     let started = context!(run, process)
-        .start(&dispatched, &plan)
+        .start(dispatched.site(), &plan)
         .expect("start");
 
     // A reviewer whose completion never ran, holding the pair its role takes.
@@ -2345,11 +2345,11 @@ fn a_failing_gate_rejects_the_judgement_and_its_snapshot_is_still_cleaned() {
     let mut process = Process::new();
 
     let started = context!(run, process)
-        .start(&dispatched, &plan)
+        .start(dispatched.site(), &plan)
         .expect("start");
     agent_edits(&dispatched.worktree);
     let capture = context!(run, process)
-        .capture(&dispatched)
+        .capture(dispatched.site())
         .expect("capture");
     // Built before the context borrows `run` mutably.
     let review_inputs = run.review_inputs();
@@ -2358,7 +2358,7 @@ fn a_failing_gate_rejects_the_judgement_and_its_snapshot_is_still_cleaned() {
     // cheap rungs never saw.
     let assessed = context!(run, process)
         .assess(
-            &dispatched,
+            dispatched.site(),
             &plan,
             &started,
             &capture,
@@ -2368,7 +2368,7 @@ fn a_failing_gate_rejects_the_judgement_and_its_snapshot_is_still_cleaned() {
         .expect("the scaffold's adapter parses its own worker output");
     let judgement = context!(run, process)
         .judge(
-            &dispatched,
+            dispatched.site(),
             &plan,
             Judging {
                 run: &started,

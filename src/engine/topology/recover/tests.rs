@@ -5044,6 +5044,170 @@ fn the_driver_refuses_a_tree_a_filter_has_transformed() {
     );
 }
 
+/// **The retaining incarnation takes its next attempt in place.**
+///
+/// The ready-retry branch, end to end and in two iterations of the loop.
+///
+/// The first settles `Retained`: the agent reports its own error, which is
+/// neither an outage nor a question, so `next_step` retries on the same rung —
+/// and `resume: true`, because pre-flight probed the agent as
+/// `session_resume` and the attempt returned a session. **Both halves are
+/// required**, which is why the caps are given here and were empty everywhere
+/// else: with either missing the generation closes and the task retries from a
+/// fresh one instead.
+///
+/// The second is the retry itself: `{pipeline}` reservation, `Worktree.Verify`
+/// against the retained tree, `attempt_started(retry)` carrying the session,
+/// then the attempt and its settlement.
+///
+/// `Quiescence::HoldsTree` is the reason this needs a real worktree: a retry
+/// verified against the base would pass on a tree that had been reset and would
+/// re-gate an empty one as if it were the retained work.
+#[test]
+fn the_retaining_incarnation_retries_in_place() {
+    use crate::engine::topology::run::{Progress, RunSeams, TopologyRun};
+    use crate::engine::topology::select::Ceiling;
+
+    let fixture = Fixture::healthy("driver-retries");
+    let caps = vec![(
+        crate::engine::topology::scaffold::AGENT.to_owned(),
+        crate::agent::Caps {
+            version: "1.2.3".to_owned(),
+            json_output: true,
+            session_resume: true,
+            cost_reporting: true,
+            read_only_mode: true,
+            acp: false,
+            model_list: false,
+        },
+    )];
+    let harness = harness();
+    let runtime = runtime_holding_the_record();
+    let certifies = AlwaysCertifies;
+    let given = Given::healthy(&fixture, &runtime, &certifies);
+
+    let (outcome, _) = resume_holding(&fixture, &harness, &given);
+    let (_recovered, handle) = outcome.expect("the healthy resume completes");
+
+    let mut run = TopologyRun::resumed(handle, fixture.inputs(), Ceiling::unlimited());
+    let mut hooks = HarnessTopologyHooks::new(Arc::clone(&harness));
+    let sleeper = RecordingSleeper::default();
+    let manager = fixture.manager();
+    let runner = RecordingRunner::editing();
+    let adapters = crate::engine::topology::scaffold::ScaffoldAdapters::erroring();
+    let paths = crate::rundir::RunPaths::with_private_root(
+        &fixture.repo_root,
+        &fixture.started.run_id,
+        &fixture.private_root,
+    );
+    paths.create().expect("the run directories are creatable");
+    // **Through the production assembler, not a fixture plan shape.** The
+    // condition on this extraction was that the scaffold be re-pointed at the
+    // real one or round-tripped against it; a fixture that hand-built an
+    // `AttemptPlan` here would be exactly the fifth copy the `frozen_binding`
+    // precedent warns about.
+    let plans = crate::engine::assembly::FrozenPlans {
+        adapters: &adapters,
+        paths: &paths,
+        gates: &[],
+        pools: &[],
+        caps: &caps,
+        worker_timeout: std::time::Duration::from_secs(300),
+        decisions: &[],
+    };
+    let seams = RunSeams {
+        manager: &manager,
+        clock: &Frozen,
+        sleeper: &sleeper,
+        runner: &runner,
+        adapters: &adapters,
+        paths: &paths,
+        plans: &plans,
+        reviews: &crate::engine::attempt::LegacyReviewPasses,
+        input_policy: &crate::engine::attempt::LegacyReviewInputPolicy,
+        ids: &FixedIds,
+        halts_run: false,
+    };
+
+    let first = run
+        .step(&seams, &mut hooks)
+        .expect("the first attempt settles");
+    let Progress::Settled { accepted, .. } = first else {
+        panic!("the first iteration did not settle: {first:?}");
+    };
+    assert!(!accepted, "an agent error is not an acceptable attempt");
+
+    // The generation is retained, not closed: only a retained one is retried in
+    // place, and `settle::retry` refuses any other class by name.
+    let retained = TopologyFold::parse_log(&fixture.log_bytes())
+        .expect("the log parses")
+        .into_iter()
+        .filter_map(|event| match event.body {
+            TopologyEventBody::AttemptFinished { data } => Some(data.settlement),
+            _ => None,
+        })
+        .next_back()
+        .expect("the first attempt settled");
+    assert!(
+        matches!(retained, AttemptSettlement::Retained { .. }),
+        "the generation did not retain its session: {retained:?}"
+    );
+
+    let second = run
+        .step(&seams, &mut hooks)
+        .expect("the retry runs in the retained generation");
+    let Progress::Settled { key, .. } = second else {
+        panic!("the second iteration did not run a retry: {second:?}");
+    };
+    assert_eq!(key, TaskKey(0));
+
+    // **Two attempts in one generation, the second resuming the first.** A
+    // driver that opened a fresh generation would append `task_dispatched`
+    // again; a driver that lost the session would append `attempt_started`
+    // with none.
+    let starts: Vec<(u32, bool)> = TopologyFold::parse_log(&fixture.log_bytes())
+        .expect("the log parses")
+        .into_iter()
+        .filter_map(|event| match event.body {
+            TopologyEventBody::AttemptStarted { data } => {
+                Some((data.attempt.0, data.resume_session.is_some()))
+            }
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        starts,
+        vec![(1, false), (2, true)],
+        "the retry is not the same generation's second attempt on a resumed \
+         session"
+    );
+    assert_eq!(
+        durable_kinds(&fixture)
+            .iter()
+            .filter(|kind| *kind == "task_dispatched")
+            .count(),
+        1,
+        "the retry opened a fresh generation instead of continuing the retained one"
+    );
+
+    // **The worker was actually told to resume.** The event records that a
+    // session was retained; this records that the command carried it. They are
+    // different claims, and a retry that appended the first without the second
+    // would re-implement the task from scratch on a worktree that already holds
+    // its previous work.
+    let resumed = runner
+        .requests()
+        .iter()
+        .filter(|request| request.role == crate::runner::ExecutionRole::Implement)
+        .filter(|request| request.command.args.iter().any(|arg| arg == "--resume"))
+        .count();
+    assert_eq!(
+        resumed, 1,
+        "exactly one of the two worker invocations should carry a session to \
+         resume, and it is the second"
+    );
+}
+
 /// An [`IdSource`] whose question id is a constant.
 ///
 /// A park appends the id it minted, and `rematerialize_question` reads it back

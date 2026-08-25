@@ -44,15 +44,15 @@ use crate::topology::events::TopologyEventBody;
 use crate::events::AttemptRecord;
 use crate::interaction::Sleeper;
 use crate::topology::events::{
-    CandidateLeaseEffect, CommitSha, FrozenQuestion, GenerationId, SessionId,
+    AttemptNumber, CandidateLeaseEffect, CommitSha, FrozenQuestion, GenerationId, SessionId,
 };
 use crate::topology::fold::{FrozenInputs, TopologyFold};
 use crate::topology::registry::TaskKey;
 use crate::workspace_manager::WorkspaceManager;
 
 use super::attempt::{
-    Assessment, AttemptContext, AttemptPlan, AttemptPlans, Capture, InputsRequest, Judgement,
-    Judging, PlanRequest, ReviewInputPolicy, ReviewPasses,
+    Assessment, AttemptContext, AttemptPlan, AttemptPlans, AttemptSite, Capture, InputsRequest,
+    Judgement, Judging, PlanRequest, ReviewInputPolicy, ReviewPasses,
 };
 use super::candidate::{
     CandidateJournal, JudgedTree, append_candidate_created, append_candidate_prepared,
@@ -284,11 +284,12 @@ impl LoopBranch {
             // generation" is here; running that attempt and settling it is the
             // half still owed, and it is the same machinery the ready-dispatch
             // branch already runs.
-            Self::ReadyRetry => Disposition::PartlyImplemented {
-                performs: "the {pipeline} reservation, Worktree.Verify, and the retry's \
-                           attempt_started",
-                owes: "run the retried attempt through the Runner and settle it",
-            },
+            // "{pipeline} reservation, next attempt in the retained
+            // generation", whole: the reservation, `Worktree.Verify`, the
+            // retry's `attempt_started`, the attempt itself and its
+            // settlement. The attempt half is the ready-dispatch branch's
+            // machinery, reached through the same `attempt` and `settle`.
+            Self::ReadyRetry => Disposition::Performed,
             Self::IngestAnswers | Self::HardBlock => Disposition::NotYetImplemented,
         }
     }
@@ -410,6 +411,26 @@ pub struct RunSeams<'a> {
     pub halts_run: bool,
 }
 
+/// Which attempt of which rung this is, and whether it has already been
+/// announced.
+///
+/// The difference between the two branches that run an attempt. A dispatch is
+/// always attempt one on rung zero with nothing to resume, and it appends
+/// `attempt_started` itself; a retry is the generation's next attempt, may
+/// resume a session, and was already announced by `settle::retry` after the
+/// worktree verified.
+#[derive(Debug, Clone)]
+struct RunAs {
+    /// Which attempt of the generation.
+    attempt: AttemptNumber,
+    /// Which rung of the frozen ladder.
+    rung: u32,
+    /// The session this attempt resumes, if any.
+    resume_session: Option<SessionId>,
+    /// Whether `attempt_started` is already durable.
+    announced: bool,
+}
+
 /// What one attempt produced, for the settlement that reads all three.
 ///
 /// The counterpart to [`Judging`], one phase later: judging reads the
@@ -449,6 +470,16 @@ pub enum Progress {
         /// decision reads, which is why it is carried out of the branch rather
         /// than derived again there.
         spent_attempt: bool,
+    },
+    /// A retained generation's worktree did not verify, so the generation
+    /// closed instead of retrying.
+    ///
+    /// Not a failure of the task: `generation_closed{WorktreeMissing}` leaves
+    /// it dispatchable from a fresh generation, which is what the next
+    /// iteration selects.
+    GenerationClosed {
+        /// Whose generation.
+        key: TaskKey,
     },
     /// The defer backoff elapsed and `defer_wait_elapsed` is durable.
     Waited {
@@ -597,17 +628,23 @@ impl TopologyRun {
             }
             Admitted::Retry {
                 key, generation, ..
-            } => {
-                self.retry_ready(key, generation, seams, hooks)?;
-                Err(LoopBranch::ReadyRetry.unimplemented())
-            }
+            } => self.retry_ready(key, generation, seams, hooks),
             Admitted::Dispatch { key, generation } => {
                 let dispatched = self.dispatch_ready(key, generation, seams, hooks)?;
-                let (plan, capture, assessed, judgement) =
-                    self.attempt(&dispatched, seams, hooks)?;
+                let (plan, capture, assessed, judgement) = self.attempt(
+                    dispatched.site(),
+                    RunAs {
+                        attempt: Self::FIRST_ATTEMPT,
+                        rung: Self::FIRST_RUNG,
+                        resume_session: None,
+                        announced: false,
+                    },
+                    seams,
+                    hooks,
+                )?;
                 let accepted = judgement.accepted();
                 let spent_attempt = self.settle(
-                    &dispatched,
+                    dispatched.site(),
                     &plan,
                     Produced {
                         capture: &capture,
@@ -719,7 +756,7 @@ impl TopologyRun {
         generation: GenerationId,
         seams: &RunSeams<'_>,
         hooks: &mut dyn TopologyHooks,
-    ) -> Result<(), UpstrokeError> {
+    ) -> Result<Progress, UpstrokeError> {
         let retained_tree = self.retained.get(&key).cloned().ok_or_else(|| {
             UpstrokeError::Refused {
                 message: format!(
@@ -741,7 +778,8 @@ impl TopologyRun {
                     Self::FIRST_RUNG
                 ),
             })?;
-        let slot = task_slot(key, generation);
+        let slot_for_run = task_slot(key, generation);
+        let slot = slot_for_run.clone();
 
         let outcome = {
             let worktrees = ManagedWorktrees::new(seams.manager);
@@ -764,6 +802,14 @@ impl TopologyRun {
 
         match outcome {
             RetryOutcome::Start(started) => {
+                let run_as = RunAs {
+                    attempt: started.attempt,
+                    rung: started.rung,
+                    resume_session: started.resume_session.clone(),
+                    // `settle::retry` built this event; appending it is what
+                    // announces the attempt, and the fold refuses a second.
+                    announced: true,
+                };
                 self.emit(
                     TopologyEventBody::AttemptStarted { data: *started },
                     seams,
@@ -771,6 +817,47 @@ impl TopologyRun {
                 )?;
                 self.reservations.convert(key, ReservationKind::Retry)?;
                 self.deferral.progressed();
+
+                let base = self
+                    .handle
+                    .fold
+                    .task(key)
+                    .and_then(|task| task.generations.iter().find(|held| held.id == generation))
+                    .map(|held| held.base_sha.clone())
+                    .ok_or_else(|| UpstrokeError::Refused {
+                        message: format!(
+                            "generation {} of task {} left the fold mid-retry",
+                            generation.0,
+                            key.index()
+                        ),
+                    })?;
+                let worktree = seams.manager.slot_path(&slot_for_run);
+                let site = AttemptSite {
+                    key,
+                    generation,
+                    base: &base,
+                    slot: &slot_for_run,
+                    worktree: &worktree,
+                };
+                let (plan, capture, assessed, judgement) =
+                    self.attempt(site, run_as, seams, hooks)?;
+                let accepted = judgement.accepted();
+                let spent_attempt = self.settle(
+                    site,
+                    &plan,
+                    Produced {
+                        capture: &capture,
+                        assessed: &assessed,
+                        judgement: &judgement,
+                    },
+                    seams,
+                    hooks,
+                )?;
+                return Ok(Progress::Settled {
+                    key,
+                    accepted,
+                    spent_attempt,
+                });
             }
             RetryOutcome::Close { closed, .. } => {
                 // The reservation was already cancelled by `retry`.
@@ -782,7 +869,7 @@ impl TopologyRun {
                 self.retained.remove(&key);
             }
         }
-        Ok(())
+        Ok(Progress::GenerationClosed { key })
     }
 
     /// The fourth clause of the ready-dispatch branch: **run one attempt
@@ -818,21 +905,22 @@ impl TopologyRun {
 
     fn attempt(
         &mut self,
-        dispatched: &Dispatched,
+        site: AttemptSite<'_>,
+        run_as: RunAs,
         seams: &RunSeams<'_>,
         hooks: &mut dyn TopologyHooks,
     ) -> Result<(AttemptPlan, Capture, Assessment, Judgement), UpstrokeError> {
-        let key = dispatched.key;
+        let key = site.key;
         let binding = self
             .handle
             .fold
-            .frozen_rung_binding(key, Self::FIRST_RUNG)
+            .frozen_rung_binding(key, run_as.rung)
             .ok_or_else(|| UpstrokeError::Refused {
                 message: format!(
                     "task {} has no rung {} in its frozen ladder, so there is no binding to \
                      run it under",
                     key.index(),
-                    Self::FIRST_RUNG
+                    run_as.rung
                 ),
             })?;
 
@@ -856,11 +944,11 @@ impl TopologyRun {
         let plan = seams.plans.plan(&PlanRequest {
             key,
             entry: &entry,
-            attempt: Self::FIRST_ATTEMPT,
-            rung: Self::FIRST_RUNG,
+            attempt: run_as.attempt,
+            rung: run_as.rung,
             binding,
-            workspace: &dispatched.worktree,
-            resume_session: None,
+            workspace: site.worktree,
+            resume_session: run_as.resume_session.clone(),
             materialization_observed: None,
         })?;
 
@@ -887,17 +975,24 @@ impl TopologyRun {
             input_policy: seams.input_policy,
         };
 
-        let run = cx.start(dispatched, &plan)?;
-        let capture = cx.capture(dispatched)?;
-        let diff =
-            seams
-                .manager
-                .candidate_diff(&dispatched.slot, &capture.parent, &capture.tree)?;
+        // **`attempt_started` is the retry branch's, not this one's.** A retry
+        // appends it inside `settle::retry`, after the worktree verified, so a
+        // second append here would be refused by the fold — and rightly: the
+        // verify is what makes the claim true.
+        let run = if run_as.announced {
+            cx.run_worker(site, &plan)?
+        } else {
+            cx.start(site, &plan)?
+        };
+        let capture = cx.capture(site)?;
+        let diff = seams
+            .manager
+            .candidate_diff(site.slot, &capture.parent, &capture.tree)?;
 
         // The ladder's cheap rungs, before the expensive ones. `judge` starts
         // from this rather than from `None`, so a worker that died or produced
         // no diff never reaches a gate or a frontier reviewer.
-        let assessed = cx.assess(dispatched, &plan, &run, &capture, &diff, entry.spec.kind)?;
+        let assessed = cx.assess(site, &plan, &run, &capture, &diff, entry.spec.kind)?;
 
         let inputs = seams.plans.inputs(&InputsRequest {
             entry: &entry,
@@ -905,7 +1000,7 @@ impl TopologyRun {
         })?;
 
         let judgement = cx.judge(
-            dispatched,
+            site,
             &plan,
             Judging {
                 run: &run,
@@ -942,7 +1037,7 @@ impl TopologyRun {
     /// existed, and both refusals are gone with their causes.
     fn settle(
         &mut self,
-        dispatched: &Dispatched,
+        site: AttemptSite<'_>,
         plan: &AttemptPlan,
         produced: Produced<'_>,
         seams: &RunSeams<'_>,
@@ -967,13 +1062,13 @@ impl TopologyRun {
         );
 
         let Some(failure) = judgement.failure.as_ref() else {
-            self.promote_candidate(dispatched, plan, capture, record, seams, hooks)?;
+            self.promote_candidate(site, plan, capture, record, seams, hooks)?;
             return Ok(true);
         };
 
-        let policy = self.ladder_policy(dispatched.key)?;
+        let policy = self.ladder_policy(site.key)?;
 
-        let defers = self.deferrals_recorded(dispatched.key)?;
+        let defers = self.deferrals_recorded(site.key)?;
 
         let next = crate::ladder::next_step(
             failure,
@@ -1000,7 +1095,7 @@ impl TopologyRun {
         // slice keeps paying for.
         let question = match next {
             crate::ladder::Next::AskHuman(kind) => {
-                Some(self.park_question(dispatched.key, plan, kind, failure, seams.ids)?)
+                Some(self.park_question(site.key, plan, kind, failure, seams.ids)?)
             }
             _ => None,
         };
@@ -1008,8 +1103,8 @@ impl TopologyRun {
         let settled = settle_failed(
             &self.handle.fold,
             &FinishedAttempt {
-                key: dispatched.key,
-                generation: dispatched.generation,
+                key: site.key,
+                generation: site.generation,
                 attempt: plan.attempt,
                 record,
                 next,
@@ -1035,9 +1130,9 @@ impl TopologyRun {
             settled.event.settlement,
             crate::topology::events::AttemptSettlement::Retained { .. }
         ) {
-            self.retained.insert(dispatched.key, capture.tree.clone());
+            self.retained.insert(site.key, capture.tree.clone());
         }
-        self.spend.record(dispatched.key, &settled.event.record);
+        self.spend.record(site.key, &settled.event.record);
         self.emit(
             TopologyEventBody::AttemptFinished {
                 data: Box::new(settled.event),
@@ -1078,27 +1173,25 @@ impl TopologyRun {
     /// compiles.
     fn promote_candidate(
         &mut self,
-        dispatched: &Dispatched,
+        site: AttemptSite<'_>,
         plan: &AttemptPlan,
         capture: &Capture,
         record: AttemptRecord,
         seams: &RunSeams<'_>,
         hooks: &mut dyn TopologyHooks,
     ) -> Result<(), UpstrokeError> {
-        let key = dispatched.key;
+        let key = site.key;
         // **The region the diff actually touched**, read through the manager
         // rather than predicted: `lease_effect` is `ReplacesPredicted`, and the
         // whole point of that variant is that the prediction is replaced by the
         // measurement.
-        let actual_paths = seams
-            .manager
-            .changed_paths(&dispatched.slot, &capture.parent)?;
+        let actual_paths = seams.manager.changed_paths(site.slot, &capture.parent)?;
 
         let judged = JudgedTree {
             key,
-            generation: dispatched.generation,
+            generation: site.generation,
             attempt: Box::new(record.clone()),
-            base_sha: dispatched.base.clone(),
+            base_sha: site.base.clone(),
             tree_sha: CommitSha(capture.tree.clone()),
             message: format!(
                 "upstroke: {} attempt {}",
@@ -1107,9 +1200,7 @@ impl TopologyRun {
             ),
             actual_paths,
             lease_effect: CandidateLeaseEffect::ReplacesPredicted {
-                paths: seams
-                    .manager
-                    .changed_paths(&dispatched.slot, &capture.parent)?,
+                paths: seams.manager.changed_paths(site.slot, &capture.parent)?,
             },
         };
 
@@ -1121,7 +1212,7 @@ impl TopologyRun {
         let settlement = settle_succeeded(
             &self.handle.fold,
             key,
-            dispatched.generation,
+            site.generation,
             plan.attempt,
             &record,
         )?;
@@ -1148,7 +1239,7 @@ impl TopologyRun {
         let created = self.with_journal(seams, hooks, |journal| {
             append_candidate_created(journal, referenced)
         })?;
-        reclaim_after_creation(seams.manager, hooks, &dispatched.slot, created)?;
+        reclaim_after_creation(seams.manager, hooks, site.slot, created)?;
         Ok(())
     }
 

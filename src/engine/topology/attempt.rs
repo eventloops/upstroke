@@ -381,6 +381,42 @@ pub struct Assessment {
     pub failure: Option<AttemptFailure>,
 }
 
+/// Where one attempt runs, whichever branch put it there.
+///
+/// **A dispatch and a retry are the same attempt over different ground.** The
+/// ready-dispatch branch opens a generation and gets a [`Dispatched`]; the
+/// ready-retry branch continues one whose worktree already holds the previous
+/// attempt's cumulative work, and no dispatch happened. Constructing a
+/// `Dispatched` for the second would be a type asserting something false, so
+/// the phases ask for the five facts they actually read instead.
+#[derive(Debug, Clone, Copy)]
+pub struct AttemptSite<'a> {
+    /// The task.
+    pub key: crate::topology::registry::TaskKey,
+    /// The generation the attempt runs in.
+    pub generation: crate::topology::events::GenerationId,
+    /// The commit the worktree was created at.
+    pub base: &'a crate::topology::events::CommitSha,
+    /// The worktree's slot.
+    pub slot: &'a Slot,
+    /// Its path on disk.
+    pub worktree: &'a std::path::Path,
+}
+
+impl Dispatched {
+    /// This dispatch, as the ground an attempt runs on.
+    #[must_use]
+    pub fn site(&self) -> AttemptSite<'_> {
+        AttemptSite {
+            key: self.key,
+            generation: self.generation,
+            base: &self.base,
+            slot: &self.slot,
+            worktree: &self.worktree,
+        }
+    }
+}
+
 /// What one attempt produced, for the judging that reads all three.
 ///
 /// A bundle because they arrive together and are read together: `judge` needs
@@ -589,13 +625,13 @@ impl AttemptContext<'_> {
 
     pub fn start(
         &mut self,
-        dispatched: &Dispatched,
+        site: AttemptSite<'_>,
         plan: &AttemptPlan,
     ) -> Result<AttemptRun, UpstrokeError> {
         self.emit(TopologyEventBody::AttemptStarted {
             data: AttemptStarted4 {
-                key: dispatched.key,
-                generation: dispatched.generation,
+                key: site.key,
+                generation: site.generation,
                 attempt: plan.attempt,
                 rung: plan.rung,
                 binding: plan.binding.clone(),
@@ -605,12 +641,30 @@ impl AttemptContext<'_> {
             },
         })?;
 
-        let identities =
-            AttemptIdentities::new(dispatched.key, dispatched.generation, plan.attempt);
+        self.run_worker(site, plan)
+    }
+
+    /// The worker half of [`Self::start`], without the append.
+    ///
+    /// **A retry's `attempt_started` is appended by `settle::retry`**, after
+    /// `Worktree.Verify` — the verify is what makes the claim true, and the
+    /// fold refuses a second append for the same attempt. So the ready-retry
+    /// branch reaches the worker through here and the ready-dispatch branch
+    /// through `start`, which is that append plus this.
+    ///
+    /// # Errors
+    ///
+    /// Whatever the Runner returns.
+    pub fn run_worker(
+        &mut self,
+        site: AttemptSite<'_>,
+        plan: &AttemptPlan,
+    ) -> Result<AttemptRun, UpstrokeError> {
+        let identities = AttemptIdentities::new(site.key, site.generation, plan.attempt);
         let invocation = identities.worker();
         let request = worker_request(
             plan.worker.clone(),
-            dispatched.worktree.clone(),
+            site.worktree.to_path_buf(),
             plan.agent.clone(),
             plan.worker_timeout,
             invocation.clone(),
@@ -632,15 +686,15 @@ impl AttemptContext<'_> {
     /// # Errors
     ///
     /// The containment refusals or a Git error.
-    pub fn capture(&mut self, dispatched: &Dispatched) -> Result<Capture, UpstrokeError> {
+    pub fn capture(&mut self, site: AttemptSite<'_>) -> Result<Capture, UpstrokeError> {
         self.manager
-            .candidate_stage(self.hooks.effects(), &dispatched.slot)?;
+            .candidate_stage(self.hooks.effects(), site.slot)?;
         let tree = self
             .manager
-            .candidate_write_tree(self.hooks.effects(), &dispatched.slot)?;
+            .candidate_write_tree(self.hooks.effects(), site.slot)?;
         Ok(Capture {
             tree,
-            parent: dispatched.base.0.clone(),
+            parent: site.base.0.clone(),
         })
     }
 
@@ -666,7 +720,7 @@ impl AttemptContext<'_> {
     /// has no adapter.
     pub fn assess(
         &mut self,
-        dispatched: &Dispatched,
+        site: AttemptSite<'_>,
         plan: &AttemptPlan,
         run: &AttemptRun,
         capture: &Capture,
@@ -700,10 +754,7 @@ impl AttemptContext<'_> {
         // dirty submodule is a policy failure of the tree, and the classifier
         // that decides so is `run_attempt`'s, reused rather than restated.
         if failure.is_none() {
-            if let Some(problem) = self
-                .input_policy
-                .problem(&dispatched.worktree, &capture.tree)?
-            {
+            if let Some(problem) = self.input_policy.problem(site.worktree, &capture.tree)? {
                 failure = Some(crate::engine::classify::review_input_failure(problem));
             }
         }
@@ -752,7 +803,7 @@ impl AttemptContext<'_> {
     /// runner failure.
     pub fn judge(
         &mut self,
-        dispatched: &Dispatched,
+        site: AttemptSite<'_>,
         plan: &AttemptPlan,
         judging: Judging<'_>,
         inputs: &ReviewInputs,
@@ -763,7 +814,7 @@ impl AttemptContext<'_> {
             capture,
             assessed,
         } = judging;
-        let generation = dispatched.generation.0;
+        let generation = site.generation.0;
         let attempt = plan.attempt.0;
 
         // **The cheap rungs carry forward, and they short-circuit the expensive

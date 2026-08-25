@@ -151,22 +151,20 @@ fn a_refusal_names_the_branch_and_says_whether_anything_happened() {
         "and says the run is untouched: {untouched}"
     );
 
-    // **A half-built branch says what it already did**, because by the time it
-    // refuses, `attempt_started` or `task_dispatched` is durable and an
-    // operator reading "not implemented" would look for a run that had not
-    // started. `ReadyRetry` is the current one.
-    let partial = LoopBranch::ReadyRetry.unimplemented().to_string();
+    // **No branch is `PartlyImplemented` today**, and that is a statement about
+    // this build rather than about the type. `ReadyRetry` was the last one and
+    // became `Performed` when its second half landed. The variant stays because
+    // the next branch built in halves will need it, and this assertion is what
+    // says so out loud the moment one appears — a half-built branch is the one
+    // shape whose refusal has to say what it already did, because by then
+    // `attempt_started` or `task_dispatched` is durable.
     assert!(
-        partial.contains("performed the {pipeline} reservation, Worktree.Verify"),
-        "a half-built branch says what it DID: {partial}"
-    );
-    assert!(
-        partial.contains("does not run the retried attempt through the Runner and settle it"),
-        "and what it did not, in the branch's own words: {partial}"
-    );
-    assert!(
-        !partial.contains("no event was appended"),
-        "and never claims the log is untouched: {partial}"
+        LoopBranch::ALL
+            .iter()
+            .all(|branch| !matches!(branch.disposition(), Disposition::PartlyImplemented { .. })),
+        "a branch is partly built again — assert its `performed ... does not ...` \
+         message here, because an operator reading `not implemented` would look \
+         for a run that had not started"
     );
 
     // Every refusal names its own branch, whatever its disposition. A message
