@@ -4665,6 +4665,100 @@ fn the_driver_carries_an_accepted_attempt_through_the_candidate_sequence() {
     );
 }
 
+/// **A run's spend is the same live as it is on replay.**
+///
+/// The ground-truth invariant, pinned as a property rather than as a count. The
+/// ceiling reads `Spend`; a live process keeps it current as it settles, and
+/// every fresh process rebuilds it with `Spend::replay` from the log. If those
+/// two disagree, a resumed run either refuses work it could afford or buys work
+/// it could not, and neither shows up as a wrong number anywhere — it shows up
+/// as a run that behaves differently after a restart.
+///
+/// **Why this class, not this instance.** Both `attempt_finished` and
+/// `candidate_prepared` carry an `AttemptRecord`, and for a successful attempt
+/// the driver appends both. `Spend::replay` counted each occurrence, so replay
+/// priced every success twice while live priced it once. Asserting a corrected
+/// number would have fixed the instance; asserting **live == replay over the
+/// run's own log** kills the class, including the next event kind that carries
+/// a record.
+#[test]
+fn a_runs_spend_is_the_same_live_as_on_replay() {
+    use crate::engine::topology::run::{RunSeams, TopologyRun};
+    use crate::engine::topology::select::{Ceiling, Spend};
+
+    let fixture = Fixture::healthy("spend-parity");
+    let harness = harness();
+    let runtime = runtime_holding_the_record();
+    let certifies = AlwaysCertifies;
+    let given = Given::healthy(&fixture, &runtime, &certifies);
+
+    let (outcome, _) = resume_holding(&fixture, &harness, &given);
+    let (_recovered, handle) = outcome.expect("the healthy resume completes");
+
+    let mut run = TopologyRun::resumed(handle, fixture.inputs(), Ceiling::unlimited());
+    let mut hooks = HarnessTopologyHooks::new(Arc::clone(&harness));
+    let sleeper = RecordingSleeper::default();
+    let manager = fixture.manager();
+    let runner = RecordingRunner::editing();
+    let adapters = crate::engine::topology::scaffold::ScaffoldAdapters::new();
+    let paths = crate::rundir::RunPaths::with_private_root(
+        &fixture.repo_root,
+        &fixture.started.run_id,
+        &fixture.private_root,
+    );
+    paths.create().expect("the run directories are creatable");
+    // **Through the production assembler, not a fixture plan shape.** The
+    // condition on this extraction was that the scaffold be re-pointed at the
+    // real one or round-tripped against it; a fixture that hand-built an
+    // `AttemptPlan` here would be exactly the fifth copy the `frozen_binding`
+    // precedent warns about.
+    let plans = crate::engine::assembly::FrozenPlans {
+        adapters: &adapters,
+        paths: &paths,
+        gates: &[],
+        pools: &[],
+        caps: &[],
+        worker_timeout: std::time::Duration::from_secs(300),
+        decisions: &[],
+    };
+    let seams = RunSeams {
+        manager: &manager,
+        clock: &Frozen,
+        sleeper: &sleeper,
+        runner: &runner,
+        adapters: &adapters,
+        paths: &paths,
+        plans: &plans,
+        reviews: &crate::engine::attempt::LegacyReviewPasses,
+        input_policy: &crate::engine::attempt::LegacyReviewInputPolicy,
+        answers: &crate::interaction::UnattendedAnswers,
+        ids: &FixedIds,
+        halts_run: false,
+    };
+
+    run.step(&seams, &mut hooks)
+        .expect("the accepted attempt runs the candidate sequence");
+
+    // What the process believes it has spent, after settling one success.
+    let live = run.spend().run_total();
+
+    // What any fresh process would believe, from the same bytes.
+    let events = TopologyFold::parse_log(&fixture.log_bytes()).expect("the log parses");
+    let replayed = Spend::replay(&events).run_total();
+
+    assert!(
+        live > 0.0,
+        "the fixture priced nothing, so this asserts two zeroes and proves \
+         nothing: give the scaffold adapter a cost"
+    );
+    assert!(
+        (live - replayed).abs() < 1e-9,
+        "a live run and a replay of its own log price it differently: live \
+         {live}, replay {replayed}. A resumed run would refuse work it could \
+         afford, or buy work it could not"
+    );
+}
+
 /// **The driver settles an outage from the fold's deferral count.**
 ///
 /// The witness that closes the mutation named in `deferrals_recorded`'s own
@@ -5211,6 +5305,140 @@ fn the_retaining_incarnation_retries_in_place() {
         resumed, 1,
         "exactly one of the two worker invocations should carry a session to \
          resume, and it is the second"
+    );
+}
+
+/// **The driver spends the allowance the log records, not the one it assumed.**
+///
+/// The driver-level half of `PR7-FOLD-LADDER-POSITION`. The fold half is
+/// `fold::tests::a_ladder_position_is_derived_by_replay_and_not_assumed`; this
+/// is the read, and it needed a fixture that makes the read observable.
+///
+/// This fixture's chain has **one** tier and `attempts_per = 2`, so an
+/// escalation has nowhere to climb and the allowance is the whole ladder. One
+/// attempt is already durable in the log. The driver's next attempt is
+/// therefore the **second** on that rung, which exhausts the allowance, and
+/// `next_step` has no rung to escalate onto — so the task fails terminally.
+///
+/// A driver that assumed `attempts_on_rung: 1` would hand `next_step` the first
+/// attempt of two and get `RetrySameRung` instead: the task would retry
+/// forever, spending a rung's allowance on every restart and never failing.
+/// That is what the constant did before this test existed.
+#[test]
+fn the_driver_spends_the_allowance_the_log_records() {
+    use crate::engine::topology::run::{Progress, RunSeams, TopologyRun};
+    use crate::engine::topology::select::Ceiling;
+
+    // One attempt already spent on rung 0, settled as a same-rung retry so the
+    // task returns to `Pending` and this branch selects it again.
+    let fixture = Fixture::build(
+        "driver-allowance",
+        Damage {
+            extra: vec![
+                dispatched(),
+                attempt_started(1),
+                attempt_finished(
+                    1,
+                    AttemptSettlement::Closed {
+                        transition: SettlementTransition::Retry,
+                        lease: LeaseDisposition::PredictedReleased,
+                    },
+                ),
+            ],
+            ..Damage::default()
+        },
+    );
+    let harness = harness();
+    let runtime = runtime_holding_the_record();
+    let certifies = AlwaysCertifies;
+    let given = Given::healthy(&fixture, &runtime, &certifies);
+
+    let (outcome, _) = resume_holding(&fixture, &harness, &given);
+    let (_recovered, handle) = outcome.expect("the healthy resume completes");
+
+    let mut run = TopologyRun::resumed(handle, fixture.inputs(), Ceiling::unlimited());
+    let mut hooks = HarnessTopologyHooks::new(Arc::clone(&harness));
+    let sleeper = RecordingSleeper::default();
+    let manager = fixture.manager();
+    let runner = RecordingRunner::editing();
+    let adapters = crate::engine::topology::scaffold::ScaffoldAdapters::erroring();
+    let paths = crate::rundir::RunPaths::with_private_root(
+        &fixture.repo_root,
+        &fixture.started.run_id,
+        &fixture.private_root,
+    );
+    paths.create().expect("the run directories are creatable");
+    // **Through the production assembler, not a fixture plan shape.** The
+    // condition on this extraction was that the scaffold be re-pointed at the
+    // real one or round-tripped against it; a fixture that hand-built an
+    // `AttemptPlan` here would be exactly the fifth copy the `frozen_binding`
+    // precedent warns about.
+    let plans = crate::engine::assembly::FrozenPlans {
+        adapters: &adapters,
+        paths: &paths,
+        gates: &[],
+        pools: &[],
+        caps: &[],
+        worker_timeout: std::time::Duration::from_secs(300),
+        decisions: &[],
+    };
+    let seams = RunSeams {
+        manager: &manager,
+        clock: &Frozen,
+        sleeper: &sleeper,
+        runner: &runner,
+        adapters: &adapters,
+        paths: &paths,
+        plans: &plans,
+        reviews: &crate::engine::attempt::LegacyReviewPasses,
+        input_policy: &crate::engine::attempt::LegacyReviewInputPolicy,
+        answers: &crate::interaction::UnattendedAnswers,
+        ids: &FixedIds,
+        halts_run: false,
+    };
+
+    let progress = run
+        .step(&seams, &mut hooks)
+        .expect("the second attempt settles");
+    let Progress::Settled { accepted, .. } = progress else {
+        panic!("the ready-dispatch branch did not settle: {progress:?}");
+    };
+    assert!(!accepted, "an agent error is not an acceptable attempt");
+
+    let last = TopologyFold::parse_log(&fixture.log_bytes())
+        .expect("the log parses")
+        .into_iter()
+        .filter_map(|event| match event.body {
+            TopologyEventBody::AttemptFinished { data } => Some(data.settlement),
+            _ => None,
+        })
+        .next_back()
+        .expect("the attempt settled");
+
+    let AttemptSettlement::Closed { transition, .. } = last else {
+        panic!("the second attempt did not close its generation: {last:?}");
+    };
+    // **Parked, not failed** — and that is `next_step`'s answer, not a
+    // weakening of the assertion. A spent chain asks a human rather than
+    // failing the task: "Nothing further can move this task ... and the
+    // escalation chain is spent." What matters here is that the allowance was
+    // seen as spent at all.
+    let SettlementTransition::Parked { question } = transition else {
+        panic!(
+            "the second attempt on a two-attempt rung with nowhere to escalate \
+             settled as {transition:?}. A driver reading a constant \
+             `attempts_on_rung: 1` gets `Retry` here and the task retries forever"
+        );
+    };
+
+    // **And the human is told how many attempts actually ran.** The count in
+    // the question is the task's spend on this rung, not the new generation's
+    // attempt number — a park that said "1 attempt" after two would send an
+    // operator looking for a run that had barely started.
+    assert!(
+        question.context.contains("2 attempt(s)"),
+        "the question quotes the wrong attempt count: {}",
+        question.context
     );
 }
 

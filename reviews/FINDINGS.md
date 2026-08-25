@@ -161,6 +161,56 @@ direct question about scope and answered it as a disposition, which is now settl
 claim about the PR3 round, not about PR4's second confirmation, whose two findings —
 `PR4-CONF-003` and `PR4-CONF-004` — were both accepted and repaired in round 5.)*
 
+### 2026-08-25 — `PR7-FOLD-LADDER-POSITION`, per-instance Class B approval
+
+**Disclosure row for a frozen-file change, filed in the commit that makes it.** Raised by
+S5 round 1 as five findings from three lenses — `loop` ×2, `settle` ×2, `contract` — which
+is one defect seen from three directions.
+
+**What changed.** `src/topology/fold.rs`: `TaskFold` gains `rung: u32` and
+`attempts_on_rung: u32`. The rung is assigned from `SettlementTransition::Escalated { rung }`,
+which the packet defines as the rung an escalation climbs *onto*; the counter increments at
+the `attempt_started` arm that already wrote `generation.attempts`, and resets on escalation
+because the allowance is per rung. Both read through the **existing** `TopologyFold::task`
+reader — no new reader.
+
+**Why it could not be avoided.** The fold *validates* `attempt_started.rung` against the
+frozen ladder and then discards it: `GenerationFold` has no rung, and `TaskFold` had no
+ladder position at all. Meanwhile `SettlementTransition::Retry | Escalated` closes the
+generation and **does not set the task's state**, so the task stays `Pending` and the
+ready-dispatch branch selects it again — at a rung nobody could read. The driver assumed
+`rung 0, attempts_on_rung 1`, and I had justified both as "properties of the branch".
+
+**That justification holds only for a task that has never been attempted.** For any task
+past its first generation it is wrong twice: an escalated task is dispatched on rung 0
+forever and never reaches the tier its chain escalated it to, and `next_step` always sees
+the first attempt of the allowance, so the task retries forever and never escalates at all.
+Neither shows up as a wrong number — only as a run that behaves differently after a restart.
+
+**Why the fold owns it.** The same reason as [`PR7-FOLD-DEFERS-ACCUMULATOR`]: a ladder
+position survives a resume and a process-local tally does not. Witnessed in both halves —
+`a_ladder_position_is_derived_by_replay_and_not_assumed` for the accumulation (fails at
+`left: 0, right: 1` when the escalation arm is removed) and
+`the_driver_spends_the_allowance_the_log_records` for the read (the driver settles `Retry`
+instead of parking, "and the task retries forever", when `ladder_position` is replaced by
+the old constants). The second witness exists because the first mutation of the read
+**survived**: the fold half being witnessed says nothing about the driver reading it.
+
+**Why the contract owes it.** `pr_sequence[8].scope` names "failed/interrupted/deferred
+settlements" and the "same-generation retry path"; `permitted_transitions` names
+"Pending -> dispatched generation -> attempt"; and the fold itself returns an escalated task
+to `Pending`. A build that dispatches it at the wrong rung is not implementing that
+transition.
+
+**What did not change.** No event, no serialization, no transition, no refusal. The fold
+holds the position and only the position; `attempts_per` and the chain stay in
+`ladder::LadderPolicy`, read from the frozen entry.
+
+**A second defect found while witnessing it.** The park question quoted
+`plan.attempt` — this *generation's* attempt number — where the human needs the task's
+spend on the rung. After two attempts a park said "1 attempt(s)". Fixed in the same commit,
+and asserted by the same test.
+
 ### 2026-08-25 — `PR7-FOLD-DEFERS-ACCUMULATOR`, per-instance Class B approval
 
 **Disclosure row for a frozen-file change, filed in the commit that makes it.**

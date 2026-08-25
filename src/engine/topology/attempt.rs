@@ -837,7 +837,8 @@ impl AttemptContext<'_> {
                     invocation,
                 );
                 let verdict = self.verdict(&request, None)?;
-                if !verdict.passed() && failure.is_none() {
+                let refused = !verdict.passed();
+                if refused && failure.is_none() {
                     failure = Some(crate::engine::classify::gate_failure(&GateFailure {
                         gate: format!("gate {index}"),
                         summary: format!(
@@ -850,6 +851,17 @@ impl AttemptContext<'_> {
                     }));
                 }
                 gates.push(verdict);
+                // **First failure ends the set**, which is `gates::run_all`'s own
+                // shape: it `return`s the first `GateFailure` rather than running
+                // the rest. Two consequences, and both matter. A refused gate
+                // must not buy the gates after it — the diff is already
+                // rejected. And the first cause must survive: a later gate that
+                // fails to *spawn* would otherwise overwrite the real failure
+                // with an infrastructure one, and `ladder::next_step` would
+                // price the attempt from the wrong kind.
+                if refused {
+                    break;
+                }
             }
             self.manager
                 .remove_snapshot(self.hooks.effects(), &snapshot)?;

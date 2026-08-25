@@ -603,6 +603,14 @@ impl TopologyRun {
 
     /// The fold this run derives every decision from.
     #[must_use]
+    /// What this process believes the run has spent.
+    ///
+    /// Paired with `Spend::replay` over the same log, this is the parity a
+    /// resumed run depends on.
+    pub const fn spend(&self) -> &Spend {
+        &self.spend
+    }
+
     pub fn fold(&self) -> &TopologyFold {
         &self.handle.fold
     }
@@ -686,7 +694,7 @@ impl TopologyRun {
                     dispatched.site(),
                     RunAs {
                         attempt: Self::FIRST_ATTEMPT,
-                        rung: Self::FIRST_RUNG,
+                        rung: self.ladder_position(key)?.0,
                         resume_session: None,
                         announced: false,
                     },
@@ -886,6 +894,7 @@ impl TopologyRun {
         seams: &RunSeams<'_>,
         hooks: &mut dyn TopologyHooks,
     ) -> Result<Progress, UpstrokeError> {
+        let position = self.ladder_position(key)?;
         let retained_tree = self.retained.get(&key).cloned().ok_or_else(|| {
             UpstrokeError::Refused {
                 message: format!(
@@ -899,12 +908,12 @@ impl TopologyRun {
         let binding = self
             .handle
             .fold
-            .frozen_rung_binding(key, Self::FIRST_RUNG)
+            .frozen_rung_binding(key, position.0)
             .ok_or_else(|| UpstrokeError::Refused {
                 message: format!(
                     "task {} has no rung {} in its frozen ladder",
                     key.index(),
-                    Self::FIRST_RUNG
+                    position.0
                 ),
             })?;
         let slot_for_run = task_slot(key, generation);
@@ -922,7 +931,7 @@ impl TopologyRun {
                     slot,
                     retained_tree,
                     binding,
-                    rung: Self::FIRST_RUNG,
+                    rung: position.0,
                     pool: None,
                     materialization: None,
                 },
@@ -1025,9 +1034,6 @@ impl TopologyRun {
     /// would need a reader for the open generation that does not exist, and
     /// inventing one would be the fold and the log holding two answers — the
     /// shape that produced this slice's `predicted_region` defect.
-    /// The ladder index a fresh generation's first attempt binds to.
-    const FIRST_RUNG: u32 = 0;
-
     /// The attempt number a fresh generation's first attempt carries.
     const FIRST_ATTEMPT: crate::topology::events::AttemptNumber =
         crate::topology::events::AttemptNumber(1);
@@ -1198,15 +1204,18 @@ impl TopologyRun {
         let policy = self.ladder_policy(site.key)?;
 
         let defers = self.deferrals_recorded(site.key)?;
+        // Where the task stands on its ladder, from the log rather than from
+        // this branch's assumptions.
+        let position = self.ladder_position(site.key)?;
 
         let next = crate::ladder::next_step(
             failure,
             &crate::ladder::LadderState {
-                rung: Self::FIRST_RUNG as usize,
+                rung: position.0 as usize,
                 // Both properties of this branch, as in `attempt`: a ready task
                 // dispatches into a fresh generation, so this is its first
                 // attempt on its first rung.
-                attempts_on_rung: Self::FIRST_ATTEMPT.0,
+                attempts_on_rung: position.1,
                 defers,
                 // Both halves, as `LadderState::resumable` documents: the
                 // agent's CLI advertises `session_resume` and this attempt
@@ -1224,7 +1233,7 @@ impl TopologyRun {
         // slice keeps paying for.
         let question = match next {
             crate::ladder::Next::AskHuman(kind) => {
-                Some(self.park_question(site.key, plan, kind, failure, seams.ids)?)
+                Some(self.park_question(site.key, position.1, kind, failure, seams.ids)?)
             }
             _ => None,
         };
@@ -1242,7 +1251,7 @@ impl TopologyRun {
                 halts_run: seams.halts_run,
                 defers,
                 reason: failure.reason.clone(),
-                rung: Self::FIRST_RUNG.saturating_add(1),
+                rung: position.0.saturating_add(1),
             },
         )?;
 
@@ -1424,14 +1433,16 @@ impl TopologyRun {
     /// title, the acceptance list — and what this branch knows about the
     /// attempt.
     ///
-    /// **`attempts` and `rungs_spent` are one, and are properties of the
-    /// branch.** `select` reaches `Admitted::Dispatch` for a ready task, so
-    /// this is its first attempt on its first rung. `ReadyRetry` is where a
-    /// second of either comes from, and it is not built.
+    /// **`attempts` is the task's spend on this rung, from the fold.** It was
+    /// `plan.attempt` — this generation's attempt number — which restarts at
+    /// one for a same-rung retry that did not resume, so a park after two
+    /// attempts told the human "1 attempt(s)". `rungs_spent` stays one because
+    /// this fixture's chains are single-tier; a multi-rung count is owed with
+    /// the escalation lane.
     fn park_question(
         &self,
         key: TaskKey,
-        plan: &AttemptPlan,
+        attempts_on_rung: u32,
         kind: crate::ir::QuestionKind,
         failure: &crate::ladder::AttemptFailure,
         ids: &dyn IdSource,
@@ -1453,7 +1464,11 @@ impl TopologyRun {
                     display_id: entry.display_id.as_str(),
                     title: &entry.spec.title,
                     acceptance: &entry.spec.acceptance,
-                    attempts: plan.attempt.0,
+                    // The task's spend on this rung, not this generation's
+                    // attempt number: a same-rung retry that did not resume is
+                    // a fresh generation, so `plan.attempt` restarts at one
+                    // while the allowance does not.
+                    attempts: attempts_on_rung,
                     rungs_spent: 1,
                 },
                 kind,
@@ -1461,6 +1476,28 @@ impl TopologyRun {
             ),
             options: crate::engine::coordinator::question_options(kind),
         })
+    }
+
+    /// Where this task stands on its ladder: the rung its next attempt runs
+    /// at, and the attempts already spent there.
+    ///
+    /// **Both from the fold, because a ladder position survives a resume.** A
+    /// settlement that escalates closes the generation and leaves the task
+    /// `Pending`, so this branch selects it again — and a driver that assumed
+    /// rung 0 would dispatch it at rung 0 forever, never reaching the tier its
+    /// chain escalated it to. A driver that assumed attempt 1 would hand
+    /// `next_step` the first attempt of the allowance every time, so the task
+    /// would retry forever and never escalate at all. Both were true of this
+    /// driver until `PR7-FOLD-LADDER-POSITION`.
+    fn ladder_position(&self, key: TaskKey) -> Result<(u32, u32), UpstrokeError> {
+        let task = self
+            .handle
+            .fold
+            .task(key)
+            .ok_or_else(|| UpstrokeError::Refused {
+                message: format!("task {} is not in this run's fold", key.index()),
+            })?;
+        Ok((task.rung, task.attempts_on_rung))
     }
 
     /// How many times this task has already settled `Deferred`.

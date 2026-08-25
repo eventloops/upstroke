@@ -41,7 +41,7 @@
 //! integration; ascending task key answers it for a dispatch and a retry,
 //! which is §14's "lowest plan index first" over the dense registry keys.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use crate::error::UpstrokeError;
 use crate::events::{AttemptRecord, BudgetKind};
@@ -81,6 +81,15 @@ pub struct Spend {
 impl Spend {
     /// Nothing reported yet.
     #[must_use]
+    /// The run's reported spend so far.
+    ///
+    /// A reader because the ceiling is not the only thing that needs it: a
+    /// resumed process rebuilds this with [`Self::replay`], and the two totals
+    /// have to be comparable or the comparison cannot be asserted.
+    pub const fn run_total(&self) -> f64 {
+        self.run
+    }
+
     pub fn new() -> Self {
         Self::default()
     }
@@ -106,13 +115,35 @@ impl Spend {
     #[must_use]
     pub fn replay(events: &[TopologyEvent]) -> Self {
         let mut spend = Self::new();
+        // **One attempt, one contribution.** Both event kinds carry an
+        // `AttemptRecord`, and for a *successful* attempt both are appended:
+        // `attempt_finished{Succeeded}` moves the generation to `Promoting`,
+        // and `candidate_prepared` records the candidate that settlement
+        // authorized. Counting each occurrence would price every successful
+        // attempt twice — and only on replay, because a live run records it
+        // once. A live total and a replay of that run's own log would then
+        // disagree, which is the ground truth this project measures everything
+        // else against.
+        //
+        // Keyed by the attempt's identity rather than by event kind, so a
+        // vocabulary that later carries the record in a third place is counted
+        // once too.
+        let mut counted: BTreeSet<(TaskKey, u32, u32)> = BTreeSet::new();
         for event in events {
-            match &event.body {
-                TopologyEventBody::AttemptFinished { data } => spend.record(data.key, &data.record),
-                TopologyEventBody::CandidatePrepared { data } => {
-                    spend.record(data.key, &data.attempt);
+            let (key, generation, attempt, record) = match &event.body {
+                TopologyEventBody::AttemptFinished { data } => {
+                    (data.key, data.generation.0, data.attempt.0, &*data.record)
                 }
-                _ => {}
+                TopologyEventBody::CandidatePrepared { data } => (
+                    data.key,
+                    data.generation.0,
+                    data.attempt.attempt,
+                    &*data.attempt,
+                ),
+                _ => continue,
+            };
+            if counted.insert((key, generation, attempt)) {
+                spend.record(key, record);
             }
         }
         spend

@@ -197,6 +197,88 @@ fn attempt_started_is_durable_before_any_spawn() {
     );
 }
 
+/// **A refused gate ends the gate set, and its cause survives.**
+///
+/// `gates::run_all` — the legacy authority — `return`s the first `GateFailure`
+/// rather than running the rest. Two consequences, and this asserts both.
+///
+/// A refused gate must not buy the gates after it: the diff is already
+/// rejected, and every later gate is spend on a verdict that cannot change.
+///
+/// And the **first cause must survive**. This fixture's second gate would exit
+/// 127 — a spawn-shaped failure. A driver that ran it and let it overwrite the
+/// real cause would hand `ladder::next_step` an infrastructure failure where a
+/// gate rejection happened, and the ladder prices those differently: one is the
+/// implementer's, the other is not.
+#[test]
+fn a_refused_gate_ends_the_set_and_its_cause_survives() {
+    let mut run = Run::started("gate-short-circuit");
+    let dispatched = run.dispatch(ALPHA, 0);
+    let mut plan = run.attempt_plan(ALPHA, 1);
+    // Two gates: the first refuses, the second would fail to spawn.
+    let second = plan.gates[0].clone();
+    plan.gates.push(second);
+    run.runner.set_codes(vec![0, 2, 127]);
+    let mut process = Process::new();
+
+    let started = context!(run, process)
+        .start(dispatched.site(), &plan)
+        .expect("start");
+    agent_edits(&dispatched.worktree);
+    let capture = context!(run, process)
+        .capture(dispatched.site())
+        .expect("capture");
+    let review_inputs = run.review_inputs();
+    let assessed = context!(run, process)
+        .assess(
+            dispatched.site(),
+            &plan,
+            &started,
+            &capture,
+            &review_inputs.diff,
+            crate::ir::TaskKind::Implement,
+        )
+        .expect("the scaffold's adapter parses its own worker output");
+    let judgement = context!(run, process)
+        .judge(
+            dispatched.site(),
+            &plan,
+            Judging {
+                run: &started,
+                capture: &capture,
+                assessed: &assessed,
+            },
+            &review_inputs,
+            &|pass| crate::review::ReviewInvocations {
+                pass: started.identities.review_pass(pass, 0),
+                reask: started.identities.review_reask(pass, 0),
+            },
+        )
+        .expect("judge");
+
+    assert_eq!(
+        judgement.gates.len(),
+        1,
+        "the second gate ran after the first refused, so a rejected diff bought \
+         a gate that could not change the verdict"
+    );
+    let failure = judgement
+        .failure
+        .as_ref()
+        .expect("a refused gate fails the attempt");
+    assert_eq!(
+        failure.kind,
+        crate::ladder::FailureKind::GateFailed,
+        "the first cause did not survive: the attempt is recorded as {:?}, \
+         which is what the SECOND gate would have produced",
+        failure.kind
+    );
+    assert!(
+        !judgement.accepted(),
+        "an attempt whose gate refused was accepted"
+    );
+}
+
 /// **O25, O26 and O27** in one clean attempt, read off the shared harness.
 ///
 /// One test rather than three, because the clauses are one chain and splitting

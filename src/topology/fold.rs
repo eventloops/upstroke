@@ -460,6 +460,31 @@ pub struct TaskFold {
     /// `ladder::LadderPolicy`, read from `run_started(4).limits`. This is the
     /// count, and only the count.
     pub defers: u32,
+    /// The rung this task's **next** attempt runs at.
+    ///
+    /// **The fold owns it because a task's ladder position survives a resume.**
+    /// A settlement that escalates closes the generation and leaves the task
+    /// `Pending`, so the ready-dispatch branch selects it again — at a rung the
+    /// driver has no other way to know. A driver-side tally reads zero in the
+    /// next process while the log holds the escalation, so the task is
+    /// dispatched on rung 0 forever and never reaches the tier its chain
+    /// escalated it to.
+    ///
+    /// `SettlementTransition::Escalated { rung }` is the durable answer — the
+    /// packet defines it as the rung an escalation climbs *onto* — so this is
+    /// assigned from it, never computed.
+    pub rung: u32,
+    /// Attempts already spent at [`Self::rung`].
+    ///
+    /// Not `GenerationFold::attempts`: that counts one generation, and attempts
+    /// at one rung span generations — a same-rung retry that does not resume
+    /// closes its generation and opens a fresh one at the same rung. Feeding
+    /// `LadderState::attempts_on_rung` the per-generation count makes
+    /// `next_step` see the first attempt of the allowance every time, so a task
+    /// retries forever and never escalates.
+    ///
+    /// Reset by an escalation, because the allowance is per rung.
+    pub attempts_on_rung: u32,
     pub generations: Vec<GenerationFold>,
 }
 
@@ -468,6 +493,8 @@ impl TaskFold {
         Self {
             state: TaskState::Pending,
             defers: 0,
+            rung: 0,
+            attempts_on_rung: 0,
             generations: Vec::new(),
         }
     }
@@ -3171,6 +3198,13 @@ impl RunState {
                     };
                     generation.attempts = data.attempt.0;
                 }
+                // One more attempt spent at this task's current rung. Counted
+                // here rather than derived from the generation, because a
+                // same-rung retry after a close is a *new* generation at the
+                // same rung and the allowance spans both.
+                if let Some(task) = self.tasks.get_mut(data.key.index()) {
+                    task.attempts_on_rung = task.attempts_on_rung.saturating_add(1);
+                }
             }
             TopologyEventBody::AttemptFinished { data } => self.apply_settlement(data),
             TopologyEventBody::AttemptInterrupted { data } => {
@@ -3308,8 +3342,18 @@ impl RunState {
                         generation.class = GenerationClass::Promoting;
                     }
                 }
-                SettlementTransition::Retry | SettlementTransition::Escalated { .. } => {
+                SettlementTransition::Retry => {
                     self.close_generation(finished.key);
+                }
+                SettlementTransition::Escalated { rung } => {
+                    self.close_generation(finished.key);
+                    // The settlement's own number: the packet defines it as the
+                    // rung the escalation climbs *onto*. The allowance is per
+                    // rung, so it starts again here.
+                    if let Some(task) = self.tasks.get_mut(finished.key.index()) {
+                        task.rung = *rung;
+                        task.attempts_on_rung = 0;
+                    }
                 }
                 SettlementTransition::Deferred { defers, .. } => {
                     self.close_generation(finished.key);
@@ -4787,6 +4831,83 @@ mod tests {
             wider.integration_admissible(),
             "one of two entitlements held leaves room for the integration's"
         );
+    }
+
+    /// **A task's ladder position survives the process that wrote it.**
+    ///
+    /// The companion to the deferral witness, and the same disease. A
+    /// settlement that escalates closes the generation and leaves the task
+    /// `Pending` — so the ready-dispatch branch selects it again, and the rung
+    /// it runs at is a fact only the log holds.
+    ///
+    /// A driver that assumed rung 0 would dispatch an escalated task on rung 0
+    /// forever, never reaching the tier its chain escalated it to. A driver
+    /// that assumed attempt 1 would hand `next_step` the first attempt of the
+    /// allowance every time, so the task would retry forever and never
+    /// escalate at all. Both were true of `TopologyRun` until this field
+    /// existed, and neither was visible as a wrong number — only as a run that
+    /// behaves differently after a restart.
+    #[test]
+    fn a_ladder_position_is_derived_by_replay_and_not_assumed() {
+        let base = sha("base");
+        let mut live = started();
+        let mut trace = vec![run_started_event()];
+
+        // Rung 0, two attempts, allowance spent -> escalate onto rung 1.
+        for attempt in 1..=2u32 {
+            for event in [
+                dispatch(ALPHA, attempt - 1, &base),
+                attempt_started(&live, ALPHA, attempt - 1, 1, 0),
+            ] {
+                apply(&mut live, &event);
+                trace.push(event);
+            }
+            let last = attempt == 2;
+            let settlement = settle(
+                ALPHA,
+                attempt - 1,
+                1,
+                AttemptSettlement::Closed {
+                    transition: if last {
+                        SettlementTransition::Escalated { rung: 1 }
+                    } else {
+                        SettlementTransition::Retry
+                    },
+                    lease: LeaseDisposition::PredictedReleased,
+                },
+            );
+            apply(&mut live, &settlement);
+            trace.push(settlement);
+        }
+
+        let task = live.task(ALPHA).expect("registered");
+        assert_eq!(task.rung, 1, "the escalation did not move the task's rung");
+        assert_eq!(
+            task.attempts_on_rung, 0,
+            "the allowance is per rung, so an escalation starts it again"
+        );
+        assert_eq!(
+            task.state,
+            TaskState::Pending,
+            "an escalated task must be dispatchable again — this is what makes \
+             the rung above load-bearing rather than decorative"
+        );
+
+        // Through the wire, because a resume reads bytes.
+        let parsed = TopologyFold::parse_log(&wire(&trace)).expect("the log parses");
+        let replayed = TopologyFold::replay(inputs(), &parsed).expect("the log replays");
+        let after = replayed.task(ALPHA).expect("registered");
+        assert_eq!(
+            (after.rung, after.attempts_on_rung),
+            (task.rung, task.attempts_on_rung),
+            "the ladder position did not survive the process that wrote it, so \
+             the next one would dispatch this task on a rung the log contradicts"
+        );
+
+        // The two assumptions this replaces, shown wrong. A fresh process
+        // starts both at zero and agrees with the fold on every reading until
+        // a resume — which is exactly when nothing is watching.
+        assert_ne!(0, after.rung, "a process-local rung tally reads zero here");
     }
 
     /// **A deferral count survives the process that wrote it, and a

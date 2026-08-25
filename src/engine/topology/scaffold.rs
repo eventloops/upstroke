@@ -537,6 +537,18 @@ impl RecordingRunner {
         Self::default()
     }
 
+    /// Replace the queued exit codes on a runner already in a `Run`.
+    ///
+    /// `failing_with` builds one; a test that needs the fixture's whole run and
+    /// only wants different codes cannot rebuild it, because the `Run` owns the
+    /// runner and its harness.
+    pub(super) fn set_codes(&self, codes: Vec<i32>) {
+        *self
+            .codes
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = codes;
+    }
+
     /// Hand back these exit codes, in order, then zeroes.
     pub(super) fn failing_with(codes: Vec<i32>) -> Self {
         Self {
