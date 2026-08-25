@@ -36,7 +36,7 @@
 use std::time::Duration;
 
 use crate::error::UpstrokeError;
-use crate::events::{AttemptRecord, RunOutcome};
+use crate::events::{AttemptRecord, FailureRecord, RunOutcome};
 use crate::interaction::{self, Sleeper};
 use crate::ladder::Next;
 use crate::topology::events::{
@@ -156,7 +156,7 @@ pub fn settle_failed(
                         retained_incarnation: epoch,
                     },
                 },
-                spent_attempt: true,
+                spent_attempt: spent(finished),
             });
         }
     }
@@ -194,8 +194,30 @@ pub fn settle_failed(
             record: Box::new(finished.record.clone()),
             settlement: AttemptSettlement::Closed { transition, lease },
         },
-        spent_attempt: !matches!(finished.next, Next::Defer),
+        spent_attempt: spent(finished),
     })
+}
+
+/// The allowance decision, from the one authority.
+///
+/// `ladder::spends_allowance` is total over `FailureKind` and is the function
+/// whose four-cell grid was measured against the legacy park paths. This module
+/// used to answer the same question itself, as `!matches!(finished.next,
+/// Next::Defer)` — derived from the ladder's *decision* rather than from the
+/// failure the decision was made about.
+///
+/// The two disagree, and on the cell that matters most. `Next::AskHuman` from a
+/// `NeedsHuman` failure is not a `Defer`, so the old form said the attempt
+/// spent one; `spends_allowance` says it does not, because "the code was never
+/// judged, so nothing is spent and nothing escalates" — `next_step`'s own words
+/// about that exact branch. An operator would have lost a rung's attempt to a
+/// worker that asked a question instead of working.
+///
+/// A record with no failure is a settlement of work that was judged and
+/// accepted, which spends. That is `spends_allowance`'s `None` arm and not a
+/// second rule here.
+fn spent(finished: &FinishedAttempt) -> bool {
+    crate::ladder::spends_allowance(finished.record.failure.as_ref().map(FailureRecord::shape))
 }
 
 /// The settlement of an attempt that **succeeded**.
@@ -709,6 +731,7 @@ pub(crate) mod tests {
         ResolvedEffortPolicy, Task, TaskId, TaskKind, Tier,
     };
     use crate::ladder::Next;
+    use crate::ladder::{FailureKind, FailureOrigin};
     use crate::review::{PassBinding, ReviewPlan};
     use crate::rundir::{self, RunPaths};
     use crate::runner::host::{HostEnvironment, HostRunner, KeyCase};
@@ -1023,6 +1046,22 @@ pub(crate) mod tests {
     }
 
     pub(crate) fn record(attempt: u32, cost: Option<f64>) -> AttemptRecord {
+        record_failing(attempt, cost, None)
+    }
+
+    /// A record of an attempt that failed the way `failure` says.
+    ///
+    /// **A settlement of a failure whose record carries none is a fixture that
+    /// cannot happen.** `record`'s `failure: None` means "the work was judged
+    /// and accepted", and every `settle_failed` case is by definition not that.
+    /// The allowance is decided from this field, so a grid that varied `Next`
+    /// and left the failure fixed varied one half of a correlated pair — the
+    /// class `reviews/FINDINGS.md` §4 records eleven of.
+    pub(crate) fn record_failing(
+        attempt: u32,
+        cost: Option<f64>,
+        failure: Option<(FailureKind, FailureOrigin)>,
+    ) -> AttemptRecord {
         AttemptRecord {
             attempt,
             tier: "mid".to_owned(),
@@ -1034,7 +1073,11 @@ pub(crate) mod tests {
             reviews: Vec::new(),
             session_id: None,
             usage: None,
-            failure: None,
+            failure: failure.map(|(kind, origin)| FailureRecord {
+                kind,
+                origin,
+                reason: "the fixture's failure".to_owned(),
+            }),
         }
     }
 
@@ -1225,19 +1268,34 @@ pub(crate) mod tests {
         let mut fold = started();
         in_flight(&mut fold, ALEPH, 0);
 
-        let cases: Vec<(Next, SettlementTransition, bool)> = vec![
+        // **Each decision beside the failure that produces it.** The allowance
+        // is a function of the failure, not of the decision, so a grid that
+        // varied `Next` against one fixed record would be asserting a mapping
+        // that no `next_step` can reach — and would have kept passing while
+        // `settle_failed` derived the allowance from the wrong field.
+        let cases: Vec<(
+            Next,
+            (FailureKind, FailureOrigin),
+            SettlementTransition,
+            bool,
+        )> = vec![
             (
                 Next::RetrySameRung { resume: false },
+                (FailureKind::GateFailed, FailureOrigin::Worker),
                 SettlementTransition::Retry,
                 true,
             ),
             (
                 Next::Escalate,
+                (FailureKind::GateFailed, FailureOrigin::Worker),
                 SettlementTransition::Escalated { rung: 1 },
                 true,
             ),
             (
+                // The one deferral: an outage. `next_step` defers precisely so
+                // that a busy pool does not burn an attempt.
                 Next::Defer,
+                (FailureKind::RateLimited, FailureOrigin::Worker),
                 SettlementTransition::Deferred {
                     // 4 recorded + this one.
                     defers: 5,
@@ -1246,14 +1304,21 @@ pub(crate) mod tests {
                 false,
             ),
             (
+                // **This cell is the defect this grid now catches.** A park
+                // from `NeedsHuman` spends nothing — "the code was never
+                // judged, so nothing is spent and nothing escalates" — and the
+                // settlement used to answer `true` here, because `AskHuman` is
+                // not `Defer` and that was the whole of its rule.
                 Next::AskHuman(QuestionKind::Unblock),
+                (FailureKind::NeedsHuman, FailureOrigin::Worker),
                 SettlementTransition::Parked {
                     question: question_for(ALEPH),
                 },
-                true,
+                false,
             ),
             (
                 Next::Fail,
+                (FailureKind::GateFailed, FailureOrigin::Worker),
                 SettlementTransition::Failed {
                     halts_run: false,
                     reason: "aleph failed its gates".to_owned(),
@@ -1262,8 +1327,9 @@ pub(crate) mod tests {
             ),
         ];
 
-        for (next, expected, spends) in cases {
+        for (next, failure, expected, spends) in cases {
             let mut request = finished(ALEPH, 0, 1, next);
+            request.record = record_failing(1, Some(0.5), Some(failure));
             request.question = Some(question_for(ALEPH));
             let settled = settle_failed(&fold, &request).expect("settles");
             assert_eq!(
@@ -1278,7 +1344,9 @@ pub(crate) mod tests {
             );
             assert_eq!(
                 settled.spent_attempt, spends,
-                "{next:?} decided the allowance wrongly: only an outage deferral spends none"
+                "{next:?} from {failure:?} decided the allowance wrongly. The rule is \
+                 `ladder::spends_allowance`'s and not this module's: an attempt spends iff \
+                 the worker ran and produced work to judge"
             );
         }
 

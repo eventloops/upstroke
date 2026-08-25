@@ -106,11 +106,7 @@ impl AttemptFailure {
     /// An environment problem rather than a verdict on the code. These defer
     /// instead of consuming an attempt (§19).
     pub fn is_outage(&self) -> bool {
-        matches!(
-            (self.kind, self.origin),
-            (FailureKind::RateLimited | FailureKind::ReviewUnavailable, _)
-                | (FailureKind::Timeout, FailureOrigin::Reviewer)
-        )
+        FailureShape::of(self).is_outage()
     }
 }
 
@@ -159,6 +155,51 @@ pub enum Next {
     Fail,
 }
 
+/// The two fields that decide what a failure *costs*.
+///
+/// **Ask for what you read.** [`spends_allowance`] and [`FailureShape::is_outage`]
+/// read exactly `kind` and `origin` — never the reason, the feedback, or
+/// anything else on the failure. Naming that lets one rule serve both shapes a
+/// failure takes in this tree: the live [`AttemptFailure`] the ladder decides
+/// from, and the [`crate::events::FailureRecord`] the durable attempt record
+/// carries.
+///
+/// That second reader is why this exists. `settle_failed` holds an
+/// `AttemptRecord`, not an `AttemptFailure`, and it was deriving the allowance
+/// itself from the ladder's `Next` — which disagreed with this function on a
+/// park, the one cell whose whole point is that nothing is spent.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FailureShape {
+    /// What went wrong.
+    pub kind: FailureKind,
+    /// Who it is attributed to.
+    pub origin: FailureOrigin,
+}
+
+impl FailureShape {
+    /// The shape of a live failure.
+    #[must_use]
+    pub const fn of(failure: &AttemptFailure) -> Self {
+        Self {
+            kind: failure.kind,
+            origin: failure.origin,
+        }
+    }
+
+    /// Whether this failure is an outage — the environment's fault rather than
+    /// the implementer's.
+    ///
+    /// The one implementation. [`AttemptFailure::is_outage`] delegates here.
+    #[must_use]
+    pub fn is_outage(self) -> bool {
+        matches!(
+            (self.kind, self.origin),
+            (FailureKind::RateLimited | FailureKind::ReviewUnavailable, _)
+                | (FailureKind::Timeout, FailureOrigin::Reviewer)
+        )
+    }
+}
+
 /// What to do after one failed attempt.
 /// Whether an attempt that ended this way spent one of its rung's
 /// `attempts_per`.
@@ -192,7 +233,7 @@ pub enum Next {
 /// legacy engine's, preserved under `invariants_preserved[1]`, and the G2 pass
 /// carries it into the packet.
 #[must_use]
-pub fn spends_allowance(failure: Option<&AttemptFailure>) -> bool {
+pub fn spends_allowance(failure: Option<FailureShape>) -> bool {
     let Some(failure) = failure else {
         // No failure: the worker ran, and its work was judged and accepted.
         return true;
@@ -355,7 +396,7 @@ mod tests {
                 failure = failure.from_reviewer();
             }
             assert_eq!(
-                spends_allowance(Some(&failure)),
+                spends_allowance(Some(FailureShape::of(&failure))),
                 spends,
                 "{kind:?} must {} the rung's allowance — {why}",
                 if spends { "spend" } else { "not spend" }
@@ -381,7 +422,7 @@ mod tests {
         };
         let rejection = AttemptFailure::new(FailureKind::ReviewFailed, "rejected");
         assert!(
-            spends_allowance(Some(&rejection)),
+            spends_allowance(Some(FailureShape::of(&rejection))),
             "a real rejection spends, which is what walks the counter up"
         );
 

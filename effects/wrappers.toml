@@ -913,6 +913,7 @@ effect_free = [
     "review_cost_usd",
     "review_models",
     "settle_interrupted",
+    "shape",
     "started_of",
     "task",
     "validate_review_identity",

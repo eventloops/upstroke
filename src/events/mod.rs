@@ -735,6 +735,21 @@ pub struct FailureRecord {
     pub reason: String,
 }
 
+impl FailureRecord {
+    /// The two fields that decide what this failure cost.
+    ///
+    /// The durable half of [`crate::ladder::FailureShape`]: a settlement holds
+    /// a record rather than the live failure, and the allowance decision is
+    /// the same decision either way.
+    #[must_use]
+    pub const fn shape(&self) -> crate::ladder::FailureShape {
+        crate::ladder::FailureShape {
+            kind: self.kind,
+            origin: self.origin,
+        }
+    }
+}
+
 /// What the next attempt is told. Carried on the ladder events rather than on
 /// the attempt record because this is the full text — a gate log tail runs to
 /// kilobytes, and `report.json` should not grow one per attempt.
