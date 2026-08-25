@@ -50,6 +50,31 @@ observed residue classified and recovered:
 `workspace_manager::tests::sampled_git_child_kills_every_residue_classified_and_recovered`
 and `engine::topology::attempt::tests::sampled_git_add_and_write_tree_child_kills_every_residue_classified_and_recovered`.
 
+### The withheld catalogue, and two cuts of it
+
+Six mutation catalogues were authored from the packet alone, before the driver existed and
+withheld from the implementer: **265 entries** in `catalogues/ALL.json`, each carrying a
+`target`, the `mutation`, its `packet_basis`, the `killing_assertion` it predicts, and the
+`named_test_survived` it expects to slip past.
+
+Two cuts of that catalogue name the driver, and **both are correct under their own
+definition**:
+
+| Cut | Definition | Entries |
+|---|---|---|
+| §17's, at its measurement time | "written against `TopologyRun`, its loop, or the production `EventEmitter`" | **93** |
+| S5's, at application time | `target` names `TopologyRun` (86) **or** begins `predicted-*`, the driver predicates authored before the driver existed (44); union | **115** |
+
+The second is a broader needle over the same catalogue, not a correction of the first.
+`predicted-*` entries were speculative when §17 counted — there was no driver to apply them
+to — and are applicable now that `TopologyRun` exists. **Application follows the
+measurement, not the historical number**, so S5 applies 115; §17's 93 stands as what it
+was.
+
+Application is part of **PR7's** evidence rather than the G2 pass's, because the driver
+they were authored against is this slice's. The pass's W8 therefore becomes
+re-measurement against the merged head rather than first application.
+
 **A caveat the gate should carry forward.** The sampler has no seed; its variance is one
 measured git duration. A mutation caught only by a sampler is not a witness, and this
 slice treated one such catch as variance and wrote a direct test instead
