@@ -971,6 +971,33 @@ impl TopologyFold {
         ))
     }
 
+    /// The generation `key` has open with no attempt started, if it has one.
+    ///
+    /// **`T-DISPATCH`'s "continue attempt (no spend repeats)", made askable.**
+    /// A run killed between `task_dispatched` and `attempt_started` leaves the
+    /// generation `OpenNoAttempt`; recovery step (g) verifies or recreates its
+    /// worktree, and then the loop is supposed to start the attempt in it.
+    ///
+    /// [`Self::ready`] cannot answer this and must not: it requires
+    /// `task.open().is_none()`, which is correct — a task with an open
+    /// generation is not *ready to be dispatched*. The continuation is a
+    /// different question about the same task, and asking it of `ready` would
+    /// make one predicate mean two things.
+    ///
+    /// A lookup over [`Self::task`]'s own state, deciding nothing: the class is
+    /// what `apply` recorded and the id is the generation's. Poisoning is not
+    /// consulted for the same reason the other statement accessors do not — a
+    /// poisoned fold of a run with an open generation still has one, and `None`
+    /// here would be a false statement rather than a refusal.
+    #[must_use]
+    pub fn open_no_attempt(&self, key: TaskKey) -> Option<GenerationId> {
+        self.task(key)?
+            .generations
+            .iter()
+            .find(|generation| generation.class == GenerationClass::OpenNoAttempt)
+            .map(|generation| generation.id)
+    }
+
     /// The region an ordinary dispatch of `key` predicts.
     ///
     /// **The tenth reader, and it exists because the alternative was a second

@@ -120,6 +120,7 @@ fn every_step_belongs_to_one_branch_or_to_none_for_a_reason() {
             Step::Dispatch {
                 key: TaskKey(0),
                 generation: GenerationId(0),
+                continuing: false,
             },
             Some(LoopBranch::ReadyDispatch),
         ),

@@ -287,6 +287,19 @@ pub enum Step {
         /// The generation this dispatch opens: dense, so the count of the
         /// task's generations so far.
         generation: GenerationId,
+        /// Whether that generation **already exists**, open with no attempt.
+        ///
+        /// `T-DISPATCH`'s resume action is "continue attempt (no spend
+        /// repeats)": a run killed between `task_dispatched` and
+        /// `attempt_started` leaves the generation `OpenNoAttempt`, recovery
+        /// step (g) verifies or recreates its worktree, and the loop starts the
+        /// attempt in it. `task_dispatched` is already durable, so the branch
+        /// reuses rather than appending a second one.
+        ///
+        /// Not a new branch: `eligibility_order` names "new ordinary dispatch",
+        /// and a continuation is not a new one. It is the same branch reaching
+        /// the same attempt over ground that already exists.
+        continuing: bool,
     },
     /// Deferred work and nothing else. Sleep the defer backoff, then append
     /// `defer_wait_elapsed`.
@@ -324,8 +337,10 @@ pub enum Admitted {
     Dispatch {
         /// The task.
         key: TaskKey,
-        /// The generation this dispatch opens.
+        /// The generation this dispatch opens, or already opened.
         generation: GenerationId,
+        /// Whether the generation already exists. See [`Step::Dispatch`].
+        continuing: bool,
     },
     /// [`Step::Backoff`].
     Backoff,
@@ -385,9 +400,10 @@ pub fn select(fold: &TopologyFold, ceiling: &Ceiling, spend: &Spend) -> Step {
             attempt,
         });
     }
-    if let Some((key, generation)) = first_ready(fold) {
+    if let Some((key, generation, continuing)) = first_ready(fold) {
         return ceiling_or(ceiling, spend, epoch, key, || Step::Dispatch {
             key,
+            continuing,
             generation,
         });
     }
@@ -434,7 +450,15 @@ pub fn checkpoint(step: Step) -> Result<Admitted, UpstrokeError> {
             generation,
             attempt,
         }),
-        Step::Dispatch { key, generation } => Ok(Admitted::Dispatch { key, generation }),
+        Step::Dispatch {
+            key,
+            generation,
+            continuing,
+        } => Ok(Admitted::Dispatch {
+            key,
+            generation,
+            continuing,
+        }),
         Step::Backoff => Ok(Admitted::Backoff),
         Step::HardBlock { questions } => Ok(Admitted::HardBlock { questions }),
         Step::Integrate { candidate } => Err(UpstrokeError::Refused {
@@ -508,8 +532,24 @@ fn first_ready_retry(fold: &TopologyFold) -> Option<(TaskKey, GenerationId, Atte
 }
 
 /// The lowest-keyed `ready` task and the generation its dispatch opens.
-fn first_ready(fold: &TopologyFold) -> Option<(TaskKey, GenerationId)> {
+fn first_ready(fold: &TopologyFold) -> Option<(TaskKey, GenerationId, bool)> {
     keys(fold).find_map(|key| {
+        // **A continuation first, and it cannot compete with a fresh dispatch.**
+        // `T-DISPATCH`'s `authoritative_state` is "generation open
+        // (OpenNoAttempt) ... entitlement derived from the open generation", so
+        // an open generation holds the run's only entitlement at
+        // `max_parallel = 1` and `ready` is false for every other task —
+        // `pipeline_reservable` sees none free. The order between the two
+        // therefore cannot arise in this build.
+        //
+        // **`eligibility_order` is silent on it**, naming only "eligible
+        // integration precedes ready_retry precedes new ordinary dispatch",
+        // and a continuation is not a *new* dispatch. Reported as a candidate
+        // erratum rather than chosen here: at a wider pipeline the two can
+        // coexist and the packet will have to say which wins.
+        if let Some(generation) = fold.open_no_attempt(key) {
+            return Some((key, generation, true));
+        }
         if !fold.ready(key) {
             return None;
         }
@@ -517,7 +557,7 @@ fn first_ready(fold: &TopologyFold) -> Option<(TaskKey, GenerationId)> {
         // count of the ones recorded.
         let task = fold.task(key)?;
         let generation = u32::try_from(task.generations.len()).ok()?;
-        Some((key, GenerationId(generation)))
+        Some((key, GenerationId(generation), false))
     })
 }
 
@@ -798,6 +838,7 @@ mod tests {
             Step::Dispatch {
                 key: ALEPH,
                 generation: GenerationId(0),
+                continuing: false,
             }
         );
     }
@@ -824,14 +865,22 @@ mod tests {
         apply(&mut narrow, &dispatch(ALEPH, 0));
         assert_eq!(narrow.pipeline_held(), 1);
         assert!(!narrow.pipeline_reservable(), "one of one");
+
+        // **The entitlement's holder is the one thing still selectable**, and
+        // that is `T-DISPATCH`'s "continue attempt (no spend repeats)": this
+        // dispatch opened a generation and started no attempt, so the loop's
+        // job is to start one in it. What the held entitlement forbids is a
+        // *second* claim on it — the queued integration above is no longer
+        // selected, which is what this test is measuring.
         assert_eq!(
             select(&narrow, &Ceiling::unlimited(), &no_spend()),
-            Step::Closure(DerivedOutcome::NotEnding),
-            "selection spent the entitlement a second time"
-        );
-        assert!(
-            checkpoint(select(&narrow, &Ceiling::unlimited(), &no_spend())).is_err(),
-            "and the closure it derives is not one this build performs"
+            Step::Dispatch {
+                key: ALEPH,
+                generation: GenerationId(0),
+                continuing: true,
+            },
+            "selection spent the entitlement a second time, or lost the \
+             generation it already opened"
         );
 
         // One slot wider, the identical state selects the integration: what
@@ -862,6 +911,7 @@ mod tests {
             Step::Dispatch {
                 key: ALEPH,
                 generation: GenerationId(1),
+                continuing: false,
             }
         );
     }
@@ -1194,10 +1244,12 @@ mod tests {
                 Step::Dispatch {
                     key: GIMEL,
                     generation: GenerationId(2),
+                    continuing: false,
                 },
                 Admitted::Dispatch {
                     key: GIMEL,
                     generation: GenerationId(2),
+                    continuing: false,
                 },
             ),
             (Step::Backoff, Admitted::Backoff),
@@ -1383,6 +1435,7 @@ mod tests {
             Step::Dispatch {
                 key: ALEPH,
                 generation: GenerationId(1),
+                continuing: false,
             }
         );
 

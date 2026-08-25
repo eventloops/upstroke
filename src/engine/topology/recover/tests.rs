@@ -5459,6 +5459,118 @@ fn the_driver_spends_the_allowance_the_log_records() {
     );
 }
 
+/// **The loop continues an attempt in a generation recovery recreated.**
+///
+/// `T-DISPATCH`'s `resume_action` in its own words: "verify the worktree at the
+/// recorded base ... or remove it with force and recreate it ... **continue
+/// attempt (no spend repeats)**".
+///
+/// Step (g) recreated those worktrees and nothing then started an attempt in
+/// them. `fold::ready` excludes the task — correctly, since a task with an open
+/// generation is not *ready to be dispatched* — and `ready_retry` wants
+/// `RetainedIdle`, so no branch could select it. The run stalled with its only
+/// pipeline entitlement held by a generation nothing could drive, and the loop
+/// fell through to a closure it refuses.
+///
+/// `fold::open_no_attempt` is the predicate that makes it selectable, and
+/// `resume_open_no_attempt` — which had no production caller — is what reuses
+/// the ground.
+#[test]
+fn the_loop_continues_an_attempt_recovery_recreated() {
+    use crate::engine::topology::run::{Progress, RunSeams, TopologyRun};
+    use crate::engine::topology::select::Ceiling;
+
+    // Killed after `task_dispatched`, before `attempt_started`.
+    let fixture = Fixture::build(
+        "continue-open",
+        Damage {
+            open_generation: true,
+            ..Damage::default()
+        },
+    );
+    let harness = harness();
+    let runtime = runtime_holding_the_record();
+    let certifies = AlwaysCertifies;
+    let given = Given::healthy(&fixture, &runtime, &certifies);
+
+    let (outcome, _) = resume_holding(&fixture, &harness, &given);
+    let (_recovered, handle) = outcome.expect("the healthy resume completes");
+
+    let mut run = TopologyRun::resumed(handle, fixture.inputs(), Ceiling::unlimited());
+    let mut hooks = HarnessTopologyHooks::new(Arc::clone(&harness));
+    let sleeper = RecordingSleeper::default();
+    let manager = fixture.manager();
+    let runner = RecordingRunner::editing();
+    let adapters = crate::engine::topology::scaffold::ScaffoldAdapters::erroring();
+    let paths = crate::rundir::RunPaths::with_private_root(
+        &fixture.repo_root,
+        &fixture.started.run_id,
+        &fixture.private_root,
+    );
+    paths.create().expect("the run directories are creatable");
+    // **Through the production assembler, not a fixture plan shape.** The
+    // condition on this extraction was that the scaffold be re-pointed at the
+    // real one or round-tripped against it; a fixture that hand-built an
+    // `AttemptPlan` here would be exactly the fifth copy the `frozen_binding`
+    // precedent warns about.
+    let plans = crate::engine::assembly::FrozenPlans {
+        adapters: &adapters,
+        paths: &paths,
+        gates: &[],
+        pools: &[],
+        caps: &[],
+        worker_timeout: std::time::Duration::from_secs(300),
+        decisions: &[],
+    };
+    let seams = RunSeams {
+        manager: &manager,
+        clock: &Frozen,
+        sleeper: &sleeper,
+        runner: &runner,
+        adapters: &adapters,
+        paths: &paths,
+        plans: &plans,
+        reviews: &crate::engine::attempt::LegacyReviewPasses,
+        input_policy: &crate::engine::attempt::LegacyReviewInputPolicy,
+        answers: &crate::interaction::UnattendedAnswers,
+        ids: &FixedIds,
+        halts_run: false,
+    };
+
+    let before = durable_kinds(&fixture);
+    assert_eq!(
+        before.iter().filter(|k| *k == "task_dispatched").count(),
+        1,
+        "the fixture must leave exactly one dispatch for the continuation to reuse"
+    );
+
+    let progress = run
+        .step(&seams, &mut hooks)
+        .expect("the loop continues the attempt rather than stalling");
+    let Progress::Settled { key, .. } = progress else {
+        panic!("the ready-dispatch branch did not continue the attempt: {progress:?}");
+    };
+    assert_eq!(key, TaskKey(0));
+
+    // **No spend repeats**, in `T-DISPATCH`'s own words: the generation was
+    // already open, so continuing it appends an attempt and never a second
+    // `task_dispatched`.
+    let after = durable_kinds(&fixture);
+    assert_eq!(
+        after.iter().filter(|k| *k == "task_dispatched").count(),
+        1,
+        "the continuation opened a fresh generation instead of continuing the \
+         one recovery recreated — `T-DISPATCH` says continue attempt, no spend \
+         repeats"
+    );
+    assert_eq!(
+        after.iter().filter(|k| *k == "attempt_started").count(),
+        1,
+        "the continuation started no attempt, so the entitlement is still held \
+         by a generation nothing can drive"
+    );
+}
+
 /// **A reviewer runs at §10's review effort, not the implementer's.**
 ///
 /// `ResolvedEffortPolicy` has four axes and `review` is one of them: the tier a

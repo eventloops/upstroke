@@ -161,6 +161,55 @@ direct question about scope and answered it as a disposition, which is now settl
 claim about the PR3 round, not about PR4's second confirmation, whose two findings —
 `PR4-CONF-003` and `PR4-CONF-004` — were both accepted and repaired in round 5.)*
 
+### 2026-08-25 — `PR7-FOLD-OPEN-NO-ATTEMPT`, per-instance Class A approval
+
+**Disclosure row for a twelfth fold reader, filed in the commit that adds it.**
+Raised by S5 round 1 as `LOOP-RECOVERED-DISPATCH-DEADLOCK`.
+
+**What changed.** `src/topology/fold.rs` gains `open_no_attempt(key) -> Option<GenerationId>`
+— a lookup over [`TopologyFold::task`]'s own state, returning the id of the generation whose
+class `apply` already recorded. It decides nothing and derives nothing.
+
+**Why a reader and not a change to `ready`.** `ready` requires `task.open().is_none()`, and
+that is **correct**: a task with an open generation is not *ready to be dispatched*. The
+continuation is a different question about the same task, and answering it inside `ready`
+would make one predicate mean two things. The predicate is fold-owned either way, which is
+why this is a reader rather than a driver-side scan of `task().generations`.
+
+**Why it could not be avoided.** `transaction_fault_matrix[T-DISPATCH].resume_action` is
+"verify the worktree at the recorded base ... or remove it with force and recreate it ...
+**continue attempt (no spend repeats)**". Recovery step (g) recreated those worktrees and
+nothing started an attempt in them: `ready` excluded the task, `ready_retry` wants
+`RetainedIdle`, and no branch could select it. The run stalled with its only pipeline
+entitlement held by a generation nothing could drive, falling through to a closure this
+build refuses. `dispatch::resume_open_no_attempt` had no production caller — the design was
+waiting for this one.
+
+**Not a new branch.** `eligibility_order` names "eligible integration precedes ready_retry
+precedes **new** ordinary dispatch", and a continuation is not a new dispatch. It is the
+ready-dispatch branch reaching the same attempt over ground that already exists, so
+`LoopBranch` is still the packet's seven.
+
+**A candidate erratum, reported rather than chosen.** `eligibility_order` is silent on where
+a continuation sits relative to `ready` and `ready_retry`. At `max_parallel = 1` the question
+cannot arise: `T-DISPATCH`'s `authoritative_state` is "entitlement derived from the open
+generation", so an open generation holds the run's only entitlement and nothing else is
+selectable — an existing test already asserts "`OpenNoAttempt` holds a pipeline entitlement".
+At a wider pipeline the two can coexist and the packet will have to say which wins.
+
+**Witnessed in both halves**, per the fold-field class above:
+`the_loop_continues_an_attempt_recovery_recreated` fails when the reader never answers
+**and** when the selector ignores it — and in both cases the failure is the deadlock itself,
+the loop falling through to a closure it refuses.
+
+**Neighbour docs checked.** The reader sits between `frozen_rung_binding` and
+`predicted_region`; both still carry their own doc blocks. That check is here because this
+file has lost a doc block to an inserted item twice.
+
+**Delegation target named.** `recover::open_no_attempt`'s class check now delegates to this
+reader; its repair refusal stays where it is, because that is recovery's policy and not the
+fold's.
+
 ### 2026-08-25 — `PR7-APPEND-REPORT-READABLE-UNDISCHARGED`, partially repaired
 
 **A guarantee I asserted that was not true as written.** The commit that moved obligation

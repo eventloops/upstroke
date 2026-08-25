@@ -2522,10 +2522,12 @@ fn open_no_attempt(fold: &TopologyFold) -> Result<Vec<OpenGeneration>, UpstrokeE
     let mut found = Vec::new();
     for key in task_keys(fold) {
         let Some(task) = fold.task(key) else { continue };
-        for generation in &task.generations {
-            if !matches!(generation.class, GenerationClass::OpenNoAttempt) {
-                continue;
-            }
+        // The class question is the fold's, through `open_no_attempt`. The
+        // repair refusal below is recovery's own policy and stays here.
+        let Some(open) = fold.open_no_attempt(key) else {
+            continue;
+        };
+        for generation in task.generations.iter().filter(|held| held.id == open) {
             if let GenerationLease::InheritedLineage { root } = generation.lease {
                 return Err(UpstrokeError::Refused {
                     message: format!(

@@ -60,7 +60,8 @@ use super::candidate::{
     create_candidates_ref, pin_candidate, reclaim_after_creation, write_candidate_commit,
 };
 use super::dispatch::{
-    DispatchKind, DispatchRequest, Dispatched, EventEmitter, dispatch, task_slot,
+    DispatchKind, DispatchRequest, Dispatched, EventEmitter, OpenGeneration, dispatch,
+    resume_open_no_attempt, task_slot,
 };
 use super::emit::{EmitFailure, EmitState, RunIdentity, emit};
 use super::identity::{InvocationLedger, ReservationKind, Reservations, SlotAssertion};
@@ -692,8 +693,16 @@ impl TopologyRun {
             Admitted::Retry {
                 key, generation, ..
             } => self.retry_ready(key, generation, seams, hooks),
-            Admitted::Dispatch { key, generation } => {
-                let dispatched = self.dispatch_ready(key, generation, seams, hooks)?;
+            Admitted::Dispatch {
+                key,
+                generation,
+                continuing,
+            } => {
+                let dispatched = if continuing {
+                    self.continue_open(key, generation, seams, hooks)?
+                } else {
+                    self.dispatch_ready(key, generation, seams, hooks)?
+                };
                 let (plan, capture, assessed, judgement) = self.attempt(
                     dispatched.site(),
                     RunAs {
@@ -866,6 +875,67 @@ impl TopologyRun {
             affected_tasks: vec![crate::ir::TaskId(self.display_id(frozen.key)?)],
             context: frozen.context.clone(),
             options: frozen.options.clone(),
+        })
+    }
+
+    /// **`T-DISPATCH`'s "continue attempt (no spend repeats)".**
+    ///
+    /// A run killed between `task_dispatched` and `attempt_started` leaves the
+    /// generation `OpenNoAttempt`. Its `task_dispatched` is already durable and
+    /// the fold refuses a second, so this reuses the ground instead of opening
+    /// it: `Worktree.Verify` at the recorded base, or a forced recreate, and
+    /// then the same attempt the fresh path runs. No spend repeats because
+    /// nothing was spent — no attempt started.
+    ///
+    /// `resume_open_no_attempt` is what performs it, and this is the caller the
+    /// design was waiting for: recovery step (g) recreated these worktrees and
+    /// nothing then started an attempt in them, so the run stalled with the
+    /// pipeline entitlement held by a generation no branch could select.
+    fn continue_open(
+        &mut self,
+        key: TaskKey,
+        generation: GenerationId,
+        seams: &RunSeams<'_>,
+        hooks: &mut dyn TopologyHooks,
+    ) -> Result<Dispatched, UpstrokeError> {
+        let base = self
+            .handle
+            .fold
+            .task(key)
+            .and_then(|task| task.generations.iter().find(|held| held.id == generation))
+            .map(|held| held.base_sha.clone())
+            .ok_or_else(|| UpstrokeError::Refused {
+                message: format!(
+                    "task {} has no generation {} to continue",
+                    key.index(),
+                    generation.0
+                ),
+            })?;
+        let slot = task_slot(key, generation);
+        let open = OpenGeneration {
+            key,
+            generation,
+            base: base.clone(),
+            slot: slot.clone(),
+            // Repairs are PR9's; a repair generation is refused by recovery
+            // before the loop ever sees one.
+            source: None,
+        };
+        resume_open_no_attempt(seams.manager, hooks, &open)?;
+        self.deferral.progressed();
+        Ok(Dispatched {
+            key,
+            generation,
+            base,
+            worktree: seams.manager.slot_path(&slot),
+            slot,
+            kind: DispatchKind::Ordinary {
+                paths: self.handle.fold.predicted_region(key).ok_or_else(|| {
+                    UpstrokeError::Refused {
+                        message: format!("task {} has no predicted region", key.index()),
+                    }
+                })?,
+            },
         })
     }
 
