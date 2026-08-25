@@ -1887,6 +1887,55 @@ mod tests {
         );
     }
 
+    /// **An attempt's ledger line is constructed in one production place.**
+    ///
+    /// The fourth one-production-place census, and the one whose subject is
+    /// read back out. `AttemptRecord.failure` is what `ladder::next_step`
+    /// decides from and what `ladder::spends_allowance` prices, so two
+    /// constructions are two answers to "what happened to this attempt" — and
+    /// the settlement, the escalation and the allowance would each be reading
+    /// whichever one their caller happened to build.
+    ///
+    /// The column counts `AttemptRecord {` struct literals in production code,
+    /// anchored to a line of its own for the reason the profile census is:
+    /// a return type and the definition contain the same text.
+    #[test]
+    fn an_attempts_ledger_line_is_constructed_in_one_production_place() {
+        use std::collections::BTreeMap;
+
+        /// (file, `AttemptRecord {` literals, why).
+        const EXPECTED: &[(&str, usize, &str)] = &[(
+            "src/engine/classify.rs",
+            1,
+            "`attempt_record`. It was inline in `coordinator.rs`'s settlement, \
+             out of the schema-4 driver's reach, and it lives beside the \
+             failure classification rather than beside the command assembler \
+             because its last field IS a classification",
+        )];
+
+        let mut found: BTreeMap<String, usize> = BTreeMap::new();
+        for (path, code) in production_sources() {
+            let records = code
+                .lines()
+                .filter(|line| line.trim() == "AttemptRecord {")
+                .count();
+            if records > 0 {
+                found.insert(path, records);
+            }
+        }
+
+        let expected: BTreeMap<String, usize> = EXPECTED
+            .iter()
+            .map(|(path, n, _)| ((*path).to_owned(), *n))
+            .collect();
+        assert_eq!(
+            found, expected,
+            "a production site decides what one attempt's durable line says. \
+             Two sites is two answers to what happened, and the ladder reads \
+             the answer back"
+        );
+    }
+
     /// **An invocation's profile is constructed in one production place per
     /// role.**
     ///

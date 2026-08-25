@@ -30,7 +30,7 @@
 //! their result means is shared — the same split `ShellGate::command` makes
 //! for a gate's command.
 
-use crate::events::{ReviewPassOutcome, ReviewRecord};
+use crate::events::{AttemptRecord, FailureRecord, ReviewPassOutcome, ReviewRecord};
 use crate::gates::{self, GateFailure};
 use crate::ir::TaskKind;
 use crate::ladder::{AttemptFailure, FailureKind};
@@ -148,5 +148,59 @@ impl ReviewPassFacts<'_> {
                 (false, true) => ReviewPassOutcome::Failed,
             },
         }
+    }
+}
+
+/// The routing and product facts one attempt's ledger line is built from.
+///
+/// **Ask for what you read.** [`attempt_record`] reads exactly these; it never
+/// sees a task, a plan or a run. Naming them lets one construction serve the
+/// legacy coordinator, which holds a `Rung` and an `Outcome`, and the schema-4
+/// driver, which holds a `RungBinding` and an `Assessment`.
+pub(crate) struct AttemptFacts<'a> {
+    /// Which rung's tier the work ran at.
+    pub(crate) tier: crate::ir::Tier,
+    /// The model that ran it. Required, not optional — `AttemptRecord` has no
+    /// shape for "some model".
+    pub(crate) model: &'a str,
+    /// Which subscription pays for it, where one is named.
+    pub(crate) pool: Option<String>,
+    /// Whether this attempt resumed the previous one's session.
+    pub(crate) resumed: bool,
+    /// The adapter's parse of what the worker said about itself.
+    pub(crate) outcome: &'a crate::ir::Outcome,
+    /// What the reviewers said. Empty means **nothing reviewed**, which is a
+    /// different claim from "reviewed and passed", and the record keeps the
+    /// difference.
+    pub(crate) reviews: &'a [crate::events::ReviewRecord],
+    /// Why the attempt failed, if it did.
+    pub(crate) failure: Option<&'a AttemptFailure>,
+}
+
+/// One attempt's durable ledger line.
+///
+/// The one production construction of an [`AttemptRecord`]. It was inline in
+/// `coordinator.rs`'s settlement, where the schema-4 driver could not reach it,
+/// and it belongs here rather than beside the command assembler because its
+/// last field is a classification: `failure` is what this module exists to
+/// decide, and `ladder::next_step` and `ladder::spends_allowance` both read the
+/// answer back out of the record.
+pub(crate) fn attempt_record(attempt: u32, facts: AttemptFacts<'_>) -> AttemptRecord {
+    AttemptRecord {
+        attempt,
+        tier: facts.tier.to_string(),
+        model: facts.model.to_owned(),
+        pool: facts.pool,
+        resumed: facts.resumed,
+        duration: facts.outcome.duration,
+        cost_usd: facts.outcome.cost_usd,
+        reviews: facts.reviews.to_vec(),
+        session_id: facts.outcome.session_id.clone(),
+        usage: facts.outcome.usage.clone(),
+        failure: facts.failure.map(|failure| FailureRecord {
+            kind: failure.kind,
+            origin: failure.origin,
+            reason: failure.reason.clone(),
+        }),
     }
 }

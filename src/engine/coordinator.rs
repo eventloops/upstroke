@@ -12,9 +12,7 @@ use crate::agent::{AdapterSource, Caps};
 use crate::capacity;
 use crate::config::{self, OnTaskFailure};
 use crate::error::UpstrokeError;
-use crate::events::{
-    self, AttemptRecord, EventBody, EventLog, FailureRecord, Progress, RunState, TaskState,
-};
+use crate::events::{self, EventBody, EventLog, Progress, RunState, TaskState};
 use crate::interaction::{self, AnswerSource, Notifier, QuestionRecord, RealSleeper, Sleeper};
 use crate::ir::{
     Answer, Question, QuestionId, QuestionKind, ResolvedEffortPolicy, Task, WorkerProfile,
@@ -840,23 +838,18 @@ impl Run<'_> {
                 parking,
                 transition,
                 prepared_commit: prepared_commit.clone().map(Box::new),
-                data: Box::new(AttemptRecord {
+                data: Box::new(super::classify::attempt_record(
                     attempt,
-                    tier: rung.tier.to_string(),
-                    model: profile.model.clone(),
-                    pool: pool_option(&profile.pool),
-                    resumed: resume.is_some(),
-                    duration: result.outcome.duration,
-                    cost_usd: result.outcome.cost_usd,
-                    reviews: result.reviews.clone(),
-                    session_id: result.outcome.session_id.clone(),
-                    usage: result.outcome.usage.clone(),
-                    failure: result.failure.as_ref().map(|f| FailureRecord {
-                        kind: f.kind,
-                        origin: f.origin,
-                        reason: f.reason.clone(),
-                    }),
-                }),
+                    super::classify::AttemptFacts {
+                        tier: rung.tier,
+                        model: &profile.model,
+                        pool: pool_option(&profile.pool),
+                        resumed: resume.is_some(),
+                        outcome: &result.outcome,
+                        reviews: &result.reviews,
+                        failure: result.failure.as_ref(),
+                    },
+                )),
             });
             if let Err(error) = settlement {
                 // A write/flush/sync error cannot prove whether the newline-
