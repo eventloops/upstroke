@@ -4343,7 +4343,7 @@ fn the_recovery_order_hands_the_run_on_rather_than_dropping_it() {
 /// nothing outside `select.rs` so much as matched on a `Step`.
 #[test]
 fn the_driver_takes_over_from_the_recovery_order_and_steps() {
-    use crate::engine::topology::run::{RunSeams, TopologyRun};
+    use crate::engine::topology::run::{Progress, RunSeams, TopologyRun};
     use crate::engine::topology::select::Ceiling;
 
     let fixture = Fixture::healthy("driver-steps");
@@ -4359,41 +4359,81 @@ fn the_driver_takes_over_from_the_recovery_order_and_steps() {
     let mut hooks = HarnessTopologyHooks::new(Arc::clone(&harness));
     let sleeper = RecordingSleeper::default();
     let manager = fixture.manager();
+    let runner = RecordingRunner::default();
+    let adapters = crate::engine::topology::scaffold::ScaffoldAdapters::new();
+    let paths = crate::rundir::RunPaths::with_private_root(
+        &fixture.repo_root,
+        &fixture.started.run_id,
+        &fixture.private_root,
+    );
+    paths.create().expect("the run directories are creatable");
+    // **Through the production assembler, not a fixture plan shape.** The
+    // condition on this extraction was that the scaffold be re-pointed at the
+    // real one or round-tripped against it; a fixture that hand-built an
+    // `AttemptPlan` here would be exactly the fifth copy the `frozen_binding`
+    // precedent warns about.
+    let plans = crate::engine::assembly::FrozenPlans {
+        adapters: &adapters,
+        paths: &paths,
+        gates: &[],
+        pools: &[],
+        caps: &[],
+        worker_timeout: std::time::Duration::from_secs(300),
+        decisions: &[],
+    };
     let seams = RunSeams {
         manager: &manager,
         clock: &Frozen,
         sleeper: &sleeper,
+        runner: &runner,
+        adapters: &adapters,
+        paths: &paths,
+        plans: &plans,
+        reviews: &crate::engine::attempt::LegacyReviewPasses,
     };
 
     let kinds_before = durable_kinds(&fixture);
-    let refusal = run
+    let progress = run
         .step(&seams, &mut hooks)
-        .expect_err("this build performs three of the branch's four clauses");
-    let text = refusal.to_string();
+        .expect("the branch performs its first four clauses");
 
-    // Named exactly, not with an `||`. A hedge here would pass whichever
-    // branch the fixture happened to reach, and a fixture that silently
-    // started reaching a different one would take the assertion with it.
+    // **The driver ran an attempt.** Named exactly, not with a `matches!` that
+    // would pass whichever branch the fixture happened to reach — a fixture
+    // that silently started reaching a different one would take the assertion
+    // with it.
+    let Progress::Judged { key, accepted } = progress else {
+        panic!("the ready-dispatch branch did not run an attempt: {progress:?}");
+    };
+    assert_eq!(key, TaskKey(0));
     assert!(
-        text.contains("performed ceiling check, provisional dispatch reservation, dispatch"),
-        "the refusal names what the branch DID: {text}"
-    );
-    assert!(
-        text.contains("does not run one attempt through the Runner and settle"),
-        "and what it did not, in the branch's own words: {text}"
+        accepted,
+        "the fixture configures no gates and no reviewers, so nothing can \
+         reject: an unaccepted judgement here means something failed that the \
+         plan never asked for"
     );
 
-    // The dispatch is real and durable. This is the driver's first production
-    // append, and the state it leaves is `OpenNoAttempt` — which is TABLED,
-    // not stuck: recovery step (g) recreates its worktree at its base.
+    // The dispatch AND the attempt are real and durable, in that order. Both
+    // went through the production emitter, which is what makes them subject to
+    // the append-error protocol; the scaffold's emitter re-implements the
+    // append and runs none of it.
     assert_eq!(
         durable_kinds(&fixture),
         {
             let mut expected = kinds_before.clone();
             expected.push("task_dispatched".to_owned());
+            expected.push("attempt_started".to_owned());
             expected
         },
-        "exactly one event, and it is the dispatch"
+        "the dispatch, then the attempt. What is NOT here is the settlement, \
+         which is the clause this build still owes"
+    );
+
+    // **The worker ran through the Runner**, which is what makes this the
+    // fourth clause rather than a plan that was built and dropped. The whole
+    // point of the driver is that something calls the machinery.
+    assert!(
+        !runner.requests().is_empty(),
+        "the attempt appended `attempt_started` and never spawned anything"
     );
 
     // **The recorded region is the fold's, not a second derivation.**

@@ -2390,6 +2390,54 @@ impl WorkspaceManager {
         Ok(decode_changed_paths(&output))
     }
 
+    /// The diff of a captured candidate tree against the commit it is judged
+    /// against.
+    ///
+    /// **A read, so it takes no hooks and names no effect site.** It creates no
+    /// object, moves no ref and touches no worktree — the same reason
+    /// [`Self::changed_paths`] is not a funnel. The frozen `ObjectSite` enum
+    /// has no diff variant, and it should not: every variant there documents
+    /// "the row that references the created object immediately after the
+    /// effect", and a diff creates nothing to reference.
+    ///
+    /// The flags come from [`crate::workspace::REVIEW_DIFF_FLAGS`], shared with
+    /// the schema-3 capture, because both produce the text a reviewer judges
+    /// and `classify::diff_failure` reads. Two flag lists would be two
+    /// definitions of what a reviewable diff is.
+    ///
+    /// Run from the task worktree so the object names resolve in the repository
+    /// that holds them.
+    ///
+    /// # Errors
+    ///
+    /// The containment refusals, a Git error, or a diff whose bytes are not
+    /// UTF-8 — which is not a diff any reviewer can be shown.
+    pub fn candidate_diff(
+        &self,
+        slot: &Slot,
+        parent: &str,
+        tree: &str,
+    ) -> Result<String, UpstrokeError> {
+        self.revalidate()?;
+        let path = self.slot_target(slot)?;
+        let mut argv: Vec<OsString> = crate::workspace::REVIEW_DIFF_FLAGS
+            .iter()
+            .map(OsString::from)
+            .collect();
+        argv.extend([
+            OsString::from(parent),
+            OsString::from(tree),
+            OsString::from("--"),
+        ]);
+        let output = self.git_ok(&path, &argv)?;
+        String::from_utf8(output).map_err(|_| UpstrokeError::Git {
+            message: format!(
+                "the diff of {tree} against {parent} is not valid UTF-8; a reviewer cannot be \
+                 shown it and a gate would not agree with what it says"
+            ),
+        })
+    }
+
     // -----------------------------------------------------------------------
     // Git plumbing
     // -----------------------------------------------------------------------
@@ -5033,6 +5081,10 @@ mod tests {
             (
                 "changed_paths",
                 Box::new(|slot| manager.changed_paths(slot, &head).map(drop)),
+            ),
+            (
+                "candidate_diff",
+                Box::new(|slot| manager.candidate_diff(slot, &head, &head).map(drop)),
             ),
         ];
 

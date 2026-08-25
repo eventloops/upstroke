@@ -32,14 +32,18 @@
 //! below the engine — depend upward on the engine.
 
 use std::path::Path;
+use std::time::Duration;
 
-use crate::agent::{AgentAdapter, TaskRun};
+use crate::agent::{AdapterSource, AgentAdapter, TaskRun};
 use crate::error::UpstrokeError;
 use crate::ir::{Effort, PermissionMode, Task, Tier, WorkerProfile};
 use crate::rundir::RunPaths;
-use crate::runner::CommandSpec;
+use crate::runner::{AgentId, CommandSpec};
 
-use super::attempt::{RetryBrief, materialize_prompt};
+use super::attempt::{RetryBrief, materialize_prompt, pool_option};
+use super::topology::attempt::{
+    AttemptPlan, AttemptPlans, GatePlan, InputsRequest, PlanRequest, ReviewInputs, ReviewerPlan,
+};
 
 /// What the worker's prompt reads about the task.
 ///
@@ -81,6 +85,21 @@ impl<'a> WorkerSubject<'a> {
             artifacts_out: &task.artifacts_out,
         }
     }
+
+    /// The subject of a frozen registry entry, which is what the schema-4
+    /// driver holds. Deliberately a second constructor rather than a
+    /// projection: `TaskEntry::to_task` exists, but building a whole `Task` to
+    /// read five `&str` out of it allocates the other ten fields to throw them
+    /// away.
+    pub(crate) fn of_frozen(spec: &'a crate::topology::registry::FrozenTaskSpec) -> Self {
+        Self {
+            title: &spec.title,
+            body: &spec.body,
+            acceptance: &spec.acceptance,
+            artifacts_in: &spec.artifacts_in,
+            artifacts_out: &spec.artifacts_out,
+        }
+    }
 }
 
 /// Everything one worker invocation's command is derived from.
@@ -101,7 +120,7 @@ pub(crate) struct WorkerAssembly<'a> {
     /// quotes and the permissions file allows.
     pub(crate) gate_cmds: &'a [String],
     /// The run's directories: where the settings file and the artifacts go.
-    pub(crate) paths: &'a RunPaths,
+    pub paths: &'a RunPaths,
     /// The per-task file stem, and the attempt number. Together they name the
     /// settings file, so two attempts of one task never share one.
     pub(crate) stem: &'a str,
@@ -190,6 +209,17 @@ impl<'a> ImplementerBinding<'a> {
             effort,
         }
     }
+
+    /// A frozen rung's binding, which already carries the effort its run
+    /// resolved — the schema-4 driver never re-reads the policy.
+    pub(crate) fn of_frozen(binding: &'a crate::topology::events::RungBinding) -> Self {
+        Self {
+            tier: binding.tier,
+            agent: &binding.agent,
+            model: &binding.model,
+            effort: binding.effort,
+        }
+    }
 }
 
 /// The profile one implementation attempt runs under.
@@ -219,5 +249,155 @@ pub(crate) fn implementer_profile(
         effort: Some(binding.effort),
         max_turns: None,
         extra_args: Vec::new(),
+    }
+}
+
+/// The frozen registry's answer to [`AttemptPlans`], and the run's config
+/// beside it.
+///
+/// **`pub`, and waiting for its production caller like everything else in the
+/// schema-4 path.** `decisions.pr_sequence[8].production_effect` is "none
+/// (TopologyPreview selector only)": `upstroke run` still drives the legacy
+/// coordinator, so the only thing that builds a `RunSeams` today is a test.
+/// PR12 activates the path and this is what it will construct.
+///
+/// Everything here is run-scoped: the gate set, the worker allowance, the pool
+/// table, the CLI versions pre-flight probed. Nothing is per-attempt — that
+/// arrives in the [`PlanRequest`], which is what makes one of these serve a
+/// whole run.
+pub struct FrozenPlans<'a> {
+    /// Where an agent name becomes an adapter.
+    pub adapters: &'a dyn AdapterSource,
+    /// The run's directories — where permissions and artifacts live.
+    pub paths: &'a RunPaths,
+    /// The gate set, in the order the config wrote it.
+    pub gates: &'a [crate::gates::ShellGate],
+    /// The pool table §13 attributes spend against.
+    pub pools: &'a [crate::capacity::Pool],
+    /// What pre-flight certified each agent's CLI as.
+    pub caps: &'a [(String, crate::agent::Caps)],
+    /// How long one worker invocation may take.
+    pub worker_timeout: Duration,
+    /// The operator decisions a judge must honour, as the worker was given
+    /// them.
+    pub decisions: &'a [String],
+}
+
+impl FrozenPlans<'_> {
+    /// What pre-flight certified this agent's CLI as, where it certified one.
+    fn cli_version(&self, agent: &str) -> Option<String> {
+        self.caps
+            .iter()
+            .find(|(name, _)| name == agent)
+            .map(|(_, caps)| caps.version.clone())
+    }
+}
+
+impl AttemptPlans for FrozenPlans<'_> {
+    fn inputs(&self, request: &InputsRequest<'_>) -> Result<ReviewInputs, UpstrokeError> {
+        let entry = request.entry;
+        Ok(ReviewInputs {
+            title: entry.spec.title.clone(),
+            body: entry.spec.body.clone(),
+            acceptance: entry.spec.acceptance.clone(),
+            diff: request.diff.clone(),
+            // Through the one production resolver, which reads the same two
+            // artifact lists the worker's prompt wired to real files.
+            artifacts: super::attempt::load_artifacts(
+                &self.paths.artifacts(),
+                WorkerSubject::of_frozen(&entry.spec),
+            ),
+            decisions: self.decisions.to_vec(),
+            stem: entry.display_id.as_str().to_owned(),
+        })
+    }
+
+    fn plan(&self, request: &PlanRequest<'_>) -> Result<AttemptPlan, UpstrokeError> {
+        let entry = request.entry;
+        let profile = implementer_profile(
+            ImplementerBinding::of_frozen(&request.binding),
+            crate::capacity::pool_for(&request.binding.agent, self.pools)
+                .map(|pool| pool.name.clone()),
+        );
+        let adapter = self
+            .adapters
+            .get(&profile.agent)
+            .ok_or_else(|| UpstrokeError::Agent {
+                message: format!("no adapter registered for agent `{}`", profile.agent),
+            })?;
+
+        // The cmdlines, not the specs: this is what the worker's prompt quotes
+        // as the bar it has to clear, and it is the same list the gate plans
+        // below turn into commands.
+        let gate_cmds: Vec<String> = self.gates.iter().map(|gate| gate.cmd.clone()).collect();
+
+        let worker = WorkerAssembly {
+            adapter,
+            profile: &profile,
+            task: WorkerSubject::of_frozen(&entry.spec),
+            gate_cmds: &gate_cmds,
+            paths: self.paths,
+            stem: entry.display_id.as_str(),
+            attempt: request.attempt.0,
+            // A retry brief is the previous attempt's feedback, and the branch
+            // that carries one is `ReadyRetry`. A first dispatch has none.
+            retry: None,
+            workspace: request.workspace,
+            resume_session: request.resume_session.as_ref().map(|id| id.0.clone()),
+        }
+        .command()?;
+
+        // Through `ShellGate::command`, the one production place a gate's
+        // cmdline becomes a spec.
+        let gates = self
+            .gates
+            .iter()
+            .map(|gate| {
+                let (command, timeout) = gate.command();
+                GatePlan { command, timeout }
+            })
+            .collect();
+
+        let implementer =
+            crate::review::PassBinding::new(&request.binding.agent, &request.binding.model);
+        let pass_timeout = Duration::from_secs(entry.reviews.pass_timeout_secs);
+        let reviewers = if entry.reviews.enabled {
+            crate::review::passes_for(
+                crate::review::ReviewBindings {
+                    primary: entry.reviews.primary.as_ref(),
+                    alternative: entry.reviews.alternative.as_ref(),
+                    second_opinion: entry.reviews.second_opinion.as_ref(),
+                },
+                &implementer,
+            )
+            .into_iter()
+            .map(|pass| ReviewerPlan {
+                agent: AgentId::new(&pass.binding.agent),
+                preflight_cli_version: self.cli_version(&pass.binding.agent),
+                // The reviewer's effort, not the implementer's: §10's policy
+                // gives review its own axis, and the binding on the plan is
+                // the rung the *work* ran at.
+                profile: pass.profile(request.binding.effort),
+                lens: pass.lens,
+                timeout: pass_timeout,
+            })
+            .collect()
+        } else {
+            Vec::new()
+        };
+
+        Ok(AttemptPlan {
+            attempt: request.attempt,
+            rung: request.rung,
+            binding: request.binding.clone(),
+            pool: pool_option(&profile.pool),
+            resume_session: request.resume_session.clone(),
+            materialization_observed: request.materialization_observed,
+            agent: AgentId::new(&profile.agent),
+            worker,
+            worker_timeout: self.worker_timeout,
+            gates,
+            reviewers,
+        })
     }
 }

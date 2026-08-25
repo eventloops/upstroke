@@ -245,7 +245,10 @@ pub(super) fn run_attempt(
     // and costs another frontier invocation to learn it.
     let mut reviews = Vec::new();
     if failure.is_none() && !cx.reviewers.is_empty() {
-        let artifacts = load_artifacts(&cx.paths.artifacts(), cx.task);
+        let artifacts = load_artifacts(
+            &cx.paths.artifacts(),
+            super::assembly::WorkerSubject::of(cx.task),
+        );
         // Like gates, reviewers may inspect repository context beyond the
         // supplied diff. Give them the exact staged candidate, never ignored
         // worker inputs or residue from the authoritative workspace.
@@ -428,7 +431,10 @@ pub(super) fn review_failure(result: review::ReviewResult) -> Option<AttemptFail
 /// Artifacts this task should be judged against: its declared inputs, plus
 /// the conventions brief whenever one exists (§11.2 injects it into every
 /// downstream prompt).
-fn load_artifacts(artifacts_dir: &Path, task: &Task) -> Vec<(String, String)> {
+pub(super) fn load_artifacts(
+    artifacts_dir: &Path,
+    task: super::assembly::WorkerSubject<'_>,
+) -> Vec<(String, String)> {
     let mut wanted: Vec<String> = vec![CONVENTIONS_BRIEF.to_owned()];
     wanted.extend(task.artifacts_in.iter().map(|id| id.as_str().to_owned()));
     // A task's own outputs are not evidence for judging it: the reviewer

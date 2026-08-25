@@ -66,6 +66,7 @@ effect_free = [
     "assert_publishable",
     "at",
     "base",
+    "candidate_diff",
     "changed_paths",
     "classify_object_residue",
     "common_git_dir",

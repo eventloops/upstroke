@@ -36,6 +36,7 @@
 //! whole difference between debt and an omission.
 
 use crate::error::UpstrokeError;
+use crate::review;
 use crate::topology::events::TopologyEventBody;
 
 use crate::interaction::Sleeper;
@@ -44,9 +45,12 @@ use crate::topology::fold::{FrozenInputs, TopologyFold};
 use crate::topology::registry::TaskKey;
 use crate::workspace_manager::WorkspaceManager;
 
+use super::attempt::{
+    AttemptContext, AttemptPlans, InputsRequest, Judgement, PlanRequest, ReviewPasses,
+};
 use super::dispatch::{DispatchKind, DispatchRequest, Dispatched, EventEmitter, dispatch};
 use super::emit::{EmitFailure, EmitState, RunIdentity, emit};
-use super::identity::{InvocationLedger, ReservationKind, Reservations};
+use super::identity::{InvocationLedger, ReservationKind, Reservations, SlotAssertion};
 use super::recover::RunHandle;
 use super::seams::{TimeSource, TopologyHooks};
 use super::select::{Admitted, Ceiling, Spend, Step, checkpoint, select};
@@ -222,8 +226,9 @@ impl LoopBranch {
             // and `close_at_run_end` closes it. Stopping here leaves the run in
             // a shape the system already knows how to recover.
             Self::ReadyDispatch => Disposition::PartlyImplemented {
-                performs: "ceiling check, provisional dispatch reservation, dispatch",
-                owes: "run one attempt through the Runner and settle",
+                performs: "ceiling check, provisional dispatch reservation, dispatch, run one \
+                           attempt through the Runner",
+                owes: "settle",
             },
             Self::IngestAnswers | Self::ReadyRetry | Self::HardBlock => {
                 Disposition::NotYetImplemented
@@ -301,6 +306,19 @@ pub struct RunSeams<'a> {
     pub clock: &'a dyn TimeSource,
     /// What the defer backoff sleeps on.
     pub sleeper: &'a dyn Sleeper,
+    /// The boundary every process of this run crosses.
+    pub runner: &'a dyn crate::runner::Runner,
+    /// Where an agent name becomes an adapter.
+    pub adapters: &'a dyn crate::agent::AdapterSource,
+    /// The run's directories.
+    pub paths: &'a crate::rundir::RunPaths,
+    /// Where an attempt's plan and its review inputs are assembled. A seam
+    /// because building the worker's command materializes the permissions file
+    /// that defines the sandbox, and because a plan needs the run's config —
+    /// neither of which is in the log the fold replays.
+    pub plans: &'a dyn AttemptPlans,
+    /// Where a review pass is executed. `review::run_review`, behind its seam.
+    pub reviews: &'a dyn ReviewPasses,
 }
 
 /// What one iteration of the loop did.
@@ -311,6 +329,21 @@ pub struct RunSeams<'a> {
 /// one that is spinning.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Progress {
+    /// One attempt ran and was judged, and the judgement is **not yet
+    /// durable**.
+    ///
+    /// The branch reads "dispatch, run one attempt through the Runner and
+    /// settle", and the settle write is the clause this build still owes. What
+    /// exists up to here is `attempt_started`, the worker, the capture, the
+    /// gates and the reviewers — everything the settlement will record, and
+    /// nothing that records it. A generation left in this shape is
+    /// `OpenWithAttempt`, which recovery already knows how to close.
+    Judged {
+        /// Whose attempt.
+        key: TaskKey,
+        /// Whether every gate and reviewer passed.
+        accepted: bool,
+    },
     /// The defer backoff elapsed and `defer_wait_elapsed` is durable.
     Waited {
         /// How long this round slept.
@@ -348,6 +381,7 @@ pub struct TopologyRun {
     ceiling: Ceiling,
     spend: Spend,
     deferral: Deferral,
+    slots: SlotAssertion,
 }
 
 impl TopologyRun {
@@ -373,6 +407,7 @@ impl TopologyRun {
             ceiling,
             spend: Spend::new(),
             deferral: Deferral::default_backoff(),
+            slots: SlotAssertion::new(),
         }
     }
 
@@ -454,8 +489,12 @@ impl TopologyRun {
             }
             Admitted::Retry { .. } => Err(LoopBranch::ReadyRetry.unimplemented()),
             Admitted::Dispatch { key, generation } => {
-                self.dispatch_ready(key, generation, seams, hooks)?;
-                Err(LoopBranch::ReadyDispatch.unimplemented())
+                let dispatched = self.dispatch_ready(key, generation, seams, hooks)?;
+                let judgement = self.attempt(&dispatched, seams, hooks)?;
+                Ok(Progress::Judged {
+                    key,
+                    accepted: judgement.accepted(),
+                })
             }
             Admitted::HardBlock { .. } => Err(LoopBranch::HardBlock.unimplemented()),
         }
@@ -523,6 +562,127 @@ impl TopologyRun {
                 Err(error.discharging(&mut self.invocations))
             }
         }
+    }
+
+    /// The fourth clause of the ready-dispatch branch: **run one attempt
+    /// through the Runner.**
+    ///
+    /// `attempt_started`, the worker, the exact-tree capture, the gate set on
+    /// one shared snapshot, and each reviewer on a fresh one — in that order,
+    /// which is [`AttemptContext`]'s, not a second one. This function's whole
+    /// job is to assemble what that machinery reads and to hand it the seams
+    /// its effects go through, and it is what makes the driver
+    /// `review::run_review`'s **second production caller**.
+    ///
+    /// **The settle write is not here**, and the branch's `owes` says so. What
+    /// comes back is a [`Judgement`] no event records yet.
+    ///
+    /// # Attempt 1, rung 0, and why neither is read from the fold
+    ///
+    /// They are properties of *this branch*, not facts to look up. `select`
+    /// reaches `Admitted::Dispatch` for a task that is **ready** — no open
+    /// generation — and `dispatch` opens one, so the generation has had no
+    /// attempts and the ladder has not escalated. A second attempt and a
+    /// higher rung both come from `ReadyRetry`, which is
+    /// [`Disposition::NotYetImplemented`] here. Deriving them from the fold
+    /// would need a reader for the open generation that does not exist, and
+    /// inventing one would be the fold and the log holding two answers — the
+    /// shape that produced this slice's `predicted_region` defect.
+    /// The ladder index a fresh generation's first attempt binds to.
+    const FIRST_RUNG: u32 = 0;
+
+    /// The attempt number a fresh generation's first attempt carries.
+    const FIRST_ATTEMPT: crate::topology::events::AttemptNumber =
+        crate::topology::events::AttemptNumber(1);
+
+    fn attempt(
+        &mut self,
+        dispatched: &Dispatched,
+        seams: &RunSeams<'_>,
+        hooks: &mut dyn TopologyHooks,
+    ) -> Result<Judgement, UpstrokeError> {
+        let key = dispatched.key;
+        let binding = self
+            .handle
+            .fold
+            .frozen_rung_binding(key, Self::FIRST_RUNG)
+            .ok_or_else(|| UpstrokeError::Refused {
+                message: format!(
+                    "task {} has no rung {} in its frozen ladder, so there is no binding to \
+                     run it under",
+                    key.index(),
+                    Self::FIRST_RUNG
+                ),
+            })?;
+
+        // **Cloned once, before the emitter takes the fold.** The plan is built
+        // before the worker runs and the review inputs after it, and the
+        // emitter holds `&mut fold` across both — so a reference taken here
+        // would not survive to the second read. One registry entry is a few
+        // strings; the alternative is the driver copying the five fields
+        // `inputs` reads, which is assembly logic in the one place that must
+        // not hold any.
+        let entry = self
+            .handle
+            .fold
+            .registry()
+            .and_then(|registry| registry.get(key))
+            .ok_or_else(|| UpstrokeError::Refused {
+                message: format!("task {} is not in this run's frozen registry", key.index()),
+            })?
+            .clone();
+
+        let plan = seams.plans.plan(&PlanRequest {
+            key,
+            entry: &entry,
+            attempt: Self::FIRST_ATTEMPT,
+            rung: Self::FIRST_RUNG,
+            binding,
+            workspace: &dispatched.worktree,
+            resume_session: None,
+            materialization_observed: None,
+        })?;
+
+        let mut emitter = RunEmitter {
+            identity: &self.identity,
+            state: EmitState {
+                fold: &mut self.handle.fold,
+                log: &mut self.handle.log,
+                reservations: &mut self.reservations,
+                warnings: &mut self.warnings,
+            },
+            clock: seams.clock,
+        };
+        let mut cx = AttemptContext {
+            manager: seams.manager,
+            hooks,
+            emitter: &mut emitter,
+            runner: seams.runner,
+            slots: &mut self.slots,
+            ledger: &mut self.invocations,
+            adapters: seams.adapters,
+            paths: seams.paths,
+            reviews: seams.reviews,
+        };
+
+        let run = cx.start(dispatched, &plan)?;
+        let capture = cx.capture(dispatched)?;
+        let diff =
+            seams
+                .manager
+                .candidate_diff(&dispatched.slot, &capture.parent, &capture.tree)?;
+
+        let inputs = seams.plans.inputs(&InputsRequest {
+            entry: &entry,
+            diff,
+        })?;
+
+        cx.judge(dispatched, &run, &capture, &plan, &inputs, &|pass| {
+            review::ReviewInvocations {
+                pass: run.identities.review_pass(pass, 0),
+                reask: run.identities.review_reask(pass, 0),
+            }
+        })
     }
 
     /// What a first ordinary dispatch of `key` asks for.

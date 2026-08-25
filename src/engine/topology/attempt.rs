@@ -138,6 +138,82 @@ pub struct ReviewInputs {
     pub stem: String,
 }
 
+/// What only the driver knows about the attempt a plan is being built for.
+///
+/// The frozen entry travels whole rather than narrowed. Narrowing earns its
+/// keep where a consumer reads three fields of fifteen — it is why
+/// [`crate::review::ReviewBindings`] exists — and the plan assembler reads the
+/// spec's five prompt fields, the ladder's effort, and all three review
+/// bindings. A subject that wide is the entry with a second name.
+///
+/// The reference is short-lived by construction: the driver reads it out of the
+/// fold it owns, and the plan that comes back is an owned value, so the borrow
+/// ends before the append the plan authorizes.
+pub struct PlanRequest<'a> {
+    /// The task.
+    pub key: crate::topology::registry::TaskKey,
+    /// Its frozen registration — spec, ladder, review bindings.
+    pub entry: &'a crate::topology::registry::TaskEntry,
+    /// Which attempt of this generation.
+    pub attempt: AttemptNumber,
+    /// Index into the frozen ladder.
+    pub rung: u32,
+    /// The binding that rung resolved to, effort included.
+    pub binding: RungBinding,
+    /// The task worktree the worker runs in.
+    pub workspace: &'a std::path::Path,
+    /// The session a same-session retry resumes.
+    pub resume_session: Option<SessionId>,
+    /// What a repair's worktree looked like when this attempt started.
+    pub materialization_observed: Option<Materialization>,
+}
+
+/// Where an [`AttemptPlan`] is assembled.
+///
+/// **A seam for the same reason [`ReviewPasses`] is one.** Building the plan
+/// means building the worker's command, and
+/// [`crate::engine::assembly::WorkerAssembly::command`] materializes the
+/// permissions file that defines the attempt's sandbox — a write outside any
+/// inventoried `RunDir` site, in a legacy funnel this module may not be
+/// allowlisted into. So the topology module declares the plan it needs and
+/// something outside the tree builds it.
+///
+/// It is also the honest shape. A plan needs the run's config — the gate set,
+/// the worker allowance, the pool table, the probed CLI versions — and none of
+/// that is in the event log the fold replays. The driver knows the attempt; the
+/// implementation knows the run it is part of.
+pub struct InputsRequest<'a> {
+    /// The task under review, as the prompt quotes it.
+    pub entry: &'a crate::topology::registry::TaskEntry,
+    /// The diff being judged, as the engine captured it.
+    pub diff: String,
+}
+
+/// Where an [`AttemptPlan`] and the review inputs beside it are assembled.
+pub trait AttemptPlans {
+    /// What a reviewer is shown, beside the diff the driver captured.
+    ///
+    /// Separate from [`Self::plan`] because it needs the *outcome* of the
+    /// attempt — a plan is built before the worker runs and this is built
+    /// after. Same implementation, because both read the run's config: the
+    /// artifacts directory a named artifact resolves against, and the operator
+    /// decisions the judge must honour.
+    ///
+    /// # Errors
+    ///
+    /// Whatever the assembler returns.
+    fn inputs(&self, request: &InputsRequest<'_>) -> Result<ReviewInputs, UpstrokeError>;
+
+    /// The plan for one attempt.
+    ///
+    /// # Errors
+    ///
+    /// Whatever the assembler returns: an agent with no registered adapter, a
+    /// permissions file that cannot be written, a binary that cannot be
+    /// resolved.
+    fn plan(&self, request: &PlanRequest<'_>) -> Result<AttemptPlan, UpstrokeError>;
+}
+
 /// Where a review pass is executed.
 ///
 /// **A seam, and it is not optional.** `review::run_review` is on the effect

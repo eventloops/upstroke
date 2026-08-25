@@ -50,6 +50,19 @@ pub mod select;
 pub mod settle;
 pub(crate) mod startup;
 
+/// The schema-4 attempt-plan assembler, which lives engine-side.
+///
+/// Re-exported here rather than from the `engine` facade, whose contents are
+/// enumerated by the packet and asserted by
+/// `the_engine_facade_exposes_exactly_the_items_the_packet_enumerates`. This is
+/// schema-4 vocabulary, and this module is where the schema-4 vocabulary is.
+///
+/// It is engine-side rather than here for the reason [`attempt::AttemptPlans`]
+/// exists at all: building a plan materializes the permissions file that
+/// defines the attempt's sandbox, and a topology module may not be allowlisted
+/// for that write.
+pub use super::assembly::FrozenPlans;
+
 pub use attempt::{
     AttemptContext, AttemptOutcome, AttemptPlan, AttemptRun, Capture, GatePlan, Judgement,
     ReviewerPlan, Verdict,

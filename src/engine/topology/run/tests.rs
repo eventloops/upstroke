@@ -77,8 +77,9 @@ fn every_branch_states_what_this_build_does_with_it() {
     assert_eq!(
         LoopBranch::ReadyDispatch.disposition(),
         Disposition::PartlyImplemented {
-            performs: "ceiling check, provisional dispatch reservation, dispatch",
-            owes: "run one attempt through the Runner and settle",
+            performs: "ceiling check, provisional dispatch reservation, dispatch, run one \
+                       attempt through the Runner",
+            owes: "settle",
         },
         "`loop` states this branch as four clauses and this build performs \
          three; the type says which three"
@@ -160,7 +161,11 @@ fn a_refusal_names_the_branch_and_says_whether_anything_happened() {
         "a half-built branch says what it DID: {partial}"
     );
     assert!(
-        partial.contains("does not run one attempt through the Runner and settle"),
+        partial.contains("run one attempt through the Runner"),
+        "including the clause that arrived with the driver: {partial}"
+    );
+    assert!(
+        partial.contains("does not settle"),
         "and what it did not: {partial}"
     );
     assert!(

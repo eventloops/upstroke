@@ -51,6 +51,31 @@ pub struct CapturedCandidate {
     pub diff: String,
 }
 
+/// The fixed arguments of a reviewable diff, before its two revisions.
+///
+/// **Shared because there are now two callers and one meaning.** Schemas 1–3
+/// capture the diff from the task workspace ([`Workspace::capture_candidate`]);
+/// the schema-4 driver captures a tree and asks
+/// [`crate::workspace_manager::WorkspaceManager::candidate_diff`] for the diff
+/// of that tree against its parent. Both produce the text a reviewer judges and
+/// `classify::diff_failure` reads, so both must be the *same* text.
+///
+/// Every flag is load-bearing and each one defends against operator config
+/// rather than against Git's defaults. A configured `diff.external`
+/// (difftastic and friends) replaces the output wholesale; `color.ui` injects
+/// escape codes; `textconv` substitutes a rendered form for the bytes. Any of
+/// those corrupts every downstream check that reads the diff — and
+/// `capture_diff_is_immune_to_user_diff_config` is the test that says so.
+pub(crate) const REVIEW_DIFF_FLAGS: &[&str] = &[
+    "-c",
+    "color.ui=false",
+    "diff",
+    "--binary",
+    "--no-ext-diff",
+    "--no-textconv",
+    "--no-color",
+];
+
 impl Workspace {
     /// Open an existing git worktree, normalizing to its top level. Running
     /// from a subdirectory would otherwise scope `git clean` to that
@@ -557,18 +582,9 @@ impl Workspace {
         }
         self.git_with_private_hooks(&["add", "-A"])?;
         let tree_oid = self.staged_tree_oid()?;
-        let diff = self.git(&[
-            "-c",
-            "color.ui=false",
-            "diff",
-            "--binary",
-            "--no-ext-diff",
-            "--no-textconv",
-            "--no-color",
-            &parent_oid,
-            &tree_oid,
-            "--",
-        ])?;
+        let mut argv: Vec<&str> = REVIEW_DIFF_FLAGS.to_vec();
+        argv.extend([parent_oid.as_str(), tree_oid.as_str(), "--"]);
+        let diff = self.git(&argv)?;
         let observed_branch_ref = self.current_branch_ref()?;
         let observed_parent = self.head_sha_full()?;
         if observed_branch_ref != branch_ref || observed_parent != parent_oid {
