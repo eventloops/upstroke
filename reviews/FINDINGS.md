@@ -1191,3 +1191,72 @@ the bundle the caller's choice — as every Git funnel in this tree already does
 `every_family_of_the_harness_bundle_records_into_the_same_harness` is the assertion that the choice
 was right. The repair is to give the shared bundle the timeline wrapper, not to take it from the
 scaffold. Same owner as above.
+
+## 18. PR7 — the legacy engine's command assembly moved, and why that is not a behaviour change
+
+`src/engine/attempt.rs` and `src/gates.rs` are the **legacy** engine's — the path that ships today,
+that `upstroke run` drives for schemas 1–3, and that PR7's contract touches only by promising not to
+disturb. This slice moved code out of both. Recorded here rather than left for a reviewer to find,
+the same way §11 recorded PR5's frozen-file change.
+
+### What moved
+
+| from | to | what |
+|---|---|---|
+| `engine/attempt.rs::run_attempt` | `engine::assembly::WorkerAssembly::command` | permissions → `TaskRun` → `AgentAdapter::build` → stdin payload |
+| `gates.rs::ShellGate::check` | `gates::ShellGate::command` | `(shell.spec(&cmd), timeout)` |
+
+Both call sites now delegate. Neither expression changed: same inputs, same order, same adapter
+calls.
+
+### Why
+
+Two engines need the same answer. The legacy one assembles a command **at the moment of use**; the
+schema-4 driver needs the same sets **up front**, because an `AttemptPlan` is a value it appends
+`attempt_started` from. Assembling twice is this project's dominant defect class, and this slice paid
+for it directly: two derivations of a task's predicted region, disagreeing on every glob, shipped
+green in `199dc1d` and were repaired in `84a3978`.
+
+> **The finding that scoped this work: minting was never duplicated.** The crate has exactly two
+> production `CommandSpec` constructors — `gates::ShellKind::spec` and `agent::bin::Invocation::spec`
+> — and both already document themselves as the single place. All six other mints are `#[cfg(test)]`.
+> What was about to be duplicated is the **selection of their inputs**: which prompt, which
+> permissions file, which timeout, which profile. So the extraction is scoped to input selection, and
+> `a_command_is_assembled_in_one_production_place_per_role` is scoped to it too.
+
+### The neutrality evidence
+
+The contract for PR7 names **no** legacy-behaviour clause — unlike PR4's, whose
+`invariants_preserved[1]` was "legacy engine behavior unchanged". What it names is
+`production_effect: none (TopologyPreview selector only)`, which a change to the legacy path's
+behaviour would breach just as surely. So the evidence matters more, not less, for the absence of a
+clause to cite.
+
+1. **A whole-tree census reported the move and nothing else.**
+   `every_production_command_spec_payload_is_classified` counts every production call site that
+   populates a `CommandSpec` payload, per file. It failed on this change with exactly one difference
+   — `src/engine/attempt.rs: (1,0,0)` becoming `src/engine/assembly.rs: (1,0,0)` — and **every other
+   row identical**. A move that had altered a payload would have moved a number, not a filename.
+2. **The request census still holds, and was widened.**
+   `every_production_runner_request_is_built_by_its_roles_builder` asserts that
+   `engine/attempt.rs` and `engine/coordinator.rs` never construct a `RunnerRequest`;
+   `engine/assembly.rs` is now asserted absent from it too. The command says *what* to run and the
+   request says the role, the boundary and the identity — one module doing both would be a call site
+   free to choose its own role, which `ExecutionRole::is_slotted` and `host::supplies_credentials`
+   are derived from.
+3. **The full suite: 1662 passed, 0 failed**, against 1661 before, the one addition being the new
+   census itself.
+
+### What is deliberately not finished here
+
+- **The reviewer's command is still assembled in `review.rs`**, and
+  `a_command_is_assembled_in_one_production_place_per_role` carries that as a **non-zero row with a
+  reason** rather than an exemption. It does not extract by lifting one expression: the re-ask loop
+  builds a different prompt per invocation — full prompt, `REASK_PROMPT`, or both — against a
+  resumable session. It moves in its own commit, and until then the duplication is a number in a test
+  rather than a sentence in a review.
+- **The scaffold's worker command is still synthetic.** Its gate plan is now built through
+  `ShellGate::command` — the `frozen_binding` precedent, where a fixture repeating a production
+  composition kept a fifth copy alive — but re-pointing the worker needs an `AgentAdapter` in the
+  shared topology scaffold, which every topology test uses. That is the change PR5's round 7 was
+  reverted for, and it belongs with the commit where the driver introduces an adapter seam anyway.

@@ -8,7 +8,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use crate::agent::{AgentAdapter, TaskRun, proc};
+use crate::agent::{AgentAdapter, proc};
 use crate::error::UpstrokeError;
 use crate::events::{self, Feedback};
 use crate::gates::{self, ShellGate};
@@ -149,37 +149,32 @@ pub(super) fn run_attempt(
     workspace: &Workspace,
     resume_session: Option<String>,
 ) -> Result<AttemptResult, UpstrokeError> {
-    let settings_path = cx.adapter.materialize_permissions(
-        &cx.profile,
-        cx.gate_cmds,
-        &cx.paths.settings(),
-        &format!("{}-{}", cx.stem, cx.attempt),
-    )?;
-
-    let task_run = TaskRun {
-        prompt: materialize_prompt(
-            cx.task,
-            cx.gate_cmds,
-            &cx.paths.artifacts(),
-            cx.retry.as_ref(),
-        ),
-        profile: cx.profile.clone(),
-        workspace: workspace.root().to_path_buf(),
-        gate_cmds: cx.gate_cmds.to_vec(),
-        resume_session,
-        settings_path,
-    };
+    // The command is assembled by `engine::assembly`, which is the one
+    // production place that decides a worker invocation's inputs. This block
+    // used to do it inline; it moved so the schema-4 driver could be its second
+    // caller rather than its second implementation.
+    //
     // The adapter says what to run; the runner says where. `ExecutionRole::
     // Implement` with the bound agent is what makes this process slotted
     // (R3) and what tells `host-v1` to supply that agent's credential
     // location — both properties of the role, not of this call site.
-    let command = cx
-        .adapter
-        .build(&task_run)?
-        .stdin(cx.adapter.stdin_payload(&task_run).as_bytes().to_vec());
+    let worker_workspace = workspace.root().to_path_buf();
+    let command = super::assembly::WorkerAssembly {
+        adapter: cx.adapter,
+        profile: &cx.profile,
+        task: cx.task,
+        gate_cmds: cx.gate_cmds,
+        paths: cx.paths,
+        stem: &cx.stem,
+        attempt: cx.attempt,
+        retry: cx.retry.as_ref(),
+        workspace: &worker_workspace,
+        resume_session,
+    }
+    .command()?;
     let output = cx.runner.run(&crate::runner::worker_request(
         command,
-        task_run.workspace.clone(),
+        worker_workspace.clone(),
         AgentId::new(cx.adapter.id()),
         cx.timeout,
         cx.invocation(AttemptRole::Worker),

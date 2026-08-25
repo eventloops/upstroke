@@ -23,6 +23,7 @@
 //! disagree along. `report.json` is written from that state as a projection for
 //! humans; nothing ever reads it back.
 
+mod assembly;
 mod attempt;
 mod coordinator;
 mod options;

@@ -955,9 +955,20 @@ impl Run {
             agent: AgentId::new(AGENT),
             worker: CommandSpec::new("worker").arg("--implement"),
             worker_timeout: Duration::from_secs(300),
-            gates: vec![GatePlan {
-                command: CommandSpec::new("gate").arg("--check"),
-                timeout: Duration::from_secs(60),
+            // Through the production assembler, not invented here. A fixture
+            // that built its own `(command, timeout)` pair would be a second
+            // derivation of the one thing `ShellGate::command` exists to be —
+            // the `frozen_binding` precedent, where a fixture repeating a
+            // production composition kept a fifth copy of it alive.
+            gates: vec![{
+                let (command, timeout) = crate::gates::ShellGate {
+                    name: "scaffold".to_owned(),
+                    cmd: "gate --check".to_owned(),
+                    timeout: Duration::from_secs(60),
+                    shell: crate::gates::ShellKind::native(),
+                }
+                .command();
+                GatePlan { command, timeout }
             }],
             reviewers: vec![
                 ReviewerPlan {

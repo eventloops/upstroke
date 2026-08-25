@@ -1442,6 +1442,13 @@ mod tests {
             "src/review.rs",
             "src/engine/attempt.rs",
             "src/engine/coordinator.rs",
+            // Assembles a worker's *command* and must never assemble its
+            // request: the command says what to run and the request says the
+            // role, the boundary and the identity. One module doing both would
+            // be a call site that could choose its own role, which is what
+            // `ExecutionRole::is_slotted` and `host::supplies_credentials` are
+            // derived from.
+            "src/engine/assembly.rs",
         ] {
             assert!(
                 !expected.contains_key(absent),
@@ -1787,6 +1794,99 @@ mod tests {
     /// overlay the spending command does not carry, against DESIGN.md:262-264.
     /// So the third column counts struct-literal `env:`/`stdin:` initializers
     /// too, and the constructors are enumerated rows like everything else.
+    /// **A worker's command is assembled in exactly one production place, and
+    /// a gate's in exactly one other.**
+    ///
+    /// The census this slice most needed and did not have. Two engines now want
+    /// the same three command sets — the legacy one assembling them inline at
+    /// the moment of use, the schema-4 driver wanting them up front in a plan —
+    /// and assembling them twice is this project's dominant defect class. Of
+    /// PR7's review findings the expensive ones were all one rule implemented
+    /// twice, including two derivations of a task's predicted region that
+    /// disagreed on every glob and shipped green (`84a3978`).
+    ///
+    /// **What this pins is input selection, not minting.** Minting was never
+    /// duplicated: the crate has two `CommandSpec` constructors,
+    /// `gates::ShellKind::spec` and `agent::bin::Invocation::spec`, and both
+    /// already say so in their own docs. What was about to be duplicated is
+    /// *which* prompt, permissions file, timeout and profile go into them. So
+    /// the columns count the two calls that perform that selection —
+    /// `AgentAdapter::build`, and `ShellKind::spec` — per file.
+    ///
+    /// `src/review.rs` is here with a non-zero `build` count **and that is the
+    /// outstanding half of this work**, not an exemption: the reviewer's
+    /// command is still assembled in `review.rs` because its invocation
+    /// machinery is a re-ask loop with a per-invocation prompt, which does not
+    /// extract by moving one expression. When that lands, its count moves the
+    /// way the worker's did — and until then the duplication is a number in a
+    /// test rather than a sentence in a review.
+    #[test]
+    fn a_command_is_assembled_in_one_production_place_per_role() {
+        use std::collections::BTreeMap;
+
+        /// (file, `AgentAdapter::build` calls, `ShellKind::spec` calls, why).
+        const EXPECTED: &[(&str, usize, usize, &str)] = &[
+            (
+                "src/engine/assembly.rs",
+                1,
+                0,
+                "the worker's command: the one production assembler. Both \
+                 engines call it — the legacy one from `run_attempt`, the \
+                 schema-4 driver when it builds an `AttemptPlan`",
+            ),
+            (
+                "src/gates.rs",
+                0,
+                1,
+                "the gate's command: `ShellGate::command`, the one production \
+                 place a gate's cmdline becomes a spec. It lives on the type \
+                 that owns the data rather than in the engine, because \
+                 `gates.rs` sits below the engine",
+            ),
+            (
+                "src/review.rs",
+                1,
+                0,
+                "the reviewer's command. STILL ASSEMBLED HERE, and this row is \
+                 the outstanding work rather than an exception: the re-ask \
+                 loop builds a different prompt per invocation, so it does not \
+                 move by lifting one expression",
+            ),
+            (
+                "src/runner/host.rs",
+                0,
+                1,
+                "the RunnerPreflight shell probe: a shell command that is not \
+                 a gate. A different role, so a different assembler is correct \
+                 — the count is here so that it is stated rather than assumed",
+            ),
+        ];
+
+        let mut found: BTreeMap<String, (usize, usize)> = BTreeMap::new();
+        for (path, code) in production_sources() {
+            let builds =
+                code.matches(".build(&task_run)").count() + code.matches(".build(&run)").count();
+            let specs = code.matches(".spec(&self.cmd)").count()
+                + code.matches(".spec(SHELL_PROBE_COMMAND)").count();
+            if builds + specs > 0 {
+                found.insert(path, (builds, specs));
+            }
+        }
+
+        let expected: BTreeMap<String, (usize, usize)> = EXPECTED
+            .iter()
+            .map(|(path, builds, specs, _)| ((*path).to_owned(), (*builds, *specs)))
+            .collect();
+        assert_eq!(
+            found, expected,
+            "a production site selects the inputs for a command. Two sites for \
+             one role is the duplication class that cost this slice its \
+             predicted-region defect — classify it, and if it is a second \
+             assembler for a role that already has one, it is the finding \
+             rather than the fixture"
+        );
+    }
+
     #[test]
     fn every_production_command_spec_payload_is_classified() {
         use std::collections::BTreeMap;
@@ -1816,12 +1916,18 @@ mod tests {
                  reaper's `/bin/ps` query on macOS. Neither is a CommandSpec",
             ),
             (
-                "src/engine/attempt.rs",
+                "src/engine/assembly.rs",
                 1,
                 0,
                 0,
                 "the worker's prompt: `CommandSpec::stdin` from \
-                 `AgentAdapter::stdin_payload`. The role grid carries it",
+                 `AgentAdapter::stdin_payload`. The role grid carries it. \
+                 **Moved from `src/engine/attempt.rs`**, same count, when the \
+                 worker's command assembly was lifted out of the legacy \
+                 engine so the schema-4 driver could be its second *caller* \
+                 rather than its second implementation. This census is the \
+                 evidence that the move preserved behaviour: it reported one \
+                 entry changing file and every other row identical",
             ),
             (
                 "src/gates.rs",
