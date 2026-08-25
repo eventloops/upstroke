@@ -194,10 +194,28 @@ the answerable half is: **do the sequential guarantees hold at one?**
   snapshot and each reviewer on a fresh one, all from the captured tree, never the live
   worktree.
 - **Untouched user checkout.** Q5's §5 evidence.
-- **Atomic settlements.** One settlement per attempt, decided once by `settle_failed` or
-  `settle_succeeded` — the transition, the parking, the deferral count, the lease
-  disposition and the allowance together. `GenerationLease::expected` is the whole of the
-  lease rule and `check_lease_disposition` refuses any other answer.
+- **Atomic settlements — with a correction.** An earlier draft of this answer said "one
+  settlement per attempt". That is **not** what the code does, and S5's `contract` lens was
+  right to raise it. A *successful* attempt appends **two** events carrying its
+  `AttemptRecord`: `attempt_finished{Closed{Succeeded}}`, which is the only thing that
+  moves the generation to `Promoting`, and `candidate_prepared`, which
+  `check_candidate_prepared` refuses in any other class. The two-append sequence is forced
+  by the fold, not chosen by the driver.
+
+  INV-07's "candidate_prepared is the sole successful attempt settlement" is about which
+  event records the **candidate**, not about which event settles the attempt — the
+  distinction `settle_succeeded`'s own documentation draws. What *is* atomic is the
+  decision: the transition, the parking, the deferral count, the lease disposition and the
+  allowance are decided once, by `settle_failed` or `settle_succeeded`.
+  `GenerationLease::expected` is the whole of the lease rule and
+  `check_lease_disposition` refuses any other answer.
+
+  **A consequence a G2 reviewer must not be left to discover.** Because both events carry
+  the record, anything that walks the log counting records will price a successful attempt
+  twice. `Spend::replay` did exactly that until S5 round 1; it now counts one contribution
+  per `(key, generation, attempt)`, and
+  `a_runs_spend_is_the_same_live_as_on_replay` asserts live-versus-replay parity rather
+  than a corrected number.
 - **`budget_exceeded` before any budget-driven end.** `loop`: a breach *"appends
   `budget_exceeded` before any effect"*, and the append and the refusal are deliberately
   two iterations so the record of the breach is durable before the closure it causes.

@@ -27,7 +27,15 @@ has them, with each measurement taken at `f6ed9f1` and reproducible by the comma
 ## 3. Fault-injection evidence — the eleven rows
 
 `pr_sequence[8].gating` names eleven `transaction_fault_matrix` rows. Their `test:`
-fields name **117** snake_case tests between them. Every one is present in `src/`:
+fields name **117** snake_case tests between them.
+
+**What the number below is, and is not.** It is a *presence* check: every name the packet
+lists exists in `src/` and runs. It is **not** a claim that each test asserts what its row's
+`resume_action` requires, and a G2 reviewer must not read it as coverage. The gate's own
+remit is to confirm the behaviour; this artifact confirms the checklist is answered, which
+is the thing a reviewer would otherwise have to re-derive by hand. S5 round 1 found real
+defects in code these 117 tests cover, which is the sharpest possible evidence that
+presence and correctness are different measurements.
 
 ```
 $ bash ~/tactus-artifacts/pr7/drivers/tfm-gate.sh .
@@ -41,6 +49,11 @@ $ bash ~/tactus-artifacts/pr7/drivers/tfm-gate.sh .
 
 The one exception is named rather than absorbed: a single test in the checklist belongs
 to a later slice's range, and the gate reports it as such instead of counting it green.
+
+**And a second qualification, from S5.** Three of the defects round 1 confirmed —
+the driver's ladder position, the spend double-count, and the gate set not
+short-circuiting — were in behaviour these rows govern, and none of the 117 caught them.
+Each now has a witness of its own. The checklist is necessary and it is not sufficient.
 
 **Residue-class evidence** is both halves the artifact asks for. Synthetic, per element:
 `the_checked_in_residue_class_record_is_what_the_enums_generate`,
