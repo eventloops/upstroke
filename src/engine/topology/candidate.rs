@@ -556,6 +556,48 @@ pub fn complete_promotion(
     worktree: &Slot,
     promoting: PromotingCandidate,
 ) -> Result<QueuedCandidate, UpstrokeError> {
+    let referenced = create_candidates_ref(manager, hooks, promoting)?;
+    let created = append_candidate_created(journal, referenced)?;
+    reclaim_after_creation(manager, hooks, worktree, created)
+}
+
+/// The candidate has its exact ref; `task_candidate_created` has not been
+/// appended.
+#[derive(Debug)]
+#[must_use = "a candidate with its ref and no `task_candidate_created` is a \
+              generation still Promoting"]
+pub struct ReferencedCandidate {
+    candidate: CandidateRef,
+    prepared_ref: GitRef,
+}
+
+/// `task_candidate_created` is durable; the pin and the worktree are not yet
+/// reclaimed.
+#[derive(Debug)]
+#[must_use = "a created candidate still owns its pin and its worktree"]
+pub struct CreatedCandidate {
+    candidate: CandidateRef,
+    prepared_ref: GitRef,
+}
+
+/// **The effects half, before the append.** Verify the object, then create the
+/// exact candidates ref zero-old if it is absent.
+///
+/// Split out of [`complete_promotion`] so a caller whose journal *is* its hooks
+/// bundle can run the sequence at all. The three halves alternate between the
+/// two — ref, append, reclaim — and a single `&mut dyn TopologyHooks` cannot be
+/// held by the caller and by the journal at the same time. The typestate keeps
+/// the order: nothing but this produces a [`ReferencedCandidate`], and nothing
+/// but a [`ReferencedCandidate`] reaches the append.
+///
+/// # Errors
+///
+/// A missing or mismatched object, a ref already at another sha, or a Git error.
+pub fn create_candidates_ref(
+    manager: &WorkspaceManager,
+    hooks: &mut dyn TopologyHooks,
+    promoting: PromotingCandidate,
+) -> Result<ReferencedCandidate, UpstrokeError> {
     let PromotingCandidate {
         candidate,
         prepared_ref,
@@ -583,9 +625,30 @@ pub fn complete_promotion(
         }
     }
 
-    // "append task_candidate_created". Skipped when the generation has already
-    // left `Promoting`, which is the one durable fact that says this append
-    // landed: `apply_candidate_created` closes the generation.
+    Ok(ReferencedCandidate {
+        candidate,
+        prepared_ref,
+    })
+}
+
+/// **The append half.** `task_candidate_created`, and nothing else.
+///
+/// Skipped when the generation has already left `Promoting`, which is the one
+/// durable fact that says this append landed: `apply_candidate_created` closes
+/// the generation.
+///
+/// # Errors
+///
+/// Whatever the journal returns.
+pub fn append_candidate_created(
+    journal: &mut dyn CandidateJournal,
+    referenced: ReferencedCandidate,
+) -> Result<CreatedCandidate, UpstrokeError> {
+    let ReferencedCandidate {
+        candidate,
+        prepared_ref,
+    } = referenced;
+
     if is_promoting(journal.fold(), candidate.key, candidate.generation) {
         journal.emit(TopologyEventBody::TaskCandidateCreated {
             data: TaskCandidateCreated {
@@ -593,6 +656,34 @@ pub fn complete_promotion(
             },
         })?;
     }
+
+    Ok(CreatedCandidate {
+        candidate,
+        prepared_ref,
+    })
+}
+
+/// **The reclaim half, after the append.** Prune the pin, then scrub the
+/// worktree and its intent.
+///
+/// `side_effect_vs_event_ordering`: "pin pruning and scrub (forced) after
+/// task_candidate_created". The typestate is what enforces that here — this
+/// takes a [`CreatedCandidate`] and only [`append_candidate_created`] makes
+/// one.
+///
+/// # Errors
+///
+/// A Git or I/O error from the prune or the scrub.
+pub fn reclaim_after_creation(
+    manager: &WorkspaceManager,
+    hooks: &mut dyn TopologyHooks,
+    worktree: &Slot,
+    created: CreatedCandidate,
+) -> Result<QueuedCandidate, UpstrokeError> {
+    let CreatedCandidate {
+        candidate,
+        prepared_ref,
+    } = created;
 
     // "prune the pin" — expected-old, and only when it is there.
     if let Some(found) = manager.direct_ref_target(prepared_ref.as_str())? {

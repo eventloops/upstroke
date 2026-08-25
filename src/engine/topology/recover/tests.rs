@@ -658,9 +658,23 @@ struct RecordingRunner {
     seen: Mutex<Vec<RunnerRequest>>,
     /// A program whose invocation fails, so a probe refusal can be constructed.
     failing: Mutex<Option<String>>,
+    /// Whether an `Implement` invocation edits the worktree it was given.
+    ///
+    /// Off by default, because most tests here only care that a process ran.
+    /// A driver test that means to reach the **candidate sequence** needs a
+    /// non-empty diff: the ladder's cheap rungs reject an empty one, which is
+    /// what `pr_sequence[8]`'s "empty-diff attempt failures" names.
+    edits: Mutex<bool>,
 }
 
 impl RecordingRunner {
+    /// A runner whose worker leaves a change behind, so an attempt can succeed.
+    fn editing() -> Self {
+        let runner = Self::default();
+        *runner.edits.lock().unwrap_or_else(PoisonError::into_inner) = true;
+        runner
+    }
+
     fn failing(program: &str) -> Self {
         let runner = Self::default();
         *runner
@@ -694,6 +708,20 @@ impl Runner for RecordingRunner {
         } else {
             0
         };
+        // The worker's edit, which is the whole difference between an attempt
+        // the cheap rungs reject and one that reaches a candidate.
+        if code == 0
+            && request.role == crate::runner::ExecutionRole::Implement
+            && *self.edits.lock().unwrap_or_else(PoisonError::into_inner)
+        {
+            // Through the fixture funnel every other test in this file uses:
+            // `std::fs::write` is on the effect denylist here, and a test that
+            // reached around it would be the first.
+            crate::workspace_manager::fixture::write_file(
+                &request.workspace.join("worker.txt"),
+                b"the worker's edit\n",
+            );
+        }
         Ok(ProcessOutput {
             code: Some(code),
             stdout: "1.2.3".to_owned(),
@@ -4503,6 +4531,108 @@ fn the_driver_takes_over_from_the_recovery_order_and_steps() {
          `PR7-INTEGRATION-NO-ENTITLEMENT`'s failure wearing a different hat: at \
          the only width production creates, one held entitlement is a full \
          pipeline and nothing is ever selected again"
+    );
+}
+
+/// **The driver carries an accepted attempt through the whole candidate
+/// sequence.**
+///
+/// The companion to `the_driver_takes_over_from_the_recovery_order_and_steps`,
+/// which is the rejection case: there the fixture's worker edits nothing and
+/// the ladder's cheap rungs stop it at the empty diff. Here it leaves a change
+/// behind, so nothing rejects and the branch runs the sequence
+/// `side_effect_vs_event_ordering` specifies — commit object, pin, settlement,
+/// `candidate_prepared`, candidates ref, `task_candidate_created`, then the pin
+/// prune and the forced scrub.
+///
+/// Two tests rather than one parameterised over a flag: the two paths append
+/// different events in different orders, and a grid would assert the union of
+/// them.
+#[test]
+fn the_driver_carries_an_accepted_attempt_through_the_candidate_sequence() {
+    use crate::engine::topology::run::{Progress, RunSeams, TopologyRun};
+    use crate::engine::topology::select::Ceiling;
+
+    let fixture = Fixture::healthy("driver-promotes");
+    let harness = harness();
+    let runtime = runtime_holding_the_record();
+    let certifies = AlwaysCertifies;
+    let given = Given::healthy(&fixture, &runtime, &certifies);
+
+    let (outcome, _) = resume_holding(&fixture, &harness, &given);
+    let (_recovered, handle) = outcome.expect("the healthy resume completes");
+
+    let mut run = TopologyRun::resumed(handle, fixture.inputs(), Ceiling::unlimited());
+    let mut hooks = HarnessTopologyHooks::new(Arc::clone(&harness));
+    let sleeper = RecordingSleeper::default();
+    let manager = fixture.manager();
+    let runner = RecordingRunner::editing();
+    let adapters = crate::engine::topology::scaffold::ScaffoldAdapters::new();
+    let paths = crate::rundir::RunPaths::with_private_root(
+        &fixture.repo_root,
+        &fixture.started.run_id,
+        &fixture.private_root,
+    );
+    paths.create().expect("the run directories are creatable");
+    // **Through the production assembler, not a fixture plan shape.** The
+    // condition on this extraction was that the scaffold be re-pointed at the
+    // real one or round-tripped against it; a fixture that hand-built an
+    // `AttemptPlan` here would be exactly the fifth copy the `frozen_binding`
+    // precedent warns about.
+    let plans = crate::engine::assembly::FrozenPlans {
+        adapters: &adapters,
+        paths: &paths,
+        gates: &[],
+        pools: &[],
+        caps: &[],
+        worker_timeout: std::time::Duration::from_secs(300),
+        decisions: &[],
+    };
+    let seams = RunSeams {
+        manager: &manager,
+        clock: &Frozen,
+        sleeper: &sleeper,
+        runner: &runner,
+        adapters: &adapters,
+        paths: &paths,
+        plans: &plans,
+        reviews: &crate::engine::attempt::LegacyReviewPasses,
+        halts_run: false,
+    };
+
+    let kinds_before = durable_kinds(&fixture);
+    let progress = run
+        .step(&seams, &mut hooks)
+        .expect("the branch performs its first four clauses");
+
+    let Progress::Settled { key, accepted, .. } = progress else {
+        panic!("the ready-dispatch branch did not run an attempt: {progress:?}");
+    };
+    assert_eq!(key, TaskKey(0));
+    assert!(
+        accepted,
+        "the worker left a change and the plan configures no gates or reviewers, \
+     so nothing could reject it"
+    );
+
+    // **The settlement lands between the pin and `candidate_prepared`**, which
+    // is what `settle_succeeded`'s own note requires: `T-CAND-OBJ`'s window
+    // covers the commit object and the pin with `authoritative_state: attempt
+    // unsettled`. The order here is the assertion — a sequence that appended
+    // the settlement after `candidate_prepared` would leave the generation in a
+    // class the fold refuses that event from.
+    assert_eq!(
+        durable_kinds(&fixture),
+        {
+            let mut expected = kinds_before.clone();
+            expected.push("task_dispatched".to_owned());
+            expected.push("attempt_started".to_owned());
+            expected.push("attempt_finished".to_owned());
+            expected.push("candidate_prepared".to_owned());
+            expected.push("task_candidate_created".to_owned());
+            expected
+        },
+        "the whole branch, in the order the packet specifies"
     );
 }
 

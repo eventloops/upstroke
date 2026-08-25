@@ -39,15 +39,20 @@ use crate::error::UpstrokeError;
 use crate::review;
 use crate::topology::events::TopologyEventBody;
 
+use crate::events::AttemptRecord;
 use crate::interaction::Sleeper;
-use crate::topology::events::{GenerationId, SessionId};
+use crate::topology::events::{CandidateLeaseEffect, CommitSha, GenerationId, SessionId};
 use crate::topology::fold::{FrozenInputs, TopologyFold};
 use crate::topology::registry::TaskKey;
 use crate::workspace_manager::WorkspaceManager;
 
 use super::attempt::{
-    Assessment, AttemptContext, AttemptPlan, AttemptPlans, InputsRequest, Judgement, Judging,
-    PlanRequest, ReviewPasses,
+    Assessment, AttemptContext, AttemptPlan, AttemptPlans, Capture, InputsRequest, Judgement,
+    Judging, PlanRequest, ReviewPasses,
+};
+use super::candidate::{
+    CandidateJournal, JudgedTree, append_candidate_created, append_candidate_prepared,
+    create_candidates_ref, pin_candidate, reclaim_after_creation, write_candidate_commit,
 };
 use super::dispatch::{DispatchKind, DispatchRequest, Dispatched, EventEmitter, dispatch};
 use super::emit::{EmitFailure, EmitState, RunIdentity, emit};
@@ -55,7 +60,7 @@ use super::identity::{InvocationLedger, ReservationKind, Reservations, SlotAsser
 use super::recover::RunHandle;
 use super::seams::{TimeSource, TopologyHooks};
 use super::select::{Admitted, Ceiling, Spend, Step, checkpoint, select};
-use super::settle::{Deferral, FinishedAttempt, settle_failed};
+use super::settle::{Deferral, FinishedAttempt, settle_failed, settle_succeeded};
 
 // ---------------------------------------------------------------------------
 // The production emitter
@@ -111,6 +116,40 @@ impl EventEmitter for RunEmitter<'_> {
     ) -> Result<(), EmitFailure> {
         emit(self.identity, &mut self.state, self.clock, body, hooks)?;
         Ok(())
+    }
+}
+
+/// The run's [`CandidateJournal`], for the candidate sequence's own appends.
+///
+/// The sequence takes a journal rather than an [`EventEmitter`] because
+/// `candidate.rs` needs to *read* the fold between its appends — the typestate
+/// carries a candidate from commit to pin to prepared, and each step checks the
+/// generation class it is transitioning from. So the journal is an emitter and
+/// a fold reader together.
+///
+/// **Before this, `CandidateJournal` had one implementation and it was
+/// `#[cfg(test)]`** — and that one re-implements the append rather than calling
+/// [`emit`], so it runs none of the append-error protocol's five obligations.
+/// The whole candidate sequence was therefore tested against an emitter no
+/// production path would use, which is the same hole `RunEmitter` was written
+/// to close for dispatch and attempt.
+struct RunJournal<'a, 'h> {
+    emitter: RunEmitter<'a>,
+    hooks: &'h mut dyn TopologyHooks,
+    invocations: &'h mut InvocationLedger,
+}
+
+impl CandidateJournal for RunJournal<'_, '_> {
+    fn emit(&mut self, body: TopologyEventBody) -> Result<(), UpstrokeError> {
+        // Three disjoint field borrows, and the discharge of obligation (3)
+        // happens here because this struct is what holds the ledger.
+        self.emitter
+            .emit(body, self.hooks)
+            .map_err(|failure| failure.discharging(self.invocations))
+    }
+
+    fn fold(&self) -> &TopologyFold {
+        self.emitter.state.fold
     }
 }
 
@@ -354,6 +393,23 @@ pub struct RunSeams<'a> {
     pub halts_run: bool,
 }
 
+/// What one attempt produced, for the settlement that reads all three.
+///
+/// The counterpart to [`Judging`], one phase later: judging reads the
+/// identities, the tree and the cheap rungs; settling reads the tree, the
+/// worker's own report and the verdict. A bundle for the same reason — they
+/// arrive together, are read together, and passing them singly put `settle` at
+/// eight arguments.
+#[derive(Debug, Clone, Copy)]
+struct Produced<'a> {
+    /// The exact tree the attempt captured.
+    capture: &'a Capture,
+    /// What the ladder's cheap rungs said, and the adapter's parse beside it.
+    assessed: &'a Assessment,
+    /// What the gates and reviewers said.
+    judgement: &'a Judgement,
+}
+
 /// What one iteration of the loop did.
 ///
 /// A value rather than `()` so a test asserts on the branch that ran rather
@@ -523,10 +579,20 @@ impl TopologyRun {
             Admitted::Retry { .. } => Err(LoopBranch::ReadyRetry.unimplemented()),
             Admitted::Dispatch { key, generation } => {
                 let dispatched = self.dispatch_ready(key, generation, seams, hooks)?;
-                let (plan, assessed, judgement) = self.attempt(&dispatched, seams, hooks)?;
+                let (plan, capture, assessed, judgement) =
+                    self.attempt(&dispatched, seams, hooks)?;
                 let accepted = judgement.accepted();
-                let spent_attempt =
-                    self.settle(&dispatched, &plan, &assessed, &judgement, seams, hooks)?;
+                let spent_attempt = self.settle(
+                    &dispatched,
+                    &plan,
+                    Produced {
+                        capture: &capture,
+                        assessed: &assessed,
+                        judgement: &judgement,
+                    },
+                    seams,
+                    hooks,
+                )?;
                 Ok(Progress::Settled {
                     key,
                     accepted,
@@ -637,7 +703,7 @@ impl TopologyRun {
         dispatched: &Dispatched,
         seams: &RunSeams<'_>,
         hooks: &mut dyn TopologyHooks,
-    ) -> Result<(AttemptPlan, Assessment, Judgement), UpstrokeError> {
+    ) -> Result<(AttemptPlan, Capture, Assessment, Judgement), UpstrokeError> {
         let key = dispatched.key;
         let binding = self
             .handle
@@ -733,7 +799,7 @@ impl TopologyRun {
                 reask: run.identities.review_reask(pass, 0),
             },
         )?;
-        Ok((plan, assessed, judgement))
+        Ok((plan, capture, assessed, judgement))
     }
 
     /// The branch's last clause: **settle the attempt.**
@@ -766,11 +832,15 @@ impl TopologyRun {
         &mut self,
         dispatched: &Dispatched,
         plan: &AttemptPlan,
-        assessed: &Assessment,
-        judgement: &Judgement,
+        produced: Produced<'_>,
         seams: &RunSeams<'_>,
         hooks: &mut dyn TopologyHooks,
     ) -> Result<bool, UpstrokeError> {
+        let Produced {
+            capture,
+            assessed,
+            judgement,
+        } = produced;
         let record = crate::engine::classify::attempt_record(
             plan.attempt.0,
             crate::engine::classify::AttemptFacts {
@@ -785,10 +855,8 @@ impl TopologyRun {
         );
 
         let Some(failure) = judgement.failure.as_ref() else {
-            return Err(LoopBranch::ReadyDispatch.owes(
-                "the successful settlement, which lands between the candidate pin and \
-                 `candidate_prepared` and so belongs to the candidate sequence",
-            ));
+            self.promote_candidate(dispatched, plan, capture, record, seams, hooks)?;
+            return Ok(true);
         };
 
         let policy = self.ladder_policy(dispatched.key)?;
@@ -844,6 +912,153 @@ impl TopologyRun {
             hooks,
         )?;
         Ok(settled.spent_attempt)
+    }
+
+    /// The candidate sequence for an attempt nothing rejected.
+    ///
+    /// `side_effect_vs_event_ordering`: "commit object (R27) before pin
+    /// (IdUnread between); pin before candidate_prepared; candidates ref after
+    /// candidate_prepared and before task_candidate_created". The settlement
+    /// lands **between the pin and `candidate_prepared`**, which is
+    /// [`settle_succeeded`]'s own note: `T-CAND-OBJ`'s window covers the commit
+    /// object and the pin with `authoritative_state: attempt unsettled`.
+    ///
+    /// INV-07's "candidate_prepared is the sole successful attempt settlement"
+    /// is about which event records the *candidate*, not which settles the
+    /// attempt: without `attempt_finished(Succeeded)` the generation never
+    /// reaches `Promoting` and the fold refuses the `candidate_prepared` that
+    /// follows.
+    ///
+    /// # Why `complete_promotion` was split to make this callable
+    ///
+    /// It took `hooks` **and** a journal. The driver's journal must hold
+    /// `hooks` to emit through [`emit`], and one `&mut dyn TopologyHooks`
+    /// cannot be both. The test journal sidesteps that by holding a *different*
+    /// events bundle — the two-observation-surface divergence
+    /// `reviews/FINDINGS.md` records — and production must not, because then
+    /// the candidate sequence's appends would not be the ones the harness sees.
+    ///
+    /// So `complete_promotion` is now the composition of three halves that
+    /// alternate between the two borrows, with its own typestate carrying the
+    /// order. Its signature is unchanged and every existing caller still
+    /// compiles.
+    fn promote_candidate(
+        &mut self,
+        dispatched: &Dispatched,
+        plan: &AttemptPlan,
+        capture: &Capture,
+        record: AttemptRecord,
+        seams: &RunSeams<'_>,
+        hooks: &mut dyn TopologyHooks,
+    ) -> Result<(), UpstrokeError> {
+        let key = dispatched.key;
+        // **The region the diff actually touched**, read through the manager
+        // rather than predicted: `lease_effect` is `ReplacesPredicted`, and the
+        // whole point of that variant is that the prediction is replaced by the
+        // measurement.
+        let actual_paths = seams
+            .manager
+            .changed_paths(&dispatched.slot, &capture.parent)?;
+
+        let judged = JudgedTree {
+            key,
+            generation: dispatched.generation,
+            attempt: Box::new(record.clone()),
+            base_sha: dispatched.base.clone(),
+            tree_sha: CommitSha(capture.tree.clone()),
+            message: format!(
+                "upstroke: {} attempt {}",
+                self.display_id(key)?,
+                plan.attempt.0
+            ),
+            actual_paths,
+            lease_effect: CandidateLeaseEffect::ReplacesPredicted {
+                paths: seams
+                    .manager
+                    .changed_paths(&dispatched.slot, &capture.parent)?,
+            },
+        };
+
+        let run_id = self.identity.run_id.clone();
+        let unpinned = write_candidate_commit(seams.manager, hooks, &run_id, judged)?;
+        let pinned = pin_candidate(seams.manager, hooks, unpinned)?;
+
+        // Between the pin and `candidate_prepared`, and in that order.
+        let settlement = settle_succeeded(
+            &self.handle.fold,
+            key,
+            dispatched.generation,
+            plan.attempt,
+            &record,
+        )?;
+        self.spend.record(key, &settlement.record);
+        self.emit(
+            TopologyEventBody::AttemptFinished {
+                data: Box::new(settlement),
+            },
+            seams,
+            hooks,
+        )?;
+
+        // The three halves alternate between the hooks bundle and the journal,
+        // and the journal must hold the bundle to emit through `emit`. So each
+        // half runs with the borrow it needs and the typestate carries the
+        // order between them: only `append_candidate_prepared` makes a
+        // `PromotingCandidate`, only `create_candidates_ref` makes a
+        // `ReferencedCandidate`, and only `append_candidate_created` makes a
+        // `CreatedCandidate`.
+        let promoting = self.with_journal(seams, hooks, |journal| {
+            append_candidate_prepared(journal, pinned)
+        })?;
+        let referenced = create_candidates_ref(seams.manager, hooks, promoting)?;
+        let created = self.with_journal(seams, hooks, |journal| {
+            append_candidate_created(journal, referenced)
+        })?;
+        reclaim_after_creation(seams.manager, hooks, &dispatched.slot, created)?;
+        Ok(())
+    }
+
+    /// Lend the run's state to the candidate sequence as a [`CandidateJournal`].
+    ///
+    /// A closure rather than a stored field because the journal borrows the
+    /// fold, the log and the hooks, and the sequence's effect halves need the
+    /// hooks back between appends.
+    fn with_journal<T>(
+        &mut self,
+        seams: &RunSeams<'_>,
+        hooks: &mut dyn TopologyHooks,
+        run: impl FnOnce(&mut RunJournal<'_, '_>) -> Result<T, UpstrokeError>,
+    ) -> Result<T, UpstrokeError> {
+        let mut journal = RunJournal {
+            emitter: RunEmitter {
+                identity: &self.identity,
+                state: EmitState {
+                    fold: &mut self.handle.fold,
+                    log: &mut self.handle.log,
+                    reservations: &mut self.reservations,
+                    warnings: &mut self.warnings,
+                },
+                clock: seams.clock,
+            },
+            hooks,
+            invocations: &mut self.invocations,
+        };
+        run(&mut journal)
+    }
+
+    /// The display id the frozen registry gave this task.
+    fn display_id(&self, key: TaskKey) -> Result<String, UpstrokeError> {
+        Ok(self
+            .handle
+            .fold
+            .registry()
+            .and_then(|registry| registry.get(key))
+            .ok_or_else(|| UpstrokeError::Refused {
+                message: format!("task {} is not in this run's frozen registry", key.index()),
+            })?
+            .display_id
+            .as_str()
+            .to_owned())
     }
 
     /// How many times this task has already settled `Deferred`.
