@@ -85,6 +85,9 @@ macro_rules! context {
             runner: &$run.runner,
             slots: &mut $process.slots,
             ledger: &mut $process.ledger,
+            adapters: &crate::engine::topology::scaffold::ScaffoldAdapters::new(),
+            paths: &$run.paths,
+            reviews: &crate::engine::attempt::LegacyReviewPasses,
         }
     };
 }
@@ -226,8 +229,23 @@ fn capture_precedes_the_snapshots_and_every_snapshot_commits_before_its_intent()
         .capture(&dispatched)
         .expect("capture");
     let mark = run.mark();
+    // Built before the context borrows `run` mutably.
+    let review_inputs = run.review_inputs();
     let judgement = context!(run, process)
-        .judge(&dispatched, &started, &capture, &plan)
+        .judge(
+            &dispatched,
+            &started,
+            &capture,
+            &plan,
+            &review_inputs,
+            // Caller-supplied, ordinal included: nothing pass-shaped is
+            // minted inside `judge`, so PR8's merge verification can
+            // supply its `SequenceIdentities` here without a redesign.
+            &|pass| crate::review::ReviewInvocations {
+                pass: started.identities.review_pass(pass, 0),
+                reask: started.identities.review_reask(pass, 0),
+            },
+        )
         .expect("judge");
 
     // O25: both capture sites, in order, before any snapshot effect.
@@ -320,15 +338,43 @@ fn gates_and_reviewers_run_on_fresh_exact_snapshots_and_never_in_the_task_worktr
     let capture = context!(run, process)
         .capture(&dispatched)
         .expect("capture");
+    // Built before the context borrows `run` mutably.
+    let review_inputs = run.review_inputs();
     let judgement = context!(run, process)
-        .judge(&dispatched, &started, &capture, &plan)
+        .judge(
+            &dispatched,
+            &started,
+            &capture,
+            &plan,
+            &review_inputs,
+            // Caller-supplied, ordinal included: nothing pass-shaped is
+            // minted inside `judge`, so PR8's merge verification can
+            // supply its `SequenceIdentities` here without a redesign.
+            &|pass| crate::review::ReviewInvocations {
+                pass: started.identities.review_pass(pass, 0),
+                reask: started.identities.review_reask(pass, 0),
+            },
+        )
         .expect("judge");
 
-    let workspaces: Vec<PathBuf> = judgement
-        .gates
-        .iter()
-        .chain(&judgement.reviews)
-        .map(|verdict| verdict.workspace.clone())
+    // **Where the processes actually ran, not where the judgement says they
+    // ran.** This used to read `Verdict::workspace` from both lists, and
+    // `Judgement.reviews` is now `Vec<ReviewRecord>` — a wire type, which has
+    // no path to carry and should not grow one. The runner's record is the
+    // better evidence anyway: it observes the request each process was spawned
+    // with, so a `judge` that reported one workspace and spawned in another
+    // fails here, and the old assertion could not have seen that.
+    let workspaces: Vec<PathBuf> = run
+        .runner
+        .ran()
+        .into_iter()
+        .filter(|ran| {
+            matches!(
+                ran.role,
+                crate::runner::ExecutionRole::Gate | crate::runner::ExecutionRole::Review
+            )
+        })
+        .map(|ran| ran.workspace)
         .collect();
     for workspace in &workspaces {
         assert_ne!(
@@ -349,9 +395,12 @@ fn gates_and_reviewers_run_on_fresh_exact_snapshots_and_never_in_the_task_worktr
         "one snapshot for the gate set and one fresh per reviewer, never shared across roles \
          or between reviewers: {workspaces:?}"
     );
-    assert_ne!(
-        judgement.reviews[0].workspace,
-        judgement.reviews[1].workspace
+    assert_eq!(
+        judgement.reviews.len(),
+        2,
+        "both passes produced a record; `AttemptRecord.reviews` being empty \
+         MEANS nothing was reviewed, so a pass that ran and recorded nothing \
+         would write a false statement into the log"
     );
 
     // Cleaned on completion: nothing survives the judgement.
@@ -418,8 +467,22 @@ fn gates_take_no_slot_and_the_worker_and_reviewers_do() {
     let capture = context!(run, process)
         .capture(&dispatched)
         .expect("capture");
+    let review_inputs = run.review_inputs();
     context!(run, process)
-        .judge(&dispatched, &started, &capture, &plan)
+        .judge(
+            &dispatched,
+            &started,
+            &capture,
+            &plan,
+            &review_inputs,
+            // Caller-supplied, ordinal included: nothing pass-shaped is
+            // minted inside `judge`, so PR8's merge verification can
+            // supply its `SequenceIdentities` here without a redesign.
+            &|pass| crate::review::ReviewInvocations {
+                pass: started.identities.review_pass(pass, 0),
+                reask: started.identities.review_reask(pass, 0),
+            },
+        )
         .expect("judge");
 
     // Every process really went through the run's Runner, with the identity
@@ -1016,7 +1079,21 @@ fn attempt_kill_child() {
         "after_snapshot_add" => run.arm(SNAPSHOT_ADD, HookPhase::After, Injection::Kill),
         other => panic!("unknown site `{other}`"),
     }
-    let _ = context!(run, process).judge(&dispatched, &started, &capture, &plan);
+    let review_inputs = run.review_inputs();
+    let _ = context!(run, process).judge(
+        &dispatched,
+        &started,
+        &capture,
+        &plan,
+        &review_inputs,
+        // Caller-supplied, ordinal included: nothing pass-shaped is
+        // minted inside `judge`, so PR8's merge verification can
+        // supply its `SequenceIdentities` here without a redesign.
+        &|pass| crate::review::ReviewInvocations {
+            pass: started.identities.review_pass(pass, 0),
+            reask: started.identities.review_reask(pass, 0),
+        },
+    );
     unreachable!("the kill must have taken this process");
 }
 
@@ -2209,16 +2286,50 @@ fn a_failing_gate_rejects_the_judgement_and_its_snapshot_is_still_cleaned() {
     let capture = context!(run, process)
         .capture(&dispatched)
         .expect("capture");
+    // Built before the context borrows `run` mutably.
+    let review_inputs = run.review_inputs();
     let judgement = context!(run, process)
-        .judge(&dispatched, &started, &capture, &plan)
+        .judge(
+            &dispatched,
+            &started,
+            &capture,
+            &plan,
+            &review_inputs,
+            // Caller-supplied, ordinal included: nothing pass-shaped is
+            // minted inside `judge`, so PR8's merge verification can
+            // supply its `SequenceIdentities` here without a redesign.
+            &|pass| crate::review::ReviewInvocations {
+                pass: started.identities.review_pass(pass, 0),
+                reask: started.identities.review_reask(pass, 0),
+            },
+        )
         .expect("judge");
 
     assert!(!judgement.gates[0].passed(), "the gate exited 2");
     assert_eq!(judgement.gates[0].code, Some(2));
     assert!(!judgement.accepted(), "a failed gate rejects the attempt");
+
+    // **The reviewers do not run, and that is a deliberate change.** This test
+    // used to assert that they ran after the failing gate and passed, because
+    // the old `judge` ran every gate and then every reviewer unconditionally.
+    // The legacy engine does not: §11.2 is "a strong reviewer judges the diff
+    // against the acceptance criteria **only once the cheap checks pass**", and
+    // `run_attempt` guards its review block on `failure.is_none()`. Buying a
+    // frontier invocation to judge a diff the gates have already refused is
+    // spend for information the run cannot act on.
     assert!(
-        judgement.reviews.iter().all(Verdict::passed),
-        "and the reviewers, which ran after it, passed"
+        judgement.reviews.is_empty(),
+        "no reviewer runs after a gate has already rejected the work"
+    );
+    assert!(
+        run.runner
+            .ran()
+            .iter()
+            .all(|ran| !matches!(ran.role, crate::runner::ExecutionRole::Review)),
+        "and none was spawned — asserted on the runner's record, because an \
+         empty `reviews` list could also mean a pass that ran and recorded \
+         nothing, which is the one thing `AttemptRecord.reviews` must never be \
+         ambiguous about"
     );
     assert!(
         run.fixture

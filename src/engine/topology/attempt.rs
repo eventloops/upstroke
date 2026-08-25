@@ -65,11 +65,18 @@
 
 use std::path::PathBuf;
 
+use crate::agent::AdapterSource;
 use crate::agent::proc::ProcessOutput;
+use crate::engine::attempt::review_failure;
 use crate::error::UpstrokeError;
+use crate::events::ReviewRecord;
+use crate::gates::GateFailure;
+use crate::ir::WorkerProfile;
+use crate::ladder::AttemptFailure;
+use crate::review;
+use crate::rundir::RunPaths;
 use crate::runner::{
-    AgentId, CommandSpec, InvocationId, Runner, RunnerRequest, gate_request, review_request,
-    worker_request,
+    AgentId, CommandSpec, InvocationId, Runner, RunnerRequest, gate_request, worker_request,
 };
 use crate::topology::events::{
     AttemptInterrupted4, AttemptNumber, AttemptStarted4, Materialization, RungBinding, SessionId,
@@ -91,16 +98,44 @@ use super::seams::TopologyHooks;
 /// snapshot: `decisions.workspace_candidates.snapshots` is "one snapshot for
 /// the gate set and one fresh snapshot per reviewer, never reused across roles
 /// or attempts".
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 pub struct ReviewerPlan {
     /// The agent whose CLI this pass runs.
     pub agent: AgentId,
-    /// The capacity pool it draws on, where its agent names one.
-    pub pool: Option<String>,
-    /// What to run.
-    pub command: CommandSpec,
-    /// How long it may take.
+    /// The routing decision this pass was bound with: model, effort, pool.
+    ///
+    /// `AttemptRecord` requires the model as a `String` and not an `Option`,
+    /// so a plan that carried only a command could not produce the record the
+    /// run must write.
+    pub profile: WorkerProfile,
+    /// Which review this is — what distinguishes it from the other passes.
+    pub lens: review::Lens,
+    /// What pre-flight certified this CLI as, where it certified one.
+    pub preflight_cli_version: Option<String>,
+    /// How long one invocation may take.
     pub timeout: std::time::Duration,
+}
+
+/// What every review pass of one attempt reads.
+///
+/// Owned, and on the plan rather than the context, because it is **data the
+/// caller decided** — the same reason `worker: CommandSpec` is on the plan. The
+/// context holds seams; the plan holds what this attempt is.
+pub struct ReviewInputs {
+    /// The task under review, as the prompt quotes it.
+    pub title: String,
+    /// Its body, which may be empty.
+    pub body: String,
+    /// Its acceptance criteria.
+    pub acceptance: Vec<String>,
+    /// The diff being judged.
+    pub diff: String,
+    /// Named artifacts the prompt wires to real files.
+    pub artifacts: Vec<(String, String)>,
+    /// Operator decisions the judge must honour, as the worker was given them.
+    pub decisions: Vec<String>,
+    /// The per-attempt file stem transcripts and settings are named from.
+    pub stem: String,
 }
 
 /// Everything one attempt executes, and the binding it executes under.
@@ -109,8 +144,44 @@ pub struct ReviewerPlan {
 /// `attempt_started` records them and the fold checks them against the frozen
 /// ladder: they are the attempt's execution identity (INV-19), and a module
 /// that re-derived them would be a second authority for a value the registry
+/// Where a review pass is executed.
+///
+/// **A seam, and it is not optional.** `review::run_review` is on the effect
+/// denylist — "UPSTROKE-WRAPPER: writes review transcripts through
+/// `util::write_text`" — because it writes outside any inventoried `RunDir`
+/// site. `decisions.effect_site_inventory.mechanism` (2) then says the legacy
+/// allowlist "never contains a topology module", and this file is one, so the
+/// escape is forbidden by name. `gates::run_all` is denied for the same reason,
+/// which is why [`AttemptContext::judge`] runs gates through `gate_request`
+/// itself rather than calling it.
+///
+/// Making the call legal directly would need a new `RunDirSite` variant for a
+/// transcript write — there is none — in `src/topology/effects.rs`, which is
+/// the file `ff0490a` froze by name. So the topology module declares what it
+/// needs and something outside the tree performs it, exactly as
+/// [`EventEmitter`], `Probes` and `IntegrationRefs` already do here.
+///
+/// **The authority is still `run_review`.** This is a seam over one
+/// implementation, not a second one, and PR8's merge verification implements
+/// the same trait rather than growing its own review path.
+pub trait ReviewPasses {
+    /// Run one review pass, re-asks and all.
+    ///
+    /// # Errors
+    ///
+    /// Whatever the review machinery returns. A reviewer that could not run is
+    /// **not** an error — it is a `ReviewResult::Unavailable`, which the ladder
+    /// defers rather than blaming on the implementer.
+    fn run(
+        &self,
+        cx: &review::ReviewCx<'_>,
+        runner: &dyn Runner,
+        invocations: &review::ReviewInvocations,
+    ) -> Result<review::ReviewOutcome, UpstrokeError>;
+}
+
 /// already froze.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 pub struct AttemptPlan {
     /// Which attempt of this generation. A retry is a **new** number, which is
     /// what makes its identities new.
@@ -204,12 +275,34 @@ impl Verdict {
 }
 
 /// What the gate set and the reviewers said.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 pub struct Judgement {
     /// One per gate, in the order the plan listed them.
+    ///
+    /// A [`Verdict`] and not something richer, because a shell gate's verdict
+    /// **is** an exit code — it runs repository-controlled code and reports
+    /// whether it passed. Widening this to carry a model and a cost would give
+    /// gates fields nothing can fill.
     pub gates: Vec<Verdict>,
-    /// One per reviewer, in the order the plan listed them.
-    pub reviews: Vec<Verdict>,
+    /// One per review pass that ran, in the order the plan listed them.
+    ///
+    /// **The record itself, not a verdict.** `AttemptRecord.reviews` is
+    /// `Vec<ReviewRecord>` and its emptiness *means* "nothing was reviewed", so
+    /// an attempt that was reviewed must produce records or write a false
+    /// statement into a log replay can never backfill. A `ReviewRecord`
+    /// requires `model` as a `String`, a `cost_usd`, a `preflight_cli_version`
+    /// and a typed `ReviewPassOutcome` — none of which an exit code can give,
+    /// which is why this is what the review machinery returns rather than what
+    /// this module derives from a process result.
+    pub reviews: Vec<ReviewRecord>,
+    /// What the gates and the reviews together say is wrong, if anything.
+    ///
+    /// Decided by the single production authorities — `engine::classify` for a
+    /// failed gate, `engine::attempt::review_failure` for a review — because
+    /// `ladder::next_step` reads this and `ladder::spends_allowance` derives
+    /// the allowance decision from it. A second opinion formed here would
+    /// change what a task costs.
+    pub failure: Option<AttemptFailure>,
 }
 
 impl Judgement {
@@ -218,9 +311,18 @@ impl Judgement {
     /// **O27's precondition.** `candidate.rs` enters the commit-tree sequence
     /// only for an accepted judgement, and a judgement exists only after every
     /// snapshot in it has been created, executed in, and removed.
+    ///
+    /// One field, not a second walk of the verdicts. This used to re-derive
+    /// "did everything pass" by folding the gate and review results, which is a
+    /// second opinion about the same question `failure` already answers — and
+    /// the two could disagree, because `failure` is decided by
+    /// `engine::classify` and `review_failure` while a fold here would be
+    /// decided by this line. `ladder::next_step` and
+    /// `ladder::spends_allowance` both read `failure`; nothing should read a
+    /// different answer to the same question.
     #[must_use]
     pub fn accepted(&self) -> bool {
-        self.gates.iter().all(Verdict::passed) && self.reviews.iter().all(Verdict::passed)
+        self.failure.is_none()
     }
 }
 
@@ -278,6 +380,17 @@ pub struct AttemptContext<'a> {
     pub slots: &'a mut SlotAssertion,
     /// R4: every Runner process registered exactly once, settled exactly once.
     pub ledger: &'a mut InvocationLedger,
+    /// Where a reviewer's adapter is resolved from.
+    ///
+    /// A seam and not a plan field: the plan says *which agent* a pass is bound
+    /// to, and this says how a name becomes an adapter. A plan carrying the
+    /// adapter would need a lifetime, and a plan is a value the driver builds
+    /// and holds across the appends it authorizes.
+    pub adapters: &'a dyn AdapterSource,
+    /// The run's directories — where a review's settings and transcripts go.
+    pub paths: &'a RunPaths,
+    /// Where a review pass is executed. See [`ReviewPasses`].
+    pub reviews: &'a dyn ReviewPasses,
 }
 
 impl AttemptContext<'_> {
@@ -419,10 +532,13 @@ impl AttemptContext<'_> {
         run: &AttemptRun,
         capture: &Capture,
         plan: &AttemptPlan,
+        inputs: &ReviewInputs,
+        invocations: &dyn Fn(u32) -> review::ReviewInvocations,
     ) -> Result<Judgement, UpstrokeError> {
         let generation = dispatched.generation.0;
         let attempt = plan.attempt.0;
 
+        let mut failure: Option<AttemptFailure> = None;
         let mut gates = Vec::with_capacity(plan.gates.len());
         if !plan.gates.is_empty() {
             let snapshot = self.snapshot(SnapshotName::gates(generation, attempt), capture)?;
@@ -436,7 +552,20 @@ impl AttemptContext<'_> {
                     gate.timeout,
                     invocation,
                 );
-                gates.push(self.verdict(&request, None)?);
+                let verdict = self.verdict(&request, None)?;
+                if !verdict.passed() && failure.is_none() {
+                    failure = Some(crate::engine::classify::gate_failure(&GateFailure {
+                        gate: format!("gate {index}"),
+                        summary: format!(
+                            "exit {}",
+                            verdict
+                                .code
+                                .map_or_else(|| "signal".to_owned(), |code| code.to_string())
+                        ),
+                        log_tail: String::new(),
+                    }));
+                }
+                gates.push(verdict);
             }
             self.manager
                 .remove_snapshot(self.hooks.effects(), &snapshot)?;
@@ -444,22 +573,84 @@ impl AttemptContext<'_> {
 
         let mut reviews = Vec::with_capacity(plan.reviewers.len());
         for (index, reviewer) in plan.reviewers.iter().enumerate() {
+            // A failed gate is a rejection of the work, and a reviewer judging
+            // a diff the gates already refused is a frontier invocation bought
+            // to learn nothing. `run_attempt` short-circuits for the same
+            // reason and §11.1 is the same sentence for gates.
+            if failure.is_some() {
+                break;
+            }
             let pass = u32::try_from(index).unwrap_or(u32::MAX);
             let snapshot =
                 self.snapshot(SnapshotName::review(generation, attempt, pass), capture)?;
-            let request = review_request(
-                reviewer.command.clone(),
-                snapshot.path.clone(),
-                reviewer.agent.clone(),
-                reviewer.timeout,
-                run.identities.review_pass(pass, 0),
+            let adapter = self.adapters.get(reviewer.agent.as_str()).ok_or_else(|| {
+                UpstrokeError::Refused {
+                    message: format!(
+                        "review pass {pass} is bound to agent `{}` and no adapter answers to that \
+                         name; pre-flight probed the agents this run recorded and this is not one \
+                         of them",
+                        reviewer.agent.as_str()
+                    ),
+                }
+            })?;
+            let outcome = self.reviews.run(
+                &review::ReviewCx {
+                    adapter,
+                    profile: reviewer.profile.clone(),
+                    lens: reviewer.lens,
+                    task: review::ReviewSubject {
+                        title: &inputs.title,
+                        body: &inputs.body,
+                        acceptance: &inputs.acceptance,
+                    },
+                    diff: &inputs.diff,
+                    artifacts: &inputs.artifacts,
+                    decisions: &inputs.decisions,
+                    workspace: &snapshot.path,
+                    settings_dir: &self.paths.settings(),
+                    reviews_dir: &self.paths.reviews(),
+                    stem: format!("{}-{}", inputs.stem, attempt),
+                    timeout: reviewer.timeout,
+                },
+                self.runner,
+                // **Caller-supplied, ordinal and all.** Nothing pass-shaped is
+                // minted here: PR8's merge verification is this machinery's
+                // third caller and its identities come from
+                // `SequenceIdentities`, not `AttemptIdentities`. A `judge` that
+                // reached for either scheme would be a seam its next caller had
+                // to redesign.
+                &invocations(pass),
+            )?;
+
+            // Read before the result is consumed: a judge that never ran is not
+            // a judge that said no, and the ledger has to show which happened.
+            let unavailable = matches!(outcome.result, review::ReviewResult::Unavailable { .. });
+            let cost_usd = outcome.cost_usd;
+            failure = review_failure(outcome.result);
+            reviews.push(
+                super::super::classify::ReviewPassFacts {
+                    pass: reviewer.lens.name(),
+                    agent: &reviewer.profile.agent,
+                    model: &reviewer.profile.model,
+                    adapter: adapter.id(),
+                    preflight_cli_version: reviewer.preflight_cli_version.clone(),
+                    effort: reviewer.profile.effort,
+                    pool: crate::engine::attempt::pool_option(&reviewer.profile.pool),
+                    cost_usd,
+                    unavailable,
+                    failed: failure.is_some(),
+                }
+                .record(),
             );
-            reviews.push(self.verdict(&request, reviewer.pool.clone())?);
             self.manager
                 .remove_snapshot(self.hooks.effects(), &snapshot)?;
         }
 
-        Ok(Judgement { gates, reviews })
+        Ok(Judgement {
+            gates,
+            reviews,
+            failure,
+        })
     }
 
     /// One exact snapshot of the captured tree, on the recorded parent.

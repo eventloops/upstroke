@@ -256,7 +256,8 @@ pub(super) fn run_attempt(
         )?;
         for (pass, reviewer) in cx.reviewers.iter().enumerate() {
             let pass = u32::try_from(pass).unwrap_or(u32::MAX);
-            let review = review::run_review(
+            let review = super::topology::attempt::ReviewPasses::run(
+                &LegacyReviewPasses,
                 &review::ReviewCx {
                     adapter: reviewer.adapter,
                     profile: reviewer.profile.clone(),
@@ -314,6 +315,34 @@ pub(super) fn run_attempt(
         candidate_tree: candidate.tree_oid,
         reviews,
     })
+}
+
+/// Runs a review pass through the legacy machinery, which is the only one.
+///
+/// **The seam's production implementation, and it lives here for a reason the
+/// allowlist already records.** `review::run_review` writes transcripts through
+/// `util::write_text`, outside any inventoried `RunDir` site — this file's
+/// allowlist entry says so, and that `RunDir` "has no transcript site in the
+/// frozen inventory, so there is no funnel to move it to inside this slice".
+/// So the call is denied everywhere except the modules the legacy section
+/// names, and `decisions.effect_site_inventory.mechanism` (2) forbids adding a
+/// topology module to that list.
+///
+/// Both engines reach the review machinery through this one function: the
+/// legacy path below, and the schema-4 driver through
+/// [`super::topology::attempt::ReviewPasses`]. One implementation, two callers
+/// — not a forwarder invented for the second.
+pub(super) struct LegacyReviewPasses;
+
+impl super::topology::attempt::ReviewPasses for LegacyReviewPasses {
+    fn run(
+        &self,
+        cx: &review::ReviewCx<'_>,
+        runner: &dyn crate::runner::Runner,
+        invocations: &review::ReviewInvocations,
+    ) -> Result<review::ReviewOutcome, UpstrokeError> {
+        review::run_review(cx, runner, invocations)
+    }
 }
 
 /// Turn a review result into an attempt failure, or `None` if it passed.

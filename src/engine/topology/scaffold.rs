@@ -620,6 +620,121 @@ impl Runner for RecordingRunner {
 }
 
 // ---------------------------------------------------------------------------
+// The agent boundary, doubled
+// ---------------------------------------------------------------------------
+
+/// An agent CLI that answers, without an agent CLI.
+///
+/// **A double, not a re-implementation.** It implements the real
+/// [`AgentAdapter`] trait, builds a real [`CommandSpec`], and every invocation
+/// it produces is spawned through [`RecordingRunner`] — so what the tests
+/// observe is the engine's own request, at the engine's own boundary. Nothing
+/// here re-implements what an adapter *does*; it stands in for what an adapter
+/// *talks to*.
+///
+/// It exists because the scaffold used to name real adapter ids —
+/// `claude-code` and `copilot` — which `BuiltinAdapters` resolves, sending
+/// `run_review` off to locate an actual CLI that is not there. A fixture that
+/// points at a real boundary and hopes is the same defect as a fixture that
+/// invents a shape production never builds, arriving from the other side.
+///
+/// `review.rs`'s three private fakes were considered and are the wrong shape:
+/// `NeverInvokedAdapter` panics on every method by design, and the other two
+/// model an outage and a deadline. All three are **negative-case** doubles, and
+/// teaching one to answer would change what it means for the tests that own it.
+pub(super) struct AnsweringAdapter {
+    id: &'static str,
+    verdict: &'static str,
+}
+
+impl AnsweringAdapter {
+    /// A reviewer that passes.
+    pub(super) const fn passing(id: &'static str) -> Self {
+        Self {
+            id,
+            verdict: "```json\n{\"pass\": true, \"reasons\": [], \"required_changes\": []}\n```",
+        }
+    }
+}
+
+impl crate::agent::AgentAdapter for AnsweringAdapter {
+    fn id(&self) -> &'static str {
+        self.id
+    }
+
+    fn probe(&self, _runner: &dyn Runner) -> Result<crate::agent::Caps, UpstrokeError> {
+        panic!("the scaffold's attempts do not pre-flight; `preflight.rs` owns that path")
+    }
+
+    fn build(&self, run: &crate::agent::TaskRun) -> Result<CommandSpec, UpstrokeError> {
+        // A real spec, carrying the prompt, so a test that reads the recorded
+        // command sees what was actually asked for.
+        Ok(CommandSpec::new(self.id)
+            .arg("--prompt")
+            .arg(run.prompt.clone()))
+    }
+
+    fn parse(
+        &self,
+        out: &crate::agent::ProcessOutput,
+    ) -> Result<crate::ir::Outcome, UpstrokeError> {
+        // `detail` is where `run_review` reads the verdict from, and `cost_usd`
+        // is what `ReviewRecord` requires — both come from the adapter because
+        // both are things only the agent's own CLI knows.
+        Ok(crate::ir::Outcome {
+            status: crate::ir::OutcomeStatus::Completed,
+            diff: String::new(),
+            detail: Some(self.verdict.to_owned()),
+            session_id: Some(format!("{}-session", self.id)),
+            usage: None,
+            cost_usd: Some(0.25),
+            transcript_path: PathBuf::new(),
+            duration: out.duration,
+        })
+    }
+
+    fn materialize_permissions(
+        &self,
+        _profile: &crate::ir::WorkerProfile,
+        _gate_cmds: &[String],
+        _dir: &Path,
+        _stem: &str,
+    ) -> Result<Option<PathBuf>, UpstrokeError> {
+        Ok(None)
+    }
+}
+
+/// The scaffold's adapters: the two the fixture's plans name, and nothing else.
+///
+/// Deliberately not `BuiltinAdapters`. An unknown agent must be a refusal a
+/// test can see, not a silent fall-through to a real CLI.
+pub(super) struct ScaffoldAdapters {
+    primary: AnsweringAdapter,
+    second: AnsweringAdapter,
+}
+
+impl ScaffoldAdapters {
+    pub(super) const fn new() -> Self {
+        Self {
+            primary: AnsweringAdapter::passing(AGENT),
+            second: AnsweringAdapter::passing(REVIEW_AGENT),
+        }
+    }
+}
+
+impl crate::agent::AdapterSource for ScaffoldAdapters {
+    fn get(&self, id: &str) -> Option<&dyn crate::agent::AgentAdapter> {
+        if id == AGENT {
+            Some(&self.primary)
+        } else if id == REVIEW_AGENT {
+            Some(&self.second)
+        } else {
+            None
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // The run
 // ---------------------------------------------------------------------------
 
@@ -628,6 +743,8 @@ impl Runner for RecordingRunner {
 pub(super) struct Run {
     /// The repository and its manager.
     pub(super) fixture: Fixture,
+    /// The run's directories, for the seams that write under them.
+    pub(super) paths: crate::rundir::RunPaths,
     /// The one harness every family records into.
     pub(super) harness: Arc<Mutex<HookHarness>>,
     /// The five families.
@@ -669,6 +786,19 @@ impl Run {
             runner: RecordingRunner::new(),
             timeline,
             harness,
+            paths: {
+                // `RunPaths`'s own doc: "Callers do this once at run start;
+                // every accessor below assumes it has happened." The scaffold
+                // was handing out paths without it, so a review's transcript
+                // write failed into `unavailable_after_error` and the pass was
+                // recorded as an OUTAGE — which spends no attempt. A fixture
+                // that skips a documented precondition does not fail loudly;
+                // it produces a plausible wrong answer.
+                let paths =
+                    crate::rundir::RunPaths::new(&fixture.base, "01SCAFFOLD00000000000000AA");
+                paths.create().expect("the scaffold's run directories");
+                paths
+            },
             fixture,
         };
         let started = run_started(&run.fixture);
@@ -820,6 +950,19 @@ impl Run {
             runner: RecordingRunner::new(),
             timeline,
             harness,
+            paths: {
+                // `RunPaths`'s own doc: "Callers do this once at run start;
+                // every accessor below assumes it has happened." The scaffold
+                // was handing out paths without it, so a review's transcript
+                // write failed into `unavailable_after_error` and the pass was
+                // recorded as an OUTAGE — which spends no attempt. A fixture
+                // that skips a documented precondition does not fail loudly;
+                // it produces a plausible wrong answer.
+                let paths =
+                    crate::rundir::RunPaths::new(&fixture.base, "01SCAFFOLD00000000000000AA");
+                paths.create().expect("the scaffold's run directories");
+                paths
+            },
             fixture,
         };
         adopted.runner.watching(adopted.emitter.log.path());
@@ -970,20 +1113,53 @@ impl Run {
                 .command();
                 GatePlan { command, timeout }
             }],
+            // Identity and policy, no command: the shared review machinery
+            // builds one per invocation, because a re-ask's prompt is not the
+            // first pass's. A fixture carrying a pre-built command would be a
+            // pass shape production never builds.
             reviewers: vec![
                 ReviewerPlan {
                     agent: AgentId::new(AGENT),
-                    pool: Some("scaffold-pool".to_owned()),
-                    command: CommandSpec::new("review").arg("--pass"),
+                    profile: crate::review::profile_for(
+                        AGENT,
+                        "scaffold-model",
+                        "primary",
+                        Effort::High,
+                    ),
+                    lens: crate::review::Lens::Acceptance,
+                    preflight_cli_version: Some("scaffold-cli/1".to_owned()),
                     timeout: Duration::from_secs(120),
                 },
                 ReviewerPlan {
                     agent: AgentId::new(REVIEW_AGENT),
-                    pool: None,
-                    command: CommandSpec::new("review").arg("--second-opinion"),
+                    profile: crate::review::profile_for(
+                        REVIEW_AGENT,
+                        "scaffold-second-model",
+                        "second_opinion",
+                        Effort::High,
+                    ),
+                    lens: crate::review::Lens::SecondOpinion,
+                    preflight_cli_version: None,
                     timeout: Duration::from_secs(120),
                 },
             ],
+        }
+    }
+
+    /// What every review pass of one scaffold attempt reads.
+    ///
+    /// Owned fixture data rather than a plan shape invented here: a review that
+    /// could not be produced from these inputs would be a pass shape production
+    /// never builds.
+    pub(super) fn review_inputs(&self) -> super::attempt::ReviewInputs {
+        super::attempt::ReviewInputs {
+            title: "scaffold task".to_owned(),
+            body: String::new(),
+            acceptance: vec!["it works".to_owned()],
+            diff: "diff --git a/a b/a\n".to_owned(),
+            artifacts: Vec::new(),
+            decisions: Vec::new(),
+            stem: "scaffold".to_owned(),
         }
     }
 
