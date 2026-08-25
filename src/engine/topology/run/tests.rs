@@ -61,13 +61,27 @@ fn every_branch_states_what_this_build_does_with_it() {
         .filter(|branch| branch.disposition() == Disposition::NotYetImplemented)
         .map(|branch| branch.label())
         .collect();
-    assert_eq!(
-        owed,
-        vec!["ingest answers", "hard block"],
+    assert!(
+        owed.is_empty(),
         "the branches this build has not written. Every one of them is carried \
          in the type so that no instrument here has to notice its absence. \
          `defer backoff` left this list when `TopologyRun::step` grew its arm, \
-         which is the shape every entry here is expected to leave by"
+         which is the shape every entry here is expected to leave by. It is \
+         empty now: {owed:?}"
+    );
+
+    // **What is another slice's, cited rather than owed.** `ingest answers` is
+    // not debt and is not a checkpoint refusal — the packet authorises exactly
+    // two of those — so it carries the contract passage that assigns it.
+    let elsewhere: Vec<&str> = LoopBranch::ALL
+        .iter()
+        .filter(|branch| matches!(branch.disposition(), Disposition::NotThisSlice { .. }))
+        .map(|branch| branch.label())
+        .collect();
+    assert_eq!(
+        elsewhere,
+        vec!["ingest answers"],
+        "a branch left this build's scope without saying which slice took it"
     );
 
     // The half-built one, and both halves in the branch's own words. A branch

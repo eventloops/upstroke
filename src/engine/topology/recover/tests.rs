@@ -4442,6 +4442,7 @@ fn the_driver_takes_over_from_the_recovery_order_and_steps() {
         plans: &plans,
         reviews: &crate::engine::attempt::LegacyReviewPasses,
         input_policy: &crate::engine::attempt::LegacyReviewInputPolicy,
+        answers: &crate::interaction::UnattendedAnswers,
         ids: &FixedIds,
         halts_run: false,
     };
@@ -4623,6 +4624,7 @@ fn the_driver_carries_an_accepted_attempt_through_the_candidate_sequence() {
         plans: &plans,
         reviews: &crate::engine::attempt::LegacyReviewPasses,
         input_policy: &crate::engine::attempt::LegacyReviewInputPolicy,
+        answers: &crate::interaction::UnattendedAnswers,
         ids: &FixedIds,
         halts_run: false,
     };
@@ -4752,6 +4754,7 @@ fn the_driver_settles_an_outage_from_the_folds_deferral_count() {
         plans: &plans,
         reviews: &crate::engine::attempt::LegacyReviewPasses,
         input_policy: &crate::engine::attempt::LegacyReviewInputPolicy,
+        answers: &crate::interaction::UnattendedAnswers,
         ids: &FixedIds,
         halts_run: false,
     };
@@ -4870,6 +4873,7 @@ fn the_driver_parks_an_attempt_with_the_question_it_raised() {
         plans: &plans,
         reviews: &crate::engine::attempt::LegacyReviewPasses,
         input_policy: &crate::engine::attempt::LegacyReviewInputPolicy,
+        answers: &crate::interaction::UnattendedAnswers,
         ids: &FixedIds,
         halts_run: false,
     };
@@ -5005,6 +5009,7 @@ fn the_driver_refuses_a_tree_a_filter_has_transformed() {
         plans: &plans,
         reviews: &crate::engine::attempt::LegacyReviewPasses,
         input_policy: &crate::engine::attempt::LegacyReviewInputPolicy,
+        answers: &crate::interaction::UnattendedAnswers,
         ids: &FixedIds,
         halts_run: false,
     };
@@ -5125,6 +5130,7 @@ fn the_retaining_incarnation_retries_in_place() {
         plans: &plans,
         reviews: &crate::engine::attempt::LegacyReviewPasses,
         input_policy: &crate::engine::attempt::LegacyReviewInputPolicy,
+        answers: &crate::interaction::UnattendedAnswers,
         ids: &FixedIds,
         halts_run: false,
     };

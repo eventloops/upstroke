@@ -38,6 +38,7 @@
 use std::collections::BTreeMap;
 
 use crate::error::UpstrokeError;
+use crate::ir::{Answer, Question, QuestionId};
 use crate::review;
 use crate::topology::events::TopologyEventBody;
 
@@ -202,6 +203,19 @@ pub enum Disposition {
     /// **Not written yet.** Carried in the type so it cannot become the kind of
     /// omission this module exists because of.
     NotYetImplemented,
+    /// **Another slice's, by contract.** Distinct from
+    /// [`Self::RefusedByCheckpoint`], and the distinction is not pedantry:
+    /// `checkpoint_refusals` authorises this build to refuse exactly two things
+    /// — "integration and run end beyond refusal" — and a third refusal wearing
+    /// that name would be a build refusing something the packet never let it
+    /// refuse. It is not [`Self::NotYetImplemented`] either, because that is
+    /// debt this slice owes and this is not.
+    NotThisSlice {
+        /// Which slice owns it.
+        slice: &'static str,
+        /// The contract passage that says so.
+        citation: &'static str,
+    },
     /// Partly written, with both halves named **in the branch's own words**.
     ///
     /// `loop` states each branch as a sequence of clauses, and a branch can be
@@ -290,7 +304,25 @@ impl LoopBranch {
             // settlement. The attempt half is the ready-dispatch branch's
             // machinery, reached through the same `attempt` and `settle`.
             Self::ReadyRetry => Disposition::Performed,
-            Self::IngestAnswers | Self::HardBlock => Disposition::NotYetImplemented,
+            // `loop`'s "attached-terminal prompt or `wait_on_block` for open
+            // questions". The channel decision is `interaction::answers_for`'s;
+            // this branch asks whatever source it is handed. An answer that
+            // arrives is refused, because ingesting one is PR9's.
+            Self::HardBlock => Disposition::Performed,
+            // **Refused by contract, not by omission.** `pr_sequence[8]` does
+            // not contain the word "answer"; PR8 still refuses
+            // "repair-admission answers before any append"; and PR9 owns
+            // `question_answered`, `T-ANSWER`, and "AwaitingInput -> Pending
+            // via validated answer". PR7's `replay_recovery` never names
+            // `T-ANSWER`. Same shape as `Integration` and `Closure`, whose
+            // terminals arrive in PR8 and PR10.
+            Self::IngestAnswers => Disposition::NotThisSlice {
+                slice: "PR9",
+                citation: "`pr_sequence[8]` does not contain the word `answer`; PR8 still \
+                           refuses `repair-admission answers before any append`; PR9 owns \
+                           `question_answered`, `T-ANSWER`, and `AwaitingInput -> Pending via \
+                           validated answer`. PR7's `replay_recovery` never names `T-ANSWER`",
+            },
         }
     }
 
@@ -355,6 +387,13 @@ impl LoopBranch {
                     self.label()
                 ),
             },
+            Disposition::NotThisSlice { slice, citation } => UpstrokeError::Refused {
+                message: format!(
+                    "the schema-4 run loop's `{}` branch belongs to {slice}, not to this build: \
+                     {citation}. No effect was performed and no event was appended",
+                    self.label()
+                ),
+            },
             _ => UpstrokeError::Refused {
                 message: format!(
                     "the schema-4 run loop selected its `{}` branch, which this build does not \
@@ -401,6 +440,10 @@ pub struct RunSeams<'a> {
     /// Whether the staged evidence is reviewable. `Workspace`'s policy, behind
     /// its seam.
     pub input_policy: &'a dyn ReviewInputPolicy,
+    /// Where an answer comes from at a hard block: a terminal prompt or a
+    /// `wait_on_block` wait, decided by `interaction::answers_for` and not
+    /// here.
+    pub answers: &'a dyn crate::interaction::AnswerSource,
     /// Where a question's id comes from. A seam because a ULID minted inline
     /// would append different bytes every run, and a park's whole point is
     /// that the id survives to the resume that rematerializes it.
@@ -480,6 +523,14 @@ pub enum Progress {
     GenerationClosed {
         /// Whose generation.
         key: TaskKey,
+    },
+    /// Nothing could run and the run is blocked on open questions.
+    ///
+    /// The hard-block rule applied and nobody answered. Not a terminal: an
+    /// answer arriving later un-blocks the run, and that is PR9's to ingest.
+    Blocked {
+        /// How many questions are open.
+        questions: usize,
     },
     /// The defer backoff elapsed and `defer_wait_elapsed` is durable.
     Waited {
@@ -660,7 +711,7 @@ impl TopologyRun {
                     spent_attempt,
                 })
             }
-            Admitted::HardBlock { .. } => Err(LoopBranch::HardBlock.unimplemented()),
+            Admitted::HardBlock { questions } => self.hard_block(&questions, seams),
         }
     }
 
@@ -726,6 +777,84 @@ impl TopologyRun {
                 Err(error.discharging(&mut self.invocations))
             }
         }
+    }
+
+    /// The hard-block branch: **apply the hard-block rules.**
+    ///
+    /// `loop`: "else apply the hard-block rules (attached-terminal prompt or
+    /// `wait_on_block` for open questions)". Which of the two applies is
+    /// **not** decided here — `interaction::answers_for` decides it, and its
+    /// own doc says why: "`on_block` at an attached terminal means *prompt*,
+    /// and the identical config detached means *wait for `upstroke answer`*.
+    /// Deciding it here rather than in the engine keeps that distinction where
+    /// the channels live." This branch asks the source it is handed and does
+    /// not know which channel it got.
+    ///
+    /// # What it does with an answer, and why that is a refusal
+    ///
+    /// Nothing, yet. **Ingesting an answer is PR9's.** `pr_sequence[8]` does
+    /// not contain the word *answer*; `pr_sequence[9]` (PR8) still lists
+    /// "repair-admission answers refused before any append"; and
+    /// `pr_sequence[10]` (PR9) owns `question_answered`, `T-ANSWER`, and
+    /// "AwaitingInput (limit | human_binding) -> Pending via validated
+    /// answer". PR7's `replay_recovery` does not name `T-ANSWER` at all.
+    ///
+    /// So an answer that arrives is refused **before any append**, which is
+    /// `checkpoint_refusals`' own shape: "an intermediate build refuses, before
+    /// any append, any operation whose terminals it does not implement".
+    /// `Answer::Unanswered` is not an answer and is not refused — it is the
+    /// detached case reporting that nobody was there, and the run stays
+    /// blocked, which is exactly what the rule prescribes.
+    fn hard_block(
+        &mut self,
+        questions: &[QuestionId],
+        seams: &RunSeams<'_>,
+    ) -> Result<Progress, UpstrokeError> {
+        for id in questions {
+            let question = self.open_question(id)?;
+            match seams.answers.resolve(&question)? {
+                Answer::Unanswered => {}
+                Answer::Answered { .. } | Answer::Declined => {
+                    return Err(UpstrokeError::Refused {
+                        message: format!(
+                            "question {} was answered, and ingesting an answer is PR9's: \
+                             `question_answered` and `T-ANSWER` are that slice's and this one's \
+                             contract does not name them. Refused before any append",
+                            id.0
+                        ),
+                    });
+                }
+            }
+        }
+        Ok(Progress::Blocked {
+            questions: questions.len(),
+        })
+    }
+
+    /// One open question, in the shape [`crate::interaction::AnswerSource`]
+    /// reads.
+    ///
+    /// The fold froze the id, kind, context and options when the settlement
+    /// parked; `affected_tasks` is the display id the registry holds for the
+    /// key it froze. Nothing is re-decided — `T-FAILED` is explicit that a
+    /// question is rematerialized from the event and "never re-decided".
+    fn open_question(&self, id: &QuestionId) -> Result<Question, UpstrokeError> {
+        let open = self
+            .handle
+            .fold
+            .open_questions()
+            .and_then(|open| open.get(id))
+            .ok_or_else(|| UpstrokeError::Refused {
+                message: format!("question {} is not open in this run's fold", id.0),
+            })?;
+        let frozen = &open.question;
+        Ok(Question {
+            id: frozen.id.clone(),
+            kind: frozen.kind,
+            affected_tasks: vec![crate::ir::TaskId(self.display_id(frozen.key)?)],
+            context: frozen.context.clone(),
+            options: frozen.options.clone(),
+        })
     }
 
     /// The first half of the ready-retry branch: **reserve, verify, and start
