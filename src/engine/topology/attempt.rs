@@ -330,6 +330,40 @@ pub struct Capture {
     pub parent: String,
 }
 
+/// What the ladder's **cheap rungs** said, before a gate or a reviewer ran.
+///
+/// `run_attempt`'s order is "outcome sanity → cheap static provenance → diff
+/// classification → gates → review. Cheapest and most objective first", and
+/// each rung is guarded by `failure.is_none()` — a worker that died is not
+/// asked to pass gates. [`AttemptContext::judge`] implements the last two
+/// rungs; this is the first ones, and without it the driver would hand an
+/// empty diff to a frontier reviewer and then settle it as a success.
+#[derive(Debug, Clone)]
+pub struct Assessment {
+    /// The adapter's parse of what the worker said about itself: session, cost,
+    /// usage, status. The attempt record is built from it.
+    pub outcome: crate::ir::Outcome,
+    /// What the cheap rungs concluded, if anything.
+    pub failure: Option<AttemptFailure>,
+}
+
+/// What one attempt produced, for the judging that reads all three.
+///
+/// A bundle because they arrive together and are read together: `judge` needs
+/// the identities to name its gate and review invocations, the tree to snapshot
+/// from, and the cheap rungs' verdict to start its own ladder at. Passing them
+/// singly put `judge` at eight arguments, which is a signal about the shape
+/// rather than about the lint.
+#[derive(Debug, Clone, Copy)]
+pub struct Judging<'a> {
+    /// The identities and the worker process.
+    pub run: &'a AttemptRun,
+    /// The exact tree and the commit it is judged against.
+    pub capture: &'a Capture,
+    /// What outcome sanity and the diff already concluded.
+    pub assessed: &'a Assessment,
+}
+
 /// One process's verdict, as the runner reported it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Verdict {
@@ -574,6 +608,60 @@ impl AttemptContext<'_> {
         })
     }
 
+    /// The ladder's cheap rungs: **outcome sanity, then the diff.**
+    ///
+    /// Both answers come from the production authorities rather than being
+    /// formed here — `engine::attempt::evaluate_outcome` for what the worker's
+    /// own report says, `engine::classify::diff_failure` for what the diff
+    /// alone says. `classify`'s doc already named this caller: "the schema-4
+    /// driver reads the same answer rather than forming its own, because
+    /// `ladder::next_step` reads the result and the allowance decision is
+    /// derived from it".
+    ///
+    /// **What is not here.** Legacy's third cheap rung is
+    /// `Workspace::review_input_problem_for_tree`, which refuses staged
+    /// evidence whose bytes are not the bytes a gate would see — a clean/smudge
+    /// filter, or a dirty submodule behind an unchanged gitlink. It reads a
+    /// `Workspace`, and this module holds a `WorkspaceManager` and a `Slot`.
+    /// Recorded rather than approximated: a driver that skipped the check
+    /// silently would judge a transformed blob and call it reviewed.
+    ///
+    /// # Errors
+    ///
+    /// Whatever the adapter's parse returns, or a refusal when the plan's agent
+    /// has no adapter.
+    pub fn assess(
+        &mut self,
+        plan: &AttemptPlan,
+        run: &AttemptRun,
+        diff: &str,
+        kind: crate::ir::TaskKind,
+    ) -> Result<Assessment, UpstrokeError> {
+        let adapter =
+            self.adapters
+                .get(plan.agent.as_str())
+                .ok_or_else(|| UpstrokeError::Refused {
+                    message: format!(
+                        "this attempt ran as agent `{}` and no adapter answers to that name",
+                        plan.agent.as_str()
+                    ),
+                })?;
+        let mut outcome = adapter.parse(&run.worker)?;
+        outcome.diff = diff.to_owned();
+
+        // In the legacy order, and each rung guarded: a worker that died is not
+        // asked what its diff looked like.
+        let mut failure = crate::engine::attempt::evaluate_outcome(&outcome, &run.worker);
+        if failure.is_none() {
+            failure = crate::engine::classify::diff_failure(
+                &outcome.diff,
+                kind,
+                !plan.reviewers.is_empty(),
+            );
+        }
+        Ok(Assessment { outcome, failure })
+    }
+
     /// **O26 and O27.** The gate set on one fresh exact snapshot, then each
     /// reviewer on its own.
     ///
@@ -617,18 +705,27 @@ impl AttemptContext<'_> {
     pub fn judge(
         &mut self,
         dispatched: &Dispatched,
-        run: &AttemptRun,
-        capture: &Capture,
         plan: &AttemptPlan,
+        judging: Judging<'_>,
         inputs: &ReviewInputs,
         invocations: &dyn Fn(u32) -> review::ReviewInvocations,
     ) -> Result<Judgement, UpstrokeError> {
+        let Judging {
+            run,
+            capture,
+            assessed,
+        } = judging;
         let generation = dispatched.generation.0;
         let attempt = plan.attempt.0;
 
-        let mut failure: Option<AttemptFailure> = None;
+        // **The cheap rungs carry forward, and they short-circuit the expensive
+        // ones.** `run_attempt` guards every rung with `failure.is_none()`, so
+        // a worker that died or produced no diff is not asked to pass gates and
+        // is certainly not shown to a frontier reviewer. Starting this at
+        // `None` would run the whole verification ladder over an empty diff.
+        let mut failure = assessed.failure.clone();
         let mut gates = Vec::with_capacity(plan.gates.len());
-        if !plan.gates.is_empty() {
+        if !plan.gates.is_empty() && failure.is_none() {
             let snapshot = self.snapshot(SnapshotName::gates(generation, attempt), capture)?;
             for (index, gate) in plan.gates.iter().enumerate() {
                 let invocation = run

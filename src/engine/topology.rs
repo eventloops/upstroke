@@ -64,8 +64,8 @@ pub(crate) mod startup;
 pub use super::assembly::FrozenPlans;
 
 pub use attempt::{
-    AttemptContext, AttemptOutcome, AttemptPlan, AttemptRun, Capture, GatePlan, Judgement,
-    ReviewerPlan, Verdict,
+    Assessment, AttemptContext, AttemptOutcome, AttemptPlan, AttemptRun, Capture, GatePlan,
+    Judgement, Judging, ReviewerPlan, Verdict,
 };
 pub use candidate::{
     CandidateJournal, CandidateNames, CandidateRecovery, JudgedTree, OrphanPin, PinnedCandidate,

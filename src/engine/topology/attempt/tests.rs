@@ -231,12 +231,26 @@ fn capture_precedes_the_snapshots_and_every_snapshot_commits_before_its_intent()
     let mark = run.mark();
     // Built before the context borrows `run` mutably.
     let review_inputs = run.review_inputs();
+    // Through the production phase, over the same diff the reviewers are
+    // shown: a fixture-built `Assessment` could show the judge a diff the
+    // cheap rungs never saw.
+    let assessed = context!(run, process)
+        .assess(
+            &plan,
+            &started,
+            &review_inputs.diff,
+            crate::ir::TaskKind::Implement,
+        )
+        .expect("the scaffold's adapter parses its own worker output");
     let judgement = context!(run, process)
         .judge(
             &dispatched,
-            &started,
-            &capture,
             &plan,
+            Judging {
+                run: &started,
+                capture: &capture,
+                assessed: &assessed,
+            },
             &review_inputs,
             // Caller-supplied, ordinal included: nothing pass-shaped is
             // minted inside `judge`, so PR8's merge verification can
@@ -340,12 +354,26 @@ fn gates_and_reviewers_run_on_fresh_exact_snapshots_and_never_in_the_task_worktr
         .expect("capture");
     // Built before the context borrows `run` mutably.
     let review_inputs = run.review_inputs();
+    // Through the production phase, over the same diff the reviewers are
+    // shown: a fixture-built `Assessment` could show the judge a diff the
+    // cheap rungs never saw.
+    let assessed = context!(run, process)
+        .assess(
+            &plan,
+            &started,
+            &review_inputs.diff,
+            crate::ir::TaskKind::Implement,
+        )
+        .expect("the scaffold's adapter parses its own worker output");
     let judgement = context!(run, process)
         .judge(
             &dispatched,
-            &started,
-            &capture,
             &plan,
+            Judging {
+                run: &started,
+                capture: &capture,
+                assessed: &assessed,
+            },
             &review_inputs,
             // Caller-supplied, ordinal included: nothing pass-shaped is
             // minted inside `judge`, so PR8's merge verification can
@@ -468,12 +496,26 @@ fn gates_take_no_slot_and_the_worker_and_reviewers_do() {
         .capture(&dispatched)
         .expect("capture");
     let review_inputs = run.review_inputs();
+    // Through the production phase, over the same diff the reviewers are
+    // shown: a fixture-built `Assessment` could show the judge a diff the
+    // cheap rungs never saw.
+    let assessed = context!(run, process)
+        .assess(
+            &plan,
+            &started,
+            &review_inputs.diff,
+            crate::ir::TaskKind::Implement,
+        )
+        .expect("the scaffold's adapter parses its own worker output");
     context!(run, process)
         .judge(
             &dispatched,
-            &started,
-            &capture,
             &plan,
+            Judging {
+                run: &started,
+                capture: &capture,
+                assessed: &assessed,
+            },
             &review_inputs,
             // Caller-supplied, ordinal included: nothing pass-shaped is
             // minted inside `judge`, so PR8's merge verification can
@@ -1080,11 +1122,25 @@ fn attempt_kill_child() {
         other => panic!("unknown site `{other}`"),
     }
     let review_inputs = run.review_inputs();
+    // Through the production phase, over the same diff the reviewers are
+    // shown: a fixture-built `Assessment` could show the judge a diff the
+    // cheap rungs never saw.
+    let assessed = context!(run, process)
+        .assess(
+            &plan,
+            &started,
+            &review_inputs.diff,
+            crate::ir::TaskKind::Implement,
+        )
+        .expect("the scaffold's adapter parses its own worker output");
     let _ = context!(run, process).judge(
         &dispatched,
-        &started,
-        &capture,
         &plan,
+        Judging {
+            run: &started,
+            capture: &capture,
+            assessed: &assessed,
+        },
         &review_inputs,
         // Caller-supplied, ordinal included: nothing pass-shaped is
         // minted inside `judge`, so PR8's merge verification can
@@ -2288,12 +2344,26 @@ fn a_failing_gate_rejects_the_judgement_and_its_snapshot_is_still_cleaned() {
         .expect("capture");
     // Built before the context borrows `run` mutably.
     let review_inputs = run.review_inputs();
+    // Through the production phase, over the same diff the reviewers are
+    // shown: a fixture-built `Assessment` could show the judge a diff the
+    // cheap rungs never saw.
+    let assessed = context!(run, process)
+        .assess(
+            &plan,
+            &started,
+            &review_inputs.diff,
+            crate::ir::TaskKind::Implement,
+        )
+        .expect("the scaffold's adapter parses its own worker output");
     let judgement = context!(run, process)
         .judge(
             &dispatched,
-            &started,
-            &capture,
             &plan,
+            Judging {
+                run: &started,
+                capture: &capture,
+                assessed: &assessed,
+            },
             &review_inputs,
             // Caller-supplied, ordinal included: nothing pass-shaped is
             // minted inside `judge`, so PR8's merge verification can

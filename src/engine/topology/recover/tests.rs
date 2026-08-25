@@ -4405,11 +4405,22 @@ fn the_driver_takes_over_from_the_recovery_order_and_steps() {
         panic!("the ready-dispatch branch did not run an attempt: {progress:?}");
     };
     assert_eq!(key, TaskKey(0));
+
+    // **Not accepted, and the reason is the contract's.** This fixture's runner
+    // answers every request with `exit 0` and never touches the worktree, so
+    // the capture's tree is the base's and the diff is empty.
+    // `pr_sequence[8].slice_contract.expected_failures_refusals` names
+    // "empty-diff and unresolved-index attempt failures" as this slice's, and
+    // this is the driver reaching one.
+    //
+    // It asserted `accepted` before the ladder's cheap rungs were wired, and
+    // passed: `judge` starts at gates, the plan configures none, and nothing
+    // had asked what the diff contained. A driver that accepted this would have
+    // pinned a candidate whose commit is its own parent.
     assert!(
-        accepted,
-        "the fixture configures no gates and no reviewers, so nothing can \
-         reject: an unaccepted judgement here means something failed that the \
-         plan never asked for"
+        !accepted,
+        "a worker that edited nothing was judged acceptable, which means the \
+         cheap rungs of the verification ladder did not run"
     );
 
     // The dispatch AND the attempt are real and durable, in that order. Both

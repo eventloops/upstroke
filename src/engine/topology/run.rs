@@ -46,7 +46,7 @@ use crate::topology::registry::TaskKey;
 use crate::workspace_manager::WorkspaceManager;
 
 use super::attempt::{
-    AttemptContext, AttemptPlans, InputsRequest, Judgement, PlanRequest, ReviewPasses,
+    AttemptContext, AttemptPlans, InputsRequest, Judgement, Judging, PlanRequest, ReviewPasses,
 };
 use super::dispatch::{DispatchKind, DispatchRequest, Dispatched, EventEmitter, dispatch};
 use super::emit::{EmitFailure, EmitState, RunIdentity, emit};
@@ -672,17 +672,30 @@ impl TopologyRun {
                 .manager
                 .candidate_diff(&dispatched.slot, &capture.parent, &capture.tree)?;
 
+        // The ladder's cheap rungs, before the expensive ones. `judge` starts
+        // from this rather than from `None`, so a worker that died or produced
+        // no diff never reaches a gate or a frontier reviewer.
+        let assessed = cx.assess(&plan, &run, &diff, entry.spec.kind)?;
+
         let inputs = seams.plans.inputs(&InputsRequest {
             entry: &entry,
             diff,
         })?;
 
-        cx.judge(dispatched, &run, &capture, &plan, &inputs, &|pass| {
-            review::ReviewInvocations {
+        cx.judge(
+            dispatched,
+            &plan,
+            Judging {
+                run: &run,
+                capture: &capture,
+                assessed: &assessed,
+            },
+            &inputs,
+            &|pass| review::ReviewInvocations {
                 pass: run.identities.review_pass(pass, 0),
                 reask: run.identities.review_reask(pass, 0),
-            }
-        })
+            },
+        )
     }
 
     /// What a first ordinary dispatch of `key` asks for.
