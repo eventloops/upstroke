@@ -5459,6 +5459,228 @@ fn the_driver_spends_the_allowance_the_log_records() {
     );
 }
 
+/// **Erratum E6: a resume converges the settled-but-unrecorded candidate.**
+///
+/// The window `attempt_finished{Closed{Succeeded}}` durable, `candidate_prepared`
+/// absent. The fold makes it mandatory — that settlement is the only thing that
+/// sets `Promoting` and `check_candidate_prepared` refuses every other class —
+/// and before E6 it was governed by no fault-matrix row: `T-CAND-OBJ` ends at
+/// "attempt_started only, attempt unsettled", and `T-CAND-REF` used to begin at
+/// `candidate_prepared`. Recovery **refused**, which was a third checkpoint
+/// refusal where the packet authorises exactly two.
+///
+/// E6 moves `T-CAND-REF`'s boundary to the settlement, and that row converges
+/// forward. Every input is derived from durable state: the pin names the commit,
+/// the commit names its tree and message, the generation names the base,
+/// `diff-tree base commit` names the region. Nothing is re-decided.
+#[test]
+fn a_resume_converges_a_settled_candidate_that_was_never_recorded() {
+    let fixture = Fixture::build(
+        "e6-converges",
+        Damage {
+            // **The dispatch comes from `open_generation`, not from `extra`.**
+            // It records the fixture's real base, and the convergence diffs the
+            // candidate commit against it — a placeholder sha makes `diff-tree`
+            // fail rather than report a region. Measured.
+            open_generation: true,
+            extra: vec![
+                attempt_started(1),
+                attempt_finished(
+                    1,
+                    AttemptSettlement::Closed {
+                        transition: SettlementTransition::Succeeded,
+                        lease: LeaseDisposition::PredictedRetained,
+                    },
+                ),
+            ],
+            ..Damage::default()
+        },
+    );
+    let commit = seed_candidate_commit(&fixture, 0);
+
+    let harness = harness();
+    let runtime = runtime_holding_the_record();
+    let certifies = AlwaysCertifies;
+    let given = Given::healthy(&fixture, &runtime, &certifies);
+    let (outcome, _) = resume_holding(&fixture, &harness, &given);
+    let (recovered, _handle) = outcome.expect("the resume converges rather than refusing");
+
+    assert_eq!(
+        recovered.promoted,
+        vec![TaskKey(0)],
+        "recovery did not converge the promoting generation"
+    );
+
+    // **The candidate names the object the pin named.** A convergence that
+    // invented an identity would still append something; this is what makes the
+    // append the settlement's candidate rather than a new one.
+    let prepared = TopologyFold::parse_log(&fixture.log_bytes())
+        .expect("the log parses")
+        .into_iter()
+        .find_map(|event| match event.body {
+            TopologyEventBody::CandidatePrepared { data } => Some(data),
+            _ => None,
+        })
+        .expect("`candidate_prepared` is durable after the convergence");
+
+    assert_eq!(
+        prepared.commit_sha.0, commit,
+        "a different commit was named"
+    );
+
+    // **And the identity derived FROM that commit**, not just the commit. An
+    // earlier draft asserted only the sha, and a mutation that invented the tree
+    // and the message survived it — the pin is read either way, so the sha alone
+    // proves nothing about `commit_identity`. Measured.
+    let tree = crate::workspace_manager::fixture::git(
+        &fixture.repo_root,
+        &["rev-parse", &format!("{commit}^{{tree}}")],
+    );
+    assert_eq!(prepared.tree_sha.0, tree, "the tree is not the commit's");
+    assert_eq!(
+        prepared.message, "upstroke: alpha attempt 1",
+        "the message is not the commit's"
+    );
+    assert_eq!(prepared.base_sha, fixture.base_sha, "the base moved");
+    assert_eq!(prepared.parent_sha, fixture.base_sha);
+    assert_eq!(prepared.key, TaskKey(0));
+
+    // The attempt record is the settlement's, not a fresh one: the convergence
+    // reads it from the events the barrier itself parsed.
+    assert_eq!(prepared.attempt.attempt, 1);
+}
+
+/// **The convergence is a resume, so its spend is the log's.**
+///
+/// The parity that `a_runs_spend_is_the_same_live_as_on_replay` asserts for a
+/// live run, over a log a *resume* completed. Both `attempt_finished{Succeeded}`
+/// and `candidate_prepared` carry the record, and the convergence appends the
+/// second one — so a spend reader that counted occurrences would price this
+/// attempt twice, and the double-count would arrive from recovery rather than
+/// from the driver.
+#[test]
+fn a_converged_log_prices_its_attempt_once() {
+    use crate::engine::topology::select::Spend;
+
+    let fixture = Fixture::build(
+        "e6-parity",
+        Damage {
+            // **The dispatch comes from `open_generation`, not from `extra`.**
+            // It records the fixture's real base, and the convergence diffs the
+            // candidate commit against it — a placeholder sha makes `diff-tree`
+            // fail rather than report a region. Measured.
+            open_generation: true,
+            extra: vec![
+                attempt_started(1),
+                attempt_finished(
+                    1,
+                    AttemptSettlement::Closed {
+                        transition: SettlementTransition::Succeeded,
+                        lease: LeaseDisposition::PredictedRetained,
+                    },
+                ),
+            ],
+            ..Damage::default()
+        },
+    );
+    seed_candidate_commit(&fixture, 0);
+
+    let harness = harness();
+    let runtime = runtime_holding_the_record();
+    let certifies = AlwaysCertifies;
+    let given = Given::healthy(&fixture, &runtime, &certifies);
+    let (outcome, _) = resume_holding(&fixture, &harness, &given);
+    outcome.expect("the resume converges");
+
+    let events = TopologyFold::parse_log(&fixture.log_bytes()).expect("the log parses");
+    let settlements = events
+        .iter()
+        .filter(|event| {
+            matches!(
+                event.body,
+                TopologyEventBody::AttemptFinished { .. }
+                    | TopologyEventBody::CandidatePrepared { .. }
+            )
+        })
+        .count();
+    assert_eq!(
+        settlements, 2,
+        "the converged log should carry both events for one attempt — if it \
+         does not, this test is not measuring the double-count it exists for"
+    );
+
+    let priced = Spend::replay(&events).run_total();
+    let once = events
+        .iter()
+        .find_map(|event| match &event.body {
+            TopologyEventBody::AttemptFinished { data } => Some(
+                data.record.cost_usd.unwrap_or(0.0) + data.record.review_cost_usd().unwrap_or(0.0),
+            ),
+            _ => None,
+        })
+        .expect("the settlement is durable");
+    assert!(
+        (priced - once).abs() < 1e-9,
+        "a converged log prices its one attempt at {priced}, and the attempt \
+         cost {once}: recovery's append made the run look more expensive than \
+         it was"
+    );
+}
+
+/// Put a real candidate commit and its pin in the fixture's repository.
+///
+/// **Erratum E6's window needs both halves to be real.** The convergence
+/// reconstructs the candidate's identity from the object the pin points at —
+/// tree and message from the commit, region from `diff-tree base commit` — so a
+/// fixture that seeded only events would exercise the refusal, not the
+/// convergence. This writes an actual commit on top of the fixture's base and
+/// creates the pin at it, which is exactly what a run killed after its
+/// settlement leaves behind.
+///
+/// Returns the commit sha, so a test can assert `candidate_prepared` names the
+/// object the pin named rather than one recovery invented.
+fn seed_candidate_commit(fixture: &Fixture, generation: u32) -> String {
+    use crate::workspace_manager::fixture::{git, write_file};
+
+    let repo = &fixture.repo_root;
+    // A change on top of the base, committed without moving the branch: the
+    // candidate commit is unreferenced except by its pin, which is R23's shape.
+    //
+    // **One path, never `add -A`.** The run's own directory lives under
+    // `.upstroke/` inside this repository, so `add -A` stages it and any
+    // subsequent worktree restore deletes it — measured, as a resume that could
+    // not find its own run.
+    write_file(&repo.join("candidate.txt"), b"the worker's edit\n");
+    git(repo, &["add", "--", "candidate.txt"]);
+    let tree = git(repo, &["write-tree"]);
+    let commit = git(
+        repo,
+        &[
+            "commit-tree",
+            &tree,
+            "-p",
+            fixture.base_sha.as_str(),
+            "-m",
+            "upstroke: alpha attempt 1",
+        ],
+    );
+    // Unstage and remove just that path, so the index matches the base again
+    // and the pin is the only thing referencing the commit. Targeted for the
+    // same reason the add was.
+    //
+    // `git rm` rather than `std::fs::remove_file`: deletion is a funnel in this
+    // crate and the effect denylist refuses the raw call even in a fixture,
+    // which is the rule working rather than getting in the way.
+    git(repo, &["rm", "-q", "-f", "--", "candidate.txt"]);
+    let pin = crate::engine::topology::candidate::candidate_pin_ref(
+        RUN_ID,
+        TaskKey(0),
+        GenerationId(generation),
+    );
+    git(repo, &["update-ref", pin.as_str(), &commit]);
+    commit
+}
+
 /// An [`IdSource`] whose question id is a constant.
 ///
 /// A park appends the id it minted, and `rematerialize_question` reads it back
