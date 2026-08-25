@@ -5,7 +5,7 @@ production code, tests, examples, build support, and code-generation inputs. It 
 project-specific: official Rust guidance is the foundation, while upstroke's product invariants,
 failure modes, and supported platforms determine the stricter rules.
 
-Last reconciled with the sources listed below: 2026-08-24.
+Last reconciled with the sources listed below: 2026-08-25.
 
 ## 1. Authority and scope
 
@@ -33,6 +33,14 @@ touches compliant. Unrelated debt should be recorded rather than hidden inside a
 scope expansion, unless it creates an immediate correctness or security risk; deferring such a
 risk requires an explicit owner and rationale.
 
+### Known conflicts at adoption
+
+`DESIGN.md:222` freezes `CommandSpec.program` as `String`, while §8 requires paths to use
+OS-native path types. This conflict is unresolved and is tracked as the open owner question
+`PR4-PROGRAM-PATH-NOT-UNICODE` in the parallelism workstream's `reviews/FINDINGS.md`. Its decision
+venue is workstream W4, in the G2 pass over PR3's layer. Until that ruling, the frozen design
+governs this one field; the exception is recorded rather than treated as precedent for other paths.
+
 ## 2. Automated baseline
 
 Every change MUST pass the same commands as CI, from the repository root:
@@ -42,7 +50,14 @@ cargo fmt --check
 cargo clippy --all-targets --all-features -- -D warnings
 cargo test --all-targets --all-features
 cargo +1.85.0 check --locked --all-targets --all-features
+bash .github/scripts/test-release-record.sh
+bash .github/scripts/test-pr-policy.sh
+bash .github/scripts/test-pr-ledger-evidence.sh
+bash .github/scripts/test-docs-consistency.sh
 ```
+
+Run all eight commands from the repository root. `CLAUDE.md`'s Gates section records the known
+root-invocation trap and the extra `jq` prerequisite for the release-record fixture.
 
 The project uses Rust edition 2024 and has an MSRV of 1.85.0. Code and dependencies MUST remain
 compatible with both the MSRV and the current stable toolchain. A green baseline is necessary,
@@ -58,6 +73,14 @@ Lint policy:
   those groups intentionally contain contextual, experimental, or mutually incompatible lints.
 - Do not rewrite clear code merely to satisfy a stylistic lint. Configure or narrowly suppress
   the lint, with rationale, when its premise does not hold.
+- A `clippy.toml` denylist, when present, is effect-funnel enforcement rather than style. Every
+  denied path MUST resolve under a Clippy CI leg that compiles the platform where the symbol
+  exists. An unresolved denial enforces nothing; Clippy reports it only as a bare configuration
+  warning, and `-D warnings` does not promote that warning.
+- A denylist MUST have a resolution census run by a named gate. The census links the probe against
+  every dependency needed to resolve its paths, enumerates the declared platform exceptions, and
+  injects a misspelled control that it must detect. At adoption, `master` has no `clippy.toml`;
+  these requirements activate in the same change that introduces one.
 
 ## 3. Rust-native design principles
 
@@ -90,12 +113,19 @@ The following rules cut across every section:
    protocol, not timing luck.
 8. **Make abstraction pay rent.** Abstract to protect an invariant, express a genuine family of
    behaviour, or remove proven duplication. Duplication is often cheaper than a false unification.
+   That is not permission to implement one design clause twice: every implementation claiming to
+   satisfy the same clause MUST be counted, and two is a finding even when both appear correct.
+   Once one authority is chosen, a source census with an injected positive control MUST pin it
+   as the only production implementation.
 
 ## 4. Formatting, naming, and readability
 
 `rustfmt` is the formatting authority. Run it rather than hand-aligning code or debating local
 style. A `#[rustfmt::skip]` or generated-file exclusion MUST be limited to syntax that rustfmt
 cannot represent usefully and MUST say why.
+
+No `rustfmt.toml` or `.rustfmt.toml` exists at adoption, so default rustfmt is the authority.
+Adding either file changes this standard and MUST update this document in the same change.
 
 Names MUST follow the Rust API Guidelines and standard casing:
 
@@ -271,6 +301,10 @@ subprocesses, and the engine does not add an HTTP/model-API path.
 
 ## 10. Concurrency and async code
 
+The codebase is synchronous at adoption. Requirements that specifically mention `.await` are N/A
+until the v0.2 async scheduler lands; the ownership, arbitration, cancellation, ordering, and
+bounded-work rules apply to current threads and subprocesses now.
+
 Concurrent code MUST have a written protocol visible in types, API documentation, or an adjacent
 comment. The protocol identifies the owner of shared state, the atomic/linearization point, valid
 state transitions, winner and loser behaviour, and cleanup after failure or cancellation.
@@ -308,8 +342,12 @@ Every unsafe operation MUST:
    as applicable;
 4. be wrapped in a safe API that cannot be called without satisfying the remaining preconditions;
 5. use explicit unsafe blocks inside an `unsafe fn` (`unsafe_op_in_unsafe_fn` discipline);
-6. have focused native tests on each supported platform where the code is active, plus Miri or
-   sanitizers where they can exercise the code meaningfully.
+6. have focused native tests on each supported platform where the code is active.
+
+New unsafe code that Miri can reach SHOULD be exercised under Miri. Sanitizers SHOULD be used
+where a configured platform leg can exercise the affected boundary. Until either tool has a named
+repository gate, its use is a triggered review requirement rather than an automated compliance
+claim.
 
 Windows, macOS, and Linux are supported targets. Cross-platform code MUST use platform-neutral
 types and semantics; `cfg` modules isolate genuine OS differences. Do not make Unix path, signal,
@@ -345,6 +383,30 @@ Tests MUST be deterministic and hermetic by default:
 - assert externally meaningful state and side effects, not an implementation copied into the
   test as its own oracle.
 
+### Instruments and censuses
+
+Source-based enforcement is code and needs tests of its own:
+
+- A census of Rust structure MUST blank comments and string, character, byte-string, and raw-string
+  literals before counting. The blanker MUST preserve positions and output length. Every scan MUST
+  assert a non-zero blanked-region count unless its declared domain intentionally contains none;
+  the blanker's tests MUST prove this with a fixture containing removable regions. Prefer a parser
+  or structural match to a substring search.
+- Every census MUST assert the size and boundaries of the domain it claims and carry a positive
+  control that injects one violation and observes the expected failure. A positive control inside
+  a truncated domain does not prove that the whole named domain was scanned.
+- Test-only items MUST follow every production item in a source file. A mid-file `#[cfg(test)]`
+  boundary can silently truncate any instrument that defines production as the prefix before the
+  first test item.
+- After inserting an item, verify that the neighbouring doc comments and attributes still attach
+  to their intended items. In particular, check `#[cfg]`, `#[test]`, lint attributes, derives, and
+  rustdoc on both sides of the insertion.
+- Derive a fixture's field list from the production type, not intuition. Vary every independently
+  meaningful field independently and assert hostility with distinct-value counts or a complete
+  written-out table; correlated values do not prove the field named by the test.
+- Name each test as the sentence it proves, so a failure reads as the broken claim rather than as
+  an implementation detail.
+
 A regression test MUST fail for the reported defect before the fix and pass after it. Prefer a
 minimal reproducer that names the violated contract over a broad snapshot that happens to change.
 Property tests and state-machine tests SHOULD be considered for parsers, replay, routing,
@@ -356,8 +418,10 @@ reaching through private state when the public behaviour can be exercised direct
 ## 13. Documentation and observability
 
 New or changed public items MUST have rustdoc that states their contract. Include `# Errors`,
-`# Panics`, and `# Safety` sections when applicable. Examples SHOULD compile as doctests unless
-they are explicitly marked otherwise for a reason.
+`# Panics`, and `# Safety` sections when applicable. Examples SHOULD remain valid Rust and MAY be
+doctests, but doctests are documentation in this repository: `cargo test --all-targets` excludes
+them. Executable evidence MUST live in a unit, integration, or other run target executed by a
+named CI command; a doctest alone does not satisfy a testing requirement.
 
 A change to behaviour, configuration, events, persisted data, CLI output, or a supported platform
 MUST update its user and design documentation in the same pull request. Do not leave a code comment
@@ -416,9 +480,11 @@ Reviewers and authors should be able to answer yes to each applicable item:
 - [ ] Platform assumptions are isolated and tested natively.
 - [ ] Untrusted input is bounded and validated before it gains authority; secrets stay redacted.
 - [ ] Tests force the important failure/interleaving and do not depend on ambient machine state.
+- [ ] Source instruments scan their complete claimed domain and their injected controls fail.
 - [ ] Public behaviour, persisted formats, events, and documentation change together.
 - [ ] New abstraction and dependencies have a demonstrated purpose and do not widen capability.
-- [ ] Formatting, Clippy, tests, and the MSRV check pass with the exact CI commands.
+- [ ] Every cited standard maps to a named mechanism or is explicitly review-only.
+- [ ] All eight §2 baseline commands pass from the repository root.
 
 ## 17. Upstream references
 
@@ -440,3 +506,37 @@ not an unversioned way to change the repository's contract:
 - [The Rust Book: recoverable errors](https://doc.rust-lang.org/book/ch09-02-recoverable-errors-with-result.html)
   and [fearless concurrency](https://doc.rust-lang.org/book/ch16-00-concurrency.html) — the language's
   error and ownership model.
+
+## Appendix A. Enforcement map
+
+A rule is automated only on the paths and platforms a named mechanism actually examines. Compiler
+assistance is not the same as enforcement, and a green gate is not evidence for review-only rules.
+
+| Rule area | Mechanism | Enforcement status |
+|---|---|---|
+| §1 authority, precedence, and known conflicts | Pull-request review; `test-docs-consistency.sh` for the document relationships it explicitly enumerates | Review-only unless the named Bash fixture contains the claim |
+| §2 formatting | `cargo fmt --check` / rustfmt | Automated on all formatted Rust inputs; default configuration at adoption |
+| §2 compiler and ordinary lint baseline | `cargo clippy --all-targets --all-features -- -D warnings` | Automated for code compiled by the lint job |
+| §2 effect denylist | `clippy.toml` disallowed methods, types, and macros; denylist resolution census with an injected typo control | Conditional: not present on `master` at adoption; automated only after both the file and its platform Clippy legs and census land |
+| §§3–6 design, types, APIs, ownership, and resources | rustc ownership/type checking and targeted Clippy lints where applicable; tests; pull-request review | Partly automated; semantic and abstraction rules are review-only |
+| §7 errors and panics | type checking, tests, and any specifically enabled panic/error lint | Review-only for `.unwrap()`, `.expect()`, panic policy, context quality, and error taxonomy until targeted lints are enabled |
+| §§8–9 filesystem, persistence, and processes | behavioural tests; platform CI; effect denylist once active | Partly automated; atomicity, durability, ownership, parsing, and protocol completeness require review |
+| §10 concurrency and async code | rustc `Send`/`Sync` and borrowing checks; deterministic concurrency tests | Partly automated; protocol, cancellation safety, bounds, and ordering require review. `.await`-specific rows are N/A until async production code lands |
+| §11 unsafe and platform code | rustc unsafe checks, `unsafe_op_in_unsafe_fn`, native tests; Miri or sanitizer only when a named leg exists | Partly automated; safety proofs and tool triggers require review |
+| §12 tests, instruments, and censuses | `cargo test --all-targets --all-features`; each instrument's positive control and named test or Bash gate | Execution is automated; sufficiency, independence, complete domains, and oracle quality require review |
+| §13 documentation | `test-docs-consistency.sh` for its enumerated contracts; rustdoc/compiler where a compiled example target exists | Otherwise review-only; doctests are not run by the baseline |
+| §14 security and trust boundaries | behavioural/security tests; effect denylist once active; pull-request review | Review-only where no named test or denial is cited |
+| §15 dependencies and features | locked MSRV check, all-feature compiler/test gates, and dependency diff review | Compatibility is partly automated; maintenance, licence, security, and capability assessment are review-only |
+| Contribution, PR, and release policy | `test-pr-policy.sh`, `test-pr-ledger-evidence.sh`, and `test-release-record.sh` | Automated by the lint job |
+
+Application rules:
+
+- A review finding that cites this standard MUST identify the applicable map row and either the
+  named enforcement mechanism or `review-only`. Absence of a mechanism never means compliant.
+- An enforcement artifact MUST be exercised by a named command that CI runs and MUST carry a
+  positive control proving that the command detects a violation in the claimed domain.
+- A lint is enabled in the same commit that makes the complete claimed tree clean under it. This
+  ratchet applies equally to a new lint, a widened lint scope, and a newly compiled platform.
+- A mechanism enforces only the files, targets, features, and platforms it actually evaluates.
+  Cross-compilation, an MSRV `check`, and a native test leg do not substitute for a platform Clippy
+  leg when the claim is a rustc-HIR-resolved denial.
