@@ -657,6 +657,20 @@ pub(super) struct AnsweringAdapter {
 
 impl AnsweringAdapter {
     /// A reviewer that passes.
+    /// An agent that stops and asks rather than working.
+    ///
+    /// `evaluate_outcome` reads `UPSTROKE-QUESTION:` out of the outcome's
+    /// detail **before** the evidence rules, because "an agent that stopped to
+    /// ask has not failed at anything". That is `FailureKind::NeedsHuman`,
+    /// which `next_step` sends straight to a park.
+    pub(super) const fn asking(id: &'static str) -> Self {
+        Self {
+            verdict: "UPSTROKE-QUESTION: the spec names two incompatible \
+                      formats and I should not pick one alone",
+            ..Self::passing(id)
+        }
+    }
+
     /// An agent whose CLI reports it is rate-limited: `evaluate_outcome` maps
     /// that to `FailureKind::RateLimited`, which `is_outage` recognises and
     /// `next_step` defers rather than blames on the implementer.
@@ -733,6 +747,14 @@ pub(super) struct ScaffoldAdapters {
 }
 
 impl ScaffoldAdapters {
+    /// The same two agents, with the implementer stopping to ask.
+    pub(super) const fn asking() -> Self {
+        Self {
+            primary: AnsweringAdapter::asking(AGENT),
+            second: AnsweringAdapter::passing(REVIEW_AGENT),
+        }
+    }
+
     /// The same two agents, with the implementer reporting a rate limit.
     pub(super) const fn rate_limiting() -> Self {
         Self {

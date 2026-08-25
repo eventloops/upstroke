@@ -41,7 +41,9 @@ use crate::topology::events::TopologyEventBody;
 
 use crate::events::AttemptRecord;
 use crate::interaction::Sleeper;
-use crate::topology::events::{CandidateLeaseEffect, CommitSha, GenerationId, SessionId};
+use crate::topology::events::{
+    CandidateLeaseEffect, CommitSha, FrozenQuestion, GenerationId, SessionId,
+};
 use crate::topology::fold::{FrozenInputs, TopologyFold};
 use crate::topology::registry::TaskKey;
 use crate::workspace_manager::WorkspaceManager;
@@ -58,7 +60,7 @@ use super::dispatch::{DispatchKind, DispatchRequest, Dispatched, EventEmitter, d
 use super::emit::{EmitFailure, EmitState, RunIdentity, emit};
 use super::identity::{InvocationLedger, ReservationKind, Reservations, SlotAssertion};
 use super::recover::RunHandle;
-use super::seams::{TimeSource, TopologyHooks};
+use super::seams::{IdSource, TimeSource, TopologyHooks};
 use super::select::{Admitted, Ceiling, Spend, Step, checkpoint, select};
 use super::settle::{Deferral, FinishedAttempt, settle_failed, settle_succeeded};
 
@@ -265,18 +267,12 @@ impl LoopBranch {
             // stuck one: recovery step (g) recreates its worktree at its base,
             // and `close_at_run_end` closes it. Stopping here leaves the run in
             // a shape the system already knows how to recover.
-            // The branch's four clauses are all here. What it still refuses
-            // are two *cases* of the last one, each named at its refusal: the
-            // successful settlement (the candidate sequence's, since it lands
-            // between the pin and `candidate_prepared`) and a park (no
-            // production builder for a question's id, context and options).
-            //
-            // An outage deferral was a third until `TaskFold::defers` existed.
-            Self::ReadyDispatch => Disposition::PartlyImplemented {
-                performs: "ceiling check, provisional dispatch reservation, dispatch, run one \
-                           attempt through the Runner and settle it",
-                owes: "settle a success or a park",
-            },
+            // All four clauses, and every case of the last one: a success
+            // through the candidate sequence, a retry, an escalation, an
+            // outage deferral, a park, and a terminal failure. The last two
+            // were refusals until `TaskFold::defers` and the question builder
+            // existed, and both refusals went with their causes.
+            Self::ReadyDispatch => Disposition::Performed,
             Self::IngestAnswers | Self::ReadyRetry | Self::HardBlock => {
                 Disposition::NotYetImplemented
             }
@@ -387,6 +383,10 @@ pub struct RunSeams<'a> {
     pub plans: &'a dyn AttemptPlans,
     /// Where a review pass is executed. `review::run_review`, behind its seam.
     pub reviews: &'a dyn ReviewPasses,
+    /// Where a question's id comes from. A seam because a ULID minted inline
+    /// would append different bytes every run, and a park's whole point is
+    /// that the id survives to the resume that rematerializes it.
+    pub ids: &'a dyn IdSource,
     /// `decisions.run_end_policy`: whether a task's terminal failure halts the
     /// run. Run configuration rather than an injection point, and here because
     /// the settlement records it and the log is the only place it survives.
@@ -813,21 +813,14 @@ impl TopologyRun {
     /// run has — what the ladder decided, what the record says, and what the
     /// run's policy does with a terminal failure.
     ///
-    /// # What this build refuses
+    /// # Every case of the branch, and nothing refused
     ///
-    /// A park: `Next::AskHuman` names a `QuestionKind` and nothing else, and
-    /// the id, context and options are the caller's. There is no production
-    /// builder for them yet, and inventing them at the settlement would decide
-    /// something the resume then has to re-decide identically.
-    ///
-    /// The refusal leaves the generation `OpenWithAttempt`, which is a state
-    /// recovery already closes.
-    ///
-    /// **An outage is no longer refused.** It was, because `next_step` reads
-    /// `LadderState::defers` on that branch and schema 4 had no reader for the
-    /// count. `TaskFold::defers` is that reader now
-    /// (`PR7-FOLD-DEFERS-ACCUMULATOR`), so the deferral settles from the number
-    /// the log holds rather than from one this process guessed.
+    /// A success goes through the candidate sequence; a retry, an escalation
+    /// and a terminal failure settle directly; an outage defers from
+    /// `TaskFold::defers` (`PR7-FOLD-DEFERS-ACCUMULATOR`); and a park raises
+    /// its question through [`Self::park_question`] before the settlement that
+    /// records it. Two of those were refusals until the readers they needed
+    /// existed, and both refusals are gone with their causes.
     fn settle(
         &mut self,
         dispatched: &Dispatched,
@@ -876,11 +869,18 @@ impl TopologyRun {
             },
             &policy,
         );
-        if let crate::ladder::Next::AskHuman(_) = next {
-            return Err(LoopBranch::ReadyDispatch.owes(
-                "a park, whose question id, context and options have no production builder",
-            ));
-        }
+        // **The question a park raises, built once here.** `settle_failed`
+        // refuses a parking settlement that carries none, and
+        // `rematerialize_question` reads it back out of the event on resume
+        // rather than re-deciding it — so a question invented at the resume
+        // would have to word itself identically, which is the duplication this
+        // slice keeps paying for.
+        let question = match next {
+            crate::ladder::Next::AskHuman(kind) => {
+                Some(self.park_question(dispatched.key, plan, kind, failure, seams.ids)?)
+            }
+            _ => None,
+        };
 
         let settled = settle_failed(
             &self.handle.fold,
@@ -891,7 +891,7 @@ impl TopologyRun {
                 record,
                 next,
                 session: assessed.outcome.session_id.clone().map(SessionId),
-                question: None,
+                question,
                 halts_run: seams.halts_run,
                 defers,
                 reason: failure.reason.clone(),
@@ -1059,6 +1059,54 @@ impl TopologyRun {
             .display_id
             .as_str()
             .to_owned())
+    }
+
+    /// The question a parked attempt raises.
+    ///
+    /// Every word of it comes from the legacy authorities:
+    /// `coordinator::question_context` for the prose the human reads and
+    /// `coordinator::question_options` for what they can answer. The driver
+    /// supplies only what the frozen registry knows — the display id, the
+    /// title, the acceptance list — and what this branch knows about the
+    /// attempt.
+    ///
+    /// **`attempts` and `rungs_spent` are one, and are properties of the
+    /// branch.** `select` reaches `Admitted::Dispatch` for a ready task, so
+    /// this is its first attempt on its first rung. `ReadyRetry` is where a
+    /// second of either comes from, and it is not built.
+    fn park_question(
+        &self,
+        key: TaskKey,
+        plan: &AttemptPlan,
+        kind: crate::ir::QuestionKind,
+        failure: &crate::ladder::AttemptFailure,
+        ids: &dyn IdSource,
+    ) -> Result<FrozenQuestion, UpstrokeError> {
+        let entry = self
+            .handle
+            .fold
+            .registry()
+            .and_then(|registry| registry.get(key))
+            .ok_or_else(|| UpstrokeError::Refused {
+                message: format!("task {} is not in this run's frozen registry", key.index()),
+            })?;
+        Ok(FrozenQuestion {
+            id: ids.question_id(),
+            key,
+            kind,
+            context: crate::engine::coordinator::question_context(
+                crate::engine::coordinator::ParkSubject {
+                    display_id: entry.display_id.as_str(),
+                    title: &entry.spec.title,
+                    acceptance: &entry.spec.acceptance,
+                    attempts: plan.attempt.0,
+                    rungs_spent: 1,
+                },
+                kind,
+                failure,
+            ),
+            options: crate::engine::coordinator::question_options(kind),
+        })
     }
 
     /// How many times this task has already settled `Deferred`.

@@ -83,6 +83,10 @@ impl TimeSource for Fixed {
 }
 
 impl IdSource for Fixed {
+    fn question_id(&self) -> crate::ir::QuestionId {
+        crate::ir::QuestionId("q-fixed".to_owned())
+    }
+
     fn run_id(&self) -> String {
         self.run_id.clone()
     }

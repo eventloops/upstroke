@@ -76,11 +76,7 @@ fn every_branch_states_what_this_build_does_with_it() {
     // `Performed` would be claiming an attempt ran.
     assert_eq!(
         LoopBranch::ReadyDispatch.disposition(),
-        Disposition::PartlyImplemented {
-            performs: "ceiling check, provisional dispatch reservation, dispatch, run one \
-                       attempt through the Runner and settle it",
-            owes: "settle a success or a park",
-        },
+        Disposition::Performed,
         "`loop` states this branch as four clauses and this build performs \
          three; the type says which three"
     );
@@ -155,22 +151,29 @@ fn a_refusal_names_the_branch_and_says_whether_anything_happened() {
         "and says the run is untouched: {untouched}"
     );
 
-    let partial = LoopBranch::ReadyDispatch.unimplemented().to_string();
+    // **No branch is `PartlyImplemented` today**, and that is a statement
+    // about this build rather than about the type. `ReadyDispatch` was the
+    // last one, and it became `Performed` when the question builder closed its
+    // final refused case. The variant stays because `ReadyRetry` will be built
+    // in halves the same way, and a test that deleted it would have to
+    // rediscover the shape.
     assert!(
-        partial.contains("performed ceiling check, provisional dispatch reservation, dispatch"),
-        "a half-built branch says what it DID: {partial}"
+        LoopBranch::ALL
+            .iter()
+            .all(|branch| !matches!(branch.disposition(), Disposition::PartlyImplemented { .. })),
+        "a branch is partly built again — this test needs its message asserted, \
+         because a half-built branch is the one shape whose refusal has to say \
+         what it already did"
     );
-    assert!(
-        partial.contains("run one attempt through the Runner and settle it"),
-        "including the clauses that arrived with the driver: {partial}"
-    );
-    assert!(
-        partial.contains("does not settle a success or a park"),
-        "and the two cases of the last clause it still refuses: {partial}"
-    );
-    assert!(
-        !partial.contains("no event was appended"),
-        "and never claims the log is untouched, because `task_dispatched` is \
-         durable by the time this is returned: {partial}"
-    );
+
+    // Every refusal names its own branch, whatever its disposition. A message
+    // that named the wrong one would send an operator to the wrong lane.
+    for branch in LoopBranch::ALL {
+        let refusal = branch.unimplemented().to_string();
+        assert!(
+            refusal.contains(branch.label()),
+            "`{}`'s refusal does not name it: {refusal}",
+            branch.label()
+        );
+    }
 }

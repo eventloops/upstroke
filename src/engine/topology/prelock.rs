@@ -427,6 +427,10 @@ mod tests {
     struct Ids;
 
     impl IdSource for Ids {
+        fn question_id(&self) -> crate::ir::QuestionId {
+            crate::ir::QuestionId("q-fixed".to_owned())
+        }
+
         fn run_id(&self) -> String {
             "01KZTPR7B00000000000000001".to_owned()
         }

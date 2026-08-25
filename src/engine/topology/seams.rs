@@ -25,6 +25,7 @@ use std::sync::{Arc, Mutex};
 
 use crate::agent::proc::SpawnHooks;
 use crate::events::log::EventHooks;
+use crate::ir::QuestionId;
 use crate::rundir::RunDirHooks;
 use crate::runner::container::ContainerHooks;
 use crate::topology::effects::HookHarness;
@@ -304,6 +305,14 @@ pub trait IdSource {
 
     /// This process's id, as the `.creating` marker records it.
     fn pid(&self) -> u32;
+
+    /// A fresh question id.
+    ///
+    /// Here rather than called directly so a test can drive a park to a known
+    /// id: `interaction::new_question_id` is a ULID, and a settlement that
+    /// minted one inline would append a different byte string every run,
+    /// which no durable-log assertion can pin.
+    fn question_id(&self) -> QuestionId;
 }
 
 /// Production: ULIDs and the real process id.
@@ -311,6 +320,10 @@ pub trait IdSource {
 pub struct RealIds;
 
 impl IdSource for RealIds {
+    fn question_id(&self) -> QuestionId {
+        crate::interaction::new_question_id()
+    }
+
     fn run_id(&self) -> String {
         crate::ulid::ulid()
     }
@@ -370,6 +383,10 @@ mod tests {
 
         fn pid(&self) -> u32 {
             self.pid
+        }
+
+        fn question_id(&self) -> QuestionId {
+            QuestionId("q-fixed".to_owned())
         }
     }
 

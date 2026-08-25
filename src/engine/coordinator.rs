@@ -771,8 +771,11 @@ impl Run<'_> {
                         )));
                     }
                     Next::AskHuman(kind) => {
-                        let context =
-                            question_context(task, kind, failure, &self.state.progress[index]);
+                        let context = question_context(
+                            ParkSubject::of(task, &self.state.progress[index]),
+                            kind,
+                            failure,
+                        );
                         let question = self.build_question(index, kind, context);
                         parking = Some(Box::new(events::AttemptParking {
                             question: question.clone(),
@@ -1456,14 +1459,52 @@ impl Run<'_> {
 /// What the human is shown. Every agent-authored fragment is quoted behind a
 /// fence the payload cannot close and labelled as agent-authored — a worker
 /// that "asks a question" is still an agent writing into a human's terminal.
-fn question_context(
-    task: &Task,
+pub(super) struct ParkSubject<'a> {
+    /// The id a human reads.
+    pub(super) display_id: &'a str,
+    /// What the task was asked to do.
+    pub(super) title: &'a str,
+    /// The bar it was asked to clear.
+    pub(super) acceptance: &'a [String],
+    /// How many attempts have run, which the context quotes back.
+    pub(super) attempts: u32,
+    /// How many distinct rungs those attempts spent, at least one.
+    pub(super) rungs_spent: usize,
+}
+
+impl<'a> ParkSubject<'a> {
+    /// The subject of a schema-3 task and its progress.
+    pub(super) fn of(task: &'a Task, progress: &Progress) -> Self {
+        Self {
+            display_id: task.id.as_str(),
+            title: &task.title,
+            acceptance: &task.acceptance,
+            attempts: progress.attempts,
+            rungs_spent: progress
+                .records
+                .iter()
+                .map(|record| record.tier.as_str())
+                .collect::<std::collections::BTreeSet<_>>()
+                .len()
+                .max(1),
+        }
+    }
+}
+
+/// The context a parked task's question quotes back to the human.
+///
+/// **Ask for what you read.** It reads the display id, the title, the
+/// acceptance list and the attempt count — never the body, the artifacts or the
+/// plan. Naming them lets the schema-4 driver, which holds a `FrozenTaskSpec`
+/// and no `Task`, raise the same question the legacy engine does rather than
+/// wording its own.
+pub(super) fn question_context(
+    task: ParkSubject<'_>,
     kind: QuestionKind,
     failure: &AttemptFailure,
-    progress: &Progress,
 ) -> String {
     let mut context = String::new();
-    let _ = writeln!(context, "Task `{}` — {}", task.id, task.title);
+    let _ = writeln!(context, "Task `{}` — {}", task.display_id, task.title);
     let asker = match failure.origin {
         FailureOrigin::Reviewer => "the reviewer",
         FailureOrigin::Worker => "the implementing agent",
@@ -1500,14 +1541,7 @@ fn question_context(
                     context,
                     "Nothing further can move this task: {} attempt(s) across {} rung(s) all failed, \
                  and the escalation chain is spent. The last failure was:",
-                    progress.attempts,
-                    progress
-                        .records
-                        .iter()
-                        .map(|r| r.tier.as_str())
-                        .collect::<std::collections::BTreeSet<_>>()
-                        .len()
-                        .max(1)
+                    task.attempts, task.rungs_spent
                 );
             }
         }
@@ -1516,7 +1550,7 @@ fn question_context(
     let _ = writeln!(context, "{fence}\n{}\n{fence}", failure.reason.trim());
     if !task.acceptance.is_empty() {
         context.push_str("Acceptance criteria this task must meet:\n");
-        for item in &task.acceptance {
+        for item in task.acceptance {
             let _ = writeln!(context, "- {item}");
         }
     }

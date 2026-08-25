@@ -4418,6 +4418,7 @@ fn the_driver_takes_over_from_the_recovery_order_and_steps() {
         paths: &paths,
         plans: &plans,
         reviews: &crate::engine::attempt::LegacyReviewPasses,
+        ids: &FixedIds,
         halts_run: false,
     };
 
@@ -4597,6 +4598,7 @@ fn the_driver_carries_an_accepted_attempt_through_the_candidate_sequence() {
         paths: &paths,
         plans: &plans,
         reviews: &crate::engine::attempt::LegacyReviewPasses,
+        ids: &FixedIds,
         halts_run: false,
     };
 
@@ -4724,6 +4726,7 @@ fn the_driver_settles_an_outage_from_the_folds_deferral_count() {
         paths: &paths,
         plans: &plans,
         reviews: &crate::engine::attempt::LegacyReviewPasses,
+        ids: &FixedIds,
         halts_run: false,
     };
 
@@ -4775,6 +4778,168 @@ fn the_driver_settles_an_outage_from_the_folds_deferral_count() {
         "the second deferral did not continue the first. A driver reading a \
          process-local zero records `1` here and defers forever"
     );
+}
+
+/// **The driver parks an attempt, and the question it raises is durable.**
+///
+/// The last case of the ready-dispatch branch. An agent that stops and asks has
+/// not failed at anything — `evaluate_outcome` reads `UPSTROKE-QUESTION:` out
+/// of the outcome before the evidence rules, precisely so that an agent is not
+/// punished for the empty diff its own question explains — so the chain is
+/// `NeedsHuman` -> `Next::AskHuman(Clarify)` -> a parking settlement.
+///
+/// **`settle_failed` refuses a park that carries no question**, so reaching a
+/// durable settlement at all is half the assertion. The other half is that the
+/// question is the one the legacy engine would have asked: its context comes
+/// from `coordinator::question_context` and its options from
+/// `coordinator::question_options`, and this test reads both back out of the
+/// log rather than out of the builder.
+#[test]
+fn the_driver_parks_an_attempt_with_the_question_it_raised() {
+    use crate::engine::topology::run::{Progress, RunSeams, TopologyRun};
+    use crate::engine::topology::select::Ceiling;
+
+    let fixture = Fixture::healthy("driver-parks");
+    let harness = harness();
+    let runtime = runtime_holding_the_record();
+    let certifies = AlwaysCertifies;
+    let given = Given::healthy(&fixture, &runtime, &certifies);
+
+    let (outcome, _) = resume_holding(&fixture, &harness, &given);
+    let (_recovered, handle) = outcome.expect("the healthy resume completes");
+
+    let mut run = TopologyRun::resumed(handle, fixture.inputs(), Ceiling::unlimited());
+    let mut hooks = HarnessTopologyHooks::new(Arc::clone(&harness));
+    let sleeper = RecordingSleeper::default();
+    let manager = fixture.manager();
+    let runner = RecordingRunner::editing();
+    let adapters = crate::engine::topology::scaffold::ScaffoldAdapters::asking();
+    let paths = crate::rundir::RunPaths::with_private_root(
+        &fixture.repo_root,
+        &fixture.started.run_id,
+        &fixture.private_root,
+    );
+    paths.create().expect("the run directories are creatable");
+    // **Through the production assembler, not a fixture plan shape.** The
+    // condition on this extraction was that the scaffold be re-pointed at the
+    // real one or round-tripped against it; a fixture that hand-built an
+    // `AttemptPlan` here would be exactly the fifth copy the `frozen_binding`
+    // precedent warns about.
+    let plans = crate::engine::assembly::FrozenPlans {
+        adapters: &adapters,
+        paths: &paths,
+        gates: &[],
+        pools: &[],
+        caps: &[],
+        worker_timeout: std::time::Duration::from_secs(300),
+        decisions: &[],
+    };
+    let seams = RunSeams {
+        manager: &manager,
+        clock: &Frozen,
+        sleeper: &sleeper,
+        runner: &runner,
+        adapters: &adapters,
+        paths: &paths,
+        plans: &plans,
+        reviews: &crate::engine::attempt::LegacyReviewPasses,
+        ids: &FixedIds,
+        halts_run: false,
+    };
+
+    let progress = run.step(&seams, &mut hooks).expect("the branch parks");
+
+    let Progress::Settled {
+        accepted,
+        spent_attempt,
+        ..
+    } = progress
+    else {
+        panic!("the ready-dispatch branch did not settle: {progress:?}");
+    };
+    assert!(
+        !accepted,
+        "an agent that asked a question produced no verdict"
+    );
+
+    // **A park spends no allowance.** "The code was never judged, so nothing is
+    // spent and nothing escalates" — `next_step`'s own words, and the cell that
+    // was wrong when the settlement derived the allowance from `Next` instead
+    // of from the failure.
+    assert!(
+        !spent_attempt,
+        "a park spent one of the rung's attempts, which is the cell the \
+         allowance fix exists for"
+    );
+
+    // The settlement is durable and carries its question.
+    let parked = TopologyFold::parse_log(&fixture.log_bytes())
+        .expect("the log parses")
+        .into_iter()
+        .find_map(|event| match event.body {
+            TopologyEventBody::AttemptFinished { data } => match data.settlement {
+                AttemptSettlement::Closed {
+                    transition: SettlementTransition::Parked { question },
+                    ..
+                } => Some(question),
+                _ => None,
+            },
+            _ => None,
+        })
+        .expect("a parking settlement is durable");
+
+    assert_eq!(parked.id, crate::ir::QuestionId("q-park-fixed".to_owned()));
+    assert_eq!(parked.key, TaskKey(0));
+    assert_eq!(parked.kind, crate::ir::QuestionKind::Clarify);
+
+    // **The words are the legacy authorities', not the driver's.** The context
+    // quotes the agent as data and names the task; the options are what
+    // `question_options` gives a `Clarify`. A driver that worded its own would
+    // pass every assertion above and fail these.
+    assert!(
+        parked.context.contains("stopped and asked for a decision"),
+        "the context is not `question_context`'s: {}",
+        parked.context
+    );
+    assert!(
+        parked
+            .context
+            .contains("two incompatible \\\n                      formats")
+            || parked.context.contains("incompatible"),
+        "the agent's own words are not quoted back: {}",
+        parked.context
+    );
+    assert_eq!(
+        parked.options,
+        crate::engine::coordinator::question_options(crate::ir::QuestionKind::Clarify),
+        "the options are not `question_options`'s"
+    );
+}
+
+/// An [`IdSource`] whose question id is a constant.
+///
+/// A park appends the id it minted, and `rematerialize_question` reads it back
+/// on resume rather than re-deciding it — so a test that asserts on the durable
+/// question needs the id to be the same bytes every run. `RealIds` gives a
+/// ULID, which is right in production and unpinnable here.
+struct FixedIds;
+
+impl crate::engine::topology::seams::IdSource for FixedIds {
+    fn run_id(&self) -> String {
+        RUN_ID.to_owned()
+    }
+
+    fn incarnation(&self) -> crate::topology::events::IncarnationId {
+        crate::topology::events::IncarnationId("inc-fixed".to_owned())
+    }
+
+    fn pid(&self) -> u32 {
+        4242
+    }
+
+    fn question_id(&self) -> crate::ir::QuestionId {
+        crate::ir::QuestionId("q-park-fixed".to_owned())
+    }
 }
 
 /// The kinds in a fixture's durable log, in order.
