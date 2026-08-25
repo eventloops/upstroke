@@ -88,6 +88,7 @@ macro_rules! context {
             adapters: &crate::engine::topology::scaffold::ScaffoldAdapters::new(),
             paths: &$run.paths,
             reviews: &crate::engine::attempt::LegacyReviewPasses,
+            input_policy: &crate::engine::attempt::LegacyReviewInputPolicy,
         }
     };
 }
@@ -236,8 +237,10 @@ fn capture_precedes_the_snapshots_and_every_snapshot_commits_before_its_intent()
     // cheap rungs never saw.
     let assessed = context!(run, process)
         .assess(
+            &dispatched,
             &plan,
             &started,
+            &capture,
             &review_inputs.diff,
             crate::ir::TaskKind::Implement,
         )
@@ -359,8 +362,10 @@ fn gates_and_reviewers_run_on_fresh_exact_snapshots_and_never_in_the_task_worktr
     // cheap rungs never saw.
     let assessed = context!(run, process)
         .assess(
+            &dispatched,
             &plan,
             &started,
+            &capture,
             &review_inputs.diff,
             crate::ir::TaskKind::Implement,
         )
@@ -501,8 +506,10 @@ fn gates_take_no_slot_and_the_worker_and_reviewers_do() {
     // cheap rungs never saw.
     let assessed = context!(run, process)
         .assess(
+            &dispatched,
             &plan,
             &started,
+            &capture,
             &review_inputs.diff,
             crate::ir::TaskKind::Implement,
         )
@@ -1127,8 +1134,10 @@ fn attempt_kill_child() {
     // cheap rungs never saw.
     let assessed = context!(run, process)
         .assess(
+            &dispatched,
             &plan,
             &started,
+            &capture,
             &review_inputs.diff,
             crate::ir::TaskKind::Implement,
         )
@@ -2349,8 +2358,10 @@ fn a_failing_gate_rejects_the_judgement_and_its_snapshot_is_still_cleaned() {
     // cheap rungs never saw.
     let assessed = context!(run, process)
         .assess(
+            &dispatched,
             &plan,
             &started,
+            &capture,
             &review_inputs.diff,
             crate::ir::TaskKind::Implement,
         )

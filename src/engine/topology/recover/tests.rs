@@ -658,6 +658,12 @@ struct RecordingRunner {
     seen: Mutex<Vec<RunnerRequest>>,
     /// A program whose invocation fails, so a probe refusal can be constructed.
     failing: Mutex<Option<String>>,
+    /// Whether the worker also declares a clean/smudge filter.
+    ///
+    /// A `.gitattributes` naming a filter makes the staged bytes and the bytes
+    /// a gate would see potentially different, which is what the ladder's third
+    /// cheap rung refuses.
+    filters: Mutex<bool>,
     /// Whether an `Implement` invocation edits the worktree it was given.
     ///
     /// Off by default, because most tests here only care that a process ran.
@@ -668,6 +674,17 @@ struct RecordingRunner {
 }
 
 impl RecordingRunner {
+    /// A worker that leaves a change behind **and** a filter declaration, so
+    /// the staged evidence is not the evidence a gate would see.
+    fn filtering() -> Self {
+        let runner = Self::editing();
+        *runner
+            .filters
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = true;
+        runner
+    }
+
     /// A runner whose worker leaves a change behind, so an attempt can succeed.
     fn editing() -> Self {
         let runner = Self::default();
@@ -721,6 +738,12 @@ impl Runner for RecordingRunner {
                 &request.workspace.join("worker.txt"),
                 b"the worker's edit\n",
             );
+            if *self.filters.lock().unwrap_or_else(PoisonError::into_inner) {
+                crate::workspace_manager::fixture::write_file(
+                    &request.workspace.join(".gitattributes"),
+                    b"* filter=upstroke-test\n",
+                );
+            }
         }
         Ok(ProcessOutput {
             code: Some(code),
@@ -4418,6 +4441,7 @@ fn the_driver_takes_over_from_the_recovery_order_and_steps() {
         paths: &paths,
         plans: &plans,
         reviews: &crate::engine::attempt::LegacyReviewPasses,
+        input_policy: &crate::engine::attempt::LegacyReviewInputPolicy,
         ids: &FixedIds,
         halts_run: false,
     };
@@ -4598,6 +4622,7 @@ fn the_driver_carries_an_accepted_attempt_through_the_candidate_sequence() {
         paths: &paths,
         plans: &plans,
         reviews: &crate::engine::attempt::LegacyReviewPasses,
+        input_policy: &crate::engine::attempt::LegacyReviewInputPolicy,
         ids: &FixedIds,
         halts_run: false,
     };
@@ -4726,6 +4751,7 @@ fn the_driver_settles_an_outage_from_the_folds_deferral_count() {
         paths: &paths,
         plans: &plans,
         reviews: &crate::engine::attempt::LegacyReviewPasses,
+        input_policy: &crate::engine::attempt::LegacyReviewInputPolicy,
         ids: &FixedIds,
         halts_run: false,
     };
@@ -4843,6 +4869,7 @@ fn the_driver_parks_an_attempt_with_the_question_it_raised() {
         paths: &paths,
         plans: &plans,
         reviews: &crate::engine::attempt::LegacyReviewPasses,
+        input_policy: &crate::engine::attempt::LegacyReviewInputPolicy,
         ids: &FixedIds,
         halts_run: false,
     };
@@ -4913,6 +4940,107 @@ fn the_driver_parks_an_attempt_with_the_question_it_raised() {
         parked.options,
         crate::engine::coordinator::question_options(crate::ir::QuestionKind::Clarify),
         "the options are not `question_options`'s"
+    );
+}
+
+/// **The driver refuses a tree whose bytes a gate would not see.**
+///
+/// The ladder's third cheap rung, and the one that was owed longest.
+/// `Workspace::review_input_problem_for_tree` refuses staged evidence a
+/// clean/smudge filter has transformed, or a worktree still holding unstaged or
+/// dirty nested state — either makes the reviewed diff describe something other
+/// than what the gates run against.
+///
+/// The worker here leaves a real edit **and** a `.gitattributes` naming a
+/// filter, so the diff is non-empty (the first two rungs pass) and the tree is
+/// still unreviewable. Without this rung the attempt would be accepted and a
+/// candidate pinned from a transformed blob.
+#[test]
+fn the_driver_refuses_a_tree_a_filter_has_transformed() {
+    use crate::engine::topology::run::{Progress, RunSeams, TopologyRun};
+    use crate::engine::topology::select::Ceiling;
+
+    let fixture = Fixture::healthy("driver-filtered");
+    let harness = harness();
+    let runtime = runtime_holding_the_record();
+    let certifies = AlwaysCertifies;
+    let given = Given::healthy(&fixture, &runtime, &certifies);
+
+    let (outcome, _) = resume_holding(&fixture, &harness, &given);
+    let (_recovered, handle) = outcome.expect("the healthy resume completes");
+
+    let mut run = TopologyRun::resumed(handle, fixture.inputs(), Ceiling::unlimited());
+    let mut hooks = HarnessTopologyHooks::new(Arc::clone(&harness));
+    let sleeper = RecordingSleeper::default();
+    let manager = fixture.manager();
+    let runner = RecordingRunner::filtering();
+    let adapters = crate::engine::topology::scaffold::ScaffoldAdapters::new();
+    let paths = crate::rundir::RunPaths::with_private_root(
+        &fixture.repo_root,
+        &fixture.started.run_id,
+        &fixture.private_root,
+    );
+    paths.create().expect("the run directories are creatable");
+    // **Through the production assembler, not a fixture plan shape.** The
+    // condition on this extraction was that the scaffold be re-pointed at the
+    // real one or round-tripped against it; a fixture that hand-built an
+    // `AttemptPlan` here would be exactly the fifth copy the `frozen_binding`
+    // precedent warns about.
+    let plans = crate::engine::assembly::FrozenPlans {
+        adapters: &adapters,
+        paths: &paths,
+        gates: &[],
+        pools: &[],
+        caps: &[],
+        worker_timeout: std::time::Duration::from_secs(300),
+        decisions: &[],
+    };
+    let seams = RunSeams {
+        manager: &manager,
+        clock: &Frozen,
+        sleeper: &sleeper,
+        runner: &runner,
+        adapters: &adapters,
+        paths: &paths,
+        plans: &plans,
+        reviews: &crate::engine::attempt::LegacyReviewPasses,
+        input_policy: &crate::engine::attempt::LegacyReviewInputPolicy,
+        ids: &FixedIds,
+        halts_run: false,
+    };
+
+    let progress = run
+        .step(&seams, &mut hooks)
+        .expect("the branch settles the refusal");
+
+    let Progress::Settled { accepted, .. } = progress else {
+        panic!("the ready-dispatch branch did not settle: {progress:?}");
+    };
+    assert!(
+        !accepted,
+        "a tree a filter has transformed was accepted, so the ladder's third \
+         cheap rung did not run"
+    );
+
+    // **The refusal is the policy's own words, attributed to the reviewer.**
+    // `classify::review_input_failure` is the one place that decides what an
+    // unreviewable tree means for the attempt, and the message is
+    // `Workspace`'s, not a driver paraphrase.
+    let failure = TopologyFold::parse_log(&fixture.log_bytes())
+        .expect("the log parses")
+        .into_iter()
+        .find_map(|event| match event.body {
+            TopologyEventBody::AttemptFinished { data } => data.record.failure.clone(),
+            _ => None,
+        })
+        .expect("the settlement records a failure");
+
+    assert_eq!(failure.kind, crate::ladder::FailureKind::ReviewInputOpaque);
+    assert_eq!(failure.origin, crate::ladder::FailureOrigin::Reviewer);
+    assert!(
+        failure.reason.contains("filter"),
+        "the reason is not the policy's: {}",
+        failure.reason
     );
 }
 

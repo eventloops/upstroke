@@ -2030,7 +2030,7 @@ mod tests {
             ),
             (
                 "src/engine/attempt.rs",
-                9,
+                8,
                 0,
                 "`review_failure`'s arms, the reviewer-unavailable mapping, \
                  and the outcome-status classification. Already functions and \
@@ -2038,17 +2038,20 @@ mod tests {
                  move — a pure move of something already callable is churn. \
                  `review_failure`'s own doc carries the rule the allowance \
                  derivation rests on: a reviewer asking for a human `must not \
-                 spend an attempt or escalate`",
+                 spend an attempt or escalate`. Nine until the review-input \
+                 refusal moved to `classify`, which is where the driver reads \
+                 it from",
             ),
             (
                 "src/engine/classify.rs",
-                3,
+                4,
                 3,
                 "what was INLINE in `run_attempt`'s verification ladder: the \
                  diff's two observations and a failed gate, plus the three \
-                 arms that decide a review pass's outcome. Both engines read \
-                 these, and this is the only production site that CONSTRUCTS \
-                 a `ReviewPassOutcome`",
+                 arms that decide a review pass's outcome, plus the \
+                 review-input refusal the ladder's third cheap rung raises. \
+                 Both engines read these, and this is the only production site \
+                 that CONSTRUCTS a `ReviewPassOutcome`",
             ),
             (
                 "src/engine/coordinator.rs",

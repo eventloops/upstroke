@@ -211,9 +211,16 @@ pub(super) fn run_attempt(
             super::classify::diff_failure(&outcome.diff, cx.task.kind, !cx.reviewers.is_empty());
     }
     if failure.is_none() {
-        if let Some(problem) = workspace.review_input_problem_for_tree(&candidate.tree_oid)? {
-            failure =
-                Some(AttemptFailure::new(FailureKind::ReviewInputOpaque, problem).from_reviewer());
+        // Through the seam and the classifier, so the schema-4 driver runs the
+        // same rung rather than a copy of it.
+        if let Some(problem) =
+            <LegacyReviewInputPolicy as super::topology::attempt::ReviewInputPolicy>::problem(
+                &LegacyReviewInputPolicy,
+                workspace.root(),
+                &candidate.tree_oid,
+            )?
+        {
+            failure = Some(super::classify::review_input_failure(problem));
         }
     }
     if failure.is_none() && !cx.gates.is_empty() {
@@ -336,6 +343,24 @@ pub(super) fn run_attempt(
 /// [`super::topology::attempt::ReviewPasses`]. One implementation, two callers
 /// — not a forwarder invented for the second.
 pub(super) struct LegacyReviewPasses;
+
+/// [`crate::workspace::Workspace`]'s review-input policy, for a caller that
+/// holds a worktree path instead of a `Workspace`.
+///
+/// The legacy verification ladder is its first caller — through
+/// `run_attempt`'s own `workspace`, not through this — and the schema-4 driver
+/// is its second. One policy, two callers.
+pub(super) struct LegacyReviewInputPolicy;
+
+impl super::topology::attempt::ReviewInputPolicy for LegacyReviewInputPolicy {
+    fn problem(
+        &self,
+        worktree: &std::path::Path,
+        tree: &str,
+    ) -> Result<Option<String>, UpstrokeError> {
+        crate::workspace::Workspace::open(worktree)?.review_input_problem_for_tree(tree)
+    }
+}
 
 impl super::topology::attempt::ReviewPasses for LegacyReviewPasses {
     fn run(

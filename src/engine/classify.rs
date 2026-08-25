@@ -204,3 +204,14 @@ pub(crate) fn attempt_record(attempt: u32, facts: AttemptFacts<'_>) -> AttemptRe
         }),
     }
 }
+
+/// A tree whose staged bytes are not the bytes a gate would see.
+///
+/// `Workspace::review_input_problem_for_tree` decides *whether* — a
+/// clean/smudge filter, or a dirty submodule behind an unchanged gitlink — and
+/// this decides what that means for the attempt. Attributed to the reviewer,
+/// not the implementer: the worker wrote what it was asked to, and the tree is
+/// what cannot be judged.
+pub(crate) fn review_input_failure(problem: String) -> AttemptFailure {
+    AttemptFailure::new(FailureKind::ReviewInputOpaque, problem).from_reviewer()
+}

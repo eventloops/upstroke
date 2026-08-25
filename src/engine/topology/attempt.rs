@@ -214,6 +214,33 @@ pub trait AttemptPlans {
     fn plan(&self, request: &PlanRequest<'_>) -> Result<AttemptPlan, UpstrokeError>;
 }
 
+/// Whether the staged evidence is the evidence a gate would see.
+///
+/// **The ladder's third cheap rung, and a seam for the reason
+/// [`ReviewPasses`] is one.** `Workspace::review_input_problem_for_tree` is the
+/// policy: it refuses a tree whose bytes a clean/smudge filter has transformed,
+/// and a worktree still holding unstaged or dirty nested state behind an
+/// unchanged gitlink. Either makes the diff describe something other than what
+/// the gates run against, so neither can be reviewed completely.
+///
+/// It reads a [`crate::workspace::Workspace`], which is the legacy type; this
+/// module holds a `WorkspaceManager` and a `Slot`. Re-deriving the policy on
+/// the manager would be a second implementation of a refusal whose whole job is
+/// to be exact, so the topology module declares what it needs and something
+/// outside the tree performs it.
+pub trait ReviewInputPolicy {
+    /// The problem with this tree as review input, or `None`.
+    ///
+    /// # Errors
+    ///
+    /// A Git or I/O error from the inspection.
+    fn problem(
+        &self,
+        worktree: &std::path::Path,
+        tree: &str,
+    ) -> Result<Option<String>, UpstrokeError>;
+}
+
 /// Where a review pass is executed.
 ///
 /// **A seam, and it is not optional.** `review::run_review` is on the effect
@@ -501,6 +528,8 @@ pub struct AttemptContext<'a> {
     pub paths: &'a RunPaths,
     /// Where a review pass is executed. See [`ReviewPasses`].
     pub reviews: &'a dyn ReviewPasses,
+    /// Whether the staged evidence is reviewable. See [`ReviewInputPolicy`].
+    pub input_policy: &'a dyn ReviewInputPolicy,
 }
 
 impl AttemptContext<'_> {
@@ -618,13 +647,11 @@ impl AttemptContext<'_> {
     /// `ladder::next_step` reads the result and the allowance decision is
     /// derived from it".
     ///
-    /// **What is not here.** Legacy's third cheap rung is
-    /// `Workspace::review_input_problem_for_tree`, which refuses staged
+    /// The third rung is here too, behind [`ReviewInputPolicy`]: staged
     /// evidence whose bytes are not the bytes a gate would see — a clean/smudge
-    /// filter, or a dirty submodule behind an unchanged gitlink. It reads a
-    /// `Workspace`, and this module holds a `WorkspaceManager` and a `Slot`.
-    /// Recorded rather than approximated: a driver that skipped the check
-    /// silently would judge a transformed blob and call it reviewed.
+    /// filter, or a dirty submodule behind an unchanged gitlink — cannot be
+    /// reviewed completely, and a driver that skipped the check would judge a
+    /// transformed blob and call it reviewed.
     ///
     /// # Errors
     ///
@@ -632,8 +659,10 @@ impl AttemptContext<'_> {
     /// has no adapter.
     pub fn assess(
         &mut self,
+        dispatched: &Dispatched,
         plan: &AttemptPlan,
         run: &AttemptRun,
+        capture: &Capture,
         diff: &str,
         kind: crate::ir::TaskKind,
     ) -> Result<Assessment, UpstrokeError> {
@@ -658,6 +687,18 @@ impl AttemptContext<'_> {
                 kind,
                 !plan.reviewers.is_empty(),
             );
+        }
+        // The third rung: is the staged evidence the evidence a gate would
+        // see. Attributed to the reviewer, not the implementer — a filter or a
+        // dirty submodule is a policy failure of the tree, and the classifier
+        // that decides so is `run_attempt`'s, reused rather than restated.
+        if failure.is_none() {
+            if let Some(problem) = self
+                .input_policy
+                .problem(&dispatched.worktree, &capture.tree)?
+            {
+                failure = Some(crate::engine::classify::review_input_failure(problem));
+            }
         }
         Ok(Assessment { outcome, failure })
     }

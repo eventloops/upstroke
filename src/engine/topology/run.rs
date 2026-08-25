@@ -50,7 +50,7 @@ use crate::workspace_manager::WorkspaceManager;
 
 use super::attempt::{
     Assessment, AttemptContext, AttemptPlan, AttemptPlans, Capture, InputsRequest, Judgement,
-    Judging, PlanRequest, ReviewPasses,
+    Judging, PlanRequest, ReviewInputPolicy, ReviewPasses,
 };
 use super::candidate::{
     CandidateJournal, JudgedTree, append_candidate_created, append_candidate_prepared,
@@ -383,6 +383,9 @@ pub struct RunSeams<'a> {
     pub plans: &'a dyn AttemptPlans,
     /// Where a review pass is executed. `review::run_review`, behind its seam.
     pub reviews: &'a dyn ReviewPasses,
+    /// Whether the staged evidence is reviewable. `Workspace`'s policy, behind
+    /// its seam.
+    pub input_policy: &'a dyn ReviewInputPolicy,
     /// Where a question's id comes from. A seam because a ULID minted inline
     /// would append different bytes every run, and a park's whole point is
     /// that the id survives to the resume that rematerializes it.
@@ -766,6 +769,7 @@ impl TopologyRun {
             adapters: seams.adapters,
             paths: seams.paths,
             reviews: seams.reviews,
+            input_policy: seams.input_policy,
         };
 
         let run = cx.start(dispatched, &plan)?;
@@ -778,7 +782,7 @@ impl TopologyRun {
         // The ladder's cheap rungs, before the expensive ones. `judge` starts
         // from this rather than from `None`, so a worker that died or produced
         // no diff never reaches a gate or a frontier reviewer.
-        let assessed = cx.assess(&plan, &run, &diff, entry.spec.kind)?;
+        let assessed = cx.assess(dispatched, &plan, &run, &capture, &diff, entry.spec.kind)?;
 
         let inputs = seams.plans.inputs(&InputsRequest {
             entry: &entry,
