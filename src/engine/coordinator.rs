@@ -17,8 +17,7 @@ use crate::events::{
 };
 use crate::interaction::{self, AnswerSource, Notifier, QuestionRecord, RealSleeper, Sleeper};
 use crate::ir::{
-    Answer, PermissionMode, Question, QuestionId, QuestionKind, ResolvedEffortPolicy, Task,
-    WorkerProfile,
+    Answer, Question, QuestionId, QuestionKind, ResolvedEffortPolicy, Task, WorkerProfile,
 };
 use crate::ladder::{
     self, AttemptFailure, FailureKind, FailureOrigin, LadderPolicy, LadderState, Next,
@@ -587,22 +586,16 @@ impl Run<'_> {
                 return Ok(false);
             }
 
-            let profile = WorkerProfile {
-                name: format!("{}-{}", rung.tier, rung.binding.model),
-                agent: rung.binding.agent.clone(),
-                model: rung.binding.model.clone(),
-                // Attribution only (§13 read-only): which subscription pays for
-                // this attempt, so the ledger and the estimator can say so.
-                // Nothing routes on it.
-                pool: self.pool_name_for(&rung.binding.agent).unwrap_or_default(),
-                permissions: PermissionMode::Edit,
-                // What the rung's tier is worth on an agent with an effort
-                // axis: without this the whole chain runs at one vendor
-                // default and escalating a rung moves nothing (§10).
-                effort: Some(self.effort_policy.implementation_for(rung.tier)),
-                max_turns: None,
-                extra_args: Vec::new(),
-            };
+            // Attribution only (§13 read-only): which subscription pays for
+            // this attempt. Resolved here because it needs the run's config,
+            // and passed in.
+            let profile = super::assembly::implementer_profile(
+                super::assembly::ImplementerBinding::of_rung(
+                    rung,
+                    self.effort_policy.implementation_for(rung.tier),
+                ),
+                self.pool_name_for(&rung.binding.agent),
+            );
             let adapter = adapters
                 .get(&profile.agent)
                 .ok_or_else(|| UpstrokeError::Agent {

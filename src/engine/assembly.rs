@@ -1,4 +1,4 @@
-//! The single production authority for **what command an invocation runs**.
+//! The single production authority for **what an invocation runs, and as what**.
 //!
 //! # Why this module exists
 //!
@@ -35,11 +35,53 @@ use std::path::Path;
 
 use crate::agent::{AgentAdapter, TaskRun};
 use crate::error::UpstrokeError;
-use crate::ir::{Task, WorkerProfile};
+use crate::ir::{Effort, PermissionMode, Task, Tier, WorkerProfile};
 use crate::rundir::RunPaths;
 use crate::runner::CommandSpec;
 
 use super::attempt::{RetryBrief, materialize_prompt};
+
+/// What the worker's prompt reads about the task.
+///
+/// Five fields, and [`materialize_prompt`] is the only thing in this path to
+/// touch the task at all — the same narrowing `review::ReviewSubject` made, for
+/// the same reason and against the same wall. The schema-4 driver holds a
+/// `FrozenTaskSpec` from the frozen registry and no `ir::Task` anywhere, so
+/// sharing the assembler would otherwise mean synthesising one: inventing an
+/// id, a kind and a dependency list the prompt never reads. A conversion that
+/// fabricates fields is free to drift from the plan it claims to represent.
+///
+/// Separate from `ReviewSubject` rather than one widened type, because the two
+/// prompts genuinely read different things: a reviewer is handed artifacts
+/// already resolved and never sees `artifacts_in`. Merging them would give each
+/// caller fields it does not read, which is the wall this is climbing over.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct WorkerSubject<'a> {
+    /// The task's one-line title.
+    pub(crate) title: &'a str,
+    /// Its body, which may be empty.
+    pub(crate) body: &'a str,
+    /// Its acceptance criteria.
+    pub(crate) acceptance: &'a [String],
+    /// Artifacts the prompt wires in as readable files.
+    pub(crate) artifacts_in: &'a [crate::ir::ArtifactId],
+    /// Artifacts the worker is asked to produce.
+    pub(crate) artifacts_out: &'a [crate::ir::ArtifactId],
+}
+
+impl<'a> WorkerSubject<'a> {
+    /// The subject of a legacy plan's task.
+    #[must_use]
+    pub(crate) fn of(task: &'a Task) -> Self {
+        Self {
+            title: &task.title,
+            body: &task.body,
+            acceptance: &task.acceptance,
+            artifacts_in: &task.artifacts_in,
+            artifacts_out: &task.artifacts_out,
+        }
+    }
+}
 
 /// Everything one worker invocation's command is derived from.
 ///
@@ -53,8 +95,8 @@ pub(crate) struct WorkerAssembly<'a> {
     pub(crate) adapter: &'a dyn AgentAdapter,
     /// The routing decision for this attempt: tier, model, effort, pool.
     pub(crate) profile: &'a WorkerProfile,
-    /// The task, as the frozen plan records it.
-    pub(crate) task: &'a Task,
+    /// What the prompt reads about the task.
+    pub(crate) task: WorkerSubject<'a>,
     /// The gate command lines the worker is permitted to run, which the prompt
     /// quotes and the permissions file allows.
     pub(crate) gate_cmds: &'a [String],
@@ -115,5 +157,67 @@ impl WorkerAssembly<'_> {
             .adapter
             .build(&task_run)?
             .stdin(self.adapter.stdin_payload(&task_run).as_bytes().to_vec()))
+    }
+}
+
+/// The routing facts an implementer's profile is built from.
+///
+/// **Ask for what you read.** [`implementer_profile`] reads exactly these four
+/// and the pool; it never sees a chain, a task or a run. Naming them lets one
+/// construction serve the legacy coordinator, which holds a
+/// [`crate::route::Rung`] and resolves effort from the policy, and the schema-4
+/// driver, which holds a [`crate::topology::events::RungBinding`] that already
+/// carries the effort its run froze.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct ImplementerBinding<'a> {
+    /// Which rung of the chain this is.
+    pub(crate) tier: Tier,
+    /// The agent whose CLI runs the work.
+    pub(crate) agent: &'a str,
+    /// The model it runs.
+    pub(crate) model: &'a str,
+    /// What this tier is worth on an agent with an effort axis.
+    pub(crate) effort: Effort,
+}
+
+impl<'a> ImplementerBinding<'a> {
+    /// A resolved chain's rung, with the effort the run's policy gives its tier.
+    pub(crate) fn of_rung(rung: &'a crate::route::Rung, effort: Effort) -> Self {
+        Self {
+            tier: rung.tier,
+            agent: &rung.binding.agent,
+            model: &rung.binding.model,
+            effort,
+        }
+    }
+}
+
+/// The profile one implementation attempt runs under.
+///
+/// The one production construction of an implementer's [`WorkerProfile`]. It
+/// was inline in `coordinator.rs`, where the schema-4 driver could not reach
+/// it; a driver that rebuilt it would be a second answer to `permissions`, and
+/// a worker spawned `ReadyOnly` edits nothing while reporting success.
+///
+/// `pool` is passed rather than resolved here because resolving it needs the
+/// run's config: §13 is read-only, so this is **attribution only** — which
+/// subscription pays for the attempt, so the ledger and the estimator can say
+/// so. Nothing routes on it.
+pub(crate) fn implementer_profile(
+    binding: ImplementerBinding<'_>,
+    pool: Option<String>,
+) -> WorkerProfile {
+    WorkerProfile {
+        name: format!("{}-{}", binding.tier, binding.model),
+        agent: binding.agent.to_owned(),
+        model: binding.model.to_owned(),
+        pool: pool.unwrap_or_default(),
+        permissions: PermissionMode::Edit,
+        // What the rung's tier is worth on an agent with an effort axis:
+        // without this the whole chain runs at one vendor default and
+        // escalating a rung moves nothing (§10).
+        effort: Some(binding.effort),
+        max_turns: None,
+        extra_args: Vec::new(),
     }
 }

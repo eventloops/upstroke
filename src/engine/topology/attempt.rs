@@ -138,12 +138,6 @@ pub struct ReviewInputs {
     pub stem: String,
 }
 
-/// Everything one attempt executes, and the binding it executes under.
-///
-/// The binding, rung and pool are here rather than derived because
-/// `attempt_started` records them and the fold checks them against the frozen
-/// ladder: they are the attempt's execution identity (INV-19), and a module
-/// that re-derived them would be a second authority for a value the registry
 /// Where a review pass is executed.
 ///
 /// **A seam, and it is not optional.** `review::run_review` is on the effect
@@ -180,6 +174,12 @@ pub trait ReviewPasses {
     ) -> Result<review::ReviewOutcome, UpstrokeError>;
 }
 
+/// Everything one attempt executes, and the binding it executes under.
+///
+/// The binding, rung and pool are here rather than derived because
+/// `attempt_started` records them and the fold checks them against the frozen
+/// ladder: they are the attempt's execution identity (INV-19), and a module
+/// that re-derived them would be a second authority for a value the registry
 /// already froze.
 #[derive(Debug, Clone)]
 pub struct AttemptPlan {

@@ -162,7 +162,7 @@ pub(super) fn run_attempt(
     let command = super::assembly::WorkerAssembly {
         adapter: cx.adapter,
         profile: &cx.profile,
-        task: cx.task,
+        task: super::assembly::WorkerSubject::of(cx.task),
         gate_cmds: cx.gate_cmds,
         paths: cx.paths,
         stem: &cx.stem,
@@ -555,7 +555,7 @@ pub(super) fn worker_question(detail: Option<&str>) -> Option<String> {
 /// exact-match, so the agent must know the literal strings), plus — on a
 /// retry — why the last attempt did not pass (§11.4).
 pub(super) fn materialize_prompt(
-    task: &Task,
+    task: super::assembly::WorkerSubject<'_>,
     gate_cmds: &[String],
     artifacts_dir: &Path,
     retry: Option<&RetryBrief>,
@@ -583,19 +583,19 @@ pub(super) fn materialize_prompt(
     );
     let _ = writeln!(prompt, "# Task: {}\n", task.title);
     if !task.body.is_empty() {
-        prompt.push_str(&task.body);
+        prompt.push_str(task.body);
         prompt.push_str("\n\n");
     }
     if !task.acceptance.is_empty() {
         prompt.push_str("Acceptance criteria (all must hold when you finish):\n");
-        for item in &task.acceptance {
+        for item in task.acceptance {
             let _ = writeln!(prompt, "- {item}");
         }
         prompt.push('\n');
     }
     // Artifacts are real files in the run directory: a consumer is shown the
     // content that exists, never told to look for something nothing wrote.
-    for id in &task.artifacts_in {
+    for id in task.artifacts_in {
         let path = artifact_path(artifacts_dir, id.as_str());
         match fs::read_to_string(&path) {
             Ok(content) if !content.trim().is_empty() => {
@@ -614,7 +614,7 @@ pub(super) fn materialize_prompt(
             }
         }
     }
-    for id in &task.artifacts_out {
+    for id in task.artifacts_out {
         let _ = writeln!(
             prompt,
             "Before you finish, write artifact `{id}` — the notes later tasks depend on — to:\n\

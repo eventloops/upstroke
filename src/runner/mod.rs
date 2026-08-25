@@ -1887,6 +1887,67 @@ mod tests {
         );
     }
 
+    /// **An invocation's profile is constructed in one production place per
+    /// role.**
+    ///
+    /// The third of the one-production-place censuses, and the one that decides
+    /// what a process is *allowed to do*. A [`crate::ir::WorkerProfile`] carries
+    /// `permissions`, and the two roles want opposite answers: an implementer
+    /// is `Edit`, a reviewer is `ReadOnly`. A driver that rebuilt an
+    /// implementer's profile and reached for the nearest existing constructor
+    /// would get `review::profile_for` — a read-only profile. The worker would
+    /// spawn, edit nothing, and report success, and the gates would judge an
+    /// empty diff.
+    ///
+    /// The column counts `WorkerProfile {` struct literals in production
+    /// code, anchored to a line of its own: a return type (`-> WorkerProfile
+    /// {`) and the definition itself (`struct WorkerProfile {`) both contain
+    /// the same text and neither constructs anything. Measured without the
+    /// anchor this census reported five sites and three files.
+    #[test]
+    fn a_worker_profile_is_constructed_in_one_production_place_per_role() {
+        use std::collections::BTreeMap;
+
+        /// (file, `WorkerProfile {` literals, why).
+        const EXPECTED: &[(&str, usize, &str)] = &[
+            (
+                "src/engine/assembly.rs",
+                1,
+                "the implementer's profile, `permissions: Edit`. It was inline \
+                 in `coordinator.rs`, out of the schema-4 driver's reach; both \
+                 engines call it now",
+            ),
+            (
+                "src/review.rs",
+                1,
+                "the reviewer's profile, `permissions: ReadOnly`. \
+                 `PassBinding::profile` delegates here rather than repeating \
+                 the literal, so the two roles are two sites and not four",
+            ),
+        ];
+
+        let mut found: BTreeMap<String, usize> = BTreeMap::new();
+        for (path, code) in production_sources() {
+            let profiles = code
+                .lines()
+                .filter(|line| line.trim() == "WorkerProfile {")
+                .count();
+            if profiles > 0 {
+                found.insert(path, profiles);
+            }
+        }
+
+        let expected: BTreeMap<String, usize> = EXPECTED
+            .iter()
+            .map(|(path, n, _)| ((*path).to_owned(), *n))
+            .collect();
+        assert_eq!(
+            found, expected,
+            "a production site decides what a process may do. Two sites for \
+             one role is how an implementer gets spawned read-only"
+        );
+    }
+
     /// **An observation about an attempt is classified in one production
     /// place.**
     ///

@@ -3398,7 +3398,7 @@ fn prompt_names_the_allowed_gate_commands() {
     let run_dir = std::env::temp_dir().join(format!("upstroke-prompt-{}", std::process::id()));
     fs::create_dir_all(run_dir.join("artifacts")).expect("run dir");
     let prompt = materialize_prompt(
-        &task,
+        crate::engine::assembly::WorkerSubject::of(&task),
         &["cargo check --all-targets".to_owned()],
         &run_dir,
         None,
@@ -3409,7 +3409,12 @@ fn prompt_names_the_allowed_gate_commands() {
         prompt.contains(QUESTION_MARKER),
         "the worker is told how to ask (§12)"
     );
-    let bare = materialize_prompt(&task, &[], &run_dir, None);
+    let bare = materialize_prompt(
+        crate::engine::assembly::WorkerSubject::of(&task),
+        &[],
+        &run_dir,
+        None,
+    );
     assert!(!bare.contains("EXACTLY these commands"));
 }
 
@@ -3433,7 +3438,12 @@ fn prompt_wires_artifacts_to_real_files() {
     };
 
     // Missing input: say so plainly rather than pointing at nothing.
-    let prompt = materialize_prompt(&task, &[], &run_dir, None);
+    let prompt = materialize_prompt(
+        crate::engine::assembly::WorkerSubject::of(&task),
+        &[],
+        &run_dir,
+        None,
+    );
     assert!(prompt.contains("did \n     not leave one") || prompt.contains("did not leave one"));
     assert!(
         prompt.contains("write artifact `notes`"),
@@ -3446,7 +3456,12 @@ fn prompt_wires_artifacts_to_real_files() {
         "cursor = base64(offset)",
     )
     .expect("artifact");
-    let prompt = materialize_prompt(&task, &[], &run_dir, None);
+    let prompt = materialize_prompt(
+        crate::engine::assembly::WorkerSubject::of(&task),
+        &[],
+        &run_dir,
+        None,
+    );
     assert!(
         prompt.contains("cursor = base64(offset)"),
         "content inlined"
@@ -3454,7 +3469,12 @@ fn prompt_wires_artifacts_to_real_files() {
 
     task.artifacts_in.clear();
     task.artifacts_out.clear();
-    let bare = materialize_prompt(&task, &[], &run_dir, None);
+    let bare = materialize_prompt(
+        crate::engine::assembly::WorkerSubject::of(&task),
+        &[],
+        &run_dir,
+        None,
+    );
     assert!(!bare.contains("artifact"));
 }
 
