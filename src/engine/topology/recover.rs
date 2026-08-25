@@ -132,14 +132,16 @@ use std::path::Path;
 
 use crate::config::RunnerSelection;
 use crate::error::UpstrokeError;
+use crate::events::AttemptRecord;
 use crate::events::RunOutcome;
 use crate::rundir::{RepoKey, RunLock, WorktreeLock};
 use crate::runner::container::GitView;
 use crate::runner::container::resolve::RunnerPreflight;
 use crate::runner::container::runtime::{ContainerRuntime, OwnerLiveness};
 use crate::topology::events::{
-    AttemptInterrupted4, AttemptNumber, GenerationCloseReason, GenerationClosed, GenerationId,
-    IncarnationId, LeaseDisposition, RunResumed4, RunStarted4, TopologyEventBody,
+    AttemptInterrupted4, AttemptNumber, CandidateLeaseEffect, CandidatePrepared, CommitSha,
+    GenerationCloseReason, GenerationClosed, GenerationId, IncarnationId, LeaseDisposition,
+    RunResumed4, RunStarted4, TopologyEvent, TopologyEventBody,
 };
 use crate::topology::fold::{FrozenInputs, GenerationClass, TopologyFold};
 use crate::topology::leases::GenerationLease;
@@ -798,6 +800,11 @@ pub mod chain {
             /// The exact bytes that were synced, reread, proven, and replayed.
             bytes: Vec<u8>,
             /// The fold built from exactly those bytes, and no others.
+            /// The events the barrier parsed from exactly those bytes.
+            ///
+            /// Carried rather than re-derived for the same reason the fold is:
+            /// there is one production parse of a log and it is the barrier's.
+            events: Vec<crate::topology::events::TopologyEvent>,
             fold: TopologyFold,
             barrier: StablePrefixBarrier,
         }
@@ -827,7 +834,7 @@ pub mod chain {
                 // append handle from here on, and a `StablePrefix` that both
                 // this value and a caller could reach would be two handles onto
                 // one log.
-                let (log, bytes, fold) = prefix.into_log_and_fold();
+                let (log, bytes, events, fold) = prefix.into_log_and_fold();
                 let measured = PrefixBytes::of(&bytes);
                 let barrier = StablePrefixBarrier::establish(
                     // Every byte the barrier proved is a byte
@@ -846,6 +853,7 @@ pub mod chain {
                     &PrefixReplay { replayed: measured },
                 )?;
                 Ok(Self {
+                    events,
                     records,
                     log,
                     bytes,
@@ -881,6 +889,17 @@ pub mod chain {
             #[must_use]
             pub fn fold(&self) -> &TopologyFold {
                 &self.fold
+            }
+
+            /// The events the barrier parsed from exactly those bytes.
+            ///
+            /// For a recovery step that needs what the fold does not keep — the
+            /// `AttemptRecord` a durable settlement carried. Reading them here
+            /// rather than parsing the log again is what keeps the barrier the
+            /// one production parse.
+            #[must_use]
+            pub fn events(&self) -> &[crate::topology::events::TopologyEvent] {
+                &self.events
             }
 
             /// The proven bytes.
@@ -1573,6 +1592,9 @@ pub struct Recovered {
     pub interrupted: usize,
     /// (e): how many `RetainedIdle` generations were closed.
     pub retained_closed: usize,
+    /// The `Promoting` generations whose `candidate_prepared` this resume
+    /// appended — erratum **E6**'s convergence. Empty on a healthy resume.
+    pub promoted: Vec<TaskKey>,
     /// (g): every `OpenNoAttempt` generation rebuilt, and whether its worktree
     /// verified or had to be recreated. A value rather than a count, because
     /// "the step ran" and "the step ran and found nothing to do" are the two
@@ -1670,7 +1692,7 @@ pub fn run_recovery_order(
     // append — which is why it precedes (d) and (e) rather than sitting in its
     // own numbered position: a refusal after two appends is not "before any
     // append".
-    refuse_unimplemented_terminals(&certified)?;
+    refuse_unimplemented_terminals(&certified, seams.manager)?;
 
     // T-RUNSTART's P7/P8 repair, after (f) and before the first append. The
     // module comment argues each bound; the one that is not merely tidy is (f),
@@ -1678,7 +1700,6 @@ pub fn run_recovery_order(
     // ref still sitting at the recorded base, and "present == base continue"
     // would adopt it under a transaction this build cannot resolve.
     ensure_recorded_integration_ref(&certified, seams.refs, hooks)?;
-    steps.push(RecoveryStep::F);
 
     // The append-error protocol's two ledgers. The recovery order takes no
     // provisional reservation and registers no invocation of its own — (c)'s
@@ -1702,10 +1723,18 @@ pub fn run_recovery_order(
     let retained_closed = close_retained_idle(&mut certified, &mut context)?;
     steps.push(RecoveryStep::E);
 
+    // (f)'s converging half, which **appends** and so cannot sit with its
+    // refusing half above: erratum E6 puts the settled-but-unrecorded candidate
+    // in `T-CAND-REF`, and that row converges forward. The refusal that stays
+    // before every append is the integration transaction's, which is PR8's
+    // terminal and one of the two `checkpoint_refusals` authorises.
+    let promoted = complete_promotions(&mut certified, seams.manager, &mut context)?;
+
     // (g) — after (e) and before (h), the packet's own position. A worktree
     // effect and not an append, so it takes no `EmitContext`; the borrow of
     // `hooks` that `context` holds ends here for the same reason the step must
     // run before (h): `run_resumed` consumes the witness this step reads.
+    steps.push(RecoveryStep::F);
     let recreated = recreate_open_no_attempt(&certified, seams.manager, context.hooks)?;
     steps.push(RecoveryStep::G);
 
@@ -1716,6 +1745,7 @@ pub fn run_recovery_order(
         Recovered {
             interrupted,
             retained_closed,
+            promoted,
             recreated,
             steps,
             resumed,
@@ -1787,7 +1817,10 @@ pub fn refuse_if_finished(censused: &ResumeCensused) -> Result<(), UpstrokeError
 ///
 /// [`UpstrokeError::Refused`] naming the task whose generation is `Promoting`,
 /// or the unresolved integration transaction.
-pub fn refuse_unimplemented_terminals(certified: &PreflightCertified) -> Result<(), UpstrokeError> {
+pub fn refuse_unimplemented_terminals(
+    certified: &PreflightCertified,
+    manager: &WorkspaceManager,
+) -> Result<(), UpstrokeError> {
     let fold = fold_of(certified);
     if fold.transaction().is_some() {
         return Err(UpstrokeError::Refused {
@@ -1798,24 +1831,203 @@ pub fn refuse_unimplemented_terminals(certified: &PreflightCertified) -> Result<
                 .to_owned(),
         });
     }
+    // **A `Promoting` generation whose pin is gone.** E6 converges the ordinary
+    // window by reconstructing the commit identity from the pin. With no pin
+    // there is nothing to reconstruct from, and a settled attempt with no pin is
+    // neither `T-CAND-OBJ` (which leaves an unpinned object to Git) nor a
+    // completable `T-CAND-REF`.
+    //
+    // Refused **here**, with the other refusal, because a refusal belongs before
+    // any effect and this one is a predicate over durable state alone. Leaving
+    // it to the converging half would put it after P7/P8 publishes the ref,
+    // which is the ordering `the_p7_p8_step_runs_after_the_refusals_that_bound_it`
+    // exists to hold.
+    let run_id = fold
+        .started()
+        .map(|started| started.run_id.clone())
+        .unwrap_or_default();
     for key in task_keys(fold) {
-        if let Some(task) = fold.task(key) {
-            if task
-                .generations
+        let Some(generation) = fold.task(key).and_then(|task| {
+            task.generations
                 .iter()
-                .any(|generation| generation.class == GenerationClass::Promoting)
-            {
-                return Err(UpstrokeError::Refused {
-                    message: format!(
-                        "task {key} has a generation in promotion. Recovery step (f) completes \
-                         Promoting promotions, and this build implements no promotion terminal, \
-                         so it refuses before any append."
-                    ),
-                });
-            }
+                .find(|held| held.class == GenerationClass::Promoting && held.candidate.is_none())
+        }) else {
+            continue;
+        };
+        let names =
+            crate::engine::topology::candidate::CandidateNames::of(&run_id, key, generation.id);
+        if manager
+            .direct_ref_target(names.prepared_ref.as_str())?
+            .is_none()
+        {
+            return Err(UpstrokeError::Refused {
+                message: format!(
+                    "task {key} is promoting and its candidate pin is absent, so the commit its \
+                     settlement authorised cannot be named. `T-CAND-OBJ` governs an unpinned \
+                     object and leaves it to Git; a settled attempt with no pin is neither row \
+                     and is refused before any effect rather than guessed"
+                ),
+            });
         }
     }
+
+    // **A `Promoting` generation WITH its pin is no longer refused here.** It was, and that
+    // was a third checkpoint refusal: `checkpoint_refusals` authorises this
+    // build to refuse exactly two things, integration and run end, and a
+    // generation whose settlement is durable is neither. Erratum **E6** places
+    // the window in `T-CAND-REF` — whose boundary begins at the settlement, not
+    // at `candidate_prepared` — and that row converges forward. The convergence
+    // is [`complete_promotions`], and it appends, so it runs with the other
+    // appending steps rather than here before any of them.
     Ok(())
+}
+
+/// One `Promoting` generation whose `candidate_prepared` never landed.
+struct Pending {
+    key: TaskKey,
+    generation: GenerationId,
+    base_sha: CommitSha,
+    record: Box<AttemptRecord>,
+}
+
+/// The generation this task is promoting, if its candidate was never recorded.
+///
+/// `GenerationFold::candidate` is `Some` once `candidate_prepared` applied, so
+/// `Promoting` with `None` is exactly erratum **E6**'s window and nothing else.
+fn promoting_without_candidate(
+    fold: &TopologyFold,
+    events: &[TopologyEvent],
+    key: TaskKey,
+) -> Option<Pending> {
+    let generation = fold
+        .task(key)?
+        .generations
+        .iter()
+        .find(|held| held.class == GenerationClass::Promoting && held.candidate.is_none())?;
+    // The record the settlement carried, from the proven bytes.
+    let record = events.iter().rev().find_map(|event| match &event.body {
+        TopologyEventBody::AttemptFinished { data }
+            if data.key == key && data.generation == generation.id =>
+        {
+            Some(data.record.clone())
+        }
+        _ => None,
+    })?;
+    Some(Pending {
+        key,
+        generation: generation.id,
+        base_sha: generation.base_sha.clone(),
+        record,
+    })
+}
+
+/// **Recovery step (f), the converging half.** Complete every `Promoting`
+/// generation whose `candidate_prepared` never landed.
+///
+/// # Erratum E6
+///
+/// `T-CAND-OBJ`'s window ends where its own `durable_state` says: "attempt_started
+/// only", with the attempt unsettled. `T-CAND-REF`'s `boundary` begins at the
+/// settlement — **not** at `candidate_prepared`, which is what the text said
+/// before E6 and which left the prefix "settlement durable, `candidate_prepared`
+/// absent" governed by no row at all. The fold makes that prefix mandatory:
+/// `attempt_finished{Closed{Succeeded}}` is the only thing that sets `Promoting`
+/// and `check_candidate_prepared` refuses every other class, so the two appends
+/// cannot be collapsed.
+///
+/// **Every input is derived from durable state and nothing is re-decided.** The
+/// pin names the commit; the commit names its tree and its message; the
+/// generation names the base; `diff-tree base commit` names the region the diff
+/// actually touched, which is the same primitive
+/// `decisions.admission_and_leases.path_policy.actual` specifies. The attempt
+/// record is the one the durable settlement already carried.
+///
+/// After the append the generation is exactly what `T-CAND-REF`'s existing
+/// `resume_action` describes, and the rest of that row — verify object, create
+/// the exact candidates ref, append `task_candidate_created`, prune the pin —
+/// is unchanged.
+///
+/// # Errors
+///
+/// A Git error reading the pin or the commit, a refusal when the pin is missing
+/// (the object is then Git's and `T-CAND-OBJ` governs), or whatever the append
+/// returns.
+pub fn complete_promotions(
+    certified: &mut PreflightCertified,
+    manager: &WorkspaceManager,
+    context: &mut EmitContext<'_>,
+) -> Result<Vec<TaskKey>, UpstrokeError> {
+    let mut converged = Vec::new();
+    let run_id = fold_of(certified)
+        .started()
+        .ok_or_else(|| UpstrokeError::Refused {
+            message: "the proven prefix has no run".to_owned(),
+        })?
+        .run_id
+        .clone();
+
+    // **The barrier's own parse**, for the one thing the fold does not keep: the
+    // `AttemptRecord` the durable settlement carried. `candidate_prepared`
+    // records it, and inventing one would re-decide what the settlement already
+    // decided.
+    //
+    // Read through `StablePrefix::events` rather than parsing the log again.
+    // A second parse is reachable around the barrier by anyone, which is what
+    // `the_stable_prefix_barrier_is_the_only_way_a_log_becomes_a_topology_fold`
+    // refuses — and it refused this convergence's first draft.
+    let pendings: Vec<Pending> = {
+        let barrier = certified.rebuilt().censused().barrier();
+        let events = barrier.events();
+        let fold = barrier.fold();
+        task_keys(fold)
+            .into_iter()
+            .filter_map(|key| promoting_without_candidate(fold, events, key))
+            .collect()
+    };
+
+    for pending in pendings {
+        let key = pending.key;
+        let names = crate::engine::topology::candidate::CandidateNames::of(
+            &run_id,
+            key,
+            pending.generation,
+        );
+        // Step (f)'s refusing half already proved the pin is there, before any
+        // effect, and nothing between them touches a ref.
+        let Some(commit) = manager.direct_ref_target(names.prepared_ref.as_str())? else {
+            return Err(UpstrokeError::Refused {
+                message: format!("task {key}'s candidate pin vanished during recovery"),
+            });
+        };
+        let (tree, message) = manager.commit_identity(&commit)?;
+        let actual_paths = manager.changed_paths_between(pending.base_sha.as_str(), &commit)?;
+
+        let prepared = CandidatePrepared {
+            key,
+            generation: pending.generation,
+            attempt: pending.record,
+            base_sha: pending.base_sha.clone(),
+            parent_sha: pending.base_sha,
+            tree_sha: CommitSha(tree),
+            commit_sha: CommitSha(commit),
+            message,
+            prepared_ref: names.prepared_ref,
+            candidate_ref: names.candidate_ref,
+            actual_paths: actual_paths.clone(),
+            lease_effect: CandidateLeaseEffect::ReplacesPredicted {
+                paths: actual_paths,
+            },
+        };
+        emit(
+            certified,
+            context,
+            TopologyEventBody::CandidatePrepared {
+                data: Box::new(prepared),
+            },
+        )?;
+        converged.push(key);
+    }
+    Ok(converged)
 }
 
 // ---------------------------------------------------------------------------

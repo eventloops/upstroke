@@ -2438,6 +2438,82 @@ impl WorkspaceManager {
         })
     }
 
+    /// The tree and message a candidate commit records.
+    ///
+    /// **A read, so it takes no hooks and names no effect site** — the same
+    /// reason [`Self::changed_paths`] and [`Self::candidate_diff`] are not
+    /// funnels.
+    ///
+    /// Recovery needs this for erratum **E6**: a run killed after
+    /// `attempt_finished{Succeeded}` and before `candidate_prepared` has the
+    /// commit on disk and the pin referencing it, but nothing in the log names
+    /// the tree. `candidate_prepared` records the complete identity, so the
+    /// convergence reconstructs it from the object the pin already points at
+    /// rather than re-deciding anything.
+    ///
+    /// `-s` and an explicit format, because the default `git show` runs a diff
+    /// this does not want and would let `diff.external` reshape.
+    ///
+    /// # Errors
+    ///
+    /// A Git error, or output this cannot parse.
+    pub fn commit_identity(&self, commit: &str) -> Result<(String, String), UpstrokeError> {
+        self.revalidate()?;
+        let out = self.git_ok(
+            self.base(),
+            &[
+                OsString::from("show"),
+                OsString::from("-s"),
+                OsString::from("--no-textconv"),
+                OsString::from("--format=%T%n%B"),
+                OsString::from(commit),
+            ],
+        )?;
+        let text = String::from_utf8(out).map_err(|_| UpstrokeError::Git {
+            message: format!("commit {commit} has a message that is not valid UTF-8"),
+        })?;
+        let (tree, message) = text.split_once('\n').ok_or_else(|| UpstrokeError::Git {
+            message: format!("commit {commit} produced no tree line"),
+        })?;
+        Ok((tree.trim().to_owned(), message.trim_end().to_owned()))
+    }
+
+    /// The paths a commit changed against `base`, byte-safely.
+    ///
+    /// `decisions.admission_and_leases.path_policy.actual` in its own words:
+    /// "`git diff-tree -r -z -M --name-status base tree`; **both rename
+    /// endpoints**". [`Self::changed_paths`] answers the same question about a
+    /// worktree's *index* and uses `git diff --cached` for it; this answers it
+    /// about two committed trees, which is the form the passage actually names.
+    ///
+    /// One undecodable path makes the whole answer repo-wide rather than a
+    /// silently shorter list, and both endpoints of a detected rename are
+    /// reported — the old one is what another owner may hold a lease on.
+    ///
+    /// # Errors
+    ///
+    /// A Git error.
+    pub fn changed_paths_between(
+        &self,
+        base: &str,
+        commit: &str,
+    ) -> Result<PathSet, UpstrokeError> {
+        self.revalidate()?;
+        let output = self.git_ok(
+            self.base(),
+            &[
+                OsString::from("diff-tree"),
+                OsString::from("-r"),
+                OsString::from("-z"),
+                OsString::from("-M"),
+                OsString::from("--name-status"),
+                OsString::from(base),
+                OsString::from(commit),
+            ],
+        )?;
+        Ok(decode_changed_paths(&output))
+    }
+
     // -----------------------------------------------------------------------
     // Git plumbing
     // -----------------------------------------------------------------------

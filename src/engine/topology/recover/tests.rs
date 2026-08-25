@@ -3703,9 +3703,16 @@ fn the_p7_p8_step_runs_after_the_refusals_that_bound_it() {
                 extra: vec![
                     dispatched(),
                     attempt_started(1),
-                    // `Succeeded` is what puts the generation in `Promoting`,
-                    // and PR7 implements no promotion terminal, so step (f)
-                    // refuses the prefix rather than completing it.
+                    // `Succeeded` is what puts the generation in `Promoting`.
+                    // Under erratum **E6** step (f) *converges* that window
+                    // rather than refusing it — but the convergence needs the
+                    // pin, which names the commit the settlement authorised,
+                    // and this fixture seeds events without one. A settled
+                    // attempt whose pin is gone is neither `T-CAND-OBJ` (which
+                    // governs an unpinned object and leaves it to Git) nor a
+                    // completable `T-CAND-REF`, so it is refused rather than
+                    // guessed — and that refusal still precedes P7/P8, which is
+                    // what this case is about.
                     attempt_finished(
                         1,
                         AttemptSettlement::Closed {
@@ -3725,11 +3732,11 @@ fn the_p7_p8_step_runs_after_the_refusals_that_bound_it() {
         let text = message(
             &resume(&fixture, &harness, &given)
                 .0
-                .expect_err("an unimplemented terminal refuses"),
+                .expect_err("a promoting generation with no pin cannot be converged"),
         );
         assert!(
-            text.contains("generation in promotion"),
-            "the refusal names what it could not finish: {text}"
+            text.contains("candidate pin is absent"),
+            "the refusal names what it could not name: {text}"
         );
         assert_eq!(
             create_ref_entries(&harness),
@@ -4142,8 +4149,13 @@ fn the_recovery_order_performs_every_step_the_packet_names() {
     );
 
     // And the one that does move, moved for its reason and not by accident:
-    // (f) is a refusal in this build, and `checkpoint_refusals` puts a refusal
-    // before any append, so it must precede (d) and (e), which append.
+    // **(f) has two halves and erratum E6 separated them.** Its refusing half —
+    // the unresolved integration transaction, one of the two things
+    // `checkpoint_refusals` authorises — still runs before any append. Its
+    // converging half appends `candidate_prepared` for a settled-but-unrecorded
+    // candidate, so it runs *with* the appending steps and is what `steps`
+    // records. A `Promoting` generation was refused here until E6, and that was
+    // a third checkpoint refusal.
     let at = |step: RecoveryStep| {
         recovered
             .steps
@@ -4152,9 +4164,14 @@ fn the_recovery_order_performs_every_step_the_packet_names() {
             .expect("every owed step was performed")
     };
     assert!(
-        at(RecoveryStep::F) < at(RecoveryStep::D) && at(RecoveryStep::F) < at(RecoveryStep::E),
-        "(f) refuses, and `checkpoint_refusals` puts a refusal before any \
-         append; (d) and (e) append"
+        at(RecoveryStep::D) < at(RecoveryStep::F) && at(RecoveryStep::E) < at(RecoveryStep::F),
+        "(f)'s converging half appends, so it belongs with (d) and (e) rather \
+         than before them. Its refusing half is unmarked because a refusal ends \
+         the command and records no step"
+    );
+    assert!(
+        at(RecoveryStep::F) < at(RecoveryStep::G) && at(RecoveryStep::G) < at(RecoveryStep::H),
+        "and it stays in the packet's position: after (e), before (g) and (h)"
     );
 }
 

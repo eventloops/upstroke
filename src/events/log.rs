@@ -1381,6 +1381,7 @@ impl From<BarrierError> for UpstrokeError {
 pub struct StablePrefix {
     log: EventLog,
     bytes: Vec<u8>,
+    events: Vec<TopologyEvent>,
     fold: TopologyFold,
 }
 
@@ -1397,6 +1398,26 @@ impl StablePrefix {
         &self.bytes
     }
 
+    /// The events the barrier itself parsed from those bytes.
+    ///
+    /// **Exposing the barrier's own parse, not offering a second one.** Step (5)
+    /// parses the reread bytes once and replays them into [`Self::fold`]; before
+    /// this accessor the events were dropped, so a caller that needed one — a
+    /// recovery convergence needing the `AttemptRecord` a settlement carried,
+    /// which the fold does not keep — had to parse the log again.
+    ///
+    /// That second parse is what
+    /// `the_stable_prefix_barrier_is_the_only_way_a_log_becomes_a_topology_fold`
+    /// refuses, and it is right to: "I used the proven bytes" is the argument
+    /// every unproven read would make, and a second entry point is reachable
+    /// around the barrier by anyone. There is still exactly one production
+    /// `TopologyFold::parse_log` call, in this module, on the bytes step (4)
+    /// proved — and that census still refuses everyone else.
+    #[must_use]
+    pub fn events(&self) -> &[TopologyEvent] {
+        &self.events
+    }
+
     /// The fold built from exactly those bytes.
     #[must_use]
     pub fn fold(&self) -> &TopologyFold {
@@ -1405,8 +1426,8 @@ impl StablePrefix {
 
     /// Take the two halves apart.
     #[must_use]
-    pub fn into_log_and_fold(self) -> (EventLog, Vec<u8>, TopologyFold) {
-        (self.log, self.bytes, self.fold)
+    pub fn into_log_and_fold(self) -> (EventLog, Vec<u8>, Vec<TopologyEvent>, TopologyFold) {
+        (self.log, self.bytes, self.events, self.fold)
     }
 }
 
@@ -1550,6 +1571,7 @@ pub fn establish_stable_prefix(
 
     Ok(StablePrefix {
         log,
+        events,
         bytes: reread,
         fold,
     })

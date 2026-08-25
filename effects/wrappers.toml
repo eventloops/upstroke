@@ -68,7 +68,9 @@ effect_free = [
     "base",
     "candidate_diff",
     "changed_paths",
+    "changed_paths_between",
     "classify_object_residue",
+    "commit_identity",
     "common_git_dir",
     "decode_changed_paths",
     "derive",
@@ -319,6 +321,7 @@ effect_free = [
     # touches a file — the sync they describe was performed by
     # `sync_log_file`/`sync_directory`, which are the funnel's own.
     "durability_ledger",
+    "events",
     "synced",
     "written_kill_shape",
     "bytes",
