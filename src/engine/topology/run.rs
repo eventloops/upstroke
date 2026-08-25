@@ -1071,15 +1071,15 @@ impl TopologyRun {
     /// `fold::tests::a_deferral_count_is_derived_by_replay_and_not_by_a_process_local_tally`
     /// is the witness for that property.
     ///
-    /// **Untested at this level, and named rather than left silent.** The value
-    /// is load-bearing only on the outage branch: `next_step` ignores it
-    /// otherwise, and so does `settle_failed`, which reads
-    /// `FinishedAttempt::defers` only to build `SettlementTransition::Deferred`.
-    /// No driver fixture produces an outage — the recovery fixture's runner
-    /// answers every request with `exit 0` — so replacing this expression with
-    /// a constant zero leaves the whole suite green. Measured, not assumed.
-    /// The witness that would kill it is a driver test whose worker rate-limits,
-    /// and it is owed with the outage lane rather than approximated here.
+    /// **Witnessed at this level too.** The value is load-bearing only on the
+    /// outage branch — `next_step` ignores it otherwise, and so does
+    /// `settle_failed`, which reads `FinishedAttempt::defers` only to build
+    /// `SettlementTransition::Deferred` — so replacing this expression with a
+    /// constant zero once left the whole suite green.
+    /// `the_driver_settles_an_outage_from_the_folds_deferral_count` closes
+    /// that: it seeds one deferral in the log before the run, so the settlement
+    /// must record `defers: 2`, and the constant-zero mutation records `1`.
+    /// A prior deferral is what makes the read observable at all.
     fn deferrals_recorded(&self, key: TaskKey) -> Result<u32, UpstrokeError> {
         Ok(self
             .handle

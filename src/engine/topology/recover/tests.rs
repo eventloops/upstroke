@@ -4636,6 +4636,147 @@ fn the_driver_carries_an_accepted_attempt_through_the_candidate_sequence() {
     );
 }
 
+/// **The driver settles an outage from the fold's deferral count.**
+///
+/// The witness that closes the mutation named in `deferrals_recorded`'s own
+/// doc. The fold-level witness
+/// (`fold::tests::a_deferral_count_is_derived_by_replay_and_not_by_a_process_local_tally`)
+/// covers the *accumulation*; this covers the **read**, which is load-bearing
+/// on exactly one branch and so needed a fixture that reaches it.
+///
+/// The chain is the one the ladder specifies: an agent whose CLI reports a rate
+/// limit -> `evaluate_outcome` maps it to `FailureKind::RateLimited` ->
+/// `is_outage` recognises it -> `next_step` defers rather than blaming the
+/// implementer -> `settle_failed` records `Deferred`.
+///
+/// **The prior deferral is what makes the read load-bearing.** The fixture's
+/// log already holds one, so the settlement must record `defers: 2`. Without
+/// it, a driver reading a constant zero would record `1` and be
+/// indistinguishable from a correct one — which is precisely why the mutation
+/// survived before this test existed.
+#[test]
+fn the_driver_settles_an_outage_from_the_folds_deferral_count() {
+    use crate::engine::topology::run::{Progress, RunSeams, TopologyRun};
+    use crate::engine::topology::select::Ceiling;
+
+    // One deferral already in the log, and the resume wakes the task back to
+    // `Pending` so the driver can dispatch it again.
+    let fixture = Fixture::build(
+        "driver-outage",
+        Damage {
+            extra: vec![
+                dispatched(),
+                attempt_started(1),
+                attempt_finished(
+                    1,
+                    AttemptSettlement::Closed {
+                        transition: SettlementTransition::Deferred {
+                            defers: 1,
+                            reason: "the pool was exhausted".to_owned(),
+                        },
+                        lease: LeaseDisposition::PredictedReleased,
+                    },
+                ),
+            ],
+            ..Damage::default()
+        },
+    );
+    let harness = harness();
+    let runtime = runtime_holding_the_record();
+    let certifies = AlwaysCertifies;
+    let given = Given::healthy(&fixture, &runtime, &certifies);
+
+    let (outcome, _) = resume_holding(&fixture, &harness, &given);
+    let (_recovered, handle) = outcome.expect("the healthy resume completes");
+
+    let mut run = TopologyRun::resumed(handle, fixture.inputs(), Ceiling::unlimited());
+    let mut hooks = HarnessTopologyHooks::new(Arc::clone(&harness));
+    let sleeper = RecordingSleeper::default();
+    let manager = fixture.manager();
+    let runner = RecordingRunner::editing();
+    let adapters = crate::engine::topology::scaffold::ScaffoldAdapters::rate_limiting();
+    let paths = crate::rundir::RunPaths::with_private_root(
+        &fixture.repo_root,
+        &fixture.started.run_id,
+        &fixture.private_root,
+    );
+    paths.create().expect("the run directories are creatable");
+    // **Through the production assembler, not a fixture plan shape.** The
+    // condition on this extraction was that the scaffold be re-pointed at the
+    // real one or round-tripped against it; a fixture that hand-built an
+    // `AttemptPlan` here would be exactly the fifth copy the `frozen_binding`
+    // precedent warns about.
+    let plans = crate::engine::assembly::FrozenPlans {
+        adapters: &adapters,
+        paths: &paths,
+        gates: &[],
+        pools: &[],
+        caps: &[],
+        worker_timeout: std::time::Duration::from_secs(300),
+        decisions: &[],
+    };
+    let seams = RunSeams {
+        manager: &manager,
+        clock: &Frozen,
+        sleeper: &sleeper,
+        runner: &runner,
+        adapters: &adapters,
+        paths: &paths,
+        plans: &plans,
+        reviews: &crate::engine::attempt::LegacyReviewPasses,
+        halts_run: false,
+    };
+
+    let progress = run
+        .step(&seams, &mut hooks)
+        .expect("the branch settles an outage");
+
+    let Progress::Settled {
+        accepted,
+        spent_attempt,
+        ..
+    } = progress
+    else {
+        panic!("the ready-dispatch branch did not settle: {progress:?}");
+    };
+    assert!(
+        !accepted,
+        "a rate-limited worker produced nothing to accept"
+    );
+
+    // **An outage spends no allowance.** `next_step` defers precisely so that
+    // "retrying would burn attempts on a run that never got a verdict" does not
+    // happen, and `spends_allowance` prices it the same way.
+    assert!(
+        !spent_attempt,
+        "an outage spent one of the rung's attempts, which is the cell \
+         `ladder::spends_allowance` exists to get right"
+    );
+
+    // **The count came from the fold**, not from a tally this process kept.
+    // One deferral was already durable, so the settlement records two.
+    let settlements: Vec<u32> = TopologyFold::parse_log(&fixture.log_bytes())
+        .expect("the log parses")
+        .into_iter()
+        .filter_map(|event| match event.body {
+            TopologyEventBody::AttemptFinished { data } => match data.settlement {
+                AttemptSettlement::Closed {
+                    transition: SettlementTransition::Deferred { defers, .. },
+                    ..
+                } => Some(defers),
+                _ => None,
+            },
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        settlements,
+        vec![1, 2],
+        "the second deferral did not continue the first. A driver reading a \
+         process-local zero records `1` here and defers forever"
+    );
+}
+
 /// The kinds in a fixture's durable log, in order.
 fn durable_kinds(fixture: &Fixture) -> Vec<String> {
     TopologyFold::parse_log(&fixture.log_bytes())

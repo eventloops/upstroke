@@ -645,14 +645,33 @@ impl Runner for RecordingRunner {
 pub(super) struct AnsweringAdapter {
     id: &'static str,
     verdict: &'static str,
+    /// What this agent reports about its own run.
+    ///
+    /// A field rather than a constant because an **outage** is a distinct path
+    /// through the ladder and needs a fixture that reaches it: `RateLimited` is
+    /// what `AttemptFailure::is_outage` recognises, and it is the difference
+    /// between an attempt that spends one of its rung's allowances and one that
+    /// defers spending none.
+    status: crate::ir::OutcomeStatus,
 }
 
 impl AnsweringAdapter {
     /// A reviewer that passes.
+    /// An agent whose CLI reports it is rate-limited: `evaluate_outcome` maps
+    /// that to `FailureKind::RateLimited`, which `is_outage` recognises and
+    /// `next_step` defers rather than blames on the implementer.
+    pub(super) const fn rate_limited(id: &'static str) -> Self {
+        Self {
+            status: crate::ir::OutcomeStatus::RateLimited,
+            ..Self::passing(id)
+        }
+    }
+
     pub(super) const fn passing(id: &'static str) -> Self {
         Self {
             id,
             verdict: "```json\n{\"pass\": true, \"reasons\": [], \"required_changes\": []}\n```",
+            status: crate::ir::OutcomeStatus::Completed,
         }
     }
 }
@@ -682,7 +701,7 @@ impl crate::agent::AgentAdapter for AnsweringAdapter {
         // is what `ReviewRecord` requires — both come from the adapter because
         // both are things only the agent's own CLI knows.
         Ok(crate::ir::Outcome {
-            status: crate::ir::OutcomeStatus::Completed,
+            status: self.status,
             diff: String::new(),
             detail: Some(self.verdict.to_owned()),
             session_id: Some(format!("{}-session", self.id)),
@@ -714,6 +733,14 @@ pub(super) struct ScaffoldAdapters {
 }
 
 impl ScaffoldAdapters {
+    /// The same two agents, with the implementer reporting a rate limit.
+    pub(super) const fn rate_limiting() -> Self {
+        Self {
+            primary: AnsweringAdapter::rate_limited(AGENT),
+            second: AnsweringAdapter::passing(REVIEW_AGENT),
+        }
+    }
+
     pub(super) const fn new() -> Self {
         Self {
             primary: AnsweringAdapter::passing(AGENT),
