@@ -118,7 +118,6 @@ pub struct EmitState<'a> {
     pub reservations: &'a mut Reservations,
     /// The invocation ledger. Every still-running entry is cancelled by the
     /// protocol; cancelling the *processes* is the caller's.
-    pub invocations: &'a mut InvocationLedger,
     /// Where a torn-tail normalization at the protocol's reopen is reported.
     pub warnings: &'a mut Vec<String>,
 }
@@ -200,14 +199,60 @@ impl fmt::Display for FirstAppendDisposition {
     }
 }
 
-/// An append that was entered and returned an error, after the protocol ran.
+/// An append that was entered and returned an error, after **all five**
+/// obligations ran.
 ///
-/// Everything on it is a *report*. Nothing here was derived from the poisoned
-/// fold: `run_id`, `kind` and `site` were known before the append, `outcome`
-/// comes from the reopened prefix, and the two cancellation counts come from
-/// the process-local ledgers.
+/// Reaching this type is proof that obligation (3) ran, because
+/// [`UncancelledAppend::cancelling`] is its only constructor and it takes the
+/// ledger. Everything the protocol established before (3) is on the report;
+/// what this adds is the count only the discharge could know.
 #[derive(Debug)]
 pub struct AppendError {
+    /// What obligations (1), (2), (4) and (5) established.
+    pub report: UncancelledAppend,
+    /// How many still-running invocations the ledger cancelled.
+    pub cancelled_invocations: usize,
+    /// Proof that obligation (3) ran, and the reason this type has no
+    /// struct-literal construction outside this module.
+    ///
+    /// `Cancelled`'s own field is private, so nothing else in this crate can
+    /// build one — the `PrivateHalfProof` device applied to an obligation
+    /// instead of a directory.
+    _cancelled: Cancelled,
+}
+
+impl fmt::Display for AppendError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.report.fmt(f)
+    }
+}
+
+/// Proof that in-flight invocations were cancelled.
+#[derive(Debug)]
+struct Cancelled(());
+
+/// The append-error report with obligation (3) still outstanding.
+///
+/// Obligations (1), (2), (4) and (5) have run — the fold is poisoned, the
+/// provisional reservation is cancelled, nothing was retried or rebuilt from
+/// memory, and the stable-prefix barrier is established. What has not run is
+/// the ledger half of "in-flight invocations are cancelled", because the ledger
+/// belongs to the caller: it is the same object [`crate::engine::topology::AttemptContext`]
+/// registers every Runner process in, and an emitter that held it for its whole
+/// life could not lend it to the attempt that is running.
+///
+/// That is the same reason `hooks` is a per-call parameter of
+/// [`crate::engine::topology::EventEmitter::emit`] and not a field: "the caller
+/// holds the same bundle for its own effects and cannot lend it for an
+/// emitter's whole lifetime". This is that sentence applied to the ledger.
+///
+/// The obligation is discharged by [`Self::cancelling`], which is the only
+/// constructor of [`AppendError`]. `cancel_all_running` has one call site, and
+/// this is it.
+#[derive(Debug)]
+#[must_use = "obligation (3) of the append-error protocol is outstanding: pass this to \
+              `cancelling` with the run's ledger"]
+pub struct UncancelledAppend {
     /// The run the operator is told about.
     pub run_id: String,
     /// The event kind whose outcome is unknown.
@@ -222,11 +267,9 @@ pub struct AppendError {
     pub outcome: AppendOutcome,
     /// Whether a provisional reservation was held and cancelled.
     pub cancelled_reservation: bool,
-    /// How many still-running invocations the ledger cancelled.
-    pub cancelled_invocations: usize,
 }
 
-impl AppendError {
+impl UncancelledAppend {
     /// The creator's report, for `Event.AppendFirst` and for nothing else.
     ///
     /// `None` rather than a fourth `AppendOutcome` variant: the three shapes
@@ -257,9 +300,21 @@ impl AppendError {
     pub const fn resumable(&self) -> bool {
         true
     }
+    /// Discharge obligation (3) and mint the report.
+    ///
+    /// "In-flight invocations are cancelled through the Runner"; this is the
+    /// ledger half. The Runner half — cancelling the pipelines and discarding
+    /// the completions — is the caller's too, and always was.
+    pub fn cancelling(self, invocations: &mut InvocationLedger) -> AppendError {
+        AppendError {
+            report: self,
+            cancelled_invocations: invocations.cancel_all_running(),
+            _cancelled: Cancelled(()),
+        }
+    }
 }
 
-impl fmt::Display for AppendError {
+impl fmt::Display for UncancelledAppend {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
             f,
@@ -303,7 +358,7 @@ pub enum EmitError {
     NotEntered(UpstrokeError),
     /// The append was entered and returned an error. The protocol ran, and this
     /// is its report.
-    AppendFailed(Box<AppendError>),
+    AppendFailed(Box<UncancelledAppend>),
 }
 
 impl EmitError {
@@ -320,7 +375,7 @@ impl EmitError {
 
     /// The outcome-unknown append this refusal carries, if it carries one.
     #[must_use]
-    pub fn append_error(&self) -> Option<&AppendError> {
+    pub fn append_error(&self) -> Option<&UncancelledAppend> {
         match self {
             Self::AppendFailed(error) => Some(error),
             _ => None,
@@ -340,15 +395,24 @@ impl fmt::Display for EmitError {
 
 impl std::error::Error for EmitError {}
 
-impl From<EmitError> for UpstrokeError {
-    fn from(error: EmitError) -> Self {
-        match error {
-            EmitError::Unserializable(error) | EmitError::NotEntered(error) => error,
-            EmitError::Refused(refusal) => Self::Refused {
+impl EmitError {
+    /// This refusal as the error a caller propagates, discharging obligation
+    /// (3) on the way if one is outstanding.
+    ///
+    /// **There is deliberately no `From<EmitError> for UpstrokeError`.** The
+    /// conversion reads the report — `append.to_string()` — and reaching the
+    /// report is exactly what must require the ledger. A blanket `From` would
+    /// let every `?` in the tree turn an outstanding obligation into a string
+    /// and drop it, which is the "remembered, not enforced" failure this
+    /// design exists to make impossible.
+    pub fn discharging(self, invocations: &mut InvocationLedger) -> UpstrokeError {
+        match self {
+            Self::Unserializable(error) | Self::NotEntered(error) => error,
+            Self::Refused(refusal) => UpstrokeError::Refused {
                 message: refusal.to_string(),
             },
-            EmitError::AppendFailed(append) => Self::Refused {
-                message: append.to_string(),
+            Self::AppendFailed(append) => UpstrokeError::Refused {
+                message: append.cancelling(invocations).to_string(),
             },
         }
     }
@@ -445,7 +509,7 @@ fn protocol(
     site: EventSite,
     cause: UpstrokeError,
     hooks: &mut dyn TopologyHooks,
-) -> AppendError {
+) -> UncancelledAppend {
     // (1) The fold is poisoned here, explicitly, and this is the only caller
     //     that does it. `EventLog` poisoned its own handle inside the funnel;
     //     that is a different object, and a fold left unpoisoned goes on
@@ -459,11 +523,10 @@ fn protocol(
     //     for.
     let cancelled_reservation = state.reservations.cancel_any();
 
-    // (3) The ledger half of "in-flight invocations are cancelled through the
-    //     Runner". The Runner half — cancelling the pipelines and discarding
-    //     the completions — belongs to the caller, which is the only thing
-    //     holding the Runner.
-    let cancelled_invocations = state.invocations.cancel_all_running();
+    // (3) Not here. The ledger half of "in-flight invocations are cancelled
+    //     through the Runner" is the caller's, beside the Runner half that
+    //     always was — see `UncancelledAppend`, which is what this returns and
+    //     which cannot become a report without it.
 
     // (4) No retry. No cleanup. No report from memory. Stated by absence,
     //     which is the only way it can be stated.
@@ -502,14 +565,82 @@ fn protocol(
         },
     };
 
-    AppendError {
+    UncancelledAppend {
         run_id: identity.run_id.clone(),
         kind: line.kind(),
         site,
         cause,
         outcome,
         cancelled_reservation,
-        cancelled_invocations,
+    }
+}
+
+/// A failure on a path that emits, with obligation (3) still outstanding if the
+/// append was entered.
+///
+/// **The error type of the emit seam, and the reason it is not
+/// [`UpstrokeError`].** An ordering module — `dispatch.rs`, `candidate.rs` —
+/// emits without holding the run's ledger, so it cannot discharge obligation
+/// (3) and must not be able to pretend it did. Carrying the obligation in the
+/// error is what makes it travel to the one place that can: the driver, which
+/// owns the ledger because [`crate::engine::topology::AttemptContext`] registers
+/// every Runner process in it.
+///
+/// `From<UpstrokeError>` exists so a function that fails for ordinary reasons
+/// *and* emits still returns one error type and still uses `?` for both.
+#[derive(Debug)]
+#[must_use]
+pub enum EmitFailure {
+    /// Something other than an entered append: an ordinary refusal, or one of
+    /// the three pre-append aborts. No obligation.
+    Clean(UpstrokeError),
+    /// The append was entered and failed. Obligation (3) is outstanding.
+    Undischarged(Box<UncancelledAppend>),
+}
+
+impl EmitFailure {
+    /// The error a caller propagates, discharging obligation (3) on the way if
+    /// one is outstanding.
+    pub fn discharging(self, invocations: &mut InvocationLedger) -> UpstrokeError {
+        match self {
+            Self::Clean(error) => error,
+            Self::Undischarged(append) => UpstrokeError::Refused {
+                message: append.cancelling(invocations).to_string(),
+            },
+        }
+    }
+
+    /// Whether this failure left the log exactly as it found it.
+    #[must_use]
+    pub const fn wrote_nothing(&self) -> bool {
+        matches!(self, Self::Clean(_))
+    }
+}
+
+impl From<UpstrokeError> for EmitFailure {
+    fn from(error: UpstrokeError) -> Self {
+        Self::Clean(error)
+    }
+}
+
+impl From<EmitError> for EmitFailure {
+    fn from(error: EmitError) -> Self {
+        match error {
+            EmitError::AppendFailed(append) => Self::Undischarged(append),
+            EmitError::Unserializable(error) | EmitError::NotEntered(error) => Self::Clean(error),
+            EmitError::Refused(refusal) => Self::Clean(UpstrokeError::Refused {
+                message: refusal.to_string(),
+            }),
+        }
+    }
+}
+
+impl fmt::Display for EmitFailure {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Clean(error) => write!(f, "{error}"),
+            Self::Undischarged(append) => write!(f, "{append}"),
+        }
     }
 }
 

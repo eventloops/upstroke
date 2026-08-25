@@ -289,7 +289,7 @@ impl EventEmitter for FoldedEmitter {
         &mut self,
         body: TopologyEventBody,
         _hooks: &mut dyn super::seams::TopologyHooks,
-    ) -> Result<(), UpstrokeError> {
+    ) -> Result<(), crate::engine::topology::emit::EmitFailure> {
         let event = TopologyEvent {
             ts: <super::seams::SystemClock as super::seams::TimeSource>::now_rfc3339(&self.clock),
             body,
@@ -755,6 +755,9 @@ pub(super) struct Run {
     pub(super) emitter: FoldedEmitter,
     /// What a spawn would have been.
     pub(super) runner: RecordingRunner,
+    /// The R4 ledger this fixture discharges obligation (3) against. In
+    /// production the driver owns it; here the fixture is the caller.
+    pub(super) invocations: crate::engine::topology::identity::InvocationLedger,
 }
 
 impl Run {
@@ -783,6 +786,7 @@ impl Run {
                 clock: super::seams::SystemClock,
             },
             hooks: Hooks::new(&harness, &timeline),
+            invocations: crate::engine::topology::identity::InvocationLedger::new(),
             runner: RecordingRunner::new(),
             timeline,
             harness,
@@ -948,6 +952,7 @@ impl Run {
             },
             hooks: Hooks::new(&harness, &timeline),
             runner: RecordingRunner::new(),
+            invocations: crate::engine::topology::identity::InvocationLedger::new(),
             timeline,
             harness,
             paths: {
@@ -987,6 +992,11 @@ impl Run {
     }
 
     /// [`Self::dispatch`], keeping the error.
+    ///
+    /// Obligation (3) is discharged against a ledger of this fixture's own:
+    /// `dispatch` emits without holding one, so the failure carries the
+    /// obligation out, and something has to be the caller. In production that
+    /// is `TopologyRun`, which owns the run's ledger.
     pub(super) fn try_dispatch(
         &mut self,
         key: TaskKey,
@@ -1006,6 +1016,7 @@ impl Run {
             &mut self.emitter,
             &request,
         )
+        .map_err(|failure| failure.discharging(&mut self.invocations))
     }
 
     /// Register a repair of `root`, the way a merge rejection will.

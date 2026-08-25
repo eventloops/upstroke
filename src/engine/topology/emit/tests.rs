@@ -356,7 +356,6 @@ impl Fixture {
             fold: &mut self.fold,
             log: &mut self.log,
             reservations: &mut self.reservations,
-            invocations: &mut self.invocations,
             warnings: &mut self.warnings,
         };
         emit(
@@ -465,7 +464,7 @@ fn resume(paths: &RunPaths) -> StablePrefix {
 }
 
 #[track_caller]
-fn append_error(error: &EmitError) -> &AppendError {
+fn append_error(error: &EmitError) -> &UncancelledAppend {
     error
         .append_error()
         .unwrap_or_else(|| panic!("not an outcome-unknown append: {error}"))
@@ -1201,7 +1200,17 @@ fn append_error_never_triggers_cleanup_or_report_from_memory() {
     // report: neither is derived from the fold, and both are obligations of the
     // protocol in their own right.
     assert!(failed.cancelled_reservation);
-    assert_eq!(failed.cancelled_invocations, 1);
+
+    // **Obligation (3) is the caller's, and this is the caller.** The report
+    // does not exist until the ledger is handed over: `AppendError` has a
+    // private witness field and `UncancelledAppend::cancelling` is its only
+    // constructor, so a caller that skipped this could not have reached a count
+    // to assert. That is the compile-time half; this is the behavioural one.
+    let report = match error {
+        EmitError::AppendFailed(append) => append.cancelling(&mut fixture.invocations),
+        other => panic!("the entered append did not report as one: {other}"),
+    };
+    assert_eq!(report.cancelled_invocations, 1);
     assert!(
         fixture.reservations.is_empty() && fixture.reservations.balances(),
         "the provisional reservation was left held"
@@ -1785,7 +1794,8 @@ fn the_harness_event_observer_can_ask_for_the_torn_written_shape() {
 // The production emitter is this protocol, not a second copy of it
 // ---------------------------------------------------------------------------
 
-/// [`super::super::run::RunEmitter`] reaches the append-error protocol.
+/// [`super::super::run::RunEmitter`] reaches the append-error protocol, and
+/// **all five obligations are observed with the caller in the loop**.
 ///
 /// **The assertion is that the forwarder forwards.** `EventEmitter` had one
 /// implementation in this tree before the driver existed, and it was
@@ -1794,42 +1804,115 @@ fn the_harness_event_observer_can_ask_for_the_torn_written_shape() {
 /// candidate test drives through it, so "the pipeline's appends are protected
 /// by the protocol" was a claim nothing checked.
 ///
-/// So this drives the *production* emitter over an armed append and asks the
-/// protocol's first obligation: is the fold poisoned. A `RunEmitter` that had
-/// grown its own append path — the duplication shape this slice has paid for
-/// four times — would fail here.
+/// So this drives the *production* emitter over an armed append and asks all
+/// five. A `RunEmitter` that had grown its own append path — the duplication
+/// shape this slice has paid for four times — would fail here.
+///
+/// # Why the caller is in the loop
+///
+/// Obligation (3) is no longer emit's. The ledger belongs to the driver,
+/// because it is the same object every Runner process of an attempt registers
+/// in and an emitter holding it could not lend it to the attempt that is
+/// running. So the emitter hands back an [`super::EmitFailure`] and the caller
+/// discharges — and `discharging` is the exact expression
+/// `TopologyRun::emit` runs.
+///
+/// Asserting four here and hoping for the fifth is what this test refuses to
+/// do: the obligation moved across this boundary, so this is the test that has
+/// to watch it cross.
 #[test]
 fn the_production_emitter_reaches_the_append_error_protocol() {
     use super::super::dispatch::EventEmitter;
     use super::super::run::RunEmitter;
 
     let mut fixture = Fixture::started("run-emitter-forwards");
+
+    // A reservation held and an invocation running, so "cancelled" is
+    // distinguishable from "there was nothing to cancel" for (2) and (3).
+    fixture
+        .reservations
+        .take(AAY, ReservationKind::Dispatch)
+        .expect("the ledger is empty at process start");
+    let worker = AttemptIdentities::new(AAY, GenerationId(0), AttemptNumber(1)).worker();
+    fixture
+        .invocations
+        .register(&worker)
+        .expect("a fresh identity registers");
+
     fixture.arm(
         EventSite::Append,
         SubEffectPoint::WrittenFull,
         InjectionMode::ErrorReturn,
     );
 
-    let outcome = {
+    let failure = {
         let mut emitter = RunEmitter {
             identity: &fixture.identity,
             state: EmitState {
                 fold: &mut fixture.fold,
                 log: &mut fixture.log,
                 reservations: &mut fixture.reservations,
-                invocations: &mut fixture.invocations,
                 warnings: &mut fixture.warnings,
             },
             clock: &fixture.clock,
         };
-        emitter.emit(budget_body(), &mut fixture.hooks)
+        emitter
+            .emit(budget_body(), &mut fixture.hooks)
+            .expect_err("the flush was made to fail")
     };
 
-    outcome.expect_err("the flush was made to fail");
+    // (3), and it is first because it is the one that moved. The report does
+    // not exist until the ledger is handed over — `AppendError` carries a
+    // private witness and `UncancelledAppend::cancelling` is its only
+    // constructor — so reaching a count to assert is itself the proof.
+    let super::EmitFailure::Undischarged(append) = failure else {
+        panic!("an entered append did not report as one");
+    };
+    let report = append.cancelling(&mut fixture.invocations);
+    assert_eq!(report.cancelled_invocations, 1);
+    assert!(
+        fixture.invocations.balances() && fixture.invocations.running().is_empty(),
+        "an invocation was left running after the caller discharged"
+    );
+
+    // (1)
     assert!(
         fixture.fold.is_poisoned(),
         "the protocol's first obligation. An emitter that appended for itself \
          would leave the fold live here, and every effect after it would be \
          derived from state this process cannot vouch for"
     );
+
+    // (2)
+    assert!(report.report.cancelled_reservation);
+    assert!(
+        fixture.reservations.is_empty() && fixture.reservations.balances(),
+        "the provisional reservation was left held"
+    );
+
+    // (4): no retry, no cleanup, no report from memory. Derived from the
+    // harness so a site group added later is covered without editing a list.
+    let ran = fixture.non_event_sites();
+    assert!(ran.is_empty(), "the protocol performed an effect: {ran:?}");
+    assert!(
+        !fixture.paths.public.join("report.json").exists(),
+        "a report was written from the poisoned fold"
+    );
+    assert!(
+        fixture.paths.public.is_dir() && fixture.paths.private.is_dir(),
+        "the protocol removed a run directory"
+    );
+
+    // (5): the prefix was reopened and the barrier established, so the outcome
+    // is an answer rather than an absence. Which answer depends on where the
+    // injection cut, and the test does not care — it cares that one was
+    // reached, because that is what the reopen produces.
+    assert!(
+        matches!(
+            report.report.outcome,
+            AppendOutcome::Present | AppendOutcome::Absent | AppendOutcome::Undetermined { .. }
+        ),
+        "the stable-prefix barrier did not run"
+    );
+    assert!(report.report.resumable());
 }

@@ -426,26 +426,38 @@ impl AttemptContext<'_> {
     /// Whatever the emitter returns; [`UpstrokeError::Refused`] from the slot
     /// assertion or the invocation ledger; or a runner failure. A non-zero exit
     /// is not an error — it is a [`ProcessOutput`] and the caller's to judge.
+    /// Emit, discharging obligation (3) from this context's own ledger.
+    ///
+    /// The seam hands back an [`EmitFailure`] because an ordering module may
+    /// not hold the ledger. This one does — it is the same ledger every Runner
+    /// process of the attempt registers in — so the obligation is discharged
+    /// here and the attempt half keeps returning [`UpstrokeError`].
+    fn emit(&mut self, body: TopologyEventBody) -> Result<(), UpstrokeError> {
+        // Three disjoint field borrows, which is why the hooks are taken from
+        // `self` here rather than passed in: a caller writing
+        // `self.emit(body, self.hooks)` borrows all of `self` twice.
+        self.emitter
+            .emit(body, self.hooks)
+            .map_err(|failure| failure.discharging(self.ledger))
+    }
+
     pub fn start(
         &mut self,
         dispatched: &Dispatched,
         plan: &AttemptPlan,
     ) -> Result<AttemptRun, UpstrokeError> {
-        self.emitter.emit(
-            TopologyEventBody::AttemptStarted {
-                data: AttemptStarted4 {
-                    key: dispatched.key,
-                    generation: dispatched.generation,
-                    attempt: plan.attempt,
-                    rung: plan.rung,
-                    binding: plan.binding.clone(),
-                    pool: plan.pool.clone(),
-                    resume_session: plan.resume_session.clone(),
-                    materialization_observed: plan.materialization_observed,
-                },
+        self.emit(TopologyEventBody::AttemptStarted {
+            data: AttemptStarted4 {
+                key: dispatched.key,
+                generation: dispatched.generation,
+                attempt: plan.attempt,
+                rung: plan.rung,
+                binding: plan.binding.clone(),
+                pool: plan.pool.clone(),
+                resume_session: plan.resume_session.clone(),
+                materialization_observed: plan.materialization_observed,
             },
-            self.hooks,
-        )?;
+        })?;
 
         let identities =
             AttemptIdentities::new(dispatched.key, dispatched.generation, plan.attempt);
@@ -711,18 +723,15 @@ impl AttemptContext<'_> {
         attempt: AttemptNumber,
         outcome: AttemptOutcome,
     ) -> Result<(), UpstrokeError> {
-        self.emitter.emit(
-            TopologyEventBody::AttemptInterrupted {
-                data: AttemptInterrupted4 {
-                    key: dispatched.key,
-                    generation: dispatched.generation,
-                    attempt,
-                    lease: dispatched.closing_disposition(),
-                    detail: outcome.detail().to_owned(),
-                },
+        self.emit(TopologyEventBody::AttemptInterrupted {
+            data: AttemptInterrupted4 {
+                key: dispatched.key,
+                generation: dispatched.generation,
+                attempt,
+                lease: dispatched.closing_disposition(),
+                detail: outcome.detail().to_owned(),
             },
-            self.hooks,
-        )?;
+        })?;
         self.discard_residue(dispatched)
     }
 

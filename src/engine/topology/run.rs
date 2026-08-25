@@ -45,7 +45,7 @@ use crate::topology::registry::TaskKey;
 use crate::workspace_manager::WorkspaceManager;
 
 use super::dispatch::{DispatchKind, DispatchRequest, Dispatched, EventEmitter, dispatch};
-use super::emit::{EmitState, RunIdentity, emit};
+use super::emit::{EmitFailure, EmitState, RunIdentity, emit};
 use super::identity::{InvocationLedger, ReservationKind, Reservations};
 use super::recover::RunHandle;
 use super::seams::{TimeSource, TopologyHooks};
@@ -103,7 +103,7 @@ impl EventEmitter for RunEmitter<'_> {
         &mut self,
         body: TopologyEventBody,
         hooks: &mut dyn TopologyHooks,
-    ) -> Result<(), UpstrokeError> {
+    ) -> Result<(), EmitFailure> {
         emit(self.identity, &mut self.state, self.clock, body, hooks)?;
         Ok(())
     }
@@ -502,7 +502,6 @@ impl TopologyRun {
                     fold: &mut self.handle.fold,
                     log: &mut self.handle.log,
                     reservations: &mut self.reservations,
-                    invocations: &mut self.invocations,
                     warnings: &mut self.warnings,
                 },
                 clock: seams.clock,
@@ -521,7 +520,7 @@ impl TopologyRun {
                 // failure hide the failure that caused it: the first error is
                 // the one an operator needs.
                 let _ = self.reservations.cancel(key, ReservationKind::Dispatch);
-                Err(error)
+                Err(error.discharging(&mut self.invocations))
             }
         }
     }
@@ -584,12 +583,17 @@ impl TopologyRun {
                 fold: &mut self.handle.fold,
                 log: &mut self.handle.log,
                 reservations: &mut self.reservations,
-                invocations: &mut self.invocations,
                 warnings: &mut self.warnings,
             },
             clock: seams.clock,
         };
-        emitter.emit(body, hooks)
+        // The driver owns the ledger, so obligation (3) is discharged here
+        // and the loop keeps one error type. `emitter` borrows the fold, the
+        // log, the reservations and the warnings; `invocations` is a disjoint
+        // field, which is the whole reason it is no longer inside `EmitState`.
+        emitter
+            .emit(body, hooks)
+            .map_err(|failure| failure.discharging(&mut self.invocations))
     }
 }
 

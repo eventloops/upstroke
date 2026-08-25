@@ -95,15 +95,24 @@ pub trait EventEmitter {
     ///
     /// # Errors
     ///
-    /// Whatever the emitter's append protocol returns. A caller here never
-    /// interprets it: an emit that failed means the fold is poisoned and the
-    /// coordinator is ending, and the effect that would have followed this
-    /// event must not run.
+    /// Whatever the emitter's append protocol returns, as an
+    /// [`super::emit::EmitFailure`] rather than an [`UpstrokeError`]. A caller
+    /// here never interprets it: an emit that failed means the fold is poisoned
+    /// and the coordinator is ending, and the effect that would have followed
+    /// this event must not run.
+    ///
+    /// **It is not an `UpstrokeError` because obligation (3) may be
+    /// outstanding.** An entered append that fails leaves in-flight
+    /// invocations to cancel, and the ledger belongs to the driver, not to an
+    /// ordering module. The failure carries the obligation until it reaches
+    /// something that can discharge it; converting to `UpstrokeError` early
+    /// would drop it silently, which is the "remembered, not enforced" failure
+    /// this seam exists to make impossible.
     fn emit(
         &mut self,
         body: TopologyEventBody,
         hooks: &mut dyn TopologyHooks,
-    ) -> Result<(), UpstrokeError>;
+    ) -> Result<(), super::emit::EmitFailure>;
 }
 
 // ---------------------------------------------------------------------------
@@ -334,7 +343,7 @@ pub fn dispatch(
     hooks: &mut dyn TopologyHooks,
     emitter: &mut dyn EventEmitter,
     request: &DispatchRequest,
-) -> Result<Dispatched, UpstrokeError> {
+) -> Result<Dispatched, super::emit::EmitFailure> {
     // Before the append, because a refusal after it would leave an open
     // generation whose worktree can never be built. `T-DISPATCH` lists "source
     // candidate object missing" beside the containment refusals, so both are
@@ -705,7 +714,7 @@ pub fn close_at_run_end(
     emitter: &mut dyn EventEmitter,
     dispatched: &Dispatched,
     outcome: RunOutcome,
-) -> Result<(), UpstrokeError> {
+) -> Result<(), super::emit::EmitFailure> {
     emitter.emit(
         TopologyEventBody::GenerationClosed {
             data: GenerationClosed {
@@ -717,7 +726,7 @@ pub fn close_at_run_end(
         },
         hooks,
     )?;
-    scrub(manager, hooks, &dispatched.slot)
+    Ok(scrub(manager, hooks, &dispatched.slot)?)
 }
 
 /// Forced removal of a worktree and then its intent.

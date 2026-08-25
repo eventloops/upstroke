@@ -2164,12 +2164,14 @@ fn emit(
         fold,
         log,
         reservations: context.reservations,
-        invocations: context.invocations,
         warnings: context.warnings,
     };
+    // Recovery holds the run's ledger, so it discharges obligation (3) here
+    // rather than carrying it further: the recovery order is the one caller
+    // that both emits and owns every invocation this process registered.
     super::emit::emit(&identity, &mut state, context.clock, body, context.hooks)
         .map(|_| ())
-        .map_err(UpstrokeError::from)
+        .map_err(|error| super::emit::EmitFailure::from(error).discharging(context.invocations))
 }
 
 // ---------------------------------------------------------------------------
