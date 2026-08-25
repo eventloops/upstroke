@@ -287,7 +287,7 @@ pub(super) fn run_attempt(
                     adapter: reviewer.adapter,
                     profile: reviewer.profile.clone(),
                     lens: reviewer.lens,
-                    task: cx.task,
+                    task: review::ReviewSubject::of(cx.task),
                     diff: &outcome.diff,
                     artifacts: &artifacts,
                     decisions: &cx.decisions,

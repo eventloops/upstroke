@@ -1248,6 +1248,39 @@ clause to cite.
 3. **The full suite: 1662 passed, 0 failed**, against 1661 before, the one addition being the new
    census itself.
 
+### The reviewer needed no move at all — it needed a narrowing
+
+The third role was expected to be the hard one, and the expectation was wrong in an instructive way.
+
+`review::run_review` is already engine-agnostic. It is a `pub fn` over a caller-supplied `ReviewCx`,
+a `&dyn Runner` and a `ReviewInvocations { pass, reask }` — **the caller supplies both identities**,
+and the workspace, settings and reviews directories too. It returns a `ReviewOutcome` carrying the
+result, the **cost**, the invocation count and the transcript path: everything `ReviewRecord` needs
+and an exit code cannot give. The re-ask loop, the per-invocation prompt and the verdict parsing are
+all inside it.
+
+So the machinery was never legacy-shaped. It was **shared-capable and never shared** — the same
+shape as everything else this slice has found: built, documented, and waiting for a caller nobody
+wrote.
+
+**One thing did block reuse, and it was a parameter that asked for too much.** `ReviewCx` took an
+`&ir::Task` to reach three fields — `title`, `body`, `acceptance` — which `materialize_prompt` is the
+only thing in that path to read. The schema-4 driver holds a `FrozenTaskSpec` from the frozen
+registry and no `ir::Task` anywhere, so sharing would have meant **synthesising** one: inventing an
+id, a kind and a dependency list the reviewer never reads. A conversion that fabricates fields is
+free to drift from the plan it claims to represent, and improvising assembly inputs is the specific
+thing this work was told not to do.
+
+`ReviewSubject { title, body, acceptance }` is what the path reads, and `ReviewCx` now asks for that.
+The same narrowing `OpenGeneration` made for the rebuild family, for the same reason, and with the
+same result: the frozen-layer question disappears rather than being answered.
+
+Preservation: the suite is **1662 / 0 before and after** — no test added, removed or changed
+behaviour — and no `CommandSpec` census moved, because no mint or call site did. The effect
+classifier did fire, on the new `ReviewSubject::of` being an unclassified externally-reachable fn of
+a classified module; it is classified `effect_free` in the same commit, which is the enforcement
+layer working rather than an obstacle.
+
 ### What is deliberately not finished here
 
 - **The reviewer's command is still assembled in `review.rs`**, and

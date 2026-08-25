@@ -656,6 +656,7 @@ effect_free = [
     "fmt",
     "name",
     "new",
+    "of",
     "parse_verdict",
     "pass_timeout",
     "passes_for",

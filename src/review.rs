@@ -469,13 +469,49 @@ pub fn plan_for(
     Ok(resolved)
 }
 
+/// What a review pass reads about the task under review.
+///
+/// **Three fields, and [`ReviewCx`] used to take a whole `ir::Task` to reach
+/// them.** `materialize_prompt` — the only thing in this module's review path
+/// that touches the task at all — quotes the title, the body and the acceptance
+/// criteria, and nothing else.
+///
+/// The wider field could not be shared. The schema-4 driver holds a
+/// `FrozenTaskSpec` from the frozen registry and no `ir::Task` anywhere:
+/// synthesising one would mean inventing an id, a kind and a dependency list
+/// the reviewer never reads, and a conversion that fabricates fields is free to
+/// drift from the plan it claims to represent. Asking for what is read removes
+/// the question — the same narrowing `OpenGeneration` made for the rebuild
+/// family, and for the same reason.
+#[derive(Debug, Clone, Copy)]
+pub struct ReviewSubject<'a> {
+    /// The task's one-line title.
+    pub title: &'a str,
+    /// Its body, which may be empty.
+    pub body: &'a str,
+    /// Its acceptance criteria, which may be empty.
+    pub acceptance: &'a [String],
+}
+
+impl<'a> ReviewSubject<'a> {
+    /// The subject of a legacy plan's task.
+    #[must_use]
+    pub fn of(task: &'a Task) -> Self {
+        Self {
+            title: &task.title,
+            body: &task.body,
+            acceptance: &task.acceptance,
+        }
+    }
+}
+
 pub struct ReviewCx<'a> {
     pub adapter: &'a dyn AgentAdapter,
     pub profile: WorkerProfile,
     /// Which pass this is (§11.5). Decides the prompt preamble and the names of
     /// this review's artifacts on disk.
     pub lens: Lens,
-    pub task: &'a Task,
+    pub task: ReviewSubject<'a>,
     pub diff: &'a str,
     /// Artifacts the reviewer should judge against (conventions brief first).
     pub artifacts: &'a [(String, String)],
@@ -839,7 +875,7 @@ fn materialize_prompt(cx: &ReviewCx<'_>) -> Result<String, UpstrokeError> {
         );
     } else {
         prompt.push_str("Acceptance criteria (every one must hold):\n");
-        for item in &task.acceptance {
+        for item in task.acceptance {
             let _ = writeln!(prompt, "- {item}");
         }
         prompt.push('\n');
@@ -1323,7 +1359,7 @@ mod tests {
                 adapter: &adapter,
                 profile: profile_for("unavailable-test", "test-model", "review", Effort::High),
                 lens: Lens::Acceptance,
-                task: &task,
+                task: ReviewSubject::of(&task),
                 diff: "diff --git a/a.rs b/a.rs\n+++ b/a.rs\n+fn x() {}\n",
                 artifacts: &[],
                 decisions: &[],
@@ -1502,7 +1538,7 @@ mod tests {
             adapter: &crate::agent::claude::ClaudeCodeAdapter,
             profile: profile_for("claude-code", "claude-opus-5", "review", Effort::High),
             lens: Lens::Acceptance,
-            task: &task,
+            task: ReviewSubject::of(&task),
             diff: "+++ b/src/api.rs\n+fn encode() {}\n",
             artifacts: &[],
             decisions: &[],
@@ -1540,7 +1576,7 @@ mod tests {
             adapter: &crate::agent::claude::ClaudeCodeAdapter,
             profile: profile_for("claude-code", "claude-opus-5", "review", Effort::High),
             lens: Lens::Acceptance,
-            task: &task,
+            task: ReviewSubject::of(&task),
             diff: "+++ b/src/api.rs\n+fn encode() {}\n",
             artifacts: &[],
             decisions: &decisions,
@@ -1587,7 +1623,7 @@ mod tests {
             adapter: &crate::agent::claude::ClaudeCodeAdapter,
             profile: profile_for("claude-code", "claude-opus-5", "review", Effort::High),
             lens: Lens::Acceptance,
-            task: &task,
+            task: ReviewSubject::of(&task),
             diff: "+++ b/src/api.rs\n+fn encode() {}\n",
             artifacts: &artifacts,
             decisions: &[],
@@ -1627,7 +1663,7 @@ mod tests {
             adapter: &crate::agent::claude::ClaudeCodeAdapter,
             profile: profile_for("claude-code", "claude-opus-5", "review", Effort::High),
             lens: Lens::Acceptance,
-            task: &task,
+            task: ReviewSubject::of(&task),
             diff: &broad,
             artifacts: &[],
             decisions: &[],
@@ -1651,7 +1687,7 @@ mod tests {
             adapter: &NeverInvokedAdapter,
             profile: profile_for("claude-code", "claude-opus-5", "review", Effort::High),
             lens: Lens::Acceptance,
-            task: &task,
+            task: ReviewSubject::of(&task),
             diff: &huge,
             artifacts: &[],
             decisions: &[],
@@ -1678,7 +1714,7 @@ mod tests {
             adapter: &NeverInvokedAdapter,
             profile: profile_for("claude-code", "claude-opus-5", "review", Effort::High),
             lens: Lens::Acceptance,
-            task: &task,
+            task: ReviewSubject::of(&task),
             diff: opaque,
             artifacts: &[],
             decisions: &[],
@@ -1703,7 +1739,7 @@ mod tests {
             adapter: &NeverInvokedAdapter,
             profile: profile_for("claude-code", "claude-opus-5", "review", Effort::High),
             lens: Lens::Acceptance,
-            task: &task,
+            task: ReviewSubject::of(&task),
             diff: gitlink,
             artifacts: &[],
             decisions: &[],
@@ -1757,7 +1793,7 @@ mod tests {
             adapter: &adapter,
             profile: profile_for("deadline-test", "test-model", "review", Effort::High),
             lens: Lens::Acceptance,
-            task: &task,
+            task: ReviewSubject::of(&task),
             diff: "diff --git a/a.rs b/a.rs\n+++ b/a.rs\n+fn x() {}\n",
             artifacts: &[],
             decisions: &[],
@@ -1804,7 +1840,7 @@ mod tests {
             adapter: &adapter,
             profile: profile_for("deadline-test", "test-model", "review", Effort::High),
             lens: Lens::Acceptance,
-            task: &task,
+            task: ReviewSubject::of(&task),
             diff: "diff --git a/a.rs b/a.rs\n+++ b/a.rs\n+fn x() {}\n",
             artifacts: &[],
             decisions: &[],
@@ -1859,7 +1895,7 @@ mod tests {
             adapter: &crate::agent::claude::ClaudeCodeAdapter,
             profile: profile_for("claude-code", "claude-opus-5", "review", Effort::High),
             lens: Lens::Acceptance,
-            task: &task,
+            task: ReviewSubject::of(&task),
             diff,
             artifacts: &[("brief".to_owned(), "Use ``` for code.".to_owned())],
             decisions: &[],
@@ -2296,7 +2332,7 @@ mod tests {
                 Effort::High,
             ),
             lens: Lens::SecondOpinion,
-            task: &task,
+            task: ReviewSubject::of(&task),
             diff: "+++ b/src/api.rs\n+fn encode() {}\n",
             artifacts: &[],
             decisions: &[],
