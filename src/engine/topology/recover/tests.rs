@@ -5459,6 +5459,45 @@ fn the_driver_spends_the_allowance_the_log_records() {
     );
 }
 
+/// **The loop inherits the digest recovery verified.**
+///
+/// `committed.json.run_started_sha256` is what step (a) checks the committed
+/// first line against, and the append-error protocol reads it back: the creator
+/// disposition is a projection of the outcome onto the run's *commitment*
+/// boundary, and a run that cannot say whether it is committed cannot report
+/// one.
+///
+/// Recovery's own emitter passes `Some(...)`. `TopologyRun::resumed` passed
+/// `None` — so over one run, the two emitters disagreed about whether it was
+/// committed, and only the loop's appends lost the answer. Nothing observed it
+/// because nothing compared them.
+#[test]
+fn the_loop_inherits_the_committed_digest_recovery_verified() {
+    let fixture = Fixture::healthy("digest-inherited");
+    let harness = harness();
+    let runtime = runtime_holding_the_record();
+    let certifies = AlwaysCertifies;
+    let given = Given::healthy(&fixture, &runtime, &certifies);
+
+    let (outcome, _) = resume_holding(&fixture, &harness, &given);
+    let (_recovered, handle) = outcome.expect("the healthy resume completes");
+
+    // Computed independently from the run's own committed first line, rather
+    // than read back from the record the handle came through: a comparison of
+    // the record with itself would pass however the digest was carried.
+    let expected = crate::rundir::run_started_sha256(&fixture.first_line);
+
+    assert_eq!(
+        handle.committed_first_line_sha256, expected,
+        "the handle carries a digest that is not the committed first line's"
+    );
+    assert!(
+        !handle.committed_first_line_sha256.is_empty(),
+        "an empty digest asserts nothing: this fixture must publish a commit \
+         record for the comparison to mean anything"
+    );
+}
+
 /// **Erratum E6: a resume converges the settled-but-unrecorded candidate.**
 ///
 /// The window `attempt_finished{Closed{Succeeded}}` durable, `candidate_prepared`

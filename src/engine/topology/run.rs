@@ -585,7 +585,11 @@ impl TopologyRun {
         let identity = RunIdentity {
             run_id: handle.started.run_id.clone(),
             inputs,
-            committed_first_line_sha256: None,
+            // The digest recovery verified, not `None`. A loop that dropped it
+            // would make its own appends unable to report a creator
+            // disposition, while recovery's emitter — over the same run —
+            // could.
+            committed_first_line_sha256: Some(handle.committed_first_line_sha256.clone()),
         };
         Self {
             handle,

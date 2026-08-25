@@ -2235,11 +2235,15 @@ pub fn run_resumed(
         .into_censused()
         .into_barrier()
         .into_log_fold_and_records();
+    // Taken before the records are unwound: the digest step (a) verified is the
+    // one the loop's own appends must be able to check themselves against.
+    let committed_first_line_sha256 = records.commit().run_started_sha256.clone();
     let (run_lock, worktree_lock, root) = records.into_locks().into_guards();
     Ok((
         resumed,
         RunHandle {
             started: root.started().clone(),
+            committed_first_line_sha256,
             log,
             fold,
             _run: run_lock,
@@ -2275,6 +2279,14 @@ pub fn run_resumed(
 /// is released before the worktree lease. All this changes is *when* — the end
 /// of the loop rather than the end of recovery.
 pub struct RunHandle {
+    /// The digest recovery verified `committed.json.run_started_sha256` against.
+    ///
+    /// **Carried because the loop's appends need it too.** The append-error
+    /// protocol's creator disposition is a projection of the outcome onto the
+    /// run's commitment boundary, and without this the loop's `RunIdentity`
+    /// answers `None` where recovery's own emitter answers `Some` — two
+    /// emitters of one run disagreeing about whether it is committed.
+    pub committed_first_line_sha256: String,
     /// The append handle the stable-prefix barrier entitled this command to.
     pub log: crate::events::log::EventLog,
     /// The fold built from exactly the barrier-proven bytes.
