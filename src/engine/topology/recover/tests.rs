@@ -4390,6 +4390,7 @@ fn the_driver_takes_over_from_the_recovery_order_and_steps() {
         paths: &paths,
         plans: &plans,
         reviews: &crate::engine::attempt::LegacyReviewPasses,
+        halts_run: false,
     };
 
     let kinds_before = durable_kinds(&fixture);
@@ -4401,7 +4402,12 @@ fn the_driver_takes_over_from_the_recovery_order_and_steps() {
     // would pass whichever branch the fixture happened to reach — a fixture
     // that silently started reaching a different one would take the assertion
     // with it.
-    let Progress::Judged { key, accepted } = progress else {
+    let Progress::Settled {
+        key,
+        accepted,
+        spent_attempt,
+    } = progress
+    else {
         panic!("the ready-dispatch branch did not run an attempt: {progress:?}");
     };
     assert_eq!(key, TaskKey(0));
@@ -4433,10 +4439,20 @@ fn the_driver_takes_over_from_the_recovery_order_and_steps() {
             let mut expected = kinds_before.clone();
             expected.push("task_dispatched".to_owned());
             expected.push("attempt_started".to_owned());
+            expected.push("attempt_finished".to_owned());
             expected
         },
-        "the dispatch, then the attempt. What is NOT here is the settlement, \
-         which is the clause this build still owes"
+        "the whole branch, in order: the dispatch, the attempt, the settlement"
+    );
+
+    // **The allowance, from `ladder::spends_allowance` and nowhere else.** An
+    // empty diff spends: the line is "the worker ran", not "a verdict was
+    // reached". The settlement carries the answer out of the branch because it
+    // is the input the *next* ladder decision reads.
+    assert!(
+        spent_attempt,
+        "an attempt whose worker ran and produced a diff to judge did not spend \
+         one of its rung's attempts"
     );
 
     // **The worker ran through the Runner**, which is what makes this the

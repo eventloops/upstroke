@@ -40,13 +40,14 @@ use crate::review;
 use crate::topology::events::TopologyEventBody;
 
 use crate::interaction::Sleeper;
-use crate::topology::events::GenerationId;
+use crate::topology::events::{GenerationId, SessionId};
 use crate::topology::fold::{FrozenInputs, TopologyFold};
 use crate::topology::registry::TaskKey;
 use crate::workspace_manager::WorkspaceManager;
 
 use super::attempt::{
-    AttemptContext, AttemptPlans, InputsRequest, Judgement, Judging, PlanRequest, ReviewPasses,
+    Assessment, AttemptContext, AttemptPlan, AttemptPlans, InputsRequest, Judgement, Judging,
+    PlanRequest, ReviewPasses,
 };
 use super::dispatch::{DispatchKind, DispatchRequest, Dispatched, EventEmitter, dispatch};
 use super::emit::{EmitFailure, EmitState, RunIdentity, emit};
@@ -54,7 +55,7 @@ use super::identity::{InvocationLedger, ReservationKind, Reservations, SlotAsser
 use super::recover::RunHandle;
 use super::seams::{TimeSource, TopologyHooks};
 use super::select::{Admitted, Ceiling, Spend, Step, checkpoint, select};
-use super::settle::Deferral;
+use super::settle::{Deferral, FinishedAttempt, settle_failed};
 
 // ---------------------------------------------------------------------------
 // The production emitter
@@ -225,10 +226,16 @@ impl LoopBranch {
             // stuck one: recovery step (g) recreates its worktree at its base,
             // and `close_at_run_end` closes it. Stopping here leaves the run in
             // a shape the system already knows how to recover.
+            // The branch's four clauses are all here. What it still refuses
+            // are three *cases* of the last one, each named at its refusal:
+            // the successful settlement (the candidate sequence's, since it
+            // lands between the pin and `candidate_prepared`), a park (no
+            // production builder for a question's id, context and options),
+            // and an outage deferral (no fold reader for the deferral count).
             Self::ReadyDispatch => Disposition::PartlyImplemented {
                 performs: "ceiling check, provisional dispatch reservation, dispatch, run one \
-                           attempt through the Runner",
-                owes: "settle",
+                           attempt through the Runner and settle it",
+                owes: "settle a success, a park, or an outage deferral",
             },
             Self::IngestAnswers | Self::ReadyRetry | Self::HardBlock => {
                 Disposition::NotYetImplemented
@@ -258,6 +265,27 @@ impl LoopBranch {
             Step::Backoff => Some(Self::DeferBackoff),
             Step::HardBlock { .. } => Some(Self::HardBlock),
             Step::Closure(_) => Some(Self::Closure),
+        }
+    }
+
+    /// The refusal a branch returns for one clause it does not implement.
+    ///
+    /// Distinct from [`Self::unimplemented`], which speaks for the whole
+    /// branch. This one names a single clause, so a branch that performs most
+    /// of itself can still refuse a case precisely — and the message says which
+    /// case rather than which branch, because "ready dispatch is not
+    /// implemented" would be false by the time this is reached.
+    ///
+    /// # Errors
+    ///
+    /// Always [`UpstrokeError::Refused`].
+    pub fn owes(self, clause: &str) -> UpstrokeError {
+        UpstrokeError::Refused {
+            message: format!(
+                "the schema-4 run loop's `{}` branch reached a case this build does not \
+                 implement: {clause}. Nothing was appended for it",
+                self.label()
+            ),
         }
     }
 
@@ -319,6 +347,10 @@ pub struct RunSeams<'a> {
     pub plans: &'a dyn AttemptPlans,
     /// Where a review pass is executed. `review::run_review`, behind its seam.
     pub reviews: &'a dyn ReviewPasses,
+    /// `decisions.run_end_policy`: whether a task's terminal failure halts the
+    /// run. Run configuration rather than an injection point, and here because
+    /// the settlement records it and the log is the only place it survives.
+    pub halts_run: bool,
 }
 
 /// What one iteration of the loop did.
@@ -329,20 +361,20 @@ pub struct RunSeams<'a> {
 /// one that is spinning.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Progress {
-    /// One attempt ran and was judged, and the judgement is **not yet
-    /// durable**.
+    /// One attempt ran, was judged, and its settlement is **durable**.
     ///
-    /// The branch reads "dispatch, run one attempt through the Runner and
-    /// settle", and the settle write is the clause this build still owes. What
-    /// exists up to here is `attempt_started`, the worker, the capture, the
-    /// gates and the reviewers — everything the settlement will record, and
-    /// nothing that records it. A generation left in this shape is
-    /// `OpenWithAttempt`, which recovery already knows how to close.
-    Judged {
+    /// The whole of the ready-dispatch branch: ceiling check, reservation,
+    /// dispatch, the attempt through the Runner, and `attempt_finished`.
+    Settled {
         /// Whose attempt.
         key: TaskKey,
-        /// Whether every gate and reviewer passed.
+        /// Whether the verification ladder found nothing to reject.
         accepted: bool,
+        /// Whether this settlement spent one of the rung's `attempts_per`, as
+        /// `ladder::spends_allowance` prices it. The input the **next** ladder
+        /// decision reads, which is why it is carried out of the branch rather
+        /// than derived again there.
+        spent_attempt: bool,
     },
     /// The defer backoff elapsed and `defer_wait_elapsed` is durable.
     Waited {
@@ -490,10 +522,14 @@ impl TopologyRun {
             Admitted::Retry { .. } => Err(LoopBranch::ReadyRetry.unimplemented()),
             Admitted::Dispatch { key, generation } => {
                 let dispatched = self.dispatch_ready(key, generation, seams, hooks)?;
-                let judgement = self.attempt(&dispatched, seams, hooks)?;
-                Ok(Progress::Judged {
+                let (plan, assessed, judgement) = self.attempt(&dispatched, seams, hooks)?;
+                let accepted = judgement.accepted();
+                let spent_attempt =
+                    self.settle(&dispatched, &plan, &assessed, &judgement, seams, hooks)?;
+                Ok(Progress::Settled {
                     key,
-                    accepted: judgement.accepted(),
+                    accepted,
+                    spent_attempt,
                 })
             }
             Admitted::HardBlock { .. } => Err(LoopBranch::HardBlock.unimplemented()),
@@ -600,7 +636,7 @@ impl TopologyRun {
         dispatched: &Dispatched,
         seams: &RunSeams<'_>,
         hooks: &mut dyn TopologyHooks,
-    ) -> Result<Judgement, UpstrokeError> {
+    ) -> Result<(AttemptPlan, Assessment, Judgement), UpstrokeError> {
         let key = dispatched.key;
         let binding = self
             .handle
@@ -682,7 +718,7 @@ impl TopologyRun {
             diff,
         })?;
 
-        cx.judge(
+        let judgement = cx.judge(
             dispatched,
             &plan,
             Judging {
@@ -695,7 +731,169 @@ impl TopologyRun {
                 pass: run.identities.review_pass(pass, 0),
                 reask: run.identities.review_reask(pass, 0),
             },
-        )
+        )?;
+        Ok((plan, assessed, judgement))
+    }
+
+    /// The branch's last clause: **settle the attempt.**
+    ///
+    /// `settle_failed` decides the transition, the parking, the deferral count,
+    /// whether the generation survives, the lease disposition and the
+    /// allowance — all of it, once. Nothing here re-decides any of them: the
+    /// lease disposition comes from `GenerationLease::expected`, which is the
+    /// whole of that rule, and the allowance from `ladder::spends_allowance`.
+    /// This function's job is to hand that module the three answers only the
+    /// run has — what the ladder decided, what the record says, and what the
+    /// run's policy does with a terminal failure.
+    ///
+    /// # What this build refuses, and why it refuses rather than guesses
+    ///
+    /// `ladder::next_step` reads `LadderState::defers` on exactly one branch:
+    /// an outage defers while `defers < max_defers` and parks at it. **Schema 4
+    /// has no reader for that count.** `SettlementTransition::Deferred {
+    /// defers }` is written into the log, but the fold never accumulates it
+    /// onto the task: `TaskFold` has no such field and `TaskState::Deferred` is
+    /// a unit variant. The legacy engine keeps it in
+    /// `state.progress[index].defers`, which is in-memory schema-3 state, and
+    /// schema 4 derives everything by replay.
+    ///
+    /// So an outage is refused here, before any append. Passing a number the
+    /// fold cannot vouch for would make a run park early or defer forever, and
+    /// the charter is explicit that a missing fold answer is a question rather
+    /// than a derivation. `checkpoint_refusals` is the same idiom one level up:
+    /// "an intermediate build refuses, before any append, any operation whose
+    /// terminals it does not implement".
+    ///
+    /// A park is refused for a second, smaller reason: `Next::AskHuman` names a
+    /// `QuestionKind` and nothing else, and the id, context and options are the
+    /// caller's. There is no production builder for them yet.
+    ///
+    /// Both refusals leave the generation `OpenWithAttempt`, which is a state
+    /// recovery already closes.
+    fn settle(
+        &mut self,
+        dispatched: &Dispatched,
+        plan: &AttemptPlan,
+        assessed: &Assessment,
+        judgement: &Judgement,
+        seams: &RunSeams<'_>,
+        hooks: &mut dyn TopologyHooks,
+    ) -> Result<bool, UpstrokeError> {
+        let record = crate::engine::classify::attempt_record(
+            plan.attempt.0,
+            crate::engine::classify::AttemptFacts {
+                tier: plan.binding.tier,
+                model: &plan.binding.model,
+                pool: plan.pool.clone(),
+                resumed: plan.resume_session.is_some(),
+                outcome: &assessed.outcome,
+                reviews: &judgement.reviews,
+                failure: judgement.failure.as_ref(),
+            },
+        );
+
+        let Some(failure) = judgement.failure.as_ref() else {
+            return Err(LoopBranch::ReadyDispatch.owes(
+                "the successful settlement, which lands between the candidate pin and \
+                 `candidate_prepared` and so belongs to the candidate sequence",
+            ));
+        };
+
+        let policy = self.ladder_policy(dispatched.key)?;
+        if failure.is_outage() {
+            return Err(UpstrokeError::Refused {
+                message: format!(
+                    "task {} failed with an outage, and settling one needs the deferral count \
+                     this task has already spent. Schema 4 has no reader for it: the fold \
+                     records `Deferred {{ defers }}` in the log and never accumulates it onto \
+                     the task. Refused before any append rather than settled on a guessed \
+                     count",
+                    dispatched.key.index()
+                ),
+            });
+        }
+
+        let next = crate::ladder::next_step(
+            failure,
+            &crate::ladder::LadderState {
+                rung: Self::FIRST_RUNG as usize,
+                // Both properties of this branch, as in `attempt`: a ready task
+                // dispatches into a fresh generation, so this is its first
+                // attempt on its first rung.
+                attempts_on_rung: Self::FIRST_ATTEMPT.0,
+                // Sound only because the outage branch above already returned:
+                // this is the one field `next_step` reads for an outage and for
+                // nothing else.
+                defers: 0,
+                resumable: false,
+            },
+            &policy,
+        );
+        if let crate::ladder::Next::AskHuman(_) = next {
+            return Err(LoopBranch::ReadyDispatch.owes(
+                "a park, whose question id, context and options have no production builder",
+            ));
+        }
+
+        let settled = settle_failed(
+            &self.handle.fold,
+            &FinishedAttempt {
+                key: dispatched.key,
+                generation: dispatched.generation,
+                attempt: plan.attempt,
+                record,
+                next,
+                session: assessed.outcome.session_id.clone().map(SessionId),
+                question: None,
+                halts_run: seams.halts_run,
+                defers: 0,
+                reason: failure.reason.clone(),
+                rung: Self::FIRST_RUNG.saturating_add(1),
+            },
+        )?;
+
+        // The ceiling's ledger, before the append: `Spend::replay` rebuilds it
+        // from the log on resume, so this keeps the in-process copy current
+        // for the next iteration's ceiling check rather than being a second
+        // source for it.
+        self.spend.record(dispatched.key, &settled.event.record);
+        self.emit(
+            TopologyEventBody::AttemptFinished {
+                data: Box::new(settled.event),
+            },
+            seams,
+            hooks,
+        )?;
+        Ok(settled.spent_attempt)
+    }
+
+    /// The frozen ladder's shape, as `next_step` reads it.
+    ///
+    /// Every field from a record the run already froze: the entry's own ladder
+    /// for the allowance and the rung count, and `run_started(4).limits` for the
+    /// deferral ceiling. None of it is re-derived.
+    fn ladder_policy(&self, key: TaskKey) -> Result<crate::ladder::LadderPolicy, UpstrokeError> {
+        let entry = self
+            .handle
+            .fold
+            .registry()
+            .and_then(|registry| registry.get(key))
+            .ok_or_else(|| UpstrokeError::Refused {
+                message: format!("task {} is not in this run's frozen registry", key.index()),
+            })?;
+        let limits = self
+            .handle
+            .fold
+            .started()
+            .ok_or_else(|| UpstrokeError::Refused {
+                message: "the run has not started".to_owned(),
+            })?
+            .limits;
+        Ok(crate::ladder::LadderPolicy {
+            attempts_per: entry.ladder.attempts_per,
+            rungs: entry.ladder.rungs.len(),
+            max_defers: limits.max_defers,
+        })
     }
 
     /// What a first ordinary dispatch of `key` asks for.
