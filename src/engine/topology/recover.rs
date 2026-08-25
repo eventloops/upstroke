@@ -2297,6 +2297,33 @@ pub struct RunHandle {
     _worktree: WorktreeLock,
 }
 
+impl RunHandle {
+    /// The handle a **freshly created** run hands to the loop.
+    ///
+    /// The resumed path builds this by unwinding the recovery chain, where each
+    /// field is the product of a witness. A created run has the same fields from
+    /// P0-P8 instead, and the lock guards stay private either way — they exist
+    /// to be dropped, in declaration order, and nothing reads them.
+    #[must_use]
+    pub fn created(
+        started: RunStarted4,
+        committed_first_line_sha256: String,
+        log: crate::events::log::EventLog,
+        fold: TopologyFold,
+        run: RunLock,
+        worktree: WorktreeLock,
+    ) -> Self {
+        Self {
+            started,
+            committed_first_line_sha256,
+            log,
+            fold,
+            _run: run,
+            _worktree: worktree,
+        }
+    }
+}
+
 impl std::fmt::Debug for RunHandle {
     /// Names the run and says nothing about the locks.
     ///

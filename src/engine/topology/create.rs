@@ -684,6 +684,10 @@ mod steps {
         log: EventLog,
         fold: TopologyFold,
         event: TopologyEvent,
+        /// `committed.json`, carried so the loop can name the digest the
+        /// creator computed. Dropped at P6 before erratum-E6-adjacent work
+        /// showed the loop needs it too.
+        commit: CommitRecord,
         record: RunStarted4,
     }
 
@@ -694,10 +698,11 @@ mod steps {
             event: TopologyEvent,
         ) -> Self {
             let record = previous.stamped.clone();
-            let (facts, lock, log, _commit) = previous.into_parts();
+            let (facts, lock, log, commit) = previous.into_parts();
             Self {
                 facts,
                 lock,
+                commit,
                 log,
                 fold,
                 event,
@@ -718,12 +723,17 @@ mod steps {
         log: EventLog,
         fold: TopologyFold,
         event: TopologyEvent,
+        /// `committed.json`, carried so the loop can name the digest the
+        /// creator computed. Dropped at P6 before erratum-E6-adjacent work
+        /// showed the loop needs it too.
+        commit: CommitRecord,
         record: RunStarted4,
     }
 
     impl MarkerRemoved {
         pub(super) fn new(previous: RunStartedDurable) -> Self {
             Self {
+                commit: previous.commit,
                 facts: previous.facts,
                 lock: previous.lock,
                 log: previous.log,
@@ -751,12 +761,17 @@ mod steps {
         log: EventLog,
         fold: TopologyFold,
         event: TopologyEvent,
+        /// `committed.json`, carried so the loop can name the digest the
+        /// creator computed. Dropped at P6 before erratum-E6-adjacent work
+        /// showed the loop needs it too.
+        commit: CommitRecord,
         record: RunStarted4,
     }
 
     impl Started {
         pub(super) fn new(previous: MarkerRemoved) -> Self {
             Self {
+                commit: previous.commit,
                 facts: previous.facts,
                 lock: previous.lock,
                 log: previous.log,
@@ -805,6 +820,38 @@ mod steps {
 
         /// Take the run apart for the loop that will drive it.
         #[must_use]
+        /// The run this created, as the loop's own state.
+        ///
+        /// **`decisions.sequential_substrate.engine` is one sentence about both
+        /// paths**: "`TopologyRun` drives schema 4 at max_parallel = 1
+        /// synchronously; every path exists here before Tokio." A fresh run is
+        /// created by P0-P8 and a resumed one by the recovery order, and both
+        /// then reach the same loop. Before this, only the resumed one could:
+        /// nothing consumed `Started`, so `pr_sequence[8]`'s scope — which names
+        /// "serialized run creation P0-P8" and the dispatch chain in one
+        /// sentence — was half unreachable.
+        ///
+        /// The worktree lock is a parameter because the creator holds it across
+        /// the census and the whole run, and it is not this chain's to mint.
+        ///
+        /// # Errors
+        ///
+        /// Never; the `Result` is for symmetry with the recovery path, whose
+        /// handle is the product of a fallible unwind.
+        pub fn into_handle(
+            self,
+            worktree: crate::rundir::WorktreeLock,
+        ) -> super::super::recover::RunHandle {
+            super::super::recover::RunHandle::created(
+                self.record,
+                self.commit.run_started_sha256,
+                self.log,
+                self.fold,
+                self.lock,
+                worktree,
+            )
+        }
+
         pub fn into_parts(self) -> (RunPaths, RunLock, EventLog, TopologyFold, TopologyEvent) {
             (self.facts.paths, self.lock, self.log, self.fold, self.event)
         }

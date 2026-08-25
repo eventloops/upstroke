@@ -830,6 +830,63 @@ fn owner_of(private: &Path) -> OwnerRecord {
 /// was reached, the private skeleton exists *and* the owner record does
 /// (O08 is asserted separately by the P3a tests, which is where the
 /// ordering is observable), and the marker is gone while the log is
+/// **A freshly created run is drivable, not just creatable.**
+///
+/// `decisions.sequential_substrate.engine` is one sentence about both paths —
+/// "`TopologyRun` drives schema 4 at max_parallel = 1 synchronously; every path
+/// exists here before Tokio" — and `pr_sequence[8]`'s scope names "serialized
+/// run creation P0-P8" and the dispatch chain together.
+///
+/// Nothing consumed `Started`, so half of that sentence had no caller: only a
+/// **resumed** run could reach the loop. `PR31-CONTRACT-005`, and the §17
+/// omission shape — a packet-named path with no production caller, green
+/// everywhere because nothing asked which command runs it.
+#[test]
+fn a_created_run_hands_itself_to_the_loop() {
+    let fixture = Fixture::new("created-drivable");
+    let probes = RecordingProbes::new(&crate::runner::policy::runner_policy_sha256(
+        &crate::runner::policy::host_policy(),
+    ));
+    let refs = FakeRefs::empty();
+    let mut hooks = TestHooks::new();
+    let mut driver = Driver::new(&fixture, &probes, &refs);
+    let started = driver
+        .run(&mut hooks)
+        .map_err(Refused::into_error)
+        .expect("P0-P8");
+
+    // A real `.git`, because the worktree lock lives inside it. This fixture
+    // builds run directories rather than repositories, so nothing else here has
+    // needed one.
+    crate::workspace_manager::fixture::git(&fixture.repo, &["init", "-q", "-b", "main"]);
+    let worktree =
+        crate::rundir::WorktreeLock::acquire_in(&fixture.repo, &fixture.repo.join(".git"))
+            .expect("the fixture's repository locks");
+    let handle = started.into_handle(worktree);
+
+    // The digest a created run hands over is the one P6 committed. Without it
+    // the loop's appends cannot report a creator disposition — `EMIT-002`'s
+    // defect on the resumed path, arriving on the created one.
+    assert!(
+        !handle.committed_first_line_sha256.is_empty(),
+        "a created run handed the loop no committed digest"
+    );
+
+    let run = crate::engine::topology::run::TopologyRun::resumed(
+        handle,
+        inputs(),
+        crate::engine::topology::select::Ceiling::unlimited(),
+    );
+    assert!(
+        !run.fold().is_poisoned(),
+        "the loop took over a poisoned fold from a healthy creation"
+    );
+    assert!(
+        run.fold().started().is_some(),
+        "the loop's fold has no run, so `run_started` did not survive the handover"
+    );
+}
+
 /// committed.
 #[test]
 fn the_publication_prefixes_run_in_the_packets_order() {
