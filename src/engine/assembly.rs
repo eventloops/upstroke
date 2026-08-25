@@ -374,10 +374,15 @@ impl AttemptPlans for FrozenPlans<'_> {
             .map(|pass| ReviewerPlan {
                 agent: AgentId::new(&pass.binding.agent),
                 preflight_cli_version: self.cli_version(&pass.binding.agent),
-                // The reviewer's effort, not the implementer's: §10's policy
-                // gives review its own axis, and the binding on the plan is
-                // the rung the *work* ran at.
-                profile: pass.profile(request.binding.effort),
+                // **The reviewer's effort, from §10's own review axis.** This
+                // said exactly that and then passed `request.binding.effort` —
+                // the *implementer's*, the rung the work ran at. A comment
+                // asserting the opposite of its line is worse than no comment:
+                // it answers the question a reader would otherwise ask.
+                //
+                // `ResolvedEffortPolicy::review` is the axis, frozen on the
+                // entry beside the implementation efforts.
+                profile: pass.profile(entry.ladder.effort.review),
                 lens: pass.lens,
                 timeout: pass_timeout,
             })

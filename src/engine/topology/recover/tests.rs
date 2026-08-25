@@ -5459,6 +5459,97 @@ fn the_driver_spends_the_allowance_the_log_records() {
     );
 }
 
+/// **A reviewer runs at §10's review effort, not the implementer's.**
+///
+/// `ResolvedEffortPolicy` has four axes and `review` is one of them: the tier a
+/// rung binds decides what the *work* costs, and review has its own budget.
+/// `FrozenPlans` passed `request.binding.effort` — the implementer's — while its
+/// own comment said "the reviewer's effort, not the implementer's". A comment
+/// asserting the opposite of its line is worse than none: it answers the
+/// question a reader would otherwise ask.
+///
+/// This fixture's Mid rung is `High` and its review axis is `Medium`, so the two
+/// are distinguishable. A fixture where they matched would assert nothing.
+#[test]
+fn a_reviewer_runs_at_the_review_effort_not_the_implementers() {
+    let fixture = Fixture::healthy("review-effort");
+    let harness = harness();
+    let runtime = runtime_holding_the_record();
+    let certifies = AlwaysCertifies;
+    let given = Given::healthy(&fixture, &runtime, &certifies);
+    let (outcome, _) = resume_holding(&fixture, &harness, &given);
+    let (_recovered, handle) = outcome.expect("the healthy resume completes");
+
+    let entry = handle
+        .fold
+        .registry()
+        .and_then(|registry| registry.get(TaskKey(0)))
+        .expect("the fixture registers alpha");
+    assert_eq!(
+        entry.ladder.effort.review,
+        Effort::Medium,
+        "the fixture's review axis moved; this test needs it to differ from the rung's"
+    );
+    assert_eq!(
+        entry
+            .ladder
+            .effort
+            .implementation_for(entry.ladder.rungs[0].tier),
+        Effort::High,
+        "the fixture's Mid rung moved; this test needs it to differ from review"
+    );
+
+    let manager = fixture.manager();
+    let adapters = crate::engine::topology::scaffold::ScaffoldAdapters::new();
+    let paths = crate::rundir::RunPaths::with_private_root(
+        &fixture.repo_root,
+        &fixture.started.run_id,
+        &fixture.private_root,
+    );
+    paths.create().expect("the run directories are creatable");
+    let plans = crate::engine::assembly::FrozenPlans {
+        adapters: &adapters,
+        paths: &paths,
+        gates: &[],
+        pools: &[],
+        caps: &[],
+        worker_timeout: std::time::Duration::from_secs(300),
+        decisions: &[],
+    };
+    let binding = handle
+        .fold
+        .frozen_rung_binding(TaskKey(0), 0)
+        .expect("rung 0 is frozen");
+    let plan = crate::engine::topology::attempt::AttemptPlans::plan(
+        &plans,
+        &crate::engine::topology::attempt::PlanRequest {
+            key: TaskKey(0),
+            entry,
+            attempt: crate::topology::events::AttemptNumber(1),
+            rung: 0,
+            binding,
+            workspace: &fixture.repo_root,
+            resume_session: None,
+            materialization_observed: None,
+        },
+    )
+    .expect("the plan assembles");
+
+    assert!(
+        !plan.reviewers.is_empty(),
+        "this fixture plans no reviewer, so the effort below is unasserted"
+    );
+    for reviewer in &plan.reviewers {
+        assert_eq!(
+            reviewer.profile.effort,
+            Some(Effort::Medium),
+            "reviewer `{}` runs at the implementer's effort",
+            reviewer.lens.name()
+        );
+    }
+    let _ = manager;
+}
+
 /// **The loop inherits the digest recovery verified.**
 ///
 /// `committed.json.run_started_sha256` is what step (a) checks the committed
