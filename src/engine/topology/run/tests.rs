@@ -79,7 +79,7 @@ fn every_branch_states_what_this_build_does_with_it() {
         Disposition::PartlyImplemented {
             performs: "ceiling check, provisional dispatch reservation, dispatch, run one \
                        attempt through the Runner and settle it",
-            owes: "settle a success, a park, or an outage deferral",
+            owes: "settle a success or a park",
         },
         "`loop` states this branch as four clauses and this build performs \
          three; the type says which three"
@@ -165,8 +165,8 @@ fn a_refusal_names_the_branch_and_says_whether_anything_happened() {
         "including the clauses that arrived with the driver: {partial}"
     );
     assert!(
-        partial.contains("does not settle a success, a park, or an outage deferral"),
-        "and the three cases of the last clause it still refuses: {partial}"
+        partial.contains("does not settle a success or a park"),
+        "and the two cases of the last clause it still refuses: {partial}"
     );
     assert!(
         !partial.contains("no event was appended"),

@@ -201,6 +201,15 @@ transition, and no other reader moved.
 **Measured split.** The fold change and this row land together, with the suite at 1667/0 and the
 witness green; the driver consuming the reader and deleting its refusal is the commit after.
 
+**Owed, and measured rather than assumed.** The driver's read of this count is load-bearing only on
+the outage branch — `next_step` ignores it otherwise, and `settle_failed` reads
+`FinishedAttempt::defers` only to build `SettlementTransition::Deferred`. No driver fixture produces
+an outage (the recovery fixture's runner answers every request with `exit 0`), so replacing
+`TopologyRun::deferrals_recorded`'s expression with a constant zero leaves the whole suite green.
+Measured. The fold-level witness is green and kills its own mutation; the driver-level one needs a
+fixture whose worker rate-limits, and is owed with the outage lane. `deferrals_recorded` carries the
+gap in its own doc rather than the line sitting silent.
+
 ### 2026-08-24 — the PR7 unfreeze challenge, adjudicated
 
 **Challenge.** `reviews/2026-08-24-unfreeze-challenge-request.md`, filed by the PR7 implementer

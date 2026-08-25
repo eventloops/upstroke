@@ -227,15 +227,16 @@ impl LoopBranch {
             // and `close_at_run_end` closes it. Stopping here leaves the run in
             // a shape the system already knows how to recover.
             // The branch's four clauses are all here. What it still refuses
-            // are three *cases* of the last one, each named at its refusal:
-            // the successful settlement (the candidate sequence's, since it
-            // lands between the pin and `candidate_prepared`), a park (no
-            // production builder for a question's id, context and options),
-            // and an outage deferral (no fold reader for the deferral count).
+            // are two *cases* of the last one, each named at its refusal: the
+            // successful settlement (the candidate sequence's, since it lands
+            // between the pin and `candidate_prepared`) and a park (no
+            // production builder for a question's id, context and options).
+            //
+            // An outage deferral was a third until `TaskFold::defers` existed.
             Self::ReadyDispatch => Disposition::PartlyImplemented {
                 performs: "ceiling check, provisional dispatch reservation, dispatch, run one \
                            attempt through the Runner and settle it",
-                owes: "settle a success, a park, or an outage deferral",
+                owes: "settle a success or a park",
             },
             Self::IngestAnswers | Self::ReadyRetry | Self::HardBlock => {
                 Disposition::NotYetImplemented
@@ -746,30 +747,21 @@ impl TopologyRun {
     /// run has — what the ladder decided, what the record says, and what the
     /// run's policy does with a terminal failure.
     ///
-    /// # What this build refuses, and why it refuses rather than guesses
+    /// # What this build refuses
     ///
-    /// `ladder::next_step` reads `LadderState::defers` on exactly one branch:
-    /// an outage defers while `defers < max_defers` and parks at it. **Schema 4
-    /// has no reader for that count.** `SettlementTransition::Deferred {
-    /// defers }` is written into the log, but the fold never accumulates it
-    /// onto the task: `TaskFold` has no such field and `TaskState::Deferred` is
-    /// a unit variant. The legacy engine keeps it in
-    /// `state.progress[index].defers`, which is in-memory schema-3 state, and
-    /// schema 4 derives everything by replay.
+    /// A park: `Next::AskHuman` names a `QuestionKind` and nothing else, and
+    /// the id, context and options are the caller's. There is no production
+    /// builder for them yet, and inventing them at the settlement would decide
+    /// something the resume then has to re-decide identically.
     ///
-    /// So an outage is refused here, before any append. Passing a number the
-    /// fold cannot vouch for would make a run park early or defer forever, and
-    /// the charter is explicit that a missing fold answer is a question rather
-    /// than a derivation. `checkpoint_refusals` is the same idiom one level up:
-    /// "an intermediate build refuses, before any append, any operation whose
-    /// terminals it does not implement".
-    ///
-    /// A park is refused for a second, smaller reason: `Next::AskHuman` names a
-    /// `QuestionKind` and nothing else, and the id, context and options are the
-    /// caller's. There is no production builder for them yet.
-    ///
-    /// Both refusals leave the generation `OpenWithAttempt`, which is a state
+    /// The refusal leaves the generation `OpenWithAttempt`, which is a state
     /// recovery already closes.
+    ///
+    /// **An outage is no longer refused.** It was, because `next_step` reads
+    /// `LadderState::defers` on that branch and schema 4 had no reader for the
+    /// count. `TaskFold::defers` is that reader now
+    /// (`PR7-FOLD-DEFERS-ACCUMULATOR`), so the deferral settles from the number
+    /// the log holds rather than from one this process guessed.
     fn settle(
         &mut self,
         dispatched: &Dispatched,
@@ -800,18 +792,8 @@ impl TopologyRun {
         };
 
         let policy = self.ladder_policy(dispatched.key)?;
-        if failure.is_outage() {
-            return Err(UpstrokeError::Refused {
-                message: format!(
-                    "task {} failed with an outage, and settling one needs the deferral count \
-                     this task has already spent. Schema 4 has no reader for it: the fold \
-                     records `Deferred {{ defers }}` in the log and never accumulates it onto \
-                     the task. Refused before any append rather than settled on a guessed \
-                     count",
-                    dispatched.key.index()
-                ),
-            });
-        }
+
+        let defers = self.deferrals_recorded(dispatched.key)?;
 
         let next = crate::ladder::next_step(
             failure,
@@ -821,10 +803,7 @@ impl TopologyRun {
                 // dispatches into a fresh generation, so this is its first
                 // attempt on its first rung.
                 attempts_on_rung: Self::FIRST_ATTEMPT.0,
-                // Sound only because the outage branch above already returned:
-                // this is the one field `next_step` reads for an outage and for
-                // nothing else.
-                defers: 0,
+                defers,
                 resumable: false,
             },
             &policy,
@@ -846,7 +825,7 @@ impl TopologyRun {
                 session: assessed.outcome.session_id.clone().map(SessionId),
                 question: None,
                 halts_run: seams.halts_run,
-                defers: 0,
+                defers,
                 reason: failure.reason.clone(),
                 rung: Self::FIRST_RUNG.saturating_add(1),
             },
@@ -865,6 +844,36 @@ impl TopologyRun {
             hooks,
         )?;
         Ok(settled.spent_attempt)
+    }
+
+    /// How many times this task has already settled `Deferred`.
+    ///
+    /// **The fold's count, not a tally this process kept.** `next_step` reads
+    /// it on the outage branch alone, and a process-local number agrees with
+    /// the log on every reading except the one after a resume — where it reads
+    /// zero while the log holds the deferrals, and the run defers past its
+    /// allowance forever.
+    /// `fold::tests::a_deferral_count_is_derived_by_replay_and_not_by_a_process_local_tally`
+    /// is the witness for that property.
+    ///
+    /// **Untested at this level, and named rather than left silent.** The value
+    /// is load-bearing only on the outage branch: `next_step` ignores it
+    /// otherwise, and so does `settle_failed`, which reads
+    /// `FinishedAttempt::defers` only to build `SettlementTransition::Deferred`.
+    /// No driver fixture produces an outage — the recovery fixture's runner
+    /// answers every request with `exit 0` — so replacing this expression with
+    /// a constant zero leaves the whole suite green. Measured, not assumed.
+    /// The witness that would kill it is a driver test whose worker rate-limits,
+    /// and it is owed with the outage lane rather than approximated here.
+    fn deferrals_recorded(&self, key: TaskKey) -> Result<u32, UpstrokeError> {
+        Ok(self
+            .handle
+            .fold
+            .task(key)
+            .ok_or_else(|| UpstrokeError::Refused {
+                message: format!("task {} is not in this run's fold", key.index()),
+            })?
+            .defers)
     }
 
     /// The frozen ladder's shape, as `next_step` reads it.
