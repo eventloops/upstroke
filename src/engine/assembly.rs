@@ -418,7 +418,24 @@ impl AttemptPlans for FrozenPlans<'_> {
                 //
                 // `ResolvedEffortPolicy::review` is the axis, frozen on the
                 // entry beside the implementation efforts.
-                profile: pass.profile(entry.ladder.effort.review),
+                profile: {
+                    // **A reviewer's pool is looked up from its own agent, not
+                    // inherited from the implementer.** `coordinator.rs` states
+                    // the reason on its own line and §11.3/§13 are the citation:
+                    // a cross-vendor second opinion draws on a different
+                    // subscription than the work it is reviewing.
+                    //
+                    // The legacy caller did this and the extraction did not, so
+                    // a schema-4 reviewer drained an empty pool name — the same
+                    // class as `PR7-R3-ATTEMPT-001`, one payload over: that
+                    // dropped a **guard**, this drops a **value**. Found by
+                    // Sol's independent `seams` read, round 3.
+                    let mut profile = pass.profile(entry.ladder.effort.review);
+                    profile.pool = crate::capacity::pool_for(&pass.binding.agent, self.pools)
+                        .map(|pool| pool.name.clone())
+                        .unwrap_or_default();
+                    profile
+                },
                 lens: pass.lens,
                 timeout: pass_timeout,
             })

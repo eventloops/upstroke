@@ -2259,6 +2259,109 @@ mod tests {
         );
     }
 
+    /// **Every field of a reviewer's `WorkerProfile` is accounted for at both
+    /// callers.**
+    ///
+    /// The seventh single-authority census, and the one that closes the class
+    /// `PR7-R3-ATTEMPT-001` opened: **the extraction dropped something the
+    /// legacy caller supplied.** Three instances now — the sanitiser on a task
+    /// id (a **guard**), the reviewer's pool and the retry's pool (**values**) —
+    /// found one at a time by three different reviewers.
+    ///
+    /// # The field list comes from the type
+    ///
+    /// PR4's rule, and the reason this census cannot sprawl: the roll is
+    /// `crate::ir::WorkerProfile`'s own fields, not a list somebody thought of.
+    /// Adding a field to that struct fails this test until the new field is
+    /// given a cell, which is the property a census of "did we forget anything"
+    /// has to have to mean anything.
+    ///
+    /// # Three cells, and every field has exactly one
+    ///
+    /// - **Identical** — both callers supply the same value by the same route.
+    /// - **Differs, cited** — the callers legitimately disagree, and the cell
+    ///   carries the §-citation for why. `pool` is the model: §11.3/§13 make a
+    ///   cross-vendor second opinion draw on its own subscription, so it is
+    ///   looked up from the reviewer's agent rather than inherited.
+    /// - **Absent, cited** — neither caller sets it beyond the constructor's
+    ///   default, and the cell says what supplies it instead.
+    ///
+    /// A cell is prose and this test cannot check prose. What it checks is that
+    /// **the roll is complete** — that no field of the type is missing a cell —
+    /// which is exactly the failure all three instances share: nobody had
+    /// enumerated what the legacy caller supplies.
+    #[test]
+    fn a_reviewers_profile_is_accounted_for_at_both_callers() {
+        use std::collections::BTreeSet;
+
+        /// (field, cell).
+        const ROLL: &[(&str, &str)] = &[
+            (
+                "name",
+                "IDENTICAL — `ReviewPass::profile` builds `{lens}-{model}` for both.",
+            ),
+            (
+                "agent",
+                "IDENTICAL — the pass's own binding, at both callers.",
+            ),
+            (
+                "model",
+                "IDENTICAL — the pass's own binding, at both callers.",
+            ),
+            (
+                "pool",
+                "DIFFERS, CITED — §11.3/§13: a cross-vendor second opinion draws on a different                  subscription than the implementer, so the pool is looked up from the reviewer's                  OWN agent rather than inherited. `coordinator.rs` does this via `pool_name_for`;                  `assembly.rs` via `capacity::pool_for` over its frozen pool table. Same rule, two                  lookups, because the two callers hold the table differently. **This is the field                  the extraction dropped** — `assembly.rs` left the constructor's empty string, so                  a schema-4 reviewer drained a pool with no name (Sol, round 3).",
+            ),
+            (
+                "permissions",
+                "IDENTICAL — `PermissionMode::ReadOnly` from `profile_for`. A reviewer never                  writes, and neither caller overrides it.",
+            ),
+            (
+                "effort",
+                "DIFFERS, CITED — §10's review axis is separate from the implementation rungs.                  `coordinator.rs` passes `self.effort_policy.review`; `assembly.rs` passes                  `entry.ladder.effort.review`, the same policy frozen onto the entry. The values                  agree; the routes differ because a resumed run reads its policy from the record                  rather than from today's config.",
+            ),
+            (
+                "max_turns",
+                "ABSENT, CITED — `profile_for` leaves it `None` and neither caller sets it. A                  review pass is one shot with a pass timeout (`ReviewPlan::pass_timeout_secs`),                  not a turn budget.",
+            ),
+            (
+                "extra_args",
+                "ABSENT, CITED — `profile_for` leaves it empty and neither caller sets it. Extra                  arguments are an implementer affordance; a reviewer's command is assembled from                  its lens and its inputs.",
+            ),
+        ];
+
+        // The roll is checked against the TYPE, not against itself.
+        let ir = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/ir.rs"),
+        )
+        .expect("the ir source");
+        let start = ir
+            .find("pub struct WorkerProfile {")
+            .expect("`WorkerProfile` is declared in `src/ir.rs`");
+        // Past the declaration line: `pub struct WorkerProfile {` itself starts
+        // with `pub ` and would otherwise parse as a field.
+        let open = start + ir[start..].find('{').expect("an opening brace") + 1;
+        let body = &ir[open..open + ir[open..].find("\n}").expect("a closing brace")];
+        let fields: BTreeSet<String> = body
+            .lines()
+            .filter_map(|line| line.trim().strip_prefix("pub "))
+            .filter_map(|rest| rest.split(':').next())
+            .map(str::to_owned)
+            .collect();
+
+        assert!(
+            fields.len() >= 6,
+            "only {} fields parsed out of `WorkerProfile`, so this census is reading the wrong              thing: {fields:?}",
+            fields.len()
+        );
+
+        let rolled: BTreeSet<String> = ROLL.iter().map(|(f, _)| (*f).to_owned()).collect();
+        assert_eq!(
+            rolled, fields,
+            "the roll and `WorkerProfile`'s fields disagree. A field the type has and the roll              does not is a field nobody has asked whether both callers supply — which is how the              reviewer's `pool` was dropped by the extraction and found three rounds later"
+        );
+    }
+
     #[test]
     fn every_production_command_spec_payload_is_classified() {
         use std::collections::BTreeMap;

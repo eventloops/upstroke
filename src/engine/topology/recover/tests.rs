@@ -6529,11 +6529,19 @@ fn a_reviewer_runs_at_the_review_effort_not_the_implementers() {
         &fixture.private_root,
     );
     paths.create().expect("the run directories are creatable");
+    // Named so that a plan inheriting the implementer's pool and one looking up
+    // the reviewer's own could not both pass.
+    let reviewer_pools = vec![crate::capacity::Pool::discovered(
+        "the-reviewers-own-pool",
+        crate::capacity::PoolKind::SubscriptionWindow,
+        AGENT,
+        vec![crate::capacity::Source::Signals],
+    )];
     let plans = crate::engine::assembly::FrozenPlans {
         adapters: &adapters,
         paths: &paths,
         gates: &[],
-        pools: &[],
+        pools: &reviewer_pools,
         caps: &[],
         worker_timeout: std::time::Duration::from_secs(300),
         decisions: &[],
@@ -6568,6 +6576,25 @@ fn a_reviewer_runs_at_the_review_effort_not_the_implementers() {
             Some(Effort::Medium),
             "reviewer `{}` runs at the implementer's effort",
             reviewer.lens.name()
+        );
+
+        // **And its own agent's pool**, which is the other cell of
+        // `a_reviewers_profile_is_accounted_for_at_both_callers` whose value the
+        // extraction dropped. That census checks the roll is complete and cannot
+        // check a value — a cell is prose. This is the value.
+        //
+        // §11.3/§13: a cross-vendor second opinion draws on a different
+        // subscription than the implementer, so the pool is looked up from the
+        // reviewer's own agent. `coordinator.rs` did it and `assembly.rs` did
+        // not, leaving `profile_for`'s empty string — so the capacity engine
+        // attributed a reviewer's spend to a pool with no name. Sol's
+        // independent `seams` read, round 3.
+        assert_eq!(
+            reviewer.profile.pool,
+            "the-reviewers-own-pool",
+            "reviewer `{}` carries pool `{}`",
+            reviewer.lens.name(),
+            reviewer.profile.pool
         );
     }
     let _ = manager;
