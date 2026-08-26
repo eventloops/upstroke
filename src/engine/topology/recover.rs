@@ -799,12 +799,12 @@ pub mod chain {
             log: crate::events::log::EventLog,
             /// The exact bytes that were synced, reread, proven, and replayed.
             bytes: Vec<u8>,
-            /// The fold built from exactly those bytes, and no others.
             /// The events the barrier parsed from exactly those bytes.
             ///
             /// Carried rather than re-derived for the same reason the fold is:
             /// there is one production parse of a log and it is the barrier's.
             events: Vec<crate::topology::events::TopologyEvent>,
+            /// The fold built from exactly those bytes, and no others.
             fold: TopologyFold,
             barrier: StablePrefixBarrier,
         }
