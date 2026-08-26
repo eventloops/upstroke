@@ -1092,6 +1092,7 @@ pub(crate) mod tests {
                 kind,
                 origin,
                 reason: "the fixture's failure".to_owned(),
+                detail: None,
             }),
         }
     }

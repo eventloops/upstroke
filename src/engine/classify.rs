@@ -179,12 +179,30 @@ pub(crate) struct AttemptFacts<'a> {
 
 /// One attempt's durable ledger line.
 ///
-/// The one production construction of an [`AttemptRecord`]. It was inline in
-/// `coordinator.rs`'s settlement, where the schema-4 driver could not reach it,
-/// and it belongs here rather than beside the command assembler because its
-/// last field is a classification: `failure` is what this module exists to
-/// decide, and `ladder::next_step` and `ladder::spends_allowance` both read the
-/// answer back out of the record.
+/// The one production construction of an [`AttemptRecord`] **for an attempt
+/// that reached a settlement**. It was inline in `coordinator.rs`'s settlement,
+/// where the schema-4 driver could not reach it, and it belongs here rather
+/// than beside the command assembler because its last field is a
+/// classification: `failure` is what this module exists to decide, and
+/// `ladder::next_step` and `ladder::spends_allowance` both read the answer back
+/// out of the record.
+///
+/// **The qualifier is not decoration.** This said "the one production
+/// construction" outright, and there is a second: `events::Dangling::event`
+/// builds the record for an attempt that started and never reported back, which
+/// by construction was never classified. A census over the type's initializers
+/// in production regions returns exactly those two, and the unqualified sentence
+/// is the class §22b of `reviews/FINDINGS.md` names — a property claim about the
+/// rest of the tree, true when written and checkable only by census. It was
+/// caught by adding a field to `FailureRecord` and reading the compiler's list
+/// of what stopped compiling.
+///
+/// **Neither this comment nor that census may spell the tokens it counts.** The
+/// first draft of this paragraph quoted the initializer and the test-only
+/// attribute literally, and a region-cutting census then stopped *here* — inside
+/// a doc comment, above the construction it was looking for — and reported one
+/// production construction where there are two. Same class as §4's
+/// self-referential greps, and the third time this slice has paid for it.
 pub(crate) fn attempt_record(attempt: u32, facts: AttemptFacts<'_>) -> AttemptRecord {
     AttemptRecord {
         attempt,
@@ -201,6 +219,13 @@ pub(crate) fn attempt_record(attempt: u32, facts: AttemptFacts<'_>) -> AttemptRe
             kind: failure.kind,
             origin: failure.origin,
             reason: failure.reason.clone(),
+            // §11.4's feedback, onto the durable record. It was dropped here:
+            // `AttemptFailure` carried the gate tail and the reviewer's
+            // `required_changes`, and the record kept only the summary — so a
+            // resumed run could say *that* an attempt failed and nothing about
+            // what the next one must do differently.
+            // `decisions/2026-08-26-durable-retry-feedback.md`.
+            detail: failure.feedback.clone(),
         }),
     }
 }

@@ -733,6 +733,29 @@ pub struct FailureRecord {
     pub kind: FailureKind,
     pub origin: FailureOrigin,
     pub reason: String,
+    /// What the next attempt is told, verbatim — §11.4's feedback.
+    ///
+    /// **The durable half of [`crate::ladder::AttemptFailure::feedback`]**, which
+    /// is "a gate log tail (§11.1) or the reviewer's `required_changes` (§11.2),
+    /// verbatim". `reason` is the human-facing summary — `gate \`fmt\` failed:
+    /// exit 1` — and a retry given only that is asked to guess what the gate
+    /// printed. This field is what it actually printed.
+    ///
+    /// **Additive and optional so `SCHEMA_VERSION` does not move.** A line
+    /// written before this field existed reads back as `None` and folds
+    /// unchanged. Deliberately *not* `skip_serializing_if`: schema 4's strict
+    /// door (`refusals[24]`) proves exactness by re-encoding a decoded record
+    /// and comparing keys, and its own documentation rests on no embedded
+    /// record using that attribute.
+    ///
+    /// Written at exactly one place — `engine::classify::attempt_record`, the
+    /// one production construction of an [`AttemptRecord`] — and read by
+    /// `TopologyRun`'s brief, which derives §11.4's accumulated feedback from
+    /// the log rather than from a counter only the live path incremented.
+    /// `decisions/2026-08-26-durable-retry-feedback.md` is the Class C
+    /// authorization for this field and states its bounds.
+    #[serde(default)]
+    pub detail: Option<String>,
 }
 
 impl FailureRecord {
@@ -1004,6 +1027,10 @@ impl InterruptedAttempt {
                     reason: "the engine stopped while this attempt was running; whatever it \
                              spent is unknown and nothing judged the result"
                         .to_owned(),
+                    // Nothing produced feedback: the process died before any
+                    // gate ran or any reviewer read the diff, which is the same
+                    // reason `reviews` and `cost_usd` above are empty.
+                    detail: None,
                 }),
             }),
         }
@@ -2807,6 +2834,7 @@ mod tests {
             kind: FailureKind::GateFailed,
             origin: FailureOrigin::Worker,
             reason: "failed".to_owned(),
+            detail: None,
         });
         let error = replay(
             vec![
@@ -2911,6 +2939,7 @@ mod tests {
                 kind,
                 origin,
                 reason: "special failure".to_owned(),
+                detail: None,
             });
             *recorded_transition = transition;
             *recorded_parking = parking;
@@ -2947,6 +2976,7 @@ mod tests {
             kind: FailureKind::GateFailed,
             origin: FailureOrigin::Worker,
             reason: "failed".to_owned(),
+            detail: None,
         });
         *prepared_commit = None;
         let mut approval = question("q-spend", "t1");
@@ -3490,6 +3520,7 @@ mod tests {
                 },
                 origin: FailureOrigin::Worker,
                 reason: "settled".to_owned(),
+                detail: None,
             });
             *prepared_commit = None;
             *recorded = Some(Box::new(transition.clone()));
@@ -3551,6 +3582,7 @@ mod tests {
             kind: FailureKind::GateFailed,
             origin: FailureOrigin::Worker,
             reason: "failed without a session".to_owned(),
+            detail: None,
         });
         *prepared_commit = None;
         *transition = Some(Box::new(AttemptTransition::Retry(LadderRetry {
@@ -3599,6 +3631,7 @@ mod tests {
             kind: FailureKind::ReviewInputTooLarge,
             origin: FailureOrigin::Reviewer,
             reason: "too large".to_owned(),
+            detail: None,
         });
         *prepared_commit = None;
         *parking = Some(Box::new(AttemptParking {

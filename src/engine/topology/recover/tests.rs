@@ -169,6 +169,17 @@ struct Damage {
     /// of `PR7-FOLD-LADDER-POSITION`'s reader stayed unwitnessed through the
     /// repair filed against it, and why S5 round 2 found it still open.
     two_tier: bool,
+    /// Freeze a two-tier chain with **two attempts per rung**.
+    ///
+    /// Neither existing chain can show an *accumulated* brief. `chain()` has one
+    /// tier, so its second failure exhausts the ladder and the task parks with
+    /// no third dispatch; `escalating_chain()` allows one attempt per rung, so
+    /// nothing ever carries two entries onto a rung. §11.4's second half —
+    /// "next rung, fresh session, **accumulated feedback summary included**" —
+    /// needs a ladder deep enough to hold two failures below the rung that reads
+    /// them, and this is that ladder. Additive so no existing fixture's chain
+    /// moves.
+    deep_ladder: bool,
 }
 
 impl Fixture {
@@ -244,6 +255,7 @@ impl Fixture {
             runner,
             &base_sha,
             damage.two_tier,
+            damage.deep_ladder,
             damage.two_tasks,
         );
 
@@ -630,6 +642,22 @@ fn escalating_chain() -> ChainSummary {
     }
 }
 
+/// Two tiers **and** two attempts per rung.
+///
+/// The only chain in this file on which a rung can read more than one earlier
+/// failure. Rung 0 spends two attempts, both fail, and the escalation lands on
+/// rung 1 with two records below it — which is what §11.4's "accumulated
+/// feedback summary" is a claim about. Its bindings match
+/// [`escalating_chain`]'s for the same reason that one's match [`chain`]'s: the
+/// seeded `attempt_started` carries rung 0's binding, and the fold refuses an
+/// attempt whose binding is not the one the run froze for its rung.
+fn deep_chain() -> ChainSummary {
+    ChainSummary {
+        attempts_per: 2,
+        ..escalating_chain()
+    }
+}
+
 fn review_plan() -> ReviewPlan {
     ReviewPlan {
         enabled: Some(true),
@@ -658,6 +686,7 @@ fn run_started(
     runner: RunnerPolicy,
     base: &CommitSha,
     two_tier: bool,
+    deep_ladder: bool,
     two_tasks: bool,
 ) -> RunStarted4 {
     let unauthenticated = RunStarted4 {
@@ -697,7 +726,9 @@ fn run_started(
         }],
         interaction_mode: "attached".to_owned(),
         chains: {
-            let first = if two_tier {
+            let first = if deep_ladder {
+                deep_chain()
+            } else if two_tier {
                 escalating_chain()
             } else {
                 chain()
@@ -1913,6 +1944,34 @@ fn for_task(key: TaskKey, prefix: &str, body: TopologyEventBody) -> TopologyEven
     }
 }
 
+/// Re-key an event built for generation 0 onto a later generation.
+///
+/// `for_task` moves a seeded event sideways; this moves it forward. A
+/// **closed** generation is what a sessionless retry and every escalation leave
+/// behind — `settle::failed` closes it and the next attempt runs in a fresh one
+/// — so a log with two failures below one rung has two generations in it, and
+/// `attempt_started` on a closed generation is a barrier refusal rather than a
+/// fixture. The worktree path moves with the generation because two live
+/// dispatches may not name the same one.
+fn in_generation(generation: GenerationId, body: TopologyEventBody) -> TopologyEventBody {
+    match body {
+        TopologyEventBody::TaskDispatched { mut data } => {
+            data.generation = generation;
+            data.worktree_path = format!("wt/g{}", generation.0);
+            TopologyEventBody::TaskDispatched { data }
+        }
+        TopologyEventBody::AttemptStarted { mut data } => {
+            data.generation = generation;
+            TopologyEventBody::AttemptStarted { data }
+        }
+        TopologyEventBody::AttemptFinished { mut data } => {
+            data.generation = generation;
+            TopologyEventBody::AttemptFinished { data }
+        }
+        other => other,
+    }
+}
+
 fn attempt_started(attempt: u32) -> TopologyEventBody {
     TopologyEventBody::AttemptStarted {
         data: AttemptStarted4 {
@@ -1960,6 +2019,34 @@ fn attempt_finished(attempt: u32, settlement: AttemptSettlement) -> TopologyEven
             settlement,
         }),
     }
+}
+
+/// `attempt_finished` carrying the failure — and the feedback — a crash left
+/// durable.
+///
+/// [`attempt_finished`] records `failure: None`, which is the shape of an
+/// attempt nothing judged. A crash-resume claim is about the other shape: the
+/// ladder decided something, and §11.4's feedback is on the record it decided
+/// from. `detail` is what the next attempt is told, and it is the field this
+/// helper exists to put in a log.
+fn attempt_finished_failing(
+    attempt: u32,
+    kind: crate::ladder::FailureKind,
+    reason: &str,
+    detail: &str,
+    settlement: AttemptSettlement,
+) -> TopologyEventBody {
+    let TopologyEventBody::AttemptFinished { mut data } = attempt_finished(attempt, settlement)
+    else {
+        unreachable!("attempt_finished builds an attempt_finished")
+    };
+    data.record.failure = Some(crate::events::FailureRecord {
+        kind,
+        origin: crate::ladder::FailureOrigin::Worker,
+        reason: reason.to_owned(),
+        detail: Some(detail.to_owned()),
+    });
+    TopologyEventBody::AttemptFinished { data }
 }
 
 fn budget_exceeded(epoch: u32) -> TopologyEventBody {
@@ -6321,6 +6408,352 @@ fn the_driver_dispatches_at_the_rung_the_log_records() {
          the tier its chain escalated it to, and the only symptom is a task that \
          never gets better"
     );
+}
+
+/// **A crash does not erase what the last attempt was told to fix.**
+///
+/// §11.4's first half: "failure feedback (gate log or `required_changes`) goes
+/// back to the *same rung*". The brief that carries it was a process-local
+/// `BTreeMap` the live loop pushed to, and `TopologyRun::resumed` created it
+/// **empty** — so the sequence the 2026-08-26 frontier review of `75da796` set
+/// out in finding 2 held exactly: attempt 1 fails a gate with an 8-KiB
+/// diagnostic tail, `attempt_finished` is durably appended, the conductor
+/// crashes before the next dispatch, and the retry is handed attempt 1's prompt
+/// verbatim. A rung's allowance spent to be told nothing, and the same defect
+/// free to repeat.
+///
+/// The fixture is that crash: one attempt already settled in the durable log,
+/// carrying the tail, and a chain with a second attempt left on the rung. The
+/// process that wrote it is gone — this run is built by `resumed` from the log
+/// alone, which is the only path a real resume has.
+///
+/// **Asserted on the worker's own stdin**, because the prompt is the only place
+/// the claim is observable: a brief the driver rebuilds and does not send is the
+/// same defect one rung further along. And asserted on the tail's exact text
+/// rather than on the prompt's length — a longer prompt is evidence that
+/// *something* was carried, which is what the live-mode witness
+/// `a_retried_worker_is_told_what_the_last_attempt_failed_on` could say and is
+/// not what §11.4 requires.
+#[test]
+fn a_crash_does_not_erase_what_the_last_attempt_was_told_to_fix() {
+    // §11.1's payload: what the gate printed, not the summary of it.
+    const TAIL: &str = "error[E0308]: mismatched types\n  --> src/alpha.rs:12:9\n   \
+                        expected `u32`, found `&str`";
+
+    // One tier, `attempts_per = 2`: the retry the log entitles this run to is on
+    // the **same rung**, which is the half of §11.4 this test is about.
+    let fixture = Fixture::build(
+        "driver-brief-resume",
+        Damage {
+            extra: vec![
+                dispatched(),
+                attempt_started(1),
+                attempt_finished_failing(
+                    1,
+                    crate::ladder::FailureKind::GateFailed,
+                    "gate `cargo test` failed: 1 failed",
+                    TAIL,
+                    AttemptSettlement::Closed {
+                        transition: SettlementTransition::Retry,
+                        lease: LeaseDisposition::PredictedReleased,
+                    },
+                ),
+            ],
+            ..Damage::default()
+        },
+    );
+
+    let runner = RecordingRunner::editing();
+    let prompts = drive_one_attempt(&fixture, &runner);
+
+    assert_eq!(
+        prompts.len(),
+        1,
+        "the resumed run dispatched {} implementer(s); this test needs exactly \
+         the one the log entitles it to",
+        prompts.len()
+    );
+    assert!(
+        prompts[0].contains(TAIL),
+        "the retry after the crash was not told what the gate printed. §11.4 \
+         sends the gate log back to the same rung, and this prompt carries none \
+         of it:\n--- prompt ---\n{}",
+        prompts[0]
+    );
+}
+
+/// **An escalation after a crash carries the accumulated feedback.**
+///
+/// §11.4's second half: "`attempts_per` exhausted → next rung, fresh session,
+/// **accumulated feedback summary included**", and its other named source — the
+/// reviewer's `required_changes`, which §11.2 says the retry gets back verbatim.
+///
+/// Two failures are already durable on rung 0 and the ladder has a rung above,
+/// so the only dispatch this run can make is the escalation. The empty brief a
+/// resume used to rebuild sent it none of them: a fresh, stronger worker on the
+/// same task, given attempt 1's prompt and no reason to do anything different.
+///
+/// **What "accumulated" means here is what `feedback_section` actually sends**,
+/// and this asserts that rather than a stronger reading of the sentence. Every
+/// earlier attempt contributes its summary line; only the newest carries its
+/// full detail, because "older ones would bury it, and the newest is the one
+/// still standing in the way" — the production comment on that decision. So the
+/// claim under test is: both summaries reach the rung above, the newest
+/// reviewer's required changes reach it verbatim, and the accumulated section
+/// exists at all — `feedback_section` writes its header **only** when it is
+/// rendering more than one entry for a fresh rung, so that sentence is the
+/// accumulation itself and not a statement about it.
+#[test]
+fn an_escalation_after_a_crash_carries_the_accumulated_feedback() {
+    const FIRST_SUMMARY: &str = "review failed: the parser accepts a trailing comma";
+    const SECOND_SUMMARY: &str = "review failed: the empty list still panics";
+    const SECOND_DETAIL: &str = "- reject a trailing comma in `parse_list`\n\
+                                 - the empty list must round-trip";
+
+    let fixture = Fixture::build(
+        "driver-brief-escalate",
+        Damage {
+            deep_ladder: true,
+            extra: vec![
+                dispatched(),
+                attempt_started(1),
+                attempt_finished_failing(
+                    1,
+                    crate::ladder::FailureKind::ReviewFailed,
+                    FIRST_SUMMARY,
+                    "- reject a trailing comma in `parse_list`",
+                    AttemptSettlement::Closed {
+                        transition: SettlementTransition::Retry,
+                        lease: LeaseDisposition::PredictedReleased,
+                    },
+                ),
+                // A closed generation cannot take another attempt, so the
+                // second failure is in the generation the retry opened —
+                // which is exactly what a sessionless retry leaves in a log.
+                in_generation(GenerationId(1), dispatched()),
+                in_generation(GenerationId(1), attempt_started(1)),
+                in_generation(
+                    GenerationId(1),
+                    attempt_finished_failing(
+                        1,
+                        crate::ladder::FailureKind::ReviewFailed,
+                        SECOND_SUMMARY,
+                        SECOND_DETAIL,
+                        AttemptSettlement::Closed {
+                            transition: SettlementTransition::Escalated { rung: 1 },
+                            lease: LeaseDisposition::PredictedReleased,
+                        },
+                    ),
+                ),
+            ],
+            ..Damage::default()
+        },
+    );
+
+    let runner = RecordingRunner::editing();
+    let prompts = drive_one_attempt(&fixture, &runner);
+    assert_eq!(
+        prompts.len(),
+        1,
+        "the resumed run dispatched {} implementer(s); this test needs the \
+         escalation the log entitles it to",
+        prompts.len()
+    );
+    let prompt = &prompts[0];
+
+    for summary in [FIRST_SUMMARY, SECOND_SUMMARY] {
+        assert!(
+            prompt.contains(summary),
+            "the escalated worker was not told `{summary}`. §11.4 carries the \
+             accumulated feedback onto the next rung, and this prompt carries \
+             part of it at best:\n--- prompt ---\n{prompt}"
+        );
+    }
+    assert!(
+        prompt.contains(SECOND_DETAIL),
+        "the escalated worker was not given the reviewer's required changes \
+         verbatim. §11.2 is what the retry gets back, and after a crash it \
+         reached this prompt as a summary or not at \
+         all:\n--- prompt ---\n{prompt}"
+    );
+    assert!(
+        prompt.contains("Earlier attempts at this task failed"),
+        "the escalated worker's prompt has no accumulated section, so at most \
+         one record below its rung reached it:\n--- prompt ---\n{prompt}"
+    );
+}
+
+/// **A log written before the field existed still folds, and still resumes.**
+///
+/// `FailureRecord::detail` is additive and `SCHEMA_VERSION` does not move, which
+/// is a claim about *older logs* rather than about new ones:
+/// `decisions/2026-08-26-durable-retry-feedback.md` argues that a line without
+/// the key reads back as `None`, folds unchanged, and passes schema 4's strict
+/// door — the door being a witness comparison that reports "any key the input
+/// carried that the record did not claim back", so an added output key is not an
+/// unknown input key.
+///
+/// That argument is worth exactly as much as a log that tests it. This deletes
+/// the key from every `attempt_finished` in a real fixture's bytes — the shape a
+/// binary one commit older wrote — and resumes from the result through the
+/// production parse.
+#[test]
+fn a_log_predating_the_detail_field_folds_and_resumes() {
+    let fixture = Fixture::build(
+        "driver-brief-oldlog",
+        Damage {
+            extra: vec![
+                dispatched(),
+                attempt_started(1),
+                attempt_finished_failing(
+                    1,
+                    crate::ladder::FailureKind::GateFailed,
+                    "gate `cargo test` failed: 1 failed",
+                    "error[E0308]: mismatched types",
+                    AttemptSettlement::Closed {
+                        transition: SettlementTransition::Retry,
+                        lease: LeaseDisposition::PredictedReleased,
+                    },
+                ),
+            ],
+            ..Damage::default()
+        },
+    );
+
+    // The older binary's bytes: the same log with the key it never wrote.
+    let current = String::from_utf8(fixture.log_bytes()).expect("the log is utf-8");
+    let aged: String = current
+        .lines()
+        .enumerate()
+        .map(|(position, line)| {
+            // **The first line is passed through byte for byte.** The commit
+            // record pins its sha256, and a re-serialization that only reorders
+            // keys is enough to make recovery refuse for a reason that has
+            // nothing to do with this field.
+            if position == 0 {
+                return format!("{line}\n");
+            }
+            let mut value: serde_json::Value =
+                serde_json::from_str(line).expect("every log line is a json object");
+            // Nested rather than a let-chain: MSRV is 1.85 and let-chains
+            // are 1.88.
+            if let Some(failure) = value.pointer_mut("/data/record/failure") {
+                if let Some(object) = failure.as_object_mut() {
+                    object.remove("detail");
+                }
+            }
+            format!("{value}\n")
+        })
+        .collect();
+    assert!(
+        !aged.contains("\"detail\""),
+        "the aged log still carries a detail key, so this test is reading the \
+         current shape and proving nothing about the older one"
+    );
+    assert!(
+        aged.contains("attempt_finished"),
+        "the aged log has no settlement in it, so the field being absent is \
+         vacuous"
+    );
+
+    let events = TopologyFold::parse_log(aged.as_bytes()).expect(
+        "a log written before the detail field existed still parses — if this \
+         refuses, the field is not additive and SCHEMA_VERSION had to move",
+    );
+    let details: Vec<Option<String>> = events
+        .iter()
+        .filter_map(|event| match &event.body {
+            TopologyEventBody::AttemptFinished { data } => {
+                Some(data.record.failure.as_ref()?.detail.clone())
+            }
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        details,
+        vec![None],
+        "an absent detail key must read back as None; anything else means an \
+         older log folds to a different value than it was written with"
+    );
+
+    // And the run it describes still resumes: the brief is simply empty for the
+    // attempts that predate the field, which is the honest answer for a log that
+    // never recorded what they were told.
+    let harness = harness();
+    let runtime = runtime_holding_the_record();
+    let certifies = AlwaysCertifies;
+    let given = Given::healthy(&fixture, &runtime, &certifies);
+    // `std::fs::write` is on the effect denylist here; the fixture writer is
+    // the sanctioned way a test plants bytes.
+    crate::workspace_manager::fixture::write_file(&fixture.log(), aged.as_bytes());
+    let (outcome, _) = resume_holding(&fixture, &harness, &given);
+    outcome.expect("a run whose log predates the field still resumes");
+}
+
+/// Resume the fixture from its log alone, take one step, and return the
+/// implementer prompts the run actually sent.
+///
+/// The whole apparatus of the driver tests above, factored out because the two
+/// crash-resume witnesses differ only in what their logs already hold and in
+/// what they expect to come back. **Recovery is not stubbed**: this is
+/// `resume_holding` into `TopologyRun::resumed`, the same pair every other
+/// driver test in this file uses, so the brief under test is rebuilt from the
+/// barrier's own parse of the durable bytes.
+fn drive_one_attempt(fixture: &Fixture, runner: &RecordingRunner) -> Vec<String> {
+    use crate::engine::topology::run::{RunSeams, TopologyRun};
+    use crate::engine::topology::select::Ceiling;
+
+    let harness = harness();
+    let runtime = runtime_holding_the_record();
+    let certifies = AlwaysCertifies;
+    let given = Given::healthy(fixture, &runtime, &certifies);
+    let (outcome, _) = resume_holding(fixture, &harness, &given);
+    let (_recovered, handle) = outcome.expect("the healthy resume completes");
+
+    let mut run = TopologyRun::resumed(handle, fixture.inputs(), Ceiling::unlimited());
+    let mut hooks = HarnessTopologyHooks::new(Arc::clone(&harness));
+    let sleeper = RecordingSleeper::default();
+    let manager = fixture.manager();
+    let adapters = crate::engine::topology::scaffold::ScaffoldAdapters::erroring();
+    let paths = crate::rundir::RunPaths::with_private_root(
+        &fixture.repo_root,
+        &fixture.started.run_id,
+        &fixture.private_root,
+    );
+    paths.create().expect("the run directories are creatable");
+    let plans = crate::engine::assembly::FrozenPlans {
+        adapters: &adapters,
+        paths: &paths,
+        gates: &[],
+        pools: &[],
+        caps: &[],
+        worker_timeout: std::time::Duration::from_secs(300),
+        decisions: &[],
+    };
+    let seams = RunSeams {
+        manager: &manager,
+        clock: &Frozen,
+        sleeper: &sleeper,
+        runner,
+        adapters: &adapters,
+        paths: &paths,
+        plans: &plans,
+        reviews: &crate::engine::attempt::LegacyReviewPasses,
+        input_policy: &crate::engine::attempt::LegacyReviewInputPolicy,
+        answers: &crate::interaction::UnattendedAnswers,
+        ids: &FixedIds,
+        halts_run: false,
+    };
+
+    run.step(&seams, &mut hooks)
+        .expect("the resumed attempt settles");
+
+    runner
+        .requests()
+        .into_iter()
+        .filter(|request| request.role == crate::runner::ExecutionRole::Implement)
+        .map(|request| String::from_utf8_lossy(&request.command.stdin).into_owned())
+        .collect()
 }
 
 /// **The driver spends the allowance the log records, not the one it assumed.**

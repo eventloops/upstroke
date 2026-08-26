@@ -750,6 +750,7 @@ mod tests {
                         kind: FailureKind::GateFailed,
                         origin: FailureOrigin::Worker,
                         reason: "the attempt failed".to_owned(),
+                        detail: None,
                     }),
                 }),
                 parking: None,
@@ -782,6 +783,7 @@ mod tests {
                     kind: FailureKind::GateFailed,
                     origin: FailureOrigin::Worker,
                     reason: "the attempt failed".to_owned(),
+                    detail: None,
                 }),
             }),
             parking: Some(Box::new(events::AttemptParking {

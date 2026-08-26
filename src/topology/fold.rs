@@ -4563,6 +4563,7 @@ mod tests {
             kind,
             origin: crate::ladder::FailureOrigin::Worker,
             reason: "the fixture's failure".to_owned(),
+            detail: None,
         });
         ev(TopologyEventBody::AttemptFinished {
             data: Box::new(AttemptFinished4 {

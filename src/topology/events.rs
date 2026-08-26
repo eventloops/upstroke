@@ -2433,6 +2433,7 @@ mod tests {
                 kind: FailureKind::GateFailed,
                 origin: FailureOrigin::Reviewer,
                 reason: "  clippy: 3 warnings, one of them Ünicode  ".to_owned(),
+                detail: None,
             }),
         }
     }

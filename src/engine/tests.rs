@@ -4363,8 +4363,95 @@ fn attempt_record(attempt: u32, tier: &str, failed: bool) -> AttemptRecord {
             kind: FailureKind::GateFailed,
             origin: FailureOrigin::Worker,
             reason: "no".to_owned(),
+            detail: None,
         }),
     }
+}
+
+/// **Both of §11.4's feedback sources reach the durable record.**
+///
+/// §11.4 names exactly two: "failure feedback (gate log or `required_changes`)
+/// goes back to the *same rung*". `AttemptFailure::feedback` unifies them —
+/// `classify::gate_failure` puts the 8-KiB tail there, and
+/// `attempt::review_failure` puts the reviewer's required changes there — and
+/// `classify::attempt_record` is the one production construction that copies
+/// the pair onto the wire.
+///
+/// It copied `{kind, origin, reason}` and dropped the feedback. `reason` is the
+/// human-facing summary, so a resumed run could say *that* a gate failed and
+/// nothing about **what it printed**: the retry ran on attempt 1's prompt and
+/// could repeat the same defect while spending another attempt. The 2026-08-26
+/// frontier review of `75da796` raised it as finding 2 and it is
+/// `PR7-FEEDBACK-NOT-DURABLE-IN-SCHEMA-4`; the field is authorised by
+/// `decisions/2026-08-26-durable-retry-feedback.md`.
+///
+/// Asserted on **content**, not on `is_some()`: the claim is that the next
+/// worker is told what this one was told to fix, and a record carrying the
+/// wrong string satisfies a presence check exactly as well as the right one.
+#[test]
+fn both_feedback_sources_reach_the_durable_attempt_record() {
+    use crate::gates::GateFailure;
+
+    let tail =
+        "error[E0308]: mismatched types\n  --> src/alpha.rs:12:9\n   expected `u32`, found `&str`";
+    let gate = super::classify::gate_failure(&GateFailure {
+        gate: "cargo test".to_owned(),
+        summary: "1 failed".to_owned(),
+        log_tail: tail.to_owned(),
+    });
+    assert_eq!(
+        durable_detail(&gate).as_deref(),
+        Some(tail),
+        "§11.1's gate tail did not reach the record, so a resume cannot tell the \
+         retry what the gate printed"
+    );
+
+    let review = super::attempt::review_failure(review::ReviewResult::Judged(crate::ir::Verdict {
+        pass: false,
+        reasons: vec!["the parser accepts a trailing comma".to_owned()],
+        required_changes: vec![
+            "reject a trailing comma in `parse_list`".to_owned(),
+            "add a case for the empty list".to_owned(),
+        ],
+        needs_human: false,
+    }))
+    .expect("a failed verdict is a failure");
+    assert_eq!(
+        durable_detail(&review).as_deref(),
+        Some("- reject a trailing comma in `parse_list`\n- add a case for the empty list"),
+        "§11.2's required_changes did not reach the record verbatim, so an \
+         escalation carries the reviewer's summary instead of its instructions"
+    );
+}
+
+/// One failure's `detail` as the wire carries it, through the production
+/// builder rather than around it.
+fn durable_detail(failure: &crate::ladder::AttemptFailure) -> Option<String> {
+    let outcome = crate::ir::Outcome {
+        status: crate::ir::OutcomeStatus::Completed,
+        diff: String::new(),
+        detail: None,
+        session_id: None,
+        usage: None,
+        cost_usd: None,
+        transcript_path: PathBuf::new(),
+        duration: Duration::ZERO,
+    };
+    super::classify::attempt_record(
+        1,
+        super::classify::AttemptFacts {
+            tier: crate::ir::Tier::Mid,
+            model: "claude-opus-5",
+            pool: None,
+            resumed: false,
+            outcome: &outcome,
+            reviews: &[],
+            failure: Some(failure),
+        },
+    )
+    .failure
+    .expect("a classified failure produces a failure record")
+    .detail
 }
 
 #[test]

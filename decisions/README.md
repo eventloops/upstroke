@@ -66,3 +66,8 @@ artifacts (§15); records promoted here are the durable subset.
   signing environment are retired; the ruleset requires `upstroke-ci` and
   `upstroke-pr-policy` only. The review obligation is unchanged and the owner's
   merge is the attestation; 2026-08-20 §5 remains the bar for any automated return.
+- [2026-08-26 — the retry brief survives a crash](2026-08-26-durable-retry-feedback.md):
+  `FailureRecord` gains one additive `#[serde(default)] detail`, carrying §11.4's
+  feedback onto the durable record; the schema-4 brief becomes a fold over it,
+  derived once and called by both the live loop and a replay. `SCHEMA_VERSION`
+  unmoved. Class C exception to the 2026-08-20 freeze, scoped to that field.

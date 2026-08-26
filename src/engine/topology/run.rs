@@ -46,6 +46,7 @@ use crate::events::AttemptRecord;
 use crate::interaction::Sleeper;
 use crate::topology::events::{
     AttemptNumber, CandidateLeaseEffect, CommitSha, FrozenQuestion, GenerationId, SessionId,
+    TopologyEvent,
 };
 use crate::topology::fold::{FrozenInputs, TopologyFold};
 use crate::topology::registry::TaskKey;
@@ -506,6 +507,99 @@ struct RunAs {
     announced: bool,
 }
 
+/// §11.4's accumulated brief, derived from the durable record.
+///
+/// "Failure feedback (gate log or `required_changes`) goes back to the *same
+/// rung* … `attempts_per` exhausted → next rung, fresh session, **accumulated
+/// feedback summary included**." The brief is what that sentence sends.
+///
+/// **Derived rather than accumulated, for the reason §15 states.** "One fold,
+/// not two": the engine "appends an event and folds it back in through the same
+/// function `resume` and `status` use … and it applies the event *as it will be
+/// read back* rather than as constructed". [`Self::replay`] is that reader and
+/// [`Self::record`] is the single step it is made of, so the live loop —
+/// recording each settlement from the record it is appending, never from the
+/// live `AttemptFailure` beside it — reaches the identical value a replay of
+/// its own log does. The shape is [`super::select::Spend`]'s, and so is the
+/// argument.
+///
+/// This was a `BTreeMap` the live path pushed to and `TopologyRun::resumed`
+/// created empty. A crash after a gate failure therefore threw away the
+/// diagnostic tail: the retry ran on attempt 1's prompt, spent a rung's
+/// allowance to be told nothing, and could repeat the same defect. The
+/// 2026-08-26 frontier review of `75da796` raised it as finding 2; the durable
+/// field it needed is authorised by
+/// `decisions/2026-08-26-durable-retry-feedback.md`.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct Brief {
+    per_task: BTreeMap<TaskKey, Vec<crate::events::Feedback>>,
+}
+
+impl Brief {
+    /// Nothing recorded yet.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// What this task's earlier attempts failed on, oldest first.
+    #[must_use]
+    pub fn lines(&self, key: TaskKey) -> Vec<crate::events::Feedback> {
+        self.per_task.get(&key).cloned().unwrap_or_default()
+    }
+
+    /// Add one settled attempt's line to its task's brief.
+    ///
+    /// **Every judged failure adds one, whatever settlement it produced.** The
+    /// sentence is "failure feedback goes back to the same rung, **and an
+    /// escalation carries the accumulated feedback with it**", and an escalation
+    /// closes the generation — so the brief belongs to the *task*. Gating it on
+    /// a retained generation is what made every escalation and every sessionless
+    /// retry, which is every Copilot attempt (`DESIGN.md:452`), start from
+    /// nothing.
+    ///
+    /// A record with no failure adds nothing: a successful attempt has no
+    /// feedback, and `detail` is `None` on an attempt nothing judged.
+    pub fn record(&mut self, key: TaskKey, record: &AttemptRecord) {
+        let Some(failure) = record.failure.as_ref() else {
+            return;
+        };
+        self.per_task
+            .entry(key)
+            .or_default()
+            .push(crate::events::Feedback {
+                attempt: record.attempt,
+                tier: record.tier.clone(),
+                summary: failure.reason.clone(),
+                detail: failure.detail.clone(),
+                human: false,
+            });
+    }
+
+    /// Every task's brief over a whole log.
+    ///
+    /// **`attempt_finished` only, which is exactly the live loop's coverage.**
+    /// Two events carry an [`AttemptRecord`] — `attempt_finished` and
+    /// `candidate_prepared` — and the driver calls [`Self::record`] beside
+    /// `Spend::record` at both of its own appends. `candidate_prepared` is the
+    /// *successful* settlement (INV-07), so its record carries no failure and
+    /// contributes nothing either way; walking it here would add a duplicate
+    /// only on the replay side. `attempt_interrupted` is deliberately absent:
+    /// nothing judged that attempt, the live path settles it in recovery rather
+    /// than through a settlement, and a line for it would be a line replay
+    /// invented.
+    #[must_use]
+    pub fn replay(events: &[TopologyEvent]) -> Self {
+        let mut brief = Self::new();
+        for event in events {
+            if let TopologyEventBody::AttemptFinished { data } = &event.body {
+                brief.record(data.key, &data.record);
+            }
+        }
+        brief
+    }
+}
+
 /// What the retaining incarnation kept from the attempt it settled.
 ///
 /// The tree a retry re-gates, and what that attempt failed on. Both are
@@ -650,15 +744,16 @@ pub struct TopologyRun {
     /// escalation and every sessionless retry — which is every Copilot attempt,
     /// `DESIGN.md:452` — therefore ran on attempt 1's prompt.
     ///
-    /// **Process-local, and that is a real boundary rather than a choice.**
-    /// Schema 4's wire cannot carry it: `FailureRecord` is `{kind, origin,
-    /// reason}` with no detail, and no `SettlementTransition` variant has a
-    /// feedback field — where the legacy schema-3 `LadderRetry` and
-    /// `LadderEscalated` events carry `summary` **and** `detail` outright. So a
-    /// resume still restarts the brief empty. That is
-    /// `PR7-FEEDBACK-NOT-DURABLE-IN-SCHEMA-4` in `reviews/FINDINGS.md` §2, and
-    /// closing it is a wire field on a frozen file.
-    brief: BTreeMap<TaskKey, Vec<crate::events::Feedback>>,
+    /// **Durable, and derived from the log.** This field said schema 4's wire
+    /// could not carry it and that a resume therefore restarted the brief empty
+    /// — true when written, and the defect the 2026-08-26 frontier review of
+    /// `75da796` raised as finding 2. [`crate::events::FailureRecord::detail`]
+    /// now carries what §11.4 sends, and [`Brief`] derives the whole map from
+    /// the log by the same step the live loop applies.
+    /// `PR7-FEEDBACK-NOT-DURABLE-IN-SCHEMA-4` in `reviews/FINDINGS.md` §2 is
+    /// closed by that field, authorised as Class C in
+    /// `decisions/2026-08-26-durable-retry-feedback.md`.
+    brief: Brief,
 }
 
 impl TopologyRun {
@@ -681,6 +776,11 @@ impl TopologyRun {
         };
         // Read before the handle moves into the struct below it.
         let spend = Spend::replay(&handle.events);
+        // **The log's brief, not an empty map.** Same reader, same reason as
+        // `spend`: §11.4's feedback is on the durable record now, so a resumed
+        // run tells the next worker what the attempts before the crash failed
+        // on rather than handing it attempt 1's prompt.
+        let brief = Brief::replay(&handle.events);
         Self {
             handle,
             identity,
@@ -704,7 +804,7 @@ impl TopologyRun {
             deferral: Deferral::default_backoff(),
             slots: SlotAssertion::new(),
             retained: BTreeMap::new(),
-            brief: BTreeMap::new(),
+            brief,
         }
     }
 
@@ -859,7 +959,7 @@ impl TopologyRun {
                         // feedback goes with it. Empty here meant a retried
                         // worker got attempt 1's prompt verbatim — a rung's
                         // allowance spent to be told nothing.
-                        feedback: self.brief.get(&key).cloned().unwrap_or_default(),
+                        feedback: self.brief.lines(key),
                         announced: false,
                     },
                     seams,
@@ -1181,7 +1281,7 @@ impl TopologyRun {
                     // From the task's brief, which every judged failure adds to
                     // — not from the retained generation, which only a resumable
                     // same-rung retry ever produces.
-                    feedback: self.brief.get(&key).cloned().unwrap_or_default(),
+                    feedback: self.brief.lines(key),
                     // `settle::retry` built this event; appending it is what
                     // announces the attempt, and the fold refuses a second.
                     announced: true,
@@ -1531,23 +1631,6 @@ impl TopologyRun {
             },
         )?;
 
-        // **§11.4's brief, accumulated for the task and not for a generation.**
-        // Every judged failure adds a line, whatever settlement it produced: the
-        // sentence is "failure feedback goes back to the same rung, and an
-        // escalation carries the accumulated feedback with it", and an
-        // escalation closes the generation. Gating this on `Retained` is what
-        // made every escalation and every sessionless retry start from nothing.
-        self.brief
-            .entry(site.key)
-            .or_default()
-            .push(crate::events::Feedback {
-                attempt: plan.attempt.0,
-                tier: plan.binding.tier.to_string(),
-                summary: failure.reason.clone(),
-                detail: failure.feedback.clone(),
-                human: false,
-            });
-
         // **The retaining incarnation's own note.** `T-RETAINED`'s resume action
         // is "the retaining incarnation proceeds to T-RETRY; a fresh process
         // closes it in recovery", so the tree a retry re-gates is legitimately
@@ -1573,6 +1656,12 @@ impl TopologyRun {
         // the next iteration's ceiling check rather than being a second source
         // for it.
         self.spend.record(site.key, &settled.event.record);
+        // **§11.4's brief, from the record being appended.** Not from the
+        // `AttemptFailure` beside it: `Brief::replay` reads this event back off
+        // the log, and applying the event as it will be read back is what makes
+        // a live run and a replay of its own log one computation rather than two
+        // that agree by inspection (§15, "one fold, not two").
+        self.brief.record(site.key, &settled.event.record);
         self.emit(
             TopologyEventBody::AttemptFinished {
                 data: Box::new(settled.event),
@@ -1657,6 +1746,12 @@ impl TopologyRun {
             &record,
         )?;
         self.spend.record(key, &settlement.record);
+        // The same step on the success path, so the two callers of
+        // `Brief::record` are exactly the driver's two `attempt_finished`
+        // appends. A succeeded record carries no failure and adds no line;
+        // calling it anyway is what keeps the coverage identical to
+        // `Brief::replay`'s rather than equal by argument.
+        self.brief.record(key, &settlement.record);
         self.emit(
             TopologyEventBody::AttemptFinished {
                 data: Box::new(settlement),
