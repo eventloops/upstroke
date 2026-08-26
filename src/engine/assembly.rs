@@ -31,6 +31,25 @@
 //! as `ShellGate::command`. Putting it here would make `gates.rs` — which sits
 //! below the engine — depend upward on the engine.
 
+// **`dead_code` is allowed here for a lib build only, and the shape is the
+// point.** With `engine::topology` narrowed to `pub(crate)`, this subsystem has
+// no non-`#[cfg(test)]` caller — which is exactly what
+// `production_effect = "none"` asserts, and `pub` was what kept the compiler
+// from saying so. Narrowing it made rustc report **328 items** across this
+// module tree as never used.
+//
+// `cfg_attr(not(test), …)` rather than a bare allow, deliberately. A blanket
+// `#![allow(dead_code)]` would hide a genuinely dead item added later, which is
+// the class this slice's own review rounds kept finding. Under this form the
+// **test** build carries no allow, so anything not reached even by a test is
+// still an error at `-D warnings`. What is silenced is precisely the one true
+// fact — the production binary does not drive schema 4 yet.
+//
+// **Remove this when PR12 activates the driver.** At that point the items have
+// production callers and the allow stops being true rather than stops being
+// convenient.
+#![cfg_attr(not(test), allow(dead_code))]
+
 use std::path::Path;
 use std::time::Duration;
 

@@ -142,6 +142,7 @@ pub struct HarnessTopologyHooks {
     events: crate::events::log::HarnessEventHooks,
     container: crate::runner::container::HarnessHooks,
     spawn: crate::runner::HarnessHooks,
+    #[allow(dead_code)] // never called at 610106b; see `PR7-NARROWED-SURFACE-19-UNCALLED` (§2)
     harness: Arc<Mutex<HookHarness>>,
 }
 
@@ -161,6 +162,7 @@ impl HarnessTopologyHooks {
 
     /// The harness all five families record into.
     #[must_use]
+    #[allow(dead_code)] // never called at 610106b; see `PR7-NARROWED-SURFACE-19-UNCALLED` (§2)
     pub fn harness(&self) -> &Arc<Mutex<HookHarness>> {
         &self.harness
     }

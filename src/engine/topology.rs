@@ -38,6 +38,25 @@
 //! [`super::coordinator`]; a schema-4 run is reachable only from a
 //! `#[cfg(test)]` writer selector. PR12 activates it.
 
+// **`dead_code` is allowed here for a lib build only, and the shape is the
+// point.** With `engine::topology` narrowed to `pub(crate)`, this subsystem has
+// no non-`#[cfg(test)]` caller — which is exactly what
+// `production_effect = "none"` asserts, and `pub` was what kept the compiler
+// from saying so. Narrowing it made rustc report **328 items** across this
+// module tree as never used.
+//
+// `cfg_attr(not(test), …)` rather than a bare allow, deliberately. A blanket
+// `#![allow(dead_code)]` would hide a genuinely dead item added later, which is
+// the class this slice's own review rounds kept finding. Under this form the
+// **test** build carries no allow, so anything not reached even by a test is
+// still an error at `-D warnings`. What is silenced is precisely the one true
+// fact — the production binary does not drive schema 4 yet.
+//
+// **Remove this when PR12 activates the driver.** At that point the items have
+// production callers and the allow stops being true rather than stops being
+// convenient.
+#![cfg_attr(not(test), allow(dead_code))]
+
 pub mod attempt;
 pub mod candidate;
 pub mod create;
@@ -61,52 +80,36 @@ pub(crate) mod startup;
 /// exists at all: building a plan materializes the permissions file that
 /// defines the attempt's sandbox, and a topology module may not be allowlisted
 /// for that write.
-pub use super::assembly::FrozenPlans;
-
-pub use attempt::{
-    Assessment, AttemptContext, AttemptOutcome, AttemptPlan, AttemptRun, Capture, GatePlan,
-    Judgement, Judging, ReviewerPlan, Verdict,
-};
-pub use candidate::{
-    CandidateJournal, CandidateNames, CandidateRecovery, JudgedTree, OrphanPin, PinnedCandidate,
-    PromotingCandidate, QueuedCandidate, UnpinnedCandidate,
-};
-pub use dispatch::{
-    DispatchKind, DispatchRequest, Dispatched, EventEmitter, Reuse, close_at_run_end, dispatch,
-    materialize_repair, resume_open_no_attempt, task_slot, verify_or_recreate, verify_reuse,
-};
-pub use emit::{
-    AppendError, AppendOutcome, EmitError, EmitState, FirstAppendDisposition, RunIdentity, emit,
-};
-pub use identity::{
-    AttemptIdentities, InvocationLedger, PreflightIdentities, ReservationKind, Reservations,
-    SequenceIdentities, SlotAssertion, SlotPair, is_slotted,
-};
-pub use seams::{
-    HarnessTopologyHooks, IdSource, NoTopologyHooks, RealIds, SystemClock, TimeSource,
-    TopologyHooks,
-};
+// **The schema-4 facade's re-exports, reduced to the ones the crate uses.**
+//
+// This file carried ~45 lines of `pub use` flattening every submodule's types
+// into `engine::topology::*`. Narrowing `engine::topology` to `pub(crate)` made
+// rustc report almost all of them **unused**: nothing in the crate used the
+// shortened path — callers name `topology::attempt::AttemptPlan` and so on
+// directly — so they existed to populate a public path that should not have
+// existed. `pub` was hiding dead code, which is the second thing the frontier
+// review's finding 1 bought.
+//
+// What remains below is exactly what a compile with `-D warnings` says is
+// reached, derived by deleting the block and re-adding only the names that
+// failed to resolve. Deleted rather than `#[allow]`-ed: an allow hides the same
+// dead code one level in.
+//
+// Seven names, all reached from test modules through the flattened path.
 pub mod preflight;
 pub mod recover;
 pub mod run;
 
-pub use preflight::{Probed, RunPreflight};
-pub use recover::{
-    BarrierHeld, EmitContext, LocksHeld, PreflightCertified, RecordsVerified, ResumeCensused,
-    Resumed, RootDerived, RunnerRebuilt,
-};
-pub use run::{Disposition, LoopBranch};
-pub use select::{Admitted, Breach, Ceiling, Spend, Step, checkpoint, select};
-pub use settle::{
-    Deferral, FinishedAttempt, ManagedWorktrees, RetryOutcome, RetryRequest, Settled,
-    WorktreeVerify, close_generation, close_retained, rematerialize_question, retry, run_ending,
-    settle_failed, settle_succeeded,
-};
-pub use startup::{
-    CensusInputs, FailedStep, FreshCensused, RunDirCensusReport, RunDirEntry, RunDirOutcome,
-    StartupCensus, WorktreeLocked, startup_census,
-};
-
+// **No re-exports at all, and the last attempt is why.** Gating the seven
+// test-reached names with `#[cfg(test)]` put a `#[cfg(test)]` in front of a
+// `pub use` rather than a `mod`, which truncates this file's
+// `effects::production_region` at that line — and everything below a cut is
+// invisible to every census consulting that region, silently.
+// `effects::tests::every_production_region_that_stops_early_stops_at_a_module`
+// pins the ten files whose cut lands on something that is not a module, its doc
+// says "this file is not one of them and must not become one", and it caught
+// this within one `cargo test`. The seven call sites name their submodule
+// directly instead.
 /// The schema-4 run that `dispatch.rs` and `attempt.rs` are tested against.
 ///
 /// One fixture for both, because the two halves of one lifecycle are tested

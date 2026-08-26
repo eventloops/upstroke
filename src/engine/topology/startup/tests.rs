@@ -1793,7 +1793,7 @@ fn startup_census_returns_the_witness_and_runs_both_halves() {
         .publish_owner();
 
     let locked = WorktreeLocked::from(fixture.worktree_lock());
-    let mut hooks = crate::engine::topology::NoTopologyHooks::new();
+    let mut hooks = crate::engine::topology::seams::NoTopologyHooks::new();
     let censused = startup_census(locked, &mut hooks, &fixture.inputs()).expect("the census");
 
     assert_eq!(
@@ -1871,7 +1871,7 @@ fn a_refusal_in_half_a_leaves_half_b_untouched() {
         ..fixture.inputs()
     };
     let locked = WorktreeLocked::from(fixture.worktree_lock());
-    let mut hooks = crate::engine::topology::NoTopologyHooks::new();
+    let mut hooks = crate::engine::topology::seams::NoTopologyHooks::new();
 
     let error = startup_census(locked, &mut hooks, &inputs)
         .expect_err("half (a) refuses when the runtime answers and will not list");
@@ -1891,7 +1891,7 @@ fn a_refusal_in_half_a_leaves_half_b_untouched() {
     // half (a) proceeds and half (b) runs. Without it the assertions above
     // would pass against a census that never ran either half.
     let locked = WorktreeLocked::from(fixture.worktree_lock());
-    let mut hooks = crate::engine::topology::NoTopologyHooks::new();
+    let mut hooks = crate::engine::topology::seams::NoTopologyHooks::new();
     let censused = startup_census(locked, &mut hooks, &fixture.inputs()).expect("the census");
     assert_eq!(
         censused

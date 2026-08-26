@@ -151,6 +151,7 @@ pub struct ReviewInputs {
 /// ends before the append the plan authorizes.
 pub struct PlanRequest<'a> {
     /// The task.
+    #[allow(dead_code)] // never called at 610106b; see `PR7-NARROWED-SURFACE-19-UNCALLED` (§2)
     pub key: crate::topology::registry::TaskKey,
     /// Its frozen registration — spec, ladder, review bindings.
     pub entry: &'a crate::topology::registry::TaskEntry,

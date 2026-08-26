@@ -8952,7 +8952,22 @@ fn a_worker_that_cannot_be_spawned_returns_an_error_and_settles_nothing() {
 fn the_engine_facade_exposes_exactly_the_items_the_packet_enumerates() {
     use std::collections::BTreeSet;
 
-    let source = include_str!("mod.rs");
+    // **The blanked region, not the raw file.** This read `include_str!` and
+    // counted prose: the doc comment on `pub(crate) mod topology;` explains
+    // that this census forbids `pub mod `, and that sentence *is* a `pub mod `
+    // in the file — so the census failed on its own explanation.
+    // `PR4-CENSUS-COMMENT-ORACLE`, and the same trick would have let any of the
+    // six widenings be smuggled past by writing it in a comment.
+    let raw = include_str!("mod.rs");
+    let blanked = crate::effects::production_code(raw);
+    let source: &str = &blanked;
+    assert!(
+        source.len() * 2 > raw.len(),
+        "the blanked region of the engine facade is {} of {} bytes, so a census over it says \
+         little about the file",
+        source.len(),
+        raw.len()
+    );
 
     // Every `pub fn` at the facade's top level.
     let public_fns: BTreeSet<&str> = source
@@ -8980,6 +8995,17 @@ fn the_engine_facade_exposes_exactly_the_items_the_packet_enumerates() {
         "pub struct",
         "pub enum",
         "pub const",
+        // **`pub mod ` was missing from this list, and it is the route the
+        // schema-4 surface actually took.** `pub mod topology;` stood here for
+        // the whole slice: this census enumerated functions and re-exports, so
+        // a whole subsystem reached the public path without moving any number
+        // it counts. `create_run`, `Started::into_handle`,
+        // `TopologyRun::resumed` and `step` were reachable by any downstream
+        // caller of this library, which could then write schema-4 state that
+        // this build's own recovery refuses — the frontier review of
+        // `75da796`, finding 1. A census that forbids five widenings and not
+        // the sixth is the shape of every fail-open needle this slice found.
+        "pub mod ",
     ] {
         assert!(
             !source.contains(widening),

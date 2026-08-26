@@ -461,6 +461,7 @@ impl EmitError {
     /// let every `?` in the tree turn an outstanding obligation into a string
     /// and drop it, which is the "remembered, not enforced" failure this
     /// design exists to make impossible.
+    #[allow(dead_code)] // never called at 610106b; see `PR7-NARROWED-SURFACE-19-UNCALLED` (§2)
     pub fn discharging(self, invocations: &mut InvocationLedger) -> UpstrokeError {
         match self {
             Self::Unserializable(error) | Self::NotEntered(error) => error,
@@ -668,6 +669,7 @@ impl EmitFailure {
 
     /// Whether this failure left the log exactly as it found it.
     #[must_use]
+    #[allow(dead_code)] // never called at 610106b; see `PR7-NARROWED-SURFACE-19-UNCALLED` (§2)
     pub const fn wrote_nothing(&self) -> bool {
         matches!(self, Self::Clean(_))
     }

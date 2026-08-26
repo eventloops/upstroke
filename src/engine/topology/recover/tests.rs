@@ -63,9 +63,8 @@ use crate::workspace_manager::Refusal;
 
 use crate::engine::topology::identity::{InvocationLedger, ReservationKind, Reservations};
 use crate::engine::topology::preflight::RunPreflight;
-use crate::engine::topology::seams::{HarnessTopologyHooks, TimeSource};
-use crate::engine::topology::startup::FailedStep;
-use crate::engine::topology::{RunDirOutcome, TopologyHooks};
+use crate::engine::topology::seams::{HarnessTopologyHooks, TimeSource, TopologyHooks};
+use crate::engine::topology::startup::{FailedStep, RunDirOutcome};
 
 // ---------------------------------------------------------------------------
 // Fixed identities
@@ -3382,7 +3381,7 @@ fn ledgers_empty_after_resume() {
         .map(|request| {
             (
                 request.command.program.clone(),
-                crate::engine::topology::is_slotted(&request.invocation),
+                crate::engine::topology::identity::is_slotted(&request.invocation),
             )
         })
         .collect();
@@ -3393,9 +3392,9 @@ fn ledgers_empty_after_resume() {
     );
     // And the process-local ledgers a fresh coordinator starts with are empty
     // by construction, which is the other half of the row.
-    assert!(crate::engine::topology::Reservations::new().is_empty());
-    assert!(crate::engine::topology::SlotAssertion::new().is_empty());
-    assert!(crate::engine::topology::InvocationLedger::new().balances());
+    assert!(crate::engine::topology::identity::Reservations::new().is_empty());
+    assert!(crate::engine::topology::identity::SlotAssertion::new().is_empty());
+    assert!(crate::engine::topology::identity::InvocationLedger::new().balances());
 }
 
 /// A `Runner` that gives every probe a real container through the container

@@ -386,6 +386,7 @@ impl PromotingCandidate {
     /// it in hand: the append built `parent_sha` from it, and the recovery reads
     /// it off the durable `PreparedCandidate`.
     #[must_use]
+    #[allow(dead_code)] // never called at 610106b; see `PR7-NARROWED-SURFACE-19-UNCALLED` (§2)
     pub fn base(&self) -> &CommitSha {
         &self.base
     }

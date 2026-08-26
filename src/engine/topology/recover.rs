@@ -215,6 +215,8 @@ pub mod chain {
             public_dir: PathBuf,
             private_root: PathBuf,
             private_dir: PathBuf,
+            #[allow(dead_code)]
+            // never called at 610106b; see `PR7-NARROWED-SURFACE-19-UNCALLED` (§2)
             reader: ReaderSelection,
             /// The committed first line, **without** its newline — the bytes
             /// `committed.json.run_started_sha256` names.
@@ -239,6 +241,7 @@ pub mod chain {
             /// other than `<root>/runs/<run_id>`, or an explicit
             /// `--private-root` naming a different root.
             /// [`UpstrokeError::Io`] when the log cannot be read.
+            #[allow(dead_code)] // never called at 610106b; see `PR7-NARROWED-SURFACE-19-UNCALLED` (§2)
             pub fn derive(
                 repo_root: &Path,
                 wanted_run_id: &str,
@@ -390,6 +393,7 @@ pub mod chain {
             /// The reader the header selected. Always
             /// [`ReaderSelection::Topology`] for a value that exists.
             #[must_use]
+            #[allow(dead_code)] // never called at 610106b; see `PR7-NARROWED-SURFACE-19-UNCALLED` (§2)
             pub fn reader(&self) -> ReaderSelection {
                 self.reader
             }
@@ -578,6 +582,8 @@ pub mod chain {
         #[derive(Debug)]
         pub struct RecordsVerified {
             locks: LocksHeld,
+            #[allow(dead_code)]
+            // never called at 610106b; see `PR7-NARROWED-SURFACE-19-UNCALLED` (§2)
             owner: OwnerRecord,
             commit: CommitRecord,
         }
@@ -701,6 +707,7 @@ pub mod chain {
 
             /// The verified owner record.
             #[must_use]
+            #[allow(dead_code)] // never called at 610106b; see `PR7-NARROWED-SURFACE-19-UNCALLED` (§2)
             pub fn owner(&self) -> &OwnerRecord {
                 &self.owner
             }
@@ -798,6 +805,8 @@ pub mod chain {
             /// The append handle the barrier entitles this command to.
             log: crate::events::log::EventLog,
             /// The exact bytes that were synced, reread, proven, and replayed.
+            #[allow(dead_code)]
+            // never called at 610106b; see `PR7-NARROWED-SURFACE-19-UNCALLED` (§2)
             bytes: Vec<u8>,
             /// The events the barrier parsed from exactly those bytes.
             ///
@@ -904,6 +913,7 @@ pub mod chain {
 
             /// The proven bytes.
             #[must_use]
+            #[allow(dead_code)] // never called at 610106b; see `PR7-NARROWED-SURFACE-19-UNCALLED` (§2)
             pub fn bytes(&self) -> &[u8] {
                 &self.bytes
             }

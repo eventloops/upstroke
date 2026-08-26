@@ -612,6 +612,7 @@ impl StartupCensus {
 
     /// Both halves, for a caller that owns the value.
     #[must_use]
+    #[allow(dead_code)] // never called at 610106b; see `PR7-NARROWED-SURFACE-19-UNCALLED` (§2)
     pub fn into_parts(self) -> (CensusComplete, RunDirCensusReport) {
         (self.containers, self.run_dirs)
     }
@@ -1001,6 +1002,8 @@ mod witness {
         /// outlive the exclusion it claims.
         #[derive(Debug)]
         pub struct WorktreeLocked {
+            #[allow(dead_code)]
+            // never called at 610106b; see `PR7-NARROWED-SURFACE-19-UNCALLED` (§2)
             lock: WorktreeLock,
         }
 
@@ -1013,6 +1016,7 @@ mod witness {
 
             /// The lock this witness is holding.
             #[must_use]
+            #[allow(dead_code)] // never called at 610106b; see `PR7-NARROWED-SURFACE-19-UNCALLED` (§2)
             pub const fn lock(&self) -> &WorktreeLock {
                 &self.lock
             }
@@ -1072,6 +1076,7 @@ mod witness {
 
             /// The worktree lock, still held.
             #[must_use]
+            #[allow(dead_code)] // never called at 610106b; see `PR7-NARROWED-SURFACE-19-UNCALLED` (§2)
             pub const fn locked(&self) -> &WorktreeLocked {
                 &self.locked
             }

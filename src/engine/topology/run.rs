@@ -225,6 +225,7 @@ pub enum Disposition {
     /// Runner. Collapsing that into `Performed` would claim work nobody did,
     /// and into `NotYetImplemented` would hide a production append that
     /// genuinely happens. Neither is true, so the type says both.
+    #[allow(dead_code)] // never called at 610106b; see `PR7-NARROWED-SURFACE-19-UNCALLED` (§2)
     PartlyImplemented {
         /// The clauses this build performs.
         performs: &'static str,
@@ -363,6 +364,7 @@ impl LoopBranch {
     /// # Errors
     ///
     /// Always [`UpstrokeError::Refused`].
+    #[allow(dead_code)] // never called at 610106b; see `PR7-NARROWED-SURFACE-19-UNCALLED` (§2)
     pub fn owes(self, clause: &str) -> UpstrokeError {
         UpstrokeError::Refused {
             message: format!(
@@ -761,6 +763,7 @@ impl TopologyRun {
 
     /// Warnings accumulated across the run, in order.
     #[must_use]
+    #[allow(dead_code)] // never called at 610106b; see `PR7-NARROWED-SURFACE-19-UNCALLED` (§2)
     pub fn warnings(&self) -> &[String] {
         &self.warnings
     }
@@ -777,6 +780,7 @@ impl TopologyRun {
 
     /// Which wait the defer backoff is on.
     #[must_use]
+    #[allow(dead_code)] // never called at 610106b; see `PR7-NARROWED-SURFACE-19-UNCALLED` (§2)
     pub fn defer_round(&self) -> u32 {
         self.deferral.round()
     }
