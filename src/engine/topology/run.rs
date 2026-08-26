@@ -618,8 +618,8 @@ pub enum Progress {
 /// initialises it with `SlotAssertion::new()`, and `fn attempt` threads
 /// `slots: &mut self.slots` into the one production `AttemptContext`. Named
 /// rather than cited by line: the correction that replaced this paragraph made
-/// it thirteen lines longer, so the `run.rs:615` the first draft carried now
-/// points **into the correction itself**. `R5-SEAMS`/`PR7-R5-ATT-007`, and
+/// it thirteen lines longer, so the `run.rs:615` the first draft carried — correct
+/// **at `9b6fef1`** — now points **into the correction itself**. `R5-SEAMS`/`PR7-R5-ATT-007`, and
 /// CLAUDE.md's trap list already names stale line anchors as a repeat cost. The denial was written
 /// while that was true — "a field nothing reads is a claim the code does not
 /// back" — and stayed after the branch that uses it arrived.

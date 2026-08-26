@@ -445,8 +445,8 @@ fn the_frozen_pool_table_is_read_through_one_seam() {
 /// reach the arm**". One does: the fixture is
 /// `recover::tests::the_retaining_incarnation_retries_in_place`, and it exists —
 /// **named, not cited by line**. The first draft of this block quoted
-/// `recover/tests.rs:5488` as terminal output; the very next commit inserted
-/// nineteen lines above it and 5488 became a blank line. `PR7-R6-ATT-003`, and
+/// `recover/tests.rs:5488` as terminal output — correct **at `c01a844`** — and the
+/// very next commit inserted nineteen lines above it. `PR7-R6-ATT-003`, and
 /// the rule it gives: a doc comment names an item, because a line number is a
 /// claim about a version of a file and decays silently. The doc-comment filter
 /// (`| grep -v '///'`) is the other half — a needle quoted here would otherwise
