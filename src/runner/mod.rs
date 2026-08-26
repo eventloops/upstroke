@@ -2186,6 +2186,68 @@ mod tests {
         );
     }
 
+    /// **A plan-authored id never reaches a filename unsanitised.**
+    ///
+    /// The sixth single-authority census, and the one with the sharpest
+    /// consequence. A task's `display_id` is whatever an `id=` annotation said —
+    /// `plan/markdown.rs`'s `assemble` takes `Some(explicit) => explicit`
+    /// verbatim, and `keys_by_display_id` checks only the reserved `repair-N-`
+    /// prefix and duplicates. It then becomes a `stem`, and a stem becomes
+    /// `dir.join(format!("{stem}.json"))` in every adapter's
+    /// `materialize_permissions`.
+    ///
+    /// `PR7-R3-ATTEMPT-001`: the schema-4 assembler took `display_id` **raw**
+    /// while `coordinator.rs:537`, the legacy authority it was extracted from,
+    /// wrote `format!("{index:02}-{}", util::filename_component(task.id.as_str()))`.
+    /// So `id=../../x` wrote outside the run directory. The extraction dropped a
+    /// **guard**, which is the one-rule-two-places class at its worst — a
+    /// dropped convenience is a bug, a dropped guard is a vulnerability.
+    ///
+    /// The census is on the **pairing**, not on a count: wherever a `stem` is
+    /// built from a `display_id`, `filename_component` appears in the same
+    /// expression. That is what makes it survive a third assembler being
+    /// written, which a count could not.
+    ///
+    /// `util::filename_component_neutralizes_hostile_names` is the other half —
+    /// it asserts `"unit/fast"` becomes `"unit-fast"` and that an all-dots
+    /// result becomes `"x"`, so `..` is neutralised. This census says the guard
+    /// is *reached*; that test says it *works*.
+    #[test]
+    fn a_plan_authored_id_never_reaches_a_filename_unsanitised() {
+        let mut unguarded: Vec<String> = Vec::new();
+        let mut guarded = 0_usize;
+        for (path, code) in production_sources() {
+            for (at, _) in code.match_indices("stem:") {
+                // The value expression: to the end of that statement.
+                let rest = &code[at..];
+                let end = rest.find(',').unwrap_or(rest.len());
+                let value = &rest[..end];
+                if !value.contains("display_id") {
+                    continue;
+                }
+                if value.contains("filename_component") {
+                    guarded += 1;
+                } else {
+                    let line = code[..at].matches('\n').count() + 1;
+                    unguarded.push(format!("{path}:{line}"));
+                }
+            }
+        }
+        assert!(
+            guarded >= 2,
+            "only {guarded} guarded stem site(s) found, so a green result here \
+             would mean the needle stopped matching rather than that the tree is \
+             clean"
+        );
+        assert!(
+            unguarded.is_empty(),
+            "these sites put a plan-authored `display_id` into a filename stem \
+             without `util::filename_component`, so an `id=` annotation \
+             containing a path separator or `..` reaches `std::fs::write`: \
+             {unguarded:?}"
+        );
+    }
+
     #[test]
     fn every_production_command_spec_payload_is_classified() {
         use std::collections::BTreeMap;

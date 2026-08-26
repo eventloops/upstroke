@@ -308,7 +308,10 @@ impl AttemptPlans for FrozenPlans<'_> {
                 WorkerSubject::of_frozen(&entry.spec),
             ),
             decisions: self.decisions.to_vec(),
-            stem: entry.display_id.as_str().to_owned(),
+            // **Through the sanitiser, exactly as the legacy engine does it.**
+            // See `Self::plan`'s stem for why this is a guard and not a
+            // convenience.
+            stem: crate::util::filename_component(entry.display_id.as_str()),
         })
     }
 
@@ -341,7 +344,31 @@ impl AttemptPlans for FrozenPlans<'_> {
             task: WorkerSubject::of_frozen(&entry.spec),
             gate_cmds: &gate_cmds,
             paths: self.paths,
-            stem: entry.display_id.as_str(),
+            // **A task id is plan-authored input, and this becomes a filename.**
+            //
+            // `WorkerAssembly::command` hands this to
+            // `materialize_permissions`, which does
+            // `dir.join(format!("{stem}.json"))` and writes. A `display_id` is
+            // whatever an `id=` annotation said: `plan/markdown.rs`'s `assemble`
+            // takes `Some(explicit) => explicit` verbatim, and
+            // `keys_by_display_id` checks only the reserved `repair-N-` prefix
+            // and duplicates. So `id=../../x` wrote outside the run directory
+            // until this call existed.
+            //
+            // `util::filename_component` is the guard the legacy authority this
+            // module was extracted from already used —
+            // `coordinator.rs`: `format!("{index:02}-{}", filename_component(..))`
+            // — and the extraction dropped it. Its own test names the shapes:
+            // `filename_component_neutralizes_hostile_names` asserts
+            // `"unit/fast"` becomes `"unit-fast"`, and an all-dots result
+            // becomes `"x"`, so `..` is neutralised too.
+            //
+            // `PR7-R3-ATTEMPT-001`, round 3. Three rules broken by one omission:
+            // `invariants_preserved[1]`, the one-rule-two-production-places
+            // class in its most consequential form — the copy dropped a
+            // **guard** — and §4's "all paths through `std::path`" honoured
+            // mechanically while the value entering the path was untrusted.
+            stem: &crate::util::filename_component(entry.display_id.as_str()),
             attempt: request.attempt.0,
             // §11.4's brief, when there is one. A first dispatch has no
             // feedback and passes `None`; a retry passes what the attempts

@@ -372,6 +372,33 @@ pub fn select(fold: &TopologyFold, ceiling: &Ceiling, spend: &Spend) -> Step {
         return Step::Closure(fold.derived_outcome());
     };
 
+    // **An ending run offers no work, whatever else is live.**
+    //
+    // `loop` says a breach "appends `budget_exceeded` before any effect and
+    // **proceeds to closure**", and a halted run is the same shape one cause
+    // over. `run_is_ending()` is `halted_at.is_some() || budget_stop_is_current()`.
+    //
+    // **One guard, at the top, rather than one per arm** — and that placement is
+    // the repair rather than an implementation detail. Three of the eligibility
+    // predicates already embed `!run_is_ending()` inside themselves
+    // (`ready`, `ready_retry`, `integration_admissible`) and the fourth,
+    // `open_no_attempt`, does not: it is a *statement* accessor whose doc
+    // correctly declines to consult run state, and recovery step (g) depends on
+    // that — (g) runs before `run_resumed` increments the epoch, so a
+    // budget-stopped run whose reader refused would silently skip rebuilding its
+    // worktrees. Patching the one arm would leave the next arm to be written in
+    // the same position as `open_no_attempt` was.
+    //
+    // Found by round 3's `loop` lens, measured end to end: five consecutive
+    // `step()` calls each returned `Progress::BudgetExceeded` and appended a
+    // duplicate stop record, because the continuation was offered, refused by
+    // the ceiling, and offered again — a run that never terminates. With
+    // `halted_at` set the same path returned `Dispatch { continuing: true }`: a
+    // halted run spawning a worker.
+    if fold.run_is_ending() {
+        return Step::Closure(fold.derived_outcome());
+    }
+
     if let Some(candidate) = eligible_integration(fold) {
         // The **run** ceiling, and not the task's. `BudgetExceeded4::key` is
         // "the task whose next attempt was refused. Not a failed task:
@@ -1534,6 +1561,77 @@ mod tests {
             select(&stopped, &Ceiling::unlimited(), &no_spend()),
             Step::Closure(DerivedOutcome::Ending(RunOutcome::BudgetExceeded))
         );
+    }
+
+    /// **An ending run offers no work — for every arm, not for the empty fold.**
+    ///
+    /// `an_ending_run_reaches_closure` already asserts this, and asserts it only
+    /// where **nothing else is live**. That is the scoping gap round 3
+    /// harvested: the property being claimed is "an ending run proceeds to
+    /// closure", and the fixture only ever tested "an idle ending run does".
+    ///
+    /// `PR7-R3-LOOP-001` is what got through it. `TopologyFold::open_no_attempt`
+    /// is a statement accessor and — correctly, and unlike `ready`,
+    /// `ready_retry` and `integration_admissible` — consults no run state, so
+    /// the continuation arm offered work on a budget-stopped run. Measured end
+    /// to end by that lens: five `step()` calls, five duplicate
+    /// `budget_exceeded` records, no closure; and with `halted_at` set,
+    /// `Dispatch { continuing: true }` — a halted run spawning a worker.
+    ///
+    /// So the witness is written over **every arm that can offer work**, each
+    /// with its own precondition satisfied and the run ending. An arm added
+    /// later fails this the moment it is reachable, which the one-arm version
+    /// could not do.
+    #[test]
+    fn an_ending_run_offers_no_work_from_any_arm() {
+        // Each case: a fold where THIS arm is live, then the same fold ended.
+        // The `live` assertion is the premise — without it a case could pass
+        // because its arm was never eligible in the first place.
+        /// A fixture builder for one arm, named for the failure message.
+        type Arm = (&'static str, fn() -> TopologyFold);
+
+        let cases: Vec<Arm> = vec![
+            ("continuation (OpenNoAttempt)", || {
+                let mut fold = started();
+                apply(&mut fold, &dispatch(ALEPH, 0));
+                fold
+            }),
+            ("ready dispatch", started),
+            ("ready retry (RetainedIdle)", || {
+                let mut fold = started();
+                retained_generation(&mut fold, BET, 0);
+                fold
+            }),
+        ];
+
+        for (name, build) in cases {
+            let live = build();
+            assert!(
+                !matches!(
+                    select(&live, &Ceiling::unlimited(), &no_spend()),
+                    Step::Closure(_)
+                ),
+                "{name}: the arm is not live before the run ends, so ending it \
+                 proves nothing"
+            );
+
+            let mut ending = build();
+            apply(
+                &mut ending,
+                &super::super::settle::tests::budget_exceeded(Epoch(0), GIMEL),
+            );
+            assert!(
+                matches!(
+                    select(&ending, &Ceiling::unlimited(), &no_spend()),
+                    Step::Closure(_)
+                ),
+                "{name}: an ending run offered work. `loop` says a breach \
+                 proceeds to closure, and a run that keeps selecting an arm it \
+                 then refuses appends a duplicate stop record every iteration \
+                 and never terminates: {:?}",
+                select(&ending, &Ceiling::unlimited(), &no_spend())
+            );
+        }
     }
 
     /// The hard-block branch: open questions and nothing else runnable.
