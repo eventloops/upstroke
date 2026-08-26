@@ -1663,3 +1663,97 @@ first gate run"*. Two things this occurrence adds to it:
    *phantom failure in the one test this session was about to repair* — which is the
    direction that costs an hour. The other direction hides a real defect and costs more.
    **A suite run that follows a review round is cleaned, not trusted.**
+
+
+## 20. PR7 S5 round 4 — the disposition of all 27, and what is carried past it
+
+§19 is the eight false claims. This is every finding of that round with where it
+went, and the backlog behind it. **Twenty-six of the 27 are closed in-slice; one
+is carried with an owner.** Each closure names the commit that carries its
+witness, and every mutation round 4 measured as surviving has been re-run against
+the repaired tree and killed.
+
+### The 27, by lens
+
+| id | sev | disposition |
+|---|---|---|
+| `PR7-R4-LOOP-001` · `PR7-R4-CONTRACT-001` · `R4-SEAMS-002` · `PR7-R4-ATTEMPT-004`(a) | P1 | **Repaired, `59cde4d`.** The census read `attempt.rs`/`settle.rs`; the literal `None` was in `run.rs`. Restoring it left the whole suite green — re-measured here. `the_retaining_incarnation_retries_in_place` now seeds a pool and asserts it on **both** `attempt_started` appends, which is the behavioural witness `79cd9c8` said was unavailable |
+| `PR7-R4-ATTEMPT-001` · `PR7-R4-CONTRACT-002` · `R4-SEAMS-001` · `PR7-R4-SETTLE-001` | P1/P2 | **Repaired, `21f1de0` and `faf0158`.** Three holes in one census: the substring collision (`expected_refs(` ⊂ `refuse_unexpected_refs(`), the fourteen out-of-line test files reading as production, and three unrelated items named `settle_interrupted`. Closed by a boundary-aware needle, a test-file skip with a control that it is in force, and a per-entry **call form**. Each name must now also be defined. All three of round 4's mutations re-run and killed |
+| `PR7-R4-LOOP-002` · `PR7-R4-SETTLE-002` · `PR7-R4-CONTRACT-006` | P2 | **Repaired, `5a08f19` and `faf0158`.** The ending witness drove three of six arms while its doc said every. All six now, with `arm_label` total over `Step` so a seventh is a compile error, and `a_halted_run_offers_no_work_from_the_arms_that_rest_on_the_guard` pins the guard's other disjunct — round 4 measured `&& halted_at().is_none()` surviving the whole suite twice |
+| `PR7-R4-LOOP-003` | P3 | **Repaired, `5a08f19`.** `an_ending_run_reaches_closure` does not exist; the real predecessors are named |
+| `PR7-R4-LOOP-006` | P3 | **Repaired, `21f1de0`.** The census's doc now states what it does **not** cover, `Spend::replay` first among them |
+| `PR7-R4-ATTEMPT-002` · `PR7-R4-SETTLE-003` | P2 | **Repaired, `59cde4d`.** The reviewer-pool fixture's implementer and reviewer shared an agent, so both behaviours passed. It binds `REVIEW_AGENT` now and asserts that premise before the claim, so it cannot degrade back |
+| `PR7-R4-ATTEMPT-003` · `PR7-R4-SETTLE-004` | P2 | **Repaired, `59cde4d`.** `capacity::pool_for` had three call sites in `assembly.rs`; the two copies were character-for-character the seam's body and now go through it. `the_frozen_pool_table_is_read_through_one_seam` holds the count at one |
+| `PR7-R4-ATTEMPT-004`(b) | P2 | **Repaired, `59cde4d`.** "No driver fixture can reach the arm" — one does, and it is now the witness |
+| `PR7-R4-CONTRACT-003` | P2 | **Repaired, `6f71b64`.** The pre-clean's second caller. `preclean_names` now refuses a name that is not this build slot's, so a third caller cannot repeat it |
+| `PR7-R4-ATTEMPT-005` · `PR7-R4-CONTRACT-004` · `R4-SEAMS-003` | P2/P3 | **Repaired, `faf0158`.** The stem census took its value to the first comma and matched field initializers only, so it could not see `coordinator.rs:537` — the **live legacy path**, where dropping the sanitiser left the whole suite green |
+| `PR7-R4-CONTRACT-005` · `PR7-R4-SETTLE-005` | P3 | **Repaired, `faf0158`.** The allowance census's needle missed `+=` |
+| `PR7-R4-LOOP-005` | P3 | **Repaired, `faf0158`.** `RunAs`'s doc said "fresh generation"; the continuation path is not one |
+| `R4-SEAMS-004` · `R4-SEAMS-005` | P3 | **Repaired, `faf0158`.** A §4 count cell that contradicted its own row, and a §4 row orphaned from the table by a blank line |
+| `PR7-R4-LOOP-004` | P3 | **Carried — see below.** `Closure(NotEnding)` on the ending path |
+
+### The one carried, and why
+
+**`PR7-R4-LOOP-004`: `select` can return `Closure(DerivedOutcome::NotEnding)`.**
+`RunState::derived_outcome` returns `NotEnding` whenever a generation blocks run
+end, and an `OpenNoAttempt` generation does — which is exactly the fold the
+ending guard was written for. `Step::Closure`'s own doc says "run-end closure is
+due, with the outcome the fold derives", so the value contradicts itself, and
+`checkpoint` then refuses with "closure derives NotEnding" to the operator of a
+run that is in fact budget-stopped.
+
+**Owner: the slice that implements closure — PR8/PR10.** Carried rather than
+repaired for two reasons, both stated so the next slice does not have to
+re-derive them. The behaviour is masked here: this build refuses run-end closure
+outright (`checkpoint_refusals`), so no run acts on the value. And the repair is a
+choice this slice has no standing to make — either closure closes the open
+generation first and re-derives, or `derived_outcome` learns to answer for a run
+that is ending with work still open. The second changes a `src/topology/**`
+reader and the first is closure's own shape. What is owed with it is the
+diagnostic: whatever PR8 chooses, an operator told "closure derives NotEnding"
+about a budget-stopped run is being told the wrong thing.
+
+### Round 3's carried P2/P3s, confirmed against the tree
+
+Six were confirmed still true and repaired in `9b6fef1` — `PR7-R3-EMIT-003`,
+`-004`, `-005`, `PR7-R3-CONTRACT-006`, `-007` and `PR7-R3-LOOP-003`, the last of
+which was a measured surviving mutation on `loop`'s branch order. The rest are
+carried, each with what would close it:
+
+| id | why it is carried |
+|---|---|
+| `PR7-R3-ATTEMPT-002-REVIEWERS-TAKE-NO-SLOT` | A review pass reaches the Runner through the `ReviewPasses` seam with a raw `&dyn Runner`, so it takes no slot. **R3 is "assertion only" at `max_parallel = 1`** and this slice ships that width, so nothing can over-subscribe. It becomes live with PR11's parallelism, and the repair is a seam change — the reviewer path taking the same `SlotAssertion` — not a line. Owner: **PR11** |
+| `PR7-R3-ATTEMPT-003-RESIDUE-DISCARD-UNREACHED` | The snapshot worktree's ephemeral commit is reachable after a coordinator death mid-attempt, and nothing discards it. Owner: **the slice that owns snapshot reclaim**. Carried because the repair needs a reclaim path this slice does not have, and because the residue is inside the run's own private root |
+| `PR7-R3-ATTEMPT-004-NO-TRANSCRIPT-NO-GATE-LOG` | §11.1's feedback is intact — `judge` builds the gate tail and the retry is told — but nothing on the schema-4 path writes `transcripts/<stem>-<attempt>.json`, so the **operator-facing** evidence the legacy engine wrote is absent. A real capability gap, not a defect in what exists. Owner: **project owner, for the G2 erratum list**, with `PR7-FEEDBACK-NOT-DURABLE-IN-SCHEMA-4` in §2, which is the same shape one artifact over |
+| `PR7-R3-EMIT-006-DEFER-ROUND-IS-A-BACKOFF-ROUND` | `DeferWaitElapsed4.round` is documented as "Which sleep this was, **counted across the run**" and is filled from `Deferral::round`, which `progressed()` resets — a backoff round. The doc that is wrong is `src/topology/events.rs:1283`, **frozen for this slice**. Not edited, per the standing rule; the erratum text is the field's own doc replaced by "consecutive waits where deferred work was the only runnable work". Owner: **project owner** |
+| `PR7-R3-SETTLE-LADDER-POSITION-RUNG-HALF` | The `rung` half of `ladder_position`'s accumulator, filed in §4's "an accumulator's witness proves the accumulation and not the read" row at 4 occurrences. Owner: **PR8** |
+| `PR7-R3-CONTRACT-004-UNRESOLVED-INDEX-REFUSAL-UNREACHABLE` | `expected_failures_refusals` names "empty-diff **and unresolved-index** attempt failures"; the empty-diff half is produced and named, the unresolved-index half has no fixture that reaches it. Owner: **project owner**, as a G2 erratum question — whether the clause is this slice's at all |
+| `PR7-R3-SETTLE-CAND-OBJ-REFUSAL-UNREACHABLE` | **Closed by `cf7bdb5`**, and confirmed here: `refuse_unexpected_refs` has a production caller in `run_recovery_order` (`recover.rs:1735`) and `expected_refs` derives its entitlement at `:1732`. Recorded rather than dropped, because the round-3 report predates the repair |
+
+### Round 2's carried items, unchanged
+
+`PR7-PIPELINE-008` (§2, `PR7-STEP-D-LINEAGE-ARM-UNWITNESSED`) and
+`PR7-PIPELINE-014` are unchanged in disposition and unchanged in evidence: the
+first is unreachable until PR8's merge queue spawns a repair, measured over
+`effects::production_code`; the second is a "held across" claim that needs a
+paused run, which is `PR5-R2-WORKTREE-LOCK-RETENTION`'s shape.
+
+### `R3-SEAMS-006`'s residual
+
+Unchanged, and it is in §2 as `R3-SEAMS-006-ATT003-REPAIRED-POSTHOC`. The claim
+as described is refuted with the item and lines inspected; the residual — whether
+a Runner-**spawned**-but-unreportable process belongs in the invocation ledger —
+is a real `permits.protocol` question and is the owner's.
+
+### One consolidation this round's repairs leave behind
+
+`every_packet_named_recovery_action_has_a_production_caller` skips out-of-line
+test files by file stem; `runner::tests::production_sources` does the same job
+through `effects::census_domain::declared_whole_file_test_modules`, which derives
+the set from the crate's own `#[cfg(test)] mod …;` declarations and asserts it
+found at least thirteen. **Two idioms for one rule**, and the second is the
+better one. Not unified here because the neighbouring census in the same file —
+`the_barrier_is_the_only_topology_route_from_a_proven_prefix_to_an_append_handle`
+— uses the file-stem skip too, so the change is one edit across both plus a
+decision about where the shared walk lives. `R4-SEAMS-001` named the seam and it
+is right. Owner: **whichever slice next opens `effects::census_domain`**.
