@@ -5662,6 +5662,115 @@ fn the_retaining_incarnation_retries_in_place() {
     );
 }
 
+/// **A step that refused holds no entitlement afterwards.**
+///
+/// `permits.protocol` is "every Runner process registered exactly once, settled
+/// exactly once", and `append_error_protocol`'s obligation (2) is
+/// `Reservations::cancel_any` on any outcome-unknown path. Three catalogue
+/// entries take an entitlement **before** the step that can refuse and leak it
+/// on the refusing path — `PR7-PIPELINE-014` (the `Dispatch` take moved into the
+/// `Ok` arm), `PR7-SELECT-024` (a `Retry` reservation taken before `select`),
+/// `PR7-SELECT-033` (an `Integration` pair taken before `checkpoint` refuses) —
+/// and all three were green, because nothing asked the ledger anything after a
+/// refusal.
+///
+/// The budget breach is the refusal this drives, because it is the one a fixture
+/// can reach without arming an injection: seed a settled attempt that cost
+/// something, resume, and set a ceiling below it. That the spend is visible at
+/// all is itself new — `Spend::replay` had no production caller until `6d3fc6f`.
+#[test]
+fn a_refused_step_leaves_no_entitlement_held() {
+    use crate::engine::topology::run::{Progress, RunSeams, TopologyRun};
+    use crate::engine::topology::select::Ceiling;
+
+    let fixture = Fixture::build(
+        "refused-entitlement",
+        Damage {
+            extra: vec![
+                dispatched(),
+                attempt_started(1),
+                attempt_finished(
+                    1,
+                    AttemptSettlement::Closed {
+                        transition: SettlementTransition::Retry,
+                        lease: LeaseDisposition::PredictedReleased,
+                    },
+                ),
+            ],
+            ..Damage::default()
+        },
+    );
+
+    let harness = harness();
+    let runtime = runtime_holding_the_record();
+    let certifies = AlwaysCertifies;
+    let given = Given::healthy(&fixture, &runtime, &certifies);
+    let (outcome, _) = resume_holding(&fixture, &harness, &given);
+    let (_recovered, handle) = outcome.expect("the healthy resume completes");
+
+    // A ceiling the log's own spend has already passed.
+    let mut run = TopologyRun::resumed(
+        handle,
+        fixture.inputs(),
+        Ceiling {
+            run_usd: Some(0.000_001),
+            task_usd: None,
+        },
+    );
+    assert!(
+        run.spend().run_total() > 0.000_001,
+        "the seeded attempt must cost more than the ceiling, or this test drives \
+         an ordinary dispatch and asserts nothing about a refusal"
+    );
+
+    let mut hooks = HarnessTopologyHooks::new(Arc::clone(&harness));
+    let sleeper = RecordingSleeper::default();
+    let manager = fixture.manager();
+    let runner = RecordingRunner::editing();
+    let adapters = crate::engine::topology::scaffold::ScaffoldAdapters::new();
+    let paths = crate::rundir::RunPaths::with_private_root(
+        &fixture.repo_root,
+        &fixture.started.run_id,
+        &fixture.private_root,
+    );
+    paths.create().expect("the run directories are creatable");
+    let plans = crate::engine::assembly::FrozenPlans {
+        adapters: &adapters,
+        paths: &paths,
+        gates: &[],
+        pools: &[],
+        caps: &[],
+        worker_timeout: std::time::Duration::from_secs(300),
+        decisions: &[],
+    };
+    let seams = RunSeams {
+        manager: &manager,
+        clock: &Frozen,
+        sleeper: &sleeper,
+        runner: &runner,
+        adapters: &adapters,
+        paths: &paths,
+        plans: &plans,
+        reviews: &crate::engine::attempt::LegacyReviewPasses,
+        input_policy: &crate::engine::attempt::LegacyReviewInputPolicy,
+        answers: &crate::interaction::UnattendedAnswers,
+        ids: &FixedIds,
+        halts_run: false,
+    };
+
+    let progress = run.step(&seams, &mut hooks).expect("the ceiling refuses");
+    assert!(
+        matches!(progress, Progress::BudgetExceeded),
+        "the seeded spend did not breach the ceiling: {progress:?}"
+    );
+    assert!(
+        !run.holds_entitlement(),
+        "the refused step is still holding a pipeline entitlement. At \
+         `max_parallel = 1` that is the whole pipeline, held by a step that \
+         did nothing"
+    );
+}
+
 /// **A retried worker is told what the last one failed on.**
 ///
 /// §11.4, quoted on `PlanRequest::feedback` itself: "failure feedback goes back

@@ -668,6 +668,26 @@ impl TopologyRun {
         self.identity.committed_first_line_sha256.as_deref()
     }
 
+    /// Whether this run is still holding a pipeline entitlement.
+    ///
+    /// The `Reservations` counterpart of [`Self::invocations_balance`], and it
+    /// exists for the same reason: `permits.protocol` is "registered exactly
+    /// once, settled exactly once", and a claim about a ledger is checkable
+    /// only if something can ask the ledger.
+    ///
+    /// **A step that refused must leave nothing held.** Three catalogue entries
+    /// — `PR7-PIPELINE-014`, `PR7-SELECT-024`, `PR7-SELECT-033` — take an
+    /// entitlement before the step that can refuse and leak it on the refusing
+    /// path, and all three were green because no test asked this question.
+    #[must_use]
+    pub fn holds_entitlement(&mut self) -> bool {
+        // `cancel_any` reports whether there was one *and* releases it, which
+        // is exactly right here: the run is being inspected after the step it
+        // was supposed to have released on, and leaving it held would make the
+        // next assertion in the same test read a stale ledger.
+        self.reservations.cancel_any()
+    }
+
     /// Whether every Runner process this run registered was also settled.
     ///
     /// R4's "registered and settled exactly once", as a question a test can
