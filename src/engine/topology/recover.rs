@@ -1703,6 +1703,38 @@ pub fn run_recovery_order(
     // append".
     refuse_unimplemented_terminals(&certified, seams.manager)?;
 
+    // **`T-CAND-OBJ`'s other refusal**, and it belongs here for the same reason:
+    // `refusal_condition` is "pin symbolic or an unexpected ref under the run
+    // namespace", and a refusal after an append is not a refusal before one.
+    //
+    // `refuse_unexpected_refs` and `expected_refs` were both written, correct,
+    // and called only from their own tests — `expected_refs` derives the
+    // entitlement from the fold precisely so a ref with no durable record behind
+    // it is what fails, and nothing derived it. Round 3 reached this twice
+    // (`consumer`, Sol).
+    //
+    // **The citation matters and the obvious one is wrong.**
+    // `expected_failures_refusals[2]` naming "unexpected refs under the run
+    // namespace" is **`pr_sequence[6]`'s** contract, not this slice's — PR7's
+    // `[2]` is "empty-diff and unresolved-index attempt failures". What binds
+    // here is `transaction_fault_matrix[4].refusal_condition`, and PR7 owns that
+    // row.
+    {
+        let fold = fold_of(&certified);
+        let run_id = fold
+            .started()
+            .ok_or_else(|| UpstrokeError::Refused {
+                message: "the proven prefix has no run".to_owned(),
+            })?
+            .run_id
+            .clone();
+        let namespace = crate::engine::topology::candidate::run_namespace(&run_id);
+        let expected = crate::engine::topology::candidate::expected_refs(&run_id, fold);
+        seams
+            .manager
+            .refuse_unexpected_refs(&namespace, &expected)?;
+    }
+
     // T-RUNSTART's P7/P8 repair, after (f) and before the first append. The
     // module comment argues each bound; the one that is not merely tidy is (f),
     // because a prefix with an unresolved integration transaction can have its
@@ -2110,19 +2142,39 @@ pub fn finish_promotions(
 
     // Classified before anything is appended, from the fold as it stands. The
     // borrow ends here because the sequence below needs the chain mutably.
-    let unfinished: Vec<crate::engine::topology::candidate::PromotingCandidate> = {
+    // **Both products of the classification, not one.**
+    //
+    // `CandidateRecovery` carries a `promotion`, an `orphan_pin` and
+    // `settles_interrupted`, and an earlier draft of this function read only the
+    // first. That left `T-CAND-OBJ` (b)'s `resume_action` — "delete the exact
+    // orphan pin expected-old, after which the object is again Git's" —
+    // performed by nothing, with `prune_orphan_pin` written, correct, and called
+    // only from its own test. Round 3 found it three times over (`consumer`,
+    // `seams`, and Sol's independent `seams`), which is the classifier's answer
+    // being computed and dropped by its only caller.
+    let mut unfinished = Vec::new();
+    let mut orphans = Vec::new();
+    {
         let fold = fold_of(certified);
-        let mut found = Vec::new();
         for key in task_keys(fold) {
-            if let Some(promoting) =
-                crate::engine::topology::candidate::recovery_for(manager, &run_id, fold, key)?
-                    .promotion
-            {
-                found.push(promoting);
+            let recovery =
+                crate::engine::topology::candidate::recovery_for(manager, &run_id, fold, key)?;
+            if let Some(promoting) = recovery.promotion {
+                unfinished.push(promoting);
+            }
+            if let Some(orphan) = recovery.orphan_pin {
+                orphans.push(orphan);
             }
         }
-        found
-    };
+    }
+
+    // The prune is `T-CAND-OBJ` (b)'s and runs before the promotions: an orphan
+    // pin is one nothing durable names, so there is no promotion that could want
+    // it, and leaving it until after would leave a ref the closure procedure
+    // would then have to distinguish from its own.
+    for orphan in orphans {
+        crate::engine::topology::candidate::prune_orphan_pin(manager, context.hooks, orphan)?;
+    }
 
     let mut finished = Vec::new();
     for promoting in unfinished {

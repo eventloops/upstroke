@@ -7080,3 +7080,141 @@ impl crate::interaction::Sleeper for RecordingSleeper {
             .push(duration);
     }
 }
+
+/// **Every packet-named recovery action and refusal has a production caller.**
+///
+/// The class this slice produced more than any other, and the one census that
+/// closes it. Across three review rounds, ten separate things were found
+/// **built, correct, and never called**: `TopologyRun` itself, `settle_*`, the
+/// candidate sequence, `resume_open_no_attempt`, `Started`, `CandidateJournal`,
+/// `Spend::replay`, `complete_promotion`'s continuation, `prune_orphan_pin` and
+/// `refuse_unexpected_refs`.
+///
+/// Two of those were P0/P1 liveness defects — a converged promotion that stalled
+/// the run forever, and a resumed run that forgot its whole spend. The rest were
+/// coverage gaps that would have become defects the moment a caller appeared.
+/// Each was found separately, by a different reviewer noticing a different
+/// symptom, over four rounds.
+///
+/// **This asserts the property the packet states, rather than waiting for a
+/// reviewer to notice its absence.** A function that implements a
+/// `resume_action` or a `refusal_condition` and has no production caller is not
+/// an implementation of that clause — it is a plan to implement it.
+///
+/// The needle is the call, not the definition, and the region is
+/// `effects::production_code`, so a mention in a doc comment cannot satisfy it
+/// and a `#[cfg(test)]` caller cannot either — the two ways this census could
+/// pass while the clause stayed unperformed.
+#[test]
+fn every_packet_named_recovery_action_has_a_production_caller() {
+    /// (function, the packet clause it performs).
+    const CLAUSES: &[(&str, &str)] = &[
+        (
+            "prune_orphan_pin",
+            "transaction_fault_matrix[T-CAND-OBJ].resume_action (b): delete the exact orphan pin \
+             expected-old",
+        ),
+        (
+            "refuse_unexpected_refs",
+            "transaction_fault_matrix[T-CAND-OBJ].refusal_condition: an unexpected ref under the \
+             run namespace",
+        ),
+        (
+            "expected_refs",
+            "the entitlement `refuse_unexpected_refs` refuses against, derived from the fold",
+        ),
+        (
+            "complete_promotions",
+            "erratum E6: append candidate_prepared for a settled-but-unrecorded candidate",
+        ),
+        (
+            "finish_promotions",
+            "transaction_fault_matrix[T-CAND-REF].resume_action: verify, create the ref, append \
+             task_candidate_created, prune the pin",
+        ),
+        (
+            "recreate_open_no_attempt",
+            "transaction_fault_matrix[T-DISPATCH].resume_action: verify the worktree or recreate it",
+        ),
+        (
+            "settle_interrupted",
+            "transaction_fault_matrix[T-ATTEMPT].resume_action: append attempt_interrupted",
+        ),
+        (
+            "close_retained_idle",
+            "transaction_fault_matrix[T-RETAINED].resume_action: a fresh process closes it in \
+             recovery",
+        ),
+        (
+            "ensure_recorded_integration_ref",
+            "transaction_fault_matrix[T-RUNSTART].resume_action: P7/P8 create the ref zero-old at \
+             the recorded base",
+        ),
+        (
+            "refuse_unimplemented_terminals",
+            "checkpoint_refusals: refuse, before any append, any operation whose terminals this \
+             build does not implement",
+        ),
+        (
+            "resume_open_no_attempt",
+            "transaction_fault_matrix[T-DISPATCH].resume_action: continue attempt (no spend \
+             repeats)",
+        ),
+    ];
+
+    let sources: Vec<(String, String)> = {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let mut out = Vec::new();
+        let mut stack = vec![root.clone()];
+        while let Some(dir) = stack.pop() {
+            for entry in std::fs::read_dir(&dir).expect("src is readable") {
+                let path = entry.expect("a directory entry").path();
+                if path.is_dir() {
+                    stack.push(path);
+                    continue;
+                }
+                if path.extension().is_none_or(|ext| ext != "rs") {
+                    continue;
+                }
+                let relative = path
+                    .strip_prefix(&root)
+                    .unwrap_or(&path)
+                    .to_string_lossy()
+                    .replace('\\', "/");
+                let source = std::fs::read_to_string(&path).expect("a source file");
+                out.push((relative, crate::effects::production_code(&source)));
+            }
+        }
+        out
+    };
+    assert!(
+        sources.len() > 20,
+        "the walk found {} sources, so its zero counts would prove nothing",
+        sources.len()
+    );
+
+    let mut uncalled: Vec<String> = Vec::new();
+    for (name, clause) in CLAUSES {
+        let needle = format!("{name}(");
+        let calls: usize = sources
+            .iter()
+            .map(|(_, code)| {
+                code.match_indices(&needle)
+                    // Calls, not definitions.
+                    .filter(|(at, _)| !code[..*at].trim_end().ends_with("fn"))
+                    .count()
+            })
+            .sum();
+        if calls == 0 {
+            uncalled.push(format!("`{name}` performs `{clause}`"));
+        }
+    }
+
+    assert!(
+        uncalled.is_empty(),
+        "these implement a packet clause and nothing in production calls them, so the clause is \
+         not performed by any run — which is how this slice shipped a converged promotion that \
+         stalled forever and a resumed run that forgot its spend:\n  {}",
+        uncalled.join("\n  ")
+    );
+}
