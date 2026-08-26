@@ -125,13 +125,16 @@ pub struct EmitState<'a> {
     pub reservations: &'a mut Reservations,
     /// Where a torn-tail normalization at the protocol's reopen is reported.
     ///
-    /// **The two lines above this one used to be here too** — "The invocation
+    /// **Two lines that are no longer here used to be**: "The invocation
     /// ledger. Every still-running entry is cancelled by the protocol;
     /// cancelling the *processes* is the caller's." `bcc5c2f` deleted the
     /// `invocations: &'a mut InvocationLedger` field they documented and left
     /// them stranded on this one, so rustdoc rendered a warnings sink as a
     /// ledger. `PR7-R3-EMIT-003`; confirmed against the tree and removed
     /// 2026-08-26. `EmitState` has four fields and each now documents itself.
+    /// (The first draft of this note opened "the two lines **above this one**",
+    /// which resolves only against the version it replaced — S5 round 5's
+    /// `seams` lens, filed to the standards work-list.)
     pub warnings: &'a mut Vec<String>,
 }
 

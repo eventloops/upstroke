@@ -277,16 +277,19 @@ fn a_pre_clean_refuses_every_name_a_concurrent_run_could_also_ask_for() {
 
     assert_ne!(
         mine, theirs,
-        "this slot's key is `{STRANGERS}`, so the two halves of this test are the same name and          it asserts nothing"
+        "this slot's key is `{STRANGERS}`, so the two halves of this test are the same name and \
+         it asserts nothing"
     );
     assert!(
         super::fake::unscoped_names(&[&mine]).is_empty(),
-        "a name carrying this slot's own repo key was refused, so the pre-clean can no longer          reclaim the residue of a killed run in this slot — the only thing it is for"
+        "a name carrying this slot's own repo key was refused, so the pre-clean can no longer \
+         reclaim the residue of a killed run in this slot — the only thing it is for"
     );
     assert_eq!(
         super::fake::unscoped_names(&[&mine, &theirs]),
         vec![theirs.as_str().to_owned()],
-        "the refusal must name exactly the name it refused: a report that says only `some name`          sends the reader to the wrong caller"
+        "the refusal must name exactly the name it refused: a report that says only `some name` \
+         sends the reader to the wrong caller"
     );
 }
 

@@ -31,3 +31,22 @@ that cannot be salvaged is a work-list that gets re-derived.
 | Observation | File | Region sha256 | Standards section cited | Raised by / round |
 |---|---|---|---|---|
 | _(none yet)_ | — | — | — | — |
+
+## From S5 rounds 5 and 6 — the sweep's remit, not this merge's
+
+Round 5's five lenses returned **7 `standards` observations** under the shield. Three were
+things this session introduced and are repaired in-slice because they are mine; four are
+routed here.
+
+| observation | section cited |
+|---|---|
+| **A wrapped string literal without the `\`-continuation** leaves a run of eight or more spaces in the rendered message. Three new instances in the pre-clean witnesses were repaired; the class is **tree-wide and predates this slice** — `rundir.rs:5194`, `rundir.rs:5203`, `workspace_manager.rs:5536`, `workspace_manager.rs:7015`, `effects/tests.rs:1787`, `effects/tests.rs:1800` among them. A `grep -rnP '"[^"]*\s{8,}'` over `src/` is the whole sweep | no citable section |
+| **`each_census_needle_covers_the_domain_its_doc_states` has a whole-tree name for a test over two helpers** local to `runner::tests`. The name promises more than the body | no citable section |
+| **`the_frozen_pool_table_is_read_through_one_seam`'s headline is unscoped and its needle is one file.** The assertion message scopes itself; the name does not | no citable section |
+| **The two ending-guard witnesses use opposite idioms for one rule**, and one's doc argues against the idiom its neighbour uses | no citable section |
+
+The two that were repaired rather than routed, because a false sentence is not a style
+preference: `emit.rs`'s repaired field doc opened "the two lines **above this one**", which
+resolves only against the version it replaced; and `AttemptContext::start`'s historical note
+sat inside its `# Errors` section, so rustdoc rendered provenance as part of the error
+contract.
