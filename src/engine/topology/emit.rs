@@ -36,10 +36,14 @@
 //! 2. Provisional reservations are cancelled ([`Reservations::cancel_any`]) —
 //!    `permits`: "cancellation on any pre-append failure, run end, shutdown, or
 //!    a poisoned fold".
-//! 3. In-flight invocations are cancelled. The Runner side of that is the
-//!    caller's ("in-flight invocations are cancelled through the Runner");
-//!    [`InvocationLedger::cancel_all_running`] is the ledger side and is this
-//!    module's.
+//! 3. In-flight invocations are cancelled, and **both halves are the
+//!    caller's**. The Runner side always was ("in-flight invocations are
+//!    cancelled through the Runner"); the ledger side moved out of this module
+//!    in `bcc5c2f`, which deleted `EmitState`'s `invocations` field and made
+//!    [`AppendError`] carry the obligation to its constructor instead — see
+//!    [`UncancelledAppend`]'s own note, which has said so since. This sentence
+//!    still claimed the ledger side "is this module's". Frontier review of
+//!    `75da796`, finding 5.
 //! 4. **No retry, no cleanup, and no report, status or question payload derived
 //!    from the poisoned fold.** There is no code here that does any of them,
 //!    which is the only way to state that clause.

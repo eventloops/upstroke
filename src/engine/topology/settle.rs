@@ -106,13 +106,28 @@ pub struct Settled {
     /// The **allowance decision**: whether this settlement spent one of the
     /// rung's `attempts_per`.
     ///
-    /// An outage deferral spends none — `ladder::next_step` defers precisely
-    /// so that "retrying would burn attempts on a run that never got a
-    /// verdict" does not happen — and every other settlement spends one. It is
-    /// not a field of the event because the fold derives the attempt count
-    /// from `attempt_started`; it is returned because it is the input the
-    /// *next* ladder decision reads, and deriving it twice from two different
-    /// places is how the two disagree.
+    /// **Five kinds spend nothing, not one.** This said "an outage deferral
+    /// spends none … and every other settlement spends one", and
+    /// `ladder::spends_allowance` — the single authority, total over
+    /// `FailureKind` — answers `false` for **`NeedsHuman`, `NoChain`,
+    /// `Interrupted` and `Declined`** as well. The rule those four share is the
+    /// one §2's `PR3-ATTEMPT-SHAPE` ruling states: *an attempt spends one of its
+    /// rung's `attempts_per` iff the worker ran and produced work to judge.* A
+    /// declined task, an exhausted chain, an interruption and a reviewer asking
+    /// for a person are each a case where nothing was judged. The outage
+    /// deferral is the fifth and the only one this sentence named.
+    ///
+    /// **And the fold derives it when applying `attempt_finished`, not
+    /// `attempt_started`** — `TopologyFold::apply_settlement` calls
+    /// `spends_allowance` on the settled record. Counting at the settlement is
+    /// what makes `T-ATTEMPT`'s refund the *absence of a charge* rather than a
+    /// correction, which is the whole contrast with the legacy tracker's seven
+    /// write sites.
+    ///
+    /// It is returned rather than carried on the event because it is the input
+    /// the *next* ladder decision reads, and deriving it twice from two
+    /// different places is how the two disagree. Frontier review of `75da796`,
+    /// finding 5.
     pub spent_attempt: bool,
 }
 

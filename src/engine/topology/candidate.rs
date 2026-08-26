@@ -96,11 +96,22 @@
 //! checked out. Calling it would add a Git subprocess per candidate to answer a
 //! question whose answer is fixed by where the ref lives.
 //!
-//! # Nothing here is a production path yet
+//! # What "no production path" means here, precisely
 //!
-//! `decisions.pr_sequence[8].production_effect` is "none". These functions are
-//! reached by this module's own suite; the schema-4 coordinator that will call
-//! them is the rest of PR7.
+//! `decisions.pr_sequence[8].production_effect` is "none", and that is true of
+//! the **shipped binary**: `upstroke run` drives the legacy coordinator and
+//! reaches nothing in this file.
+//!
+//! It stopped being true as written. This section said "nothing here is a
+//! production path yet … the schema-4 coordinator that will call them is the
+//! rest of PR7", and that coordinator **arrived in this slice**:
+//! `TopologyRun::promote_candidate` calls `write_candidate_commit`,
+//! `pin_candidate`, `append_candidate_prepared`, `create_candidates_ref`,
+//! `append_candidate_created` and `reclaim_after_creation`, and
+//! `recover::finish_promotions` calls the last three. They are non-`#[cfg(test)]`
+//! callers; what keeps the effect "none" is that `engine::topology` is
+//! `pub(crate)` and no shipped command drives it, not that the callers do not
+//! exist. Frontier review of `75da796`, finding 5.
 
 use std::path::Path;
 
