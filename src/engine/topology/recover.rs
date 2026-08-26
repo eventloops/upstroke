@@ -1595,6 +1595,15 @@ pub struct Recovered {
     /// The `Promoting` generations whose `candidate_prepared` this resume
     /// appended — erratum **E6**'s convergence. Empty on a healthy resume.
     pub promoted: Vec<TaskKey>,
+    /// The promotions this resume carried through to `task_candidate_created`
+    /// — `T-CAND-REF`'s continuation, which E6 defers to.
+    ///
+    /// A **superset** of `promoted` and reported separately for that reason: the
+    /// two windows the continuation serves are told apart by which list a key is
+    /// in, and a key in `promoted` but not here is a convergence that entered the
+    /// sequence and did not leave it — which is precisely the stall this field
+    /// exists to make visible rather than silent.
+    pub finished: Vec<TaskKey>,
     /// (g): every `OpenNoAttempt` generation rebuilt, and whether its worktree
     /// verified or had to be recreated. A value rather than a count, because
     /// "the step ran" and "the step ran and found nothing to do" are the two
@@ -1730,6 +1739,12 @@ pub fn run_recovery_order(
     // terminal and one of the two `checkpoint_refusals` authorises.
     let promoted = complete_promotions(&mut certified, seams.manager, &mut context)?;
 
+    // E6's "then continue as `T-CAND-REF`", and `T-CAND-REF`'s own window with
+    // it. The append above is the entry to that row's four-step sequence; this
+    // is the rest of it, and without it a converged generation stalls at
+    // `Promoting` with nothing in the loop able to advance it.
+    let finished = finish_promotions(&mut certified, seams.manager, &mut context)?;
+
     // (g) — after (e) and before (h), the packet's own position. A worktree
     // effect and not an append, so it takes no `EmitContext`; the borrow of
     // `hooks` that `context` holds ends here for the same reason the step must
@@ -1746,6 +1761,7 @@ pub fn run_recovery_order(
             interrupted,
             retained_closed,
             promoted,
+            finished,
             recreated,
             steps,
             resumed,
@@ -2028,6 +2044,136 @@ pub fn complete_promotions(
         converged.push(key);
     }
     Ok(converged)
+}
+
+/// **The continuation `T-CAND-REF`'s `resume_action` names, and E6 defers to.**
+///
+/// The row's own words are a four-step sequence, not one append: *"verify
+/// object; create exact candidates ref zero-old if absent; append
+/// `task_candidate_created`; prune the pin (no spend repeats); the closure
+/// procedure performs the same steps at any run end"*. Erratum **E6** moved the
+/// row's boundary back to the settlement and says of the earlier window "append
+/// `candidate_prepared`, **then continue as `T-CAND-REF`**" — so the append
+/// [`complete_promotions`] makes is the *entry* to this sequence and never the
+/// whole of it.
+///
+/// # What this repairs, and it was a stall rather than a wrong answer
+///
+/// Without it, a converged generation sat at `Promoting` forever. Nothing else
+/// finishes one: `TopologyRun`'s only promotion call is on the **settle** path,
+/// which a resumed run never reaches, and `select` has no branch that advances a
+/// `Promoting` generation — `eligible_integration` wants `task_candidate_created`,
+/// `first_ready_retry` wants `RetainedIdle`, and `RunState::ready` wants
+/// `task.open().is_none()`. `Promoting` holds a pipeline entitlement, so at
+/// `max_parallel = 1` the stall took every other task with it.
+///
+/// It was also a **regression against a refusal**: before E6,
+/// [`refuse_unimplemented_terminals`] refused any `Promoting` generation before
+/// any append. Narrowing that refusal without implementing the continuation
+/// traded a clean pre-append refusal for a silent permanent stall, which is the
+/// worse of the two by the project's own ordering — a refusal is a resumable
+/// end, and this was not an end at all.
+///
+/// # Both windows, one sequence
+///
+/// [`recovery_for`] classifies an unfinished promotion from the **durable
+/// record**, so this covers the generation [`complete_promotions`] just appended
+/// for *and* the ordinary `T-CAND-REF` window — a run killed between
+/// `candidate_prepared` and `task_candidate_created`, which needs no erratum and
+/// reached the same dead end. Two windows, one continuation, because the row
+/// describes one.
+///
+/// # Idempotent, because the row requires it
+///
+/// Each half already refuses to repeat itself: `create_candidates_ref` accepts a
+/// ref already at the recorded SHA, `append_candidate_created` is skipped once
+/// the generation has left `Promoting`, and `reclaim_after_creation` prunes the
+/// pin only while it is there. That is what lets "the closure procedure performs
+/// the same steps at any run end" be one function rather than two.
+///
+/// # Errors
+///
+/// Any refusal of the three halves — a missing or mismatched object, a ref at
+/// another SHA — or whatever the append returns.
+pub fn finish_promotions(
+    certified: &mut PreflightCertified,
+    manager: &WorkspaceManager,
+    context: &mut EmitContext<'_>,
+) -> Result<Vec<TaskKey>, UpstrokeError> {
+    let run_id = fold_of(certified)
+        .started()
+        .ok_or_else(|| UpstrokeError::Refused {
+            message: "the proven prefix has no run".to_owned(),
+        })?
+        .run_id
+        .clone();
+
+    // Classified before anything is appended, from the fold as it stands. The
+    // borrow ends here because the sequence below needs the chain mutably.
+    let unfinished: Vec<crate::engine::topology::candidate::PromotingCandidate> = {
+        let fold = fold_of(certified);
+        let mut found = Vec::new();
+        for key in task_keys(fold) {
+            if let Some(promoting) =
+                crate::engine::topology::candidate::recovery_for(manager, &run_id, fold, key)?
+                    .promotion
+            {
+                found.push(promoting);
+            }
+        }
+        found
+    };
+
+    let mut finished = Vec::new();
+    for promoting in unfinished {
+        let key = promoting.candidate().key;
+        let generation = promoting.candidate().generation;
+        let slot = crate::engine::topology::dispatch::task_slot(key, generation);
+
+        // The three halves alternate between the hooks bundle and the journal,
+        // exactly as they do in the driver: the journal must hold the bundle to
+        // append, and the effect halves need it back. The typestate carries the
+        // order — only `create_candidates_ref` makes a `ReferencedCandidate`,
+        // and only that makes an `append_candidate_created` callable.
+        let referenced = crate::engine::topology::candidate::create_candidates_ref(
+            manager,
+            &mut *context.hooks,
+            promoting,
+        )?;
+        let created = {
+            let mut journal = RecoveryJournal { certified, context };
+            crate::engine::topology::candidate::append_candidate_created(&mut journal, referenced)?
+        };
+        crate::engine::topology::candidate::reclaim_after_creation(
+            manager,
+            &mut *context.hooks,
+            &slot,
+            created,
+        )?;
+        finished.push(key);
+    }
+    Ok(finished)
+}
+
+/// The recovery's chain, lent to the candidate sequence as a [`CandidateJournal`].
+///
+/// The sequence is written once and runs from two places — the driver on the
+/// settle path and the recovery on resume — so what differs between them is the
+/// journal and not the steps. `TopologyRun::with_journal` is the driver's half of
+/// the same idea; this is the recovery's.
+struct RecoveryJournal<'c, 'e, 'x> {
+    certified: &'c mut PreflightCertified,
+    context: &'e mut EmitContext<'x>,
+}
+
+impl crate::engine::topology::candidate::CandidateJournal for RecoveryJournal<'_, '_, '_> {
+    fn emit(&mut self, body: TopologyEventBody) -> Result<(), UpstrokeError> {
+        emit(self.certified, self.context, body)
+    }
+
+    fn fold(&self) -> &TopologyFold {
+        fold_of(self.certified)
+    }
 }
 
 // ---------------------------------------------------------------------------

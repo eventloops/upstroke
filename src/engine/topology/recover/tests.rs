@@ -5839,6 +5839,159 @@ fn a_resume_converges_a_settled_candidate_that_was_never_recorded() {
     // The attempt record is the settlement's, not a fresh one: the convergence
     // reads it from the events the barrier itself parsed.
     assert_eq!(prepared.attempt.attempt, 1);
+
+    // -----------------------------------------------------------------------
+    // **And the row's continuation ran.** E6 says "append `candidate_prepared`,
+    // then continue as `T-CAND-REF`", and everything above this line witnesses
+    // only the append. The whole suite passed with the continuation absent —
+    // which is what left the converged generation stalled at `Promoting` with
+    // no loop branch able to advance it, and every other task blocked behind
+    // its pipeline entitlement at `max_parallel = 1`.
+    // -----------------------------------------------------------------------
+    assert_eq!(
+        recovered.finished,
+        vec![TaskKey(0)],
+        "the convergence entered `T-CAND-REF`'s sequence and did not leave it"
+    );
+
+    // "append task_candidate_created" — the durable half of the row's own
+    // resume_action, and the event `eligible_integration` waits for.
+    let events = TopologyFold::parse_log(&fixture.log_bytes()).expect("the log parses");
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| matches!(event.body, TopologyEventBody::TaskCandidateCreated { .. }))
+            .count(),
+        1,
+        "`task_candidate_created` is what fixes the FIFO position; without it the \
+         generation holds its entitlement forever"
+    );
+
+    // The generation has **left** `Promoting`. This is the assertion that speaks
+    // to the stall rather than to the paperwork: `select` has no branch for a
+    // `Promoting` generation, so while it stays there the run cannot progress
+    // whatever else is in the log.
+    let fold = TopologyFold::replay(fixture.inputs(), &events).expect("the converged log folds");
+    assert_ne!(
+        fold.task(TaskKey(0))
+            .and_then(|task| task.generations.last())
+            .map(|generation| generation.class.clone()),
+        Some(GenerationClass::Promoting),
+        "a generation still Promoting after recovery is the stall itself"
+    );
+
+    // "create exact candidates ref zero-old if absent" and "prune the pin", the
+    // row's two effect steps, in the repository rather than in the log.
+    let refs = crate::workspace_manager::fixture::git(
+        &fixture.repo_root,
+        &["for-each-ref", "--format=%(refname) %(objectname)"],
+    );
+    assert!(
+        refs.lines()
+            .any(|line| line.contains("candidates") && line.ends_with(commit.as_str())),
+        "the candidates ref is missing or at another sha:\n{refs}"
+    );
+    assert!(
+        !refs.contains("prepared"),
+        "the pin was not pruned:\n{refs}"
+    );
+}
+
+/// **"The closure procedure performs the same steps at any run end"** — twice.
+///
+/// `T-CAND-REF`'s `resume_action` ends with that sentence, and it is a claim
+/// about *repetition*: the continuation must be safe to run again on a
+/// generation it already finished. `candidate::tests::
+/// kill_after_candidate_prepared_appends_candidate_created_once` proves the
+/// once-ness at the unit level, by calling the sequence twice directly. This
+/// proves it where it actually repeats — a second **resume**, which is what a
+/// second crash produces.
+///
+/// The second run also exercises the path the first cannot: on resume one,
+/// `candidate_prepared` is appended by the convergence and finished in the same
+/// pass; on resume two it is already durable, which is `T-CAND-REF`'s *own*
+/// window rather than E6's. `recovery_for` reads the durable record either way,
+/// so the two windows differ only in who wrote the record — and this is the
+/// assertion that says so.
+#[test]
+fn a_second_resume_finishes_nothing_and_appends_nothing() {
+    let fixture = Fixture::build(
+        "e6-converges-twice",
+        Damage {
+            open_generation: true,
+            extra: vec![
+                attempt_started(1),
+                attempt_finished(
+                    1,
+                    AttemptSettlement::Closed {
+                        transition: SettlementTransition::Succeeded,
+                        lease: LeaseDisposition::PredictedRetained,
+                    },
+                ),
+            ],
+            ..Damage::default()
+        },
+    );
+    seed_candidate_commit(&fixture, 0);
+
+    let harness = harness();
+    let runtime = runtime_holding_the_record();
+    let certifies = AlwaysCertifies;
+
+    let given = Given::healthy(&fixture, &runtime, &certifies);
+    let (first, _) = resume_holding(&fixture, &harness, &given);
+    let (first, handle) = first.expect("the first resume converges and finishes");
+    assert_eq!(first.promoted, vec![TaskKey(0)]);
+    assert_eq!(first.finished, vec![TaskKey(0)]);
+
+    let after_first = TopologyFold::parse_log(&fixture.log_bytes()).expect("parses");
+    let created_once = after_first
+        .iter()
+        .filter(|event| matches!(event.body, TopologyEventBody::TaskCandidateCreated { .. }))
+        .count();
+    assert_eq!(created_once, 1);
+
+    // The first run's handle holds the worktree lock for the whole run, so a
+    // second resume while it lives is refused — correctly, and by the guard
+    // `PR5-R2-WORKTREE-LOCK-RETENTION` says nothing witnesses. Dropping it is
+    // what makes this a *second run* rather than a second driver.
+    drop(handle);
+
+    // The same fixture, resumed again — a second crash, or an operator running
+    // `resume` twice.
+    let second_harness = crate::engine::topology::recover::tests::harness();
+    let runtime2 = runtime_holding_the_record();
+    let given2 = Given::healthy(&fixture, &runtime2, &certifies);
+    let (second, _) = resume_holding(&fixture, &second_harness, &given2);
+    let (second, _handle2) = second.expect("the second resume is a no-op, not a refusal");
+
+    assert!(
+        second.promoted.is_empty(),
+        "the convergence ran again on a generation that already has its candidate"
+    );
+    assert!(
+        second.finished.is_empty(),
+        "the continuation ran again on a promotion that already left `Promoting`"
+    );
+
+    let after_second = TopologyFold::parse_log(&fixture.log_bytes()).expect("parses");
+    assert_eq!(
+        after_second
+            .iter()
+            .filter(|event| matches!(event.body, TopologyEventBody::TaskCandidateCreated { .. }))
+            .count(),
+        1,
+        "a second `task_candidate_created` is a line the fold refuses on the next replay — \
+         a log that cannot be resumed"
+    );
+    assert_eq!(
+        after_second
+            .iter()
+            .filter(|event| matches!(event.body, TopologyEventBody::CandidatePrepared { .. }))
+            .count(),
+        1,
+        "and a second `candidate_prepared` is the same defect one event earlier"
+    );
 }
 
 /// **The convergence is a resume, so its spend is the log's.**
