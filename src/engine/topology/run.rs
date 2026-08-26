@@ -459,10 +459,19 @@ pub struct RunSeams<'a> {
 /// announced.
 ///
 /// The difference between the two branches that run an attempt. A dispatch is
-/// always attempt one on rung zero with nothing to resume, and it appends
+/// attempt one of a **fresh generation**, at the rung the log records, carrying
+/// the task's accumulated brief, with nothing to resume, and it appends
 /// `attempt_started` itself; a retry is the generation's next attempt, may
 /// resume a session, and was already announced by `settle::retry` after the
 /// worktree verified.
+///
+/// **This sentence said "always attempt one on rung zero" with an empty brief,
+/// and both halves were falsified by the repairs that made them false.** The
+/// rung half by `6d3fc6f`, which made this arm read `ladder_position` and added
+/// a test asserting it dispatches at rung 1; the brief half by `136fcdb`, whose
+/// commit message **quotes this exact sentence as false** and then left it
+/// standing. `PR7-R3-RUNAS-DOC-FALSIFIED-BY-ITS-OWN-REPAIR`, and a doc class
+/// sub-shape no insertion detector can see, because nothing moved.
 #[derive(Debug, Clone)]
 struct RunAs {
     /// What the attempts before this one failed on, oldest first. Empty for a
@@ -1472,15 +1481,6 @@ impl TopologyRun {
             },
         )?;
 
-        // The ceiling's ledger, before the append: `Spend::replay` rebuilds it
-        // from the log on resume, so this keeps the in-process copy current
-        // for the next iteration's ceiling check rather than being a second
-        // source for it.
-        // **The retaining incarnation's own note.** `T-RETAINED`'s resume action
-        // is "the retaining incarnation proceeds to T-RETRY; a fresh process
-        // closes it in recovery", so the tree a retry re-gates is legitimately
-        // process-local: a different process may not use it, and the fold's
-        // `RetainedIdle { incarnation }` is what refuses one that tries.
         // **§11.4's brief, accumulated for the task and not for a generation.**
         // Every judged failure adds a line, whatever settlement it produced: the
         // sentence is "failure feedback goes back to the same rung, and an
@@ -1498,9 +1498,15 @@ impl TopologyRun {
                 human: false,
             });
 
-        // The retained *tree* is still per-generation: `Quiescence::HoldsTree`
-        // is a claim about a worktree this process left in place, and only a
-        // `Retained` settlement leaves one.
+        // **The retaining incarnation's own note.** `T-RETAINED`'s resume action
+        // is "the retaining incarnation proceeds to T-RETRY; a fresh process
+        // closes it in recovery", so the tree a retry re-gates is legitimately
+        // process-local: a different process may not use it, and the fold's
+        // `RetainedIdle { incarnation }` is what refuses one that tries.
+        //
+        // The retained *tree* is per-generation where the brief above is
+        // per-task: `Quiescence::HoldsTree` is a claim about a worktree this
+        // process left in place, and only a `Retained` settlement leaves one.
         if matches!(
             settled.event.settlement,
             crate::topology::events::AttemptSettlement::Retained { .. }
@@ -1512,6 +1518,10 @@ impl TopologyRun {
                 },
             );
         }
+        // The ceiling's ledger, before the append: `Spend::replay` rebuilds it
+        // from the log on resume, so this keeps the in-process copy current for
+        // the next iteration's ceiling check rather than being a second source
+        // for it.
         self.spend.record(site.key, &settled.event.record);
         self.emit(
             TopologyEventBody::AttemptFinished {

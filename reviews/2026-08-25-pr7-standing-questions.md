@@ -43,10 +43,18 @@ surviving Unix reaper's shared hold is the exception the question anticipates: i
 (`the_reapers_cleanup_hold_is_shared_between_overlapping_invocations`, R28).
 
 **Durable recovery records reclaimed or repaired before any reuse.** The recovery order is
-eleven steps (a0)–(i) carried as a type, `RecoveryStep::ALL`, so an omitted step fails to
-compile rather than passing silently — the guard this project adopted after
-`PR7-RECOVERY-STEP-G-MISSING`, where a packet-named step had no implementation and 117
-tests were green.
+eleven steps (a0)–(i) carried as a type, `RecoveryStep::ALL`, and an omitted step fails
+`the_recovery_order_performs_every_step_the_packet_names` — which compares the steps the
+body actually pushed against that array.
+
+**Corrected at `0cd2001` (`PR7-R3-CONTRACT-003`): this previously said "fails to
+compile", and it does not.** `run_recovery_order` builds `let mut steps =
+vec![RecoveryStep::A]` and pushes one per step; nothing in the type system forces the body
+to cover the array, so a deleted step compiles cleanly and is caught at **runtime** by the
+named test. The guard is real and it is the one this project adopted after
+`PR7-RECOVERY-STEP-G-MISSING` — where a packet-named step had no implementation and 117
+tests were green — but calling a test a compile error overstates it, and this document is
+frontier-review input.
 
 **The stable-prefix barrier precedes every fold-derived effect.**
 `resume_establishes_stable_prefix_barrier_before_any_fold_derived_effect`,

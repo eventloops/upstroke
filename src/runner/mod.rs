@@ -2111,11 +2111,22 @@ mod tests {
     ///
     /// # The two columns
     ///
-    /// **Writes** are the sites that *decide* the count: an assignment or an
-    /// increment. There may be exactly the three in the fold — the zero at
-    /// construction, the increment at the settlement, and the reset the
-    /// escalation performs onto its new rung — and no others anywhere. A fourth
-    /// is a second counting rule.
+    /// **Writes** are **assignments through a receiver** — `.attempts_on_rung =`
+    /// — which is what makes a site a decider of persisted state. There may be
+    /// exactly the two in the fold, the increment at the settlement and the
+    /// reset the escalation performs onto its new rung, and no others anywhere.
+    /// A third is a second counting rule.
+    ///
+    /// **The construction default is deliberately outside this domain, and the
+    /// doc said otherwise until `PR7-R3-CENSUS-WRITE-DOMAIN-PROSE`.**
+    /// `TaskFold`'s `attempts_on_rung: 0` is a field initializer, not an
+    /// assignment, so the needle never matched it while this comment claimed
+    /// three sites and the table expected two. **A census whose stated domain is
+    /// wider than its counted domain fails open**: a second `TaskFold`
+    /// constructor with a non-zero default would move no count, and this
+    /// census's whole purpose is that a new writer cannot appear silently.
+    /// The domain is now stated as what it counts; widening it to constructors
+    /// is a separate needle and a separate claim.
     ///
     /// **Consults** are calls to `spends_allowance`. These are *expected* to be
     /// plural: one rule consulted from several places is the shape this census

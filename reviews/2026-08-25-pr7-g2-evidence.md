@@ -123,31 +123,67 @@ is what makes the declaration binding rather than descriptive.
 ## 5. User-checkout inventory
 
 `checkout inventory unchanged` is in `pr_sequence[8].proof_tests`. The engine never
-touches the user's checkout: every worktree it creates is under the execution root, and
-the tests that hold that line are
-`snapshots_create_no_object_for_a_commit_and_never_share_a_checkout`,
-`gate_snapshot_does_not_execute_post_checkout_hook`,
-`branch_creation_and_switch_do_not_execute_post_checkout_hook`,
-`sparse_checkout_is_refused_before_worker_spend` and
-`sparse_checkout_preflight_refusal_leaves_worktree_clean`.
+touches the user's checkout: every worktree it creates is under the execution root.
+
+**Citations corrected at `0cd2001` (`PR7-R3-CONTRACT-002`).** Two of the five tests
+previously listed here do not hold this line, and saying they did was the failure mode
+this document exists to avoid — it is frontier-review input, where a false claim costs
+more than a false comment.
+
+Holding the line:
+
+- `snapshots_create_no_object_for_a_commit_and_never_share_a_checkout` — a snapshot
+  never shares the user's checkout.
+- `gate_snapshot_does_not_execute_post_checkout_hook` and
+  `branch_creation_and_switch_do_not_execute_post_checkout_hook` — the engine's
+  worktree operations do not run the user's hooks.
+
+**Not** holding it, and previously cited as if they did:
+
+- `sparse_checkout_is_refused_before_worker_spend` asserts that an incomplete index
+  fails with "sparse checkout is active", that a complete checkout is accepted, and two
+  Git-version requirements. It says nothing about inventory or worktree location: it is
+  a **precondition refusal** test.
+- `sparse_checkout_preflight_refusal_leaves_worktree_clean` asserts the worktree is
+  clean **after a refusal**, which is a claim about a path that did no work — not about
+  a run's effect on the checkout.
+
+So the line rests on three tests, not five, and the two removed are a *precondition*
+and a *refusal-cleanup*. Whether three tests are sufficient evidence for
+`proof_tests`'s "checkout inventory unchanged" is a question for the reviewer; the
+point of this correction is that the question is now asked against what the tests
+actually assert.
 
 ## 6. Docker-gated suite — environment
 
-**Not run, and the environment is the reason.** The Docker-gated suite is PR6's
-artifact; this box has no Docker daemon, and the container half of §2's parity outputs
-is gated the same way. Recorded as environment-absent rather than skipped silently, per
-the "no silent caps" rule. The fake container runtime paths — which are what PR7's own
-range touches — are exercised in-suite.
+**Corrected at `0cd2001` — the previous text said "this box has no Docker daemon",
+and that is false** (`PR7-R3-CONTRACT-005`).
+
+The box **has** a Docker daemon and the Docker-gated tests execute against it. They run
+in every full-suite invocation on this machine, and their real-daemon responses are
+visible in this slice's own history: the `Conflict. The container name ... is already in
+use` failures recorded during round 2 came from a live daemon, not from a fake.
+
+What that misstatement cost is worth recording, because it is the reason to correct
+rather than delete it. Believing the gated suite did not run, round 2 attributed those
+failures to passive "contention" between concurrent runs. Round 3's `contract` lens
+found the real cause: `fake::preclean_names` kills and removes containers by a **fixed**
+name with no liveness check, so a second suite run killed the first's live container
+(`PR7-R3-CONTRACT-001`, repaired by scoping the name to the build slot). A false
+environment claim in this document delayed that diagnosis by a round.
 
 ## 7. Effect enforcement
 
-All five artifacts present, and all enforced by tests that run in CI:
+**Four** artifacts, all present and all enforced by tests that run in CI.
+Re-measured at `0cd2001`; the previous table said "five" while listing four, and its
+`effects/wrappers.toml` row was stale — that file moved when `commit_parent` was
+classified during round 2 (`PR7-R3-CONTRACT-008`).
 
 | artifact | bytes | sha256 (16) |
 |---|---|---|
 | `clippy.toml` | 18898 | `80d59dae80054fd7` |
 | `effects/allowlist.toml` | 32262 | `2121b60d10f904b9` |
-| `effects/wrappers.toml` | 26976 | `b3ddceb6447d961b` |
+| `effects/wrappers.toml` | 27063 | `0a261b72874f5ad3` |
 | `effect_sites.json` | 33547 | `ab9edaad67abcfc7` |
 
 `cargo test --all-features effects::` — **90 passed, 0 failed**. Among them the

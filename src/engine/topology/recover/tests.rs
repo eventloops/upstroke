@@ -5999,6 +5999,130 @@ impl TopologyHooks for TracedHooks {
     }
 }
 
+/// **The driver writes the rung an escalation climbs ONTO, not the one it leaves.**
+///
+/// The **write** side of `PR7-FOLD-LADDER-POSITION`'s class, and the exact
+/// mirror of the read-side gap closed at `6d3fc6f`. That repair witnessed the
+/// driver *reading* `ladder_position`; nothing witnessed the driver *writing*
+/// the escalation target, and `PR7-R3-ESCALATED-RUNG-WRITER-UNPINNED` is what
+/// got through: replacing `rung: position.0.saturating_add(1)` with
+/// `rung: position.0` left the whole suite green.
+///
+/// The consequence of that mutation is not a wrong number in a record. The fold
+/// assigns `task.rung = *rung` and resets the allowance, so the task escalates
+/// onto the rung it is **leaving**, `ready` selects it again, the binding
+/// resolves, and it loops without bound — never reaching the tier its chain
+/// escalated it to and never exhausting the chain.
+///
+/// **Written as the round trip, which is the class boundary.** Asserting the
+/// recorded number alone would pin the write and leave the same gap one step
+/// over. This drives the escalation, reads the durable settlement, and then
+/// drives the *next* attempt and asserts the model it actually ran at — so the
+/// value the driver wrote and the value it later reads are held by one test.
+#[test]
+fn the_driver_escalates_onto_the_rung_above() {
+    use crate::engine::topology::run::{RunSeams, TopologyRun};
+    use crate::engine::topology::select::Ceiling;
+
+    // Two tiers, one attempt per rung: the first failure exhausts rung 0.
+    let fixture = Fixture::build(
+        "driver-escalates",
+        Damage {
+            two_tier: true,
+            ..Damage::default()
+        },
+    );
+
+    let harness = harness();
+    let runtime = runtime_holding_the_record();
+    let certifies = AlwaysCertifies;
+    let given = Given::healthy(&fixture, &runtime, &certifies);
+    let (outcome, _) = resume_holding(&fixture, &harness, &given);
+    let (_recovered, handle) = outcome.expect("the healthy resume completes");
+
+    let mut run = TopologyRun::resumed(handle, fixture.inputs(), Ceiling::unlimited());
+    let mut hooks = HarnessTopologyHooks::new(Arc::clone(&harness));
+    let sleeper = RecordingSleeper::default();
+    let manager = fixture.manager();
+    let runner = RecordingRunner::editing();
+    let adapters = crate::engine::topology::scaffold::ScaffoldAdapters::erroring();
+    let paths = crate::rundir::RunPaths::with_private_root(
+        &fixture.repo_root,
+        &fixture.started.run_id,
+        &fixture.private_root,
+    );
+    paths.create().expect("the run directories are creatable");
+    let plans = crate::engine::assembly::FrozenPlans {
+        adapters: &adapters,
+        paths: &paths,
+        gates: &[],
+        pools: &[],
+        caps: &[],
+        worker_timeout: std::time::Duration::from_secs(300),
+        decisions: &[],
+    };
+    let seams = RunSeams {
+        manager: &manager,
+        clock: &Frozen,
+        sleeper: &sleeper,
+        runner: &runner,
+        adapters: &adapters,
+        paths: &paths,
+        plans: &plans,
+        reviews: &crate::engine::attempt::LegacyReviewPasses,
+        input_policy: &crate::engine::attempt::LegacyReviewInputPolicy,
+        answers: &crate::interaction::UnattendedAnswers,
+        ids: &FixedIds,
+        halts_run: false,
+    };
+
+    // Attempt one, on rung 0, fails and exhausts the rung's allowance.
+    run.step(&seams, &mut hooks)
+        .expect("the first attempt settles");
+
+    let escalated = TopologyFold::parse_log(&fixture.log_bytes())
+        .expect("the log parses")
+        .into_iter()
+        .find_map(|event| match event.body {
+            TopologyEventBody::AttemptFinished { data } => match data.settlement {
+                AttemptSettlement::Closed {
+                    transition: SettlementTransition::Escalated { rung },
+                    ..
+                } => Some(rung),
+                _ => None,
+            },
+            _ => None,
+        })
+        .expect("the exhausted rung escalates");
+
+    assert_eq!(
+        escalated, 1,
+        "the driver recorded an escalation onto rung {escalated}, the rung it is \
+         leaving. The fold assigns `task.rung` from this number and resets the \
+         allowance, so the task is selected again at the same tier and loops \
+         forever — never reaching the tier its chain escalated it to"
+    );
+
+    // And the read side, in the same test: the next attempt runs at rung 1's
+    // binding. Pinning the written number alone would leave the same gap one
+    // step over, which is how this class keeps recurring.
+    run.step(&seams, &mut hooks)
+        .expect("the second attempt settles");
+    let ran_at = TopologyFold::parse_log(&fixture.log_bytes())
+        .expect("the log parses")
+        .into_iter()
+        .filter_map(|event| match event.body {
+            TopologyEventBody::AttemptStarted { data } => Some(data.binding.model.clone()),
+            _ => None,
+        })
+        .next_back()
+        .expect("the driver started a second attempt");
+    assert_eq!(
+        ran_at, "claude-fable-5",
+        "the escalated task ran at {ran_at}, which is rung 0's model"
+    );
+}
+
 /// **The driver dispatches at the rung the log records, not at rung 0.**
 ///
 /// The **other** driver-side half of `PR7-FOLD-LADDER-POSITION`, and the one
