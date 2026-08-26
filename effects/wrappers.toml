@@ -72,6 +72,7 @@ effect_free = [
     "classify_object_residue",
     "commit_identity",
     "commit_parent",
+    "commit_tree_sha",
     "common_git_dir",
     "decode_changed_paths",
     "derive",

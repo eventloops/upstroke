@@ -435,6 +435,25 @@ pub struct PreparedCandidate {
     pub candidate: CandidateRef,
     /// The base the work started from, and the parent of the commit.
     pub base_sha: CommitSha,
+    /// The tree the gates ran against and the reviewers judged.
+    ///
+    /// **Retained because adoption is about identity, not existence.**
+    /// `DESIGN.md` §15 requires `candidate_prepared` to record "exactly one
+    /// complete attempt/base/commit/tree identity ... so resume adopts only
+    /// that exact shape". The tree was on the event and stopped here: recovery
+    /// could check that the object exists and that its parent is the recorded
+    /// base, and a commit with that parent and a **different tree** passed —
+    /// so a resume could publish an object no gate ran against and no reviewer
+    /// read. `candidate.rs`'s own comment recorded the gap rather than closing
+    /// it, because closing it is this field.
+    ///
+    /// Per-instance **Class B** approval, granted 2026-08-26 against the
+    /// frontier re-review of `c2c0294`, finding B; the ledger row is
+    /// `reviews/FINDINGS.md` §3 and `PR7-CANDIDATE-TREE-UNVERIFIED` in §2.
+    /// Nothing serde-visible moves — `CandidatePrepared::tree_sha` already
+    /// exists on the wire and this is the fold keeping what it reads. It
+    /// conforms to §15 rather than amending it.
+    pub tree_sha: CommitSha,
     pub paths: PathSet,
 }
 
@@ -3459,6 +3478,7 @@ impl RunState {
         let record = PreparedCandidate {
             candidate: prepared.candidate(),
             base_sha: prepared.base_sha.clone(),
+            tree_sha: prepared.tree_sha.clone(),
             paths: prepared.actual_paths.clone(),
         };
         if let Some(generation) = self.open_generation_mut(prepared.key) {

@@ -2504,6 +2504,37 @@ impl WorkspaceManager {
             .filter(|text| !text.is_empty()))
     }
 
+    /// The tree a commit points at, or `None` if it is not a commit.
+    ///
+    /// The sibling of [`Self::commit_parent`] and deliberately the same shape:
+    /// `rev-parse --verify --quiet` with a peel, so a missing object, a
+    /// non-commit and a malformed id all arrive as `None` rather than as three
+    /// different errors the caller would have to tell apart. What the caller
+    /// does with `None` is refuse, and it refuses the same way for all three.
+    ///
+    /// Added for candidate adoption: `DESIGN.md` §15 requires resume to adopt
+    /// only the exact judged object, and the parent alone does not say what the
+    /// commit *contains*.
+    ///
+    /// # Errors
+    ///
+    /// The containment refusals.
+    pub fn commit_tree_sha(&self, commit: &str) -> Result<Option<String>, UpstrokeError> {
+        self.revalidate()?;
+        let argv = [
+            OsString::from("rev-parse"),
+            OsString::from("--verify"),
+            OsString::from("--quiet"),
+            OsString::from(format!("{commit}^{{commit}}^{{tree}}")),
+        ];
+        Ok(self
+            .git_ok(self.base(), &argv)
+            .ok()
+            .and_then(|out| String::from_utf8(out).ok())
+            .map(|text| text.trim().to_owned())
+            .filter(|text| !text.is_empty()))
+    }
+
     /// The paths a commit changed against `base`, byte-safely.
     ///
     /// `decisions.admission_and_leases.path_policy.actual` in its own words:
