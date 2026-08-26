@@ -1766,6 +1766,112 @@ mod tests {
         );
     }
 
+    /// **A halted run offers no work either — the guard's other disjunct.**
+    ///
+    /// `run_is_ending()` is `halted_at.is_some() || budget_stop_is_current()`
+    /// and every case in [`an_ending_run_offers_no_work_from_any_arm`] ends its
+    /// run the second way. So the halted half was unpinned: S5 round 4 measured
+    /// `if fold.run_is_ending() && fold.halted_at().is_none()` — the guard with
+    /// the halted disjunct dropped — surviving the **whole suite**, twice.
+    ///
+    /// A halted run that keeps offering work is the worse of the two: a budget
+    /// stop at least appends a record each iteration, and `halts_run` is set by
+    /// a task that asked the run to stop.
+    ///
+    /// Two arms rather than six, and the reason is measured rather than
+    /// economised: those two are the ones that rest on the guard at all — the
+    /// other four embed `!run_is_ending()` in their own predicate, so they are
+    /// closed against a halt by the same code that closes them against a
+    /// breach. The proof is in the sibling test's doc: delete the guard and it
+    /// reports exactly `Dispatch (continuing)` and `HardBlock`.
+    #[test]
+    fn a_halted_run_offers_no_work_from_the_arms_that_rest_on_the_guard() {
+        /// `BET` fails, and `halts` decides whether it asks the run to stop.
+        ///
+        /// **One field varied and everything else held constant**, because a
+        /// halted run cannot be built by *adding* a settlement to a fold where
+        /// the hard block is already live: the hard block needs every task
+        /// settled, and a halt needs a task left to settle. The control fold is
+        /// the same fold with `halts_run = false`, so the comparison isolates
+        /// the flag rather than the shape.
+        fn settle_bet(fold: &mut TopologyFold, halts: bool) {
+            in_flight(fold, BET, 0);
+            let mut settlement = finished(BET, 0, 1, Next::Fail);
+            settlement.halts_run = halts;
+            settle_into(fold, &settlement);
+        }
+
+        /// The continuation arm: `TopologyFold::open_no_attempt` is a statement
+        /// accessor, so nothing below the guard refuses on its behalf.
+        fn continuation(halts: bool) -> TopologyFold {
+            let mut fold = started();
+            apply(&mut fold, &dispatch(ALEPH, 0));
+            settle_bet(&mut fold, halts);
+            fold
+        }
+
+        /// The hard block: `TopologyFold::questions_open` is the same shape one
+        /// accessor over.
+        fn hard_block(halts: bool) -> TopologyFold {
+            let mut fold = started();
+            in_flight(&mut fold, ALEPH, 0);
+            let mut parking = finished(
+                ALEPH,
+                0,
+                1,
+                Next::AskHuman(crate::ir::QuestionKind::Unblock),
+            );
+            parking.question = Some(question_for(ALEPH));
+            settle_into(&mut fold, &parking);
+            in_flight(&mut fold, GIMEL, 0);
+            settle_into(&mut fold, &finished(GIMEL, 0, 1, Next::Fail));
+            settle_bet(&mut fold, halts);
+            fold
+        }
+
+        for (arm, build) in [
+            (
+                "Dispatch (continuing)",
+                continuation as fn(bool) -> TopologyFold,
+            ),
+            ("HardBlock", hard_block),
+        ] {
+            let live = build(false);
+            assert!(
+                live.halted_at().is_none(),
+                "{arm}: the control fold halted the run, so it is not a control"
+            );
+            assert_eq!(
+                arm_label(&select(&live, &Ceiling::unlimited(), &no_spend())),
+                arm,
+                "{arm}: the arm is not live in the control fold, so halting the same fold proves \
+                 nothing about it"
+            );
+
+            let halted = build(true);
+            // The premise: this ends the run the **other** way. A fixture that
+            // also carried a current budget stop would pass with the halted
+            // disjunct deleted, which is the mutation this test exists for.
+            assert!(
+                halted.halted_at().is_some(),
+                "{arm}: the fixture did not halt the run"
+            );
+            assert!(
+                halted.budget_stop().is_none(),
+                "{arm}: the fixture also budget-stopped the run, so it cannot tell the guard's \
+                 two disjuncts apart"
+            );
+
+            let after = select(&halted, &Ceiling::unlimited(), &no_spend());
+            assert!(
+                matches!(after, Step::Closure(_)),
+                "{arm}: a halted run offered work. A budget stop at least appends a record each \
+                 iteration; a halted run that keeps selecting was asked to stop by one of its own \
+                 tasks: {after:?}"
+            );
+        }
+    }
+
     /// The hard-block branch: open questions and nothing else runnable.
     #[test]
     fn open_questions_reach_the_hard_block_branch_before_closure() {

@@ -7204,7 +7204,7 @@ impl crate::interaction::Sleeper for RecordingSleeper {
 /// `the_barrier_is_the_only_topology_route_from_a_proven_prefix_to_an_append_handle`
 /// closed the same class: that census's needle is a constant it could choose,
 /// this one's is eleven names the packet chose.
-fn production_calls(code: &str, name: &str) -> usize {
+fn production_calls(code: &str, name: &str, form: Call) -> usize {
     let needle = format!("{name}(");
     code.match_indices(&needle)
         // Not the tail of a longer identifier.
@@ -7216,7 +7216,35 @@ fn production_calls(code: &str, name: &str) -> usize {
         })
         // Calls, not definitions.
         .filter(|(at, _)| !code[..*at].trim_end().ends_with("fn"))
+        // And the form the clause is written in, which is what tells three
+        // items of one name apart.
+        .filter(|(at, _)| {
+            let dotted = code[..*at].trim_end().ends_with('.');
+            match form {
+                Call::Free => !dotted,
+                Call::Method => dotted,
+            }
+        })
         .count()
+}
+
+/// How a clause's function is **called** in production.
+///
+/// Not decoration. `settle_interrupted` names three unrelated production items
+/// in this tree — `recover::settle_interrupted` (the `T-ATTEMPT` clause, a free
+/// function), `AttemptContext::settle_interrupted` and
+/// `events::RunState::settle_interrupted` (both methods, both called) — and a
+/// census counting the bare name is satisfied by either of the other two.
+/// Measured by S5 round 4: deleting step (d)'s only production call left the
+/// census **and the entire suite** green, with `attempt_interrupted` appended
+/// by no run. `reviews/FINDINGS.md` §4's "a refutation must name which item it
+/// inspected" is the same rule; this is it applied to the instrument.
+#[derive(Clone, Copy)]
+enum Call {
+    /// `name(…)` or `path::name(…)` — never `receiver.name(…)`.
+    Free,
+    /// `receiver.name(…)`.
+    Method,
 }
 
 /// **A call census's needle is not satisfied by a longer name ending in it.**
@@ -7237,7 +7265,8 @@ fn a_call_census_needle_is_not_satisfied_by_a_longer_name_ending_in_it() {
     assert_eq!(
         production_calls(
             "            .refuse_unexpected_refs(&namespace, &expected)?;\n",
-            "expected_refs"
+            "expected_refs",
+            Call::Free
         ),
         0,
         "a longer identifier ending in the entry's name satisfied its census entry"
@@ -7245,7 +7274,8 @@ fn a_call_census_needle_is_not_satisfied_by_a_longer_name_ending_in_it() {
     assert_eq!(
         production_calls(
             "        let expected = crate::engine::topology::candidate::expected_refs(&r, f);\n",
-            "expected_refs"
+            "expected_refs",
+            Call::Free
         ),
         1,
         "a genuine call through a path was rejected: `:` is not an identifier byte"
@@ -7253,7 +7283,8 @@ fn a_call_census_needle_is_not_satisfied_by_a_longer_name_ending_in_it() {
     assert_eq!(
         production_calls(
             "    let e = expected_refs(&run_id, fold);\n",
-            "expected_refs"
+            "expected_refs",
+            Call::Free
         ),
         1,
         "a genuine bare call was rejected"
@@ -7261,7 +7292,8 @@ fn a_call_census_needle_is_not_satisfied_by_a_longer_name_ending_in_it() {
     assert_eq!(
         production_calls(
             "pub fn expected_refs(run_id: &str, fold: &TopologyFold) -> Vec<String> {\n",
-            "expected_refs"
+            "expected_refs",
+            Call::Free
         ),
         0,
         "a definition is not a call: a function that calls only itself is what this census exists \
@@ -7292,7 +7324,7 @@ fn a_call_census_needle_is_not_satisfied_by_a_longer_name_ending_in_it() {
          the file, {region} in the production region), so the zero below proves nothing"
     );
     assert_eq!(
-        production_calls(&code, "expected_refs"),
+        production_calls(&code, "expected_refs", Call::Free),
         0,
         "the production region of `workspace_manager.rs` has {region} occurrence(s) of \
          `expected_refs(` and every one of them belongs to `refuse_unexpected_refs`; counting \
@@ -7348,56 +7380,67 @@ fn a_call_census_needle_is_not_satisfied_by_a_longer_name_ending_in_it() {
 /// `into_log_and_fold` was.
 #[test]
 fn every_packet_named_recovery_action_has_a_production_caller() {
-    /// (function, the packet clause it performs).
-    const CLAUSES: &[(&str, &str)] = &[
+    /// (function, how production calls it, the packet clause it performs).
+    const CLAUSES: &[(&str, Call, &str)] = &[
         (
             "prune_orphan_pin",
+            Call::Free,
             "transaction_fault_matrix[T-CAND-OBJ].resume_action (b): delete the exact orphan pin \
              expected-old",
         ),
         (
             "refuse_unexpected_refs",
+            Call::Method,
             "transaction_fault_matrix[T-CAND-OBJ].refusal_condition: an unexpected ref under the \
              run namespace",
         ),
         (
             "expected_refs",
+            Call::Free,
             "the entitlement `refuse_unexpected_refs` refuses against, derived from the fold",
         ),
         (
             "complete_promotions",
+            Call::Free,
             "erratum E6: append candidate_prepared for a settled-but-unrecorded candidate",
         ),
         (
             "finish_promotions",
+            Call::Free,
             "transaction_fault_matrix[T-CAND-REF].resume_action: verify, create the ref, append \
              task_candidate_created, prune the pin",
         ),
         (
             "recreate_open_no_attempt",
+            Call::Free,
             "transaction_fault_matrix[T-DISPATCH].resume_action: verify the worktree or recreate it",
         ),
         (
             "settle_interrupted",
+            Call::Free,
             "transaction_fault_matrix[T-ATTEMPT].resume_action: append attempt_interrupted",
         ),
         (
             "close_retained_idle",
+            Call::Free,
             "transaction_fault_matrix[T-RETAINED].resume_action: a fresh process closes it in \
              recovery",
         ),
         (
             "ensure_recorded_integration_ref",
+            Call::Free,
             "transaction_fault_matrix[T-RUNSTART].resume_action: P7/P8 create the ref zero-old at \
              the recorded base",
         ),
         (
             "refuse_unimplemented_terminals",
+            Call::Free,
             "checkpoint_refusals: refuse, before any append, any operation whose terminals this \
              build does not implement",
         ),
         (
             "resume_open_no_attempt",
+            Call::Free,
             "transaction_fault_matrix[T-DISPATCH].resume_action: continue attempt (no spend \
              repeats)",
         ),
@@ -7458,15 +7501,35 @@ fn every_packet_named_recovery_action_has_a_production_caller() {
     );
 
     let mut uncalled: Vec<String> = Vec::new();
-    for (name, clause) in CLAUSES {
+    let mut undefined: Vec<String> = Vec::new();
+    for (name, form, clause) in CLAUSES {
+        // **The named item exists.** The census never checked, so renaming a
+        // clause's definition out of the tree left it green — measured, S5
+        // round 4. Not pinned to exactly one definition, because
+        // `settle_interrupted` legitimately names three items and `form` is
+        // what separates them.
+        let defined: usize = sources
+            .iter()
+            .map(|(_, code)| code.matches(&format!("fn {name}(")).count())
+            .sum();
+        if defined == 0 {
+            undefined.push((*name).to_owned());
+        }
         let calls: usize = sources
             .iter()
-            .map(|(_, code)| production_calls(code, name))
+            .map(|(_, code)| production_calls(code, name, *form))
             .sum();
         if calls == 0 {
             uncalled.push(format!("`{name}` performs `{clause}`"));
         }
     }
+
+    assert!(
+        undefined.is_empty(),
+        "these are named as performing a packet clause and no production item of that name \
+         exists, so the row below cannot fail for the right reason and has been passing on \
+         somebody else's call sites: {undefined:?}"
+    );
 
     assert!(
         uncalled.is_empty(),

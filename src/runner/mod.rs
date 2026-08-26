@@ -1221,6 +1221,84 @@ mod tests {
         }
     }
 
+    /// Assignments to `field` **through a receiver**, in every assignment form.
+    ///
+    /// `x.field = …`, `x.field += …` and the other compound operators; never
+    /// `x.field == …`, and never a longer field whose name starts with this
+    /// one. The literal `".field ="` misses `+=`, which is the idiomatic form
+    /// of an increment and therefore the form a second counting rule is most
+    /// likely to arrive in — measured surviving, S5 round 4.
+    fn receiver_writes(code: &str, field: &str) -> usize {
+        let needle = format!(".{field}");
+        code.match_indices(&needle)
+            .filter(|(at, _)| {
+                let rest = code[at + needle.len()..].trim_start();
+                match rest.as_bytes() {
+                    [b'=', b'=', ..] => false,
+                    [b'=', ..] => true,
+                    [op, b'=', ..] => matches!(op, b'+' | b'-' | b'*' | b'/' | b'%'),
+                    _ => false,
+                }
+            })
+            .count()
+    }
+
+    /// `value` up to `terminator` at **nesting depth zero**, so a comma inside
+    /// `format!("{a}-{}", b)` does not end the expression.
+    ///
+    /// The reason this exists: taking a field initializer's value as "everything
+    /// up to the first comma" truncates every multi-argument expression before
+    /// its arguments, so the site is skipped rather than judged. Measured by S5
+    /// round 4 — a planted `stem: format!("{index:02}-{}", display_id)` was
+    /// invisible to the census that exists to forbid exactly that.
+    fn until_depth_zero(value: &str, terminator: u8) -> &str {
+        let mut depth = 0_i32;
+        for (at, ch) in value.char_indices() {
+            match ch {
+                '(' | '[' | '{' => depth += 1,
+                ')' | ']' | '}' if depth == 0 => return &value[..at],
+                ')' | ']' | '}' => depth -= 1,
+                _ if depth == 0 && ch as u32 == u32::from(terminator) => return &value[..at],
+                _ => {}
+            }
+        }
+        value
+    }
+
+    /// Every place production builds a filename `stem`, and the expression it
+    /// builds it from.
+    ///
+    /// **Both shapes**: the field initializer `stem: <value>,` and the binding
+    /// `let stem = <value>;`. The census counted only the first, so
+    /// `coordinator.rs:537` — the live legacy path, and the site the schema-4
+    /// assembler was extracted from — was outside its domain entirely.
+    fn stem_values(code: &str) -> Vec<(usize, String)> {
+        let mut out = Vec::new();
+        for (at, _) in code.match_indices("stem") {
+            let before = &code[..at];
+            if before
+                .chars()
+                .next_back()
+                .is_some_and(|ch| ch.is_alphanumeric() || ch == '_')
+            {
+                continue;
+            }
+            let rest = &code[at + "stem".len()..];
+            let head = before.trim_end();
+            let head = head.strip_suffix("mut").map_or(head, str::trim_end);
+            if head.ends_with("let") {
+                let Some(eq) = rest.find('=') else { continue };
+                out.push((at, until_depth_zero(&rest[eq + 1..], b';').to_owned()));
+            } else if let Some(tail) = rest.strip_prefix(':') {
+                if tail.starts_with(':') {
+                    continue;
+                }
+                out.push((at, until_depth_zero(tail, b',').to_owned()));
+            }
+        }
+        out
+    }
+
     /// Every `src/**/*.rs`, as `(repo-relative path, production code)`, with
     /// whole-file test modules left out.
     ///
@@ -2111,11 +2189,20 @@ mod tests {
     ///
     /// # The two columns
     ///
-    /// **Writes** are **assignments through a receiver** — `.attempts_on_rung =`
-    /// — which is what makes a site a decider of persisted state. There may be
-    /// exactly the two in the fold, the increment at the settlement and the
-    /// reset the escalation performs onto its new rung, and no others anywhere.
-    /// A third is a second counting rule.
+    /// **Writes** are **assignments through a receiver** — which is what makes a
+    /// site a decider of persisted state. There may be exactly the two in the
+    /// fold, the increment at the settlement and the reset the escalation
+    /// performs onto its new rung, and no others anywhere. A third is a second
+    /// counting rule.
+    ///
+    /// **Every assignment operator, not just `=`.** The needle was the literal
+    /// `".attempts_on_rung ="`, which does not match `+=` — the most idiomatic
+    /// form of the very thing this census counts. Measured by S5 round 4:
+    /// planting `ladder.attempts_on_rung += 1;` in a production function left
+    /// this census green. That is `PR7-R3-CENSUS-WRITE-DOMAIN-PROSE` one
+    /// operator over: the stated domain ("assignments through a receiver")
+    /// still exceeded the counted domain. [`receiver_writes`] counts the
+    /// compound forms too, and excludes `==`.
     ///
     /// **The construction default is deliberately outside this domain, and the
     /// doc said otherwise until `PR7-R3-CENSUS-WRITE-DOMAIN-PROSE`.**
@@ -2178,7 +2265,7 @@ mod tests {
             // *decider* of persisted state. `let attempts_on_rung = ...` in the
             // driver is a local binding of a value it is about to pass, and
             // counting it would make this census report the consult twice.
-            let writes = code.matches(".attempts_on_rung =").count();
+            let writes = receiver_writes(&code, "attempts_on_rung");
             let consults = code.matches("spends_allowance(").count();
             if writes > 0 || consults > 0 {
                 found.insert(path, (writes, consults));
@@ -2194,6 +2281,63 @@ mod tests {
              it. A second counting site is two rules deciding when an operator \
              pays for a pricier tier, and the first one diverged silently for \
              an entire slice"
+        );
+    }
+
+    /// **Each census needle covers the domain its doc states.**
+    ///
+    /// The class boundary for three findings of one shape, all measured
+    /// surviving in S5 round 4: a census whose **stated** domain is wider than
+    /// its **counted** domain fails open, and does so in the passing direction,
+    /// so nothing ever reports it. `PR7-R3-CENSUS-WRITE-DOMAIN-PROSE` was the
+    /// first instance and was repaired by narrowing the prose; these are the
+    /// same defect at three more needles, repaired by widening the needle,
+    /// because in each case the wider domain is the one the census is for.
+    ///
+    /// Unit assertions over the needles themselves, deliberately: the censuses
+    /// that use them are whole-tree and green, and a green whole-tree census is
+    /// exactly what a fail-open needle produces.
+    #[test]
+    fn each_census_needle_covers_the_domain_its_doc_states() {
+        // `receiver_writes`: every assignment form is a write, `==` is not, and
+        // a longer field name is not this field.
+        assert_eq!(receiver_writes("state.attempts = 1;", "attempts"), 1);
+        assert_eq!(
+            receiver_writes("state.attempts += 1;", "attempts"),
+            1,
+            "`+=` is the idiomatic increment and the form a second counting rule arrives in"
+        );
+        assert_eq!(receiver_writes("state.attempts -= 1;", "attempts"), 1);
+        assert_eq!(receiver_writes("if state.attempts == 1 {}", "attempts"), 0);
+        assert_eq!(receiver_writes("state.attempts_total = 1;", "attempts"), 0);
+        assert_eq!(receiver_writes("let x = state.attempts;", "attempts"), 0);
+
+        // `stem_values`: a field initializer's value runs to the end of the
+        // statement rather than to the first comma...
+        let field = stem_values("Inputs { stem: format!(\"{i:02}-{}\", display_id), n: 1 }");
+        assert_eq!(field.len(), 1, "{field:?}");
+        assert!(
+            field[0].1.contains("display_id"),
+            "the value was truncated at the comma inside `format!`, so the site is skipped \
+             rather than judged: {:?}",
+            field[0].1
+        );
+
+        // ...and a `let` binding is a stem site too, which is the shape the one
+        // production site on the live legacy path uses.
+        let binding =
+            stem_values("let stem = format!(\"{i:02}-{}\", filename_component(task.id));\n");
+        assert_eq!(binding.len(), 1, "{binding:?}");
+        assert!(
+            binding[0].1.contains("task.id") && binding[0].1.contains("filename_component"),
+            "{:?}",
+            binding[0].1
+        );
+
+        // A different identifier that merely ends in `stem` is not one.
+        assert!(
+            stem_values("let file_stem = path.file_stem();").is_empty(),
+            "`file_stem` is not a filename stem built from a task id"
         );
     }
 
@@ -2225,30 +2369,43 @@ mod tests {
     /// is *reached*; that test says it *works*.
     #[test]
     fn a_plan_authored_id_never_reaches_a_filename_unsanitised() {
+        /// How this project spells a **plan-authored** task identifier. Both,
+        /// because both engines are live: schema 4 froze the annotation onto
+        /// `TaskEntry::display_id`, and the legacy coordinator — the path
+        /// `upstroke run` still drives — reads `task.id`. The census used to
+        /// name only the first, so the site the second one owns, which is the
+        /// site the extraction was copied *from*, was outside its domain.
+        const PLAN_AUTHORED: &[&str] = &["display_id", "task.id"];
+
         let mut unguarded: Vec<String> = Vec::new();
-        let mut guarded = 0_usize;
+        let mut guarded: Vec<String> = Vec::new();
         for (path, code) in production_sources() {
-            for (at, _) in code.match_indices("stem:") {
-                // The value expression: to the end of that statement.
-                let rest = &code[at..];
-                let end = rest.find(',').unwrap_or(rest.len());
-                let value = &rest[..end];
-                if !value.contains("display_id") {
+            for (at, value) in stem_values(&code) {
+                if !PLAN_AUTHORED.iter().any(|id| value.contains(id)) {
                     continue;
                 }
+                let line = code[..at].matches('\n').count() + 1;
                 if value.contains("filename_component") {
-                    guarded += 1;
+                    guarded.push(format!("{path}:{line}"));
                 } else {
-                    let line = code[..at].matches('\n').count() + 1;
                     unguarded.push(format!("{path}:{line}"));
                 }
             }
         }
-        assert!(
-            guarded >= 2,
-            "only {guarded} guarded stem site(s) found, so a green result here \
-             would mean the needle stopped matching rather than that the tree is \
-             clean"
+        // The control comes first and counts **sites**, not guarded ones: a
+        // needle that stops matching must not read as a clean tree, and a site
+        // that loses its guard must be reported as unguarded rather than
+        // disappearing out of the count.
+        assert_eq!(
+            guarded.len() + unguarded.len(),
+            3,
+            "this tree has three production sites that build a filename stem from a \
+             plan-authored id — `coordinator.rs`'s `let stem = …` on the live legacy path and \
+             `assembly.rs`'s two field initializers — and the census found {} ({guarded:?}, \
+             {unguarded:?}). An equality rather than a floor, because a fourth site has to be \
+             read once by a person, and because a needle that quietly stops matching is how this \
+             census came to miss the legacy site entirely",
+            guarded.len() + unguarded.len()
         );
         assert!(
             unguarded.is_empty(),

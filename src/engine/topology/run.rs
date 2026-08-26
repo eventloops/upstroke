@@ -459,11 +459,28 @@ pub struct RunSeams<'a> {
 /// announced.
 ///
 /// The difference between the two branches that run an attempt. A dispatch is
-/// attempt one of a **fresh generation**, at the rung the log records, carrying
-/// the task's accumulated brief, with nothing to resume, and it appends
+/// **attempt one of its generation**, at the rung the log records, carrying the
+/// task's accumulated brief, with nothing to resume, and it appends
 /// `attempt_started` itself; a retry is the generation's next attempt, may
 /// resume a session, and was already announced by `settle::retry` after the
 /// worktree verified.
+///
+/// **Attempt one of its generation, not of a *fresh* one**, and the distinction
+/// is the third false half of this comment rather than pedantry. `step`'s
+/// `Admitted::Dispatch` arm builds one `RunAs` for both of its paths —
+/// `dispatch_ready` when `continuing` is false and `continue_open` when it is
+/// true — and the continuation runs over the `OpenNoAttempt` generation a
+/// **prior process** opened with `task_dispatched` and recovery step (g)
+/// recreated the worktree for. `Step::Dispatch`'s own doc says so in as many
+/// words: "It is the same branch reaching the same attempt over ground that
+/// already exists."
+///
+/// `Self::FIRST_ATTEMPT` is still right for it, and the corrected sentence is
+/// what leaves a reader a reason to check that: `OpenNoAttempt` means the
+/// generation exists and **no attempt has started in it**, so the continuation's
+/// attempt is its first. A reader who believed "fresh generation" would conclude
+/// the continuation never reaches this constructor and stop looking.
+/// `PR7-R4-LOOP-005`, S5 round 4.
 ///
 /// **This sentence said "always attempt one on rung zero" with an empty brief,
 /// and both halves were falsified by the repairs that made them false.** The
