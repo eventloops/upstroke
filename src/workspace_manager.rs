@@ -2478,6 +2478,32 @@ impl WorkspaceManager {
         Ok((tree.trim().to_owned(), message.trim_end().to_owned()))
     }
 
+    /// A commit's first parent, or `None` when the object is not a commit.
+    ///
+    /// **A read**, like its neighbours. `rev-parse <sha>^` answers with the
+    /// parent and errors for a blob or a tree, so "not a commit" and "a commit
+    /// with no parent" both arrive here as `None` — which is the same answer
+    /// for the caller's purpose: neither is a candidate on a recorded base.
+    ///
+    /// # Errors
+    ///
+    /// The containment refusals.
+    pub fn commit_parent(&self, commit: &str) -> Result<Option<String>, UpstrokeError> {
+        self.revalidate()?;
+        let argv = [
+            OsString::from("rev-parse"),
+            OsString::from("--verify"),
+            OsString::from("--quiet"),
+            OsString::from(format!("{commit}^{{commit}}^")),
+        ];
+        Ok(self
+            .git_ok(self.base(), &argv)
+            .ok()
+            .and_then(|out| String::from_utf8(out).ok())
+            .map(|text| text.trim().to_owned())
+            .filter(|text| !text.is_empty()))
+    }
+
     /// The paths a commit changed against `base`, byte-safely.
     ///
     /// `decisions.admission_and_leases.path_policy.actual` in its own words:

@@ -362,6 +362,7 @@ pub struct PinnedCandidate {
 pub struct PromotingCandidate {
     candidate: CandidateRef,
     prepared_ref: GitRef,
+    base: CommitSha,
 }
 
 impl PromotingCandidate {
@@ -375,6 +376,18 @@ impl PromotingCandidate {
     #[must_use]
     pub fn prepared_ref(&self) -> &GitRef {
         &self.prepared_ref
+    }
+
+    /// The base the generation was dispatched at — the candidate's parent.
+    ///
+    /// Carried alongside the candidate rather than re-derived because the
+    /// promotion is what verifies the object, and verifying it means comparing
+    /// it against the base the record already committed to. Both producers have
+    /// it in hand: the append built `parent_sha` from it, and the recovery reads
+    /// it off the durable `PreparedCandidate`.
+    #[must_use]
+    pub fn base(&self) -> &CommitSha {
+        &self.base
     }
 }
 
@@ -491,7 +504,7 @@ pub fn append_candidate_prepared(
         generation: judged.generation,
         attempt: judged.attempt,
         base_sha: judged.base_sha.clone(),
-        parent_sha: judged.base_sha,
+        parent_sha: judged.base_sha.clone(),
         tree_sha: judged.tree_sha,
         commit_sha,
         message: judged.message,
@@ -507,6 +520,7 @@ pub fn append_candidate_prepared(
     Ok(PromotingCandidate {
         candidate,
         prepared_ref: names.prepared_ref,
+        base: judged.base_sha,
     })
 }
 
@@ -601,10 +615,11 @@ pub fn create_candidates_ref(
     let PromotingCandidate {
         candidate,
         prepared_ref,
+        base,
     } = promoting;
 
     // "verify object".
-    verify_object(manager, &candidate)?;
+    verify_object(manager, &candidate, &base)?;
 
     // "create exact candidates ref zero-old if absent".
     match manager.direct_ref_target(candidate.candidate_ref.as_str())? {
@@ -850,6 +865,7 @@ pub fn recovery_for(
         promotion: unfinished.then(|| PromotingCandidate {
             candidate: prepared.candidate.clone(),
             prepared_ref: names.prepared_ref,
+            base: prepared.base_sha.clone(),
         }),
         orphan_pin: None,
         settles_interrupted: false,
@@ -947,21 +963,49 @@ fn is_promoting(fold: &TopologyFold, key: TaskKey, generation: GenerationId) -> 
 fn verify_object(
     manager: &WorkspaceManager,
     candidate: &CandidateRef,
+    base: &CommitSha,
 ) -> Result<(), UpstrokeError> {
     let repository: &Path = manager.base();
     let residue = classify_object_residue(
         EffectSiteId::Object(ObjectSite::CandidateCommitTree),
         &ResidueTarget::new(repository).published(candidate.commit_sha.as_str()),
     )?;
-    if residue == ObjectResidue::After {
-        return Ok(());
+    if residue != ObjectResidue::After {
+        return Err(Refusal::ObjectMissing {
+            key: candidate.key.0,
+            generation: candidate.generation.0,
+            commit: candidate.commit_sha.0.clone(),
+        }
+        .into());
     }
-    Err(Refusal::ObjectMissing {
-        key: candidate.key.0,
-        generation: candidate.generation.0,
-        commit: candidate.commit_sha.0.clone(),
+
+    // **Existence is not identity.** DESIGN.md §15: `candidate_prepared`
+    // records the complete attempt/base/commit/tree identity "so resume adopts
+    // only the judged object". Presence alone accepts any object that happens
+    // to be at that sha — an unrelated commit, or a blob — which is exactly what
+    // a resume must not adopt.
+    //
+    // What is checkable here is what the fold keeps: the generation's base. A
+    // candidate is a commit **on** that base, so an object that is not a commit
+    // has no parent to read and one that is a different commit has the wrong
+    // parent. Neither can pass.
+    //
+    // **The tree is not checked, and that is a real residue.** `PreparedCandidate`
+    // keeps the candidate, the base and the paths; the tree lives only in the
+    // event, so a resume cannot compare it without the fold retaining it. A
+    // commit with the recorded parent and a *different* tree would still pass
+    // here. Recorded rather than approximated — closing it is a fold field and
+    // therefore its own decision.
+    let parent = manager.commit_parent(candidate.commit_sha.as_str())?;
+    if parent.as_deref() != Some(base.as_str()) {
+        return Err(Refusal::ObjectMissing {
+            key: candidate.key.0,
+            generation: candidate.generation.0,
+            commit: candidate.commit_sha.0.clone(),
+        }
+        .into());
     }
-    .into())
+    Ok(())
 }
 
 fn refuse_malformed_commit(
@@ -1150,6 +1194,23 @@ mod tests {
                 actual_paths: region(),
                 lease_effect: CandidateLeaseEffect::ReplacesPredicted { paths: region() },
             }
+        }
+
+        /// A second commit on the same base, differing only in its message.
+        ///
+        /// A *sibling*: `verify_object` now checks the parent, so a test that
+        /// wants to reach a later refusal needs an object that passes the
+        /// identity check without being the recorded candidate. The base itself
+        /// no longer serves — its parent is not the base.
+        fn sibling_commit(&self, hooks: &mut Hooks) -> CommitSha {
+            let judged = JudgedTree {
+                message: "alpha: a sibling of the judged tree".to_owned(),
+                ..self.judged()
+            };
+            write_candidate_commit(&self.manager, hooks, RUN_ID, judged)
+                .expect("commit-tree")
+                .commit_sha()
+                .clone()
         }
 
         /// Every unreachable object in the repository, per `git fsck`.
@@ -2117,6 +2178,7 @@ mod tests {
                 candidate_ref: candidates_ref(RUN_ID, ALPHA, GENERATION),
             },
             prepared_ref: candidate_pin_ref(RUN_ID, ALPHA, GENERATION),
+            base: fixture.base_sha.clone(),
         };
         complete_promotion(
             &fixture.manager,
@@ -2142,14 +2204,17 @@ mod tests {
 
         // And the refusal the same sentence names: a ref present at another
         // SHA is not accepted as "already created".
+        let sibling = fixture.sibling_commit(&mut hooks);
+        assert_ne!(sibling, commit, "a different commit on the same base");
         let forged = PromotingCandidate {
             candidate: CandidateRef {
                 key: ALPHA,
                 generation: GENERATION,
-                commit_sha: fixture.base_sha.clone(),
+                commit_sha: sibling,
                 candidate_ref: candidates_ref(RUN_ID, ALPHA, GENERATION),
             },
             prepared_ref: candidate_pin_ref(RUN_ID, ALPHA, GENERATION),
+            base: fixture.base_sha.clone(),
         };
         let refused = complete_promotion(
             &fixture.manager,
@@ -2643,6 +2708,7 @@ mod tests {
                 candidate_ref: candidates_ref(RUN_ID, ALPHA, GENERATION),
             },
             prepared_ref: candidate_pin_ref(RUN_ID, ALPHA, GENERATION),
+            base: fixture.base_sha.clone(),
         };
         let refused = complete_promotion(
             &fixture.manager,
@@ -2665,6 +2731,85 @@ mod tests {
             fixture.run_refs()
         );
         assert_eq!(journal.count("task_candidate_created"), 0);
+    }
+
+    /// **Present is not the same as *is the candidate*.**
+    ///
+    /// DESIGN.md §15 has `candidate_prepared` record the complete
+    /// attempt/base/commit/tree identity "so resume adopts only the judged
+    /// object". A promotion that asks only whether *something* is at that SHA
+    /// adopts whatever is there, and the two things that can be there are the
+    /// two this asserts: an object that is not a commit at all, and a commit
+    /// that is not on the generation's base. Both exist; neither is the judged
+    /// candidate; both must refuse before the ref is created.
+    ///
+    /// The tree is deliberately **not** asserted, and it is not an oversight:
+    /// the fold keeps the candidate, the base and the paths, so a resume has no
+    /// recorded tree to compare against. `PR7-CANDIDATE-TREE-UNVERIFIED` in
+    /// `reviews/FINDINGS.md` §2 is that residue, recorded rather than papered
+    /// over.
+    #[test]
+    fn promotion_refuses_an_object_that_is_not_the_judged_candidate() {
+        for (label, present) in [
+            ("a tree, not a commit", true),
+            ("a commit that is not on the base", false),
+        ] {
+            let fixture = Fixture::new("object-not-the-candidate");
+            let mut hooks = Hooks::new();
+            let mut journal = fixture.journal(&hooks);
+            journal.settle_succeeded();
+
+            // Two real objects of the fixture's own repository. The tree is not
+            // a commit; the base is a commit whose parent is not the base.
+            let impostor = if present {
+                CommitSha(fixture.tree_sha.0.clone())
+            } else {
+                fixture.base_sha.clone()
+            };
+            // The **production** presence predicate, not the fixture's: the
+            // residue classifier asks `cat-file -e <sha>^{}`, which resolves any
+            // object, so a tree answers "present" there. Asserting it here is
+            // what makes this a test of identity rather than of existence — the
+            // check being repaired would have passed both of these.
+            assert!(
+                fixture
+                    .manager
+                    .object_exists(impostor.as_str())
+                    .expect("cat-file"),
+                "{label}: the impostor is present to the residue classifier, so existence alone \
+                 would pass"
+            );
+
+            let forged = PromotingCandidate {
+                candidate: CandidateRef {
+                    key: ALPHA,
+                    generation: GENERATION,
+                    commit_sha: impostor.clone(),
+                    candidate_ref: candidates_ref(RUN_ID, ALPHA, GENERATION),
+                },
+                prepared_ref: candidate_pin_ref(RUN_ID, ALPHA, GENERATION),
+                base: fixture.base_sha.clone(),
+            };
+            let Err(refused) = complete_promotion(
+                &fixture.manager,
+                &mut hooks,
+                &mut journal,
+                &fixture.task,
+                forged,
+            ) else {
+                panic!("{label}: an impostor object must refuse");
+            };
+            assert!(
+                refused.to_string().contains(impostor.as_str()),
+                "{label}: {refused}"
+            );
+            assert!(
+                fixture.run_refs().is_empty(),
+                "{label}: and it refuses before creating anything: {:?}",
+                fixture.run_refs()
+            );
+            assert_eq!(journal.count("task_candidate_created"), 0, "{label}");
+        }
     }
 
     /// `git commit-tree` printing something that is not a full object id is

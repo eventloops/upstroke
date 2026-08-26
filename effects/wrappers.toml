@@ -71,6 +71,7 @@ effect_free = [
     "changed_paths_between",
     "classify_object_residue",
     "commit_identity",
+    "commit_parent",
     "common_git_dir",
     "decode_changed_paths",
     "derive",

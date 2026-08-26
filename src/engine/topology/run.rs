@@ -627,6 +627,17 @@ impl TopologyRun {
 
     /// The fold this run derives every decision from.
     #[must_use]
+    /// The digest this run's appends prove their committed first line against.
+    ///
+    /// `establish_stable_prefix` skips the check entirely when this is `None` —
+    /// `if let Some(expected)` — so a loop that lost it would reopen after an
+    /// append error and accept a first line the commit record does not name.
+    /// That is `PR31-CONTRACT-006`, and the answer is `EMIT-002`'s: the handle
+    /// carries the digest recovery verified and this is where it lands.
+    pub fn commitment_digest(&self) -> Option<&str> {
+        self.identity.committed_first_line_sha256.as_deref()
+    }
+
     /// Whether every Runner process this run registered was also settled.
     ///
     /// R4's "registered and settled exactly once", as a question a test can

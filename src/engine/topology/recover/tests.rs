@@ -5732,6 +5732,22 @@ fn the_loop_inherits_the_committed_digest_recovery_verified() {
         "an empty digest asserts nothing: this fixture must publish a commit \
          record for the comparison to mean anything"
     );
+
+    // **And it survives into the loop's own identity**, which is the hop that
+    // matters: `establish_stable_prefix` skips its check entirely when the
+    // digest is `None`, so a loop that carried the handle's value and then
+    // dropped it would reopen after an append error and accept a first line the
+    // commit record does not name. `PR31-CONTRACT-006`.
+    let run = crate::engine::topology::run::TopologyRun::resumed(
+        handle,
+        fixture.inputs(),
+        crate::engine::topology::select::Ceiling::unlimited(),
+    );
+    assert_eq!(
+        run.commitment_digest(),
+        Some(expected.as_str()),
+        "the loop's appends cannot prove their committed first line"
+    );
 }
 
 /// **Erratum E6: a resume converges the settled-but-unrecorded candidate.**
