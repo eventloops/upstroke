@@ -3373,15 +3373,20 @@ impl RunState {
         // Before the `Escalated` arm below, which resets the count: an attempt
         // that escalates spent its allowance on the rung it is leaving, and the
         // rung it climbs onto starts again at zero.
+        //
+        // Nested rather than a `let`-chain: `if cond && let Some(x) = ..` is
+        // unstable on **1.85**, which this crate's MSRV pins, and stable rustc
+        // accepts it — so the local gates pass and only the MSRV leg refuses.
         if crate::ladder::spends_allowance(
             finished
                 .record
                 .failure
                 .as_ref()
                 .map(crate::events::FailureRecord::shape),
-        ) && let Some(task) = self.tasks.get_mut(finished.key.index())
-        {
-            task.attempts_on_rung = task.attempts_on_rung.saturating_add(1);
+        ) {
+            if let Some(task) = self.tasks.get_mut(finished.key.index()) {
+                task.attempts_on_rung = task.attempts_on_rung.saturating_add(1);
+            }
         }
 
         match &finished.settlement {
