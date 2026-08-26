@@ -294,8 +294,19 @@ impl FrozenPlans<'_> {
 }
 
 impl AttemptPlans for FrozenPlans<'_> {
-    /// The one production resolution of an agent's pool, which the plan builder
-    /// below and the retry's `attempt_started` both read.
+    /// The one production resolution of an agent's pool over the frozen table:
+    /// the plan builder below, the reviewer profile beside it, and the driver
+    /// filling the retry's `RetryRequest` all read **this**.
+    ///
+    /// **It did not, until `21f1de0`'s round.** `79cd9c8` introduced this method
+    /// and said it gave the rule "one production implementation"; the plan
+    /// builder and the reviewer profile went on calling
+    /// `crate::capacity::pool_for` directly, so the count was three and this
+    /// method's only caller was the driver. The two direct calls were
+    /// character-for-character copies of this body, so routing them here is a
+    /// substitution and not a behaviour change.
+    /// `run::tests::the_frozen_pool_table_is_read_through_one_seam` holds the
+    /// count at one. `reviews/FINDINGS.md` §19, claim (4).
     fn pool_for(&self, agent: &str) -> Option<String> {
         crate::capacity::pool_for(agent, self.pools).map(|pool| pool.name.clone())
     }
@@ -325,8 +336,12 @@ impl AttemptPlans for FrozenPlans<'_> {
         let entry = request.entry;
         let profile = implementer_profile(
             ImplementerBinding::of_frozen(&request.binding),
-            crate::capacity::pool_for(&request.binding.agent, self.pools)
-                .map(|pool| pool.name.clone()),
+            // Through the seam, which is what makes it *the* production
+            // resolution rather than one of three. This read
+            // `crate::capacity::pool_for(...).map(|pool| pool.name.clone())` --
+            // `Self::pool_for`'s body, character for character -- while that
+            // method's own doc said the plan builder read it.
+            self.pool_for(&request.binding.agent),
         );
         let adapter = self
             .adapters
@@ -437,9 +452,7 @@ impl AttemptPlans for FrozenPlans<'_> {
                     // dropped a **guard**, this drops a **value**. Found by
                     // Sol's independent `seams` read, round 3.
                     let mut profile = pass.profile(entry.ladder.effort.review);
-                    profile.pool = crate::capacity::pool_for(&pass.binding.agent, self.pools)
-                        .map(|pool| pool.name.clone())
-                        .unwrap_or_default();
+                    profile.pool = self.pool_for(&pass.binding.agent).unwrap_or_default();
                     profile
                 },
                 lens: pass.lens,

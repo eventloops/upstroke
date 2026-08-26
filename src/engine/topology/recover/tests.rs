@@ -5489,6 +5489,11 @@ fn the_retaining_incarnation_retries_in_place() {
     use crate::engine::topology::run::{Progress, RunSeams, TopologyRun};
     use crate::engine::topology::select::Ceiling;
 
+    /// The pool this fixture's agent resolves to. Named rather than empty so
+    /// that "took the pool from the authority" and "took nothing" are different
+    /// observations.
+    const RETRY_POOL: &str = "the-retrying-agents-pool";
+
     let fixture = Fixture::healthy("driver-retries");
     let caps = vec![(
         crate::engine::topology::scaffold::AGENT.to_owned(),
@@ -5527,11 +5532,24 @@ fn the_retaining_incarnation_retries_in_place() {
     // real one or round-tripped against it; a fixture that hand-built an
     // `AttemptPlan` here would be exactly the fifth copy the `frozen_binding`
     // precedent warns about.
+    // **A pool the implementer's agent resolves to**, because the two
+    // `attempt_started` appends below are asserted to carry it. With `pools:
+    // &[]` — what this fixture had — `AttemptPlans::pool_for` returns `None`
+    // for every agent, so the retry arm's `pool: None` and its repair are
+    // indistinguishable, and `run.rs` passing a literal `None` left the whole
+    // suite green. Measured, twice: once as `R3-SEAMS-001` and once when round
+    // 4 restored the literal.
+    let pools = vec![crate::capacity::Pool::discovered(
+        RETRY_POOL,
+        crate::capacity::PoolKind::SubscriptionWindow,
+        crate::engine::topology::scaffold::AGENT,
+        vec![crate::capacity::Source::Signals],
+    )];
     let plans = crate::engine::assembly::FrozenPlans {
         adapters: &adapters,
         paths: &paths,
         gates: &[],
-        pools: &[],
+        pools: &pools,
         caps: &caps,
         worker_timeout: std::time::Duration::from_secs(300),
         decisions: &[],
@@ -5587,21 +5605,36 @@ fn the_retaining_incarnation_retries_in_place() {
     // driver that opened a fresh generation would append `task_dispatched`
     // again; a driver that lost the session would append `attempt_started`
     // with none.
-    let starts: Vec<(u32, bool)> = TopologyFold::parse_log(&fixture.log_bytes())
+    //
+    // **And the pool each attempt drained**, which is the field `R3-SEAMS-001`
+    // was about and the one no test held. The dispatch arm reads `plan.pool`;
+    // the retry arm appends before its plan exists and takes the same answer
+    // from `AttemptPlans::pool_for` one step earlier. Both are asserted here, in
+    // one run, against the pool the assembler actually resolves — which is the
+    // behavioural witness `79cd9c8` said was unavailable because "no driver
+    // fixture can reach the arm". This fixture reaches it, and reached it then.
+    // `reviews/FINDINGS.md` §19, claims (2) and (3).
+    let starts: Vec<(u32, bool, Option<String>)> = TopologyFold::parse_log(&fixture.log_bytes())
         .expect("the log parses")
         .into_iter()
         .filter_map(|event| match event.body {
-            TopologyEventBody::AttemptStarted { data } => {
-                Some((data.attempt.0, data.resume_session.is_some()))
-            }
+            TopologyEventBody::AttemptStarted { data } => Some((
+                data.attempt.0,
+                data.resume_session.is_some(),
+                data.pool.clone(),
+            )),
             _ => None,
         })
         .collect();
     assert_eq!(
         starts,
-        vec![(1, false), (2, true)],
-        "the retry is not the same generation's second attempt on a resumed \
-         session"
+        vec![
+            (1, false, Some(RETRY_POOL.to_owned())),
+            (2, true, Some(RETRY_POOL.to_owned())),
+        ],
+        "the retry is not the same generation's second attempt on a resumed session, drawing on \
+         the pool the assembler resolves for its agent. A `None` here is the ledger and the plan \
+         disagreeing about which subscription one attempt drained"
     );
     assert_eq!(
         durable_kinds(&fixture)
@@ -6529,19 +6562,48 @@ fn a_reviewer_runs_at_the_review_effort_not_the_implementers() {
         &fixture.private_root,
     );
     paths.create().expect("the run directories are creatable");
-    // Named so that a plan inheriting the implementer's pool and one looking up
-    // the reviewer's own could not both pass.
-    let reviewer_pools = vec![crate::capacity::Pool::discovered(
-        "the-reviewers-own-pool",
-        crate::capacity::PoolKind::SubscriptionWindow,
-        AGENT,
-        vec![crate::capacity::Source::Signals],
-    )];
+    // **The reviewer is bound to a different agent than the implementer, and it
+    // has to be.** The comment here used to say the single pool was "named so
+    // that a plan inheriting the implementer's pool and one looking up the
+    // reviewer's own could not both pass" — and the fixture's primary reviewer
+    // is `(claude-code, opus)` while its rung-0 implementer is
+    // `(claude-code, alpha-Mid-model)`. `review::passes_for` rebinds only on
+    // **exact `(agent, model)` equality**, so it does not fire and the pass
+    // keeps agent `claude-code`: the two lookups were the same lookup, both
+    // behaviours passed, and the mutation recorded as killed died because the
+    // pool became *empty* rather than wrong. `reviews/FINDINGS.md` §19,
+    // claim (8).
+    //
+    // With `REVIEW_AGENT` on the primary and a pool for each agent, inheriting
+    // the implementer's pool yields `the-implementers-pool` and fails.
+    //
+    // Through the scaffold's own constant rather than a literal: it is the
+    // agent that fixture's `alternative` binding already names, so this is the
+    // second agent the run actually probed and not one invented here.
+    use crate::engine::topology::scaffold::REVIEW_AGENT;
+
+    let mut reviewer_bound = entry.clone();
+    reviewer_bound.reviews.primary = Some(crate::review::PassBinding::new(REVIEW_AGENT, "gpt"));
+    let entry = &reviewer_bound;
+    let pools = vec![
+        crate::capacity::Pool::discovered(
+            "the-implementers-pool",
+            crate::capacity::PoolKind::SubscriptionWindow,
+            AGENT,
+            vec![crate::capacity::Source::Signals],
+        ),
+        crate::capacity::Pool::discovered(
+            "the-reviewers-own-pool",
+            crate::capacity::PoolKind::SubscriptionWindow,
+            REVIEW_AGENT,
+            vec![crate::capacity::Source::Signals],
+        ),
+    ];
     let plans = crate::engine::assembly::FrozenPlans {
         adapters: &adapters,
         paths: &paths,
         gates: &[],
-        pools: &reviewer_pools,
+        pools: &pools,
         caps: &[],
         worker_timeout: std::time::Duration::from_secs(300),
         decisions: &[],
@@ -6570,7 +6632,22 @@ fn a_reviewer_runs_at_the_review_effort_not_the_implementers() {
         !plan.reviewers.is_empty(),
         "this fixture plans no reviewer, so the effort below is unasserted"
     );
+    // The implementer's own pool, so the two values in play are distinguishable
+    // and the assertion below is about which one the reviewer got.
+    assert_eq!(
+        plan.pool.as_deref(),
+        Some("the-implementers-pool"),
+        "the implementer did not resolve its own agent's pool, so a reviewer carrying that value \
+         would not tell us anything"
+    );
     for reviewer in &plan.reviewers {
+        assert_eq!(
+            reviewer.agent.as_str(),
+            REVIEW_AGENT,
+            "reviewer `{}` runs on the implementer's agent, so its pool lookup and the \
+             implementer's are one lookup and both behaviours pass",
+            reviewer.lens.name()
+        );
         assert_eq!(
             reviewer.profile.effort,
             Some(Effort::Medium),

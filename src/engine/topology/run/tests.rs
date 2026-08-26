@@ -334,6 +334,51 @@ fn the_loop_selects_through_one_function() {
     );
 }
 
+/// **The frozen pool table is read through one seam.**
+///
+/// `AttemptPlans::pool_for` exists so that the plan builder, the reviewer
+/// profile and the driver's `RetryRequest` reach one answer. `79cd9c8` said it
+/// gave the rule "one production implementation" and it did not: `assembly.rs`
+/// called `crate::capacity::pool_for` from three places, two of them
+/// character-for-character copies of the seam's body, and the seam's only caller
+/// was `run.rs`. `reviews/FINDINGS.md` §19, claim (4).
+///
+/// **The needle is the qualified path**, and that is what makes a plain
+/// substring search sound here: nothing else in the crate ends in
+/// `capacity::pool_for`, so the collision class that
+/// `every_packet_named_recovery_action_has_a_production_caller` was carrying
+/// cannot arise. Stated rather than assumed, because assuming it is what that
+/// census did.
+///
+/// **The count is one and not zero.** Zero would mean the seam had been rewritten
+/// to resolve pools some other way, which is the same defect from the other
+/// side, so the assertion is an equality.
+#[test]
+fn the_frozen_pool_table_is_read_through_one_seam() {
+    const FILE: &str = "src/engine/assembly.rs";
+
+    let source =
+        std::fs::read_to_string(std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(FILE))
+            .expect("a source file");
+    let code = crate::effects::production_code(&source);
+    assert!(
+        code.len() * 2 > source.len(),
+        "the production region of {FILE} is {} of {} bytes, so a count over it says little about \
+         the file",
+        code.len(),
+        source.len()
+    );
+
+    let calls = code.matches("capacity::pool_for(").count();
+    assert_eq!(
+        calls, 1,
+        "{FILE} resolves an agent's pool from the frozen table in {calls} places. One is \
+         `AttemptPlans::pool_for`, which is the seam every caller is supposed to ask; a second is \
+         a rule with two implementations, and `wrong_internal_assumption` is how this project \
+         pays for those"
+    );
+}
+
 /// **Both arms of `attempt_started` get their pool from an authority.**
 ///
 /// `attempt_started` is appended from two places and they reach it differently:
@@ -344,16 +389,39 @@ fn the_loop_selects_through_one_function() {
 /// recorded no pool while the plan it then built resolved one, and the two
 /// disagreed about the same attempt.
 ///
-/// **A source census rather than a behavioural test, and the reason is
-/// structural.** A retry is only reachable *within* one process: recovery step
-/// (e) closes every `RetainedIdle` generation, so a resumed run never has one to
-/// retry, and no driver fixture can reach the arm. Asserting the property over
-/// the construction sites is what is available, and it is what actually failed —
-/// a literal `None` where the other arm had an authority.
-///
 /// The needle is the field's value in each production `AttemptStarted4` literal.
 /// A hard-coded `None` fails; anything that names something does not, because
 /// this census's claim is "not invented here", not "non-empty".
+///
+/// # Two corrections to what this test was said to be
+///
+/// **It is not the only witness available, and the claim that it was is false.**
+/// `79cd9c8`'s message argued a source census was structurally necessary because
+/// "a retry is only reachable *within* one process … and **no driver fixture can
+/// reach the arm**". One does:
+///
+/// ```text
+/// $ grep -rn 'fn the_retaining_incarnation_retries_in_place' --include='*.rs' src/
+/// src/engine/topology/recover/tests.rs:5488
+/// ```
+///
+/// It drives `TopologyRun::step` twice in one process and the second iteration
+/// **is** the retained-generation retry. It now asserts the pool on both
+/// `attempt_started` appends, which is the behavioural witness this census was
+/// offered in place of. `reviews/FINDINGS.md` §19, claim (3).
+///
+/// **And this census does not read the file the defect was in.** The two sites
+/// below are `attempt.rs` and `settle.rs`; the literal `None` that
+/// `R3-SEAMS-001` found was in **`run.rs`**, which fills `settle::retry`'s
+/// `RetryRequest`, and `settle.rs`'s own literal reads `request.pool` and was
+/// correct throughout. Measured at `5a08f19`: restoring `pool: None` in
+/// `run.rs` leaves this census green **and the entire suite green** — 1698 + 8
+/// passed, 0 failed. The behavioural assertion above is what kills it. §19,
+/// claim (2).
+///
+/// So this census keeps a real and narrower job: the two *literals* name an
+/// authority rather than inventing a value. It is not a witness that the value
+/// arriving at them is right.
 #[test]
 fn both_attempt_started_arms_take_their_pool_from_an_authority() {
     const SITES: &[(&str, &str)] = &[
