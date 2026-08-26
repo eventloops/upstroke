@@ -294,6 +294,12 @@ impl FrozenPlans<'_> {
 }
 
 impl AttemptPlans for FrozenPlans<'_> {
+    /// The one production resolution of an agent's pool, which the plan builder
+    /// below and the retry's `attempt_started` both read.
+    fn pool_for(&self, agent: &str) -> Option<String> {
+        crate::capacity::pool_for(agent, self.pools).map(|pool| pool.name.clone())
+    }
+
     fn inputs(&self, request: &InputsRequest<'_>) -> Result<ReviewInputs, UpstrokeError> {
         let entry = request.entry;
         Ok(ReviewInputs {

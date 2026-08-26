@@ -1101,6 +1101,8 @@ impl TopologyRun {
             })?;
         let slot_for_run = task_slot(key, generation);
         let slot = slot_for_run.clone();
+        // Read before `binding` moves into the request below it.
+        let pool = seams.plans.pool_for(&binding.agent);
 
         let outcome = {
             let worktrees = ManagedWorktrees::new(seams.manager);
@@ -1115,7 +1117,11 @@ impl TopologyRun {
                     retained_tree: held.tree.clone(),
                     binding,
                     rung: position.0,
-                    pool: None,
+                    // Through the seam that owns the frozen pool table, not a
+                    // second lookup here. The dispatch arm reads `plan.pool`;
+                    // this arm appends before its plan exists, so it asks the
+                    // same authority one step earlier (`R3-SEAMS-001`).
+                    pool: pool.clone(),
                     materialization: None,
                 },
             )?

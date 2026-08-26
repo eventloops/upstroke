@@ -212,6 +212,22 @@ pub trait AttemptPlans {
     /// Whatever the assembler returns.
     fn inputs(&self, request: &InputsRequest<'_>) -> Result<ReviewInputs, UpstrokeError>;
 
+    /// The capacity pool `agent` drains, where the run's table names one.
+    ///
+    /// **Here rather than in the driver because the pool rule has one
+    /// production implementation** and this seam owns the frozen table it reads.
+    /// The dispatch arm gets the pool from the plan (`plan.pool`); the retry arm
+    /// appends `attempt_started` **before** its plan exists — `settle::retry`
+    /// produces the event and the plan is built after — so it needs the same
+    /// answer one step earlier. Resolving it in the driver would be a second
+    /// place that decides which pool an attempt drains, which is what
+    /// `a_reviewers_profile_is_accounted_for_at_both_callers` exists to forbid.
+    ///
+    /// Sol's `R3-SEAMS-001`: the retry passed `pool: None`, so a resumed run's
+    /// `attempt_started` recorded no pool while the plan it then built resolved
+    /// one — the ledger and the plan disagreeing about the same attempt.
+    fn pool_for(&self, agent: &str) -> Option<String>;
+
     /// The plan for one attempt.
     ///
     /// # Errors

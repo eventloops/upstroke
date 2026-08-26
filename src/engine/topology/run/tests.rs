@@ -333,3 +333,66 @@ fn the_loop_selects_through_one_function() {
          reached the loop unguarded is `INV-07`'s failure"
     );
 }
+
+/// **Both arms of `attempt_started` get their pool from an authority.**
+///
+/// `attempt_started` is appended from two places and they reach it differently:
+/// the dispatch arm builds its plan first and reads `plan.pool`; the retry arm
+/// appends **before** its plan exists, because `settle::retry` produces the
+/// event and the plan is built after. Sol's `R3-SEAMS-001` is what that
+/// asymmetry produced — the retry passed `pool: None`, so a resumed run's ledger
+/// recorded no pool while the plan it then built resolved one, and the two
+/// disagreed about the same attempt.
+///
+/// **A source census rather than a behavioural test, and the reason is
+/// structural.** A retry is only reachable *within* one process: recovery step
+/// (e) closes every `RetainedIdle` generation, so a resumed run never has one to
+/// retry, and no driver fixture can reach the arm. Asserting the property over
+/// the construction sites is what is available, and it is what actually failed —
+/// a literal `None` where the other arm had an authority.
+///
+/// The needle is the field's value in each production `AttemptStarted4` literal.
+/// A hard-coded `None` fails; anything that names something does not, because
+/// this census's claim is "not invented here", not "non-empty".
+#[test]
+fn both_attempt_started_arms_take_their_pool_from_an_authority() {
+    const SITES: &[(&str, &str)] = &[
+        (
+            "src/engine/topology/attempt.rs",
+            "the dispatch arm: `plan.pool`, resolved by the assembler that owns the pool table",
+        ),
+        (
+            "src/engine/topology/settle.rs",
+            "the retry arm: `request.pool`, which the driver fills from `AttemptPlans::pool_for` \
+             — the same authority, asked one step earlier",
+        ),
+    ];
+
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let mut invented: Vec<String> = Vec::new();
+    let mut checked = 0_usize;
+    for (file, why) in SITES {
+        let source = std::fs::read_to_string(root.join(file)).expect("a source file");
+        let code = crate::effects::production_code(&source);
+        let at = code
+            .find("AttemptStarted4 {")
+            .unwrap_or_else(|| panic!("{file} no longer constructs an `AttemptStarted4`"));
+        let rest = &code[at..];
+        let body = &rest[..rest.find("})").unwrap_or(rest.len())];
+        let pool = body
+            .lines()
+            .find_map(|line| line.trim().strip_prefix("pool:"))
+            .unwrap_or_else(|| panic!("{file}'s `AttemptStarted4` has no `pool` field"));
+        checked += 1;
+        if pool.trim().starts_with("None") {
+            invented.push(format!("{file} — {why}"));
+        }
+    }
+
+    assert_eq!(checked, SITES.len(), "a site stopped being found");
+    assert!(
+        invented.is_empty(),
+        "these append `attempt_started` with a hard-coded `pool: None`, so the ledger and the \
+         plan disagree about which pool the attempt drained: {invented:?}"
+    );
+}
