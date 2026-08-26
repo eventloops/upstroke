@@ -2137,6 +2137,93 @@ above the construction it was looking for, and reported one production construct
 where there are two — the §4 self-referential-grep class, one file further along.
 Both corrections and the rule are on the function itself.
 
+## 22c. The re-review of `c2c0294`, and the one finding that was the harness
+
+`reviews/2026-08-26-pr7-frontier-review-c2c0294.md` is the record. Four blocking findings;
+three stand, one dismisses. This is what they changed here.
+
+### Finding A — the repair reached the legacy wire, and a census could not have seen it
+
+**Correction to `decisions/2026-08-26-durable-retry-feedback.md`, amended on-branch before
+it landed anywhere.** The record's compatibility section claimed *"`report.json` is
+unaffected … this change adds no call site to it"*. Measured at `502970d`:
+
+```
+$ grep -n 'classify::attempt_record' src/engine/coordinator.rs
+844:                data: Box::new(super::classify::attempt_record(
+                        failure: result.failure.as_ref(),
+$ grep -n 'pub attempts' src/engine/report.rs
+83:    pub attempts: Vec<AttemptRecord>,
+530:        attempts: records.clone(),
+```
+
+`coordinator.rs` is the **live** schema-3 path. It passes an `AttemptFailure` whose
+`feedback` holds the gate tail or the reviewer's `required_changes` into the shared
+builder, so `detail: failure.feedback.clone()` put the full text on the legacy wire and
+into `report.json` — once per failed attempt, duplicating the `ladder_retry` copy, and
+reversing the reason `LadderRetry`'s own doc gives for holding it.
+
+**Why every instrument this slice owns missed it, which is the part worth keeping.** "Adds
+no call site" was *true*. The change added no **initializer**; it changed what an existing
+shared one writes. Every census in this repository counts constructions — that is how the
+second `AttemptRecord` construction was found two sections above — and a construction
+census cannot see **value flow through a shared builder into a caller nobody read**. §22b
+says a property claim about another part of the tree ages and only a census or a reviewer
+catches it. This is the sharper case: not a claim that aged, but a claim about a caller
+that was never read at all, and no census could have read it.
+
+> A claim that a change does not reach some other engine is a claim about that engine's
+> **callers**, not about this change's call sites. The instrument is reading them.
+
+**The repair** is `classify::FeedbackCarrier` — a two-variant choice on `AttemptFacts`
+with **no default**, so a caller must decide and a third engine will not compile until
+someone does. The compiler named all three existing sites when the field was added.
+
+**Witnesses, and the mutation that kills each.** All run in one invocation:
+
+| mutation | legacy wire | schema-4 live | schema-4 crash | write path |
+|---|---|---|---|---|
+| *(none — baseline)* | ok | ok | ok | ok |
+| the legacy caller asks for `AttemptRecord` (finding A, re-applied) | **FAILED** | ok | ok | ok |
+| the schema-4 caller asks for `LadderEvent` | ok | **FAILED** | ok | ok |
+| the `match` collapses to an unconditional write | **FAILED** | ok | ok | ok |
+| `#[serde(default)]` becomes `skip_serializing_if` | ok | ok | ok | ok — but the **strict door** witness FAILS |
+
+Columns: `the_legacy_wire_and_report_carry_no_feedback_on_the_attempt_record`,
+`a_retried_worker_is_told_what_the_last_attempt_failed_on`,
+`a_crash_does_not_erase_what_the_last_attempt_was_told_to_fix`,
+`both_feedback_sources_reach_the_durable_attempt_record`.
+
+**The second row is a witness gap this battery found, not a mutation that was expected to
+survive.** The crash witnesses seed a log directly, so they assert what a resume does with
+a `detail` already present and cannot tell whether a live schema-4 settlement writes one.
+Pointing the driver at the legacy carrier left every test in the file green. The live
+driver test now reads its own log and asserts a settled failure carries the text.
+
+**And the legacy witness is a fixture comparison, not a self-transform.** The expected
+bytes are the bytes `610106b` — the commit before the field existed — actually wrote for
+the same gate-failure scenario, captured by running it there:
+
+```
+"failure":{"kind":"gate_failed","origin":"worker","reason":"gate `needs-test` failed: …"}
+```
+
+Three keys. The test asserts that stripping `,"detail":null` from what this build writes
+leaves exactly those three, with those values — and that the strip *fires*, so an absent
+key cannot pass vacuously.
+
+**One residual difference is stated rather than hidden.** `detail` serializes as an
+explicit `null`, so a legacy `failure` object gains that one key.
+`skip_serializing_if = "Option::is_none"` would remove it and **breaks schema 4's strict
+door**: an input carrying `"detail":null` decodes to `None`, re-encodes to nothing, and the
+door reports a key the record did not claim back, refusing every failed attempt's
+settlement. That was an argument in the decision record and is now a measurement — and the
+door's own precondition test stays green under the attribute, because its fixture's
+`AttemptRecord` has `failure: None` and contains no `FailureRecord` at all.
+`an_explicit_null_detail_survives_the_strict_door` is that case, one record deeper, in a
+file this exception may touch.
+
+
 ## 22a. A driver that fails silently on a diff this size
 
 Recorded here because it was found while launching the frontier review and it would have

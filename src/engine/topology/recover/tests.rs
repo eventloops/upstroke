@@ -6008,6 +6008,37 @@ fn a_retried_worker_is_told_what_the_last_attempt_failed_on() {
         prompts[0],
         prompts[1]
     );
+
+    // **And the feedback is on the durable record, because this engine has no
+    // other carrier.** The crash-resume witnesses seed a log directly, so they
+    // assert what a resume does with a `detail` that is already there and
+    // cannot tell whether a *live* schema-4 settlement writes one. Nothing did,
+    // until this: `classify::FeedbackCarrier` is a per-caller choice, and
+    // pointing the driver at `LadderEvent` — the legacy answer — left every
+    // test in this file green while making the brief empty again for every run
+    // that actually crashes. Measured 2026-08-26.
+    let settled: Vec<serde_json::Value> = TopologyFold::parse_log(&fixture.log_bytes())
+        .expect("the log parses")
+        .into_iter()
+        .filter_map(|event| match event.body {
+            TopologyEventBody::AttemptFinished { data } => {
+                serde_json::to_value(data.record.failure.as_ref()?).ok()
+            }
+            _ => None,
+        })
+        .collect();
+    assert!(
+        !settled.is_empty(),
+        "no failed settlement in the log, so the assertion below is vacuous"
+    );
+    assert!(
+        settled
+            .iter()
+            .any(|failure| failure["detail"].as_str().is_some_and(|d| !d.is_empty())),
+        "every failed attempt this run settled carries `detail: null`, so the \
+         schema-4 driver is asking for the legacy carrier and §11.4's feedback \
+         is durable nowhere: {settled:?}"
+    );
 }
 
 /// The order the funnels ran in, for the **driver's** composition of the

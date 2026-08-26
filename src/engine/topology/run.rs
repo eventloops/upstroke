@@ -1540,6 +1540,10 @@ impl TopologyRun {
                 outcome: &assessed.outcome,
                 reviews: &judgement.reviews,
                 failure: judgement.failure.as_ref(),
+                // Schema 4 has no other carrier: no `SettlementTransition`
+                // variant holds feedback, so this record is where §11.4's text
+                // survives a crash or it does not survive one.
+                feedback: crate::engine::classify::FeedbackCarrier::AttemptRecord,
             },
         );
 

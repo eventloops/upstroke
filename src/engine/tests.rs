@@ -4368,6 +4368,284 @@ fn attempt_record(attempt: u32, tier: &str, failed: bool) -> AttemptRecord {
     }
 }
 
+/// The raw text of the JSON object that follows `key` in `line`.
+///
+/// Byte-exact and order-preserving, which is the whole point: a `serde_json::Value`
+/// round-trip re-emits an object with its keys sorted, and a claim about *what the
+/// log holds* cannot be made from a value that has been through one. Tracks string
+/// state so a brace inside a gate's error text does not end the object early.
+fn raw_object_after(line: &str, key: &str) -> Option<String> {
+    let start = line.find(key)? + key.len();
+    let bytes: Vec<char> = line[start..].chars().collect();
+    if bytes.first() != Some(&'{') {
+        return None;
+    }
+    let (mut depth, mut in_string, mut escaped) = (0usize, false, false);
+    for (index, c) in bytes.iter().enumerate() {
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        match c {
+            '\\' if in_string => escaped = true,
+            '"' => in_string = !in_string,
+            '{' if !in_string => depth += 1,
+            '}' if !in_string => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(bytes[..=index].iter().collect());
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+/// **The legacy record did not change when schema 4's did.**
+///
+/// `FailureRecord::detail` exists for schema 4, whose settlement transitions have no
+/// feedback field. The record builder is shared with `coordinator.rs`, and the first
+/// version of the repair copied the value in unconditionally — so the **live**
+/// `upstroke run` path began writing an 8-KiB gate tail onto the legacy wire and into
+/// `report.json`, once per failed attempt, duplicating the `ladder_retry` copy that
+/// already held it. The 2026-08-26 re-review of `c2c0294` found it as finding A.
+/// `classify::FeedbackCarrier` is the repair; this is what holds it.
+///
+/// **The fixture is real, not a transform of what this build produces.** These are the
+/// bytes `610106b` — the commit before the field existed — wrote for the same scenario,
+/// captured by running it there:
+///
+/// ```text
+/// "failure":{"kind":"gate_failed","origin":"worker","reason":"gate `needs-test` failed: …"}
+/// ```
+///
+/// Three keys. This build must write those three keys with those values, and **one
+/// residual difference that is stated rather than hidden**: `detail` serializes as an
+/// explicit null, because `skip_serializing_if` is not available here. Schema 4's strict
+/// door decides "unknown field" by asking the record which keys it claims back, so a
+/// field that decodes from `"detail":null` and re-encodes to nothing makes the door
+/// refuse every failed attempt's settlement — measured, and held by
+/// `an_explicit_null_detail_survives_the_strict_door` above.
+///
+/// So the claim is exact: **strip `,"detail":null` and the bytes are the pre-change
+/// bytes.** Not "similar", and not asserted by rebuilding the expected value from the
+/// observed one — the strip must fire, and what is left must match key for key.
+#[test]
+fn the_legacy_wire_and_report_carry_no_feedback_on_the_attempt_record() {
+    let repo = temp_engine_repo("legacy-no-detail");
+    seed(
+        &repo,
+        "## Implement the widget\n<!-- upstroke: id=t1 kind=implement depends= -->\n",
+        Some(
+            "[routing]\nimplement = { chain = [\"small\"], attempts_per = 2 }\n\n\
+                 [[gates]]\nname = \"needs-test\"\ncmd = \"git ls-files --error-unmatch \
+                 widget_test.rs\"\n",
+        ),
+    );
+    let mut opts = options(&repo);
+    opts.config_path = Some(repo.join("upstroke.toml"));
+    let source = source(
+        vec![Effect::EditFile, Effect::EditTest],
+        vec![ReviewBehavior::Pass],
+    );
+    run_with(&opts, &source).expect("run");
+
+    let runs = opts.repo_root.join(".upstroke").join("runs");
+    let public = fs::read_dir(&runs)
+        .expect("the runs root")
+        .flatten()
+        .map(|entry| entry.path())
+        .find(|path| path.join("events.jsonl").is_file())
+        .expect("the run left a public directory");
+    let log = fs::read_to_string(public.join("events.jsonl")).expect("the log");
+
+    let mut failures = 0;
+    let mut carried_tail = false;
+    for line in log.lines() {
+        let event: serde_json::Value = serde_json::from_str(line).expect("a json line");
+        if event.get("event").and_then(serde_json::Value::as_str) != Some("attempt_finished") {
+            continue;
+        }
+        let Some(failure) = event.pointer("/data/failure").filter(|v| !v.is_null()) else {
+            continue;
+        };
+        failures += 1;
+
+        // **The log's own bytes, sliced out of the line.** Not
+        // `serde_json::to_string(failure)`: a `Value` round-trip sorts keys, so
+        // the field order the comparison is about would be the map's rather than
+        // the struct's, and the pre-change fixture's `,"detail":null` suffix
+        // would never appear where it actually appears.
+        let bytes =
+            raw_object_after(line, "\"failure\":").expect("the line carries a failure object");
+        let stripped = bytes.replace(",\"detail\":null", "");
+        assert_ne!(
+            stripped, bytes,
+            "the legacy failure record carries no `detail` key at all: {bytes}. This test \
+             asserts the *only* difference from `610106b` is that one null, and if the key \
+             is absent the assertion below is vacuous"
+        );
+        assert_eq!(
+            bytes.matches(",\"detail\":").count(),
+            1,
+            "expected exactly one `detail` key in {bytes}"
+        );
+
+        let pre: serde_json::Value = serde_json::from_str(&stripped).expect("still json");
+        let keys: Vec<&str> = pre
+            .as_object()
+            .expect("an object")
+            .keys()
+            .map(String::as_str)
+            .collect();
+        assert_eq!(
+            keys,
+            vec!["kind", "origin", "reason"],
+            "stripping the null left {keys:?}, which is not the shape `610106b` wrote"
+        );
+        assert_eq!(pre["kind"], "gate_failed");
+        assert_eq!(pre["origin"], "worker");
+        assert!(
+            pre["reason"]
+                .as_str()
+                .is_some_and(|r| r.starts_with("gate `needs-test` failed:")),
+            "reason: {}",
+            pre["reason"]
+        );
+
+        // The point of the whole finding: the tail is not on the record.
+        assert!(
+            failure["detail"].is_null(),
+            "the legacy attempt record carries §11.4's feedback again, which is the \
+             kilobytes-per-attempt duplication `LadderRetry`'s own doc exists to avoid: {}",
+            failure["detail"]
+        );
+
+        // And it is still delivered — by the carrier that owns it here.
+        if event
+            .pointer("/transition/data/detail")
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|d| d.contains("widget_test.rs"))
+        {
+            carried_tail = true;
+        }
+    }
+    assert!(
+        failures >= 1,
+        "no failed attempt in the log, so this test asserted nothing"
+    );
+    assert!(
+        carried_tail,
+        "the gate tail reached no `ladder_retry` transition either, so the legacy engine \
+         lost §11.4's feedback rather than keeping it where it belongs"
+    );
+
+    // `report.json` is the other reader of these records, and the reason
+    // `LadderRetry` holds the text instead: it "should not grow one per attempt".
+    let report: serde_json::Value = serde_json::from_str(
+        &fs::read_to_string(public.join("report.json")).expect("report.json is written"),
+    )
+    .expect("report.json is json");
+    let mut checked = 0;
+    for task in report["tasks"].as_array().into_iter().flatten() {
+        for attempt in task["attempts"].as_array().into_iter().flatten() {
+            let Some(failure) = attempt.get("failure").filter(|v| !v.is_null()) else {
+                continue;
+            };
+            checked += 1;
+            assert!(
+                failure["detail"].is_null(),
+                "report.json grew a gate tail on attempt {}: {}",
+                attempt["attempt"],
+                failure["detail"]
+            );
+        }
+    }
+    assert!(
+        checked >= 1,
+        "no failed attempt reached report.json, so its half of this test asserted nothing"
+    );
+
+    // The retry was still told. Delivery is the whole reason the field exists on the
+    // other engine, and removing it here must not cost the legacy one anything.
+    let runs = source.adapter.runs();
+    assert!(
+        runs[1].prompt.contains("gate `needs-test` failed"),
+        "the legacy retry lost the gate's words: {}",
+        runs[1].prompt
+    );
+}
+
+/// **The strict door's precondition, checked over the record that gained a field.**
+///
+/// Schema 4 refuses an unknown field in a transaction payload (`refusals[24]`) by
+/// decoding a record, re-encoding it, and reporting any key the input carried that
+/// the record did not claim back. That is exact **only** while every embedded record
+/// serializes each field it deserializes — no `skip_serializing_if` — and
+/// `topology::events::strict`'s own documentation says so.
+///
+/// `events::tests::a_known_null_survives_the_strict_door_and_an_unknown_null_does_not`
+/// checks that precondition, and checks it over `AttemptRecord`'s own optional fields:
+/// its fixture has `failure: None`, so **no `FailureRecord` appears in the payload at
+/// all**. Adding `skip_serializing_if` to `FailureRecord::detail` therefore leaves that
+/// test green while breaking the door for every failed attempt — measured 2026-08-26,
+/// which is why `decisions/2026-08-26-durable-retry-feedback.md`'s argument for a plain
+/// `#[serde(default)]` needed a witness rather than a paragraph.
+///
+/// This is that witness, one record deeper. It lives here because
+/// `src/topology/events.rs` is frozen and this needs no change to it.
+#[test]
+fn an_explicit_null_detail_survives_the_strict_door() {
+    use crate::topology::events::{
+        AttemptFinished4, AttemptNumber, AttemptSettlement, GenerationId, LeaseDisposition,
+        SettlementTransition, TopologyEvent, TopologyEventBody,
+    };
+
+    let mut record = serde_json::to_value(attempt_record(1, "mid", true)).expect("serialize");
+    let failure = record
+        .get_mut("failure")
+        .and_then(serde_json::Value::as_object_mut)
+        .expect("a failed record carries a failure object");
+    // Explicit, not absent: an absent key is the older-log case and is covered by
+    // `a_log_predating_the_detail_field_folds_and_resumes`. What is under test here
+    // is the key being *present* and null, which is what this build writes.
+    failure.insert("detail".to_owned(), serde_json::Value::Null);
+
+    let mut value = serde_json::to_value(TopologyEvent::now(TopologyEventBody::AttemptFinished {
+        data: Box::new(AttemptFinished4 {
+            key: crate::topology::registry::TaskKey(0),
+            generation: GenerationId(0),
+            attempt: AttemptNumber(1),
+            record: Box::new(attempt_record(1, "mid", true)),
+            settlement: AttemptSettlement::Closed {
+                transition: SettlementTransition::Retry,
+                lease: LeaseDisposition::PredictedReleased,
+            },
+        }),
+    }))
+    .expect("the event serializes");
+    value["data"]["record"] = record;
+
+    let parsed: TopologyEvent = serde_json::from_value(value).expect(
+        "an explicit null on a known optional field must pass the strict door; if this \
+         refuses, the door is reporting a field the record does declare, and every \
+         failed attempt's settlement is unreadable",
+    );
+    let TopologyEventBody::AttemptFinished { data } = parsed.body else {
+        unreachable!("built as an attempt_finished")
+    };
+    assert_eq!(
+        data.record
+            .failure
+            .as_ref()
+            .expect("the failure survives")
+            .detail,
+        None,
+        "an explicit null must read back as None"
+    );
+}
+
 /// **Both of §11.4's feedback sources reach the durable record.**
 ///
 /// §11.4 names exactly two: "failure feedback (gate log or `required_changes`)
@@ -4447,6 +4725,9 @@ fn durable_detail(failure: &crate::ladder::AttemptFailure) -> Option<String> {
             outcome: &outcome,
             reviews: &[],
             failure: Some(failure),
+            // The schema-4 carrier, because that is the path under test: this
+            // helper exists to assert the field is written at all.
+            feedback: super::classify::FeedbackCarrier::AttemptRecord,
         },
     )
     .failure

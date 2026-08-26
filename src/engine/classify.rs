@@ -151,6 +151,38 @@ impl ReviewPassFacts<'_> {
     }
 }
 
+/// Where §11.4's feedback is durable for this settlement.
+///
+/// **An explicit choice with no default, because the record builder is shared and
+/// the two engines answer differently.** §11.4 sends a gate log tail or the
+/// reviewer's `required_changes` back to the next attempt; the question this
+/// answers is which durable record carries that text, and only the caller knows.
+///
+/// It exists because the alternative was tried and was wrong.
+/// `FailureRecord::detail` was added for schema 4 — whose settlement transitions
+/// have no feedback field, so the attempt record is the only carrier there — and
+/// the value was copied in unconditionally. `coordinator.rs` calls the same
+/// builder, so the *legacy* wire and `report.json` began carrying the full text
+/// too, duplicating the `ladder_retry`/`ladder_escalated` copy that already held
+/// it and reversing the reason [`crate::events::LadderRetry`] gives for its own
+/// shape: "a gate log tail runs to kilobytes, and `report.json` should not grow
+/// one per attempt". The 2026-08-26 re-review of `c2c0294` found it, finding A.
+///
+/// **A field rather than a defaulted parameter** so that adding a third engine
+/// does not compile until someone decides which carrier it has. A default here
+/// would answer that question silently, in whichever direction the last author
+/// happened to need.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum FeedbackCarrier {
+    /// Schemas 1-3: `ladder_retry` and `ladder_escalated` carry `summary` **and**
+    /// `detail` outright, and `Progress::feedback` is rebuilt by replaying them.
+    /// The attempt record must not duplicate the text.
+    LadderEvent,
+    /// Schema 4: no `SettlementTransition` variant has a feedback field, so the
+    /// attempt record is where §11.4's feedback is durable or it is nowhere.
+    AttemptRecord,
+}
+
 /// The routing and product facts one attempt's ledger line is built from.
 ///
 /// **Ask for what you read.** [`attempt_record`] reads exactly these; it never
@@ -175,6 +207,8 @@ pub(crate) struct AttemptFacts<'a> {
     pub(crate) reviews: &'a [crate::events::ReviewRecord],
     /// Why the attempt failed, if it did.
     pub(crate) failure: Option<&'a AttemptFailure>,
+    /// Which durable record carries this settlement's §11.4 feedback.
+    pub(crate) feedback: FeedbackCarrier,
 }
 
 /// One attempt's durable ledger line.
@@ -219,13 +253,20 @@ pub(crate) fn attempt_record(attempt: u32, facts: AttemptFacts<'_>) -> AttemptRe
             kind: failure.kind,
             origin: failure.origin,
             reason: failure.reason.clone(),
-            // §11.4's feedback, onto the durable record. It was dropped here:
+            // §11.4's feedback, onto the durable record — **for the caller
+            // that has nowhere else to put it**. It was dropped here entirely:
             // `AttemptFailure` carried the gate tail and the reviewer's
-            // `required_changes`, and the record kept only the summary — so a
-            // resumed run could say *that* an attempt failed and nothing about
-            // what the next one must do differently.
+            // `required_changes`, and the record kept only the summary, so a
+            // resumed schema-4 run could say *that* an attempt failed and
+            // nothing about what the next one must do differently. Then it was
+            // copied here unconditionally, which handed the same text to the
+            // legacy wire and `report.json` as well. Neither is the rule; the
+            // rule is that the carrier is the caller's answer.
             // `decisions/2026-08-26-durable-retry-feedback.md`.
-            detail: failure.feedback.clone(),
+            detail: match facts.feedback {
+                FeedbackCarrier::AttemptRecord => failure.feedback.clone(),
+                FeedbackCarrier::LadderEvent => None,
+            },
         }),
     }
 }

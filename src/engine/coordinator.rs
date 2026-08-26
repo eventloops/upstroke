@@ -851,6 +851,13 @@ impl Run<'_> {
                         outcome: &result.outcome,
                         reviews: &result.reviews,
                         failure: result.failure.as_ref(),
+                        // The legacy wire's own carrier. `ladder_retry` and
+                        // `ladder_escalated` are appended with `summary` and
+                        // `detail` a few lines below, and `Progress::feedback`
+                        // is rebuilt by replaying them, so a copy on the record
+                        // would be the same kilobytes twice — once in the log
+                        // and once in every `report.json`.
+                        feedback: super::classify::FeedbackCarrier::LadderEvent,
                     },
                 )),
             });

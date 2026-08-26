@@ -130,6 +130,16 @@ says *what it is told* — and it belongs on the same line.
   which is why this field is a plain `#[serde(default)]` and deliberately **not**
   `skip_serializing_if = "Option::is_none"`, even though that would keep existing lines
   byte-identical. Keeping the door exact is worth more than keeping the bytes narrow.
+
+  **Measured 2026-08-26, because the argument alone was not enough.** Adding
+  `skip_serializing_if` leaves the door's own precondition test —
+  `events::tests::a_known_null_survives_the_strict_door_and_an_unknown_null_does_not` —
+  **green**: its fixture's `AttemptRecord` has `failure: None`, so no `FailureRecord`
+  appears in the payload it checks at all. One record deeper, an input carrying
+  `"detail":null` decodes to `None`, re-encodes to nothing, and the door reports `detail`
+  as a key the record did not claim back — refusing every failed attempt's settlement.
+  `engine::tests::an_explicit_null_detail_survives_the_strict_door` is that case, in a
+  file this exception may touch, and it fails under the attribute and passes without it.
 - **No external schema-4 writer exists.** The same repair round narrowed the schema-4
   driver's surface: `src/engine/mod.rs:61` is `pub(crate) mod topology;`, so nothing
   outside this crate can construct or append one of these records. A wire nobody else
@@ -142,13 +152,52 @@ says *what it is told* — and it belongs on the same line.
   gate half and by the reviewer's required-changes text for the review half. That is
   stated rather than claimed away: the prompt-side bound (`MAX_FEEDBACK_ENTRIES` = 6) is a
   bound on what a *prompt* quotes, not on what the log stores.
-- **`report.json` is unaffected.** The existing note on `LadderRetry` — feedback is
-  "carried on the ladder events rather than on the attempt record because this is the
-  full text … and `report.json` should not grow one per attempt" — is about the legacy
-  schema-3 projection, which reads `AttemptRecord` for its ledger. `detail` is `None` on
-  every successful attempt and every attempt the legacy coordinator settles, because the
-  legacy path constructs its feedback into `LadderRetry` as before and this change adds
-  no call site to it.
+- **The legacy schema-3 wire and `report.json` are unaffected — by the carrier choice
+  below, not by accident.**
+
+  > **Amended 2026-08-26, before this record landed anywhere.** This bullet first read:
+  > *"`report.json` is unaffected … `detail` is `None` on every successful attempt and
+  > every attempt the legacy coordinator settles, because the legacy path constructs its
+  > feedback into `LadderRetry` as before and this change adds no call site to it."* That
+  > was false, and it was false at the moment it was written. The frontier re-review of
+  > `c2c0294` found it as finding A.
+  >
+  > **The mechanism, measured.** `classify::attempt_record` is *shared*, and
+  > `src/engine/coordinator.rs:844` — the live schema-3 path, the one `upstroke run` uses
+  > today — calls it with `failure: result.failure.as_ref()`, an `AttemptFailure` whose
+  > `feedback` holds the gate tail or the reviewer's `required_changes`. Writing
+  > `detail: failure.feedback.clone()` unconditionally therefore put the full text on the
+  > legacy wire **and** into `report.json`, which clones these records into
+  > `TaskReport.attempts` at `src/engine/report.rs:530` — once per failed attempt,
+  > duplicating the `ladder_retry` copy, and reversing the reason `LadderRetry`'s own doc
+  > gives for holding the text: *"a gate log tail runs to kilobytes, and `report.json`
+  > should not grow one per attempt."*
+  >
+  > **Why the original claim survived every check.** "This change adds no call site" is
+  > true and irrelevant. The change adds no *initializer*; it changes what an existing
+  > shared one writes. A census over constructions — the instrument this slice reaches
+  > for, and the one that found the second `AttemptRecord` construction below — sees
+  > initializers, not **value flow through a shared builder into an existing caller**.
+  > Only reading the callers, or a reviewer, finds that. It is the §22b class with a
+  > sharper edge: not a claim that aged, but a claim about a caller that was never read.
+  >
+  > **The repair that makes this bullet true** is `classify::FeedbackCarrier`, an explicit
+  > two-variant choice on `AttemptFacts` with **no default**, so a caller must decide and
+  > a third engine does not compile until someone does. `coordinator.rs` passes
+  > `LadderEvent` (its transitions carry `summary` and `detail` outright); the schema-4
+  > driver passes `AttemptRecord` (its transitions have no feedback field at all). Held by
+  > `engine::tests::the_legacy_wire_and_report_carry_no_feedback_on_the_attempt_record`,
+  > which runs a real legacy gate failure and compares the settled bytes against the bytes
+  > `610106b` wrote for the same scenario, and by
+  > `recover::tests::a_retried_worker_is_told_what_the_last_attempt_failed_on`, which pins
+  > the other carrier at a live schema-4 settlement. Pointing either caller at the other
+  > variant fails exactly one of them, and nothing else.
+
+  One residual difference on the legacy wire is stated rather than hidden: `detail`
+  serializes as an explicit `null`, so a legacy `failure` object gains that one key.
+  `skip_serializing_if` would remove it and is not available — see the strict-door bullet
+  above, which is now a measurement rather than an argument. The witness asserts exactly
+  that: strip `,"detail":null` and the bytes are `610106b`'s bytes.
 
 ## The passages it serves
 
@@ -193,7 +242,7 @@ the implementation to meet it.
 ## Scope
 
 This record authorises exactly: the one field, its population in
-`classify::attempt_record`, the `Brief` derivation and its two call sites in the schema-4
-driver, and the witness. No other frozen-file change rides along. The corresponding ledger
+`classify::attempt_record` **under the carrier the caller names**, the `Brief` derivation
+and its two call sites in the schema-4 driver, and the witnesses. No other frozen-file change rides along. The corresponding ledger
 entries are `reviews/FINDINGS.md` §3 (the per-instance Class C approval) and §22 (the
 `PR7-FEEDBACK-NOT-DURABLE-IN-SCHEMA-4` row flipping to fixed, sha-stamped).
