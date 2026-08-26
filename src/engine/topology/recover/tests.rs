@@ -6707,9 +6707,15 @@ fn a_log_predating_the_detail_field_folds_and_resumes() {
          older log folds to a different value than it was written with"
     );
 
-    // And the run it describes still resumes: the brief is simply empty for the
-    // attempts that predate the field, which is the honest answer for a log that
-    // never recorded what they were told.
+    // And the run it describes still resumes. **What the brief holds for those
+    // attempts is a line per failure carrying its `summary` and no `detail`** —
+    // not an empty brief, which is what this comment used to claim and what the
+    // 2026-08-26 re-review of `c2c0294` corrected as finding C. `Brief::record`
+    // adds an entry whenever the record carries a failure at all, and that is
+    // right: a summary is what an older log preserved, and sending the next
+    // worker "attempt 1 failed: gate `x` failed" beats sending it nothing.
+    // Asserted below rather than described, because a comment about content is
+    // the thing this slice keeps getting wrong.
     let harness = harness();
     let runtime = runtime_holding_the_record();
     let certifies = AlwaysCertifies;
@@ -6718,7 +6724,28 @@ fn a_log_predating_the_detail_field_folds_and_resumes() {
     // the sanctioned way a test plants bytes.
     crate::workspace_manager::fixture::write_file(&fixture.log(), aged.as_bytes());
     let (outcome, _) = resume_holding(&fixture, &harness, &given);
-    outcome.expect("a run whose log predates the field still resumes");
+    let (_recovered, handle) = outcome.expect("a run whose log predates the field still resumes");
+
+    // The brief that resume rebuilds from those bytes, asserted rather than
+    // described: one line for the failure the older log recorded, carrying its
+    // summary and no detail.
+    let brief = crate::engine::topology::run::Brief::replay(&handle.events);
+    let lines = brief.lines(ALPHA);
+    assert_eq!(
+        lines.len(),
+        1,
+        "an older log's failure must still contribute its summary; the brief holds \
+         {} line(s): {lines:?}",
+        lines.len()
+    );
+    assert_eq!(
+        lines[0].summary, "gate `cargo test` failed: 1 failed",
+        "the summary is what an older log preserved and it must reach the next worker"
+    );
+    assert_eq!(
+        lines[0].detail, None,
+        "a log that never recorded the tail cannot produce one"
+    );
 }
 
 /// Resume the fixture from its log alone, take one step, and return the

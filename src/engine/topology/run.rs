@@ -1859,10 +1859,29 @@ impl TopologyRun {
     ///   the task's;
     /// * rungs spent is `task.rung + 1`, floored at one. Rungs are dense and
     ///   monotonic — `settle`'s escalation moves a task to `rung + 1` and
-    ///   nothing moves it back — so the count of distinct rungs a task has
-    ///   occupied *is* its current rung plus one. That is the same quantity the
-    ///   legacy `BTreeSet<tier>` computes, derived from the fold instead of
-    ///   from a record list this engine does not keep.
+    ///   nothing moves it back — so the count of distinct **rungs** a task has
+    ///   occupied *is* its current rung plus one.
+    ///
+    /// **It is not always the same number the legacy path computes, and this
+    /// used to claim it was.** `ParkSubject::of` counts distinct *tiers* with a
+    /// `BTreeSet`; a rung is an index into the chain, and `ChainSummary.tiers`
+    /// is a `Vec<Tier>` that nothing deduplicates. For a chain naming the same
+    /// tier twice — `chain = ["small", "small"]`, which config accepts — a task
+    /// that exhausts both rungs is 2 here and 1 there. The 2026-08-26 re-review
+    /// of `c2c0294` found the claim, finding C.
+    ///
+    /// **The two are answering different questions and this one is the right
+    /// one for the sentence it builds.** The question is "how much of your
+    /// ladder did this task spend before it asked for you", and a chain with a
+    /// repeated tier really does have two rungs to spend: the task ran twice,
+    /// at two allowances, and telling the operator "1 rung" would understate it
+    /// in exactly the direction finding 3 was about. The legacy count is the
+    /// one that is wrong for such a chain; it is not changed here because that
+    /// is the shipped path and a question's wording is not worth a behaviour
+    /// change to it.
+    ///
+    /// Held by `recover::tests::the_driver_escalates_onto_the_rung_above`,
+    /// which asserts the sentence for a two-tier chain.
     fn park_question(
         &self,
         key: TaskKey,

@@ -106,16 +106,38 @@ pub struct Settled {
     /// The **allowance decision**: whether this settlement spent one of the
     /// rung's `attempts_per`.
     ///
-    /// **Five kinds spend nothing, not one.** This said "an outage deferral
-    /// spends none … and every other settlement spends one", and
-    /// `ladder::spends_allowance` — the single authority, total over
-    /// `FailureKind` — answers `false` for **`NeedsHuman`, `NoChain`,
-    /// `Interrupted` and `Declined`** as well. The rule those four share is the
-    /// one §2's `PR3-ATTEMPT-SHAPE` ruling states: *an attempt spends one of its
-    /// rung's `attempts_per` iff the worker ran and produced work to judge.* A
-    /// declined task, an exhausted chain, an interruption and a reviewer asking
-    /// for a person are each a case where nothing was judged. The outage
-    /// deferral is the fifth and the only one this sentence named.
+    /// **Seven shapes spend nothing, and the count is a `FailureShape` count —
+    /// not a `FailureKind` count.** `ladder::spends_allowance` is the single
+    /// authority; it answers `false` for four kinds outright — **`NeedsHuman`,
+    /// `NoChain`, `Interrupted`, `Declined`** — and, before the match runs at
+    /// all, for anything `FailureShape::is_outage` accepts:
+    /// **`RateLimited`** at any origin, **`ReviewUnavailable`** at any origin,
+    /// and **`Timeout` with `FailureOrigin::Reviewer`**. Seven.
+    ///
+    /// The rule they share is the one §2's `PR3-ATTEMPT-SHAPE` ruling states:
+    /// *an attempt spends one of its rung's `attempts_per` iff the worker ran
+    /// and produced work to judge.* A declined task, an exhausted chain, an
+    /// interruption, a reviewer asking for a person, and a pool or a reviewer
+    /// that was simply not there are each a case where nothing was judged.
+    ///
+    /// **Third statement of this sentence, and the first that is a count of the
+    /// right thing.** It first said an outage deferral spends none "and every
+    /// other settlement spends one" — off by six. Round 6 corrected it to
+    /// "five kinds … `NeedsHuman`, `NoChain`, `Interrupted` and `Declined`, and
+    /// the outage deferral is the fifth" — which reads the outage arm as one
+    /// kind when it is three shapes, and counts kinds when the authority
+    /// dispatches on `(kind, origin)`. The 2026-08-26 re-review of `c2c0294`
+    /// found it, finding C. **Note the reader's trap it comes from**: the
+    /// match's last arm lists `Timeout | RateLimited | … | ReviewUnavailable =>
+    /// true`, and all three of those are unreachable there for the origins the
+    /// outage guard already took. Reading the arm alone gives the wrong
+    /// answer, which is how this sentence has been wrong twice.
+    ///
+    /// **The number is no longer prose.**
+    /// `ladder::tests::exactly_seven_failure_shapes_spend_no_allowance` counts it from
+    /// the authority over every `(kind, origin)` pair and names the seven, so a fourth
+    /// restatement that disagrees is a failing test rather than a sentence nobody
+    /// re-reads.
     ///
     /// **And the fold derives it when applying `attempt_finished`, not
     /// `attempt_started`** — `TopologyFold::apply_settlement` calls

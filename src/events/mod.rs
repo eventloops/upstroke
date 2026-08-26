@@ -748,10 +748,23 @@ pub struct FailureRecord {
     /// and comparing keys, and its own documentation rests on no embedded
     /// record using that attribute.
     ///
-    /// Written at exactly one place — `engine::classify::attempt_record`, the
-    /// one production construction of an [`AttemptRecord`] — and read by
-    /// `TopologyRun`'s brief, which derives §11.4's accumulated feedback from
-    /// the log rather than from a counter only the live path incremented.
+    /// Written at exactly one place — `engine::classify::attempt_record`, which
+    /// is the one production construction of an [`AttemptRecord`] **for an
+    /// attempt that reached a settlement**; `Dangling::event` below builds the
+    /// other, for an attempt that started and never reported back, and sets
+    /// this to `None` because nothing judged it. Read by `TopologyRun`'s brief,
+    /// which derives §11.4's accumulated feedback from the log rather than from
+    /// a counter only the live path incremented.
+    ///
+    /// The unqualified sentence was corrected on `classify::attempt_record` in
+    /// the commit that added this field, and written again here in the same
+    /// commit — one copy fixed, one copy created. The 2026-08-26 re-review of
+    /// `c2c0294` found it, finding C.
+    ///
+    /// **And which caller writes it is not a property of this field.**
+    /// `classify::FeedbackCarrier` decides, because the builder is shared with
+    /// the legacy coordinator and the two engines answer differently. A
+    /// sentence here that named one engine would be the §22c class again.
     /// `decisions/2026-08-26-durable-retry-feedback.md` is the Class C
     /// authorization for this field and states its bounds.
     #[serde(default)]

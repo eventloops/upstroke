@@ -2308,6 +2308,35 @@ in the first case, the recovered promotion in the second.
 > prove that anything upstream produces that input. When the defect being repaired is
 > *upstream of the check*, the witness has to start further back.
 
+### Finding C — five false property claims, and the one that is now a test
+
+Corrected where they stand. Measured at `4809cd4`.
+
+| where | said | is | what holds it now |
+|---|---|---|---|
+| `settle.rs`, `Settled::spent_attempt` | "**five kinds** spend nothing" | **seven shapes**: four kinds outright, plus `RateLimited` and `ReviewUnavailable` at any origin and `Timeout` at `FailureOrigin::Reviewer`, all three taken by `FailureShape::is_outage` before the match runs | `ladder::tests::exactly_seven_failure_shapes_spend_no_allowance` |
+| `events/mod.rs`, `FailureRecord::detail` | "the one production construction of an `AttemptRecord`" | two; `Dangling::event` is the other | the qualifier, and the census in §22b |
+| `recover/tests.rs`, the old-log witness | after an older log "the brief is simply empty" | one line per failure, carrying its summary with `detail: None` | three assertions on the rebuilt brief's actual content |
+| `recover.rs`, step (f) | "PR7 implements neither terminal" | `finish_promotions` calls `append_candidate_created`; the refusal is the *integration* half only | the sentence now says which half |
+| `run.rs`, `park_question` | `task.rung + 1` "is the same quantity the legacy `BTreeSet<tier>` computes" | not for a chain naming one tier twice — `ChainSummary.tiers` is a `Vec<Tier>` nothing deduplicates, so `["small", "small"]` is 2 here and 1 there | the claim is narrowed and the divergence is stated, with which answer is right for the sentence being built |
+
+**The `settle.rs` one has been wrong three times, and that is why it stopped being
+prose.** It first said an outage deferral spends none "and every other settlement spends
+one" — off by six. Round 6 corrected it to "five kinds", which reads the outage arm as one
+kind when it is three shapes, and counts kinds when the authority dispatches on
+`(kind, origin)`. A fourth restatement is a fourth chance to be wrong, so the number is now
+counted from `spends_allowance` itself over every pair, the seven are named, and the one
+pair where the origin decides — `Timeout` — is asserted in both directions.
+
+**Where the wrong answer comes from is worth recording.** `spends_allowance`'s last match
+arm reads `Timeout | RateLimited | … | ReviewUnavailable => true`, and all three of those
+are unreachable there for the origins the outage guard already took. A reader who checks
+the arm gets the wrong answer and has checked. That is the shape of a doc that is wrong
+twice about code nobody misread.
+
+> A number in a doc comment that a function can compute should be computed by a test, not
+> restated by a person. The third restatement is the signal, not the first.
+
 
 ## 22a. A driver that fails silently on a diff this size
 

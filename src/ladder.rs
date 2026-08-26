@@ -472,6 +472,100 @@ mod tests {
         AttemptFailure::new(kind, "because")
     }
 
+    /// Every `(kind, origin)` pair, and how many of them spend nothing.
+    ///
+    /// `Interrupted` is `FailureKind`'s first variant and `Declined` its last; a new
+    /// variant between them fails this list to compile, which is what makes the count
+    /// below a count of the enum rather than of a hand-copied subset.
+    const EVERY_SHAPE: [FailureKind; 14] = [
+        FailureKind::Interrupted,
+        FailureKind::NoChain,
+        FailureKind::EmptyDiff,
+        FailureKind::AgentError,
+        FailureKind::Timeout,
+        FailureKind::RateLimited,
+        FailureKind::GateFailed,
+        FailureKind::TestProvenance,
+        FailureKind::ReviewInputTooLarge,
+        FailureKind::ReviewInputOpaque,
+        FailureKind::ReviewFailed,
+        FailureKind::ReviewUnavailable,
+        FailureKind::NeedsHuman,
+        FailureKind::Declined,
+    ];
+
+    /// **How many shapes spend no allowance, counted rather than described.**
+    ///
+    /// [`Settled::spent_attempt`]'s doc has stated this number three times. It said
+    /// "an outage deferral spends none and every other settlement spends one" — off by
+    /// six. Round 6 corrected it to "five kinds", which reads the outage arm as one
+    /// kind when [`FailureShape::is_outage`] accepts **three shapes**, and counts
+    /// kinds when [`spends_allowance`] dispatches on `(kind, origin)`. The 2026-08-26
+    /// re-review of `c2c0294` found the second version, finding C.
+    ///
+    /// A fourth prose restatement would be a fourth chance to be wrong. This is the
+    /// count, taken from the authority itself, so a doc that disagrees with it is a
+    /// failing test rather than a sentence nobody re-reads.
+    ///
+    /// It also pins the *shape* of the answer: `Timeout` spends at the worker and not
+    /// at the reviewer, which is the one pair where the origin decides — and a count
+    /// alone would stay green if that pair flipped and another compensated.
+    #[test]
+    fn exactly_seven_failure_shapes_spend_no_allowance() {
+        let mut free: Vec<(FailureKind, FailureOrigin)> = Vec::new();
+        for kind in EVERY_SHAPE {
+            for origin in [FailureOrigin::Worker, FailureOrigin::Reviewer] {
+                if !spends_allowance(Some(FailureShape { kind, origin })) {
+                    free.push((kind, origin));
+                }
+            }
+        }
+
+        // Both origins of the four that spend nothing outright, both origins of the
+        // two outage kinds, and the reviewer's timeout: 4×2 + 2×2 + 1 = 13 pairs over
+        // **seven** shapes, where a shape is a kind whose answer does not depend on
+        // origin, or a (kind, origin) pair where it does.
+        let kinds: std::collections::BTreeSet<String> =
+            free.iter().map(|(kind, _)| format!("{kind:?}")).collect();
+        assert_eq!(
+            kinds.len(),
+            7,
+            "{} kinds spend nothing, not 7: {kinds:?}. `Settled::spent_attempt`'s doc \\
+             states this number, and it has been wrong twice",
+            kinds.len()
+        );
+        assert_eq!(
+            kinds.iter().map(String::as_str).collect::<Vec<_>>(),
+            vec![
+                "Declined",
+                "Interrupted",
+                "NeedsHuman",
+                "NoChain",
+                "RateLimited",
+                "ReviewUnavailable",
+                "Timeout",
+            ],
+            "the set changed, so the doc naming them is now wrong"
+        );
+
+        // The one pair where the origin decides, asserted directly: a worker timeout
+        // is a run that happened and spends; a reviewer timeout is an outage.
+        assert!(
+            spends_allowance(Some(FailureShape {
+                kind: FailureKind::Timeout,
+                origin: FailureOrigin::Worker,
+            })),
+            "a worker that ran out of wall clock still ran"
+        );
+        assert!(
+            !spends_allowance(Some(FailureShape {
+                kind: FailureKind::Timeout,
+                origin: FailureOrigin::Reviewer,
+            })),
+            "a reviewer that never answered judged nothing"
+        );
+    }
+
     #[test]
     fn a_rejected_attempt_retries_the_same_rung_until_attempts_per() {
         for kind in [

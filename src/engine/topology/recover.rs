@@ -1862,10 +1862,17 @@ pub fn refuse_if_finished(censused: &ResumeCensused) -> Result<(), UpstrokeError
 ///
 /// `checkpoint_refusals`: "an intermediate build refuses, **before any
 /// append**, any operation whose terminals it does not implement (PR7:
-/// integration and run end beyond refusal)". A proven prefix that leaves a
-/// promotion or an integration transaction unresolved is exactly such an
-/// operation: completing it means `task_candidate_created` or a CAS, and PR7
-/// implements neither terminal.
+/// integration and run end beyond refusal)".
+///
+/// **The refusal here is the *integration* transaction's, and only that.** This
+/// sentence read "completing it means `task_candidate_created` or a CAS, and
+/// PR7 implements neither terminal", which was true when the step was written
+/// and false by the time the driver existed: `finish_promotions` calls
+/// `candidate::append_candidate_created`, so PR7 implements that terminal and
+/// step (f) hands unresolved promotions to it rather than refusing them. What
+/// this refuses is the integration half — completing one means a
+/// compare-and-swap on the integration ref, which is PR8's. The 2026-08-26
+/// re-review of `c2c0294` found the stale half, finding C.
 ///
 /// Takes `&PreflightCertified` because it is a step-(f) emitter's predicate and
 /// every recovery emitter takes one — the refusal has to be reachable from the
