@@ -5404,6 +5404,107 @@ fn the_retaining_incarnation_retries_in_place() {
     );
 }
 
+/// **A retried worker is told what the last one failed on.**
+///
+/// §11.4, quoted on `PlanRequest::feedback` itself: "failure feedback goes back
+/// to the same rung, and an escalation carries the accumulated feedback with
+/// it."
+///
+/// The driver accumulated the brief inside [`Retained`], which `settle::retry`
+/// produces **only** for a resumable same-rung retry that returned a session.
+/// Every escalation and every sessionless retry — which is every Copilot
+/// attempt, `DESIGN.md:452` — therefore dispatched with `feedback: Vec::new()`
+/// and handed the next worker attempt 1's prompt verbatim: a rung's allowance
+/// spent to be told nothing. Found by round 2's `contract`, `seams` and
+/// `attempt` lenses independently.
+///
+/// This drives **two** attempts through the real assembler and asserts on the
+/// second worker's own stdin, because the prompt is the only place the claim is
+/// observable — a brief the driver holds and does not send is the defect.
+#[test]
+fn a_retried_worker_is_told_what_the_last_attempt_failed_on() {
+    use crate::engine::topology::run::{RunSeams, TopologyRun};
+    use crate::engine::topology::select::Ceiling;
+
+    let fixture = Fixture::build(
+        "driver-brief",
+        Damage {
+            two_tier: true,
+            ..Damage::default()
+        },
+    );
+
+    let harness = harness();
+    let runtime = runtime_holding_the_record();
+    let certifies = AlwaysCertifies;
+    let given = Given::healthy(&fixture, &runtime, &certifies);
+    let (outcome, _) = resume_holding(&fixture, &harness, &given);
+    let (_recovered, handle) = outcome.expect("the healthy resume completes");
+
+    let mut run = TopologyRun::resumed(handle, fixture.inputs(), Ceiling::unlimited());
+    let mut hooks = HarnessTopologyHooks::new(Arc::clone(&harness));
+    let sleeper = RecordingSleeper::default();
+    let manager = fixture.manager();
+    let runner = RecordingRunner::editing();
+    let adapters = crate::engine::topology::scaffold::ScaffoldAdapters::erroring();
+    let paths = crate::rundir::RunPaths::with_private_root(
+        &fixture.repo_root,
+        &fixture.started.run_id,
+        &fixture.private_root,
+    );
+    paths.create().expect("the run directories are creatable");
+    let plans = crate::engine::assembly::FrozenPlans {
+        adapters: &adapters,
+        paths: &paths,
+        gates: &[],
+        pools: &[],
+        caps: &[],
+        worker_timeout: std::time::Duration::from_secs(300),
+        decisions: &[],
+    };
+    let seams = RunSeams {
+        manager: &manager,
+        clock: &Frozen,
+        sleeper: &sleeper,
+        runner: &runner,
+        adapters: &adapters,
+        paths: &paths,
+        plans: &plans,
+        reviews: &crate::engine::attempt::LegacyReviewPasses,
+        input_policy: &crate::engine::attempt::LegacyReviewInputPolicy,
+        answers: &crate::interaction::UnattendedAnswers,
+        ids: &FixedIds,
+        halts_run: false,
+    };
+
+    // Attempt one fails and, with one attempt per rung, escalates onto rung 1.
+    run.step(&seams, &mut hooks)
+        .expect("the first attempt settles");
+    // Attempt two, on the rung above, from a fresh generation.
+    run.step(&seams, &mut hooks)
+        .expect("the second attempt settles");
+
+    let prompts: Vec<String> = runner
+        .requests()
+        .into_iter()
+        .filter(|request| request.role == crate::runner::ExecutionRole::Implement)
+        .map(|request| String::from_utf8_lossy(&request.command.stdin).into_owned())
+        .collect();
+    assert!(
+        prompts.len() >= 2,
+        "the fixture ran {} implementer(s); this test needs a second attempt to \
+         have a prompt at all",
+        prompts.len()
+    );
+    assert!(
+        prompts[1].len() > prompts[0].len(),
+        "the second worker's prompt is no longer than the first's, so nothing \
+         was carried forward:\n--- first ---\n{}\n--- second ---\n{}",
+        prompts[0],
+        prompts[1]
+    );
+}
+
 /// **The driver dispatches at the rung the log records, not at rung 0.**
 ///
 /// The **other** driver-side half of `PR7-FOLD-LADDER-POSITION`, and the one

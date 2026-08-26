@@ -489,9 +489,6 @@ struct RunAs {
 struct Retained {
     /// `Quiescence::HoldsTree`'s subject: the cumulative work the retry re-gates.
     tree: String,
-    /// §11.4's brief, oldest first. Without it a retry is the first attempt
-    /// again, spending a rung's allowance to be told nothing.
-    feedback: Vec<crate::events::Feedback>,
 }
 
 /// What one attempt produced, for the settlement that reads all three.
@@ -591,6 +588,26 @@ pub struct TopologyRun {
     deferral: Deferral,
     slots: SlotAssertion,
     retained: BTreeMap<TaskKey, Retained>,
+    /// §11.4's accumulated brief, per task, oldest first.
+    ///
+    /// **Separate from [`Retained`] because the brief outlives the retained
+    /// generation.** §11.4 is "failure feedback goes back to the same rung, and
+    /// an escalation carries the accumulated feedback with it" — so it belongs
+    /// to the *task*, not to a generation. Holding it inside `Retained` meant it
+    /// existed only for `AttemptSettlement::Retained`, which `settle::retry`
+    /// produces only for a resumable same-rung retry **with** a session. Every
+    /// escalation and every sessionless retry — which is every Copilot attempt,
+    /// `DESIGN.md:452` — therefore ran on attempt 1's prompt.
+    ///
+    /// **Process-local, and that is a real boundary rather than a choice.**
+    /// Schema 4's wire cannot carry it: `FailureRecord` is `{kind, origin,
+    /// reason}` with no detail, and no `SettlementTransition` variant has a
+    /// feedback field — where the legacy schema-3 `LadderRetry` and
+    /// `LadderEscalated` events carry `summary` **and** `detail` outright. So a
+    /// resume still restarts the brief empty. That is
+    /// `PR7-FEEDBACK-NOT-DURABLE-IN-SCHEMA-4` in `reviews/FINDINGS.md` §2, and
+    /// closing it is a wire field on a frozen file.
+    brief: BTreeMap<TaskKey, Vec<crate::events::Feedback>>,
 }
 
 impl TopologyRun {
@@ -636,6 +653,7 @@ impl TopologyRun {
             deferral: Deferral::default_backoff(),
             slots: SlotAssertion::new(),
             retained: BTreeMap::new(),
+            brief: BTreeMap::new(),
         }
     }
 
@@ -761,7 +779,14 @@ impl TopologyRun {
                         attempt: Self::FIRST_ATTEMPT,
                         rung: self.ladder_position(key)?.0,
                         resume_session: None,
-                        feedback: Vec::new(),
+                        // **Not empty.** A fresh generation is not a fresh
+                        // task: `settle::failed` closes the generation and
+                        // retries from a new one for every sessionless retry
+                        // and every escalation, and §11.4 says the accumulated
+                        // feedback goes with it. Empty here meant a retried
+                        // worker got attempt 1's prompt verbatim — a rung's
+                        // allowance spent to be told nothing.
+                        feedback: self.brief.get(&key).cloned().unwrap_or_default(),
                         announced: false,
                     },
                     seams,
@@ -1074,7 +1099,10 @@ impl TopologyRun {
                     rung: started.rung,
                     resume_session: started.resume_session.clone(),
                     // §11.4: what the attempts before this one failed on.
-                    feedback: held.feedback.clone(),
+                    // From the task's brief, which every judged failure adds to
+                    // — not from the retained generation, which only a resumable
+                    // same-rung retry ever produces.
+                    feedback: self.brief.get(&key).cloned().unwrap_or_default(),
                     // `settle::retry` built this event; appending it is what
                     // announces the attempt, and the fold refuses a second.
                     announced: true,
@@ -1425,27 +1453,34 @@ impl TopologyRun {
         // closes it in recovery", so the tree a retry re-gates is legitimately
         // process-local: a different process may not use it, and the fold's
         // `RetainedIdle { incarnation }` is what refuses one that tries.
-        if matches!(
-            settled.event.settlement,
-            crate::topology::events::AttemptSettlement::Retained { .. }
-        ) {
-            let mut feedback = self
-                .retained
-                .remove(&site.key)
-                .map(|held| held.feedback)
-                .unwrap_or_default();
-            feedback.push(crate::events::Feedback {
+        // **§11.4's brief, accumulated for the task and not for a generation.**
+        // Every judged failure adds a line, whatever settlement it produced: the
+        // sentence is "failure feedback goes back to the same rung, and an
+        // escalation carries the accumulated feedback with it", and an
+        // escalation closes the generation. Gating this on `Retained` is what
+        // made every escalation and every sessionless retry start from nothing.
+        self.brief
+            .entry(site.key)
+            .or_default()
+            .push(crate::events::Feedback {
                 attempt: plan.attempt.0,
                 tier: plan.binding.tier.to_string(),
                 summary: failure.reason.clone(),
                 detail: failure.feedback.clone(),
                 human: false,
             });
+
+        // The retained *tree* is still per-generation: `Quiescence::HoldsTree`
+        // is a claim about a worktree this process left in place, and only a
+        // `Retained` settlement leaves one.
+        if matches!(
+            settled.event.settlement,
+            crate::topology::events::AttemptSettlement::Retained { .. }
+        ) {
             self.retained.insert(
                 site.key,
                 Retained {
                     tree: capture.tree.clone(),
-                    feedback,
                 },
             );
         }
