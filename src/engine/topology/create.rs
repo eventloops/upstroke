@@ -834,10 +834,10 @@ mod steps {
         /// The worktree lock is a parameter because the creator holds it across
         /// the census and the whole run, and it is not this chain's to mint.
         ///
-        /// # Errors
-        ///
-        /// Never; the `Result` is for symmetry with the recovery path, whose
-        /// handle is the product of a fallible unwind.
+        /// **Infallible, and the signature says so.** An earlier draft returned
+        /// a `Result` "for symmetry with the recovery path", and the `# Errors`
+        /// section that justified it outlived the `Result` itself — a doc
+        /// promising a failure mode the type cannot express.
         pub fn into_handle(
             self,
             worktree: crate::rundir::WorktreeLock,
@@ -852,6 +852,13 @@ mod steps {
             )
         }
 
+        /// The created run's parts, for the caller that assembles its own
+        /// handle rather than taking [`Self::into_handle`]'s.
+        ///
+        /// **Every element is a resource.** The two locks are guards whose whole
+        /// contract is to be held; dropping the tuple drops both and releases a
+        /// run's claim on its worktree while the run is still live.
+        #[must_use]
         pub fn into_parts(self) -> (RunPaths, RunLock, EventLog, TopologyFold, TopologyEvent) {
             (self.facts.paths, self.lock, self.log, self.fold, self.event)
         }

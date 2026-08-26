@@ -4045,6 +4045,7 @@ fn the_barrier_is_the_only_topology_route_from_a_proven_prefix_to_an_append_hand
     let src = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
     let mut stack = vec![src.clone()];
     let mut callers: Vec<(String, usize)> = Vec::new();
+    let mut regions: Vec<(String, usize, usize)> = Vec::new();
     let mut scanned = 0_usize;
     while let Some(dir) = stack.pop() {
         for entry in std::fs::read_dir(&dir).expect("src is readable") {
@@ -4077,16 +4078,29 @@ fn the_barrier_is_the_only_topology_route_from_a_proven_prefix_to_an_append_hand
             let source = std::fs::read_to_string(&path).expect("a source file");
             // The production half only. A test that takes a prefix apart is a
             // fixture, not a path a run can take.
-            // The cut is at the ATTRIBUTE, and it is built rather than
-            // written as a literal for the reason `recover.rs`'s own module
-            // comment now records: a prose mention of it in a doc comment
-            // would cut this file's production half to nothing and the census
-            // would pass by scanning less.
-            let attribute = format!("#[{}(test)]", "cfg");
-            let production = match source.find(&attribute) {
-                Some(end) => &source[..end],
-                None => source.as_str(),
-            };
+            //
+            // **`effects::production_code`, not a cut at the first
+            // `#[cfg(test)]`.** The cut was the bug: it fired on the first *raw*
+            // occurrence of the text, comments included, and in
+            // `engine/topology/run.rs` that is **line 83 of 1777** — inside a
+            // doc comment — so this census was scanning 4.7% of the driver, the
+            // single most likely file for a second route to appear in. In
+            // `engine/topology.rs` it was line 39, inside the module doc.
+            //
+            // An earlier repair built the needle with `format!` so that a
+            // mention *in this file* could not cut it. That fixed one instance
+            // of `PR4-CENSUS-COMMENT-ORACLE` and left the class open in every
+            // file this walk reads. `production_code` blanks comments and
+            // string literals and removes each `#[cfg(test)]` **item** in place
+            // rather than truncating, which is the repair the four whole-tree
+            // censuses already have.
+            //
+            // Found by S5 round 2's `seams` lens, and it lands on this slice's
+            // own evidence: the guard was cited as proving that
+            // `StablePrefix::events` did not become a second entry point, and
+            // that check ran against the truncated domain.
+            let production = crate::effects::production_code(&source);
+            let production = production.as_str();
             // Calls, not definitions — a definition is not a route.
             //
             // The needle used to be the bare `into_parts(`, and at integration
@@ -4097,6 +4111,14 @@ fn the_barrier_is_the_only_topology_route_from_a_proven_prefix_to_an_append_hand
             // that is what was done: `StablePrefix`'s accessor is
             // `into_log_and_fold`, a name nothing else in the crate carries,
             // so the needle now means what it says.
+            // **The control this census did not have.** A zero count from an
+            // empty region is indistinguishable from a zero count from a clean
+            // file, and that is exactly how the truncation hid: the driver's
+            // region was 83 lines of 1777 and its zero looked like a pass. The
+            // four whole-tree censuses each carry this control; this one did
+            // not, which is why the class survived here.
+            regions.push((relative.clone(), production.len(), source.len()));
+
             let count = production
                 .match_indices(ENTRY)
                 .filter(|(at, _)| !production[..*at].trim_end().ends_with("fn"))
@@ -4112,6 +4134,16 @@ fn the_barrier_is_the_only_topology_route_from_a_proven_prefix_to_an_append_hand
         scanned >= 4,
         "the walk found only {scanned} topology sources, so its zero counts would prove nothing"
     );
+    // Every region is a real fraction of its file. A tenth is a generous floor
+    // and still an order of magnitude above what the truncation left behind.
+    for (file, region, whole) in &regions {
+        assert!(
+            *region * 10 > *whole,
+            "{file}'s production region is {region} of {whole} bytes. A census over a fraction \
+             of a file reports zero for the part it never read — this is `PR4-CENSUS-COMMENT-ORACLE`, \
+             and it is how the driver was scanned at 4.7% while reading as a pass"
+        );
+    }
     assert_eq!(
         callers,
         vec![("engine/topology/recover.rs".to_owned(), 1)],

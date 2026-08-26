@@ -657,8 +657,6 @@ impl TopologyRun {
         }
     }
 
-    /// The fold this run derives every decision from.
-    #[must_use]
     /// The digest this run's appends prove their committed first line against.
     ///
     /// `establish_stable_prefix` skips the check entirely when this is `None` —
@@ -686,6 +684,8 @@ impl TopologyRun {
         &self.spend
     }
 
+    /// The fold this run derives every decision from.
+    #[must_use]
     pub fn fold(&self) -> &TopologyFold {
         &self.handle.fold
     }
@@ -1169,6 +1169,10 @@ impl TopologyRun {
         Ok(Progress::GenerationClosed { key })
     }
 
+    /// The attempt number a fresh generation's first attempt carries.
+    const FIRST_ATTEMPT: crate::topology::events::AttemptNumber =
+        crate::topology::events::AttemptNumber(1);
+
     /// The fourth clause of the ready-dispatch branch: **run one attempt
     /// through the Runner.**
     ///
@@ -1179,24 +1183,28 @@ impl TopologyRun {
     /// its effects go through, and it is what makes the driver
     /// `review::run_review`'s **second production caller**.
     ///
-    /// **The settle write is not here**, and the branch's `owes` says so. What
-    /// comes back is a [`Judgement`] no event records yet.
+    /// **The settle write is not here.** What comes back is a [`Judgement`] no
+    /// event records yet; the caller appends it, immediately after this
+    /// returns.
     ///
-    /// # Attempt 1, rung 0, and why neither is read from the fold
+    /// # This block was re-targeted, and two of its sentences went false
     ///
-    /// They are properties of *this branch*, not facts to look up. `select`
-    /// reaches `Admitted::Dispatch` for a task that is **ready** — no open
-    /// generation — and `dispatch` opens one, so the generation has had no
-    /// attempts and the ladder has not escalated. A second attempt and a
-    /// higher rung both come from `ReadyRetry`, which is
-    /// [`Disposition::NotYetImplemented`] here. Deriving them from the fold
-    /// would need a reader for the open generation that does not exist, and
-    /// inventing one would be the fold and the log holding two answers — the
-    /// shape that produced this slice's `predicted_region` defect.
-    /// The attempt number a fresh generation's first attempt carries.
-    const FIRST_ATTEMPT: crate::topology::events::AttemptNumber =
-        crate::topology::events::AttemptNumber(1);
-
+    /// It was written for this function and an insertion moved it onto
+    /// `FIRST_ATTEMPT`, where it stayed while the code beneath it changed —
+    /// `PR7-R2-CONTRACT-005`, the doc-re-targeting class's second site. Both
+    /// corrections are recorded rather than quietly applied, because a doc that
+    /// has been wrong is worth more as a warning than as clean prose:
+    ///
+    /// 1. It said "the branch's `owes` says so". [`LoopBranch::owes`] has
+    ///    **zero call sites** in the crate. The clause it named was never a
+    ///    thing the code did.
+    /// 2. It carried a section titled *"Attempt 1, rung 0, and why neither is
+    ///    read from the fold"*, arguing they were properties of the branch. That
+    ///    was true when written and is now the opposite of the code: both are
+    ///    read from the fold, because assuming them was `C1` — a task resumed
+    ///    mid-ladder dispatched at rung 0, attempt 1, forever. The argument the
+    ///    section made against a fold reader is the argument this slice had to
+    ///    abandon.
     fn attempt(
         &mut self,
         site: AttemptSite<'_>,

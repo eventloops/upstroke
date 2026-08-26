@@ -79,8 +79,6 @@ pub struct Spend {
 }
 
 impl Spend {
-    /// Nothing reported yet.
-    #[must_use]
     /// The run's reported spend so far.
     ///
     /// A reader because the ceiling is not the only thing that needs it: a
@@ -90,6 +88,8 @@ impl Spend {
         self.run
     }
 
+    /// Nothing reported yet.
+    #[must_use]
     pub fn new() -> Self {
         Self::default()
     }
