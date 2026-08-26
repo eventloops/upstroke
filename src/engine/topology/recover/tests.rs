@@ -6172,6 +6172,43 @@ fn the_driver_escalates_onto_the_rung_above() {
         ran_at, "claude-fable-5",
         "the escalated task ran at {ran_at}, which is rung 0's model"
     );
+
+    // **And the third step exhausts the chain, which is where the human is
+    // told a number.** This is the class boundary the frontier review of
+    // `75da796` (finding 3) found unguarded: `park_question` hard-coded
+    // `rungs_spent: 1` and passed *this rung's* attempts as the total, so a
+    // two-rung exhaustion said "1 attempt(s) across 1 rung(s) all failed" when
+    // two attempts across two rungs had. Nothing asserted it — this file's
+    // two-rung test stopped at the escalated model, its count test drove a
+    // single rung, and **no topology test asserted `rung(s)` at all**.
+    //
+    // Asserted here rather than in a fixture of its own because the numbers are
+    // only true of a task that has *actually* climbed: a single-rung fixture
+    // reports 1 and 1 whether the code derives them or hard-codes them, which
+    // is exactly how the constant survived.
+    run.step(&seams, &mut hooks)
+        .expect("the exhausted chain settles");
+    let parked = TopologyFold::parse_log(&fixture.log_bytes())
+        .expect("the log parses")
+        .into_iter()
+        .find_map(|event| match event.body {
+            TopologyEventBody::AttemptFinished { data } => match data.settlement {
+                AttemptSettlement::Closed {
+                    transition: SettlementTransition::Parked { question },
+                    ..
+                } => Some(question),
+                _ => None,
+            },
+            _ => None,
+        })
+        .expect("the exhausted chain parks a question");
+
+    assert!(
+        parked.context.contains("2 attempt(s) across 2 rung(s)"),
+        "the human is told the wrong history of this task. Two attempts across \
+         two rungs failed; the question says:\n{}",
+        parked.context
+    );
 }
 
 /// **The driver dispatches at the rung the log records, not at rung 0.**

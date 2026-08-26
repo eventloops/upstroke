@@ -1738,9 +1738,32 @@ impl TopologyRun {
     /// **`attempts` is the task's spend on this rung, from the fold.** It was
     /// `plan.attempt` — this generation's attempt number — which restarts at
     /// one for a same-rung retry that did not resume, so a park after two
-    /// attempts told the human "1 attempt(s)". `rungs_spent` stays one because
-    /// this fixture's chains are single-tier; a multi-rung count is owed with
-    /// the escalation lane.
+    /// attempts told the human "1 attempt(s)".
+    ///
+    /// **And `rungs_spent` was the literal `1`**, with a comment saying a
+    /// multi-rung count was "owed with the escalation lane" — while this slice
+    /// claimed that lane delivered. A two-rung chain at `attempts_per = 1` that
+    /// exhausts told the operator *"1 attempt(s) across 1 rung(s) all failed"*
+    /// when two attempts across two rungs had. The frontier review of
+    /// `75da796`, finding 3.
+    ///
+    /// **Both numbers now come from the fold, and both match the legacy
+    /// authority's rule.** `coordinator::ParkSubject::of` — the schema-3 path
+    /// that ships today — counts `attempts` as the task's total across every
+    /// record and `rungs_spent` as the number of *distinct tiers* those records
+    /// name, floored at one. Here:
+    ///
+    /// * total attempts is the sum of every generation's `attempts`, because
+    ///   `GenerationFold::attempts` is the highest attempt number started in
+    ///   that generation and the number restarts at each new generation — so a
+    ///   single generation's count is what the old code passed, and the sum is
+    ///   the task's;
+    /// * rungs spent is `task.rung + 1`, floored at one. Rungs are dense and
+    ///   monotonic — `settle`'s escalation moves a task to `rung + 1` and
+    ///   nothing moves it back — so the count of distinct rungs a task has
+    ///   occupied *is* its current rung plus one. That is the same quantity the
+    ///   legacy `BTreeSet<tier>` computes, derived from the fold instead of
+    ///   from a record list this engine does not keep.
     fn park_question(
         &self,
         key: TaskKey,
@@ -1757,6 +1780,23 @@ impl TopologyRun {
             .ok_or_else(|| UpstrokeError::Refused {
                 message: format!("task {} is not in this run's frozen registry", key.index()),
             })?;
+        let task = self
+            .handle
+            .fold
+            .task(key)
+            .ok_or_else(|| UpstrokeError::Refused {
+                message: format!("task {} is not in this run's fold", key.index()),
+            })?;
+        let total_attempts: u32 = task
+            .generations
+            .iter()
+            .map(|generation| generation.attempts)
+            .sum();
+        let rungs_spent = (task.rung as usize).saturating_add(1).max(1);
+        // `attempts_on_rung` stays a parameter: it is what the caller has in
+        // hand at the park, and dropping it would let a future caller pass a
+        // number nothing reads. It is deliberately not what the human is told.
+        let _ = attempts_on_rung;
         Ok(FrozenQuestion {
             id: ids.question_id(),
             key,
@@ -1766,12 +1806,14 @@ impl TopologyRun {
                     display_id: entry.display_id.as_str(),
                     title: &entry.spec.title,
                     acceptance: &entry.spec.acceptance,
-                    // The task's spend on this rung, not this generation's
-                    // attempt number: a same-rung retry that did not resume is
-                    // a fresh generation, so `plan.attempt` restarts at one
-                    // while the allowance does not.
-                    attempts: attempts_on_rung,
-                    rungs_spent: 1,
+                    // The task's **total** attempts and the rungs they
+                    // spent, both derived from the fold, because that is what
+                    // the sentence the operator reads says: "N attempt(s)
+                    // across M rung(s) all failed". `attempts_on_rung` is this
+                    // rung's spend and is what the ladder reads; it is not what
+                    // the human is told.
+                    attempts: total_attempts,
+                    rungs_spent,
                 },
                 kind,
                 failure,
