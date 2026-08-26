@@ -44,8 +44,8 @@ use crate::runner::policy::runner_policy_sha256;
 use crate::runner::{CommandSpec, Runner, RunnerRequest};
 use crate::topology::effects::EventSite;
 use crate::topology::effects::{
-    EffectSiteId, HookHarness, HookPhase, Injection, InjectionMode, LockSite, RefSite, RunDirSite,
-    SubEffectPoint,
+    EffectSiteId, HookHarness, HookPhase, Injection, InjectionMode, LockSite, ObjectSite, RefSite,
+    RunDirSite, SubEffectPoint,
 };
 use crate::topology::events::{
     AttemptFinished4, AttemptSettlement, AttemptStarted4, BudgetExceeded4, CommitSha, Epoch,
@@ -154,6 +154,14 @@ struct Damage {
     /// between `task_dispatched` and `attempt_started` leaves, and the only
     /// state recovery step (g) has anything to do in.
     open_generation: bool,
+    /// Register a **second task**, `beta`, beside `alpha`.
+    ///
+    /// The default plan has one task, so a recovery step that loops over tasks
+    /// or generations cannot be told apart from one that handles the first and
+    /// stops. Not hypothetical: catalogue entry `PR7-PIPELINE-010` reduced step
+    /// (e) to `.take(1)` and the whole suite stayed green. Opt-in rather than
+    /// default, so no existing fixture's registry size moves.
+    two_tasks: bool,
     /// Freeze a **two-tier** chain instead of the default one-tier one.
     ///
     /// The default chain has a single tier, so a task's rung is always 0 and a
@@ -221,7 +229,7 @@ impl Fixture {
             mkdir(&private_dir);
         }
 
-        let plan = plan();
+        let plan = plan_with(damage.two_tasks);
         let recorded_locator = damage
             .locator
             .clone()
@@ -231,7 +239,14 @@ impl Fixture {
         } else {
             container_runner()
         };
-        let started = run_started(&plan, &recorded_locator, runner, &base_sha, damage.two_tier);
+        let started = run_started(
+            &plan,
+            &recorded_locator,
+            runner,
+            &base_sha,
+            damage.two_tier,
+            damage.two_tasks,
+        );
 
         // P1: the `.creating` marker the creator published and never removed,
         // because this run was interrupted between P5b's commit record and P8's
@@ -495,6 +510,27 @@ fn event(body: TopologyEventBody) -> TopologyEvent {
 // The recorded run
 // ---------------------------------------------------------------------------
 
+fn plan_with(two_tasks: bool) -> Plan {
+    let mut plan = plan();
+    if two_tasks {
+        let alpha = plan.tasks[0].clone();
+        plan.tasks.push(Task {
+            id: TaskId::from("beta"),
+            title: "beta".to_owned(),
+            body: "beta body".to_owned(),
+            acceptance: vec!["beta passes".to_owned()],
+            path_hints: vec!["src/beta/*.rs".to_owned()],
+            artifacts_out: vec![ArtifactId::from("beta-out")],
+            ..alpha
+        });
+        plan.artifacts.push(Artifact {
+            id: ArtifactId::from("beta-out"),
+            produced_by: Some(TaskId::from("beta")),
+        });
+    }
+    plan
+}
+
 fn plan() -> Plan {
     Plan {
         source: PlanSource {
@@ -623,6 +659,7 @@ fn run_started(
     runner: RunnerPolicy,
     base: &CommitSha,
     two_tier: bool,
+    two_tasks: bool,
 ) -> RunStarted4 {
     let unauthenticated = RunStarted4 {
         schema: TOPOLOGY_SCHEMA,
@@ -660,18 +697,37 @@ fn run_started(
             shell: ShellKind::Bash,
         }],
         interaction_mode: "attached".to_owned(),
-        chains: vec![if two_tier {
-            escalating_chain()
-        } else {
-            chain()
-        }],
+        chains: {
+            let first = if two_tier {
+                escalating_chain()
+            } else {
+                chain()
+            };
+            let mut chains = vec![first.clone()];
+            if two_tasks {
+                chains.push(ChainSummary {
+                    task: "beta".to_owned(),
+                    ..first
+                });
+            }
+            chains
+        },
         effort_policy: ResolvedEffortPolicy {
             small: Effort::Low,
             mid: Effort::High,
             frontier: Effort::Max,
             review: Effort::Medium,
         },
-        reviews: review_plan(),
+        reviews: {
+            // `second_opinion` is per task, so a second task needs a second
+            // entry — the registry refuses a record whose review alignment does
+            // not match its plan, which is the check working.
+            let mut reviews = review_plan();
+            if two_tasks {
+                reviews.second_opinion.push(None);
+            }
+            reviews
+        },
     };
     let registry_digest = TaskRegistry::originals_with_agents(
         plan,
@@ -1824,6 +1880,40 @@ fn dispatched() -> TopologyEventBody {
     }
 }
 
+/// Re-key an event built for `alpha` onto another task.
+///
+/// The seeded-event helpers are all `ALPHA`'s, which was enough while every
+/// fixture had one task. A step that loops needs a second, and re-keying is
+/// cheaper than a second set of builders — and keeps the two tasks' events
+/// identical apart from the key, which is what makes "the step handled both" a
+/// claim about the step rather than about the fixture.
+///
+/// The predicted region moves with the key: two tasks holding the same region
+/// is an overlap the fold refuses, and rightly.
+fn for_task(key: TaskKey, prefix: &str, body: TopologyEventBody) -> TopologyEventBody {
+    match body {
+        TopologyEventBody::TaskDispatched { mut data } => {
+            data.key = key;
+            data.worktree_path = format!("wt/{prefix}-g0");
+            data.lease = LeaseGrant::Predicted {
+                paths: PathSet::Prefixes {
+                    paths: vec![GitPath(format!("src/{prefix}"))],
+                },
+            };
+            TopologyEventBody::TaskDispatched { data }
+        }
+        TopologyEventBody::AttemptStarted { mut data } => {
+            data.key = key;
+            TopologyEventBody::AttemptStarted { data }
+        }
+        TopologyEventBody::AttemptFinished { mut data } => {
+            data.key = key;
+            TopologyEventBody::AttemptFinished { data }
+        }
+        other => other,
+    }
+}
+
 fn attempt_started(attempt: u32) -> TopologyEventBody {
     TopologyEventBody::AttemptStarted {
         data: AttemptStarted4 {
@@ -2704,6 +2794,96 @@ fn resume_clears_budget_stop_and_wakes_deferred() {
         Some(TaskState::Pending),
         "and every Deferred task is woken by the resume"
     );
+}
+
+/// **Steps (d) and (e) handle every entry, not the first one.**
+///
+/// Two catalogue entries survived the whole suite at `6a21be6` for one reason —
+/// no fixture had a second thing for these loops to reach:
+///
+/// - `PR7-PIPELINE-010` reduced step (e) to
+///   `retained_idle(..).into_iter().take(1)`, closing only the first
+///   `RetainedIdle` generation. Green.
+/// - `PR7-PIPELINE-008` added `if lease == LineageHeld { continue; }` to step
+///   (d)'s loop, skipping a whole lease class. Green.
+///
+/// Both loops were already correct. What was missing was a fixture that could
+/// tell a loop from a `.first()`, which is why this is a witness and not a
+/// repair. `Damage::two_tasks` registers `beta` beside `alpha` so there are two
+/// of everything for the steps to walk.
+///
+/// **Live above `max_parallel = 1`, latent at it** — which is exactly the
+/// condition a carried row would have named. It is cheaper to hold it than to
+/// write it down: PR11 inherits a substrate whose recovery loops are witnessed
+/// rather than a note saying they are not.
+#[test]
+fn steps_d_and_e_reach_every_generation_not_the_first() {
+    const BETA: TaskKey = TaskKey(1);
+
+    let fixture = Fixture::build(
+        "loops-reach-every",
+        Damage {
+            two_tasks: true,
+            extra: vec![
+                // alpha: retained and idle — step (e)'s subject.
+                dispatched(),
+                attempt_started(1),
+                attempt_finished(
+                    1,
+                    AttemptSettlement::Retained {
+                        retained_session: SessionId("alpha-session".to_owned()),
+                        retained_incarnation: Epoch(0),
+                    },
+                ),
+                // beta: the same, and the second entry the loop must reach.
+                for_task(BETA, "beta", dispatched()),
+                for_task(BETA, "beta", attempt_started(1)),
+                for_task(
+                    BETA,
+                    "beta",
+                    attempt_finished(
+                        1,
+                        AttemptSettlement::Retained {
+                            retained_session: SessionId("beta-session".to_owned()),
+                            retained_incarnation: Epoch(0),
+                        },
+                    ),
+                ),
+            ],
+            ..Damage::default()
+        },
+    );
+
+    // The premise: two retained generations before the resume. Without this the
+    // assertion below is satisfied by a fixture that only ever had one.
+    let before = replayed(&fixture);
+    assert!(
+        before.ready_retry(ALPHA) && before.ready_retry(BETA),
+        "both tasks must be retryable before the resume, or a `.take(1)` would \
+         pass this test by accident"
+    );
+
+    let harness = harness();
+    let runtime = runtime_holding_the_record();
+    let certifies = AlwaysCertifies;
+    let given = Given::healthy(&fixture, &runtime, &certifies);
+    let (result, _) = resume(&fixture, &harness, &given);
+    let recovered = result.expect("a run with two retained sessions resumes");
+
+    assert_eq!(
+        recovered.retained_closed, 2,
+        "step (e) closed {} of two retained generations — a loop that stops at \
+         the first leaves the rest holding their entitlements for the whole run",
+        recovered.retained_closed
+    );
+
+    let after = replayed(&fixture);
+    for (key, name) in [(ALPHA, "alpha"), (BETA, "beta")] {
+        assert!(
+            !after.ready_retry(key),
+            "{name}'s retained generation survived the resume"
+        );
+    }
 }
 
 /// A retained session belongs to the incarnation that retained it. Step (e)
@@ -4685,7 +4865,7 @@ fn the_driver_carries_an_accepted_attempt_through_the_candidate_sequence() {
     let (_recovered, handle) = outcome.expect("the healthy resume completes");
 
     let mut run = TopologyRun::resumed(handle, fixture.inputs(), Ceiling::unlimited());
-    let mut hooks = HarnessTopologyHooks::new(Arc::clone(&harness));
+    let mut hooks = TracedHooks::new(&harness);
     let sleeper = RecordingSleeper::default();
     let manager = fixture.manager();
     let runner = RecordingRunner::editing();
@@ -4758,6 +4938,48 @@ fn the_driver_carries_an_accepted_attempt_through_the_candidate_sequence() {
             expected
         },
         "the whole branch, in the order the packet specifies"
+    );
+
+    // -----------------------------------------------------------------------
+    // **The same clause over the EFFECTS, not only the events.**
+    //
+    // `side_effect_vs_event_ordering`: "commit object (R27) before pin
+    // (IdUnread between); **pin before `candidate_prepared`**; **candidates ref
+    // after `candidate_prepared`** and before `task_candidate_created`". The
+    // event list above cannot see any of that — it holds no refs and no objects.
+    //
+    // `candidate::tests::pin_pruned_after_promotion` asserts exactly this, over
+    // `candidate::promote`. The driver assembles the same steps from the three
+    // split halves, and **no ordering assertion reached that composition**:
+    // four `PR7-PIPELINE-*` catalogue mutations that reorder it — the pin moved
+    // after `candidate_prepared`, the candidates ref moved before it, the commit
+    // object moved to just after capture, the pin created before `commit-tree` —
+    // were all green. One rule, two production compositions, one witness.
+    assert_eq!(
+        hooks.timeline.order(&[
+            EffectSiteId::Object(ObjectSite::CandidateCommitTree),
+            EffectSiteId::Ref(RefSite::PinCandidatePrepared),
+            EffectSiteId::Event(EventSite::Append),
+            EffectSiteId::Ref(RefSite::CreateCandidates),
+            EffectSiteId::Ref(RefSite::DeleteCandidatePin),
+        ]),
+        vec![
+            // task_dispatched and attempt_started: the branch's own prologue,
+            // which this fixture drives in the same step.
+            "Event.Append".to_owned(),
+            "Event.Append".to_owned(),
+            "Object.CandidateCommitTree".to_owned(),
+            "Ref.PinCandidatePrepared".to_owned(),
+            // attempt_finished(succeeded).
+            "Event.Append".to_owned(),
+            // candidate_prepared.
+            "Event.Append".to_owned(),
+            "Ref.CreateCandidates".to_owned(),
+            // task_candidate_created.
+            "Event.Append".to_owned(),
+            "Ref.DeleteCandidatePin".to_owned(),
+        ],
+        "the driver's candidate sequence, as one observed order over both families"
     );
 }
 
@@ -5535,6 +5757,133 @@ fn a_retried_worker_is_told_what_the_last_attempt_failed_on() {
         prompts[0],
         prompts[1]
     );
+}
+
+/// The order the funnels ran in, for the **driver's** composition of the
+/// candidate sequence.
+///
+/// `candidate.rs` has one of these and it covers `candidate::promote`. The
+/// driver assembles the same four steps from the three split halves
+/// (`create_candidates_ref`, `append_candidate_created`,
+/// `reclaim_after_creation`), and until this existed **no ordering assertion
+/// reached that composition** — the only two `trace.order(` calls in the
+/// topology engine were both in `candidate.rs`. Found by S5 round 2's catalogue:
+/// four `PR7-PIPELINE-*` mutations that reorder the driver's sequence were green,
+/// while `pin_pruned_after_promotion` would have caught every one of them on the
+/// other path.
+#[derive(Clone, Default)]
+struct Timeline(Arc<Mutex<Vec<String>>>);
+
+impl Timeline {
+    fn push(&self, site: EffectSiteId, phase: HookPhase) {
+        // `Before` only: one entry per funnel, at the point it begins, which is
+        // what an ordering clause is about.
+        if phase != HookPhase::Before {
+            return;
+        }
+        self.0
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .push(site.to_string());
+    }
+
+    /// The recorded sequence with everything not `of_interest` dropped.
+    ///
+    /// Filtered rather than compared whole: a driver step also creates an
+    /// execution root, writes an intent and adds a worktree, and an assertion
+    /// over the unfiltered list would be an assertion about the fixture.
+    fn order(&self, of_interest: &[EffectSiteId]) -> Vec<String> {
+        let names: Vec<String> = of_interest.iter().map(ToString::to_string).collect();
+        self.0
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .iter()
+            .filter(|seen| names.contains(seen))
+            .cloned()
+            .collect()
+    }
+}
+
+struct TracedEffects {
+    inner: crate::workspace_manager::HarnessEffects,
+    timeline: Timeline,
+}
+
+impl crate::workspace_manager::EffectHooks for TracedEffects {
+    fn phase(
+        &mut self,
+        site: EffectSiteId,
+        phase: HookPhase,
+    ) -> crate::topology::effects::Injection {
+        let answered = self.inner.phase(site, phase);
+        self.timeline.push(site, phase);
+        answered
+    }
+
+    fn durability_ledger(&self) -> crate::util::DurabilityLedger {
+        self.inner.durability_ledger()
+    }
+}
+
+struct TracedEvents {
+    inner: crate::events::log::HarnessEventHooks,
+    timeline: Timeline,
+}
+
+impl crate::events::log::EventHooks for TracedEvents {
+    fn phase(&mut self, site: crate::topology::effects::EventSite, phase: HookPhase) {
+        self.inner.phase(site, phase);
+        self.timeline.push(EffectSiteId::Event(site), phase);
+    }
+}
+
+/// [`HarnessTopologyHooks`] with the two families an ordering clause spans
+/// recorded onto one timeline.
+struct TracedHooks {
+    effects: TracedEffects,
+    events: TracedEvents,
+    rest: HarnessTopologyHooks,
+    timeline: Timeline,
+}
+
+impl TracedHooks {
+    fn new(harness: &Arc<Mutex<HookHarness>>) -> Self {
+        let timeline = Timeline::default();
+        Self {
+            effects: TracedEffects {
+                inner: crate::workspace_manager::HarnessEffects::new(Arc::clone(harness)),
+                timeline: timeline.clone(),
+            },
+            events: TracedEvents {
+                inner: crate::events::log::HarnessEventHooks::new(Arc::clone(harness)),
+                timeline: timeline.clone(),
+            },
+            rest: HarnessTopologyHooks::new(Arc::clone(harness)),
+            timeline,
+        }
+    }
+}
+
+impl TopologyHooks for TracedHooks {
+    fn effects(&mut self) -> &mut dyn crate::workspace_manager::EffectHooks {
+        &mut self.effects
+    }
+
+    fn rundir(&mut self) -> &mut dyn crate::rundir::RunDirHooks {
+        self.rest.rundir()
+    }
+
+    fn events(&mut self) -> &mut dyn crate::events::log::EventHooks {
+        &mut self.events
+    }
+
+    fn container(&mut self) -> &mut dyn crate::runner::container::ContainerHooks {
+        self.rest.container()
+    }
+
+    fn spawn(&mut self) -> &mut dyn crate::agent::proc::SpawnHooks {
+        self.rest.spawn()
+    }
 }
 
 /// **The driver dispatches at the rung the log records, not at rung 0.**
