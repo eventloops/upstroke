@@ -273,3 +273,63 @@ fn every_driver_append_propagates_its_error() {
          protocol never runs for them: {unpropagated:?}"
     );
 }
+
+/// **The loop chooses its branch through one selector.**
+///
+/// `decisions.sequential_substrate.loop` gives seven branches in one order, and
+/// `select` is where that order lives. Catalogue entry `PR7-SELECT-015` added a
+/// **second** selector — `select_rescan`, ordered Dispatch/Retry/Integrate
+/// instead of Integrate/Retry/Dispatch — pointed `TopologyRun::step` at it, and
+/// left canonical `select` untouched with every one of its tests still passing.
+/// The whole suite was green.
+///
+/// That is the seams category in its purest form: `select.rs` is coherent,
+/// `run.rs` is coherent, and the branch order the packet specifies is not the
+/// one the run takes. No per-function test can see it, because each function is
+/// right about itself.
+///
+/// The fifth single-authority census this slice owns, and the cheapest: the
+/// driver reaches its branch order through exactly one call, and `checkpoint`
+/// guards exactly that call's result. A second selector makes this count zero,
+/// not two — which is why the assertion is on the **canonical** name rather than
+/// on a total.
+#[test]
+fn the_loop_selects_through_one_function() {
+    let source = std::fs::read_to_string(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/engine/topology/run.rs"),
+    )
+    .expect("the driver's own source");
+    let code = crate::effects::production_code(&source);
+
+    assert!(
+        code.len() * 10 > source.len(),
+        "the production region is {} of {} bytes",
+        code.len(),
+        source.len()
+    );
+
+    // Calls, not definitions — neither is defined here, but the filter is the
+    // one the barrier census learned to use and costs nothing.
+    let calls = |needle: &str| {
+        code.match_indices(needle)
+            .filter(|(at, _)| !code[..*at].trim_end().ends_with("fn"))
+            .count()
+    };
+
+    assert_eq!(
+        calls("select("),
+        1,
+        "the driver reaches its branch order through {} calls to `select`. Zero \
+         means a second selector was written and this one bypassed — the branch \
+         order the packet specifies is then not the order the run takes, and \
+         `select`'s own tests still pass",
+        calls("select(")
+    );
+    assert_eq!(
+        calls("checkpoint("),
+        1,
+        "`checkpoint` refuses the terminals this build does not implement. One \
+         selector guarded by one checkpoint is the pair; a selected step that \
+         reached the loop unguarded is `INV-07`'s failure"
+    );
+}
