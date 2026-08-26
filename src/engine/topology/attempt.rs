@@ -164,6 +164,14 @@ pub struct PlanRequest<'a> {
     pub workspace: &'a std::path::Path,
     /// The session a same-session retry resumes.
     pub resume_session: Option<SessionId>,
+    /// What the previous attempts failed on, oldest first.
+    ///
+    /// §11.4: failure feedback goes back to the same rung, and an escalation
+    /// carries the accumulated feedback with it. This was always empty — the
+    /// plan hard-coded `retry: None` — so a retried worker was given the same
+    /// prompt as the first attempt and no reason to do anything differently.
+    /// The whole point of spending a second attempt is that it is informed.
+    pub feedback: Vec<crate::events::Feedback>,
     /// What a repair's worktree looked like when this attempt started.
     pub materialization_observed: Option<Materialization>,
 }
@@ -328,6 +336,10 @@ pub struct AttemptPlan {
 /// that says so.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GatePlan {
+    /// The gate's configured name, which is what a failure reports and a human
+    /// reads. `gate {index}` named the position instead, so an operator had to
+    /// count the config to find out which gate rejected their task.
+    pub name: String,
     /// What to run.
     pub command: CommandSpec,
     /// How long it may take.
@@ -437,6 +449,21 @@ pub struct Judging<'a> {
 /// One process's verdict, as the runner reported it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Verdict {
+    /// Whether the Runner truncated the process's output.
+    ///
+    /// §11.1 makes the 8-KiB tail the feedback a retry is given, so a truncated
+    /// log is a different claim from a short one and the ladder is entitled to
+    /// know which it has.
+    pub output_limited: bool,
+    /// Whether the Runner killed it on its timeout.
+    pub timed_out: bool,
+    /// What it printed, for the tail `GateFailure::log_tail` carries.
+    ///
+    /// Kept because the driver's gate failure had `log_tail: String::new()`: a
+    /// gate could reject an attempt and the retry that followed was told the
+    /// exit code and nothing else. §11.4 sends the diagnostic back to the same
+    /// rung, and there was no diagnostic to send.
+    pub log: String,
     /// Which process.
     pub invocation: InvocationId,
     /// Where it ran — always an exact snapshot, never the task worktree.
@@ -840,14 +867,29 @@ impl AttemptContext<'_> {
                 let refused = !verdict.passed();
                 if refused && failure.is_none() {
                     failure = Some(crate::engine::classify::gate_failure(&GateFailure {
-                        gate: format!("gate {index}"),
+                        gate: gate.name.clone(),
                         summary: format!(
-                            "exit {}",
+                            "exit {}{}{}",
                             verdict
                                 .code
-                                .map_or_else(|| "signal".to_owned(), |code| code.to_string())
+                                .map_or_else(|| "signal".to_owned(), |code| code.to_string()),
+                            if verdict.timed_out {
+                                " (timed out)"
+                            } else {
+                                ""
+                            },
+                            if verdict.output_limited {
+                                " (output truncated)"
+                            } else {
+                                ""
+                            }
                         ),
-                        log_tail: String::new(),
+                        // §11.1's tail, which is what §11.4 sends back to the
+                        // same rung. This was empty.
+                        log_tail: crate::util::tail(
+                            &verdict.log,
+                            crate::gates::FEEDBACK_TAIL_BYTES,
+                        ),
                     }));
                 }
                 gates.push(verdict);
@@ -917,6 +959,33 @@ impl AttemptContext<'_> {
                 // to redesign.
                 &invocations(pass),
             )?;
+
+            // **R4, for the processes the seam ran.** `permits.protocol` is
+            // "every Runner process is registered and settled exactly once",
+            // and a review pass reaches the Runner through `run_review` with
+            // the raw handle — so the worker and the gates were in the ledger
+            // and the reviewers and their re-asks were not.
+            //
+            // Reconciled after the call rather than before it, because the seam
+            // owns the spawning and only its outcome knows how many processes
+            // ran: `ReviewOutcome::invocations` counts the pass plus each
+            // re-ask. Registering a re-ask up front would put an id in the
+            // ledger for a process that may never exist, which is the opposite
+            // failure.
+            //
+            // The ids are the caller's own — the same `ReviewInvocations` the
+            // pass was given — so this records what ran under the names it ran
+            // under rather than minting new ones.
+            let ids = invocations(pass);
+            for ordinal in 0..outcome.invocations {
+                let id = if ordinal == 0 {
+                    ids.pass.clone()
+                } else {
+                    run.identities.review_reask(pass, ordinal - 1)
+                };
+                self.ledger.register(&id)?;
+                self.ledger.complete(&id)?;
+            }
 
             // Read before the result is consumed: a judge that never ran is not
             // a judge that said no, and the ledger has to show which happened.
@@ -1172,6 +1241,11 @@ impl AttemptContext<'_> {
     ) -> Result<Verdict, UpstrokeError> {
         let output = self.execute(request, pool)?;
         Ok(Verdict {
+            output_limited: output.output_limited,
+            timed_out: output.timed_out,
+            // Both streams, in the order `gates::run_all` joins them: a gate's
+            // diagnostic is as often on stderr as on stdout.
+            log: format!("{}{}", output.stdout, output.stderr),
             invocation: request.invocation.clone(),
             workspace: request.workspace.clone(),
             code: output.code,

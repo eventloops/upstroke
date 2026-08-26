@@ -197,6 +197,77 @@ fn attempt_started_is_durable_before_any_spawn() {
     );
 }
 
+/// **Every Runner process of an attempt is in the ledger, reviewers included.**
+///
+/// `permits.protocol`: "the invocation ledger records registered/completed/
+/// cancelled" and R4 is "every Runner process registered exactly once, settled
+/// exactly once". A review pass reaches the Runner through `run_review` with
+/// the raw handle, so the worker and the gates were recorded and the reviewers
+/// were not — the ledger balanced the whole time, because an unregistered
+/// process is not an unsettled one. Balance is not the assertion; the **count**
+/// is.
+#[test]
+fn every_process_of_an_attempt_is_recorded_reviewers_included() {
+    let mut run = Run::started("ledger-covers-reviews");
+    let dispatched = run.dispatch(ALPHA, 0);
+    let plan = run.attempt_plan(ALPHA, 1);
+    let mut process = Process::new();
+
+    let expected = 1 + plan.gates.len() + plan.reviewers.len();
+    assert!(
+        plan.reviewers.len() >= 2,
+        "this fixture plans {} reviewer(s); with none the count below would \
+         pass without covering the case it exists for",
+        plan.reviewers.len()
+    );
+
+    let started = context!(run, process)
+        .start(dispatched.site(), &plan)
+        .expect("start");
+    agent_edits(&dispatched.worktree);
+    let capture = context!(run, process)
+        .capture(dispatched.site())
+        .expect("capture");
+    let review_inputs = run.review_inputs();
+    let assessed = context!(run, process)
+        .assess(
+            dispatched.site(),
+            &plan,
+            &started,
+            &capture,
+            &review_inputs.diff,
+            crate::ir::TaskKind::Implement,
+        )
+        .expect("the scaffold's adapter parses its own worker output");
+    context!(run, process)
+        .judge(
+            dispatched.site(),
+            &plan,
+            Judging {
+                run: &started,
+                capture: &capture,
+                assessed: &assessed,
+            },
+            &review_inputs,
+            &|pass| crate::review::ReviewInvocations {
+                pass: started.identities.review_pass(pass, 0),
+                reask: started.identities.review_reask(pass, 0),
+            },
+        )
+        .expect("judge");
+
+    assert_eq!(
+        process.ledger.completed(),
+        expected,
+        "the ledger holds {} settled invocation(s) for an attempt that ran one \
+         worker, {} gate(s) and {} reviewer(s)",
+        process.ledger.completed(),
+        plan.gates.len(),
+        plan.reviewers.len()
+    );
+    assert!(process.balances(), "and every one of them settled");
+}
+
 /// **A refused gate ends the gate set, and its cause survives.**
 ///
 /// `gates::run_all` — the legacy authority — `return`s the first `GateFailure`
@@ -276,6 +347,30 @@ fn a_refused_gate_ends_the_set_and_its_cause_survives() {
     assert!(
         !judgement.accepted(),
         "an attempt whose gate refused was accepted"
+    );
+
+    // **The gate's diagnostic reaches the ladder.** §11.1 makes the 8-KiB tail
+    // the feedback §11.4 sends back to the same rung; the driver built its
+    // `GateFailure` with `log_tail: String::new()`, so a rejected attempt was
+    // retried knowing the exit code and nothing else.
+    assert_eq!(
+        failure.feedback.as_deref().map(str::trim),
+        Some(
+            format!(
+                "{} (exit 2)",
+                crate::engine::topology::scaffold::GATE_DIAGNOSTIC
+            )
+            .as_str()
+        ),
+        "the gate's output did not reach the failure's feedback: {:?}",
+        failure.feedback
+    );
+    // And the gate is named, not numbered: an operator reading `gate 0` has to
+    // count their own config to find out which one rejected the task.
+    assert!(
+        failure.reason.contains("scaffold"),
+        "the failure does not name the gate: {}",
+        failure.reason
     );
 }
 

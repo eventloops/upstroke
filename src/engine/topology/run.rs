@@ -465,6 +465,9 @@ pub struct RunSeams<'a> {
 /// worktree verified.
 #[derive(Debug, Clone)]
 struct RunAs {
+    /// What the attempts before this one failed on, oldest first. Empty for a
+    /// first dispatch, which has nothing to be told.
+    feedback: Vec<crate::events::Feedback>,
     /// Which attempt of the generation.
     attempt: AttemptNumber,
     /// Which rung of the frozen ladder.
@@ -473,6 +476,22 @@ struct RunAs {
     resume_session: Option<SessionId>,
     /// Whether `attempt_started` is already durable.
     announced: bool,
+}
+
+/// What the retaining incarnation kept from the attempt it settled.
+///
+/// The tree a retry re-gates, and what that attempt failed on. Both are
+/// process-local on purpose: `T-RETAINED` is "the retaining incarnation
+/// proceeds to T-RETRY; a fresh process closes it in recovery", so only the
+/// process that settled the attempt may continue it, and the fold's
+/// `RetainedIdle { incarnation }` refuses any other.
+#[derive(Debug, Clone)]
+struct Retained {
+    /// `Quiescence::HoldsTree`'s subject: the cumulative work the retry re-gates.
+    tree: String,
+    /// §11.4's brief, oldest first. Without it a retry is the first attempt
+    /// again, spending a rung's allowance to be told nothing.
+    feedback: Vec<crate::events::Feedback>,
 }
 
 /// What one attempt produced, for the settlement that reads all three.
@@ -571,7 +590,7 @@ pub struct TopologyRun {
     spend: Spend,
     deferral: Deferral,
     slots: SlotAssertion,
-    retained: BTreeMap<TaskKey, String>,
+    retained: BTreeMap<TaskKey, Retained>,
 }
 
 impl TopologyRun {
@@ -608,6 +627,14 @@ impl TopologyRun {
 
     /// The fold this run derives every decision from.
     #[must_use]
+    /// Whether every Runner process this run registered was also settled.
+    ///
+    /// R4's "registered and settled exactly once", as a question a test can
+    /// ask. It is the ledger's own answer; nothing here re-derives it.
+    pub fn invocations_balance(&self) -> bool {
+        self.invocations.balances()
+    }
+
     /// What this process believes the run has spent.
     ///
     /// Paired with `Spend::replay` over the same log, this is the parity a
@@ -709,6 +736,7 @@ impl TopologyRun {
                         attempt: Self::FIRST_ATTEMPT,
                         rung: self.ladder_position(key)?.0,
                         resume_session: None,
+                        feedback: Vec::new(),
                         announced: false,
                     },
                     seams,
@@ -969,16 +997,18 @@ impl TopologyRun {
         hooks: &mut dyn TopologyHooks,
     ) -> Result<Progress, UpstrokeError> {
         let position = self.ladder_position(key)?;
-        let retained_tree = self.retained.get(&key).cloned().ok_or_else(|| {
-            UpstrokeError::Refused {
+        let held = self
+            .retained
+            .get(&key)
+            .cloned()
+            .ok_or_else(|| UpstrokeError::Refused {
                 message: format!(
                     "task {} has a retained generation this process did not retain, so the tree \
                      its retry must re-gate is not known here. A fresh process closes a retained \
                      generation in recovery rather than continuing it",
                     key.index()
                 ),
-            }
-        })?;
+            })?;
         let binding = self
             .handle
             .fold
@@ -1003,7 +1033,7 @@ impl TopologyRun {
                 &RetryRequest {
                     key,
                     slot,
-                    retained_tree,
+                    retained_tree: held.tree.clone(),
                     binding,
                     rung: position.0,
                     pool: None,
@@ -1018,6 +1048,8 @@ impl TopologyRun {
                     attempt: started.attempt,
                     rung: started.rung,
                     resume_session: started.resume_session.clone(),
+                    // §11.4: what the attempts before this one failed on.
+                    feedback: held.feedback.clone(),
                     // `settle::retry` built this event; appending it is what
                     // announces the attempt, and the fold refuses a second.
                     announced: true,
@@ -1158,6 +1190,7 @@ impl TopologyRun {
             binding,
             workspace: site.worktree,
             resume_session: run_as.resume_session.clone(),
+            feedback: run_as.feedback.clone(),
             materialization_observed: None,
         })?;
 
@@ -1348,7 +1381,25 @@ impl TopologyRun {
             settled.event.settlement,
             crate::topology::events::AttemptSettlement::Retained { .. }
         ) {
-            self.retained.insert(site.key, capture.tree.clone());
+            let mut feedback = self
+                .retained
+                .remove(&site.key)
+                .map(|held| held.feedback)
+                .unwrap_or_default();
+            feedback.push(crate::events::Feedback {
+                attempt: plan.attempt.0,
+                tier: plan.binding.tier.to_string(),
+                summary: failure.reason.clone(),
+                detail: failure.feedback.clone(),
+                human: false,
+            });
+            self.retained.insert(
+                site.key,
+                Retained {
+                    tree: capture.tree.clone(),
+                    feedback,
+                },
+            );
         }
         self.spend.record(site.key, &settled.event.record);
         self.emit(

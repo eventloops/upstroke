@@ -522,6 +522,10 @@ pub(super) struct Ran {
 /// `decisions.workspace_candidates.snapshots` says gates and reviewers execute
 /// only in exact snapshots and "worker worktrees and the staging worktree are
 /// never used for verification processes".
+/// What a refused scaffold process prints, so a test can follow it into the
+/// feedback a retry is given.
+pub(super) const GATE_DIAGNOSTIC: &str = "scaffold gate rejected the diff";
+
 #[derive(Debug, Default)]
 pub(super) struct RecordingRunner {
     ran: Mutex<Vec<Ran>>,
@@ -622,7 +626,15 @@ impl Runner for RecordingRunner {
         let code = if codes.is_empty() { 0 } else { codes.remove(0) };
         Ok(ProcessOutput {
             code: Some(code),
-            stdout: String::new(),
+            // A refused process says something, the way a real one does: §11.1
+            // makes the tail the feedback a retry is given, and a fixture whose
+            // processes print nothing cannot tell a carried tail from a dropped
+            // one.
+            stdout: if code == 0 {
+                String::new()
+            } else {
+                format!("{GATE_DIAGNOSTIC} (exit {code})\n")
+            },
             stderr: String::new(),
             duration: Duration::from_millis(1),
             timed_out: false,
@@ -1215,7 +1227,11 @@ impl Run {
                     shell: crate::gates::ShellKind::native(),
                 }
                 .command();
-                GatePlan { command, timeout }
+                GatePlan {
+                    name: "scaffold".to_owned(),
+                    command,
+                    timeout,
+                }
             }],
             // Identity and policy, no command: the shared review machinery
             // builds one per invocation, because a re-ask's prompt is not the

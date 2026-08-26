@@ -331,6 +331,10 @@ impl AttemptPlans for FrozenPlans<'_> {
         // below turn into commands.
         let gate_cmds: Vec<String> = self.gates.iter().map(|gate| gate.cmd.clone()).collect();
 
+        let brief = (!request.feedback.is_empty()).then(|| RetryBrief {
+            resumed: request.resume_session.is_some(),
+            feedback: request.feedback.clone(),
+        });
         let worker = WorkerAssembly {
             adapter,
             profile: &profile,
@@ -339,9 +343,10 @@ impl AttemptPlans for FrozenPlans<'_> {
             paths: self.paths,
             stem: entry.display_id.as_str(),
             attempt: request.attempt.0,
-            // A retry brief is the previous attempt's feedback, and the branch
-            // that carries one is `ReadyRetry`. A first dispatch has none.
-            retry: None,
+            // §11.4's brief, when there is one. A first dispatch has no
+            // feedback and passes `None`; a retry passes what the attempts
+            // before it failed on.
+            retry: brief.as_ref(),
             workspace: request.workspace,
             resume_session: request.resume_session.as_ref().map(|id| id.0.clone()),
         }
@@ -354,7 +359,11 @@ impl AttemptPlans for FrozenPlans<'_> {
             .iter()
             .map(|gate| {
                 let (command, timeout) = gate.command();
-                GatePlan { command, timeout }
+                GatePlan {
+                    name: gate.name.clone(),
+                    command,
+                    timeout,
+                }
             })
             .collect();
 

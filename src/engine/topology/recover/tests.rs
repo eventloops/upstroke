@@ -5307,6 +5307,38 @@ fn the_retaining_incarnation_retries_in_place() {
         "the retry opened a fresh generation instead of continuing the retained one"
     );
 
+    // **And told what went wrong.** §11.4 sends the failure back to the same
+    // rung; the plan hard-coded `retry: None`, so the second attempt got the
+    // first attempt's prompt verbatim and no reason to behave differently. A
+    // retry that is not informed is a rung's allowance spent to learn nothing.
+    let briefed = runner
+        .requests()
+        .iter()
+        .filter(|request| request.role == crate::runner::ExecutionRole::Implement)
+        .filter(|request| {
+            request
+                .command
+                .args
+                .iter()
+                .any(|arg| arg.contains("agent error"))
+        })
+        .count();
+    assert_eq!(
+        briefed, 1,
+        "exactly one of the two worker prompts should carry the previous \
+         attempt's failure, and it is the second"
+    );
+
+    // Balance, which says every registration was settled. It does **not** say
+    // the reviewers were registered — an empty ledger balances too — so R4's
+    // review coverage is asserted where reviewers actually run, in
+    // `attempt::tests`.
+    assert!(
+        run.invocations_balance(),
+        "the invocation ledger does not balance, so some process was \
+         registered and never settled"
+    );
+
     // **The worker was actually told to resume.** The event records that a
     // session was retained; this records that the command carried it. They are
     // different claims, and a retry that appended the first without the second
@@ -5642,6 +5674,7 @@ fn a_reviewer_runs_at_the_review_effort_not_the_implementers() {
             binding,
             workspace: &fixture.repo_root,
             resume_session: None,
+            feedback: Vec::new(),
             materialization_observed: None,
         },
     )
