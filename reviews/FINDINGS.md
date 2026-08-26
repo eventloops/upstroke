@@ -2084,6 +2084,17 @@ the owner authorised fork 1 as **Class C with its ceremony**:
 `decisions/2026-08-26-durable-retry-feedback.md`, and §3 below carries the
 per-instance approval.
 
+> **Re-run that command at a later head and the first number is 1, not 0.** The field's
+> own doc comment quotes "the reviewer's `required_changes` (§11.2)", so the repair moved
+> the needle its justification measured. The `bd3b9cd` stamp is what keeps the quotation
+> true — §22's rule doing exactly the work it was written for — but the stamp alone would
+> leave a reviewer re-running it at HEAD to wonder, so it is said here. Fourth shape of §4's
+> self-referential-needle class in this slice, and the first where the *repair* rather than
+> the *documentation of a census* moved the count. The same caveat applies to the copy of
+> this measurement in the decision record, which is not amended for it: `decisions/` is
+> outside the 2026-08-20 exempt path set, and a docs edit there would restart a review
+> sequence over a sentence its own sha stamp already makes true.
+
 **What the witnesses assert is delivered content, and each has a mutation that kills
 it.** §23's own standard is that a mechanism existing is not the claim; the claim is
 that the next worker is *told*. All five run in the same invocation, so the columns are
