@@ -2259,8 +2259,31 @@ mod tests {
             ),
         ];
 
+        // **The control is a corpus entry, not a side call.**
+        // `each_census_needle_covers_the_domain_its_doc_states` proves
+        // `receiver_writes` is right and proves **nothing** about whether this
+        // census calls it — measured: reverting the count below to the
+        // pre-repair literal `code.matches(".attempts_on_rung =")` left that
+        // unit test green, and left a closure-based self-check green too,
+        // because the revert bypasses the closure. A control only binds the
+        // census's own count if it travels through it, so this synthetic file
+        // joins the corpus and is expected in the table like any other: it
+        // carries **two** compound assignments and one comparison, and expects
+        // 2. The pre-repair literal `.attempts_on_rung =` scores it **1**: it
+        // misses both `+=` and `-=` and matches the `==`. One compound
+        // assignment and one comparison would have scored 1 under both needles
+        // and passed — measured, and the reason the control is shaped this way.
+        const SELF_CHECK: &str = "<self-check>";
+        let mut corpus = production_sources();
+        corpus.push((
+            SELF_CHECK.to_owned(),
+            "fn control() {\n    state.attempts_on_rung += 1;\n    state.attempts_on_rung -= 1;\n    \
+             if state.attempts_on_rung == 1 {}\n}\n"
+                .to_owned(),
+        ));
+
         let mut found: BTreeMap<String, (usize, usize)> = BTreeMap::new();
-        for (path, code) in production_sources() {
+        for (path, code) in corpus {
             // **Assignments through a receiver**, which is what makes a site a
             // *decider* of persisted state. `let attempts_on_rung = ...` in the
             // driver is a local binding of a value it is about to pass, and
@@ -2274,6 +2297,7 @@ mod tests {
         let expected: BTreeMap<String, (usize, usize)> = EXPECTED
             .iter()
             .map(|(path, w, c, _)| ((*path).to_owned(), (*w, *c)))
+            .chain(std::iter::once((SELF_CHECK.to_owned(), (2, 0))))
             .collect();
         assert_eq!(
             found, expected,
@@ -2377,9 +2401,26 @@ mod tests {
         /// site the extraction was copied *from*, was outside its domain.
         const PLAN_AUTHORED: &[&str] = &["display_id", "task.id"];
 
+        // **The control is a corpus entry**, for the reason the allowance census
+        // above gives: a unit assertion on `stem_values` proves the helper and
+        // says nothing about whether this census walks the tree with it. This
+        // synthetic file is a guarded site of the exact shape the live legacy
+        // path uses — a `let` binding whose value runs past a comma — so a
+        // reader that matches only `stem:` initializers, or that truncates the
+        // value at the first comma, loses it and the site count below is 3
+        // rather than 4.
+        const SELF_CHECK: &str = "<self-check>";
+        let mut corpus = production_sources();
+        corpus.push((
+            SELF_CHECK.to_owned(),
+            "fn control() {\n    let stem = format!(\"{i:02}-{}\", \
+             filename_component(task.id));\n}\n"
+                .to_owned(),
+        ));
+
         let mut unguarded: Vec<String> = Vec::new();
         let mut guarded: Vec<String> = Vec::new();
-        for (path, code) in production_sources() {
+        for (path, code) in corpus {
             for (at, value) in stem_values(&code) {
                 if !PLAN_AUTHORED.iter().any(|id| value.contains(id)) {
                     continue;
@@ -2398,11 +2439,11 @@ mod tests {
         // disappearing out of the count.
         assert_eq!(
             guarded.len() + unguarded.len(),
-            3,
+            4,
             "this tree has three production sites that build a filename stem from a \
              plan-authored id — `coordinator.rs`'s `let stem = …` on the live legacy path and \
-             `assembly.rs`'s two field initializers — and the census found {} ({guarded:?}, \
-             {unguarded:?}). An equality rather than a floor, because a fourth site has to be \
+             `assembly.rs`'s two field initializers — plus the `<self-check>` corpus entry, and \
+             the census found {} ({guarded:?}, {unguarded:?}). An equality rather than a floor, because a fourth site has to be \
              read once by a person, and because a needle that quietly stops matching is how this \
              census came to miss the legacy site entirely",
             guarded.len() + unguarded.len()
