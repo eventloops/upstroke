@@ -2089,6 +2089,103 @@ mod tests {
         );
     }
 
+    /// **The rung's allowance is counted in one production place, and decided
+    /// in another that everyone consults.**
+    ///
+    /// The fourth single-authority census, and it exists because the pair it
+    /// covers had already diverged. S5 round 2 found `TaskFold::attempts_on_rung`
+    /// incrementing on every `attempt_started` while `ladder::spends_allowance`
+    /// — documented as *"the single production implementation of the allowance
+    /// rule"*, total over `FailureKind` — decided the same question at the
+    /// settlement. Two production places for one rule, disagreeing on every
+    /// interruption, park and outage, against
+    /// `transaction_fault_matrix[T-ATTEMPT]`'s "unknown spend, **allowance
+    /// refunded**".
+    ///
+    /// The other three censuses were each written after a defect of exactly this
+    /// shape, and none of them covered *counting*: they cover which command a
+    /// role gets, what an observation means, which profile a role runs under,
+    /// and which ledger line an attempt writes. Repairing the divergence alone
+    /// would leave the pair free to diverge again on the next edit, which is the
+    /// difference between fixing an instance and closing a class.
+    ///
+    /// # The two columns
+    ///
+    /// **Writes** are the sites that *decide* the count: an assignment or an
+    /// increment. There may be exactly the three in the fold — the zero at
+    /// construction, the increment at the settlement, and the reset the
+    /// escalation performs onto its new rung — and no others anywhere. A fourth
+    /// is a second counting rule.
+    ///
+    /// **Consults** are calls to `spends_allowance`. These are *expected* to be
+    /// plural: one rule consulted from several places is the shape this census
+    /// wants. What it forbids is the alternative — a caller that re-derives the
+    /// answer from a `SettlementTransition`, a `Next`, or an attempt number,
+    /// which is what `settle_failed` did before `FailureShape` existed and what
+    /// this fold did until round 2.
+    #[test]
+    fn the_rungs_allowance_is_counted_in_one_production_place() {
+        use std::collections::BTreeMap;
+
+        /// (file, `attempts_on_rung` writes, `spends_allowance` calls, why).
+        const EXPECTED: &[(&str, usize, usize, &str)] = &[
+            (
+                "src/events/mod.rs",
+                7,
+                0,
+                "**the legacy schema-3 progress tracker, and the reason this census exists rather than a bare repair.** It counts an attempt at its *start* and refunds by SUBTRACTION — five `saturating_sub` sites against one `saturating_add`, plus two resets. Each of those five is a place a future refund can be forgotten, which is the bug schema 4 shipped. **Recorded, not unified**: this is the legacy engine's own in-memory state, `invariants_preserved[1]` freezes its behaviour, and rewriting it would change the engine actually in production to tidy the one that is not. Zero consults is the finding in one number — the legacy engine never asks `spends_allowance`, because the rule was extracted FROM it",
+            ),
+            (
+                "src/topology/fold.rs",
+                2,
+                1,
+                "the only place schema 4 writes the count: one more at the settlement, and back to zero on the rung an escalation climbs onto. **No subtraction** — counting at the settlement makes T-ATTEMPT's refund the absence of a charge rather than a correction, which is the contrast with the seven sites above. The increment CONSULTS `spends_allowance` rather than answering for itself, and that is the whole of this census",
+            ),
+            (
+                "src/engine/topology/run.rs",
+                0,
+                2,
+                "TWO consults, both the same question about the one attempt the fold has not seen. The accepted-work arm returns `spends_allowance(None)` rather than a literal `true`; the failure arm adds this attempt to the rung before `next_step` runs, because `next_step` decides the transition the settlement will carry and the append has not happened yet. Consults, not a second rule, and no write",
+            ),
+            (
+                "src/engine/topology/settle.rs",
+                0,
+                1,
+                "`settle_failed` reads the allowance off the record rather than off the ladder's `Next` — the divergence `FailureShape`'s own doc records, on a park",
+            ),
+            (
+                "src/ladder.rs",
+                0,
+                1,
+                "the rule itself. `LadderState::attempts_on_rung` is a field this function reads, never one it writes",
+            ),
+        ];
+
+        let mut found: BTreeMap<String, (usize, usize)> = BTreeMap::new();
+        for (path, code) in production_sources() {
+            // **Assignments through a receiver**, which is what makes a site a
+            // *decider* of persisted state. `let attempts_on_rung = ...` in the
+            // driver is a local binding of a value it is about to pass, and
+            // counting it would make this census report the consult twice.
+            let writes = code.matches(".attempts_on_rung =").count();
+            let consults = code.matches("spends_allowance(").count();
+            if writes > 0 || consults > 0 {
+                found.insert(path, (writes, consults));
+            }
+        }
+        let expected: BTreeMap<String, (usize, usize)> = EXPECTED
+            .iter()
+            .map(|(path, w, c, _)| ((*path).to_owned(), (*w, *c)))
+            .collect();
+        assert_eq!(
+            found, expected,
+            "one production place counts the rung's allowance and one decides \
+             it. A second counting site is two rules deciding when an operator \
+             pays for a pricier tier, and the first one diverged silently for \
+             an entire slice"
+        );
+    }
+
     #[test]
     fn every_production_command_spec_payload_is_classified() {
         use std::collections::BTreeMap;

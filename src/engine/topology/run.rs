@@ -1332,14 +1332,37 @@ impl TopologyRun {
         // this branch's assumptions.
         let position = self.ladder_position(site.key)?;
 
+        // **The rung's allowance, including the attempt in hand.**
+        //
+        // The fold counts an attempt at its *settlement*, because that is when
+        // `spends_allowance` can answer — its line is "the worker ran and
+        // produced work to judge", which `attempt_started` cannot know.
+        // `next_step` runs one step earlier: it *decides* the transition this
+        // settlement will carry, so the append has not happened and the fold's
+        // count does not yet include this attempt.
+        //
+        // So the driver asks the same question about the one attempt the fold
+        // has not seen. That is one rule with one implementation consulted about
+        // two subjects — the settled attempts and the live one — and not a
+        // second implementation: change a cell in `spends_allowance` and both
+        // move together, which is exactly what failed to happen while the fold
+        // counted starts.
+        //
+        // Bound once and read twice, by the ladder and by the question a park
+        // raises. A park that quoted a different number than the ladder decided
+        // on would send an operator looking for a run that did not happen.
+        let attempts_on_rung =
+            position
+                .1
+                .saturating_add(u32::from(crate::ladder::spends_allowance(Some(
+                    crate::ladder::FailureShape::of(failure),
+                ))));
+
         let next = crate::ladder::next_step(
             failure,
             &crate::ladder::LadderState {
                 rung: position.0 as usize,
-                // Both properties of this branch, as in `attempt`: a ready task
-                // dispatches into a fresh generation, so this is its first
-                // attempt on its first rung.
-                attempts_on_rung: position.1,
+                attempts_on_rung,
                 defers,
                 // Both halves, as `LadderState::resumable` documents: the
                 // agent's CLI advertises `session_resume` and this attempt
@@ -1357,7 +1380,7 @@ impl TopologyRun {
         // slice keeps paying for.
         let question = match next {
             crate::ladder::Next::AskHuman(kind) => {
-                Some(self.park_question(site.key, position.1, kind, failure, seams.ids)?)
+                Some(self.park_question(site.key, attempts_on_rung, kind, failure, seams.ids)?)
             }
             _ => None,
         };

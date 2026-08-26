@@ -3225,13 +3225,16 @@ impl RunState {
                     };
                     generation.attempts = data.attempt.0;
                 }
-                // One more attempt spent at this task's current rung. Counted
-                // here rather than derived from the generation, because a
-                // same-rung retry after a close is a *new* generation at the
-                // same rung and the allowance spans both.
-                if let Some(task) = self.tasks.get_mut(data.key.index()) {
-                    task.attempts_on_rung = task.attempts_on_rung.saturating_add(1);
-                }
+                // **Not counted here.** An attempt that has *started* has not
+                // yet spent anything: `ladder::spends_allowance` is total over
+                // `FailureKind` and its line is "the worker ran and produced
+                // work to judge", which `attempt_started` cannot know. Counting
+                // here made this fold a second authority for a rule that has one
+                // production implementation, and made every interruption, park
+                // and outage burn a rung the packet says they do not —
+                // `transaction_fault_matrix[T-ATTEMPT]`'s "unknown spend,
+                // **allowance refunded**". The count is taken at the settlement,
+                // in `apply_settlement`, from the record the settlement carries.
             }
             TopologyEventBody::AttemptFinished { data } => self.apply_settlement(data),
             TopologyEventBody::AttemptInterrupted { data } => {
@@ -3351,6 +3354,36 @@ impl RunState {
     }
 
     fn apply_settlement(&mut self, finished: &AttemptFinished4) {
+        // **The allowance, decided once, by the one function that decides it.**
+        //
+        // `ladder::spends_allowance` is documented as "the single production
+        // implementation of the allowance rule" and is total over `FailureKind`
+        // so a new variant stops the build rather than taking a default. This
+        // fold consumes it; it does not re-derive it. `FailureRecord::shape`
+        // exists for exactly this call — "a settlement holds a record rather
+        // than the live failure, and the allowance decision is the same decision
+        // either way".
+        //
+        // **Taken at the settlement, which is what makes the refund free.**
+        // T-ATTEMPT refunds an interrupted attempt's allowance. An attempt that
+        // never settled never counted, so there is nothing to give back and no
+        // second rule to keep in step with the first — the refund is the absence
+        // of a charge rather than a subtraction that could be forgotten.
+        //
+        // Before the `Escalated` arm below, which resets the count: an attempt
+        // that escalates spent its allowance on the rung it is leaving, and the
+        // rung it climbs onto starts again at zero.
+        if crate::ladder::spends_allowance(
+            finished
+                .record
+                .failure
+                .as_ref()
+                .map(crate::events::FailureRecord::shape),
+        ) && let Some(task) = self.tasks.get_mut(finished.key.index())
+        {
+            task.attempts_on_rung = task.attempts_on_rung.saturating_add(1);
+        }
+
         match &finished.settlement {
             AttemptSettlement::Retained {
                 retained_session,
@@ -4508,6 +4541,35 @@ mod tests {
         })
     }
 
+    /// [`settle`], with a failure on the record.
+    ///
+    /// The allowance is decided from `AttemptRecord.failure`, so a settlement
+    /// built without one is the "worker ran and its work was accepted" cell and
+    /// cannot exercise any other.
+    fn settle_failing(
+        key: TaskKey,
+        generation: u32,
+        attempt: u32,
+        kind: crate::ladder::FailureKind,
+        settlement: AttemptSettlement,
+    ) -> TopologyEvent {
+        let mut record = attempt_record(attempt);
+        record.failure = Some(crate::events::FailureRecord {
+            kind,
+            origin: crate::ladder::FailureOrigin::Worker,
+            reason: "the fixture's failure".to_owned(),
+        });
+        ev(TopologyEventBody::AttemptFinished {
+            data: Box::new(AttemptFinished4 {
+                key,
+                generation: GenerationId(generation),
+                attempt: AttemptNumber(attempt),
+                record: Box::new(record),
+                settlement,
+            }),
+        })
+    }
+
     fn succeeded(key: TaskKey, generation: u32, attempt: u32) -> TopologyEvent {
         settle(
             key,
@@ -4935,6 +4997,84 @@ mod tests {
         // starts both at zero and agrees with the fold on every reading until
         // a resume — which is exactly when nothing is watching.
         assert_ne!(0, after.rung, "a process-local rung tally reads zero here");
+    }
+
+    /// **An interrupted attempt does not spend the rung's allowance.**
+    ///
+    /// `transaction_fault_matrix[T-ATTEMPT]`'s `resume_action` in its own words:
+    /// append `attempt_interrupted` *"(unknown spend, **allowance refunded**…)"*.
+    /// `ladder::spends_allowance` agrees from the other direction —
+    /// `FailureKind::Interrupted` is `false`, because "the engine died between
+    /// an attempt starting and finishing, so nothing judged the code".
+    ///
+    /// **This fold disagreed with both for the whole of PR7.** It counted every
+    /// `attempt_started`, so an interruption, a park and an outage each burned a
+    /// rung the packet says they do not — and the divergence was invisible
+    /// because the count is only ever read across a resume. Found by S5 round 2
+    /// (`emit` and `settle`, independently).
+    ///
+    /// The pair is asserted, not just the repair: a **judged** rejection spends,
+    /// an **interruption** does not, and the difference is the only thing that
+    /// changed between the two halves. A fold that stopped counting altogether
+    /// would satisfy half of this and fail the other.
+    #[test]
+    fn an_interrupted_attempt_refunds_the_rungs_allowance() {
+        use crate::ladder::FailureKind;
+
+        let base = sha("base");
+
+        // Half one: a judged rejection. The worker ran and produced work to
+        // judge, so it spends — this is the cell that keeps the count honest.
+        let mut spent = started();
+        for event in [
+            dispatch(ALPHA, 0, &base),
+            attempt_started(&spent, ALPHA, 0, 1, 0),
+            settle_failing(
+                ALPHA,
+                0,
+                1,
+                FailureKind::GateFailed,
+                AttemptSettlement::Closed {
+                    transition: SettlementTransition::Retry,
+                    lease: LeaseDisposition::PredictedReleased,
+                },
+            ),
+        ] {
+            apply(&mut spent, &event);
+        }
+        assert_eq!(
+            spent.task(ALPHA).expect("registered").attempts_on_rung,
+            1,
+            "a judged rejection is a spent attempt — the worker ran and its work \
+             was judged, which is `spends_allowance`'s line"
+        );
+
+        // Half two: the same shape, interrupted. Same dispatch, same start, and
+        // the settlement is the only difference.
+        let mut refunded = started();
+        for event in [
+            dispatch(ALPHA, 0, &base),
+            attempt_started(&refunded, ALPHA, 0, 1, 0),
+            settle_failing(
+                ALPHA,
+                0,
+                1,
+                FailureKind::Interrupted,
+                AttemptSettlement::Closed {
+                    transition: SettlementTransition::Retry,
+                    lease: LeaseDisposition::PredictedReleased,
+                },
+            ),
+        ] {
+            apply(&mut refunded, &event);
+        }
+        assert_eq!(
+            refunded.task(ALPHA).expect("registered").attempts_on_rung,
+            0,
+            "T-ATTEMPT refunds an interrupted attempt's allowance. A fold that \
+             counted the START charged for a run that never got a verdict, and \
+             an operator paid a pricier tier for the engine having died"
+        );
     }
 
     /// **A deferral count survives the process that wrote it, and a
