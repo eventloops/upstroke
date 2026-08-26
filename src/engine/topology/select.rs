@@ -1613,20 +1613,6 @@ mod tests {
     /// [`an_ending_run_offers_no_work_from_any_arm`] claim "every arm" and have
     /// the claim mean something. A list of names someone remembers to extend is
     /// how that test came to cover three of six while its own doc said every.
-    /// Every label [`arm_label`] can return for a step that **offers work**.
-    const OFFERS_WORK: &[&str] = &[
-        "Integrate",
-        "Retry",
-        "Dispatch",
-        "Dispatch (continuing)",
-        "Backoff",
-        "HardBlock",
-    ];
-
-    /// And every label for a step that does not. None of the three is work, and
-    /// each is a state an ending run is allowed to reach.
-    const OFFERS_NO_WORK: &[&str] = &["Poisoned", "BudgetExceeded", "Closure"];
-
     fn arm_label(step: &Step) -> &'static str {
         match step {
             Step::Poisoned => "Poisoned",
@@ -1644,6 +1630,38 @@ mod tests {
             Step::Closure(_) => "Closure",
         }
     }
+
+    /// Every label [`arm_label`] can return for a step that **offers work**.
+    ///
+    /// **Below `arm_label`, not above it.** These two `const`s were inserted
+    /// between that function's doc block and the function, so the block
+    /// attached to `OFFERS_WORK` and `arm_label` rendered undocumented —
+    /// occurrence 10 of `reviews/FINDINGS.md` §4's doc-re-targeting class,
+    /// committed by the commit whose ledger entry corrected that class's own
+    /// count. `clippy::doc_lazy_continuation` does not fire here because the
+    /// stranded block's last line is prose rather than a list item, which is
+    /// the half §4 records that detector cannot see. `PR7-R6-ATT-005`.
+    const OFFERS_WORK: &[&str] = &[
+        "Integrate",
+        "Retry",
+        "Dispatch",
+        "Dispatch (continuing)",
+        "Backoff",
+        "HardBlock",
+    ];
+
+    /// And every label for a step that does not. None of the three is work, and
+    /// each is a state an ending run is allowed to reach.
+    ///
+    /// **Pinned by name, and that is what ties membership to behaviour.** The
+    /// census below checks only that `arm_label`'s literals equal the union of
+    /// these two lists, so moving a *work* label into this one would satisfy it
+    /// and quietly drop that arm from the ending witness's coverage
+    /// requirement — `PR7-R6-LOOP-008`. These three are structural and cannot
+    /// grow: a poisoned fold, a budget stop, and closure. So a seventh label has
+    /// exactly one place to go, and the coverage assertion then demands a case
+    /// for it.
+    const OFFERS_NO_WORK: &[&str] = &["Poisoned", "BudgetExceeded", "Closure"];
 
     /// **Every label [`arm_label`] can return is classified.**
     ///
@@ -1719,6 +1737,13 @@ mod tests {
             "`arm_label` returns {} distinct labels, so this census found a body it could not \
              read rather than a classifier: {returned:?}",
             returned.len()
+        );
+        assert_eq!(
+            OFFERS_NO_WORK,
+            ["Poisoned", "BudgetExceeded", "Closure"],
+            "the not-work list is pinned by name: without that, moving a work label into it \
+             satisfies the equality below and drops that arm from the ending witness's coverage \
+             requirement, which is the one way a seventh arm can still be added and left undriven"
         );
         assert_eq!(
             returned, classified,

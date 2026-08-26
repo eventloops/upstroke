@@ -1230,33 +1230,6 @@ pub const DENIAL_CONTROL: &str = "pub fn go(p: &std::path::Path) -> bool {\n\
 pub(crate) mod census_domain {
     use std::path::PathBuf;
 
-    /// Every `#[cfg(test)] mod <name>;` the crate declares, as
-    /// `(declaring file, name, [flat candidate, nested candidate])`.
-    ///
-    /// Such a file is test code end to end. A region function has nothing to
-    /// remove in one, so it would count the whole of it as production — a
-    /// fixture that names a census's needle would then read as a production
-    /// offender. The set is read out of the declarations rather than listed by
-    /// hand: it was `src/engine/tests.rs` alone until PR5 moved the Event funnel
-    /// into `src/events/log.rs` with two test modules of its own, and the census
-    /// failed on the first file the hand-maintained list did not know about.
-    ///
-    /// **Read out of the blanked source, and every candidate returned rather
-    /// than assumed.** The split used to be over the raw text, so a `//` line
-    /// containing `#[cfg(test)] mod policy;` derived a skip for
-    /// `src/runner/policy.rs` and removed that file from every census below —
-    /// measured, with a `git push` planted in it that the census then did not
-    /// see. Over the whole tree the raw split derived 50 skip paths of which
-    /// **34 named no file at all**, and a skip path naming no file is a skip
-    /// that has stopped meaning anything, so each caller asserts that exactly
-    /// one of the two candidates exists.
-    ///
-    /// A declaration carrying a visibility qualifier — `#[cfg(test)]
-    /// pub(crate) mod helpers;` — is deliberately **not** matched. Failing to
-    /// derive a skip leaves a test file inside a census's domain, where a
-    /// fixture is reported as an offender and someone looks; deriving one it
-    /// should not removes a real production file, silently. Only the first
-    /// direction is safe, so the predicate stays the narrow one.
     /// Calls to `name` in `code`: neither its definition, nor a longer identifier
     /// that merely ends in it.
     ///
@@ -1366,9 +1339,50 @@ pub(crate) mod census_domain {
             );
             modules.insert(present[0].clone());
         }
+        // **The control that binds every caller**, and it belongs here rather
+        // than at each of them. `the_declared_whole_file_test_modules_are_seventeen…`
+        // asserts what this *returns*; it says nothing about whether a census
+        // calls it, which is the defect `3a91626` repaired for two censuses and
+        // this witness then reproduced one commit later (`R6-SETTLE-003`). A
+        // caller cannot reach the set without passing through this line.
+        assert!(
+            modules
+                .iter()
+                .any(|path| path.file_stem().is_none_or(|stem| stem != "tests")),
+            "every module derived here is called `tests.rs`, which is exactly what the file-name \
+             rule this replaces also finds. The derivation has degraded to the rule it exists to \
+             be better than: {modules:?}"
+        );
         modules
     }
 
+    /// Every `#[cfg(test)] mod <name>;` the crate declares, as
+    /// `(declaring file, name, [flat candidate, nested candidate])`.
+    ///
+    /// Such a file is test code end to end. A region function has nothing to
+    /// remove in one, so it would count the whole of it as production — a
+    /// fixture that names a census's needle would then read as a production
+    /// offender. The set is read out of the declarations rather than listed by
+    /// hand: it was `src/engine/tests.rs` alone until PR5 moved the Event funnel
+    /// into `src/events/log.rs` with two test modules of its own, and the census
+    /// failed on the first file the hand-maintained list did not know about.
+    ///
+    /// **Read out of the blanked source, and every candidate returned rather
+    /// than assumed.** The split used to be over the raw text, so a `//` line
+    /// containing `#[cfg(test)] mod policy;` derived a skip for
+    /// `src/runner/policy.rs` and removed that file from every census below —
+    /// measured, with a `git push` planted in it that the census then did not
+    /// see. Over the whole tree the raw split derived 50 skip paths of which
+    /// **34 named no file at all**, and a skip path naming no file is a skip
+    /// that has stopped meaning anything, so each caller asserts that exactly
+    /// one of the two candidates exists.
+    ///
+    /// A declaration carrying a visibility qualifier — `#[cfg(test)]
+    /// pub(crate) mod helpers;` — is deliberately **not** matched. Failing to
+    /// derive a skip leaves a test file inside a census's domain, where a
+    /// fixture is reported as an offender and someone looks; deriving one it
+    /// should not removes a real production file, silently. Only the first
+    /// direction is safe, so the predicate stays the narrow one.
     pub(crate) fn declared_whole_file_test_modules(
         files: &[PathBuf],
     ) -> Vec<(PathBuf, String, [PathBuf; 2])> {

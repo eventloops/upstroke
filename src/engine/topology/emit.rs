@@ -308,11 +308,15 @@ struct Cancelled(());
 /// **Two production call sites, not one.** This sentence read "`cancel_all_running`
 /// has one call site, and this is it"; the other is
 /// `AttemptContext::cancel_in_flight` (`attempt.rs`), the `T-ATTEMPT`
-/// halt-cancellation path, and it is in this slice. Measured:
-/// `grep -rn 'cancel_all_running(' --include='*.rs' src/ | grep -v '///'`
-/// returns three hits — `emit.rs` here, `attempt.rs`, and one in `identity.rs`'s
-/// test module. The doc-comment filter keeps the command true once this sentence
-/// quotes its needle (`reviews/FINDINGS.md` §4).
+/// halt-cancellation path, and it is in this slice.
+///
+/// **No raw hit count here, deliberately.** The first draft quoted one, and a
+/// count over the tree changes whenever anything — including a doc comment
+/// naming the function — is added: it read three, then four, then five across
+/// three commits, each time correctly and each time differently.
+/// `PR7-R6-ATT-004`. The claim that carries the obligation is the one above and
+/// it is stable: `cancelling` is the only constructor of [`AppendError`], so the
+/// obligation cannot be discharged by forgetting it.
 /// `PR7-R3-EMIT-005`; corrected 2026-08-26. The claim that matters is unchanged
 /// and is the one above: `cancelling` is the only constructor of
 /// [`AppendError`], so the obligation cannot be discharged by forgetting it.

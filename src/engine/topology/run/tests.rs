@@ -442,17 +442,15 @@ fn the_frozen_pool_table_is_read_through_one_seam() {
 /// **It is not the only witness available, and the claim that it was is false.**
 /// `79cd9c8`'s message argued a source census was structurally necessary because
 /// "a retry is only reachable *within* one process … and **no driver fixture can
-/// reach the arm**". One does:
-///
-/// ```text
-/// $ grep -rn 'fn the_retaining_incarnation_retries_in_place' \
-///     --include='*.rs' src/ | grep -v '///'
-/// src/engine/topology/recover/tests.rs:5488
-/// ```
-///
-/// The doc-comment filter is what keeps that command true once this block
-/// quotes its needle — `reviews/FINDINGS.md` §4, "a command quoted as evidence
-/// becomes part of its own input".
+/// reach the arm**". One does: the fixture is
+/// `recover::tests::the_retaining_incarnation_retries_in_place`, and it exists —
+/// **named, not cited by line**. The first draft of this block quoted
+/// `recover/tests.rs:5488` as terminal output; the very next commit inserted
+/// nineteen lines above it and 5488 became a blank line. `PR7-R6-ATT-003`, and
+/// the rule it gives: a doc comment names an item, because a line number is a
+/// claim about a version of a file and decays silently. The doc-comment filter
+/// (`| grep -v '///'`) is the other half — a needle quoted here would otherwise
+/// match its own quotation, `reviews/FINDINGS.md` §4.
 ///
 /// It drives `TopologyRun::step` twice in one process and the second iteration
 /// **is** the retained-generation retry. It now asserts the pool on both
