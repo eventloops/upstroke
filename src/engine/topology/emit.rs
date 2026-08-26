@@ -299,8 +299,10 @@ struct Cancelled(());
 /// has one call site, and this is it"; the other is
 /// `AttemptContext::cancel_in_flight` (`attempt.rs`), the `T-ATTEMPT`
 /// halt-cancellation path, and it is in this slice. Measured:
-/// `grep -rn 'cancel_all_running(' --include='*.rs' src/` returns three hits —
-/// `emit.rs` here, `attempt.rs`, and one in `identity.rs`'s test module.
+/// `grep -rn 'cancel_all_running(' --include='*.rs' src/ | grep -v '///'`
+/// returns three hits — `emit.rs` here, `attempt.rs`, and one in `identity.rs`'s
+/// test module. The doc-comment filter keeps the command true once this sentence
+/// quotes its needle (`reviews/FINDINGS.md` §4).
 /// `PR7-R3-EMIT-005`; corrected 2026-08-26. The claim that matters is unchanged
 /// and is the one above: `cancelling` is the only constructor of
 /// [`AppendError`], so the obligation cannot be discharged by forgetting it.

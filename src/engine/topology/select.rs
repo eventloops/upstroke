@@ -1644,9 +1644,18 @@ mod tests {
     /// **A correction, because the version of this comment that shipped cited a
     /// test that does not exist.** It named `an_ending_run_reaches_closure` as
     /// the predecessor whose scope this widens;
-    /// `grep -rn 'an_ending_run_reaches_closure' src/` returns exactly one hit
-    /// and it is that sentence. The two tests named above are the real
-    /// predecessors. `reviews/FINDINGS.md` §19, claim (1).
+    /// ```text
+    /// $ grep -rn 'an_ending_run_reaches_closure' --include='*.rs' src/ | grep -v '///'
+    /// (no output)
+    /// ```
+    ///
+    /// **Zero code occurrences.** The doc-comment filter is not tidiness: this
+    /// sentence quotes the name, so the unfiltered command matches *itself* and
+    /// reports a hit for a test that does not exist. `reviews/FINDINGS.md` §4
+    /// carries that as a class — a command quoted as evidence becomes part of
+    /// its own input — and it is the documentation half of
+    /// `PR4-CENSUS-COMMENT-ORACLE`. The two tests named above are the real
+    /// predecessors. §19, claim (1).
     ///
     /// `PR7-R3-LOOP-001` is what got through the gap.
     /// `TopologyFold::open_no_attempt` is a statement accessor and — correctly,

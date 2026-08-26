@@ -542,8 +542,11 @@ struct Produced<'a> {
 /// one that is spinning.
 ///
 /// **The sentence used to name `drive` as that loop's caller and `drive` does
-/// not exist**: `grep -rn 'fn drive' --include='*.rs' src/` finds only a hook
-/// harness helper in `topology/effects.rs` and two test helpers. That is
+/// not exist**: `grep -rn 'fn drive' --include='*.rs' src/ | grep -v '///'`
+/// finds a hook harness helper in `topology/effects.rs` and two test helpers,
+/// and nothing in `src/engine/`. The doc-comment filter is what keeps that
+/// command true once this sentence quotes its needle — `reviews/FINDINGS.md`
+/// §4's "a command quoted as evidence becomes part of its own input". That is
 /// verbatim the defect this module's own header exists because of — "six
 /// independent readers all assumed the driver existed" — reproduced in the
 /// justification for a type. `PR7-R3-CONTRACT-007`; confirmed against the tree

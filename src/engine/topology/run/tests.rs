@@ -401,9 +401,14 @@ fn the_frozen_pool_table_is_read_through_one_seam() {
 /// reach the arm**". One does:
 ///
 /// ```text
-/// $ grep -rn 'fn the_retaining_incarnation_retries_in_place' --include='*.rs' src/
+/// $ grep -rn 'fn the_retaining_incarnation_retries_in_place' \
+///     --include='*.rs' src/ | grep -v '///'
 /// src/engine/topology/recover/tests.rs:5488
 /// ```
+///
+/// The doc-comment filter is what keeps that command true once this block
+/// quotes its needle — `reviews/FINDINGS.md` §4, "a command quoted as evidence
+/// becomes part of its own input".
 ///
 /// It drives `TopologyRun::step` twice in one process and the second iteration
 /// **is** the retained-generation retry. It now asserts the pool on both
