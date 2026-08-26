@@ -619,6 +619,21 @@ pub struct AttemptContext<'a> {
 }
 
 impl AttemptContext<'_> {
+    /// Emit, discharging obligation (3) from this context's own ledger.
+    ///
+    /// The seam hands back an [`EmitFailure`] because an ordering module may
+    /// not hold the ledger. This one does — it is the same ledger every Runner
+    /// process of the attempt registers in — so the obligation is discharged
+    /// here and the attempt half keeps returning [`UpstrokeError`].
+    fn emit(&mut self, body: TopologyEventBody) -> Result<(), UpstrokeError> {
+        // Three disjoint field borrows, which is why the hooks are taken from
+        // `self` here rather than passed in: a caller writing
+        // `self.emit(body, self.hooks)` borrows all of `self` twice.
+        self.emitter
+            .emit(body, self.hooks)
+            .map_err(|failure| failure.discharging(self.ledger))
+    }
+
     /// **O23, and O24's second half.** Append `attempt_started`, then spawn the
     /// worker.
     ///
@@ -651,21 +666,14 @@ impl AttemptContext<'_> {
     /// Whatever the emitter returns; [`UpstrokeError::Refused`] from the slot
     /// assertion or the invocation ledger; or a runner failure. A non-zero exit
     /// is not an error — it is a [`ProcessOutput`] and the caller's to judge.
-    /// Emit, discharging obligation (3) from this context's own ledger.
     ///
-    /// The seam hands back an [`EmitFailure`] because an ordering module may
-    /// not hold the ledger. This one does — it is the same ledger every Runner
-    /// process of the attempt registers in — so the obligation is discharged
-    /// here and the attempt half keeps returning [`UpstrokeError`].
-    fn emit(&mut self, body: TopologyEventBody) -> Result<(), UpstrokeError> {
-        // Three disjoint field borrows, which is why the hooks are taken from
-        // `self` here rather than passed in: a caller writing
-        // `self.emit(body, self.hooks)` borrows all of `self` twice.
-        self.emitter
-            .emit(body, self.hooks)
-            .map_err(|failure| failure.discharging(self.ledger))
-    }
-
+    /// **This block used to sit above `fn emit`**, which `bcc5c2f` inserted
+    /// between it and this function with no blank line — so all of it attached
+    /// to `emit`, `start` rendered undocumented, and `emit`'s own two
+    /// paragraphs read as a continuation of the `# Errors` section above.
+    /// `PR7-R3-EMIT-004`, the doc-re-targeting class `reviews/FINDINGS.md` §4
+    /// records; confirmed against the tree and split 2026-08-26 by moving
+    /// `emit` above this block rather than by moving the prose.
     pub fn start(
         &mut self,
         site: AttemptSite<'_>,

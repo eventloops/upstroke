@@ -536,10 +536,19 @@ struct Produced<'a> {
 
 /// What one iteration of the loop did.
 ///
-/// A value rather than `()` so a test asserts on the branch that ran rather
-/// than on the absence of an error — and so `drive` can tell "made progress"
-/// from "waited", which is the difference between a loop that is working and
+/// A value rather than `()` so a **test** asserts on the branch that ran rather
+/// than on the absence of an error, and so that a driving loop can tell "made
+/// progress" from "waited" — the difference between a loop that is working and
 /// one that is spinning.
+///
+/// **The sentence used to name `drive` as that loop's caller and `drive` does
+/// not exist**: `grep -rn 'fn drive' --include='*.rs' src/` finds only a hook
+/// harness helper in `topology/effects.rs` and two test helpers. That is
+/// verbatim the defect this module's own header exists because of — "six
+/// independent readers all assumed the driver existed" — reproduced in the
+/// justification for a type. `PR7-R3-CONTRACT-007`; confirmed against the tree
+/// and corrected 2026-08-26. `step`'s callers in this slice are its tests; the
+/// loop that consumes `Progress` in production is PR8's.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Progress {
     /// One attempt ran, was judged, and its settlement is **durable**.
@@ -598,11 +607,15 @@ pub enum Progress {
 /// (inside [`RunHandle`]), the two provisional ledgers, and the ceiling it was
 /// configured with. Everything else is a seam.
 ///
-/// **It does not yet own the slot assertion (R3), and that is deliberate.** The
-/// assertion belongs to the run and `SlotAssertion::balances()` has to be true
-/// at process end — but nothing here acquires a slot until the dispatch and
-/// retry branches exist, and a field nothing reads is a claim the code does not
-/// back. It arrives with the branch that uses it.
+/// **It owns the slot assertion (R3)**, and the sentence here said it did not.
+/// `slots: SlotAssertion` is a field of this struct, `TopologyRun::resumed`
+/// initialises it with `SlotAssertion::new()`, and `fn attempt` threads
+/// `slots: &mut self.slots` into every `AttemptContext`. The denial was written
+/// while that was true — "a field nothing reads is a claim the code does not
+/// back" — and stayed after the branch that uses it arrived.
+/// `PR7-R3-CONTRACT-006`; confirmed against the tree and corrected 2026-08-26.
+/// `SlotAssertion::balances()` has to be true at process end, and that is the
+/// claim the field carries.
 pub struct TopologyRun {
     handle: RunHandle,
     identity: RunIdentity,

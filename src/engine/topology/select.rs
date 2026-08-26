@@ -1425,6 +1425,49 @@ mod tests {
         );
     }
 
+    /// **A ready dispatch precedes the defer backoff, and both are live at once.**
+    ///
+    /// The order `loop` fixes, and the one adjacent pair no fixture held.
+    /// `the_backoff_branch_precedes_the_hard_block_when_both_are_live` pins the
+    /// pair below this one; `an_eligible_integration_precedes_a_retry_precedes_a_dispatch`
+    /// pins the three above it. Between them sat `first_ready` / `backoff_pending`,
+    /// and S5 round 4 measured the swap — the defer backoff selected **before** a
+    /// ready dispatch, which is the starvation this module's header warns about
+    /// ("The order is not a scheduling preference") — leaving the **entire suite
+    /// green**.
+    ///
+    /// A run with runnable work must not sleep on a wait that belongs to a task
+    /// which is not the one it could be running.
+    #[test]
+    fn a_ready_dispatch_precedes_the_backoff_when_both_are_live() {
+        let mut fold = started();
+        in_flight(&mut fold, ALEPH, 0);
+        settle_into(&mut fold, &finished(ALEPH, 0, 1, Next::Defer));
+
+        // Both premises, because "not Backoff" is satisfied by a fold where the
+        // backoff was never pending in the first place.
+        assert!(
+            fold.backoff_pending(),
+            "no task is deferred, so this asserts nothing about the branch order"
+        );
+        assert!(
+            fold.ready(BET),
+            "no task is ready, so the branch above the backoff is not live"
+        );
+
+        assert_eq!(
+            select(&fold, &Ceiling::unlimited(), &no_spend()),
+            Step::Dispatch {
+                key: BET,
+                generation: GenerationId(0),
+                continuing: false,
+            },
+            "a run with runnable work slept on another task's defer wait. `loop`'s order is not \
+             a scheduling preference: the deferred task is waiting on a wait that elapses by \
+             itself, and the ready one is waiting on nothing"
+        );
+    }
+
     /// Backoff precedes the hard block, and the two are live at once.
     ///
     /// `loop`'s order is fixed, and no other fixture holds a `Deferred` task

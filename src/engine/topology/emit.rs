@@ -116,9 +116,15 @@ pub struct EmitState<'a> {
     pub log: &'a mut EventLog,
     /// The provisional-reservation ledger. Cancelled by the protocol.
     pub reservations: &'a mut Reservations,
-    /// The invocation ledger. Every still-running entry is cancelled by the
-    /// protocol; cancelling the *processes* is the caller's.
     /// Where a torn-tail normalization at the protocol's reopen is reported.
+    ///
+    /// **The two lines above this one used to be here too** — "The invocation
+    /// ledger. Every still-running entry is cancelled by the protocol;
+    /// cancelling the *processes* is the caller's." `bcc5c2f` deleted the
+    /// `invocations: &'a mut InvocationLedger` field they documented and left
+    /// them stranded on this one, so rustdoc rendered a warnings sink as a
+    /// ledger. `PR7-R3-EMIT-003`; confirmed against the tree and removed
+    /// 2026-08-26. `EmitState` has four fields and each now documents itself.
     pub warnings: &'a mut Vec<String>,
 }
 
@@ -287,8 +293,17 @@ struct Cancelled(());
 /// emitter's whole lifetime". This is that sentence applied to the ledger.
 ///
 /// The obligation is discharged by [`Self::cancelling`], which is the only
-/// constructor of [`AppendError`]. `cancel_all_running` has one call site, and
-/// this is it.
+/// constructor of [`AppendError`].
+///
+/// **Two production call sites, not one.** This sentence read "`cancel_all_running`
+/// has one call site, and this is it"; the other is
+/// `AttemptContext::cancel_in_flight` (`attempt.rs`), the `T-ATTEMPT`
+/// halt-cancellation path, and it is in this slice. Measured:
+/// `grep -rn 'cancel_all_running(' --include='*.rs' src/` returns three hits —
+/// `emit.rs` here, `attempt.rs`, and one in `identity.rs`'s test module.
+/// `PR7-R3-EMIT-005`; corrected 2026-08-26. The claim that matters is unchanged
+/// and is the one above: `cancelling` is the only constructor of
+/// [`AppendError`], so the obligation cannot be discharged by forgetting it.
 #[derive(Debug)]
 #[must_use = "obligation (3) of the append-error protocol is outstanding: pass this to \
               `cancelling` with the run's ledger"]
