@@ -240,6 +240,107 @@ fn at(trace: &ContainerTrace, needle: &str) -> usize {
     })
 }
 
+/// **Every name a pre-clean touches is scoped to this build slot.**
+///
+/// The class boundary, and it is the *caller* half of `PR7-R3-CONTRACT-001`.
+/// The instance is that `fake::preclean_names` kills by name with no liveness
+/// check, so a name built from a **fixed** repo key is a name a concurrent
+/// suite in another slot asks for too, and the kill lands on that suite's live
+/// container. `exec.rs`'s caller was scoped by `b44040a`;
+/// `census/tests.rs`'s was not, and stayed hostile for four commits.
+///
+/// `a_container_name_is_scoped_to_its_build_slot` asserts the **key** is
+/// per-slot. This asserts the property the pre-clean actually depends on:
+/// that a name it is handed carries that key. The two are different claims —
+/// the first was true the whole time the second was false — and a rule that
+/// callers are told to follow is a rule a caller can be missing, which is why
+/// `preclean_names` now consults [`super::fake::unscoped_names`] rather than
+/// documenting the precondition.
+///
+/// **A liveness check would not have fixed it**, and that is why the boundary
+/// is here: the state the helper exists for is a SIGKILLed run whose container
+/// is still *running*, so "do not kill running ones" defeats the helper
+/// outright.
+#[test]
+fn a_pre_clean_refuses_every_name_a_concurrent_run_could_also_ask_for() {
+    const RUN: &str = "01KZTPRECLEAN0000000000000";
+    const INCARNATION: &str = "01KZTPRECLEANINC0000000000";
+    // Not this slot's, whatever slot this is: sixteen hex characters that no
+    // `CARGO_TARGET_DIR` digest and no empty-scope default can equal.
+    const STRANGERS: &str = "cccccccccccccccc";
+
+    let invocation = shell_probe();
+    let mine = ContainerName::new(super::fake::slot_repo_key(), RUN, INCARNATION, &invocation)
+        .expect("a container name");
+    let theirs =
+        ContainerName::new(STRANGERS, RUN, INCARNATION, &invocation).expect("a container name");
+
+    assert_ne!(
+        mine, theirs,
+        "this slot's key is `{STRANGERS}`, so the two halves of this test are the same name and          it asserts nothing"
+    );
+    assert!(
+        super::fake::unscoped_names(&[&mine]).is_empty(),
+        "a name carrying this slot's own repo key was refused, so the pre-clean can no longer          reclaim the residue of a killed run in this slot — the only thing it is for"
+    );
+    assert_eq!(
+        super::fake::unscoped_names(&[&mine, &theirs]),
+        vec![theirs.as_str().to_owned()],
+        "the refusal must name exactly the name it refused: a report that says only `some name`          sends the reader to the wrong caller"
+    );
+}
+
+/// **And the helper consults the rule**, rather than stating it in a doc.
+///
+/// The other half of the pair above, and the half that decides whether the
+/// class is closed. `unscoped_names` being correct closes nothing on its own —
+/// `preclean_names`'s doc *already* said "callers must build them from their
+/// own fixed constants", and one of the two callers read that and built a fixed
+/// constant, which is precisely the hostile case. A precondition a caller is
+/// asked to satisfy is one a caller can fail to satisfy.
+///
+/// The refusal is asserted to land **before any reclaim**, through the trace,
+/// because a guard that fires after the `docker kill` has already killed the
+/// stranger's container.
+#[test]
+fn a_pre_clean_of_a_strangers_name_refuses_before_it_reclaims_anything() {
+    const RUN: &str = "01KZTPRECLEAN0000000000000";
+    const INCARNATION: &str = "01KZTPRECLEANINC0000000000";
+    const STRANGERS: &str = "cccccccccccccccc";
+
+    let trace = ContainerTrace::recording();
+    let runtime = FakeRuntime::new(trace.clone());
+    let view = DisposableDirView::new(ContainerTrace::off());
+    let root = scratch("preclean-refusal");
+    let theirs =
+        ContainerName::new(STRANGERS, RUN, INCARNATION, &shell_probe()).expect("a container name");
+
+    // The panic is expected and its message is the assertion, so the hook is
+    // silenced: an expected panic printing a backtrace into a green run is how
+    // a real one stops being noticed.
+    let hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(|_| {}));
+    let refused = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        super::fake::preclean_names(&runtime, &view, &root, &[&theirs]);
+    }))
+    .expect_err("the pre-clean accepted a name built from another slot's repo key");
+    std::panic::set_hook(hook);
+
+    let message = refused
+        .downcast_ref::<String>()
+        .map_or_else(String::new, Clone::clone);
+    assert!(
+        message.contains("is not this build slot's") && message.contains(theirs.as_str()),
+        "the refusal must say what it refused and why: {message}"
+    );
+    assert!(
+        trace.rendered().is_empty(),
+        "the pre-clean reached the runtime before refusing, so a stranger's live container was \
+         already killed by the time the rule fired: {:#?}",
+        trace.rendered()
+    );
+}
+
 // ---------------------------------------------------------------------------
 // 1. The fake's six required capabilities
 // ---------------------------------------------------------------------------

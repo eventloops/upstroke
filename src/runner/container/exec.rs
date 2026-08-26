@@ -1477,58 +1477,17 @@ mod tests {
     use crate::topology::registry::TaskKey;
 
     const RUN_ID: &str = "01KZRN48A4ZK3AEDST3RJ8HMA4";
-    /// The repository key every container name in this module is built from,
-    /// **scoped to the build slot this process is running in**.
+    /// This module's repository key: **the build slot's**, through the one
+    /// place that derives it.
     ///
-    /// # Why this is not a constant
-    ///
-    /// `fake::preclean_names` kills and removes a container by name before
-    /// creating it, because no in-process cleanup runs when a process is
-    /// SIGKILLed and the name a killed run left behind is exactly the name the
-    /// next `docker create` asks for. That is correct and it is why the helper
-    /// exists.
-    ///
-    /// With a **fixed** key it is also hostile: two suite runs share every name,
-    /// so the second run's pre-clean kills the first run's **live** container.
-    /// `PR7-R3-CONTRACT-001`. This box runs concurrent suites by design — the
-    /// whole point of `upstroke-build`'s slot pool — so a fixed name is not a
-    /// theoretical collision, it is the normal case. It also re-attributes this
-    /// slice's Docker flake history: those failures were recorded as passive
-    /// "contention" and were one run killing another's container.
-    ///
-    /// **Scoped to the slot rather than to the process** deliberately. A PID
-    /// would make every run's names unique and thereby make the pre-clean
-    /// useless — it could never match the killed run's leftovers, which is the
-    /// one thing it is for. `CARGO_TARGET_DIR` is stable across runs *in* a slot
-    /// and distinct *between* slots, so a slot reclaims its own residue and
-    /// touches nobody else's. That is the same discriminator the slot pool
-    /// already uses, which is what makes this alignment rather than a second
-    /// scheme.
-    ///
-    /// Sixteen hex characters, because `workspace_manager`'s
-    /// `REPO_KEY_HEX_CHARS` says a repo key is.
+    /// The derivation and the reason it is not a constant moved to
+    /// [`crate::runner::container::fake::slot_repo_key`], beside the pre-clean it is a
+    /// precondition of. It lived here, and `census/tests.rs` — the other caller
+    /// of `fake::preclean_names` — went on using a fixed `"cccccccccccccccc"`,
+    /// which is `PR7-R3-CONTRACT-001` still live on that path. A rule with one
+    /// implementation per caller is a rule each caller can be missing.
     fn repo_key() -> &'static str {
-        static KEY: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
-            scoped_repo_key(&std::env::var("CARGO_TARGET_DIR").unwrap_or_default())
-        });
-        &KEY
-    }
-
-    /// [`repo_key`]'s derivation, as a pure function of the scope.
-    ///
-    /// Separated from the `LazyLock` so it is testable: the cache is computed
-    /// once per process, so a test that set the variable and called `repo_key`
-    /// would assert whatever the first caller in that process happened to see.
-    fn scoped_repo_key(scope: &str) -> String {
-        if scope.is_empty() {
-            // No slot — a bare `cargo test`, where nothing else is running.
-            return "0123456789abcdef".to_owned();
-        }
-        let digest = format!(
-            "{:x}",
-            <sha2::Sha256 as sha2::Digest>::digest(scope.as_bytes())
-        );
-        digest[..16].to_owned()
+        crate::runner::container::fake::slot_repo_key()
     }
 
     /// **A pre-clean reclaims its own slot's residue and nobody else's.**
@@ -1544,6 +1503,8 @@ mod tests {
     /// property rather than the instance that prompted it.
     #[test]
     fn a_container_name_is_scoped_to_its_build_slot() {
+        use crate::runner::container::fake::scoped_repo_key;
+
         let slot2 = scoped_repo_key("/mnt/ramtarget/slot2");
         let slot3 = scoped_repo_key("/mnt/ramtarget/slot3");
 

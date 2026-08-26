@@ -659,6 +659,87 @@ pub(crate) fn docker_gate(test: &str, trace: ContainerTrace) -> Result<Box<Docke
     Err(reason)
 }
 
+/// The repository key every container name in a Docker-gated test is built
+/// from, **scoped to the build slot this process is running in**.
+///
+/// # Why this is not a constant
+///
+/// [`preclean_names`] kills and removes a container by name before creating it,
+/// because no in-process cleanup runs when a process is SIGKILLed and the name a
+/// killed run left behind is exactly the name the next `docker create` asks for.
+/// That is correct and it is why the helper exists.
+///
+/// With a **fixed** key it is also hostile: two suite runs share every name, so
+/// the second run's pre-clean kills the first run's **live** container.
+/// `PR7-R3-CONTRACT-001`. This box runs concurrent suites by design — the whole
+/// point of `upstroke-build`'s slot pool — so a fixed name is not a theoretical
+/// collision, it is the normal case.
+///
+/// **Scoped to the slot rather than to the process** deliberately. A PID would
+/// make every run's names unique and thereby make the pre-clean useless — it
+/// could never match the killed run's leftovers, which is the one thing it is
+/// for. `CARGO_TARGET_DIR` is stable across runs *in* a slot and distinct
+/// *between* slots, so a slot reclaims its own residue and touches nobody
+/// else's. That is the same discriminator the slot pool already uses.
+///
+/// **Here rather than in one caller's test module.** `b44040a` put this in
+/// `exec.rs`'s and left `census/tests.rs` — the other of
+/// [`preclean_names`]'s two callers — on a fixed `"cccccccccccccccc"`, so the
+/// class stayed live on that path. A rule with one implementation per caller is
+/// a rule each caller can be missing. It sits beside the helper it is a
+/// precondition of, and [`unscoped_names`] makes it one the helper checks.
+pub(crate) fn slot_repo_key() -> &'static str {
+    static KEY: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
+        scoped_repo_key(&std::env::var("CARGO_TARGET_DIR").unwrap_or_default())
+    });
+    &KEY
+}
+
+/// [`slot_repo_key`]'s derivation, as a pure function of the scope.
+///
+/// Separated from the `LazyLock` so it is testable: the cache is computed once
+/// per process, so a test that set the variable and called [`slot_repo_key`]
+/// would assert whatever the first caller in that process happened to see.
+///
+/// Sixteen hex characters, because `workspace_manager`'s `REPO_KEY_HEX_CHARS`
+/// says a repo key is.
+pub(crate) fn scoped_repo_key(scope: &str) -> String {
+    if scope.is_empty() {
+        // No slot -- a bare `cargo test`, where nothing else is running.
+        return "0123456789abcdef".to_owned();
+    }
+    let digest = format!(
+        "{:x}",
+        <sha2::Sha256 as sha2::Digest>::digest(scope.as_bytes())
+    );
+    digest[..16].to_owned()
+}
+
+/// The names among `names` that a **concurrent run could also ask for**, as the
+/// rendered strings, so a refusal can say what it refused.
+///
+/// A name whose repo-key component is not this slot's is a name another slot's
+/// suite builds identically, and [`preclean_names`] kills by name with no
+/// liveness check. Checking the *component* rather than the whole name is
+/// deliberately narrower than the property ("no two concurrent runs ask for the
+/// same name"): a caller that scoped some other component instead gets a loud
+/// refusal it can widen this rule for, rather than a silent stranger-kill.
+///
+/// A name that will not parse is reported too. The pre-clean is the one place
+/// that acts on a name it did not build, and an unparseable one is a name whose
+/// scope cannot be established at all.
+pub(crate) fn unscoped_names(names: &[&super::intent::ContainerName]) -> Vec<String> {
+    let slot = slot_repo_key();
+    names
+        .iter()
+        .filter(|name| {
+            !super::intent::ContainerName::parse(name.as_str())
+                .is_ok_and(|parts| parts.repo_key == slot)
+        })
+        .map(|name| name.as_str().to_owned())
+        .collect()
+}
+
 /// Reclaim the container names a gated test is about to create, before it
 /// creates them.
 ///
@@ -709,6 +790,18 @@ pub(crate) fn preclean_names(
     private_root: &Path,
     names: &[&super::intent::ContainerName],
 ) {
+    // The precondition, checked rather than documented. Before this the doc
+    // below said "callers must build them from their own fixed constants" and
+    // one of the two callers did exactly that -- fixed, and therefore shared
+    // with every concurrent slot. See [`unscoped_names`].
+    let unscoped = unscoped_names(names);
+    assert!(
+        unscoped.is_empty(),
+        "pre-cleaning {unscoped:?}: the repo-key component is not this build slot's `{}`, so a \
+         concurrent suite in another slot asks for the same name and this kill lands on its live \
+         container rather than on a previous run's residue. `PR7-R3-CONTRACT-001`",
+        slot_repo_key()
+    );
     for name in names {
         super::reclaim(&mut super::NoHooks, runtime, view, private_root, name, None)
             .unwrap_or_else(|error| {

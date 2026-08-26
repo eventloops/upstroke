@@ -3575,6 +3575,68 @@ fn a_reaper_scope_whose_label_value_could_widen_the_filter_cannot_reach_the_reap
 // 9. Docker-gated: a census against the real runtime
 // ---------------------------------------------------------------------------
 
+/// The two owners `real_docker_census_reclaims_a_dead_owner_and_spares_a_live_one`
+/// creates, built here so a test that **always** runs can assert the property
+/// the gated one depends on.
+///
+/// Owner constants that test alone uses. Container names are deterministic and
+/// the daemon is one namespace shared with every other Docker-gated test in this
+/// tree, which run concurrently: reusing the fixture constants above made
+/// `docker create` fail with a name conflict against
+/// `runner::container::tests`'s own gated test. Measured, and the reason these
+/// run ids exist.
+///
+/// **The repo key is the build slot's, not a constant.** It was
+/// `"cccccccccccccccc"`, and `fake::preclean_names` kills by name with no
+/// liveness check: two suites running in two slots built the same three
+/// components, so each one's pre-clean killed the other's **live** container.
+/// `PR7-R3-CONTRACT-001`, which `b44040a` repaired at `exec.rs`'s caller and not
+/// at this one.
+///
+/// The run ids stay fixed and must: a pre-clean matches a **previous run's**
+/// residue exactly when the name recurs, and a component that is unique per
+/// process would make it a no-op that looks like protection.
+fn real_docker_census_owners() -> (Owner, Owner) {
+    const REAL_RUN_LIVE: &str = "01KZTREALLIVE00000000000AA";
+    const REAL_RUN_DEAD: &str = "01KZTREALDEAD00000000000BB";
+    let key = crate::runner::container::fake::slot_repo_key();
+    (
+        Owner::new(REAL_RUN_LIVE, INC_1, key),
+        Owner::new(REAL_RUN_DEAD, INC_2, key),
+    )
+}
+
+/// **The gated census's own names are scoped to this build slot.**
+///
+/// The instance of `PR7-R3-CONTRACT-001` on this path, asserted by a test that
+/// runs on every platform and needs no runtime — which is the point. The
+/// pre-clean it guards is inside a Docker-gated test, so on a machine with no
+/// usable image the hostile name was never even constructed, and four commits
+/// of green suites said nothing about it either way.
+///
+/// The class boundary is
+/// `runner::container::tests::a_pre_clean_refuses_every_name_a_concurrent_run_could_also_ask_for`
+/// and its sibling, which assert the rule and that the helper enforces it. This
+/// asserts that *these* names satisfy it.
+#[test]
+fn the_gated_censuss_names_are_scoped_to_this_build_slot() {
+    let (live, dead) = real_docker_census_owners();
+    let names = [live.name(&shell_probe()), dead.name(&shell_probe())];
+    let borrowed: Vec<&crate::runner::container::intent::ContainerName> = names.iter().collect();
+
+    assert_ne!(
+        names[0], names[1],
+        "the two owners build one name, so the census creates one container and its \
+         dead-versus-live comparison has nothing to compare"
+    );
+    assert!(
+        crate::runner::container::fake::unscoped_names(&borrowed).is_empty(),
+        "a name this test's pre-clean will kill is one another build slot's suite asks for too, \
+         so the kill lands on that suite's live container: {:?}",
+        crate::runner::container::fake::unscoped_names(&borrowed)
+    );
+}
+
 /// A census over **real Docker** reclaims a dead owner's labeled orphan and
 /// leaves a live owner's container alone.
 ///
@@ -3619,18 +3681,8 @@ fn real_docker_census_reclaims_a_dead_owner_and_spares_a_live_one() {
         return;
     };
 
-    // Owner constants THIS TEST ALONE uses. Container names are deterministic
-    // and the daemon is one namespace shared with every other Docker-gated test
-    // in this tree, which run concurrently: reusing the fixture constants above
-    // made `docker create` fail with a name conflict against
-    // `runner::container::tests`'s own gated test. Measured, and the reason
-    // these four constants exist.
-    const REAL_REPO_KEY: &str = "cccccccccccccccc";
-    const REAL_RUN_LIVE: &str = "01KZTREALLIVE00000000000AA";
-    const REAL_RUN_DEAD: &str = "01KZTREALDEAD00000000000BB";
     let root = scratch("real-docker-census");
-    let live = Owner::new(REAL_RUN_LIVE, INC_1, REAL_REPO_KEY);
-    let dead = Owner::new(REAL_RUN_DEAD, INC_2, REAL_REPO_KEY);
+    let (live, dead) = real_docker_census_owners();
     let liveness = RecordingLiveness::new();
     liveness.set_live(&live.run_dir);
 
@@ -3638,9 +3690,11 @@ fn real_docker_census_reclaims_a_dead_owner_and_spares_a_live_one() {
     //
     // `reviews/FINDINGS.md` §16: this test's own cleanup is correct and cannot
     // help, because no in-process cleanup runs when the process is SIGKILLed.
-    // These two names are built from the three constants above, so the name a
-    // previous SIGKILLed run left is exactly the name this run is about to ask
-    // for. That recurrence is what makes a pre-clean meaningful rather than an
+    // These two names come from [`real_docker_census_owners`]: two fixed run
+    // ids and this slot's own repo key, all stable across runs *in* this slot,
+    // so the name a previous SIGKILLed run left is exactly the name this run is
+    // about to ask for — and no name another slot's suite asks for. That
+    // recurrence is what makes a pre-clean meaningful rather than an
     // unconditional retry.
     crate::runner::container::fake::preclean_names(
         docker.as_ref(),
