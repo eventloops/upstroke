@@ -2373,6 +2373,11 @@ pub fn run_resumed(
         budget_stop_cleared: fold.budget_stop().is_none(),
     };
 
+    // Taken before the unwind, from the barrier that proved them. `run_resumed`
+    // was appended above and is deliberately not here: these are the *proven
+    // prefix*, which is what a spend replay is defined over.
+    let events = certified.rebuilt().censused().barrier().events().to_vec();
+
     // The witness is spent; what it was carrying is not. Unwound rather than
     // dropped, because everything below it is the run's own state and the loop
     // is the thing that needs it — see [`RunHandle`].
@@ -2392,6 +2397,7 @@ pub fn run_resumed(
             committed_first_line_sha256,
             log,
             fold,
+            events,
             _run: run_lock,
             _worktree: worktree_lock,
         },
@@ -2439,6 +2445,27 @@ pub struct RunHandle {
     pub fold: TopologyFold,
     /// The record the run started from, which the loop's emitter stamps from.
     pub started: RunStarted4,
+    /// The events the stable-prefix barrier parsed from the proven bytes.
+    ///
+    /// **Carried because the fold is not the whole of what a resume must
+    /// rebuild.** The fold keeps the run's *state*; it does not keep the
+    /// `AttemptRecord` each settlement carried, which is why
+    /// [`complete_promotions`] needed `StablePrefix::events` and why
+    /// `Spend::replay` — whose whole purpose is rebuilding the run's spend from
+    /// the log — had **no production caller at all** until this field existed.
+    /// A resumed run started its ceiling again at zero, every time.
+    ///
+    /// These are the barrier's own parse, not a second one: the census
+    /// `the_stable_prefix_barrier_is_the_only_way_a_log_becomes_a_topology_fold`
+    /// refuses any other route, and it refused an earlier draft of the E6
+    /// convergence for exactly this.
+    ///
+    /// **The proven prefix, not the prefix plus recovery's own appends.** That
+    /// is correct for spend and it is not an accident: an event the recovery
+    /// appends for an attempt the prefix already settled — the E6 convergence's
+    /// `candidate_prepared` is the case — is priced by `Spend::replay`'s
+    /// identity-keyed dedupe against the settlement that is already here.
+    pub events: Vec<TopologyEvent>,
     _run: RunLock,
     _worktree: WorktreeLock,
 }
@@ -2464,6 +2491,13 @@ impl RunHandle {
             committed_first_line_sha256,
             log,
             fold,
+            // **Empty, and that is a fact rather than a placeholder.** A freshly
+            // created run has appended one line, `run_started`, which carries no
+            // attempt and no spend. `Spend::replay` over it is zero, which is
+            // exactly what a fresh run's ceiling should start at — so the
+            // created and resumed paths reach the loop through the same field
+            // rather than through two rules.
+            events: Vec::new(),
             _run: run,
             _worktree: worktree,
         }

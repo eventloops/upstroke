@@ -154,6 +154,14 @@ struct Damage {
     /// between `task_dispatched` and `attempt_started` leaves, and the only
     /// state recovery step (g) has anything to do in.
     open_generation: bool,
+    /// Freeze a **two-tier** chain instead of the default one-tier one.
+    ///
+    /// The default chain has a single tier, so a task's rung is always 0 and a
+    /// driver that read the rung from the fold is indistinguishable from one
+    /// that assumed zero. That is not a hypothetical: it is why the `rung` half
+    /// of `PR7-FOLD-LADDER-POSITION`'s reader stayed unwitnessed through the
+    /// repair filed against it, and why S5 round 2 found it still open.
+    two_tier: bool,
 }
 
 impl Fixture {
@@ -223,7 +231,7 @@ impl Fixture {
         } else {
             container_runner()
         };
-        let started = run_started(&plan, &recorded_locator, runner, &base_sha);
+        let started = run_started(&plan, &recorded_locator, runner, &base_sha, damage.two_tier);
 
         // P1: the `.creating` marker the creator published and never removed,
         // because this run was interrupted between P5b's commit record and P8's
@@ -553,6 +561,40 @@ fn chain() -> ChainSummary {
     }
 }
 
+/// A chain with a rung above the first, so an escalation has somewhere to go.
+///
+/// The binding's **model differs per tier**, which is what makes the rung
+/// observable in the dispatched attempt: a driver reading rung 0 for an
+/// escalated task runs it on the cheap model forever, and the only visible
+/// symptom is a task that never gets better.
+fn escalating_chain() -> ChainSummary {
+    ChainSummary {
+        task: "alpha".to_owned(),
+        tiers: vec![Tier::Mid, Tier::Frontier],
+        attempts_per: 1,
+        bindings: Some(vec![
+            // **Rung 0 matches the default chain's binding on purpose.** The
+            // `attempt_started` helper seeds that binding, and the fold refuses
+            // an attempt whose binding is not the one the run froze for its rung
+            // — `check_attempt_started`'s `BindingMismatch`, which caught the
+            // first draft of this fixture. Only the rung *above* differs, which
+            // is the rung this test is about.
+            BindingSummary {
+                tier: Tier::Mid,
+                agent: AGENT.to_owned(),
+                model: "claude-opus-5".to_owned(),
+                pinned: false,
+            },
+            BindingSummary {
+                tier: Tier::Frontier,
+                agent: AGENT.to_owned(),
+                model: "claude-fable-5".to_owned(),
+                pinned: false,
+            },
+        ]),
+    }
+}
+
 fn review_plan() -> ReviewPlan {
     ReviewPlan {
         enabled: Some(true),
@@ -580,6 +622,7 @@ fn run_started(
     private_dir: &str,
     runner: RunnerPolicy,
     base: &CommitSha,
+    two_tier: bool,
 ) -> RunStarted4 {
     let unauthenticated = RunStarted4 {
         schema: TOPOLOGY_SCHEMA,
@@ -617,7 +660,11 @@ fn run_started(
             shell: ShellKind::Bash,
         }],
         interaction_mode: "attached".to_owned(),
-        chains: vec![chain()],
+        chains: vec![if two_tier {
+            escalating_chain()
+        } else {
+            chain()
+        }],
         effort_policy: ResolvedEffortPolicy {
             small: Effort::Low,
             mid: Effort::High,
@@ -5357,6 +5404,118 @@ fn the_retaining_incarnation_retries_in_place() {
     );
 }
 
+/// **The driver dispatches at the rung the log records, not at rung 0.**
+///
+/// The **other** driver-side half of `PR7-FOLD-LADDER-POSITION`, and the one
+/// that stayed open through the repair filed against it.
+/// `the_driver_spends_the_allowance_the_log_records` witnesses the
+/// `attempts_on_rung` half of the same reader; nothing witnessed `rung`, because
+/// that fixture's chain has one tier and a one-tier chain makes rung 0 the only
+/// rung there is. Measured at `cf22a8c`: replacing the driver's
+/// `self.ladder_position(key)?.0` with a literal `0` failed **no** topology
+/// test.
+///
+/// That is occurrence 4 of `reviews/FINDINGS.md` §4's accumulator class, and the
+/// sharpest argument for its re-scoping: the class was filed *from* this
+/// instance, and half of this instance was still open.
+///
+/// The fold half — `fold::tests::a_ladder_position_is_derived_by_replay_and_not_assumed`
+/// — already states the consequence in words: "A driver that assumed rung 0
+/// would dispatch an escalated task on rung 0 forever, never reaching the tier
+/// its chain escalated it to." This asserts it.
+#[test]
+fn the_driver_dispatches_at_the_rung_the_log_records() {
+    use crate::engine::topology::run::{RunSeams, TopologyRun};
+    use crate::engine::topology::select::Ceiling;
+
+    // A two-tier chain, one attempt per rung, and an attempt already escalated
+    // off rung 0 in the durable log. The task is `Pending` on **rung 1**.
+    let fixture = Fixture::build(
+        "driver-rung",
+        Damage {
+            two_tier: true,
+            extra: vec![
+                dispatched(),
+                attempt_started(1),
+                attempt_finished(
+                    1,
+                    AttemptSettlement::Closed {
+                        transition: SettlementTransition::Escalated { rung: 1 },
+                        lease: LeaseDisposition::PredictedReleased,
+                    },
+                ),
+            ],
+            ..Damage::default()
+        },
+    );
+
+    let harness = harness();
+    let runtime = runtime_holding_the_record();
+    let certifies = AlwaysCertifies;
+    let given = Given::healthy(&fixture, &runtime, &certifies);
+    let (outcome, _) = resume_holding(&fixture, &harness, &given);
+    let (_recovered, handle) = outcome.expect("the healthy resume completes");
+
+    let mut run = TopologyRun::resumed(handle, fixture.inputs(), Ceiling::unlimited());
+    let mut hooks = HarnessTopologyHooks::new(Arc::clone(&harness));
+    let sleeper = RecordingSleeper::default();
+    let manager = fixture.manager();
+    let runner = RecordingRunner::editing();
+    let adapters = crate::engine::topology::scaffold::ScaffoldAdapters::erroring();
+    let paths = crate::rundir::RunPaths::with_private_root(
+        &fixture.repo_root,
+        &fixture.started.run_id,
+        &fixture.private_root,
+    );
+    paths.create().expect("the run directories are creatable");
+    let plans = crate::engine::assembly::FrozenPlans {
+        adapters: &adapters,
+        paths: &paths,
+        gates: &[],
+        pools: &[],
+        caps: &[],
+        worker_timeout: std::time::Duration::from_secs(300),
+        decisions: &[],
+    };
+    let seams = RunSeams {
+        manager: &manager,
+        clock: &Frozen,
+        sleeper: &sleeper,
+        runner: &runner,
+        adapters: &adapters,
+        paths: &paths,
+        plans: &plans,
+        reviews: &crate::engine::attempt::LegacyReviewPasses,
+        input_policy: &crate::engine::attempt::LegacyReviewInputPolicy,
+        answers: &crate::interaction::UnattendedAnswers,
+        ids: &FixedIds,
+        halts_run: false,
+    };
+
+    run.step(&seams, &mut hooks).expect("the attempt settles");
+
+    // **The model the attempt actually ran at.** The rung selects the binding,
+    // and the two tiers of this chain differ by model — so this is the rung,
+    // observed rather than asserted about itself.
+    let ran_at = TopologyFold::parse_log(&fixture.log_bytes())
+        .expect("the log parses")
+        .into_iter()
+        .filter_map(|event| match event.body {
+            TopologyEventBody::AttemptStarted { data } => Some(data.binding.model.clone()),
+            _ => None,
+        })
+        .next_back()
+        .expect("the driver started an attempt");
+
+    assert_eq!(
+        ran_at, "claude-fable-5",
+        "the task escalated onto rung 1 and the driver ran it at {ran_at}, which \
+         is rung 0's model. An escalated task dispatched at rung 0 never reaches \
+         the tier its chain escalated it to, and the only symptom is a task that \
+         never gets better"
+    );
+}
+
 /// **The driver spends the allowance the log records, not the one it assumed.**
 ///
 /// The driver-level half of `PR7-FOLD-LADDER-POSITION`. The fold half is
@@ -6004,7 +6163,8 @@ fn a_second_resume_finishes_nothing_and_appends_nothing() {
 /// from the driver.
 #[test]
 fn a_converged_log_prices_its_attempt_once() {
-    use crate::engine::topology::select::Spend;
+    use crate::engine::topology::run::TopologyRun;
+    use crate::engine::topology::select::{Ceiling, Spend};
 
     let fixture = Fixture::build(
         "e6-parity",
@@ -6034,7 +6194,7 @@ fn a_converged_log_prices_its_attempt_once() {
     let certifies = AlwaysCertifies;
     let given = Given::healthy(&fixture, &runtime, &certifies);
     let (outcome, _) = resume_holding(&fixture, &harness, &given);
-    outcome.expect("the resume converges");
+    let (_recovered, handle) = outcome.expect("the resume converges");
 
     let events = TopologyFold::parse_log(&fixture.log_bytes()).expect("the log parses");
     let settlements = events
@@ -6068,6 +6228,33 @@ fn a_converged_log_prices_its_attempt_once() {
         "a converged log prices its one attempt at {priced}, and the attempt \
          cost {once}: recovery's append made the run look more expensive than \
          it was"
+    );
+
+    // -----------------------------------------------------------------------
+    // **The driver half.** Everything above measures `Spend::replay` — the
+    // accumulator. This measures whether the run *reads* it, and until the
+    // handle carried the barrier's events it did not: `TopologyRun::resumed`
+    // built a `Spend::new()`, so `Spend::replay` had no production caller at
+    // all and every restart handed the run its whole budget back.
+    //
+    // This is the §4 class's own prescription, applied to the accumulator the
+    // class's narrow name let through. A witness for the accumulation is not a
+    // witness for the read, and the two had to be written as two assertions
+    // because they are two claims.
+    // -----------------------------------------------------------------------
+    assert!(
+        priced > 0.0,
+        "the fixture's attempt costs nothing, so a driver that read no spend at \
+         all would agree with one that read it correctly — this test would \
+         assert nothing"
+    );
+    let run = TopologyRun::resumed(handle, fixture.inputs(), Ceiling::unlimited());
+    assert!(
+        (run.spend().run_total() - priced).abs() < 1e-9,
+        "the resumed run believes it has spent {} where its own log says {priced}. \
+         A ceiling counted from zero after every restart is a budget that only \
+         binds runs that never crash",
+        run.spend().run_total()
     );
 }
 

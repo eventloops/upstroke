@@ -611,6 +611,8 @@ impl TopologyRun {
             // could.
             committed_first_line_sha256: Some(handle.committed_first_line_sha256.clone()),
         };
+        // Read before the handle moves into the struct below it.
+        let spend = Spend::replay(&handle.events);
         Self {
             handle,
             identity,
@@ -618,7 +620,19 @@ impl TopologyRun {
             invocations: InvocationLedger::new(),
             warnings: Vec::new(),
             ceiling,
-            spend: Spend::new(),
+            // **The log's spend, not a fresh counter.** `Spend::replay` is
+            // documented as the reader "a resumed process rebuilds this with",
+            // and until this line it had **no production caller** — every
+            // restart started the run's ceiling again at zero, so a run that had
+            // spent its budget resumed with the whole of it back.
+            //
+            // Third occurrence of the §4 class, and the one that re-scoped it:
+            // `C2` witnessed `Spend::replay`'s accumulation and its live-vs-
+            // replay parity, and nothing witnessed the *read*. The class was
+            // filed as "a fold field's witness proves the accumulation and not
+            // the read" and `Spend` is not literally a fold field — it behaves
+            // as one, and the narrow name is what let this through.
+            spend,
             deferral: Deferral::default_backoff(),
             slots: SlotAssertion::new(),
             retained: BTreeMap::new(),
