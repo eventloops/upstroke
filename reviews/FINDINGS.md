@@ -153,7 +153,7 @@ a sound finding whose *fix* had a hole, caught only by a later independent pass.
 | PR7-FEEDBACK-NOT-DURABLE-IN-SCHEMA-4 | **§11.4's accumulated brief cannot survive a resume, because schema 4's wire has nowhere to put it.** The legacy schema-3 events carry it outright — `LadderRetry` and `LadderEscalated` each hold `summary` **and** `detail`, and `Progress::feedback` is rebuilt by replaying them. Schema 4 records `attempt_finished{AttemptRecord, SettlementTransition}`, and `FailureRecord` is `{kind, origin, reason}` with **no detail**, while no `SettlementTransition` variant has a feedback field at all. So the gate-log tail and the reviewer's `required_changes` — the two things §11.4 exists to send back — are process-local in schema 4 and in no other schema. A run that crashes mid-ladder resumes and tells its next worker nothing about the attempts before the crash | project owner — **the G2 pass**, with `TASK-DISPATCHED-REGION-UNVALIDATED` and `PR7-CANDIDATE-TREE-UNVERIFIED` | **Recorded, not repaired: the repair is a wire field and `src/topology/**` is closed to this slice by the 2026-08-24 adjudication.** This row is the half that the in-process repair could not reach. S5 round 2 found (`contract`, `seams`, `attempt`, independently) that the driver accumulated §11.4's brief inside `Retained`, which `settle::retry` produces only for a resumable same-rung retry **with** a session — so every escalation and every sessionless retry, meaning every Copilot attempt (`DESIGN.md:452`), dispatched with an empty brief even *within one process*. That half is fixed: the brief is per **task**, every judged failure adds to it, and both dispatch arms read it. What is left is the durability, and it is a real behaviour difference from the engine schema 4 replaces — worth stating plainly rather than as a footnote, because `invariants_preserved[1]` is the standing rule and this is the one place the new engine is **less** capable than the old one. **The shape of the fix is already decided by precedent, which is why it is cheap in the pass and a frozen change here**: `attempt_finished` already carries the record beside the settlement, so a `detail: Option<String>` on `FailureRecord` is a pure addition of exactly the `#[serde(default)]` kind `AttemptRecord::pool` and `AttemptRecord::usage` already are — a log written before it folds to the state it always did, and `SCHEMA_VERSION` does not move |
 | PR7-STEP-D-LINEAGE-ARM-UNWITNESSED | **Recovery step (d) handles `LeaseDisposition::LineageHeld` and no test can reach that arm.** Catalogue entry `PR7-PIPELINE-008` adds `if lease == LineageHeld { continue; }` to `settle_interrupted`'s loop and the whole suite stays green. The loop is **already correct** — this is a coverage gap, not a defect | PR8 implementer (the slice that gives the merge queue a repair to spawn) | **Carried with a condition sharper than the one the catalogue implies, and measured.** `LineageHeld` is produced only by `GenerationLease::InheritedLineage`, which only a **repair task** holds, and a repair task exists only after a `task_spawned` carrying `Origin::MergeRepair`. Measured over `effects::production_code`: the only `TaskSpawned {` constructions in the tree are the frozen layer's own definitions (`topology/events.rs`, `topology/fold.rs`) and `engine/topology/scaffold.rs`, which is `#[cfg(test)]`. **No production path in this slice spawns a repair**, so the arm is unreachable by construction rather than by width — PR8's merge queue is what makes it live, not PR11's parallelism. **Why it is carried rather than witnessed**: the fixture would have to seed a `task_spawned` whose `FrozenSpawn.entry` is a registry entry derived outside the fold — the scaffold's `spawn_repair` reads the live registry to build one, and `Damage::extra` is assembled before any fold exists. That is a different construction from the sibling gap `PR7-PIPELINE-010`, which **was** repaired in-slice this round (`Damage::two_tasks`, `steps_d_and_e_reach_every_generation_not_the_first`) because it was the loop-versus-first shape a second task settles |
 | R3-SEAMS-006-ATT003-REPAIRED-POSTHOC | **Refuted as described, with a residual question that is not the same claim.** Sol's independent `seams` read, round 3: "a first reviewer whose Runner returns an error -> `run_review` reports `invocations: 0` -> the post-hoc loop performs no registration or cancellation", concluding R4 is not held on the error path. **Inspected `src/review.rs:786-797`, the `runner.run(&request)` match arm inside `run_review`'s invocation loop** — the item, the file and the lines, per §4's refutation rule. That arm does **not** return `Err`: it returns `Ok(unavailable_after_error("review process failed", error, cost, invocation - 1, last_path))`. So `judge` receives an outcome, the reconciliation **does** run, and it registers `invocation - 1` = 0 for a first pass. The described mechanism — an `Err` bypassing the loop — does not occur | project owner, if the residual is worth a row of its own | **The residual, stated separately because it is a different claim and I nearly repaired the wrong one.** `unavailable_after_error`'s `invocation - 1` is "how many invocations *completed*", and a Runner error means none did — but the Runner may have **spawned** a process before failing. Whether a spawned-and-unreportable process belongs in the ledger is a real question about `permits.protocol`'s "registered exactly once"; it is not the question Sol asked, and the answer is not obviously yes, since registering one that never started is the opposite failure and is the reason the reconciliation is post-hoc at all. **What was almost shipped**: an error arm in `judge` registering and cancelling the pass, written against Sol's description before its reachability was checked. It compiled, the suite stayed green, and a witness built for it **failed** — `judge` returned `Ok` — which is what surfaced the refutation. Reverted rather than kept: an arm whose reachability is unestablished is the same defect as a function with no production caller, filed one commit earlier as this slice's most recurrent class |
-| PR7-R4-CLAIMS-UNVERIFIED | **Eight claims written into commit messages and doc comments of the round-3 repairs are false, and each is one `grep` from disproof.** Round 4 — five lenses over the six commits `0cd2001..040a100`, scoped to that diff alone — returned **27 findings, every one inside it**, on a head green on Linux (1702/0), the Windows guest (1651+10) and CI (10/10). The eight: (1) `an_ending_run_reaches_closure` cited as an existing test whose scoping gap justified a new witness — **the test does not exist**, the name occurs once, in that doc comment; (2) the pool census described as asserting "what actually failed" — it inspects `attempt.rs`/`settle.rs` while the defect was `pool: None` in `run.rs`, and restoring the pre-repair state leaves the whole suite green; (3) "no driver fixture can reach the arm", given as the structural reason a source census was necessary — `the_retaining_incarnation_retries_in_place` reaches it; (4) `AttemptPlans::pool_for` said to give the pool rule "one production implementation" — `capacity::pool_for` has three call sites in `assembly.rs`; (5) the ending witness said to cover "**every** arm" — three of six; (6) the pre-clean repair presented as complete — one of its two callers; (7) the packet-clause census said to have "would have caught… `Spend::replay`" — not among its eleven entries; (8) a fixture said to make two behaviours "not both pass" — its implementer and reviewer share `AGENT`, so both pass, and the mutation measured as killed died for the wrong reason | project owner — **the claims protocol a fresh session carries** | **Recorded as a ledger correction, not repaired by history surgery.** The commit messages are pushed history and the owner's instruction is that they are corrected here, citing the table, exactly as `80a141b`'s false refutation was. The full table with per-claim citations is `~/tactus-artifacts/pr7/s5/r4/FALSIFICATION-TABLE.md`; the raw lens outputs are beside it. **Three confirmed code defects accompany the claims and are open**: `expected_refs`'s census entry is satisfied by a substring collision (all four `expected_refs(` matches in `workspace_manager.rs` are `refuse_unexpected_refs(`; genuine calls zero); the pre-clean fix is half-applied, leaving the stranger-killing path live at `census/tests.rs:3645`; and `an_ending_run_offers_no_work_from_any_arm` covers three of six arms with `Integrate` in the gap. **What is not in doubt**: rounds 1-3 closed real defects — the E6 promotion stall, a resumed run that forgot its spend, and a path traversal from plan-authored input where the legacy engine sanitised and the extraction did not — and those repairs are behaviourally sound. Round 4 challenged the *claims about* several witnesses, not the fixes beneath them. **The pattern, stated once**: prose asserted at the moment of writing became the evidence for the work it described, and nothing earlier in the chain checks a claim made in a commit message — which is the artifact a reviewer trusts most |
+| PR7-R4-CLAIMS-UNVERIFIED | **Eight claims written into commit messages and doc comments of the round-3 repairs are false, and each is one `grep` from disproof.** Round 4 — five lenses over the six commits `0cd2001..040a100`, scoped to that diff alone — returned **27 findings, every one inside it**, on a head green on Linux (1702/0), the Windows guest (1651+10) and CI (10/10). The eight: (1) `an_ending_run_reaches_closure` cited as an existing test whose scoping gap justified a new witness — **the test does not exist**, the name occurs once, in that doc comment; (2) the pool census described as asserting "what actually failed" — it inspects `attempt.rs`/`settle.rs` while the defect was `pool: None` in `run.rs`, and restoring the pre-repair state leaves the whole suite green; (3) "no driver fixture can reach the arm", given as the structural reason a source census was necessary — `the_retaining_incarnation_retries_in_place` reaches it; (4) `AttemptPlans::pool_for` said to give the pool rule "one production implementation" — `capacity::pool_for` has three call sites in `assembly.rs`; (5) the ending witness said to cover "**every** arm" — three of six; (6) the pre-clean repair presented as complete — one of its two callers; (7) the packet-clause census said to have "would have caught… `Spend::replay`" — not among its eleven entries; (8) a fixture said to make two behaviours "not both pass" — its implementer and reviewer share `AGENT`, so both pass, and the mutation measured as killed died for the wrong reason | project owner — **the claims protocol a fresh session carries** | **Recorded as a ledger correction, not repaired by history surgery.** The commit messages are pushed history and the owner's instruction is that they are corrected here, citing the table, exactly as `80a141b`'s false refutation was. The full table with per-claim citations is `~/tactus-artifacts/pr7/s5/r4/FALSIFICATION-TABLE.md`; the raw lens outputs are beside it. **Three confirmed code defects accompany the claims and are open**: `expected_refs`'s census entry is satisfied by a substring collision (all four `expected_refs(` matches in `workspace_manager.rs` are `refuse_unexpected_refs(`; genuine calls zero); the pre-clean fix is half-applied, leaving the stranger-killing path live at `census/tests.rs:3645`; and `an_ending_run_offers_no_work_from_any_arm` covers three of six arms with `Integrate` in the gap. **What is not in doubt**: rounds 1-3 closed real defects — the E6 promotion stall, a resumed run that forgot its spend, and a path traversal from plan-authored input where the legacy engine sanitised and the extraction did not — and those repairs are behaviourally sound. Round 4 challenged the *claims about* several witnesses, not the fixes beneath them. **The pattern, stated once**: prose asserted at the moment of writing became the evidence for the work it described, and nothing earlier in the chain checks a claim made in a commit message — which is the artifact a reviewer trusts most. **The table itself is now in this file, verbatim, as §19**, with each of the eight disproofs re-run at `cca1276` and its command recorded beside its result — including one place the table over-reached, corrected there under the same rule |
 
 
 ## 3. Challenges to settled entries
@@ -1473,3 +1473,194 @@ layer working rather than an obstacle.
   composition kept a fifth copy alive — but re-pointing the worker needs an `AgentAdapter` in the
   shared topology scaffold, which every topology test uses. That is the change PR5's round 7 was
   reverted for, and it belongs with the commit where the driver introduces an adapter seam anyway.
+
+
+## 19. PR7 S5 round 4 — eight unverified claims, corrected in the ledger
+
+`PR7-R4-CLAIMS-UNVERIFIED` in §2 is the row; this is the evidence behind it, in the
+repository rather than in a session artifact a reviewer of the pull request cannot open.
+
+**Round 4 was five lenses over six commits of round-3 repairs** (`0cd2001..040a100`) and
+nothing else. It returned 27 findings, every one inside that diff. Eight of them are not
+defects in code: they are **claims written into those commits' messages and doc comments,
+asserting a verified property, that are false** — each one `grep` from disproof, each
+written in the same commit as the work it describes.
+
+**The correction mechanism is this section, not a history rewrite.** The commit messages
+are pushed history. This project already corrected `80a141b`'s false refutation the same
+way, and the alternative — a tired session rebasing published commits — is the worse of
+the two failure modes.
+
+**The standing rule this produced**, adopted 2026-08-26 and binding on every later commit
+in this repository:
+
+> **The claims protocol.** Any commit-message or doc assertion of a *verified* property —
+> "single authority", "every arm", "would have caught X", "test T asserts Y" — carries the
+> command that verified it and its result beside the claim, or the claim is not made.
+> Intent-language is free; verification-language pays evidence.
+
+### The round-4 falsification table, verbatim
+
+Reproduced from `~/tactus-artifacts/pr7/s5/r4/FALSIFICATION-TABLE.md`
+(sha256 `30e2134f6f8f76f9ff265a17a593aeb17dbe40acaf9377fc519f8099d952adee`). The only
+change is heading depth, so the document nests under this section:
+`sed -e 's/^# /### /' -e 's/^## /#### /'`, and
+`diff <(sed 's/^#\+ //' SOURCE) <(sed 's/^#\+ //' NESTED)` is empty.
+
+### PR7 S5 round 4 — the falsification table
+
+**Round 4's subject was six commits of round-3 repairs** (`0cd2001..040a100`), read by
+the five lenses that produced the findings those commits closed. It returned **27
+findings**, every one inside that diff, on a head verified green on all three legs
+(Linux 1702/0, Windows guest 1651+10, CI 10/10).
+
+`seams` 5 · `attempt` 5 · `contract` 6 · `loop` 6 · `settle` 5.
+Three P1s were reached independently by three lenses each.
+
+#### The eight claims
+
+Each was written into a commit message or a doc comment **in the same commit as the work
+it describes**, and each is one `grep` from disproof. This is the finding of the round;
+the code defects below are ordinary by comparison.
+
+| # | Claim, as written | Reality | Where |
+|---|---|---|---|
+| 1 | *"`an_ending_run_reaches_closure` already asserts this, and asserts it only where nothing else is live"* | **The test does not exist.** The name appears once in the whole tree — inside this doc comment. A scoping gap was described in an invented test, and the new witness's justification rests on it | `select.rs:1568` |
+| 2 | the census *"asserts the property over the two construction sites — which is what actually failed, a literal `None` where the other arm named an authority"* | It inspects `attempt.rs` and `settle.rs`. The defect was `pool: None` in **`run.rs`**'s `RetryRequest`, a file the census does not read. Both inspected literals already named an authority **before** the repair. Restoring the pre-repair state leaves the whole suite green | `79cd9c8` |
+| 3 | *"no driver fixture can reach the arm"*, given as the structural reason a source census was necessary | `the_retaining_incarnation_retries_in_place` (`recover/tests.rs:5488`) drives `step` twice in one process and reaches it. The behavioural witness said to be impossible was available | `79cd9c8` |
+| 4 | `AttemptPlans::pool_for` exists *"so the pool rule has one production implementation"* | `capacity::pool_for` has **three** call sites in `assembly.rs` — the seam itself, the plan builder, and the reviewer profile added in the same batch. The seam method is called only from `run.rs` | `79cd9c8`, `assembly.rs:300/328/440` |
+| 5 | the ending witness *"asserts it over **every** arm with that arm's precondition satisfied"* | Three of six. `Integrate`, `Backoff` and `HardBlock` are absent | `aee0432` |
+| 6 | the pre-clean repair, presented as complete | `preclean_names` has two callers. `exec.rs` was scoped to the build slot; `census/tests.rs` still carries fixed `REPO_KEY_A`/`REPO_KEY_B`. **The stranger-killing path is still live there** | `aee0432` |
+| 7 | the census *"would have caught the E6 stall, both findings above, and `Spend::replay`"* | `Spend::replay` is not among its eleven entries. It would not have | `cf7bdb5` |
+| 8 | the pool fixture is *"named … and bound to the reviewer's agent, so a plan that inherited the implementer's pool and one that looked up the reviewer's own cannot both pass"* | The fixture's implementer and reviewer share `AGENT` (`claude-code`), so both lookups return the same pool and **both pass**. The mutation measured as "killed" died because the pool became *empty*, not wrong | `b44040a` |
+
+#### The three confirmed code defects
+
+Distinct from the claims: these are things the tree does wrong, all introduced by the
+round-3 repairs, all measured.
+
+1. **`expected_refs`'s census entry is satisfied by a substring collision.** In
+   `workspace_manager.rs`, `expected_refs(` matches four times and **all four are
+   `refuse_unexpected_refs(`**. Genuine calls: zero. So
+   `every_packet_named_recovery_action_has_a_production_caller` proves one of its own
+   eleven entries by accident, and the needle `format!("{name}(")` will do the same for
+   any future entry whose name is another's suffix.
+2. **The pre-clean fix is half-applied.** `census/tests.rs:3645` still calls
+   `preclean_names` with fixed-key names, so `PR7-R3-CONTRACT-001`'s class — a helper
+   that kills a concurrent run's live container by a name both runs share — remains live
+   on that path.
+3. **`an_ending_run_offers_no_work_from_any_arm` covers three of six arms.** `Integrate`
+   is a work-offering arm and is not among them, so the guard's coverage is half what the
+   witness's own name and doc assert.
+
+Also open, and dependent on (1): the packet-clause census additionally counts
+**test** callers as production ones, because `effects::production_code` blanks
+`#[cfg(test)]` *items* and an out-of-line test file (`attempt/tests.rs`, zero `#[cfg(test)]`
+attributes) has nothing to blank. Measured by `seams` and `attempt` independently.
+
+#### What is NOT in doubt
+
+Rounds 1–3 found and closed real defects, including two P0/P1 liveness bugs — the E6
+promotion stall and the resumed run that forgot its spend — plus a path traversal from
+plan-authored input. Those repairs are behaviourally sound and independently witnessed;
+round 4 challenged the **claims about** several of their witnesses, not the underlying
+fixes. The head is green on Linux, the Windows guest and CI.
+
+#### The pattern, stated once
+
+Prose asserted at the moment of writing became the evidence for the work it described.
+The review layer caught it — round 4 did exactly what it was scoped to do — but only
+because five lenses were aimed at six commits of my own repairs. Nothing earlier in the
+chain checks a claim made in a commit message, and the claim is the artifact a reviewer
+trusts most.
+
+### Re-verified at `cca1276`, with the command beside each result
+
+The table is round 4's. This is what re-running its disproofs found on the head this
+correction lands at — the protocol applied to the correction itself, because a
+falsification table asserting eight verified properties is exactly the artifact the
+protocol exists for.
+
+| # | Command | Result | Verdict |
+|---|---|---|---|
+| 1 | `grep -rn 'an_ending_run_reaches_closure' --include='*.rs' src/ \| wc -l` | `1` — the sole occurrence is `select.rs:1568`, the doc comment that cites it | **Confirmed.** The test does not exist |
+| 2 | read `both_attempt_started_arms_take_their_pool_from_an_authority`'s `SITES` (`run/tests.rs:359`) | the two entries are `src/engine/topology/attempt.rs` and `src/engine/topology/settle.rs`; the repaired literal is `run.rs:1124` | **Confirmed.** The census does not read the file the defect was in |
+| 3 | `grep -rn 'fn the_retaining_incarnation_retries_in_place' --include='*.rs' src/` | `recover/tests.rs:5488` | **Confirmed.** The fixture said to be impossible exists |
+| 4 | `grep -n 'crate::capacity::pool_for' src/engine/assembly.rs` | lines `300`, `328`, `440` | **Confirmed.** Three call sites, not one |
+| 5 | read `an_ending_run_offers_no_work_from_any_arm`'s `cases` (`select.rs:1593`) | three: continuation, ready dispatch, ready retry. `select` offers work from five arms — `Integrate`, `Retry`, `Dispatch`, `Backoff`, `HardBlock` | **Confirmed.** Three of six cases; `Integrate`, `Backoff` and `HardBlock` absent |
+| 6 | `grep -rn 'preclean_names(' --include='*.rs' src/ \| grep -v 'pub(crate) fn'` | `exec.rs:6262` and `census/tests.rs:3645` | **Confirmed.** One of two callers was scoped |
+| 7 | the census's `CLAUSES` (`recover/tests.rs:7138`), 11 entries | `prune_orphan_pin`, `refuse_unexpected_refs`, `expected_refs`, `complete_promotions`, `finish_promotions`, `recreate_open_no_attempt`, `settle_interrupted`, `close_retained_idle`, `ensure_recorded_integration_ref`, `refuse_unimplemented_terminals`, `resume_open_no_attempt` | **Confirmed.** `Spend::replay` is not among them |
+| 8 | read `scaffold.rs:105` and `:192` | the implementer's rung-0 binding is `(claude-code, alpha-Mid-model)`; the primary reviewer's is `(claude-code, opus)`. `review::passes_for` rebinds only on **exact `(agent, model)` equality**, so it does not fire, and the pass keeps agent `claude-code` | **Confirmed.** Reviewer and implementer resolve the same pool, so both behaviours pass |
+
+**And one place the table itself over-reached, corrected here under the same rule.**
+Claim (1) of round 4's *code defects* — not of its eight claims — says the substring
+collision means the census "proves one of its own eleven entries by accident". The
+collision is real:
+
+```
+$ grep -rn 'expected_refs(' src/workspace_manager.rs
+src/workspace_manager.rs:2045:    pub fn refuse_unexpected_refs(
+src/workspace_manager.rs:5711:            .refuse_unexpected_refs(namespace, std::slice::from_ref(&mine))
+src/workspace_manager.rs:5725:                .refuse_unexpected_refs(namespace, std::slice::from_ref(&mine))
+src/workspace_manager.rs:5787:                .refuse_unexpected_refs(namespace, std::slice::from_ref(&mine))
+```
+
+but the entry is **not** satisfied only by it. A boundary-aware search finds a genuine
+production caller:
+
+```
+$ grep -rnP '(?<![A-Za-z0-9_])expected_refs\(' --include='*.rs' src/ | grep -v '/tests\.rs:'
+src/engine/topology/recover.rs:1732:        let expected = crate::engine::topology::candidate::expected_refs(&run_id, fold);
+src/engine/topology/candidate.rs:916:pub fn expected_refs(run_id: &str, fold: &TopologyFold) -> Vec<String> {
+…
+```
+
+`recover.rs:1732` is the call `cf7bdb5` added, in production code, and it satisfies the
+entry on its own merits. So the defect is that **the needle is unsound**, not that this
+entry is hollow: `format!("{name}(")` will silently satisfy any future entry whose name is
+a suffix of another identifier, and the failure is latent rather than present. Repaired at
+its class boundary rather than at the instance — see the commit that carries
+`a_call_census_needle_is_not_satisfied_by_a_longer_name_ending_in_it`.
+
+### A process note: the first suite run of this session reported a failure that was not there
+
+`an_ending_run_offers_no_work_from_any_arm` failed at `cca1276` on the first
+`upstroke-build cargo test --all-targets --all-features` of the session, with
+`Dispatch { continuing: true }` — the exact shape of the `PR7-R3-LOOP-001` defect
+`aee0432` repaired. It passed at `040a100` in a fresh worktree. No source change between
+those two commits touches `select.rs`.
+
+It was **a poisoned build slot** — §17's *"The build slot pool poisons concurrent agents
+across worktrees"*, one occurrence further on, and with §17's own signature. The second line
+of that run's log is:
+
+```
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.01s
+```
+
+`Compiling` appears **zero** times in it. So nothing from `/srv/tactus` was built and the
+suite ran a binary already sitting in `slot2`. `cargo clean` in that slot, then the same
+command, gives **1694 lib + 8 bin passed, 0 failed, 32 ignored** — green.
+
+**What is proved and what is inferred**, because this section is about that distinction.
+Proved: the run compiled nothing, and the same working tree compiles green. Inferred: the
+binary was one of round 4's five reviewer worktrees', carrying a `select.rs` mutation left
+in the artifacts — the failure has a mutation's shape, those five are the only builds this
+pool saw between `040a100` and now, and all five trees are clean at `040a100`, so no
+mutation survives in any *source*. §17's confirmation is
+`strings <target>/debug/deps/<crate>-<hash> | grep -oE '/[^ ]*<worktree>[^ ]*'`, and it is
+**not available here**: the `cargo clean` that fixed the slot destroyed the binary that
+would have named its manifest dir. Diagnose before cleaning is the third rule, and it is
+recorded because it was not followed.
+
+§17's rule is *"an agent building in a worktree must touch every source file before its
+first gate run"*. Two things this occurrence adds to it:
+
+1. **The poisoning outlives the round.** All five reviewer worktrees were clean and idle
+   when this failure appeared; nothing was building. It is the artifacts that persist, not
+   the concurrency, so the rule extends past the round that caused it.
+2. **It reaches the main tree, not only the worktrees.** §17's occurrence was a reviewer
+   handed a sibling's binary. This was `/srv/tactus` itself, and what it produced was a
+   *phantom failure in the one test this session was about to repair* — which is the
+   direction that costs an hour. The other direction hides a real defect and costs more.
+   **A suite run that follows a review round is cleaned, not trusted.**
