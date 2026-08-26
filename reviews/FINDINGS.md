@@ -1830,6 +1830,28 @@ sloppy record from a failed restore.
 > "Verified by hash" with a number a reader cannot re-derive is worth less than
 > no number: it looks checkable and is not.
 
+**And a third occurrence, in the commit that wrote that rule's own round.**
+`765a2f7` records `run.rs 94b066db…`; the committed file hashes `035a2045…`. The
+restore was real and the hash was true of it — `run.rs` was then edited once more,
+to name the slot-assertion field instead of citing a line, and the message kept
+the earlier number. Found by re-deriving my own three hashes before round 6 could,
+which is the third time in this session that running one's own claims has been
+cheaper than being told.
+
+**So the rule as stated is not enough, because it asks a person to remember a
+step at the moment they are finishing.** The mechanical form, and what this
+project should use from here:
+
+```
+$ git add -A && git show :src/path/file.rs | sha256sum
+```
+
+The **staged** content is by definition what the commit will carry, so a hash
+taken there cannot drift, and the reader re-derives it with
+`git show <sha>:<path> | sha256sum`. A hash that means "the working tree at the
+moment I restored it" is a note to oneself; a hash of the staged blob is
+evidence.
+
 ### Two things that are unverifiable by construction, named so they are not mistaken for verified
 
 - **The falsification table's `sha256`** in `21c5735`. Its source is a session
