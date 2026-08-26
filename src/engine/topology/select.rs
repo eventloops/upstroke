@@ -1563,75 +1563,207 @@ mod tests {
         );
     }
 
-    /// **An ending run offers no work — for every arm, not for the empty fold.**
+    /// The label of a step, total over [`Step`].
     ///
-    /// `an_ending_run_reaches_closure` already asserts this, and asserts it only
-    /// where **nothing else is live**. That is the scoping gap round 3
-    /// harvested: the property being claimed is "an ending run proceeds to
-    /// closure", and the fixture only ever tested "an idle ending run does".
+    /// The reason it is a `match` and not a list: adding a variant to `Step` is
+    /// a **compile error here**, which is what lets
+    /// [`an_ending_run_offers_no_work_from_any_arm`] claim "every arm" and have
+    /// the claim mean something. A list of names someone remembers to extend is
+    /// how that test came to cover three of six while its own doc said every.
+    fn arm_label(step: &Step) -> &'static str {
+        match step {
+            Step::Poisoned => "Poisoned",
+            Step::BudgetExceeded(_) => "BudgetExceeded",
+            Step::Integrate { .. } => "Integrate",
+            Step::Retry { .. } => "Retry",
+            Step::Dispatch {
+                continuing: true, ..
+            } => "Dispatch (continuing)",
+            Step::Dispatch {
+                continuing: false, ..
+            } => "Dispatch",
+            Step::Backoff => "Backoff",
+            Step::HardBlock { .. } => "HardBlock",
+            Step::Closure(_) => "Closure",
+        }
+    }
+
+    /// **An ending run offers no work — from every arm, not from the empty fold.**
     ///
-    /// `PR7-R3-LOOP-001` is what got through it. `TopologyFold::open_no_attempt`
-    /// is a statement accessor and — correctly, and unlike `ready`,
-    /// `ready_retry` and `integration_admissible` — consults no run state, so
-    /// the continuation arm offered work on a budget-stopped run. Measured end
-    /// to end by that lens: five `step()` calls, five duplicate
-    /// `budget_exceeded` records, no closure; and with `halted_at` set,
-    /// `Dispatch { continuing: true }` — a halted run spawning a worker.
+    /// The property is "an ending run proceeds to closure". What was asserted
+    /// before `PR7-R3-LOOP-001` was "an *idle* ending run does":
+    /// `a_run_with_no_admissible_work_never_asks_the_ceiling` drives an
+    /// `all_failed()` fold, where **nothing else is live**, and
+    /// `a_breach_appends_budget_exceeded_and_integration_and_run_end_are_refused`
+    /// asserts the closure on the same shape. That is the scoping gap round 3
+    /// harvested.
     ///
-    /// So the witness is written over **every arm that can offer work**, each
-    /// with its own precondition satisfied and the run ending. An arm added
-    /// later fails this the moment it is reachable, which the one-arm version
-    /// could not do.
+    /// **A correction, because the version of this comment that shipped cited a
+    /// test that does not exist.** It named `an_ending_run_reaches_closure` as
+    /// the predecessor whose scope this widens;
+    /// `grep -rn 'an_ending_run_reaches_closure' src/` returns exactly one hit
+    /// and it is that sentence. The two tests named above are the real
+    /// predecessors. `reviews/FINDINGS.md` §19, claim (1).
+    ///
+    /// `PR7-R3-LOOP-001` is what got through the gap.
+    /// `TopologyFold::open_no_attempt` is a statement accessor and — correctly,
+    /// and unlike `ready`, `ready_retry` and `integration_admissible` — consults
+    /// no run state, so the continuation arm offered work on a budget-stopped
+    /// run. Measured end to end by that lens: five `step()` calls, five
+    /// duplicate `budget_exceeded` records, no closure; and with `halted_at`
+    /// set, `Dispatch { continuing: true }` — a halted run spawning a worker.
+    ///
+    /// **"Every arm" is now the whole of `select`'s work-offering surface**, and
+    /// it is checkable rather than asserted: [`arm_label`] is total over `Step`,
+    /// [`OFFERS_WORK`] is the subset of its labels that offer work, and the six
+    /// cases below are asserted to *cover that subset exactly*. A seventh arm
+    /// cannot be added without `arm_label` failing to compile, and it cannot
+    /// then be left out of this test without the coverage assertion failing.
+    /// The version this replaces covered `Dispatch`, `Dispatch (continuing)` and
+    /// `Retry`, and its doc claimed all of them — §19, claim (5).
+    ///
+    /// **What the top guard is load-bearing for, measured rather than assumed.**
+    /// Delete `select`'s `if fold.run_is_ending()` and this test reports **two**
+    /// arms:
+    ///
+    /// ```text
+    /// Dispatch (continuing) -> Dispatch { …, continuing: true }
+    /// HardBlock             -> HardBlock { questions: [QuestionId("q-aleph-park")] }
+    /// ```
+    ///
+    /// Four of the six are protected twice over: `ready`, `ready_retry` and
+    /// `integration_admissible` embed `!run_is_ending()` in the fold, and this
+    /// module's own `backoff_pending` wrapper embeds it here. The two that rest
+    /// on the guard **alone** are the continuation — `PR7-R3-LOOP-001`, which is
+    /// why the guard exists — and `HardBlock`, which is the same shape one
+    /// accessor over: `TopologyFold::questions_open` is a statement accessor and
+    /// consults no run state either.
+    ///
+    /// `HardBlock` was not witnessed before this widening. The guard already
+    /// covered it, so this is not an open defect — it is the difference between
+    /// a guard that happens to be correct and one that is held to it, and the
+    /// three-arm version could not tell them apart.
     #[test]
     fn an_ending_run_offers_no_work_from_any_arm() {
+        /// Every label [`arm_label`] can return for a step that offers work.
+        ///
+        /// `Poisoned`, `BudgetExceeded` and `Closure` are the complement: none
+        /// of the three is work, and each is a state an ending run is allowed
+        /// to reach.
+        const OFFERS_WORK: &[&str] = &[
+            "Integrate",
+            "Retry",
+            "Dispatch",
+            "Dispatch (continuing)",
+            "Backoff",
+            "HardBlock",
+        ];
+
         // Each case: a fold where THIS arm is live, then the same fold ended.
-        // The `live` assertion is the premise — without it a case could pass
-        // because its arm was never eligible in the first place.
-        /// A fixture builder for one arm, named for the failure message.
+        // The live assertion is the premise, and it names the arm — asserting
+        // merely "not closure" let a case pass on a *different* arm being live,
+        // which is how three cases were mistaken for six.
+        /// A fixture builder for one arm, and the label its fold must select.
         type Arm = (&'static str, fn() -> TopologyFold);
 
         let cases: Vec<Arm> = vec![
-            ("continuation (OpenNoAttempt)", || {
+            ("Dispatch (continuing)", || {
                 let mut fold = started();
                 apply(&mut fold, &dispatch(ALEPH, 0));
                 fold
             }),
-            ("ready dispatch", started),
-            ("ready retry (RetainedIdle)", || {
+            ("Dispatch", started),
+            ("Retry", || {
                 let mut fold = started();
                 retained_generation(&mut fold, BET, 0);
                 fold
             }),
+            ("Integrate", || {
+                let mut fold = started();
+                let _ = queue_candidate(&mut fold, GIMEL, 0);
+                fold
+            }),
+            ("Backoff", || {
+                // Deferred work and nothing else runnable: `Backoff` sits below
+                // the three dispatching arms, so every other task must be out.
+                let mut fold = started();
+                in_flight(&mut fold, ALEPH, 0);
+                settle_into(&mut fold, &finished(ALEPH, 0, 1, Next::Defer));
+                in_flight(&mut fold, BET, 0);
+                settle_into(&mut fold, &finished(BET, 0, 1, Next::Fail));
+                in_flight(&mut fold, GIMEL, 0);
+                settle_into(&mut fold, &finished(GIMEL, 0, 1, Next::Fail));
+                fold
+            }),
+            ("HardBlock", || {
+                // An open question and nothing else — including no deferred
+                // task, because `Backoff` precedes this branch.
+                let mut fold = started();
+                in_flight(&mut fold, ALEPH, 0);
+                let mut parking = finished(
+                    ALEPH,
+                    0,
+                    1,
+                    Next::AskHuman(crate::ir::QuestionKind::Unblock),
+                );
+                parking.question = Some(question_for(ALEPH));
+                settle_into(&mut fold, &parking);
+                for key in [BET, GIMEL] {
+                    in_flight(&mut fold, key, 0);
+                    settle_into(&mut fold, &finished(key, 0, 1, Next::Fail));
+                }
+                fold
+            }),
         ];
 
-        for (name, build) in cases {
+        let mut covered: Vec<&'static str> = Vec::new();
+        let mut offered: Vec<String> = Vec::new();
+        for (arm, build) in cases {
             let live = build();
-            assert!(
-                !matches!(
-                    select(&live, &Ceiling::unlimited(), &no_spend()),
-                    Step::Closure(_)
-                ),
-                "{name}: the arm is not live before the run ends, so ending it \
-                 proves nothing"
+            let selected = select(&live, &Ceiling::unlimited(), &no_spend());
+            assert_eq!(
+                arm_label(&selected),
+                arm,
+                "{arm}: this fixture selects `{}` before the run ends, so ending it says nothing \
+                 about `{arm}` — it says a second time what the `{}` case already says",
+                arm_label(&selected),
+                arm_label(&selected)
             );
+            covered.push(arm);
 
             let mut ending = build();
             apply(
                 &mut ending,
                 &super::super::settle::tests::budget_exceeded(Epoch(0), GIMEL),
             );
-            assert!(
-                matches!(
-                    select(&ending, &Ceiling::unlimited(), &no_spend()),
-                    Step::Closure(_)
-                ),
-                "{name}: an ending run offered work. `loop` says a breach \
-                 proceeds to closure, and a run that keeps selecting an arm it \
-                 then refuses appends a duplicate stop record every iteration \
-                 and never terminates: {:?}",
-                select(&ending, &Ceiling::unlimited(), &no_spend())
-            );
+            let after = select(&ending, &Ceiling::unlimited(), &no_spend());
+            if !matches!(after, Step::Closure(_)) {
+                // Accumulated rather than asserted in the loop: a guard that
+                // stops covering three arms should report three, not the first
+                // one the case order happens to reach.
+                offered.push(format!("{arm} -> {after:?}"));
+            }
         }
+
+        assert!(
+            offered.is_empty(),
+            "an ending run offered work from {} of the {} arms. `loop` says a breach proceeds to \
+             closure, and a run that keeps selecting an arm it then refuses appends a duplicate \
+             stop record every iteration and never terminates:\n  {}",
+            offered.len(),
+            OFFERS_WORK.len(),
+            offered.join("\n  ")
+        );
+
+        covered.sort_unstable();
+        let mut expected = OFFERS_WORK.to_vec();
+        expected.sort_unstable();
+        assert_eq!(
+            covered, expected,
+            "the arms this test drives are not the arms `select` can offer work from. An arm in \
+             the second list and not the first is an arm nothing here holds to the rule — which \
+             is the defect this test carried while its own doc said `every`"
+        );
     }
 
     /// The hard-block branch: open questions and nothing else runnable.
