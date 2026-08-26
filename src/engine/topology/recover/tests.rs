@@ -45,7 +45,7 @@ use crate::runner::{CommandSpec, Runner, RunnerRequest};
 use crate::topology::effects::EventSite;
 use crate::topology::effects::{
     EffectSiteId, HookHarness, HookPhase, Injection, InjectionMode, LockSite, ObjectSite, RefSite,
-    RunDirSite, SubEffectPoint,
+    RunDirSite, SubEffectPoint, WorktreeSite,
 };
 use crate::topology::events::{
     AttemptFinished4, AttemptSettlement, AttemptStarted4, BudgetExceeded4, CommitSha, Epoch,
@@ -4962,6 +4962,7 @@ fn the_driver_carries_an_accepted_attempt_through_the_candidate_sequence() {
             EffectSiteId::Event(EventSite::Append),
             EffectSiteId::Ref(RefSite::CreateCandidates),
             EffectSiteId::Ref(RefSite::DeleteCandidatePin),
+            EffectSiteId::Worktree(WorktreeSite::Remove),
         ]),
         vec![
             // task_dispatched and attempt_started: the branch's own prologue,
@@ -4978,6 +4979,9 @@ fn the_driver_carries_an_accepted_attempt_through_the_candidate_sequence() {
             // task_candidate_created.
             "Event.Append".to_owned(),
             "Ref.DeleteCandidatePin".to_owned(),
+            // O31's scrub, which `PR7-PIPELINE-029` moved to immediately after
+            // `candidate_prepared` — three appends too early — and was green.
+            "Worktree.Remove".to_owned(),
         ],
         "the driver's candidate sequence, as one observed order over both families"
     );

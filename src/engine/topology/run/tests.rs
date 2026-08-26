@@ -193,3 +193,83 @@ fn a_refusal_names_the_branch_and_says_whether_anything_happened() {
         );
     }
 }
+
+/// **Every append the driver makes propagates its error.**
+///
+/// The append-error protocol is five obligations, and all five begin with the
+/// error *reaching* the protocol. A `let _ = self.emit(..)` reaches none of
+/// them: the fold is not poisoned, no reservation or invocation is cancelled,
+/// and the command reports success for a run whose log does not contain the
+/// line it just claimed to write.
+///
+/// Catalogue entry `PR7-SELECT-026` did exactly that to the
+/// `Admitted::BudgetExceeded` arm and the whole suite stayed green, because the
+/// arms whose append failure *is* armed by a fixture are not that one.
+///
+/// A **census rather than a fixture per arm**, for the reason the other four
+/// single-authority censuses exist: a per-arm test proves the arm it names and
+/// says nothing about the arm added next week. This proves the property over
+/// every append site the driver has, including the ones not yet written.
+///
+/// The region is [`crate::effects::production_code`], which blanks comments and
+/// strings — a `let _ = self.emit(` quoted in a doc comment must not fail this,
+/// and a truncating region would let a site below the cut through, which is
+/// `PR4-CENSUS-COMMENT-ORACLE` and is how the barrier census scanned 4.7% of
+/// this very file.
+#[test]
+fn every_driver_append_propagates_its_error() {
+    let source = std::fs::read_to_string(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/engine/topology/run.rs"),
+    )
+    .expect("the driver's own source");
+    let code = crate::effects::production_code(&source);
+
+    assert!(
+        code.len() * 10 > source.len(),
+        "the production region is {} of {} bytes — a census over a fraction of a \
+         file reports zero for the part it never read",
+        code.len(),
+        source.len()
+    );
+
+    let needle = "self.emit(";
+    let mut sites = 0;
+    let mut unpropagated = Vec::new();
+    for (at, _) in code.match_indices(needle) {
+        sites += 1;
+        // Walk to the matching close paren, then check what follows it.
+        let mut depth = 0_i32;
+        let mut end = None;
+        for (offset, ch) in code[at + needle.len() - 1..].char_indices() {
+            match ch {
+                '(' => depth += 1,
+                ')' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        end = Some(at + needle.len() - 1 + offset + 1);
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+        let Some(end) = end else {
+            unpropagated.push(format!("unbalanced call at byte {at}"));
+            continue;
+        };
+        if !code[end..].trim_start().starts_with('?') {
+            let line = code[..at].matches('\n').count() + 1;
+            unpropagated.push(format!("line {line} (of the blanked region)"));
+        }
+    }
+
+    assert!(
+        sites >= 4,
+        "only {sites} append sites found, so a green result here would prove nothing"
+    );
+    assert!(
+        unpropagated.is_empty(),
+        "these driver appends do not propagate their error, so the append-error \
+         protocol never runs for them: {unpropagated:?}"
+    );
+}

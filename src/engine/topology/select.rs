@@ -1034,6 +1034,76 @@ mod tests {
         assert!((with_reviews.task_usd(ALEPH) - 0.875).abs() < f64::EPSILON);
     }
 
+    /// **The selector's ceiling arm checks both budgets, not one.**
+    ///
+    /// `the_run_ceiling_is_checked_before_the_task_ceiling` exercises
+    /// `Ceiling::breach` directly and is green for either half alone. The arm
+    /// is what the loop actually runs, and catalogue entries `PR7-SELECT-020`
+    /// and `PR7-SELECT-023` reduced `ceiling_or`'s call to
+    /// `ceiling.task_breach(..)` and `ceiling.run_breach(..)` respectively —
+    /// each dropping one comparison — and the whole suite stayed green **twice**.
+    ///
+    /// The two halves need opposite fixtures, and that is the whole reason
+    /// neither was caught: a ceiling where both budgets are breached, or
+    /// neither, cannot tell the halves apart. Each case below has **headroom in
+    /// one budget and a breach in the other**.
+    #[test]
+    fn the_ceiling_arm_refuses_on_either_budget_alone() {
+        // Case one: the task is over, the run has room. A dropped
+        // `task_breach` admits an attempt the task's own budget refuses.
+        let fold = started();
+        assert!(fold.ready(ALEPH), "the dispatch alternative is not live");
+        let mut spend = Spend::new();
+        spend.record(ALEPH, &record(1, Some(0.6)));
+        let only_task = Ceiling {
+            run_usd: Some(10.0),
+            task_usd: Some(0.5),
+        };
+        assert_eq!(
+            only_task.run_breach(&spend),
+            None,
+            "the run budget must have headroom, or this case cannot tell a \
+             dropped task comparison from a kept one"
+        );
+        match select(&fold, &only_task, &spend) {
+            Step::BudgetExceeded(exceeded) => assert_eq!(
+                exceeded.budget,
+                BudgetKind::Task,
+                "the arm named the wrong budget"
+            ),
+            other => panic!(
+                "a task over its own ceiling was admitted because the run had \
+                 room: {other:?}"
+            ),
+        }
+
+        // Case two, the mirror: the run is over, this task has spent nothing.
+        let fold = started();
+        let mut spend = Spend::new();
+        spend.record(BET, &record(1, Some(2.0)));
+        let only_run = Ceiling {
+            run_usd: Some(1.0),
+            task_usd: Some(10.0),
+        };
+        assert_eq!(
+            only_run.task_breach(&spend, ALEPH),
+            None,
+            "the selected task must have headroom, or this case cannot tell a \
+             dropped run comparison from a kept one"
+        );
+        match select(&fold, &only_run, &spend) {
+            Step::BudgetExceeded(exceeded) => assert_eq!(
+                exceeded.budget,
+                BudgetKind::Run,
+                "the arm named the wrong budget"
+            ),
+            other => panic!(
+                "a run over its ceiling dispatched a task that had spent \
+                 nothing: {other:?}"
+            ),
+        }
+    }
+
     /// The run ceiling is named before the task ceiling, and reaching a
     /// ceiling is already a refusal.
     #[test]
