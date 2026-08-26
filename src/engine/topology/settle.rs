@@ -1570,8 +1570,9 @@ pub(crate) mod tests {
     fn the_defer_backoff_doubles_caps_and_resets() {
         let sleeper = Recorded::default();
         let mut deferral = Deferral::new(Duration::from_secs(60));
+        let mut recorded: Vec<u32> = Vec::new();
         for _ in 0..12 {
-            deferral.wait(&sleeper);
+            recorded.push(deferral.wait(&sleeper).round);
         }
         let waits = sleeper.waits();
         assert_eq!(waits[0], Duration::from_secs(60));
@@ -1582,14 +1583,33 @@ pub(crate) mod tests {
             "an uncapped backoff waits longer than asking a human is worth"
         );
         assert_eq!(deferral.round(), 12);
+
+        // **And what the event carries**, which is a different claim from what
+        // the accumulator holds — `reviews/FINDINGS.md` §4's "an accumulator's
+        // witness proves the accumulation and not the read", at four
+        // occurrences. `DeferWaitElapsed4.round` is documented on the wire, a
+        // frontier reviewer reads it there, and until this line nothing asserted
+        // the value a run actually writes.
+        assert_eq!(
+            recorded,
+            (1..=12).collect::<Vec<u32>>(),
+            "`wait` increments before it records, so the recorded round is one-based"
+        );
+
         deferral.progressed();
         assert_eq!(deferral.round(), 0);
         let sleeper = Recorded::default();
-        deferral.wait(&sleeper);
+        let after_progress = deferral.wait(&sleeper).round;
         assert_eq!(
             sleeper.waits(),
             vec![Duration::from_secs(60)],
             "progress did not reset the doubling"
+        );
+        assert_eq!(
+            after_progress, 1,
+            "the recorded sequence over one run is 1, 2, … 12, **1** — not a count across the \
+             run. A reader taking `DeferWaitElapsed4.round` as \"which sleep this was\" reads \
+             this thirteenth sleep as the first"
         );
         assert_eq!(
             Deferral::default_backoff().round(),
