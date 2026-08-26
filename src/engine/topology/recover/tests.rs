@@ -7108,6 +7108,121 @@ impl crate::interaction::Sleeper for RecordingSleeper {
     }
 }
 
+/// Calls to `name` in `code`: neither its definition, nor a longer identifier
+/// that merely ends in it.
+///
+/// The second half is the one that was missing. A needle built as
+/// `format!("{name}(")` is a plain substring search, so `expected_refs(` is
+/// satisfied by every `refuse_unexpected_refs(` in the tree — and a census whose
+/// entry is proved by a different function's call sites proves nothing about its
+/// own. Measured on this tree: `workspace_manager.rs` carries four occurrences of
+/// the substring `expected_refs(` and **zero** calls to `expected_refs` — one of
+/// the four survives into `production_code`'s region, and it is the *definition
+/// line* of `refuse_unexpected_refs`, which the "calls, not definitions" filter
+/// does not see because the text before the match is `pub fn refuse_un`.
+///
+/// The boundary is "the byte before the match is not an identifier byte", which
+/// keeps `crate::a::b::expected_refs(` — `:` is not one — and rejects
+/// `unexpected_refs(`. Not a rename, which is how
+/// `the_barrier_is_the_only_topology_route_from_a_proven_prefix_to_an_append_handle`
+/// closed the same class: that census's needle is a constant it could choose,
+/// this one's is eleven names the packet chose.
+fn production_calls(code: &str, name: &str) -> usize {
+    let needle = format!("{name}(");
+    code.match_indices(&needle)
+        // Not the tail of a longer identifier.
+        .filter(|(at, _)| {
+            code[..*at]
+                .chars()
+                .next_back()
+                .is_none_or(|before| !before.is_alphanumeric() && before != '_')
+        })
+        // Calls, not definitions.
+        .filter(|(at, _)| !code[..*at].trim_end().ends_with("fn"))
+        .count()
+}
+
+/// **A call census's needle is not satisfied by a longer name ending in it.**
+///
+/// The class boundary, not the instance. S5 round 4 found that
+/// `every_packet_named_recovery_action_has_a_production_caller` counted
+/// `refuse_unexpected_refs(` as a call to `expected_refs` — but the interesting
+/// half is that the same needle is built for **every** entry from a name the
+/// packet chose, so any future clause whose function name is a suffix of another
+/// identifier is satisfied by that other identifier's call sites, silently and
+/// in the passing direction.
+///
+/// So this asserts the needle's rule over the four shapes that decide it, and
+/// then over the real file the collision was found in — a unit assertion alone
+/// would pass against a helper that was never wired into the census.
+#[test]
+fn a_call_census_needle_is_not_satisfied_by_a_longer_name_ending_in_it() {
+    assert_eq!(
+        production_calls(
+            "            .refuse_unexpected_refs(&namespace, &expected)?;\n",
+            "expected_refs"
+        ),
+        0,
+        "a longer identifier ending in the entry's name satisfied its census entry"
+    );
+    assert_eq!(
+        production_calls(
+            "        let expected = crate::engine::topology::candidate::expected_refs(&r, f);\n",
+            "expected_refs"
+        ),
+        1,
+        "a genuine call through a path was rejected: `:` is not an identifier byte"
+    );
+    assert_eq!(
+        production_calls(
+            "    let e = expected_refs(&run_id, fold);\n",
+            "expected_refs"
+        ),
+        1,
+        "a genuine bare call was rejected"
+    );
+    assert_eq!(
+        production_calls(
+            "pub fn expected_refs(run_id: &str, fold: &TopologyFold) -> Vec<String> {\n",
+            "expected_refs"
+        ),
+        0,
+        "a definition is not a call: a function that calls only itself is what this census exists \
+         to catch"
+    );
+
+    // And on the file the collision was measured in, through the same region
+    // the census reads — a unit assertion over literals would pass against a
+    // helper nothing was wired into.
+    //
+    // **The two counts differ, and the difference is worth keeping.** The whole
+    // file carries four occurrences of `expected_refs(`; the region the census
+    // reads carries one, because three of the four sit inside `#[cfg(test)]`
+    // items that `production_code` blanks. The one that survives is the
+    // **definition line** of `refuse_unexpected_refs`, which the "calls, not
+    // definitions" filter does not catch: the text before the match is
+    // `pub fn refuse_un`, and that does not end in `fn`.
+    let source = std::fs::read_to_string(
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("src/workspace_manager.rs"),
+    )
+    .expect("a source file");
+    let code = crate::effects::production_code(&source);
+    let whole = source.matches("expected_refs(").count();
+    let region = code.matches("expected_refs(").count();
+    assert!(
+        whole >= 4 && region >= 1,
+        "`workspace_manager.rs` no longer carries the substring this test is about ({whole} in \
+         the file, {region} in the production region), so the zero below proves nothing"
+    );
+    assert_eq!(
+        production_calls(&code, "expected_refs"),
+        0,
+        "the production region of `workspace_manager.rs` has {region} occurrence(s) of \
+         `expected_refs(` and every one of them belongs to `refuse_unexpected_refs`; counting \
+         them is how a census entry gets proved by a function that is not the one it names"
+    );
+}
+
 /// **Every packet-named recovery action and refusal has a production caller.**
 ///
 /// The class this slice produced more than any other, and the one census that
@@ -7128,10 +7243,32 @@ impl crate::interaction::Sleeper for RecordingSleeper {
 /// `resume_action` or a `refusal_condition` and has no production caller is not
 /// an implementation of that clause — it is a plan to implement it.
 ///
-/// The needle is the call, not the definition, and the region is
-/// `effects::production_code`, so a mention in a doc comment cannot satisfy it
-/// and a `#[cfg(test)]` caller cannot either — the two ways this census could
-/// pass while the clause stayed unperformed.
+/// **What this census covers, exactly.** The eleven entries below and nothing
+/// else. Of the ten never-called things listed above, `Spend::replay`,
+/// `TopologyRun`, `Started`, `CandidateJournal`, `settle_*` and
+/// `complete_promotion`'s continuation are **not** among them — this would not
+/// have caught them, and the commit that added it said otherwise. Corrected in
+/// `reviews/FINDINGS.md` §19, claim (7); recorded here because the reader who
+/// needs it is the one adding the twelfth entry.
+///
+/// Four ways this could pass while a clause stayed unperformed, and each is
+/// closed by a named thing rather than by the needle being "obviously right":
+///
+/// * **A mention in a doc comment or a string.** The region is
+///   `effects::production_code`, which blanks comments and string literals.
+/// * **A `#[cfg(test)]` caller in the same file.** The same region removes each
+///   configured item in place.
+/// * **A caller in an out-of-line `tests.rs`**, where the attribute is on the
+///   parent's declaration and there is nothing in the file to blank. Skipped by
+///   file stem in the walk below. This was live until S5 round 4.
+/// * **A longer identifier ending in the entry's name.** `expected_refs(` was
+///   satisfied by `refuse_unexpected_refs(`. Closed by [`production_calls`],
+///   whose own witness is
+///   `a_call_census_needle_is_not_satisfied_by_a_longer_name_ending_in_it`.
+///
+/// The fourth is the one worth stating as a class: the needle is built from a
+/// name **the packet chose**, so it cannot be renamed out of a collision the way
+/// `into_log_and_fold` was.
 #[test]
 fn every_packet_named_recovery_action_has_a_production_caller() {
     /// (function, the packet clause it performs).
@@ -7189,6 +7326,7 @@ fn every_packet_named_recovery_action_has_a_production_caller() {
         ),
     ];
 
+    let mut test_files_skipped = 0_usize;
     let sources: Vec<(String, String)> = {
         let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
         let mut out = Vec::new();
@@ -7201,6 +7339,20 @@ fn every_packet_named_recovery_action_has_a_production_caller() {
                     continue;
                 }
                 if path.extension().is_none_or(|ext| ext != "rs") {
+                    continue;
+                }
+                // **An out-of-line test file is test code in full, and
+                // `production_code` cannot tell.** The `#[cfg(test)]` is on the
+                // *declaration* — `mod tests;` in the parent — so the file it
+                // names carries no attribute of its own and nothing in it is
+                // blanked. Fourteen files here are that shape, and without this
+                // skip a fixture calling a packet-named function satisfies the
+                // clause on its behalf: the census would report a production
+                // caller where only a test calls it, which is precisely the
+                // class it exists to close. Same skip and same reason as
+                // `the_barrier_is_the_only_topology_route_from_a_proven_prefix_to_an_append_handle`.
+                if path.file_stem().is_some_and(|stem| stem == "tests") {
+                    test_files_skipped += 1;
                     continue;
                 }
                 let relative = path
@@ -7219,18 +7371,20 @@ fn every_packet_named_recovery_action_has_a_production_caller() {
         "the walk found {} sources, so its zero counts would prove nothing",
         sources.len()
     );
+    // The skip is in force and it removed something. A zero here would mean the
+    // control was silently inert — the same failure as an empty region, one
+    // level up.
+    assert!(
+        test_files_skipped > 0 && sources.iter().all(|(rel, _)| !rel.ends_with("tests.rs")),
+        "the out-of-line test files are not being skipped ({test_files_skipped} skipped), so a \
+         fixture's call can satisfy a clause on production's behalf"
+    );
 
     let mut uncalled: Vec<String> = Vec::new();
     for (name, clause) in CLAUSES {
-        let needle = format!("{name}(");
         let calls: usize = sources
             .iter()
-            .map(|(_, code)| {
-                code.match_indices(&needle)
-                    // Calls, not definitions.
-                    .filter(|(at, _)| !code[..*at].trim_end().ends_with("fn"))
-                    .count()
-            })
+            .map(|(_, code)| production_calls(code, name))
             .sum();
         if calls == 0 {
             uncalled.push(format!("`{name}` performs `{clause}`"));
