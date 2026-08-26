@@ -343,12 +343,20 @@ fn the_loop_selects_through_one_function() {
 /// character-for-character copies of the seam's body, and the seam's only caller
 /// was `run.rs`. `reviews/FINDINGS.md` §19, claim (4).
 ///
-/// **The needle is the qualified path**, and that is what makes a plain
-/// substring search sound here: nothing else in the crate ends in
-/// `capacity::pool_for`, so the collision class that
-/// `every_packet_named_recovery_action_has_a_production_caller` was carrying
-/// cannot arise. Stated rather than assumed, because assuming it is what that
-/// census did.
+/// **The needle is a free call to `pool_for`**, through the shared
+/// [`crate::effects::census_domain::production_calls`]. It was the literal
+/// `capacity::pool_for(`, which reasons about one direction only — a longer
+/// identifier colliding with it — and not about the other: `use
+/// crate::capacity::pool_for;` followed by a bare `pool_for(...)` is the
+/// ordinary way to write a second implementation and that literal does not
+/// match it. Both spellings are already live in this tree. `R5-SEAMS-002`.
+///
+/// **What it still cannot see, stated rather than left to be found**: a second
+/// resolution that never names the function. `capacity::pool_for` is
+/// `pools.iter().find(…)`, and a caller walking `self.pools` inline is a second
+/// implementation of the rule with no `pool_for` in it. A name census cannot
+/// reach that, so what this asserts is **one named resolution**, not one
+/// resolution.
 ///
 /// **The count is one and not zero.** Zero would mean the seam had been rewritten
 /// to resolve pools some other way, which is the same defect from the other
@@ -369,13 +377,49 @@ fn the_frozen_pool_table_is_read_through_one_seam() {
         source.len()
     );
 
-    let calls = code.matches("capacity::pool_for(").count();
+    // **Free calls to `pool_for`, not the qualified spelling.** The needle was
+    // the literal `capacity::pool_for(`, which does not match the ordinary way
+    // to write a second implementation — `use crate::capacity::pool_for;` and
+    // then a bare `pool_for(...)`. Both idioms are live in this tree
+    // (`config.rs` writes the qualified form, `capacity.rs` the bare one), so
+    // it is not a hypothetical spelling. `R5-SEAMS-002`, `PR7-R5-ATT-002`.
+    //
+    // `Call::Free` is what separates a second implementation from the seam's
+    // own callers: the plan builder and the reviewer profile ask
+    // `self.pool_for(...)`, a method call, and the trait method's definition is
+    // filtered as a definition.
+    use crate::effects::census_domain::{Call, production_calls};
+
+    let calls = production_calls(&code, "pool_for", Call::Free);
     assert_eq!(
         calls, 1,
         "{FILE} resolves an agent's pool from the frozen table in {calls} places. One is \
          `AttemptPlans::pool_for`, which is the seam every caller is supposed to ask; a second is \
          a rule with two implementations, and `wrong_internal_assumption` is how this project \
          pays for those"
+    );
+
+    // Controls on the needle itself, both directions, because a needle that has
+    // stopped matching reads exactly like a clean file.
+    assert_eq!(
+        production_calls(
+            "use crate::capacity::pool_for;\nfn second() { pool_for(agent, pools); }\n",
+            "pool_for",
+            Call::Free,
+        ),
+        1,
+        "the needle this census reads {FILE} with does not see a bare `pool_for(` behind a \
+         `use`, which is how a second implementation is ordinarily written"
+    );
+    assert_eq!(
+        production_calls(
+            "fn asks() { self.pool_for(agent); }\n",
+            "pool_for",
+            Call::Free
+        ),
+        0,
+        "the needle counts the seam's own callers, so every caller asking correctly would be \
+         reported as a second implementation"
     );
 }
 

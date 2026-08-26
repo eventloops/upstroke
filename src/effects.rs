@@ -1257,6 +1257,118 @@ pub(crate) mod census_domain {
     /// fixture is reported as an offender and someone looks; deriving one it
     /// should not removes a real production file, silently. Only the first
     /// direction is safe, so the predicate stays the narrow one.
+    /// Calls to `name` in `code`: neither its definition, nor a longer identifier
+    /// that merely ends in it.
+    ///
+    /// The second half is the one that was missing. A needle built as
+    /// `format!("{name}(")` is a plain substring search, so `expected_refs(` is
+    /// satisfied by every `refuse_unexpected_refs(` in the tree — and a census whose
+    /// entry is proved by a different function's call sites proves nothing about its
+    /// own. Measured on this tree: `workspace_manager.rs` carries four occurrences of
+    /// the substring `expected_refs(` and **zero** calls to `expected_refs` — one of
+    /// the four survives into `production_code`'s region, and it is the *definition
+    /// line* of `refuse_unexpected_refs`, which the "calls, not definitions" filter
+    /// does not see because the text before the match is `pub fn refuse_un`.
+    ///
+    /// The boundary is "the byte before the match is not an identifier byte", which
+    /// keeps `crate::a::b::expected_refs(` — `:` is not one — and rejects
+    /// `unexpected_refs(`. Not a rename, which is how
+    /// `the_barrier_is_the_only_topology_route_from_a_proven_prefix_to_an_append_handle`
+    /// closed the same class: that census's needle is a constant it could choose,
+    /// this one's is eleven names the packet chose.
+    pub(crate) fn production_calls(code: &str, name: &str, form: Call) -> usize {
+        let needle = format!("{name}(");
+        code.match_indices(&needle)
+            // Not the tail of a longer identifier.
+            .filter(|(at, _)| {
+                code[..*at]
+                    .chars()
+                    .next_back()
+                    .is_none_or(|before| !before.is_alphanumeric() && before != '_')
+            })
+            // Calls, not definitions.
+            .filter(|(at, _)| !code[..*at].trim_end().ends_with("fn"))
+            // And the form the clause is written in, which is what tells three
+            // items of one name apart.
+            .filter(|(at, _)| {
+                let dotted = code[..*at].trim_end().ends_with('.');
+                match form {
+                    Call::Free => !dotted,
+                    Call::Method => dotted,
+                }
+            })
+            .count()
+    }
+
+    /// How a clause's function is **called** in production.
+    ///
+    /// Not decoration. `settle_interrupted` names three unrelated production items
+    /// in this tree — `recover::settle_interrupted` (the `T-ATTEMPT` clause, a free
+    /// function), `AttemptContext::settle_interrupted` and
+    /// `events::RunState::settle_interrupted` (both methods, both called) — and a
+    /// census counting the bare name is satisfied by either of the other two.
+    /// Measured by S5 round 4: deleting step (d)'s only production call left the
+    /// census **and the entire suite** green, with `attempt_interrupted` appended
+    /// by no run. `reviews/FINDINGS.md` §4's "a refutation must name which item it
+    /// inspected" is the same rule; this is it applied to the instrument.
+    #[derive(Clone, Copy)]
+    pub(crate) enum Call {
+        /// `name(…)` or `path::name(…)` — never `receiver.name(…)`.
+        Free,
+        /// `receiver.name(…)`.
+        Method,
+    }
+
+    /// The **files** [`declared_whole_file_test_modules`] resolves to, as a set a
+    /// census can test membership in.
+    ///
+    /// The resolution loop — assert exactly one of the two candidates exists,
+    /// collect it — was written out at each caller, and a third caller wrote a
+    /// different rule instead: `path.file_stem() == "tests"`. That covers the
+    /// fourteen files named `tests.rs` and **not** the three that are not:
+    /// `#[cfg(test)] mod scaffold;`, `mod premove;` and `mod fake;`. Seventeen,
+    /// not fourteen, and the three it missed are the ones a census is most
+    /// likely to trip over, because a scaffold and a fake exist to *name* the
+    /// things production names. Found by S5 round 5's `seams`, `attempt` and
+    /// `settle` lenses independently; the consolidation had been filed one
+    /// commit earlier in `reviews/FINDINGS.md` §20 as tidiness.
+    ///
+    /// # Panics
+    ///
+    /// When a declaration resolves to no file or to both candidates — a skip
+    /// path naming no file is a skip that has stopped meaning anything — or
+    /// when fewer than `floor` declarations are derived, which is the control
+    /// against a derivation that has silently stopped finding anything.
+    pub(crate) fn whole_file_test_modules(
+        files: &[PathBuf],
+        floor: usize,
+    ) -> std::collections::BTreeSet<PathBuf> {
+        let declarations = declared_whole_file_test_modules(files);
+        assert!(
+            declarations.len() >= floor,
+            "only {} `#[cfg(test)] mod …;` declarations were derived and the floor is {floor}; \
+             the derivation is finding nothing",
+            declarations.len()
+        );
+        let mut modules = std::collections::BTreeSet::new();
+        for (declared_in, name, candidates) in &declarations {
+            let present: Vec<&PathBuf> = candidates
+                .iter()
+                .filter(|candidate| candidate.is_file())
+                .collect();
+            assert_eq!(
+                present.len(),
+                1,
+                "`{}` declares `#[cfg(test)] mod {name};` and {} of {candidates:?} exist. A skip \
+                 path naming no file is a skip that has stopped meaning anything",
+                declared_in.display(),
+                present.len()
+            );
+            modules.insert(present[0].clone());
+        }
+        modules
+    }
+
     pub(crate) fn declared_whole_file_test_modules(
         files: &[PathBuf],
     ) -> Vec<(PathBuf, String, [PathBuf; 2])> {

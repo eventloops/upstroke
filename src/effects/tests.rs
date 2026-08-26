@@ -2931,6 +2931,67 @@ fn the_view_directory_has_one_definition_in_the_tree() {
     );
 }
 
+/// **The whole-file test modules a census skips are the crate's declarations,
+/// and there are seventeen of them.**
+///
+/// The class boundary for `PR7-R5-ATT-001`. Four whole-tree censuses skip test
+/// files; three took the set from
+/// [`census_domain::declared_whole_file_test_modules`] and one wrote its own
+/// rule, `path.file_stem() == "tests"`. That covers fourteen files. The crate
+/// declares **seventeen**, and the three it misses are exactly the ones a
+/// census is most likely to trip over — a scaffold and a fake exist to *name*
+/// what production names, and `scaffold.rs` sits inside the `engine/topology`
+/// domain one of those censuses walks.
+///
+/// Named individually rather than counted, because a count alone would pass if
+/// the derivation swapped one file for another.
+#[test]
+fn the_declared_whole_file_test_modules_are_seventeen_and_three_are_not_called_tests() {
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+    let mut files = Vec::new();
+    let mut stack = vec![root.clone()];
+    while let Some(dir) = stack.pop() {
+        for entry in std::fs::read_dir(&dir).expect("src is readable") {
+            let path = entry.expect("a directory entry").path();
+            if path.is_dir() {
+                stack.push(path);
+            } else if path.extension().is_some_and(|ext| ext == "rs") {
+                files.push(path);
+            }
+        }
+    }
+
+    let modules = crate::effects::census_domain::whole_file_test_modules(&files, 13);
+    let named: Vec<String> = modules
+        .iter()
+        .filter(|path| path.file_stem().is_none_or(|stem| stem != "tests"))
+        .map(|path| {
+            path.strip_prefix(&root)
+                .unwrap_or(path)
+                .to_string_lossy()
+                .replace('\\', "/")
+        })
+        .collect();
+
+    assert_eq!(
+        named,
+        vec![
+            "engine/topology/scaffold.rs".to_owned(),
+            "events/log/premove.rs".to_owned(),
+            "runner/container/fake.rs".to_owned(),
+        ],
+        "these are the whole-file test modules a `file_stem == \"tests\"` rule does not see, and \
+         a census that uses that rule reads them as production"
+    );
+    assert_eq!(
+        modules.len(),
+        17,
+        "the crate declares {} whole-file test modules; a census skipping fourteen of them by \
+         file name leaves the rest inside its domain",
+        modules.len()
+    );
+}
+
 /// [`production_code`] removes the item and keeps the file.
 ///
 /// Every shape here is one this tree actually contains, and each is a way a

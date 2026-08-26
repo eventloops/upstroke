@@ -613,7 +613,11 @@ pub enum Progress {
 /// **It owns the slot assertion (R3)**, and the sentence here said it did not.
 /// `slots: SlotAssertion` is a field of this struct, `TopologyRun::resumed`
 /// initialises it with `SlotAssertion::new()`, and `fn attempt` threads
-/// `slots: &mut self.slots` into every `AttemptContext`. The denial was written
+/// `slots: &mut self.slots` into the one production `AttemptContext`. Named
+/// rather than cited by line: the correction that replaced this paragraph made
+/// it thirteen lines longer, so the `run.rs:615` the first draft carried now
+/// points **into the correction itself**. `R5-SEAMS`/`PR7-R5-ATT-007`, and
+/// CLAUDE.md's trap list already names stale line anchors as a repeat cost. The denial was written
 /// while that was true — "a field nothing reads is a claim the code does not
 /// back" — and stayed after the branch that uses it arrived.
 /// `PR7-R3-CONTRACT-006`; confirmed against the tree and corrected 2026-08-26.

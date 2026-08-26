@@ -1613,6 +1613,20 @@ mod tests {
     /// [`an_ending_run_offers_no_work_from_any_arm`] claim "every arm" and have
     /// the claim mean something. A list of names someone remembers to extend is
     /// how that test came to cover three of six while its own doc said every.
+    /// Every label [`arm_label`] can return for a step that **offers work**.
+    const OFFERS_WORK: &[&str] = &[
+        "Integrate",
+        "Retry",
+        "Dispatch",
+        "Dispatch (continuing)",
+        "Backoff",
+        "HardBlock",
+    ];
+
+    /// And every label for a step that does not. None of the three is work, and
+    /// each is a state an ending run is allowed to reach.
+    const OFFERS_NO_WORK: &[&str] = &["Poisoned", "BudgetExceeded", "Closure"];
+
     fn arm_label(step: &Step) -> &'static str {
         match step {
             Step::Poisoned => "Poisoned",
@@ -1629,6 +1643,90 @@ mod tests {
             Step::HardBlock { .. } => "HardBlock",
             Step::Closure(_) => "Closure",
         }
+    }
+
+    /// **Every label [`arm_label`] can return is classified.**
+    ///
+    /// The half of "every arm" that the type does not give. `arm_label` is total
+    /// over [`Step`], so a new variant is a compile error there — measured by S5
+    /// round 5, which added a `Step::Provision` and saw `E0004` exactly as
+    /// claimed. But the claim went one step further and said the new arm "cannot
+    /// then be left out of this test without the coverage assertion failing",
+    /// and **that half was false**: once the author satisfies the compiler with
+    /// `Step::Provision => "Provision"`, [`OFFERS_WORK`] is a hand-written
+    /// `const` nothing forces them to extend, and
+    /// `an_ending_run_offers_no_work_from_any_arm` passes with the new arm
+    /// undriven. `PR7-R5-LOOP-002`, `R5-SEAMS-004`, `R5-SETTLE-003`.
+    ///
+    /// So this closes the loop from the other end: it reads `arm_label`'s own
+    /// match body out of this file and asserts every literal it returns appears
+    /// in exactly one of the two lists. A new variant now costs three edits and
+    /// **none of them can be skipped** — the match arm (rustc), the
+    /// classification (this test), and, if it offers work, a case in the
+    /// witness (that test's own coverage assertion).
+    ///
+    /// The body is bounded by brace matching rather than by a line count,
+    /// because this file's own history has three occurrences of an anchor going
+    /// stale under `cargo fmt` alone.
+    #[test]
+    fn every_label_the_arm_classifier_returns_is_classified() {
+        const SIGNATURE: &str = "fn arm_label(step: &Step) -> &'static str {";
+
+        let source = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/engine/topology/select.rs"),
+        )
+        .expect("this file is readable");
+        let at = source
+            .find(SIGNATURE)
+            .expect("`arm_label`'s signature moved; this census cannot find its body");
+        let open = at + SIGNATURE.len() - 1;
+        let mut depth = 0_usize;
+        let mut end = None;
+        for (offset, ch) in source[open..].char_indices() {
+            match ch {
+                '{' => depth += 1,
+                '}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        end = Some(open + offset);
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+        let body = &source[open..end.expect("`arm_label`'s body is brace-balanced")];
+
+        let mut returned: Vec<String> = body
+            .match_indices("=> \"")
+            .map(|(at, _)| {
+                let rest = &body[at + 4..];
+                rest[..rest.find('"').expect("a closed string literal")].to_owned()
+            })
+            .collect();
+        returned.sort_unstable();
+        returned.dedup();
+
+        let mut classified: Vec<String> = OFFERS_WORK
+            .iter()
+            .chain(OFFERS_NO_WORK.iter())
+            .map(|label| (*label).to_owned())
+            .collect();
+        classified.sort_unstable();
+
+        assert!(
+            returned.len() >= 9,
+            "`arm_label` returns {} distinct labels, so this census found a body it could not \
+             read rather than a classifier: {returned:?}",
+            returned.len()
+        );
+        assert_eq!(
+            returned, classified,
+            "`arm_label` returns a label that neither `OFFERS_WORK` nor `OFFERS_NO_WORK` names, \
+             or names one it cannot return. A new `Step` variant is a compile error in \
+             `arm_label` and nothing else, so without this the author satisfies rustc, leaves \
+             the lists alone, and the witness below passes with the new arm undriven"
+        );
     }
 
     /// **An ending run offers no work — from every arm, not from the empty fold.**
@@ -1697,20 +1795,6 @@ mod tests {
     /// three-arm version could not tell them apart.
     #[test]
     fn an_ending_run_offers_no_work_from_any_arm() {
-        /// Every label [`arm_label`] can return for a step that offers work.
-        ///
-        /// `Poisoned`, `BudgetExceeded` and `Closure` are the complement: none
-        /// of the three is work, and each is a state an ending run is allowed
-        /// to reach.
-        const OFFERS_WORK: &[&str] = &[
-            "Integrate",
-            "Retry",
-            "Dispatch",
-            "Dispatch (continuing)",
-            "Backoff",
-            "HardBlock",
-        ];
-
         // Each case: a fold where THIS arm is live, then the same fold ended.
         // The live assertion is the premise, and it names the arm — asserting
         // merely "not closure" let a case pass on a *different* arm being live,

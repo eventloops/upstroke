@@ -104,11 +104,18 @@ pub struct RunIdentity {
 
 /// The mutable state one emit touches, borrowed for the call.
 ///
-/// Five borrows rather than one `&mut TopologyRun` because this module is
+/// **Four** borrows rather than one `&mut TopologyRun` because this module is
 /// deliberately not the run: `emit` is called from creation, from recovery, and
 /// from the loop, and each of those holds its own surrounding state. What every
-/// one of them must hand over is exactly this — and the append-error protocol's
-/// obligations are each a statement about one of these five.
+/// one of them must hand over is exactly this.
+///
+/// **It said five, and said the protocol's obligations were each a statement
+/// about one of them.** Both halves stopped being true when `bcc5c2f` moved
+/// obligation (3) to the caller and deleted the `invocations` field: the count
+/// is four, and obligation (3) is now *not* a statement about a field here —
+/// [`AppendError`]'s own protocol note says so in as many words. `9b6fef1`
+/// removed that field's stranded doc lines from `warnings` and left this
+/// sentence seven lines above them unread. `R5-SEAMS-005`.
 pub struct EmitState<'a> {
     /// The derived state. Poisoned by the protocol, never mutated by it.
     pub fold: &'a mut TopologyFold,

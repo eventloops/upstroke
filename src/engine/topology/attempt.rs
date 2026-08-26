@@ -661,19 +661,23 @@ impl AttemptContext<'_> {
     /// never converted, and never cancelled, because cancellation lives in the
     /// failure branch that the first, passing, verify did not take.
     ///
+    /// **This block used to sit above `fn emit`**, which `bcc5c2f` inserted
+    /// between it and this function with no blank line — so all of it attached
+    /// to `emit`, `start` rendered undocumented, and `emit`'s own two
+    /// paragraphs read as a continuation of the `# Errors` section below.
+    /// `PR7-R3-EMIT-004`, the doc-re-targeting class `reviews/FINDINGS.md` §4
+    /// records; split 2026-08-26 by moving `emit` above this block rather than
+    /// by moving the prose. **Above the `# Errors` heading, not after it**: the
+    /// first attempt appended it to the end of the block, and rustdoc renders
+    /// everything from a heading to the next heading as that section — so this
+    /// paragraph became part of `start`'s error contract, which is the same
+    /// rendering failure one level in. `PR7-R5-ATT-006`.
+    ///
     /// # Errors
     ///
     /// Whatever the emitter returns; [`UpstrokeError::Refused`] from the slot
     /// assertion or the invocation ledger; or a runner failure. A non-zero exit
     /// is not an error — it is a [`ProcessOutput`] and the caller's to judge.
-    ///
-    /// **This block used to sit above `fn emit`**, which `bcc5c2f` inserted
-    /// between it and this function with no blank line — so all of it attached
-    /// to `emit`, `start` rendered undocumented, and `emit`'s own two
-    /// paragraphs read as a continuation of the `# Errors` section above.
-    /// `PR7-R3-EMIT-004`, the doc-re-targeting class `reviews/FINDINGS.md` §4
-    /// records; confirmed against the tree and split 2026-08-26 by moving
-    /// `emit` above this block rather than by moving the prose.
     pub fn start(
         &mut self,
         site: AttemptSite<'_>,

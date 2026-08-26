@@ -659,8 +659,27 @@ pub(crate) fn docker_gate(test: &str, trace: ContainerTrace) -> Result<Box<Docke
     Err(reason)
 }
 
-/// The repository key every container name in a Docker-gated test is built
-/// from, **scoped to the build slot this process is running in**.
+/// The repository key every container name **that a pre-clean touches** is
+/// built from, **scoped to the build slot this process is running in**.
+///
+/// **Not "every container name in a Docker-gated test".** That is what this
+/// sentence said after the move from `exec.rs`, where the narrower "every
+/// container name in this module" was true; `runner::container::tests` names
+/// Docker-gated containers with bare literals carrying no repo key at all and
+/// reclaims them with `let _ = docker.remove(name);` rather than through
+/// [`preclean_names`]. Those names are outside this rule and outside the guard
+/// that enforces it. `R5-SEAMS-003`.
+///
+/// **And the guard is inert when there is no slot.** With `CARGO_TARGET_DIR`
+/// unset, [`scoped_repo_key`] returns the fixed `0123456789abcdef`, so two
+/// concurrent bare `cargo test` runs on one box derive the same key, pass
+/// [`unscoped_names`], and each pre-clean kills the other's live container —
+/// the state the guard exists to refuse. It is inert in exactly the
+/// configuration with no other protection. Recorded rather than repaired,
+/// because the alternative — a per-process key — makes the pre-clean useless,
+/// which is the trade the "why this is not a constant" section below is about.
+/// On this box every gate command goes through `upstroke-build`, and CI's bare
+/// `cargo test` runs one job per machine. `R5-SEAMS-006`.
 ///
 /// # Why this is not a constant
 ///

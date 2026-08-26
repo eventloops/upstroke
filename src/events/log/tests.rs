@@ -3398,30 +3398,11 @@ fn the_stable_prefix_barrier_is_the_only_way_a_log_becomes_a_topology_fold() {
     // on this tree before the repair: the raw split derived 50 skip paths of
     // which 34 named no file at all, and one `//` line was enough to remove a
     // real production module from this census's domain.
-    let declarations = crate::effects::census_domain::declared_whole_file_test_modules(&files);
-    assert!(
-        declarations.len() >= 13,
-        "only {} `#[cfg(test)] mod …;` declarations were derived; the derivation is \
-         finding nothing",
-        declarations.len()
-    );
-    let mut test_modules: BTreeSet<PathBuf> = BTreeSet::new();
-    for (declared_in, name, candidates) in &declarations {
-        let present: Vec<&PathBuf> = candidates
-            .iter()
-            .filter(|candidate| candidate.is_file())
-            .collect();
-        assert_eq!(
-            present.len(),
-            1,
-            "`{}` declares `#[cfg(test)] mod {name};` and {} of {candidates:?} exist. A skip \
-             path naming no file is a skip that has stopped meaning anything, and one naming \
-             two is a skip whose target nobody chose",
-            declared_in.display(),
-            present.len()
-        );
-        test_modules.insert(present[0].clone());
-    }
+    // Through the shared resolver. This loop stood here, in `runner::tests`
+    // and — as a *third*, different rule — in `recover::tests`, which keyed on
+    // the file name and covered fourteen of the seventeen. `PR7-R5-ATT-001`.
+    let test_modules: BTreeSet<PathBuf> =
+        crate::effects::census_domain::whole_file_test_modules(&files, 13);
     assert!(
         test_modules.contains(&src.join("events").join("log").join("tests.rs")),
         "this file is declared `#[cfg(test)] mod tests;` and the scan has to know it: {test_modules:?}"

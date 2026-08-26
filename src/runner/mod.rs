@@ -1223,20 +1223,38 @@ mod tests {
 
     /// Assignments to `field` **through a receiver**, in every assignment form.
     ///
-    /// `x.field = …`, `x.field += …` and the other compound operators; never
-    /// `x.field == …`, and never a longer field whose name starts with this
-    /// one. The literal `".field ="` misses `+=`, which is the idiomatic form
-    /// of an increment and therefore the form a second counting rule is most
-    /// likely to arrive in — measured surviving, S5 round 4.
+    /// `x.field = …` and **all ten** of Rust's compound assignment operators —
+    /// `+= -= *= /= %= &= |= ^= <<= >>=`; never `x.field == …`, and never a
+    /// longer field whose name starts with this one.
+    ///
+    /// Two measured fail-open holes, both in the same direction. The literal
+    /// `".field ="` misses `+=` — the idiomatic increment, and therefore the
+    /// form a second counting rule is most likely to arrive in (S5 round 4).
+    /// The five-operator repair for that then missed `&= |= ^=` (not in its
+    /// set) and `<<= >>=` (second byte not `=`), which S5 round 5 measured with
+    /// `task.attempts_on_rung |= 1;` (`R5-SETTLE-001`). The enumeration is now
+    /// the language's, so there is no sixth hole of this shape.
     fn receiver_writes(code: &str, field: &str) -> usize {
         let needle = format!(".{field}");
         code.match_indices(&needle)
             .filter(|(at, _)| {
                 let rest = code[at + needle.len()..].trim_start();
                 match rest.as_bytes() {
+                    // `==` is a comparison, not a write.
                     [b'=', b'=', ..] => false,
                     [b'=', ..] => true,
-                    [op, b'=', ..] => matches!(op, b'+' | b'-' | b'*' | b'/' | b'%'),
+                    // `<<=` and `>>=`, whose second byte is not `=`.
+                    [b'<', b'<', b'=', ..] | [b'>', b'>', b'=', ..] => true,
+                    // The seven single-character compound operators. Rust has
+                    // ten in total and this arm used to name five: `&= |= ^=`
+                    // fell through it and `<<= >>=` never reached it, so
+                    // `task.attempts_on_rung |= 1;` — a bare assignment through
+                    // a receiver, inside the domain all three doc sentences
+                    // state — left the census green. `R5-SETTLE-001`, and it is
+                    // `PR7-R3-CENSUS-WRITE-DOMAIN-PROSE` five operators over.
+                    [op, b'=', ..] => {
+                        matches!(op, b'+' | b'-' | b'*' | b'/' | b'%' | b'&' | b'|' | b'^')
+                    }
                     _ => false,
                 }
             })
@@ -1338,29 +1356,11 @@ mod tests {
         let mut files = Vec::new();
         walk(&root.join("src"), &mut files);
         assert!(files.len() > 20, "the walk found the tree: {}", files.len());
-        let declarations = crate::effects::census_domain::declared_whole_file_test_modules(&files);
-        assert!(
-            declarations.len() >= 13,
-            "only {} `#[cfg(test)] mod …;` declarations were derived; the derivation is \
-             finding nothing",
-            declarations.len()
-        );
-        let mut test_modules = std::collections::BTreeSet::new();
-        for (declared_in, name, candidates) in &declarations {
-            let present: Vec<&PathBuf> = candidates
-                .iter()
-                .filter(|candidate| candidate.is_file())
-                .collect();
-            assert_eq!(
-                present.len(),
-                1,
-                "`{}` declares `#[cfg(test)] mod {name};` and {} of {candidates:?} exist. A \
-                 skip path naming no file is a skip that has stopped meaning anything",
-                declared_in.display(),
-                present.len()
-            );
-            test_modules.insert(present[0].clone());
-        }
+        // Through the shared resolver: this loop was written out here and in
+        // `events::log::tests`, and a third census then wrote a *different*
+        // rule — `file_stem == "tests"` — which covers fourteen of the
+        // seventeen. `PR7-R5-ATT-001`.
+        let test_modules = crate::effects::census_domain::whole_file_test_modules(&files, 13);
         // The control: a derivation that found nothing would silently count
         // every test file as production, which is the failure this replaces.
         assert!(
@@ -2268,16 +2268,20 @@ mod tests {
         // because the revert bypasses the closure. A control only binds the
         // census's own count if it travels through it, so this synthetic file
         // joins the corpus and is expected in the table like any other: it
-        // carries **two** compound assignments and one comparison, and expects
-        // 2. The pre-repair literal `.attempts_on_rung =` scores it **1**: it
-        // misses both `+=` and `-=` and matches the `==`. One compound
-        // assignment and one comparison would have scored 1 under both needles
-        // and passed — measured, and the reason the control is shaped this way.
+        // carries **four** compound assignments — one from each shape the
+        // needle has had to grow to cover, `+= -=` and `|= <<=` — and one
+        // comparison, and expects 4. The pre-repair literal
+        // `.attempts_on_rung =` scores it **1** (it matches only the `==`), and
+        // the five-operator version scores it **2**. One compound assignment
+        // and one comparison would have scored 1 under both the literal and the
+        // correct needle, because the two errors cancel — measured, and the
+        // reason the control is shaped this way.
         const SELF_CHECK: &str = "<self-check>";
         let mut corpus = production_sources();
         corpus.push((
             SELF_CHECK.to_owned(),
             "fn control() {\n    state.attempts_on_rung += 1;\n    state.attempts_on_rung -= 1;\n    \
+             state.attempts_on_rung |= 1;\n    state.attempts_on_rung <<= 1;\n    \
              if state.attempts_on_rung == 1 {}\n}\n"
                 .to_owned(),
         ));
@@ -2297,7 +2301,7 @@ mod tests {
         let expected: BTreeMap<String, (usize, usize)> = EXPECTED
             .iter()
             .map(|(path, w, c, _)| ((*path).to_owned(), (*w, *c)))
-            .chain(std::iter::once((SELF_CHECK.to_owned(), (2, 0))))
+            .chain(std::iter::once((SELF_CHECK.to_owned(), (4, 0))))
             .collect();
         assert_eq!(
             found, expected,
@@ -2332,7 +2336,21 @@ mod tests {
             "`+=` is the idiomatic increment and the form a second counting rule arrives in"
         );
         assert_eq!(receiver_writes("state.attempts -= 1;", "attempts"), 1);
+        for compound in ["*=", "/=", "%=", "&=", "|=", "^=", "<<=", ">>="] {
+            assert_eq!(
+                receiver_writes(&format!("state.attempts {compound} 1;"), "attempts"),
+                1,
+                "`{compound}` is one of Rust's ten compound assignment operators and this needle \
+                 does not see it, so a second counting rule written that way is invisible"
+            );
+        }
         assert_eq!(receiver_writes("if state.attempts == 1 {}", "attempts"), 0);
+        assert_eq!(
+            receiver_writes("if state.attempts <= 1 {}", "attempts"),
+            0,
+            "a comparison is not a write, and `<=` is one byte from `<<=`"
+        );
+        assert_eq!(receiver_writes("if state.attempts >= 1 {}", "attempts"), 0);
         assert_eq!(receiver_writes("state.attempts_total = 1;", "attempts"), 0);
         assert_eq!(receiver_writes("let x = state.attempts;", "attempts"), 0);
 
@@ -2382,10 +2400,25 @@ mod tests {
     /// **guard**, which is the one-rule-two-places class at its worst — a
     /// dropped convenience is a bug, a dropped guard is a vulnerability.
     ///
-    /// The census is on the **pairing**, not on a count: wherever a `stem` is
-    /// built from a `display_id`, `filename_component` appears in the same
-    /// expression. That is what makes it survive a third assembler being
-    /// written, which a count could not.
+    /// The census is on the **pairing**: wherever a `stem` is built from a
+    /// plan-authored id, `filename_component` appears in the same expression.
+    ///
+    /// **It is also on a count, and the two say different things.** This
+    /// paragraph used to end "that is what makes it survive a third assembler
+    /// being written, which a count could not" — and the control below is now
+    /// `assert_eq!(guarded + unguarded, 4)`, so a fourth *correctly guarded*
+    /// assembler fails this test. That is deliberate (a new site has to be read
+    /// once by a person, and a needle that quietly stops matching reads exactly
+    /// like a clean tree) but it is the opposite of what the sentence promised.
+    /// `R5-SETTLE-004`.
+    ///
+    /// **What the pairing cannot see, stated rather than left to be found**: a
+    /// site that rebinds the id one line earlier — `let id = task.id.to_string();`
+    /// and then a stem built from `id` — is not a site at all, so it never
+    /// enters either list and the count still reads 4. `coordinator.rs` already
+    /// carries a `let task_id = …` seven lines above the stem it builds, so the
+    /// shape is not hypothetical. Reaching it needs data flow, not a needle.
+    /// `R5-SETTLE-006`.
     ///
     /// `util::filename_component_neutralizes_hostile_names` is the other half —
     /// it asserts `"unit/fast"` becomes `"unit-fast"` and that an all-dots

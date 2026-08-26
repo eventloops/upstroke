@@ -4223,6 +4223,21 @@ fn kill_during_recovery_repeats_recovery() {
 fn the_barrier_is_the_only_topology_route_from_a_proven_prefix_to_an_append_handle() {
     const ENTRY: &str = "into_log_and_fold(";
     let src = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+    let test_modules = {
+        let mut all = Vec::new();
+        let mut stack = vec![src.clone()];
+        while let Some(dir) = stack.pop() {
+            for entry in std::fs::read_dir(&dir).expect("src is readable") {
+                let path = entry.expect("a directory entry").path();
+                if path.is_dir() {
+                    stack.push(path);
+                } else if path.extension().is_some_and(|ext| ext == "rs") {
+                    all.push(path);
+                }
+            }
+        }
+        crate::effects::census_domain::whole_file_test_modules(&all, 13)
+    };
     let mut stack = vec![src.clone()];
     let mut callers: Vec<(String, usize)> = Vec::new();
     let mut regions: Vec<(String, usize, usize)> = Vec::new();
@@ -4248,10 +4263,14 @@ fn the_barrier_is_the_only_topology_route_from_a_proven_prefix_to_an_append_hand
             if !relative.starts_with("engine/topology") {
                 continue;
             }
-            // A file the crate declares `mod tests;` under a test
-            // configuration is test code in full and has no production half;
-            // counting one would count a fixture as a second route.
-            if path.file_stem().is_some_and(|stem| stem == "tests") {
+            // A file the crate declares as a whole-file test module is test
+            // code in full and has no production half; counting one would
+            // count a fixture as a second route. **Through the crate's own
+            // declarations**, not through the file name: three of the
+            // seventeen are not called `tests.rs`, and one of those is
+            // `engine/topology/scaffold.rs` — inside this very census's
+            // `engine/topology` domain. `PR7-R5-ATT-001`.
+            if test_modules.contains(&path) {
                 continue;
             }
             scanned += 1;
@@ -7185,68 +7204,6 @@ impl crate::interaction::Sleeper for RecordingSleeper {
     }
 }
 
-/// Calls to `name` in `code`: neither its definition, nor a longer identifier
-/// that merely ends in it.
-///
-/// The second half is the one that was missing. A needle built as
-/// `format!("{name}(")` is a plain substring search, so `expected_refs(` is
-/// satisfied by every `refuse_unexpected_refs(` in the tree — and a census whose
-/// entry is proved by a different function's call sites proves nothing about its
-/// own. Measured on this tree: `workspace_manager.rs` carries four occurrences of
-/// the substring `expected_refs(` and **zero** calls to `expected_refs` — one of
-/// the four survives into `production_code`'s region, and it is the *definition
-/// line* of `refuse_unexpected_refs`, which the "calls, not definitions" filter
-/// does not see because the text before the match is `pub fn refuse_un`.
-///
-/// The boundary is "the byte before the match is not an identifier byte", which
-/// keeps `crate::a::b::expected_refs(` — `:` is not one — and rejects
-/// `unexpected_refs(`. Not a rename, which is how
-/// `the_barrier_is_the_only_topology_route_from_a_proven_prefix_to_an_append_handle`
-/// closed the same class: that census's needle is a constant it could choose,
-/// this one's is eleven names the packet chose.
-fn production_calls(code: &str, name: &str, form: Call) -> usize {
-    let needle = format!("{name}(");
-    code.match_indices(&needle)
-        // Not the tail of a longer identifier.
-        .filter(|(at, _)| {
-            code[..*at]
-                .chars()
-                .next_back()
-                .is_none_or(|before| !before.is_alphanumeric() && before != '_')
-        })
-        // Calls, not definitions.
-        .filter(|(at, _)| !code[..*at].trim_end().ends_with("fn"))
-        // And the form the clause is written in, which is what tells three
-        // items of one name apart.
-        .filter(|(at, _)| {
-            let dotted = code[..*at].trim_end().ends_with('.');
-            match form {
-                Call::Free => !dotted,
-                Call::Method => dotted,
-            }
-        })
-        .count()
-}
-
-/// How a clause's function is **called** in production.
-///
-/// Not decoration. `settle_interrupted` names three unrelated production items
-/// in this tree — `recover::settle_interrupted` (the `T-ATTEMPT` clause, a free
-/// function), `AttemptContext::settle_interrupted` and
-/// `events::RunState::settle_interrupted` (both methods, both called) — and a
-/// census counting the bare name is satisfied by either of the other two.
-/// Measured by S5 round 4: deleting step (d)'s only production call left the
-/// census **and the entire suite** green, with `attempt_interrupted` appended
-/// by no run. `reviews/FINDINGS.md` §4's "a refutation must name which item it
-/// inspected" is the same rule; this is it applied to the instrument.
-#[derive(Clone, Copy)]
-enum Call {
-    /// `name(…)` or `path::name(…)` — never `receiver.name(…)`.
-    Free,
-    /// `receiver.name(…)`.
-    Method,
-}
-
 /// **A call census's needle is not satisfied by a longer name ending in it.**
 ///
 /// The class boundary, not the instance. S5 round 4 found that
@@ -7263,37 +7220,37 @@ enum Call {
 #[test]
 fn a_call_census_needle_is_not_satisfied_by_a_longer_name_ending_in_it() {
     assert_eq!(
-        production_calls(
+        crate::effects::census_domain::production_calls(
             "            .refuse_unexpected_refs(&namespace, &expected)?;\n",
             "expected_refs",
-            Call::Free
+            crate::effects::census_domain::Call::Free
         ),
         0,
         "a longer identifier ending in the entry's name satisfied its census entry"
     );
     assert_eq!(
-        production_calls(
+        crate::effects::census_domain::production_calls(
             "        let expected = crate::engine::topology::candidate::expected_refs(&r, f);\n",
             "expected_refs",
-            Call::Free
+            crate::effects::census_domain::Call::Free
         ),
         1,
         "a genuine call through a path was rejected: `:` is not an identifier byte"
     );
     assert_eq!(
-        production_calls(
+        crate::effects::census_domain::production_calls(
             "    let e = expected_refs(&run_id, fold);\n",
             "expected_refs",
-            Call::Free
+            crate::effects::census_domain::Call::Free
         ),
         1,
         "a genuine bare call was rejected"
     );
     assert_eq!(
-        production_calls(
+        crate::effects::census_domain::production_calls(
             "pub fn expected_refs(run_id: &str, fold: &TopologyFold) -> Vec<String> {\n",
             "expected_refs",
-            Call::Free
+            crate::effects::census_domain::Call::Free
         ),
         0,
         "a definition is not a call: a function that calls only itself is what this census exists \
@@ -7324,7 +7281,11 @@ fn a_call_census_needle_is_not_satisfied_by_a_longer_name_ending_in_it() {
          the file, {region} in the production region), so the zero below proves nothing"
     );
     assert_eq!(
-        production_calls(&code, "expected_refs", Call::Free),
+        crate::effects::census_domain::production_calls(
+            &code,
+            "expected_refs",
+            crate::effects::census_domain::Call::Free
+        ),
         0,
         "the production region of `workspace_manager.rs` has {region} occurrence(s) of \
          `expected_refs(` and every one of them belongs to `refuse_unexpected_refs`; counting \
@@ -7371,7 +7332,7 @@ fn a_call_census_needle_is_not_satisfied_by_a_longer_name_ending_in_it() {
 ///   parent's declaration and there is nothing in the file to blank. Skipped by
 ///   file stem in the walk below. This was live until S5 round 4.
 /// * **A longer identifier ending in the entry's name.** `expected_refs(` was
-///   satisfied by `refuse_unexpected_refs(`. Closed by [`production_calls`],
+///   satisfied by `refuse_unexpected_refs(`. Closed by [`crate::effects::census_domain::production_calls`],
 ///   whose own witness is
 ///   `a_call_census_needle_is_not_satisfied_by_a_longer_name_ending_in_it`.
 ///
@@ -7381,66 +7342,66 @@ fn a_call_census_needle_is_not_satisfied_by_a_longer_name_ending_in_it() {
 #[test]
 fn every_packet_named_recovery_action_has_a_production_caller() {
     /// (function, how production calls it, the packet clause it performs).
-    const CLAUSES: &[(&str, Call, &str)] = &[
+    const CLAUSES: &[(&str, crate::effects::census_domain::Call, &str)] = &[
         (
             "prune_orphan_pin",
-            Call::Free,
+            crate::effects::census_domain::Call::Free,
             "transaction_fault_matrix[T-CAND-OBJ].resume_action (b): delete the exact orphan pin \
              expected-old",
         ),
         (
             "refuse_unexpected_refs",
-            Call::Method,
+            crate::effects::census_domain::Call::Method,
             "transaction_fault_matrix[T-CAND-OBJ].refusal_condition: an unexpected ref under the \
              run namespace",
         ),
         (
             "expected_refs",
-            Call::Free,
+            crate::effects::census_domain::Call::Free,
             "the entitlement `refuse_unexpected_refs` refuses against, derived from the fold",
         ),
         (
             "complete_promotions",
-            Call::Free,
+            crate::effects::census_domain::Call::Free,
             "erratum E6: append candidate_prepared for a settled-but-unrecorded candidate",
         ),
         (
             "finish_promotions",
-            Call::Free,
+            crate::effects::census_domain::Call::Free,
             "transaction_fault_matrix[T-CAND-REF].resume_action: verify, create the ref, append \
              task_candidate_created, prune the pin",
         ),
         (
             "recreate_open_no_attempt",
-            Call::Free,
+            crate::effects::census_domain::Call::Free,
             "transaction_fault_matrix[T-DISPATCH].resume_action: verify the worktree or recreate it",
         ),
         (
             "settle_interrupted",
-            Call::Free,
+            crate::effects::census_domain::Call::Free,
             "transaction_fault_matrix[T-ATTEMPT].resume_action: append attempt_interrupted",
         ),
         (
             "close_retained_idle",
-            Call::Free,
+            crate::effects::census_domain::Call::Free,
             "transaction_fault_matrix[T-RETAINED].resume_action: a fresh process closes it in \
              recovery",
         ),
         (
             "ensure_recorded_integration_ref",
-            Call::Free,
+            crate::effects::census_domain::Call::Free,
             "transaction_fault_matrix[T-RUNSTART].resume_action: P7/P8 create the ref zero-old at \
              the recorded base",
         ),
         (
             "refuse_unimplemented_terminals",
-            Call::Free,
+            crate::effects::census_domain::Call::Free,
             "checkpoint_refusals: refuse, before any append, any operation whose terminals this \
              build does not implement",
         ),
         (
             "resume_open_no_attempt",
-            Call::Free,
+            crate::effects::census_domain::Call::Free,
             "transaction_fault_matrix[T-DISPATCH].resume_action: continue attempt (no spend \
              repeats)",
         ),
@@ -7449,29 +7410,35 @@ fn every_packet_named_recovery_action_has_a_production_caller() {
     let mut test_files_skipped = 0_usize;
     let sources: Vec<(String, String)> = {
         let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
-        let mut out = Vec::new();
+        let mut all = Vec::new();
         let mut stack = vec![root.clone()];
         while let Some(dir) = stack.pop() {
             for entry in std::fs::read_dir(&dir).expect("src is readable") {
                 let path = entry.expect("a directory entry").path();
                 if path.is_dir() {
                     stack.push(path);
-                    continue;
+                } else if path.extension().is_some_and(|ext| ext == "rs") {
+                    all.push(path);
                 }
-                if path.extension().is_none_or(|ext| ext != "rs") {
-                    continue;
-                }
+            }
+        }
+        // **The crate's own declarations, not a file-name rule.** This skipped
+        // by the stem `"tests"` and covered fourteen files; the crate declares
+        // **seventeen** whole-file test modules and the three it missed —
+        // `scaffold`, `premove`, `fake` — are the ones most likely to name what
+        // production names. `PR7-R5-ATT-001`.
+        let test_modules = crate::effects::census_domain::whole_file_test_modules(&all, 13);
+        let mut out = Vec::new();
+        {
+            for path in all {
                 // **An out-of-line test file is test code in full, and
                 // `production_code` cannot tell.** The `#[cfg(test)]` is on the
-                // *declaration* — `mod tests;` in the parent — so the file it
-                // names carries no attribute of its own and nothing in it is
-                // blanked. Fourteen files here are that shape, and without this
-                // skip a fixture calling a packet-named function satisfies the
-                // clause on its behalf: the census would report a production
-                // caller where only a test calls it, which is precisely the
-                // class it exists to close. Same skip and same reason as
-                // `the_barrier_is_the_only_topology_route_from_a_proven_prefix_to_an_append_handle`.
-                if path.file_stem().is_some_and(|stem| stem == "tests") {
+                // *declaration* in the parent, so the file it names carries no
+                // attribute of its own and nothing in it is blanked. Without
+                // this skip a fixture calling a packet-named function satisfies
+                // the clause on production's behalf, which is precisely the
+                // class this census exists to close.
+                if test_modules.contains(&path) {
                     test_files_skipped += 1;
                     continue;
                 }
@@ -7495,9 +7462,14 @@ fn every_packet_named_recovery_action_has_a_production_caller() {
     // control was silently inert — the same failure as an empty region, one
     // level up.
     assert!(
-        test_files_skipped > 0 && sources.iter().all(|(rel, _)| !rel.ends_with("tests.rs")),
-        "the out-of-line test files are not being skipped ({test_files_skipped} skipped), so a \
-         fixture's call can satisfy a clause on production's behalf"
+        test_files_skipped >= 17
+            && sources.iter().all(|(rel, _)| !rel.ends_with("tests.rs")
+                && !rel.ends_with("scaffold.rs")
+                && !rel.ends_with("premove.rs")
+                && !rel.ends_with("fake.rs")),
+        "the out-of-line test modules are not being skipped ({test_files_skipped} skipped of the \
+         seventeen the crate declares), so a fixture's call can satisfy a clause on production's \
+         behalf. The three named here are the ones a file-name rule misses"
     );
 
     let mut uncalled: Vec<String> = Vec::new();
@@ -7517,7 +7489,7 @@ fn every_packet_named_recovery_action_has_a_production_caller() {
         }
         let calls: usize = sources
             .iter()
-            .map(|(_, code)| production_calls(code, name, *form))
+            .map(|(_, code)| crate::effects::census_domain::production_calls(code, name, *form))
             .sum();
         if calls == 0 {
             uncalled.push(format!("`{name}` performs `{clause}`"));
