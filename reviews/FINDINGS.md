@@ -2742,6 +2742,40 @@ against the tree.
 > prose written *about* accuracy. The check is mechanical and cheap: grep each backticked
 > name for a definition before committing. It is now part of the repair loop.
 
+### Round 4's second P1 — the accounting could be checked against the wrong locks
+
+`Request` carried its own ledger and slots beside a `&dyn Probes` that carried another
+pair, and nothing required them to be the same. Probes over locks A, request over empty
+locks B: P4 runs through A, creation's closing assertion reads B, finds it vacuously
+balanced, and the refusal an operator reads reports no leaked registration whatever A holds.
+
+**Fixed by making the second pair unrepresentable.** The pair lives on the `Probes` seam —
+`fn ledger()`, `fn slots()` — and `Request` has none. One owner, and no second for a caller
+to supply. That is a compile-time property, so no test demonstrates it; what the tests
+demonstrate is that the check reads a **populated** ledger.
+
+**Two witnesses, because one of them cannot discriminate on its own.**
+
+`the_append_error_balance_reads_the_ledger_the_probes_used` drives `create_run` to the
+forced first-append error through the **production** `RunnerProbes` — not a recording
+double, which registers nothing and would leave an empty ledger that balances for the wrong
+reason. Its premise assertion refuses exactly that: `completed() > 0` before `balances()`.
+That premise fired on the first draft, which used the double, and is why this test uses the
+real probes.
+
+But a balanced run cannot tell the two ledgers apart: an empty one balances too. So
+`a_leaked_probe_registration_is_reported_by_the_append_error` drives a `Probes` that
+registers an invocation and never settles it, and asserts the refusal **does** carry
+"still holds a registered invocation".
+
+| mutation | balanced witness | leaked witness |
+|---|---|---|
+| the balance check reads a ledger other than the probes' | ok | **FAILED** |
+
+The first column is the measurement that the balanced case is not a witness for this
+property at all — which is worth recording, because the round-3 witness was of exactly that
+kind and looked sufficient.
+
 
 ## 22a. A driver that fails silently on a diff this size
 

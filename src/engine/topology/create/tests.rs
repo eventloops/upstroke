@@ -415,6 +415,8 @@ struct RecordingProbes {
     /// site of its own.
     kill_shell: bool,
     kill_agent: bool,
+    ledger: std::sync::Mutex<InvocationLedger>,
+    slots: std::sync::Mutex<SlotAssertion>,
 }
 
 impl RecordingProbes {
@@ -422,6 +424,8 @@ impl RecordingProbes {
         Self {
             digest: digest.to_owned(),
             calls: Mutex::new(Vec::new()),
+            ledger: std::sync::Mutex::new(InvocationLedger::new()),
+            slots: std::sync::Mutex::new(SlotAssertion::new()),
             refuse_shell: false,
             refuse_agent: None,
             kill_shell: false,
@@ -472,6 +476,16 @@ impl Probes for RecordingProbes {
             });
         }
         Ok(())
+    }
+
+    /// The double's own pair, which is the point: creation's balance check reads
+    /// whatever ran the probes, so a fixture's ledger is the fixture's.
+    fn ledger(&self) -> &std::sync::Mutex<InvocationLedger> {
+        &self.ledger
+    }
+
+    fn slots(&self) -> &std::sync::Mutex<SlotAssertion> {
+        &self.slots
     }
 }
 
@@ -750,8 +764,6 @@ struct Driver<'a> {
     refs: &'a dyn IntegrationRefs,
     agents: Vec<String>,
     runner: RunnerPolicy,
-    ledger: std::sync::Mutex<InvocationLedger>,
-    slots: std::sync::Mutex<SlotAssertion>,
     warnings: Vec<String>,
 }
 
@@ -763,8 +775,6 @@ impl<'a> Driver<'a> {
             refs,
             agents: agents(),
             runner: crate::runner::policy::host_policy(),
-            ledger: std::sync::Mutex::new(InvocationLedger::new()),
-            slots: std::sync::Mutex::new(SlotAssertion::new()),
             warnings: Vec::new(),
         }
     }
@@ -782,8 +792,6 @@ impl<'a> Driver<'a> {
             probes: self.probes,
             refs: self.refs,
             clock: &clock,
-            ledger: &self.ledger,
-            slots: &self.slots,
         };
         create_run(self.fixture.checked(), request, hooks, &mut self.warnings)
     }
@@ -1962,6 +1970,181 @@ fn the_p1_staging_label_names_the_residue_the_stat_finds() {
 // =======================================================================
 // The append-error protocol
 // =======================================================================
+
+/// A `Probes` that leaves one invocation registered and never settles it.
+///
+/// The only shape that can tell "the check read the probes' ledger" from "the
+/// check read some other ledger": on a *balanced* run both answers agree, so a
+/// balanced fixture cannot discriminate. This one does not balance, and the
+/// refusal has to say so.
+#[derive(Debug)]
+struct LeakyProbes {
+    digest: String,
+    ledger: std::sync::Mutex<InvocationLedger>,
+    slots: std::sync::Mutex<SlotAssertion>,
+}
+
+impl LeakyProbes {
+    fn new(digest: &str) -> Self {
+        Self {
+            digest: digest.to_owned(),
+            ledger: std::sync::Mutex::new(InvocationLedger::new()),
+            slots: std::sync::Mutex::new(SlotAssertion::new()),
+        }
+    }
+}
+
+impl Probes for LeakyProbes {
+    fn policy_digest(&self) -> &str {
+        &self.digest
+    }
+
+    fn shell(&self, _invocation: InvocationId) -> Result<(), UpstrokeError> {
+        Ok(())
+    }
+
+    fn agent(&self, agent: &str) -> Result<(), UpstrokeError> {
+        // Registered and never settled: the leak P6's refusal exists to report.
+        let id = PreflightIdentities::agent(agent, 0)?;
+        self.ledger
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .register(&id)
+    }
+
+    fn ledger(&self) -> &std::sync::Mutex<InvocationLedger> {
+        &self.ledger
+    }
+
+    fn slots(&self) -> &std::sync::Mutex<SlotAssertion> {
+        &self.slots
+    }
+}
+
+/// **A leaked registration is reported, which is what proves the check reads the
+/// probes' own ledger.**
+///
+/// Its sibling above drives a balanced run, and a balanced run cannot tell the
+/// two ledgers apart: an empty one balances too. This is the discriminating half
+/// — the probes' ledger holds an unsettled registration, so a check that read any
+/// other ledger would report the run clean and this assertion would fail.
+#[test]
+fn a_leaked_probe_registration_is_reported_by_the_append_error() {
+    let fixture = Fixture::new("append-leak");
+    let probes = LeakyProbes::new(&host_digest());
+    let refs = FakeRefs::empty();
+    let mut hooks = TestHooks::new();
+    hooks.arm(
+        EventSite::AppendFirst,
+        SubEffectPoint::Written,
+        InjectionMode::ErrorReturn,
+    );
+    let mut driver = Driver::new(&fixture, &probes, &refs);
+    let refused = driver
+        .run(&mut hooks)
+        .expect_err("the append returned an error");
+
+    assert!(
+        !probes
+            .ledger()
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .balances(),
+        "the fixture settled its registration, so there is no leak to report"
+    );
+    let text = format!("{}", refused.error);
+    assert!(
+        text.contains("still holds a registered invocation"),
+        "the refusal did not report the leaked registration, so the balance was \
+         checked against some ledger other than the one the probes used: {text}"
+    );
+}
+
+/// **Creation's closing balance assertion reads the ledger P4 actually used.**
+///
+/// The append-error protocol reports whether the probes left anything unsettled,
+/// and it reports it into a refusal an operator reads. That claim is only worth
+/// something if the ledger it consults is the one the processes ran through.
+///
+/// It was not necessarily. `Request` carried its own ledger and slots beside a
+/// `&dyn Probes` that carried another pair, and nothing required them to match —
+/// so a caller could hand P4 locks A and the balance check empty locks B, and the
+/// refusal would report a balanced run whatever A held. The round-4 review of
+/// `09f9a99` set that construction out as a P1.
+///
+/// **The type system now refuses it**: the pair lives on the `Probes` seam and
+/// `Request` has none, so there is one owner and no second to supply. That is a
+/// compile-time property and this test cannot demonstrate it by construction —
+/// what it demonstrates is the other half, that the check reads a **populated**
+/// ledger rather than an empty one it could never have failed on.
+///
+/// The previous witness went through `RunnerProbes::agent` directly and inspected
+/// that wrapper's own locks; it never built a `Request` and never called
+/// `create_run`, so it proved the wrapper and not the accounting. This drives
+/// `create_run` to the forced first-append error.
+#[test]
+fn the_append_error_balance_reads_the_ledger_the_probes_used() {
+    let fixture = Fixture::new("append-balance");
+    // **The production probes, not a recording double.** A double that registers
+    // nothing leaves an empty ledger, and a balance check over an empty ledger is
+    // true for the wrong reason — which the premise assertion below refuses. This
+    // is `RunnerProbes` over a runner that answers, so P4's registrations are
+    // real and the balance is earned.
+    let runner = RecordingRunner::default();
+    let source = OneSource::default();
+    let ledger = std::sync::Mutex::new(InvocationLedger::new());
+    let slots = std::sync::Mutex::new(SlotAssertion::new());
+    let probes = RunnerProbes {
+        runner: &runner,
+        shell: crate::gates::ShellKind::Sh,
+        workspace: fixture.repo.clone(),
+        adapters: &source,
+        policy_digest: host_digest(),
+        ledger: &ledger,
+        slots: &slots,
+    };
+    let refs = FakeRefs::empty();
+    let mut hooks = TestHooks::new();
+    hooks.arm(
+        EventSite::AppendFirst,
+        SubEffectPoint::Written,
+        InjectionMode::ErrorReturn,
+    );
+    let mut driver = Driver::new(&fixture, &probes, &refs);
+    let refused = driver
+        .run(&mut hooks)
+        .expect_err("the append returned an error");
+
+    // The premise: P4 ran, and its registrations are in the ledger this test can
+    // reach — the probes' own. A balance check over an empty ledger is true for
+    // the wrong reason, and asserting the premise is what stops that.
+    let ledger = probes
+        .ledger()
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner);
+    assert!(
+        ledger.completed() > 0,
+        "P4 settled no invocation, so the balance the refusal reports is vacuous \
+         rather than earned"
+    );
+    assert!(
+        ledger.balances(),
+        "the probes' ledger does not balance, so the refusal's claim is false: {:?}",
+        ledger.running()
+    );
+    drop(ledger);
+
+    // And that is what the refusal says. A balanced run adds **nothing** — only an
+    // unbalanced one appends "(and this process still holds a registered
+    // invocation…)" — so the assertion is the absence of that clause, which is
+    // only meaningful because the premise above proved the ledger was populated
+    // and did balance. An empty ledger would satisfy this line and fail that one.
+    let text = format!("{}", refused.error);
+    assert!(
+        !text.contains("still holds a registered invocation"),
+        "the refusal reports a leaked registration for a run whose ledger balances: {text}"
+    );
+}
 
 /// A partial write: the reopen truncates the torn first line, the proven
 /// prefix has no committed line, and nothing is deleted.
@@ -3234,6 +3417,8 @@ fn container_runtime() -> Inventory {
 struct ContainerProbes {
     runner: crate::runner::container::exec::ContainerRunner,
     workspace: PathBuf,
+    ledger: std::sync::Mutex<InvocationLedger>,
+    slots: std::sync::Mutex<SlotAssertion>,
 }
 
 impl ContainerProbes {
@@ -3262,6 +3447,8 @@ impl ContainerProbes {
         .expect("a container runner over the resolved policy")
         .with_hooks(Box::new(hooks));
         Self {
+            ledger: std::sync::Mutex::new(InvocationLedger::new()),
+            slots: std::sync::Mutex::new(SlotAssertion::new()),
             runner,
             workspace: fixture.repo.clone(),
         }
@@ -3284,6 +3471,16 @@ impl Probes for ContainerProbes {
 
     fn agent(&self, _agent: &str) -> Result<(), UpstrokeError> {
         Ok(())
+    }
+
+    /// The double's own pair, which is the point: creation's balance check reads
+    /// whatever ran the probes, so a fixture's ledger is the fixture's.
+    fn ledger(&self) -> &std::sync::Mutex<InvocationLedger> {
+        &self.ledger
+    }
+
+    fn slots(&self) -> &std::sync::Mutex<SlotAssertion> {
+        &self.slots
     }
 }
 
@@ -3315,8 +3512,6 @@ fn container_probe_kill_child() {
     let plan_bytes = normalized_plan();
     let clock = Fixed::default();
     let agents = agents();
-    let ledger = std::sync::Mutex::new(InvocationLedger::new());
-    let slots = std::sync::Mutex::new(SlotAssertion::new());
     let request = Request {
         repo_root: &fixture.repo,
         repo_key: fixture.repo_key.clone(),
@@ -3327,8 +3522,6 @@ fn container_probe_kill_child() {
         probes: &probes,
         refs: &refs,
         clock: &clock,
-        ledger: &ledger,
-        slots: &slots,
     };
     let mut warnings = Vec::new();
     let _ = create_run(checked, request, &mut hooks, &mut warnings);

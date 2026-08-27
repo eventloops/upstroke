@@ -153,6 +153,21 @@ pub trait Probes {
     /// [`UpstrokeError`] when the adapter is not registered or its CLI does not
     /// answer.
     fn agent(&self, agent: &str) -> Result<(), UpstrokeError>;
+
+    /// R3's ledger for the processes **these** probes ran.
+    ///
+    /// **On the seam so that a second pair is unrepresentable.** `Request` used
+    /// to carry its own ledger and slots beside a `&dyn Probes`, with nothing
+    /// requiring the two to be the same: construct the probes over locks A and
+    /// the request over empty locks B, and P4 runs through A while creation's
+    /// closing assertion reads B, finds it vacuously balanced, and reports no
+    /// leaked registration. The round-4 review of `09f9a99` set out that
+    /// construction. The type system now refuses it — one owner, and the caller
+    /// cannot supply a second.
+    fn ledger(&self) -> &Mutex<InvocationLedger>;
+
+    /// R4's slots, from the same owner and for the same reason.
+    fn slots(&self) -> &Mutex<SlotAssertion>;
 }
 
 /// The production [`Probes`]: both probes through the run's own `Runner`.
@@ -219,6 +234,14 @@ impl Probes for RunnerProbes<'_> {
         // request. Handing `self.runner` here is what made the creation ledger
         // account one logical probe instead of the processes it ran.
         adapter.probe(&self.registering()).map(|_caps| ())
+    }
+
+    fn ledger(&self) -> &Mutex<InvocationLedger> {
+        self.ledger
+    }
+
+    fn slots(&self) -> &Mutex<SlotAssertion> {
+        self.slots
     }
 }
 
@@ -1298,18 +1321,6 @@ pub struct Request<'a> {
     pub refs: &'a dyn IntegrationRefs,
     /// Where `run_started`'s timestamp comes from.
     pub clock: &'a dyn TimeSource,
-    /// Every probe invocation is registered here.
-    /// R3's ledger — **the same one the probes execute through**.
-    ///
-    /// Behind a lock, and shared with [`RunnerProbes`], because P4's
-    /// registrations now happen inside `preflight::Registering` where the
-    /// process is built. A `&mut` here would have been a *second* ledger: the
-    /// balance check at the end of this module would read an empty one and pass
-    /// vacuously, which is a weaker claim than the one it was making before.
-    pub ledger: &'a Mutex<InvocationLedger>,
-    /// Every **slotted** probe takes its `{agent, pool?}` pair here.
-    /// R4's slots, shared with [`RunnerProbes`] for the same reason.
-    pub slots: &'a Mutex<SlotAssertion>,
 }
 
 // ---------------------------------------------------------------------------
@@ -1719,13 +1730,17 @@ fn p6_append_run_started(
             //     here rather than being implied by calls that are no longer in
             //     view. A held pair at this point means a probe took a slot and
             //     did not give it back.
+            //     **Read through the probes**, which own them, so this cannot
+            //     be checking a different pair from the one P4 used.
             let balanced = request
-                .ledger
+                .probes
+                .ledger()
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .balances()
                 && request
-                    .slots
+                    .probes
+                    .slots()
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner)
                     .held()
