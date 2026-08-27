@@ -2851,8 +2851,20 @@ would have passed on its prefix. Occurrence is not definition.
 `~/tactus-artifacts/pr7/drivers/idcheck.sh` now requires a **definition site**: a Rust item
 (`fn`/`struct`/`enum`/`trait`/`type`/`const`/`static`/`mod`), an enum variant, a struct
 field, or — for an event kind, which has no Rust item — its wire name in one of the two
-vocabularies. Controls: both fabricated names are refused, and a run over this round's diff
-is clean.
+vocabularies.
+
+**It took two corrections of its own, and the first is the instructive one.** The check
+first resolved a path by its **leaf**, and on that rule `events::Dangling::event` *passes*:
+`event` is defined all over the tree. It would have accepted the exact fabricated path it
+was written to catch, and I only found that by running the control instead of assuming it.
+It now checks **every segment** and names the one that fails. Second: its scope excludes
+`reviews/**`, because a review record and this ledger have to be able to name a fabricated
+identifier in order to record that it was fabricated — an unresolved name there is the
+artifact doing its job.
+
+Controls, both run: `events::Dangling::event` is refused at segment `Dangling`, and
+`CandidateRecovery::SettleInterrupted` at segment `SettleInterrupted`. A run over this
+round's `src/**` and `decisions/**` is clean.
 
 It also flagged something worth keeping: **`complete_promotions` and `settle_succeeded`**,
 narrated in new comments as history. They are deleted, so they do not resolve — and
@@ -2866,6 +2878,43 @@ and all **nine** call sites are now gone; each fixture's sequence is
 than tolerating it: making `apply_candidate_prepared` stop promoting fails **five** of them,
 which a no-op standing in for the step made impossible. The round-3 claim is corrected
 where it stands, in the §3 appendix that made it.
+
+### Round 4's P2 — four body claims the tree contradicted
+
+Each corrected where it stands, and the second is the one that mattered.
+
+**The head stamp.** Validation read *"Local, at `327cce3` — the head this body describes"*,
+seven commits behind and predating every repair the review was reading. Scope and Review
+evidence had been updated and Validation had not — the same section-by-section drift the
+one-declared-basis rule exists to stop, one section over.
+
+**"No event kind, serialization, or transition changed" was false twice**, and the honest
+statement is longer than the false one:
+
+* the legacy schema-3 `failure` object gains `"detail":null` — a **constant, content-free**
+  key, since the legacy carrier is `ladder_retry` and the record's copy is always `None`
+  there. No reader's behaviour changes; the growth is one null per failed attempt. This
+  branch's own byte witness against `610106b` is what makes that precise rather than
+  asserted;
+* the accepted schema-4 **transition shape** changed, and this one is **forward-only**: a
+  log this head writes settles a success with `candidate_prepared` alone, and the
+  immediately preceding build's fold required `Promoting` first and would refuse it.
+
+The second costs nothing today — schema 4 has no external writers and no shipped command
+writes it — but "revert and every old log still reads" is exactly what a rollback claim
+rests on, and for schema-4 logs written *by this head* it does not hold. Disclosed rather
+than reasoned away.
+
+**The G2 stamp named the wrong commit.** The correction was stamped `8f0e605`, which touches
+no `create.rs`; the creation repair is `35aaf8e`, one commit later. A sha stamp exists so a
+reader can go and look, and one that points at a commit without the change is worse than
+none. Corrected to `35aaf8e`, saying what it first said.
+
+**"A substitution refuses without touching anything" was too strong.** True on the
+`recovery_for` window. On the late window — substitution after the candidates ref and
+`task_candidate_created` are written — `reclaim_after_creation` refuses and preserves the
+pin, but those two effects have already landed. The security property holds on both windows;
+the absolute claim held on one, and the body now says which.
 
 
 ## 22a. A driver that fails silently on a diff this size

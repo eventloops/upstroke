@@ -203,7 +203,8 @@ sites: every worker, gate, review, re-ask and probe process carries a typed
 registered exactly once and settled exactly once (R4). The slot pair is asserted rather
 than brokered at `max_parallel = 1` (R3).
 
-> **Correction, 2026-08-27, at `8f0e605`.** "Every … probe process" was false for
+> **Correction, 2026-08-27, at `35aaf8e`** — the commit that carries the repair; this was
+> first stamped `8f0e605`, which is one commit earlier and touches no `create.rs`. "Every … probe process" was false for
 > **fresh creation** when this was written, and stayed false until the date of this note.
 > `create.rs`'s P4 registered one `probe(agent, 0)` identity around the *whole* adapter
 > call and handed the adapter the raw `Runner`, so an adapter that runs several processes
