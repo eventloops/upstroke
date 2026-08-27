@@ -286,6 +286,24 @@ Each of the named witnesses was re-derived against the invariant, and the diff i
 > landing on top of a failure's charge — and compares the live count against a replay of the
 > same bytes. Removing the successful settlement's charge fails **both** the witness and the
 > census.
+>
+> **Split for the doors appendix, 2026-08-27 at `584f77e`: +262/−17 on the frozen file**
+> — 49 doc, 22 comment, 16 blank and **175 lines of code**, of which the production change is
+> nine: `check_candidate_prepared`'s `prepared.attempt.is_successful()`,
+> `check_attempt_finished`'s `finished.record.is_successful()` and its envelope comparison,
+> and the two refusals they raise. The remaining 166 are fixtures and the four witnesses.
+> `src/events/mod.rs` takes **+30/−0** for the predicate pair itself — 20 doc, 8 code, 2
+> blank.
+>
+> **Why this is the same approval and not a new one.** The sentence granted above is
+> "settlement counting moves to the sole event, and every settlement-counting witness is
+> re-derived against the new invariant". A door that admits a settlement whose own record
+> says the attempt failed is not enforcing that invariant, it is enforcing a proxy for it —
+> `failure.is_none()` on one door and nothing on the other. `AttemptRecord::is_successful` is
+> the invariant stated once, and both doors ask it: the same "one derivation, not two" the
+> allowance charge needed, applied to the definition the charge is conditioned on. The
+> fixtures moved with it because they had to — the positive premises satisfied the review
+> clause vacuously, and a premise that passes for the wrong reason is not a re-derivation.
 
 **Two of the re-derivations were caught by the compiler rather than by care**, and both are
 worth naming. `cargo` reported a binding that no longer needed `mut` — which meant the
