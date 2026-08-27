@@ -750,7 +750,7 @@ pub struct FailureRecord {
     ///
     /// Written at exactly one place — `engine::classify::attempt_record`, which
     /// is the one production construction of an [`AttemptRecord`] **for an
-    /// attempt that reached a settlement**; `Dangling::event` below builds the
+    /// attempt that reached a settlement**; `InterruptedAttempt::event` below builds the
     /// other, for an attempt that started and never reported back, and sets
     /// this to `None` because nothing judged it. Read by `TopologyRun`'s brief,
     /// which derives §11.4's accumulated feedback from the log rather than from

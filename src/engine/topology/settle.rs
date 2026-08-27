@@ -106,13 +106,18 @@ pub struct Settled {
     /// The **allowance decision**: whether this settlement spent one of the
     /// rung's `attempts_per`.
     ///
-    /// **Seven shapes spend nothing, and the count is a `FailureShape` count —
-    /// not a `FailureKind` count.** `ladder::spends_allowance` is the single
-    /// authority; it answers `false` for four kinds outright — **`NeedsHuman`,
-    /// `NoChain`, `Interrupted`, `Declined`** — and, before the match runs at
-    /// all, for anything `FailureShape::is_outage` accepts:
-    /// **`RateLimited`** at any origin, **`ReviewUnavailable`** at any origin,
-    /// and **`Timeout` with `FailureOrigin::Reviewer`**. Seven.
+    /// **Thirteen `FailureShape`s spend nothing, spanning seven `FailureKind`s.**
+    /// `ladder::spends_allowance` is the single authority and it takes a
+    /// [`crate::ladder::FailureShape`], which **is** a `(kind, origin)` pair. It
+    /// answers `false` for four kinds outright — **`NeedsHuman`, `NoChain`,
+    /// `Interrupted`, `Declined`** — and, before the match runs at all, for
+    /// anything `FailureShape::is_outage` accepts: **`RateLimited`** at any
+    /// origin, **`ReviewUnavailable`** at any origin, and **`Timeout` with
+    /// `FailureOrigin::Reviewer`**.
+    ///
+    /// Six of those seven kinds contribute two shapes each and `Timeout`
+    /// contributes one, which is 13 — and `Timeout` is the single kind whose
+    /// answer depends on the origin at all.
     ///
     /// The rule they share is the one §2's `PR3-ATTEMPT-SHAPE` ruling states:
     /// *an attempt spends one of its rung's `attempts_per` iff the worker ran
@@ -120,24 +125,28 @@ pub struct Settled {
     /// interruption, a reviewer asking for a person, and a pool or a reviewer
     /// that was simply not there are each a case where nothing was judged.
     ///
-    /// **Third statement of this sentence, and the first that is a count of the
-    /// right thing.** It first said an outage deferral spends none "and every
-    /// other settlement spends one" — off by six. Round 6 corrected it to
-    /// "five kinds … `NeedsHuman`, `NoChain`, `Interrupted` and `Declined`, and
-    /// the outage deferral is the fifth" — which reads the outage arm as one
-    /// kind when it is three shapes, and counts kinds when the authority
-    /// dispatches on `(kind, origin)`. The 2026-08-26 re-review of `c2c0294`
-    /// found it, finding C. **Note the reader's trap it comes from**: the
+    /// **Fourth statement of this sentence, and the first that names the thing it
+    /// counts.** It first said an outage deferral spends none "and every other
+    /// settlement spends one" — off by six. Round 6 corrected it to "five kinds",
+    /// which reads the outage arm as one kind when it covers three. The
+    /// `c2c0294` review corrected that to "seven shapes … not a `FailureKind`
+    /// count" — and *seven* is the kind count: there are 13 shapes. The
+    /// `bf927f3` review found that one, and the test beneath it was computing
+    /// the kind count while the doc quoted a shape count, so the two disagreed
+    /// with each other as well as with the authority. **Note the reader's trap it comes from**: the
     /// match's last arm lists `Timeout | RateLimited | … | ReviewUnavailable =>
     /// true`, and all three of those are unreachable there for the origins the
     /// outage guard already took. Reading the arm alone gives the wrong
     /// answer, which is how this sentence has been wrong twice.
     ///
-    /// **The number is no longer prose.**
-    /// `ladder::tests::exactly_seven_failure_shapes_spend_no_allowance` counts it from
-    /// the authority over every `(kind, origin)` pair and names the seven, so a fourth
-    /// restatement that disagrees is a failing test rather than a sentence nobody
-    /// re-reads.
+    /// **The number is no longer prose, and the enumeration is no longer a list
+    /// somebody keeps up to date.**
+    /// `ladder::tests::exactly_thirteen_failure_shapes_spend_no_allowance` reads the
+    /// variants out of the enum's own source, maps each through an exhaustive
+    /// `match`, and counts the shapes the authority exempts — so a new
+    /// `FailureKind` stops the crate building until it has a value here, and a
+    /// restatement that disagrees with the authority is a failing test rather
+    /// than a sentence nobody re-reads.
     ///
     /// **And the fold derives it when applying `attempt_finished`, not
     /// `attempt_started`** — `TopologyFold::apply_settlement` calls

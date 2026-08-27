@@ -222,7 +222,7 @@ pub(crate) struct AttemptFacts<'a> {
 /// out of the record.
 ///
 /// **The qualifier is not decoration.** This said "the one production
-/// construction" outright, and there is a second: `events::Dangling::event`
+/// construction" outright, and there is a second: `events::InterruptedAttempt::event`
 /// builds the record for an attempt that started and never reported back, which
 /// by construction was never classified. A census over the type's initializers
 /// in production regions returns exactly those two, and the unqualified sentence

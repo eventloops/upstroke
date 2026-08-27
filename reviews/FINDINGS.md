@@ -2585,6 +2585,16 @@ call and handed the adapter the **raw** `Runner`. A current Codex probe runs ten
 requests — version, two help probes, six strict-config probes, the model catalog — so
 ordinal 0 was accounted and 1 through 9 were absent.
 
+**Ten, derived rather than quoted.** The review stated the figure and this round restated
+it once before checking; the standing rule for this round is that a prose count is computed
+or sha-stamped, so it is computed here, at `bcfd1bf`:
+
+| where | requests |
+|---|---|
+| `codex::probe` directly | **4** — version, fresh `exec` help, `exec resume` help, model catalog |
+| `validate_effort_config_key`, called from it | **6** — 2 surfaces (`Fresh`, `Resume`) × (1 unknown-key control + 2 efforts), one `runner.run` per `run_config_parser_probe` |
+| | **10** |
+
 **The failure is a wrong row, not a missing one.** With the version probe at ordinal 0
 succeeding and a help probe at ordinal 1 failing, the creation ledger recorded **ordinal 0
 cancelled**: the identity of the process that *succeeded*, with no record of the one that
@@ -2662,6 +2672,53 @@ direction: under that mutation `failure["detail"].is_null()` was `true` and the 
 > A claim in three artifacts that no test makes is worse than no claim, because the
 > artifacts are what a reviewer reads first. The repair is to make the test hold the claim,
 > not to weaken the claim to what the test happened to check.
+
+### Round 3 on finding C — a count of the wrong thing, and a guard that was not one
+
+Two defects in one repair, both found by the `bf927f3` review.
+
+**The number counted kinds while the doc named shapes.** A `FailureShape` **is** a
+`(kind, origin)` pair; `spends_allowance` takes one, and `FailureShape::is_outage` reads the
+origin for `Timeout`. So the shape count and the kind count are different numbers —
+**13 and 7** — and the previous repair's doc said "seven shapes … not a `FailureKind`
+count" while its test collapsed the pairs into a `BTreeSet` of kind names and asserted 7.
+The doc and the test disagreed with each other as well as with the authority.
+
+That sentence has now been wrong four times: "every other settlement spends one" (off by
+six) → "five kinds" (the outage arm covers three, not one) → "seven shapes" (that is the
+kind count) → **13 shapes spanning 7 kinds**, which is what the authority answers. Six of
+the seven kinds contribute two shapes each and `Timeout` contributes one, because `Timeout`
+is the only kind whose answer depends on the origin.
+
+**And the guard the previous repair described did not exist.** Its comment read *"a new
+variant between them fails this list to compile"* — of a 14-element **array literal**,
+which compiles perfectly well while an enum grows past it. The same comment was also
+inverted: it named `Interrupted` first and `Declined` last, and the enum begins at `NoChain`
+and ends at `Interrupted`.
+
+**Two mechanisms replace it, failing in different directions.**
+
+| | catches |
+|---|---|
+| `every_failure_kind` reads the variant names out of `ladder.rs` between the enum header and its closing brace | a variant that exists but nobody added to a list |
+| `kind_of_name` maps each name to a value through an **exhaustive `match`** | a variant that exists but has no value here — the crate stops building |
+
+Both were exercised rather than asserted. Breaking the parse so it finds nothing produces
+*"the source read found 0 variants … the parse is broken, not the enum"*; dropping a variant
+from the mapping's candidate list produces *"`Interrupted` is a variant of `FailureKind`
+that this mapping does not name"*. A source-reading test that silently reads nothing is the
+failure mode that matters here, and it now refuses instead.
+
+**The invented constructor name is corrected in both files.** `events::Dangling::event` names
+no type; it is `InterruptedAttempt::event`. The name was fabricated in the *correction of a
+false claim about that very constructor*, in `classify.rs` and `events/mod.rs` — one round
+after a fabricated sha and one before a fabricated test name in `fold.rs`. Every
+backticked type and function name added in this round has since been checked to resolve
+against the tree.
+
+> Three fabricated identifiers in three consecutive rounds — a sha, a type, a test — all in
+> prose written *about* accuracy. The check is mechanical and cheap: grep each backticked
+> name for a definition before committing. It is now part of the repair loop.
 
 
 ## 22a. A driver that fails silently on a diff this size

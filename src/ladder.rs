@@ -472,48 +472,122 @@ mod tests {
         AttemptFailure::new(kind, "because")
     }
 
-    /// Every `(kind, origin)` pair, and how many of them spend nothing.
+    /// Every `FailureKind`, read from the enum's own source.
     ///
-    /// `Interrupted` is `FailureKind`'s first variant and `Declined` its last; a new
-    /// variant between them fails this list to compile, which is what makes the count
-    /// below a count of the enum rather than of a hand-copied subset.
-    const EVERY_SHAPE: [FailureKind; 14] = [
-        FailureKind::Interrupted,
-        FailureKind::NoChain,
-        FailureKind::EmptyDiff,
-        FailureKind::AgentError,
-        FailureKind::Timeout,
-        FailureKind::RateLimited,
-        FailureKind::GateFailed,
-        FailureKind::TestProvenance,
-        FailureKind::ReviewInputTooLarge,
-        FailureKind::ReviewInputOpaque,
-        FailureKind::ReviewFailed,
-        FailureKind::ReviewUnavailable,
-        FailureKind::NeedsHuman,
-        FailureKind::Declined,
-    ];
+    /// **Derived, because a hand-written list is not an enumeration.** This was a
+    /// 14-element array whose comment claimed "a new variant between them fails
+    /// this list to compile". It does not: an array literal compiles perfectly
+    /// well while an enum grows past it, so the guard the comment described did
+    /// not exist. The comment was also **inverted** — it named `Interrupted` as
+    /// the first variant and `Declined` as the last, and the enum begins at
+    /// `NoChain` and ends at `Interrupted`. The round-3 review of `bf927f3`
+    /// found both.
+    ///
+    /// Two mechanisms now, and they fail in different directions:
+    ///
+    /// * this reads the variant names out of `ladder.rs` between the enum's
+    ///   header and its closing brace, so a variant that exists is **in the
+    ///   list** whether or not anyone remembered it;
+    /// * [`kind_of_name`] maps each name to a value through an exhaustive
+    ///   `match`, so a variant that exists **has a value here** or the crate
+    ///   does not build.
+    ///
+    /// The source read is safe from this file's own prose because the enum is
+    /// declared above every test in it, and only the first occurrence of the
+    /// header is used.
+    fn every_failure_kind() -> Vec<FailureKind> {
+        const HEADER: &str = "pub enum FailureKind {";
+        let source = include_str!("ladder.rs");
+        let body = &source[source.find(HEADER).expect("the enum is declared") + HEADER.len()..];
+        let body = &body[..body.find("\n}").expect("the enum closes")];
+        let names: Vec<&str> = body
+            .lines()
+            .map(str::trim)
+            .filter(|line| {
+                line.ends_with(',')
+                    && line[..line.len() - 1]
+                        .chars()
+                        .all(|c| c.is_ascii_alphanumeric())
+                    && line.starts_with(|c: char| c.is_ascii_uppercase())
+            })
+            .map(|line| &line[..line.len() - 1])
+            .collect();
+        assert!(
+            names.len() >= 10,
+            "the source read found {} variants, which is too few to be this enum — the \
+             parse is broken, not the enum",
+            names.len()
+        );
+        names.into_iter().map(kind_of_name).collect()
+    }
 
-    /// **How many shapes spend no allowance, counted rather than described.**
+    /// One variant name to its value, exhaustively.
     ///
-    /// [`Settled::spent_attempt`]'s doc has stated this number three times. It said
-    /// "an outage deferral spends none and every other settlement spends one" — off by
-    /// six. Round 6 corrected it to "five kinds", which reads the outage arm as one
-    /// kind when [`FailureShape::is_outage`] accepts **three shapes**, and counts
-    /// kinds when [`spends_allowance`] dispatches on `(kind, origin)`. The 2026-08-26
-    /// re-review of `c2c0294` found the second version, finding C.
+    /// The `match` is over the enum, so adding a variant stops the crate
+    /// building until it is named here; the `_` arm is over *strings* and only
+    /// catches a source read that produced something that is not a variant.
+    fn kind_of_name(name: &str) -> FailureKind {
+        let named = |kind: FailureKind| -> &'static str {
+            match kind {
+                FailureKind::NoChain => "NoChain",
+                FailureKind::EmptyDiff => "EmptyDiff",
+                FailureKind::AgentError => "AgentError",
+                FailureKind::Timeout => "Timeout",
+                FailureKind::RateLimited => "RateLimited",
+                FailureKind::GateFailed => "GateFailed",
+                FailureKind::TestProvenance => "TestProvenance",
+                FailureKind::ReviewInputTooLarge => "ReviewInputTooLarge",
+                FailureKind::ReviewInputOpaque => "ReviewInputOpaque",
+                FailureKind::ReviewFailed => "ReviewFailed",
+                FailureKind::ReviewUnavailable => "ReviewUnavailable",
+                FailureKind::NeedsHuman => "NeedsHuman",
+                FailureKind::Declined => "Declined",
+                FailureKind::Interrupted => "Interrupted",
+            }
+        };
+        for kind in [
+            FailureKind::NoChain,
+            FailureKind::EmptyDiff,
+            FailureKind::AgentError,
+            FailureKind::Timeout,
+            FailureKind::RateLimited,
+            FailureKind::GateFailed,
+            FailureKind::TestProvenance,
+            FailureKind::ReviewInputTooLarge,
+            FailureKind::ReviewInputOpaque,
+            FailureKind::ReviewFailed,
+            FailureKind::ReviewUnavailable,
+            FailureKind::NeedsHuman,
+            FailureKind::Declined,
+            FailureKind::Interrupted,
+        ] {
+            if named(kind) == name {
+                return kind;
+            }
+        }
+        panic!(
+            "`{name}` is a variant of `FailureKind` that this mapping does not name; the \
+             exhaustive match above compiles, so the candidate list beneath it is what is \
+             short"
+        )
+    }
+
+    /// **How many `FailureShape`s spend no allowance, counted from the authority.**
     ///
-    /// A fourth prose restatement would be a fourth chance to be wrong. This is the
-    /// count, taken from the authority itself, so a doc that disagrees with it is a
-    /// failing test rather than a sentence nobody re-reads.
+    /// [`Settled::spent_attempt`]'s doc has stated this number three times and been
+    /// wrong three times: "every other settlement spends one" (off by six), then
+    /// "five kinds", then "seven shapes". A `FailureShape` **is** a
+    /// `(kind, origin)` pair — `spends_allowance` dispatches on both, and
+    /// `FailureShape::is_outage` reads the origin for `Timeout` — so the shape count
+    /// and the kind count are different numbers and the doc named one while stating
+    /// the other. The round-3 review of `bf927f3` found it.
     ///
-    /// It also pins the *shape* of the answer: `Timeout` spends at the worker and not
-    /// at the reviewer, which is the one pair where the origin decides — and a count
-    /// alone would stay green if that pair flipped and another compensated.
+    /// **13 shapes, spanning 7 kinds.** Both are asserted, and the shape count is the
+    /// one the doc quotes, because a shape is what the authority takes.
     #[test]
-    fn exactly_seven_failure_shapes_spend_no_allowance() {
+    fn exactly_thirteen_failure_shapes_spend_no_allowance() {
         let mut free: Vec<(FailureKind, FailureOrigin)> = Vec::new();
-        for kind in EVERY_SHAPE {
+        for kind in every_failure_kind() {
             for origin in [FailureOrigin::Worker, FailureOrigin::Reviewer] {
                 if !spends_allowance(Some(FailureShape { kind, origin })) {
                     free.push((kind, origin));
@@ -521,19 +595,16 @@ mod tests {
             }
         }
 
-        // Both origins of the four that spend nothing outright, both origins of the
-        // two outage kinds, and the reviewer's timeout: 4×2 + 2×2 + 1 = 13 pairs over
-        // **seven** shapes, where a shape is a kind whose answer does not depend on
-        // origin, or a (kind, origin) pair where it does.
+        assert_eq!(
+            free.len(),
+            13,
+            "{} `(kind, origin)` shapes spend nothing, not 13: {free:?}. \
+             `Settled::spent_attempt` quotes this number",
+            free.len()
+        );
+
         let kinds: std::collections::BTreeSet<String> =
             free.iter().map(|(kind, _)| format!("{kind:?}")).collect();
-        assert_eq!(
-            kinds.len(),
-            7,
-            "{} kinds spend nothing, not 7: {kinds:?}. `Settled::spent_attempt`'s doc \\
-             states this number, and it has been wrong twice",
-            kinds.len()
-        );
         assert_eq!(
             kinds.iter().map(String::as_str).collect::<Vec<_>>(),
             vec![
@@ -545,11 +616,20 @@ mod tests {
                 "ReviewUnavailable",
                 "Timeout",
             ],
-            "the set changed, so the doc naming them is now wrong"
+            "the seven kinds those shapes span changed, so the doc naming them is wrong"
         );
 
-        // The one pair where the origin decides, asserted directly: a worker timeout
-        // is a run that happened and spends; a reviewer timeout is an outage.
+        // 13 = four kinds at both origins, two outage kinds at both origins, and
+        // `Timeout` at the reviewer alone. Spelled out because the arithmetic is
+        // where "seven" came from: it is the kind count, and six of the seven
+        // contribute two shapes each.
+        assert_eq!(
+            free.iter()
+                .filter(|(kind, _)| *kind == FailureKind::Timeout)
+                .count(),
+            1,
+            "`Timeout` is the one kind whose answer depends on the origin"
+        );
         assert!(
             spends_allowance(Some(FailureShape {
                 kind: FailureKind::Timeout,
