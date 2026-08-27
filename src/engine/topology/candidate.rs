@@ -231,9 +231,18 @@ pub enum Refusal {
     },
 
     /// `T-CAND-REF`: "ref present at another SHA".
+    ///
+    /// Serves both refs of the candidate sequence: the authoritative candidates
+    /// ref, which is never moved (R11), and the prepared **pin**, which binds to
+    /// the commit `candidate_prepared` recorded. A substituted pin refuses here
+    /// rather than being pruned, because deleting it is deleting the evidence
+    /// that it was substituted — DESIGN §15's "refuses while preserving
+    /// evidence".
     #[error(
         "refusing to promote `{refname}`: it is present at {found} and `candidate_prepared` \
-         recorded {expected}; a candidates ref is authoritative (R11) and is never moved"
+         recorded {expected}. The candidates ref is authoritative (R11) and is never moved, \
+         and the prepared pin binds to the recorded commit; neither is removed on a \
+         mismatch, so the substitution stays visible"
     )]
     RefAtAnotherSha {
         /// The ref.
@@ -719,8 +728,26 @@ pub fn reclaim_after_creation(
         prepared_ref,
     } = created;
 
-    // "prune the pin" — expected-old, and only when it is there.
+    // **"prune the pin" — expected-old against the *recorded* commit, not against
+    // whatever is there.** This re-read the target and deleted that value, so a
+    // pin substituted at any point before this line was removed with a
+    // successful expected-old delete: the compare-and-swap compared the ref to
+    // itself and could not fail. Deleting a substituted pin destroys the
+    // evidence of the substitution, which is the opposite of what DESIGN §15
+    // requires of an identity mismatch.
+    //
+    // The candidate this reclaim is for is `created.candidate`, whose
+    // `commit_sha` came from the durable record. That is what the pin must
+    // point at, and it is what the delete compares against.
     if let Some(found) = manager.direct_ref_target(prepared_ref.as_str())? {
+        if found != candidate.commit_sha.0 {
+            return Err(Refusal::RefAtAnotherSha {
+                refname: prepared_ref.0.clone(),
+                found,
+                expected: candidate.commit_sha.0.clone(),
+            }
+            .into());
+        }
         manager.delete_ref_expected_old(
             hooks.effects(),
             RefSite::DeleteCandidatePin,
@@ -874,11 +901,36 @@ pub fn recovery_for(
         });
     };
 
-    // `candidate_prepared` is durable. The promotion is unfinished while the
-    // queue position is missing, and also while the pin it should have pruned
-    // is still there. The candidate's identity comes from the durable record
-    // rather than from this module's own derivation of the names, because the
-    // record is what the run actually wrote.
+    // **The pin binds to the record.** `candidate_prepared` is durable and names
+    // a commit; a pin present at any other object is a substitution, and DESIGN
+    // §15's extended exact-identity rule refuses it rather than proceeding —
+    // "any substituted or symbolic pin … refuses while preserving evidence".
+    //
+    // This read the pin only as `pin.is_some()`, so a pin moved from the
+    // recorded commit `C` to some `X` after `candidate_prepared` left the resume
+    // promoting `C`, appending `task_candidate_created`, and then deleting the
+    // substituted pin expected-old on the way out — succeeding, and erasing the
+    // one ref that evidenced the substitution. The `bf927f3` review's second P1.
+    //
+    // Refused **here**, before any effect: this is a predicate over the durable
+    // record and one ref read, and a refusal belongs before the first append.
+    // Nested rather than a let-chain: MSRV is 1.85 and let-chains are 1.88.
+    if let Some(found) = pin.as_deref() {
+        if found != prepared.candidate.commit_sha.as_str() {
+            return Err(Refusal::RefAtAnotherSha {
+                refname: names.prepared_ref.0.clone(),
+                found: found.to_owned(),
+                expected: prepared.candidate.commit_sha.0.clone(),
+            }
+            .into());
+        }
+    }
+
+    // The promotion is unfinished while the queue position is missing, and also
+    // while the pin it should have pruned is still there. The candidate's
+    // identity comes from the durable record rather than from this module's own
+    // derivation of the names, because the record is what the run actually
+    // wrote.
     let unfinished = generation.class == GenerationClass::Promoting || pin.is_some();
     Ok(CandidateRecovery {
         promotion: unfinished.then(|| PromotingCandidate {
@@ -2192,6 +2244,111 @@ mod tests {
         journal.settle_succeeded();
         promote(&fixture.manager, hooks, journal, &fixture.task, pinned).expect("promote");
         commit
+    }
+
+    /// **A substituted prepared pin is refused, and the evidence survives the
+    /// refusal.**
+    ///
+    /// `DESIGN.md` §15's extended exact-identity rule: *"Any substituted or
+    /// symbolic pin, third branch SHA, changed branch identity, or mismatched
+    /// commit object refuses while preserving evidence."*
+    ///
+    /// `recovery_for` read the pin as `pin.is_some()` and never compared its
+    /// target to the commit `candidate_prepared` recorded, and
+    /// `reclaim_after_creation` re-read the target and deleted **that** value
+    /// expected-old — a compare-and-swap comparing the ref to itself, which
+    /// cannot fail. So a pin moved from the recorded `C` to some `X` after the
+    /// settlement left a resume promoting `C`, appending
+    /// `task_candidate_created`, and then removing the substituted pin on the
+    /// way out: it succeeded, and it deleted the one ref that evidenced the
+    /// substitution. The `bf927f3` review's second P1.
+    ///
+    /// Three claims, because "refuses while preserving evidence" is three
+    /// things: it refuses, it names both shas so the substitution is legible
+    /// from the error alone, and **nothing was appended, created or deleted** —
+    /// the pin is still at the substituted object for a person to look at.
+    #[test]
+    fn a_substituted_prepared_pin_refuses_and_leaves_the_evidence() {
+        let fixture = Fixture::new("pin-substituted");
+        let mut hooks = Hooks::new();
+        let mut journal = fixture.journal(&hooks);
+
+        // Reach the boundary honestly: commit, pin, `candidate_prepared`.
+        let unpinned =
+            write_candidate_commit(&fixture.manager, &mut hooks, RUN_ID, fixture.judged())
+                .expect("commit-tree");
+        let recorded = unpinned.commit_sha().clone();
+        let pinned = pin_candidate(&fixture.manager, &mut hooks, unpinned).expect("pin");
+        let promoting =
+            append_candidate_prepared(&mut journal, pinned).expect("candidate_prepared");
+        assert_eq!(journal.count("candidate_prepared"), 1);
+        assert_eq!(journal.count("task_candidate_created"), 0);
+
+        // The substitution: the pin is moved to a real sibling commit on the
+        // same base. A different *tree* is not needed — the point is that the
+        // pin no longer names the recorded commit, and this must be caught by
+        // the pin's own binding rather than by the tree check.
+        let impostor = fixture.sibling_commit(&mut hooks);
+        assert_ne!(impostor, recorded);
+        let names = CandidateNames::of(RUN_ID, ALPHA, GENERATION);
+        git_fixtures::git_ok(
+            &fixture.base,
+            &["update-ref", names.prepared_ref.as_str(), impostor.as_str()],
+        );
+
+        // (1) Recovery refuses, before any effect.
+        let refused = recovery_for(&fixture.manager, RUN_ID, journal.fold(), ALPHA)
+            .expect_err("a pin that is not the recorded commit is a substitution");
+
+        // (2) The refusal names both, so the substitution is legible from it.
+        let text = refused.to_string();
+        assert!(
+            text.contains(impostor.as_str()) && text.contains(recorded.as_str()),
+            "the refusal must name what the pin points at and what the record says: {text}"
+        );
+
+        // (3) The evidence is intact: the pin is still at the impostor, the
+        //     candidates ref was never created, and nothing was appended.
+        assert_eq!(
+            fixture
+                .manager
+                .direct_ref_target(names.prepared_ref.as_str())
+                .expect("read the pin")
+                .as_deref(),
+            Some(impostor.as_str()),
+            "the refusal removed or moved the pin, which is the evidence"
+        );
+        assert!(
+            fixture
+                .manager
+                .direct_ref_target(names.candidate_ref.as_str())
+                .expect("read the candidates ref")
+                .is_none(),
+            "a refused promotion created the authoritative candidate ref"
+        );
+        assert_eq!(journal.count("task_candidate_created"), 0);
+
+        // And the reclaim half refuses the same substitution rather than
+        // deleting it, for a caller that reached it another way.
+        let referenced = create_candidates_ref(&fixture.manager, &mut hooks, promoting)
+            .expect("the recorded commit still verifies");
+        let created =
+            append_candidate_created(&mut journal, referenced).expect("task_candidate_created");
+        let refused = reclaim_after_creation(&fixture.manager, &mut hooks, &fixture.task, created)
+            .expect_err("the prune compares against the recorded commit");
+        assert!(
+            refused.to_string().contains(impostor.as_str()),
+            "the prune's refusal must name the substituted target: {refused}"
+        );
+        assert_eq!(
+            fixture
+                .manager
+                .direct_ref_target(names.prepared_ref.as_str())
+                .expect("read the pin")
+                .as_deref(),
+            Some(impostor.as_str()),
+            "the prune deleted the substituted pin, which is the evidence"
+        );
     }
 
     /// T-CAND-REF's boundary reached by a real kill, then its `resume_action`

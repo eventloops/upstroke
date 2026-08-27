@@ -2538,6 +2538,46 @@ Found by grepping this round's own added prose for verification-language — "th
 "only", "every", "never" — and checking each against the tree. That is the cheapest
 instrument for this class and it belongs in the repair loop, not in the review.
 
+### Round 3's second P1 — the pin binds to the record
+
+`recovery_for` read the prepared pin as `pin.is_some()` and never compared its target to
+the commit `candidate_prepared` recorded; `reclaim_after_creation` re-read the target and
+deleted **that** value expected-old — a compare-and-swap comparing the ref to itself, which
+cannot fail.
+
+So a pin moved from the recorded `C` to some `X` after the settlement left a resume
+promoting `C`, appending `task_candidate_created`, and then removing the substituted pin on
+the way out. It **succeeded**, and it deleted the one ref that evidenced the substitution.
+`DESIGN.md` §15 says the opposite: *"Any substituted or symbolic pin … refuses while
+preserving evidence."*
+
+**Both halves now bind to the record.** No new refusal kind: `Refusal::RefAtAnotherSha` is
+`T-CAND-REF`'s "ref present at another SHA" and the pin is a ref present at another sha —
+the refusal inventory is packet-enumerated, so its message was widened to name the two refs
+it serves rather than a variant added.
+
+**The orphan-pin path is deliberately not bound.** With no `candidate_prepared` there is no
+recorded commit to bind to, and DESIGN says a pin without a successful settlement "is
+orphan residue and is removed without dereferencing symbolic refs". The binding applies
+exactly where a record exists to bind to.
+
+**Witness, and the mutation each half dies to.**
+`a_substituted_prepared_pin_refuses_and_leaves_the_evidence` reaches the boundary honestly —
+commit, pin, `candidate_prepared` — then moves the pin to a real sibling commit and asserts
+three things, because "refuses while preserving evidence" is three things: it refuses; the
+error names **both** shas, so the substitution is legible from the message alone; and the
+pin is still at the impostor, the candidates ref was never created, and nothing was
+appended.
+
+| mutation | the witness |
+|---|---|
+| `recovery_for` reads the pin as `is_some()` again | **FAILED** |
+| the prune deletes whatever target it finds again | **FAILED** |
+
+Deliberately **not** a different-tree commit: the sibling shares the judged tree, so the
+2026-08-26 tree check cannot catch it and the pin's own binding is what must. A witness
+that used a divergent tree would pass on the other repair's account.
+
 
 ## 22a. A driver that fails silently on a diff this size
 
