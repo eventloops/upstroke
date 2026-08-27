@@ -1277,7 +1277,10 @@ fn poisoned_fold_refuses_every_later_transition() {
         body: pool_body(),
     };
     assert_eq!(
-        fixture.fold.plan_transition(&event).unwrap_err(),
+        fixture
+            .fold
+            .plan_transition(&event)
+            .expect_err("a poisoned fold cannot plan a transition"),
         FoldError::Poisoned
     );
 

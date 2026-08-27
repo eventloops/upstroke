@@ -624,7 +624,7 @@ fn resolution_and_rebuild_ask_different_questions_of_the_runtime() {
             );
             if !reference_present {
                 assert_eq!(
-                    resolved.unwrap_err(),
+                    resolved.expect_err("resolution refuses an absent image reference"),
                     InspectionRefusal::ImageReferenceAbsent {
                         reference: REFERENCE.to_owned()
                     }
@@ -632,7 +632,7 @@ fn resolution_and_rebuild_ask_different_questions_of_the_runtime() {
             }
             if !id_present {
                 assert_eq!(
-                    rebuilt.unwrap_err(),
+                    rebuilt.expect_err("the rebuild refuses an absent image id"),
                     InspectionRefusal::ImageIdAbsent {
                         id: IMAGE_ID.to_owned()
                     }
@@ -778,7 +778,8 @@ fn resolution_refuses_a_selection_that_does_not_ask_for_a_container() {
     let (runtime, trace) = ready_runtime();
     let host = RunnerSelection::host_default();
     assert_eq!(
-        resolve_container(&runtime, &host).unwrap_err(),
+        resolve_container(&runtime, &host)
+            .expect_err("a host selection is not a container selection"),
         InspectionRefusal::NotAContainerSelection {
             kind: RunnerKind::Host
         }
@@ -786,7 +787,8 @@ fn resolution_refuses_a_selection_that_does_not_ask_for_a_container() {
     let mut imageless = selection();
     imageless.image = None;
     assert_eq!(
-        resolve_container(&runtime, &imageless).unwrap_err(),
+        resolve_container(&runtime, &imageless)
+            .expect_err("a selection carrying no image cannot resolve"),
         InspectionRefusal::SelectionWithoutImage
     );
     assert!(
@@ -1363,12 +1365,14 @@ fn the_rebuild_refuses_an_incomplete_record_before_asking_the_runtime_anything()
     let (runtime, trace) = ready_runtime();
     let mut warnings = Vec::new();
     assert_eq!(
-        rebuild_by_inspection(&runtime, &without_volumes, &selection(), &mut warnings).unwrap_err(),
+        rebuild_by_inspection(&runtime, &without_volumes, &selection(), &mut warnings)
+            .expect_err("a record without credential volumes is incomplete"),
         InspectionRefusal::RecordIncomplete(RunnerRecordDefect::ContainerWithoutCredentialVolumes)
     );
     let host = crate::runner::policy::host_policy();
     assert_eq!(
-        rebuild_by_inspection(&runtime, &host, &selection(), &mut warnings).unwrap_err(),
+        rebuild_by_inspection(&runtime, &host, &selection(), &mut warnings)
+            .expect_err("the host policy is not a container selection"),
         InspectionRefusal::NotAContainerSelection {
             kind: RunnerKind::Host
         }
