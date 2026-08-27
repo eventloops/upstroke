@@ -1968,6 +1968,37 @@ impl RunState {
                         ),
                     });
                 }
+                // **The record must say the attempt failed, and must be this
+                // attempt's.** This door refused `Succeeded` and asked nothing
+                // else, so a settlement could fail a task and halt a run while
+                // carrying a record whose failure field is empty and whose
+                // reviews all passed — a ledger line reporting success attached
+                // to a terminal failure. `AttemptRecord::is_successful` is the
+                // one definition, shared with `check_candidate_prepared`, so
+                // the two doors cannot drift apart again.
+                if finished.record.is_successful() {
+                    return Err(FoldError::InconsistentRecord {
+                        kind: KIND,
+                        detail: format!(
+                            "attempt {} of generation {} settles as a failure and its record \
+                             says the attempt succeeded — `candidate_prepared` is the \
+                             settlement of a successful attempt",
+                            finished.attempt.0, finished.generation.0
+                        ),
+                    });
+                }
+                // The envelope and the record name one attempt. Without this the
+                // ledger line a settlement carries can belong to a different
+                // attempt of the same generation.
+                if finished.record.attempt != finished.attempt.0 {
+                    return Err(FoldError::WrongAttempt {
+                        kind: KIND,
+                        key: finished.key.0,
+                        generation: finished.generation.0,
+                        attempt: finished.record.attempt,
+                        expected: finished.attempt.0.to_string(),
+                    });
+                }
                 check_lease_disposition(KIND, finished.key, generation.lease, *lease)?;
                 if let SettlementTransition::Parked { question } = transition {
                     self.check_new_question(KIND, question, finished.key)?;
@@ -2108,13 +2139,22 @@ impl RunState {
         // `InconsistentRecord` rather than a new variant: the refusal inventory
         // is packet-enumerated, and "the event disagrees with the record it
         // cites" is exactly this kind.
-        if let Some(failure) = prepared.attempt.failure.as_ref() {
+        if !prepared.attempt.is_successful() {
             return Err(FoldError::InconsistentRecord {
                 kind: KIND,
                 detail: format!(
-                    "attempt {} of generation {} records the failure `{:?}` and \
-                     `candidate_prepared` is the settlement of an attempt that succeeded",
-                    prepared.attempt.attempt, prepared.generation.0, failure.kind
+                    "attempt {} of generation {} does not record a successful attempt — \
+                     failure {:?}, review outcomes {:?} — and `candidate_prepared` is the \
+                     settlement of an attempt that succeeded",
+                    prepared.attempt.attempt,
+                    prepared.generation.0,
+                    prepared.attempt.failure.as_ref().map(|f| f.kind),
+                    prepared
+                        .attempt
+                        .reviews
+                        .iter()
+                        .map(|pass| pass.outcome)
+                        .collect::<Vec<_>>()
                 ),
             });
         }
@@ -4474,6 +4514,54 @@ mod tests {
 
     // --- event builders ----------------------------------------------------
 
+    /// One review pass's ledger line, named and concluded.
+    fn review_pass(pass: &str, outcome: ReviewPassOutcome) -> ReviewRecord {
+        ReviewRecord {
+            pass: pass.to_owned(),
+            agent: "copilot".to_owned(),
+            model: "gpt-5.6".to_owned(),
+            adapter: Some("copilot".to_owned()),
+            preflight_cli_version: Some("0.9.3".to_owned()),
+            effort: Some(Effort::Medium),
+            pool: Some("copilot-business".to_owned()),
+            cost_usd: None,
+            outcome,
+        }
+    }
+
+    /// The complete successful attempt **for this task under the frozen plan**.
+    ///
+    /// `TaskKey` is the plan index, so whether a second opinion is configured is
+    /// derived from `review_plan` rather than asserted by the fixture: the
+    /// premise carries exactly the passes §11.2 requires of that task, and no
+    /// others. `review_plan` configures one for index 2 alone.
+    fn attempt_record_for(key: TaskKey, attempt: u32) -> AttemptRecord {
+        let mut record = attempt_record(attempt);
+        // Long enough to include this task's own slot; `review_plan` decides
+        // each index by the same closure the real fixtures use, so slot `key.0`
+        // holds exactly what the frozen plan gives that task.
+        let plan = review_plan(key.0 as usize + 1);
+        if plan
+            .second_opinion
+            .get(key.0 as usize)
+            .is_some_and(Option::is_some)
+        {
+            record
+                .reviews
+                .push(review_pass("second-opinion", ReviewPassOutcome::Passed));
+        }
+        record
+    }
+
+    /// A **complete** successful attempt for a task the plan gives no second
+    /// opinion.
+    ///
+    /// The primary pass is present and `Passed`. This carried a lone
+    /// `second-opinion` entry and no primary at all — a record that satisfies
+    /// `is_successful` only because `all` over its passes never sees the pass
+    /// §11.2 actually requires. A positive premise that passes vacuously
+    /// witnesses nothing about the clause it is meant to exercise: delete the
+    /// review half of `is_successful` and no positive test here would notice.
     fn attempt_record(attempt: u32) -> AttemptRecord {
         AttemptRecord {
             attempt,
@@ -4483,17 +4571,7 @@ mod tests {
             resumed: false,
             duration: Duration::from_millis(123_456),
             cost_usd: Some(1.25),
-            reviews: vec![ReviewRecord {
-                pass: "second-opinion".to_owned(),
-                agent: "copilot".to_owned(),
-                model: "gpt-5.6".to_owned(),
-                adapter: Some("copilot".to_owned()),
-                preflight_cli_version: Some("0.9.3".to_owned()),
-                effort: Some(Effort::Medium),
-                pool: Some("copilot-business".to_owned()),
-                cost_usd: None,
-                outcome: ReviewPassOutcome::Passed,
-            }],
+            reviews: vec![review_pass("review", ReviewPassOutcome::Passed)],
             session_id: Some("sess-ÜNI-0042".to_owned()),
             usage: Some(Usage {
                 input_tokens: Some(9_001),
@@ -4659,18 +4737,33 @@ mod tests {
         })
     }
 
+    /// `attempt_finished`, whose record **says the attempt failed**.
+    ///
+    /// Every settlement this can build is a failure — `candidate_prepared` is the
+    /// sole successful one — so the record is derived to match rather than left
+    /// as the "worker ran and its work was accepted" shape. Built the other way,
+    /// each caller produced a settlement that fails a task while carrying a
+    /// ledger line saying the work passed, which `check_attempt_finished` has
+    /// refused since 2026-08-27.
     fn settle(
         key: TaskKey,
         generation: u32,
         attempt: u32,
         settlement: AttemptSettlement,
     ) -> TopologyEvent {
+        let mut record = attempt_record(attempt);
+        record.failure = Some(crate::events::FailureRecord {
+            kind: crate::ladder::FailureKind::GateFailed,
+            origin: crate::ladder::FailureOrigin::Worker,
+            reason: "the fixture's judged failure".to_owned(),
+            detail: None,
+        });
         ev(TopologyEventBody::AttemptFinished {
             data: Box::new(AttemptFinished4 {
                 key,
                 generation: GenerationId(generation),
                 attempt: AttemptNumber(attempt),
-                record: Box::new(attempt_record(attempt)),
+                record: Box::new(record),
                 settlement,
             }),
         })
@@ -4735,7 +4828,7 @@ mod tests {
             data: Box::new(CandidatePrepared {
                 key,
                 generation: GenerationId(generation),
-                attempt: Box::new(attempt_record(attempt)),
+                attempt: Box::new(attempt_record_for(key, attempt)),
                 base_sha: base.clone(),
                 parent_sha: base.clone(),
                 tree_sha: sha(&format!("tree-{}-{generation}", key.0)),
@@ -7462,6 +7555,158 @@ mod tests {
             generation.class
         );
         assert!(generation.candidate.is_none());
+    }
+
+    /// **A review outcome is authoritative, and both are.**
+    ///
+    /// [`a_candidate_prepared_whose_record_failed_is_refused`] covers the
+    /// failure field. This covers the other half of the same predicate: a record
+    /// carrying no failure at all, whose reviews say `Failed` or `Unavailable`.
+    ///
+    /// §11.2 requires *every* configured pass to pass, and a reviewer that could
+    /// not run "says nothing about the code" — which is not approval. Before
+    /// `AttemptRecord::is_successful` existed this door read `failure.is_none()`
+    /// alone, so a record whose primary reviewer returned `Failed` was promoted,
+    /// charged against the rung allowance and queued as a candidate. The
+    /// `b1f54a5` review walked that sequence.
+    #[test]
+    fn a_candidate_prepared_whose_review_did_not_pass_is_refused() {
+        for outcome in [ReviewPassOutcome::Failed, ReviewPassOutcome::Unavailable] {
+            let base = sha("base");
+            let mut fold = started();
+            apply(&mut fold, &dispatch(ZETA, 0, &base));
+            let start = attempt_started(&fold, ZETA, 0, 1, 0);
+            apply(&mut fold, &start);
+
+            // The premise: the same event with the pass *passed* is accepted, so
+            // the refusal below is about the outcome and nothing else.
+            accepts(&fold, &candidate_prepared(ZETA, 0, &base));
+
+            let mut judged = candidate_prepared(ZETA, 0, &base);
+            let TopologyEventBody::CandidatePrepared { data } = &mut judged.body else {
+                unreachable!("built as a candidate_prepared")
+            };
+            // The failure field stays empty on purpose: this is the shape the
+            // old `failure.is_none()` door called successful.
+            assert!(data.attempt.failure.is_none());
+            data.attempt
+                .reviews
+                .last_mut()
+                .expect("the premise carries the primary pass")
+                .outcome = outcome;
+
+            let error = refuse(&fold, &judged);
+            assert!(
+                matches!(error, FoldError::InconsistentRecord { .. }),
+                "a `{outcome:?}` review was settled as a success: {error:?}"
+            );
+            let text = format!("{error}");
+            assert!(
+                text.contains("review outcomes") && text.contains(&format!("{outcome:?}")),
+                "the refusal must name the outcome that decided it: {text}"
+            );
+
+            // Nothing moved.
+            let generation = fold
+                .task(ZETA)
+                .and_then(|task| task.generations.first())
+                .expect("the generation is open");
+            assert!(
+                matches!(generation.class, GenerationClass::InFlight { .. }),
+                "the refused event promoted the generation anyway: {:?}",
+                generation.class
+            );
+            assert!(generation.candidate.is_none());
+        }
+    }
+
+    /// **A failed settlement whose record says the attempt succeeded is refused.**
+    ///
+    /// The mirror of the candidate door, through the same predicate. This door
+    /// refused `Succeeded` and asked nothing further, so an `attempt_finished`
+    /// could fail a task — halting the run — while carrying a ledger line whose
+    /// failure field is empty and whose every review passed. That line is what a
+    /// person reads when deciding whether to trust a run.
+    #[test]
+    fn an_attempt_finished_whose_record_says_success_is_refused() {
+        let base = sha("base");
+        let mut fold = started();
+        apply(&mut fold, &dispatch(ZETA, 0, &base));
+        let start = attempt_started(&fold, ZETA, 0, 1, 0);
+        apply(&mut fold, &start);
+
+        let closed = || AttemptSettlement::Closed {
+            transition: SettlementTransition::Failed {
+                halts_run: false,
+                reason: "gate `clippy` failed".to_owned(),
+            },
+            lease: LeaseDisposition::PredictedReleased,
+        };
+
+        // The premise: with a record that says failed, this exact settlement
+        // applies.
+        accepts(&fold, &settle(ZETA, 0, 1, closed()));
+
+        let mut lying = settle(ZETA, 0, 1, closed());
+        let TopologyEventBody::AttemptFinished { data } = &mut lying.body else {
+            unreachable!("built as an attempt_finished")
+        };
+        // Exactly the successful shape: no failure, every pass passed.
+        *data.record = attempt_record(1);
+        assert!(data.record.is_successful());
+
+        let error = refuse(&fold, &lying);
+        assert!(
+            matches!(error, FoldError::InconsistentRecord { .. }),
+            "a failure settled while its record reported success: {error:?}"
+        );
+        assert!(
+            format!("{error}").contains("says the attempt succeeded"),
+            "the refusal must say why: {error}"
+        );
+    }
+
+    /// **The envelope and the record name one attempt.**
+    ///
+    /// Without this the ledger line a settlement carries can belong to a
+    /// different attempt of the same generation — attempt 2's cost, duration and
+    /// model recorded against attempt 1's settlement, with every derived total
+    /// reading it as authoritative.
+    #[test]
+    fn an_attempt_finished_whose_record_names_another_attempt_is_refused() {
+        let base = sha("base");
+        let mut fold = started();
+        apply(&mut fold, &dispatch(ZETA, 0, &base));
+        let start = attempt_started(&fold, ZETA, 0, 1, 0);
+        apply(&mut fold, &start);
+
+        let closed = || AttemptSettlement::Closed {
+            transition: SettlementTransition::Failed {
+                halts_run: false,
+                reason: "gate `clippy` failed".to_owned(),
+            },
+            lease: LeaseDisposition::PredictedReleased,
+        };
+        accepts(&fold, &settle(ZETA, 0, 1, closed()));
+
+        for named in [0, 2, 9] {
+            let mut misattributed = settle(ZETA, 0, 1, closed());
+            let TopologyEventBody::AttemptFinished { data } = &mut misattributed.body else {
+                unreachable!("built as an attempt_finished")
+            };
+            data.record.attempt = named;
+
+            let error = refuse(&fold, &misattributed);
+            assert!(
+                matches!(
+                    error,
+                    FoldError::WrongAttempt {
+                        attempt, ref expected, ..
+                    } if attempt == named && expected == "1"
+                ),
+                "a settlement carried attempt {named}'s record on attempt 1's line: {error:?}"
+            );
+        }
     }
 
     /// **A successful attempt spends one of its rung's allowance, and the count

@@ -144,30 +144,43 @@ pub trait Probes {
     ///
     /// [`UpstrokeError::Refused`] when the shell cannot be run, times out, or
     /// does not exit 0.
-    fn shell(&self, invocation: InvocationId) -> Result<(), UpstrokeError>;
+    fn shell(
+        &self,
+        invocation: InvocationId,
+        ledger: &Mutex<InvocationLedger>,
+        slots: &Mutex<SlotAssertion>,
+    ) -> Result<(), UpstrokeError>;
 
     /// One recorded agent's probe, slotted.
+    ///
+    /// **Takes the ledger and slots rather than owning them.** They lived on
+    /// this trait for one round, on the argument that "one owner" made a second
+    /// pair unrepresentable. That argument was wrong and is **retracted**: a
+    /// trait exposing `agent()` beside `ledger()` and `slots()` cannot force
+    /// `agent()` to use what the accessors return, so an implementation could
+    /// run its processes through one pair and report another — and creation's
+    /// closing balance would read the reported one. The `b1f54a5` review
+    /// constructed it.
+    ///
+    /// The claim is not restated in a narrower form here, because it has been
+    /// asserted and found false once already. What is true is smaller: the
+    /// caller owns the pair, the trait has no accessor, and so a probe has
+    /// nothing of its own to report.
+    ///
+    /// The caller owns the pair and hands it in. There is no second pair to
+    /// report because the trait has nothing to report *from*, which is a
+    /// property of the signature rather than of any implementation.
     ///
     /// # Errors
     ///
     /// [`UpstrokeError`] when the adapter is not registered or its CLI does not
     /// answer.
-    fn agent(&self, agent: &str) -> Result<(), UpstrokeError>;
-
-    /// R3's ledger for the processes **these** probes ran.
-    ///
-    /// **On the seam so that a second pair is unrepresentable.** `Request` used
-    /// to carry its own ledger and slots beside a `&dyn Probes`, with nothing
-    /// requiring the two to be the same: construct the probes over locks A and
-    /// the request over empty locks B, and P4 runs through A while creation's
-    /// closing assertion reads B, finds it vacuously balanced, and reports no
-    /// leaked registration. The round-4 review of `09f9a99` set out that
-    /// construction. The type system now refuses it — one owner, and the caller
-    /// cannot supply a second.
-    fn ledger(&self) -> &Mutex<InvocationLedger>;
-
-    /// R4's slots, from the same owner and for the same reason.
-    fn slots(&self) -> &Mutex<SlotAssertion>;
+    fn agent(
+        &self,
+        agent: &str,
+        ledger: &Mutex<InvocationLedger>,
+        slots: &Mutex<SlotAssertion>,
+    ) -> Result<(), UpstrokeError>;
 }
 
 /// The production [`Probes`]: both probes through the run's own `Runner`.
@@ -184,25 +197,23 @@ pub struct RunnerProbes<'a> {
     pub adapters: &'a dyn AdapterSource,
     /// The digest of the policy `runner` executes under.
     pub policy_digest: String,
-    /// R3's ledger, and R4's slots, for the **registering** runner both probes
-    /// execute through.
-    ///
-    /// Behind locks because `Runner::run` takes `&self`: the wrapper registers,
-    /// slots, runs and settles inside one call, and the two ledgers it mutates
-    /// are shared with the caller that reads them afterwards. Resume's
-    /// pre-flight holds them the same way and for the same reason.
-    pub ledger: &'a Mutex<InvocationLedger>,
-    pub slots: &'a Mutex<SlotAssertion>,
 }
 
 impl RunnerProbes<'_> {
     /// The runner both probes actually execute through: the run's, with R3 and
     /// R4 wrapped around **every** request an adapter makes.
-    fn registering(&self) -> super::preflight::Registering<'_> {
+    ///
+    /// The pair comes from the caller, so this cannot wrap one and report
+    /// another.
+    fn registering<'a>(
+        &'a self,
+        ledger: &'a Mutex<InvocationLedger>,
+        slots: &'a Mutex<SlotAssertion>,
+    ) -> super::preflight::Registering<'a> {
         super::preflight::Registering {
             inner: self.runner,
-            ledger: self.ledger,
-            slots: self.slots,
+            ledger,
+            slots,
         }
     }
 }
@@ -212,16 +223,26 @@ impl Probes for RunnerProbes<'_> {
         &self.policy_digest
     }
 
-    fn shell(&self, invocation: InvocationId) -> Result<(), UpstrokeError> {
+    fn shell(
+        &self,
+        invocation: InvocationId,
+        ledger: &Mutex<InvocationLedger>,
+        slots: &Mutex<SlotAssertion>,
+    ) -> Result<(), UpstrokeError> {
         crate::runner::host::run_shell_probe(
-            &self.registering(),
+            &self.registering(ledger, slots),
             self.shell,
             self.workspace.clone(),
             invocation,
         )
     }
 
-    fn agent(&self, agent: &str) -> Result<(), UpstrokeError> {
+    fn agent(
+        &self,
+        agent: &str,
+        ledger: &Mutex<InvocationLedger>,
+        slots: &Mutex<SlotAssertion>,
+    ) -> Result<(), UpstrokeError> {
         let adapter = self
             .adapters
             .get(agent)
@@ -233,15 +254,9 @@ impl Probes for RunnerProbes<'_> {
         // a probe that fails at its fourth request is recorded at its fourth
         // request. Handing `self.runner` here is what made the creation ledger
         // account one logical probe instead of the processes it ran.
-        adapter.probe(&self.registering()).map(|_caps| ())
-    }
-
-    fn ledger(&self) -> &Mutex<InvocationLedger> {
-        self.ledger
-    }
-
-    fn slots(&self) -> &Mutex<SlotAssertion> {
-        self.slots
+        adapter
+            .probe(&self.registering(ledger, slots))
+            .map(|_caps| ())
     }
 }
 
@@ -1321,6 +1336,17 @@ pub struct Request<'a> {
     pub refs: &'a dyn IntegrationRefs,
     /// Where `run_started`'s timestamp comes from.
     pub clock: &'a dyn TimeSource,
+    /// R3's ledger and R4's slots — **the only pair**, handed to each probe.
+    ///
+    /// They were moved onto the `Probes` trait for one round so that "one
+    /// owner" would make a second pair unrepresentable. A trait cannot do that:
+    /// exposing `agent()` beside `ledger()` leaves an implementation free to run
+    /// through one pair and report another, and the balance check below would
+    /// read the reported one. Owning them here and passing them in is the
+    /// property the signature actually gives — a probe has nothing of its own to
+    /// report.
+    pub ledger: &'a Mutex<InvocationLedger>,
+    pub slots: &'a Mutex<SlotAssertion>,
 }
 
 // ---------------------------------------------------------------------------
@@ -1540,7 +1566,10 @@ fn p4_run_preflight(
     // registers itself through `Registering`, so there is nothing to settle
     // here. The identity is still built here because the *ordinal* is this
     // module's — `recovery_order` (c) puts the shell probe first.
-    if let Err(error) = request.probes.shell(shell_id.clone()) {
+    if let Err(error) = request
+        .probes
+        .shell(shell_id.clone(), request.ledger, request.slots)
+    {
         return Err(p3b.abort(Prefix::P3b, error));
     }
 
@@ -1561,7 +1590,7 @@ fn p4_run_preflight(
     // other place.
     let mut probed = Vec::with_capacity(request.agents.len());
     for agent in request.agents {
-        if let Err(error) = request.probes.agent(agent) {
+        if let Err(error) = request.probes.agent(agent, request.ledger, request.slots) {
             return Err(p3b.abort(Prefix::P3b, error));
         }
         probed.push(agent.clone());
@@ -1733,14 +1762,12 @@ fn p6_append_run_started(
             //     **Read through the probes**, which own them, so this cannot
             //     be checking a different pair from the one P4 used.
             let balanced = request
-                .probes
-                .ledger()
+                .ledger
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .balances()
                 && request
-                    .probes
-                    .slots()
+                    .slots
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner)
                     .held()

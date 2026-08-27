@@ -752,7 +752,7 @@ pub(crate) mod tests {
     use super::*;
     use crate::agent::proc::ProcessOutput;
     use crate::events::log::{EventLog, TopologyLine};
-    use crate::events::{ChainSummary, GateSummary, RunOutcome};
+    use crate::events::{ChainSummary, GateSummary, ReviewPassOutcome, ReviewRecord, RunOutcome};
     use crate::gates::ShellKind;
     use crate::ir::{
         Artifact, ArtifactId, Effort, Plan, PlanSource, QuestionId, QuestionKind,
@@ -1098,7 +1098,26 @@ pub(crate) mod tests {
             resumed: false,
             duration: Duration::from_millis(3_141),
             cost_usd: cost,
-            reviews: Vec::new(),
+            // A success premise carries the primary pass §11.2 requires; an
+            // empty list satisfies `is_successful` vacuously and witnesses
+            // nothing about its review clause. A gate failure never reached a
+            // reviewer, so the failing variant's list is empty because it is —
+            // not for want of a fixture.
+            reviews: if failure.is_none() {
+                vec![ReviewRecord {
+                    pass: "review".to_owned(),
+                    agent: "claude-code".to_owned(),
+                    model: "claude-opus-5".to_owned(),
+                    adapter: Some("claude-code".to_owned()),
+                    preflight_cli_version: None,
+                    effort: None,
+                    pool: None,
+                    cost_usd: None,
+                    outcome: ReviewPassOutcome::Passed,
+                }]
+            } else {
+                Vec::new()
+            },
             session_id: None,
             usage: None,
             failure: failure.map(|(kind, origin)| FailureRecord {
@@ -1133,7 +1152,16 @@ pub(crate) mod tests {
             key,
             generation: GenerationId(generation),
             attempt: AttemptNumber(attempt),
-            record: record(attempt, Some(0.5)),
+            // **A failed settlement's record says failed.** This used
+            // `record(attempt, Some(0.5))`, whose `failure: None` means "the work
+            // was judged and accepted" — the very shape the comment on
+            // `record_failing` calls "a fixture that cannot happen", two hundred
+            // lines above. `check_attempt_finished` refuses it since 2026-08-27.
+            record: record_failing(
+                attempt,
+                Some(0.5),
+                Some((FailureKind::GateFailed, FailureOrigin::Worker)),
+            ),
             next,
             session: None,
             question: None,

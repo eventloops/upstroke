@@ -2009,13 +2009,35 @@ fn attempt_record(attempt: u32) -> AttemptRecord {
     }
 }
 
+/// `attempt_finished`, whose record **says the attempt failed** — because every
+/// settlement this helper can build is a failure.
+///
+/// `candidate_prepared` is the sole successful settlement, so an
+/// `attempt_finished` is a retry, an escalation, a park, a deferral, a retained
+/// hold or a terminal failure, and each of those is an attempt that did not
+/// succeed. This built `attempt_record(attempt)` — `failure: None`, no reviews —
+/// so every fixture using it produced a settlement that fails a task while
+/// carrying a ledger line saying the work passed. The fold accepted that until
+/// 2026-08-27; now `check_attempt_finished` refuses it, and this helper would
+/// have made ~8 fixtures refuse rather than making them coherent.
+///
+/// Deriving the record from the settlement is the fix, not attaching a failure
+/// at each call site: a fixture that has to remember to make its own event
+/// self-consistent is a fixture that will stop doing so.
 fn attempt_finished(attempt: u32, settlement: AttemptSettlement) -> TopologyEventBody {
+    let mut record = attempt_record(attempt);
+    record.failure = Some(crate::events::FailureRecord {
+        kind: crate::ladder::FailureKind::GateFailed,
+        origin: crate::ladder::FailureOrigin::Worker,
+        reason: "the fixture's judged failure".to_owned(),
+        detail: None,
+    });
     TopologyEventBody::AttemptFinished {
         data: Box::new(AttemptFinished4 {
             key: ALPHA,
             generation: GEN,
             attempt: AttemptNumber(attempt),
-            record: Box::new(attempt_record(attempt)),
+            record: Box::new(record),
             settlement,
         }),
     }

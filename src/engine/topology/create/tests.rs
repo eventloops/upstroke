@@ -415,8 +415,6 @@ struct RecordingProbes {
     /// site of its own.
     kill_shell: bool,
     kill_agent: bool,
-    ledger: std::sync::Mutex<InvocationLedger>,
-    slots: std::sync::Mutex<SlotAssertion>,
 }
 
 impl RecordingProbes {
@@ -424,8 +422,6 @@ impl RecordingProbes {
         Self {
             digest: digest.to_owned(),
             calls: Mutex::new(Vec::new()),
-            ledger: std::sync::Mutex::new(InvocationLedger::new()),
-            slots: std::sync::Mutex::new(SlotAssertion::new()),
             refuse_shell: false,
             refuse_agent: None,
             kill_shell: false,
@@ -446,7 +442,12 @@ impl Probes for RecordingProbes {
         &self.digest
     }
 
-    fn shell(&self, invocation: InvocationId) -> Result<(), UpstrokeError> {
+    fn shell(
+        &self,
+        invocation: InvocationId,
+        _ledger: &std::sync::Mutex<InvocationLedger>,
+        _slots: &std::sync::Mutex<SlotAssertion>,
+    ) -> Result<(), UpstrokeError> {
         self.calls
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
@@ -462,7 +463,12 @@ impl Probes for RecordingProbes {
         Ok(())
     }
 
-    fn agent(&self, agent: &str) -> Result<(), UpstrokeError> {
+    fn agent(
+        &self,
+        agent: &str,
+        _ledger: &std::sync::Mutex<InvocationLedger>,
+        _slots: &std::sync::Mutex<SlotAssertion>,
+    ) -> Result<(), UpstrokeError> {
         self.calls
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
@@ -476,16 +482,6 @@ impl Probes for RecordingProbes {
             });
         }
         Ok(())
-    }
-
-    /// The double's own pair, which is the point: creation's balance check reads
-    /// whatever ran the probes, so a fixture's ledger is the fixture's.
-    fn ledger(&self) -> &std::sync::Mutex<InvocationLedger> {
-        &self.ledger
-    }
-
-    fn slots(&self) -> &std::sync::Mutex<SlotAssertion> {
-        &self.slots
     }
 }
 
@@ -764,6 +760,8 @@ struct Driver<'a> {
     refs: &'a dyn IntegrationRefs,
     agents: Vec<String>,
     runner: RunnerPolicy,
+    ledger: std::sync::Mutex<InvocationLedger>,
+    slots: std::sync::Mutex<SlotAssertion>,
     warnings: Vec<String>,
 }
 
@@ -775,6 +773,8 @@ impl<'a> Driver<'a> {
             refs,
             agents: agents(),
             runner: crate::runner::policy::host_policy(),
+            ledger: std::sync::Mutex::new(InvocationLedger::new()),
+            slots: std::sync::Mutex::new(SlotAssertion::new()),
             warnings: Vec::new(),
         }
     }
@@ -792,6 +792,8 @@ impl<'a> Driver<'a> {
             probes: self.probes,
             refs: self.refs,
             clock: &clock,
+            ledger: &self.ledger,
+            slots: &self.slots,
         };
         create_run(self.fixture.checked(), request, hooks, &mut self.warnings)
     }
@@ -1980,16 +1982,12 @@ fn the_p1_staging_label_names_the_residue_the_stat_finds() {
 #[derive(Debug)]
 struct LeakyProbes {
     digest: String,
-    ledger: std::sync::Mutex<InvocationLedger>,
-    slots: std::sync::Mutex<SlotAssertion>,
 }
 
 impl LeakyProbes {
     fn new(digest: &str) -> Self {
         Self {
             digest: digest.to_owned(),
-            ledger: std::sync::Mutex::new(InvocationLedger::new()),
-            slots: std::sync::Mutex::new(SlotAssertion::new()),
         }
     }
 }
@@ -1999,25 +1997,29 @@ impl Probes for LeakyProbes {
         &self.digest
     }
 
-    fn shell(&self, _invocation: InvocationId) -> Result<(), UpstrokeError> {
+    fn shell(
+        &self,
+        _invocation: InvocationId,
+        _ledger: &std::sync::Mutex<InvocationLedger>,
+        _slots: &std::sync::Mutex<SlotAssertion>,
+    ) -> Result<(), UpstrokeError> {
         Ok(())
     }
 
-    fn agent(&self, agent: &str) -> Result<(), UpstrokeError> {
-        // Registered and never settled: the leak P6's refusal exists to report.
+    fn agent(
+        &self,
+        agent: &str,
+        ledger: &std::sync::Mutex<InvocationLedger>,
+        _slots: &std::sync::Mutex<SlotAssertion>,
+    ) -> Result<(), UpstrokeError> {
+        // Registered and never settled, **into the ledger it was handed** —
+        // which is the whole point: a probe has no ledger of its own to leak
+        // into and no second one to report instead.
         let id = PreflightIdentities::agent(agent, 0)?;
-        self.ledger
+        ledger
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .register(&id)
-    }
-
-    fn ledger(&self) -> &std::sync::Mutex<InvocationLedger> {
-        &self.ledger
-    }
-
-    fn slots(&self) -> &std::sync::Mutex<SlotAssertion> {
-        &self.slots
     }
 }
 
@@ -2045,8 +2047,8 @@ fn a_leaked_probe_registration_is_reported_by_the_append_error() {
         .expect_err("the append returned an error");
 
     assert!(
-        !probes
-            .ledger()
+        !driver
+            .ledger
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .balances(),
@@ -2072,11 +2074,19 @@ fn a_leaked_probe_registration_is_reported_by_the_append_error() {
 /// refusal would report a balanced run whatever A held. The round-4 review of
 /// `09f9a99` set that construction out as a P1.
 ///
-/// **The type system now refuses it**: the pair lives on the `Probes` seam and
-/// `Request` has none, so there is one owner and no second to supply. That is a
-/// compile-time property and this test cannot demonstrate it by construction —
-/// what it demonstrates is the other half, that the check reads a **populated**
-/// ledger rather than an empty one it could never have failed on.
+/// **The repair for that was wrong, and this comment claimed it worked.** Moving
+/// the pair onto the `Probes` trait was said here to make a second pair
+/// "unrepresentable" — a compile-time property. It is not: a trait exposing
+/// `agent()` beside `ledger()` cannot force `agent()` to use what the accessor
+/// returns, so an implementation could run through one pair and report another.
+/// The `b1f54a5` review disproved it, and the claim is **retracted** rather than
+/// restated a fourth time.
+///
+/// What holds now is narrower and true: `Request` owns the single pair and hands
+/// it to each probe, and the trait has **no accessor at all** — so a probe has
+/// nothing of its own to report. That is a property of the signature, and what
+/// this test adds is the other half: the check reads a **populated** ledger
+/// rather than an empty one it could never have failed on.
 ///
 /// The previous witness went through `RunnerProbes::agent` directly and inspected
 /// that wrapper's own locks; it never built a `Request` and never called
@@ -2092,16 +2102,14 @@ fn the_append_error_balance_reads_the_ledger_the_probes_used() {
     // real and the balance is earned.
     let runner = RecordingRunner::default();
     let source = OneSource::default();
-    let ledger = std::sync::Mutex::new(InvocationLedger::new());
-    let slots = std::sync::Mutex::new(SlotAssertion::new());
+    // No pair is built here: the `Request` owns the one pair and hands it to
+    // each probe, so the witness reads `driver.ledger` below.
     let probes = RunnerProbes {
         runner: &runner,
         shell: crate::gates::ShellKind::Sh,
         workspace: fixture.repo.clone(),
         adapters: &source,
         policy_digest: host_digest(),
-        ledger: &ledger,
-        slots: &slots,
     };
     let refs = FakeRefs::empty();
     let mut hooks = TestHooks::new();
@@ -2115,13 +2123,11 @@ fn the_append_error_balance_reads_the_ledger_the_probes_used() {
         .run(&mut hooks)
         .expect_err("the append returned an error");
 
-    // The premise: P4 ran, and its registrations are in the ledger this test can
-    // reach — the probes' own. A balance check over an empty ledger is true for
-    // the wrong reason, and asserting the premise is what stops that.
-    let ledger = probes
-        .ledger()
-        .lock()
-        .unwrap_or_else(PoisonError::into_inner);
+    // The premise: P4 ran, and its registrations are in **the** ledger — the one
+    // the request owns and hands to each probe, because there is no other. A
+    // balance check over an empty ledger is true for the wrong reason, and
+    // asserting the premise is what stops that.
+    let ledger = driver.ledger.lock().unwrap_or_else(PoisonError::into_inner);
     assert!(
         ledger.completed() > 0,
         "P4 settled no invocation, so the balance the refusal reports is vacuous \
@@ -3417,8 +3423,6 @@ fn container_runtime() -> Inventory {
 struct ContainerProbes {
     runner: crate::runner::container::exec::ContainerRunner,
     workspace: PathBuf,
-    ledger: std::sync::Mutex<InvocationLedger>,
-    slots: std::sync::Mutex<SlotAssertion>,
 }
 
 impl ContainerProbes {
@@ -3447,8 +3451,6 @@ impl ContainerProbes {
         .expect("a container runner over the resolved policy")
         .with_hooks(Box::new(hooks));
         Self {
-            ledger: std::sync::Mutex::new(InvocationLedger::new()),
-            slots: std::sync::Mutex::new(SlotAssertion::new()),
             runner,
             workspace: fixture.repo.clone(),
         }
@@ -3460,7 +3462,12 @@ impl Probes for ContainerProbes {
         self.runner.policy_digest()
     }
 
-    fn shell(&self, invocation: InvocationId) -> Result<(), UpstrokeError> {
+    fn shell(
+        &self,
+        invocation: InvocationId,
+        _ledger: &std::sync::Mutex<InvocationLedger>,
+        _slots: &std::sync::Mutex<SlotAssertion>,
+    ) -> Result<(), UpstrokeError> {
         crate::runner::host::run_shell_probe(
             &self.runner,
             crate::gates::ShellKind::Sh,
@@ -3469,18 +3476,13 @@ impl Probes for ContainerProbes {
         )
     }
 
-    fn agent(&self, _agent: &str) -> Result<(), UpstrokeError> {
+    fn agent(
+        &self,
+        _agent: &str,
+        _ledger: &std::sync::Mutex<InvocationLedger>,
+        _slots: &std::sync::Mutex<SlotAssertion>,
+    ) -> Result<(), UpstrokeError> {
         Ok(())
-    }
-
-    /// The double's own pair, which is the point: creation's balance check reads
-    /// whatever ran the probes, so a fixture's ledger is the fixture's.
-    fn ledger(&self) -> &std::sync::Mutex<InvocationLedger> {
-        &self.ledger
-    }
-
-    fn slots(&self) -> &std::sync::Mutex<SlotAssertion> {
-        &self.slots
     }
 }
 
@@ -3512,6 +3514,8 @@ fn container_probe_kill_child() {
     let plan_bytes = normalized_plan();
     let clock = Fixed::default();
     let agents = agents();
+    let ledger = std::sync::Mutex::new(InvocationLedger::new());
+    let slots = std::sync::Mutex::new(SlotAssertion::new());
     let request = Request {
         repo_root: &fixture.repo,
         repo_key: fixture.repo_key.clone(),
@@ -3522,6 +3526,8 @@ fn container_probe_kill_child() {
         probes: &probes,
         refs: &refs,
         clock: &clock,
+        ledger: &ledger,
+        slots: &slots,
     };
     let mut warnings = Vec::new();
     let _ = create_run(checked, request, &mut hooks, &mut warnings);
@@ -3918,12 +3924,10 @@ fn the_creation_ledger_accounts_every_probe_process() {
         workspace: std::env::temp_dir(),
         adapters: &source,
         policy_digest: host_digest(),
-        ledger: &ledger,
-        slots: &slots,
     };
 
     probes
-        .agent(AGENT)
+        .agent(AGENT, &ledger, &slots)
         .expect_err("the adapter's second request refuses");
 
     let ledger = ledger.lock().unwrap_or_else(PoisonError::into_inner);
@@ -4036,14 +4040,12 @@ fn the_production_probes_run_both_halves_through_the_runs_runner() {
         workspace: std::env::temp_dir(),
         adapters: &source,
         policy_digest: host_digest(),
-        ledger: &ledger,
-        slots: &slots,
     };
     assert_eq!(probes.policy_digest(), host_digest());
 
     let shell_id = PreflightIdentities::shell(0).expect("the shell probe identity");
     probes
-        .shell(shell_id.clone())
+        .shell(shell_id.clone(), &ledger, &slots)
         .expect("the recorded shell runs `exit 0`");
     let requests = runner.requests();
     assert_eq!(requests.len(), 1, "{requests:?}");
@@ -4060,7 +4062,9 @@ fn the_production_probes_run_both_halves_through_the_runs_runner() {
         "the recorded shell, not some other one"
     );
 
-    probes.agent(AGENT).expect("the adapter is probed");
+    probes
+        .agent(AGENT, &ledger, &slots)
+        .expect("the adapter is probed");
     assert_eq!(
         *source
             .adapter
@@ -4084,7 +4088,7 @@ fn the_production_probes_run_both_halves_through_the_runs_runner() {
     // silently skipped: a run whose pre-flight certified nothing would still
     // record it in `probed_agents`.
     let refusal = probes
-        .agent("no-such-agent")
+        .agent("no-such-agent", &ledger, &slots)
         .expect_err("an unregistered agent refuses");
     assert!(
         refusal.to_string().contains("no-such-agent"),

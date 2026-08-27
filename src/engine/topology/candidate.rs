@@ -1128,9 +1128,9 @@ mod tests {
 
     use super::*;
     use crate::agent::ProcessOutput;
-    use crate::events::GateSummary;
     use crate::events::log::{EventLog, TopologyLine, site_for};
     use crate::events::{BindingSummary, ChainSummary};
+    use crate::events::{GateSummary, ReviewPassOutcome, ReviewRecord};
     use crate::gates::ShellKind;
     use crate::ir::{Effort, Plan, PlanSource, ResolvedEffortPolicy, Task, TaskId, TaskKind, Tier};
     use crate::review::{PassBinding, ReviewPlan};
@@ -3399,7 +3399,20 @@ mod tests {
             resumed: false,
             duration: Duration::from_millis(1_234),
             cost_usd: Some(0.5),
-            reviews: Vec::new(),
+            // The primary pass §11.2 requires, present and passed. Empty
+            // `reviews` satisfies `is_successful` vacuously — the premise then
+            // exercises none of the clause it is the positive witness for.
+            reviews: vec![ReviewRecord {
+                pass: "review".to_owned(),
+                agent: "claude-code".to_owned(),
+                model: "claude-opus-5".to_owned(),
+                adapter: Some("claude-code".to_owned()),
+                preflight_cli_version: None,
+                effort: None,
+                pool: None,
+                cost_usd: None,
+                outcome: ReviewPassOutcome::Passed,
+            }],
             session_id: None,
             usage: None,
             failure: None,

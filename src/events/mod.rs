@@ -640,6 +640,36 @@ pub enum AttemptTransition {
 }
 
 impl AttemptRecord {
+    /// Whether this record says the attempt **succeeded**.
+    ///
+    /// **One definition, read by both of the fold's settlement doors.** "The
+    /// attempt succeeded" is not `failure.is_none()`: a record can carry no
+    /// failure and still hold a review whose outcome is `Failed` or
+    /// `Unavailable`, both of which are authoritative — §11.2 requires every
+    /// configured pass to pass, and a reviewer that could not run "says nothing
+    /// about the code", which is not the same as approving it.
+    ///
+    /// `check_candidate_prepared` enforced only the failure field and
+    /// `check_attempt_finished` enforced neither, so each door checked a
+    /// different half of the same question and a record with a `Failed` review
+    /// was promoted, charged and queued as a candidate. The `b1f54a5` review
+    /// walked it. This is the same "one derivation, not two" that the rung
+    /// allowance needed: the doors now ask one predicate rather than each
+    /// deciding for itself.
+    #[must_use]
+    pub fn is_successful(&self) -> bool {
+        self.failure.is_none() && self.reviews.iter().all(|pass| pass.outcome.passed())
+    }
+
+    /// Whether this record says the attempt **failed**.
+    ///
+    /// The complement, named rather than written as `!is_successful()` at each
+    /// call site, so that a settlement door reads the question it is asking.
+    #[must_use]
+    pub fn is_failed(&self) -> bool {
+        !self.is_successful()
+    }
+
     /// Total review spend for this attempt, or `None` when nothing reported any
     /// — which is not the same as nothing costing anything (§13: the Copilot
     /// route reports no spend at all).

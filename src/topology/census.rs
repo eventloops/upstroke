@@ -487,7 +487,8 @@ mod tests {
 
     use super::*;
     use crate::events::{
-        AttemptRecord, BindingSummary, BudgetKind, ChainSummary, GateSummary, RunOutcome,
+        AttemptRecord, BindingSummary, BudgetKind, ChainSummary, GateSummary, ReviewPassOutcome,
+        ReviewRecord, RunOutcome,
     };
     use crate::gates::ShellKind;
     use crate::ir::{
@@ -791,7 +792,20 @@ mod tests {
             resumed: false,
             duration: Duration::from_millis(4_321),
             cost_usd: Some(0.75),
-            reviews: Vec::new(),
+            // The primary pass §11.2 requires, present and passed. Empty
+            // `reviews` satisfies `is_successful` vacuously — the premise then
+            // exercises none of the clause it is the positive witness for.
+            reviews: vec![ReviewRecord {
+                pass: "review".to_owned(),
+                agent: "claude-code".to_owned(),
+                model: "claude-opus-5".to_owned(),
+                adapter: Some("claude-code".to_owned()),
+                preflight_cli_version: None,
+                effort: None,
+                pool: None,
+                cost_usd: None,
+                outcome: ReviewPassOutcome::Passed,
+            }],
             session_id: None,
             usage: None,
             failure: None,
@@ -865,7 +879,20 @@ mod tests {
                 key,
                 generation: GenerationId(generation),
                 attempt: AttemptNumber(attempt),
-                record: Box::new(attempt_record(attempt)),
+                record: Box::new({
+                    // The record says failed, because every settlement this
+                    // builds is one: `candidate_prepared` is the sole successful
+                    // settlement and `check_attempt_finished` refuses a failure
+                    // whose record reports success.
+                    let mut record = attempt_record(attempt);
+                    record.failure = Some(crate::events::FailureRecord {
+                        kind: crate::ladder::FailureKind::GateFailed,
+                        origin: crate::ladder::FailureOrigin::Worker,
+                        reason: "the fixture's judged failure".to_owned(),
+                        detail: None,
+                    });
+                    record
+                }),
                 settlement: AttemptSettlement::Closed { transition, lease },
             }),
         })

@@ -676,7 +676,8 @@ mod tests {
     use super::super::settle;
     use super::super::settle::tests::{
         ALEPH, BET, GIMEL, apply, dispatch, ev, finished, in_flight, inputs, label, question_for,
-        record, region, resume_event, retained_generation, settle_into, sha, started,
+        record, record_failing, region, resume_event, retained_generation, settle_into, sha,
+        started,
     };
 
     // -----------------------------------------------------------------------
@@ -970,7 +971,17 @@ mod tests {
         // A failure records on `attempt_finished`.
         in_flight(&mut fold, ALEPH, 0);
         let mut failing = finished(ALEPH, 0, 1, Next::Fail);
-        failing.record = record(1, Some(0.75));
+        // The record says failed, because the settlement does — `record`'s
+        // `failure: None` is "judged and accepted", which is not what an
+        // `attempt_finished` can carry.
+        failing.record = record_failing(
+            1,
+            Some(0.75),
+            Some((
+                crate::ladder::FailureKind::GateFailed,
+                crate::ladder::FailureOrigin::Worker,
+            )),
+        );
         let event = settle_into(&mut fold, &failing);
         log.push(ev(TopologyEventBody::AttemptFinished {
             data: Box::new(event),
