@@ -223,8 +223,27 @@ the pin-absent refusal are all removed**, because their premise is unreachable. 
 prefix is now a pin with no candidate record — orphan residue, which
 `candidate::recovery_for` prunes while settling the attempt interrupted.
 
-**Witnesses re-derived, not patched.** Roughly twenty-five failed on the invariant change.
-Each was re-derived against it and the diff is `+75/−390` in `recover/tests.rs` alone:
+**Witnesses re-derived, not patched — and that claim was false when written.**
+
+> **Corrected 2026-08-27.** Roughly twenty-five witnesses failed on the invariant change.
+> The ones named below were genuinely re-derived. But `Journal::settle_succeeded`, the
+> candidate suite's shared settlement helper, was turned into an **explicit no-op** and left
+> at its call sites so that ~15 fixtures would pass without being touched. That is patching
+> a shared helper, which is what this sentence claimed had not been done, and the round-4
+> review of `09f9a99` said so.
+>
+> The real re-derivation is done: the helper and all **nine** call sites are removed, and
+> each fixture's sequence is now `task_dispatched → attempt_started → candidate_prepared`
+> with no settlement between them. They assert the invariant rather than tolerating it —
+> making `apply_candidate_prepared` stop promoting the generation fails **five** of them
+> (`pin_pruned_after_promotion`, `promoting_completed_at_run_end`,
+> `a_pin_left_by_an_interrupted_promotion_is_pruned_by_the_closure_procedure`,
+> `worktree_removal_idempotent_after_candidate_created`,
+> `kill_after_candidate_prepared_appends_candidate_created_once`), which they could not have
+> done while a no-op stood in for the step.
+
+Each of the named witnesses was re-derived against the invariant, and the diff is
+`+75/−390` in `recover/tests.rs` alone:
 
 * `candidate_prepared_is_the_sole_successful_settlement` replaces
   `a_successful_settlement_promotes_the_generation_and_keeps_its_region` — three claims:
@@ -2807,6 +2826,46 @@ nothing moved: the generation is still `InFlight` with no candidate.
 | mutation | the witness |
 |---|---|
 | the door stops requiring success | **FAILED** |
+
+### Round 4's docs finding — and the identifier check that was too weak
+
+**Five production comments still prescribed the settlement the fold now refuses.** The
+2026-08-27 ruling changed the code and not the prose around it: `candidate.rs`'s and
+`attempt.rs`'s module headers, `run.rs`'s candidate-sequence doc, `settle.rs`'s lease note,
+and `recover.rs`'s continuation doc all described `attempt_finished(succeeded)` between the
+pin and `candidate_prepared` — two of them as the thing that *makes* the generation
+`Promoting`, which is now the opposite of true. All five are rewritten to the ruled
+semantics, each saying what it used to say and why that is wrong.
+
+**The fourth fabricated identifier.** `CandidateRecovery::SettleInterrupted` — a struct with
+a `settles_interrupted: bool` field and no such associated item. And `events::Dangling::event`,
+reported corrected "in both files" in round 3, survived in
+`decisions/2026-08-26-durable-retry-feedback.md` — the **immutable** artifact, and the one a
+reader reaches first. Three places, and I checked two.
+
+**The check that was supposed to prevent this was too weak, and the two names show how.**
+Round 3's rule was that a backticked name must *occur* in the tree. `Dangling` occurred —
+in the prose that invented it. `CandidateRecovery` occurs, so the fabricated associated item
+would have passed on its prefix. Occurrence is not definition.
+
+`~/tactus-artifacts/pr7/drivers/idcheck.sh` now requires a **definition site**: a Rust item
+(`fn`/`struct`/`enum`/`trait`/`type`/`const`/`static`/`mod`), an enum variant, a struct
+field, or — for an event kind, which has no Rust item — its wire name in one of the two
+vocabularies. Controls: both fabricated names are refused, and a run over this round's diff
+is clean.
+
+It also flagged something worth keeping: **`complete_promotions` and `settle_succeeded`**,
+narrated in new comments as history. They are deleted, so they do not resolve — and
+formatting a deleted item as a code path is what implies it still exists. They are now plain
+prose, and the check has **no exceptions**.
+
+**And the "never patched to pass" claim was false.** `Journal::settle_succeeded` was made an
+explicit no-op and left at its call sites so ~15 fixtures would pass untouched. The helper
+and all **nine** call sites are now gone; each fixture's sequence is
+`task_dispatched → attempt_started → candidate_prepared`. They assert the invariant rather
+than tolerating it: making `apply_candidate_prepared` stop promoting fails **five** of them,
+which a no-op standing in for the step made impossible. The round-3 claim is corrected
+where it stands, in the §3 appendix that made it.
 
 
 ## 22a. A driver that fails silently on a diff this size

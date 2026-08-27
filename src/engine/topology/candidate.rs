@@ -49,10 +49,16 @@
 //! `transaction_fault_matrix[T-CAND-OBJ]` puts the whole of steps 1 and 2 in a
 //! window whose `durable_state` is "attempt_started only" and whose
 //! `authoritative_state` is "**attempt unsettled**" — so the commit object and
-//! its pin are written *before* `attempt_finished(succeeded)` is appended,
-//! which is what makes the generation `Promoting` and what
-//! `candidate_prepared` then requires. The settlement is O24's and belongs to
-//! `settle.rs`.
+//! its pin are written while the attempt is still unsettled, and the settlement
+//! is `candidate_prepared` itself.
+//!
+//! **This said `attempt_finished(succeeded)` is appended between the pin and
+//! `candidate_prepared`, "which is what makes the generation `Promoting`".** It
+//! is not, and since the 2026-08-27 CONFORM ruling the fold refuses that event:
+//! `decisions/2026-08-12-merge-queue-execution-topology.md` makes
+//! `candidate_prepared` the sole successful settlement for a candidate-producing
+//! attempt and adds that `attempt_finished` "is not also emitted for that
+//! attempt". `apply_candidate_prepared` is what promotes the generation.
 //!
 //! That is the whole reason a resume in this window "settles attempt
 //! interrupted" rather than promoting: there is no settled attempt to prepare a
@@ -66,8 +72,8 @@
 //! **An unpinned candidate commit is never adopted.**
 //! `transaction_fault_matrix[T-CAND-OBJ].resume_action` for the prefix where
 //! the object exists and no pin does is "nothing to delete: the unpinned object
-//! is left to Git (never adopted; decision:295)". [`recovery_for`] answers
-//! [`CandidateRecovery::SettleInterrupted`] there and names no object at all,
+//! is left to Git (never adopted; decision:295)". [`recovery_for`] returns
+//! [`CandidateRecovery`] with `settles_interrupted` set there, naming no object,
 //! so there is no value a later step could adopt. The commit stays unreachable
 //! and Git's garbage collector owns it (R27).
 //!
@@ -1431,7 +1437,8 @@ mod tests {
         /// That is `transaction_fault_matrix[T-CAND-OBJ]`'s durable state
         /// exactly ("attempt_started only"; "attempt unsettled"), which is the
         /// state the commit-tree and the pin happen in.
-        /// [`Self::settle_succeeded`] is the step after them.
+        /// The step after them is `candidate_prepared`, which is the
+        /// settlement — there is no separate one to append first.
         fn open(private: &Path, base_sha: CommitSha, hooks: &Hooks) -> Self {
             let path = private.join("events.jsonl");
             let mut warnings = Vec::new();
@@ -1478,25 +1485,6 @@ mod tests {
                 .expect("attempt_started");
             journal
         }
-
-        /// **A no-op, kept so the sequence it named is still readable.**
-        ///
-        /// This emitted `attempt_finished(succeeded)` and called it "the
-        /// settlement that makes the generation `Promoting`". It is not:
-        /// `decisions/2026-08-12-merge-queue-execution-topology.md` makes
-        /// `candidate_prepared` the sole successful settlement and says
-        /// `attempt_finished` "is not also emitted for that attempt", and since
-        /// the 2026-08-27 CONFORM ruling the fold refuses the event this used
-        /// to write.
-        ///
-        /// The generation now reaches `Promoting` when `candidate_prepared` is
-        /// applied, which every caller of this already appends immediately
-        /// afterwards. Kept as a call rather than deleted at ~15 call sites so
-        /// that each test still reads as the sequence it drives, and so the
-        /// diff for this ruling shows the settlement moving rather than the
-        /// fixtures being rewritten around it.
-        #[allow(clippy::unused_self)]
-        fn settle_succeeded(&mut self) {}
 
         /// Reopen an existing log and replay it: `resume is
         /// replay-then-continue, and there is no second path`.
@@ -1938,7 +1926,6 @@ mod tests {
                 let unpinned = write_candidate_commit(&manager, &mut hooks, RUN_ID, judged)
                     .expect("commit-tree");
                 let pinned = pin_candidate(&manager, &mut hooks, unpinned).expect("pin");
-                journal.settle_succeeded();
                 let promoting =
                     append_candidate_prepared(&mut journal, pinned).expect("candidate_prepared");
                 hooks.arm_phase(
@@ -2241,7 +2228,6 @@ mod tests {
             .expect("commit-tree");
         let commit = unpinned.commit_sha().clone();
         let pinned = pin_candidate(&fixture.manager, hooks, unpinned).expect("pin");
-        journal.settle_succeeded();
         promote(&fixture.manager, hooks, journal, &fixture.task, pinned).expect("promote");
         commit
     }
@@ -2603,7 +2589,6 @@ mod tests {
             write_candidate_commit(&fixture.manager, &mut hooks, RUN_ID, fixture.judged())
                 .expect("commit-tree");
         let pinned = pin_candidate(&fixture.manager, &mut hooks, unpinned).expect("pin");
-        journal.settle_succeeded();
         let promoting =
             append_candidate_prepared(&mut journal, pinned).expect("candidate_prepared");
 
@@ -2963,7 +2948,6 @@ mod tests {
         let fixture = Fixture::new("object-missing");
         let mut hooks = Hooks::new();
         let mut journal = fixture.journal(&hooks);
-        journal.settle_succeeded();
 
         let absent = CommitSha("0123456789abcdef0123456789abcdef01234567".to_owned());
         assert!(
@@ -3041,7 +3025,6 @@ mod tests {
         let fixture = Fixture::new("tree-never-judged");
         let mut hooks = Hooks::new();
         let mut journal = fixture.journal(&hooks);
-        journal.settle_succeeded();
 
         let (impostor, impostor_tree) = fixture.divergent_tree_commit(&mut hooks);
         assert_ne!(
@@ -3124,7 +3107,6 @@ mod tests {
             let fixture = Fixture::new("object-not-the-candidate");
             let mut hooks = Hooks::new();
             let mut journal = fixture.journal(&hooks);
-            journal.settle_succeeded();
 
             // Two real objects of the fixture's own repository. The tree is not
             // a commit; the base is a commit whose parent is not the base.
@@ -3230,7 +3212,6 @@ mod tests {
                 .expect("commit-tree");
         let commit = unpinned.commit_sha().clone();
         let pinned = pin_candidate(&fixture.manager, &mut hooks, unpinned).expect("pin");
-        journal.settle_succeeded();
         hooks.arm_phase(
             EffectSiteId::Ref(RefSite::DeleteCandidatePin),
             HookPhase::Before,

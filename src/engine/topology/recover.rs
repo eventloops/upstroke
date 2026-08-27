@@ -1932,11 +1932,19 @@ pub fn refuse_unimplemented_terminals(certified: &PreflightCertified) -> Result<
 /// The row's own words are a four-step sequence, not one append: *"verify
 /// object; create exact candidates ref zero-old if absent; append
 /// `task_candidate_created`; prune the pin (no spend repeats); the closure
-/// procedure performs the same steps at any run end"*. Erratum **E6** moved the
-/// row's boundary back to the settlement and says of the earlier window "append
-/// `candidate_prepared`, **then continue as `T-CAND-REF`**" — so the append
-/// [`complete_promotions`] makes is the *entry* to this sequence and never the
-/// whole of it.
+/// procedure performs the same steps at any run end"*.
+///
+/// **The entry to it is the run's own `candidate_prepared`, not a resume's.**
+/// This described complete_promotions — a function deleted with the window it
+/// served — making that append: erratum E6's
+/// convergence, which rebuilt a candidate identity from the prepared pin. Both
+/// are gone: since the 2026-08-27 CONFORM ruling `candidate_prepared` is the
+/// sole successful settlement and the only thing that promotes a generation, so
+/// a `Promoting` generation always carries its own recorded candidate and E6's
+/// window — promoting with none — cannot occur. What reaches this sequence is a
+/// promotion the run itself recorded; a pin with no record is orphan residue,
+/// which `candidate::recovery_for` prunes while settling the attempt
+/// interrupted.
 ///
 /// # What this repairs, and it was a stall rather than a wrong answer
 ///
@@ -1958,7 +1966,7 @@ pub fn refuse_unimplemented_terminals(certified: &PreflightCertified) -> Result<
 /// # Both windows, one sequence
 ///
 /// [`recovery_for`] classifies an unfinished promotion from the **durable
-/// record**, so this covers the generation [`complete_promotions`] just appended
+/// record**, so this covers the generation a resume's convergence once appended
 /// for *and* the ordinary `T-CAND-REF` window — a run killed between
 /// `candidate_prepared` and `task_candidate_created`, which needs no erratum and
 /// reached the same dead end. Two windows, one continuation, because the row
@@ -2351,7 +2359,7 @@ pub struct RunHandle {
     /// **Carried because the fold is not the whole of what a resume must
     /// rebuild.** The fold keeps the run's *state*; it does not keep the
     /// `AttemptRecord` each settlement carried, which is why
-    /// [`complete_promotions`] needed `StablePrefix::events` and why
+    /// the deleted convergence needed `StablePrefix::events` and why
     /// `Spend::replay` — whose whole purpose is rebuilding the run's spend from
     /// the log — had **no production caller at all** until this field existed.
     /// A resumed run started its ceiling again at zero, every time.

@@ -1679,10 +1679,15 @@ impl TopologyRun {
     ///
     /// `side_effect_vs_event_ordering`: "commit object (R27) before pin
     /// (IdUnread between); pin before candidate_prepared; candidates ref after
-    /// candidate_prepared and before task_candidate_created". The settlement
-    /// lands **between the pin and `candidate_prepared`**, which is
-    /// [`settle_succeeded`]'s own note: `T-CAND-OBJ`'s window covers the commit
-    /// object and the pin with `authoritative_state: attempt unsettled`.
+    /// candidate_prepared and before task_candidate_created".
+    ///
+    /// **The settlement is `candidate_prepared`**, so there is no append between
+    /// the pin and it. This said the settlement "lands between the pin and
+    /// `candidate_prepared`" and cited settle_succeeded's note — the note that
+    /// reinterpreted INV-07, and the function the 2026-08-27 CONFORM ruling
+    /// deleted. `T-CAND-OBJ`'s window covers the commit object and the pin with
+    /// `authoritative_state: attempt unsettled`, and it stays unsettled until
+    /// this event.
     ///
     /// INV-07's "candidate_prepared is the sole successful attempt settlement"
     /// is about which event records the *candidate*, not which settles the

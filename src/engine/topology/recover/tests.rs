@@ -4990,7 +4990,8 @@ fn the_driver_carries_an_accepted_attempt_through_the_candidate_sequence() {
 
     // **The settlement *is* `candidate_prepared`, so there are six events and
     // not seven.** This comment required an `attempt_finished` between the pin
-    // and `candidate_prepared`, on `settle_succeeded`'s own note that INV-07
+    // and `candidate_prepared`, on the deleted settle_succeeded's own note that
+    // INV-07
     // was "about which event records the candidate, not about which event
     // settles the attempt". That reading is wrong and
     // `decisions/2026-08-12-merge-queue-execution-topology.md` had already

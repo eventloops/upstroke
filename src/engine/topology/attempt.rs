@@ -44,15 +44,22 @@
 //!
 //! # Where the attempt path hands off
 //!
-//! At the judgement, and **not** at a settlement. This module appends no
-//! `attempt_finished`: `fold::check_candidate_prepared` requires the generation
-//! to be `Promoting`, and only the succeeding settlement produces that class —
-//! so `attempt_finished(succeeded)` sits *inside* the candidate sequence,
-//! between the pin and `candidate_prepared`, rather than at the end of the
-//! attempt. `T-CAND-OBJ`'s window is "attempt unsettled" across both the commit
-//! object and the pin, which is the same statement from the fault matrix's
-//! side. The append is `settle.rs`'s; what this module produces is the
-//! [`Judgement`] that `candidate.rs` gates its sequence on.
+//! At the judgement, and **not** at a settlement. This module appends nothing:
+//! a failed attempt settles on `attempt_finished` and a successful one on
+//! `candidate_prepared`, which is the sole successful settlement for a
+//! candidate-producing attempt and is what promotes the generation.
+//!
+//! **This described the other shape** — `check_candidate_prepared` requiring
+//! `Promoting`, and an `attempt_finished(succeeded)` between the pin and
+//! `candidate_prepared` to produce it. That requirement *forced* the dual
+//! settlement `decisions/2026-08-12-merge-queue-execution-topology.md` forbids,
+//! and the 2026-08-27 CONFORM ruling reversed it: the fold now requires the
+//! generation to be **in flight**, because this event settles it.
+//!
+//! `T-CAND-OBJ`'s window is "attempt unsettled" across both the commit object
+//! and the pin, which is the same statement from the fault matrix's side, and it
+//! now runs all the way to `candidate_prepared`. What this module produces is
+//! the [`Judgement`] that `candidate.rs` gates its sequence on.
 //!
 //! # Every process here goes through the run's `&dyn Runner`
 //!

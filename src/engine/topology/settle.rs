@@ -228,9 +228,15 @@ pub fn settle_failed(
         },
     };
     // Every one of these closes the generation, so `survives` is `false`.
-    // The success that leaves it open is [`settle_succeeded`]'s, and it is a
-    // separate function because it is appended at a different point of the
-    // sequence — see that function's own note.
+    //
+    // **And there is no success here at all.** This said the surviving case was
+    // settle_succeeded's — a function this ruling deleted — "a separate
+    // function because it is appended at a
+    // different point of the sequence". That function is gone: since the
+    // 2026-08-27 CONFORM ruling `candidate_prepared` is the sole successful
+    // settlement, and the region a surviving generation hands to its candidate
+    // is decided by `CandidateLeaseEffect` on that event, which
+    // `check_candidate_prepared` matches against the entry's lineage.
     let lease = generation.lease.expected(false);
     Ok(Settled {
         event: AttemptFinished4 {
@@ -268,7 +274,7 @@ fn spent(finished: &FinishedAttempt) -> bool {
 
 // **There is no successful settlement to build here, and that is the point.**
 //
-// `settle_succeeded` used to live at this spot: it built an
+// settle_succeeded used to live at this spot, and no longer exists: it built an
 // `attempt_finished{Succeeded}` that the driver appended between the pin and
 // `candidate_prepared`, and its doc argued that INV-07's *"candidate_prepared
 // is the sole successful attempt settlement"* was "about which event records

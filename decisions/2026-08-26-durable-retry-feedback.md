@@ -73,7 +73,7 @@ verbatim (§11.4)", the comment above it). The one production construction of an
 across.
 
 The census that says so is the compiler's. Adding the field broke **17** initializers;
-exactly **one** of them is production — `events::Dangling::event`, the record for an
+exactly **one** of them is production — `events::InterruptedAttempt::event`, the record for an
 attempt that started and never reported back, which sets `detail: None` because nothing
 judged it — and the other 16 are in test modules. The 18th site is
 `classify::attempt_record` itself, which is where the value is written and so never
