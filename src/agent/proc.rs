@@ -331,7 +331,7 @@ fn kill_tree(child: &mut ProcessTree) -> Result<(), UpstrokeError> {
 }
 
 #[cfg(windows)]
-mod windows_job {
+pub(crate) mod windows_job {
     use std::io;
     use std::mem::size_of;
     use std::os::windows::io::AsRawHandle;
@@ -360,7 +360,7 @@ mod windows_job {
     /// A non-inheritable Job Object configured before any supervised code can
     /// run. The OS closes this handle on abrupt conductor death, and
     /// KILL_ON_JOB_CLOSE then terminates every ordinary descendant.
-    pub(super) struct Job {
+    pub(crate) struct Job {
         handle: HANDLE,
     }
 
@@ -395,7 +395,7 @@ mod windows_job {
             Ok(job)
         }
 
-        pub(super) fn terminate_and_wait(&self) -> io::Result<()> {
+        pub(crate) fn terminate_and_wait(&self) -> io::Result<()> {
             // SAFETY: the handle remains live for this call and the requested
             // exit code has no semantic meaning outside this private job.
             if unsafe { TerminateJobObject(self.handle, 1) } == 0 {
@@ -447,7 +447,7 @@ mod windows_job {
         }
     }
 
-    pub(super) fn spawn_suspended_in_job(command: &mut Command) -> io::Result<(Child, Job)> {
+    pub(crate) fn spawn_suspended_in_job(command: &mut Command) -> io::Result<(Child, Job)> {
         let job = Job::create()?;
         command.creation_flags(CREATE_SUSPENDED);
         let mut child = command.spawn()?;
