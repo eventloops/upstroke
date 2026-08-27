@@ -77,9 +77,10 @@ Lint policy:
   diffable authority. A crate-root `#![allow]` or `#![deny]` does not change policy.
 - Prefer `#[expect(lint, reason = "…")]` to `#[allow]`. An expectation that stops firing becomes a
   warning, so a suppression that outlives its cause removes itself from review instead of
-  surviving unnoticed. That self-retirement operates only where a lint leg compiles the annotated
-  region and promotes warnings to errors; §11 governs the platform-gated case, where it does not
-  operate at all.
+  surviving unnoticed. That self-retirement needs a leg that both compiles the annotated region
+  and promotes warnings to errors. §11 governs which legs those are for platform-gated code; where
+  none exists — a Clippy expectation in a region no Clippy leg compiles — it does not operate at
+  all.
 - Add targeted lints only after the repository is clean under them and the lint is available on
   the MSRV. Do not enable Clippy's `pedantic`, `nursery`, or `restriction` groups wholesale;
   those groups intentionally contain contextual, experimental, or mutually incompatible lints.
@@ -467,12 +468,13 @@ much as the test:
 
 - A readiness signal MUST be published only after the state it announces is complete and
   observable by the waiter. Publish it last, not alongside the work it describes.
-- **A file's existence is a readiness signal only when nothing is read from the file.** Creation
-  and content are separate events, so a waiter polling for a path can open it and read nothing. An
-  empty marker created after the state it announces is therefore sound, and so is a file staged
-  elsewhere and moved into place by atomic rename under §8: in both, the name appears only once
-  what it claims is already true. What is unsound is awaiting a path's existence and then reading
-  its contents, because the waiter observes the weaker event and asserts the stronger one.
+- **A file's existence is a readiness signal only if the file is published atomically.** Creation
+  and content are otherwise separate events, so a waiter polling for a path that is created and
+  then written can open it and read nothing. Two forms are sound: an empty marker created after
+  the state it announces, where there is nothing to read; and a file staged elsewhere and moved
+  into place by atomic rename under §8, where the name and its contents become visible together,
+  so a waiter may await the path and then read it. What is unsound is a path created in place and
+  written afterwards, because its existence is observable before the state it stands for.
 - A partial record MUST NOT be readable as a whole one. A record delimited by a terminator — a
   newline on a pipe — is complete only once the terminator arrives; an unterminated final record
   is a truncated write and MUST fail rather than yield a short value.
