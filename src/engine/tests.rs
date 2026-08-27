@@ -4412,15 +4412,15 @@ fn raw_object_after(line: &str, key: &str) -> Option<String> {
 /// already held it. The 2026-08-26 re-review of `c2c0294` found it as finding A.
 /// `classify::FeedbackCarrier` is the repair; this is what holds it.
 ///
-/// **The fixture is real, not a transform of what this build produces.** These are the
-/// bytes `610106b` — the commit before the field existed — wrote for the same scenario,
-/// captured by running it there:
+/// **The fixture is real, and it is compared byte for byte.** `PRE_CHANGE_FAILURE` below
+/// is the exact `"failure"` object `610106b` — the commit before the field existed — wrote
+/// for this scenario, captured by running it there. The earlier version of this test
+/// quoted it *elided* in prose and then asserted three key names and
+/// `reason.starts_with(...)`, so a changed reason suffix still passed. The round-3 review
+/// of `bf927f3` said so, and it was right: the body and the decision record both claimed a
+/// byte comparison this test did not make.
 ///
-/// ```text
-/// "failure":{"kind":"gate_failed","origin":"worker","reason":"gate `needs-test` failed: …"}
-/// ```
-///
-/// Three keys. This build must write those three keys with those values, and **one
+/// **One
 /// residual difference that is stated rather than hidden**: `detail` serializes as an
 /// explicit null, because `skip_serializing_if` is not available here. Schema 4's strict
 /// door decides "unknown field" by asking the record which keys it claims back, so a
@@ -4460,6 +4460,15 @@ fn the_legacy_wire_and_report_carry_no_feedback_on_the_attempt_record() {
         .expect("the run left a public directory");
     let log = fs::read_to_string(public.join("events.jsonl")).expect("the log");
 
+    // The exact bytes `610106b` wrote for this scenario's failed attempt. Captured by
+    // building a worktree at that commit and running the same gate; not derived from
+    // anything this build produces.
+    const PRE_CHANGE_FAILURE: &str = concat!(
+        r#"{"kind":"gate_failed","origin":"worker","reason":"gate `needs-test` failed: "#,
+        r#"error: pathspec 'widget_test.rs' did not match any file(s) known to git\n"#,
+        r#"Did you forget to 'git add'?\n\nexit code: Some(1)"}"#,
+    );
+
     let mut failures = 0;
     let mut carried_tail = false;
     for line in log.lines() {
@@ -4492,34 +4501,30 @@ fn the_legacy_wire_and_report_carry_no_feedback_on_the_attempt_record() {
             "expected exactly one `detail` key in {bytes}"
         );
 
-        let pre: serde_json::Value = serde_json::from_str(&stripped).expect("still json");
-        let keys: Vec<&str> = pre
-            .as_object()
-            .expect("an object")
-            .keys()
-            .map(String::as_str)
-            .collect();
+        // **Byte for byte against the captured fixture.** Not a key-set check and not a
+        // `starts_with`: every byte of `kind`, `origin` and `reason` must be what
+        // `610106b` wrote, so a changed reason — a different gate name, a reworded
+        // prefix, an extra suffix — fails here instead of passing a prefix predicate.
         assert_eq!(
-            keys,
-            vec!["kind", "origin", "reason"],
-            "stripping the null left {keys:?}, which is not the shape `610106b` wrote"
-        );
-        assert_eq!(pre["kind"], "gate_failed");
-        assert_eq!(pre["origin"], "worker");
-        assert!(
-            pre["reason"]
-                .as_str()
-                .is_some_and(|r| r.starts_with("gate `needs-test` failed:")),
-            "reason: {}",
-            pre["reason"]
+            stripped, PRE_CHANGE_FAILURE,
+            "the legacy failure record is not the bytes `610106b` wrote for this \
+             scenario. If a newer git reworded its pathspec error, re-capture the \
+             fixture at that commit rather than loosening this comparison"
         );
 
-        // The point of the whole finding: the tail is not on the record.
-        assert!(
-            failure["detail"].is_null(),
-            "the legacy attempt record carries §11.4's feedback again, which is the \
-             kilobytes-per-attempt duplication `LadderRetry`'s own doc exists to avoid: {}",
-            failure["detail"]
+        // The point of the whole finding: the tail is not on the record. Asserted as an
+        // **explicit null and not merely a falsy read** — `failure["detail"].is_null()`
+        // answers true for an absent key too, so it could not tell "the field is here
+        // and empty" from "the field is gone", which are different wires.
+        let object = failure.as_object().expect("the failure is an object");
+        assert_eq!(
+            object.get("detail"),
+            Some(&serde_json::Value::Null),
+            "the legacy attempt record's `detail` is {:?}; it must be present and null — \
+             a value would be §11.4's feedback duplicated onto the wire, and an absent \
+             key would mean the field stopped serializing, which breaks schema 4's \
+             strict door",
+            object.get("detail")
         );
 
         // And it is still delivered — by the carrier that owns it here.
@@ -4554,11 +4559,16 @@ fn the_legacy_wire_and_report_carry_no_feedback_on_the_attempt_record() {
                 continue;
             };
             checked += 1;
-            assert!(
-                failure["detail"].is_null(),
-                "report.json grew a gate tail on attempt {}: {}",
+            let object = failure.as_object().expect("the failure is an object");
+            assert_eq!(
+                object.get("detail"),
+                Some(&serde_json::Value::Null),
+                "report.json's attempt {} carries `detail` as {:?}; it must be present \
+                 and null. `is_null()` was the earlier assertion and it cannot tell an \
+                 explicit null from an absent key, so it would have passed had the \
+                 field silently stopped serializing",
                 attempt["attempt"],
-                failure["detail"]
+                object.get("detail")
             );
         }
     }

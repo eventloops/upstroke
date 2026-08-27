@@ -2624,6 +2624,45 @@ once". That was false for fresh creation when written and stayed false until now
 correction is in that file, sha-stamped, and says so — including that it was a reviewer
 that found it and not the artifact's own evidence.
 
+### Round 3 on finding A — the behaviour was repaired and the claim about it was not
+
+The round-3 review confirmed `FeedbackCarrier` works: the legacy caller chooses
+`LadderEvent`, schema 4 chooses `AttemptRecord`, the feedback no longer reaches the legacy
+record or `report.json`, and the strict-door argument for the `"detail":null` residual is
+sound. It then found that **the witness did not do what three artifacts said it did**.
+
+The commit message, the PR body and
+`decisions/2026-08-26-durable-retry-feedback.md` all said the test *compares against the
+bytes `610106b` wrote*. It did not. The captured fixture appeared only as **elided prose**
+in a doc comment — `"reason":"gate \`needs-test\` failed: …"` — and the assertions were three
+key names plus `reason.starts_with(...)`. A changed reason **suffix** passed.
+
+Two repairs, and the second is the one worth keeping.
+
+**1. The fixture is a constant and the comparison is `assert_eq!` on the bytes.**
+`PRE_CHANGE_FAILURE` holds the exact `"failure"` object captured at `610106b`; the test
+strips `,"detail":null` and compares byte for byte. Its failure message says to
+**re-capture the fixture** if a newer git rewords its pathspec error, rather than to loosen
+the comparison — a fixture that may be quietly relaxed is not a fixture.
+
+**2. `is_null()` cannot tell an explicit null from an absent key**, and both halves used
+it. `serde_json` returns `Value::Null` for a missing key, so the assertion answered *true*
+for a record whose `detail` had stopped serializing altogether — which is a different wire,
+and the one schema 4's strict door refuses. Both halves now assert
+`object.get("detail") == Some(&Value::Null)`: present, and null.
+
+| mutation | the witness |
+|---|---|
+| the reason gains a suffix — exactly what `starts_with` could not see | **FAILED** |
+| `skip_serializing_if` makes the key absent rather than null | **FAILED** (and it also fails the strict-door witness) |
+
+The second row is the measurement that the old assertion was vacuous in a reachable
+direction: under that mutation `failure["detail"].is_null()` was `true` and the test passed.
+
+> A claim in three artifacts that no test makes is worse than no claim, because the
+> artifacts are what a reviewer reads first. The repair is to make the test hold the claim,
+> not to weaken the claim to what the test happened to check.
+
 
 ## 22a. A driver that fails silently on a diff this size
 
