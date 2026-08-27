@@ -554,6 +554,10 @@ fn preflight_with_recorded(
                      append-only log before any more work starts"
                 ));
             } else if plan.pass_timeout_secs != Some(configured) {
+                #[expect(
+                    clippy::expect_used,
+                    reason = "a non-legacy plan recorded its timeout; replay enforces the pairing"
+                )]
                 let recorded = plan
                     .pass_timeout_secs
                     .expect("a non-legacy recorded review plan has an explicit timeout");
@@ -1647,6 +1651,10 @@ fn resume_harness_inner(
     // the object and appending AttemptFinished. It has no authority to move
     // HEAD and is removed with an expected-old-value CAS before retrying.
     for interrupted in replayed.state.interrupted_attempts() {
+        #[expect(
+            clippy::expect_used,
+            reason = "interrupted_attempts() yields tasks of this same replayed state"
+        )]
         let task_index = replayed
             .state
             .index_of(&interrupted.task)
@@ -2604,6 +2612,10 @@ impl Run<'_> {
             }
 
             let Some(failure) = result.failure else {
+                #[expect(
+                    clippy::expect_used,
+                    reason = "schema 3 pairs a successful settlement with its prepared commit"
+                )]
                 let prepared = prepared_commit
                     .expect("a successful schema-3 settlement has a prepared commit");
                 self.workspace
@@ -2651,6 +2663,10 @@ impl Run<'_> {
                 self.record_pool_exhausted(&task_id, &profile, &result.reviews, &failure)?;
             }
 
+            #[expect(
+                clippy::expect_used,
+                reason = "the failure path above always computes a ladder decision"
+            )]
             let next = next.expect("a failed attempt has a ladder decision");
 
             // §14: the tree survives only for a resumed retry, where the
