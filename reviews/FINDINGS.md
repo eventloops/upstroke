@@ -273,7 +273,7 @@ Each of the named witnesses was re-derived against the invariant, and the diff i
 > it. The suite was green, and the allowance census went on finding its one write site
 > because a write site nothing calls still counts as one.
 >
-> `TopologyFold::charge_allowance` is now the single write and **both** settlement appliers
+> `RunState::charge_allowance` is now the single write and **both** settlement appliers
 > reach it: one derivation, not a duplicated increment, because two increments are the two
 > rules `the_rungs_allowance_is_counted_in_one_production_place` exists to forbid. That
 > census now also counts **calls** to the core and expects two, so a settlement that stops
@@ -2484,8 +2484,8 @@ Corrected where they stand. Measured at `4809cd4`.
 
 | where | said | is | what holds it now |
 |---|---|---|---|
-| `settle.rs`, `Settled::spent_attempt` | "**five kinds** spend nothing" | **seven shapes**: four kinds outright, plus `RateLimited` and `ReviewUnavailable` at any origin and `Timeout` at `FailureOrigin::Reviewer`, all three taken by `FailureShape::is_outage` before the match runs | `ladder::tests::exactly_seven_failure_shapes_spend_no_allowance` |
-| `events/mod.rs`, `FailureRecord::detail` | "the one production construction of an `AttemptRecord`" | two; `Dangling::event` is the other | the qualifier, and the census in §22b |
+| `settle.rs`, `Settled::spent_attempt` | "**five kinds** spend nothing" | **13 shapes, spanning 7 kinds**: a `FailureShape` is a `(kind, origin)` pair, and `spends_allowance` dispatches on both — four kinds outright, plus `RateLimited` and `ReviewUnavailable` at any origin and `Timeout` at `FailureOrigin::Reviewer`, all three taken by `FailureShape::is_outage` before the match runs. **This cell said "seven shapes", which was the third wrong statement of the same number** (after "every other settlement spends one" and "five kinds"): seven is the *kind* count standing in for the shape count, which is the exact substitution the row was written to correct | `ladder::tests::exactly_thirteen_failure_shapes_spend_no_allowance`, which reads the variants out of the enum's own source and asserts both numbers |
+| `events/mod.rs`, `FailureRecord::detail` | "the one production construction of an `AttemptRecord`" | two; `InterruptedAttempt::event` (`src/events/mod.rs:1040`) is the other. **This cell said `Dangling::event`, a type that does not exist** — the same invented name §22b records, left standing in the table that corrects invented names | the qualifier, and the census in §22b |
 | `recover/tests.rs`, the old-log witness | after an older log "the brief is simply empty" | one line per failure, carrying its summary with `detail: None` | three assertions on the rebuilt brief's actual content |
 | `recover.rs`, step (f) | "PR7 implements neither terminal" | `finish_promotions` calls `append_candidate_created`; the refusal is the *integration* half only | the sentence now says which half |
 | `run.rs`, `park_question` | `task.rung + 1` "is the same quantity the legacy `BTreeSet<tier>` computes" | not for a chain naming one tier twice — `ChainSummary.tiers` is a `Vec<Tier>` nothing deduplicates, so `["small", "small"]` is 2 here and 1 there | the claim is narrowed and the divergence is stated, with which answer is right for the sentence being built |
@@ -2964,6 +2964,76 @@ countable claims, and claims about other modules that are greppable. It does not
 witness *quality* — whether a test drives the step it names or constructs its input — which
 is the class that produced findings in rounds 2, 3 and 4 and has needed a reviewer every
 time.
+
+
+## 22d. The re-review of `b1f54a5`, and what a gate can hold that a reader cannot
+
+Round 5 returned seven findings. **Three were in the fold's doors and the probe seam — the
+places round 4's repairs had touched — and four were prose.** The pattern is now five rounds
+old and stated plainly: *each round's findings are defects in the previous round's repairs*,
+and the prose half of the crop has never once been caught by a person re-reading.
+
+**The doors enforced half a definition each.** `check_candidate_prepared` asked
+`failure.is_none()`; `check_attempt_finished` asked nothing beyond refusing `Succeeded`.
+A record can carry no failure and still hold a review whose outcome is `Failed` or
+`Unavailable` — §11.2 requires every configured pass to pass, and a reviewer that could not
+run says nothing about the code — so a rejected attempt was promoted, charged against its
+rung allowance and queued as a candidate. `AttemptRecord::is_successful` is now the one
+derivation and both doors ask it. This is the third application of "one derivation, not two"
+in this slice, after the rung allowance and the settlement counting.
+
+**And the positive premises were vacuous, which is why no test noticed.** `reviews:
+Vec::new()` satisfies an `all` over review outcomes because `all` never sees a pass; two
+fixtures carried a lone `second-opinion` entry with no primary pass at all. Delete the review
+clause from `is_successful` and not one positive witness would have failed. They now build a
+complete successful attempt under the frozen plan, with `TaskKey` read as the plan index so
+the second opinion is derived from `review_plan` rather than asserted by the fixture.
+
+**"A second pair is unrepresentable" was false for the third round running, and is retracted
+rather than restated.** The trait exposed `ledger()` and `slots()`, so any implementor could
+return a pair of its own. Those accessors are deleted; `Request` owns the single pair and
+passes it as arguments. What made the retraction necessary is worth keeping separately from
+the fix: **a property asserted three times and refuted three times is not a property, and the
+fourth assertion is the defect.**
+
+**Two dead public methods could write an arbitrary path.** `commit_identity`, documented as a
+read and classified `effect_free`, ran `git show --output=<interpolated>`. Both are deleted
+with their `effects/wrappers.toml` entries rather than repaired by validating the argument:
+neither had a caller, so a check would have kept a dead escape alive behind it.
+
+### What is now gated rather than re-read
+
+Two censuses, because the prose class has survived five rounds of people looking at it.
+
+`drivers/deleted-mechanisms.sh`, in the pre-push loop, over seven retired names. It asserts
+two things, since "zero occurrences" is not the invariant: **zero as code**, and every
+surviving mention accompanied by deletion language — the tombstone comments that tell a reader
+where a function went are worth keeping, and a gate demanding literal zero would delete the
+signpost.
+
+**Its three wrong widths are the record's actual content**, because each was a plausible
+design that measurement refuted:
+
+| width | why it looked right | what it missed |
+|---|---|---|
+| the line containing the claim | `grep` is line-based and so is every other check here | doc comments wrap. *"without `attempt_finished(Succeeded)` the generation never / reaches `Promoting`"* is two innocent lines — and is the exact sentence round 5 named |
+| ±3 lines of a joined comment run | a tombstone's "deleted" sits near the name | a long block's ruling citation is 20 lines from its first line |
+| the whole joined run | a block that says "deleted" is a tombstone | a block that corrects itself in paragraph 2 was then licensed to assert the thing in paragraph 5 — which is precisely the shape round 5 found |
+| **the claim's own sentence, plus the next** | — | this is the width at which a tombstone and an assertion differ |
+
+The second is §22's own rule, applied without exception: **every count in prose carries the
+command that computes it.** `settle_succeeded` is seven, not nine. `Admitted` excludes three
+of `Step`'s eight variants, not two of seven — found by the extended sweep, and now held by
+`every_step_variant_is_admitted_or_refused_and_the_split_is_five_three`, whose `match` has no
+wildcard arm, so a ninth variant does not compile until someone says which side it falls on.
+A doc comment cannot enforce a count; that is the whole reason the count kept being wrong.
+
+**What the sweep found and deliberately did not repair.** Every dead `pub fn` it reports is
+pre-existing on the merge base rather than added here, and the two remaining `--flag={}` git
+arguments take a `rev-parse` OID and a branch name behind a `--` terminator — neither is the
+`commit_identity` class. Both are recorded as debt rather than widened into this slice.
+
+Measured at `5a442db`.
 
 
 ## 22a. A driver that fails silently on a diff this size
