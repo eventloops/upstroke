@@ -852,16 +852,61 @@ A 1-in-18 test flake is not worth a path that can delete outside the authorized 
 
 * **`PR5-RD-002` — recovery does not converge on a zero-length `commondir`.** Live passages:
   `proof_tests[8]` (*"every observed residue … recovers"*), `cancellation` (*"a
-  registered-but-unpopulated worktree is pruned"*), `proof_tests[1]`. **Owner: the slice that next opens
-  `src/workspace_manager.rs`.** Closing it requires restoring containment authorization *before*
-  widening what removal proceeds on — the two must be solved together, which is why round 7's
-  ordering failed. Reverting is not a repair; the residue still does not converge, it merely fails safe.
+  registered-but-unpopulated worktree is pruned"*), `proof_tests[1]`. Closing it requires restoring
+  containment authorization *before* widening what removal proceeds on — the two must be solved
+  together, which is why round 7's ordering failed. Reverting is not a repair; the residue still does
+  not converge, it merely fails safe.
+
+  **Owner clause restated 2026-08-27, and it is now explicit rather than file-triggered.** It read
+  *"the slice that next opens `src/workspace_manager.rs`"*. PR7 opens that file — **+491/−22** against
+  its integration base — so the clause fired, and it fired on **incidental contact**: this slice's
+  contribution to it is `commit_tree_sha`, a 31-line read-only derivation added for the candidate-tree
+  repair, with no workspace-lifecycle work in it at all. A clause that any edit satisfies names an
+  owner who did not choose the work, and recording PR7 as an owner-who-declined would leave the row
+  dangling with a name on it.
+
+  > **Owner: the slice that next changes the worktree removal or residue-recovery path in
+  > `src/workspace_manager.rs`.** Touching the file is not the trigger; changing that path is.
+  > **A repair requires a macOS reproduction path first** — see the occurrence below, where the
+  > platform's own `strerror(0)` rendering differs from the one this ledger recorded. Like every open
+  > row, it is re-ruled at the G2-gate full-ledger audit.
+
+  Carried as a **rated platform-residue row**, beside `PR7-WIN-READ-RACING-BOUND-TOO-SHORT` and
+  `PR7-MACOS-PROCESS-GROUP-FLAKE`. The three share a shape: real production behaviour, reachable only
+  under load or a kill, measured rather than described, and repaired by a slice that owns the
+  subsystem rather than by the slice that happened to be red.
+
+  **Occurrence, 2026-08-27, `327cce3`, `test (macos-latest)`** — the first observed on CI for this
+  branch:
+
+  ```
+  workspace_manager::tests::sampled_git_child_kills_every_residue_classified_and_recovered FAILED
+  panicked at src/workspace_manager.rs:9530: forced removal converges: Git { message:
+    "git worktree list --porcelain -z failed …: fatal: failed to read
+     .git/worktrees/kalpha-g0/commondir: Undefined error: 0" }
+  ```
+
+  **`Undefined error: 0` is macOS's `strerror(0)`.** This ledger recorded the glibc rendering,
+  `Success`, and §13's recognition guide tells a reader to match on that word — so the macOS
+  occurrence of this row does not match the string the row tells you to look for. Both are errno 0 on
+  a read that returned no bytes, which is the actual signature.
+
+  **Rate.** PR5 measured **1 in 18** clean-tree runs, sampled locally on Linux. On CI this is the
+  first occurrence in **41** concluded runs of this branch's CI workflow, each of which ran a macOS
+  leg; the other four concluded failures were three of `PR7-SAMPLER-SCHEDULES-FROM-A-COLD-PROBE`
+  (fixed in PR7) and one of `PR7-MACOS-PROCESS-GROUP-FLAKE`. Re-running the failed job at the same sha
+  was green, and **that is why the rate is written down here**: a re-run replaces the run's conclusion,
+  so `gh run list` no longer shows this failure at all. A rate not recorded when observed is a rate
+  destroyed by the re-run that clears it.
 ### If one of these fires before G2, this is what it looks like
 
 **Symptom.** A write command (`run`, `resume`) fails at start, in `reclaim_intents`. Git's own
 enumeration is what breaks first, so the error names a registration file rather than anything Upstroke
-owns — `fatal: failed to read .git/worktrees/<slot>/commondir: Success` is the observed shape, and
-`Success` is `strerror(0)` rather than a real errno. Every production call site propagates with `?`
+owns — `fatal: failed to read .git/worktrees/<slot>/commondir: Success` is the observed shape on
+glibc, and `Success` is `strerror(0)` rather than a real errno. **On macOS the same errno
+renders as `Undefined error: 0`** — observed 2026-08-27 at `327cce3`, and recorded because a
+reader matching on the word `Success` would not recognise this row on the platform it fired on.
+The signature is errno 0 on a read that returned no bytes, not either string. Every production call site propagates with `?`
 (`src/workspace_manager.rs:1433`, `:1816`); **nothing panics and nothing is deleted**, so the repository
 is intact and the failure is a refusal, not damage.
 
