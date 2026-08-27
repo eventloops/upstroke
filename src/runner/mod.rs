@@ -2310,6 +2310,33 @@ mod tests {
              pays for a pricier tier, and the first one diverged silently for \
              an entire slice"
         );
+
+        // **And every settlement reaches that one place.** The table above
+        // counts *write sites*, which is what it was written for — but a write
+        // site nothing calls is a rule nothing applies, and that is exactly how
+        // the allowance broke on 2026-08-27: `candidate_prepared` became the
+        // sole successful settlement, the increment stayed behind in
+        // `apply_settlement`, and this census went on finding its one write and
+        // passing. A successful attempt spent nothing and nothing said so.
+        //
+        // Schema 4 has two settlement appliers — `apply_settlement` for a
+        // failure and `apply_candidate_prepared` for a success — and both must
+        // charge. Counting the calls is what makes a settlement that stops
+        // charging a failing census rather than a silent undercount.
+        let fold = std::fs::read_to_string("src/topology/fold.rs").expect("the fold reads");
+        let production = crate::effects::production_code(&fold);
+        let charges = crate::effects::census_domain::production_calls(
+            &production,
+            "self.charge_allowance",
+            crate::effects::census_domain::Call::Free,
+        );
+        assert_eq!(
+            charges, 2,
+            "`charge_allowance` is called {charges} time(s) in the fold's production \
+             region; schema 4 has two settlement appliers and each must charge the \
+             rung — a failure through `apply_settlement` and a success through \
+             `apply_candidate_prepared`"
+        );
     }
 
     /// **Each census needle covers the domain its doc states.**

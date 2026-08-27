@@ -3424,17 +3424,7 @@ impl RunState {
         // Nested rather than a `let`-chain: `if cond && let Some(x) = ..` is
         // unstable on **1.85**, which this crate's MSRV pins, and stable rustc
         // accepts it — so the local gates pass and only the MSRV leg refuses.
-        if crate::ladder::spends_allowance(
-            finished
-                .record
-                .failure
-                .as_ref()
-                .map(crate::events::FailureRecord::shape),
-        ) {
-            if let Some(task) = self.tasks.get_mut(finished.key.index()) {
-                task.attempts_on_rung = task.attempts_on_rung.saturating_add(1);
-            }
-        }
+        self.charge_allowance(finished.key, &finished.record);
 
         match &finished.settlement {
             AttemptSettlement::Retained {
@@ -3506,6 +3496,41 @@ impl RunState {
         }
     }
 
+    /// One settled attempt against its rung's allowance.
+    ///
+    /// **The single write, and both settlements reach it through here.** The
+    /// increment used to live inline in [`Self::apply_settlement`], which was
+    /// fine while `attempt_finished` was the only settlement — and stopped being
+    /// fine on 2026-08-27, when `candidate_prepared` became the sole successful
+    /// one. The settlement moved and the counting did not, so **a successful
+    /// attempt stopped spending anything**: a first-attempt success left
+    /// `attempts_on_rung` at zero, replay reproduced the undercount, and a later
+    /// allowance reader could grant an extra attempt on a rung already paid for.
+    /// The round-4 review of `09f9a99` found it, and the Class B approval this
+    /// change was made under says the thing that did not happen — *"settlement
+    /// counting moves to the sole event"*.
+    ///
+    /// A shared core rather than a second increment, because two increments are
+    /// two rules: `the_rungs_allowance_is_counted_in_one_production_place` exists
+    /// to forbid exactly that, and it counts **calls to this** so a settlement
+    /// that stops charging is a failing census rather than a silent undercount.
+    ///
+    /// It consults `spends_allowance` and answers nothing itself. A successful
+    /// record carries no failure, and `spends_allowance(None)` is `true`: the
+    /// worker ran and produced work that was judged and accepted.
+    fn charge_allowance(&mut self, key: TaskKey, record: &crate::events::AttemptRecord) {
+        if crate::ladder::spends_allowance(
+            record
+                .failure
+                .as_ref()
+                .map(crate::events::FailureRecord::shape),
+        ) {
+            if let Some(task) = self.tasks.get_mut(key.index()) {
+                task.attempts_on_rung = task.attempts_on_rung.saturating_add(1);
+            }
+        }
+    }
+
     fn apply_candidate_prepared(&mut self, prepared: &CandidatePrepared) {
         let record = PreparedCandidate {
             candidate: prepared.candidate(),
@@ -3522,6 +3547,10 @@ impl RunState {
             // is not emitted.
             generation.class = GenerationClass::Promoting;
         }
+        // **The settlement's accounting, which moved with the settlement.**
+        // Same core as the failure path, so there is one increment in this
+        // build and both settlements reach it.
+        self.charge_allowance(prepared.key, &prepared.attempt);
         match &prepared.lease_effect {
             CandidateLeaseEffect::ReplacesPredicted { paths } => {
                 self.leases.release(LeaseOwner::Generation {
@@ -7340,6 +7369,93 @@ mod tests {
     // -----------------------------------------------------------------------
     // Candidates, the queue, and the publication relations
     // -----------------------------------------------------------------------
+
+    /// **A successful attempt spends one of its rung's allowance, and the count
+    /// survives replay.**
+    ///
+    /// `spends_allowance(None)` is `true` — the worker ran and its work was judged
+    /// and accepted — so a success charges the rung exactly as a judged failure
+    /// does. That was true while `attempt_finished{Succeeded}` was the settlement,
+    /// and it stopped being true on 2026-08-27 when the settlement moved to
+    /// `candidate_prepared` and the increment stayed behind in `apply_settlement`.
+    ///
+    /// Nothing noticed. The suite was green, the allowance census went on finding
+    /// its one write site, and the replacement witness asserted `Promoting` and
+    /// candidate presence — none of which is the allowance. A **first-attempt
+    /// success left `attempts_on_rung` at zero**, so a later reader could grant an
+    /// extra attempt on a rung already paid for. The round-4 review of `09f9a99`
+    /// found it.
+    ///
+    /// Both positions are driven, because they fail differently: a first-attempt
+    /// success is the count going 0 → 1 with nothing before it, and a
+    /// second-attempt success is the successful charge landing *on top of* a
+    /// failure's. And the live count is compared against a replay of the same log,
+    /// because a fold that counts live and not on replay is the divergence this
+    /// project measures everything else against.
+    #[test]
+    fn a_successful_attempt_charges_its_rung_live_and_on_replay() {
+        let base = sha("base");
+
+        for (label, failures_first) in [("first-attempt success", 0), ("second-attempt success", 1)]
+        {
+            let mut live = started();
+            let mut trace = vec![run_started_event()];
+
+            // Optionally a judged failure first, which retries into a new
+            // generation — the shape a second-attempt success actually has.
+            let mut generation = 0;
+            for _ in 0..failures_first {
+                push(&mut live, &mut trace, dispatch(ZETA, generation, &base));
+                let start = attempt_started(&live, ZETA, generation, 1, 0);
+                push(&mut live, &mut trace, start);
+                push(
+                    &mut live,
+                    &mut trace,
+                    settle(
+                        ZETA,
+                        generation,
+                        1,
+                        AttemptSettlement::Closed {
+                            transition: SettlementTransition::Retry,
+                            lease: LeaseDisposition::PredictedReleased,
+                        },
+                    ),
+                );
+                generation += 1;
+            }
+
+            push(&mut live, &mut trace, dispatch(ZETA, generation, &base));
+            let start = attempt_started(&live, ZETA, generation, 1, 0);
+            push(&mut live, &mut trace, start);
+            push(
+                &mut live,
+                &mut trace,
+                candidate_prepared(ZETA, generation, &base),
+            );
+
+            let expected = failures_first + 1;
+            let counted = live
+                .task(ZETA)
+                .map(|task| task.attempts_on_rung)
+                .expect("the task is registered");
+            assert_eq!(
+                counted, expected,
+                "{label}: the rung counts {counted} attempt(s) and {expected} were spent. \
+                 `candidate_prepared` is the successful settlement, and a settlement that \
+                 does not charge leaves an operator a free attempt on a rung already paid \
+                 for"
+            );
+
+            // And a replay of exactly those bytes reaches the same number.
+            let replayed = TopologyFold::replay(inputs(), &trace).expect("the trace replays");
+            assert_eq!(
+                replayed.task(ZETA).map(|task| task.attempts_on_rung),
+                Some(expected),
+                "{label}: the live fold counted {expected} and a replay of its own log did \
+                 not — one fold, not two"
+            );
+        }
+    }
 
     /// **A candidate is prepared by the generation whose attempt is in flight,
     /// and preparing it is what settles that attempt.**

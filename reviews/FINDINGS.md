@@ -246,6 +246,28 @@ Each was re-derived against it and the diff is `+75/−390` in `recover/tests.rs
   `an_overlapping_region_is_explored_and_changes_a_transition_answer`'s differing index is
   regenerated from the shorter trace rather than the assertion being loosened.
 
+> **Appended 2026-08-27, under this same approval — no new one needed, because its own
+> sentence mandates the change.** The approval reads *"settlement counting moves to the sole
+> event"*, and it did not: `apply_settlement` kept the `attempts_on_rung` increment inline
+> and `apply_candidate_prepared` never charged. **A successful attempt spent nothing** — a
+> first-attempt success left the rung at zero — and the round-4 review of `09f9a99` found
+> it. The suite was green, and the allowance census went on finding its one write site
+> because a write site nothing calls still counts as one.
+>
+> `TopologyFold::charge_allowance` is now the single write and **both** settlement appliers
+> reach it: one derivation, not a duplicated increment, because two increments are the two
+> rules `the_rungs_allowance_is_counted_in_one_production_place` exists to forbid. That
+> census now also counts **calls** to the core and expects two, so a settlement that stops
+> charging is a failing census rather than a silent undercount.
+>
+> **Split for this appendix: +127/−11 on the frozen file** — 44 doc, 6 comment, 7 blank and
+> **70 lines of code**, most of it the witness below.
+> `a_successful_attempt_charges_its_rung_live_and_on_replay` drives a first-attempt and a
+> second-attempt candidate success — they fail differently, one going 0 → 1 and the other
+> landing on top of a failure's charge — and compares the live count against a replay of the
+> same bytes. Removing the successful settlement's charge fails **both** the witness and the
+> census.
+
 **Two of the re-derivations were caught by the compiler rather than by care**, and both are
 worth naming. `cargo` reported a binding that no longer needed `mut` — which meant the
 "Promoting" case of `a_generation_is_closed_only_from_an_open_class_with_no_attempt` was
