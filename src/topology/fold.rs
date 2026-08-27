@@ -56,10 +56,10 @@ use crate::topology::events::{
     GenerationClosed, GenerationId, GitRef, IncarnationId, LeaseDisposition, LeaseGrant,
     MergeLeaseRelease, MergePrepared, MergeRejected, MergeVerificationInterrupted,
     MergeVerificationStarted, MergeVerificationUnavailable, PreparedDisposition, QuestionAnswered4,
-    RejectionDisposition, RejectionLeaseEffect, RunFinished4, RunResumed4, RunStarted4, SequenceId,
-    SessionId, SettlementTransition, SpawnAdmission, TaskCandidateCreated, TaskDispatched,
-    TaskMerged, TopologyEvent, TopologyEventBody, UnavailableCause, UnavailableOutcome,
-    VerificationBasis, VerificationSource, VerificationVerdict,
+    RejectionDisposition, RejectionLeaseEffect, RunFinished4, RunResumed4, RunStarted4,
+    RungBinding, SequenceId, SessionId, SettlementTransition, SpawnAdmission, TaskCandidateCreated,
+    TaskDispatched, TaskMerged, TopologyEvent, TopologyEventBody, UnavailableCause,
+    UnavailableOutcome, VerificationBasis, VerificationSource, VerificationVerdict,
 };
 use crate::topology::leases::{GenerationLease, LeaseOwner, LeaseTable};
 use crate::topology::paths::{GitPath, PathSet};
@@ -435,6 +435,25 @@ pub struct PreparedCandidate {
     pub candidate: CandidateRef,
     /// The base the work started from, and the parent of the commit.
     pub base_sha: CommitSha,
+    /// The tree the gates ran against and the reviewers judged.
+    ///
+    /// **Retained because adoption is about identity, not existence.**
+    /// `DESIGN.md` §15 requires `candidate_prepared` to record "exactly one
+    /// complete attempt/base/commit/tree identity ... so resume adopts only
+    /// that exact shape". The tree was on the event and stopped here: recovery
+    /// could check that the object exists and that its parent is the recorded
+    /// base, and a commit with that parent and a **different tree** passed —
+    /// so a resume could publish an object no gate ran against and no reviewer
+    /// read. `candidate.rs`'s own comment recorded the gap rather than closing
+    /// it, because closing it is this field.
+    ///
+    /// Per-instance **Class B** approval, granted 2026-08-26 against the
+    /// frontier re-review of `c2c0294`, finding B; the ledger row is
+    /// `reviews/FINDINGS.md` §3 and `PR7-CANDIDATE-TREE-UNVERIFIED` in §2.
+    /// Nothing serde-visible moves — `CandidatePrepared::tree_sha` already
+    /// exists on the wire and this is the fold keeping what it reads. It
+    /// conforms to §15 rather than amending it.
+    pub tree_sha: CommitSha,
     pub paths: PathSet,
 }
 
@@ -442,6 +461,49 @@ pub struct PreparedCandidate {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TaskFold {
     pub state: TaskState,
+    /// How many times an attempt on this task has settled `Deferred`.
+    ///
+    /// **The fold owns this count because only the fold survives a resume.**
+    /// `ladder::next_step` reads it on exactly one branch — an outage defers
+    /// while `defers < max_defers` and parks at it — and a driver keeping its
+    /// own tally would restart at zero in the next process while the log still
+    /// held the deferrals, so a run that had already exhausted its allowance
+    /// would defer forever. The legacy engine keeps it in
+    /// `state.progress[index].defers`, which is in-memory schema-3 state; a
+    /// schema-4 run derives everything by replay, so this is derived by replay.
+    ///
+    /// Read through the existing [`TopologyFold::task`] reader. It is a field
+    /// rather than a twelfth reader for that reason.
+    ///
+    /// `max_defers` is **not** here: the ceiling is policy and stays in
+    /// `ladder::LadderPolicy`, read from `run_started(4).limits`. This is the
+    /// count, and only the count.
+    pub defers: u32,
+    /// The rung this task's **next** attempt runs at.
+    ///
+    /// **The fold owns it because a task's ladder position survives a resume.**
+    /// A settlement that escalates closes the generation and leaves the task
+    /// `Pending`, so the ready-dispatch branch selects it again — at a rung the
+    /// driver has no other way to know. A driver-side tally reads zero in the
+    /// next process while the log holds the escalation, so the task is
+    /// dispatched on rung 0 forever and never reaches the tier its chain
+    /// escalated it to.
+    ///
+    /// `SettlementTransition::Escalated { rung }` is the durable answer — the
+    /// packet defines it as the rung an escalation climbs *onto* — so this is
+    /// assigned from it, never computed.
+    pub rung: u32,
+    /// Attempts already spent at [`Self::rung`].
+    ///
+    /// Not `GenerationFold::attempts`: that counts one generation, and attempts
+    /// at one rung span generations — a same-rung retry that does not resume
+    /// closes its generation and opens a fresh one at the same rung. Feeding
+    /// `LadderState::attempts_on_rung` the per-generation count makes
+    /// `next_step` see the first attempt of the allowance every time, so a task
+    /// retries forever and never escalates.
+    ///
+    /// Reset by an escalation, because the allowance is per rung.
+    pub attempts_on_rung: u32,
     pub generations: Vec<GenerationFold>,
 }
 
@@ -449,6 +511,9 @@ impl TaskFold {
     fn new() -> Self {
         Self {
             state: TaskState::Pending,
+            defers: 0,
+            rung: 0,
+            attempts_on_rung: 0,
             generations: Vec::new(),
         }
     }
@@ -755,6 +820,235 @@ impl TopologyFold {
 
     pub fn binding_override(&self, key: TaskKey) -> Option<&BindingOverride> {
         self.run.as_ref()?.overrides.get(&key)
+    }
+
+    // -----------------------------------------------------------------------
+    // Selection predicates
+    //
+    // `decisions.admission_and_leases` defines `ready` and `ready_retry` as
+    // "structural over fold state only", and INV-22 makes entitlements
+    // fold-enforced. The loop that drives a run therefore has to ask the fold
+    // these questions rather than answer them itself: a second implementation
+    // of "which generation classes hold the pipeline entitlement" is two rules
+    // that can disagree, and `wrong_internal_assumption` is the largest
+    // measured root cause in this project by a factor of three.
+    //
+    // What stays with the caller is the packet's actual division of labour:
+    // the loop decides *which* eligible item to take and checks the budget
+    // ceiling (`sequential_substrate.loop`; a breach appends `budget_exceeded`
+    // before any effect), and the fold decides *whether* an item is
+    // structurally eligible. These accessors are that second half and nothing
+    // more — each delegates to the private predicate it names and adds no
+    // logic of its own.
+    //
+    // Each returns the value that is true of a run which has not recorded its
+    // `run_started` yet, rather than an `Option`: no task of an unstarted run
+    // is ready, and such a run holds no entitlement. Those are statements, not
+    // defaults.
+    //
+    // **A poisoned fold authorises nothing.** `plan_transition` refuses with
+    // `FoldError::Poisoned` once an append has returned an error, and INV-20
+    // says "no completion is applied after the fold is poisoned by a returned
+    // append error". A predicate that kept answering `true` would let the
+    // coordinator select work from a state this process can no longer vouch
+    // for, and the append-error protocol's "no report, cleanup, or question
+    // payload is derived from the poisoned fold" would hold in the emit path
+    // and leak here. So every predicate below is false once poisoned.
+    //
+    // The exceptions are the four that state what the run *is* rather than
+    // what it may do: `pipeline_held`, `run_is_ending`, `backoff_pending` and
+    // `questions_open`. They are accounting, not authorisation. A poisoned
+    // fold whose `halted_at` is set is still a halted run, and answering `0`
+    // or `false` there would be a false statement about durable state rather
+    // than a refusal. Their callers must not derive a report from them after a
+    // poisoned append either, but that is a rule about reports and it lives in
+    // the emit path — and nothing selects on them from a poisoned fold in any
+    // case, because selection refuses at the top on `is_poisoned`.
+    // -----------------------------------------------------------------------
+
+    /// Whether `key` may be dispatched into a fresh generation.
+    ///
+    /// `decisions.admission_and_leases.ready`.
+    #[must_use]
+    pub fn ready(&self, key: TaskKey) -> bool {
+        !self.poisoned && self.run.as_ref().is_some_and(|run| run.ready(key))
+    }
+
+    /// Whether `key` may take its next attempt in the generation it retained.
+    ///
+    /// `decisions.admission_and_leases.ready_retry`. False in any incarnation
+    /// but the retaining one — `retained_incarnation == state.resumes` is part
+    /// of the predicate, which is why a caller must not re-derive it.
+    #[must_use]
+    pub fn ready_retry(&self, key: TaskKey) -> bool {
+        !self.poisoned && self.run.as_ref().is_some_and(|run| run.ready_retry(key))
+    }
+
+    /// The pipeline entitlement currently held, derived from the fold.
+    ///
+    /// Generations in `OpenNoAttempt`, `InFlight` and `Promoting` hold one
+    /// each; `RetainedIdle` and `Closed` hold none; an unresolved integration
+    /// transaction holds one. `decisions.admission_and_leases.permits.pipeline`.
+    #[must_use]
+    pub fn pipeline_held(&self) -> usize {
+        self.run.as_ref().map_or(0, RunState::pipeline_held)
+    }
+
+    /// Whether a further pipeline entitlement is within `max_parallel`.
+    #[must_use]
+    pub fn pipeline_reservable(&self) -> bool {
+        !self.poisoned && self.run.as_ref().is_some_and(RunState::pipeline_reservable)
+    }
+
+    /// Whether some task could be dispatched, retried, or integrated from this
+    /// state alone.
+    ///
+    /// Budget, capacity and runner availability are not consulted — this is
+    /// what "structurally admissible" means, and it is the predicate the
+    /// ceiling check is applied *to*, not a substitute for it.
+    #[must_use]
+    pub fn structurally_admissible(&self) -> bool {
+        !self.poisoned
+            && self
+                .run
+                .as_ref()
+                .is_some_and(RunState::structurally_admissible)
+    }
+
+    /// Whether an integration transaction could start from this state.
+    #[must_use]
+    pub fn integration_admissible(&self) -> bool {
+        !self.poisoned
+            && self
+                .run
+                .as_ref()
+                .is_some_and(RunState::integration_admissible)
+    }
+
+    /// Whether this run has already ended in the sense that forbids further
+    /// work: `halted_at` is set, or a `budget_stop` of **this** epoch is.
+    ///
+    /// The epoch is the load-bearing half. A `budget_stop` recorded in an
+    /// earlier incarnation was cleared by the resume that raised the ceiling,
+    /// and a caller that read the field without the epoch would refuse a run
+    /// the operator has already unblocked. It is exposed for the same reason
+    /// `ready` is: `refusals[18]` refuses `defer_wait_elapsed` under either
+    /// condition, so a selector that decided the backoff branch from its own
+    /// copy of this rule would offer the loop an append the fold is about to
+    /// refuse — and the two copies would be free to disagree.
+    #[must_use]
+    pub fn run_is_ending(&self) -> bool {
+        self.run.as_ref().is_some_and(RunState::run_is_ending)
+    }
+
+    /// Whether anything is waiting on a wait: a task in
+    /// [`TaskState::Deferred`], or a queue entry whose verification was
+    /// deferred by an outage.
+    ///
+    /// This is the *pending work* half of the backoff branch and not the
+    /// branch itself — [`Self::run_is_ending`] is the other half, and
+    /// `derived_outcome` consults this one alone. Both halves are here so that
+    /// neither is re-derived: the fold walks its own tasks, and a caller
+    /// walking the registry's keys instead is walking a different sequence the
+    /// moment a repair is registered.
+    #[must_use]
+    pub fn backoff_pending(&self) -> bool {
+        self.run.as_ref().is_some_and(RunState::backoff_pending)
+    }
+
+    /// The binding rung `rung` of `key` is frozen as.
+    ///
+    /// **The eleventh reader, and it is deliberately only half of the fold's
+    /// rule.** `check_attempt_started` accepts a binding that matches the
+    /// human override when one is recorded, and the frozen rung otherwise.
+    /// This returns the frozen rung's, and nothing else, for two reasons.
+    ///
+    /// First, no override is constructible in a run this crate currently
+    /// drives: a `BindingOverride` arrives from an `Answered` event, and the
+    /// loop's answer-ingest branch is not implemented, so the override arm has
+    /// no reachable input. Second, and more important, **the fold's override
+    /// check is partial**: `matches_override` compares agent, model and effort
+    /// and says nothing about `tier` or `pinned`. A caller that built an
+    /// override binding would be choosing those two fields unchallenged, and
+    /// this reader is not the place to invent a rule the packet states
+    /// somewhere the author of this method has not read.
+    ///
+    /// So a caller holding an override must not use this. The intended shape,
+    /// when the answers branch lands, is that this method grows the second arm
+    /// together with the passage that decides those two fields — not that a
+    /// caller composes one from [`Self::binding_override`] and this.
+    ///
+    /// `None` when the run has no registry, the task is not registered, or the
+    /// ladder has no such rung.
+    #[must_use]
+    pub fn frozen_rung_binding(&self, key: TaskKey, rung: u32) -> Option<RungBinding> {
+        let entry = self.registry()?.get(key)?;
+        let frozen = entry.ladder.rungs.get(usize::try_from(rung).ok()?)?;
+        Some(RungBinding::from_frozen(
+            frozen,
+            entry.ladder.effort.implementation_for(frozen.tier),
+        ))
+    }
+
+    /// The generation `key` has open with no attempt started, if it has one.
+    ///
+    /// **`T-DISPATCH`'s "continue attempt (no spend repeats)", made askable.**
+    /// A run killed between `task_dispatched` and `attempt_started` leaves the
+    /// generation `OpenNoAttempt`; recovery step (g) verifies or recreates its
+    /// worktree, and then the loop is supposed to start the attempt in it.
+    ///
+    /// [`Self::ready`] cannot answer this and must not: it requires
+    /// `task.open().is_none()`, which is correct — a task with an open
+    /// generation is not *ready to be dispatched*. The continuation is a
+    /// different question about the same task, and asking it of `ready` would
+    /// make one predicate mean two things.
+    ///
+    /// A lookup over [`Self::task`]'s own state, deciding nothing: the class is
+    /// what `apply` recorded and the id is the generation's. Poisoning is not
+    /// consulted for the same reason the other statement accessors do not — a
+    /// poisoned fold of a run with an open generation still has one, and `None`
+    /// here would be a false statement rather than a refusal.
+    #[must_use]
+    pub fn open_no_attempt(&self, key: TaskKey) -> Option<GenerationId> {
+        self.task(key)?
+            .generations
+            .iter()
+            .find(|generation| generation.class == GenerationClass::OpenNoAttempt)
+            .map(|generation| generation.id)
+    }
+
+    /// The region an ordinary dispatch of `key` predicts.
+    ///
+    /// **The tenth reader, and it exists because the alternative was a second
+    /// authority.** `dispatch_lease_check` decides whether a task is `ready` at
+    /// all by computing this region and asking the lease table what it
+    /// overlaps. A caller that then recorded a *different* region in
+    /// `task_dispatched` would have the fold admitting on one answer and the
+    /// log holding another — and the log's is the one the lease table keeps.
+    ///
+    /// That is not hypothetical. It was written: a driver that took the plan's
+    /// hints literally recorded `src/auth/*.rs` as a **prefix**, which overlaps
+    /// nothing, while the fold had admitted the dispatch on `src/auth`. At
+    /// `max_parallel = 1` nothing can collide and the disagreement is
+    /// invisible; at the first width above one it is two tasks editing the same
+    /// files.
+    ///
+    /// `None` when the run has no registry yet, which is before `run_started`.
+    #[must_use]
+    pub fn predicted_region(&self, key: TaskKey) -> Option<PathSet> {
+        self.registry()
+            .and_then(|registry| registry.get(key))
+            .map(predicted_region)
+    }
+
+    /// Whether any question is open.
+    ///
+    /// The ids themselves are [`Self::open_questions`]; this is the predicate
+    /// `derived_outcome` decides `Parked` with, exposed so that the hard-block
+    /// branch and the derived outcome cannot disagree about what "open" means.
+    #[must_use]
+    pub fn questions_open(&self) -> bool {
+        self.run.as_ref().is_some_and(RunState::questions_open)
     }
 
     // -----------------------------------------------------------------------
@@ -1646,8 +1940,66 @@ impl RunState {
                 }
             }
             AttemptSettlement::Closed { transition, lease } => {
-                let survives = matches!(transition, SettlementTransition::Succeeded);
-                check_lease_disposition(KIND, finished.key, generation.lease, survives, *lease)?;
+                // **`attempt_finished` does not settle a success.** INV-07 and
+                // `decisions/2026-08-12-merge-queue-execution-topology.md` say
+                // it outright — `candidate_prepared` is "the **sole**
+                // successful settlement for an attempt that produces a
+                // candidate … `attempt_finished` is not also emitted for that
+                // attempt" — and this build appended both, so one attempt
+                // carried its record on two lines.
+                //
+                // Refused here rather than tolerated downstream. The 2026-08-27
+                // ruling is CONFORM, not supersession, and a reader that
+                // *coped* with the dual pattern would be a second reading of
+                // the same sentence: `Spend::replay` grew per-attempt
+                // deduplication to survive it, which is evidence of the
+                // duplicate rather than permission for it. Schema 4 has no
+                // external writers — `src/engine/mod.rs` is `pub(crate) mod
+                // topology` — so no log this build did not write can carry the
+                // shape, and refusing it costs no compatibility.
+                if matches!(transition, SettlementTransition::Succeeded) {
+                    return Err(FoldError::InconsistentRecord {
+                        kind: KIND,
+                        detail: format!(
+                            "attempt {} of generation {} settles `succeeded`, and \
+                             `candidate_prepared` is the sole successful settlement for a \
+                             candidate-producing attempt",
+                            finished.attempt.0, finished.generation.0
+                        ),
+                    });
+                }
+                // **The record must say the attempt failed, and must be this
+                // attempt's.** This door refused `Succeeded` and asked nothing
+                // else, so a settlement could fail a task and halt a run while
+                // carrying a record whose failure field is empty and whose
+                // reviews all passed — a ledger line reporting success attached
+                // to a terminal failure. `AttemptRecord::is_successful` is the
+                // one definition, shared with `check_candidate_prepared`, so
+                // the two doors cannot drift apart again.
+                if finished.record.is_successful() {
+                    return Err(FoldError::InconsistentRecord {
+                        kind: KIND,
+                        detail: format!(
+                            "attempt {} of generation {} settles as a failure and its record \
+                             says the attempt succeeded — `candidate_prepared` is the \
+                             settlement of a successful attempt",
+                            finished.attempt.0, finished.generation.0
+                        ),
+                    });
+                }
+                // The envelope and the record name one attempt. Without this the
+                // ledger line a settlement carries can belong to a different
+                // attempt of the same generation.
+                if finished.record.attempt != finished.attempt.0 {
+                    return Err(FoldError::WrongAttempt {
+                        kind: KIND,
+                        key: finished.key.0,
+                        generation: finished.generation.0,
+                        attempt: finished.record.attempt,
+                        expected: finished.attempt.0.to_string(),
+                    });
+                }
+                check_lease_disposition(KIND, finished.key, generation.lease, *lease)?;
                 if let SettlementTransition::Parked { question } = transition {
                     self.check_new_question(KIND, question, finished.key)?;
                 }
@@ -1679,13 +2031,7 @@ impl RunState {
         // unknown, so the worktree is scrubbed with force rather than reused —
         // which is why an ordinary generation releases its predicted region
         // here and a lineage member goes on holding its root's.
-        check_lease_disposition(
-            KIND,
-            interrupted.key,
-            generation.lease,
-            false,
-            interrupted.lease,
-        )
+        check_lease_disposition(KIND, interrupted.key, generation.lease, interrupted.lease)
     }
 
     // --- generation_closed -------------------------------------------------
@@ -1711,7 +2057,7 @@ impl RunState {
                 });
             }
         }
-        check_lease_disposition(KIND, closed.key, generation.lease, false, closed.lease)
+        check_lease_disposition(KIND, closed.key, generation.lease, closed.lease)
     }
 
     // --- defer_wait_elapsed ------------------------------------------------
@@ -1741,14 +2087,21 @@ impl RunState {
         let entry = self.entry(KIND, prepared.key)?;
         let task = self.task(KIND, prepared.key)?;
         let generation = self.open_generation(KIND, task, prepared.key, prepared.generation)?;
-        if generation.class != GenerationClass::Promoting {
+        // **The generation is still in flight, because this event is what
+        // settles it.** It used to require `Promoting`, which only an
+        // `attempt_finished{Succeeded}` could produce — so the fold *required*
+        // the dual pattern the 2026-08-12 record forbids. With the settlement
+        // moved here, a `Promoting` generation means that record was appended
+        // anyway, and the arm above already refuses it; this refuses the other
+        // half of the same shape, so neither order can produce two settlements.
+        if !matches!(generation.class, GenerationClass::InFlight { .. }) {
             return Err(FoldError::NotTheOpenGeneration {
                 kind: KIND,
                 key: prepared.key.0,
                 generation: prepared.generation.0,
                 detail: format!(
                     "the generation is {}, and a candidate is prepared by a generation whose \
-                     attempt succeeded",
+                     attempt is still in flight — this event is its settlement",
                     generation.class.name()
                 ),
             });
@@ -1766,6 +2119,43 @@ impl RunState {
                 detail: "the generation has already prepared a candidate, and one generation \
                          prepares at most one"
                     .to_owned(),
+            });
+        }
+        // **And the attempt it names must have succeeded.** This event is the
+        // sole successful settlement for a candidate-producing attempt, so a
+        // record carrying a failure is a settlement contradicting itself: the
+        // candidate's own authoritative evidence would say a gate failed while
+        // the fold promoted the generation and carried it to
+        // `task_candidate_created`, queueing it as a success.
+        //
+        // Missing until 2026-08-27. The Class B change made this the successful
+        // settlement and did not make the fold require success — the semantic
+        // condition that motivated the change was the one condition not
+        // enforced, and the round-4 review of `09f9a99` walked the five steps.
+        // It also gives `TopologyRun`'s `Brief::replay` the property it already
+        // assumed: a `candidate_prepared` record never carries feedback,
+        // because it never carries a failure.
+        //
+        // `InconsistentRecord` rather than a new variant: the refusal inventory
+        // is packet-enumerated, and "the event disagrees with the record it
+        // cites" is exactly this kind.
+        if !prepared.attempt.is_successful() {
+            return Err(FoldError::InconsistentRecord {
+                kind: KIND,
+                detail: format!(
+                    "attempt {} of generation {} does not record a successful attempt — \
+                     failure {:?}, review outcomes {:?} — and `candidate_prepared` is the \
+                     settlement of an attempt that succeeded",
+                    prepared.attempt.attempt,
+                    prepared.generation.0,
+                    prepared.attempt.failure.as_ref().map(|f| f.kind),
+                    prepared
+                        .attempt
+                        .reviews
+                        .iter()
+                        .map(|pass| pass.outcome)
+                        .collect::<Vec<_>>()
+                ),
             });
         }
         // ST-06: a candidate is prepared *by the attempt that succeeded*, so
@@ -2829,8 +3219,18 @@ impl RunState {
             < usize::try_from(self.started.limits.max_parallel).unwrap_or(usize::MAX)
     }
 
+    /// `permits.provisional_reservations` gives integration selection the
+    /// `{pipeline, merge}` pair, and `deadlock_freedom` takes a reservation
+    /// "only when the derived count permits" — so the entitlement is a clause
+    /// of admissibility here for the same reason it is one in [`Self::ready`]
+    /// and [`Self::ready_retry`], and not a check the caller is trusted to
+    /// remember. `permits.pipeline` counts an unresolved integration
+    /// transaction among the held, which is the other half of the same
+    /// statement: a selector that admitted an integration while the count was
+    /// at `max_parallel` would open the entitlement that is already held.
     fn integration_admissible(&self) -> bool {
         self.transaction.is_none()
+            && self.pipeline_reservable()
             && !self.run_is_ending()
             && self
                 .queue
@@ -2940,6 +3340,16 @@ impl RunState {
                     };
                     generation.attempts = data.attempt.0;
                 }
+                // **Not counted here.** An attempt that has *started* has not
+                // yet spent anything: `ladder::spends_allowance` is total over
+                // `FailureKind` and its line is "the worker ran and produced
+                // work to judge", which `attempt_started` cannot know. Counting
+                // here made this fold a second authority for a rule that has one
+                // production implementation, and made every interruption, park
+                // and outage burn a rung the packet says they do not —
+                // `transaction_fault_matrix[T-ATTEMPT]`'s "unknown spend,
+                // **allowance refunded**". The count is taken at the settlement,
+                // in `apply_settlement`, from the record the settlement carries.
             }
             TopologyEventBody::AttemptFinished { data } => self.apply_settlement(data),
             TopologyEventBody::AttemptInterrupted { data } => {
@@ -3059,6 +3469,31 @@ impl RunState {
     }
 
     fn apply_settlement(&mut self, finished: &AttemptFinished4) {
+        // **The allowance, decided once, by the one function that decides it.**
+        //
+        // `ladder::spends_allowance` is documented as "the single production
+        // implementation of the allowance rule" and is total over `FailureKind`
+        // so a new variant stops the build rather than taking a default. This
+        // fold consumes it; it does not re-derive it. `FailureRecord::shape`
+        // exists for exactly this call — "a settlement holds a record rather
+        // than the live failure, and the allowance decision is the same decision
+        // either way".
+        //
+        // **Taken at the settlement, which is what makes the refund free.**
+        // T-ATTEMPT refunds an interrupted attempt's allowance. An attempt that
+        // never settled never counted, so there is nothing to give back and no
+        // second rule to keep in step with the first — the refund is the absence
+        // of a charge rather than a subtraction that could be forgotten.
+        //
+        // Before the `Escalated` arm below, which resets the count: an attempt
+        // that escalates spent its allowance on the rung it is leaving, and the
+        // rung it climbs onto starts again at zero.
+        //
+        // Nested rather than a `let`-chain: `if cond && let Some(x) = ..` is
+        // unstable on **1.85**, which this crate's MSRV pins, and stable rustc
+        // accepts it — so the local gates pass and only the MSRV leg refuses.
+        self.charge_allowance(finished.key, &finished.record);
+
         match &finished.settlement {
             AttemptSettlement::Retained {
                 retained_session,
@@ -3072,17 +3507,38 @@ impl RunState {
                 }
             }
             AttemptSettlement::Closed { transition, .. } => match transition {
-                SettlementTransition::Succeeded => {
-                    if let Some(generation) = self.open_generation_mut(finished.key) {
-                        generation.class = GenerationClass::Promoting;
+                // Unreachable: `check_attempt_finished` refuses this
+                // transition before `apply` is called, because
+                // `candidate_prepared` is the sole successful settlement. The
+                // arm stays so the match is total over the wire vocabulary —
+                // the variant is still a legal *shape*, it is simply not a
+                // settlement this fold accepts — and it does nothing, so a
+                // check that stopped refusing would produce a generation stuck
+                // in flight rather than a silently-promoted one.
+                SettlementTransition::Succeeded => {}
+                SettlementTransition::Retry => {
+                    self.close_generation(finished.key);
+                }
+                SettlementTransition::Escalated { rung } => {
+                    self.close_generation(finished.key);
+                    // The settlement's own number: the packet defines it as the
+                    // rung the escalation climbs *onto*. The allowance is per
+                    // rung, so it starts again here.
+                    if let Some(task) = self.tasks.get_mut(finished.key.index()) {
+                        task.rung = *rung;
+                        task.attempts_on_rung = 0;
                     }
                 }
-                SettlementTransition::Retry | SettlementTransition::Escalated { .. } => {
-                    self.close_generation(finished.key);
-                }
-                SettlementTransition::Deferred { .. } => {
+                SettlementTransition::Deferred { defers, .. } => {
                     self.close_generation(finished.key);
                     self.set_state(finished.key, TaskState::Deferred);
+                    // The settlement's own number, not this fold's plus one.
+                    // `settle_failed` computed it as `defers.saturating_add(1)`
+                    // and appended it; recomputing here would be a second
+                    // derivation of a value the log already holds, and a replay
+                    // of the same log would then disagree with the process that
+                    // wrote it.
+                    self.set_defers(finished.key, *defers);
                 }
                 SettlementTransition::Parked { question } => {
                     self.close_generation(finished.key);
@@ -3108,15 +3564,61 @@ impl RunState {
         }
     }
 
+    /// One settled attempt against its rung's allowance.
+    ///
+    /// **The single write, and both settlements reach it through here.** The
+    /// increment used to live inline in [`Self::apply_settlement`], which was
+    /// fine while `attempt_finished` was the only settlement — and stopped being
+    /// fine on 2026-08-27, when `candidate_prepared` became the sole successful
+    /// one. The settlement moved and the counting did not, so **a successful
+    /// attempt stopped spending anything**: a first-attempt success left
+    /// `attempts_on_rung` at zero, replay reproduced the undercount, and a later
+    /// allowance reader could grant an extra attempt on a rung already paid for.
+    /// The round-4 review of `09f9a99` found it, and the Class B approval this
+    /// change was made under says the thing that did not happen — *"settlement
+    /// counting moves to the sole event"*.
+    ///
+    /// A shared core rather than a second increment, because two increments are
+    /// two rules: `the_rungs_allowance_is_counted_in_one_production_place` exists
+    /// to forbid exactly that, and it counts **calls to this** so a settlement
+    /// that stops charging is a failing census rather than a silent undercount.
+    ///
+    /// It consults `spends_allowance` and answers nothing itself. A successful
+    /// record carries no failure, and `spends_allowance(None)` is `true`: the
+    /// worker ran and produced work that was judged and accepted.
+    fn charge_allowance(&mut self, key: TaskKey, record: &crate::events::AttemptRecord) {
+        if crate::ladder::spends_allowance(
+            record
+                .failure
+                .as_ref()
+                .map(crate::events::FailureRecord::shape),
+        ) {
+            if let Some(task) = self.tasks.get_mut(key.index()) {
+                task.attempts_on_rung = task.attempts_on_rung.saturating_add(1);
+            }
+        }
+    }
+
     fn apply_candidate_prepared(&mut self, prepared: &CandidatePrepared) {
         let record = PreparedCandidate {
             candidate: prepared.candidate(),
             base_sha: prepared.base_sha.clone(),
+            tree_sha: prepared.tree_sha.clone(),
             paths: prepared.actual_paths.clone(),
         };
         if let Some(generation) = self.open_generation_mut(prepared.key) {
             generation.candidate = Some(record);
+            // **The settlement, which used to arrive on its own event.** A
+            // candidate-producing attempt has exactly one successful
+            // settlement and this is it, so the class transition belongs here
+            // rather than to an `attempt_finished` the 2026-08-12 record says
+            // is not emitted.
+            generation.class = GenerationClass::Promoting;
         }
+        // **The settlement's accounting, which moved with the settlement.**
+        // Same core as the failure path, so there is one increment in this
+        // build and both settlements reach it.
+        self.charge_allowance(prepared.key, &prepared.attempt);
         match &prepared.lease_effect {
             CandidateLeaseEffect::ReplacesPredicted { paths } => {
                 self.leases.release(LeaseOwner::Generation {
@@ -3369,6 +3871,17 @@ impl RunState {
         }
     }
 
+    /// Record the deferral count a `Deferred` settlement carried.
+    ///
+    /// Assignment rather than increment: the number is the settlement's, which
+    /// is what makes a replay of the same log reach the same count as the
+    /// process that wrote it.
+    fn set_defers(&mut self, key: TaskKey, defers: u32) {
+        if let Some(task) = self.tasks.get_mut(key.index()) {
+            task.defers = defers;
+        }
+    }
+
     fn open_generation_mut(&mut self, key: TaskKey) -> Option<&mut GenerationFold> {
         self.tasks.get_mut(key.index())?.open_mut()
     }
@@ -3462,14 +3975,29 @@ fn ordinal(index: u32) -> String {
 
 /// refusals[14]: the disposition an event records must be the one this
 /// generation's holding admits.
+/// The recorded disposition against the one the holding implies.
+///
+/// **Every caller passes a closing generation, and since 2026-08-27 there is no
+/// other kind.** This took a `survives: bool`, and exactly one caller ever
+/// passed `true`: `attempt_finished{Succeeded}`, the settlement that left a
+/// generation open to hand its region to a candidate. That event is no longer a
+/// settlement this fold accepts — `candidate_prepared` is the sole successful
+/// one — so the parameter had a single reachable value and a second value that
+/// documented a rule nothing could exercise.
+///
+/// **The surviving case did not disappear, it moved.** A generation that keeps
+/// its region hands it over through `CandidatePrepared::lease_effect`, which
+/// [`TopologyFold::check_candidate_prepared`] matches against the entry's
+/// lineage — the same decision, on the event that now makes it.
+/// [`GenerationLease::expected`] keeps both arms and its own table test,
+/// because it is the statement of the rule rather than a caller of it.
 fn check_lease_disposition(
     kind: &'static str,
     key: TaskKey,
     lease: GenerationLease,
-    survives: bool,
     recorded: LeaseDisposition,
 ) -> Result<(), FoldError> {
-    let expected = lease.expected(survives);
+    let expected = lease.expected(false);
     if recorded == expected {
         return Ok(());
     }
@@ -3481,7 +4009,7 @@ fn check_lease_disposition(
             GenerationLease::Own => "leaseholding",
             GenerationLease::InheritedLineage { .. } => "lineage",
         },
-        fate: if survives { "stays open" } else { "closes" },
+        fate: "closes",
         expected: format!("{expected:?}"),
     })
 }
@@ -3531,6 +4059,9 @@ mod tests {
     const ZETA: TaskKey = TaskKey(0);
     const ALPHA: TaskKey = TaskKey(1);
     const MID: TaskKey = TaskKey(2);
+    /// The fourth task of [`wide_plan`] only. `plan()` and `chain_plan()` have
+    /// three, and `region` already answers `src/repairs` for this key.
+    const BETA: TaskKey = TaskKey(3);
 
     // -----------------------------------------------------------------------
     // Fixtures
@@ -3801,6 +4332,85 @@ mod tests {
         })
     }
 
+    /// Four tasks that wait on nothing and touch four disjoint regions.
+    ///
+    /// `plan()` and `chain_plan()` are both chains, and in a chain at most one
+    /// of `ready`, `ready_retry` and `integration_admissible` can hold at a
+    /// time: everything waits on one task, and that task is pending, open, or
+    /// merged. A predicate that is never independently true is one no guard
+    /// over it can be measured against — which is how four of the five poison
+    /// guards came to be asserted by a test that would have passed without
+    /// them. The three original ids keep their kinds, tiers, hints and
+    /// ladders; only `depends_on` differs, and `beta` is the fourth holder a
+    /// held pipeline entitlement needs.
+    fn wide_plan() -> Plan {
+        Plan {
+            source: PlanSource {
+                adapter: "markdown".to_owned(),
+                hash: "frozen-wide-Ünicode-hash".to_owned(),
+            },
+            tasks: vec![
+                task_of("zeta", &[], &["src/Zebra/"], Some(Tier::Small)),
+                task_of("alpha", &[], &["src/alpha/*.rs"], None),
+                task_of("mid", &[], &["src/mid/", "build.rs"], Some(Tier::Mid)),
+                task_of("beta", &[], &["src/repairs/"], None),
+            ],
+            artifacts: vec![Artifact {
+                id: ArtifactId::from("contract"),
+                produced_by: Some(TaskId::from("alpha")),
+            }],
+        }
+    }
+
+    fn wide_inputs() -> FrozenInputs {
+        FrozenInputs {
+            plan: wide_plan(),
+            normalized_plan_digest: NORMALIZED_DIGEST.to_owned(),
+        }
+    }
+
+    /// The wide plan's `run_started`, authenticated against its own registry,
+    /// at a stated pipeline width.
+    ///
+    /// The width is a parameter because it is the one limit selection reads,
+    /// and because `DEFAULT_MAX_PARALLEL` is 1: a fixture fixed at 3 tests a
+    /// width `config` refuses to create a run at.
+    fn wide_run_started_event(max_parallel: u32) -> TopologyEvent {
+        let plan = wide_plan();
+        let base = run_started_unauthenticated();
+        let limits = TopologyLimits {
+            max_parallel,
+            ..base.limits
+        };
+        let unauthenticated = RunStarted4 {
+            plan_hash: plan.source.hash.clone(),
+            chains: plan.tasks.iter().map(|t| chain(t.id.as_str())).collect(),
+            reviews: review_plan(plan.tasks.len()),
+            limits,
+            ..base
+        };
+        let digest = TaskRegistry::originals_with_agents(
+            &plan,
+            &unauthenticated.registry_record(),
+            &unauthenticated.probed_agents,
+        )
+        .expect("the wide record derives a registry")
+        .digest();
+        ev(TopologyEventBody::RunStarted {
+            data: Box::new(RunStarted4 {
+                registry_digest: digest,
+                ..unauthenticated
+            }),
+        })
+    }
+
+    /// A fold over [`wide_plan`] that has recorded its `run_started`.
+    fn wide_started(max_parallel: u32) -> TopologyFold {
+        let mut fold = TopologyFold::new(wide_inputs());
+        apply(&mut fold, &wide_run_started_event(max_parallel));
+        fold
+    }
+
     fn registry_digest() -> String {
         let plan = plan();
         let started = run_started_unauthenticated();
@@ -3904,6 +4514,54 @@ mod tests {
 
     // --- event builders ----------------------------------------------------
 
+    /// One review pass's ledger line, named and concluded.
+    fn review_pass(pass: &str, outcome: ReviewPassOutcome) -> ReviewRecord {
+        ReviewRecord {
+            pass: pass.to_owned(),
+            agent: "copilot".to_owned(),
+            model: "gpt-5.6".to_owned(),
+            adapter: Some("copilot".to_owned()),
+            preflight_cli_version: Some("0.9.3".to_owned()),
+            effort: Some(Effort::Medium),
+            pool: Some("copilot-business".to_owned()),
+            cost_usd: None,
+            outcome,
+        }
+    }
+
+    /// The complete successful attempt **for this task under the frozen plan**.
+    ///
+    /// `TaskKey` is the plan index, so whether a second opinion is configured is
+    /// derived from `review_plan` rather than asserted by the fixture: the
+    /// premise carries exactly the passes §11.2 requires of that task, and no
+    /// others. `review_plan` configures one for index 2 alone.
+    fn attempt_record_for(key: TaskKey, attempt: u32) -> AttemptRecord {
+        let mut record = attempt_record(attempt);
+        // Long enough to include this task's own slot; `review_plan` decides
+        // each index by the same closure the real fixtures use, so slot `key.0`
+        // holds exactly what the frozen plan gives that task.
+        let plan = review_plan(key.0 as usize + 1);
+        if plan
+            .second_opinion
+            .get(key.0 as usize)
+            .is_some_and(Option::is_some)
+        {
+            record
+                .reviews
+                .push(review_pass("second-opinion", ReviewPassOutcome::Passed));
+        }
+        record
+    }
+
+    /// A **complete** successful attempt for a task the plan gives no second
+    /// opinion.
+    ///
+    /// The primary pass is present and `Passed`. This carried a lone
+    /// `second-opinion` entry and no primary at all — a record that satisfies
+    /// `is_successful` only because `all` over its passes never sees the pass
+    /// §11.2 actually requires. A positive premise that passes vacuously
+    /// witnesses nothing about the clause it is meant to exercise: delete the
+    /// review half of `is_successful` and no positive test here would notice.
     fn attempt_record(attempt: u32) -> AttemptRecord {
         AttemptRecord {
             attempt,
@@ -3913,17 +4571,7 @@ mod tests {
             resumed: false,
             duration: Duration::from_millis(123_456),
             cost_usd: Some(1.25),
-            reviews: vec![ReviewRecord {
-                pass: "second-opinion".to_owned(),
-                agent: "copilot".to_owned(),
-                model: "gpt-5.6".to_owned(),
-                adapter: Some("copilot".to_owned()),
-                preflight_cli_version: Some("0.9.3".to_owned()),
-                effort: Some(Effort::Medium),
-                pool: Some("copilot-business".to_owned()),
-                cost_usd: None,
-                outcome: ReviewPassOutcome::Passed,
-            }],
+            reviews: vec![review_pass("review", ReviewPassOutcome::Passed)],
             session_id: Some("sess-ÜNI-0042".to_owned()),
             usage: Some(Usage {
                 input_tokens: Some(9_001),
@@ -3978,14 +4626,94 @@ mod tests {
         })
     }
 
+    /// Delegates to the production reader rather than repeating its
+    /// composition.
+    ///
+    /// It used to repeat it, and that made this file hold **two** derivations
+    /// of one value — the validator's, in `check_attempt_started`, and this
+    /// one. Every test that builds an `attempt_started` goes through here, so
+    /// routing it to [`TopologyFold::frozen_rung_binding`] puts that reader
+    /// under the whole existing attempt corpus: if it ever disagrees with the
+    /// validator beside it, dozens of tests fail rather than none.
     fn frozen_binding(fold: &TopologyFold, key: TaskKey, rung: usize) -> RungBinding {
-        let entry = fold
-            .registry()
-            .expect("the run has started")
-            .get(key)
-            .expect("the fixture task");
-        let frozen = &entry.ladder.rungs[rung];
-        RungBinding::from_frozen(frozen, entry.ladder.effort.implementation_for(frozen.tier))
+        fold.frozen_rung_binding(key, u32::try_from(rung).expect("a small fixture rung"))
+            .expect("the run has started and the fixture task has this rung")
+    }
+
+    /// The reader's answer is exactly what the validator accepts.
+    ///
+    /// **Round-tripped against `check_attempt_started`, not compared to a
+    /// literal.** A literal expectation would be a second transcription of the
+    /// same rule, and would agree with this reader for the same reason the
+    /// reader is right or wrong — the self-oracle shape. Feeding the reader's
+    /// output to the validator asks the only question that matters: do the two
+    /// halves of this file agree.
+    ///
+    /// The negative half is what gives it teeth. Perturbing one field of the
+    /// binding must be refused, or the validator is not checking the thing the
+    /// reader produces and the positive half proves nothing.
+    #[test]
+    fn the_frozen_rung_binding_is_what_the_validator_accepts() {
+        let mut fold = started();
+        apply(&mut fold, &dispatch(ALPHA, 0, &sha("base")));
+
+        let binding = fold
+            .frozen_rung_binding(ALPHA, 0)
+            .expect("the fixture task has rung 0");
+
+        let accepted = ev(TopologyEventBody::AttemptStarted {
+            data: AttemptStarted4 {
+                key: ALPHA,
+                generation: GenerationId(0),
+                attempt: AttemptNumber(1),
+                rung: 0,
+                binding: binding.clone(),
+                pool: None,
+                resume_session: None,
+                materialization_observed: None,
+            },
+        });
+        fold.plan_transition(&accepted)
+            .expect("the validator accepts the binding this reader produced");
+
+        for (label, mutate) in [
+            (
+                "model",
+                (|b: &mut RungBinding| b.model.push_str("-x")) as fn(&mut RungBinding),
+            ),
+            ("agent", |b: &mut RungBinding| b.agent.push_str("-x")),
+            ("effort", |b: &mut RungBinding| {
+                b.effort = if b.effort == Effort::High {
+                    Effort::Low
+                } else {
+                    Effort::High
+                }
+            }),
+        ] {
+            let mut wrong = binding.clone();
+            mutate(&mut wrong);
+            let refused = ev(TopologyEventBody::AttemptStarted {
+                data: AttemptStarted4 {
+                    key: ALPHA,
+                    generation: GenerationId(0),
+                    attempt: AttemptNumber(1),
+                    rung: 0,
+                    binding: wrong,
+                    pool: None,
+                    resume_session: None,
+                    materialization_observed: None,
+                },
+            });
+            assert!(
+                matches!(
+                    fold.plan_transition(&refused),
+                    Err(FoldError::BindingMismatch { .. })
+                ),
+                "a binding differing only in `{label}` must be refused, or the \
+                 positive half above is satisfied by a validator that is not \
+                 looking"
+            );
+        }
     }
 
     fn attempt_started(
@@ -4009,33 +4737,66 @@ mod tests {
         })
     }
 
+    /// `attempt_finished`, whose record **says the attempt failed**.
+    ///
+    /// Every settlement this can build is a failure — `candidate_prepared` is the
+    /// sole successful one — so the record is derived to match rather than left
+    /// as the "worker ran and its work was accepted" shape. Built the other way,
+    /// each caller produced a settlement that fails a task while carrying a
+    /// ledger line saying the work passed, which `check_attempt_finished` has
+    /// refused since 2026-08-27.
     fn settle(
         key: TaskKey,
         generation: u32,
         attempt: u32,
         settlement: AttemptSettlement,
     ) -> TopologyEvent {
+        let mut record = attempt_record(attempt);
+        record.failure = Some(crate::events::FailureRecord {
+            kind: crate::ladder::FailureKind::GateFailed,
+            origin: crate::ladder::FailureOrigin::Worker,
+            reason: "the fixture's judged failure".to_owned(),
+            detail: None,
+        });
         ev(TopologyEventBody::AttemptFinished {
             data: Box::new(AttemptFinished4 {
                 key,
                 generation: GenerationId(generation),
                 attempt: AttemptNumber(attempt),
-                record: Box::new(attempt_record(attempt)),
+                record: Box::new(record),
                 settlement,
             }),
         })
     }
 
-    fn succeeded(key: TaskKey, generation: u32, attempt: u32) -> TopologyEvent {
-        settle(
-            key,
-            generation,
-            attempt,
-            AttemptSettlement::Closed {
-                transition: SettlementTransition::Succeeded,
-                lease: LeaseDisposition::PredictedRetained,
-            },
-        )
+    /// [`settle`], with a failure on the record.
+    ///
+    /// The allowance is decided from `AttemptRecord.failure`, so a settlement
+    /// built without one is the "worker ran and its work was accepted" cell and
+    /// cannot exercise any other.
+    fn settle_failing(
+        key: TaskKey,
+        generation: u32,
+        attempt: u32,
+        kind: crate::ladder::FailureKind,
+        settlement: AttemptSettlement,
+    ) -> TopologyEvent {
+        let mut record = attempt_record(attempt);
+        record.failure = Some(crate::events::FailureRecord {
+            kind,
+            origin: crate::ladder::FailureOrigin::Worker,
+            reason: "the fixture's failure".to_owned(),
+            detail: None,
+        });
+        ev(TopologyEventBody::AttemptFinished {
+            data: Box::new(AttemptFinished4 {
+                key,
+                generation: GenerationId(generation),
+                attempt: AttemptNumber(attempt),
+                record: Box::new(record),
+                settlement,
+            }),
+        })
     }
 
     fn candidate_of(key: TaskKey, generation: u32) -> CandidateRef {
@@ -4067,7 +4828,7 @@ mod tests {
             data: Box::new(CandidatePrepared {
                 key,
                 generation: GenerationId(generation),
-                attempt: Box::new(attempt_record(attempt)),
+                attempt: Box::new(attempt_record_for(key, attempt)),
                 base_sha: base.clone(),
                 parent_sha: base.clone(),
                 tree_sha: sha(&format!("tree-{}-{generation}", key.0)),
@@ -4137,6 +4898,639 @@ mod tests {
         })
     }
 
+    // --- selection accessors -----------------------------------------------
+
+    /// The accessors answer for an unstarted run, and answer it as a statement
+    /// rather than as an `Option` the caller must decide what to do with.
+    #[test]
+    fn selection_accessors_report_an_unstarted_run_as_holding_and_offering_nothing() {
+        let fold = TopologyFold::new(inputs());
+        assert_eq!(fold.pipeline_held(), 0, "nothing is dispatched yet");
+        assert!(!fold.pipeline_reservable(), "there is no max_parallel yet");
+        assert!(!fold.structurally_admissible());
+        assert!(!fold.integration_admissible());
+        for key in [ZETA, ALPHA, MID] {
+            assert!(!fold.ready(key), "no task of an unstarted run is ready");
+            assert!(!fold.ready_retry(key));
+        }
+    }
+
+    /// `ready` is the fold's predicate, not a constant: exactly the task whose
+    /// dependencies are met is ready, and the two that depend on it are not.
+    #[test]
+    fn ready_names_only_the_task_whose_dependencies_are_merged() {
+        let fold = started();
+        assert!(fold.ready(ALPHA), "`alpha` has no dependencies");
+        assert!(!fold.ready(ZETA), "`zeta` depends on `alpha`");
+        assert!(!fold.ready(MID), "`mid` depends on `alpha` and `zeta`");
+        assert!(
+            fold.structurally_admissible(),
+            "one ready task makes the run admissible"
+        );
+        assert!(
+            !fold.integration_admissible(),
+            "nothing is queued for integration"
+        );
+    }
+
+    /// `pipeline_held` counts what the packet says holds the entitlement, and
+    /// the count moves with the generation class.
+    ///
+    /// This is the accessor a caller would otherwise re-derive by walking
+    /// `GenerationClass` itself, so the assertion is that the accessor agrees
+    /// with the classes actually present — not merely that it returns a number.
+    #[test]
+    fn pipeline_held_tracks_the_generation_classes_that_hold_the_entitlement() {
+        let mut fold = started();
+        assert_eq!(fold.pipeline_held(), 0);
+
+        apply(&mut fold, &dispatch(ALPHA, 0, &sha("base")));
+        assert_eq!(
+            fold.pipeline_held(),
+            1,
+            "`OpenNoAttempt` holds a pipeline entitlement"
+        );
+        assert!(matches!(
+            fold.task(ALPHA).and_then(TaskFold::open).map(|g| &g.class),
+            Some(GenerationClass::OpenNoAttempt)
+        ));
+        assert!(
+            !fold.ready(ALPHA),
+            "a task with an open generation is not ready for a fresh dispatch"
+        );
+
+        let start = attempt_started(&fold, ALPHA, 0, 1, 0);
+        apply(&mut fold, &start);
+        assert_eq!(fold.pipeline_held(), 1, "`InFlight` holds one, not two");
+
+        // max_parallel is 3 in this fixture, so one held entitlement leaves
+        // room — the reservable predicate is a comparison, not a boolean flag.
+        assert!(fold.pipeline_reservable());
+    }
+
+    /// A settlement to `RetainedIdle` releases the pipeline entitlement while
+    /// keeping the generation open — the one class whose two properties differ.
+    #[test]
+    fn a_retained_generation_holds_no_pipeline_entitlement_and_is_ready_to_retry() {
+        let mut fold = started();
+        apply(&mut fold, &dispatch(ALPHA, 0, &sha("base")));
+        let start = attempt_started(&fold, ALPHA, 0, 1, 0);
+        apply(&mut fold, &start);
+        apply(
+            &mut fold,
+            &settle(
+                ALPHA,
+                0,
+                1,
+                AttemptSettlement::Retained {
+                    retained_session: SessionId("sess-ÜNI-0007".to_owned()),
+                    retained_incarnation: Epoch(0),
+                },
+            ),
+        );
+
+        assert_eq!(
+            fold.pipeline_held(),
+            0,
+            "`RetainedIdle` releases the entitlement"
+        );
+        assert!(
+            fold.task(ALPHA).and_then(TaskFold::open).is_some(),
+            "and keeps the generation open"
+        );
+        assert!(
+            fold.ready_retry(ALPHA),
+            "the retaining incarnation may retry in place"
+        );
+        assert!(
+            !fold.ready(ALPHA),
+            "a retained generation is retried, never re-dispatched"
+        );
+        assert!(fold.structurally_admissible());
+    }
+
+    /// A poisoned fold authorises nothing.
+    ///
+    /// INV-20: "no completion is applied after the fold is poisoned by a
+    /// returned append error". `plan_transition` already refuses; a predicate
+    /// that kept answering `true` would let the coordinator select work from a
+    /// state this process can no longer vouch for.
+    #[test]
+    fn a_poisoned_fold_authorises_nothing_while_still_reporting_what_it_holds() {
+        // Every one of the five predicates is **independently true** before
+        // the poison, which is the whole of what makes the five assertions
+        // after it load-bearing: `alpha` waits on nothing and holds no
+        // generation, `zeta` holds a generation this incarnation retained,
+        // `mid`'s candidate is queued and eligible, and `beta` holds one of the
+        // three pipeline entitlements. This test used to poison a fold in
+        // which `alpha` had just been dispatched and the other two waited on
+        // it — nothing was admissible even unpoisoned, and four of the five
+        // guards could be deleted without it going red.
+        let mut fold = wide_started(3);
+        queue_candidate(&mut fold, MID, 0);
+        retained_generation(&mut fold, ZETA, 0);
+        apply(&mut fold, &dispatch(BETA, 0, &sha("base")));
+
+        assert!(
+            fold.ready(ALPHA),
+            "`alpha` waits on nothing and holds no generation"
+        );
+        assert!(
+            fold.ready_retry(ZETA),
+            "`zeta` retained a session in this incarnation"
+        );
+        assert!(
+            fold.pipeline_reservable(),
+            "one of three entitlements is held"
+        );
+        assert!(fold.structurally_admissible());
+        assert!(
+            fold.integration_admissible(),
+            "`mid`'s candidate is queued and eligible"
+        );
+        assert_eq!(fold.pipeline_held(), 1, "`beta` holds one");
+
+        fold.poison();
+
+        assert!(fold.is_poisoned());
+        assert!(!fold.ready(ALPHA), "a poisoned fold offered a dispatch");
+        assert!(!fold.ready_retry(ZETA), "a poisoned fold offered a retry");
+        assert!(
+            !fold.pipeline_reservable(),
+            "a poisoned fold offered an entitlement"
+        );
+        assert!(
+            !fold.structurally_admissible(),
+            "a poisoned fold called itself admissible"
+        );
+        assert!(
+            !fold.integration_admissible(),
+            "a poisoned fold offered an integration"
+        );
+        for key in [ZETA, ALPHA, MID, BETA] {
+            assert!(!fold.ready(key), "a poisoned fold offered a dispatch");
+            assert!(!fold.ready_retry(key), "a poisoned fold offered a retry");
+        }
+
+        // Accounting, not authorisation: answering `0` here would be a false
+        // statement about the run rather than a refusal. The rule that keeps a
+        // report from being derived from this is the append-error protocol's,
+        // and it belongs in the emit path.
+        assert_eq!(
+            fold.pipeline_held(),
+            1,
+            "the entitlement is still held; only the authorisation is withdrawn"
+        );
+    }
+
+    /// The pipeline entitlement is a clause of `integration_admissible`, and
+    /// at the width production actually runs it is the binding one.
+    ///
+    /// `permits.pipeline` counts an unresolved integration transaction among
+    /// the held, `permits.provisional_reservations` gives integration
+    /// selection `{pipeline, merge}`, and `deadlock_freedom` takes a
+    /// reservation "only when the derived count permits". So an integration is
+    /// admissible only within `max_parallel`, exactly as a dispatch and a
+    /// retry are.
+    ///
+    /// At width 1 — `DEFAULT_MAX_PARALLEL`, and the only width `config`
+    /// accepts for a fresh run — this is reachable rather than theoretical: a
+    /// crash after `task_dispatched` and before `attempt_started` leaves an
+    /// `OpenNoAttempt` generation holding the single slot, and the resumed
+    /// loop's first selection is where an admissibility that ignored the count
+    /// would spend it twice.
+    #[test]
+    fn an_integration_is_inadmissible_while_the_pipeline_entitlement_is_held() {
+        let mut narrow = wide_started(1);
+        queue_candidate(&mut narrow, MID, 0);
+        assert_eq!(narrow.pipeline_held(), 0, "the generation closed");
+        assert!(
+            narrow.integration_admissible(),
+            "an eligible candidate with the slot free is admissible"
+        );
+
+        // `zeta` takes the only slot, and stops where a crash between the
+        // dispatch and the first attempt stops it.
+        apply(&mut narrow, &dispatch(ZETA, 0, &sha("base")));
+        assert_eq!(narrow.pipeline_held(), 1);
+        assert!(!narrow.pipeline_reservable(), "one of one");
+        assert!(
+            !narrow.ready(ALPHA),
+            "a fresh dispatch is refused by the entitlement"
+        );
+        assert!(
+            !narrow.integration_admissible(),
+            "and so is an integration, which would hold one of its own"
+        );
+        assert!(
+            !narrow.structurally_admissible(),
+            "no branch is structurally admissible while the run's one slot is held"
+        );
+
+        // One slot wider, the identical state admits it: the clause under
+        // test is the count and nothing else about this fixture.
+        let mut wider = wide_started(2);
+        queue_candidate(&mut wider, MID, 0);
+        apply(&mut wider, &dispatch(ZETA, 0, &sha("base")));
+        assert_eq!(wider.pipeline_held(), 1);
+        assert!(
+            wider.integration_admissible(),
+            "one of two entitlements held leaves room for the integration's"
+        );
+    }
+
+    /// **A task's ladder position survives the process that wrote it.**
+    ///
+    /// The companion to the deferral witness, and the same disease. A
+    /// settlement that escalates closes the generation and leaves the task
+    /// `Pending` — so the ready-dispatch branch selects it again, and the rung
+    /// it runs at is a fact only the log holds.
+    ///
+    /// A driver that assumed rung 0 would dispatch an escalated task on rung 0
+    /// forever, never reaching the tier its chain escalated it to. A driver
+    /// that assumed attempt 1 would hand `next_step` the first attempt of the
+    /// allowance every time, so the task would retry forever and never
+    /// escalate at all. Both were true of `TopologyRun` until this field
+    /// existed, and neither was visible as a wrong number — only as a run that
+    /// behaves differently after a restart.
+    #[test]
+    fn a_ladder_position_is_derived_by_replay_and_not_assumed() {
+        let base = sha("base");
+        let mut live = started();
+        let mut trace = vec![run_started_event()];
+
+        // Rung 0, two attempts, allowance spent -> escalate onto rung 1.
+        for attempt in 1..=2u32 {
+            for event in [
+                dispatch(ALPHA, attempt - 1, &base),
+                attempt_started(&live, ALPHA, attempt - 1, 1, 0),
+            ] {
+                apply(&mut live, &event);
+                trace.push(event);
+            }
+            let last = attempt == 2;
+            let settlement = settle(
+                ALPHA,
+                attempt - 1,
+                1,
+                AttemptSettlement::Closed {
+                    transition: if last {
+                        SettlementTransition::Escalated { rung: 1 }
+                    } else {
+                        SettlementTransition::Retry
+                    },
+                    lease: LeaseDisposition::PredictedReleased,
+                },
+            );
+            apply(&mut live, &settlement);
+            trace.push(settlement);
+        }
+
+        let task = live.task(ALPHA).expect("registered");
+        assert_eq!(task.rung, 1, "the escalation did not move the task's rung");
+        assert_eq!(
+            task.attempts_on_rung, 0,
+            "the allowance is per rung, so an escalation starts it again"
+        );
+        assert_eq!(
+            task.state,
+            TaskState::Pending,
+            "an escalated task must be dispatchable again — this is what makes \
+             the rung above load-bearing rather than decorative"
+        );
+
+        // Through the wire, because a resume reads bytes.
+        let parsed = TopologyFold::parse_log(&wire(&trace)).expect("the log parses");
+        let replayed = TopologyFold::replay(inputs(), &parsed).expect("the log replays");
+        let after = replayed.task(ALPHA).expect("registered");
+        assert_eq!(
+            (after.rung, after.attempts_on_rung),
+            (task.rung, task.attempts_on_rung),
+            "the ladder position did not survive the process that wrote it, so \
+             the next one would dispatch this task on a rung the log contradicts"
+        );
+
+        // The two assumptions this replaces, shown wrong. A fresh process
+        // starts both at zero and agrees with the fold on every reading until
+        // a resume — which is exactly when nothing is watching.
+        assert_ne!(0, after.rung, "a process-local rung tally reads zero here");
+    }
+
+    /// **An interrupted attempt does not spend the rung's allowance.**
+    ///
+    /// `transaction_fault_matrix[T-ATTEMPT]`'s `resume_action` in its own words:
+    /// append `attempt_interrupted` *"(unknown spend, **allowance refunded**…)"*.
+    /// `ladder::spends_allowance` agrees from the other direction —
+    /// `FailureKind::Interrupted` is `false`, because "the engine died between
+    /// an attempt starting and finishing, so nothing judged the code".
+    ///
+    /// **This fold disagreed with both for the whole of PR7.** It counted every
+    /// `attempt_started`, so an interruption, a park and an outage each burned a
+    /// rung the packet says they do not — and the divergence was invisible
+    /// because the count is only ever read across a resume. Found by S5 round 2
+    /// (`emit` and `settle`, independently).
+    ///
+    /// The pair is asserted, not just the repair: a **judged** rejection spends,
+    /// an **interruption** does not, and the difference is the only thing that
+    /// changed between the two halves. A fold that stopped counting altogether
+    /// would satisfy half of this and fail the other.
+    #[test]
+    fn an_interrupted_attempt_refunds_the_rungs_allowance() {
+        use crate::ladder::FailureKind;
+
+        let base = sha("base");
+
+        // Half one: a judged rejection. The worker ran and produced work to
+        // judge, so it spends — this is the cell that keeps the count honest.
+        let mut spent = started();
+        for event in [
+            dispatch(ALPHA, 0, &base),
+            attempt_started(&spent, ALPHA, 0, 1, 0),
+            settle_failing(
+                ALPHA,
+                0,
+                1,
+                FailureKind::GateFailed,
+                AttemptSettlement::Closed {
+                    transition: SettlementTransition::Retry,
+                    lease: LeaseDisposition::PredictedReleased,
+                },
+            ),
+        ] {
+            apply(&mut spent, &event);
+        }
+        assert_eq!(
+            spent.task(ALPHA).expect("registered").attempts_on_rung,
+            1,
+            "a judged rejection is a spent attempt — the worker ran and its work \
+             was judged, which is `spends_allowance`'s line"
+        );
+
+        // Half two: the same shape, interrupted. Same dispatch, same start, and
+        // the settlement is the only difference.
+        let mut refunded = started();
+        for event in [
+            dispatch(ALPHA, 0, &base),
+            attempt_started(&refunded, ALPHA, 0, 1, 0),
+            settle_failing(
+                ALPHA,
+                0,
+                1,
+                FailureKind::Interrupted,
+                AttemptSettlement::Closed {
+                    transition: SettlementTransition::Retry,
+                    lease: LeaseDisposition::PredictedReleased,
+                },
+            ),
+        ] {
+            apply(&mut refunded, &event);
+        }
+        assert_eq!(
+            refunded.task(ALPHA).expect("registered").attempts_on_rung,
+            0,
+            "T-ATTEMPT refunds an interrupted attempt's allowance. A fold that \
+             counted the START charged for a run that never got a verdict, and \
+             an operator paid a pricier tier for the engine having died"
+        );
+    }
+
+    /// **A deferral count survives the process that wrote it, and a
+    /// driver-side tally does not.**
+    ///
+    /// The witness for why this count is the fold's. `ladder::next_step` reads
+    /// it on exactly one branch — an outage defers while `defers < max_defers`
+    /// and parks at it — so a run that has already spent its allowance must
+    /// park rather than defer again.
+    ///
+    /// A driver keeping its own tally is correct for as long as its process
+    /// lives. This test is the case where that stops being true: the log holds
+    /// three deferrals, the process dies, and the next one replays. The fold
+    /// reaches three. A fresh in-memory counter reaches **zero**, and with
+    /// `max_defers = 3` the run would defer a fourth time, and a fifth, and
+    /// never park — the allowance silently becoming unbounded across a resume.
+    ///
+    /// That is `predicted_region`'s shape with a resume-shaped fuse: two
+    /// derivations of one number, agreeing until the moment they do not.
+    #[test]
+    fn a_deferral_count_is_derived_by_replay_and_not_by_a_process_local_tally() {
+        let base = sha("base");
+        let mut live = started();
+        let mut trace = vec![run_started_event()];
+
+        // Three deferrals of one task, each one a fresh generation the way a
+        // `defer_wait_elapsed` wake produces.
+        for round in 1..=3u32 {
+            for event in [
+                dispatch(ALPHA, round - 1, &base),
+                attempt_started(&live, ALPHA, round - 1, 1, 0),
+            ] {
+                apply(&mut live, &event);
+                trace.push(event);
+            }
+            let settlement = settle(
+                ALPHA,
+                round - 1,
+                1,
+                AttemptSettlement::Closed {
+                    transition: SettlementTransition::Deferred {
+                        defers: round,
+                        reason: "the pool is down".to_owned(),
+                    },
+                    lease: LeaseDisposition::PredictedReleased,
+                },
+            );
+            apply(&mut live, &settlement);
+            trace.push(settlement);
+
+            // `Deferred -> Pending via defer_wait_elapsed`, which is the
+            // transition the contract names and the only way back to a
+            // dispatchable state. The fold refuses a re-dispatch without it.
+            let woken = ev(TopologyEventBody::DeferWaitElapsed {
+                data: DeferWaitElapsed4 {
+                    waited_ms: 30_000,
+                    round,
+                },
+            });
+            apply(&mut live, &woken);
+            trace.push(woken);
+        }
+
+        let live_defers = live.task(ALPHA).expect("the task is registered").defers;
+        assert_eq!(live_defers, 3, "the writing process counted three");
+
+        // Through the wire, because a resume reads bytes and not values.
+        let parsed = TopologyFold::parse_log(&wire(&trace)).expect("the log parses");
+        let replayed = TopologyFold::replay(inputs(), &parsed).expect("the log replays");
+        let replayed_defers = replayed.task(ALPHA).expect("registered").defers;
+
+        assert_eq!(
+            replayed_defers, live_defers,
+            "the count did not survive the process that wrote it, so the next \
+             one would decide the outage branch from a number the log \
+             contradicts"
+        );
+
+        // The tally the driver is forbidden from keeping, shown failing. A new
+        // process starts one at zero: it agrees with the fold on every reading
+        // until a resume, and this is the reading after one.
+        let process_local_tally: u32 = 0;
+        assert_ne!(
+            process_local_tally, replayed_defers,
+            "a process-local tally is only wrong across a resume, which is \
+             exactly when nothing is watching it"
+        );
+    }
+
+    /// The three statements the selector delegates rather than re-derives.
+    ///
+    /// Statements about the run and not authorisations, which is why poisoning
+    /// does not flip them: a poisoned fold of a run with a deferred task still
+    /// has one, and `false` there would be a false statement rather than a
+    /// refusal. `pipeline_held` is exempted for the same reason and by the
+    /// same sentence.
+    #[test]
+    fn the_statement_accessors_report_the_run_rather_than_authorising_anything() {
+        let unstarted = TopologyFold::new(inputs());
+        assert!(
+            !unstarted.run_is_ending(),
+            "a run that has recorded nothing has not ended"
+        );
+        assert!(!unstarted.backoff_pending());
+        assert!(!unstarted.questions_open());
+
+        let mut fold = started();
+        assert!(!fold.run_is_ending());
+        assert!(!fold.backoff_pending());
+        assert!(!fold.questions_open());
+
+        apply(&mut fold, &dispatch(ALPHA, 0, &sha("base")));
+        let start = attempt_started(&fold, ALPHA, 0, 1, 0);
+        apply(&mut fold, &start);
+        apply(
+            &mut fold,
+            &settle(
+                ALPHA,
+                0,
+                1,
+                AttemptSettlement::Closed {
+                    transition: SettlementTransition::Deferred {
+                        defers: 1,
+                        reason: "  the pool is down  ".to_owned(),
+                    },
+                    lease: LeaseDisposition::PredictedReleased,
+                },
+            ),
+        );
+        assert!(
+            fold.backoff_pending(),
+            "a deferred task is waiting on a wait"
+        );
+        assert!(!fold.questions_open(), "and a wait is not a question");
+        assert!(!fold.run_is_ending(), "neither ends the run");
+
+        apply(&mut fold, &raised("q-ÜNI-statement", ZETA));
+        assert!(fold.questions_open());
+        assert!(fold.backoff_pending(), "a question is not a wait either");
+        assert!(!fold.run_is_ending());
+
+        let mut poisoned = fold.clone();
+        poisoned.poison();
+        assert!(
+            poisoned.backoff_pending(),
+            "poisoning unsaid a deferred task"
+        );
+        assert!(
+            poisoned.questions_open(),
+            "poisoning unsaid an open question"
+        );
+        assert!(
+            !poisoned.structurally_admissible(),
+            "and it did withdraw the authorisation"
+        );
+
+        // `run_is_ending` is the epoch-aware half, which is why a caller must
+        // not read `budget_stop` for itself: a stop of **this** epoch ends the
+        // run, and the resume that raised the ceiling clears it.
+        let mut stopped = started();
+        apply(&mut stopped, &budget_exceeded(0, Some(MID)));
+        assert!(stopped.run_is_ending(), "a stop of this epoch ends the run");
+        apply(&mut stopped, &resume(container_runner()));
+        assert!(
+            !stopped.run_is_ending(),
+            "the resume raised the ceiling the stop was against"
+        );
+        stopped.poison();
+        assert!(
+            !stopped.run_is_ending(),
+            "poisoning invented an ending the log does not record"
+        );
+
+        // A halt ends it in every epoch, poisoned or not.
+        let mut halted = started();
+        apply(&mut halted, &dispatch(ZETA, 0, &sha("base")));
+        let start = attempt_started(&halted, ZETA, 0, 1, 0);
+        apply(&mut halted, &start);
+        apply(
+            &mut halted,
+            &settle(
+                ZETA,
+                0,
+                1,
+                AttemptSettlement::Closed {
+                    transition: SettlementTransition::Failed {
+                        halts_run: true,
+                        reason: "  the halt policy fired  ".to_owned(),
+                    },
+                    lease: LeaseDisposition::PredictedReleased,
+                },
+            ),
+        );
+        assert_eq!(halted.halted_at(), Some(ZETA));
+        assert!(halted.run_is_ending());
+        halted.poison();
+        assert!(halted.run_is_ending(), "poisoning unsaid a halt");
+    }
+
+    /// Take one task to a **queued** candidate: dispatch, attempt, success,
+    /// prepare, create.
+    ///
+    /// [`merge_task`] minus its last two events. The generation closes at
+    /// `task_candidate_created` and releases the entitlement it held, so a
+    /// fold built this way holds a queued candidate and nothing else.
+    fn queue_candidate(fold: &mut TopologyFold, key: TaskKey, generation: u32) {
+        let base = sha("base");
+        apply(fold, &dispatch(key, generation, &base));
+        let start = attempt_started(fold, key, generation, 1, 0);
+        apply(fold, &start);
+        apply(fold, &candidate_prepared(key, generation, &base));
+        apply(fold, &candidate_created(key, generation));
+    }
+
+    /// A generation of `key` retained by the incarnation the fold is in.
+    ///
+    /// The incarnation is read from the fold rather than written as `0`:
+    /// `ready_retry` is false in every incarnation but the retaining one, so a
+    /// fixture that hard-coded the epoch would silently stop being a
+    /// `ready_retry` state the moment it was used after a resume.
+    fn retained_generation(fold: &mut TopologyFold, key: TaskKey, generation: u32) {
+        let epoch = fold.epoch().expect("the run has started");
+        apply(fold, &dispatch(key, generation, &sha("base")));
+        let start = attempt_started(fold, key, generation, 1, 0);
+        apply(fold, &start);
+        apply(
+            fold,
+            &settle(
+                key,
+                generation,
+                1,
+                AttemptSettlement::Retained {
+                    retained_session: SessionId(format!("sess-ÜNI-{}-{generation}", key.0)),
+                    retained_incarnation: epoch,
+                },
+            ),
+        );
+    }
+
     /// Drive one task from pending to merged over the fast path, at the head
     /// the integration ref is currently at.
     fn merge_task(fold: &mut TopologyFold, key: TaskKey, generation: u32, sequence: u32) {
@@ -4144,7 +5538,6 @@ mod tests {
         apply(fold, &dispatch(key, generation, &base));
         let start = attempt_started(fold, key, generation, 1, 0);
         apply(fold, &start);
-        apply(fold, &succeeded(key, generation, 1));
         apply(fold, &candidate_prepared(key, generation, &base));
         apply(fold, &candidate_created(key, generation));
         apply(
@@ -5903,29 +7296,44 @@ mod tests {
                     "a {holding} generation that is interrupted and records {disposition:?}"
                 );
 
-                // A success is the one settlement that leaves the generation
-                // open: it hands the region to the candidate, so the
-                // generation keeps holding it.
-                let surviving_ok = disposition
-                    == if holding == "ordinary" {
-                        LeaseDisposition::PredictedRetained
-                    } else {
-                        LeaseDisposition::LineageHeld
-                    };
-                let succeeded = settle(
-                    key,
-                    0,
-                    1,
-                    AttemptSettlement::Closed {
-                        transition: SettlementTransition::Succeeded,
-                        lease: disposition,
-                    },
-                );
-                assert_eq!(
-                    fold.plan_transition(&succeeded).is_ok(),
-                    surviving_ok,
-                    "a {holding} generation that succeeded and records {disposition:?}"
-                );
+                // **No `attempt_finished` leaves a generation open, so there is
+                // no surviving disposition to enumerate here any more.** This
+                // block asserted that a `succeeded` settlement recording
+                // `PredictedRetained` (ordinary) or `LineageHeld` (lineage) is
+                // accepted — the one case where a settlement kept its region to
+                // hand to a candidate. Since the 2026-08-27 CONFORM ruling that
+                // event is refused whatever it records, because
+                // `candidate_prepared` is the sole successful settlement.
+                //
+                // Re-derived rather than deleted: the claim becomes *refused
+                // for every disposition*, which is stronger than the row it
+                // replaces and fails if the transition is ever readmitted.
+                for recorded in [
+                    LeaseDisposition::PredictedRetained,
+                    LeaseDisposition::PredictedReleased,
+                    LeaseDisposition::LineageHeld,
+                ] {
+                    let succeeded = settle(
+                        key,
+                        0,
+                        1,
+                        AttemptSettlement::Closed {
+                            transition: SettlementTransition::Succeeded,
+                            lease: recorded,
+                        },
+                    );
+                    assert!(
+                        fold.plan_transition(&succeeded).is_err(),
+                        "a {holding} generation accepted a `succeeded` settlement recording \
+                         {recorded:?}; `candidate_prepared` is the sole successful settlement"
+                    );
+                }
+
+                // And the region a candidate inherits is decided on the event
+                // that now settles the attempt: `check_candidate_prepared`
+                // matches `CandidateLeaseEffect` against the entry's lineage.
+                // `a_lineage_lease_only_ever_grows_and_a_released_one_is_gone`
+                // holds that half.
             }
         }
     }
@@ -6049,8 +7457,16 @@ mod tests {
         );
 
         // Promoting: not closable — a promoting generation is promoted.
+        //
+        // **Reached by preparing a candidate, which is what promotes it.** This
+        // cloned the in-flight fold and applied `succeeded(ZETA, 0, 1)`; since
+        // the 2026-08-27 CONFORM ruling that event is refused, and a clone
+        // alone would have left this case asserting about an *in-flight*
+        // generation while calling itself the promoting one — the same
+        // assertion passing for the wrong reason. `cargo` said so: the binding
+        // stopped needing `mut`.
         let mut promoting = fold.clone();
-        apply(&mut promoting, &succeeded(ZETA, 0, 1));
+        apply(&mut promoting, &candidate_prepared(ZETA, 0, &base));
         assert!(matches!(
             refuse(
                 &promoting,
@@ -6061,7 +7477,6 @@ mod tests {
 
         // Closed: not closable twice.
         let mut over = promoting.clone();
-        apply(&mut over, &candidate_prepared(ZETA, 0, &base));
         apply(&mut over, &candidate_created(ZETA, 0));
         assert!(matches!(
             refuse(
@@ -6076,20 +7491,335 @@ mod tests {
     // Candidates, the queue, and the publication relations
     // -----------------------------------------------------------------------
 
+    /// **A `candidate_prepared` whose record says the attempt failed is refused.**
+    ///
+    /// The round-4 review of `09f9a99` set out the sequence exactly, and this is
+    /// it: a valid `run_started`, `task_dispatched` and `attempt_started`, then an
+    /// otherwise-consistent `candidate_prepared` whose embedded `AttemptRecord`
+    /// carries `failure: Some(GateFailed)`. Before this check the fold accepted
+    /// it, recorded the candidate, entered `Promoting`, and the task was carried
+    /// to `task_candidate_created` — **durably queued as a successful candidate
+    /// whose own authoritative evidence says a gate failed.**
+    ///
+    /// The 2026-08-27 Class B change made this event the sole successful
+    /// settlement and enforced everything about it except the one thing that made
+    /// it *successful*. The fold is the authority against malformed, reconstructed
+    /// and faulty future writers, not just against this build's own driver, which
+    /// happens to supply a passing record.
+    ///
+    /// It also earns the property `TopologyRun`'s brief already assumed: a
+    /// `candidate_prepared` record never carries feedback, because it never
+    /// carries a failure.
     #[test]
-    fn a_candidate_is_prepared_by_the_generation_whose_attempt_succeeded() {
+    fn a_candidate_prepared_whose_record_failed_is_refused() {
         let base = sha("base");
         let mut fold = started();
         apply(&mut fold, &dispatch(ZETA, 0, &base));
         let start = attempt_started(&fold, ZETA, 0, 1, 0);
         apply(&mut fold, &start);
 
-        // ST-06: not while the attempt is still running.
-        assert!(matches!(
-            refuse(&fold, &candidate_prepared(ZETA, 0, &base)),
-            FoldError::NotTheOpenGeneration { key: 0, .. }
-        ));
-        apply(&mut fold, &succeeded(ZETA, 0, 1));
+        // The premise: with a passing record this exact event is accepted, so the
+        // refusal below is about the failure and not about anything else in it.
+        accepts(&fold, &candidate_prepared(ZETA, 0, &base));
+
+        let mut failed = candidate_prepared(ZETA, 0, &base);
+        let TopologyEventBody::CandidatePrepared { data } = &mut failed.body else {
+            unreachable!("built as a candidate_prepared")
+        };
+        data.attempt.failure = Some(crate::events::FailureRecord {
+            kind: crate::ladder::FailureKind::GateFailed,
+            origin: crate::ladder::FailureOrigin::Worker,
+            reason: "gate `clippy` failed".to_owned(),
+            detail: None,
+        });
+
+        let error = refuse(&fold, &failed);
+        assert!(
+            matches!(error, FoldError::InconsistentRecord { .. }),
+            "the fold accepted a successful settlement whose record failed: {error:?}"
+        );
+        assert!(
+            format!("{error}").contains("succeeded"),
+            "the refusal must say what it required: {error}"
+        );
+
+        // And nothing moved: a refused transition changes nothing, so the
+        // generation is still in flight and has no candidate.
+        let generation = fold
+            .task(ZETA)
+            .and_then(|task| task.generations.first())
+            .expect("the generation is open");
+        assert!(
+            matches!(generation.class, GenerationClass::InFlight { .. }),
+            "the refused event promoted the generation anyway: {:?}",
+            generation.class
+        );
+        assert!(generation.candidate.is_none());
+    }
+
+    /// **A review outcome is authoritative, and both are.**
+    ///
+    /// [`a_candidate_prepared_whose_record_failed_is_refused`] covers the
+    /// failure field. This covers the other half of the same predicate: a record
+    /// carrying no failure at all, whose reviews say `Failed` or `Unavailable`.
+    ///
+    /// §11.2 requires *every* configured pass to pass, and a reviewer that could
+    /// not run "says nothing about the code" — which is not approval. Before
+    /// `AttemptRecord::is_successful` existed this door read `failure.is_none()`
+    /// alone, so a record whose primary reviewer returned `Failed` was promoted,
+    /// charged against the rung allowance and queued as a candidate. The
+    /// `b1f54a5` review walked that sequence.
+    #[test]
+    fn a_candidate_prepared_whose_review_did_not_pass_is_refused() {
+        for outcome in [ReviewPassOutcome::Failed, ReviewPassOutcome::Unavailable] {
+            let base = sha("base");
+            let mut fold = started();
+            apply(&mut fold, &dispatch(ZETA, 0, &base));
+            let start = attempt_started(&fold, ZETA, 0, 1, 0);
+            apply(&mut fold, &start);
+
+            // The premise: the same event with the pass *passed* is accepted, so
+            // the refusal below is about the outcome and nothing else.
+            accepts(&fold, &candidate_prepared(ZETA, 0, &base));
+
+            let mut judged = candidate_prepared(ZETA, 0, &base);
+            let TopologyEventBody::CandidatePrepared { data } = &mut judged.body else {
+                unreachable!("built as a candidate_prepared")
+            };
+            // The failure field stays empty on purpose: this is the shape the
+            // old `failure.is_none()` door called successful.
+            assert!(data.attempt.failure.is_none());
+            data.attempt
+                .reviews
+                .last_mut()
+                .expect("the premise carries the primary pass")
+                .outcome = outcome;
+
+            let error = refuse(&fold, &judged);
+            assert!(
+                matches!(error, FoldError::InconsistentRecord { .. }),
+                "a `{outcome:?}` review was settled as a success: {error:?}"
+            );
+            let text = format!("{error}");
+            assert!(
+                text.contains("review outcomes") && text.contains(&format!("{outcome:?}")),
+                "the refusal must name the outcome that decided it: {text}"
+            );
+
+            // Nothing moved.
+            let generation = fold
+                .task(ZETA)
+                .and_then(|task| task.generations.first())
+                .expect("the generation is open");
+            assert!(
+                matches!(generation.class, GenerationClass::InFlight { .. }),
+                "the refused event promoted the generation anyway: {:?}",
+                generation.class
+            );
+            assert!(generation.candidate.is_none());
+        }
+    }
+
+    /// **A failed settlement whose record says the attempt succeeded is refused.**
+    ///
+    /// The mirror of the candidate door, through the same predicate. This door
+    /// refused `Succeeded` and asked nothing further, so an `attempt_finished`
+    /// could fail a task — halting the run — while carrying a ledger line whose
+    /// failure field is empty and whose every review passed. That line is what a
+    /// person reads when deciding whether to trust a run.
+    #[test]
+    fn an_attempt_finished_whose_record_says_success_is_refused() {
+        let base = sha("base");
+        let mut fold = started();
+        apply(&mut fold, &dispatch(ZETA, 0, &base));
+        let start = attempt_started(&fold, ZETA, 0, 1, 0);
+        apply(&mut fold, &start);
+
+        let closed = || AttemptSettlement::Closed {
+            transition: SettlementTransition::Failed {
+                halts_run: false,
+                reason: "gate `clippy` failed".to_owned(),
+            },
+            lease: LeaseDisposition::PredictedReleased,
+        };
+
+        // The premise: with a record that says failed, this exact settlement
+        // applies.
+        accepts(&fold, &settle(ZETA, 0, 1, closed()));
+
+        let mut lying = settle(ZETA, 0, 1, closed());
+        let TopologyEventBody::AttemptFinished { data } = &mut lying.body else {
+            unreachable!("built as an attempt_finished")
+        };
+        // Exactly the successful shape: no failure, every pass passed.
+        *data.record = attempt_record(1);
+        assert!(data.record.is_successful());
+
+        let error = refuse(&fold, &lying);
+        assert!(
+            matches!(error, FoldError::InconsistentRecord { .. }),
+            "a failure settled while its record reported success: {error:?}"
+        );
+        assert!(
+            format!("{error}").contains("says the attempt succeeded"),
+            "the refusal must say why: {error}"
+        );
+    }
+
+    /// **The envelope and the record name one attempt.**
+    ///
+    /// Without this the ledger line a settlement carries can belong to a
+    /// different attempt of the same generation — attempt 2's cost, duration and
+    /// model recorded against attempt 1's settlement, with every derived total
+    /// reading it as authoritative.
+    #[test]
+    fn an_attempt_finished_whose_record_names_another_attempt_is_refused() {
+        let base = sha("base");
+        let mut fold = started();
+        apply(&mut fold, &dispatch(ZETA, 0, &base));
+        let start = attempt_started(&fold, ZETA, 0, 1, 0);
+        apply(&mut fold, &start);
+
+        let closed = || AttemptSettlement::Closed {
+            transition: SettlementTransition::Failed {
+                halts_run: false,
+                reason: "gate `clippy` failed".to_owned(),
+            },
+            lease: LeaseDisposition::PredictedReleased,
+        };
+        accepts(&fold, &settle(ZETA, 0, 1, closed()));
+
+        for named in [0, 2, 9] {
+            let mut misattributed = settle(ZETA, 0, 1, closed());
+            let TopologyEventBody::AttemptFinished { data } = &mut misattributed.body else {
+                unreachable!("built as an attempt_finished")
+            };
+            data.record.attempt = named;
+
+            let error = refuse(&fold, &misattributed);
+            assert!(
+                matches!(
+                    error,
+                    FoldError::WrongAttempt {
+                        attempt, ref expected, ..
+                    } if attempt == named && expected == "1"
+                ),
+                "a settlement carried attempt {named}'s record on attempt 1's line: {error:?}"
+            );
+        }
+    }
+
+    /// **A successful attempt spends one of its rung's allowance, and the count
+    /// survives replay.**
+    ///
+    /// `spends_allowance(None)` is `true` — the worker ran and its work was judged
+    /// and accepted — so a success charges the rung exactly as a judged failure
+    /// does. That was true while `attempt_finished{Succeeded}` was the settlement,
+    /// and it stopped being true on 2026-08-27 when the settlement moved to
+    /// `candidate_prepared` and the increment stayed behind in `apply_settlement`.
+    ///
+    /// Nothing noticed. The suite was green, the allowance census went on finding
+    /// its one write site, and the replacement witness asserted `Promoting` and
+    /// candidate presence — none of which is the allowance. A **first-attempt
+    /// success left `attempts_on_rung` at zero**, so a later reader could grant an
+    /// extra attempt on a rung already paid for. The round-4 review of `09f9a99`
+    /// found it.
+    ///
+    /// Both positions are driven, because they fail differently: a first-attempt
+    /// success is the count going 0 → 1 with nothing before it, and a
+    /// second-attempt success is the successful charge landing *on top of* a
+    /// failure's. And the live count is compared against a replay of the same log,
+    /// because a fold that counts live and not on replay is the divergence this
+    /// project measures everything else against.
+    #[test]
+    fn a_successful_attempt_charges_its_rung_live_and_on_replay() {
+        let base = sha("base");
+
+        for (label, failures_first) in [("first-attempt success", 0), ("second-attempt success", 1)]
+        {
+            let mut live = started();
+            let mut trace = vec![run_started_event()];
+
+            // Optionally a judged failure first, which retries into a new
+            // generation — the shape a second-attempt success actually has.
+            let mut generation = 0;
+            for _ in 0..failures_first {
+                push(&mut live, &mut trace, dispatch(ZETA, generation, &base));
+                let start = attempt_started(&live, ZETA, generation, 1, 0);
+                push(&mut live, &mut trace, start);
+                push(
+                    &mut live,
+                    &mut trace,
+                    settle(
+                        ZETA,
+                        generation,
+                        1,
+                        AttemptSettlement::Closed {
+                            transition: SettlementTransition::Retry,
+                            lease: LeaseDisposition::PredictedReleased,
+                        },
+                    ),
+                );
+                generation += 1;
+            }
+
+            push(&mut live, &mut trace, dispatch(ZETA, generation, &base));
+            let start = attempt_started(&live, ZETA, generation, 1, 0);
+            push(&mut live, &mut trace, start);
+            push(
+                &mut live,
+                &mut trace,
+                candidate_prepared(ZETA, generation, &base),
+            );
+
+            let expected = failures_first + 1;
+            let counted = live
+                .task(ZETA)
+                .map(|task| task.attempts_on_rung)
+                .expect("the task is registered");
+            assert_eq!(
+                counted, expected,
+                "{label}: the rung counts {counted} attempt(s) and {expected} were spent. \
+                 `candidate_prepared` is the successful settlement, and a settlement that \
+                 does not charge leaves an operator a free attempt on a rung already paid \
+                 for"
+            );
+
+            // And a replay of exactly those bytes reaches the same number.
+            let replayed = TopologyFold::replay(inputs(), &trace).expect("the trace replays");
+            assert_eq!(
+                replayed.task(ZETA).map(|task| task.attempts_on_rung),
+                Some(expected),
+                "{label}: the live fold counted {expected} and a replay of its own log did \
+                 not — one fold, not two"
+            );
+        }
+    }
+
+    /// **A candidate is prepared by the generation whose attempt is in flight,
+    /// and preparing it is what settles that attempt.**
+    ///
+    /// Re-derived, not adjusted. This was
+    /// `a_candidate_is_prepared_by_the_generation_whose_attempt_succeeded`, and it
+    /// asserted the opposite of the first claim below: that `candidate_prepared`
+    /// is **refused** while the attempt is still running, and accepted only after
+    /// an `attempt_finished{Succeeded}` had promoted the generation. That is the
+    /// dual-settlement pattern `decisions/2026-08-12-merge-queue-execution-topology.md`
+    /// forbids — "`attempt_finished` is not also emitted for that attempt" — and the
+    /// fold was *requiring* it. Ruled CONFORM 2026-08-27.
+    ///
+    /// The other three claims are unchanged and still ST-06's: not another
+    /// generation's, not another task's, and parented on the base the generation
+    /// was dispatched at.
+    #[test]
+    fn a_candidate_is_prepared_by_the_generation_whose_attempt_is_in_flight() {
+        let base = sha("base");
+        let mut fold = started();
+        apply(&mut fold, &dispatch(ZETA, 0, &base));
+        let start = attempt_started(&fold, ZETA, 0, 1, 0);
+        apply(&mut fold, &start);
+
+        // The attempt is running, and this event settles it.
         accepts(&fold, &candidate_prepared(ZETA, 0, &base));
 
         // ST-06: not another generation's, and not another task's.
@@ -6261,7 +7991,6 @@ mod tests {
             },
         });
         push(&mut live, &mut trace, retry);
-        push(&mut live, &mut trace, succeeded(ALPHA, 0, 2));
 
         // Attempt 1 ran and did not produce this candidate; attempt 2 did.
         assert!(matches!(
@@ -6310,7 +8039,6 @@ mod tests {
         apply(&mut fold, &dispatch(ZETA, 0, &base));
         let start = attempt_started(&fold, ZETA, 0, 1, 0);
         apply(&mut fold, &start);
-        apply(&mut fold, &succeeded(ZETA, 0, 1));
 
         // Before anything was prepared.
         assert!(matches!(
@@ -6371,7 +8099,6 @@ mod tests {
             apply(&mut fold, &dispatch(key, generation, &base));
             let start = attempt_started(&fold, key, generation, 1, 0);
             apply(&mut fold, &start);
-            apply(&mut fold, &succeeded(key, generation, 1));
             apply(&mut fold, &candidate_prepared(key, generation, &base));
             apply(&mut fold, &candidate_created(key, generation));
         }
@@ -6929,7 +8656,6 @@ mod tests {
             push(&mut live, &mut trace, dispatch(key, generation, &base));
             let start = attempt_started(&live, key, generation, 1, 0);
             push(&mut live, &mut trace, start);
-            push(&mut live, &mut trace, succeeded(key, generation, 1));
             push(
                 &mut live,
                 &mut trace,
@@ -7239,7 +8965,6 @@ mod tests {
             apply(&mut fold, &dispatch(key, generation, &base));
             let start = attempt_started(&fold, key, generation, 1, 0);
             apply(&mut fold, &start);
-            apply(&mut fold, &succeeded(key, generation, 1));
             apply(&mut fold, &candidate_prepared(key, generation, &base));
         }
         // Prepared mid, then zeta. Created zeta, then mid.
@@ -7352,7 +9077,6 @@ mod tests {
         apply(&mut fold, &dispatch(ZETA, 0, &base));
         let start = attempt_started(&fold, ZETA, 0, 1, 0);
         apply(&mut fold, &start);
-        apply(&mut fold, &succeeded(ZETA, 0, 1));
         apply(&mut fold, &candidate_prepared(ZETA, 0, &base));
         apply(&mut fold, &candidate_created(ZETA, 0));
         apply(
@@ -7851,7 +9575,6 @@ mod tests {
         apply(&mut ready, &dispatch(MID, 0, &base));
         let start = attempt_started(&ready, MID, 0, 1, 0);
         apply(&mut ready, &start);
-        apply(&mut ready, &succeeded(MID, 0, 1));
         apply(&mut ready, &candidate_prepared(MID, 0, &base));
         apply(&mut ready, &candidate_created(MID, 0));
         apply(
@@ -7951,7 +9674,6 @@ mod tests {
         apply(&mut fold, &dispatch(MID, 0, &base));
         let start = attempt_started(&fold, MID, 0, 1, 0);
         apply(&mut fold, &start);
-        apply(&mut fold, &succeeded(MID, 0, 1));
         apply(&mut fold, &candidate_prepared(MID, 0, &base));
         apply(&mut fold, &candidate_created(MID, 0));
 
@@ -8971,7 +10693,21 @@ mod tests {
                     materialization_observed: None,
                 },
             }),
-            succeeded(ZETA, 0, 1),
+            // **`attempt_finished`, on a transition this fold accepts.** The
+            // table held `succeeded(ZETA, 0, 1)` here, and since the 2026-08-27
+            // CONFORM ruling that is not a settlement the fold accepts at all —
+            // `candidate_prepared` further down is the successful one. A
+            // *poisoned* fold must still refuse `attempt_finished`, so the kind
+            // stays in the table on a transition a healthy fold would take.
+            settle(
+                ZETA,
+                0,
+                1,
+                AttemptSettlement::Closed {
+                    transition: SettlementTransition::Retry,
+                    lease: LeaseDisposition::PredictedReleased,
+                },
+            ),
             ev(TopologyEventBody::AttemptInterrupted {
                 data: AttemptInterrupted4 {
                     key: ZETA,
@@ -9221,7 +10957,6 @@ mod tests {
             },
         });
         push(&mut live, &mut trace, resumed);
-        push(&mut live, &mut trace, succeeded(ALPHA, 0, 2));
         // Attempt 2 is the one that succeeded, so it is the one the candidate
         // is attributed to.
         push(
@@ -9242,7 +10977,6 @@ mod tests {
         push(&mut live, &mut trace, dispatch(ZETA, 0, &base));
         let start = attempt_started(&live, ZETA, 0, 1, 0);
         push(&mut live, &mut trace, start);
-        push(&mut live, &mut trace, succeeded(ZETA, 0, 1));
         push(&mut live, &mut trace, candidate_prepared(ZETA, 0, &base));
         push(&mut live, &mut trace, candidate_created(ZETA, 0));
         push(
@@ -9348,7 +11082,6 @@ mod tests {
         push(&mut live, &mut trace, dispatch(ALPHA, 0, &base));
         let start = attempt_started(&live, ALPHA, 0, 1, 0);
         push(&mut live, &mut trace, start);
-        push(&mut live, &mut trace, succeeded(ALPHA, 0, 1));
         push(&mut live, &mut trace, candidate_prepared(ALPHA, 0, &base));
         push(&mut live, &mut trace, candidate_created(ALPHA, 0));
         push(
@@ -9368,7 +11101,6 @@ mod tests {
         push(&mut live, &mut trace, dispatch(ZETA, 2, &base));
         let start = attempt_started(&live, ZETA, 2, 1, 0);
         push(&mut live, &mut trace, start);
-        push(&mut live, &mut trace, succeeded(ZETA, 2, 1));
         push(&mut live, &mut trace, candidate_prepared(ZETA, 2, &base));
         push(&mut live, &mut trace, candidate_created(ZETA, 2));
         push(
@@ -9413,7 +11145,6 @@ mod tests {
             push(&mut live, &mut trace, dispatch(key, 0, &base));
             let start = attempt_started(&live, key, 0, 1, 0);
             push(&mut live, &mut trace, start);
-            push(&mut live, &mut trace, succeeded(key, 0, 1));
             push(&mut live, &mut trace, candidate_prepared(key, 0, &base));
             push(&mut live, &mut trace, candidate_created(key, 0));
             push(
@@ -10321,7 +12052,6 @@ mod tests {
         );
         assert_eq!(run(&retained), 0, "a retained generation holds none");
 
-        apply(&mut fold, &succeeded(ZETA, 0, 1));
         assert_eq!(run(&fold), 1, "promoting still holds it");
         apply(&mut fold, &candidate_prepared(ZETA, 0, &base));
         assert_eq!(run(&fold), 1);

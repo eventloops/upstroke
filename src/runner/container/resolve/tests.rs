@@ -1673,11 +1673,41 @@ fn no_module_outside_the_container_runner_writes_a_container_intent() {
             "the ContainerRunner that owns an invocation",
         ),
     ];
+    /// The files left out of the scan, each an **exact** repo-relative path.
+    ///
+    /// Every one of them is asserted to exist below: an exclusion that names no
+    /// file excludes nothing today and silently excludes whatever is created at
+    /// that path tomorrow.
+    const EXCLUDED: &[&str] = &[
+        "src/effects/tests.rs",
+        "src/engine/topology/create/tests.rs",
+        "src/engine/topology/recover/tests.rs",
+        "src/runner/container/census/tests.rs",
+        "src/runner/container/fake.rs",
+        "src/runner/container/resolve/tests.rs",
+        "src/runner/container/tests.rs",
+    ];
 
     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     let allowed: BTreeSet<&str> = ALLOWED.iter().map(|(path, _)| *path).collect();
+    for excluded in EXCLUDED {
+        assert!(
+            root.join(excluded).is_file(),
+            "`{excluded}` is excluded from this census and names no file; an exclusion that \
+             matches nothing today is one that matches whatever is created at that path \
+             tomorrow"
+        );
+    }
+    let mut sorted = EXCLUDED.to_vec();
+    sorted.sort_unstable();
+    assert_eq!(
+        EXCLUDED,
+        &sorted[..],
+        "`EXCLUDED` is read by eye, so it is written sorted"
+    );
     let mut offenders = Vec::new();
     let mut found = BTreeSet::new();
+    let mut matched_needles: BTreeSet<&str> = BTreeSet::new();
     let mut scanned = 0;
     for path in rust_sources(&root.join("src")) {
         let relative = path
@@ -1688,6 +1718,16 @@ fn no_module_outside_the_container_runner_writes_a_container_intent() {
         // Test modules of the container subtree drive the funnel and name its
         // types; they are excluded by name, so a new one is a change here.
         //
+        // **Every exclusion is an exact path.** Three of them were
+        // `starts_with` — `src/runner/container/tests`,
+        // `.../census/tests`, `.../resolve/tests` — under a comment claiming
+        // the opposite, and a prefix widens to every sibling whose name begins
+        // the same way. Measured: a `pub fn write_one(intent: &ContainerIntent)`
+        // module failed this census as `src/runner/container/rogue.rs` and
+        // passed it as `src/runner/container/tests_of_the_funnel.rs`. The list
+        // is `EXCLUDED` above, every entry of it is asserted to name a file that
+        // exists, and the match is `==`.
+        //
         // `src/effects/tests.rs` is the fourth, added by PR6 lane E. It is the
         // `#[cfg(test)] mod tests;` of `src/effects.rs` — a test module, never
         // reachable from production — and it names `ContainerName` for one
@@ -1697,12 +1737,30 @@ fn no_module_outside_the_container_runner_writes_a_container_intent() {
         // survived all 1324 tests). It writes no intent and constructs no
         // container. The exclusion is by exact path rather than by prefix, so
         // it cannot widen to a sibling.
-        if relative.starts_with("src/runner/container/tests")
-            || relative.starts_with("src/runner/container/census/tests")
-            || relative.starts_with("src/runner/container/resolve/tests")
-            || relative == "src/runner/container/fake.rs"
-            || relative == "src/effects/tests.rs"
-        {
+        //
+        // `src/engine/topology/recover/tests.rs` is the fifth, added by PR7
+        // lane E. It is the `mod tests;` of `src/engine/topology/recover.rs`,
+        // declared under a test configuration and never reachable from
+        // production, and it names these types for one reason: recovery step
+        // (a)'s row is "containers **incl. every earlier incarnation of this
+        // run** under `<R>/containers`", so
+        // `resume_of_nondefault_root_run_reclaims_earlier_incarnation_intents_in_recorded_root`
+        // has to *plant* a dead incarnation's intent for the census to find,
+        // and it plants it through this very funnel rather than with `fs`. A
+        // fixture that writes an intent for the census to reclaim is the same
+        // category as `src/runner/container/census/tests.rs` above. The
+        // exclusion is by exact path, so it cannot widen to a sibling.
+        // `src/engine/topology/create/tests.rs` is the seventh, added by PR7
+        // lane B, on the same terms. It is the `#[cfg(test)] mod tests;` of the
+        // schema-4 creator. It names `ContainerIntent`, `ContainerName` and
+        // `containers_dir` to **read back** the intent a containerized probe
+        // left after a kill —
+        // `probe_intent_carries_runner_policy_digest_matching_owner_record` and
+        // `kill_during_containerized_probe_...` — and writes none: the one that
+        // exists was written by `ContainerRunner` through the funnel. Exact, so
+        // it cannot widen to `src/engine/topology/create.rs`, which is
+        // production and is scanned.
+        if EXCLUDED.contains(&relative.as_str()) {
             continue;
         }
         let source = fs::read_to_string(&path).expect("read source");
@@ -1728,6 +1786,7 @@ fn no_module_outside_the_container_runner_writes_a_container_intent() {
             if scanned_text.contains(writer) {
                 if allowed.contains(relative.as_str()) {
                     found.insert(relative.clone());
+                    matched_needles.insert(writer);
                 } else {
                     offenders.push(format!("{relative} names `{writer}`"));
                 }
@@ -1749,13 +1808,30 @@ fn no_module_outside_the_container_runner_writes_a_container_intent() {
         "a module outside the container runner can write a container intent, so a legacy \
          process could own a container with no run identity behind it: {offenders:#?}"
     );
-    // The needle control. Without it a census whose needles stopped matching
-    // would be silently green — `PR6F-DOCKER-CENSUS-CANNOT-FAIL`, measured this
-    // slice, in this repository, on this clause.
+    // The needle control, in two halves, because the file half alone does not
+    // hold. Without either, a census whose needles stopped matching would be
+    // silently green — `PR6F-DOCKER-CENSUS-CANNOT-FAIL`, measured this slice, in
+    // this repository, on this clause.
+    //
+    // (a) Every allowed file was reached.
     assert_eq!(
         found.len(),
         ALLOWED.len(),
         "the census found {found:?} of {ALLOWED:?}, so it is not looking at what it claims to"
+    );
+    // (b) Every needle matched something. This half was missing, and (a) does
+    // not imply it: `ContainerName` alone appears in all four allowed files, so
+    // the other four `WRITERS` could each have stopped matching anywhere in the
+    // tree and (a) would still have counted four. Measured: rewriting the two
+    // `crate::runner::container::write_intent(` call sites as
+    // `super::super::write_intent(` — a legal, meaning-preserving refactor —
+    // left the needle `container::write_intent` matching nothing in the scanned
+    // set, and this census stayed green.
+    assert_eq!(
+        matched_needles,
+        WRITERS.iter().copied().collect::<BTreeSet<_>>(),
+        "a `WRITERS` needle matches nothing in the allowed files, so the prohibition it \
+         encodes is not being enforced on anything"
     );
 }
 

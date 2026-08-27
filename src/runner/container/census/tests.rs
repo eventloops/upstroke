@@ -23,13 +23,22 @@
 #![deny(clippy::disallowed_types, clippy::disallowed_macros)]
 
 // `effects::production_region` cuts a source at its FIRST `#[cfg(test)]`, and
-// several source censuses in this tree scan every `src/**/*.rs` — including
-// this one, which is reached only through `#[cfg(test)] mod tests;` and so has
-// no attribute of its own for them to cut on. The marker below is redundant to
-// the compiler and load-bearing to those censuses: it makes this file's
+// this file is reached only through `#[cfg(test)] mod tests;` so it has no
+// attribute of its own for a scan to cut on. The marker below is redundant to
+// the compiler and load-bearing to every reader that still consults the
+// TRUNCATING region — `effects::externally_reachable_fns` and the three
+// censuses in `src/runner/container/exec.rs` — for which it makes this file's
 // production region empty, so a fixture that names a primitive is not reported
 // as a production offender (`PR5-R1-CFG-TEST-SHRINKS-THE-DOMAIN`, used here in
 // the direction it is wanted).
+//
+// **It does not do that for the four whole-tree censuses.** They read
+// `effects::production_code`, which excises this marker as the configured item
+// it is and then scans the file IN FULL. What keeps this file out of those is
+// not the marker: it is the `#[cfg(test)] mod tests;` declaration in
+// `src/runner/container/census.rs`, which
+// `effects::census_domain::declared_whole_file_test_modules` derives into their
+// skip set.
 #[cfg(test)]
 mod this_file_is_test_only {}
 
@@ -3019,34 +3028,76 @@ fn every_topology_write_command_performs_the_census() {
 /// *which file* and there is no other field to pin. What replaces a second axis
 /// here is the positive control — a scan whose needle stopped matching would
 /// otherwise report an empty offender set and pass.
+///
+/// **The region is the whole file, and the floor is over bytes.** Two repairs,
+/// both measured on this tree:
+///
+/// * The region was `effects::production_region`, which truncates a file at its
+///   first `#[cfg(test)]`. Ten files stop at something that is not a module —
+///   `src/engine/coordinator.rs` at a `#[cfg(test)] use` on line 36 of 1599 —
+///   so a `struct CensusComplete { forged: () }` at the **bottom** of that file
+///   passed while the identical five lines above the cut failed.
+/// * The floor was `scanned > 20` with `scanned += 1` unconditional, so it
+///   counted files walked rather than regions read: it would have passed with
+///   every region empty, which is exactly the state the previous point put ten
+///   of them in. It is a byte floor now, and every region is asserted non-empty
+///   by name.
 #[test]
 fn census_returns_the_only_token_that_reaches_a_consumer() {
     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     let census_module = root.join("src/runner/container/census.rs");
     let mut offenders = Vec::new();
     let mut scanned = 0;
+    let mut scanned_bytes = 0_usize;
     for path in walk(&root.join("src")) {
         let source = fs::read_to_string(&path).expect("read source");
-        let production =
-            crate::effects::blank_comments_and_strings(&crate::effects::production_region(&source));
+        let production = crate::effects::production_code(&source);
+        let dense = production
+            .as_bytes()
+            .iter()
+            .filter(|byte| !byte.is_ascii_whitespace())
+            .count();
+        // Per file, because the byte floor below is a sum: it stands at
+        // 1,000,000 against an actual over 1,500,000, so one file's region can
+        // empty itself and the sum still clears the bar.
+        //
+        // **Necessary, not sufficient**, and this is the assertion most likely
+        // to be mistaken for more than it is. It sees a region that COLLAPSES.
+        // It does not see one that is REPLACED: `PR7-R2C-CHAR-LITERAL-DESYNC`'s
+        // refined form removes exactly the forged lines and adds a probe of the
+        // same size, and was measured at 8525 non-whitespace bytes both with the
+        // attack and without it. No floor, per-file or aggregate, can see a
+        // zero-byte delta. What closes that is `effects::char_literal_end` and
+        // `effects::configured_item_end` returning `start` instead of the file's
+        // length when it cannot find an item's end.
+        assert!(
+            dense > 0,
+            "{}'s region is empty, so it contributes nothing to the count below",
+            path.display()
+        );
         scanned += 1;
+        scanned_bytes += dense;
         if path == census_module {
             continue;
         }
-        if production.contains("CensusComplete {") {
+        if constructs_the_token(&production) {
             offenders.push(path.display().to_string());
         }
     }
     assert!(scanned > 20, "the walk found the tree: {scanned}");
     assert!(
+        scanned_bytes > 1_000_000,
+        "the {scanned} regions hold {scanned_bytes} non-whitespace bytes between them; a file \
+         count passes with every region empty and this is what does not"
+    );
+    assert!(
         offenders.is_empty(),
         "`CensusComplete` is constructed outside the census: {offenders:#?}"
     );
 
-    let production =
-        crate::effects::blank_comments_and_strings(&crate::effects::production_region(
-            &fs::read_to_string(&census_module).expect("the census module"),
-        ));
+    let production = crate::effects::production_code(
+        &fs::read_to_string(&census_module).expect("the census module"),
+    );
     // The positive control. `CensusComplete {` appears three times here — the
     // declaration, the `impl` header and the one construction — so the control
     // needle is the construction shape alone, and the scan above would find it
@@ -3065,6 +3116,71 @@ fn census_returns_the_only_token_that_reaches_a_consumer() {
     let complete = harness.census(&fresh(INC_1)).expect("an empty census");
     assert_eq!(complete.report().incarnation, INC_1);
     assert_eq!(complete.report().orphan_window, super::orphan_window());
+}
+
+/// Whether `production` contains a **construction** of the token, as opposed to
+/// a return type whose function body brace follows it.
+///
+/// `CensusComplete {` is also the last sixteen characters of
+/// `-> &CensusComplete {`, and the first legitimate consumer of the token
+/// necessarily has an accessor of that shape — PR7's startup census holds the
+/// token and hands it out. A bare `contains` therefore reports the first real
+/// caller as a forger, which is a scan that has stopped measuring what it
+/// names.
+///
+/// **The exclusion is the arrow, not the ampersand.** Excluding every
+/// `CensusComplete {` preceded by `&` would also excuse `&CensusComplete { .. }`
+/// — a reference to a struct literal, which *is* a construction and is the
+/// shape a forged token takes when it is passed to something that borrows one.
+/// Only a return position can be followed by a body brace, so only a return
+/// position is excused. Every construction shape — `CensusComplete { .. }`,
+/// `&CensusComplete { .. }`, `Ok(CensusComplete { .. }`,
+/// `Self::CensusComplete { .. }` — still matches, and the positive control
+/// above is what keeps that true.
+fn constructs_the_token(production: &str) -> bool {
+    production.match_indices("CensusComplete {").any(|(at, _)| {
+        let before = production[..at].trim_end();
+        let before = before.strip_suffix('&').unwrap_or(before);
+        !before.trim_end().ends_with("->")
+    })
+}
+
+/// The scan's needle classifies a return position and a construction apart,
+/// including the construction that hides behind an ampersand.
+///
+/// A unit test over strings rather than a planted file, because a planted
+/// forgery **does not compile**: `CensusComplete`'s fields are private, so the
+/// type system already refuses one. That makes this scan defence-in-depth for
+/// the day those fields widen — and defence-in-depth that is never exercised is
+/// the thing this project keeps paying for. So the classifier is exercised
+/// directly.
+#[test]
+fn the_token_scan_excuses_a_return_position_and_nothing_else() {
+    for excused in [
+        "fn containers(&self) -> &CensusComplete {",
+        "fn into_inner(self) -> CensusComplete {",
+        "    pub fn report(&self) -> &CensusComplete  {",
+    ] {
+        assert!(
+            !constructs_the_token(excused),
+            "a return position was read as a construction: {excused}"
+        );
+    }
+
+    for construction in [
+        "let token = CensusComplete { report };",
+        // The one lane C's first needle would have missed: a reference to a
+        // struct literal is a construction, and it is the shape a forged token
+        // takes when it is handed to something that borrows one.
+        "consume(&CensusComplete { report });",
+        "Ok(CensusComplete { report })",
+        "Self::CensusComplete { report }",
+    ] {
+        assert!(
+            constructs_the_token(construction),
+            "a construction was excused: {construction}"
+        );
+    }
 }
 
 /// Every `src/**/*.rs`, sorted.
@@ -3459,6 +3575,68 @@ fn a_reaper_scope_whose_label_value_could_widen_the_filter_cannot_reach_the_reap
 // 9. Docker-gated: a census against the real runtime
 // ---------------------------------------------------------------------------
 
+/// The two owners `real_docker_census_reclaims_a_dead_owner_and_spares_a_live_one`
+/// creates, built here so a test that **always** runs can assert the property
+/// the gated one depends on.
+///
+/// Owner constants that test alone uses. Container names are deterministic and
+/// the daemon is one namespace shared with every other Docker-gated test in this
+/// tree, which run concurrently: reusing the fixture constants above made
+/// `docker create` fail with a name conflict against
+/// `runner::container::tests`'s own gated test. Measured, and the reason these
+/// run ids exist.
+///
+/// **The repo key is the build slot's, not a constant.** It was
+/// `"cccccccccccccccc"`, and `fake::preclean_names` kills by name with no
+/// liveness check: two suites running in two slots built the same three
+/// components, so each one's pre-clean killed the other's **live** container.
+/// `PR7-R3-CONTRACT-001`, which `b44040a` repaired at `exec.rs`'s caller and not
+/// at this one.
+///
+/// The run ids stay fixed and must: a pre-clean matches a **previous run's**
+/// residue exactly when the name recurs, and a component that is unique per
+/// process would make it a no-op that looks like protection.
+fn real_docker_census_owners() -> (Owner, Owner) {
+    const REAL_RUN_LIVE: &str = "01KZTREALLIVE00000000000AA";
+    const REAL_RUN_DEAD: &str = "01KZTREALDEAD00000000000BB";
+    let key = crate::runner::container::fake::slot_repo_key();
+    (
+        Owner::new(REAL_RUN_LIVE, INC_1, key),
+        Owner::new(REAL_RUN_DEAD, INC_2, key),
+    )
+}
+
+/// **The gated census's own names are scoped to this build slot.**
+///
+/// The instance of `PR7-R3-CONTRACT-001` on this path, asserted by a test that
+/// runs on every platform and needs no runtime — which is the point. The
+/// pre-clean it guards is inside a Docker-gated test, so on a machine with no
+/// usable image the hostile name was never even constructed, and four commits
+/// of green suites said nothing about it either way.
+///
+/// The class boundary is
+/// `runner::container::tests::a_pre_clean_refuses_every_name_a_concurrent_run_could_also_ask_for`
+/// and its sibling, which assert the rule and that the helper enforces it. This
+/// asserts that *these* names satisfy it.
+#[test]
+fn the_gated_censuss_names_are_scoped_to_this_build_slot() {
+    let (live, dead) = real_docker_census_owners();
+    let names = [live.name(&shell_probe()), dead.name(&shell_probe())];
+    let borrowed: Vec<&crate::runner::container::intent::ContainerName> = names.iter().collect();
+
+    assert_ne!(
+        names[0], names[1],
+        "the two owners build one name, so the census creates one container and its \
+         dead-versus-live comparison has nothing to compare"
+    );
+    assert!(
+        crate::runner::container::fake::unscoped_names(&borrowed).is_empty(),
+        "a name this test's pre-clean will kill is one another build slot's suite asks for too, \
+         so the kill lands on that suite's live container: {:?}",
+        crate::runner::container::fake::unscoped_names(&borrowed)
+    );
+}
+
 /// A census over **real Docker** reclaims a dead owner's labeled orphan and
 /// leaves a live owner's container alone.
 ///
@@ -3503,20 +3681,27 @@ fn real_docker_census_reclaims_a_dead_owner_and_spares_a_live_one() {
         return;
     };
 
-    // Owner constants THIS TEST ALONE uses. Container names are deterministic
-    // and the daemon is one namespace shared with every other Docker-gated test
-    // in this tree, which run concurrently: reusing the fixture constants above
-    // made `docker create` fail with a name conflict against
-    // `runner::container::tests`'s own gated test. Measured, and the reason
-    // these four constants exist.
-    const REAL_REPO_KEY: &str = "cccccccccccccccc";
-    const REAL_RUN_LIVE: &str = "01KZTREALLIVE00000000000AA";
-    const REAL_RUN_DEAD: &str = "01KZTREALDEAD00000000000BB";
     let root = scratch("real-docker-census");
-    let live = Owner::new(REAL_RUN_LIVE, INC_1, REAL_REPO_KEY);
-    let dead = Owner::new(REAL_RUN_DEAD, INC_2, REAL_REPO_KEY);
+    let (live, dead) = real_docker_census_owners();
     let liveness = RecordingLiveness::new();
     liveness.set_live(&live.run_dir);
+
+    // Pre-clean before the first `docker create`, not after the last teardown.
+    //
+    // `reviews/FINDINGS.md` §16: this test's own cleanup is correct and cannot
+    // help, because no in-process cleanup runs when the process is SIGKILLed.
+    // These two names come from [`real_docker_census_owners`]: two fixed run
+    // ids and this slot's own repo key, all stable across runs *in* this slot,
+    // so the name a previous SIGKILLed run left is exactly the name this run is
+    // about to ask for — and no name another slot's suite asks for. That
+    // recurrence is what makes a pre-clean meaningful rather than an
+    // unconditional retry.
+    crate::runner::container::fake::preclean_names(
+        docker.as_ref(),
+        &DisposableDirView::new(ContainerTrace::off()),
+        &root,
+        &[&live.name(&shell_probe()), &dead.name(&shell_probe())],
+    );
 
     let mut names = Vec::new();
     for owner in [&live, &dead] {

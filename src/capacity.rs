@@ -1073,6 +1073,7 @@ mod tests {
                         kind,
                         origin: FailureOrigin::Worker,
                         reason: "r".to_owned(),
+                        detail: None,
                     }),
                 }),
             })
@@ -1159,6 +1160,7 @@ mod tests {
                     kind: FailureKind::RateLimited,
                     origin: FailureOrigin::Reviewer,
                     reason: "review pool limited".to_owned(),
+                    detail: None,
                 }),
             }),
         });

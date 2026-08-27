@@ -487,7 +487,8 @@ mod tests {
 
     use super::*;
     use crate::events::{
-        AttemptRecord, BindingSummary, BudgetKind, ChainSummary, GateSummary, RunOutcome,
+        AttemptRecord, BindingSummary, BudgetKind, ChainSummary, GateSummary, ReviewPassOutcome,
+        ReviewRecord, RunOutcome,
     };
     use crate::gates::ShellKind;
     use crate::ir::{
@@ -791,7 +792,20 @@ mod tests {
             resumed: false,
             duration: Duration::from_millis(4_321),
             cost_usd: Some(0.75),
-            reviews: Vec::new(),
+            // The primary pass §11.2 requires, present and passed. Empty
+            // `reviews` satisfies `is_successful` vacuously — the premise then
+            // exercises none of the clause it is the positive witness for.
+            reviews: vec![ReviewRecord {
+                pass: "review".to_owned(),
+                agent: "claude-code".to_owned(),
+                model: "claude-opus-5".to_owned(),
+                adapter: Some("claude-code".to_owned()),
+                preflight_cli_version: None,
+                effort: None,
+                pool: None,
+                cost_usd: None,
+                outcome: ReviewPassOutcome::Passed,
+            }],
             session_id: None,
             usage: None,
             failure: None,
@@ -865,7 +879,20 @@ mod tests {
                 key,
                 generation: GenerationId(generation),
                 attempt: AttemptNumber(attempt),
-                record: Box::new(attempt_record(attempt)),
+                record: Box::new({
+                    // The record says failed, because every settlement this
+                    // builds is one: `candidate_prepared` is the sole successful
+                    // settlement and `check_attempt_finished` refuses a failure
+                    // whose record reports success.
+                    let mut record = attempt_record(attempt);
+                    record.failure = Some(crate::events::FailureRecord {
+                        kind: crate::ladder::FailureKind::GateFailed,
+                        origin: crate::ladder::FailureOrigin::Worker,
+                        reason: "the fixture's judged failure".to_owned(),
+                        detail: None,
+                    });
+                    record
+                }),
                 settlement: AttemptSettlement::Closed { transition, lease },
             }),
         })
@@ -2627,13 +2654,11 @@ mod tests {
         for event in [
             dispatch(ALEPH, 0),
             attempt_started(&fold, ALEPH, 0, 1),
-            settle(
-                ALEPH,
-                0,
-                1,
-                SettlementTransition::Succeeded,
-                LeaseDisposition::PredictedRetained,
-            ),
+            // No `attempt_finished{Succeeded}` between them: `candidate_prepared`
+            // is the sole successful settlement for a candidate-producing
+            // attempt, and the fold refuses the pair since the 2026-08-27
+            // CONFORM ruling. A prefix that still built it would be refused
+            // here rather than silently exploring a shape no run can write.
             candidate_prepared_over(ALEPH, 0, 1, paths.clone()),
             candidate_created(ALEPH, 0),
         ] {
@@ -2664,13 +2689,8 @@ mod tests {
         for event in [
             dispatch_at(ALEPH, 0, region(ALEPH), base.clone()),
             attempt_started(&fold, ALEPH, 0, 1),
-            settle(
-                ALEPH,
-                0,
-                1,
-                SettlementTransition::Succeeded,
-                LeaseDisposition::PredictedRetained,
-            ),
+            // The settlement is `candidate_prepared` itself; see the sibling
+            // prefix above.
             candidate_prepared_at(ALEPH, 0, 1, region(ALEPH), base, commit.clone()),
             candidate_created_of(candidate_at(ALEPH, 0, commit)),
         ] {
@@ -2824,13 +2844,8 @@ mod tests {
             for event in [
                 dispatch(key, 0),
                 attempt_started(&fold, key, 0, 1),
-                settle(
-                    key,
-                    0,
-                    1,
-                    SettlementTransition::Succeeded,
-                    LeaseDisposition::PredictedRetained,
-                ),
+                // `candidate_prepared` settles the attempt; see the prefix
+                // helpers above.
                 candidate_prepared(key, 0, 1),
                 candidate_created(key, 0),
             ] {
@@ -3239,7 +3254,15 @@ mod tests {
         let differing: Vec<usize> = (0..wide.trace.len())
             .filter(|index| wide.trace[*index] != narrow.trace[*index])
             .collect();
-        assert_eq!(differing, vec![4], "more than the region moved");
+        // **Index 3, because the trace is one event shorter than it was.** The
+        // explorer keeps the transitions the fold accepts, and since the
+        // 2026-08-27 CONFORM ruling `attempt_finished{Succeeded}` is not one:
+        // `candidate_prepared` is the sole successful settlement, so that edge
+        // is gone from the graph and every trace through a promotion loses a
+        // step. The index is regenerated from the shorter trace rather than the
+        // assertion being loosened — it is still "exactly one event differs,
+        // and in it only the region".
+        assert_eq!(differing, vec![3], "more than the region moved");
 
         // Two states, and two different answers to the same offer.
         assert_ne!(wide.id, narrow.id);

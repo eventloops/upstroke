@@ -1280,7 +1280,35 @@ pub struct GenerationClosed {
 #[serde(deny_unknown_fields)]
 pub struct DeferWaitElapsed4 {
     pub waited_ms: u64,
-    /// Which sleep this was, counted across the run.
+    /// **Consecutive waits where deferred work was the only runnable work.**
+    ///
+    /// Not "which sleep this was, counted across the run", which is what this
+    /// said and what no writer produces.
+    ///
+    /// The sole production construction is `settle::Deferral::wait`
+    /// (`settle.rs:334`), reached from `TopologyRun::step` alone, and it writes
+    /// `self.round` — the field `Deferral::progressed()` **resets to zero**.
+    /// That reset has three production callers, all in the driver:
+    /// `dispatch_ready`, `continue_open` and `retry_ready`.
+    ///
+    /// So the sequence a reader actually sees is **1, 2, 1**, not 1, 2, 3: a run
+    /// that defers, sleeps twice, dispatches something, and defers again writes
+    /// `round: 1` for that fourth sleep. `wait` increments before it records, so
+    /// the value is one-based and restarts at one rather than at zero — which is
+    /// why "counted across the run" is not merely imprecise but reads a *later*
+    /// sleep as an earlier one.
+    ///
+    /// It is a backoff round because that is what it indexes:
+    /// `interaction::defer_backoff(self.base, self.round)`, an exponential
+    /// doubling that has to restart when the run stops being stuck.
+    ///
+    /// **Comment-only, on a frozen file, by per-instance approval of
+    /// 2026-08-26**, carrying `reviews/FINDINGS.md` §20's staged erratum text.
+    /// The wire is unchanged: no field, no type and no serde attribute moves,
+    /// and `events::SCHEMA_VERSION` — which lives outside this file — is not
+    /// touched. The reason it was not left for the G2 pass is
+    /// that this is a **reviewer-facing wire doc**, and the frontier review
+    /// reads the wire to decide what the events mean. `PR7-R3-EMIT-006`.
     pub round: u32,
 }
 
@@ -2405,6 +2433,7 @@ mod tests {
                 kind: FailureKind::GateFailed,
                 origin: FailureOrigin::Reviewer,
                 reason: "  clippy: 3 warnings, one of them Ünicode  ".to_owned(),
+                detail: None,
             }),
         }
     }

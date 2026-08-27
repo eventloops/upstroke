@@ -1221,82 +1221,121 @@ mod tests {
         }
     }
 
-    /// The file minus every `#[cfg(test)] mod … { … }` block.
+    /// Assignments to `field` **through a receiver**, in every assignment form.
     ///
-    /// Sound because `cargo fmt --check` is a gate, so a module's closing brace
-    /// is the first line at exactly the module's own indentation.
-    /// `src/engine/tests.rs` is a whole test module (`engine/mod.rs`:
-    /// `#[cfg(test)] mod tests;`) and is excluded as one by every caller.
-    fn production_region(source: &str) -> String {
-        let lines: Vec<&str> = source.lines().collect();
-        let mut kept = String::new();
-        let mut index = 0;
-        while index < lines.len() {
-            let line = lines[index];
-            let is_test_mod = line.trim() == "#[cfg(test)]"
-                && lines
-                    .get(index + 1)
-                    .is_some_and(|next| next.trim_start().starts_with("mod "));
-            if !is_test_mod {
-                kept.push_str(line);
-                kept.push('\n');
-                index += 1;
+    /// `x.field = …` and **all ten** of Rust's compound assignment operators —
+    /// `+= -= *= /= %= &= |= ^= <<= >>=`; never `x.field == …`, and never a
+    /// longer field whose name starts with this one.
+    ///
+    /// Two measured fail-open holes, both in the same direction. The literal
+    /// `".field ="` misses `+=` — the idiomatic increment, and therefore the
+    /// form a second counting rule is most likely to arrive in (S5 round 4).
+    /// The five-operator repair for that then missed `&= |= ^=` (not in its
+    /// set) and `<<= >>=` (second byte not `=`), which S5 round 5 measured with
+    /// `task.attempts_on_rung |= 1;` (`R5-SETTLE-001`). The enumeration is now
+    /// the language's, so there is no sixth hole of this shape.
+    fn receiver_writes(code: &str, field: &str) -> usize {
+        let needle = format!(".{field}");
+        code.match_indices(&needle)
+            .filter(|(at, _)| {
+                let rest = code[at + needle.len()..].trim_start();
+                match rest.as_bytes() {
+                    // `==` is a comparison, not a write.
+                    [b'=', b'=', ..] => false,
+                    [b'=', ..] => true,
+                    // `<<=` and `>>=`, whose second byte is not `=`.
+                    [b'<', b'<', b'=', ..] | [b'>', b'>', b'=', ..] => true,
+                    // The seven single-character compound operators. Rust has
+                    // ten in total and this arm used to name five: `&= |= ^=`
+                    // fell through it and `<<= >>=` never reached it, so
+                    // `task.attempts_on_rung |= 1;` — a bare assignment through
+                    // a receiver, inside the domain all three doc sentences
+                    // state — left the census green. `R5-SETTLE-001`, and it is
+                    // `PR7-R3-CENSUS-WRITE-DOMAIN-PROSE` five operators over.
+                    [op, b'=', ..] => {
+                        matches!(op, b'+' | b'-' | b'*' | b'/' | b'%' | b'&' | b'|' | b'^')
+                    }
+                    _ => false,
+                }
+            })
+            .count()
+    }
+
+    /// `value` up to `terminator` at **nesting depth zero**, so a comma inside
+    /// `format!("{a}-{}", b)` does not end the expression.
+    ///
+    /// The reason this exists: taking a field initializer's value as "everything
+    /// up to the first comma" truncates every multi-argument expression before
+    /// its arguments, so the site is skipped rather than judged. Measured by S5
+    /// round 4 — a planted `stem: format!("{index:02}-{}", display_id)` was
+    /// invisible to the census that exists to forbid exactly that.
+    fn until_depth_zero(value: &str, terminator: u8) -> &str {
+        let mut depth = 0_i32;
+        for (at, ch) in value.char_indices() {
+            match ch {
+                '(' | '[' | '{' => depth += 1,
+                ')' | ']' | '}' if depth == 0 => return &value[..at],
+                ')' | ']' | '}' => depth -= 1,
+                _ if depth == 0 && ch as u32 == u32::from(terminator) => return &value[..at],
+                _ => {}
+            }
+        }
+        value
+    }
+
+    /// Every place production builds a filename `stem`, and the expression it
+    /// builds it from.
+    ///
+    /// **Both shapes**: the field initializer `stem: <value>,` and the binding
+    /// `let stem = <value>;`. The census counted only the first, so
+    /// `coordinator.rs:537` — the live legacy path, and the site the schema-4
+    /// assembler was extracted from — was outside its domain entirely.
+    fn stem_values(code: &str) -> Vec<(usize, String)> {
+        let mut out = Vec::new();
+        for (at, _) in code.match_indices("stem") {
+            let before = &code[..at];
+            if before
+                .chars()
+                .next_back()
+                .is_some_and(|ch| ch.is_alphanumeric() || ch == '_')
+            {
                 continue;
             }
-            let header = lines[index + 1];
-            let indent = &header[..header.len() - header.trim_start().len()];
-            let closing = format!("{indent}}}");
-            index += 2;
-            while index < lines.len() && lines[index] != closing {
-                index += 1;
+            let rest = &code[at + "stem".len()..];
+            let head = before.trim_end();
+            let head = head.strip_suffix("mut").map_or(head, str::trim_end);
+            if head.ends_with("let") {
+                let Some(eq) = rest.find('=') else { continue };
+                out.push((at, until_depth_zero(&rest[eq + 1..], b';').to_owned()));
+            } else if let Some(tail) = rest.strip_prefix(':') {
+                if tail.starts_with(':') {
+                    continue;
+                }
+                out.push((at, until_depth_zero(tail, b',').to_owned()));
             }
-            index += 1;
         }
-        kept
+        out
     }
 
-    /// Every source file the crate declares as `#[cfg(test)] mod <name>;`.
-    ///
-    /// Such a file is test code end to end, and [`production_region`] — which
-    /// cuts a file at its first *inline* `#[cfg(test)]` — has nothing to cut in
-    /// one, so it would count the whole of it as production. The set is read
-    /// out of the declarations rather than listed by hand: it was
-    /// `src/engine/tests.rs` alone until PR5 moved the Event funnel into
-    /// `src/events/log.rs` with two test modules of its own, and the census
-    /// failed on the first file the hand-maintained list did not know about.
-    fn whole_file_test_modules(files: &[PathBuf]) -> std::collections::BTreeSet<PathBuf> {
-        files
-            .iter()
-            .flat_map(|path| {
-                let source = std::fs::read_to_string(path).expect("read source");
-                let parent = path.parent().expect("a source file has a directory");
-                let stem = path.file_stem().expect("a source file has a name");
-                let dir = if stem == "mod" || stem == "lib" || stem == "main" {
-                    parent.to_path_buf()
-                } else {
-                    parent.join(stem)
-                };
-                source
-                    .split("#[cfg(test)]")
-                    .skip(1)
-                    .filter_map(|rest| {
-                        let name = rest.trim_start().strip_prefix("mod ")?;
-                        let name = name.split(';').next()?.trim();
-                        (!name.is_empty() && !name.contains('{')).then(|| {
-                            [
-                                dir.join(format!("{name}.rs")),
-                                dir.join(name).join("mod.rs"),
-                            ]
-                        })
-                    })
-                    .flatten()
-                    .collect::<Vec<_>>()
-            })
-            .collect()
-    }
-
-    /// Every `src/**/*.rs`, as `(repo-relative path, production region)`, with
+    /// Every `src/**/*.rs`, as `(repo-relative path, production code)`, with
     /// whole-file test modules left out.
+    ///
+    /// The region is [`crate::effects::production_code`]: the whole file with
+    /// comments and string literals blanked and every `#[cfg(test)]` item
+    /// removed. Every census below counts over it, and each of the three
+    /// properties is load-bearing:
+    ///
+    /// * **Blanked**, because a count over raw text counts prose.
+    ///   `src/agent/proc.rs` names `run_with_timeout` eight times, five in code
+    ///   and three in doc comments, and a real `run_with_timeout_unbounded`
+    ///   bypassing `OUTPUT_LIMIT_BYTES` could be paid for by deleting two
+    ///   sentences in the same file. Measured — it was.
+    /// * **The whole file**, because the previous region dropped everything
+    ///   between a `#[cfg(test)] mod tests;` declaration and the next line that
+    ///   is exactly `}`. Thirteen files declare their tests that way, and a
+    ///   `Command::new("git").arg("push")` appended after one was invisible
+    ///   while the identical lines above it failed the census.
+    /// * **Item-wise removal**, not truncation, for the same reason.
     fn production_sources() -> Vec<(String, String)> {
         fn walk(dir: &std::path::Path, into: &mut Vec<PathBuf>) {
             let mut entries: Vec<_> = std::fs::read_dir(dir)
@@ -1317,14 +1356,26 @@ mod tests {
         let mut files = Vec::new();
         walk(&root.join("src"), &mut files);
         assert!(files.len() > 20, "the walk found the tree: {}", files.len());
-        let test_modules = whole_file_test_modules(&files);
+        // Through the shared resolver: this loop was written out here and in
+        // `events::log::tests`, and a third census then wrote a *different*
+        // rule — `file_stem == "tests"` — which covers fourteen of the
+        // seventeen. `PR7-R5-ATT-001`.
+        let test_modules = crate::effects::census_domain::whole_file_test_modules(&files, 13);
         // The control: a derivation that found nothing would silently count
         // every test file as production, which is the failure this replaces.
         assert!(
             test_modules.contains(&root.join("src").join("engine").join("tests.rs")),
             "the `#[cfg(test)] mod tests;` derivation found no engine test module: {test_modules:?}"
         );
-        files
+        fn dense(text: &str) -> usize {
+            text.as_bytes()
+                .iter()
+                .filter(|byte| !byte.is_ascii_whitespace())
+                .count()
+        }
+
+        let mut raw_bytes = 0_usize;
+        let sources: Vec<(String, String)> = files
             .into_iter()
             .filter_map(|path| {
                 if test_modules.contains(&path) {
@@ -1336,9 +1387,52 @@ mod tests {
                     .to_string_lossy()
                     .replace('\\', "/");
                 let source = std::fs::read_to_string(&path).expect("read source");
-                Some((relative, production_region(&source)))
+                raw_bytes += dense(&source);
+                Some((relative, crate::effects::production_code(&source)))
             })
-            .collect()
+            .collect();
+        // The three controls every census below shares, all of
+        // `PR4-CENSUS-COMMENT-ORACLE`'s class.
+        //
+        // The regions are not empty, **file by file**. The aggregate floor below
+        // is the weaker half of this and cannot replace it: it stands at
+        // 750,000 against an actual 926,043, so 176,043 non-whitespace bytes may
+        // vanish before it notices, and the two largest files this walk keeps
+        // hold 146,260 between them — inside that headroom. One file's region
+        // collapsing to nothing is exactly what a `#[cfg(test)]` in a comment
+        // used to do, and it is invisible to a sum.
+        //
+        // **Necessary, not sufficient.** A per-file floor sees a region that
+        // collapses; it does not see one that is *replaced*.
+        // `PR7-R2C-CHAR-LITERAL-DESYNC`'s refined form removes exactly the
+        // forged lines and adds a probe of the same size, and was measured at
+        // 8525 dense bytes both with the attack and without it. What closes that
+        // is `effects::char_literal_end` and `configured_item_end` returning
+        // `start` rather than the file's length — not this.
+        for (relative, code) in &sources {
+            assert!(
+                dense(code) > 0,
+                "{relative}'s region is empty, so it contributes nothing to any count below \
+                 and every prohibition this census states is vacuous for that file"
+            );
+        }
+        let region_bytes: usize = sources.iter().map(|(_, code)| dense(code)).sum();
+        assert!(
+            region_bytes > 750_000,
+            "the {} regions hold {region_bytes} non-whitespace bytes between them, so every \
+             count below is over almost nothing",
+            sources.len()
+        );
+        // And the blanking removed something. A blanking that silently stopped
+        // working would put every doc comment and string literal back into the
+        // counts, which is how a real ninth `run_with_timeout` entry point was
+        // paid for by deleting two sentences.
+        assert!(
+            region_bytes < raw_bytes,
+            "the sources hold {raw_bytes} non-whitespace bytes and the regions hold \
+             {region_bytes}; the blanking removed nothing, so the counts below are over prose"
+        );
+        sources
     }
 
     /// Every `RunnerRequest` production builds is built by the builder for its
@@ -1426,6 +1520,13 @@ mod tests {
             "src/review.rs",
             "src/engine/attempt.rs",
             "src/engine/coordinator.rs",
+            // Assembles a worker's *command* and must never assemble its
+            // request: the command says what to run and the request says the
+            // role, the boundary and the identity. One module doing both would
+            // be a call site that could choose its own role, which is what
+            // `ExecutionRole::is_slotted` and `host::supplies_credentials` are
+            // derived from.
+            "src/engine/assembly.rs",
         ] {
             assert!(
                 !expected.contains_key(absent),
@@ -1444,15 +1545,22 @@ mod tests {
                 "src/agent/proc.rs",
                 1,
                 2,
-                8,
+                5,
                 "the process funnel itself: two `command.spawn()` (Unix and \
-                 Windows), the `run_with_timeout*` entry points — the plain \
-                 one now *delegates* to the hooked one rather than calling \
-                 the private limit-taking entry beside it, which is the eighth \
-                 mention and the reason there is one bounded-capture value \
-                 rather than two — and one `/bin/ps` on macOS that asks the \
-                 kernel whether a process group has settled: a kernel query \
-                 inside the reaper, not a CLI or a gate",
+                 Windows), the `run_with_timeout*` entry points — five \
+                 mentions in CODE: `run_with_timeout` and its delegation to \
+                 `run_with_timeout_hooked`, `run_with_timeout_hooked` and its \
+                 delegation to `run_with_timeout_and_limit` (the plain entry \
+                 delegates rather than calling the private limit-taking one \
+                 beside it, so there is one bounded-capture value rather than \
+                 two), and that private entry's own declaration — and one \
+                 `/bin/ps` on macOS that asks the kernel whether a process \
+                 group has settled: a kernel query inside the reaper, not a \
+                 CLI or a gate. It was **eight** while this census counted \
+                 unblanked text: three of the eight are doc comments, and a \
+                 real `run_with_timeout_unbounded` bypassing \
+                 `OUTPUT_LIMIT_BYTES` could be paid for by deleting two \
+                 sentences in this file. Measured — it was",
             ),
             (
                 "src/runner/host.rs",
@@ -1506,22 +1614,6 @@ mod tests {
                  worktrees, snapshots, refs and Git objects behind these \
                  funnels; nothing here is a CLI, a gate, or a reviewer",
             ),
-            (
-                "src/effects.rs",
-                1,
-                0,
-                0,
-                "NOT a process start at all: the one `Command::new(` is inside \
-                 `DENIAL_FIXTURES`, a string constant whose whole purpose is to \
-                 be REFUSED. `effects::tests::every_declared_effect_denial_\
-                 refuses_for_the_reason_it_declares` compiles it against \
-                 `clippy.toml` and asserts it emits `clippy::disallowed_types` \
-                 naming `std::process::Command` — so this row is the denylist's \
-                 own evidence, and if it ever started compiling clean that test \
-                 fails first. This census counts literal occurrences and does \
-                 not strip string literals (`PR4-CENSUS-COMMENT-ORACLE`), which \
-                 is why the row exists rather than the count being zero",
-            ),
         ];
 
         fn count(haystack: &str, needle: &str) -> usize {
@@ -1551,16 +1643,25 @@ mod tests {
              (DESIGN.md:612): route it through the Runner, or say here why it \
              is one of the things that never crosses the boundary"
         );
-        // The table names six files, and it is the *set* that is the claim:
+        // The table names five files, and it is the *set* that is the claim:
         // adapters, gates, review and the engine appear nowhere in it, which
         // is what "every CLI and gate process executes through Runner" means
-        // once the migration has happened. Five of the six really do start a
-        // process; the sixth, `src/effects.rs`, is a fixture that exists to be
-        // refused, and its row says so. PR6's `src/runner/container.rs` is the
-        // newest, and its row says why a `docker` call is one of the things
-        // that never crosses the boundary rather than one that was forgotten.
-        assert_eq!(expected.len(), 6);
+        // once the migration has happened. All five really do start a process.
+        // PR6's `src/runner/container.rs` is the newest, and its row says why a
+        // `docker` call is one of the things that never crosses the boundary
+        // rather than one that was forgotten.
+        //
+        // It was six. The sixth was `src/effects.rs`, whose only
+        // `Command::new(` is inside `DENIAL_FIXTURES` — a string constant whose
+        // whole purpose is to be REFUSED, compiled against `clippy.toml` by
+        // `effects::tests::every_declared_effect_denial_refuses_for_the_reason_
+        // it_declares`. It was a row here only because this census counted
+        // string literals. It counts code now, so a fixture is not a process
+        // start and `src/effects.rs` is named below with the rest of the files
+        // that start none.
+        assert_eq!(expected.len(), 5);
         for name in [
+            "src/effects.rs",
             "src/gates.rs",
             "src/review.rs",
             "src/engine/attempt.rs",
@@ -1611,11 +1712,7 @@ mod tests {
             ),
         ] {
             let source = std::fs::read_to_string(root.join(file)).expect("read the event log");
-            let code: String = production_region(&source)
-                .lines()
-                .filter(|line| !line.trim_start().starts_with("//"))
-                .collect::<Vec<_>>()
-                .join("\n");
+            let code = crate::effects::production_code(&source);
             for token in [
                 "Command::new(",
                 ".spawn()",
@@ -1650,12 +1747,10 @@ mod tests {
         ] {
             let source = std::fs::read_to_string(root.join(adapter)).expect("read adapter");
             // Code, not prose: a doc comment may name the host runner to
-            // explain why something is the way it is, and several do.
-            let code: String = production_region(&source)
-                .lines()
-                .filter(|line| !line.trim_start().starts_with("//"))
-                .collect::<Vec<_>>()
-                .join("\n");
+            // explain why something is the way it is, and several do. The
+            // blanking is what removes them; a `//`-prefixed-line filter left a
+            // trailing `// … HostRunner …` on a code line in place.
+            let code = crate::effects::production_code(&source);
             assert_eq!(
                 count(&code, "HostRunner"),
                 0,
@@ -1725,12 +1820,10 @@ mod tests {
         ];
 
         let mut found: BTreeMap<String, (usize, usize, usize)> = BTreeMap::new();
-        for (relative, production) in production_sources() {
-            let code: String = production
-                .lines()
-                .filter(|line| !line.trim_start().starts_with("//"))
-                .collect::<Vec<_>>()
-                .join("\n");
+        for (relative, code) in production_sources() {
+            // `production_sources` already blanks comments and string literals,
+            // so a doc comment naming either symbol — and two of them do it to
+            // explain this very rule — contributes nothing.
             let counts = (
                 code.matches("proc::join_ambient_job(").count(),
                 code.matches("Contained::new()").count(),
@@ -1779,6 +1872,754 @@ mod tests {
     /// overlay the spending command does not carry, against DESIGN.md:262-264.
     /// So the third column counts struct-literal `env:`/`stdin:` initializers
     /// too, and the constructors are enumerated rows like everything else.
+    /// **A worker's command is assembled in exactly one production place, and
+    /// a gate's in exactly one other.**
+    ///
+    /// The census this slice most needed and did not have. Two engines now want
+    /// the same three command sets — the legacy one assembling them inline at
+    /// the moment of use, the schema-4 driver wanting them up front in a plan —
+    /// and assembling them twice is this project's dominant defect class. Of
+    /// PR7's review findings the expensive ones were all one rule implemented
+    /// twice, including two derivations of a task's predicted region that
+    /// disagreed on every glob and shipped green (`84a3978`).
+    ///
+    /// **What this pins is input selection, not minting.** Minting was never
+    /// duplicated: the crate has two `CommandSpec` constructors,
+    /// `gates::ShellKind::spec` and `agent::bin::Invocation::spec`, and both
+    /// already say so in their own docs. What was about to be duplicated is
+    /// *which* prompt, permissions file, timeout and profile go into them. So
+    /// the columns count the two calls that perform that selection —
+    /// `AgentAdapter::build`, and `ShellKind::spec` — per file.
+    ///
+    /// `src/review.rs` is here with a non-zero `build` count **and that is the
+    /// outstanding half of this work**, not an exemption: the reviewer's
+    /// command is still assembled in `review.rs` because its invocation
+    /// machinery is a re-ask loop with a per-invocation prompt, which does not
+    /// extract by moving one expression. When that lands, its count moves the
+    /// way the worker's did — and until then the duplication is a number in a
+    /// test rather than a sentence in a review.
+    #[test]
+    fn a_command_is_assembled_in_one_production_place_per_role() {
+        use std::collections::BTreeMap;
+
+        /// (file, `AgentAdapter::build` calls, `ShellKind::spec` calls, why).
+        const EXPECTED: &[(&str, usize, usize, &str)] = &[
+            (
+                "src/engine/assembly.rs",
+                1,
+                0,
+                "the worker's command: the one production assembler. Both \
+                 engines call it — the legacy one from `run_attempt`, the \
+                 schema-4 driver when it builds an `AttemptPlan`",
+            ),
+            (
+                "src/gates.rs",
+                0,
+                1,
+                "the gate's command: `ShellGate::command`, the one production \
+                 place a gate's cmdline becomes a spec. It lives on the type \
+                 that owns the data rather than in the engine, because \
+                 `gates.rs` sits below the engine",
+            ),
+            (
+                "src/review.rs",
+                1,
+                0,
+                "the reviewer's command. STILL ASSEMBLED HERE, and this row is \
+                 the outstanding work rather than an exception: the re-ask \
+                 loop builds a different prompt per invocation, so it does not \
+                 move by lifting one expression",
+            ),
+            (
+                "src/runner/host.rs",
+                0,
+                1,
+                "the RunnerPreflight shell probe: a shell command that is not \
+                 a gate. A different role, so a different assembler is correct \
+                 — the count is here so that it is stated rather than assumed",
+            ),
+        ];
+
+        let mut found: BTreeMap<String, (usize, usize)> = BTreeMap::new();
+        for (path, code) in production_sources() {
+            let builds =
+                code.matches(".build(&task_run)").count() + code.matches(".build(&run)").count();
+            let specs = code.matches(".spec(&self.cmd)").count()
+                + code.matches(".spec(SHELL_PROBE_COMMAND)").count();
+            if builds + specs > 0 {
+                found.insert(path, (builds, specs));
+            }
+        }
+
+        let expected: BTreeMap<String, (usize, usize)> = EXPECTED
+            .iter()
+            .map(|(path, builds, specs, _)| ((*path).to_owned(), (*builds, *specs)))
+            .collect();
+        assert_eq!(
+            found, expected,
+            "a production site selects the inputs for a command. Two sites for \
+             one role is the duplication class that cost this slice its \
+             predicted-region defect — classify it, and if it is a second \
+             assembler for a role that already has one, it is the finding \
+             rather than the fixture"
+        );
+    }
+
+    /// **An attempt's ledger line is constructed in one production place.**
+    ///
+    /// The fourth one-production-place census, and the one whose subject is
+    /// read back out. `AttemptRecord.failure` is what `ladder::next_step`
+    /// decides from and what `ladder::spends_allowance` prices, so two
+    /// constructions are two answers to "what happened to this attempt" — and
+    /// the settlement, the escalation and the allowance would each be reading
+    /// whichever one their caller happened to build.
+    ///
+    /// The column counts `AttemptRecord {` struct literals in production code,
+    /// anchored to a line of its own for the reason the profile census is:
+    /// a return type and the definition contain the same text.
+    #[test]
+    fn an_attempts_ledger_line_is_constructed_in_one_production_place() {
+        use std::collections::BTreeMap;
+
+        /// (file, `AttemptRecord {` literals, why).
+        const EXPECTED: &[(&str, usize, &str)] = &[(
+            "src/engine/classify.rs",
+            1,
+            "`attempt_record`. It was inline in `coordinator.rs`'s settlement, \
+             out of the schema-4 driver's reach, and it lives beside the \
+             failure classification rather than beside the command assembler \
+             because its last field IS a classification",
+        )];
+
+        let mut found: BTreeMap<String, usize> = BTreeMap::new();
+        for (path, code) in production_sources() {
+            let records = code
+                .lines()
+                .filter(|line| line.trim() == "AttemptRecord {")
+                .count();
+            if records > 0 {
+                found.insert(path, records);
+            }
+        }
+
+        let expected: BTreeMap<String, usize> = EXPECTED
+            .iter()
+            .map(|(path, n, _)| ((*path).to_owned(), *n))
+            .collect();
+        assert_eq!(
+            found, expected,
+            "a production site decides what one attempt's durable line says. \
+             Two sites is two answers to what happened, and the ladder reads \
+             the answer back"
+        );
+    }
+
+    /// **An invocation's profile is constructed in one production place per
+    /// role.**
+    ///
+    /// The third of the one-production-place censuses, and the one that decides
+    /// what a process is *allowed to do*. A [`crate::ir::WorkerProfile`] carries
+    /// `permissions`, and the two roles want opposite answers: an implementer
+    /// is `Edit`, a reviewer is `ReadOnly`. A driver that rebuilt an
+    /// implementer's profile and reached for the nearest existing constructor
+    /// would get `review::profile_for` — a read-only profile. The worker would
+    /// spawn, edit nothing, and report success, and the gates would judge an
+    /// empty diff.
+    ///
+    /// The column counts `WorkerProfile {` struct literals in production
+    /// code, anchored to a line of its own: a return type (`-> WorkerProfile
+    /// {`) and the definition itself (`struct WorkerProfile {`) both contain
+    /// the same text and neither constructs anything. Measured without the
+    /// anchor this census reported five sites and three files.
+    #[test]
+    fn a_worker_profile_is_constructed_in_one_production_place_per_role() {
+        use std::collections::BTreeMap;
+
+        /// (file, `WorkerProfile {` literals, why).
+        const EXPECTED: &[(&str, usize, &str)] = &[
+            (
+                "src/engine/assembly.rs",
+                1,
+                "the implementer's profile, `permissions: Edit`. It was inline \
+                 in `coordinator.rs`, out of the schema-4 driver's reach; both \
+                 engines call it now",
+            ),
+            (
+                "src/review.rs",
+                1,
+                "the reviewer's profile, `permissions: ReadOnly`. \
+                 `PassBinding::profile` delegates here rather than repeating \
+                 the literal, so the two roles are two sites and not four",
+            ),
+        ];
+
+        let mut found: BTreeMap<String, usize> = BTreeMap::new();
+        for (path, code) in production_sources() {
+            let profiles = code
+                .lines()
+                .filter(|line| line.trim() == "WorkerProfile {")
+                .count();
+            if profiles > 0 {
+                found.insert(path, profiles);
+            }
+        }
+
+        let expected: BTreeMap<String, usize> = EXPECTED
+            .iter()
+            .map(|(path, n, _)| ((*path).to_owned(), *n))
+            .collect();
+        assert_eq!(
+            found, expected,
+            "a production site decides what a process may do. Two sites for \
+             one role is how an implementer gets spawned read-only"
+        );
+    }
+
+    /// **An observation about an attempt is classified in one production
+    /// place.**
+    ///
+    /// The companion to `a_command_is_assembled_in_one_production_place_per_role`,
+    /// and it pins the higher-stakes half. A command assembled twice runs the
+    /// wrong process; a *classification* made twice decides the wrong thing
+    /// about a task — `ladder::next_step` reads an `AttemptFailure` and chooses
+    /// retry, escalate, defer, park or fail from it, and **the allowance
+    /// decision is derived from the same field**. Two engines calling one diff
+    /// different things would not surface as a wrong answer. It would surface
+    /// as a task escalating to a pricier tier because the other engine
+    /// disagreed about what its diff was.
+    ///
+    /// Columns count the constructors of the two verdict types: `AttemptFailure`
+    /// and `ReviewRecord`. `src/engine/classify.rs` holds what was inline in
+    /// the legacy verification ladder. `src/engine/attempt.rs` keeps its count
+    /// for `review_failure`, which was **already a function** — a pure move of
+    /// something already callable is churn, not extraction — and `src/ladder.rs`
+    /// keeps its own for the escalation vocabulary it owns.
+    #[test]
+    fn an_observation_about_an_attempt_is_classified_in_one_production_place() {
+        use std::collections::BTreeMap;
+
+        /// (file, `AttemptFailure::new` calls, `ReviewPassOutcome::` uses, why).
+        const EXPECTED: &[(&str, usize, usize, &str)] = &[
+            (
+                "src/capacity.rs",
+                0,
+                1,
+                "reads an outcome to account for it. A reader, not a decider",
+            ),
+            (
+                "src/engine/attempt.rs",
+                8,
+                0,
+                "`review_failure`'s arms, the reviewer-unavailable mapping, \
+                 and the outcome-status classification. Already functions and \
+                 already reachable from the schema-4 driver, so they did not \
+                 move — a pure move of something already callable is churn. \
+                 `review_failure`'s own doc carries the rule the allowance \
+                 derivation rests on: a reviewer asking for a human `must not \
+                 spend an attempt or escalate`. Nine until the review-input \
+                 refusal moved to `classify`, which is where the driver reads \
+                 it from",
+            ),
+            (
+                "src/engine/classify.rs",
+                4,
+                3,
+                "what was INLINE in `run_attempt`'s verification ladder: the \
+                 diff's two observations and a failed gate, plus the three \
+                 arms that decide a review pass's outcome, plus the \
+                 review-input refusal the ladder's third cheap rung raises. \
+                 Both engines read these, and this is the only production site \
+                 that CONSTRUCTS a `ReviewPassOutcome`",
+            ),
+            (
+                "src/engine/coordinator.rs",
+                0,
+                1,
+                "reads an outcome while reporting. A reader",
+            ),
+            (
+                "src/export.rs",
+                0,
+                3,
+                "reads outcomes to export them. A reader",
+            ),
+        ];
+
+        let mut found: BTreeMap<String, (usize, usize)> = BTreeMap::new();
+        for (path, code) in production_sources() {
+            let failures = code.matches("AttemptFailure::new(").count();
+            let records = code.matches("ReviewPassOutcome::").count();
+            if failures + records > 0 {
+                found.insert(path, (failures, records));
+            }
+        }
+
+        let expected: BTreeMap<String, (usize, usize)> = EXPECTED
+            .iter()
+            .map(|(path, f, r, _)| ((*path).to_owned(), (*f, *r)))
+            .collect();
+        assert_eq!(
+            found, expected,
+            "a production site decides what an observation means about an \
+             attempt. A second site for an observation that already has one is \
+             two rules deciding one task's fate, and `ladder::next_step` and \
+             the allowance derivation both read the answer"
+        );
+    }
+
+    /// **The rung's allowance is counted in one production place, and decided
+    /// in another that everyone consults.**
+    ///
+    /// The fourth single-authority census, and it exists because the pair it
+    /// covers had already diverged. S5 round 2 found `TaskFold::attempts_on_rung`
+    /// incrementing on every `attempt_started` while `ladder::spends_allowance`
+    /// — documented as *"the single production implementation of the allowance
+    /// rule"*, total over `FailureKind` — decided the same question at the
+    /// settlement. Two production places for one rule, disagreeing on every
+    /// interruption, park and outage, against
+    /// `transaction_fault_matrix[T-ATTEMPT]`'s "unknown spend, **allowance
+    /// refunded**".
+    ///
+    /// The other three censuses were each written after a defect of exactly this
+    /// shape, and none of them covered *counting*: they cover which command a
+    /// role gets, what an observation means, which profile a role runs under,
+    /// and which ledger line an attempt writes. Repairing the divergence alone
+    /// would leave the pair free to diverge again on the next edit, which is the
+    /// difference between fixing an instance and closing a class.
+    ///
+    /// # The two columns
+    ///
+    /// **Writes** are **assignments through a receiver** — which is what makes a
+    /// site a decider of persisted state. There may be exactly the two in the
+    /// fold, the increment at the settlement and the reset the escalation
+    /// performs onto its new rung, and no others anywhere. A third is a second
+    /// counting rule.
+    ///
+    /// **Every assignment operator, not just `=`.** The needle was the literal
+    /// `".attempts_on_rung ="`, which does not match `+=` — the most idiomatic
+    /// form of the very thing this census counts. Measured by S5 round 4:
+    /// planting `ladder.attempts_on_rung += 1;` in a production function left
+    /// this census green. That is `PR7-R3-CENSUS-WRITE-DOMAIN-PROSE` one
+    /// operator over: the stated domain ("assignments through a receiver")
+    /// still exceeded the counted domain. [`receiver_writes`] counts the
+    /// compound forms too, and excludes `==`.
+    ///
+    /// **The construction default is deliberately outside this domain, and the
+    /// doc said otherwise until `PR7-R3-CENSUS-WRITE-DOMAIN-PROSE`.**
+    /// `TaskFold`'s `attempts_on_rung: 0` is a field initializer, not an
+    /// assignment, so the needle never matched it while this comment claimed
+    /// three sites and the table expected two. **A census whose stated domain is
+    /// wider than its counted domain fails open**: a second `TaskFold`
+    /// constructor with a non-zero default would move no count, and this
+    /// census's whole purpose is that a new writer cannot appear silently.
+    /// The domain is now stated as what it counts; widening it to constructors
+    /// is a separate needle and a separate claim.
+    ///
+    /// **Consults** are calls to `spends_allowance`. These are *expected* to be
+    /// plural: one rule consulted from several places is the shape this census
+    /// wants. What it forbids is the alternative — a caller that re-derives the
+    /// answer from a `SettlementTransition`, a `Next`, or an attempt number,
+    /// which is what `settle_failed` did before `FailureShape` existed and what
+    /// this fold did until round 2.
+    #[test]
+    fn the_rungs_allowance_is_counted_in_one_production_place() {
+        use std::collections::BTreeMap;
+
+        /// (file, `attempts_on_rung` writes, `spends_allowance` calls, why).
+        const EXPECTED: &[(&str, usize, usize, &str)] = &[
+            (
+                "src/events/mod.rs",
+                7,
+                0,
+                "**the legacy schema-3 progress tracker, and the reason this census exists rather than a bare repair.** It counts an attempt at its *start* and refunds by SUBTRACTION — five `saturating_sub` sites against one `saturating_add`, plus two resets. Each of those five is a place a future refund can be forgotten, which is the bug schema 4 shipped. **Recorded, not unified**: this is the legacy engine's own in-memory state, `invariants_preserved[1]` freezes its behaviour, and rewriting it would change the engine actually in production to tidy the one that is not. Zero consults is the finding in one number — the legacy engine never asks `spends_allowance`, because the rule was extracted FROM it",
+            ),
+            (
+                "src/topology/fold.rs",
+                2,
+                1,
+                "the only place schema 4 writes the count: one more at the settlement, and back to zero on the rung an escalation climbs onto. **No subtraction** — counting at the settlement makes T-ATTEMPT's refund the absence of a charge rather than a correction, which is the contrast with the seven sites above. The increment CONSULTS `spends_allowance` rather than answering for itself, and that is the whole of this census",
+            ),
+            (
+                "src/engine/topology/run.rs",
+                0,
+                2,
+                "TWO consults, both the same question about the one attempt the fold has not seen. The accepted-work arm returns `spends_allowance(None)` rather than a literal `true`; the failure arm adds this attempt to the rung before `next_step` runs, because `next_step` decides the transition the settlement will carry and the append has not happened yet. Consults, not a second rule, and no write",
+            ),
+            (
+                "src/engine/topology/settle.rs",
+                0,
+                1,
+                "`settle_failed` reads the allowance off the record rather than off the ladder's `Next` — the divergence `FailureShape`'s own doc records, on a park",
+            ),
+            (
+                "src/ladder.rs",
+                0,
+                1,
+                "the rule itself. `LadderState::attempts_on_rung` is a field this function reads, never one it writes",
+            ),
+        ];
+
+        // **The control is a corpus entry, not a side call.**
+        // `each_census_needle_covers_the_domain_its_doc_states` proves
+        // `receiver_writes` is right and proves **nothing** about whether this
+        // census calls it — measured: reverting the count below to the
+        // pre-repair literal `code.matches(".attempts_on_rung =")` left that
+        // unit test green, and left a closure-based self-check green too,
+        // because the revert bypasses the closure. A control only binds the
+        // census's own count if it travels through it, so this synthetic file
+        // joins the corpus and is expected in the table like any other: it
+        // carries **four** compound assignments — one from each shape the
+        // needle has had to grow to cover, `+= -=` and `|= <<=` — and one
+        // comparison, and expects 4. The pre-repair literal
+        // `.attempts_on_rung =` scores it **1** (it matches only the `==`), and
+        // the five-operator version scores it **2**. One compound assignment
+        // and one comparison would have scored 1 under both the literal and the
+        // correct needle, because the two errors cancel — measured, and the
+        // reason the control is shaped this way.
+        const SELF_CHECK: &str = "<self-check>";
+        let mut corpus = production_sources();
+        corpus.push((
+            SELF_CHECK.to_owned(),
+            "fn control() {\n    state.attempts_on_rung += 1;\n    state.attempts_on_rung -= 1;\n    \
+             state.attempts_on_rung |= 1;\n    state.attempts_on_rung <<= 1;\n    \
+             if state.attempts_on_rung == 1 {}\n}\n"
+                .to_owned(),
+        ));
+
+        let mut found: BTreeMap<String, (usize, usize)> = BTreeMap::new();
+        for (path, code) in corpus {
+            // **Assignments through a receiver**, which is what makes a site a
+            // *decider* of persisted state. `let attempts_on_rung = ...` in the
+            // driver is a local binding of a value it is about to pass, and
+            // counting it would make this census report the consult twice.
+            let writes = receiver_writes(&code, "attempts_on_rung");
+            let consults = code.matches("spends_allowance(").count();
+            if writes > 0 || consults > 0 {
+                found.insert(path, (writes, consults));
+            }
+        }
+        let expected: BTreeMap<String, (usize, usize)> = EXPECTED
+            .iter()
+            .map(|(path, w, c, _)| ((*path).to_owned(), (*w, *c)))
+            .chain(std::iter::once((SELF_CHECK.to_owned(), (4, 0))))
+            .collect();
+        assert_eq!(
+            found, expected,
+            "one production place counts the rung's allowance and one decides \
+             it. A second counting site is two rules deciding when an operator \
+             pays for a pricier tier, and the first one diverged silently for \
+             an entire slice"
+        );
+
+        // **And every settlement reaches that one place.** The table above
+        // counts *write sites*, which is what it was written for — but a write
+        // site nothing calls is a rule nothing applies, and that is exactly how
+        // the allowance broke on 2026-08-27: `candidate_prepared` became the
+        // sole successful settlement, the increment stayed behind in
+        // `apply_settlement`, and this census went on finding its one write and
+        // passing. A successful attempt spent nothing and nothing said so.
+        //
+        // Schema 4 has two settlement appliers — `apply_settlement` for a
+        // failure and `apply_candidate_prepared` for a success — and both must
+        // charge. Counting the calls is what makes a settlement that stops
+        // charging a failing census rather than a silent undercount.
+        let fold = std::fs::read_to_string("src/topology/fold.rs").expect("the fold reads");
+        let production = crate::effects::production_code(&fold);
+        let charges = crate::effects::census_domain::production_calls(
+            &production,
+            "self.charge_allowance",
+            crate::effects::census_domain::Call::Free,
+        );
+        assert_eq!(
+            charges, 2,
+            "`charge_allowance` is called {charges} time(s) in the fold's production \
+             region; schema 4 has two settlement appliers and each must charge the \
+             rung — a failure through `apply_settlement` and a success through \
+             `apply_candidate_prepared`"
+        );
+    }
+
+    /// **Each census needle covers the domain its doc states.**
+    ///
+    /// The class boundary for three findings of one shape, all measured
+    /// surviving in S5 round 4: a census whose **stated** domain is wider than
+    /// its **counted** domain fails open, and does so in the passing direction,
+    /// so nothing ever reports it. `PR7-R3-CENSUS-WRITE-DOMAIN-PROSE` was the
+    /// first instance and was repaired by narrowing the prose; these are the
+    /// same defect at three more needles, repaired by widening the needle,
+    /// because in each case the wider domain is the one the census is for.
+    ///
+    /// Unit assertions over the needles themselves, deliberately: the censuses
+    /// that use them are whole-tree and green, and a green whole-tree census is
+    /// exactly what a fail-open needle produces.
+    #[test]
+    fn each_census_needle_covers_the_domain_its_doc_states() {
+        // `receiver_writes`: every assignment form is a write, `==` is not, and
+        // a longer field name is not this field.
+        assert_eq!(receiver_writes("state.attempts = 1;", "attempts"), 1);
+        assert_eq!(
+            receiver_writes("state.attempts += 1;", "attempts"),
+            1,
+            "`+=` is the idiomatic increment and the form a second counting rule arrives in"
+        );
+        assert_eq!(receiver_writes("state.attempts -= 1;", "attempts"), 1);
+        for compound in ["*=", "/=", "%=", "&=", "|=", "^=", "<<=", ">>="] {
+            assert_eq!(
+                receiver_writes(&format!("state.attempts {compound} 1;"), "attempts"),
+                1,
+                "`{compound}` is one of Rust's ten compound assignment operators and this needle \
+                 does not see it, so a second counting rule written that way is invisible"
+            );
+        }
+        assert_eq!(receiver_writes("if state.attempts == 1 {}", "attempts"), 0);
+        assert_eq!(
+            receiver_writes("if state.attempts <= 1 {}", "attempts"),
+            0,
+            "a comparison is not a write, and `<=` is one byte from `<<=`"
+        );
+        assert_eq!(receiver_writes("if state.attempts >= 1 {}", "attempts"), 0);
+        assert_eq!(receiver_writes("state.attempts_total = 1;", "attempts"), 0);
+        assert_eq!(receiver_writes("let x = state.attempts;", "attempts"), 0);
+
+        // `stem_values`: a field initializer's value runs to the end of the
+        // statement rather than to the first comma...
+        let field = stem_values("Inputs { stem: format!(\"{i:02}-{}\", display_id), n: 1 }");
+        assert_eq!(field.len(), 1, "{field:?}");
+        assert!(
+            field[0].1.contains("display_id"),
+            "the value was truncated at the comma inside `format!`, so the site is skipped \
+             rather than judged: {:?}",
+            field[0].1
+        );
+
+        // ...and a `let` binding is a stem site too, which is the shape the one
+        // production site on the live legacy path uses.
+        let binding =
+            stem_values("let stem = format!(\"{i:02}-{}\", filename_component(task.id));\n");
+        assert_eq!(binding.len(), 1, "{binding:?}");
+        assert!(
+            binding[0].1.contains("task.id") && binding[0].1.contains("filename_component"),
+            "{:?}",
+            binding[0].1
+        );
+
+        // A different identifier that merely ends in `stem` is not one.
+        assert!(
+            stem_values("let file_stem = path.file_stem();").is_empty(),
+            "`file_stem` is not a filename stem built from a task id"
+        );
+    }
+
+    /// **A plan-authored id never reaches a filename unsanitised.**
+    ///
+    /// The sixth single-authority census, and the one with the sharpest
+    /// consequence. A task's `display_id` is whatever an `id=` annotation said —
+    /// `plan/markdown.rs`'s `assemble` takes `Some(explicit) => explicit`
+    /// verbatim, and `keys_by_display_id` checks only the reserved `repair-N-`
+    /// prefix and duplicates. It then becomes a `stem`, and a stem becomes
+    /// `dir.join(format!("{stem}.json"))` in every adapter's
+    /// `materialize_permissions`.
+    ///
+    /// `PR7-R3-ATTEMPT-001`: the schema-4 assembler took `display_id` **raw**
+    /// while `coordinator.rs:537`, the legacy authority it was extracted from,
+    /// wrote `format!("{index:02}-{}", util::filename_component(task.id.as_str()))`.
+    /// So `id=../../x` wrote outside the run directory. The extraction dropped a
+    /// **guard**, which is the one-rule-two-places class at its worst — a
+    /// dropped convenience is a bug, a dropped guard is a vulnerability.
+    ///
+    /// The census is on the **pairing**: wherever a `stem` is built from a
+    /// plan-authored id, `filename_component` appears in the same expression.
+    ///
+    /// **It is also on a count, and the two say different things.** This
+    /// paragraph used to end "that is what makes it survive a third assembler
+    /// being written, which a count could not" — and the control below is now
+    /// `assert_eq!(guarded + unguarded, 4)`, so a fourth *correctly guarded*
+    /// assembler fails this test. That is deliberate (a new site has to be read
+    /// once by a person, and a needle that quietly stops matching reads exactly
+    /// like a clean tree) but it is the opposite of what the sentence promised.
+    /// `R5-SETTLE-004`.
+    ///
+    /// **What the pairing cannot see, stated rather than left to be found**: a
+    /// site that rebinds the id one line earlier — `let id = task.id.to_string();`
+    /// and then a stem built from `id` — is not a site at all, so it never
+    /// enters either list and the count still reads 4. `coordinator.rs` already
+    /// carries a `let task_id = …` seven lines above the stem it builds, so the
+    /// shape is not hypothetical. Reaching it needs data flow, not a needle.
+    /// `R5-SETTLE-006`.
+    ///
+    /// `util::filename_component_neutralizes_hostile_names` is the other half —
+    /// it asserts `"unit/fast"` becomes `"unit-fast"` and that an all-dots
+    /// result becomes `"x"`, so `..` is neutralised. This census says the guard
+    /// is *reached*; that test says it *works*.
+    #[test]
+    fn a_plan_authored_id_never_reaches_a_filename_unsanitised() {
+        /// How this project spells a **plan-authored** task identifier. Both,
+        /// because both engines are live: schema 4 froze the annotation onto
+        /// `TaskEntry::display_id`, and the legacy coordinator — the path
+        /// `upstroke run` still drives — reads `task.id`. The census used to
+        /// name only the first, so the site the second one owns, which is the
+        /// site the extraction was copied *from*, was outside its domain.
+        const PLAN_AUTHORED: &[&str] = &["display_id", "task.id"];
+
+        // **The control is a corpus entry**, for the reason the allowance census
+        // above gives: a unit assertion on `stem_values` proves the helper and
+        // says nothing about whether this census walks the tree with it. This
+        // synthetic file is a guarded site of the exact shape the live legacy
+        // path uses — a `let` binding whose value runs past a comma — so a
+        // reader that matches only `stem:` initializers, or that truncates the
+        // value at the first comma, loses it and the site count below is 3
+        // rather than 4.
+        const SELF_CHECK: &str = "<self-check>";
+        let mut corpus = production_sources();
+        corpus.push((
+            SELF_CHECK.to_owned(),
+            "fn control() {\n    let stem = format!(\"{i:02}-{}\", \
+             filename_component(task.id));\n}\n"
+                .to_owned(),
+        ));
+
+        let mut unguarded: Vec<String> = Vec::new();
+        let mut guarded: Vec<String> = Vec::new();
+        for (path, code) in corpus {
+            for (at, value) in stem_values(&code) {
+                if !PLAN_AUTHORED.iter().any(|id| value.contains(id)) {
+                    continue;
+                }
+                let line = code[..at].matches('\n').count() + 1;
+                if value.contains("filename_component") {
+                    guarded.push(format!("{path}:{line}"));
+                } else {
+                    unguarded.push(format!("{path}:{line}"));
+                }
+            }
+        }
+        // The control comes first and counts **sites**, not guarded ones: a
+        // needle that stops matching must not read as a clean tree, and a site
+        // that loses its guard must be reported as unguarded rather than
+        // disappearing out of the count.
+        assert_eq!(
+            guarded.len() + unguarded.len(),
+            4,
+            "this tree has three production sites that build a filename stem from a \
+             plan-authored id — `coordinator.rs`'s `let stem = …` on the live legacy path and \
+             `assembly.rs`'s two field initializers — plus the `<self-check>` corpus entry, and \
+             the census found {} ({guarded:?}, {unguarded:?}). An equality rather than a floor, because a fourth site has to be \
+             read once by a person, and because a needle that quietly stops matching is how this \
+             census came to miss the legacy site entirely",
+            guarded.len() + unguarded.len()
+        );
+        assert!(
+            unguarded.is_empty(),
+            "these sites put a plan-authored `display_id` into a filename stem \
+             without `util::filename_component`, so an `id=` annotation \
+             containing a path separator or `..` reaches `std::fs::write`: \
+             {unguarded:?}"
+        );
+    }
+
+    /// **Every field of a reviewer's `WorkerProfile` is accounted for at both
+    /// callers.**
+    ///
+    /// The seventh single-authority census, and the one that closes the class
+    /// `PR7-R3-ATTEMPT-001` opened: **the extraction dropped something the
+    /// legacy caller supplied.** Three instances now — the sanitiser on a task
+    /// id (a **guard**), the reviewer's pool and the retry's pool (**values**) —
+    /// found one at a time by three different reviewers.
+    ///
+    /// # The field list comes from the type
+    ///
+    /// PR4's rule, and the reason this census cannot sprawl: the roll is
+    /// `crate::ir::WorkerProfile`'s own fields, not a list somebody thought of.
+    /// Adding a field to that struct fails this test until the new field is
+    /// given a cell, which is the property a census of "did we forget anything"
+    /// has to have to mean anything.
+    ///
+    /// # Three cells, and every field has exactly one
+    ///
+    /// - **Identical** — both callers supply the same value by the same route.
+    /// - **Differs, cited** — the callers legitimately disagree, and the cell
+    ///   carries the §-citation for why. `pool` is the model: §11.3/§13 make a
+    ///   cross-vendor second opinion draw on its own subscription, so it is
+    ///   looked up from the reviewer's agent rather than inherited.
+    /// - **Absent, cited** — neither caller sets it beyond the constructor's
+    ///   default, and the cell says what supplies it instead.
+    ///
+    /// A cell is prose and this test cannot check prose. What it checks is that
+    /// **the roll is complete** — that no field of the type is missing a cell —
+    /// which is exactly the failure all three instances share: nobody had
+    /// enumerated what the legacy caller supplies.
+    #[test]
+    fn a_reviewers_profile_is_accounted_for_at_both_callers() {
+        use std::collections::BTreeSet;
+
+        /// (field, cell).
+        const ROLL: &[(&str, &str)] = &[
+            (
+                "name",
+                "IDENTICAL — `ReviewPass::profile` builds `{lens}-{model}` for both.",
+            ),
+            (
+                "agent",
+                "IDENTICAL — the pass's own binding, at both callers.",
+            ),
+            (
+                "model",
+                "IDENTICAL — the pass's own binding, at both callers.",
+            ),
+            (
+                "pool",
+                "DIFFERS, CITED — §11.3/§13: a cross-vendor second opinion draws on a different                  subscription than the implementer, so the pool is looked up from the reviewer's                  OWN agent rather than inherited. `coordinator.rs` does this via `pool_name_for`;                  `assembly.rs` via `capacity::pool_for` over its frozen pool table. Same rule, two                  lookups, because the two callers hold the table differently. **This is the field                  the extraction dropped** — `assembly.rs` left the constructor's empty string, so                  a schema-4 reviewer drained a pool with no name (Sol, round 3).",
+            ),
+            (
+                "permissions",
+                "IDENTICAL — `PermissionMode::ReadOnly` from `profile_for`. A reviewer never                  writes, and neither caller overrides it.",
+            ),
+            (
+                "effort",
+                "DIFFERS, CITED — §10's review axis is separate from the implementation rungs.                  `coordinator.rs` passes `self.effort_policy.review`; `assembly.rs` passes                  `entry.ladder.effort.review`, the same policy frozen onto the entry. The values                  agree; the routes differ because a resumed run reads its policy from the record                  rather than from today's config.",
+            ),
+            (
+                "max_turns",
+                "ABSENT, CITED — `profile_for` leaves it `None` and neither caller sets it. A                  review pass is one shot with a pass timeout (`ReviewPlan::pass_timeout_secs`),                  not a turn budget.",
+            ),
+            (
+                "extra_args",
+                "ABSENT, CITED — `profile_for` leaves it empty and neither caller sets it. Extra                  arguments are an implementer affordance; a reviewer's command is assembled from                  its lens and its inputs.",
+            ),
+        ];
+
+        // The roll is checked against the TYPE, not against itself.
+        let ir = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/ir.rs"),
+        )
+        .expect("the ir source");
+        let start = ir
+            .find("pub struct WorkerProfile {")
+            .expect("`WorkerProfile` is declared in `src/ir.rs`");
+        // Past the declaration line: `pub struct WorkerProfile {` itself starts
+        // with `pub ` and would otherwise parse as a field.
+        let open = start + ir[start..].find('{').expect("an opening brace") + 1;
+        let body = &ir[open..open + ir[open..].find("\n}").expect("a closing brace")];
+        let fields: BTreeSet<String> = body
+            .lines()
+            .filter_map(|line| line.trim().strip_prefix("pub "))
+            .filter_map(|rest| rest.split(':').next())
+            .map(str::to_owned)
+            .collect();
+
+        assert!(
+            fields.len() >= 6,
+            "only {} fields parsed out of `WorkerProfile`, so this census is reading the wrong              thing: {fields:?}",
+            fields.len()
+        );
+
+        let rolled: BTreeSet<String> = ROLL.iter().map(|(f, _)| (*f).to_owned()).collect();
+        assert_eq!(
+            rolled, fields,
+            "the roll and `WorkerProfile`'s fields disagree. A field the type has and the roll              does not is a field nobody has asked whether both callers supply — which is how the              reviewer's `pool` was dropped by the extraction and found three rounds later"
+        );
+    }
+
     #[test]
     fn every_production_command_spec_payload_is_classified() {
         use std::collections::BTreeMap;
@@ -1808,12 +2649,18 @@ mod tests {
                  reaper's `/bin/ps` query on macOS. Neither is a CommandSpec",
             ),
             (
-                "src/engine/attempt.rs",
+                "src/engine/assembly.rs",
                 1,
                 0,
                 0,
                 "the worker's prompt: `CommandSpec::stdin` from \
-                 `AgentAdapter::stdin_payload`. The role grid carries it",
+                 `AgentAdapter::stdin_payload`. The role grid carries it. \
+                 **Moved from `src/engine/attempt.rs`**, same count, when the \
+                 worker's command assembly was lifted out of the legacy \
+                 engine so the schema-4 driver could be its second *caller* \
+                 rather than its second implementation. This census is the \
+                 evidence that the move preserved behaviour: it reported one \
+                 entry changing file and every other row identical",
             ),
             (
                 "src/gates.rs",
@@ -1857,14 +2704,7 @@ mod tests {
         ];
 
         let mut found: BTreeMap<String, (usize, usize, usize)> = BTreeMap::new();
-        let mut stripped = 0_usize;
-        for (relative, production) in production_sources() {
-            let kept: Vec<&str> = production
-                .lines()
-                .filter(|line| !line.trim_start().starts_with("//"))
-                .collect();
-            stripped += production.lines().count() - kept.len();
-            let code: String = kept.join("\n");
+        for (relative, code) in production_sources() {
             let counts = (
                 code.matches(".stdin(").count(),
                 code.matches(".env(").count(),
@@ -1883,14 +2723,12 @@ mod tests {
                 found.insert(relative, counts);
             }
         }
-        // The comment strip is a census over a file format that has comments,
-        // which is `PR4-CENSUS-COMMENT-ORACLE`'s class. Assert it removed
-        // something: a strip that silently stopped working would put every doc
-        // comment mentioning `.env(` back into the counts.
-        assert!(
-            stripped > 100,
-            "the comment strip removed {stripped} lines, so it is not working"
-        );
+        // `PR4-CENSUS-COMMENT-ORACLE`'s class — a census over a file format that
+        // has comments. The control that the blanking removed something is in
+        // `production_sources`, which every census here shares, rather than
+        // repeated four times: it asserts the regions hold strictly fewer
+        // non-whitespace bytes than the sources they came from, and a floor
+        // beneath which the counts would be over nothing.
 
         let expected: BTreeMap<String, (usize, usize, usize)> = EXPECTED
             .iter()

@@ -1420,20 +1420,29 @@ fn bounded(bytes: &[u8], limit: usize) -> (String, bool) {
 }
 
 // -- test-only declarations ----------------------------------------------
-// At the BOTTOM: `effects::production_region` cuts a source at its first
-// `#[cfg(test)]` (`PR5-R1-CFG-TEST-SHRINKS-THE-DOMAIN`).
+// At the BOTTOM: `effects::production_region`, which
+// `effects::externally_reachable_fns` and the three censuses further down this
+// file still use, cuts a source at its first `#[cfg(test)]`
+// (`PR5-R1-CFG-TEST-SHRINKS-THE-DOMAIN`).
 //
-// **The allow below is written ABOVE `#[cfg(test)]`, and that order is
-// load-bearing.** `runner::tests::production_region` is line-based: it excludes
-// a test module by matching a line that is exactly `#[cfg(test)]` followed by a
-// line starting `mod `, so an attribute between the two makes this whole test
+// **The allow below is written ABOVE `#[cfg(test)]`. That order used to be
+// load-bearing and is now a convention.** The reader that made it load-bearing
+// was `runner::tests::production_region`, which was line-based: it excluded a
+// test module by matching a line that is exactly `#[cfg(test)]` followed by a
+// line starting `mod `, so an attribute between the two made this whole test
 // region read as PRODUCTION and both
 // `every_production_runner_request_is_built_by_its_roles_builder` and
-// `every_production_command_spec_payload_is_classified` fail with these
+// `every_production_command_spec_payload_is_classified` failed with these
 // fixtures counted as production call sites. Measured in repair round F1 and
-// filed as `PR6F1-RUNNER-PRODUCTION-REGION-BREAKS-ON-AN-ATTRIBUTE`;
-// `effects::is_module_level` skips further attributes before requiring `mod`,
-// so this order satisfies both readers.
+// filed as `PR6F1-RUNNER-PRODUCTION-REGION-BREAKS-ON-AN-ATTRIBUTE`.
+//
+// **That reader is deleted.** `effects::production_code`, which those censuses
+// share now, finds the item's extent by delimiter matching, so it removes this
+// module with the attribute in either position — measured both ways on this
+// file. The order is kept because it is the one `effects::is_module_level`
+// reads without relying on its skip-further-attributes step, and because with
+// the allow written below `#[cfg(test)]` it becomes part of the configured
+// item and is blanked along with it.
 //
 // Allowlist placement: the **funnel section** of `effects/allowlist.toml`, by
 // attachment to `src/runner/container.rs`. It covers this file's TEST REGION
@@ -1468,7 +1477,65 @@ mod tests {
     use crate::topology::registry::TaskKey;
 
     const RUN_ID: &str = "01KZRN48A4ZK3AEDST3RJ8HMA4";
-    const REPO_KEY: &str = "0123456789abcdef";
+    /// This module's repository key: **the build slot's**, through the one
+    /// place that derives it.
+    ///
+    /// The derivation and the reason it is not a constant moved to
+    /// [`crate::runner::container::fake::slot_repo_key`], beside the pre-clean it is a
+    /// precondition of. It lived here, and `census/tests.rs` — the other caller
+    /// of `fake::preclean_names` — went on using a fixed `"cccccccccccccccc"`,
+    /// which is `PR7-R3-CONTRACT-001` still live on that path. A rule with one
+    /// implementation per caller is a rule each caller can be missing.
+    fn repo_key() -> &'static str {
+        crate::runner::container::fake::slot_repo_key()
+    }
+
+    /// **A pre-clean reclaims its own slot's residue and nobody else's.**
+    ///
+    /// The class boundary, not the instance. `PR7-R3-CONTRACT-001` is that
+    /// `fake::preclean_names` kills by name with no liveness check, and a
+    /// *fixed* name means the container it kills may be a live stranger's.
+    ///
+    /// **A liveness check would not have fixed it.** The state this helper
+    /// exists for is a SIGKILLed run whose container is still *running*, so
+    /// "don't kill running ones" defeats the helper. The fix is that two
+    /// concurrent runs never ask for the same name, and this asserts that
+    /// property rather than the instance that prompted it.
+    #[test]
+    fn a_container_name_is_scoped_to_its_build_slot() {
+        use crate::runner::container::fake::scoped_repo_key;
+
+        let slot2 = scoped_repo_key("/mnt/ramtarget/slot2");
+        let slot3 = scoped_repo_key("/mnt/ramtarget/slot3");
+
+        assert_ne!(
+            slot2, slot3,
+            "two build slots share a repository key, so their container names \
+             collide and each run's pre-clean kills the other's container"
+        );
+        assert_eq!(
+            slot2,
+            scoped_repo_key("/mnt/ramtarget/slot2"),
+            "the key is not stable for one slot, so a pre-clean cannot match the \
+             residue its own previous run left — the only thing it is for"
+        );
+        for (scope, key) in [
+            ("/mnt/ramtarget/slot2", &slot2),
+            ("/mnt/ramtarget/slot3", &slot3),
+            ("", &scoped_repo_key("")),
+        ] {
+            assert!(
+                key.len() == 16 && key.chars().all(|c| c.is_ascii_hexdigit()),
+                "`{scope}` derives `{key}`, which is not the sixteen hex \
+                 characters `workspace_manager::REPO_KEY_HEX_CHARS` requires"
+            );
+        }
+        assert_eq!(
+            repo_key(),
+            scoped_repo_key(&std::env::var("CARGO_TARGET_DIR").unwrap_or_default()),
+            "the cached key is not this process's own scope's"
+        );
+    }
     const INCARNATION_1: &str = "01KZTAAAAAAAAAAAAAAAAAAAAA";
     const INCARNATION_2: &str = "01KZTBBBBBBBBBBBBBBBBBBBBB";
     const IMAGE_ID: &str =
@@ -1695,7 +1762,7 @@ mod tests {
             .expect("the container namespace");
 
             let execution_root =
-                crate::workspace_manager::execution_root_of(&private_root, REPO_KEY, RUN_ID);
+                crate::workspace_manager::execution_root_of(&private_root, repo_key(), RUN_ID);
             let task_a = execution_root.join("tasks").join("kalpha-g0");
             let task_b = execution_root.join("tasks").join("kbeta-g0");
             let merge = execution_root.join("merge").join("s0");
@@ -1712,7 +1779,7 @@ mod tests {
                     run_id: RUN_ID.to_owned(),
                     run_dir: paths.public.clone(),
                     incarnation: INCARNATION_1.to_owned(),
-                    repo_key: REPO_KEY.to_owned(),
+                    repo_key: repo_key().to_owned(),
                 },
                 runtime: Runtime::new(trace.clone(), exit_on_start),
                 trace,
@@ -2493,7 +2560,7 @@ mod tests {
             let fixture = Fixture::new(&format!("mismatch-{phase}"), true);
             let runner = fixture.runner();
             let request = build(&fixture);
-            let name = ContainerName::new(REPO_KEY, RUN_ID, INCARNATION_1, &request.invocation)
+            let name = ContainerName::new(repo_key(), RUN_ID, INCARNATION_1, &request.invocation)
                 .expect("a name");
             fixture
                 .runtime
@@ -2613,7 +2680,7 @@ mod tests {
             // And the error the classification builds carries it in its variant
             // rather than in prose.
             let name =
-                ContainerName::new(REPO_KEY, RUN_ID, INCARNATION_1, invocation).expect("a name");
+                ContainerName::new(repo_key(), RUN_ID, INCARNATION_1, invocation).expect("a name");
             let error = got.error(&name, OTHER_IMAGE_ID, IMAGE_ID);
             assert_eq!(
                 matches!(error, UpstrokeError::Refused { .. }),
@@ -2716,7 +2783,7 @@ mod tests {
         let runner = fixture.runner();
         let invocation = shell_probe_id();
         let name =
-            ContainerName::new(REPO_KEY, RUN_ID, INCARNATION_1, &invocation).expect("a name");
+            ContainerName::new(repo_key(), RUN_ID, INCARNATION_1, &invocation).expect("a name");
 
         host::run_shell_probe(
             &runner,
@@ -2819,7 +2886,7 @@ mod tests {
             });
             let runner = fixture.runner();
             let name =
-                ContainerName::new(REPO_KEY, RUN_ID, INCARNATION_1, &invocation).expect("a name");
+                ContainerName::new(repo_key(), RUN_ID, INCARNATION_1, &invocation).expect("a name");
 
             // The observation is a spawn, not an inspection: `non_goals[2]` is
             // "non-spawn shell/CLI presence inspection", and the container was
@@ -3271,7 +3338,7 @@ mod tests {
             Duration::from_secs(10),
             worker_id(0),
         );
-        let name = ContainerName::new(REPO_KEY, RUN_ID, INCARNATION_1, &request.invocation)
+        let name = ContainerName::new(repo_key(), RUN_ID, INCARNATION_1, &request.invocation)
             .expect("a name");
 
         let output = runner
@@ -3378,7 +3445,7 @@ mod tests {
             worker_id(0),
         );
         request.timeout = Duration::ZERO;
-        let name = ContainerName::new(REPO_KEY, RUN_ID, INCARNATION_1, &request.invocation)
+        let name = ContainerName::new(repo_key(), RUN_ID, INCARNATION_1, &request.invocation)
             .expect("a name");
 
         let output = runner
@@ -3543,8 +3610,9 @@ mod tests {
                     Duration::from_secs(10),
                     worker_id(2),
                 );
-                let name = ContainerName::new(REPO_KEY, RUN_ID, INCARNATION_1, &request.invocation)
-                    .expect("a name");
+                let name =
+                    ContainerName::new(repo_key(), RUN_ID, INCARNATION_1, &request.invocation)
+                        .expect("a name");
                 fixture
                     .runtime
                     .fake()
@@ -3588,8 +3656,9 @@ mod tests {
                     Duration::from_secs(10),
                     worker_id(4),
                 );
-                let name = ContainerName::new(REPO_KEY, RUN_ID, INCARNATION_1, &request.invocation)
-                    .expect("a name");
+                let name =
+                    ContainerName::new(repo_key(), RUN_ID, INCARNATION_1, &request.invocation)
+                        .expect("a name");
                 let mut hooks = RecordingHooks::new(fixture.trace.clone());
                 crate::runner::container::reclaim(
                     &mut hooks,
@@ -3753,8 +3822,9 @@ mod tests {
                     Duration::from_secs(10),
                     worker_id(0),
                 );
-                let name = ContainerName::new(REPO_KEY, RUN_ID, INCARNATION_1, &request.invocation)
-                    .expect("a name");
+                let name =
+                    ContainerName::new(repo_key(), RUN_ID, INCARNATION_1, &request.invocation)
+                        .expect("a name");
 
                 let refusal = runner
                     .run(&request)
@@ -3977,7 +4047,7 @@ mod tests {
                 Duration::from_secs(10),
                 worker_id(0),
             );
-            let name = ContainerName::new(REPO_KEY, RUN_ID, INCARNATION_1, &request.invocation)
+            let name = ContainerName::new(repo_key(), RUN_ID, INCARNATION_1, &request.invocation)
                 .expect("a name");
             let view = view_dir(&fixture.private_root, &name);
             let intent = name.intent_path(&fixture.private_root);
@@ -4492,7 +4562,7 @@ mod tests {
         .expect("a container policy");
 
         let execution_root =
-            crate::workspace_manager::execution_root_of(&fixture.private_root, REPO_KEY, RUN_ID);
+            crate::workspace_manager::execution_root_of(&fixture.private_root, repo_key(), RUN_ID);
         // One hostile workspace per category, each written from the type that
         // owns that path rather than read back out of `Confinement`.
         let hostile: Vec<(Withheld, PathBuf)> = vec![
@@ -4590,7 +4660,7 @@ mod tests {
         let fixture = Fixture::new("exec-root", true);
         let runner = fixture.runner();
         let execution_root =
-            crate::workspace_manager::execution_root_of(&fixture.private_root, REPO_KEY, RUN_ID);
+            crate::workspace_manager::execution_root_of(&fixture.private_root, repo_key(), RUN_ID);
         // `decisions.workspace_candidates.manager`: "tasks/k<key>-g<gen>,
         // merge/s<seq>", plus `snapshots`.
         let namespaces: Vec<PathBuf> = vec![
@@ -4707,7 +4777,7 @@ mod tests {
         assert_eq!(all.len(), 5, "all five roles");
         let mut expected: Vec<(String, String)> = Vec::new();
         for request in &all {
-            let name = ContainerName::new(REPO_KEY, RUN_ID, INCARNATION_1, &request.invocation)
+            let name = ContainerName::new(repo_key(), RUN_ID, INCARNATION_1, &request.invocation)
                 .expect("a name");
             expected.push((name.as_str().to_owned(), request.invocation.render()));
             runner.run(request).expect("runs");
@@ -4735,7 +4805,7 @@ mod tests {
                 fixture.paths.public
             );
             assert_eq!(record.incarnation, INCARNATION_1);
-            assert_eq!(record.repo_key, REPO_KEY);
+            assert_eq!(record.repo_key, repo_key());
             assert_eq!(
                 &record.invocation, expected_invocation,
                 "`{name}` carries another invocation's record"
@@ -4809,9 +4879,9 @@ mod tests {
         let fixture = Fixture::new("intent-capability", false);
         let root = fixture.private_root.clone();
         let mine =
-            ContainerName::new(REPO_KEY, RUN_ID, INCARNATION_1, &worker_id(0)).expect("a name");
+            ContainerName::new(repo_key(), RUN_ID, INCARNATION_1, &worker_id(0)).expect("a name");
         let other =
-            ContainerName::new(REPO_KEY, RUN_ID, INCARNATION_1, &worker_id(1)).expect("a name");
+            ContainerName::new(repo_key(), RUN_ID, INCARNATION_1, &worker_id(1)).expect("a name");
 
         // (1a) Absent: the proof cannot be minted at all.
         let refusal = crate::runner::container::intent::IntentWritten::certify(&root, &mine)
@@ -4976,8 +5046,9 @@ mod tests {
                     Duration::from_secs(10),
                     worker_id(0),
                 );
-                let name = ContainerName::new(REPO_KEY, RUN_ID, INCARNATION_1, &request.invocation)
-                    .expect("a name");
+                let name =
+                    ContainerName::new(repo_key(), RUN_ID, INCARNATION_1, &request.invocation)
+                        .expect("a name");
                 let mut runner = fixture.runner();
                 match point {
                     Where::View => runner = runner.with_view(Box::new(FailingView)),
@@ -5465,7 +5536,7 @@ mod tests {
             run_id: run_id.to_owned(),
             run_dir: paths.public,
             incarnation: INCARNATION_1.to_owned(),
-            repo_key: REPO_KEY.to_owned(),
+            repo_key: repo_key().to_owned(),
         }
     }
 
@@ -5843,7 +5914,7 @@ mod tests {
         let identity = real_identity(&root, &repo_dir, run_id);
         let paths = RunPaths::with_private_root(&repo_dir, run_id, &identity.private_root);
         let execution_root =
-            crate::workspace_manager::execution_root_of(&identity.private_root, REPO_KEY, run_id);
+            crate::workspace_manager::execution_root_of(&identity.private_root, repo_key(), run_id);
         let mine = execution_root.join("tasks").join("kalpha-g0");
         let sibling = execution_root.join("tasks").join("kbeta-g0");
         repo::worktree(&repo_dir, &mine, &head);
@@ -5980,7 +6051,7 @@ mod tests {
         let (head, _) = repo::repository(&repo_dir);
         let identity = real_identity(&root, &repo_dir, run_id);
         let execution_root =
-            crate::workspace_manager::execution_root_of(&identity.private_root, REPO_KEY, run_id);
+            crate::workspace_manager::execution_root_of(&identity.private_root, repo_key(), run_id);
         let mine = execution_root.join("tasks").join("kalpha-g0");
         repo::worktree(&repo_dir, &mine, &head);
 
@@ -6113,7 +6184,7 @@ mod tests {
         let (head, _) = repo::repository(&repo_dir);
         let identity = real_identity(&root, &repo_dir, run_id);
         let execution_root =
-            crate::workspace_manager::execution_root_of(&identity.private_root, REPO_KEY, run_id);
+            crate::workspace_manager::execution_root_of(&identity.private_root, repo_key(), run_id);
         let mine = execution_root.join("tasks").join("kalpha-g0");
         repo::worktree(&repo_dir, &mine, &head);
 
@@ -6139,6 +6210,25 @@ mod tests {
         );
         let plan = runner.plan(&request).expect("plans");
         let name = plan.launch.name.clone();
+
+        // Pre-clean before the create, not after the teardown.
+        //
+        // `reviews/FINDINGS.md` §16: `LeaveNoResidue` above is correct and
+        // cannot help, because no in-process cleanup runs when the process is
+        // SIGKILLed. Every component of this name is fixed — `repo_key()`, the
+        // run id from `GATED_RUNS`, `INCARNATION_1`, and `gate_id(0)`'s
+        // deterministic invocation hash — so the name a previous SIGKILLed run
+        // left behind is exactly the name this `docker create` is about to ask
+        // for. The recurrence is what makes the pre-clean meaningful.
+        crate::runner::container::fake::preclean_names(
+            docker.as_ref(),
+            &RoleGitView::new(ContainerTrace::off()).for_reader(
+                BoundaryLayout::DEFAULT_GIT_VIEW,
+                BoundaryLayout::DEFAULT_GIT_OBJECTS,
+            ),
+            &identity.private_root,
+            &[&name],
+        );
 
         // Write the intent, materialise the view, create — and stop there.
         // The view is the runner's own projection rather than a bare directory:
@@ -6302,7 +6392,7 @@ mod tests {
         let (head, _) = repo::repository(&repo_dir);
         let identity = real_identity(&root, &repo_dir, run_id);
         let execution_root =
-            crate::workspace_manager::execution_root_of(&identity.private_root, REPO_KEY, run_id);
+            crate::workspace_manager::execution_root_of(&identity.private_root, repo_key(), run_id);
         let mine = execution_root.join("tasks").join("kalpha-g0");
         repo::worktree(&repo_dir, &mine, &head);
 
@@ -6460,7 +6550,7 @@ mod tests {
         let planted = repo::engine_refs(&repo_dir, &head);
         let identity = real_identity(&root, &repo_dir, run_id);
         let execution_root =
-            crate::workspace_manager::execution_root_of(&identity.private_root, REPO_KEY, run_id);
+            crate::workspace_manager::execution_root_of(&identity.private_root, repo_key(), run_id);
         let workspace = execution_root.join("tasks").join("kalpha-g0");
         repo::worktree(&repo_dir, &workspace, &head);
         repo::git_ok(&repo_dir, &["pack-refs", "--all"]);

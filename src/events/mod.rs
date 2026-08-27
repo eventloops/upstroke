@@ -640,6 +640,36 @@ pub enum AttemptTransition {
 }
 
 impl AttemptRecord {
+    /// Whether this record says the attempt **succeeded**.
+    ///
+    /// **One definition, read by both of the fold's settlement doors.** "The
+    /// attempt succeeded" is not `failure.is_none()`: a record can carry no
+    /// failure and still hold a review whose outcome is `Failed` or
+    /// `Unavailable`, both of which are authoritative — §11.2 requires every
+    /// configured pass to pass, and a reviewer that could not run "says nothing
+    /// about the code", which is not the same as approving it.
+    ///
+    /// `check_candidate_prepared` enforced only the failure field and
+    /// `check_attempt_finished` enforced neither, so each door checked a
+    /// different half of the same question and a record with a `Failed` review
+    /// was promoted, charged and queued as a candidate. The `b1f54a5` review
+    /// walked it. This is the same "one derivation, not two" that the rung
+    /// allowance needed: the doors now ask one predicate rather than each
+    /// deciding for itself.
+    #[must_use]
+    pub fn is_successful(&self) -> bool {
+        self.failure.is_none() && self.reviews.iter().all(|pass| pass.outcome.passed())
+    }
+
+    /// Whether this record says the attempt **failed**.
+    ///
+    /// The complement, named rather than written as `!is_successful()` at each
+    /// call site, so that a settlement door reads the question it is asking.
+    #[must_use]
+    pub fn is_failed(&self) -> bool {
+        !self.is_successful()
+    }
+
     /// Total review spend for this attempt, or `None` when nothing reported any
     /// — which is not the same as nothing costing anything (§13: the Copilot
     /// route reports no spend at all).
@@ -733,6 +763,57 @@ pub struct FailureRecord {
     pub kind: FailureKind,
     pub origin: FailureOrigin,
     pub reason: String,
+    /// What the next attempt is told, verbatim — §11.4's feedback.
+    ///
+    /// **The durable half of [`crate::ladder::AttemptFailure::feedback`]**, which
+    /// is "a gate log tail (§11.1) or the reviewer's `required_changes` (§11.2),
+    /// verbatim". `reason` is the human-facing summary — `gate \`fmt\` failed:
+    /// exit 1` — and a retry given only that is asked to guess what the gate
+    /// printed. This field is what it actually printed.
+    ///
+    /// **Additive and optional so `SCHEMA_VERSION` does not move.** A line
+    /// written before this field existed reads back as `None` and folds
+    /// unchanged. Deliberately *not* `skip_serializing_if`: schema 4's strict
+    /// door (`refusals[24]`) proves exactness by re-encoding a decoded record
+    /// and comparing keys, and its own documentation rests on no embedded
+    /// record using that attribute.
+    ///
+    /// Written at exactly one place — `engine::classify::attempt_record`, which
+    /// is the one production construction of an [`AttemptRecord`] **for an
+    /// attempt that reached a settlement**; `InterruptedAttempt::event` below builds the
+    /// other, for an attempt that started and never reported back, and sets
+    /// this to `None` because nothing judged it. Read by `TopologyRun`'s brief,
+    /// which derives §11.4's accumulated feedback from the log rather than from
+    /// a counter only the live path incremented.
+    ///
+    /// The unqualified sentence was corrected on `classify::attempt_record` in
+    /// the commit that added this field, and written again here in the same
+    /// commit — one copy fixed, one copy created. The 2026-08-26 re-review of
+    /// `c2c0294` found it, finding C.
+    ///
+    /// **And which caller writes it is not a property of this field.**
+    /// `classify::FeedbackCarrier` decides, because the builder is shared with
+    /// the legacy coordinator and the two engines answer differently. A
+    /// sentence here that named one engine would be the §22c class again.
+    /// `decisions/2026-08-26-durable-retry-feedback.md` is the Class C
+    /// authorization for this field and states its bounds.
+    #[serde(default)]
+    pub detail: Option<String>,
+}
+
+impl FailureRecord {
+    /// The two fields that decide what this failure cost.
+    ///
+    /// The durable half of [`crate::ladder::FailureShape`]: a settlement holds
+    /// a record rather than the live failure, and the allowance decision is
+    /// the same decision either way.
+    #[must_use]
+    pub const fn shape(&self) -> crate::ladder::FailureShape {
+        crate::ladder::FailureShape {
+            kind: self.kind,
+            origin: self.origin,
+        }
+    }
 }
 
 /// What the next attempt is told. Carried on the ladder events rather than on
@@ -989,6 +1070,10 @@ impl InterruptedAttempt {
                     reason: "the engine stopped while this attempt was running; whatever it \
                              spent is unknown and nothing judged the result"
                         .to_owned(),
+                    // Nothing produced feedback: the process died before any
+                    // gate ran or any reviewer read the diff, which is the same
+                    // reason `reviews` and `cost_usd` above are empty.
+                    detail: None,
                 }),
             }),
         }
@@ -2792,6 +2877,7 @@ mod tests {
             kind: FailureKind::GateFailed,
             origin: FailureOrigin::Worker,
             reason: "failed".to_owned(),
+            detail: None,
         });
         let error = replay(
             vec![
@@ -2896,6 +2982,7 @@ mod tests {
                 kind,
                 origin,
                 reason: "special failure".to_owned(),
+                detail: None,
             });
             *recorded_transition = transition;
             *recorded_parking = parking;
@@ -2932,6 +3019,7 @@ mod tests {
             kind: FailureKind::GateFailed,
             origin: FailureOrigin::Worker,
             reason: "failed".to_owned(),
+            detail: None,
         });
         *prepared_commit = None;
         let mut approval = question("q-spend", "t1");
@@ -3475,6 +3563,7 @@ mod tests {
                 },
                 origin: FailureOrigin::Worker,
                 reason: "settled".to_owned(),
+                detail: None,
             });
             *prepared_commit = None;
             *recorded = Some(Box::new(transition.clone()));
@@ -3536,6 +3625,7 @@ mod tests {
             kind: FailureKind::GateFailed,
             origin: FailureOrigin::Worker,
             reason: "failed without a session".to_owned(),
+            detail: None,
         });
         *prepared_commit = None;
         *transition = Some(Box::new(AttemptTransition::Retry(LadderRetry {
@@ -3584,6 +3674,7 @@ mod tests {
             kind: FailureKind::ReviewInputTooLarge,
             origin: FailureOrigin::Reviewer,
             reason: "too large".to_owned(),
+            detail: None,
         });
         *prepared_commit = None;
         *parking = Some(Box::new(AttemptParking {

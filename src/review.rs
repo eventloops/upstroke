@@ -307,26 +307,67 @@ impl ReviewPlan {
         ))
     }
 
-    /// The ordered passes for one task, given the binding the implementer is
-    /// actually running on.
-    ///
-    /// Two rules meet here, and the order matters:
-    ///
-    /// 1. A task with a configured second opinion keeps its primary reviewer
-    ///    **unrebound**. Rebinding it would let both passes resolve to the same
-    ///    different-family model, and Anthropic-written code would lose its
-    ///    Anthropic review entirely — strictly worse than the self-review the
-    ///    rebind exists to prevent.
-    /// 2. Otherwise the primary rebinds when it would be the *same model* that
-    ///    wrote the code. Exact `(agent, model)` equality, not family
-    ///    similarity: `claude-sonnet-5` reviewed by `claude-opus-5` is a
-    ///    genuine second look, and rebinding it would spend cross-vendor
-    ///    capacity on half the tasks in a run for no verification gain.
+    /// The ordered passes for the task at `index`. See [`passes_for`].
     pub fn passes_for(&self, index: usize, implementer: &PassBinding) -> Vec<ReviewPass> {
-        let Some(primary) = self.primary.clone() else {
+        passes_for(ReviewBindings::of_plan(self, index), implementer)
+    }
+}
+
+/// The three bindings pass selection actually reads, for one task.
+///
+/// **Ask for what you read.** [`passes_for`] consumes exactly `primary`,
+/// `alternative` and this task's `second_opinion` — never the enabled flag, the
+/// timeout, or the other tasks' entries. Naming that as a type is what lets one
+/// rule serve two shapes: a schema-3 [`ReviewPlan`] indexed by task position,
+/// and a schema-4 [`crate::topology::registry::FrozenTaskSpec`] that resolved
+/// its own second opinion at freeze time. The alternative was a driver-side
+/// re-derivation of the rebind rule, and `wrong_internal_assumption` is 48.3%
+/// of this project's classified findings — a second implementation of a rule
+/// with two interacting cases is exactly the shape that produces them.
+#[derive(Debug, Clone, Copy)]
+pub struct ReviewBindings<'a> {
+    /// The reviewer configured for every task in the run.
+    pub primary: Option<&'a PassBinding>,
+    /// The anti-self-review fallback, where the run retained one.
+    pub alternative: Option<&'a PassBinding>,
+    /// This task's §11.3 second opinion, where its paths asked for one.
+    pub second_opinion: Option<&'a PassBinding>,
+}
+
+impl<'a> ReviewBindings<'a> {
+    /// The run-level plan's answer for the task at `index`.
+    #[must_use]
+    pub fn of_plan(plan: &'a ReviewPlan, index: usize) -> Self {
+        Self {
+            primary: plan.primary.as_ref(),
+            alternative: plan.alternative.as_ref(),
+            second_opinion: plan.second_opinion.get(index).and_then(Option::as_ref),
+        }
+    }
+}
+
+/// The ordered passes for one task, given the binding the implementer is
+/// actually running on.
+///
+/// Two rules meet here, and the order matters:
+///
+/// 1. A task with a configured second opinion keeps its primary reviewer
+///    **unrebound**. Rebinding it would let both passes resolve to the same
+///    different-family model, and Anthropic-written code would lose its
+///    Anthropic review entirely — strictly worse than the self-review the
+///    rebind exists to prevent.
+/// 2. Otherwise the primary rebinds when it would be the *same model* that
+///    wrote the code. Exact `(agent, model)` equality, not family similarity:
+///    `claude-sonnet-5` reviewed by `claude-opus-5` is a genuine second look,
+///    and rebinding it would spend cross-vendor capacity on half the tasks in a
+///    run for no verification gain.
+#[must_use]
+pub fn passes_for(bindings: ReviewBindings<'_>, implementer: &PassBinding) -> Vec<ReviewPass> {
+    {
+        let Some(primary) = bindings.primary.cloned() else {
             return Vec::new();
         };
-        if let Some(second) = self.second_opinion.get(index).and_then(Option::as_ref) {
+        if let Some(second) = bindings.second_opinion {
             return vec![
                 ReviewPass {
                     lens: Lens::Acceptance,
@@ -338,7 +379,7 @@ impl ReviewPlan {
                 },
             ];
         }
-        let binding = match &self.alternative {
+        let binding = match bindings.alternative {
             Some(alt) if primary == *implementer => alt.clone(),
             _ => primary,
         };
@@ -469,13 +510,49 @@ pub fn plan_for(
     Ok(resolved)
 }
 
+/// What a review pass reads about the task under review.
+///
+/// **Three fields, and [`ReviewCx`] used to take a whole `ir::Task` to reach
+/// them.** `materialize_prompt` — the only thing in this module's review path
+/// that touches the task at all — quotes the title, the body and the acceptance
+/// criteria, and nothing else.
+///
+/// The wider field could not be shared. The schema-4 driver holds a
+/// `FrozenTaskSpec` from the frozen registry and no `ir::Task` anywhere:
+/// synthesising one would mean inventing an id, a kind and a dependency list
+/// the reviewer never reads, and a conversion that fabricates fields is free to
+/// drift from the plan it claims to represent. Asking for what is read removes
+/// the question — the same narrowing `OpenGeneration` made for the rebuild
+/// family, and for the same reason.
+#[derive(Debug, Clone, Copy)]
+pub struct ReviewSubject<'a> {
+    /// The task's one-line title.
+    pub title: &'a str,
+    /// Its body, which may be empty.
+    pub body: &'a str,
+    /// Its acceptance criteria, which may be empty.
+    pub acceptance: &'a [String],
+}
+
+impl<'a> ReviewSubject<'a> {
+    /// The subject of a legacy plan's task.
+    #[must_use]
+    pub fn of(task: &'a Task) -> Self {
+        Self {
+            title: &task.title,
+            body: &task.body,
+            acceptance: &task.acceptance,
+        }
+    }
+}
+
 pub struct ReviewCx<'a> {
     pub adapter: &'a dyn AgentAdapter,
     pub profile: WorkerProfile,
     /// Which pass this is (§11.5). Decides the prompt preamble and the names of
     /// this review's artifacts on disk.
     pub lens: Lens,
-    pub task: &'a Task,
+    pub task: ReviewSubject<'a>,
     pub diff: &'a str,
     /// Artifacts the reviewer should judge against (conventions brief first).
     pub artifacts: &'a [(String, String)],
@@ -839,7 +916,7 @@ fn materialize_prompt(cx: &ReviewCx<'_>) -> Result<String, UpstrokeError> {
         );
     } else {
         prompt.push_str("Acceptance criteria (every one must hold):\n");
-        for item in &task.acceptance {
+        for item in task.acceptance {
             let _ = writeln!(prompt, "- {item}");
         }
         prompt.push('\n');
@@ -1323,7 +1400,7 @@ mod tests {
                 adapter: &adapter,
                 profile: profile_for("unavailable-test", "test-model", "review", Effort::High),
                 lens: Lens::Acceptance,
-                task: &task,
+                task: ReviewSubject::of(&task),
                 diff: "diff --git a/a.rs b/a.rs\n+++ b/a.rs\n+fn x() {}\n",
                 artifacts: &[],
                 decisions: &[],
@@ -1502,7 +1579,7 @@ mod tests {
             adapter: &crate::agent::claude::ClaudeCodeAdapter,
             profile: profile_for("claude-code", "claude-opus-5", "review", Effort::High),
             lens: Lens::Acceptance,
-            task: &task,
+            task: ReviewSubject::of(&task),
             diff: "+++ b/src/api.rs\n+fn encode() {}\n",
             artifacts: &[],
             decisions: &[],
@@ -1540,7 +1617,7 @@ mod tests {
             adapter: &crate::agent::claude::ClaudeCodeAdapter,
             profile: profile_for("claude-code", "claude-opus-5", "review", Effort::High),
             lens: Lens::Acceptance,
-            task: &task,
+            task: ReviewSubject::of(&task),
             diff: "+++ b/src/api.rs\n+fn encode() {}\n",
             artifacts: &[],
             decisions: &decisions,
@@ -1587,7 +1664,7 @@ mod tests {
             adapter: &crate::agent::claude::ClaudeCodeAdapter,
             profile: profile_for("claude-code", "claude-opus-5", "review", Effort::High),
             lens: Lens::Acceptance,
-            task: &task,
+            task: ReviewSubject::of(&task),
             diff: "+++ b/src/api.rs\n+fn encode() {}\n",
             artifacts: &artifacts,
             decisions: &[],
@@ -1627,7 +1704,7 @@ mod tests {
             adapter: &crate::agent::claude::ClaudeCodeAdapter,
             profile: profile_for("claude-code", "claude-opus-5", "review", Effort::High),
             lens: Lens::Acceptance,
-            task: &task,
+            task: ReviewSubject::of(&task),
             diff: &broad,
             artifacts: &[],
             decisions: &[],
@@ -1651,7 +1728,7 @@ mod tests {
             adapter: &NeverInvokedAdapter,
             profile: profile_for("claude-code", "claude-opus-5", "review", Effort::High),
             lens: Lens::Acceptance,
-            task: &task,
+            task: ReviewSubject::of(&task),
             diff: &huge,
             artifacts: &[],
             decisions: &[],
@@ -1678,7 +1755,7 @@ mod tests {
             adapter: &NeverInvokedAdapter,
             profile: profile_for("claude-code", "claude-opus-5", "review", Effort::High),
             lens: Lens::Acceptance,
-            task: &task,
+            task: ReviewSubject::of(&task),
             diff: opaque,
             artifacts: &[],
             decisions: &[],
@@ -1703,7 +1780,7 @@ mod tests {
             adapter: &NeverInvokedAdapter,
             profile: profile_for("claude-code", "claude-opus-5", "review", Effort::High),
             lens: Lens::Acceptance,
-            task: &task,
+            task: ReviewSubject::of(&task),
             diff: gitlink,
             artifacts: &[],
             decisions: &[],
@@ -1757,7 +1834,7 @@ mod tests {
             adapter: &adapter,
             profile: profile_for("deadline-test", "test-model", "review", Effort::High),
             lens: Lens::Acceptance,
-            task: &task,
+            task: ReviewSubject::of(&task),
             diff: "diff --git a/a.rs b/a.rs\n+++ b/a.rs\n+fn x() {}\n",
             artifacts: &[],
             decisions: &[],
@@ -1804,7 +1881,7 @@ mod tests {
             adapter: &adapter,
             profile: profile_for("deadline-test", "test-model", "review", Effort::High),
             lens: Lens::Acceptance,
-            task: &task,
+            task: ReviewSubject::of(&task),
             diff: "diff --git a/a.rs b/a.rs\n+++ b/a.rs\n+fn x() {}\n",
             artifacts: &[],
             decisions: &[],
@@ -1859,7 +1936,7 @@ mod tests {
             adapter: &crate::agent::claude::ClaudeCodeAdapter,
             profile: profile_for("claude-code", "claude-opus-5", "review", Effort::High),
             lens: Lens::Acceptance,
-            task: &task,
+            task: ReviewSubject::of(&task),
             diff,
             artifacts: &[("brief".to_owned(), "Use ``` for code.".to_owned())],
             decisions: &[],
@@ -2296,7 +2373,7 @@ mod tests {
                 Effort::High,
             ),
             lens: Lens::SecondOpinion,
-            task: &task,
+            task: ReviewSubject::of(&task),
             diff: "+++ b/src/api.rs\n+fn encode() {}\n",
             artifacts: &[],
             decisions: &[],

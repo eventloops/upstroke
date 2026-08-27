@@ -2840,6 +2840,375 @@ fn every_barrier_step_is_reachable_and_named() {
 }
 
 // ---------------------------------------------------------------------------
+// T-APPEND: the kill rows, and the two shapes only a raw mutation can build
+// ---------------------------------------------------------------------------
+//
+// `T-APPEND`'s `boundary` splits into kill cases — (w) bytes partially written,
+// (u) the full line written but not yet synced, (s) synced — and error-return
+// cases. The error-return halves belong to the emit path and live with it in
+// `src/engine/topology/emit.rs`, which as a `TOPOLOGY_MODULE` may name neither
+// `std::process::Command` nor a raw `std::fs` mutation. The kill halves need
+// both: a kill is `std::process::abort` and its claim is what a process that
+// runs **no** cleanup leaves durable, and "a line lost before the barrier"
+// needs the loss to be real. So they are here, beside the kill apparatus this
+// file already has, and they reuse [`kill_at`] rather than growing a second
+// one.
+//
+// **What "recovery matches the row" is measured as.** These logs are
+// `defer_wait_elapsed` lines, which the checked fold refuses before a
+// `run_started` — so the assertion is over [`TopologyFold::parse_log`], the
+// barrier's own step-(5) parser, and over the *whole event vector* rather than
+// any projection of it. That is what recovery consumes, so equality of vectors
+// is stronger than equality of anything derived from them, not weaker.
+
+/// Hash rather than length: a one-character edit does not move a length, and
+/// "the surviving prefix is the before-append one" is a claim about bytes.
+fn digest_of(bytes: &[u8]) -> String {
+    format!("{:x}", Sha256::digest(bytes))
+}
+
+/// A durable before-append prefix, and the events it replays to.
+///
+/// `topology_line(7)` rather than `topology_line(1)`: the kill helper appends
+/// round 1, so a seed of round 1 would make "the line that survived" and "the
+/// line that was already there" the same bytes, and every assertion below
+/// would hold for the wrong reason.
+fn seeded_prefix(tag: &str) -> (PathBuf, Vec<u8>, Vec<TopologyEvent>) {
+    let path = log_path(tag);
+    let mut warnings = Vec::new();
+    let mut log = EventLog::open(EventSite::OpenLog, &path, &mut warnings).expect("open");
+    log.append_topology(EventSite::Append, &topology_line(7))
+        .expect("the before-append prefix");
+    drop(log);
+    let bytes = fs::read(&path).expect("the seeded log");
+    let events = TopologyFold::parse_log(&bytes).expect("the seed replays");
+    (path, bytes, events)
+}
+
+/// What the log would hold if the killed append had committed.
+fn after_append_events(before: &[TopologyEvent]) -> Vec<TopologyEvent> {
+    let mut events = before.to_vec();
+    events.push(topology_event(1));
+    events
+}
+
+/// T-APPEND (w): "bytes partially written (torn tail: no terminating
+/// newline)". `durable_state` is "the previous prefix (an unterminated final
+/// line is not an event: the newline is the commit marker)", and
+/// `resume_action` is "`Event.OpenLog` truncates an unterminated final line
+/// before taking the append handle … only then does recovery follow the fault
+/// row of the surviving prefix (before-append …)".
+#[test]
+fn torn_tail_truncated_on_open_and_recovery_matches_before_append_row() {
+    let (path, before, before_events) = seeded_prefix("torn-before-append-row");
+
+    // A real process death inside the write, in the torn half of `Written`'s
+    // kill entry.
+    let killed = kill_at("written-torn", SubEffectPoint::Written, &path);
+    assert!(
+        killed.len() > before.len(),
+        "the child died before it wrote anything, so there is no torn tail to truncate"
+    );
+    assert!(
+        !killed.ends_with(b"\n"),
+        "a torn tail has no commit marker: {}",
+        String::from_utf8_lossy(&killed[before.len()..])
+    );
+
+    // The open normalizes it, before it takes the append handle.
+    let mut warnings = Vec::new();
+    let log = EventLog::open(EventSite::OpenLog, &path, &mut warnings).expect("open");
+    drop(log);
+
+    let survived = fs::read(&path).expect("the log after the open");
+    assert_eq!(
+        digest_of(&survived),
+        digest_of(&before),
+        "the surviving prefix is not the before-append one"
+    );
+    assert_eq!(
+        TopologyFold::parse_log(&survived).expect("the surviving prefix replays"),
+        before_events,
+        "recovery would follow the after-append order for a line that was never committed"
+    );
+    assert!(
+        warnings
+            .iter()
+            .any(|warning| warning.contains("never finished being written")),
+        "the truncation is reported: {warnings:?}"
+    );
+    // And the two rows really differ, so the assertion above is a choice.
+    assert_ne!(before_events, after_append_events(&before_events));
+}
+
+/// T-APPEND (u): "the full line written but not yet synced". `durable_state`
+/// is "**either** the previous prefix or the prefix incl. the line, decided by
+/// what survives at the next open", and `authoritative_state` is "exactly the
+/// durable prefix; the adjacent effect's fault row applies to **whichever
+/// prefix survived**".
+///
+/// So the assertion is deliberately a disjunction *plus* a statement of which
+/// arm this machine produced. A test that asserted only the arm would be
+/// asserting a durability guarantee the packet does not make; one that asserted
+/// only the disjunction would pass for a log that lost the whole prefix.
+#[test]
+fn unsynced_line_recovery_matches_whichever_prefix_survived() {
+    let (path, _before, before_events) = seeded_prefix("unsynced-whichever");
+    let after_events = after_append_events(&before_events);
+    assert_ne!(before_events, after_events, "the two rows must differ");
+
+    let killed = kill_at("written-complete", SubEffectPoint::Written, &path);
+    assert!(
+        killed.ends_with(b"\n"),
+        "the complete-unsynced shape is the whole line, commit marker included"
+    );
+
+    let mut warnings = Vec::new();
+    let log = EventLog::open(EventSite::OpenLog, &path, &mut warnings).expect("open");
+    drop(log);
+    let survived = fs::read(&path).expect("the log after the open");
+    let recovered = TopologyFold::parse_log(&survived).expect("the surviving prefix replays");
+
+    assert!(
+        recovered == before_events || recovered == after_events,
+        "recovery followed neither row: {recovered:?}"
+    );
+    assert_eq!(
+        recovered, after_events,
+        "on this machine the line survived the kill, so recovery follows the after-append order"
+    );
+    assert!(
+        warnings.is_empty(),
+        "a complete line is not a torn tail and nothing was truncated: {warnings:?}"
+    );
+    assert_eq!(
+        digest_of(&survived),
+        digest_of(&killed),
+        "the open changed a prefix that was already at a commit marker"
+    );
+}
+
+/// T-APPEND (s): "synced". `durable_state` is "the prefix incl. the line" with
+/// no disjunction, which is the whole difference from (u) — and the reason
+/// this is a separate test rather than a second cell of the one above.
+#[test]
+fn synced_line_recovery_matches_after_append_row() {
+    let (path, before, before_events) = seeded_prefix("synced-after-append-row");
+    let after_events = after_append_events(&before_events);
+
+    let killed = kill_at("synced", SubEffectPoint::Synced, &path);
+    assert!(killed.ends_with(b"\n"));
+    assert!(killed.len() > before.len());
+
+    let mut warnings = Vec::new();
+    let log = EventLog::open(EventSite::OpenLog, &path, &mut warnings).expect("open");
+    drop(log);
+    let survived = fs::read(&path).expect("the log after the open");
+
+    assert_eq!(
+        TopologyFold::parse_log(&survived).expect("the surviving prefix replays"),
+        after_events,
+        "a synced line is not 'either prefix'"
+    );
+    assert_ne!(
+        TopologyFold::parse_log(&survived).expect("replays"),
+        before_events,
+        "recovery followed the before-append row for a line that was made durable"
+    );
+    assert!(warnings.is_empty(), "{warnings:?}");
+}
+
+/// `stable_prefix_barrier`: "a line an earlier process wrote but never synced
+/// or whose sync reported failure" is made durable by the barrier's own
+/// `SyncPrefix`, and thereafter "a line the barrier synced **cannot be reverted
+/// by a later loss**".
+///
+/// Two crashes, which is what makes the claim more than a restatement of the
+/// previous test: the first leaves the line unsynced, the barrier syncs it, and
+/// the second crash — a torn write on top of it — does not take it away.
+#[test]
+fn unsynced_line_made_durable_by_barrier_survives_later_power_loss() {
+    let (path, _before, before_events) = seeded_prefix("barrier-durability");
+    let after_events = after_append_events(&before_events);
+
+    // Crash one: the complete-unsynced shape.
+    let unsynced = kill_at("written-complete", SubEffectPoint::Written, &path);
+    assert!(unsynced.ends_with(b"\n"));
+    let full = unsynced.len() as u64;
+
+    // The barrier's step (2): the whole surviving prefix — including that
+    // line — is successfully synced by the reopening process.
+    let mut witness = Witness::default().recording_durability();
+    let mut warnings = Vec::new();
+    let log = EventLog::open_hooked(EventSite::OpenLog, &path, &mut warnings, &mut witness)
+        .expect("open");
+    drop(log);
+    assert_eq!(
+        witness.file_syncs(),
+        vec![full],
+        "the open synced the surviving prefix at its full length"
+    );
+    assert!(witness.steps().contains(&DurableStep::SyncedFile));
+
+    // Crash two, on top of the now-durable prefix: a torn write that the next
+    // open truncates away.
+    let torn = kill_at("written-torn", SubEffectPoint::Written, &path);
+    assert!(
+        !torn.ends_with(b"\n"),
+        "the second crash left no commit marker"
+    );
+    assert!(torn.len() > unsynced.len());
+
+    let mut warnings = Vec::new();
+    let log = EventLog::open(EventSite::OpenLog, &path, &mut warnings).expect("open");
+    drop(log);
+    let survived = fs::read(&path).expect("the log after the second open");
+
+    assert_eq!(
+        digest_of(&survived),
+        digest_of(&unsynced),
+        "the barrier-synced prefix did not survive the second crash"
+    );
+    assert_eq!(
+        TopologyFold::parse_log(&survived).expect("the surviving prefix replays"),
+        after_events,
+        "the line the barrier made durable was reverted by a later loss"
+    );
+    assert_ne!(before_events, after_events);
+}
+
+/// `stable_prefix_barrier`: "the barrier makes no claim about lines lost before
+/// it — a line no effect ever depended on may still be lost and then converges
+/// to the before-append order of its fault row **precisely because nothing
+/// acted on it**".
+///
+/// The loss has to be real, which is why this test is here rather than beside
+/// the emit path: nothing in any funnel removes a committed line, so the only
+/// way to model a power loss that drops an unsynced write is to truncate the
+/// file directly. It happens **before** any open, so no process ever saw the
+/// line, let alone acted on it.
+#[test]
+fn unsynced_line_lost_before_barrier_converges_to_before_append_order() {
+    let (path, before, before_events) = seeded_prefix("unsynced-lost");
+    let after_events = after_append_events(&before_events);
+
+    let unsynced = kill_at("written-complete", SubEffectPoint::Written, &path);
+    assert!(unsynced.ends_with(b"\n"), "the line reached the file");
+    assert!(unsynced.len() > before.len());
+
+    // The loss: the unsynced tail is gone, and no process has opened the log
+    // since the crash — so nothing has been authorized by that line, which is
+    // the premise the convergence rests on.
+    fs::OpenOptions::new()
+        .write(true)
+        .open(&path)
+        .expect("open for truncation")
+        .set_len(before.len() as u64)
+        .expect("the unsynced tail is lost");
+
+    let mut warnings = Vec::new();
+    let log = EventLog::open(EventSite::OpenLog, &path, &mut warnings).expect("open");
+    drop(log);
+    let survived = fs::read(&path).expect("the log after the open");
+
+    assert_eq!(digest_of(&survived), digest_of(&before));
+    assert_eq!(
+        TopologyFold::parse_log(&survived).expect("the surviving prefix replays"),
+        before_events,
+        "a lost line still steered recovery"
+    );
+    assert!(
+        warnings.is_empty(),
+        "a lost line is not a torn tail: {warnings:?}"
+    );
+
+    // The control. The identical fixture, with the loss removed, converges to
+    // the *other* row — so the assertion above is about the loss and not about
+    // a fixture that could only ever produce one answer.
+    let (kept_path, _, kept_before) = seeded_prefix("unsynced-kept");
+    let kept = kill_at("written-complete", SubEffectPoint::Written, &kept_path);
+    assert!(kept.ends_with(b"\n"));
+    let mut warnings = Vec::new();
+    let log = EventLog::open(EventSite::OpenLog, &kept_path, &mut warnings).expect("open");
+    drop(log);
+    assert_eq!(
+        TopologyFold::parse_log(&fs::read(&kept_path).expect("log")).expect("replays"),
+        after_append_events(&kept_before),
+        "without the loss the same fixture must reach the after-append order"
+    );
+    assert_ne!(before_events, after_events);
+}
+
+/// `stable_prefix_barrier`: an unstable reread "performs none of those effects:
+/// the write command ends … **the run is NoRunFinished and resumable, and the
+/// next resume re-establishes the barrier from (a0)**".
+///
+/// `an_unstable_reread_refuses_naming_prove_prefix_stable_and_hands_out_no_handle`
+/// covers the three clauses of the proof and the naming. What is asserted here
+/// is the other half of the same sentence, and it is the half a refusal that
+/// "repaired" the log would fail: nothing was done, and the next barrier over
+/// the same path holds.
+#[test]
+fn unstable_reread_after_open_sync_refuses_resumably() {
+    let path = log_path("unstable-resumable");
+    let committed = topology_line(3);
+    let mut warnings = Vec::new();
+    let mut log = EventLog::open(EventSite::OpenLog, &path, &mut warnings).expect("open");
+    log.append_topology(EventSite::Append, &committed)
+        .expect("a committed prefix");
+    drop(log);
+    let synced = fs::read(&path).expect("log");
+    assert!(!synced.is_empty());
+
+    // The reread differs from the prefix synced at open, which is the only
+    // thing the proof is about.
+    let mut rewriter = Rewrite::after_sync(&path, b"");
+    let error = establish_stable_prefix(&path, inputs(), None, &mut warnings, &mut rewriter)
+        .expect_err("an unstable reread authorizes nothing");
+    assert_eq!(error.step, BarrierStep::ProvePrefixStable);
+    assert!(
+        error.to_string().contains("the run is resumable"),
+        "the refusal says so in the words the packet uses: {error}"
+    );
+
+    // Nothing was done *by the refusal*: the log is exactly what the rewrite
+    // left, neither restored nor repaired.
+    assert_eq!(
+        fs::read(&path).expect("the log after the refusal"),
+        Vec::<u8>::new(),
+        "the refusal touched the log"
+    );
+
+    // Resumable. The next barrier over the same path holds and hands out both
+    // halves — which is what "the next resume re-establishes the barrier"
+    // means, and what a refusal that had left a half-truncated file would not
+    // allow.
+    let mut prefix =
+        establish_stable_prefix(&path, inputs(), None, &mut warnings, &mut NoEventHooks)
+            .expect("the next resume establishes the barrier");
+    assert!(prefix.bytes().is_empty());
+    assert_eq!(prefix.log().opened_at(), EventSite::OpenLog);
+    assert_eq!(prefix.log().poisoned_at(), None);
+
+    // The control. The identical bytes, with the rewrite removed, get *past*
+    // step (4) and refuse at step (5) instead — these fixture lines need a
+    // `run_started` the frozen inputs do not describe. So the refusal above was
+    // caused by the instability rather than by anything the fixture would have
+    // refused anyway, which is the one thing a single-cell refusal test cannot
+    // otherwise tell.
+    let untouched = log_path("unstable-resumable-control");
+    fs::write(&untouched, &synced).expect("seed");
+    let control =
+        establish_stable_prefix(&untouched, inputs(), None, &mut warnings, &mut NoEventHooks)
+            .expect_err("these lines are refused by the checked fold, not by the proof");
+    assert_eq!(
+        control.step,
+        BarrierStep::CheckedReplay,
+        "with the reread stable the proof passes and the barrier reaches the replay"
+    );
+}
+
+// ---------------------------------------------------------------------------
 // Structure
 // ---------------------------------------------------------------------------
 
@@ -2910,6 +3279,17 @@ fn the_event_log_is_written_in_exactly_one_module() {
     );
 }
 
+/// One scanned path, as `FOLD_MENTIONS` writes it: relative to the manifest
+/// directory and slash-separated, so one literal reads on every platform.
+fn relative_slashed(path: &Path) -> String {
+    path.strip_prefix(env!("CARGO_MANIFEST_DIR"))
+        .unwrap_or(path)
+        .components()
+        .map(|component| component.as_os_str().to_string_lossy())
+        .collect::<Vec<_>>()
+        .join("/")
+}
+
 /// The barrier is the **only** path by which a topology write command obtains a
 /// fold from an existing log.
 ///
@@ -2919,14 +3299,80 @@ fn the_event_log_is_written_in_exactly_one_module() {
 /// that entitlement a convention rather than a mechanism. This is that sentence
 /// as a count over the whole crate.
 ///
-/// Two hazards are handled rather than tripped over. `PR4-CENSUS-COMMENT-ORACLE`:
-/// comments are stripped, and the strip is asserted to have removed something.
-/// And a census whose regions collapse to nothing counts zero and reads as
-/// "nobody does this", so the control below asserts the scan really did reach
-/// the files that mention the fold at all.
+/// Four hazards are handled rather than tripped over, and each has an assertion
+/// of its own in the body rather than a sentence here — a docstring that claims
+/// a control is not a control, which is what this paragraph used to be.
+///
+/// * `PR4-CENSUS-COMMENT-ORACLE`. The regions come from
+///   [`crate::effects::production_code`], which blanks comments **and string
+///   literals**, and `the_blanking_this_census_depends_on_is_live` below asserts
+///   that the blanking removed prose naming the very token counted here. The
+///   `//`-only strip this census used before saw neither a `/* … */` nor a
+///   `const CFG_TEST_ATTR: &str = "#[cfg(test)]";`, and either one collapsed a
+///   whole production file's region to nothing.
+/// * **A region that stops at `#[cfg(test)] mod tests;`.** Thirteen files in
+///   this tree declare their tests that way, and everything below such a
+///   declaration is legal production code that a truncating region cannot see.
+///   `production_code` removes the item and keeps the rest of the file.
+/// * **A skip derived from prose.** The whole-file test modules are read out of
+///   the **blanked** source, and every declaration is asserted to resolve to a
+///   file that exists: a `// … #[cfg(test)] mod policy;` in a comment otherwise
+///   derives a skip for a real production module.
+/// * **A scan that collapses.** The control below asserts the scan really did
+///   reach the files that mention the fold at all, and a floor on the total
+///   non-whitespace bytes scanned catches the case where every region is empty
+///   and the file count alone still passes.
 #[test]
 fn the_stable_prefix_barrier_is_the_only_way_a_log_becomes_a_topology_fold() {
     const FOLD_ENTRIES: &[&str] = &["TopologyFold::replay(", "TopologyFold::parse_log("];
+
+    // The control: every production region that **names** the fold at all.
+    //
+    // A list rather than a count, and the reason is a merge hazard rather than
+    // a readability one. As a count, each module that starts naming the fold
+    // bumped the same number — so two independent changes that each add one
+    // module both write the same new value, the merge takes it once, and the
+    // census silently ends up expecting fewer regions than it scans. That is
+    // wrong in the direction that **weakens** the control: a scan whose regions
+    // collapsed would then be indistinguishable from a correct one, and its
+    // zero counts below would prove nothing. A list merges additively, and when
+    // it does disagree it names the file.
+    //
+    // Slash-separated and relative to the manifest directory, so the literals
+    // read the same on Windows, where the walk produces `\`.
+    //
+    // Sorted, asserted sorted, and asserted duplicate-free: an entry appended in
+    // the wrong place, or twice by two merges, fails here rather than passing.
+    const FOLD_MENTIONS: &[&str] = &[
+        // PR7's candidate pipeline. Holds a fold, builds none from bytes.
+        "src/engine/topology/candidate.rs",
+        // PR7's schema-4 creator. It holds a fold across P5b and P6 because
+        // `emit` puts `plan_transition` before the commit record and
+        // `apply_delta` after the append.
+        "src/engine/topology/create.rs",
+        // PR7's emit path. It holds a fold and appends to a log and builds
+        // neither from bytes — it obtains one from `establish_stable_prefix` —
+        // so it names the type without adding to `callers` below.
+        "src/engine/topology/emit.rs",
+        // This funnel: `establish_stable_prefix` is the one place a log becomes
+        // a fold.
+        // PR7's selection and settlement halves. Both read a fold; neither
+        // builds one from bytes.
+        // PR7's recovery order. Reads a fold; builds none from bytes.
+        "src/engine/topology/recover.rs",
+        // PR7's driver. Holds the fold `RunHandle` handed it and reads it to
+        // select; builds none from bytes, because the one it holds is the one
+        // the barrier proved and a second derivation would be a rule that can
+        // disagree with the first.
+        "src/engine/topology/run.rs",
+        "src/engine/topology/select.rs",
+        "src/engine/topology/settle.rs",
+        "src/events/log.rs",
+        // ST-14's bounded reachability census over fold states.
+        "src/topology/census.rs",
+        // The fold itself.
+        "src/topology/fold.rs",
+    ];
     let src = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
     let funnel = src.join("events").join("log.rs");
 
@@ -2947,58 +3393,58 @@ fn the_stable_prefix_barrier_is_the_only_way_a_log_becomes_a_topology_fold() {
     // Whole files the crate declares under `#[cfg(test)]` are test code with no
     // production half at all, and treating them as production would count a
     // fixture as a second path. The set is read out of the declarations rather
-    // than guessed from a filename convention.
-    let test_modules: BTreeSet<PathBuf> = files
-        .iter()
-        .flat_map(|path| {
-            let source = fs::read_to_string(path).expect("a source file");
-            let parent = path.parent().expect("a source file has a directory");
-            let stem = path.file_stem().expect("a source file has a name");
-            let dir = if stem == "mod" || stem == "lib" || stem == "main" {
-                parent.to_path_buf()
-            } else {
-                parent.join(stem)
-            };
-            source
-                .split("#[cfg(test)]")
-                .skip(1)
-                .filter_map(|rest| {
-                    let declaration = rest.trim_start();
-                    let name = declaration.strip_prefix("mod ")?;
-                    let name = name.split(';').next()?.trim();
-                    (!name.is_empty() && !name.contains('{')).then(|| {
-                        [
-                            dir.join(format!("{name}.rs")),
-                            dir.join(name).join("mod.rs"),
-                        ]
-                    })
-                })
-                .flatten()
-                .collect::<Vec<_>>()
-        })
-        .collect();
+    // than guessed from a filename convention — and out of the **blanked**
+    // source, because a declaration written inside a comment is prose. Measured
+    // on this tree before the repair: the raw split derived 50 skip paths of
+    // which 34 named no file at all, and one `//` line was enough to remove a
+    // real production module from this census's domain.
+    // Through the shared resolver. This loop stood here, in `runner::tests`
+    // and — as a *third*, different rule — in `recover::tests`, which keyed on
+    // the file name and covered fourteen of the seventeen. `PR7-R5-ATT-001`.
+    let test_modules: BTreeSet<PathBuf> =
+        crate::effects::census_domain::whole_file_test_modules(&files, 13);
     assert!(
         test_modules.contains(&src.join("events").join("log").join("tests.rs")),
         "this file is declared `#[cfg(test)] mod tests;` and the scan has to know it: {test_modules:?}"
     );
 
     let mut scanned = 0_usize;
-    let mut mentioning = 0_usize;
+    let mut scanned_bytes = 0_usize;
+    let mut mentioning: Vec<String> = Vec::new();
     let mut callers: Vec<(PathBuf, &str, usize)> = Vec::new();
     for path in &files {
         if test_modules.contains(path) {
             continue;
         }
         let source = fs::read_to_string(path).expect("a source file");
-        let stripped = strip_comments(&source);
-        // A file with no inline `#[cfg(test)]` is production in full.
-        let production = match stripped.find("#[cfg(test)]") {
-            Some(end) => &stripped[..end],
-            None => stripped.as_str(),
-        };
+        // The whole file, comments and string literals blanked and every
+        // `#[cfg(test)]` item removed — not a truncation at the first one.
+        let production = crate::effects::production_code(&source);
+        let dense = production
+            .as_bytes()
+            .iter()
+            .filter(|byte| !byte.is_ascii_whitespace())
+            .count();
+        // Per file, because the aggregate floor below cannot see one region
+        // collapsing: it stands at 750,000 against an actual over 900,000, so a
+        // file may empty itself and the sum still clears the bar. A region that
+        // is empty answers "nobody calls the fold" for that file no matter what
+        // the file contains.
+        //
+        // **Necessary, not sufficient.** It sees a region that collapses, not
+        // one that is replaced: `PR7-R2C-CHAR-LITERAL-DESYNC`'s refined form
+        // removes the forged lines and adds a probe of the same size, and
+        // measured a zero-byte delta. `effects::char_literal_end` and
+        // `configured_item_end`'s give-up direction are what close that.
+        assert!(
+            dense > 0,
+            "{}'s region is empty, so it contributes nothing to the counts below",
+            path.display()
+        );
         scanned += 1;
+        scanned_bytes += dense;
         if production.contains("TopologyFold") {
-            mentioning += 1;
+            mentioning.push(relative_slashed(path));
         }
         for entry in FOLD_ENTRIES {
             let count = production.matches(entry).count();
@@ -3009,11 +3455,42 @@ fn the_stable_prefix_barrier_is_the_only_way_a_log_becomes_a_topology_fold() {
     }
 
     assert!(scanned > 40, "the walk found only {scanned} source files");
+    // And the regions were not empty. A file count alone passes with every
+    // region collapsed to nothing, which is precisely what a `#[cfg(test)]` in a
+    // comment used to do to one.
+    assert!(
+        scanned_bytes > 750_000,
+        "the {scanned} regions hold {scanned_bytes} non-whitespace bytes between them, so the \
+         counts below are over almost nothing"
+    );
+
+    let mut sorted = FOLD_MENTIONS.to_vec();
+    sorted.sort_unstable();
     assert_eq!(
-        mentioning, 3,
-        "the control: `TopologyFold` is named in the production half of the fold, its census and \
-         this funnel. A different number means the regions this census scanned are not the ones \
-         it thinks they are, and its zero counts would prove nothing"
+        FOLD_MENTIONS,
+        &sorted[..],
+        "`FOLD_MENTIONS` is compared sorted, so it has to be written sorted"
+    );
+    let repeated: Vec<&&str> = FOLD_MENTIONS
+        .iter()
+        .filter(|path| FOLD_MENTIONS.iter().filter(|other| other == path).count() > 1)
+        .collect();
+    assert!(
+        repeated.is_empty(),
+        "`FOLD_MENTIONS` names {repeated:?} twice — the shape two merges of the same addition \
+         produce, and the one a length comparison would report as a bare number"
+    );
+    mentioning.sort();
+    assert_eq!(
+        mentioning,
+        FOLD_MENTIONS
+            .iter()
+            .map(|path| (*path).to_owned())
+            .collect::<Vec<_>>(),
+        "the control: exactly these production regions name `TopologyFold`. A module missing from \
+         the list is one nobody classified; a module in the list that no longer appears means the \
+         regions this census scanned are not the ones it thinks they are, and its zero counts \
+         below would prove nothing"
     );
 
     assert_eq!(
@@ -3026,13 +3503,27 @@ fn the_stable_prefix_barrier_is_the_only_way_a_log_becomes_a_topology_fold() {
     );
 
     // And that one place is inside the barrier, not merely inside this file.
-    let barrier = {
-        let source = strip_comments(&fs::read_to_string(&funnel).expect("the funnel"));
-        let start = source
-            .find("pub fn establish_stable_prefix(")
-            .expect("the barrier is still here");
-        source[start..].to_owned()
-    };
+    //
+    // The slice ends at the barrier's own closing brace. It used to run to end
+    // of file, which also covered `read_all`, `read_bytes`, `parse_bytes` and
+    // `impl LogTail` — so the parse could be lifted into a private helper
+    // *below* the barrier and this check would still count one. Measured: it
+    // did, and the census stayed green.
+    let funnel_code =
+        crate::effects::production_code(&fs::read_to_string(&funnel).expect("the funnel"));
+    let barrier = fn_body(&funnel_code, "pub fn establish_stable_prefix(");
+    // The bound is real: the readers below the barrier are outside it.
+    for below in ["pub fn read_all(", "impl LogTail {"] {
+        assert!(
+            funnel_code.contains(below),
+            "`{below}` left the funnel, so the bound below proves nothing"
+        );
+        assert!(
+            !barrier.contains(below),
+            "the barrier slice reaches `{below}`, so it is a suffix of the file rather than \
+             the function"
+        );
+    }
     for entry in FOLD_ENTRIES {
         assert_eq!(
             barrier.matches(entry).count(),
@@ -3040,6 +3531,90 @@ fn the_stable_prefix_barrier_is_the_only_way_a_log_becomes_a_topology_fold() {
             "`{entry}` is in the funnel but not in `establish_stable_prefix`"
         );
     }
+}
+
+/// The blanking every source census in this file depends on is doing something.
+///
+/// `PR4-CENSUS-COMMENT-ORACLE` in its live form: this tree's prose names
+/// `#[cfg(test)]` 104 times outside code and `TopologyFold` far more often than
+/// its code does, so a blanking that silently stopped working would not make the
+/// censuses fail — it would make them count prose and pass.
+#[test]
+fn the_blanking_this_census_depends_on_is_live() {
+    let src = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+    let mut raw_attributes = 0_usize;
+    let mut code_attributes = 0_usize;
+    let mut raw_folds = 0_usize;
+    let mut code_folds = 0_usize;
+    let mut files = 0_usize;
+    let mut stack = vec![src];
+    while let Some(dir) = stack.pop() {
+        for entry in fs::read_dir(&dir).expect("src is readable") {
+            let path = entry.expect("a directory entry").path();
+            if path.is_dir() {
+                stack.push(path);
+                continue;
+            }
+            if !path.extension().is_some_and(|ext| ext == "rs") {
+                continue;
+            }
+            let source = fs::read_to_string(&path).expect("a source file");
+            let blanked = crate::effects::blank_comments_and_strings(&source);
+            files += 1;
+            raw_attributes += source.matches("#[cfg(test)]").count();
+            code_attributes += blanked.matches("#[cfg(test)]").count();
+            raw_folds += source.matches("TopologyFold").count();
+            code_folds += crate::effects::production_code(&source)
+                .matches("TopologyFold")
+                .count();
+        }
+    }
+    assert!(files > 40, "the walk found only {files} source files");
+    assert!(
+        code_attributes < raw_attributes,
+        "the tree names `#[cfg(test)]` {raw_attributes} times and the blanking left \
+         {code_attributes} of them; a `#[cfg(test)]` quoted in prose is what collapses a \
+         production region to nothing"
+    );
+    assert!(
+        code_folds < raw_folds,
+        "the tree names `TopologyFold` {raw_folds} times and the production regions hold \
+         {code_folds}; the census above counts this token, so a blanking that removed no \
+         prose would be counting sentences"
+    );
+    assert!(
+        code_folds > 0,
+        "and it removed everything, which is the other way for a census to prove nothing"
+    );
+}
+
+/// The body of the item whose declaration begins with `header`, brace-matched.
+///
+/// A suffix slice to end of file is not a function: it is the function plus
+/// everything the file happens to declare after it.
+fn fn_body(source: &str, header: &str) -> String {
+    let start = source
+        .find(header)
+        .unwrap_or_else(|| panic!("`{header}` is still here"));
+    let mut depth = 0_usize;
+    let mut opened = false;
+    for (offset, byte) in source.as_bytes().iter().enumerate().skip(start) {
+        match byte {
+            b'{' => {
+                depth += 1;
+                opened = true;
+            }
+            b'}' => {
+                assert!(opened, "`{header}` closes a brace it never opened");
+                depth -= 1;
+                if depth == 0 {
+                    return source[start..=offset].to_owned();
+                }
+            }
+            _ => {}
+        }
+    }
+    panic!("`{header}` never closes its body");
 }
 
 /// Everything before the `#[cfg(test)]` submodules.
@@ -3050,8 +3625,16 @@ fn production_region(source: &str) -> &str {
     &source[..end]
 }
 
-/// Remove `//` line comments. Enough for this census: the strings the census
-/// counts never contain `//`.
+/// Remove `//` line comments.
+///
+/// Enough for its two remaining callers — `the_event_log_is_written_in_exactly_
+/// one_module` and `the_legacy_engine_reports_and_stops_on_a_returned_append_
+/// error` — which count primitives no string literal in those two files spells,
+/// and which assert that this strip shortened the text before counting anything.
+/// It is **not** enough for a census over the whole tree: it sees neither a
+/// `/* … */` nor a string literal, and either can carry a `#[cfg(test)]` that
+/// collapses a file's region. Whole-tree censuses use
+/// [`crate::effects::production_code`].
 fn strip_comments(source: &str) -> String {
     source
         .lines()

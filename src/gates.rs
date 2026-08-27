@@ -194,6 +194,25 @@ impl ShellGate {
     }
 }
 
+impl ShellGate {
+    /// The command and timeout this gate runs as.
+    ///
+    /// **One expression, and it is here so that it is the only one.** The
+    /// legacy engine reached this through [`Gate::check`], which mints and runs
+    /// in one step; the schema-4 driver needs the same pair *up front*, because
+    /// a `GatePlan` is a value it builds before any process starts. Two engines
+    /// deriving "which command is this gate" separately is the shape that made
+    /// two derivations of a task's predicted region disagree on every glob.
+    ///
+    /// It lives on this type rather than in `engine::assembly` because the data
+    /// is this type's, and `gates.rs` sits below the engine — an assembler in
+    /// the engine would make this module depend upward on it.
+    #[must_use]
+    pub fn command(&self) -> (CommandSpec, Duration) {
+        (self.shell.spec(&self.cmd), self.timeout)
+    }
+}
+
 impl Gate for ShellGate {
     fn name(&self) -> &str {
         &self.name
@@ -214,10 +233,11 @@ impl Gate for ShellGate {
         // credential directory (`host::supplies_credentials`). Both are
         // properties of the role, so naming the role correctly is what buys
         // them.
+        let (command, timeout) = self.command();
         let out = runner.run(&crate::runner::gate_request(
-            self.shell.spec(&self.cmd),
+            command,
             ws.root().to_path_buf(),
-            self.timeout,
+            timeout,
             invocation,
         ))?;
         let mut log = String::new();

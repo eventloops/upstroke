@@ -66,8 +66,11 @@ effect_free = [
     "assert_publishable",
     "at",
     "base",
+    "candidate_diff",
     "changed_paths",
     "classify_object_residue",
+    "commit_parent",
+    "commit_tree_sha",
     "common_git_dir",
     "decode_changed_paths",
     "derive",
@@ -91,6 +94,7 @@ effect_free = [
     "ledger",
     "new",
     "object_directory",
+    "object_exists",
     "observed_residue_elements",
     "phase",
     "private_root",
@@ -125,6 +129,7 @@ funnel = [
     "acquire_hooked",
     "acquire_in_hooked",
     "create_private_dir",
+    "create_private_skeleton",
     "create_public_dir",
     "ingest_answer",
     "observe_cleanup_hold",
@@ -159,6 +164,10 @@ effect_free = [
     "as_str",
     "classify_run_dir",
     "commit_record_after_error",
+    # Conjunct 12's classification, read-only and total: it takes the stat that
+    # was already performed and answers whether it *proves* the private commit
+    # record absent. Only `NotFound` does.
+    "commit_record_proves_absence",
     "create",
     "create_hooked",
     "default_private_root",
@@ -305,7 +314,14 @@ effect_free = [
     # `EventHooks` default bodies, in the classification domain since the
     # parser was repaired (`PR6-LANEF-007`). Each returns a constant or does
     # nothing: `WrittenShape::Complete`, `DurabilityLedger::off()`, `{}`.
+    #
+    # `durability_ledger` and `synced` are also `HarnessEventHooks`'s overrides
+    # from PR7. Both stay effect-free: one hands back a clone of an in-memory
+    # `Vec` handle and the other pushes a `SyncRecord` onto one. Neither
+    # touches a file — the sync they describe was performed by
+    # `sync_log_file`/`sync_directory`, which are the funnel's own.
     "durability_ledger",
+    "events",
     "synced",
     "written_kill_shape",
     "bytes",
@@ -315,8 +331,10 @@ effect_free = [
     "fold",
     "from",
     "harness",
-    "into_parts",
+    "into_log_and_fold",
     "kind",
+    # PR7: `HarnessEventHooks`'s durability read-back. In-memory only.
+    "ledger",
     "log",
     "name",
     "new",
@@ -327,8 +345,15 @@ effect_free = [
     "poll",
     "read_all",
     "read_bytes",
+    # PR7: turns this observer's ledger on. Allocates a `Vec`; performs nothing.
+    "recording_durability",
     "round_trip",
     "skip_existing",
+    # PR7: the collected `SyncRecord`s, cloned out of a mutex.
+    "syncs",
+    # PR7: sets which of `Written`'s two tabled durable shapes this observer
+    # asks the funnel for. Stores an enum; the funnel performs the write.
+    "with_written_kill_shape",
 ]
 
 [[module]]
@@ -423,6 +448,11 @@ effect_free = [
     "closed_by_a_reaper",
     "collect",
     "containers_with_label",
+    # `HarnessHooks`'s two accessors, the pair `src/rundir.rs`'s own
+    # `HarnessHooks` already classifies here by the same names. Both hand back a
+    # handle the caller already owns -- the shared `HookHarness`, and the
+    # `ContainerTrace` the funnel writes into. Neither reaches the daemon.
+    "harness",
     "image_by_id",
     "image_by_reference",
     "list_intents",
@@ -436,6 +466,7 @@ effect_free = [
     "phase",
     "probe",
     "read_intent",
+    "recording_trace",
     "volume_present",
 ]
 
@@ -456,6 +487,46 @@ effect_free = [
     "render",
     "sequence",
     "serialize",
+]
+
+[[module]]
+# The body of `Container.MountGitView` / `Container.UnmountGitView` (R19), added
+# to the domain by PR7's census repair. It carries
+# `#![allow(clippy::disallowed_methods)]` over its production region and was the
+# only non-test production module in the tree in that position with no row here,
+# so nothing required its reachable surface to be classified at all -- and
+# `every_effectful_wrapper_is_on_the_disallowed_list` can only force a name onto
+# the denylist for a module that has a row.
+path = "src/runner/container/view.rs"
+crate_path = "upstroke::runner::container::view"
+funnel = []
+effectful = []
+# `RoleGitView`'s two `GitView` methods, and this class rather than `effectful`
+# for the reason the class exists: both reach an effect -- `materialize` creates
+# the view directory and writes every projected entry, `discard` removes the
+# whole of it -- and a trait-dispatched method has no clippy path of its own.
+# What denies them is the trait's own pair,
+# `upstroke::runner::container::GitView::{materialize,discard}`, classified
+# `effectful` by `src/runner/container.rs` above and on the disallowed list as
+# `Container.MountGitView` / `Container.UnmountGitView`. Recorded here so the
+# absence from clippy.toml under THIS module's path is a decision.
+effectful_unnameable = [
+    "discard",
+    "materialize",
+]
+# Two readers and three pure constructors/accessors. `resolve` reads
+# `<workspace>/.git` and `commondir`; `detached_head` reads `HEAD` and the loose
+# ref it may name. Both return values and write nothing, and a read is not an
+# effect on this denylist -- which governs creation, writing, removal, rename
+# and process start. The same answer `src/runner/container.rs` gives
+# `read_intent` and `list_intents`. `new`, `for_reader` and `reader_paths` touch
+# no path at all: they build and read back a `RoleGitView`'s reader projection.
+effect_free = [
+    "detached_head",
+    "for_reader",
+    "new",
+    "reader_paths",
+    "resolve",
 ]
 
 [[module]]
@@ -589,6 +660,8 @@ effect_free = [
     "fmt",
     "name",
     "new",
+    "of",
+    "of_plan",
     "parse_verdict",
     "pass_timeout",
     "passes_for",
@@ -841,8 +914,11 @@ effect_free = [
     "replay",
     "review_cost_incomplete",
     "review_cost_usd",
+    "is_failed",
+    "is_successful",
     "review_models",
     "settle_interrupted",
+    "shape",
     "started_of",
     "task",
     "validate_review_identity",

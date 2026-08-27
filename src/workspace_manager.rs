@@ -2316,6 +2316,24 @@ impl WorkspaceManager {
         )
     }
 
+    /// Whether `object` is an object this repository has.
+    ///
+    /// Read-only, and the read `T-DISPATCH`'s "source candidate object missing"
+    /// refusal is made of: a repair is materialized from a *protected* candidate
+    /// commit, and the alternative to asking is letting `git cherry-pick` fail
+    /// with a message about a revision rather than about a lost candidate.
+    ///
+    /// `^{}` is the peel: it makes the question "is there an object here",
+    /// following a tag to what it names, rather than "is there a ref by this
+    /// spelling".
+    ///
+    /// # Errors
+    ///
+    /// A Git error other than "no such object", which is the `false` answer.
+    pub fn object_exists(&self, object: &str) -> Result<bool, UpstrokeError> {
+        object_exists(&self.base, object)
+    }
+
     // -----------------------------------------------------------------------
     // Byte-safe changed paths
     // -----------------------------------------------------------------------
@@ -2370,6 +2388,111 @@ impl WorkspaceManager {
             ],
         )?;
         Ok(decode_changed_paths(&output))
+    }
+
+    /// The diff of a captured candidate tree against the commit it is judged
+    /// against.
+    ///
+    /// **A read, so it takes no hooks and names no effect site.** It creates no
+    /// object, moves no ref and touches no worktree — the same reason
+    /// [`Self::changed_paths`] is not a funnel. The frozen `ObjectSite` enum
+    /// has no diff variant, and it should not: every variant there documents
+    /// "the row that references the created object immediately after the
+    /// effect", and a diff creates nothing to reference.
+    ///
+    /// The flags come from [`crate::workspace::REVIEW_DIFF_FLAGS`], shared with
+    /// the schema-3 capture, because both produce the text a reviewer judges
+    /// and `classify::diff_failure` reads. Two flag lists would be two
+    /// definitions of what a reviewable diff is.
+    ///
+    /// Run from the task worktree so the object names resolve in the repository
+    /// that holds them.
+    ///
+    /// # Errors
+    ///
+    /// The containment refusals, a Git error, or a diff whose bytes are not
+    /// UTF-8 — which is not a diff any reviewer can be shown.
+    pub fn candidate_diff(
+        &self,
+        slot: &Slot,
+        parent: &str,
+        tree: &str,
+    ) -> Result<String, UpstrokeError> {
+        self.revalidate()?;
+        let path = self.slot_target(slot)?;
+        let mut argv: Vec<OsString> = crate::workspace::REVIEW_DIFF_FLAGS
+            .iter()
+            .map(OsString::from)
+            .collect();
+        argv.extend([
+            OsString::from(parent),
+            OsString::from(tree),
+            OsString::from("--"),
+        ]);
+        let output = self.git_ok(&path, &argv)?;
+        String::from_utf8(output).map_err(|_| UpstrokeError::Git {
+            message: format!(
+                "the diff of {tree} against {parent} is not valid UTF-8; a reviewer cannot be \
+                 shown it and a gate would not agree with what it says"
+            ),
+        })
+    }
+
+    /// A commit's first parent, or `None` when the object is not a commit.
+    ///
+    /// **A read**, like its neighbours. `rev-parse <sha>^` answers with the
+    /// parent and errors for a blob or a tree, so "not a commit" and "a commit
+    /// with no parent" both arrive here as `None` — which is the same answer
+    /// for the caller's purpose: neither is a candidate on a recorded base.
+    ///
+    /// # Errors
+    ///
+    /// The containment refusals.
+    pub fn commit_parent(&self, commit: &str) -> Result<Option<String>, UpstrokeError> {
+        self.revalidate()?;
+        let argv = [
+            OsString::from("rev-parse"),
+            OsString::from("--verify"),
+            OsString::from("--quiet"),
+            OsString::from(format!("{commit}^{{commit}}^")),
+        ];
+        Ok(self
+            .git_ok(self.base(), &argv)
+            .ok()
+            .and_then(|out| String::from_utf8(out).ok())
+            .map(|text| text.trim().to_owned())
+            .filter(|text| !text.is_empty()))
+    }
+
+    /// The tree a commit points at, or `None` if it is not a commit.
+    ///
+    /// The sibling of [`Self::commit_parent`] and deliberately the same shape:
+    /// `rev-parse --verify --quiet` with a peel, so a missing object, a
+    /// non-commit and a malformed id all arrive as `None` rather than as three
+    /// different errors the caller would have to tell apart. What the caller
+    /// does with `None` is refuse, and it refuses the same way for all three.
+    ///
+    /// Added for candidate adoption: `DESIGN.md` §15 requires resume to adopt
+    /// only the exact judged object, and the parent alone does not say what the
+    /// commit *contains*.
+    ///
+    /// # Errors
+    ///
+    /// The containment refusals.
+    pub fn commit_tree_sha(&self, commit: &str) -> Result<Option<String>, UpstrokeError> {
+        self.revalidate()?;
+        let argv = [
+            OsString::from("rev-parse"),
+            OsString::from("--verify"),
+            OsString::from("--quiet"),
+            OsString::from(format!("{commit}^{{commit}}^{{tree}}")),
+        ];
+        Ok(self
+            .git_ok(self.base(), &argv)
+            .ok()
+            .and_then(|out| String::from_utf8(out).ok())
+            .map(|text| text.trim().to_owned())
+            .filter(|text| !text.is_empty()))
     }
 
     // -----------------------------------------------------------------------
@@ -3408,27 +3531,42 @@ fn common_git_dir(inside: &Path) -> Result<PathBuf, UpstrokeError> {
         .map_err(|source| UpstrokeError::Io { path, source })
 }
 
+/// The git, worktree and process effects a **test in another module** needs.
+///
+/// `src/engine/topology/**` is a topology module: `clippy.toml` denies
+/// `std::fs::write`, `std::fs::create_dir_all`, `std::process::Command` and
+/// their neighbours there, and the denial applies to `#[cfg(test)]` code as
+/// well — measured, four errors from a probe module that did nothing but call
+/// them. A schema-4 test still has to build a real repository, put bytes in a
+/// worktree, and spawn a child it can kill, and no funnel owns `git init`.
+///
+/// So the primitives live here, in the funnel module `effects/allowlist.toml`
+/// already reviews, and every one of them is `#[cfg(test)]`. This module adds
+/// **no attribute**: it is nested inside this file and inherits the
+/// module-level allow the allowlist already records for it, so the
+/// allow-placement scan sees nothing new.
+///
+/// [`Fixture`] and the three helpers above it were `mod tests`'s and are
+/// **moved** rather than copied. A second repository fixture maintained beside
+/// this one is the class this crate has already recorded three times: two
+/// hand-maintained copies of one value disagree eventually, and the copy that
+/// disagrees silently is the one a census stands on.
 #[cfg(test)]
-mod tests {
+pub(crate) mod fixture {
     use super::*;
 
-    use std::collections::BTreeSet;
     use std::sync::atomic::{AtomicU32, Ordering};
-
-    use crate::topology::effects::{
-        ClassHistogram, Evidence, EvidenceLabel, SamplingRecord, SyntheticRecord,
-    };
 
     // -----------------------------------------------------------------------
     // Fixtures
     // -----------------------------------------------------------------------
 
-    static SCRATCH: AtomicU32 = AtomicU32::new(0);
+    pub(crate) static SCRATCH: AtomicU32 = AtomicU32::new(0);
 
     /// A scratch directory unique to this process *and* to this call, because
     /// the suite runs tests in parallel and two fixtures sharing a directory
     /// would each measure the other's Git repository.
-    fn scratch(tag: &str) -> PathBuf {
+    pub(crate) fn scratch(tag: &str) -> PathBuf {
         let ordinal = SCRATCH.fetch_add(1, Ordering::SeqCst);
         let dir = std::env::temp_dir().join(format!(
             "upstroke-wm-{tag}-{}-{ordinal}",
@@ -3439,7 +3577,7 @@ mod tests {
         dir
     }
 
-    fn git_out(dir: &Path, args: &[&str]) -> Output {
+    pub(crate) fn git_out(dir: &Path, args: &[&str]) -> Output {
         Command::new("git")
             .arg("-C")
             .arg(dir)
@@ -3448,7 +3586,7 @@ mod tests {
             .expect("run git")
     }
 
-    fn git(dir: &Path, args: &[&str]) -> String {
+    pub(crate) fn git(dir: &Path, args: &[&str]) -> String {
         let output = git_out(dir, args);
         assert!(
             output.status.success(),
@@ -3460,21 +3598,21 @@ mod tests {
     }
 
     /// A real repository, a real private root, and a manager over both.
-    struct Fixture {
-        root: PathBuf,
-        base: PathBuf,
-        private: PathBuf,
-        manager: WorkspaceManager,
+    pub(crate) struct Fixture {
+        pub(crate) root: PathBuf,
+        pub(crate) base: PathBuf,
+        pub(crate) private: PathBuf,
+        pub(crate) manager: WorkspaceManager,
         /// The first commit.
-        seed: String,
+        pub(crate) seed: String,
         /// The tip of `main`.
-        head: String,
+        pub(crate) head: String,
         /// A commit on a side branch, based on `seed`, for the cherry-picks.
-        side: String,
+        pub(crate) side: String,
     }
 
     impl Fixture {
-        fn new(tag: &str) -> Self {
+        pub(crate) fn new(tag: &str) -> Self {
             let root = scratch(tag);
             let base = root.join("repo");
             let private = root.join("private");
@@ -3517,7 +3655,39 @@ mod tests {
             }
         }
 
-        fn created(tag: &str) -> Self {
+        /// Re-open a fixture a **previous process** built.
+        ///
+        /// A kill child dies by `std::process::abort()`, so its `Drop` never
+        /// runs and its scratch tree survives it. The parent then has to speak
+        /// about that tree — which repository, which private root, which
+        /// commits — and re-deriving it is the only honest way: a value passed
+        /// through an environment variable would be the child's belief about
+        /// its own state, and the whole point of a kill test is that the
+        /// child's beliefs did not survive.
+        ///
+        /// The manager is derived with the **same** run id and incarnation as
+        /// [`Self::new`], because an intent records both and a reclaim that
+        /// derived a different pair would be reclaiming another run's residue.
+        pub(crate) fn adopt(root: PathBuf) -> Self {
+            let base = root.join("repo");
+            let private = root.join("private");
+            let head = git(&base, &["rev-parse", "main"]);
+            let seed = git(&base, &["rev-parse", "main~1"]);
+            let side = git(&base, &["rev-parse", "side"]);
+            let manager = WorkspaceManager::derive(&base, &private, "run-1", "inc-1")
+                .expect("derive the manager over an adopted fixture");
+            Self {
+                root,
+                base,
+                private,
+                manager,
+                seed,
+                head,
+                side,
+            }
+        }
+
+        pub(crate) fn created(tag: &str) -> Self {
             let fixture = Self::new(tag);
             fixture
                 .manager
@@ -3526,7 +3696,7 @@ mod tests {
             fixture
         }
 
-        fn task(&self, key: &str, generation: u32) -> Slot {
+        pub(crate) fn task(&self, key: &str, generation: u32) -> Slot {
             Slot::Task {
                 key: key.to_owned(),
                 generation,
@@ -3534,7 +3704,12 @@ mod tests {
         }
 
         /// A task worktree at `head`, intent first.
-        fn add_task(&self, hooks: &mut dyn EffectHooks, key: &str, generation: u32) -> Slot {
+        pub(crate) fn add_task(
+            &self,
+            hooks: &mut dyn EffectHooks,
+            key: &str,
+            generation: u32,
+        ) -> Slot {
             let slot = self.task(key, generation);
             self.manager
                 .write_intent(hooks, &slot)
@@ -3551,6 +3726,220 @@ mod tests {
             let _ = fs::remove_dir_all(&self.root);
         }
     }
+
+    // -----------------------------------------------------------------------
+    // The primitives a topology module's test cannot reach for itself
+    // -----------------------------------------------------------------------
+
+    /// Write `bytes` at `path`, creating the parent directories.
+    ///
+    /// This is a test's *worker*: in production an agent subprocess edits files
+    /// and the engine never does (DESIGN.md §4). A test has no agent, so it
+    /// writes what the agent would have written — and it does it here, where
+    /// the write is inside the reviewed funnel module, rather than in the
+    /// topology module whose whole point is that it cannot.
+    pub(crate) fn write_file(path: &Path, bytes: &[u8]) {
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent).expect("the parent directory of a fixture file");
+        }
+        fs::write(path, bytes).expect("write a fixture file");
+    }
+
+    /// Create `path` and every missing parent.
+    pub(crate) fn create_dir(path: &Path) {
+        fs::create_dir_all(path).expect("create a fixture directory");
+    }
+
+    /// Remove `path` if it is there. Idempotent, like every reclaim.
+    pub(crate) fn remove_file(path: &Path) {
+        match fs::remove_file(path) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => panic!("removing {}: {error}", path.display()),
+        }
+    }
+
+    /// Run this test binary again, `--exact --ignored`, with `env` set, and
+    /// return its exit status.
+    ///
+    /// The kill-test shape `src/rundir.rs` established: `Injection::Kill` is
+    /// `std::process::abort()`, a real process death, so the child has to be a
+    /// real process and the claim is what it left on disk. `env` is a list
+    /// rather than a map so a caller can pass the same key twice and see the
+    /// last win, exactly as `Command` does.
+    pub(crate) fn run_kill_child(test: &str, env: &[(&str, &OsStr)]) -> std::process::ExitStatus {
+        let mut command = Command::new(std::env::current_exe().expect("this test binary"));
+        command
+            .args(["--exact", test, "--ignored", "--nocapture"])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        for (key, value) in env {
+            command.env(key, value);
+        }
+        command.status().expect("spawn the kill child")
+    }
+
+    /// A `git` child a test can kill at a chosen moment.
+    ///
+    /// The residue sampler's child, and deliberately **blind to what it is
+    /// running**: no argv reaches [`Self::kill`], so a per-command count taken
+    /// over these cannot be defeated inside this type. It is the same shape
+    /// `mod tests`'s `SampledChild` uses, which stays there because the
+    /// four-command sampler stays there; this one exists because the
+    /// two-command sampler of `T-ATTEMPT` lives in a module that cannot name
+    /// [`Command`].
+    pub(crate) struct KillableGitChild {
+        child: std::process::Child,
+        /// Started once the spawn has returned, so what [`Self::kill`] reads
+        /// off it is time the child was left *running*.
+        spawned: std::time::Instant,
+        /// What the clock said when a kill fired at this child, or `None` if
+        /// none ever did. Written only by [`Self::kill`].
+        fired: Option<std::time::Duration>,
+    }
+
+    impl KillableGitChild {
+        /// Spawn `git -C cwd <args>` with its streams discarded.
+        pub(crate) fn spawn(cwd: &Path, args: &[String]) -> Self {
+            let child = Command::new("git")
+                .arg("-C")
+                .arg(cwd)
+                .args(["-c", "core.fsmonitor=false"])
+                .args(args)
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+                .expect("spawn the sampled git child");
+            Self {
+                child,
+                spawned: std::time::Instant::now(),
+                fired: None,
+            }
+        }
+
+        /// Kill the child, recording when the kill fired.
+        ///
+        /// The clock is read at the instant of the kill and stored *after* the
+        /// kill returns, so deleting `self.child.kill()` leaves `outcome`
+        /// unbound and the module stops compiling.
+        pub(crate) fn kill(&mut self) {
+            let fired = self.spawned.elapsed();
+            let outcome = self.child.kill();
+            self.fired = Some(fired);
+            let _ = outcome;
+        }
+
+        /// Whether the child has exited on its own, and how long it took.
+        ///
+        /// The sampler races a measured duration, and when its measurement is
+        /// wrong every kill lands after the child is already gone. Wall time
+        /// from spawn to reap cannot tell it so: that clock includes the
+        /// scheduled sleep, so an over-long schedule reports itself back as the
+        /// duration it should have been. This reports the child's **own** time,
+        /// which is the only number a recalibration can honestly use.
+        ///
+        /// `None` while it is still running.
+        pub(crate) fn exited(&mut self) -> Option<std::time::Duration> {
+            match self.child.try_wait() {
+                Ok(Some(_)) => Some(self.spawned.elapsed()),
+                _ => None,
+            }
+        }
+
+        /// Reap it. The wait status is the only thing a kill changes.
+        pub(crate) fn wait(&mut self) -> std::process::ExitStatus {
+            self.child.wait().expect("reap the sampled git child")
+        }
+
+        /// When a kill fired at this child, if one ever did.
+        pub(crate) fn fired(&self) -> Option<std::time::Duration> {
+            self.fired
+        }
+    }
+
+    /// Whether `status` is the death `std::process::abort()` produces.
+    ///
+    /// **Not `!status.success()`.** A kill child that reaches its own
+    /// `unreachable!` panics, and a panic also fails to succeed — so a parent
+    /// that accepted any unsuccessful exit would read "the injection stopped
+    /// killing" as "the injection killed", and would then go on to inspect a
+    /// directory the panicking child's `Drop` had already deleted. Measured:
+    /// exactly that, on a kill armed at a site the child never reached.
+    ///
+    /// Unix has a value for it — `SIGABRT`, which no Rust panic raises. Windows
+    /// does not expose one portably (`abort()` reaches `__fastfail`, whose code
+    /// has moved between CRT versions), so there the oracle is the *negation*
+    /// of the panic's own exit code, which `std::process::abort` cannot produce
+    /// and `panic!` always does.
+    pub(crate) fn died_by_abort(status: &std::process::ExitStatus) -> bool {
+        #[cfg(unix)]
+        {
+            std::os::unix::process::ExitStatusExt::signal(status) == Some(libc::SIGABRT)
+        }
+        #[cfg(windows)]
+        {
+            /// What a Rust process exits with when a panic unwinds out of main.
+            const PANIC: i32 = 101;
+            !status.success() && status.code() != Some(PANIC)
+        }
+    }
+
+    /// Whether `status` carries this platform's signature of a
+    /// [`std::process::Child::kill`].
+    ///
+    /// A **value** per platform, not `!status.success()`: a command that merely
+    /// failed also fails to succeed, and reading that as a kill is how a
+    /// kill-count keeps counting after the kill is gone.
+    pub(crate) fn died_by_kill(status: &std::process::ExitStatus) -> bool {
+        // `Child::kill` sends `SIGKILL`, and no exit a child reaches on its own
+        // carries a signal at all.
+        #[cfg(unix)]
+        {
+            std::os::unix::process::ExitStatusExt::signal(status) == Some(libc::SIGKILL)
+        }
+        // `Child::kill` is `TerminateProcess(handle, 1)`; the sampler's probe
+        // asserts the same command exits 0 when nothing kills it, so 1 is not
+        // an end these commands reach by themselves.
+        #[cfg(windows)]
+        {
+            status.code() == Some(1)
+        }
+    }
+
+    /// Time one uninterrupted run of `git -C cwd <args>`.
+    ///
+    /// The kill ladder is fractions of this duration, which is the only
+    /// variance a replay can pin — see `mod tests`'s `measure_budget` for the
+    /// argument, and for why the measurement runs in a **probe slot of its
+    /// own** rather than in the worktree the samples will kill in.
+    pub(crate) fn time_git(cwd: &Path, args: &[String]) -> std::time::Duration {
+        let start = std::time::Instant::now();
+        let output = git_out(cwd, &args.iter().map(String::as_str).collect::<Vec<_>>());
+        let elapsed = start.elapsed();
+        assert!(
+            output.status.success(),
+            "the probe must really run: git {args:?} in {}: {}",
+            cwd.display(),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        elapsed
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use std::collections::BTreeSet;
+
+    // The repository fixture and the three Git helpers are `fixture`'s, not
+    // this module's: `src/engine/topology/**` needs them too and cannot reach
+    // an effect primitive of its own. See that module for why they moved.
+    use super::fixture::{Fixture, git, git_out, scratch};
+    use crate::topology::effects::{
+        ClassHistogram, Evidence, EvidenceLabel, SamplingRecord, SyntheticRecord,
+    };
 
     /// A harness that answers `Proceed` and records everything.
     fn harness() -> (HarnessEffects, Arc<Mutex<HookHarness>>) {
@@ -4749,6 +5138,10 @@ mod tests {
             (
                 "changed_paths",
                 Box::new(|slot| manager.changed_paths(slot, &head).map(drop)),
+            ),
+            (
+                "candidate_diff",
+                Box::new(|slot| manager.candidate_diff(slot, &head, &head).map(drop)),
             ),
         ];
 

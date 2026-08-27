@@ -3398,7 +3398,7 @@ fn prompt_names_the_allowed_gate_commands() {
     let run_dir = std::env::temp_dir().join(format!("upstroke-prompt-{}", std::process::id()));
     fs::create_dir_all(run_dir.join("artifacts")).expect("run dir");
     let prompt = materialize_prompt(
-        &task,
+        crate::engine::assembly::WorkerSubject::of(&task),
         &["cargo check --all-targets".to_owned()],
         &run_dir,
         None,
@@ -3409,7 +3409,12 @@ fn prompt_names_the_allowed_gate_commands() {
         prompt.contains(QUESTION_MARKER),
         "the worker is told how to ask (§12)"
     );
-    let bare = materialize_prompt(&task, &[], &run_dir, None);
+    let bare = materialize_prompt(
+        crate::engine::assembly::WorkerSubject::of(&task),
+        &[],
+        &run_dir,
+        None,
+    );
     assert!(!bare.contains("EXACTLY these commands"));
 }
 
@@ -3433,7 +3438,12 @@ fn prompt_wires_artifacts_to_real_files() {
     };
 
     // Missing input: say so plainly rather than pointing at nothing.
-    let prompt = materialize_prompt(&task, &[], &run_dir, None);
+    let prompt = materialize_prompt(
+        crate::engine::assembly::WorkerSubject::of(&task),
+        &[],
+        &run_dir,
+        None,
+    );
     assert!(prompt.contains("did \n     not leave one") || prompt.contains("did not leave one"));
     assert!(
         prompt.contains("write artifact `notes`"),
@@ -3446,7 +3456,12 @@ fn prompt_wires_artifacts_to_real_files() {
         "cursor = base64(offset)",
     )
     .expect("artifact");
-    let prompt = materialize_prompt(&task, &[], &run_dir, None);
+    let prompt = materialize_prompt(
+        crate::engine::assembly::WorkerSubject::of(&task),
+        &[],
+        &run_dir,
+        None,
+    );
     assert!(
         prompt.contains("cursor = base64(offset)"),
         "content inlined"
@@ -3454,7 +3469,12 @@ fn prompt_wires_artifacts_to_real_files() {
 
     task.artifacts_in.clear();
     task.artifacts_out.clear();
-    let bare = materialize_prompt(&task, &[], &run_dir, None);
+    let bare = materialize_prompt(
+        crate::engine::assembly::WorkerSubject::of(&task),
+        &[],
+        &run_dir,
+        None,
+    );
     assert!(!bare.contains("artifact"));
 }
 
@@ -4343,8 +4363,386 @@ fn attempt_record(attempt: u32, tier: &str, failed: bool) -> AttemptRecord {
             kind: FailureKind::GateFailed,
             origin: FailureOrigin::Worker,
             reason: "no".to_owned(),
+            detail: None,
         }),
     }
+}
+
+/// The raw text of the JSON object that follows `key` in `line`.
+///
+/// Byte-exact and order-preserving, which is the whole point: a `serde_json::Value`
+/// round-trip re-emits an object with its keys sorted, and a claim about *what the
+/// log holds* cannot be made from a value that has been through one. Tracks string
+/// state so a brace inside a gate's error text does not end the object early.
+fn raw_object_after(line: &str, key: &str) -> Option<String> {
+    let start = line.find(key)? + key.len();
+    let bytes: Vec<char> = line[start..].chars().collect();
+    if bytes.first() != Some(&'{') {
+        return None;
+    }
+    let (mut depth, mut in_string, mut escaped) = (0usize, false, false);
+    for (index, c) in bytes.iter().enumerate() {
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        match c {
+            '\\' if in_string => escaped = true,
+            '"' => in_string = !in_string,
+            '{' if !in_string => depth += 1,
+            '}' if !in_string => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(bytes[..=index].iter().collect());
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+/// **The legacy record did not change when schema 4's did.**
+///
+/// `FailureRecord::detail` exists for schema 4, whose settlement transitions have no
+/// feedback field. The record builder is shared with `coordinator.rs`, and the first
+/// version of the repair copied the value in unconditionally — so the **live**
+/// `upstroke run` path began writing an 8-KiB gate tail onto the legacy wire and into
+/// `report.json`, once per failed attempt, duplicating the `ladder_retry` copy that
+/// already held it. The 2026-08-26 re-review of `c2c0294` found it as finding A.
+/// `classify::FeedbackCarrier` is the repair; this is what holds it.
+///
+/// **The fixture is real, and it is compared byte for byte.** `PRE_CHANGE_FAILURE` below
+/// is the exact `"failure"` object `610106b` — the commit before the field existed — wrote
+/// for this scenario, captured by running it there. The earlier version of this test
+/// quoted it *elided* in prose and then asserted three key names and
+/// `reason.starts_with(...)`, so a changed reason suffix still passed. The round-3 review
+/// of `bf927f3` said so, and it was right: the body and the decision record both claimed a
+/// byte comparison this test did not make.
+///
+/// **One
+/// residual difference that is stated rather than hidden**: `detail` serializes as an
+/// explicit null, because `skip_serializing_if` is not available here. Schema 4's strict
+/// door decides "unknown field" by asking the record which keys it claims back, so a
+/// field that decodes from `"detail":null` and re-encodes to nothing makes the door
+/// refuse every failed attempt's settlement — measured, and held by
+/// `an_explicit_null_detail_survives_the_strict_door` above.
+///
+/// So the claim is exact: **strip `,"detail":null` and the bytes are the pre-change
+/// bytes.** Not "similar", and not asserted by rebuilding the expected value from the
+/// observed one — the strip must fire, and what is left must match key for key.
+#[test]
+fn the_legacy_wire_and_report_carry_no_feedback_on_the_attempt_record() {
+    let repo = temp_engine_repo("legacy-no-detail");
+    seed(
+        &repo,
+        "## Implement the widget\n<!-- upstroke: id=t1 kind=implement depends= -->\n",
+        Some(
+            "[routing]\nimplement = { chain = [\"small\"], attempts_per = 2 }\n\n\
+                 [[gates]]\nname = \"needs-test\"\ncmd = \"git ls-files --error-unmatch \
+                 widget_test.rs\"\n",
+        ),
+    );
+    let mut opts = options(&repo);
+    opts.config_path = Some(repo.join("upstroke.toml"));
+    let source = source(
+        vec![Effect::EditFile, Effect::EditTest],
+        vec![ReviewBehavior::Pass],
+    );
+    run_with(&opts, &source).expect("run");
+
+    let runs = opts.repo_root.join(".upstroke").join("runs");
+    let public = fs::read_dir(&runs)
+        .expect("the runs root")
+        .flatten()
+        .map(|entry| entry.path())
+        .find(|path| path.join("events.jsonl").is_file())
+        .expect("the run left a public directory");
+    let log = fs::read_to_string(public.join("events.jsonl")).expect("the log");
+
+    // The exact bytes `610106b` wrote for this scenario's failed attempt. Captured by
+    // building a worktree at that commit and running the same gate; not derived from
+    // anything this build produces.
+    const PRE_CHANGE_FAILURE: &str = concat!(
+        r#"{"kind":"gate_failed","origin":"worker","reason":"gate `needs-test` failed: "#,
+        r#"error: pathspec 'widget_test.rs' did not match any file(s) known to git\n"#,
+        r#"Did you forget to 'git add'?\n\nexit code: Some(1)"}"#,
+    );
+
+    let mut failures = 0;
+    let mut carried_tail = false;
+    for line in log.lines() {
+        let event: serde_json::Value = serde_json::from_str(line).expect("a json line");
+        if event.get("event").and_then(serde_json::Value::as_str) != Some("attempt_finished") {
+            continue;
+        }
+        let Some(failure) = event.pointer("/data/failure").filter(|v| !v.is_null()) else {
+            continue;
+        };
+        failures += 1;
+
+        // **The log's own bytes, sliced out of the line.** Not
+        // `serde_json::to_string(failure)`: a `Value` round-trip sorts keys, so
+        // the field order the comparison is about would be the map's rather than
+        // the struct's, and the pre-change fixture's `,"detail":null` suffix
+        // would never appear where it actually appears.
+        let bytes =
+            raw_object_after(line, "\"failure\":").expect("the line carries a failure object");
+        let stripped = bytes.replace(",\"detail\":null", "");
+        assert_ne!(
+            stripped, bytes,
+            "the legacy failure record carries no `detail` key at all: {bytes}. This test \
+             asserts the *only* difference from `610106b` is that one null, and if the key \
+             is absent the assertion below is vacuous"
+        );
+        assert_eq!(
+            bytes.matches(",\"detail\":").count(),
+            1,
+            "expected exactly one `detail` key in {bytes}"
+        );
+
+        // **Byte for byte against the captured fixture.** Not a key-set check and not a
+        // `starts_with`: every byte of `kind`, `origin` and `reason` must be what
+        // `610106b` wrote, so a changed reason — a different gate name, a reworded
+        // prefix, an extra suffix — fails here instead of passing a prefix predicate.
+        assert_eq!(
+            stripped, PRE_CHANGE_FAILURE,
+            "the legacy failure record is not the bytes `610106b` wrote for this \
+             scenario. If a newer git reworded its pathspec error, re-capture the \
+             fixture at that commit rather than loosening this comparison"
+        );
+
+        // The point of the whole finding: the tail is not on the record. Asserted as an
+        // **explicit null and not merely a falsy read** — `failure["detail"].is_null()`
+        // answers true for an absent key too, so it could not tell "the field is here
+        // and empty" from "the field is gone", which are different wires.
+        let object = failure.as_object().expect("the failure is an object");
+        assert_eq!(
+            object.get("detail"),
+            Some(&serde_json::Value::Null),
+            "the legacy attempt record's `detail` is {:?}; it must be present and null — \
+             a value would be §11.4's feedback duplicated onto the wire, and an absent \
+             key would mean the field stopped serializing, which breaks schema 4's \
+             strict door",
+            object.get("detail")
+        );
+
+        // And it is still delivered — by the carrier that owns it here.
+        if event
+            .pointer("/transition/data/detail")
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|d| d.contains("widget_test.rs"))
+        {
+            carried_tail = true;
+        }
+    }
+    assert!(
+        failures >= 1,
+        "no failed attempt in the log, so this test asserted nothing"
+    );
+    assert!(
+        carried_tail,
+        "the gate tail reached no `ladder_retry` transition either, so the legacy engine \
+         lost §11.4's feedback rather than keeping it where it belongs"
+    );
+
+    // `report.json` is the other reader of these records, and the reason
+    // `LadderRetry` holds the text instead: it "should not grow one per attempt".
+    let report: serde_json::Value = serde_json::from_str(
+        &fs::read_to_string(public.join("report.json")).expect("report.json is written"),
+    )
+    .expect("report.json is json");
+    let mut checked = 0;
+    for task in report["tasks"].as_array().into_iter().flatten() {
+        for attempt in task["attempts"].as_array().into_iter().flatten() {
+            let Some(failure) = attempt.get("failure").filter(|v| !v.is_null()) else {
+                continue;
+            };
+            checked += 1;
+            let object = failure.as_object().expect("the failure is an object");
+            assert_eq!(
+                object.get("detail"),
+                Some(&serde_json::Value::Null),
+                "report.json's attempt {} carries `detail` as {:?}; it must be present \
+                 and null. `is_null()` was the earlier assertion and it cannot tell an \
+                 explicit null from an absent key, so it would have passed had the \
+                 field silently stopped serializing",
+                attempt["attempt"],
+                object.get("detail")
+            );
+        }
+    }
+    assert!(
+        checked >= 1,
+        "no failed attempt reached report.json, so its half of this test asserted nothing"
+    );
+
+    // The retry was still told. Delivery is the whole reason the field exists on the
+    // other engine, and removing it here must not cost the legacy one anything.
+    let runs = source.adapter.runs();
+    assert!(
+        runs[1].prompt.contains("gate `needs-test` failed"),
+        "the legacy retry lost the gate's words: {}",
+        runs[1].prompt
+    );
+}
+
+/// **The strict door's precondition, checked over the record that gained a field.**
+///
+/// Schema 4 refuses an unknown field in a transaction payload (`refusals[24]`) by
+/// decoding a record, re-encoding it, and reporting any key the input carried that
+/// the record did not claim back. That is exact **only** while every embedded record
+/// serializes each field it deserializes — no `skip_serializing_if` — and
+/// `topology::events::strict`'s own documentation says so.
+///
+/// `events::tests::a_known_null_survives_the_strict_door_and_an_unknown_null_does_not`
+/// checks that precondition, and checks it over `AttemptRecord`'s own optional fields:
+/// its fixture has `failure: None`, so **no `FailureRecord` appears in the payload at
+/// all**. Adding `skip_serializing_if` to `FailureRecord::detail` therefore leaves that
+/// test green while breaking the door for every failed attempt — measured 2026-08-26,
+/// which is why `decisions/2026-08-26-durable-retry-feedback.md`'s argument for a plain
+/// `#[serde(default)]` needed a witness rather than a paragraph.
+///
+/// This is that witness, one record deeper. It lives here because
+/// `src/topology/events.rs` is frozen and this needs no change to it.
+#[test]
+fn an_explicit_null_detail_survives_the_strict_door() {
+    use crate::topology::events::{
+        AttemptFinished4, AttemptNumber, AttemptSettlement, GenerationId, LeaseDisposition,
+        SettlementTransition, TopologyEvent, TopologyEventBody,
+    };
+
+    let mut record = serde_json::to_value(attempt_record(1, "mid", true)).expect("serialize");
+    let failure = record
+        .get_mut("failure")
+        .and_then(serde_json::Value::as_object_mut)
+        .expect("a failed record carries a failure object");
+    // Explicit, not absent: an absent key is the older-log case and is covered by
+    // `a_log_predating_the_detail_field_folds_and_resumes`. What is under test here
+    // is the key being *present* and null, which is what this build writes.
+    failure.insert("detail".to_owned(), serde_json::Value::Null);
+
+    let mut value = serde_json::to_value(TopologyEvent::now(TopologyEventBody::AttemptFinished {
+        data: Box::new(AttemptFinished4 {
+            key: crate::topology::registry::TaskKey(0),
+            generation: GenerationId(0),
+            attempt: AttemptNumber(1),
+            record: Box::new(attempt_record(1, "mid", true)),
+            settlement: AttemptSettlement::Closed {
+                transition: SettlementTransition::Retry,
+                lease: LeaseDisposition::PredictedReleased,
+            },
+        }),
+    }))
+    .expect("the event serializes");
+    value["data"]["record"] = record;
+
+    let parsed: TopologyEvent = serde_json::from_value(value).expect(
+        "an explicit null on a known optional field must pass the strict door; if this \
+         refuses, the door is reporting a field the record does declare, and every \
+         failed attempt's settlement is unreadable",
+    );
+    let TopologyEventBody::AttemptFinished { data } = parsed.body else {
+        unreachable!("built as an attempt_finished")
+    };
+    assert_eq!(
+        data.record
+            .failure
+            .as_ref()
+            .expect("the failure survives")
+            .detail,
+        None,
+        "an explicit null must read back as None"
+    );
+}
+
+/// **Both of §11.4's feedback sources reach the durable record.**
+///
+/// §11.4 names exactly two: "failure feedback (gate log or `required_changes`)
+/// goes back to the *same rung*". `AttemptFailure::feedback` unifies them —
+/// `classify::gate_failure` puts the 8-KiB tail there, and
+/// `attempt::review_failure` puts the reviewer's required changes there — and
+/// `classify::attempt_record` is the one production construction that copies
+/// the pair onto the wire.
+///
+/// It copied `{kind, origin, reason}` and dropped the feedback. `reason` is the
+/// human-facing summary, so a resumed run could say *that* a gate failed and
+/// nothing about **what it printed**: the retry ran on attempt 1's prompt and
+/// could repeat the same defect while spending another attempt. The 2026-08-26
+/// frontier review of `75da796` raised it as finding 2 and it is
+/// `PR7-FEEDBACK-NOT-DURABLE-IN-SCHEMA-4`; the field is authorised by
+/// `decisions/2026-08-26-durable-retry-feedback.md`.
+///
+/// Asserted on **content**, not on `is_some()`: the claim is that the next
+/// worker is told what this one was told to fix, and a record carrying the
+/// wrong string satisfies a presence check exactly as well as the right one.
+#[test]
+fn both_feedback_sources_reach_the_durable_attempt_record() {
+    use crate::gates::GateFailure;
+
+    let tail =
+        "error[E0308]: mismatched types\n  --> src/alpha.rs:12:9\n   expected `u32`, found `&str`";
+    let gate = super::classify::gate_failure(&GateFailure {
+        gate: "cargo test".to_owned(),
+        summary: "1 failed".to_owned(),
+        log_tail: tail.to_owned(),
+    });
+    assert_eq!(
+        durable_detail(&gate).as_deref(),
+        Some(tail),
+        "§11.1's gate tail did not reach the record, so a resume cannot tell the \
+         retry what the gate printed"
+    );
+
+    let review = super::attempt::review_failure(review::ReviewResult::Judged(crate::ir::Verdict {
+        pass: false,
+        reasons: vec!["the parser accepts a trailing comma".to_owned()],
+        required_changes: vec![
+            "reject a trailing comma in `parse_list`".to_owned(),
+            "add a case for the empty list".to_owned(),
+        ],
+        needs_human: false,
+    }))
+    .expect("a failed verdict is a failure");
+    assert_eq!(
+        durable_detail(&review).as_deref(),
+        Some("- reject a trailing comma in `parse_list`\n- add a case for the empty list"),
+        "§11.2's required_changes did not reach the record verbatim, so an \
+         escalation carries the reviewer's summary instead of its instructions"
+    );
+}
+
+/// One failure's `detail` as the wire carries it, through the production
+/// builder rather than around it.
+fn durable_detail(failure: &crate::ladder::AttemptFailure) -> Option<String> {
+    let outcome = crate::ir::Outcome {
+        status: crate::ir::OutcomeStatus::Completed,
+        diff: String::new(),
+        detail: None,
+        session_id: None,
+        usage: None,
+        cost_usd: None,
+        transcript_path: PathBuf::new(),
+        duration: Duration::ZERO,
+    };
+    super::classify::attempt_record(
+        1,
+        super::classify::AttemptFacts {
+            tier: crate::ir::Tier::Mid,
+            model: "claude-opus-5",
+            pool: None,
+            resumed: false,
+            outcome: &outcome,
+            reviews: &[],
+            failure: Some(failure),
+            // The schema-4 carrier, because that is the path under test: this
+            // helper exists to assert the field is written at all.
+            feedback: super::classify::FeedbackCarrier::AttemptRecord,
+        },
+    )
+    .failure
+    .expect("a classified failure produces a failure record")
+    .detail
 }
 
 #[test]
@@ -8932,7 +9330,22 @@ fn a_worker_that_cannot_be_spawned_returns_an_error_and_settles_nothing() {
 fn the_engine_facade_exposes_exactly_the_items_the_packet_enumerates() {
     use std::collections::BTreeSet;
 
-    let source = include_str!("mod.rs");
+    // **The blanked region, not the raw file.** This read `include_str!` and
+    // counted prose: the doc comment on `pub(crate) mod topology;` explains
+    // that this census forbids `pub mod `, and that sentence *is* a `pub mod `
+    // in the file — so the census failed on its own explanation.
+    // `PR4-CENSUS-COMMENT-ORACLE`, and the same trick would have let any of the
+    // six widenings be smuggled past by writing it in a comment.
+    let raw = include_str!("mod.rs");
+    let blanked = crate::effects::production_code(raw);
+    let source: &str = &blanked;
+    assert!(
+        source.len() * 2 > raw.len(),
+        "the blanked region of the engine facade is {} of {} bytes, so a census over it says \
+         little about the file",
+        source.len(),
+        raw.len()
+    );
 
     // Every `pub fn` at the facade's top level.
     let public_fns: BTreeSet<&str> = source
@@ -8960,6 +9373,17 @@ fn the_engine_facade_exposes_exactly_the_items_the_packet_enumerates() {
         "pub struct",
         "pub enum",
         "pub const",
+        // **`pub mod ` was missing from this list, and it is the route the
+        // schema-4 surface actually took.** `pub mod topology;` stood here for
+        // the whole slice: this census enumerated functions and re-exports, so
+        // a whole subsystem reached the public path without moving any number
+        // it counts. `create_run`, `Started::into_handle`,
+        // `TopologyRun::resumed` and `step` were reachable by any downstream
+        // caller of this library, which could then write schema-4 state that
+        // this build's own recovery refuses — the frontier review of
+        // `75da796`, finding 1. A census that forbids five widenings and not
+        // the sixth is the shape of every fail-open needle this slice found.
+        "pub mod ",
     ] {
         assert!(
             !source.contains(widening),

@@ -23,12 +23,42 @@
 //! disagree along. `report.json` is written from that state as a projection for
 //! humans; nothing ever reads it back.
 
+mod assembly;
 mod attempt;
+mod classify;
 mod coordinator;
 mod options;
 mod preflight;
 mod report;
 mod resume;
+/// The schema-4 run lifecycle.
+///
+/// **`pub(crate)`, and that is what makes `production_effect = "none"` true
+/// rather than an erratum.** It was `pub`, on the argument that the capability
+/// types this module *will* carry are to be guarded by compile-fail fixtures
+/// building out-of-process against the public path — and that behind a private
+/// `mod` those refusals collapse to `E0603`, a compile-fail test passing
+/// because the module is unreachable rather than because the token did its
+/// job. That argument is sound and its subject does not exist: the same doc
+/// admitted "no such fixture exists yet: the visibility is set ahead of the
+/// types".
+///
+/// **What the speculative `pub` actually bought was a defect.** `create_run`,
+/// `Started::into_handle`, `TopologyRun::resumed` and `step` formed a
+/// non-`#[cfg(test)]` writer path reachable by any downstream caller of this
+/// library. Such a caller writes P0–P8 schema-4 state; this build's recovery
+/// refuses every schema-4 log at reader ceiling 3; so `upstroke resume` could
+/// not resume what the released library itself created. Found by the frontier
+/// review of `75da796`, finding 1, and it is the reason the module doc one
+/// level down — "a schema-4 run is reachable only from a `#[cfg(test)]` writer
+/// selector" — was false as written.
+///
+/// **Set back when the fixtures exist**, not before: the visibility follows the
+/// types rather than leading them, which is the opposite of the order tried
+/// here. `the_engine_facade_exposes_exactly_the_items_the_packet_enumerates`
+/// now forbids `pub mod ` in this file, so the next attempt has to be
+/// deliberate.
+pub(crate) mod topology;
 
 use crate::agent::proc::NoHooks;
 use crate::error::UpstrokeError;

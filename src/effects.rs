@@ -279,22 +279,18 @@ pub fn blank_comments(source: &str) -> String {
                 i = end;
             }
             b'\'' => {
-                // A char literal is `'x'`, `'\n'` or `'\u{1}'`; `'a` is a
-                // lifetime and must be left alone. `'"'` is the one that matters
-                // here: without this arm it opens a string.
-                let is_char = bytes.get(i + 1) == Some(&b'\\')
-                    || (bytes.get(i + 2) == Some(&b'\'') && bytes.get(i + 1).is_some());
-                if is_char {
-                    let start = i;
-                    i += 1;
-                    while i < bytes.len() && bytes[i] != b'\'' {
-                        i += if bytes[i] == b'\\' { 2 } else { 1 };
+                // `'"'` is the one that matters here: without this arm it opens
+                // a string. [`char_literal_end`] decides, so this and its
+                // sibling cannot drift apart.
+                match char_literal_end(bytes, i) {
+                    Some(end) => {
+                        out.extend_from_slice(&bytes[i..end]);
+                        i = end;
                     }
-                    i = (i + 1).min(bytes.len());
-                    out.extend_from_slice(&bytes[start..i]);
-                } else {
-                    out.push(bytes[i]);
-                    i += 1;
+                    None => {
+                        out.push(bytes[i]);
+                        i += 1;
+                    }
                 }
             }
             byte => {
@@ -304,6 +300,82 @@ pub fn blank_comments(source: &str) -> String {
         }
     }
     String::from_utf8_lossy(&out).into_owned()
+}
+
+/// Where the char literal starting at `from` ends, exclusive, or `None` when
+/// `from` does not start one.
+///
+/// A char literal is `'`, then either an escape (`\n`, `\\`, `\'`, `\u{1F600}`)
+/// or **one UTF-8 scalar**, then `'`. The scalar is one to four bytes, and that
+/// is the whole reason this is a scan rather than a lookahead.
+///
+/// ## The desync a fixed lookahead produces, and how far it reaches
+///
+/// Both blankers used to answer the question with two bytes: `'` is a char
+/// literal when the byte at `+2` is a quote. `'é'` closes at `+3`, so it was
+/// classified as **not** a literal, scanning resumed on its closing quote, and
+/// that quote was then read as an *opening* one. From there the tokeniser is out
+/// of phase: in `('é','{')` the pairing shifts by one and the `{` that is inside
+/// a char literal survives into the blanked text as visible **code**.
+///
+/// One unbalanced brace is enough to take a file out of every census that
+/// consults [`production_code`]. [`matching`] counts it, so
+/// [`configured_item_end`]'s brace arm walks past the item's real `}`, finds no
+/// balancing brace and gives up — and giving up used to mean "blank to end of
+/// file".
+///
+/// Measured end to end, twice. On `src/agent/claude.rs`, with the pair inside
+/// that file's `#[cfg(test)] mod tests` and a forged item appended below it, the
+/// region measured **8525** non-whitespace bytes with the attack and 8525
+/// without — a zero-byte delta no floor can see — and every source census was
+/// green. Then gate-clean, because the first form is not: `cargo fmt` rewrites
+/// `('é','{')` to `('é', '{')` and the space defuses it, and
+/// `clippy::items_after_test_module` refuses an item placed below a file's own
+/// `mod tests`. Both are avoidable. `stringify! { ('é','{') }` is left alone by
+/// rustfmt (macro bodies in braces are), and a `#[cfg(test)]` module not named
+/// `tests` is not what that lint looks for. With the probe inside
+/// `src/runner/container/view.rs`'s `#[cfg(test)] pub(crate) mod fixtures` and a
+/// forged `RunnerRequest {` builder above the file's real test module,
+/// `cargo fmt --check` and `cargo clippy --all-targets -- -D warnings` both exit
+/// 0 and `runner::tests::every_production_runner_request_is_built_by_its_roles_\
+/// builder` passes — while the identical forged builder **without** the probe
+/// fails it by name.
+///
+/// The preconditions are already in this tree: `src/status.rs`, `src/util.rs`
+/// (twice on one line) and `src/engine/tests.rs` all hold non-ASCII char
+/// literals. Only the adjacency was missing.
+///
+/// `'a` is a lifetime and is not a char literal; nor is `'_`, nor the `'static`
+/// in `&'static str`. All three are refused by one rule — the byte after the
+/// scalar is not a quote — rather than by a list.
+fn char_literal_end(bytes: &[u8], from: usize) -> Option<usize> {
+    if bytes.get(from) != Some(&b'\'') {
+        return None;
+    }
+    let mut at = from + 1;
+    if bytes.get(at) == Some(&b'\\') {
+        // An escape. The longest Rust spells is `\u{10FFFF}`, which closes at
+        // `from + 11`, so the window is bounded and a runaway scan over the rest
+        // of the file cannot happen.
+        at += 2;
+        let limit = (from + 13).min(bytes.len());
+        while at < limit && bytes[at] != b'\'' {
+            at += 1;
+        }
+        return (bytes.get(at) == Some(&b'\'')).then_some(at + 1);
+    }
+    // One UTF-8 scalar, whose width its lead byte states. A continuation or an
+    // otherwise invalid lead cannot begin one, and `source` is a `&str`, so the
+    // remaining ranges are unreachable rather than merely unhandled.
+    let width = match *bytes.get(at)? {
+        0x00..=0x7F => 1,
+        0xC2..=0xDF => 2,
+        0xE0..=0xEF => 3,
+        0xF0..=0xF4 => 4,
+        _ => return None,
+    };
+    at += width;
+    (bytes.get(at) == Some(&b'\'')).then_some(at + 1)
 }
 
 /// Where the string literal starting at `from` ends, or `None` when `from` does
@@ -435,20 +507,15 @@ pub fn blank_comments_and_strings(source: &str) -> String {
                 code_start = i;
             }
             b'\'' => {
-                // A char literal is `'x'`, `'\n'` or `'\u{1}'`; `'a` is a
-                // lifetime and must be left alone.
-                let is_char = bytes.get(i + 1) == Some(&b'\\')
-                    || (bytes.get(i + 2) == Some(&b'\'') && bytes.get(i + 1).is_some());
-                if is_char {
-                    keep(&mut out, code_start, i);
-                    i += 1;
-                    while i < bytes.len() && bytes[i] != b'\'' {
-                        i += if bytes[i] == b'\\' { 2 } else { 1 };
+                // [`char_literal_end`] decides, so this and its sibling in
+                // [`blank_comments`] cannot drift apart.
+                match char_literal_end(bytes, i) {
+                    Some(end) => {
+                        keep(&mut out, code_start, i);
+                        i = end;
+                        code_start = i;
                     }
-                    i = (i + 1).min(bytes.len());
-                    code_start = i;
-                } else {
-                    i += 1;
+                    None => i += 1,
                 }
             }
             _ => i += 1,
@@ -467,6 +534,131 @@ pub fn production_region(source: &str) -> String {
         Some(cut) => source[..cut].to_owned(),
         None => source.to_owned(),
     }
+}
+
+/// The production **code** of `source`: comments and string literals blanked,
+/// and every `#[cfg(test)]`-configured item removed.
+///
+/// [`production_region`] answers a different question and keeps its answer: it
+/// *truncates* at the first `#[cfg(test)]`, which is what a **domain** question
+/// wants (everything above the cut is certainly production) and what a
+/// **prohibition** question must not have. Three failures a prohibition census
+/// pays for with a truncating region, all three measured on this tree:
+///
+/// * A file that declares its tests as `#[cfg(test)] mod tests;` — thirteen of
+///   them here — puts every line **below** that declaration outside the region.
+///   The declaration is usually the last item, so the hole is normally empty;
+///   appending to the file fills it. Legal Rust, no comment trick, and it
+///   defeated the barrier census, the process-start census and the container
+///   token census at once.
+/// * A `#[cfg(test)]` inside a block comment or a string literal truncates a
+///   region that a `//`-only strip cannot see. `PR4-CENSUS-COMMENT-ORACLE`,
+///   in the shape a `//`-only strip does not close.
+/// * Counting over unblanked text counts prose. `src/agent/proc.rs` names
+///   `run_with_timeout` eight times, five in code and three in doc comments, so
+///   a real ninth entry point could be paid for by deleting two sentences.
+///
+/// So this returns the **whole file**, blanked, with each `#[cfg(test)]` item
+/// blanked out in place. Newlines survive, so a byte offset still maps to the
+/// line it came from.
+///
+/// The item's extent is found by delimiter matching over the blanked text — a
+/// brace body ends at its matching `}` (and takes a trailing `;` with it, for
+/// `use a::{b, c};`), anything else ends at the first `;` or `,` outside a
+/// nested delimiter, and a closing delimiter that would leave the enclosing
+/// block ends it too. Angle brackets are deliberately not matched: a
+/// `#[cfg(test)] field: BTreeMap<K, V>,` ends at the comma inside the generics
+/// and leaves `V>,` behind. That is the safe direction — a region that is too
+/// **large** can only make a census match more, never less.
+#[must_use]
+pub fn production_code(source: &str) -> String {
+    const ATTR: &[u8] = b"#[cfg(test)]";
+    let blanked = blank_comments_and_strings(source);
+    let bytes = blanked.as_bytes();
+    let mut out = bytes.to_vec();
+    let mut from = 0;
+    // Searched over bytes rather than `str::find`, because a cut offset is not
+    // guaranteed to be a char boundary and slicing one panics.
+    while let Some(at) = bytes
+        .get(from..)
+        .and_then(|rest| rest.windows(ATTR.len()).position(|at| at == ATTR))
+        .map(|found| from + found)
+    {
+        // Any further attributes stacked on the same item belong to it.
+        let mut start = at + ATTR.len();
+        loop {
+            while bytes.get(start).is_some_and(u8::is_ascii_whitespace) {
+                start += 1;
+            }
+            if bytes.get(start) == Some(&b'#') {
+                let open = if bytes.get(start + 1) == Some(&b'!') {
+                    start + 2
+                } else {
+                    start + 1
+                };
+                if bytes.get(open) == Some(&b'[') {
+                    if let Some(close) = matching(bytes, open, b'[', b']') {
+                        start = close + 1;
+                        continue;
+                    }
+                }
+            }
+            break;
+        }
+        let end = configured_item_end(bytes, start);
+        for byte in &mut out[at..end] {
+            if *byte != b'\n' {
+                *byte = b' ';
+            }
+        }
+        from = end.max(at + ATTR.len());
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+/// Where the item beginning at `start` ends, exclusive. See [`production_code`].
+///
+/// **The two give-up paths return `start`, not `bytes.len()`.** Both are reached
+/// only when the blanked text does not parse — an unbalanced brace, or an item
+/// with no terminator before end of file — and neither is reachable from this
+/// tree today (measured: zero occurrences over all 92 source files). What
+/// decides the value is the *direction* they fail in. `bytes.len()` reads "the
+/// item is the rest of the file" and blanks it, so a tokeniser that has lost
+/// phase silently removes every production item below the attribute from every
+/// census that consults this region — which is exactly what
+/// [`char_literal_end`]'s desync used to buy. Returning `start` blanks the
+/// attribute and nothing else, so the test module below it reads as production
+/// and the censuses go **loud** instead. The larger region is always the safe
+/// one here, for the same reason the doc above gives for not matching angle
+/// brackets: it can only make a census match more, never less.
+fn configured_item_end(bytes: &[u8], start: usize) -> usize {
+    let mut depth = 0usize;
+    let mut index = start;
+    while index < bytes.len() {
+        match bytes[index] {
+            b'{' if depth == 0 => {
+                let Some(close) = matching(bytes, index, b'{', b'}') else {
+                    return start;
+                };
+                let mut after = close + 1;
+                while bytes.get(after).is_some_and(u8::is_ascii_whitespace) {
+                    after += 1;
+                }
+                return if bytes.get(after) == Some(&b';') {
+                    after + 1
+                } else {
+                    close + 1
+                };
+            }
+            b'(' | b'[' | b'{' => depth += 1,
+            b')' | b']' | b'}' if depth == 0 => return index,
+            b')' | b']' | b'}' => depth -= 1,
+            b';' | b',' if depth == 0 => return index + 1,
+            _ => {}
+        }
+        index += 1;
+    }
+    start
 }
 
 /// Every `allow`/`expect` of a governed lint in `source`, with where it sits.
@@ -651,11 +843,24 @@ pub const FROZEN_LEGACY_ALLOWLIST: &[&str] = &[
 /// `src/runner/{host,container,invocation}.rs` and `src/workspace_manager.rs`
 /// are in the funnel section without contradiction — the same sentence lists
 /// them there.
+///
+/// `src/engine/topology/` is the fifth entry and is **not** in the packet
+/// sentence, which names `src/engine/topology.rs` only. It is here because
+/// [`topology_modules_among`] matches with `str::starts_with`, and
+/// `"src/engine/topology/create.rs"` does not start with
+/// `"src/engine/topology.rs"` — the sentence's four shapes were written when
+/// the schema-4 engine was one file, and PR7 makes it a directory. Without
+/// this entry the ban silently stops covering every submodule of the module it
+/// exists to cover. Widening a ban is not a relaxation of the packet, and
+/// `the_legacy_section_never_contains_a_topology_module` executes the gap: it
+/// asserts the four-entry list misses a submodule that the five-entry list
+/// catches.
 pub const TOPOLOGY_MODULES: &[&str] = &[
     "src/topology/",
     "src/runner/",
     "src/workspace_manager.rs",
     "src/engine/topology.rs",
+    "src/engine/topology/",
 ];
 
 /// Entries of `current` that the frozen list does not contain — i.e. growth.
@@ -720,6 +925,15 @@ pub const CLASSIFIED_MODULES: &[&str] = &[
     // sentence enumerates — and `every_effectful_wrapper_is_on_the_disallowed_list`
     // requires a `upstroke::` denial to be a row somebody classified.
     "src/runner/container.rs",
+    // The body of the Container funnel's R19 view, added by PR7's census
+    // repair. It carries `#![allow(clippy::disallowed_methods)]` over its
+    // production region and was the **only** non-test production module in the
+    // tree in that position and absent from this list. The consequence was not
+    // theoretical: with no row here, none of its `pub fn` needed classifying,
+    // so `every_effectful_wrapper_is_on_the_disallowed_list` could never force
+    // one onto the denylist — a module that may reach `fs` under its own allow,
+    // and whose reachable surface nobody had to account for.
+    "src/runner/container/view.rs",
     // legacy
     "src/engine/coordinator.rs",
     "src/engine/resume.rs",
@@ -995,6 +1209,218 @@ pub const DENIAL_CONTROL: &str = "pub fn go(p: &std::path::Path) -> bool {\n\
                                   \x20   let _ = upstroke::util::tail(\"x\", 1);\n\
                                   \x20   p.exists()\n\
                                   }\n";
+
+// -- test-only declarations ----------------------------------------------
+// At the BOTTOM, and a `mod` rather than a bare `fn`: `production_region` cuts a
+// file at its first `#[cfg(test)]`, and
+// `effects::tests::every_production_region_that_stops_early_stops_at_a_module`
+// pins by name the ten files whose cut lands on something that is not a module.
+// This file is not one of them and must not become one.
+
+/// The **domain** every whole-tree census draws, derived once.
+///
+/// `PR5D-VISIBILITY-CHECK-DUPLICATED`: a value two places both maintain by hand
+/// disagree eventually, and the one that disagrees silently is the one that
+/// decides what a census is allowed to see. This derivation was written twice —
+/// `runner::tests::whole_file_test_module_declarations` and
+/// `events::log::tests::declared_whole_file_test_modules`, identical by hand,
+/// each deciding which files four whole-tree censuses skip. It lives beside
+/// [`production_code`] now, which is the region those same censuses count over.
+#[cfg(test)]
+pub(crate) mod census_domain {
+    use std::path::PathBuf;
+
+    /// Calls to `name` in `code`: neither its definition, nor a longer identifier
+    /// that merely ends in it.
+    ///
+    /// The second half is the one that was missing. A needle built as
+    /// `format!("{name}(")` is a plain substring search, so `expected_refs(` is
+    /// satisfied by every `refuse_unexpected_refs(` in the tree — and a census whose
+    /// entry is proved by a different function's call sites proves nothing about its
+    /// own. Measured on this tree: `workspace_manager.rs` carries four occurrences of
+    /// the substring `expected_refs(` and **zero** calls to `expected_refs` — one of
+    /// the four survives into `production_code`'s region, and it is the *definition
+    /// line* of `refuse_unexpected_refs`, which the "calls, not definitions" filter
+    /// does not see because the text before the match is `pub fn refuse_un`.
+    ///
+    /// The boundary is "the byte before the match is not an identifier byte", which
+    /// keeps `crate::a::b::expected_refs(` — `:` is not one — and rejects
+    /// `unexpected_refs(`. Not a rename, which is how
+    /// `the_barrier_is_the_only_topology_route_from_a_proven_prefix_to_an_append_handle`
+    /// closed the same class: that census's needle is a constant it could choose,
+    /// this one's is eleven names the packet chose.
+    pub(crate) fn production_calls(code: &str, name: &str, form: Call) -> usize {
+        let needle = format!("{name}(");
+        code.match_indices(&needle)
+            // Not the tail of a longer identifier.
+            .filter(|(at, _)| {
+                code[..*at]
+                    .chars()
+                    .next_back()
+                    .is_none_or(|before| !before.is_alphanumeric() && before != '_')
+            })
+            // Calls, not definitions.
+            .filter(|(at, _)| !code[..*at].trim_end().ends_with("fn"))
+            // And the form the clause is written in, which is what tells three
+            // items of one name apart.
+            .filter(|(at, _)| {
+                let dotted = code[..*at].trim_end().ends_with('.');
+                match form {
+                    Call::Free => !dotted,
+                    Call::Method => dotted,
+                }
+            })
+            .count()
+    }
+
+    /// How a clause's function is **called** in production.
+    ///
+    /// Not decoration. `settle_interrupted` names three unrelated production items
+    /// in this tree — `recover::settle_interrupted` (the `T-ATTEMPT` clause, a free
+    /// function), `AttemptContext::settle_interrupted` and
+    /// `events::RunState::settle_interrupted` (both methods, both called) — and a
+    /// census counting the bare name is satisfied by either of the other two.
+    /// Measured by S5 round 4: deleting step (d)'s only production call left the
+    /// census **and the entire suite** green, with `attempt_interrupted` appended
+    /// by no run. `reviews/FINDINGS.md` §4's "a refutation must name which item it
+    /// inspected" is the same rule; this is it applied to the instrument.
+    #[derive(Clone, Copy)]
+    pub(crate) enum Call {
+        /// `name(…)` or `path::name(…)` — never `receiver.name(…)`.
+        Free,
+        /// `receiver.name(…)`.
+        Method,
+    }
+
+    /// The **files** [`declared_whole_file_test_modules`] resolves to, as a set a
+    /// census can test membership in.
+    ///
+    /// The resolution loop — assert exactly one of the two candidates exists,
+    /// collect it — was written out at each caller, and a third caller wrote a
+    /// different rule instead: `path.file_stem() == "tests"`. That covers the
+    /// fourteen files named `tests.rs` and **not** the three that are not:
+    /// `#[cfg(test)] mod scaffold;`, `mod premove;` and `mod fake;`. Seventeen,
+    /// not fourteen, and the three it missed are the ones a census is most
+    /// likely to trip over, because a scaffold and a fake exist to *name* the
+    /// things production names. Found by S5 round 5's `seams`, `attempt` and
+    /// `settle` lenses independently; the consolidation had been filed one
+    /// commit earlier in `reviews/FINDINGS.md` §20 as tidiness.
+    ///
+    /// # Panics
+    ///
+    /// When a declaration resolves to no file or to both candidates — a skip
+    /// path naming no file is a skip that has stopped meaning anything — or
+    /// when fewer than `floor` declarations are derived, which is the control
+    /// against a derivation that has silently stopped finding anything.
+    pub(crate) fn whole_file_test_modules(
+        files: &[PathBuf],
+        floor: usize,
+    ) -> std::collections::BTreeSet<PathBuf> {
+        let declarations = declared_whole_file_test_modules(files);
+        assert!(
+            declarations.len() >= floor,
+            "only {} `#[cfg(test)] mod …;` declarations were derived and the floor is {floor}; \
+             the derivation is finding nothing",
+            declarations.len()
+        );
+        let mut modules = std::collections::BTreeSet::new();
+        for (declared_in, name, candidates) in &declarations {
+            let present: Vec<&PathBuf> = candidates
+                .iter()
+                .filter(|candidate| candidate.is_file())
+                .collect();
+            assert_eq!(
+                present.len(),
+                1,
+                "`{}` declares `#[cfg(test)] mod {name};` and {} of {candidates:?} exist. A skip \
+                 path naming no file is a skip that has stopped meaning anything",
+                declared_in.display(),
+                present.len()
+            );
+            modules.insert(present[0].clone());
+        }
+        // **The control that binds every caller**, and it belongs here rather
+        // than at each of them. `the_declared_whole_file_test_modules_are_seventeen…`
+        // asserts what this *returns*; it says nothing about whether a census
+        // calls it, which is the defect `3a91626` repaired for two censuses and
+        // this witness then reproduced one commit later (`R6-SETTLE-003`). A
+        // caller cannot reach the set without passing through this line.
+        assert!(
+            modules
+                .iter()
+                .any(|path| path.file_stem().is_none_or(|stem| stem != "tests")),
+            "every module derived here is called `tests.rs`, which is exactly what the file-name \
+             rule this replaces also finds. The derivation has degraded to the rule it exists to \
+             be better than: {modules:?}"
+        );
+        modules
+    }
+
+    /// Every `#[cfg(test)] mod <name>;` the crate declares, as
+    /// `(declaring file, name, [flat candidate, nested candidate])`.
+    ///
+    /// Such a file is test code end to end. A region function has nothing to
+    /// remove in one, so it would count the whole of it as production — a
+    /// fixture that names a census's needle would then read as a production
+    /// offender. The set is read out of the declarations rather than listed by
+    /// hand: it was `src/engine/tests.rs` alone until PR5 moved the Event funnel
+    /// into `src/events/log.rs` with two test modules of its own, and the census
+    /// failed on the first file the hand-maintained list did not know about.
+    ///
+    /// **Read out of the blanked source, and every candidate returned rather
+    /// than assumed.** The split used to be over the raw text, so a `//` line
+    /// containing `#[cfg(test)] mod policy;` derived a skip for
+    /// `src/runner/policy.rs` and removed that file from every census below —
+    /// measured, with a `git push` planted in it that the census then did not
+    /// see. Over the whole tree the raw split derived 50 skip paths of which
+    /// **34 named no file at all**, and a skip path naming no file is a skip
+    /// that has stopped meaning anything, so each caller asserts that exactly
+    /// one of the two candidates exists.
+    ///
+    /// A declaration carrying a visibility qualifier — `#[cfg(test)]
+    /// pub(crate) mod helpers;` — is deliberately **not** matched. Failing to
+    /// derive a skip leaves a test file inside a census's domain, where a
+    /// fixture is reported as an offender and someone looks; deriving one it
+    /// should not removes a real production file, silently. Only the first
+    /// direction is safe, so the predicate stays the narrow one.
+    pub(crate) fn declared_whole_file_test_modules(
+        files: &[PathBuf],
+    ) -> Vec<(PathBuf, String, [PathBuf; 2])> {
+        let mut found = Vec::new();
+        for path in files {
+            let blanked = super::blank_comments_and_strings(
+                &std::fs::read_to_string(path).expect("read source"),
+            );
+            let parent = path.parent().expect("a source file has a directory");
+            let stem = path.file_stem().expect("a source file has a name");
+            let dir = if stem == "mod" || stem == "lib" || stem == "main" {
+                parent.to_path_buf()
+            } else {
+                parent.join(stem)
+            };
+            for rest in blanked.split("#[cfg(test)]").skip(1) {
+                let Some(name) = rest.trim_start().strip_prefix("mod ") else {
+                    continue;
+                };
+                let Some(name) = name.split(';').next().map(str::trim) else {
+                    continue;
+                };
+                if name.is_empty() || name.contains('{') {
+                    continue;
+                }
+                found.push((
+                    path.clone(),
+                    name.to_owned(),
+                    [
+                        dir.join(format!("{name}.rs")),
+                        dir.join(name).join("mod.rs"),
+                    ],
+                ));
+            }
+        }
+        found
+    }
+}
 
 #[cfg(test)]
 mod tests;

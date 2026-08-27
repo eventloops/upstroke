@@ -12,13 +12,10 @@ use crate::agent::{AdapterSource, Caps};
 use crate::capacity;
 use crate::config::{self, OnTaskFailure};
 use crate::error::UpstrokeError;
-use crate::events::{
-    self, AttemptRecord, EventBody, EventLog, FailureRecord, Progress, RunState, TaskState,
-};
+use crate::events::{self, EventBody, EventLog, Progress, RunState, TaskState};
 use crate::interaction::{self, AnswerSource, Notifier, QuestionRecord, RealSleeper, Sleeper};
 use crate::ir::{
-    Answer, PermissionMode, Question, QuestionId, QuestionKind, ResolvedEffortPolicy, Task,
-    WorkerProfile,
+    Answer, Question, QuestionId, QuestionKind, ResolvedEffortPolicy, Task, WorkerProfile,
 };
 use crate::ladder::{
     self, AttemptFailure, FailureKind, FailureOrigin, LadderPolicy, LadderState, Next,
@@ -587,22 +584,16 @@ impl Run<'_> {
                 return Ok(false);
             }
 
-            let profile = WorkerProfile {
-                name: format!("{}-{}", rung.tier, rung.binding.model),
-                agent: rung.binding.agent.clone(),
-                model: rung.binding.model.clone(),
-                // Attribution only (§13 read-only): which subscription pays for
-                // this attempt, so the ledger and the estimator can say so.
-                // Nothing routes on it.
-                pool: self.pool_name_for(&rung.binding.agent).unwrap_or_default(),
-                permissions: PermissionMode::Edit,
-                // What the rung's tier is worth on an agent with an effort
-                // axis: without this the whole chain runs at one vendor
-                // default and escalating a rung moves nothing (§10).
-                effort: Some(self.effort_policy.implementation_for(rung.tier)),
-                max_turns: None,
-                extra_args: Vec::new(),
-            };
+            // Attribution only (§13 read-only): which subscription pays for
+            // this attempt. Resolved here because it needs the run's config,
+            // and passed in.
+            let profile = super::assembly::implementer_profile(
+                super::assembly::ImplementerBinding::of_rung(
+                    rung,
+                    self.effort_policy.implementation_for(rung.tier),
+                ),
+                self.pool_name_for(&rung.binding.agent),
+            );
             let adapter = adapters
                 .get(&profile.agent)
                 .ok_or_else(|| UpstrokeError::Agent {
@@ -780,8 +771,11 @@ impl Run<'_> {
                         )));
                     }
                     Next::AskHuman(kind) => {
-                        let context =
-                            question_context(task, kind, failure, &self.state.progress[index]);
+                        let context = question_context(
+                            ParkSubject::of(task, &self.state.progress[index]),
+                            kind,
+                            failure,
+                        );
                         let question = self.build_question(index, kind, context);
                         parking = Some(Box::new(events::AttemptParking {
                             question: question.clone(),
@@ -847,23 +841,25 @@ impl Run<'_> {
                 parking,
                 transition,
                 prepared_commit: prepared_commit.clone().map(Box::new),
-                data: Box::new(AttemptRecord {
+                data: Box::new(super::classify::attempt_record(
                     attempt,
-                    tier: rung.tier.to_string(),
-                    model: profile.model.clone(),
-                    pool: pool_option(&profile.pool),
-                    resumed: resume.is_some(),
-                    duration: result.outcome.duration,
-                    cost_usd: result.outcome.cost_usd,
-                    reviews: result.reviews.clone(),
-                    session_id: result.outcome.session_id.clone(),
-                    usage: result.outcome.usage.clone(),
-                    failure: result.failure.as_ref().map(|f| FailureRecord {
-                        kind: f.kind,
-                        origin: f.origin,
-                        reason: f.reason.clone(),
-                    }),
-                }),
+                    super::classify::AttemptFacts {
+                        tier: rung.tier,
+                        model: &profile.model,
+                        pool: pool_option(&profile.pool),
+                        resumed: resume.is_some(),
+                        outcome: &result.outcome,
+                        reviews: &result.reviews,
+                        failure: result.failure.as_ref(),
+                        // The legacy wire's own carrier. `ladder_retry` and
+                        // `ladder_escalated` are appended with `summary` and
+                        // `detail` a few lines below, and `Progress::feedback`
+                        // is rebuilt by replaying them, so a copy on the record
+                        // would be the same kilobytes twice — once in the log
+                        // and once in every `report.json`.
+                        feedback: super::classify::FeedbackCarrier::LadderEvent,
+                    },
+                )),
             });
             if let Err(error) = settlement {
                 // A write/flush/sync error cannot prove whether the newline-
@@ -1470,14 +1466,52 @@ impl Run<'_> {
 /// What the human is shown. Every agent-authored fragment is quoted behind a
 /// fence the payload cannot close and labelled as agent-authored — a worker
 /// that "asks a question" is still an agent writing into a human's terminal.
-fn question_context(
-    task: &Task,
+pub(super) struct ParkSubject<'a> {
+    /// The id a human reads.
+    pub(super) display_id: &'a str,
+    /// What the task was asked to do.
+    pub(super) title: &'a str,
+    /// The bar it was asked to clear.
+    pub(super) acceptance: &'a [String],
+    /// How many attempts have run, which the context quotes back.
+    pub(super) attempts: u32,
+    /// How many distinct rungs those attempts spent, at least one.
+    pub(super) rungs_spent: usize,
+}
+
+impl<'a> ParkSubject<'a> {
+    /// The subject of a schema-3 task and its progress.
+    pub(super) fn of(task: &'a Task, progress: &Progress) -> Self {
+        Self {
+            display_id: task.id.as_str(),
+            title: &task.title,
+            acceptance: &task.acceptance,
+            attempts: progress.attempts,
+            rungs_spent: progress
+                .records
+                .iter()
+                .map(|record| record.tier.as_str())
+                .collect::<std::collections::BTreeSet<_>>()
+                .len()
+                .max(1),
+        }
+    }
+}
+
+/// The context a parked task's question quotes back to the human.
+///
+/// **Ask for what you read.** It reads the display id, the title, the
+/// acceptance list and the attempt count — never the body, the artifacts or the
+/// plan. Naming them lets the schema-4 driver, which holds a `FrozenTaskSpec`
+/// and no `Task`, raise the same question the legacy engine does rather than
+/// wording its own.
+pub(super) fn question_context(
+    task: ParkSubject<'_>,
     kind: QuestionKind,
     failure: &AttemptFailure,
-    progress: &Progress,
 ) -> String {
     let mut context = String::new();
-    let _ = writeln!(context, "Task `{}` — {}", task.id, task.title);
+    let _ = writeln!(context, "Task `{}` — {}", task.display_id, task.title);
     let asker = match failure.origin {
         FailureOrigin::Reviewer => "the reviewer",
         FailureOrigin::Worker => "the implementing agent",
@@ -1514,14 +1548,7 @@ fn question_context(
                     context,
                     "Nothing further can move this task: {} attempt(s) across {} rung(s) all failed, \
                  and the escalation chain is spent. The last failure was:",
-                    progress.attempts,
-                    progress
-                        .records
-                        .iter()
-                        .map(|r| r.tier.as_str())
-                        .collect::<std::collections::BTreeSet<_>>()
-                        .len()
-                        .max(1)
+                    task.attempts, task.rungs_spent
                 );
             }
         }
@@ -1530,7 +1557,7 @@ fn question_context(
     let _ = writeln!(context, "{fence}\n{}\n{fence}", failure.reason.trim());
     if !task.acceptance.is_empty() {
         context.push_str("Acceptance criteria this task must meet:\n");
-        for item in &task.acceptance {
+        for item in task.acceptance {
             let _ = writeln!(context, "- {item}");
         }
     }

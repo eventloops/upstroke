@@ -8,11 +8,11 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use crate::agent::{AgentAdapter, TaskRun, proc};
+use crate::agent::{AgentAdapter, proc};
 use crate::error::UpstrokeError;
 use crate::events::{self, Feedback};
 use crate::gates::{self, ShellGate};
-use crate::ir::{Outcome, OutcomeStatus, Task, TaskKind, WorkerProfile};
+use crate::ir::{Outcome, OutcomeStatus, Task, WorkerProfile};
 use crate::ladder::{AttemptFailure, FailureKind};
 use crate::review;
 use crate::rundir::RunPaths;
@@ -149,37 +149,32 @@ pub(super) fn run_attempt(
     workspace: &Workspace,
     resume_session: Option<String>,
 ) -> Result<AttemptResult, UpstrokeError> {
-    let settings_path = cx.adapter.materialize_permissions(
-        &cx.profile,
-        cx.gate_cmds,
-        &cx.paths.settings(),
-        &format!("{}-{}", cx.stem, cx.attempt),
-    )?;
-
-    let task_run = TaskRun {
-        prompt: materialize_prompt(
-            cx.task,
-            cx.gate_cmds,
-            &cx.paths.artifacts(),
-            cx.retry.as_ref(),
-        ),
-        profile: cx.profile.clone(),
-        workspace: workspace.root().to_path_buf(),
-        gate_cmds: cx.gate_cmds.to_vec(),
-        resume_session,
-        settings_path,
-    };
+    // The command is assembled by `engine::assembly`, which is the one
+    // production place that decides a worker invocation's inputs. This block
+    // used to do it inline; it moved so the schema-4 driver could be its second
+    // caller rather than its second implementation.
+    //
     // The adapter says what to run; the runner says where. `ExecutionRole::
     // Implement` with the bound agent is what makes this process slotted
     // (R3) and what tells `host-v1` to supply that agent's credential
     // location — both properties of the role, not of this call site.
-    let command = cx
-        .adapter
-        .build(&task_run)?
-        .stdin(cx.adapter.stdin_payload(&task_run).as_bytes().to_vec());
+    let worker_workspace = workspace.root().to_path_buf();
+    let command = super::assembly::WorkerAssembly {
+        adapter: cx.adapter,
+        profile: &cx.profile,
+        task: super::assembly::WorkerSubject::of(cx.task),
+        gate_cmds: cx.gate_cmds,
+        paths: cx.paths,
+        stem: &cx.stem,
+        attempt: cx.attempt,
+        retry: cx.retry.as_ref(),
+        workspace: &worker_workspace,
+        resume_session,
+    }
+    .command()?;
     let output = cx.runner.run(&crate::runner::worker_request(
         command,
-        task_run.workspace.clone(),
+        worker_workspace.clone(),
         AgentId::new(cx.adapter.id()),
         cx.timeout,
         cx.invocation(AttemptRole::Worker),
@@ -207,35 +202,25 @@ pub(super) fn run_attempt(
     // Verification ladder (§11): outcome sanity → cheap static provenance →
     // gates → review. Cheapest and most objective first.
     let mut failure = evaluate_outcome(&outcome, &output);
+    // What the diff alone says, in the legacy order. `engine::classify` is the
+    // one production place that decides it; the schema-4 driver reads the same
+    // answer rather than forming its own, because `ladder::next_step` reads the
+    // result and the allowance decision is derived from it.
     if failure.is_none() {
-        if let Some(error) = review::complete_diff_error(&outcome.diff) {
-            if matches!(error, review::CompleteDiffError::Opaque) || !cx.reviewers.is_empty() {
-                let kind = match error {
-                    review::CompleteDiffError::Opaque => FailureKind::ReviewInputOpaque,
-                    review::CompleteDiffError::TooLarge { .. } => FailureKind::ReviewInputTooLarge,
-                };
-                failure = Some(AttemptFailure::new(kind, error.to_string()).from_reviewer());
-            }
-        }
-    }
-    if failure.is_none() && cx.task.kind == TaskKind::Test && !gates::diff_adds_tests(&outcome.diff)
-    {
-        failure = Some(
-            AttemptFailure::new(
-                FailureKind::TestProvenance,
-                "test provenance: this Test task adds no test code — a Test task that changes no \
-                 tests proves nothing",
-            )
-            .with_feedback(
-                "The diff contains no test code. Add tests that would fail without your change."
-                    .to_owned(),
-            ),
-        );
+        failure =
+            super::classify::diff_failure(&outcome.diff, cx.task.kind, !cx.reviewers.is_empty());
     }
     if failure.is_none() {
-        if let Some(problem) = workspace.review_input_problem_for_tree(&candidate.tree_oid)? {
-            failure =
-                Some(AttemptFailure::new(FailureKind::ReviewInputOpaque, problem).from_reviewer());
+        // Through the seam and the classifier, so the schema-4 driver runs the
+        // same rung rather than a copy of it.
+        if let Some(problem) =
+            <LegacyReviewInputPolicy as super::topology::attempt::ReviewInputPolicy>::problem(
+                &LegacyReviewInputPolicy,
+                workspace.root(),
+                &candidate.tree_oid,
+            )?
+        {
+            failure = Some(super::classify::review_input_failure(problem));
         }
     }
     if failure.is_none() && !cx.gates.is_empty() {
@@ -253,16 +238,7 @@ pub(super) fn run_attempt(
             &cx.stem,
             cx.attempt,
         )? {
-            failure = Some(
-                AttemptFailure::new(
-                    FailureKind::GateFailed,
-                    format!(
-                        "gate `{}` failed: {}",
-                        gate_failure.gate, gate_failure.summary
-                    ),
-                )
-                .with_feedback(gate_failure.log_tail),
-            );
+            failure = Some(super::classify::gate_failure(&gate_failure));
         }
     }
 
@@ -276,7 +252,10 @@ pub(super) fn run_attempt(
     // and costs another frontier invocation to learn it.
     let mut reviews = Vec::new();
     if failure.is_none() && !cx.reviewers.is_empty() {
-        let artifacts = load_artifacts(&cx.paths.artifacts(), cx.task);
+        let artifacts = load_artifacts(
+            &cx.paths.artifacts(),
+            super::assembly::WorkerSubject::of(cx.task),
+        );
         // Like gates, reviewers may inspect repository context beyond the
         // supplied diff. Give them the exact staged candidate, never ignored
         // worker inputs or residue from the authoritative workspace.
@@ -287,12 +266,13 @@ pub(super) fn run_attempt(
         )?;
         for (pass, reviewer) in cx.reviewers.iter().enumerate() {
             let pass = u32::try_from(pass).unwrap_or(u32::MAX);
-            let review = review::run_review(
+            let review = super::topology::attempt::ReviewPasses::run(
+                &LegacyReviewPasses,
                 &review::ReviewCx {
                     adapter: reviewer.adapter,
                     profile: reviewer.profile.clone(),
                     lens: reviewer.lens,
-                    task: cx.task,
+                    task: review::ReviewSubject::of(cx.task),
                     diff: &outcome.diff,
                     artifacts: &artifacts,
                     decisions: &cx.decisions,
@@ -316,21 +296,21 @@ pub(super) fn run_attempt(
             // a judge that said no, and the ledger has to show which happened.
             let unavailable = matches!(review.result, review::ReviewResult::Unavailable { .. });
             failure = review_failure(review.result);
-            reviews.push(events::ReviewRecord {
-                pass: reviewer.lens.name().to_owned(),
-                agent: reviewer.profile.agent.clone(),
-                model: reviewer.profile.model.clone(),
-                adapter: Some(reviewer.adapter.id().to_owned()),
-                preflight_cli_version: reviewer.preflight_cli_version.clone(),
-                effort: reviewer.profile.effort,
-                pool: pool_option(&reviewer.profile.pool),
-                cost_usd,
-                outcome: match (unavailable, failure.is_none()) {
-                    (true, _) => events::ReviewPassOutcome::Unavailable,
-                    (false, true) => events::ReviewPassOutcome::Passed,
-                    (false, false) => events::ReviewPassOutcome::Failed,
-                },
-            });
+            reviews.push(
+                super::classify::ReviewPassFacts {
+                    pass: reviewer.lens.name(),
+                    agent: &reviewer.profile.agent,
+                    model: &reviewer.profile.model,
+                    adapter: reviewer.adapter.id(),
+                    preflight_cli_version: reviewer.preflight_cli_version.clone(),
+                    effort: reviewer.profile.effort,
+                    pool: pool_option(&reviewer.profile.pool),
+                    cost_usd,
+                    unavailable,
+                    failed: failure.is_some(),
+                }
+                .record(),
+            );
             if failure.is_some() {
                 break;
             }
@@ -345,6 +325,52 @@ pub(super) fn run_attempt(
         candidate_tree: candidate.tree_oid,
         reviews,
     })
+}
+
+/// Runs a review pass through the legacy machinery, which is the only one.
+///
+/// **The seam's production implementation, and it lives here for a reason the
+/// allowlist already records.** `review::run_review` writes transcripts through
+/// `util::write_text`, outside any inventoried `RunDir` site — this file's
+/// allowlist entry says so, and that `RunDir` "has no transcript site in the
+/// frozen inventory, so there is no funnel to move it to inside this slice".
+/// So the call is denied everywhere except the modules the legacy section
+/// names, and `decisions.effect_site_inventory.mechanism` (2) forbids adding a
+/// topology module to that list.
+///
+/// Both engines reach the review machinery through this one function: the
+/// legacy path below, and the schema-4 driver through
+/// [`super::topology::attempt::ReviewPasses`]. One implementation, two callers
+/// — not a forwarder invented for the second.
+pub(super) struct LegacyReviewPasses;
+
+/// [`crate::workspace::Workspace`]'s review-input policy, for a caller that
+/// holds a worktree path instead of a `Workspace`.
+///
+/// The legacy verification ladder is its first caller — through
+/// `run_attempt`'s own `workspace`, not through this — and the schema-4 driver
+/// is its second. One policy, two callers.
+pub(super) struct LegacyReviewInputPolicy;
+
+impl super::topology::attempt::ReviewInputPolicy for LegacyReviewInputPolicy {
+    fn problem(
+        &self,
+        worktree: &std::path::Path,
+        tree: &str,
+    ) -> Result<Option<String>, UpstrokeError> {
+        crate::workspace::Workspace::open(worktree)?.review_input_problem_for_tree(tree)
+    }
+}
+
+impl super::topology::attempt::ReviewPasses for LegacyReviewPasses {
+    fn run(
+        &self,
+        cx: &review::ReviewCx<'_>,
+        runner: &dyn crate::runner::Runner,
+        invocations: &review::ReviewInvocations,
+    ) -> Result<review::ReviewOutcome, UpstrokeError> {
+        review::run_review(cx, runner, invocations)
+    }
 }
 
 /// Turn a review result into an attempt failure, or `None` if it passed.
@@ -430,7 +456,10 @@ pub(super) fn review_failure(result: review::ReviewResult) -> Option<AttemptFail
 /// Artifacts this task should be judged against: its declared inputs, plus
 /// the conventions brief whenever one exists (§11.2 injects it into every
 /// downstream prompt).
-fn load_artifacts(artifacts_dir: &Path, task: &Task) -> Vec<(String, String)> {
+pub(super) fn load_artifacts(
+    artifacts_dir: &Path,
+    task: super::assembly::WorkerSubject<'_>,
+) -> Vec<(String, String)> {
     let mut wanted: Vec<String> = vec![CONVENTIONS_BRIEF.to_owned()];
     wanted.extend(task.artifacts_in.iter().map(|id| id.as_str().to_owned()));
     // A task's own outputs are not evidence for judging it: the reviewer
@@ -557,7 +586,7 @@ pub(super) fn worker_question(detail: Option<&str>) -> Option<String> {
 /// exact-match, so the agent must know the literal strings), plus — on a
 /// retry — why the last attempt did not pass (§11.4).
 pub(super) fn materialize_prompt(
-    task: &Task,
+    task: super::assembly::WorkerSubject<'_>,
     gate_cmds: &[String],
     artifacts_dir: &Path,
     retry: Option<&RetryBrief>,
@@ -585,19 +614,19 @@ pub(super) fn materialize_prompt(
     );
     let _ = writeln!(prompt, "# Task: {}\n", task.title);
     if !task.body.is_empty() {
-        prompt.push_str(&task.body);
+        prompt.push_str(task.body);
         prompt.push_str("\n\n");
     }
     if !task.acceptance.is_empty() {
         prompt.push_str("Acceptance criteria (all must hold when you finish):\n");
-        for item in &task.acceptance {
+        for item in task.acceptance {
             let _ = writeln!(prompt, "- {item}");
         }
         prompt.push('\n');
     }
     // Artifacts are real files in the run directory: a consumer is shown the
     // content that exists, never told to look for something nothing wrote.
-    for id in &task.artifacts_in {
+    for id in task.artifacts_in {
         let path = artifact_path(artifacts_dir, id.as_str());
         match fs::read_to_string(&path) {
             Ok(content) if !content.trim().is_empty() => {
@@ -616,7 +645,7 @@ pub(super) fn materialize_prompt(
             }
         }
     }
-    for id in &task.artifacts_out {
+    for id in task.artifacts_out {
         let _ = writeln!(
             prompt,
             "Before you finish, write artifact `{id}` — the notes later tasks depend on — to:\n\
