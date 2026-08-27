@@ -5,6 +5,11 @@
 //! Zero spend: `probe()` reads `--version` and `--help`, and `discover()` asks
 //! each vendor's CLI about its own account. Neither runs a model.
 
+#![expect(
+    clippy::print_stdout,
+    reason = "an example exists to print what it demonstrates; its output is its contract (§13)"
+)]
+
 use upstroke::agent;
 
 fn main() {

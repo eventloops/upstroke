@@ -223,6 +223,10 @@ fn review_echo(plan: &ReviewPlan) -> String {
     let Some(primary) = &plan.primary else {
         return "review: disabled ([routing] review = { enabled = false })".to_owned();
     };
+    #[expect(
+        clippy::expect_used,
+        reason = "resolve() sets a timeout on every plan it returns"
+    )]
     let mut line = format!(
         "review: {} ({}s independent timeout per pass)",
         primary.describe(),
