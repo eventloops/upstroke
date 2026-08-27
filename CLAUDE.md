@@ -50,7 +50,14 @@ project actually is before adding something out of sequence.
 dated, immutable records of why; `proposals/` are inputs that bind nothing
 until a decision cites them. When a decision changes the spec, `DESIGN.md`
 gets the compressed edit and the record is cited. Read `decisions/README.md`
-and `proposals/README.md` before adding to either.
+before adding a record.
+
+**New proposals are filed privately**, in a private companion repository,
+engine mechanisms included
+(`decisions/2026-08-27-proposals-private.md`). The proposals already in
+`proposals/` stay there because decision records cite them as inputs; read
+`proposals/README.md` before touching those. Decisions stay public and still
+name their inputs.
 
 ## Gates
 
@@ -143,7 +150,7 @@ session has no standing to do it even when it runs on the owner's token.
 | `MAINTAINING.md` | Full merge lifecycle, trust boundary, release contract |
 | `CONTRIBUTING.md` | Contributor rules and CLA |
 | `decisions/` | Dated, immutable decision records |
-| `proposals/` | Dated design proposals and their critiques |
+| `proposals/` | Design proposals filed before 2026-08-27; new ones are private |
 | `.github/scripts/` | The 4 `test-*.sh` gates and the `validate-*` helpers they exercise |
 | `acceptance/RESULT.md` | The v0.1 acceptance run write-up |
 | `reviews/` | Review records, and the standing finding ledger once it lands |
