@@ -228,11 +228,11 @@ prefix is now a pin with no candidate record — orphan residue, which
 > **Corrected 2026-08-27.** Roughly twenty-five witnesses failed on the invariant change.
 > The ones named below were genuinely re-derived. But `Journal::settle_succeeded`, the
 > candidate suite's shared settlement helper, was turned into an **explicit no-op** and left
-> at its call sites so that ~15 fixtures would pass without being touched. That is patching
-> a shared helper, which is what this sentence claimed had not been done, and the round-4
-> review of `09f9a99` said so.
+> at its call sites so the fixtures reaching it would pass without being touched. That is
+> patching a shared helper, which is what this sentence claimed had not been done, and the
+> round-4 review of `09f9a99` said so.
 >
-> The real re-derivation is done: the helper and all **nine** call sites are removed, and
+> The real re-derivation is done: the helper and all **seven** call sites are removed, and
 > each fixture's sequence is now `task_dispatched → attempt_started → candidate_prepared`
 > with no settlement between them. They assert the invariant rather than tolerating it —
 > making `apply_candidate_prepared` stop promoting the generation fails **five** of them
@@ -2872,11 +2872,16 @@ formatting a deleted item as a code path is what implies it still exists. They a
 prose, and the check has **no exceptions**.
 
 **And the "never patched to pass" claim was false.** `Journal::settle_succeeded` was made an
-explicit no-op and left at its call sites so ~15 fixtures would pass untouched. The helper
-and all **nine** call sites are now gone; each fixture's sequence is
+explicit no-op and left at its call sites so the fixtures reaching it would pass untouched.
+The helper and all **seven** call sites are now gone — `git grep -c '\.settle_succeeded()'
+5ccc8f5^ -- src/` returns `7`, and the round-5 record's own count of "nine" was the fourth
+uncomputed number this branch published. Each fixture's sequence is
 `task_dispatched → attempt_started → candidate_prepared`. They assert the invariant rather
 than tolerating it: making `apply_candidate_prepared` stop promoting fails **five** of them,
-which a no-op standing in for the step made impossible. The round-3 claim is corrected
+which a no-op standing in for the step made impossible. Re-measured at `23958c3` after this
+round's fixture changes — deleting `generation.class = GenerationClass::Promoting` from
+`apply_candidate_prepared` fails **20** tests suite-wide, of which `grep -c
+'engine::topology::candidate::tests'` over the failure list returns **5**. The round-3 claim is corrected
 where it stands, in the §3 appendix that made it.
 
 ### Round 4's P2 — four body claims the tree contradicted

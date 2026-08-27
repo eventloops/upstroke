@@ -16,20 +16,28 @@
 //!
 //! That measurement is the argument for the shape this module is being built
 //! into: a rule it could get wrong at runtime is preferably a rule the type
-//! checker refuses to compile. Three such rules are **planned and not yet
-//! written** — a recovery order that is a chain of witnesses each consuming the
-//! last, a creator deletion boundary minted only from the outcome of the step
-//! that could have crossed it, and P0–P8 as a typestate. None of them exists
-//! here today; what exists is the seams and the identity ledgers they will be
-//! built on.
+//! checker refuses to compile. Three such rules were named here. **One of them
+//! is now written**: P0–P8 is a typestate, in `create`'s private `steps`
+//! module — eleven witnesses from `PublicDirCreated` to `Started` beside the
+//! `Facts` every prefix carries, each
+//! constructor taking its predecessor by value, no field nameable outside the
+//! module and no `Clone`, `Copy` or `Default` on any of them, so a step cannot
+//! run out of order, run twice, or run on a witness whose step failed.
 //!
-//! Stated in the future tense deliberately. The device is established —
-//! [`crate::rundir::PrivateHalfProof`],
-//! [`crate::runner::container::intent::IntentWritten`] and
-//! [`crate::topology::fold::TopologyDelta`] all use it — but a module comment
-//! that describes an intended shape as an existing one is a false claim about
-//! the code, and this project treats that as a defect rather than as
-//! optimism.
+//! The other two are still **planned and not yet written**: a recovery order
+//! that is a chain of witnesses each consuming the last — `RecoveryStep` is a
+//! `Vec` pushed at runtime, which is a record of the order rather than an
+//! enforcement of it — and a creator deletion boundary minted only from the
+//! outcome of the step that could have crossed it, where
+//! [`crate::rundir::CommitRecordPresence`] is derived by a `stat` after the
+//! fact and says so in its own doc.
+//!
+//! The two are stated in the future tense deliberately, and the first in the
+//! past. A module comment that describes an intended shape as an existing one
+//! is a false claim about the code, and this project treats that as a defect
+//! rather than as optimism — but the converse is a defect too, and this
+//! paragraph was one for as long as it said "none of them exists here today"
+//! about a typestate the module below had already implemented.
 //!
 //! # Nothing here is a production path yet
 //!
