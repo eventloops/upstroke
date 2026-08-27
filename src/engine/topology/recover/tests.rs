@@ -4498,13 +4498,20 @@ fn the_recovery_order_performs_every_step_the_packet_names() {
     );
 
     // And the one that does move, moved for its reason and not by accident:
-    // **(f) has two halves and erratum E6 separated them.** Its refusing half —
-    // the unresolved integration transaction, one of the two things
+    // **(f) had two halves and now has one.** Its refusing half — the
+    // unresolved integration transaction, one of the two things
     // `checkpoint_refusals` authorises — still runs before any append. Its
-    // converging half appends `candidate_prepared` for a settled-but-unrecorded
-    // candidate, so it runs *with* the appending steps and is what `steps`
-    // records. A `Promoting` generation was refused here until E6, and that was
-    // a third checkpoint refusal.
+    // converging half, which appended a rebuilt `candidate_prepared` for a
+    // settled-but-unrecorded candidate, is deleted with erratum E6's window:
+    // since the 2026-08-27 CONFORM ruling `Promoting` is set only in the block
+    // that records the candidate, so a `Promoting` generation without one
+    // cannot occur and the walk could only ever have returned nothing.
+    //
+    // What survives at (f) is `finish_promotions`, which still appends —
+    // `T-CAND-REF`'s four-step sequence for candidates that *are* recorded —
+    // so the step keeps its position among the appending steps and is still
+    // what `steps` records here. The ordering this asserts is unchanged; the
+    // reason given for it was not.
     let at = |step: RecoveryStep| {
         recovered
             .steps
@@ -7342,16 +7349,23 @@ fn a_prepared_pin_without_a_candidate_record_is_orphan_residue() {
 
 /// Put a real candidate commit and its pin in the fixture's repository.
 ///
-/// **Erratum E6's window needs both halves to be real.** The convergence
-/// reconstructs the candidate's identity from the object the pin points at —
-/// tree and message from the commit, region from `diff-tree base commit` — so a
-/// fixture that seeded only events would exercise the refusal, not the
-/// convergence. This writes an actual commit on top of the fixture's base and
-/// creates the pin at it, which is exactly what a run killed after its
-/// settlement leaves behind.
+/// **Both halves are real because the residue is real.** This said the halves
+/// had to be real so that erratum E6's convergence could reconstruct the
+/// candidate's identity from the object the pin points at, and called the state
+/// "what a run killed after its settlement leaves behind". Neither survives the
+/// 2026-08-27 CONFORM ruling: the convergence is deleted with the window it
+/// converged, and a run killed *after* its settlement has appended
+/// `candidate_prepared`, so it leaves a recorded candidate rather than a bare
+/// pin.
 ///
-/// Returns the commit sha, so a test can assert `candidate_prepared` names the
-/// object the pin named rather than one recovery invented.
+/// What this seeds is the crash **before** the settlement — the commit object
+/// and its pin written, R27's order, and the append that would have settled the
+/// attempt never reached. A fixture that seeded only events would leave nothing
+/// on disk for the pruning to be about, so the object and the pin are written
+/// for real.
+///
+/// Returns the commit sha, so a test can assert what became of the object the
+/// pin named.
 fn seed_candidate_commit(fixture: &Fixture, generation: u32) -> String {
     use crate::workspace_manager::fixture::{git, write_file};
 

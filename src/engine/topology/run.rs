@@ -1690,11 +1690,19 @@ impl TopologyRun {
     /// `authoritative_state: attempt unsettled`, and it stays unsettled until
     /// this event.
     ///
-    /// INV-07's "candidate_prepared is the sole successful attempt settlement"
-    /// is about which event records the *candidate*, not which settles the
-    /// attempt: without `attempt_finished(Succeeded)` the generation never
-    /// reaches `Promoting` and the fold refuses the `candidate_prepared` that
-    /// follows.
+    /// **The reinterpretation that stood here is deleted, not softened.** It
+    /// read: INV-07's "candidate_prepared is the sole successful attempt
+    /// settlement" is about which event records the *candidate*, not which
+    /// settles the attempt, so without `attempt_finished(Succeeded)` the
+    /// generation never reaches `Promoting`. Both halves are now false and the
+    /// second was the mechanism the first was invented to justify:
+    /// `apply_candidate_prepared` sets `Promoting` itself, in the same block
+    /// that records the candidate, and `check_attempt_finished` refuses
+    /// `Succeeded` outright. The sentence survived the 2026-08-27 CONFORM
+    /// ruling by sitting three paragraphs under the paragraph that corrects
+    /// it, which is how the `b1f54a5` review found it and why
+    /// `drivers/deleted-mechanisms.sh` now reads a claim's own sentence rather
+    /// than the block around it.
     ///
     /// # Why `complete_promotion` was split to make this callable
     ///

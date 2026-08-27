@@ -2369,11 +2369,18 @@ pub struct RunHandle {
     /// refuses any other route, and it refused an earlier draft of the E6
     /// convergence for exactly this.
     ///
-    /// **The proven prefix, not the prefix plus recovery's own appends.** That
-    /// is correct for spend and it is not an accident: an event the recovery
-    /// appends for an attempt the prefix already settled — the E6 convergence's
-    /// `candidate_prepared` is the case — is priced by `Spend::replay`'s
-    /// identity-keyed dedupe against the settlement that is already here.
+    /// **The proven prefix, not the prefix plus recovery's own appends.** This
+    /// justified itself by naming two mechanisms that no longer exist: the E6
+    /// convergence's rebuilt `candidate_prepared`, deleted with the window it
+    /// converged, and `Spend::replay`'s identity-keyed dedupe, deleted with the
+    /// duplicate settlement it was written to hide. Neither can price anything
+    /// now.
+    ///
+    /// It is still correct, for a simpler reason. Recovery appends no event for
+    /// an attempt the prefix already settled, so there is nothing here for a
+    /// dedupe to have caught: an attempt's record reaches the log exactly once,
+    /// on `attempt_finished` if it failed and on `candidate_prepared` if it
+    /// succeeded, and the fold refuses both of the shapes that made it twice.
     pub events: Vec<TopologyEvent>,
     _run: RunLock,
     _worktree: WorktreeLock,
