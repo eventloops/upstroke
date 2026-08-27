@@ -40,6 +40,10 @@ The contract that keeps this folder safe:
 
 ## Index
 
+- [2026-08-24 — v0.2 — the G2 pass over PR3's layer](2026-08-24-v0.2-g2-pr3-layer-pass.md): ten
+  workstreams over `src/topology/**`, the enforcement layer that ranges over it,
+  and the test infrastructure that observes it — behaviour before structure before
+  churn. Decided by the freeze charter; runs before PR8.
 - [2026-08-22 — v0.3 — repository hazard map](2026-08-22-v0.3-hazard-map.md):
   path-indexed design defects and review findings, fed back into Phase 1 as
   mandatory question-exhaustion items where they overlap a story's path hints.

@@ -66,6 +66,15 @@ artifacts (§15); records promoted here are the durable subset.
   signing environment are retired; the ruleset requires `upstroke-ci` and
   `upstroke-pr-policy` only. The review obligation is unchanged and the owner's
   merge is the attestation; 2026-08-20 §5 remains the bar for any automated return.
+- [2026-08-24 — the PR3-layer freeze: charter, adjudication, and the G2 pass](2026-08-24-pr3-layer-freeze-charter.md): three
+  deviation classes charter what the freeze admits; PR7's `fold.rs` footprint is
+  blessed as a disclosed deviation; the pass over the layer runs before PR8.
+- [2026-08-25 — `CommandSpec.program` widens to `OsString`](2026-08-25-commandspec-program-osstring.md):
+  resolves `PR4-PROGRAM-PATH-NOT-UNICODE` at the pass's W4 and retires the
+  known-conflict block `CODING_STANDARDS.md` §1 carries to name it.
+- [2026-08-25 — integration merges happen at attested checkpoints](2026-08-25-checkpoint-merges.md):
+  `codex/parallelism-design` merges to `master` at the G2 checkpoint and again at
+  v0.2 completion, rather than once at the end.
 - [2026-08-26 — the retry brief survives a crash](2026-08-26-durable-retry-feedback.md):
   `FailureRecord` gains one additive `#[serde(default)] detail`, carrying §11.4's
   feedback onto the durable record; the schema-4 brief becomes a fold over it,
