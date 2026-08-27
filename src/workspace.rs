@@ -2948,26 +2948,114 @@ mod tests {
         );
     }
 
+    /// The line prefix the snapshot owner announces its materialised root
+    /// under, so the waiting parent can tell it from libtest's own output.
+    const SNAPSHOT_ROOT_ANNOUNCEMENT: &str = "snapshot-root: ";
+
+    /// Reads `announcements` until a line carries `marker`, and returns the
+    /// rest of that line.
+    ///
+    /// A line counts only once its newline has arrived. That is the whole
+    /// point: the signal a waiter blocks on has to mean the state it is about
+    /// to assert. A readiness *file* cannot carry that meaning — `fs::write`
+    /// is a `create` followed by a write, so the path exists, and reads as
+    /// empty, before its bytes land. A waiter that keyed on existence read an
+    /// empty path out of it and then asserted that the empty path was a
+    /// materialised snapshot.
+    ///
+    /// An unterminated final line is that same hazard in the shape a pipe can
+    /// still take — a writer that died mid-announcement — so it fails rather
+    /// than yielding a truncated value. End of output, not a wall clock, is
+    /// the failure signal: a helper that cannot materialise a snapshot panics,
+    /// and libtest exits and closes the pipe.
+    fn await_announcement(
+        announcements: &mut impl std::io::BufRead,
+        marker: &str,
+    ) -> Result<String, String> {
+        let mut line = String::new();
+        loop {
+            line.clear();
+            let read = announcements
+                .read_line(&mut line)
+                .map_err(|error| format!("reading the helper's output: {error}"))?;
+            if read == 0 {
+                return Err("the helper ended before it announced anything".to_owned());
+            }
+            let Some(body) = line.strip_suffix('\n') else {
+                return Err(format!("the helper ended mid-announcement: {line:?}"));
+            };
+            if let Some(value) = body.trim_end_matches('\r').strip_prefix(marker) {
+                return Ok(value.to_owned());
+            }
+        }
+    }
+
     #[test]
-    #[ignore = "subprocess helper"]
+    fn an_announcement_is_found_past_the_harness_own_output() {
+        let mut stream = std::io::Cursor::new(
+            "\nrunning 1 test\nsnapshot-root: /tmp/upstroke-snap\ntest result: ok\n",
+        );
+        assert_eq!(
+            await_announcement(&mut stream, SNAPSHOT_ROOT_ANNOUNCEMENT).expect("announcement"),
+            "/tmp/upstroke-snap"
+        );
+    }
+
+    #[test]
+    fn a_carriage_return_does_not_become_part_of_the_announced_path() {
+        let mut stream = std::io::Cursor::new("snapshot-root: /tmp/upstroke-snap\r\n");
+        assert_eq!(
+            await_announcement(&mut stream, SNAPSHOT_ROOT_ANNOUNCEMENT).expect("announcement"),
+            "/tmp/upstroke-snap"
+        );
+    }
+
+    #[test]
+    fn an_announcement_without_its_newline_is_not_an_announcement() {
+        // The defect this handshake replaced, in the shape a pipe can take: a
+        // partial record must not read as a whole one. Under the readiness file
+        // the partial record was an empty path; here it is a line the writer
+        // never finished.
+        let mut torn = std::io::Cursor::new("snapshot-root: /tmp/upstroke-sna");
+        let error = await_announcement(&mut torn, SNAPSHOT_ROOT_ANNOUNCEMENT)
+            .expect_err("an unfinished announcement is not an announcement");
+        assert!(error.contains("mid-announcement"), "{error}");
+    }
+
+    #[test]
+    fn a_helper_that_ends_without_announcing_fails_rather_than_waiting() {
+        let mut noise = std::io::Cursor::new("\nrunning 1 test\ntest result: FAILED\n");
+        let error = await_announcement(&mut noise, SNAPSHOT_ROOT_ANNOUNCEMENT)
+            .expect_err("end of output is not readiness");
+        assert!(error.contains("ended before it announced"), "{error}");
+    }
+
+    /// The subprocess half of `hard_killed_snapshot_owner_is_reclaimed_before_resume`:
+    /// materialises a durable snapshot, says where it put it, and holds it open
+    /// until the parent kills it.
+    #[test]
+    #[ignore = "spawned as a subprocess by hard_killed_snapshot_owner_is_reclaimed_before_resume"]
     fn gate_snapshot_owner_helper() {
         if env::var_os("UPSTROKE_SNAPSHOT_OWNER").is_none() {
             return;
         }
         let repo = PathBuf::from(env::var_os("UPSTROKE_REPO").expect("repo path"));
         let store = PathBuf::from(env::var_os("UPSTROKE_SNAPSHOT_STORE").expect("store path"));
-        let ready = PathBuf::from(env::var_os("UPSTROKE_READY").expect("ready path"));
         let workspace = Workspace::open(&repo).expect("open helper workspace");
         let parent = workspace.head_sha_full().expect("snapshot parent");
         let tree = workspace.staged_tree_oid().expect("snapshot tree");
         let snapshot = workspace
             .gate_snapshot_for_candidate_in_store(&parent, &tree, &store)
             .expect("create durable snapshot");
-        fs::write(
-            &ready,
-            snapshot.workspace().root().to_string_lossy().as_bytes(),
-        )
-        .expect("publish snapshot path");
+        // Announced only now, and only as a whole line, so the parent cannot
+        // observe a readiness that predates the snapshot it names.
+        println!(
+            "{SNAPSHOT_ROOT_ANNOUNCEMENT}{}",
+            snapshot.workspace().root().display()
+        );
+        std::io::stdout()
+            .flush()
+            .expect("publish the snapshot root");
         std::thread::sleep(std::time::Duration::from_secs(30));
         drop(snapshot);
     }
@@ -2980,30 +3068,35 @@ mod tests {
             std::process::id(),
             crate::ulid::ulid()
         ));
-        let ready = store.with_extension("ready");
         let workspace = Workspace::open(&repo).expect("open");
         let registrations_before = workspace
             .git(&["worktree", "list", "--porcelain"])
             .expect("registrations before");
         let mut owner = Command::new(env::current_exe().expect("test executable"))
-            .args(["gate_snapshot_owner_helper", "--ignored", "--nocapture"])
+            .args([
+                "--exact",
+                "workspace::tests::gate_snapshot_owner_helper",
+                "--ignored",
+                "--nocapture",
+            ])
             .env("UPSTROKE_SNAPSHOT_OWNER", "1")
             .env("UPSTROKE_REPO", &repo)
             .env("UPSTROKE_SNAPSHOT_STORE", &store)
-            .env("UPSTROKE_READY", &ready)
-            .stdout(Stdio::null())
+            .stdout(Stdio::piped())
             .stderr(Stdio::null())
             .spawn()
             .expect("spawn disposable snapshot owner");
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
-        while !ready.exists() && std::time::Instant::now() < deadline {
-            std::thread::sleep(std::time::Duration::from_millis(10));
-        }
-        assert!(ready.exists(), "snapshot owner never published readiness");
-        let snapshot_path = PathBuf::from(
-            String::from_utf8(fs::read(&ready).expect("read snapshot path"))
-                .expect("test temp path is UTF-8"),
-        );
+
+        // Block until the owner says where the snapshot is, rather than waiting
+        // for a file to appear and hoping its bytes arrived with it.
+        let mut announcements =
+            std::io::BufReader::new(owner.stdout.take().expect("snapshot owner stdout"));
+        let announced = await_announcement(&mut announcements, SNAPSHOT_ROOT_ANNOUNCEMENT);
+        let snapshot_path = PathBuf::from(announced.unwrap_or_else(|error| {
+            let _ = owner.kill();
+            let _ = owner.wait();
+            panic!("snapshot owner never announced a snapshot: {error}")
+        }));
         assert!(snapshot_path.exists(), "snapshot was not materialized");
         assert_ne!(
             workspace
@@ -3039,7 +3132,6 @@ mod tests {
                 .expect("reclamation is idempotent"),
             0
         );
-        let _ = fs::remove_file(ready);
         let _ = fs::remove_dir_all(store);
     }
 
