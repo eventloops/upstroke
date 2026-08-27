@@ -2916,6 +2916,50 @@ none. Corrected to `35aaf8e`, saying what it first said.
 pin, but those two effects have already landed. The security property holds on both windows;
 the absolute claim held on one, and the body now says which.
 
+### The self-audit sweep over the reviewer's not-read list
+
+**The reviewer publishes next-round targets every round.** Its coverage declaration names
+what it did not read, which is the cheapest convergence available: read them first, fix what
+they hold, and the next review spends its budget elsewhere. Run before round 5, at `021edf7`,
+over the files round 4 declared unread — **7,337 lines across seven files**: `startup.rs`
+and its tests, `scaffold.rs`, `seams.rs`, `run/tests.rs`, `dispatch.rs` and its tests.
+
+**What it found was all in the instruments, not the code.**
+
+*The identifier check had two more defects, either of which would have produced a false
+verdict.* Run over whole files rather than a diff, it flagged eighteen `std::` paths: it
+skipped the `std` segment and then asked this repository to define `fs`, `process`,
+`SystemTime`. A path rooted in the standard library is now skipped whole. **That flaw was
+live in the committed check** and would have fired on the first future round whose added
+prose mentioned `std::fs::write`.
+
+It then flagged one real bare mention — `SystemTime::now` in `seams.rs`, where the *subject*
+of a grep-checkable rule is deliberately unqualified. **The rule was audited and holds**:
+nothing under `src/engine/topology/**` or `src/topology/**` calls it outside comments, and
+`util::rfc3339_utc_now` is where the clock is read. Left as prose, because qualifying it
+would break the grep needle the rule is about, and the diff-scoped gate never sees the line.
+
+**What it checked in the code and found sound**, each verified rather than read past:
+
+| claim | verified |
+|---|---|
+| `seams.rs`: "five effect-hook families" | `TopologyHooks` exposes exactly five — effects, rundir, events, container, spawn |
+| `startup.rs`: calls step (a) and "does not reimplement it" | `run_startup_census` called at `startup.rs:676`, defined in `runner/container/census.rs`; no container-runtime or label scan outside comments |
+| `dispatch.rs`: `closing_disposition` reads the lease rule rather than restating it | it calls `expected(false)`, and is still correct after `check_lease_disposition` lost its `survives` parameter |
+| `run/tests.rs`: the pool seam's "only caller was `run.rs`" | historical narration, sha-stamped, and it states what its census cannot see |
+| `scaffold.rs`: `durable_at_spawn` is "the only oracle O23 has" | carries its own measurement — the test stayed green with the append moved after the spawn until the field existed |
+
+**And nothing in the sweep set was staled by rounds 3 and 4.** No reference to the removed
+successful `attempt_finished`, the deleted convergence, `Recovered::promoted`,
+`attempts_on_rung` or the settlement move appears in any of the seven files — established by
+grep rather than by reading, so the absence is a measurement.
+
+**What this sweep cannot see, stated rather than left to be found.** It checks identifiers,
+countable claims, and claims about other modules that are greppable. It does not check
+witness *quality* — whether a test drives the step it names or constructs its input — which
+is the class that produced findings in rounds 2, 3 and 4 and has needed a reviewer every
+time.
+
 
 ## 22a. A driver that fails silently on a diff this size
 
