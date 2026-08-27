@@ -2776,6 +2776,38 @@ The first column is the measurement that the balanced case is not a witness for 
 property at all — which is worth recording, because the round-3 witness was of exactly that
 kind and looked sufficient.
 
+### Round 4's third P1 — the successful settlement did not require success
+
+The 2026-08-27 Class B change made `candidate_prepared` the sole **successful** settlement
+and `check_candidate_prepared` validated attempt number, base, parent and lease — and
+mentioned `failure` nowhere. So a `candidate_prepared` whose embedded `AttemptRecord`
+carries `failure: Some(GateFailed)` was accepted, promoted the generation, and was carried
+to `task_candidate_created`: a task durably queued as a successful candidate whose own
+authoritative evidence says a gate failed.
+
+**The one condition that made the event *successful* was the one condition not enforced**,
+in the change that made it the successful settlement. The fold is the authority against
+malformed, reconstructed and faulty future writers — not only against this build's driver,
+which happens to supply a passing record — and that is the whole argument for a checked
+fold.
+
+`prepared.attempt.failure.is_none()` is now required, refused as `InconsistentRecord`
+rather than a new variant, because the inventory is packet-enumerated and "the event
+disagrees with the record it cites" is exactly this kind (P1-2's rule, applied again).
+
+**It also earns a property the driver had been assuming.** `Brief::replay` walks settlements
+and takes a `candidate_prepared` record to carry no feedback — true because it carries no
+failure, which until now nothing checked.
+
+`a_candidate_prepared_whose_record_failed_is_refused` drives the review's five steps, and
+asserts its own premise first — the same event with a passing record **is** accepted — so
+the refusal is about the failure and not about anything else in the fixture. It then asserts
+nothing moved: the generation is still `InFlight` with no candidate.
+
+| mutation | the witness |
+|---|---|
+| the door stops requiring success | **FAILED** |
+
 
 ## 22a. A driver that fails silently on a diff this size
 

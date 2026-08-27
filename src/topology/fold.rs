@@ -2090,6 +2090,34 @@ impl RunState {
                     .to_owned(),
             });
         }
+        // **And the attempt it names must have succeeded.** This event is the
+        // sole successful settlement for a candidate-producing attempt, so a
+        // record carrying a failure is a settlement contradicting itself: the
+        // candidate's own authoritative evidence would say a gate failed while
+        // the fold promoted the generation and carried it to
+        // `task_candidate_created`, queueing it as a success.
+        //
+        // Missing until 2026-08-27. The Class B change made this the successful
+        // settlement and did not make the fold require success — the semantic
+        // condition that motivated the change was the one condition not
+        // enforced, and the round-4 review of `09f9a99` walked the five steps.
+        // It also gives `TopologyRun`'s `Brief::replay` the property it already
+        // assumed: a `candidate_prepared` record never carries feedback,
+        // because it never carries a failure.
+        //
+        // `InconsistentRecord` rather than a new variant: the refusal inventory
+        // is packet-enumerated, and "the event disagrees with the record it
+        // cites" is exactly this kind.
+        if let Some(failure) = prepared.attempt.failure.as_ref() {
+            return Err(FoldError::InconsistentRecord {
+                kind: KIND,
+                detail: format!(
+                    "attempt {} of generation {} records the failure `{:?}` and \
+                     `candidate_prepared` is the settlement of an attempt that succeeded",
+                    prepared.attempt.attempt, prepared.generation.0, failure.kind
+                ),
+            });
+        }
         // ST-06: a candidate is prepared *by the attempt that succeeded*, so
         // the embedded record names the generation's current attempt. Without
         // this the record is inert data and a candidate can be published
@@ -7369,6 +7397,72 @@ mod tests {
     // -----------------------------------------------------------------------
     // Candidates, the queue, and the publication relations
     // -----------------------------------------------------------------------
+
+    /// **A `candidate_prepared` whose record says the attempt failed is refused.**
+    ///
+    /// The round-4 review of `09f9a99` set out the sequence exactly, and this is
+    /// it: a valid `run_started`, `task_dispatched` and `attempt_started`, then an
+    /// otherwise-consistent `candidate_prepared` whose embedded `AttemptRecord`
+    /// carries `failure: Some(GateFailed)`. Before this check the fold accepted
+    /// it, recorded the candidate, entered `Promoting`, and the task was carried
+    /// to `task_candidate_created` — **durably queued as a successful candidate
+    /// whose own authoritative evidence says a gate failed.**
+    ///
+    /// The 2026-08-27 Class B change made this event the sole successful
+    /// settlement and enforced everything about it except the one thing that made
+    /// it *successful*. The fold is the authority against malformed, reconstructed
+    /// and faulty future writers, not just against this build's own driver, which
+    /// happens to supply a passing record.
+    ///
+    /// It also earns the property `TopologyRun`'s brief already assumed: a
+    /// `candidate_prepared` record never carries feedback, because it never
+    /// carries a failure.
+    #[test]
+    fn a_candidate_prepared_whose_record_failed_is_refused() {
+        let base = sha("base");
+        let mut fold = started();
+        apply(&mut fold, &dispatch(ZETA, 0, &base));
+        let start = attempt_started(&fold, ZETA, 0, 1, 0);
+        apply(&mut fold, &start);
+
+        // The premise: with a passing record this exact event is accepted, so the
+        // refusal below is about the failure and not about anything else in it.
+        accepts(&fold, &candidate_prepared(ZETA, 0, &base));
+
+        let mut failed = candidate_prepared(ZETA, 0, &base);
+        let TopologyEventBody::CandidatePrepared { data } = &mut failed.body else {
+            unreachable!("built as a candidate_prepared")
+        };
+        data.attempt.failure = Some(crate::events::FailureRecord {
+            kind: crate::ladder::FailureKind::GateFailed,
+            origin: crate::ladder::FailureOrigin::Worker,
+            reason: "gate `clippy` failed".to_owned(),
+            detail: None,
+        });
+
+        let error = refuse(&fold, &failed);
+        assert!(
+            matches!(error, FoldError::InconsistentRecord { .. }),
+            "the fold accepted a successful settlement whose record failed: {error:?}"
+        );
+        assert!(
+            format!("{error}").contains("succeeded"),
+            "the refusal must say what it required: {error}"
+        );
+
+        // And nothing moved: a refused transition changes nothing, so the
+        // generation is still in flight and has no candidate.
+        let generation = fold
+            .task(ZETA)
+            .and_then(|task| task.generations.first())
+            .expect("the generation is open");
+        assert!(
+            matches!(generation.class, GenerationClass::InFlight { .. }),
+            "the refused event promoted the generation anyway: {:?}",
+            generation.class
+        );
+        assert!(generation.candidate.is_none());
+    }
 
     /// **A successful attempt spends one of its rung's allowance, and the count
     /// survives replay.**
