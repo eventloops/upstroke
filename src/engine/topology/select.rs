@@ -41,7 +41,7 @@
 //! integration; ascending task key answers it for a dispatch and a retry,
 //! which is §14's "lowest plan index first" over the dense registry keys.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 
 use crate::error::UpstrokeError;
 use crate::events::{AttemptRecord, BudgetKind};
@@ -115,36 +115,32 @@ impl Spend {
     #[must_use]
     pub fn replay(events: &[TopologyEvent]) -> Self {
         let mut spend = Self::new();
-        // **One attempt, one contribution.** Both event kinds carry an
-        // `AttemptRecord`, and for a *successful* attempt both are appended:
-        // `attempt_finished{Succeeded}` moves the generation to `Promoting`,
-        // and `candidate_prepared` records the candidate that settlement
-        // authorized. Counting each occurrence would price every successful
-        // attempt twice — and only on replay, because a live run records it
-        // once. A live total and a replay of that run's own log would then
-        // disagree, which is the ground truth this project measures everything
-        // else against.
+        // **One attempt, one contribution — and now by construction rather than
+        // by filtering.** This kept a `BTreeSet` of attempt identities because
+        // a successful attempt's record was appended *twice*: once on
+        // `attempt_finished{Succeeded}` and once on `candidate_prepared`.
+        // Counting each occurrence priced every successful attempt twice, and
+        // only on replay, so a live total and a replay of that run's own log
+        // disagreed — the deduplication existed to hide that.
         //
-        // Keyed by the attempt's identity rather than by event kind, so a
-        // vocabulary that later carries the record in a third place is counted
-        // once too.
-        let mut counted: BTreeSet<(TaskKey, u32, u32)> = BTreeSet::new();
+        // The `bf927f3` review named the dedup as evidence of the duplicate
+        // rather than a licence for it, and the 2026-08-27 ruling agreed:
+        // `candidate_prepared` is the sole successful settlement, the fold
+        // refuses either half of the old pair, and an attempt's record now
+        // reaches the log exactly once. A failure arrives on `attempt_finished`
+        // and a success on `candidate_prepared`, and no attempt produces both.
+        //
+        // Removing it is the point. A filter that survives the shape it was
+        // written for would keep a *second* reading of "one settlement per
+        // attempt" alive beside the fold's, free to disagree with it — and the
+        // one place that rule is enforced should be the one place it is stated.
         for event in events {
-            let (key, generation, attempt, record) = match &event.body {
-                TopologyEventBody::AttemptFinished { data } => {
-                    (data.key, data.generation.0, data.attempt.0, &*data.record)
-                }
-                TopologyEventBody::CandidatePrepared { data } => (
-                    data.key,
-                    data.generation.0,
-                    data.attempt.attempt,
-                    &*data.attempt,
-                ),
+            let (key, record) = match &event.body {
+                TopologyEventBody::AttemptFinished { data } => (data.key, &*data.record),
+                TopologyEventBody::CandidatePrepared { data } => (data.key, &*data.attempt),
                 _ => continue,
             };
-            if counted.insert((key, generation, attempt)) {
-                spend.record(key, record);
-            }
+            spend.record(key, record);
         }
         spend
     }
@@ -672,8 +668,8 @@ mod tests {
     use crate::events::RunOutcome;
     use crate::ladder::Next;
     use crate::topology::events::{
-        AttemptSettlement, CandidateLeaseEffect, CandidatePrepared, GitRef, LeaseDisposition,
-        RunStarted4, SettlementTransition, TaskCandidateCreated, TopologyLimits,
+        CandidateLeaseEffect, CandidatePrepared, GitRef, RunStarted4, TaskCandidateCreated,
+        TopologyLimits,
     };
     use crate::topology::fold::TopologyFold;
 
@@ -703,33 +699,11 @@ mod tests {
     /// success, prepare, create.
     fn queue_candidate(fold: &mut TopologyFold, key: TaskKey, generation: u32) -> CandidateRef {
         in_flight(fold, key, generation);
-        // Through the settlement module, at the point `T-CAND-OBJ` puts it:
-        // between the pin and `candidate_prepared`. A fixture that hand-built
-        // this event would agree with itself about a shape neither half had
-        // asked the module under test.
-        let settled = settle::settle_succeeded(
-            fold,
-            key,
-            GenerationId(generation),
-            AttemptNumber(1),
-            &record(1, Some(0.25)),
-        )
-        .expect("a succeeding attempt settles");
-        assert_eq!(
-            settled.settlement,
-            AttemptSettlement::Closed {
-                transition: SettlementTransition::Succeeded,
-                // A generation that survives its settlement keeps its region
-                // and hands it to the candidate at `candidate_prepared`.
-                lease: LeaseDisposition::PredictedRetained,
-            }
-        );
-        apply(
-            fold,
-            &ev(TopologyEventBody::AttemptFinished {
-                data: Box::new(settled),
-            }),
-        );
+        // **No `attempt_finished` between the pin and `candidate_prepared`.**
+        // `candidate_prepared` is the sole successful settlement for a
+        // candidate-producing attempt, and the fold refuses either half of the
+        // pair this fixture used to build — so a fixture that still appended one
+        // would be refused by `apply` rather than quietly agreeing with itself.
         let candidate = candidate_of(key, generation);
         apply(
             fold,

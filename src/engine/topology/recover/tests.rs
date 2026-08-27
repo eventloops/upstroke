@@ -4008,56 +4008,19 @@ fn the_p7_p8_step_runs_after_the_refusals_that_bound_it() {
         assert_eq!(given.refs.target(), None);
     }
 
-    // (f): a generation the log left in promotion.
-    {
-        let fixture = Fixture::build(
-            "ref-p78-after-f",
-            Damage {
-                extra: vec![
-                    dispatched(),
-                    attempt_started(1),
-                    // `Succeeded` is what puts the generation in `Promoting`.
-                    // Under erratum **E6** step (f) *converges* that window
-                    // rather than refusing it — but the convergence needs the
-                    // pin, which names the commit the settlement authorised,
-                    // and this fixture seeds events without one. A settled
-                    // attempt whose pin is gone is neither `T-CAND-OBJ` (which
-                    // governs an unpinned object and leaves it to Git) nor a
-                    // completable `T-CAND-REF`, so it is refused rather than
-                    // guessed — and that refusal still precedes P7/P8, which is
-                    // what this case is about.
-                    attempt_finished(
-                        1,
-                        AttemptSettlement::Closed {
-                            transition: SettlementTransition::Succeeded,
-                            lease: LeaseDisposition::PredictedRetained,
-                        },
-                    ),
-                ],
-                ..Damage::default()
-            },
-        );
-        let harness = harness();
-        let runtime = runtime_holding_the_record();
-        let certifies = AlwaysCertifies;
-        let given = Given::healthy(&fixture, &runtime, &certifies);
-
-        let text = message(
-            &resume(&fixture, &harness, &given)
-                .0
-                .expect_err("a promoting generation with no pin cannot be converged"),
-        );
-        assert!(
-            text.contains("candidate pin is absent"),
-            "the refusal names what it could not name: {text}"
-        );
-        assert_eq!(
-            create_ref_entries(&harness),
-            0,
-            "(f) refused and the ref was published anyway"
-        );
-        assert_eq!(given.refs.target(), None);
-    }
+    // **(f)'s pin-absent refusal is gone with the convergence it guarded.**
+    // This case drove a `Promoting` generation whose prepared pin had vanished,
+    // and asserted that step (f) refuses it before P7/P8 publishes any ref.
+    // Since the 2026-08-27 CONFORM ruling there is no convergence to guard:
+    // `candidate_prepared` is the sole successful settlement and the only thing
+    // that promotes a generation, so a promoting generation carries its own
+    // candidate identity and a pin is no longer what recovery rebuilds from.
+    //
+    // The refusal that still bounds (f) is the integration transaction's, and
+    // `a_resume_refuses_an_integration_ref_at_another_sha_before_touching_anything`
+    // holds that ordering. Removed rather than rewritten around a predicate
+    // that cannot fire — a case asserting a refusal nothing can reach would
+    // pass for the wrong reason.
 }
 
 // ===========================================================================
@@ -5025,19 +4988,21 @@ fn the_driver_carries_an_accepted_attempt_through_the_candidate_sequence() {
      so nothing could reject it"
     );
 
-    // **The settlement lands between the pin and `candidate_prepared`**, which
-    // is what `settle_succeeded`'s own note requires: `T-CAND-OBJ`'s window
-    // covers the commit object and the pin with `authoritative_state: attempt
-    // unsettled`. The order here is the assertion — a sequence that appended
-    // the settlement after `candidate_prepared` would leave the generation in a
-    // class the fold refuses that event from.
+    // **The settlement *is* `candidate_prepared`, so there are six events and
+    // not seven.** This comment required an `attempt_finished` between the pin
+    // and `candidate_prepared`, on `settle_succeeded`'s own note that INV-07
+    // was "about which event records the candidate, not about which event
+    // settles the attempt". That reading is wrong and
+    // `decisions/2026-08-12-merge-queue-execution-topology.md` had already
+    // answered it: `attempt_finished` "is not also emitted for that attempt".
+    // Ruled CONFORM 2026-08-27, and the count below is the assertion — a build
+    // that re-introduced the pair puts a seventh kind back here.
     assert_eq!(
         durable_kinds(&fixture),
         {
             let mut expected = kinds_before.clone();
             expected.push("task_dispatched".to_owned());
             expected.push("attempt_started".to_owned());
-            expected.push("attempt_finished".to_owned());
             expected.push("candidate_prepared".to_owned());
             expected.push("task_candidate_created".to_owned());
             expected
@@ -5076,9 +5041,12 @@ fn the_driver_carries_an_accepted_attempt_through_the_candidate_sequence() {
             "Event.Append".to_owned(),
             "Object.CandidateCommitTree".to_owned(),
             "Ref.PinCandidatePrepared".to_owned(),
-            // attempt_finished(succeeded).
-            "Event.Append".to_owned(),
-            // candidate_prepared.
+            // **candidate_prepared — one append here, not two.** This list
+            // carried an `attempt_finished(succeeded)` above it; that event is
+            // not emitted for a candidate-producing attempt
+            // (`decisions/2026-08-12-merge-queue-execution-topology.md`, ruled
+            // CONFORM 2026-08-27), and the fold now refuses it. The count is
+            // part of the ordering claim.
             "Event.Append".to_owned(),
             "Ref.CreateCandidates".to_owned(),
             // task_candidate_created.
@@ -7278,40 +7246,40 @@ fn the_loop_inherits_the_committed_digest_recovery_verified() {
     );
 }
 
-/// **Erratum E6: a resume converges the settled-but-unrecorded candidate.**
+/// **A prepared pin with no `candidate_prepared` is orphan residue, not a
+/// candidate to reconstruct.**
 ///
-/// The window `attempt_finished{Closed{Succeeded}}` durable, `candidate_prepared`
-/// absent. The fold makes it mandatory — that settlement is the only thing that
-/// sets `Promoting` and `check_candidate_prepared` refuses every other class —
-/// and before E6 it was governed by no fault-matrix row: `T-CAND-OBJ` ends at
-/// "attempt_started only, attempt unsettled", and `T-CAND-REF` used to begin at
-/// `candidate_prepared`. Recovery **refused**, which was a third checkpoint
-/// refusal where the packet authorises exactly two.
+/// This replaces three tests —
+/// `a_resume_converges_a_settled_candidate_that_was_never_recorded`,
+/// `a_second_resume_finishes_nothing_and_appends_nothing` and
+/// `a_converged_log_prices_its_attempt_once` — which drove erratum **E6**'s
+/// convergence: a `Promoting` generation with no recorded candidate, whose
+/// `candidate_prepared` a resume rebuilt from whatever the prepared pin pointed
+/// at, deriving tree, message and paths from that commit.
 ///
-/// E6 moves `T-CAND-REF`'s boundary to the settlement, and that row converges
-/// forward. Every input is derived from durable state: the pin names the commit,
-/// the commit names its tree and message, the generation names the base,
-/// `diff-tree base commit` names the region. Nothing is re-decided.
+/// **They were witnesses for a window that no longer exists, and for a path that
+/// was a defect.** `Promoting` was reachable by `attempt_finished{Succeeded}`
+/// alone; since the 2026-08-27 CONFORM ruling `candidate_prepared` is the sole
+/// successful settlement and is the only thing that sets `Promoting`, in the
+/// same block that records the candidate. The `bf927f3` review's first P1 was
+/// exactly this reconstruction: substitute the pin between the settlement and
+/// the append and recovery builds a successful candidate around an object no
+/// gate judged — and the tree check cannot catch it, because recovery itself
+/// recorded that tree.
+///
+/// So the fixture is the same crash and the expectation is the other one: the
+/// attempt was never settled, so it settles **interrupted**, and the pin is
+/// residue that recovery prunes. Not patched to pass — the log this drives is
+/// one the fold accepts, which the old fixture no longer is.
 #[test]
-fn a_resume_converges_a_settled_candidate_that_was_never_recorded() {
+fn a_prepared_pin_without_a_candidate_record_is_orphan_residue() {
     let fixture = Fixture::build(
-        "e6-converges",
+        "e6-orphan",
         Damage {
-            // **The dispatch comes from `open_generation`, not from `extra`.**
-            // It records the fixture's real base, and the convergence diffs the
-            // candidate commit against it — a placeholder sha makes `diff-tree`
-            // fail rather than report a region. Measured.
             open_generation: true,
-            extra: vec![
-                attempt_started(1),
-                attempt_finished(
-                    1,
-                    AttemptSettlement::Closed {
-                        transition: SettlementTransition::Succeeded,
-                        lease: LeaseDisposition::PredictedRetained,
-                    },
-                ),
-            ],
+            // An attempt that started and never settled: the whole of what a
+            // crash between the pin and `candidate_prepared` leaves durable.
+            extra: vec![attempt_started(1)],
             ..Damage::default()
         },
     );
@@ -7322,308 +7290,30 @@ fn a_resume_converges_a_settled_candidate_that_was_never_recorded() {
     let certifies = AlwaysCertifies;
     let given = Given::healthy(&fixture, &runtime, &certifies);
     let (outcome, _) = resume_holding(&fixture, &harness, &given);
-    let (recovered, _handle) = outcome.expect("the resume converges rather than refusing");
+    let (recovered, _handle) = outcome.expect("the resume completes rather than refusing");
 
     assert_eq!(
-        recovered.promoted,
-        vec![TaskKey(0)],
-        "recovery did not converge the promoting generation"
+        recovered.interrupted, 1,
+        "the attempt was running and nothing settled it, so the resume settles it \
+         interrupted"
+    );
+    assert!(
+        recovered.finished.is_empty(),
+        "there is no candidate record, so there is no promotion to carry through: {:?}",
+        recovered.finished
     );
 
-    // **The candidate names the object the pin named.** A convergence that
-    // invented an identity would still append something; this is what makes the
-    // append the settlement's candidate rather than a new one.
-    let prepared = TopologyFold::parse_log(&fixture.log_bytes())
+    // **And no `candidate_prepared` was invented.** This is the assertion the
+    // removed trio inverted: they required exactly one to appear.
+    let prepared: Vec<_> = TopologyFold::parse_log(&fixture.log_bytes())
         .expect("the log parses")
         .into_iter()
-        .find_map(|event| match event.body {
-            TopologyEventBody::CandidatePrepared { data } => Some(data),
-            _ => None,
-        })
-        .expect("`candidate_prepared` is durable after the convergence");
-
-    assert_eq!(
-        prepared.commit_sha.0, commit,
-        "a different commit was named"
-    );
-
-    // **And the identity derived FROM that commit**, not just the commit. An
-    // earlier draft asserted only the sha, and a mutation that invented the tree
-    // and the message survived it — the pin is read either way, so the sha alone
-    // proves nothing about `commit_identity`. Measured.
-    let tree = crate::workspace_manager::fixture::git(
-        &fixture.repo_root,
-        &["rev-parse", &format!("{commit}^{{tree}}")],
-    );
-    assert_eq!(prepared.tree_sha.0, tree, "the tree is not the commit's");
-    assert_eq!(
-        prepared.message, "upstroke: alpha attempt 1",
-        "the message is not the commit's"
-    );
-    assert_eq!(prepared.base_sha, fixture.base_sha, "the base moved");
-    assert_eq!(prepared.parent_sha, fixture.base_sha);
-    assert_eq!(prepared.key, TaskKey(0));
-
-    // The attempt record is the settlement's, not a fresh one: the convergence
-    // reads it from the events the barrier itself parsed.
-    assert_eq!(prepared.attempt.attempt, 1);
-
-    // -----------------------------------------------------------------------
-    // **And the row's continuation ran.** E6 says "append `candidate_prepared`,
-    // then continue as `T-CAND-REF`", and everything above this line witnesses
-    // only the append. The whole suite passed with the continuation absent —
-    // which is what left the converged generation stalled at `Promoting` with
-    // no loop branch able to advance it, and every other task blocked behind
-    // its pipeline entitlement at `max_parallel = 1`.
-    // -----------------------------------------------------------------------
-    assert_eq!(
-        recovered.finished,
-        vec![TaskKey(0)],
-        "the convergence entered `T-CAND-REF`'s sequence and did not leave it"
-    );
-
-    // "append task_candidate_created" — the durable half of the row's own
-    // resume_action, and the event `eligible_integration` waits for.
-    let events = TopologyFold::parse_log(&fixture.log_bytes()).expect("the log parses");
-    assert_eq!(
-        events
-            .iter()
-            .filter(|event| matches!(event.body, TopologyEventBody::TaskCandidateCreated { .. }))
-            .count(),
-        1,
-        "`task_candidate_created` is what fixes the FIFO position; without it the \
-         generation holds its entitlement forever"
-    );
-
-    // The generation has **left** `Promoting`. This is the assertion that speaks
-    // to the stall rather than to the paperwork: `select` has no branch for a
-    // `Promoting` generation, so while it stays there the run cannot progress
-    // whatever else is in the log.
-    let fold = TopologyFold::replay(fixture.inputs(), &events).expect("the converged log folds");
-    assert_ne!(
-        fold.task(TaskKey(0))
-            .and_then(|task| task.generations.last())
-            .map(|generation| generation.class.clone()),
-        Some(GenerationClass::Promoting),
-        "a generation still Promoting after recovery is the stall itself"
-    );
-
-    // "create exact candidates ref zero-old if absent" and "prune the pin", the
-    // row's two effect steps, in the repository rather than in the log.
-    let refs = crate::workspace_manager::fixture::git(
-        &fixture.repo_root,
-        &["for-each-ref", "--format=%(refname) %(objectname)"],
-    );
+        .filter(|event| matches!(event.body, TopologyEventBody::CandidatePrepared { .. }))
+        .collect();
     assert!(
-        refs.lines()
-            .any(|line| line.contains("candidates") && line.ends_with(commit.as_str())),
-        "the candidates ref is missing or at another sha:\n{refs}"
-    );
-    assert!(
-        !refs.contains("prepared"),
-        "the pin was not pruned:\n{refs}"
-    );
-}
-
-/// **"The closure procedure performs the same steps at any run end"** — twice.
-///
-/// `T-CAND-REF`'s `resume_action` ends with that sentence, and it is a claim
-/// about *repetition*: the continuation must be safe to run again on a
-/// generation it already finished. `candidate::tests::
-/// kill_after_candidate_prepared_appends_candidate_created_once` proves the
-/// once-ness at the unit level, by calling the sequence twice directly. This
-/// proves it where it actually repeats — a second **resume**, which is what a
-/// second crash produces.
-///
-/// The second run also exercises the path the first cannot: on resume one,
-/// `candidate_prepared` is appended by the convergence and finished in the same
-/// pass; on resume two it is already durable, which is `T-CAND-REF`'s *own*
-/// window rather than E6's. `recovery_for` reads the durable record either way,
-/// so the two windows differ only in who wrote the record — and this is the
-/// assertion that says so.
-#[test]
-fn a_second_resume_finishes_nothing_and_appends_nothing() {
-    let fixture = Fixture::build(
-        "e6-converges-twice",
-        Damage {
-            open_generation: true,
-            extra: vec![
-                attempt_started(1),
-                attempt_finished(
-                    1,
-                    AttemptSettlement::Closed {
-                        transition: SettlementTransition::Succeeded,
-                        lease: LeaseDisposition::PredictedRetained,
-                    },
-                ),
-            ],
-            ..Damage::default()
-        },
-    );
-    seed_candidate_commit(&fixture, 0);
-
-    let harness = harness();
-    let runtime = runtime_holding_the_record();
-    let certifies = AlwaysCertifies;
-
-    let given = Given::healthy(&fixture, &runtime, &certifies);
-    let (first, _) = resume_holding(&fixture, &harness, &given);
-    let (first, handle) = first.expect("the first resume converges and finishes");
-    assert_eq!(first.promoted, vec![TaskKey(0)]);
-    assert_eq!(first.finished, vec![TaskKey(0)]);
-
-    let after_first = TopologyFold::parse_log(&fixture.log_bytes()).expect("parses");
-    let created_once = after_first
-        .iter()
-        .filter(|event| matches!(event.body, TopologyEventBody::TaskCandidateCreated { .. }))
-        .count();
-    assert_eq!(created_once, 1);
-
-    // The first run's handle holds the worktree lock for the whole run, so a
-    // second resume while it lives is refused — correctly, and by the guard
-    // `PR5-R2-WORKTREE-LOCK-RETENTION` says nothing witnesses. Dropping it is
-    // what makes this a *second run* rather than a second driver.
-    drop(handle);
-
-    // The same fixture, resumed again — a second crash, or an operator running
-    // `resume` twice.
-    let second_harness = crate::engine::topology::recover::tests::harness();
-    let runtime2 = runtime_holding_the_record();
-    let given2 = Given::healthy(&fixture, &runtime2, &certifies);
-    let (second, _) = resume_holding(&fixture, &second_harness, &given2);
-    let (second, _handle2) = second.expect("the second resume is a no-op, not a refusal");
-
-    assert!(
-        second.promoted.is_empty(),
-        "the convergence ran again on a generation that already has its candidate"
-    );
-    assert!(
-        second.finished.is_empty(),
-        "the continuation ran again on a promotion that already left `Promoting`"
-    );
-
-    let after_second = TopologyFold::parse_log(&fixture.log_bytes()).expect("parses");
-    assert_eq!(
-        after_second
-            .iter()
-            .filter(|event| matches!(event.body, TopologyEventBody::TaskCandidateCreated { .. }))
-            .count(),
-        1,
-        "a second `task_candidate_created` is a line the fold refuses on the next replay — \
-         a log that cannot be resumed"
-    );
-    assert_eq!(
-        after_second
-            .iter()
-            .filter(|event| matches!(event.body, TopologyEventBody::CandidatePrepared { .. }))
-            .count(),
-        1,
-        "and a second `candidate_prepared` is the same defect one event earlier"
-    );
-}
-
-/// **The convergence is a resume, so its spend is the log's.**
-///
-/// The parity that `a_runs_spend_is_the_same_live_as_on_replay` asserts for a
-/// live run, over a log a *resume* completed. Both `attempt_finished{Succeeded}`
-/// and `candidate_prepared` carry the record, and the convergence appends the
-/// second one — so a spend reader that counted occurrences would price this
-/// attempt twice, and the double-count would arrive from recovery rather than
-/// from the driver.
-#[test]
-fn a_converged_log_prices_its_attempt_once() {
-    use crate::engine::topology::run::TopologyRun;
-    use crate::engine::topology::select::{Ceiling, Spend};
-
-    let fixture = Fixture::build(
-        "e6-parity",
-        Damage {
-            // **The dispatch comes from `open_generation`, not from `extra`.**
-            // It records the fixture's real base, and the convergence diffs the
-            // candidate commit against it — a placeholder sha makes `diff-tree`
-            // fail rather than report a region. Measured.
-            open_generation: true,
-            extra: vec![
-                attempt_started(1),
-                attempt_finished(
-                    1,
-                    AttemptSettlement::Closed {
-                        transition: SettlementTransition::Succeeded,
-                        lease: LeaseDisposition::PredictedRetained,
-                    },
-                ),
-            ],
-            ..Damage::default()
-        },
-    );
-    seed_candidate_commit(&fixture, 0);
-
-    let harness = harness();
-    let runtime = runtime_holding_the_record();
-    let certifies = AlwaysCertifies;
-    let given = Given::healthy(&fixture, &runtime, &certifies);
-    let (outcome, _) = resume_holding(&fixture, &harness, &given);
-    let (_recovered, handle) = outcome.expect("the resume converges");
-
-    let events = TopologyFold::parse_log(&fixture.log_bytes()).expect("the log parses");
-    let settlements = events
-        .iter()
-        .filter(|event| {
-            matches!(
-                event.body,
-                TopologyEventBody::AttemptFinished { .. }
-                    | TopologyEventBody::CandidatePrepared { .. }
-            )
-        })
-        .count();
-    assert_eq!(
-        settlements, 2,
-        "the converged log should carry both events for one attempt — if it \
-         does not, this test is not measuring the double-count it exists for"
-    );
-
-    let priced = Spend::replay(&events).run_total();
-    let once = events
-        .iter()
-        .find_map(|event| match &event.body {
-            TopologyEventBody::AttemptFinished { data } => Some(
-                data.record.cost_usd.unwrap_or(0.0) + data.record.review_cost_usd().unwrap_or(0.0),
-            ),
-            _ => None,
-        })
-        .expect("the settlement is durable");
-    assert!(
-        (priced - once).abs() < 1e-9,
-        "a converged log prices its one attempt at {priced}, and the attempt \
-         cost {once}: recovery's append made the run look more expensive than \
-         it was"
-    );
-
-    // -----------------------------------------------------------------------
-    // **The driver half.** Everything above measures `Spend::replay` — the
-    // accumulator. This measures whether the run *reads* it, and until the
-    // handle carried the barrier's events it did not: `TopologyRun::resumed`
-    // built a `Spend::new()`, so `Spend::replay` had no production caller at
-    // all and every restart handed the run its whole budget back.
-    //
-    // This is the §4 class's own prescription, applied to the accumulator the
-    // class's narrow name let through. A witness for the accumulation is not a
-    // witness for the read, and the two had to be written as two assertions
-    // because they are two claims.
-    // -----------------------------------------------------------------------
-    assert!(
-        priced > 0.0,
-        "the fixture's attempt costs nothing, so a driver that read no spend at \
-         all would agree with one that read it correctly — this test would \
-         assert nothing"
-    );
-    let run = TopologyRun::resumed(handle, fixture.inputs(), Ceiling::unlimited());
-    assert!(
-        (run.spend().run_total() - priced).abs() < 1e-9,
-        "the resumed run believes it has spent {} where its own log says {priced}. \
-         A ceiling counted from zero after every restart is a budget that only \
-         binds runs that never crash",
-        run.spend().run_total()
+        prepared.is_empty(),
+        "recovery synthesised a candidate around the pinned commit {commit:?}; with one \
+         atomic settlement a pin without a record is residue, not authorization"
     );
 }
 
@@ -7886,11 +7576,6 @@ fn every_packet_named_recovery_action_has_a_production_caller() {
             "expected_refs",
             crate::effects::census_domain::Call::Free,
             "the entitlement `refuse_unexpected_refs` refuses against, derived from the fold",
-        ),
-        (
-            "complete_promotions",
-            crate::effects::census_domain::Call::Free,
-            "erratum E6: append candidate_prepared for a settled-but-unrecorded candidate",
         ),
         (
             "finish_promotions",

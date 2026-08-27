@@ -257,51 +257,27 @@ fn spent(finished: &FinishedAttempt) -> bool {
     crate::ladder::spends_allowance(finished.record.failure.as_ref().map(FailureRecord::shape))
 }
 
-/// The settlement of an attempt that **succeeded**.
-///
-/// Separate from [`settle_failed`] for two reasons, and neither is tidiness.
-///
-/// It is the one settlement that leaves the generation **open**: it moves it to
-/// `Promoting`, which is the class `check_candidate_prepared` requires. So its
-/// lease disposition is `expected(true)` — an ordinary generation keeps its
-/// predicted region and hands it to the candidate at `candidate_prepared`,
-/// rather than releasing it.
-///
-/// And it is appended at a **different point of the sequence**. `T-CAND-OBJ`'s
-/// window covers the commit object *and* the pin, with
-/// `authoritative_state: attempt unsettled` — so the settlement lands between
-/// the pin and `candidate_prepared`, not before the candidate phase begins. It
-/// is a pure function of the fold and the record, with no ordering of its own
-/// to get wrong; where it is called is the candidate sequence's business.
-///
-/// INV-07's "candidate_prepared is the sole successful attempt settlement" is
-/// about which event records the *candidate*, not about which event settles the
-/// attempt: without this one the generation never reaches `Promoting` and the
-/// fold refuses the `candidate_prepared` that follows.
-///
-/// # Errors
-///
-/// [`UpstrokeError::Refused`] when the fold holds no such open generation, or
-/// when the run has not started.
-pub fn settle_succeeded(
-    fold: &TopologyFold,
-    key: TaskKey,
-    generation: GenerationId,
-    attempt: AttemptNumber,
-    record: &AttemptRecord,
-) -> Result<AttemptFinished4, UpstrokeError> {
-    let open = open_generation(fold, key, generation)?;
-    Ok(AttemptFinished4 {
-        key,
-        generation,
-        attempt,
-        record: Box::new(record.clone()),
-        settlement: AttemptSettlement::Closed {
-            transition: SettlementTransition::Succeeded,
-            lease: open.lease.expected(true),
-        },
-    })
-}
+// **There is no successful settlement to build here, and that is the point.**
+//
+// `settle_succeeded` used to live at this spot: it built an
+// `attempt_finished{Succeeded}` that the driver appended between the pin and
+// `candidate_prepared`, and its doc argued that INV-07's *"candidate_prepared
+// is the sole successful attempt settlement"* was "about which event records
+// the candidate, not about which event settles the attempt".
+//
+// That reading was wrong, and
+// `decisions/2026-08-12-merge-queue-execution-topology.md` had already
+// answered it in the same breath as the sentence it reinterpreted:
+// `candidate_prepared` "contains exactly one complete attempt record … ;
+// **`attempt_finished` is not also emitted for that attempt**". Ruled CONFORM
+// on 2026-08-27 — the record stands and the code changed.
+//
+// The settlement now belongs to `candidate_prepared`:
+// [`crate::topology::fold::TopologyFold`] promotes the generation when it
+// applies that event, refuses an `attempt_finished` that settles `succeeded`
+// at all, and refuses a `candidate_prepared` whose generation is already
+// promoted — so neither ordering of the old pair can be written. The per-instance
+// Class B approval is `reviews/FINDINGS.md` §3.
 
 /// The question a settlement raised, read back from the event.
 ///
@@ -1437,65 +1413,113 @@ pub(crate) mod tests {
         assert_eq!(fold.task_state(BET), Some(TaskState::Failed));
     }
 
-    /// A successful settlement leaves the generation open at `Promoting`, and
-    /// keeps the region it is about to hand to its candidate.
+    /// **`candidate_prepared` is the successful settlement, and the fold refuses
+    /// either half of the pair that used to stand in for it.**
     ///
-    /// The two halves are one property: `check_candidate_prepared` requires
-    /// `Promoting`, and `check_lease_disposition` requires
-    /// `PredictedRetained` for a generation that survives. A settlement that
-    /// released the region would be refused by the fold before the candidate
-    /// could take it.
+    /// Re-derived from `a_successful_settlement_promotes_the_generation_and_keeps_its_region`,
+    /// which asserted that an `attempt_finished{Succeeded}` promotes the generation
+    /// — the event `decisions/2026-08-12-merge-queue-execution-topology.md` says is
+    /// "not also emitted for that attempt". The old test was not wrong about the
+    /// build; it was a witness for a shape the record forbids, and re-deriving it
+    /// against the invariant is the point of the 2026-08-27 CONFORM ruling. It was
+    /// not patched to pass.
+    ///
+    /// Three claims, because the invariant has three parts: the settlement lands on
+    /// `candidate_prepared`; an `attempt_finished` that settles `succeeded` is
+    /// refused whatever else is true; and a `candidate_prepared` for a generation
+    /// that is *already* promoted is refused, so neither order of the old pair can
+    /// be written.
     #[test]
-    fn a_successful_settlement_promotes_the_generation_and_keeps_its_region() {
+    fn candidate_prepared_is_the_sole_successful_settlement() {
+        use crate::topology::events::CandidatePrepared;
+
+        let prepared_for = |key: TaskKey, generation: u32| CandidatePrepared {
+            key,
+            generation: GenerationId(generation),
+            attempt: Box::new(record(1, Some(0.25))),
+            base_sha: sha("base"),
+            parent_sha: sha("base"),
+            tree_sha: sha("tree"),
+            commit_sha: sha("commit"),
+            message: "aleph: the judged tree".to_owned(),
+            prepared_ref: GitRef("refs/upstroke/prepared/x".to_owned()),
+            candidate_ref: GitRef("refs/upstroke/candidates/x".to_owned()),
+            actual_paths: PathSet::Prefixes {
+                paths: vec![GitPath("src/aleph".to_owned())],
+            },
+            lease_effect: crate::topology::events::CandidateLeaseEffect::ReplacesPredicted {
+                paths: PathSet::Prefixes {
+                    paths: vec![GitPath("src/aleph".to_owned())],
+                },
+            },
+        };
+
+        // (1) The settlement is this event. An in-flight generation reaches
+        //     `Promoting` by applying it, with no `attempt_finished` in between.
         let mut fold = started();
         in_flight(&mut fold, ALEPH, 0);
-        let settled = settle_succeeded(
-            &fold,
-            ALEPH,
-            GenerationId(0),
-            AttemptNumber(1),
-            &record(1, Some(0.25)),
-        )
-        .expect("a succeeding attempt settles");
-        assert_eq!(
-            settled.settlement,
-            AttemptSettlement::Closed {
-                transition: SettlementTransition::Succeeded,
-                lease: LeaseDisposition::PredictedRetained,
-            }
-        );
-        assert!(
-            !settled.halts_run(),
-            "a success is not a halt carrier under any policy"
-        );
-        assert_eq!(rematerialize_question(&settled), None);
-
         apply(
             &mut fold,
-            &ev(TopologyEventBody::AttemptFinished {
-                data: Box::new(settled),
+            &ev(TopologyEventBody::CandidatePrepared {
+                data: Box::new(prepared_for(ALEPH, 0)),
             }),
         );
+        let promoted = fold
+            .task(ALEPH)
+            .and_then(|task| task.generations.first())
+            .expect("the generation is open");
+        assert_eq!(
+            promoted.class,
+            GenerationClass::Promoting,
+            "`candidate_prepared` did not settle the attempt, so nothing did"
+        );
         assert!(
-            matches!(
-                fold.task(ALEPH).and_then(|task| task.generations.first()),
-                Some(held) if held.class == GenerationClass::Promoting
-            ),
-            "the generation did not reach the class `candidate_prepared` requires"
+            promoted.candidate.is_some(),
+            "the settlement recorded no candidate"
         );
 
-        // It is a pure function of the fold and the record, with no ordering
-        // of its own: naming a generation that is not the open one is refused
-        // rather than settled.
-        let error = settle_succeeded(
-            &fold,
-            BET,
-            GenerationId(0),
-            AttemptNumber(1),
-            &record(1, None),
-        )
-        .expect_err("no open generation");
-        assert!(format!("{error}").contains("no open generation"), "{error}");
+        // (2) An `attempt_finished` that settles `succeeded` is refused outright.
+        let mut fold = started();
+        in_flight(&mut fold, ALEPH, 0);
+        let refused = fold
+            .plan_transition(&ev(TopologyEventBody::AttemptFinished {
+                data: Box::new(AttemptFinished4 {
+                    key: ALEPH,
+                    generation: GenerationId(0),
+                    attempt: AttemptNumber(1),
+                    record: Box::new(record(1, Some(0.25))),
+                    settlement: AttemptSettlement::Closed {
+                        transition: SettlementTransition::Succeeded,
+                        lease: LeaseDisposition::PredictedRetained,
+                    },
+                }),
+            }))
+            .expect_err("a succeeded attempt_finished is not a settlement this fold accepts");
+        assert!(
+            format!("{refused}").contains("sole successful settlement"),
+            "the refusal must say why, so a reader is not left guessing: {refused}"
+        );
+
+        // (3) And the other order: a generation already promoted may not then
+        //     prepare a candidate, so a log carrying both is refused whichever
+        //     event it reaches first.
+        let mut fold = started();
+        in_flight(&mut fold, ALEPH, 0);
+        apply(
+            &mut fold,
+            &ev(TopologyEventBody::CandidatePrepared {
+                data: Box::new(prepared_for(ALEPH, 0)),
+            }),
+        );
+        let refused = fold
+            .plan_transition(&ev(TopologyEventBody::CandidatePrepared {
+                data: Box::new(prepared_for(ALEPH, 0)),
+            }))
+            .expect_err("a promoted generation prepares no second candidate");
+        assert!(
+            format!("{refused}").contains("still in flight"),
+            "the refusal must name the class it required: {refused}"
+        );
     }
 
     /// `T-FAILED.resume_action`: "rematerialize question from the event …

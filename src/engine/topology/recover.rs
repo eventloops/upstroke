@@ -132,16 +132,14 @@ use std::path::Path;
 
 use crate::config::RunnerSelection;
 use crate::error::UpstrokeError;
-use crate::events::AttemptRecord;
 use crate::events::RunOutcome;
 use crate::rundir::{RepoKey, RunLock, WorktreeLock};
 use crate::runner::container::GitView;
 use crate::runner::container::resolve::RunnerPreflight;
 use crate::runner::container::runtime::{ContainerRuntime, OwnerLiveness};
 use crate::topology::events::{
-    AttemptInterrupted4, AttemptNumber, CandidateLeaseEffect, CandidatePrepared, CommitSha,
-    GenerationCloseReason, GenerationClosed, GenerationId, IncarnationId, LeaseDisposition,
-    RunResumed4, RunStarted4, TopologyEvent, TopologyEventBody,
+    AttemptInterrupted4, AttemptNumber, GenerationCloseReason, GenerationClosed, GenerationId,
+    IncarnationId, LeaseDisposition, RunResumed4, RunStarted4, TopologyEvent, TopologyEventBody,
 };
 use crate::topology::fold::{FrozenInputs, GenerationClass, TopologyFold};
 use crate::topology::leases::GenerationLease;
@@ -1602,17 +1600,16 @@ pub struct Recovered {
     pub interrupted: usize,
     /// (e): how many `RetainedIdle` generations were closed.
     pub retained_closed: usize,
-    /// The `Promoting` generations whose `candidate_prepared` this resume
-    /// appended — erratum **E6**'s convergence. Empty on a healthy resume.
-    pub promoted: Vec<TaskKey>,
     /// The promotions this resume carried through to `task_candidate_created`
-    /// — `T-CAND-REF`'s continuation, which E6 defers to.
+    /// — `T-CAND-REF`'s continuation.
     ///
-    /// A **superset** of `promoted` and reported separately for that reason: the
-    /// two windows the continuation serves are told apart by which list a key is
-    /// in, and a key in `promoted` but not here is a convergence that entered the
-    /// sequence and did not leave it — which is precisely the stall this field
-    /// exists to make visible rather than silent.
+    /// **There was a `promoted` field beside this one**, holding the
+    /// generations whose `candidate_prepared` a resume *synthesised* from the
+    /// prepared pin — erratum E6's convergence. It is gone with the path that
+    /// filled it: since `candidate_prepared` became the sole successful
+    /// settlement on 2026-08-27, a `Promoting` generation always has a recorded
+    /// candidate, so the window E6 converged cannot occur and a pin without a
+    /// candidate record is orphan residue instead.
     pub finished: Vec<TaskKey>,
     /// (g): every `OpenNoAttempt` generation rebuilt, and whether its worktree
     /// verified or had to be recreated. A value rather than a count, because
@@ -1711,7 +1708,7 @@ pub fn run_recovery_order(
     // append — which is why it precedes (d) and (e) rather than sitting in its
     // own numbered position: a refusal after two appends is not "before any
     // append".
-    refuse_unimplemented_terminals(&certified, seams.manager)?;
+    refuse_unimplemented_terminals(&certified)?;
 
     // **`T-CAND-OBJ`'s other refusal**, and it belongs here for the same reason:
     // `refusal_condition` is "pin symbolic or an unexpected ref under the run
@@ -1774,17 +1771,29 @@ pub fn run_recovery_order(
     let retained_closed = close_retained_idle(&mut certified, &mut context)?;
     steps.push(RecoveryStep::E);
 
-    // (f)'s converging half, which **appends** and so cannot sit with its
-    // refusing half above: erratum E6 puts the settled-but-unrecorded candidate
-    // in `T-CAND-REF`, and that row converges forward. The refusal that stays
-    // before every append is the integration transaction's, which is PR8's
-    // terminal and one of the two `checkpoint_refusals` authorises.
-    let promoted = complete_promotions(&mut certified, seams.manager, &mut context)?;
-
-    // E6's "then continue as `T-CAND-REF`", and `T-CAND-REF`'s own window with
-    // it. The append above is the entry to that row's four-step sequence; this
-    // is the rest of it, and without it a converged generation stalls at
-    // `Promoting` with nothing in the loop able to advance it.
+    // **(f)'s converging half is gone, because the window it converged cannot
+    // occur.** It walked generations that were `Promoting` with no recorded
+    // candidate — erratum E6's window — and rebuilt a `candidate_prepared` from
+    // whatever the prepared pin pointed at, deriving tree, message and paths
+    // from that commit.
+    //
+    // That window existed only because `attempt_finished{Succeeded}` promoted a
+    // generation on its own. Since the 2026-08-27 CONFORM ruling
+    // `candidate_prepared` is the sole successful settlement, `Promoting` is
+    // set at exactly one place in the fold — the same block that records the
+    // candidate — so `Promoting` now implies a recorded candidate and the walk
+    // could only ever return nothing.
+    //
+    // **It was also the third P1 of the `bf927f3` review**: a pin substituted
+    // between the settlement and the append made recovery reconstruct a
+    // successful candidate around an object no gate ran against, and the tree
+    // check could not catch it because recovery itself recorded that tree. With
+    // one atomic settlement the same prefix is a pin with no candidate record —
+    // orphan residue, which `candidate::recovery_for` prunes while settling the
+    // attempt interrupted.
+    //
+    // `T-CAND-REF`'s four-step sequence still runs below; what is removed is
+    // the synthetic entry to it.
     let finished = finish_promotions(&mut certified, seams.manager, &mut context)?;
 
     // (g) — after (e) and before (h), the packet's own position. A worktree
@@ -1802,7 +1811,6 @@ pub fn run_recovery_order(
         Recovered {
             interrupted,
             retained_closed,
-            promoted,
             finished,
             recreated,
             steps,
@@ -1880,12 +1888,15 @@ pub fn refuse_if_finished(censused: &ResumeCensused) -> Result<(), UpstrokeError
 ///
 /// # Errors
 ///
-/// [`UpstrokeError::Refused`] naming the task whose generation is `Promoting`,
-/// or the unresolved integration transaction.
-pub fn refuse_unimplemented_terminals(
-    certified: &PreflightCertified,
-    manager: &WorkspaceManager,
-) -> Result<(), UpstrokeError> {
+/// [`UpstrokeError::Refused`] naming the unresolved integration transaction.
+///
+/// **It named a second thing until 2026-08-27**: a task whose generation was
+/// `Promoting` with its candidate pin gone. That refusal guarded erratum E6's
+/// convergence, which rebuilt a candidate identity from the pin; with
+/// `candidate_prepared` as the sole successful settlement there is no such
+/// reconstruction and no such window, so one refusal is left and this takes no
+/// `WorkspaceManager` — it is now a predicate over the fold alone.
+pub fn refuse_unimplemented_terminals(certified: &PreflightCertified) -> Result<(), UpstrokeError> {
     let fold = fold_of(certified);
     if fold.transaction().is_some() {
         return Err(UpstrokeError::Refused {
@@ -1896,203 +1907,24 @@ pub fn refuse_unimplemented_terminals(
                 .to_owned(),
         });
     }
-    // **A `Promoting` generation whose pin is gone.** E6 converges the ordinary
-    // window by reconstructing the commit identity from the pin. With no pin
-    // there is nothing to reconstruct from, and a settled attempt with no pin is
-    // neither `T-CAND-OBJ` (which leaves an unpinned object to Git) nor a
-    // completable `T-CAND-REF`.
+    // **A `Promoting` generation whose pin is gone used to be refused here**,
+    // because E6's convergence rebuilt the candidate identity *from* that pin
+    // and had nothing to rebuild from without it.
     //
-    // Refused **here**, with the other refusal, because a refusal belongs before
-    // any effect and this one is a predicate over durable state alone. Leaving
-    // it to the converging half would put it after P7/P8 publishes the ref,
-    // which is the ordering `the_p7_p8_step_runs_after_the_refusals_that_bound_it`
-    // exists to hold.
-    let run_id = fold
-        .started()
-        .map(|started| started.run_id.clone())
-        .unwrap_or_default();
-    for key in task_keys(fold) {
-        let Some(generation) = fold.task(key).and_then(|task| {
-            task.generations
-                .iter()
-                .find(|held| held.class == GenerationClass::Promoting && held.candidate.is_none())
-        }) else {
-            continue;
-        };
-        let names =
-            crate::engine::topology::candidate::CandidateNames::of(&run_id, key, generation.id);
-        if manager
-            .direct_ref_target(names.prepared_ref.as_str())?
-            .is_none()
-        {
-            return Err(UpstrokeError::Refused {
-                message: format!(
-                    "task {key} is promoting and its candidate pin is absent, so the commit its \
-                     settlement authorised cannot be named. `T-CAND-OBJ` governs an unpinned \
-                     object and leaves it to Git; a settled attempt with no pin is neither row \
-                     and is refused before any effect rather than guessed"
-                ),
-            });
-        }
-    }
+    // Both are gone. Since the 2026-08-27 CONFORM ruling `candidate_prepared`
+    // is the sole successful settlement and the only thing that sets
+    // `Promoting`, in the same block that records the candidate — so a
+    // promoting generation carries its own identity and needs no pin to
+    // reconstruct one. A pin already pruned is `T-CAND-REF`'s ordinary
+    // late-crash prefix, which `finish_promotions` completes; a pin with no
+    // candidate record is orphan residue, which `candidate::recovery_for`
+    // prunes while settling the attempt interrupted.
+    //
+    // What still refuses before any append is the integration transaction
+    // above, which is PR8's terminal and one of the two `checkpoint_refusals`
+    // authorises.
 
-    // **A `Promoting` generation WITH its pin is no longer refused here.** It was, and that
-    // was a third checkpoint refusal: `checkpoint_refusals` authorises this
-    // build to refuse exactly two things, integration and run end, and a
-    // generation whose settlement is durable is neither. Erratum **E6** places
-    // the window in `T-CAND-REF` — whose boundary begins at the settlement, not
-    // at `candidate_prepared` — and that row converges forward. The convergence
-    // is [`complete_promotions`], and it appends, so it runs with the other
-    // appending steps rather than here before any of them.
     Ok(())
-}
-
-/// One `Promoting` generation whose `candidate_prepared` never landed.
-struct Pending {
-    key: TaskKey,
-    generation: GenerationId,
-    base_sha: CommitSha,
-    record: Box<AttemptRecord>,
-}
-
-/// The generation this task is promoting, if its candidate was never recorded.
-///
-/// `GenerationFold::candidate` is `Some` once `candidate_prepared` applied, so
-/// `Promoting` with `None` is exactly erratum **E6**'s window and nothing else.
-fn promoting_without_candidate(
-    fold: &TopologyFold,
-    events: &[TopologyEvent],
-    key: TaskKey,
-) -> Option<Pending> {
-    let generation = fold
-        .task(key)?
-        .generations
-        .iter()
-        .find(|held| held.class == GenerationClass::Promoting && held.candidate.is_none())?;
-    // The record the settlement carried, from the proven bytes.
-    let record = events.iter().rev().find_map(|event| match &event.body {
-        TopologyEventBody::AttemptFinished { data }
-            if data.key == key && data.generation == generation.id =>
-        {
-            Some(data.record.clone())
-        }
-        _ => None,
-    })?;
-    Some(Pending {
-        key,
-        generation: generation.id,
-        base_sha: generation.base_sha.clone(),
-        record,
-    })
-}
-
-/// **Recovery step (f), the converging half.** Complete every `Promoting`
-/// generation whose `candidate_prepared` never landed.
-///
-/// # Erratum E6
-///
-/// `T-CAND-OBJ`'s window ends where its own `durable_state` says: "attempt_started
-/// only", with the attempt unsettled. `T-CAND-REF`'s `boundary` begins at the
-/// settlement — **not** at `candidate_prepared`, which is what the text said
-/// before E6 and which left the prefix "settlement durable, `candidate_prepared`
-/// absent" governed by no row at all. The fold makes that prefix mandatory:
-/// `attempt_finished{Closed{Succeeded}}` is the only thing that sets `Promoting`
-/// and `check_candidate_prepared` refuses every other class, so the two appends
-/// cannot be collapsed.
-///
-/// **Every input is derived from durable state and nothing is re-decided.** The
-/// pin names the commit; the commit names its tree and its message; the
-/// generation names the base; `diff-tree base commit` names the region the diff
-/// actually touched, which is the same primitive
-/// `decisions.admission_and_leases.path_policy.actual` specifies. The attempt
-/// record is the one the durable settlement already carried.
-///
-/// After the append the generation is exactly what `T-CAND-REF`'s existing
-/// `resume_action` describes, and the rest of that row — verify object, create
-/// the exact candidates ref, append `task_candidate_created`, prune the pin —
-/// is unchanged.
-///
-/// # Errors
-///
-/// A Git error reading the pin or the commit, a refusal when the pin is missing
-/// (the object is then Git's and `T-CAND-OBJ` governs), or whatever the append
-/// returns.
-pub fn complete_promotions(
-    certified: &mut PreflightCertified,
-    manager: &WorkspaceManager,
-    context: &mut EmitContext<'_>,
-) -> Result<Vec<TaskKey>, UpstrokeError> {
-    let mut converged = Vec::new();
-    let run_id = fold_of(certified)
-        .started()
-        .ok_or_else(|| UpstrokeError::Refused {
-            message: "the proven prefix has no run".to_owned(),
-        })?
-        .run_id
-        .clone();
-
-    // **The barrier's own parse**, for the one thing the fold does not keep: the
-    // `AttemptRecord` the durable settlement carried. `candidate_prepared`
-    // records it, and inventing one would re-decide what the settlement already
-    // decided.
-    //
-    // Read through `StablePrefix::events` rather than parsing the log again.
-    // A second parse is reachable around the barrier by anyone, which is what
-    // `the_stable_prefix_barrier_is_the_only_way_a_log_becomes_a_topology_fold`
-    // refuses — and it refused this convergence's first draft.
-    let pendings: Vec<Pending> = {
-        let barrier = certified.rebuilt().censused().barrier();
-        let events = barrier.events();
-        let fold = barrier.fold();
-        task_keys(fold)
-            .into_iter()
-            .filter_map(|key| promoting_without_candidate(fold, events, key))
-            .collect()
-    };
-
-    for pending in pendings {
-        let key = pending.key;
-        let names = crate::engine::topology::candidate::CandidateNames::of(
-            &run_id,
-            key,
-            pending.generation,
-        );
-        // Step (f)'s refusing half already proved the pin is there, before any
-        // effect, and nothing between them touches a ref.
-        let Some(commit) = manager.direct_ref_target(names.prepared_ref.as_str())? else {
-            return Err(UpstrokeError::Refused {
-                message: format!("task {key}'s candidate pin vanished during recovery"),
-            });
-        };
-        let (tree, message) = manager.commit_identity(&commit)?;
-        let actual_paths = manager.changed_paths_between(pending.base_sha.as_str(), &commit)?;
-
-        let prepared = CandidatePrepared {
-            key,
-            generation: pending.generation,
-            attempt: pending.record,
-            base_sha: pending.base_sha.clone(),
-            parent_sha: pending.base_sha,
-            tree_sha: CommitSha(tree),
-            commit_sha: CommitSha(commit),
-            message,
-            prepared_ref: names.prepared_ref,
-            candidate_ref: names.candidate_ref,
-            actual_paths: actual_paths.clone(),
-            lease_effect: CandidateLeaseEffect::ReplacesPredicted {
-                paths: actual_paths,
-            },
-        };
-        emit(
-            certified,
-            context,
-            TopologyEventBody::CandidatePrepared {
-                data: Box::new(prepared),
-            },
-        )?;
-        converged.push(key);
-    }
-    Ok(converged)
 }
 
 /// **The continuation `T-CAND-REF`'s `resume_action` names, and E6 defers to.**

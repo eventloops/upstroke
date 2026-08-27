@@ -1940,8 +1940,35 @@ impl RunState {
                 }
             }
             AttemptSettlement::Closed { transition, lease } => {
-                let survives = matches!(transition, SettlementTransition::Succeeded);
-                check_lease_disposition(KIND, finished.key, generation.lease, survives, *lease)?;
+                // **`attempt_finished` does not settle a success.** INV-07 and
+                // `decisions/2026-08-12-merge-queue-execution-topology.md` say
+                // it outright — `candidate_prepared` is "the **sole**
+                // successful settlement for an attempt that produces a
+                // candidate … `attempt_finished` is not also emitted for that
+                // attempt" — and this build appended both, so one attempt
+                // carried its record on two lines.
+                //
+                // Refused here rather than tolerated downstream. The 2026-08-27
+                // ruling is CONFORM, not supersession, and a reader that
+                // *coped* with the dual pattern would be a second reading of
+                // the same sentence: `Spend::replay` grew per-attempt
+                // deduplication to survive it, which is evidence of the
+                // duplicate rather than permission for it. Schema 4 has no
+                // external writers — `src/engine/mod.rs` is `pub(crate) mod
+                // topology` — so no log this build did not write can carry the
+                // shape, and refusing it costs no compatibility.
+                if matches!(transition, SettlementTransition::Succeeded) {
+                    return Err(FoldError::InconsistentRecord {
+                        kind: KIND,
+                        detail: format!(
+                            "attempt {} of generation {} settles `succeeded`, and \
+                             `candidate_prepared` is the sole successful settlement for a \
+                             candidate-producing attempt",
+                            finished.attempt.0, finished.generation.0
+                        ),
+                    });
+                }
+                check_lease_disposition(KIND, finished.key, generation.lease, *lease)?;
                 if let SettlementTransition::Parked { question } = transition {
                     self.check_new_question(KIND, question, finished.key)?;
                 }
@@ -1973,13 +2000,7 @@ impl RunState {
         // unknown, so the worktree is scrubbed with force rather than reused —
         // which is why an ordinary generation releases its predicted region
         // here and a lineage member goes on holding its root's.
-        check_lease_disposition(
-            KIND,
-            interrupted.key,
-            generation.lease,
-            false,
-            interrupted.lease,
-        )
+        check_lease_disposition(KIND, interrupted.key, generation.lease, interrupted.lease)
     }
 
     // --- generation_closed -------------------------------------------------
@@ -2005,7 +2026,7 @@ impl RunState {
                 });
             }
         }
-        check_lease_disposition(KIND, closed.key, generation.lease, false, closed.lease)
+        check_lease_disposition(KIND, closed.key, generation.lease, closed.lease)
     }
 
     // --- defer_wait_elapsed ------------------------------------------------
@@ -2035,14 +2056,21 @@ impl RunState {
         let entry = self.entry(KIND, prepared.key)?;
         let task = self.task(KIND, prepared.key)?;
         let generation = self.open_generation(KIND, task, prepared.key, prepared.generation)?;
-        if generation.class != GenerationClass::Promoting {
+        // **The generation is still in flight, because this event is what
+        // settles it.** It used to require `Promoting`, which only an
+        // `attempt_finished{Succeeded}` could produce — so the fold *required*
+        // the dual pattern the 2026-08-12 record forbids. With the settlement
+        // moved here, a `Promoting` generation means that record was appended
+        // anyway, and the arm above already refuses it; this refuses the other
+        // half of the same shape, so neither order can produce two settlements.
+        if !matches!(generation.class, GenerationClass::InFlight { .. }) {
             return Err(FoldError::NotTheOpenGeneration {
                 kind: KIND,
                 key: prepared.key.0,
                 generation: prepared.generation.0,
                 detail: format!(
                     "the generation is {}, and a candidate is prepared by a generation whose \
-                     attempt succeeded",
+                     attempt is still in flight — this event is its settlement",
                     generation.class.name()
                 ),
             });
@@ -3421,11 +3449,15 @@ impl RunState {
                 }
             }
             AttemptSettlement::Closed { transition, .. } => match transition {
-                SettlementTransition::Succeeded => {
-                    if let Some(generation) = self.open_generation_mut(finished.key) {
-                        generation.class = GenerationClass::Promoting;
-                    }
-                }
+                // Unreachable: `check_attempt_finished` refuses this
+                // transition before `apply` is called, because
+                // `candidate_prepared` is the sole successful settlement. The
+                // arm stays so the match is total over the wire vocabulary —
+                // the variant is still a legal *shape*, it is simply not a
+                // settlement this fold accepts — and it does nothing, so a
+                // check that stopped refusing would produce a generation stuck
+                // in flight rather than a silently-promoted one.
+                SettlementTransition::Succeeded => {}
                 SettlementTransition::Retry => {
                     self.close_generation(finished.key);
                 }
@@ -3483,6 +3515,12 @@ impl RunState {
         };
         if let Some(generation) = self.open_generation_mut(prepared.key) {
             generation.candidate = Some(record);
+            // **The settlement, which used to arrive on its own event.** A
+            // candidate-producing attempt has exactly one successful
+            // settlement and this is it, so the class transition belongs here
+            // rather than to an `attempt_finished` the 2026-08-12 record says
+            // is not emitted.
+            generation.class = GenerationClass::Promoting;
         }
         match &prepared.lease_effect {
             CandidateLeaseEffect::ReplacesPredicted { paths } => {
@@ -3840,14 +3878,29 @@ fn ordinal(index: u32) -> String {
 
 /// refusals[14]: the disposition an event records must be the one this
 /// generation's holding admits.
+/// The recorded disposition against the one the holding implies.
+///
+/// **Every caller passes a closing generation, and since 2026-08-27 there is no
+/// other kind.** This took a `survives: bool`, and exactly one caller ever
+/// passed `true`: `attempt_finished{Succeeded}`, the settlement that left a
+/// generation open to hand its region to a candidate. That event is no longer a
+/// settlement this fold accepts — `candidate_prepared` is the sole successful
+/// one — so the parameter had a single reachable value and a second value that
+/// documented a rule nothing could exercise.
+///
+/// **The surviving case did not disappear, it moved.** A generation that keeps
+/// its region hands it over through `CandidatePrepared::lease_effect`, which
+/// [`TopologyFold::check_candidate_prepared`] matches against the entry's
+/// lineage — the same decision, on the event that now makes it.
+/// [`GenerationLease::expected`] keeps both arms and its own table test,
+/// because it is the statement of the rule rather than a caller of it.
 fn check_lease_disposition(
     kind: &'static str,
     key: TaskKey,
     lease: GenerationLease,
-    survives: bool,
     recorded: LeaseDisposition,
 ) -> Result<(), FoldError> {
-    let expected = lease.expected(survives);
+    let expected = lease.expected(false);
     if recorded == expected {
         return Ok(());
     }
@@ -3859,7 +3912,7 @@ fn check_lease_disposition(
             GenerationLease::Own => "leaseholding",
             GenerationLease::InheritedLineage { .. } => "lineage",
         },
-        fate: if survives { "stays open" } else { "closes" },
+        fate: "closes",
         expected: format!("{expected:?}"),
     })
 }
@@ -4596,18 +4649,6 @@ mod tests {
         })
     }
 
-    fn succeeded(key: TaskKey, generation: u32, attempt: u32) -> TopologyEvent {
-        settle(
-            key,
-            generation,
-            attempt,
-            AttemptSettlement::Closed {
-                transition: SettlementTransition::Succeeded,
-                lease: LeaseDisposition::PredictedRetained,
-            },
-        )
-    }
-
     fn candidate_of(key: TaskKey, generation: u32) -> CandidateRef {
         CandidateRef {
             key,
@@ -5311,7 +5352,6 @@ mod tests {
         apply(fold, &dispatch(key, generation, &base));
         let start = attempt_started(fold, key, generation, 1, 0);
         apply(fold, &start);
-        apply(fold, &succeeded(key, generation, 1));
         apply(fold, &candidate_prepared(key, generation, &base));
         apply(fold, &candidate_created(key, generation));
     }
@@ -5348,7 +5388,6 @@ mod tests {
         apply(fold, &dispatch(key, generation, &base));
         let start = attempt_started(fold, key, generation, 1, 0);
         apply(fold, &start);
-        apply(fold, &succeeded(key, generation, 1));
         apply(fold, &candidate_prepared(key, generation, &base));
         apply(fold, &candidate_created(key, generation));
         apply(
@@ -7107,29 +7146,44 @@ mod tests {
                     "a {holding} generation that is interrupted and records {disposition:?}"
                 );
 
-                // A success is the one settlement that leaves the generation
-                // open: it hands the region to the candidate, so the
-                // generation keeps holding it.
-                let surviving_ok = disposition
-                    == if holding == "ordinary" {
-                        LeaseDisposition::PredictedRetained
-                    } else {
-                        LeaseDisposition::LineageHeld
-                    };
-                let succeeded = settle(
-                    key,
-                    0,
-                    1,
-                    AttemptSettlement::Closed {
-                        transition: SettlementTransition::Succeeded,
-                        lease: disposition,
-                    },
-                );
-                assert_eq!(
-                    fold.plan_transition(&succeeded).is_ok(),
-                    surviving_ok,
-                    "a {holding} generation that succeeded and records {disposition:?}"
-                );
+                // **No `attempt_finished` leaves a generation open, so there is
+                // no surviving disposition to enumerate here any more.** This
+                // block asserted that a `succeeded` settlement recording
+                // `PredictedRetained` (ordinary) or `LineageHeld` (lineage) is
+                // accepted — the one case where a settlement kept its region to
+                // hand to a candidate. Since the 2026-08-27 CONFORM ruling that
+                // event is refused whatever it records, because
+                // `candidate_prepared` is the sole successful settlement.
+                //
+                // Re-derived rather than deleted: the claim becomes *refused
+                // for every disposition*, which is stronger than the row it
+                // replaces and fails if the transition is ever readmitted.
+                for recorded in [
+                    LeaseDisposition::PredictedRetained,
+                    LeaseDisposition::PredictedReleased,
+                    LeaseDisposition::LineageHeld,
+                ] {
+                    let succeeded = settle(
+                        key,
+                        0,
+                        1,
+                        AttemptSettlement::Closed {
+                            transition: SettlementTransition::Succeeded,
+                            lease: recorded,
+                        },
+                    );
+                    assert!(
+                        fold.plan_transition(&succeeded).is_err(),
+                        "a {holding} generation accepted a `succeeded` settlement recording \
+                         {recorded:?}; `candidate_prepared` is the sole successful settlement"
+                    );
+                }
+
+                // And the region a candidate inherits is decided on the event
+                // that now settles the attempt: `check_candidate_prepared`
+                // matches `CandidateLeaseEffect` against the entry's lineage.
+                // `a_lineage_lease_only_ever_grows_and_a_released_one_is_gone`
+                // holds that half.
             }
         }
     }
@@ -7253,8 +7307,16 @@ mod tests {
         );
 
         // Promoting: not closable — a promoting generation is promoted.
+        //
+        // **Reached by preparing a candidate, which is what promotes it.** This
+        // cloned the in-flight fold and applied `succeeded(ZETA, 0, 1)`; since
+        // the 2026-08-27 CONFORM ruling that event is refused, and a clone
+        // alone would have left this case asserting about an *in-flight*
+        // generation while calling itself the promoting one — the same
+        // assertion passing for the wrong reason. `cargo` said so: the binding
+        // stopped needing `mut`.
         let mut promoting = fold.clone();
-        apply(&mut promoting, &succeeded(ZETA, 0, 1));
+        apply(&mut promoting, &candidate_prepared(ZETA, 0, &base));
         assert!(matches!(
             refuse(
                 &promoting,
@@ -7265,7 +7327,6 @@ mod tests {
 
         // Closed: not closable twice.
         let mut over = promoting.clone();
-        apply(&mut over, &candidate_prepared(ZETA, 0, &base));
         apply(&mut over, &candidate_created(ZETA, 0));
         assert!(matches!(
             refuse(
@@ -7280,20 +7341,30 @@ mod tests {
     // Candidates, the queue, and the publication relations
     // -----------------------------------------------------------------------
 
+    /// **A candidate is prepared by the generation whose attempt is in flight,
+    /// and preparing it is what settles that attempt.**
+    ///
+    /// Re-derived, not adjusted. This was
+    /// `a_candidate_is_prepared_by_the_generation_whose_attempt_succeeded`, and it
+    /// asserted the opposite of the first claim below: that `candidate_prepared`
+    /// is **refused** while the attempt is still running, and accepted only after
+    /// an `attempt_finished{Succeeded}` had promoted the generation. That is the
+    /// dual-settlement pattern `decisions/2026-08-12-merge-queue-execution-topology.md`
+    /// forbids — "`attempt_finished` is not also emitted for that attempt" — and the
+    /// fold was *requiring* it. Ruled CONFORM 2026-08-27.
+    ///
+    /// The other three claims are unchanged and still ST-06's: not another
+    /// generation's, not another task's, and parented on the base the generation
+    /// was dispatched at.
     #[test]
-    fn a_candidate_is_prepared_by_the_generation_whose_attempt_succeeded() {
+    fn a_candidate_is_prepared_by_the_generation_whose_attempt_is_in_flight() {
         let base = sha("base");
         let mut fold = started();
         apply(&mut fold, &dispatch(ZETA, 0, &base));
         let start = attempt_started(&fold, ZETA, 0, 1, 0);
         apply(&mut fold, &start);
 
-        // ST-06: not while the attempt is still running.
-        assert!(matches!(
-            refuse(&fold, &candidate_prepared(ZETA, 0, &base)),
-            FoldError::NotTheOpenGeneration { key: 0, .. }
-        ));
-        apply(&mut fold, &succeeded(ZETA, 0, 1));
+        // The attempt is running, and this event settles it.
         accepts(&fold, &candidate_prepared(ZETA, 0, &base));
 
         // ST-06: not another generation's, and not another task's.
@@ -7465,7 +7536,6 @@ mod tests {
             },
         });
         push(&mut live, &mut trace, retry);
-        push(&mut live, &mut trace, succeeded(ALPHA, 0, 2));
 
         // Attempt 1 ran and did not produce this candidate; attempt 2 did.
         assert!(matches!(
@@ -7514,7 +7584,6 @@ mod tests {
         apply(&mut fold, &dispatch(ZETA, 0, &base));
         let start = attempt_started(&fold, ZETA, 0, 1, 0);
         apply(&mut fold, &start);
-        apply(&mut fold, &succeeded(ZETA, 0, 1));
 
         // Before anything was prepared.
         assert!(matches!(
@@ -7575,7 +7644,6 @@ mod tests {
             apply(&mut fold, &dispatch(key, generation, &base));
             let start = attempt_started(&fold, key, generation, 1, 0);
             apply(&mut fold, &start);
-            apply(&mut fold, &succeeded(key, generation, 1));
             apply(&mut fold, &candidate_prepared(key, generation, &base));
             apply(&mut fold, &candidate_created(key, generation));
         }
@@ -8133,7 +8201,6 @@ mod tests {
             push(&mut live, &mut trace, dispatch(key, generation, &base));
             let start = attempt_started(&live, key, generation, 1, 0);
             push(&mut live, &mut trace, start);
-            push(&mut live, &mut trace, succeeded(key, generation, 1));
             push(
                 &mut live,
                 &mut trace,
@@ -8443,7 +8510,6 @@ mod tests {
             apply(&mut fold, &dispatch(key, generation, &base));
             let start = attempt_started(&fold, key, generation, 1, 0);
             apply(&mut fold, &start);
-            apply(&mut fold, &succeeded(key, generation, 1));
             apply(&mut fold, &candidate_prepared(key, generation, &base));
         }
         // Prepared mid, then zeta. Created zeta, then mid.
@@ -8556,7 +8622,6 @@ mod tests {
         apply(&mut fold, &dispatch(ZETA, 0, &base));
         let start = attempt_started(&fold, ZETA, 0, 1, 0);
         apply(&mut fold, &start);
-        apply(&mut fold, &succeeded(ZETA, 0, 1));
         apply(&mut fold, &candidate_prepared(ZETA, 0, &base));
         apply(&mut fold, &candidate_created(ZETA, 0));
         apply(
@@ -9055,7 +9120,6 @@ mod tests {
         apply(&mut ready, &dispatch(MID, 0, &base));
         let start = attempt_started(&ready, MID, 0, 1, 0);
         apply(&mut ready, &start);
-        apply(&mut ready, &succeeded(MID, 0, 1));
         apply(&mut ready, &candidate_prepared(MID, 0, &base));
         apply(&mut ready, &candidate_created(MID, 0));
         apply(
@@ -9155,7 +9219,6 @@ mod tests {
         apply(&mut fold, &dispatch(MID, 0, &base));
         let start = attempt_started(&fold, MID, 0, 1, 0);
         apply(&mut fold, &start);
-        apply(&mut fold, &succeeded(MID, 0, 1));
         apply(&mut fold, &candidate_prepared(MID, 0, &base));
         apply(&mut fold, &candidate_created(MID, 0));
 
@@ -10175,7 +10238,21 @@ mod tests {
                     materialization_observed: None,
                 },
             }),
-            succeeded(ZETA, 0, 1),
+            // **`attempt_finished`, on a transition this fold accepts.** The
+            // table held `succeeded(ZETA, 0, 1)` here, and since the 2026-08-27
+            // CONFORM ruling that is not a settlement the fold accepts at all —
+            // `candidate_prepared` further down is the successful one. A
+            // *poisoned* fold must still refuse `attempt_finished`, so the kind
+            // stays in the table on a transition a healthy fold would take.
+            settle(
+                ZETA,
+                0,
+                1,
+                AttemptSettlement::Closed {
+                    transition: SettlementTransition::Retry,
+                    lease: LeaseDisposition::PredictedReleased,
+                },
+            ),
             ev(TopologyEventBody::AttemptInterrupted {
                 data: AttemptInterrupted4 {
                     key: ZETA,
@@ -10425,7 +10502,6 @@ mod tests {
             },
         });
         push(&mut live, &mut trace, resumed);
-        push(&mut live, &mut trace, succeeded(ALPHA, 0, 2));
         // Attempt 2 is the one that succeeded, so it is the one the candidate
         // is attributed to.
         push(
@@ -10446,7 +10522,6 @@ mod tests {
         push(&mut live, &mut trace, dispatch(ZETA, 0, &base));
         let start = attempt_started(&live, ZETA, 0, 1, 0);
         push(&mut live, &mut trace, start);
-        push(&mut live, &mut trace, succeeded(ZETA, 0, 1));
         push(&mut live, &mut trace, candidate_prepared(ZETA, 0, &base));
         push(&mut live, &mut trace, candidate_created(ZETA, 0));
         push(
@@ -10552,7 +10627,6 @@ mod tests {
         push(&mut live, &mut trace, dispatch(ALPHA, 0, &base));
         let start = attempt_started(&live, ALPHA, 0, 1, 0);
         push(&mut live, &mut trace, start);
-        push(&mut live, &mut trace, succeeded(ALPHA, 0, 1));
         push(&mut live, &mut trace, candidate_prepared(ALPHA, 0, &base));
         push(&mut live, &mut trace, candidate_created(ALPHA, 0));
         push(
@@ -10572,7 +10646,6 @@ mod tests {
         push(&mut live, &mut trace, dispatch(ZETA, 2, &base));
         let start = attempt_started(&live, ZETA, 2, 1, 0);
         push(&mut live, &mut trace, start);
-        push(&mut live, &mut trace, succeeded(ZETA, 2, 1));
         push(&mut live, &mut trace, candidate_prepared(ZETA, 2, &base));
         push(&mut live, &mut trace, candidate_created(ZETA, 2));
         push(
@@ -10617,7 +10690,6 @@ mod tests {
             push(&mut live, &mut trace, dispatch(key, 0, &base));
             let start = attempt_started(&live, key, 0, 1, 0);
             push(&mut live, &mut trace, start);
-            push(&mut live, &mut trace, succeeded(key, 0, 1));
             push(&mut live, &mut trace, candidate_prepared(key, 0, &base));
             push(&mut live, &mut trace, candidate_created(key, 0));
             push(
@@ -11525,7 +11597,6 @@ mod tests {
         );
         assert_eq!(run(&retained), 0, "a retained generation holds none");
 
-        apply(&mut fold, &succeeded(ZETA, 0, 1));
         assert_eq!(run(&fold), 1, "promoting still holds it");
         apply(&mut fold, &candidate_prepared(ZETA, 0, &base));
         assert_eq!(run(&fold), 1);

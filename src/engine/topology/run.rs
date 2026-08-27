@@ -71,7 +71,6 @@ use super::seams::{IdSource, TimeSource, TopologyHooks};
 use super::select::{Admitted, Ceiling, Spend, Step, checkpoint, select};
 use super::settle::{
     Deferral, FinishedAttempt, ManagedWorktrees, RetryOutcome, RetryRequest, retry, settle_failed,
-    settle_succeeded,
 };
 
 // ---------------------------------------------------------------------------
@@ -1742,27 +1741,23 @@ impl TopologyRun {
         let pinned = pin_candidate(seams.manager, hooks, unpinned)?;
 
         // Between the pin and `candidate_prepared`, and in that order.
-        let settlement = settle_succeeded(
-            &self.handle.fold,
-            key,
-            site.generation,
-            plan.attempt,
-            &record,
-        )?;
-        self.spend.record(key, &settlement.record);
-        // The same step on the success path, so the two callers of
-        // `Brief::record` are exactly the driver's two `attempt_finished`
-        // appends. A succeeded record carries no failure and adds no line;
-        // calling it anyway is what keeps the coverage identical to
-        // `Brief::replay`'s rather than equal by argument.
-        self.brief.record(key, &settlement.record);
-        self.emit(
-            TopologyEventBody::AttemptFinished {
-                data: Box::new(settlement),
-            },
-            seams,
-            hooks,
-        )?;
+        // **No `attempt_finished` here.** `candidate_prepared` is the sole
+        // successful settlement for a candidate-producing attempt —
+        // `decisions/2026-08-12-merge-queue-execution-topology.md`, which adds
+        // "`attempt_finished` is not also emitted for that attempt" — and this
+        // path appended both until the 2026-08-27 ruling. The fold now refuses
+        // either half of that pair, so the omission is enforced rather than
+        // remembered.
+        //
+        // The record still reaches the ledger: `append_candidate_prepared`
+        // carries it on the event that settles the attempt, which is where the
+        // record was always specified to live.
+        self.spend.record(key, &record);
+        // A succeeded record carries no failure and adds no brief line. Called
+        // anyway so that `Brief::record`'s coverage is identical to
+        // `Brief::replay`'s by construction rather than equal by argument —
+        // replay walks every settlement, and this is one.
+        self.brief.record(key, &record);
 
         // The three halves alternate between the hooks bundle and the journal,
         // and the journal must hold the bundle to emit through `emit`. So each

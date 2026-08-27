@@ -169,6 +169,90 @@ direct question about scope and answered it as a disposition, which is now settl
 claim about the PR3 round, not about PR4's second confirmation, whose two findings —
 `PR4-CONF-003` and `PR4-CONF-004` — were both accepted and repaired in round 5.)*
 
+### 2026-08-27 — `candidate_prepared` is the sole successful settlement, per-instance Class B approval
+
+**The owner's ruling, quoted:**
+
+> **Finding 1 ruled: CONFORM — no supersession.** `candidate_prepared` is the sole
+> successful settlement for a candidate-producing attempt, as the 2026-08-12 record and
+> DESIGN state; the driver stops emitting `attempt_finished` for those attempts. The
+> slice's own doc that blessed dual emission is corrected — not the record. Class B on the
+> frozen fold, per-instance approval granted with ceremony: settlement counting moves to
+> the sole event, and every settlement-counting witness is re-derived against the new
+> invariant — one settlement per candidate-producing attempt, crash prefixes per DESIGN's
+> enumerated resume cases — never patched to pass.
+
+Raised by the frontier review of `bf927f3` as its first P1. The authority is
+`decisions/2026-08-12-merge-queue-execution-topology.md`: *"`candidate_prepared`: the
+**sole** successful settlement for an attempt that produces a candidate … ;
+`attempt_finished` is not also emitted for that attempt."*
+
+**The doc that reinterpreted it, now corrected rather than the record.** `settle_succeeded`
+argued that INV-07 was *"about which event records the candidate, not about which event
+settles the attempt"*. It was not; the record answers that in the same sentence.
+
+**What changed in the frozen file — `src/topology/fold.rs`, +152/−81** (31 doc, 69 comment,
+1 blank, **51 lines of code**), and the code is four things:
+
+| | |
+|---|---|
+| `check_attempt_finished` | refuses `Closed{Succeeded}` outright — the strict door, so the dual pattern is unrepresentable rather than tolerated |
+| `check_candidate_prepared` | requires `InFlight`, where it required `Promoting`; the old requirement *forced* the pair the record forbids |
+| `apply_candidate_prepared` | performs the settlement — `class = Promoting` — in the same block that records the candidate |
+| `check_lease_disposition` | loses its `survives` parameter: every caller now passes a closing generation, and the surviving case moved to `CandidatePrepared::lease_effect`, which `check_candidate_prepared` already matches against the entry's lineage |
+
+**The strict door was chosen over tolerance, as the ruling directed**, and it is reachable:
+schema 4 has no external writers (`src/engine/mod.rs` is `pub(crate) mod topology`), so no
+log this build did not write can carry the shape. `Spend::replay`'s per-attempt
+deduplication is **deleted** — it existed only to survive the duplicate, and a filter that
+outlived the shape it was written for would keep a second reading of "one settlement per
+attempt" alive beside the fold's, free to disagree.
+
+**One invariant now holds by construction, and it is what closes the review's sequence.**
+`class = GenerationClass::Promoting` appears at exactly one place in the fold, inside the
+block that sets `candidate = Some(record)`. So **a promoting generation always has a
+recorded candidate** — and erratum **E6**'s window, a `Promoting` generation with no
+candidate record, cannot occur.
+
+That window was the review's attack: crash between the settlement and the append,
+substitute the pin, and `complete_promotions` rebuilt a `candidate_prepared` from whatever
+the pin pointed at — deriving tree, message and paths from that commit, so the tree check
+added on 2026-08-26 could not catch it, because recovery itself recorded the tree.
+**`complete_promotions`, `promoting_without_candidate`, the `Recovered::promoted` field and
+the pin-absent refusal are all removed**, because their premise is unreachable. The same
+prefix is now a pin with no candidate record — orphan residue, which
+`candidate::recovery_for` prunes while settling the attempt interrupted.
+
+**Witnesses re-derived, not patched.** Roughly twenty-five failed on the invariant change.
+Each was re-derived against it and the diff is `+75/−390` in `recover/tests.rs` alone:
+
+* `candidate_prepared_is_the_sole_successful_settlement` replaces
+  `a_successful_settlement_promotes_the_generation_and_keeps_its_region` — three claims:
+  the settlement lands on `candidate_prepared`, a `succeeded` `attempt_finished` is refused
+  whatever else is true, and a promoted generation may not then prepare, so **neither order
+  of the old pair can be written**.
+* `a_candidate_is_prepared_by_the_generation_whose_attempt_is_in_flight` replaces
+  `…whose_attempt_succeeded`, which asserted the *opposite* of the new first claim.
+* `a_prepared_pin_without_a_candidate_record_is_orphan_residue` replaces three E6
+  convergence tests. Same crash, the other expectation: the attempt settles interrupted and
+  **no `candidate_prepared` is invented**.
+* `a_settlement_records_the_disposition_its_holding_admits` enumerated the one surviving
+  lease disposition; it now asserts `succeeded` is refused for **every** disposition, which
+  is stronger than the row it replaces.
+* Three ordering witnesses lose exactly one `Event.Append`, and the count is the assertion:
+  `pin_pruned_after_promotion`, `the_driver_carries_an_accepted_attempt_through_the_candidate_sequence`,
+  and the branch's durable-kind list — three appends in the candidate sequence, not four.
+* The census's explored traces are one step shorter, so
+  `an_overlapping_region_is_explored_and_changes_a_transition_answer`'s differing index is
+  regenerated from the shorter trace rather than the assertion being loosened.
+
+**Two of the re-derivations were caught by the compiler rather than by care**, and both are
+worth naming. `cargo` reported a binding that no longer needed `mut` — which meant the
+"Promoting" case of `a_generation_is_closed_only_from_an_open_class_with_no_attempt` was
+asserting about an *in-flight* generation while calling itself the promoting one. And the
+`survives` parameter went constant, which is how the moved lease rule was found rather than
+lost.
+
 ### 2026-08-26 — `PR7-CANDIDATE-TREE-UNVERIFIED`, per-instance Class B approval
 
 **The owner's ruling, quoted:**

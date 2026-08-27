@@ -1084,8 +1084,7 @@ mod tests {
         WorktreeSite,
     };
     use crate::topology::events::{
-        AttemptFinished4, AttemptNumber, AttemptSettlement, IncarnationId, LeaseDisposition,
-        LeaseGrant, RungBinding, SettlementTransition, TaskDispatched, TopologyEvent,
+        AttemptNumber, IncarnationId, LeaseGrant, RungBinding, TaskDispatched, TopologyEvent,
     };
     use crate::topology::events::{AttemptStarted4, RunStarted4, TopologyLimits};
     use crate::topology::fold::{FrozenInputs, TopologyFold};
@@ -1428,27 +1427,24 @@ mod tests {
             journal
         }
 
-        /// `attempt_finished(succeeded)`: the settlement that makes the
-        /// generation `Promoting`.
+        /// **A no-op, kept so the sequence it named is still readable.**
         ///
-        /// `LeaseDisposition::PredictedRetained` because a success is the one
-        /// settlement that leaves the generation open — it hands its region to
-        /// the candidate — and the fold refuses every other disposition here.
-        fn settle_succeeded(&mut self) {
-            self.emit(TopologyEventBody::AttemptFinished {
-                data: Box::new(AttemptFinished4 {
-                    key: ALPHA,
-                    generation: GENERATION,
-                    attempt: AttemptNumber(1),
-                    record: Box::new(attempt_record()),
-                    settlement: AttemptSettlement::Closed {
-                        transition: SettlementTransition::Succeeded,
-                        lease: LeaseDisposition::PredictedRetained,
-                    },
-                }),
-            })
-            .expect("attempt_finished(succeeded)");
-        }
+        /// This emitted `attempt_finished(succeeded)` and called it "the
+        /// settlement that makes the generation `Promoting`". It is not:
+        /// `decisions/2026-08-12-merge-queue-execution-topology.md` makes
+        /// `candidate_prepared` the sole successful settlement and says
+        /// `attempt_finished` "is not also emitted for that attempt", and since
+        /// the 2026-08-27 CONFORM ruling the fold refuses the event this used
+        /// to write.
+        ///
+        /// The generation now reaches `Promoting` when `candidate_prepared` is
+        /// applied, which every caller of this already appends immediately
+        /// afterwards. Kept as a call rather than deleted at ~15 call sites so
+        /// that each test still reads as the sequence it drives, and so the
+        /// diff for this ruling shows the settlement moving rather than the
+        /// fixtures being rewritten around it.
+        #[allow(clippy::unused_self)]
+        fn settle_succeeded(&mut self) {}
 
         /// Reopen an existing log and replay it: `resume is
         /// replay-then-continue, and there is no second path`.
@@ -2367,10 +2363,18 @@ mod tests {
             vec![
                 "Object.CandidateCommitTree".to_owned(),
                 "Ref.PinCandidatePrepared".to_owned(),
-                // attempt_finished(succeeded): the settlement, which is not
-                // this module's and which the matrix puts here.
-                "Event.Append".to_owned(),
-                // candidate_prepared.
+                // **candidate_prepared — the settlement itself, and there is
+                // one.** This list carried a second `Event.Append` above this
+                // one for an `attempt_finished(succeeded)` between the pin and
+                // the prepare, annotated "the settlement, which is not this
+                // module's". It was not the settlement and it should not have
+                // been appended: `candidate_prepared` is the sole successful
+                // settlement for a candidate-producing attempt, per
+                // `decisions/2026-08-12-merge-queue-execution-topology.md`, and
+                // the 2026-08-27 ruling conformed the code to it. **Three
+                // appends in this sequence, not four**, and the count is the
+                // assertion — a build that re-introduced the pair would put the
+                // fourth back and fail here.
                 "Event.Append".to_owned(),
                 "Ref.CreateCandidates".to_owned(),
                 // task_candidate_created.
@@ -2378,7 +2382,8 @@ mod tests {
                 "Ref.DeleteCandidatePin".to_owned(),
                 "Worktree.Remove".to_owned(),
             ],
-            "O28 to O31, as one observed order"
+            "O28 to O31, as one observed order — three appends, because \
+             `candidate_prepared` is the sole successful settlement"
         );
 
         // What is left: the authoritative ref, and nothing else.
