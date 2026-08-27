@@ -62,3 +62,26 @@ windows-sys = { version = "0.61", features = [
     "Win32_System_JobObjects",
     "Win32_System_Threading",
 ] }
+
+# Lint levels are repository policy and change only here (CODING_STANDARDS.md
+# §2). Each entry landed with the tree already clean under it; the named output
+# modules and the documented §7 invariant sites carry `#[expect]` with reasons,
+# and `clippy.toml` holds the test allowances.
+[lints.rust]
+unsafe_op_in_unsafe_fn = "deny"
+
+[lints.clippy]
+unwrap_used = "deny"
+expect_used = "deny"
+panic = "deny"
+todo = "deny"
+unimplemented = "deny"
+dbg_macro = "deny"
+print_stdout = "deny"
+print_stderr = "deny"
+
+# §5: an overflow nobody chose fails loudly in release builds instead of
+# wrapping. The panic strategy stays `unwind` in every profile — §6's cleanup
+# guarantees depend on RAII running during unwinding (CODING_STANDARDS.md §7).
+[profile.release]
+overflow-checks = true

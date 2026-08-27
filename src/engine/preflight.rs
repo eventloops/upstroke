@@ -262,6 +262,10 @@ pub(super) fn preflight_with_recorded(
                      append-only log before any more work starts"
                 ));
             } else if plan.pass_timeout_secs != Some(configured) {
+                #[expect(
+                    clippy::expect_used,
+                    reason = "a non-legacy plan recorded its timeout; replay enforces the pairing"
+                )]
                 let recorded = plan
                     .pass_timeout_secs
                     .expect("a non-legacy recorded review plan has an explicit timeout");

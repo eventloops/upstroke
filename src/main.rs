@@ -10,6 +10,11 @@
     clippy::disallowed_methods,
     clippy::disallowed_types
 )]
+#![expect(
+    clippy::print_stdout,
+    clippy::print_stderr,
+    reason = "the CLI binary is the §13 output surface: stdout carries results, stderr carries diagnostics"
+)]
 
 use std::io::{BufRead, IsTerminal, Read};
 use std::path::PathBuf;

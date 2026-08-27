@@ -5524,6 +5524,10 @@ pub fn check_bijection(
         }
 
         for phase in required {
+            #[expect(
+                clippy::expect_used,
+                reason = "before, after and point phases all have a hook phase"
+            )]
             let hook = phase
                 .hook_phase()
                 .expect("before, after and point phases all have a hook phase");

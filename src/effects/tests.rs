@@ -129,6 +129,48 @@ struct ClippyToml {
     disallowed_types: Vec<DeniedPath>,
     #[serde(default, rename = "disallowed-macros")]
     disallowed_macros: Vec<DeniedPath>,
+    // The §7 panic-policy allowances (CODING_STANDARDS.md §2), which arrived
+    // with master's lint mechanization. They configure clippy's own lints
+    // rather than naming an effect primitive, so `all()` deliberately excludes
+    // them. They are declared because `deny_unknown_fields` above is the
+    // mechanism that turns an unclassified clippy.toml key into a failure --
+    // the correct response to a new key is to classify it here, never to
+    // relax the attribute -- and they are asserted by
+    // `the_panic_policy_allowances_are_exactly_what_the_standard_states` so a
+    // field this file merely parses cannot drift unobserved.
+    #[serde(default, rename = "allow-expect-in-tests")]
+    allow_expect_in_tests: bool,
+    #[serde(default, rename = "allow-panic-in-tests")]
+    allow_panic_in_tests: bool,
+    #[serde(default, rename = "allow-print-in-tests")]
+    allow_print_in_tests: bool,
+}
+
+/// The three allowances are on, and `.unwrap()` has none.
+///
+/// CODING_STANDARDS.md §2: tests fail their own setup with `.expect(` and a
+/// message, use `panic!` in their own assertion helpers, and may print;
+/// `.unwrap()` "is denied everywhere, tests included" because it carries no
+/// diagnostic. A `false` here would silently re-deny a form 4,400 call sites
+/// use, and an `unwrap` allowance appearing would silently permit one the
+/// standard refuses -- so both directions are asserted rather than assumed.
+#[test]
+fn the_panic_policy_allowances_are_exactly_what_the_standard_states() {
+    let clippy = denylist();
+    assert!(
+        clippy.allow_expect_in_tests,
+        "§2 allows .expect( with a message in tests"
+    );
+    assert!(
+        clippy.allow_panic_in_tests,
+        "§2 allows panic! in a test's own assertion helpers"
+    );
+    assert!(clippy.allow_print_in_tests, "§2 allows printing from tests");
+    let text = fs::read_to_string(repo_root().join(CLIPPY_TOML)).expect("clippy.toml");
+    assert!(
+        !text.contains("allow-unwrap-in-tests"),
+        "§2: .unwrap() has no allowance -- it is denied everywhere, tests included"
+    );
 }
 
 #[derive(Debug, Deserialize)]
