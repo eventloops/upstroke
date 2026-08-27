@@ -311,11 +311,28 @@ pub enum Step {
 
 /// The branches an **intermediate build** is entitled to perform.
 ///
-/// [`Step`] has seven variants and this has five. The two that are missing are
-/// the whole of `checkpoint_refusals` for PR7: there is no value of this type
-/// that can carry an integration or a run end, so no caller holding one can
-/// append `merge_verification_started` or `run_finished`. That is the refusal
-/// made unrepresentable rather than remembered.
+/// [`Step`] has **eight** variants and this has five, so **three** do not
+/// cross: `Integrate`, `Closure` and `Poisoned`. The first two are the whole of
+/// `checkpoint_refusals` for PR7 — there is no value of this type that can
+/// carry an integration or a run end, so no caller holding one can append
+/// `merge_verification_started` or `run_finished`. That is the refusal made
+/// unrepresentable rather than remembered.
+///
+/// The third is not a refusal of a *branch*. `Poisoned` is the absence of one:
+/// an append errored, this process's fold is not authoritative, and nothing
+/// further is selected at all. It is excluded from this type for the same
+/// reason the other two are — a caller holding an `Admitted` may act — but not
+/// for the same cause, and the count said "seven" and "two" until 2026-08-27
+/// precisely by folding it into them.
+///
+/// Both counts are computed, per §22:
+///
+/// ```text
+/// $ awk '/^pub enum Step \{/,/^\}/'     src/engine/topology/select.rs | grep -cE '^    [A-Z]'
+/// 8
+/// $ awk '/^pub enum Admitted \{/,/^\}/' src/engine/topology/select.rs | grep -cE '^    [A-Z]'
+/// 5
+/// ```
 #[derive(Debug, Clone, PartialEq)]
 pub enum Admitted {
     /// [`Step::BudgetExceeded`].
@@ -1347,6 +1364,100 @@ mod tests {
         for (step, expected) in admitted {
             assert_eq!(checkpoint(step.clone()).expect("admitted"), expected);
         }
+    }
+
+    /// **Which of `Step`'s variants cross the checkpoint, counted rather than
+    /// asserted in prose.**
+    ///
+    /// `Admitted`'s doc said "[`Step`] has seven variants and this has five.
+    /// The two that are missing…" for as long as `Step` had **eight** and three
+    /// were missing. The undercount folded `Poisoned` into the two
+    /// `checkpoint_refusals` branches, which is a different thing: `Integrate`
+    /// and `Closure` are branches this build declines to perform, and
+    /// `Poisoned` is the absence of a branch — the fold is not authoritative
+    /// and nothing is selected at all.
+    ///
+    /// The `match` below has **no wildcard arm**, so adding a variant to `Step`
+    /// stops this file compiling until someone says which side it falls on.
+    /// That is the part a count in a doc comment cannot do.
+    #[test]
+    fn every_step_variant_is_admitted_or_refused_and_the_split_is_five_three() {
+        let every: Vec<Step> = vec![
+            Step::Poisoned,
+            budget_exceeded(
+                Epoch(0),
+                Breach {
+                    budget: BudgetKind::Run,
+                    limit_usd: 1.0,
+                    spent_usd: 2.0,
+                },
+                Some(ALEPH),
+            ),
+            Step::Integrate {
+                candidate: Box::new(queue_candidate(&mut started(), GIMEL, 0)),
+            },
+            Step::Retry {
+                key: BET,
+                generation: GenerationId(3),
+                attempt: AttemptNumber(4),
+            },
+            Step::Dispatch {
+                key: GIMEL,
+                generation: GenerationId(2),
+                continuing: false,
+            },
+            Step::Backoff,
+            Step::HardBlock {
+                questions: vec![question_for(ALEPH).id],
+            },
+            Step::Closure(DerivedOutcome::Ending(RunOutcome::Complete)),
+        ];
+
+        // Exhaustive by construction: no `_` arm, so a ninth variant is a
+        // compile error here rather than a silently untested branch.
+        let mut names = Vec::new();
+        for step in &every {
+            names.push(match step {
+                Step::Poisoned => "Poisoned",
+                Step::BudgetExceeded(_) => "BudgetExceeded",
+                Step::Integrate { .. } => "Integrate",
+                Step::Retry { .. } => "Retry",
+                Step::Dispatch { .. } => "Dispatch",
+                Step::Backoff => "Backoff",
+                Step::HardBlock { .. } => "HardBlock",
+                Step::Closure(_) => "Closure",
+            });
+        }
+        // On a COPY: `names` must stay in the list's order, because it is
+        // zipped with it below. Sorting it in place paired every step with
+        // another step's label and the assertion read
+        // `["Backoff", "Closure", "Retry"]`.
+        let mut distinct = names.clone();
+        distinct.sort_unstable();
+        distinct.dedup();
+        assert_eq!(
+            distinct.len(),
+            every.len(),
+            "the list repeats a variant, so some variant is untested: {distinct:?}"
+        );
+
+        let (crossed, refused): (Vec<_>, Vec<_>) = every
+            .into_iter()
+            .zip(names)
+            .partition(|(step, _)| checkpoint(step.clone()).is_ok());
+        let refused: Vec<&str> = refused.into_iter().map(|(_, name)| name).collect();
+
+        assert_eq!(
+            crossed.len(),
+            5,
+            "the admitted count moved: {:?}",
+            crossed.iter().map(|(_, n)| *n).collect::<Vec<_>>()
+        );
+        assert_eq!(
+            refused,
+            vec!["Poisoned", "Integrate", "Closure"],
+            "the set that does not cross the checkpoint changed"
+        );
     }
 
     // -----------------------------------------------------------------------

@@ -273,8 +273,9 @@ impl LoopBranch {
             // append, any operation whose terminals it does not implement
             // (PR7: integration and run end beyond refusal)". Both are made
             // unrepresentable rather than remembered — `Admitted` carries five
-            // of `Step`'s seven variants, so no value reaching the acting half
-            // can name either.
+            // of `Step`'s eight variants, so no value reaching the acting half
+            // can name either. (The third that does not cross is `Poisoned`,
+            // which is not a branch this build declines but the absence of one.)
             Self::Integration | Self::Closure => Disposition::RefusedByCheckpoint,
             // `Deferral::wait` sleeps the backoff and returns the event;
             // `TopologyRun::step` appends it. In that order — the event records
