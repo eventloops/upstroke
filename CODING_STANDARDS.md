@@ -59,6 +59,11 @@ bash .github/scripts/test-docs-consistency.sh
 Run all eight commands from the repository root. `CLAUDE.md`'s Gates section records the known
 root-invocation trap and the extra `jq` prerequisite for the release-record fixture.
 
+These eight commands run on one operating system. They establish nothing about a `cfg` region
+compiled only for another target: an inactive `cfg` block is not compiled, so neither its
+diagnostics nor its lint attributes exist for that run. §11 states what platform-gated code and
+its annotations require instead.
+
 The project uses Rust edition 2024 and has an MSRV of 1.85.0. Code and dependencies MUST remain
 compatible with both the MSRV and the current stable toolchain. A green baseline is necessary,
 not sufficient: the compiler, rustfmt, and Clippy cannot establish the behavioural rules below.
@@ -72,7 +77,8 @@ Lint policy:
   diffable authority. A crate-root `#![allow]` or `#![deny]` does not change policy.
 - Prefer `#[expect(lint, reason = "…")]` to `#[allow]`. An expectation that stops firing becomes a
   warning, so a suppression that outlives its cause removes itself from review instead of
-  surviving unnoticed.
+  surviving unnoticed. That self-retirement operates only where a lint leg compiles the annotated
+  region; §11 governs the platform-gated case, where it does not operate at all.
 - Add targeted lints only after the repository is clean under them and the lint is available on
   the MSRV. Do not enable Clippy's `pedantic`, `nursery`, or `restriction` groups wholesale;
   those groups intentionally contain contextual, experimental, or mutually incompatible lints.
@@ -397,6 +403,23 @@ permission, executable-suffix, process-tree, rename, or locking assumptions in s
 Platform code is not verified by compiling it on another OS alone: behaviour needs native CI
 coverage.
 
+Evidence is platform-gated in the same way the code is. A test, a lint attribute, or a suppression
+that covers a `cfg` region is evidenced only by a leg that compiles that region, and each kind of
+claim needs the leg that evaluates it:
+
+- A lint attribute is evidenced only by a lint leg for that platform. A native test leg and a
+  native MSRV `check` leg on the same platform do not substitute: they compile the region without
+  running Clippy over it, so they pass while a Clippy leg for that platform fails.
+- An `#[expect]` inside a region no lint leg compiles is inert in both directions. It suppresses
+  nothing, and it cannot become the warning that retires it. It reads as enforcement and is not.
+- Cross-compilation is evidence, not a native run, and it carries its own blind spot: a path that
+  resolves for the host may not resolve for the target, which Clippy reports as a bare
+  configuration warning that `-D warnings` does not promote.
+
+A change that adds platform-gated code, tests, or annotations MUST name the leg that evaluates
+them. Where no leg does, that is recorded in Appendix A as an uncovered platform rather than left
+to be inferred from a green baseline.
+
 ## 12. Tests
 
 Tests are executable evidence of a contract. New behaviour and bug fixes MUST include tests at the
@@ -419,13 +442,66 @@ Tests MUST be deterministic and hermetic by default:
 - inject or control clocks, randomness, environment, capacity observations, and process responses;
 - do not depend on network access, ambient credentials, user configuration, PATH contents, test
   execution order, or an installed vendor CLI unless the test is explicitly an integration test;
-- do not use sleeping as synchronization; signal the state the test needs to observe;
+- do not use sleeping as synchronization; signal the state the test needs to observe, under the
+  readiness rules below;
 - do not silently return success when a prerequisite is absent. Either provide the dependency,
   classify the test outside the default suite, or fail with a useful diagnostic;
 - state the reason in the attribute when a test is disabled (`#[ignore = "…"]`); a bare
   `#[ignore]` is a parking space, not a classification;
 - assert externally meaningful state and side effects, not an implementation copied into the
   test as its own oracle.
+
+### Readiness protocols
+
+A readiness signal is a claim about state, and a waiter is entitled to assert everything the claim
+names. The producer's ordering is what makes that claim true, so these rules bind the helper as
+much as the test:
+
+- A readiness signal MUST be published only after the state it announces is complete and
+  observable by the waiter. Publish it last, not alongside the work it describes.
+- **A file's existence is not a readiness signal.** Creation and content are separate events, so a
+  waiter polling for a path can open it and read nothing. Where a file must carry the signal,
+  publish it by atomic rename from a temporary path under §8, so the name appears only with
+  its content.
+- A partial record MUST NOT be readable as a whole one. A record delimited by a terminator — a
+  newline on a pipe — is complete only once the terminator arrives; an unterminated final record
+  is a truncated write and MUST fail rather than yield a short value.
+- Keep the payload inside what the framing can carry. A path is not safely a line: an ancestor may
+  contain the delimiter, or bytes that are not text at all. Send an identifier the receiver can
+  rejoin to a root it already knows.
+- The wait MUST be bounded, and the bound MUST bound a producer that has wedged rather than time
+  one that is healthy. A deadline short enough to expire on a loaded runner has become the signal
+  itself, which is the failure this rule exists to prevent. The fast path is a producer that fails
+  and closes its channel; the bound is for the one that stays alive and silent.
+
+### Flakes
+
+A test that fails intermittently is a fact about the repository, and it is handled by measurement
+rather than by adjective. "Occasionally" and "flaky under load" are not records.
+
+When a test is observed failing without a change that explains it:
+
+- **Measure a rate before naming it a flake.** Record a numerator over a denominator of observed
+  runs — "one failure in 31 full-suite runs" — with the platform, the head, and the assertion
+  that failed. One failure and no denominator is an observation, not a rate.
+- **Establish that the head is not the cause.** One byte-identical tree producing both outcomes is
+  the evidence that separates a flake from a defect in the head, and re-running the failed job at
+  the same commit is the cheapest way to get it. Where a nearby change is the alternative
+  explanation, show that it cannot reach the behaviour rather than asserting that it does not.
+- **Name an owner and state the consequence**, so a later red is triaged instead of re-diagnosed:
+  which test, and that a failure of that test is this flake until proven otherwise, checked by name
+  before it is treated as a regression.
+- **The classification is provisional, and a cause retires it.** A failure with an identified
+  mechanism on a supported platform is a defect at whatever rate it occurs, triaged by repairing
+  that mechanism rather than by re-running. A rate does not settle the category; it is what makes
+  the category arguable.
+- **Preserve the evidence a rate is made of.** A harness that writes every run to one path cannot
+  measure a rate, because the next run destroys the failure the last one caught. Write per-run
+  output, and quote the diagnostic — the message and its error code — rather than the bare fact
+  of a failure.
+
+A red that recurs with no rate, no owner, and no stated consequence trains reviewers to discount
+CI, which costs more than the test does.
 
 ### Instruments and censuses
 
@@ -540,9 +616,12 @@ Reviewers and authors should be able to answer yes to each applicable item:
 - [ ] No production panic path handles data, environment, persistence, process, or scheduling.
 - [ ] Filesystem publication and concurrent arbitration use the required atomic semantics.
 - [ ] External commands check both process and protocol outcomes and clean up descendants.
-- [ ] Platform assumptions are isolated and tested natively.
+- [ ] Platform assumptions are isolated and tested natively, and platform-gated code, tests, and
+      annotations name the leg that evaluates them.
 - [ ] Untrusted input is bounded and validated before it gains authority; secrets stay redacted.
 - [ ] Tests force the important failure/interleaving and do not depend on ambient machine state.
+- [ ] Readiness signals follow their state, cannot be read partially, and every wait is bounded.
+- [ ] An intermittent failure carries a measured rate, an owner, and a re-run-or-repair rule.
 - [ ] Source instruments scan their complete claimed domain and their injected controls fail.
 - [ ] Public behaviour, persisted formats, events, and documentation change together.
 - [ ] New abstraction and dependencies have a demonstrated purpose and do not widen capability.
@@ -584,11 +663,13 @@ assistance is not the same as enforcement, and a green gate is not evidence for 
 | §2 compiler and ordinary lint baseline | `cargo clippy --all-targets --all-features -- -D warnings` | Automated for code compiled by the lint job |
 | §2 effect denylist | `clippy.toml` disallowed methods, types, and macros; denylist resolution census with an injected typo control | Conditional: `clippy.toml` holds only test-allowance booleans; automated only after denied paths, their platform Clippy legs, and the census land |
 | §§3–6 design, types, APIs, ownership, and resources | rustc ownership/type checking and targeted Clippy lints where applicable; tests; pull-request review | Partly automated; semantic and abstraction rules are review-only, and the ambient-authority funnel is review-enforced until denylist entries pin it |
-| §7 errors and panics | `[lints]`-denied `unwrap_used`, `expect_used`, `panic`, `todo`, `unimplemented`, and `dbg_macro`; type checking; tests | Panic policy automated for code the Clippy leg compiles, with `#[expect]` marking each documented §7 exception; context quality and error taxonomy stay review-only |
+| §7 errors and panics | `[lints]`-denied `unwrap_used`, `expect_used`, `panic`, `todo`, `unimplemented`, and `dbg_macro`; type checking; tests | Panic policy automated for code the Clippy leg compiles, with `#[expect]` marking each documented §7 exception; see the platform-coverage row below for which platforms that is; context quality and error taxonomy stay review-only |
 | §§8–9 filesystem, persistence, and processes | behavioural tests; platform CI; effect denylist once active | Partly automated; atomicity, durability, ownership, parsing, and protocol completeness require review |
 | §10 concurrency and async code | rustc `Send`/`Sync` and borrowing checks; deterministic concurrency tests | Partly automated; protocol, cancellation safety, bounds, and ordering require review. `.await`-specific rows are N/A until async production code lands |
 | §11 unsafe and platform code | rustc unsafe checks, `unsafe_op_in_unsafe_fn` denied via `[lints]`, native tests; Miri or sanitizer only when a named leg exists; `undocumented_unsafe_blocks` pending its ratchet commit | Partly automated; safety proofs and tool triggers require review |
+| §11 platform coverage of lint claims | A Clippy leg per supported platform; the `test` and `msrv` matrices cover behaviour on all three | **Uncovered on two of three targets.** `ci.yml` runs one Clippy leg, on `ubuntu-latest`, so every `#[cfg(windows)]` and macOS-gated region is evaluated by no lint gate — including the three `#[expect(clippy::expect_used)]` annotations in `src/agent/proc.rs`'s `windows_job`, which suppress nothing and cannot self-retire. The `test` and `msrv` matrices do compile those regions on their native platforms, which is why a green baseline does not reveal this. The Windows half is repaired on `codex/parallelism-design` by a `lint (windows)` job and reaches master with the G2 checkpoint; the macOS half has no host |
 | §12 tests, instruments, and censuses | `cargo test --all-targets --all-features`; each instrument's positive control and named test or Bash gate | Execution is automated; sufficiency, independence, complete domains, oracle quality, `#[ignore]` reasons, and the periodic mutation pass require review |
+| §12 readiness protocols and flake records | Pull-request review; a standing finding ledger for a carried flake's rate, owner, and consequence | Review-only, and not automatable as stated. No gate detects a readiness signal published before the state it announces — the test passes whenever the race is won — and no single CI attempt can establish a failure rate, which is measured across repeated runs of one head |
 | §13 documentation | `test-docs-consistency.sh` for its enumerated contracts; rustdoc/compiler where a compiled example target exists; `print_stdout`/`print_stderr` deny output outside the named modules | Otherwise review-only; doctests are not run by the baseline |
 | §14 security and trust boundaries | behavioural/security tests; effect denylist once active; pull-request review | Review-only where no named test or denial is cited |
 | §15 dependencies and features | locked MSRV check, all-feature compiler/test gates, and dependency diff review; SHA-pinned actions (review-verified); `cargo deny` once its configuration lands | Compatibility is partly automated; maintenance, licence, security, and capability assessment are review-only |
