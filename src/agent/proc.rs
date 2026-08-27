@@ -848,6 +848,7 @@ mod windows_job {
     ) -> i32 {
         // SAFETY: the output buffer is correctly typed and sized and the
         // optional returned-length pointer is not needed.
+        #[expect(clippy::expect_used, reason = "a fixed Win32 struct size fits in u32")]
         unsafe {
             QueryInformationJobObject(
                 handle,
@@ -893,6 +894,7 @@ mod windows_job {
             let job = Self { handle };
             let mut limits = JOBOBJECT_EXTENDED_LIMIT_INFORMATION::default();
             limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+            #[expect(clippy::expect_used, reason = "a fixed Win32 struct size fits in u32")]
             let size = u32::try_from(size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>())
                 .expect("job information structure fits in u32");
             if configure(job.handle, &limits, size) == 0 {
@@ -1330,6 +1332,7 @@ mod windows_job {
             return Err(io::Error::last_os_error());
         }
         let snapshot = Snapshot(snapshot);
+        #[expect(clippy::expect_used, reason = "a fixed Win32 struct size fits in u32")]
         let mut entry = THREADENTRY32 {
             dwSize: u32::try_from(size_of::<THREADENTRY32>())
                 .expect("thread entry structure fits in u32"),
