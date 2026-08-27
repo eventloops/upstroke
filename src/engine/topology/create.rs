@@ -1759,8 +1759,16 @@ fn p6_append_run_started(
             //     here rather than being implied by calls that are no longer in
             //     view. A held pair at this point means a probe took a slot and
             //     did not give it back.
-            //     **Read through the probes**, which own them, so this cannot
-            //     be checking a different pair from the one P4 used.
+            //     **Read off the `Request`, which owns them**, so this cannot
+            //     be checking a different pair from the one P4 used: the same
+            //     two fields are what P4 hands to `probes.shell(..)` and
+            //     `probes.agent(..)` above.
+            //
+            //     This said "read through the probes, which own them", and they
+            //     no longer do — `ledger()` and `slots()` were deleted from the
+            //     trait on 2026-08-27 precisely so a probe could not hold a pair
+            //     of its own. The sentence was left describing the arrangement
+            //     the deletion removed, by the change that removed it.
             let balanced = request
                 .ledger
                 .lock()

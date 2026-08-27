@@ -2024,12 +2024,17 @@ impl Probes for LeakyProbes {
 }
 
 /// **A leaked registration is reported, which is what proves the check reads the
-/// probes' own ledger.**
+/// ledger the probe registered into.**
 ///
-/// Its sibling above drives a balanced run, and a balanced run cannot tell the
-/// two ledgers apart: an empty one balances too. This is the discriminating half
-/// — the probes' ledger holds an unsettled registration, so a check that read any
-/// other ledger would report the run clean and this assertion would fail.
+/// "The probes' own ledger" is what this said, and probes have not had one since
+/// `ledger()` and `slots()` left the trait on 2026-08-27: the `Request` owns the
+/// single pair and hands it to each probe as an argument. The property is the
+/// same and its name was a round out of date.
+///
+/// Its sibling above drives a balanced run, and a balanced run cannot tell two
+/// ledgers apart: an empty one balances too. This is the discriminating half —
+/// the pair the request holds carries an unsettled registration, so a check
+/// reading any other would report the run clean and this assertion would fail.
 #[test]
 fn a_leaked_probe_registration_is_reported_by_the_append_error() {
     let fixture = Fixture::new("append-leak");
