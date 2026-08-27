@@ -2337,6 +2337,44 @@ twice about code nobody misread.
 > A number in a doc comment that a function can compute should be computed by a test, not
 > restated by a person. The third restatement is the signal, not the first.
 
+### A local gate that existed and was never run
+
+`upstroke-pr-policy` failed at `e85f348` on five ledger rows, every one of them a location
+or an identifier that does not exist at the sha it cites — the class this round was
+repairing, in the artifact describing the repair:
+
+```
+PR7-FEEDBACK-NOT-DURABLE-IN-SCHEMA-4 prevention identifier is not tracked at exact head:
+  #[serde(default)] detail: Option<String>
+PR7-FR-005 location line 2300 exceeds reviews/FINDINGS.md at 75da796 (2050 lines)
+PR7-FR-006 location does not exist at its reviewed SHA:
+  75da796 / reviews/2026-08-26-pr7-frontier-review-75da796.md
+PR7-RR-D  location does not exist at its reviewed SHA:
+  c2c0294 / reviews/2026-08-26-pr7-frontier-review-c2c0294.md
+PR7-FR-006 prevention identifier is not tracked at exact head: headRefOid
+```
+
+Line 2300 was read out of the *current* file for a claim about a 2050-line one, and both
+review records were cited at shas that predate the commits adding them.
+
+**The gate was runnable locally the whole time and I was running the wrong one.**
+`bash .github/scripts/test-pr-ledger-evidence.sh` tests the *validator* — it passes
+whatever the body says. The check CI performs is
+
+```
+cat <body> | bash .github/scripts/validate-pr-ledger-evidence.sh <exact-head-sha>
+```
+
+which resolves every cited `path:line` at its stated reviewed sha and every backticked
+identifier at the head. Run against the body it caught all five, including two the CI run
+had not reached.
+
+> A `test-*.sh` gate proves the validator works. It says nothing about the artifact.
+> Validating the artifact means running `validate-*.sh` against the artifact.
+
+That is the same shape as §22c's rule one layer up: the instrument was pointed at the
+mechanism instead of at the thing the mechanism judges.
+
 
 ## 22a. A driver that fails silently on a diff this size
 
