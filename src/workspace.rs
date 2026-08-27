@@ -2948,9 +2948,17 @@ mod tests {
         );
     }
 
-    /// The line prefix the snapshot owner announces its materialised root
+    /// The line prefix the snapshot owner announces its snapshot's name
     /// under, so the waiting parent can tell it from libtest's own output.
-    const SNAPSHOT_ROOT_ANNOUNCEMENT: &str = "snapshot-root: ";
+    const SNAPSHOT_NAME_ANNOUNCEMENT: &str = "snapshot-name: ";
+
+    /// How long the parent waits for that announcement before killing the
+    /// owner. Generous on purpose: it bounds a wedged owner rather than timing
+    /// a healthy one, which announces in milliseconds. The readiness file this
+    /// replaced used its 15s deadline as the signal itself, which is why that
+    /// deadline could expire on a loaded runner; nothing is decided here except
+    /// that an owner which has said nothing at all is not going to.
+    const ANNOUNCEMENT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
 
     /// Reads `announcements` until a line carries `marker`, and returns the
     /// rest of that line.
@@ -2990,23 +2998,56 @@ mod tests {
         }
     }
 
+    /// Waits for `owner` to announce `marker`, killing and reaping it if it has
+    /// not within `within`.
+    ///
+    /// The complete line stays the readiness signal; the watchdog bounds only
+    /// how long an owner that never finishes one can hold the suite. An owner
+    /// that fails exits and closes the pipe, which is the fast path — this is
+    /// for the one that stays alive and silent, with a wedged `git` under it.
+    /// `read_line` would block on that for as long as CI allowed, where the
+    /// readiness file it replaced at least failed in seconds.
+    fn announced_within(
+        owner: &mut std::process::Child,
+        marker: &'static str,
+        within: std::time::Duration,
+    ) -> Result<String, String> {
+        let Some(stdout) = owner.stdout.take() else {
+            return Err("the owner's stdout has already been taken".to_owned());
+        };
+        let (announced, waiting) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let mut lines = std::io::BufReader::new(stdout);
+            let _ = announced.send(await_announcement(&mut lines, marker));
+        });
+        let outcome = waiting
+            .recv_timeout(within)
+            .unwrap_or_else(|_| Err(format!("no announcement within {within:?}")));
+        if outcome.is_err() {
+            // Killing closes the pipe, which releases the reader thread.
+            let _ = owner.kill();
+            let _ = owner.wait();
+        }
+        outcome
+    }
+
     #[test]
     fn an_announcement_is_found_past_the_harness_own_output() {
         let mut stream = std::io::Cursor::new(
-            "\nrunning 1 test\nsnapshot-root: /tmp/upstroke-snap\ntest result: ok\n",
+            "\nrunning 1 test\nsnapshot-name: upstroke-gates-7-01JABC\ntest result: ok\n",
         );
         assert_eq!(
-            await_announcement(&mut stream, SNAPSHOT_ROOT_ANNOUNCEMENT).expect("announcement"),
-            "/tmp/upstroke-snap"
+            await_announcement(&mut stream, SNAPSHOT_NAME_ANNOUNCEMENT).expect("announcement"),
+            "upstroke-gates-7-01JABC"
         );
     }
 
     #[test]
     fn a_carriage_return_does_not_become_part_of_the_announced_path() {
-        let mut stream = std::io::Cursor::new("snapshot-root: /tmp/upstroke-snap\r\n");
+        let mut stream = std::io::Cursor::new("snapshot-name: upstroke-gates-7-01JABC\r\n");
         assert_eq!(
-            await_announcement(&mut stream, SNAPSHOT_ROOT_ANNOUNCEMENT).expect("announcement"),
-            "/tmp/upstroke-snap"
+            await_announcement(&mut stream, SNAPSHOT_NAME_ANNOUNCEMENT).expect("announcement"),
+            "upstroke-gates-7-01JABC"
         );
     }
 
@@ -3016,8 +3057,8 @@ mod tests {
         // partial record must not read as a whole one. Under the readiness file
         // the partial record was an empty path; here it is a line the writer
         // never finished.
-        let mut torn = std::io::Cursor::new("snapshot-root: /tmp/upstroke-sna");
-        let error = await_announcement(&mut torn, SNAPSHOT_ROOT_ANNOUNCEMENT)
+        let mut torn = std::io::Cursor::new("snapshot-name: upstroke-gates-7-01JAB");
+        let error = await_announcement(&mut torn, SNAPSHOT_NAME_ANNOUNCEMENT)
             .expect_err("an unfinished announcement is not an announcement");
         assert!(error.contains("mid-announcement"), "{error}");
     }
@@ -3025,7 +3066,7 @@ mod tests {
     #[test]
     fn a_helper_that_ends_without_announcing_fails_rather_than_waiting() {
         let mut noise = std::io::Cursor::new("\nrunning 1 test\ntest result: FAILED\n");
-        let error = await_announcement(&mut noise, SNAPSHOT_ROOT_ANNOUNCEMENT)
+        let error = await_announcement(&mut noise, SNAPSHOT_NAME_ANNOUNCEMENT)
             .expect_err("end of output is not readiness");
         assert!(error.contains("ended before it announced"), "{error}");
     }
@@ -3047,31 +3088,83 @@ mod tests {
         let snapshot = workspace
             .gate_snapshot_for_candidate_in_store(&parent, &tree, &store)
             .expect("create durable snapshot");
+        // Only the snapshot's own generated name crosses the wire. It is
+        // `upstroke-gates-<pid>-<ulid>`, which `valid_snapshot_name` holds to
+        // ASCII, so no ancestor of the store is ever encoded as a line — an
+        // ancestor may carry a newline, which would truncate the record, or
+        // bytes that are not text at all, which `Path::display` would mangle.
+        let name = snapshot
+            .workspace()
+            .root()
+            .file_name()
+            .and_then(|name| name.to_str())
+            .expect("a generated snapshot name is ASCII");
         // Announced only now, and only as a whole line, so the parent cannot
         // observe a readiness that predates the snapshot it names.
-        println!(
-            "{SNAPSHOT_ROOT_ANNOUNCEMENT}{}",
-            snapshot.workspace().root().display()
-        );
+        println!("{SNAPSHOT_NAME_ANNOUNCEMENT}{name}");
         std::io::stdout()
             .flush()
-            .expect("publish the snapshot root");
+            .expect("publish the snapshot name");
         std::thread::sleep(std::time::Duration::from_secs(30));
         drop(snapshot);
     }
 
+    /// The subprocess half of
+    /// `an_owner_that_never_finishes_its_line_is_killed_not_waited_on`: begins
+    /// an announcement, never ends the line, and stays alive holding the pipe
+    /// open. This is the case that made the watchdog necessary.
     #[test]
-    fn hard_killed_snapshot_owner_is_reclaimed_before_resume() {
-        let repo = temp_repo("snapshot-hard-kill");
-        let store = env::temp_dir().join(format!(
-            "upstroke-snapshot-store-{}-{}",
-            std::process::id(),
-            crate::ulid::ulid()
-        ));
-        let workspace = Workspace::open(&repo).expect("open");
-        let registrations_before = workspace
-            .git(&["worktree", "list", "--porcelain"])
-            .expect("registrations before");
+    #[ignore = "spawned as a subprocess by an_owner_that_never_finishes_its_line_is_killed_not_waited_on"]
+    fn unfinished_announcement_helper() {
+        if env::var_os("UPSTROKE_UNFINISHED_ANNOUNCEMENT").is_none() {
+            return;
+        }
+        print!("{SNAPSHOT_NAME_ANNOUNCEMENT}upstroke-gates-never-finished");
+        std::io::stdout()
+            .flush()
+            .expect("publish a partial announcement");
+        std::thread::sleep(std::time::Duration::from_secs(30));
+    }
+
+    #[test]
+    fn an_owner_that_never_finishes_its_line_is_killed_not_waited_on() {
+        let mut owner = Command::new(env::current_exe().expect("test executable"))
+            .args([
+                "--exact",
+                "workspace::tests::unfinished_announcement_helper",
+                "--ignored",
+                "--nocapture",
+            ])
+            .env("UPSTROKE_UNFINISHED_ANNOUNCEMENT", "1")
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn an owner that never finishes its announcement");
+        let started = std::time::Instant::now();
+        let error = announced_within(
+            &mut owner,
+            SNAPSHOT_NAME_ANNOUNCEMENT,
+            std::time::Duration::from_millis(250),
+        )
+        .expect_err("an unfinished line is not an announcement");
+        assert!(error.contains("no announcement within"), "{error}");
+        // The owner holds its pipe open for 30 seconds. Returning at all is the
+        // contract under test: the wait is bounded rather than open-ended.
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(25),
+            "the watchdog did not bound the wait: {:?}",
+            started.elapsed()
+        );
+        assert!(
+            owner.try_wait().expect("owner status").is_some(),
+            "an owner that never announced must be killed and reaped, not left behind"
+        );
+    }
+
+    /// Spawns a snapshot owner against `repo` and `store`, waits for it to name
+    /// its snapshot, and returns the owner alongside the snapshot path rebuilt
+    /// from `store`.
+    fn spawn_snapshot_owner(repo: &Path, store: &Path) -> (std::process::Child, PathBuf) {
         let mut owner = Command::new(env::current_exe().expect("test executable"))
             .args([
                 "--exact",
@@ -3080,24 +3173,40 @@ mod tests {
                 "--nocapture",
             ])
             .env("UPSTROKE_SNAPSHOT_OWNER", "1")
-            .env("UPSTROKE_REPO", &repo)
-            .env("UPSTROKE_SNAPSHOT_STORE", &store)
+            .env("UPSTROKE_REPO", repo)
+            .env("UPSTROKE_SNAPSHOT_STORE", store)
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
             .spawn()
             .expect("spawn disposable snapshot owner");
 
-        // Block until the owner says where the snapshot is, rather than waiting
-        // for a file to appear and hoping its bytes arrived with it.
-        let mut announcements =
-            std::io::BufReader::new(owner.stdout.take().expect("snapshot owner stdout"));
-        let announced = await_announcement(&mut announcements, SNAPSHOT_ROOT_ANNOUNCEMENT);
-        let snapshot_path = PathBuf::from(announced.unwrap_or_else(|error| {
-            let _ = owner.kill();
-            let _ = owner.wait();
-            panic!("snapshot owner never announced a snapshot: {error}")
-        }));
+        // Block until the owner names its snapshot, rather than waiting for a
+        // file to appear and hoping its bytes arrived with it. `announced_within`
+        // has already killed and reaped the owner on any error path.
+        let announced =
+            announced_within(&mut owner, SNAPSHOT_NAME_ANNOUNCEMENT, ANNOUNCEMENT_TIMEOUT)
+                .unwrap_or_else(|error| {
+                    panic!("snapshot owner never announced a snapshot: {error}")
+                });
+        assert!(
+            valid_snapshot_name(&announced),
+            "the owner announced a name the engine itself would refuse: {announced:?}"
+        );
+        // Rebuilt from the store the caller already holds, so nothing but the
+        // generated ASCII name has to survive the wire.
+        let snapshot_path = store.join("worktrees").join(&announced);
         assert!(snapshot_path.exists(), "snapshot was not materialized");
+        (owner, snapshot_path)
+    }
+
+    /// The hard-kill reclamation contract in full, including the linked-worktree
+    /// registrations, driven against an arbitrary `store`.
+    fn hard_kill_and_reclaim(repo: &Path, store: &Path) {
+        let workspace = Workspace::open(repo).expect("open");
+        let registrations_before = workspace
+            .git(&["worktree", "list", "--porcelain"])
+            .expect("registrations before");
+        let (mut owner, snapshot_path) = spawn_snapshot_owner(repo, store);
         assert_ne!(
             workspace
                 .git(&["worktree", "list", "--porcelain"])
@@ -3114,7 +3223,7 @@ mod tests {
         );
         assert_eq!(
             workspace
-                .reclaim_gate_workspaces(&store)
+                .reclaim_gate_workspaces(store)
                 .expect("resume reclaims durable intents"),
             1
         );
@@ -3128,11 +3237,101 @@ mod tests {
         );
         assert_eq!(
             workspace
-                .reclaim_gate_workspaces(&store)
+                .reclaim_gate_workspaces(store)
                 .expect("reclamation is idempotent"),
             0
         );
-        let _ = fs::remove_dir_all(store);
+    }
+
+    #[test]
+    fn hard_killed_snapshot_owner_is_reclaimed_before_resume() {
+        let repo = temp_repo("snapshot-hard-kill");
+        let store = env::temp_dir().join(format!(
+            "upstroke-snapshot-store-{}-{}",
+            std::process::id(),
+            crate::ulid::ulid()
+        ));
+        hard_kill_and_reclaim(&repo, &store);
+        let _ = fs::remove_dir_all(&store);
+    }
+
+    /// Drives the hard-kill contract with the store under `ancestor`, whose
+    /// name the caller has chosen to be something a line protocol could not
+    /// carry.
+    #[cfg(unix)]
+    fn reclaim_with_the_store_under(ancestor: &std::ffi::OsStr, tag: &str) {
+        let ancestor = env::temp_dir().join(ancestor);
+        let _ = fs::remove_dir_all(&ancestor);
+        fs::create_dir_all(&ancestor).expect("create the hostile ancestor");
+        let repo = temp_repo(tag);
+        let store = ancestor.join(format!(
+            "upstroke-snapshot-store-{}-{}",
+            std::process::id(),
+            crate::ulid::ulid()
+        ));
+        hard_kill_and_reclaim(&repo, &store);
+        let _ = fs::remove_dir_all(&ancestor);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_store_under_a_newline_ancestor_is_still_reclaimed() {
+        use std::os::unix::ffi::OsStrExt;
+
+        // A newline in an ancestor would truncate the announcement if the path
+        // were the thing announced. It is not: the owner sends its snapshot's
+        // generated ASCII name and the parent rebuilds the path from the store
+        // it already holds, so no ancestor ever reaches the wire.
+        reclaim_with_the_store_under(
+            std::ffi::OsStr::from_bytes(b"upstroke-newline\n-ancestor"),
+            "snapshot-hard-kill-newline",
+        );
+    }
+
+    /// Linux only, for the reason `gate_snapshot_accepts_non_utf8_tmpdir_on_linux`
+    /// is: APFS enforces UTF-8 filenames, so 0xff cannot be a macOS path
+    /// component. The newline half above runs on every Unix.
+    ///
+    /// This one stops short of the registration comparisons the full contract
+    /// makes. `Workspace::git` decodes `git worktree list --porcelain` as UTF-8,
+    /// so it cannot describe a worktree under this ancestor at all — a standing
+    /// limit of the engine, and unrelated to how the owner announces itself.
+    /// What is under test here is that the announcement survives ancestors
+    /// `Path::display` would replace with U+FFFD, leaving a path that does not
+    /// exist.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_store_under_a_non_utf8_ancestor_still_announces_and_is_reclaimed() {
+        use std::os::unix::ffi::OsStrExt;
+
+        let ancestor = env::temp_dir().join(std::ffi::OsStr::from_bytes(
+            b"upstroke-non-utf8\n-\xff-ancestor",
+        ));
+        let _ = fs::remove_dir_all(&ancestor);
+        fs::create_dir_all(&ancestor).expect("create the hostile ancestor");
+        let repo = temp_repo("snapshot-hard-kill-non-utf8");
+        let store = ancestor.join(format!(
+            "upstroke-snapshot-store-{}-{}",
+            std::process::id(),
+            crate::ulid::ulid()
+        ));
+        let workspace = Workspace::open(&repo).expect("open");
+        let (mut owner, snapshot_path) = spawn_snapshot_owner(&repo, &store);
+
+        owner.kill().expect("hard-kill snapshot owner");
+        owner.wait().expect("reap snapshot owner");
+        assert!(
+            snapshot_path.exists(),
+            "hard kill unexpectedly ran the snapshot destructor"
+        );
+        assert_eq!(
+            workspace
+                .reclaim_gate_workspaces(&store)
+                .expect("resume reclaims durable intents"),
+            1
+        );
+        assert!(!snapshot_path.exists(), "snapshot directory was reclaimed");
+        let _ = fs::remove_dir_all(&ancestor);
     }
 
     #[cfg(unix)]
