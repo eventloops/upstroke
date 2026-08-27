@@ -83,6 +83,7 @@
 //! Its only production caller is the legacy coordinator.
 
 use std::path::{Path, PathBuf};
+use std::sync::Mutex;
 
 use crate::agent::AdapterSource;
 use crate::error::UpstrokeError;
@@ -103,7 +104,7 @@ use crate::topology::effects::EventSite;
 use crate::topology::events::{RunStarted4, TopologyEvent, TopologyEventBody};
 use crate::topology::fold::{FrozenInputs, TopologyDelta, TopologyFold};
 
-use super::identity::{InvocationLedger, PreflightIdentities, SlotAssertion, SlotPair};
+use super::identity::{InvocationLedger, PreflightIdentities, SlotAssertion};
 use super::prelock::PreLockChecked;
 use super::seams::{TimeSource, TopologyHooks};
 
@@ -168,6 +169,27 @@ pub struct RunnerProbes<'a> {
     pub adapters: &'a dyn AdapterSource,
     /// The digest of the policy `runner` executes under.
     pub policy_digest: String,
+    /// R3's ledger, and R4's slots, for the **registering** runner both probes
+    /// execute through.
+    ///
+    /// Behind locks because `Runner::run` takes `&self`: the wrapper registers,
+    /// slots, runs and settles inside one call, and the two ledgers it mutates
+    /// are shared with the caller that reads them afterwards. Resume's
+    /// pre-flight holds them the same way and for the same reason.
+    pub ledger: &'a Mutex<InvocationLedger>,
+    pub slots: &'a Mutex<SlotAssertion>,
+}
+
+impl RunnerProbes<'_> {
+    /// The runner both probes actually execute through: the run's, with R3 and
+    /// R4 wrapped around **every** request an adapter makes.
+    fn registering(&self) -> super::preflight::Registering<'_> {
+        super::preflight::Registering {
+            inner: self.runner,
+            ledger: self.ledger,
+            slots: self.slots,
+        }
+    }
 }
 
 impl Probes for RunnerProbes<'_> {
@@ -177,7 +199,7 @@ impl Probes for RunnerProbes<'_> {
 
     fn shell(&self, invocation: InvocationId) -> Result<(), UpstrokeError> {
         crate::runner::host::run_shell_probe(
-            self.runner,
+            &self.registering(),
             self.shell,
             self.workspace.clone(),
             invocation,
@@ -191,7 +213,12 @@ impl Probes for RunnerProbes<'_> {
             .ok_or_else(|| UpstrokeError::Agent {
                 message: format!("no adapter registered for agent `{agent}`"),
             })?;
-        adapter.probe(self.runner).map(|_caps| ())
+        // **Through the registering runner, not the raw one.** Every process the
+        // adapter builds is its own registered invocation with its own slot, so
+        // a probe that fails at its fourth request is recorded at its fourth
+        // request. Handing `self.runner` here is what made the creation ledger
+        // account one logical probe instead of the processes it ran.
+        adapter.probe(&self.registering()).map(|_caps| ())
     }
 }
 
@@ -1272,9 +1299,17 @@ pub struct Request<'a> {
     /// Where `run_started`'s timestamp comes from.
     pub clock: &'a dyn TimeSource,
     /// Every probe invocation is registered here.
-    pub ledger: &'a mut InvocationLedger,
+    /// R3's ledger — **the same one the probes execute through**.
+    ///
+    /// Behind a lock, and shared with [`RunnerProbes`], because P4's
+    /// registrations now happen inside `preflight::Registering` where the
+    /// process is built. A `&mut` here would have been a *second* ledger: the
+    /// balance check at the end of this module would read an empty one and pass
+    /// vacuously, which is a weaker claim than the one it was making before.
+    pub ledger: &'a Mutex<InvocationLedger>,
     /// Every **slotted** probe takes its `{agent, pool?}` pair here.
-    pub slots: &'a mut SlotAssertion,
+    /// R4's slots, shared with [`RunnerProbes`] for the same reason.
+    pub slots: &'a Mutex<SlotAssertion>,
 }
 
 // ---------------------------------------------------------------------------
@@ -1490,42 +1525,32 @@ fn p4_run_preflight(
         Ok(id) => id,
         Err(error) => return Err(p3b.abort(Prefix::P3b, error)),
     };
-    if let Err(error) = request.ledger.register(&shell_id) {
-        return Err(p3b.abort(Prefix::P3b, error));
-    }
+    // Same boundary as the agent probes below: the shell probe's own request
+    // registers itself through `Registering`, so there is nothing to settle
+    // here. The identity is still built here because the *ordinal* is this
+    // module's — `recovery_order` (c) puts the shell probe first.
     if let Err(error) = request.probes.shell(shell_id.clone()) {
-        let _ = request.ledger.cancel(&shell_id);
-        return Err(p3b.abort(Prefix::P3b, error));
-    }
-    if let Err(error) = request.ledger.complete(&shell_id) {
         return Err(p3b.abort(Prefix::P3b, error));
     }
 
+    // **No outer registration around the adapter call.** This wrapped one
+    // `probe(agent, 0)` identity, with one slot pair, around the *whole* of
+    // `probes.agent(...)` — and an adapter runs a process per request. A current
+    // Codex probe runs ten: version, two help probes, six strict-config probes
+    // and the model catalog. Only ordinal 0 reached the ledger, so a failure at
+    // ordinal 1 was recorded as **ordinal 0 cancelled**: the ledger named the
+    // process that succeeded and held no record of the one that failed. The
+    // `bf927f3` review's third P1.
+    //
+    // Registration now happens where the process is built, in
+    // `preflight::Registering`, which `RunnerProbes` wraps its runner in — the
+    // same boundary resume has used since it was written, and whose own doc says
+    // "one place, so that 'each a registered invocation' is true of a process an
+    // adapter built as much as of one this module built". This module was the
+    // other place.
     let mut probed = Vec::with_capacity(request.agents.len());
     for agent in request.agents {
-        let id = match PreflightIdentities::agent(agent, 0) {
-            Ok(id) => id,
-            Err(error) => return Err(p3b.abort(Prefix::P3b, error)),
-        };
-        let pair = SlotPair {
-            agent: agent.clone(),
-            pool: None,
-        };
-        if let Err(error) = request.slots.acquire(&id, pair) {
-            return Err(p3b.abort(Prefix::P3b, error));
-        }
-        if let Err(error) = request.ledger.register(&id) {
-            let _ = request.slots.release(&id);
-            return Err(p3b.abort(Prefix::P3b, error));
-        }
-        let probed_ok = request.probes.agent(agent);
-        let settled = if probed_ok.is_ok() {
-            request.ledger.complete(&id)
-        } else {
-            request.ledger.cancel(&id)
-        };
-        let released = request.slots.release(&id);
-        if let Err(error) = probed_ok.and(settled).and(released) {
+        if let Err(error) = request.probes.agent(agent) {
             return Err(p3b.abort(Prefix::P3b, error));
         }
         probed.push(agent.clone());
@@ -1685,7 +1710,26 @@ fn p6_append_run_started(
             // (b) Nothing is cancelled because nothing is in flight: P4's probes
             //     were all settled, which is why the ledger balances here. The
             //     claim is asserted rather than assumed.
-            let balanced = request.ledger.balances();
+            //
+            //     **Both halves, since 2026-08-27.** P4 used to acquire and
+            //     release each probe's slot pair itself, so "every pair
+            //     released" was visible in this module's own code. Registration
+            //     moved to `preflight::Registering`, where the process is built,
+            //     and the R4 half moved with it — so the claim is now checked
+            //     here rather than being implied by calls that are no longer in
+            //     view. A held pair at this point means a probe took a slot and
+            //     did not give it back.
+            let balanced = request
+                .ledger
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .balances()
+                && request
+                    .slots
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .held()
+                    .is_none();
             // (c) The handle is dropped, unretried, and the log reopened.
             let (facts, lock, log, _record) = p5b.into_parts();
             drop(log);

@@ -203,6 +203,29 @@ sites: every worker, gate, review, re-ask and probe process carries a typed
 registered exactly once and settled exactly once (R4). The slot pair is asserted rather
 than brokered at `max_parallel = 1` (R3).
 
+> **Correction, 2026-08-27, at `8f0e605`.** "Every … probe process" was false for
+> **fresh creation** when this was written, and stayed false until the date of this note.
+> `create.rs`'s P4 registered one `probe(agent, 0)` identity around the *whole* adapter
+> call and handed the adapter the raw `Runner`, so an adapter that runs several processes
+> put one of them in the ledger. A current Codex probe runs **ten** Runner requests —
+> version, two help probes, six strict-config probes and the model catalog — of which
+> ordinal 0 was accounted and 1 through 9 were absent.
+>
+> The consequence was a *wrong* row rather than a missing one: with the version probe
+> succeeding and a later probe failing, the ledger recorded **ordinal 0 cancelled** — the
+> identity of the process that succeeded — and held no record of the one that failed.
+>
+> Resume was never affected: `preflight::Registering` wraps the Runner and registers each
+> request, and its own doc says why — *"one place, so that 'each a registered invocation'
+> is true of a process an adapter built as much as of one this module built"*. Fresh
+> creation was the other place. It now uses the same wrapper, and
+> `create::tests::the_creation_ledger_accounts_every_probe_process` holds it: two
+> processes, the second refusing, and the ledger reads one completed and one cancelled
+> where it read nought and one before.
+>
+> Found by the frontier review of `bf927f3` (its third P1), not by this artifact's own
+> evidence — which is the point of recording it here rather than only in the ledger.
+
 Two identity facts this slice established are worth carrying to the gate:
 
 - The **append-error protocol's obligation (3)** — cancelling in-flight invocations —

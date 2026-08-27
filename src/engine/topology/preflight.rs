@@ -296,10 +296,20 @@ fn refused(policy: &RunnerPolicy, what: &str) -> UpstrokeError {
 ///
 /// One place, so that "each a registered invocation" is true of a process an
 /// adapter built as much as of one this module built.
-struct Registering<'a> {
-    inner: &'a dyn Runner,
-    ledger: &'a Mutex<InvocationLedger>,
-    slots: &'a Mutex<SlotAssertion>,
+///
+/// **`pub(super)` since 2026-08-27, because "one place" was not true.** Fresh
+/// creation did not use it: `create.rs`'s P4 registered a single
+/// `probe(agent, 0)` identity around the *whole* adapter call and handed the
+/// adapter the raw Runner, so an adapter that runs ten processes — a current
+/// Codex probe runs version, two help probes, six strict-config probes and the
+/// model catalog — put one of them in the ledger. A failure at ordinal 1 was
+/// recorded as ordinal 0 cancelled: the ledger named the process that
+/// *succeeded* and held no record of the one that failed. The `bf927f3` review
+/// found it as its third P1; the doc above was already the argument against it.
+pub(super) struct Registering<'a> {
+    pub(super) inner: &'a dyn Runner,
+    pub(super) ledger: &'a Mutex<InvocationLedger>,
+    pub(super) slots: &'a Mutex<SlotAssertion>,
 }
 
 impl Runner for Registering<'_> {

@@ -750,8 +750,8 @@ struct Driver<'a> {
     refs: &'a dyn IntegrationRefs,
     agents: Vec<String>,
     runner: RunnerPolicy,
-    ledger: InvocationLedger,
-    slots: SlotAssertion,
+    ledger: std::sync::Mutex<InvocationLedger>,
+    slots: std::sync::Mutex<SlotAssertion>,
     warnings: Vec<String>,
 }
 
@@ -763,8 +763,8 @@ impl<'a> Driver<'a> {
             refs,
             agents: agents(),
             runner: crate::runner::policy::host_policy(),
-            ledger: InvocationLedger::new(),
-            slots: SlotAssertion::new(),
+            ledger: std::sync::Mutex::new(InvocationLedger::new()),
+            slots: std::sync::Mutex::new(SlotAssertion::new()),
             warnings: Vec::new(),
         }
     }
@@ -782,8 +782,8 @@ impl<'a> Driver<'a> {
             probes: self.probes,
             refs: self.refs,
             clock: &clock,
-            ledger: &mut self.ledger,
-            slots: &mut self.slots,
+            ledger: &self.ledger,
+            slots: &self.slots,
         };
         create_run(self.fixture.checked(), request, hooks, &mut self.warnings)
     }
@@ -3315,8 +3315,8 @@ fn container_probe_kill_child() {
     let plan_bytes = normalized_plan();
     let clock = Fixed::default();
     let agents = agents();
-    let mut ledger = InvocationLedger::new();
-    let mut slots = SlotAssertion::new();
+    let ledger = std::sync::Mutex::new(InvocationLedger::new());
+    let slots = std::sync::Mutex::new(SlotAssertion::new());
     let request = Request {
         repo_root: &fixture.repo,
         repo_key: fixture.repo_key.clone(),
@@ -3327,8 +3327,8 @@ fn container_probe_kill_child() {
         probes: &probes,
         refs: &refs,
         clock: &clock,
-        ledger: &mut ledger,
-        slots: &mut slots,
+        ledger: &ledger,
+        slots: &slots,
     };
     let mut warnings = Vec::new();
     let _ = create_run(checked, request, &mut hooks, &mut warnings);
@@ -3603,6 +3603,166 @@ impl crate::runner::Runner for RecordingRunner {
     }
 }
 
+/// A runner that serves the first request and refuses the second.
+///
+/// The shape a real probe fails in: a version probe answers, and the help probe
+/// after it does not. What the ledger says about *which* process failed is the
+/// whole of what `the_creation_ledger_accounts_every_probe_process` asserts.
+#[derive(Debug, Default)]
+struct FailsTheSecondRequest {
+    seen: Mutex<Vec<String>>,
+}
+
+impl crate::runner::Runner for FailsTheSecondRequest {
+    fn run(
+        &self,
+        request: &crate::runner::RunnerRequest,
+    ) -> Result<crate::agent::proc::ProcessOutput, UpstrokeError> {
+        let mut seen = self.seen.lock().unwrap_or_else(PoisonError::into_inner);
+        seen.push(request.invocation.to_string());
+        if seen.len() >= 2 {
+            return Err(UpstrokeError::Agent {
+                message: "the help probe did not answer".to_owned(),
+            });
+        }
+        Ok(crate::agent::proc::ProcessOutput {
+            code: Some(0),
+            stdout: String::new(),
+            stderr: String::new(),
+            duration: std::time::Duration::from_millis(1),
+            timed_out: false,
+            output_limited: false,
+        })
+    }
+}
+
+/// An adapter whose probe runs **two** processes, as every real one does.
+#[derive(Debug, Default)]
+struct TwoRequestAdapter;
+
+impl crate::agent::AgentAdapter for TwoRequestAdapter {
+    fn id(&self) -> &'static str {
+        AGENT
+    }
+
+    fn probe(
+        &self,
+        runner: &dyn crate::runner::Runner,
+    ) -> Result<crate::agent::Caps, UpstrokeError> {
+        for ordinal in 0..2 {
+            let request = crate::agent::probe_request(
+                AGENT,
+                crate::runner::CommandSpec::new(AGENT),
+                ordinal,
+                std::time::Duration::from_secs(5),
+            )?;
+            runner.run(&request)?;
+        }
+        Ok(crate::agent::Caps {
+            version: "1.0".to_owned(),
+            json_output: true,
+            session_resume: false,
+            cost_reporting: false,
+            read_only_mode: false,
+            acp: false,
+            model_list: false,
+        })
+    }
+
+    fn build(
+        &self,
+        _run: &crate::agent::TaskRun,
+    ) -> Result<crate::runner::CommandSpec, UpstrokeError> {
+        Ok(crate::runner::CommandSpec::new(AGENT))
+    }
+
+    fn parse(
+        &self,
+        _out: &crate::agent::proc::ProcessOutput,
+    ) -> Result<crate::ir::Outcome, UpstrokeError> {
+        Err(UpstrokeError::Agent {
+            message: "this adapter exists to be probed".to_owned(),
+        })
+    }
+}
+
+#[derive(Debug, Default)]
+struct TwoRequestSource {
+    adapter: TwoRequestAdapter,
+}
+
+impl crate::agent::AdapterSource for TwoRequestSource {
+    fn get(&self, id: &str) -> Option<&dyn crate::agent::AgentAdapter> {
+        (id == AGENT).then_some(&self.adapter as &dyn crate::agent::AgentAdapter)
+    }
+}
+
+/// **Every Runner process a probe builds is its own registered invocation.**
+///
+/// `permits.protocol` asks for "registered/completed/cancelled **exactly
+/// once**" per invocation, and `R3`'s subject is a *process*. Fresh creation
+/// registered one `probe(agent, 0)` identity around the whole adapter call and
+/// handed the adapter the raw Runner — so an adapter that runs ten processes,
+/// which a current Codex probe does, put one of them in the ledger.
+///
+/// The consequence is not a missing row, it is a **wrong** one. With the version
+/// probe at ordinal 0 succeeding and the help probe at ordinal 1 failing, the
+/// creation ledger read `completed: 0, cancelled: 1` — it cancelled the identity
+/// of the process that *succeeded*, and held no record at all of the one that
+/// failed. The `bf927f3` review's third P1.
+///
+/// This asserts the counts, because the counts are what tell the two accounts
+/// apart: one process accounted, or two.
+#[test]
+fn the_creation_ledger_accounts_every_probe_process() {
+    let runner = FailsTheSecondRequest::default();
+    let source = TwoRequestSource::default();
+    let ledger = std::sync::Mutex::new(InvocationLedger::new());
+    let slots = std::sync::Mutex::new(SlotAssertion::new());
+    let probes = RunnerProbes {
+        runner: &runner,
+        shell: crate::gates::ShellKind::Sh,
+        workspace: std::env::temp_dir(),
+        adapters: &source,
+        policy_digest: host_digest(),
+        ledger: &ledger,
+        slots: &slots,
+    };
+
+    probes
+        .agent(AGENT)
+        .expect_err("the adapter's second request refuses");
+
+    let ledger = ledger.lock().unwrap_or_else(PoisonError::into_inner);
+    assert_eq!(
+        (ledger.completed(), ledger.cancelled()),
+        (1, 1),
+        "the ledger accounts {} completed and {} cancelled; two processes ran, one \
+         answered and one did not, so it must hold both — (0, 1) is the pre-repair \
+         reading, in which the *successful* process is the one recorded cancelled",
+        ledger.completed(),
+        ledger.cancelled()
+    );
+    assert!(
+        ledger.balances(),
+        "every registration is settled exactly once on the failure path too"
+    );
+    assert!(
+        ledger.running().is_empty(),
+        "a refused probe left an invocation running: {:?}",
+        ledger.running()
+    );
+
+    // And the slot the failing process took was released, so a second agent
+    // could still be probed after this one refused.
+    let slots = slots.lock().unwrap_or_else(PoisonError::into_inner);
+    assert!(
+        slots.held().is_none(),
+        "the refused probe kept its slot pair: {:?}",
+        slots.held()
+    );
+}
+
 /// One adapter, whose `probe` is the only method this seam reaches.
 #[derive(Debug, Default)]
 struct OneAdapter {
@@ -3675,12 +3835,16 @@ impl crate::agent::AdapterSource for OneSource {
 fn the_production_probes_run_both_halves_through_the_runs_runner() {
     let runner = RecordingRunner::default();
     let source = OneSource::default();
+    let ledger = std::sync::Mutex::new(InvocationLedger::new());
+    let slots = std::sync::Mutex::new(SlotAssertion::new());
     let probes = RunnerProbes {
         runner: &runner,
         shell: crate::gates::ShellKind::Sh,
         workspace: std::env::temp_dir(),
         adapters: &source,
         policy_digest: host_digest(),
+        ledger: &ledger,
+        slots: &slots,
     };
     assert_eq!(probes.policy_digest(), host_digest());
 

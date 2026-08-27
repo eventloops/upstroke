@@ -2578,6 +2578,52 @@ Deliberately **not** a different-tree commit: the sibling shares the judged tree
 2026-08-26 tree check cannot catch it and the pin's own binding is what must. A witness
 that used a divergent tree would pass on the other repair's account.
 
+### Round 3's third P1 — one probe accounted where ten processes ran
+
+Fresh creation registered a single `probe(agent, 0)` identity around the whole adapter
+call and handed the adapter the **raw** `Runner`. A current Codex probe runs ten Runner
+requests — version, two help probes, six strict-config probes, the model catalog — so
+ordinal 0 was accounted and 1 through 9 were absent.
+
+**The failure is a wrong row, not a missing one.** With the version probe at ordinal 0
+succeeding and a help probe at ordinal 1 failing, the creation ledger recorded **ordinal 0
+cancelled**: the identity of the process that *succeeded*, with no record of the one that
+failed. `permits.protocol` asks for "registered/completed/cancelled exactly once" per
+invocation, and R3's subject is a process.
+
+**Resume already had the answer, and had written down why.**
+`preflight::Registering` wraps the Runner and registers each request, and its doc reads:
+*"One place, so that 'each a registered invocation' is true of a process an adapter built
+as much as of one this module built."* Fresh creation was the other place. It is now
+`pub(super)` and both paths use it, so the sentence is true.
+
+**Three things fell out of moving the boundary, and each was a real consequence rather
+than tidying.**
+
+1. **P4's own register/slot/settle calls are gone.** They *were* the wrong boundary; the
+   wrapper does it per process.
+2. **`Request::ledger` and `::slots` became shared locks.** They were `&mut`, and leaving
+   them so would have given `create.rs` a *second* ledger: its end-of-module
+   `ledger.balances()` would have read an empty one and passed vacuously. One ledger, held
+   by both, or the check is theatre.
+3. **The R4 half moved out of view, so it is now asserted.** P4 used to acquire and release
+   each pair itself, which made "every pair released" visible in this module's code. The
+   balance check now tests `slots.held().is_none()` beside it — otherwise `Request::slots`
+   would have been an unread field, which the compiler said outright.
+
+**Witness and mutation.** `the_creation_ledger_accounts_every_probe_process` drives an
+adapter that runs two processes against a runner that refuses the second, and asserts
+`(completed, cancelled) == (1, 1)` — naming `(0, 1)` as the pre-repair reading in the
+failure message, so the two accounts are told apart rather than a count being asserted in
+isolation. Handing the adapter the raw runner again fails it.
+
+**And the shipped claim it falsified is corrected where it stands.**
+`reviews/2026-08-25-pr7-g2-evidence.md` §8 said "every worker, gate, review, re-ask and
+probe process carries a typed `InvocationId` … registered exactly once and settled exactly
+once". That was false for fresh creation when written and stayed false until now; the
+correction is in that file, sha-stamped, and says so — including that it was a reviewer
+that found it and not the artifact's own evidence.
+
 
 ## 22a. A driver that fails silently on a diff this size
 
