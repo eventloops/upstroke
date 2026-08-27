@@ -5,7 +5,7 @@ production code, tests, examples, build support, and code-generation inputs. It 
 project-specific: official Rust guidance is the foundation, while upstroke's product invariants,
 failure modes, and supported platforms determine the stricter rules.
 
-Last reconciled with the sources listed below: 2026-08-25.
+Last reconciled with the sources listed below: 2026-08-27.
 
 ## 1. Authority and scope
 
@@ -68,6 +68,11 @@ Lint policy:
 - Fix warnings at their cause. Do not use crate- or module-wide `allow(warnings)`.
 - A lint suppression MUST be as narrow as practical and explain why the flagged construction is
   correct. Test-only generated code is the usual exception to the explanation requirement.
+- Lint levels are repository policy and are set only in `Cargo.toml`'s `[lints]` tables — one
+  diffable authority. A crate-root `#![allow]` or `#![deny]` does not change policy.
+- Prefer `#[expect(lint, reason = "…")]` to `#[allow]`. An expectation that stops firing becomes a
+  warning, so a suppression that outlives its cause removes itself from review instead of
+  surviving unnoticed.
 - Add targeted lints only after the repository is clean under them and the lint is available on
   the MSRV. Do not enable Clippy's `pedantic`, `nursery`, or `restriction` groups wholesale;
   those groups intentionally contain contextual, experimental, or mutually incompatible lints.
@@ -79,8 +84,9 @@ Lint policy:
   warning, and `-D warnings` does not promote that warning.
 - A denylist MUST have a resolution census run by a named gate. The census links the probe against
   every dependency needed to resolve its paths, enumerates the declared platform exceptions, and
-  injects a misspelled control that it must detect. At adoption, `master` has no `clippy.toml`;
-  these requirements activate in the same change that introduces one.
+  injects a misspelled control that it must detect. These requirements attach to `disallowed-*`
+  entries: `clippy.toml` carries only the `allow-*-in-tests` booleans today, and the census
+  activates in the same change that introduces the first denied path.
 
 ## 3. Rust-native design principles
 
@@ -117,6 +123,18 @@ The following rules cut across every section:
    satisfy the same clause MUST be counted, and two is a finding even when both appear correct.
    Once one authority is chosen, a source census with an injected positive control MUST pin it
    as the only production implementation.
+
+### Ambient authority
+
+Wall-clock time, monotonic time, environment variables, and randomness are effects under rule 4.
+Production reads of them live in a deliberately small set of boundary modules, and decision logic
+receives values or injected capabilities instead of asking the machine. A change that adds a read
+site outside the existing set MUST say why the funnel cannot serve it; the future `clippy.toml`
+denylist pins the funnel once its platform legs and census exist.
+
+Deadlines, timeouts, and elapsed measurements use `Instant`. `SystemTime` appears only where a
+recorded timestamp or a minted identifier needs wall-clock meaning. The two are never compared,
+interchanged, or converted into one another.
 
 ## 4. Formatting, naming, and readability
 
@@ -165,7 +183,8 @@ code they describe.
 - Use checked conversions for narrowing or signedness changes. An `as` cast is acceptable only
   when it is lossless by type or a nearby invariant proves the range. Arithmetic MUST choose
   checked, saturating, wrapping, or failing behaviour deliberately; floating-point input MUST
-  reject non-finite values before it is ordered, budgeted, or persisted.
+  reject non-finite values before it is ordered, budgeted, or persisted. Release builds keep
+  `overflow-checks = true`, so an overflow nobody chose fails loudly instead of wrapping.
 - Avoid wildcard arms over closed domain enums when a new variant should force a decision at each
   call site. Wildcards remain appropriate for intentionally open external inputs.
 
@@ -183,7 +202,9 @@ code they describe.
 - Implement common traits (`Debug`, `Clone`, `Eq`, `Hash`, iterators, and conversions) when their
   semantics are honest and useful. `From` is infallible; validation belongs in `TryFrom` or a
   named fallible constructor.
-- New or changed public APIs MUST be assessed for SemVer impact. Public types SHOULD remain open to
+- New or changed public APIs MUST be assessed for SemVer impact — the crate is published, so this
+  is a live contract. `cargo semver-checks` becomes the named mechanism when a release-workflow
+  leg runs it; the assessment is review-only until then. Public types SHOULD remain open to
   compatible evolution only when that flexibility is deliberate; do not add `#[non_exhaustive]`
   reflexively.
 
@@ -229,6 +250,8 @@ Error types and handling MUST follow these rules:
 
 - Define variants around decisions a caller can make, not one variant for every line that can
   fail. Preserve the source error where it helps diagnosis.
+- Error `Display` text starts lowercase, carries no trailing period, and does not repeat its
+  source's message: report chains join fragments with `": "`.
 - Add operation, path, task, run, or adapter context at the layer that knows it. Do not include
   secrets, tokens, full sensitive prompts, or other values that must not enter logs.
 - Inspect structured error kinds. Only an actual not-found condition becomes absence; permission,
@@ -244,10 +267,19 @@ Production code MUST NOT call `.unwrap()` or `.expect()`. It also MUST NOT use `
 persisted state, I/O, subprocess behaviour, or scheduling outcomes. Prefer exhaustive matching
 and types that make an impossible branch impossible.
 
-An assertion or `unreachable!` for a true internal invariant is exceptional: the invariant and
-proof MUST be local and documented, termination must be the intended response to a program defect,
-and tests MUST cover the surrounding boundary. Tests may use `.unwrap()` or `.expect()` to fail
-their own setup, although an `expect` message is preferable when the failed premise is not obvious.
+The panic policy is machine-enforced: `[lints]` denies `clippy::unwrap_used`, `expect_used`,
+`panic`, `todo`, `unimplemented`, and `dbg_macro` on every target the Clippy leg compiles.
+`.unwrap()` has no test allowance; the other lints carve tests out through `clippy.toml`'s
+`allow-*-in-tests` booleans.
+
+An assertion, an `unreachable!`, or an `.expect()` under `#[expect(clippy::expect_used, reason)]`
+for a true internal invariant is exceptional: the invariant and proof MUST be local and
+documented, termination must be the intended response to a program defect, and tests MUST cover
+the surrounding boundary. Tests fail their own setup with `.expect(` and a message naming the
+failed premise; `.unwrap()` stays denied in tests too.
+
+The panic strategy stays `unwind` in every profile: §6's cleanup guarantees depend on RAII running
+during unwinding, so `panic = "abort"` is a change to this standard, not a build setting.
 
 ## 8. Filesystems, persistence, and paths
 
@@ -319,6 +351,9 @@ state transitions, winner and loser behaviour, and cleanup after failure or canc
   not occupy an async executor thread without an explicit blocking boundary.
 - Bound queues, fan-out, retries, and spawned work. Backpressure and overload behaviour are part of
   the API, not tuning details.
+- Join every spawned thread's `JoinHandle` and turn a worker panic into a defined outcome. A
+  detached thread whose failure nobody observes is the worker that dies without a report. The
+  same rule applies to task handles when the async scheduler lands.
 - Cancellation MUST leave no published partial result, orphaned child process, leaked worktree, or
   permanently claimed capacity. If an operation is not cancellation-safe, its API MUST make that
   constraint explicit and shield the critical region.
@@ -327,7 +362,10 @@ state transitions, winner and loser behaviour, and cleanup after failure or canc
   require the same proof discipline as any other unsafe code.
 
 Concurrency tests SHOULD force the disputed interleaving with barriers, channels, or controlled
-fakes. A stress loop or a sleep may supplement such a test but cannot be its only oracle.
+fakes. A stress loop or a sleep may supplement such a test but cannot be its only oracle. When the
+v0.2 scheduler lands, interleaving-sensitive protocols SHOULD also run under a model checker such
+as Loom where its modelled primitives reach the code; until a named repository gate exists, that
+is a triggered review requirement, exactly as with Miri in §11.
 
 ## 11. Unsafe and platform-specific code
 
@@ -348,6 +386,10 @@ New unsafe code that Miri can reach SHOULD be exercised under Miri. Sanitizers S
 where a configured platform leg can exercise the affected boundary. Until either tool has a named
 repository gate, its use is a triggered review requirement rather than an automated compliance
 claim.
+
+`clippy::undocumented_unsafe_blocks` is the intended mechanism for item 2. The tree does not yet
+satisfy it everywhere, so per the §2 ratchet it turns on in the commit that closes that gap —
+production and tests alike.
 
 Windows, macOS, and Linux are supported targets. Cross-platform code MUST use platform-neutral
 types and semantics; `cfg` modules isolate genuine OS differences. Do not make Unix path, signal,
@@ -380,6 +422,8 @@ Tests MUST be deterministic and hermetic by default:
 - do not use sleeping as synchronization; signal the state the test needs to observe;
 - do not silently return success when a prerequisite is absent. Either provide the dependency,
   classify the test outside the default suite, or fail with a useful diagnostic;
+- state the reason in the attribute when a test is disabled (`#[ignore = "…"]`); a bare
+  `#[ignore]` is a parking space, not a classification;
 - assert externally meaningful state and side effects, not an implementation copied into the
   test as its own oracle.
 
@@ -407,10 +451,17 @@ Source-based enforcement is code and needs tests of its own:
 - Name each test as the sentence it proves, so a failure reads as the broken claim rather than as
   an implementation detail.
 
+A periodic mutation pass (for example `cargo mutants`) over gates and instruments is the
+systematic form of the injected-control discipline and SHOULD accompany changes to enforcement
+code. It has no named repository gate at adoption.
+
 A regression test MUST fail for the reported defect before the fix and pass after it. Prefer a
 minimal reproducer that names the violated contract over a broad snapshot that happens to change.
 Property tests and state-machine tests SHOULD be considered for parsers, replay, routing,
 serialization, and concurrent protocols where example cases leave a large state space uncovered.
+Parsers over untrusted input — the plan format, agent stdout — SHOULD additionally get fuzz
+coverage once a fuzzing target exists in the repository; until then that is a triggered review
+consideration.
 
 Test code may trade some abstraction for clarity, but it must not weaken production invariants by
 reaching through private state when the public behaviour can be exercised directly.
@@ -422,6 +473,11 @@ New or changed public items MUST have rustdoc that states their contract. Includ
 doctests, but doctests are documentation in this repository: `cargo test --all-targets` excludes
 them. Executable evidence MUST live in a unit, integration, or other run target executed by a
 named CI command; a doctest alone does not satisfy a testing requirement.
+
+Process output is part of the product surface. The `println!` and `eprintln!` macros are denied
+(`clippy::print_stdout`, `print_stderr`) outside the named output modules — the CLI binary and the
+terminal interaction module — each of which carries `#![expect]` stating its contract. Examples
+print what they demonstrate and carry the same expectation.
 
 A change to behaviour, configuration, events, persisted data, CLI output, or a supported platform
 MUST update its user and design documentation in the same pull request. Do not leave a code comment
@@ -463,6 +519,13 @@ transitive cost, binary-size/compile-time effect, MSRV, and target support in pr
   use a feature to select mutually incompatible meanings for the same API.
 - Dependency types SHOULD not leak through a public API unless that dependency is intentionally
   part of the public contract.
+- CI workflow actions MUST be pinned to a full commit SHA with the version named in a comment; a
+  tag is a mutable reference, not a pin.
+- The crate builds without a build script. Introducing one, or adding a proc-macro dependency,
+  names the new compile-time supply-chain surface in this section's assessment.
+- A dependency-policy gate (`cargo deny`: advisories, licences, bans, sources) is the intended
+  mechanism for this section's review duties. Its requirements activate in the same change that
+  introduces its configuration, carrying the positive control Appendix A requires.
 - No dependency may introduce direct model-API or engine HTTP behaviour contrary to `DESIGN.md`
   §4, even behind an optional feature.
 
@@ -484,6 +547,8 @@ Reviewers and authors should be able to answer yes to each applicable item:
 - [ ] Public behaviour, persisted formats, events, and documentation change together.
 - [ ] New abstraction and dependencies have a demonstrated purpose and do not widen capability.
 - [ ] Every cited standard maps to a named mechanism or is explicitly review-only.
+- [ ] Lint-level changes live only in `[lints]`, and new suppressions are `#[expect]` with a reason.
+- [ ] Ambient time, environment, and randomness stay inside the named funnel modules.
 - [ ] All eight §2 baseline commands pass from the repository root.
 
 ## 17. Upstream references
@@ -517,16 +582,16 @@ assistance is not the same as enforcement, and a green gate is not evidence for 
 | §1 authority, precedence, and known conflicts | Pull-request review; `test-docs-consistency.sh` for the document relationships it explicitly enumerates | Review-only unless the named Bash fixture contains the claim |
 | §2 formatting | `cargo fmt --check` / rustfmt | Automated on all formatted Rust inputs; default configuration at adoption |
 | §2 compiler and ordinary lint baseline | `cargo clippy --all-targets --all-features -- -D warnings` | Automated for code compiled by the lint job |
-| §2 effect denylist | `clippy.toml` disallowed methods, types, and macros; denylist resolution census with an injected typo control | Conditional: not present on `master` at adoption; automated only after both the file and its platform Clippy legs and census land |
-| §§3–6 design, types, APIs, ownership, and resources | rustc ownership/type checking and targeted Clippy lints where applicable; tests; pull-request review | Partly automated; semantic and abstraction rules are review-only |
-| §7 errors and panics | type checking, tests, and any specifically enabled panic/error lint | Review-only for `.unwrap()`, `.expect()`, panic policy, context quality, and error taxonomy until targeted lints are enabled |
+| §2 effect denylist | `clippy.toml` disallowed methods, types, and macros; denylist resolution census with an injected typo control | Conditional: `clippy.toml` holds only test-allowance booleans; automated only after denied paths, their platform Clippy legs, and the census land |
+| §§3–6 design, types, APIs, ownership, and resources | rustc ownership/type checking and targeted Clippy lints where applicable; tests; pull-request review | Partly automated; semantic and abstraction rules are review-only, and the ambient-authority funnel is review-enforced until denylist entries pin it |
+| §7 errors and panics | `[lints]`-denied `unwrap_used`, `expect_used`, `panic`, `todo`, `unimplemented`, and `dbg_macro`; type checking; tests | Panic policy automated for code the Clippy leg compiles, with `#[expect]` marking each documented §7 exception; context quality and error taxonomy stay review-only |
 | §§8–9 filesystem, persistence, and processes | behavioural tests; platform CI; effect denylist once active | Partly automated; atomicity, durability, ownership, parsing, and protocol completeness require review |
 | §10 concurrency and async code | rustc `Send`/`Sync` and borrowing checks; deterministic concurrency tests | Partly automated; protocol, cancellation safety, bounds, and ordering require review. `.await`-specific rows are N/A until async production code lands |
-| §11 unsafe and platform code | rustc unsafe checks, `unsafe_op_in_unsafe_fn`, native tests; Miri or sanitizer only when a named leg exists | Partly automated; safety proofs and tool triggers require review |
-| §12 tests, instruments, and censuses | `cargo test --all-targets --all-features`; each instrument's positive control and named test or Bash gate | Execution is automated; sufficiency, independence, complete domains, and oracle quality require review |
-| §13 documentation | `test-docs-consistency.sh` for its enumerated contracts; rustdoc/compiler where a compiled example target exists | Otherwise review-only; doctests are not run by the baseline |
+| §11 unsafe and platform code | rustc unsafe checks, `unsafe_op_in_unsafe_fn` denied via `[lints]`, native tests; Miri or sanitizer only when a named leg exists; `undocumented_unsafe_blocks` pending its ratchet commit | Partly automated; safety proofs and tool triggers require review |
+| §12 tests, instruments, and censuses | `cargo test --all-targets --all-features`; each instrument's positive control and named test or Bash gate | Execution is automated; sufficiency, independence, complete domains, oracle quality, `#[ignore]` reasons, and the periodic mutation pass require review |
+| §13 documentation | `test-docs-consistency.sh` for its enumerated contracts; rustdoc/compiler where a compiled example target exists; `print_stdout`/`print_stderr` deny output outside the named modules | Otherwise review-only; doctests are not run by the baseline |
 | §14 security and trust boundaries | behavioural/security tests; effect denylist once active; pull-request review | Review-only where no named test or denial is cited |
-| §15 dependencies and features | locked MSRV check, all-feature compiler/test gates, and dependency diff review | Compatibility is partly automated; maintenance, licence, security, and capability assessment are review-only |
+| §15 dependencies and features | locked MSRV check, all-feature compiler/test gates, and dependency diff review; SHA-pinned actions (review-verified); `cargo deny` once its configuration lands | Compatibility is partly automated; maintenance, licence, security, and capability assessment are review-only |
 | Contribution, PR, and release policy | `test-pr-policy.sh`, `test-pr-ledger-evidence.sh`, and `test-release-record.sh` | Automated by the lint job |
 
 Application rules:

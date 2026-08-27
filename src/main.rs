@@ -3,6 +3,12 @@
 // see LICENSE, or <https://www.gnu.org/licenses/>. Commercial licences are
 // available for use the AGPL does not permit — see README.md.
 
+#![expect(
+    clippy::print_stdout,
+    clippy::print_stderr,
+    reason = "the CLI binary is the §13 output surface: stdout carries results, stderr carries diagnostics"
+)]
+
 use std::io::{BufRead, IsTerminal, Read};
 use std::path::PathBuf;
 use std::process::ExitCode;

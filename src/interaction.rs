@@ -13,6 +13,11 @@
 //! notifier, a dashboard, or a future UI reads: the engine stays headless and
 //! panes are thin clients over its record.
 
+#![expect(
+    clippy::print_stderr,
+    reason = "terminal question delivery and the answer prompt are this module's §13 output surface"
+)]
+
 use std::fmt;
 use std::io::{IsTerminal, Write};
 use std::path::{Path, PathBuf};

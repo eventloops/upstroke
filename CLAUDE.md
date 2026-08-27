@@ -92,7 +92,9 @@ needs `jq`.
 Read and follow `CODING_STANDARDS.md` before changing Rust. In particular:
 
 - **Edition 2024**, MSRV 1.85.
-- **No panicking `.unwrap()` or `.expect()` outside tests.**
+- **The §7 panic policy is lint-enforced.** `.unwrap()` is denied everywhere — tests included —
+  and `.expect()`/`panic!` are denied outside tests, via Cargo.toml's `[lints]`;
+  `#[expect(..., reason)]` marks the few documented invariant sites.
 - **`anyhow` only at the binary edge.** Libraries return `thiserror` types.
 - **All paths through `std::path`.** Windows is a first-class target — CI runs
   the full test and MSRV matrix on ubuntu, macos and windows.
