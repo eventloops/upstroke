@@ -2239,8 +2239,16 @@ mod tests {
         // `promotion_refuses_a_commit_on_the_base_whose_tree_was_never_judged`
         // builds its `PromotingCandidate` by hand, so it proves the *check* and
         // not the *value it checks against*: the fold retaining `base_sha` in
-        // that field left it green. This is the recovered value, which is the
-        // only one production ever uses.
+        // that field left it green.
+        //
+        // **This is the resumed value, and it is the one that needed a witness.**
+        // Production builds a `PromotingCandidate` in two places: `promote`
+        // returns one carrying `judged.tree_sha` — the same value it has just
+        // written into the event, so the comparison there cannot fail and
+        // witnesses nothing — and `recovery_for` builds one from the fold,
+        // where the number has been through a serialization, a replay and an
+        // `apply`. Only the second can be wrong, and only the second is
+        // asserted here.
         assert_eq!(
             promoting.tree, fixture.tree_sha,
             "the recovered promotion carries {} where `candidate_prepared` recorded \

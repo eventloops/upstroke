@@ -2375,6 +2375,40 @@ had not reached.
 That is the same shape as §22c's rule one layer up: the instrument was pointed at the
 mechanism instead of at the thing the mechanism judges.
 
+### Two more of the same class, both found before a reviewer saw them
+
+**The base-mismatch guard refused correct diffs.** `502970d` compared the pull request's
+file list against the diff's `+++ b/` headers. A deletion writes `+++ /dev/null`, so a
+deleted file never appears there and the guard would have refused a correct diff for any
+pull request that removes one:
+
+```
+--- name-only ---     --- old rule (+++ b/) ---   --- new rule (diff --git b-side) ---
+added.txt             added.txt                   added.txt
+gone.txt                                          gone.txt
+keep.txt              keep.txt                    keep.txt
+```
+
+It now reads the b-side of each `diff --git a/X b/Y` header, which `git diff --name-only`
+agrees with for modify, delete **and** rename. Verified both directions: exact match on
+this pull request's 66 files, and it still refuses the wrong-base diff at 182.
+
+The guard had been tested by pointing it at the bad diff and watching it refuse. **That
+proves it rejects and says nothing about whether it accepts what it should** — §22c's rule
+in the tool that enforces §22c.
+
+**And a claim written in this round's own repair.** The comment explaining the
+fold-value assertion said the recovered `PromotingCandidate` "is the only one production
+ever uses". Production builds two: `promote` returns one carrying `judged.tree_sha`, and
+`recovery_for` builds one from the fold. The distinction that matters is not which is used
+but which can be *wrong* — `promote`'s tree is the value it has just written into the
+event, so the comparison there is a tautology, while the fold's has been through a
+serialization, a replay and an `apply`. The comment now says that instead.
+
+Found by grepping this round's own added prose for verification-language — "the one",
+"only", "every", "never" — and checking each against the tree. That is the cheapest
+instrument for this class and it belongs in the repair loop, not in the review.
+
 
 ## 22a. A driver that fails silently on a diff this size
 
