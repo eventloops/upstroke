@@ -364,6 +364,29 @@ Same salvage rule. These rows belong to the sweep slice that follows the pass.
 | A default unit test writes its machine-varying evidence artifact into the source checkout. — The selected path is beneath `CARGO_MANIFEST_DIR`, and the same test later writes the generated histogram there. The test is neither isolated in a temporary directory nor classified outside the default suite, so it mutates shared workspace state and can collide with concurrent runs. | `src/workspace_manager.rs` | `e90f81cd0f7a09aae013bc30a1305364f3ca4724ed1a9b1367d2ecf405057b7c` | §12 testing strategy | standards review of 3e5212d / T4-workspace |
 | The central Git runner has no timeout, cancellation, or descendant-process cleanup protocol. — `Command::output` blocks until Git and its inherited descendants close their output handles. This helper supplies no deadline or cancellation mechanism and cannot terminate or reap a descendant tree if Git hangs. | `src/workspace_manager.rs` | `fcfe4c903b4def9f858d22e9794ec79f0de3de68a010d452f7b7ec82e7ae604c` | §9 processes and external tools | standards review of 3e5212d / T4-workspace |
 
+### The hash gate can reject — measured, not assumed
+
+**0 rejected across 321 rows is only evidence if the gate can reject.** A gate that
+rejects nothing is indistinguishable from a gate that cannot, so both of its rejection
+paths were exercised against real filed findings, not synthetic ones. The target in
+each case was the same row — `L1-fold`, `src/topology/fold.rs`, region sha256
+`260e12fc1a63d79b39089480fc1ec10954e4f264b677eedbc1cc5cdcfb4b1062` — and the gate was
+re-run over a copy of the lens output with the tree untouched.
+
+| control | mutation | result |
+|---|---|---|
+| quote no longer matches the tree | **one** character flipped inside the quoted region (`'e'` → `'Z'`) | 320 accepted, **1** rejected: *"quoted region does not appear in the file byte-for-byte"* |
+| anchor is not unique | region replaced with `    }`, which occurs **1451** times in that file | 320 accepted, **1** rejected: *"quoted region appears 1451 times; not a unique anchor"* |
+
+In the first control the dropped row was verified to be **exactly** the target by
+sha256, with zero rows appearing that were not in the baseline — so the gate rejected
+the corrupted row and nothing else.
+
+What this does and does not establish: the gate detects a quote that has drifted from
+the tree and a quote too generic to anchor. It says nothing about whether a lens's
+*judgement* is right, and nothing about what the lenses did not look at — see the
+triage record for that, which is the larger limit on what these rows are worth.
+
 ### What this review covered, and what it rejected
 
 Fourteen lenses over `src/`, every `.rs` file assigned to exactly one lens.
