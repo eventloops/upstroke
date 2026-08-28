@@ -72,10 +72,10 @@ artifacts (§15); records promoted here are the durable subset.
   deviation classes charter what the freeze admits; PR7's `fold.rs` footprint is
   blessed as a disclosed deviation; the pass over the layer runs before PR8.
 - [2026-08-25 — `CommandSpec.program` stays `String`](2026-08-25-commandspec-program-stays-string.md):
-  closes `PR4-PROGRAM-PATH-NOT-UNICODE` as not reproducible in production. The field
-  holds a bare CLI name and never a path, so `DESIGN.md:222` is unchanged and §8 does
-  not govern it. An earlier revision of this record decided the opposite and is
-  withdrawn; `CODING_STANDARDS.md` §1's known-conflict block retires on its own motion.
+  closes `PR4-PROGRAM-PATH-NOT-UNICODE` as not reproducible in production. Every production
+  route puts a bare CLI name in the field, so `DESIGN.md:222` is unchanged and the W4 widening
+  is withdrawn; the boundary stays path-capable, and `CODING_STANDARDS.md` §1's known-conflict
+  block retires on its own motion.
 - [2026-08-25 — integration merges happen at attested checkpoints](2026-08-25-checkpoint-merges.md):
   `codex/parallelism-design` merges to `master` at the G2 checkpoint and again at
   v0.2 completion, rather than once at the end.

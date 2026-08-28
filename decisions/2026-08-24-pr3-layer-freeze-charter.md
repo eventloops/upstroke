@@ -183,8 +183,7 @@ landed after the 2026-08-24 adjudication and carries its own per-instance Class 
   `PR5-MACOS-CLIPPY-NEVER-RUN`, which belongs to the slice that next opens that file.
 - Packet errata are owner-side and enumerated in the proposal's "Owner inputs": the
   effect-site variant, the adjacency row, the region-validation contract, and
-  `matches_override`'s field list. **The `CommandSpec` shape is no longer among them.** An
-  earlier revision listed it, on the expectation that the pass would widen the field; the
-  decision that would have widened it is withdrawn and the shape is unchanged, so no
+  `matches_override`'s field list. **The `CommandSpec` shape is no longer among them.** The
+  decision that would have widened the field is withdrawn and the shape is unchanged, so no
   erratum is owed and ordering one here would send an implementer to widen a field this
   charter's own pass no longer touches.

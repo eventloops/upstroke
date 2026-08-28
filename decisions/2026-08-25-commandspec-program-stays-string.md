@@ -3,10 +3,9 @@
 **Verdict: no change.** `DESIGN.md:222` keeps `program: String`, and
 `PR4-PROGRAM-PATH-NOT-UNICODE` is **closed as not reproducible in production**.
 
-An earlier revision of this record decided the opposite — that `program` widens to
-`OsString`, scheduled to a workstream of the G2 pass. That verdict is **withdrawn**. It
-rested on a premise about production that the tree does not support, and the premise was
-checked only after two attempts to re-ground it had each been refuted in turn.
+The repair the standing ledger row proposed — widening `program` to `OsString`, scheduled to
+a workstream of the G2 pass — is **withdrawn**. It rested on a premise about production that
+the tree does not support.
 
 ## The premise that failed
 
@@ -34,13 +33,21 @@ So a CLI installed under a non-UTF-8 directory is found and executed **today**. 
 fires only for an `Invocation` carrying a non-Unicode path, and only a test can construct
 one.
 
-## What the conflict turned out to be
+## What the conflict amounts to on the production route
 
 `CODING_STANDARDS.md` §1 records a conflict between two live passages: `DESIGN.md:222`
-freezing `program: String`, and §8 requiring OS-native types for paths. **They do not
-conflict, because the field does not hold a path.** It holds a bare CLI name, which §8 does
-not govern and which a `String` represents exactly. The apparent conflict came from reading
-the field as path-shaped; the runner's own comment had already said otherwise.
+freezing `program: String`, and §8 requiring OS-native types for paths. **On every route
+production takes, the field carries a bare CLI name** — which §8 does not govern and which a
+`String` represents exactly — so the conflict has no reachable instance today.
+
+**That is not a finding that the field cannot hold a path, and §1's retirement must not say
+it is.** The boundary is path-capable by contract: `src/runner/host.rs:828` turns on whether
+`program` is *"a name for this boundary to resolve, rather than a location to use as given"*
+and hands a location to `Command` byte for byte, and the retained test at
+`src/agent/bin.rs:496` asserts `/usr/local/bin/claude` in `fine.program`. §8 therefore
+governs this field the moment a path-valued input exists. What closes the finding is that no
+production constructor supplies one; making the name-only reading a property of the *type*
+would be a `DESIGN.md` change, and `DESIGN.md:222` says nothing of the kind.
 
 ## Consequences
 
@@ -51,11 +58,12 @@ the field as path-shaped; the runner's own comment had already said otherwise.
 - **That test stays, and its subject is now correctly described.** It exercises a state
   production cannot construct, which is what a defensive refusal is for: if a path-valued
   constructor is ever added, the boundary fails closed rather than spawning a lossily
-  converted path that names something else. An earlier revision ordered it deleted; deleting
-  it would remove the guard that makes adding such a constructor safe.
+  converted path that names something else. Deleting it would remove the guard that makes
+  adding such a constructor safe.
 - **§1's "Known conflicts at adoption" block is owed a retirement**, no longer as cargo on a
   spec edit that is not happening. It retires on its own motion, by its own pull request to
-  `master`, recording that the conflict resolved by there being none.
+  `master`, recording that the conflict has no reachable instance on the production route and
+  that the boundary's path-capable contract is what a future path-valued input would meet.
 
   **That block is now inaccurate, where a ruling of 2026-08-28 found it merely incomplete.**
   It says the conflict "is unresolved", names `PR4-PROGRAM-PATH-NOT-UNICODE` "the open owner
@@ -91,7 +99,7 @@ inside the image cannot be resolved on the coordinator.
 `runner/mod.rs`'s "a `String` was always wide enough"; and `runner/host.rs` splitting `PATH`
 as an `OsStr`.
 
-**Assumed**: nothing. The earlier verdict's central claim was assumed and is what failed.
+**Assumed**: nothing. The withdrawn repair's central claim was assumed and is what failed.
 
 **Not measured, and deliberately**: whether any future adapter will want a path-valued
 program. If one does, it arrives with its own decision, and the refusal this record
