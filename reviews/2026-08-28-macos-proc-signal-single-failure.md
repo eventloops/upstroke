@@ -178,13 +178,22 @@ load-bearing**.
 | `PR7-MACOS-PROCESS-GROUP-FLAKE` (§2) | `runner::host::tests::every_role_reaches_the_containment_points_of_this_platform` | macOS only | 2 in 14 completed macOS jobs |
 | PR #36 | `workspace::tests::hard_killed_snapshot_owner_is_reclaimed_before_resume` | Linux 1 in 80,000; Windows 1 in 44 | measured |
 
-This one sits at the **intersection of the first two**: it is in the same module as
-§12's and turns on the same subject — a *suspended* process that must be woken or
-reaped — and it is macOS-only like `PR7-MACOS-PROCESS-GROUP-FLAKE`. Unlike either, its
-corrected mechanism points at the **code under test** rather than at the environment. That is the
-observation worth carrying: `agent::proc`'s supervision code has now produced two
-distinct suspended-process timing failures, and macOS has produced two distinct
-process failures. Neither pattern is visible from one record alone.
+This one sits **adjacent to the first two, and no closer**: it is in the same module as
+§12's and turns on the same subject — a *suspended* process that must be woken or reaped —
+and it is macOS-only like `PR7-MACOS-PROCESS-GROUP-FLAKE`.
+
+**What an earlier revision said here is withdrawn.** It claimed the corrected mechanism
+points at the code under test rather than at the environment, and that `agent::proc`'s
+supervision code has *produced* these failures. **Neither follows**, and both contradict
+the mechanism section above: the atomic that selects the exit path has several writers, and
+an environmentally induced reaper-cleanup failure writes SIGTERM to it with no signal
+handled at all. Pointing at the code under test is a cause, and this record does not have
+one.
+
+What is carried instead is only the adjacency: the same module and the same platform have
+now produced more than one suspended-process timing failure, which is a reason to look at
+them together and not a claim about what they share. That pattern is not visible from a
+single record, which is why each is written down.
 
 ## What is owed, and deliberately not done now
 
