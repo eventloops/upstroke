@@ -1,13 +1,22 @@
 # 2026-08-25 — `CommandSpec.program` widens to `OsString`
 
-**Verdict.** `CommandSpec.program` widens from `String` to `OsString` at the
-G2 pass (workstream W4 of
-`proposals/2026-08-24-v0.2-g2-pr3-layer-pass.md`), and `DESIGN.md:222` gets
-the compressed edit citing this record when that lands. This resolves
-`PR4-PROGRAM-PATH-NOT-UNICODE` — open since 2026-08-20 as one of the two
-accepted deviations the owner ruling of that date carried to G2 — and retires
-the "Known conflicts at adoption" block that `CODING_STANDARDS.md` §1 has
-carried since `6772b2a`, which exists solely to name this conflict.
+**Verdict — scheduled, not yet in force.** This record fixes the *direction*:
+when workstream W4 of `proposals/2026-08-24-v0.2-g2-pr3-layer-pass.md` opens
+`CommandSpec`, `program` widens from `String` to `OsString`. It does **not** move
+the spec today. `DESIGN.md:222` still reads `String` and still governs, and
+`CODING_STANDARDS.md` §1's "Known conflicts at adoption" block — carried since
+`6772b2a` — remains accurate and stays. Both change in one commit at W4, which
+cites this record.
+
+**Why this record does not carry a `DESIGN.md` edit.** `decisions/README.md`
+requires the compressed edit at the time of the decision for a record whose
+outcome changes the spec. That rule is satisfied by not claiming an outcome the
+spec has not taken: `PR4-PROGRAM-PATH-NOT-UNICODE` stays **open** until W4 lands,
+and this record is its scheduled venue and settled direction, not its closure. A
+W4 implementer therefore has one authority, `DESIGN.md`, and one instruction,
+this record's direction — never two live documents disagreeing about the type.
+
+This addresses
 
 The scope is deliberately the one measured field. `args: Vec<String>` and the
 `env` pairs are audited in W4 under the same standard (§8) and widened only
