@@ -1329,8 +1329,13 @@ fn the_workflow_that_runs_these_tests_installs_the_compiler_they_need() {
     );
 }
 
-/// Every platform that needs the effect-denial gate has one, and the merge
-/// aggregate requires each.
+/// `ci.yml` lexically names a Clippy job for each of three platforms, and
+/// `merge-gate` lists each one.
+///
+/// **This is a substring check over one text file, not a proof of coverage.**
+/// The predicates it holds are enumerated below; the parse that would close its
+/// escapes is specified as `BRIDGE-CI-SHAPE-TEST-IS-A-SUBSTRING-ORACLE` in
+/// `reviews/FINDINGS.md` and needs a YAML dependency this crate does not have.
 ///
 /// It pins three separable things per platform, because a gate that can be
 /// dropped from the merge aggregate is a gate that can fail without blocking
@@ -1357,10 +1362,21 @@ fn the_workflow_that_runs_these_tests_installs_the_compiler_they_need() {
 /// tuples. It needs a YAML dependency this crate does not have, which is an
 /// owner decision rather than a patch.
 ///
-/// What it does hold: a job named per platform, on that platform's runner,
-/// present in `needs`, present in the deciding loop, and free of a literal
-/// `if: false`. That is a shape check, and it earns its place only by being
-/// honest about being one.
+/// **What it does hold, stated as the substring predicates it actually is.**
+/// For each of three hard-coded runners: some job block contains both the
+/// literal gate command and the literal runner string; `merge-gate`'s `needs:`
+/// line contains that job's name as a substring; `merge-gate`'s `env:` mapping
+/// contains the literal `<JOB>_RESULT: ${{ needs.<job>.result }}`; the
+/// whitespace-normalised job block does not contain `if: false`; and the
+/// `for gate in` line contains the upper-cased job name as a
+/// whitespace-delimited word. Every one of those is `contains` over text.
+/// A `for gate in LINT LINT_WINDOWS MSRV TEST; do : LINT_MACOS` satisfies the
+/// last while omitting the gate from the loop, and that is the shape of every
+/// escape still open.
+///
+/// The name says `lexically` for that reason: it is what this test proves, and
+/// a name that promised platform coverage would be promising the parse it does
+/// not perform.
 ///
 /// **Why this is a loop and not three tests.** `PR5D-MSVC-CLIPPY-NEVER-RUN`
 /// and `PR5-MACOS-CLIPPY-NEVER-RUN` are the same defect on two platforms, found
@@ -1368,7 +1384,7 @@ fn the_workflow_that_runs_these_tests_installs_the_compiler_they_need() {
 /// an instance rather than a class. A per-platform table makes the next
 /// platform's omission a failure here rather than a third finding.
 #[test]
-fn every_platform_that_needs_the_effect_denial_gate_has_one_the_aggregate_requires() {
+fn ci_yml_lexically_names_a_clippy_job_per_platform_and_the_aggregate_lists_it() {
     const GATE: &str = "cargo clippy --all-targets --all-features -- -D warnings";
     // The runner, never the job name: what discharges the clause is the platform
     // that compiles the `#[cfg(...)]` bodies, and a name is a label.
@@ -1568,9 +1584,14 @@ fn platform_cfgs_in_production() -> BTreeSet<String> {
         // occurrence.
         //
         // So the name comes from raw text and the POSITION is gated on the
-        // blanked text still carrying `cfg(` at the same offset. A comment
-        // blanks to spaces and fails that gate; an attribute keeps its
-        // structure and passes.
+        // blanked text still carrying `target_os =` at the same offset -- the
+        // KEY, not `cfg(`. That gate is LEXICAL and nothing more: **any**
+        // code-position `target_os =` passes it, including `let target_os =
+        // "android";`, which this census would then report as a platform
+        // demanding its own Clippy runner. Confirming the occurrence sits in
+        // cfg syntax needs the parse that `BRIDGE-CI-SHAPE-TEST-IS-A-SUBSTRING-
+        // ORACLE` specifies. A comment blanks to spaces and fails the gate;
+        // code of any kind keeps its structure and passes.
         let text = &source;
         let blanked = blank_comments_and_strings(&source);
 

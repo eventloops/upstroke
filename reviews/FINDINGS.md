@@ -172,7 +172,7 @@ direct question about scope and answered it as a disposition, which is now settl
 claim about the PR3 round, not about PR4's second confirmation, whose two findings —
 `PR4-CONF-003` and `PR4-CONF-004` — were both accepted and repaired in round 5.)*
 
-### 2026-08-28 — `BRIDGE-CI-SHAPE-TEST-IS-A-SUBSTRING-ORACLE`, open, owner decision
+### 2026-08-28 — `BRIDGE-CI-SHAPE-TEST-IS-A-SUBSTRING-ORACLE`, **deferred**
 
 **The finding, and the ruling it overturned.** Six review rounds of PR #34
 examined the test that pins the platform Clippy legs into `merge-gate`.
@@ -211,14 +211,30 @@ parsed cfg predicates against the finite CI target tuples rather than
 collecting names, with a permanent injected control fixture as
 `CODING_STANDARDS.md` §12 requires of a census.
 
-**Why it is not done here, and what the owner must decide.** The repair needs a
-YAML parser. This crate has no YAML dependency and no `[dev-dependencies]`
-section at all, so it is a **dependency decision**, not a patch — and a project
-whose thesis includes a small trusted surface should take that deliberately.
-The owner's options are to authorise the dependency and the structural repair;
-to merge with this row as the recorded disposition and schedule the repair; or
-to delete the test on the ground that an oracle claiming more than it enforces
-is worse than none, leaving CI as the only claim.
+**Disposition: DEFERRED, and this row is that disposition rather than a menu.**
+The repair needs a YAML parser; this crate has no YAML dependency and no
+`[dev-dependencies]` section at all, so it cannot be made without adding one.
+Adding a dependency is a judgement about what the crate should carry, and
+`DESIGN.md` does not settle it — an earlier draft of this row asserted a
+"small trusted surface" thesis and `grep -ci 'trusted surface' DESIGN.md`
+returns 0, so that was an owner tradeoff dressed as an established premise. It
+is withdrawn.
+
+**Owner:** the slice that next adds a dependency to `Cargo.toml`, or the G2
+pass, whichever comes first. **Condition on the deferral:** the test must not
+grow further substring predicates in the meantime — the escapes are enumerated
+above and in its doc, and adding heuristics to chase them is what six review
+rounds established does not work here.
+
+**Why deferring is defensible rather than convenient.** The oracle guards
+wiring that is *correct at this head and proven so by execution*: `lint (macos)`
+ran green on all three platforms, and `lint (windows)` has been green since it
+landed. A weak regression oracle risks a *future* silent change, not a present
+defect, and the row names exactly what that change would look like. The
+alternative dispositions were considered and rejected: `accepted-risk` overstates
+the acceptance, because the repair is specified and intended rather than waived;
+and deleting the test would regress `PR5D-MSVC-CLIPPY-NEVER-RUN`, whose Windows
+guard this test contains.
 
 **What is not in doubt.** `lint (macos)` exists, is wired into the aggregate,
 and **passed on its first run in this repository's history** — the tree is
