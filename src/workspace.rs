@@ -2948,63 +2948,516 @@ mod tests {
         );
     }
 
+    /// The line prefix the snapshot owner announces its snapshot's name
+    /// under, so the waiting parent can tell it from libtest's own output.
+    const SNAPSHOT_NAME_ANNOUNCEMENT: &str = "snapshot-name: ";
+
+    /// How long the parent waits for that announcement before terminating the
+    /// owner. Generous on purpose: it bounds a wedged owner rather than timing
+    /// a healthy one, which announces in milliseconds. The readiness file this
+    /// replaced used its 15s deadline as the signal itself, which is why that
+    /// deadline could expire on a loaded runner; nothing is decided here except
+    /// that an owner which has said nothing at all is not going to.
+    const ANNOUNCEMENT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
+
+    /// How long termination has to empty the tree. Every write handle on the
+    /// owner's stdout closes as its holders die, so end-of-output is immediate
+    /// in every case except the one this bounds: a descendant that outlived the
+    /// kill and is still holding the pipe.
+    const SETTLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+    /// A uniquely named directory that removes itself when the guard drops.
+    ///
+    /// The name carries this process's id and a ULID, so two test processes
+    /// running concurrently — routine on the build box, where several worktrees
+    /// build at once — can never delete each other's live fixtures. Anything
+    /// hostile a test needs in a path goes *inside* this root, so the recursive
+    /// removal below can only ever reach what this test created.
+    struct OwnedTempDir {
+        root: PathBuf,
+    }
+
+    impl OwnedTempDir {
+        fn new(tag: &str) -> Self {
+            let root = env::temp_dir().join(format!(
+                "upstroke-{tag}-{}-{}",
+                std::process::id(),
+                crate::ulid::ulid()
+            ));
+            fs::create_dir_all(&root).expect("create the owned temp root");
+            Self { root }
+        }
+
+        fn path(&self) -> &Path {
+            &self.root
+        }
+    }
+
+    impl Drop for OwnedTempDir {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.root);
+        }
+    }
+
+    /// A helper subprocess and the platform primitive that owns its ordinary
+    /// descendants, so terminating it reaches a wedged `git` underneath rather
+    /// than only the helper itself.
+    ///
+    /// This is the test-scoped sibling of `agent::proc`'s `ProcessTree`. That
+    /// one delegates Unix group ownership to the engine's process-global signal
+    /// supervisor, which a test must not install; this one owns its group
+    /// directly and reuses the same Windows Job Object, rather than growing a
+    /// second implementation of the same unsafe primitive.
+    struct OwnedProcessTree {
+        child: std::process::Child,
+        #[cfg(windows)]
+        job: crate::agent::proc::windows_job::Job,
+        settled: bool,
+    }
+
+    impl OwnedProcessTree {
+        fn spawn(command: &mut Command) -> std::io::Result<Self> {
+            #[cfg(windows)]
+            {
+                let (child, job) =
+                    crate::agent::proc::windows_job::spawn_suspended_in_job(command)?;
+                Ok(Self {
+                    child,
+                    job,
+                    settled: false,
+                })
+            }
+            #[cfg(not(windows))]
+            {
+                use std::os::unix::process::CommandExt;
+
+                // Its own group, so the kill in `terminate` addresses every
+                // descendant rather than the direct child alone — and so that
+                // kill can never reach the test runner itself.
+                command.process_group(0);
+                command.spawn().map(|child| Self {
+                    child,
+                    settled: false,
+                })
+            }
+        }
+
+        /// Kill the whole tree and reap the direct child.
+        ///
+        /// Errors propagate: a tree that will not die is a test failure, not
+        /// something to shrug at, because whatever survived still holds locks
+        /// and open handles in a temporary directory about to be removed.
+        fn terminate(&mut self) -> Result<(), String> {
+            if self.settled {
+                return Ok(());
+            }
+            self.settled = true;
+            #[cfg(windows)]
+            self.job
+                .terminate_and_wait()
+                .map_err(|error| format!("terminating the helper's job object: {error}"))?;
+            #[cfg(not(windows))]
+            {
+                let group = i32::try_from(self.child.id())
+                    .map_err(|_| "the helper's pid does not fit a pid_t".to_owned())?;
+                // SAFETY: a negative pid addresses the process group whose id
+                // is `group`, and `process_group(0)` at spawn made that group
+                // this child's own. The kill precedes the reap below, so the
+                // group cannot have been recycled under another process.
+                if unsafe { libc::kill(-group, libc::SIGKILL) } != 0 {
+                    let error = std::io::Error::last_os_error();
+                    // An empty group is the outcome we wanted, not a failure.
+                    if error.raw_os_error() != Some(libc::ESRCH) {
+                        return Err(format!("killing the helper's process group: {error}"));
+                    }
+                }
+            }
+            self.child
+                .wait()
+                .map_err(|error| format!("reaping the helper: {error}"))?;
+            Ok(())
+        }
+    }
+
+    impl Drop for OwnedProcessTree {
+        fn drop(&mut self) {
+            // The fail-safe for an early return or a panic between spawn and
+            // settlement. The explicit `terminate` above is where a failure is
+            // reported; by the time a guard drops there is no one to report to.
+            let _ = self.terminate();
+        }
+    }
+
+    impl std::ops::Deref for OwnedProcessTree {
+        type Target = std::process::Child;
+
+        fn deref(&self) -> &Self::Target {
+            &self.child
+        }
+    }
+
+    impl std::ops::DerefMut for OwnedProcessTree {
+        fn deref_mut(&mut self) -> &mut Self::Target {
+            &mut self.child
+        }
+    }
+
+    /// Reads `announcements` until a line carries `marker`, and returns the
+    /// rest of that line.
+    ///
+    /// A line counts only once its newline has arrived. That is the whole
+    /// point: the signal a waiter blocks on has to mean the state it is about
+    /// to assert. A readiness *file* cannot carry that meaning — `fs::write`
+    /// is a `create` followed by a write, so the path exists, and reads as
+    /// empty, before its bytes land. A waiter that keyed on existence read an
+    /// empty path out of it and then asserted that the empty path was a
+    /// materialised snapshot.
+    ///
+    /// An unterminated final line is that same hazard in the shape a pipe can
+    /// still take — a writer that died mid-announcement — so it fails rather
+    /// than yielding a truncated value.
+    fn await_announcement(
+        announcements: &mut impl std::io::BufRead,
+        marker: &str,
+    ) -> Result<String, String> {
+        let mut line = String::new();
+        loop {
+            line.clear();
+            let read = announcements
+                .read_line(&mut line)
+                .map_err(|error| format!("reading the helper's output: {error}"))?;
+            if read == 0 {
+                return Err("the helper ended before it announced anything".to_owned());
+            }
+            let Some(body) = line.strip_suffix('\n') else {
+                return Err(format!("the helper ended mid-announcement: {line:?}"));
+            };
+            if let Some(value) = body.trim_end_matches('\r').strip_prefix(marker) {
+                return Ok(value.to_owned());
+            }
+        }
+    }
+
+    /// Waits for `owner` to announce `marker`, terminating its whole tree if it
+    /// has not within `within`.
+    ///
+    /// The complete line stays the readiness signal; the watchdog bounds only
+    /// how long an owner that never finishes one can hold the suite. An owner
+    /// that fails exits and closes the pipe, which is the fast path — this is
+    /// for the one that stays alive and silent, with a wedged `git` under it.
+    /// `read_line` would block on that for as long as CI allowed.
+    ///
+    /// Terminating the tree closes every write handle on the owner's stdout, so
+    /// the reader then sees end-of-output and returns, and the thread is joined
+    /// like any other. The one case that cannot be joined is a descendant that
+    /// outlived the kill and still holds the pipe: the reader is genuinely
+    /// stuck, so that is reported as the failure it is rather than waited on.
+    fn announced_within(
+        owner: &mut OwnedProcessTree,
+        marker: &'static str,
+        within: std::time::Duration,
+    ) -> Result<String, String> {
+        let Some(stdout) = owner.stdout.take() else {
+            return Err("the owner's stdout has already been taken".to_owned());
+        };
+        let (announced, waiting) = std::sync::mpsc::channel();
+        let reader = std::thread::spawn(move || {
+            let mut lines = std::io::BufReader::new(stdout);
+            let _ = announced.send(await_announcement(&mut lines, marker));
+        });
+        let join = |reader: std::thread::JoinHandle<()>| {
+            reader
+                .join()
+                .map_err(|_| "the announcement reader panicked".to_owned())
+        };
+
+        let failure = match waiting.recv_timeout(within) {
+            Ok(Ok(value)) => {
+                join(reader)?;
+                return Ok(value);
+            }
+            Ok(Err(failure)) => failure,
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                format!("no announcement within {within:?}")
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                "the reader thread ended without reporting".to_owned()
+            }
+        };
+        owner.terminate().map_err(|cleanup| {
+            format!("{failure}; and terminating the helper's tree failed: {cleanup}")
+        })?;
+        match waiting.recv_timeout(SETTLE_TIMEOUT) {
+            Ok(_) | Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {}
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                return Err(format!(
+                    "{failure}; and a descendant outlived the kill, still holding the pipe"
+                ));
+            }
+        }
+        join(reader)?;
+        Err(failure)
+    }
+
     #[test]
-    #[ignore = "subprocess helper"]
+    fn an_announcement_is_found_past_the_harness_own_output() {
+        let mut stream = std::io::Cursor::new(
+            "\nrunning 1 test\nsnapshot-name: upstroke-gates-7-01JABC\ntest result: ok\n",
+        );
+        assert_eq!(
+            await_announcement(&mut stream, SNAPSHOT_NAME_ANNOUNCEMENT).expect("announcement"),
+            "upstroke-gates-7-01JABC"
+        );
+    }
+
+    #[test]
+    fn a_carriage_return_does_not_become_part_of_the_announced_path() {
+        let mut stream = std::io::Cursor::new("snapshot-name: upstroke-gates-7-01JABC\r\n");
+        assert_eq!(
+            await_announcement(&mut stream, SNAPSHOT_NAME_ANNOUNCEMENT).expect("announcement"),
+            "upstroke-gates-7-01JABC"
+        );
+    }
+
+    #[test]
+    fn an_announcement_without_its_newline_is_not_an_announcement() {
+        // The defect this handshake replaced, in the shape a pipe can take: a
+        // partial record must not read as a whole one. Under the readiness file
+        // the partial record was an empty path; here it is a line the writer
+        // never finished.
+        let mut torn = std::io::Cursor::new("snapshot-name: upstroke-gates-7-01JAB");
+        let error = await_announcement(&mut torn, SNAPSHOT_NAME_ANNOUNCEMENT)
+            .expect_err("an unfinished announcement is not an announcement");
+        assert!(error.contains("mid-announcement"), "{error}");
+    }
+
+    #[test]
+    fn a_helper_that_ends_without_announcing_fails_rather_than_waiting() {
+        let mut noise = std::io::Cursor::new("\nrunning 1 test\ntest result: FAILED\n");
+        let error = await_announcement(&mut noise, SNAPSHOT_NAME_ANNOUNCEMENT)
+            .expect_err("end of output is not readiness");
+        assert!(error.contains("ended before it announced"), "{error}");
+    }
+
+    /// The subprocess half of `hard_killed_snapshot_owner_is_reclaimed_before_resume`:
+    /// materialises a durable snapshot, names it, and holds it open until the
+    /// parent kills it.
+    #[test]
+    #[ignore = "spawned as a subprocess by hard_killed_snapshot_owner_is_reclaimed_before_resume"]
     fn gate_snapshot_owner_helper() {
         if env::var_os("UPSTROKE_SNAPSHOT_OWNER").is_none() {
             return;
         }
         let repo = PathBuf::from(env::var_os("UPSTROKE_REPO").expect("repo path"));
         let store = PathBuf::from(env::var_os("UPSTROKE_SNAPSHOT_STORE").expect("store path"));
-        let ready = PathBuf::from(env::var_os("UPSTROKE_READY").expect("ready path"));
         let workspace = Workspace::open(&repo).expect("open helper workspace");
         let parent = workspace.head_sha_full().expect("snapshot parent");
         let tree = workspace.staged_tree_oid().expect("snapshot tree");
         let snapshot = workspace
             .gate_snapshot_for_candidate_in_store(&parent, &tree, &store)
             .expect("create durable snapshot");
-        fs::write(
-            &ready,
-            snapshot.workspace().root().to_string_lossy().as_bytes(),
-        )
-        .expect("publish snapshot path");
+        // Only the snapshot's own generated name crosses the wire. It is
+        // `upstroke-gates-<pid>-<ulid>`, which `valid_snapshot_name` holds to
+        // ASCII, so no ancestor of the store is ever encoded as a line — an
+        // ancestor may carry a newline, which would truncate the record, or
+        // bytes that are not text at all, which `Path::display` would mangle.
+        let name = snapshot
+            .workspace()
+            .root()
+            .file_name()
+            .and_then(|name| name.to_str())
+            .expect("a generated snapshot name is ASCII");
+        // Announced only now, and only as a whole line, so the parent cannot
+        // observe a readiness that predates the snapshot it names.
+        println!("{SNAPSHOT_NAME_ANNOUNCEMENT}{name}");
+        std::io::stdout()
+            .flush()
+            .expect("publish the snapshot name");
         std::thread::sleep(std::time::Duration::from_secs(30));
         drop(snapshot);
     }
 
+    /// The subprocess half of
+    /// `an_owner_that_never_finishes_its_line_is_killed_not_waited_on`: begins
+    /// an announcement, never ends the line, and stays alive holding the pipe
+    /// open. This is the case that made the watchdog necessary.
     #[test]
-    fn hard_killed_snapshot_owner_is_reclaimed_before_resume() {
-        let repo = temp_repo("snapshot-hard-kill");
-        let store = env::temp_dir().join(format!(
-            "upstroke-snapshot-store-{}-{}",
-            std::process::id(),
-            crate::ulid::ulid()
-        ));
-        let ready = store.with_extension("ready");
-        let workspace = Workspace::open(&repo).expect("open");
+    #[ignore = "spawned as a subprocess by an_owner_that_never_finishes_its_line_is_killed_not_waited_on"]
+    fn unfinished_announcement_helper() {
+        if env::var_os("UPSTROKE_UNFINISHED_ANNOUNCEMENT").is_none() {
+            return;
+        }
+        print!("{SNAPSHOT_NAME_ANNOUNCEMENT}upstroke-gates-never-finished");
+        std::io::stdout()
+            .flush()
+            .expect("publish a partial announcement");
+        std::thread::sleep(std::time::Duration::from_secs(30));
+    }
+
+    #[test]
+    fn an_owner_that_never_finishes_its_line_is_killed_not_waited_on() {
+        let mut command = Command::new(env::current_exe().expect("test executable"));
+        command
+            .args([
+                "--exact",
+                "workspace::tests::unfinished_announcement_helper",
+                "--ignored",
+                "--nocapture",
+            ])
+            .env("UPSTROKE_UNFINISHED_ANNOUNCEMENT", "1")
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null());
+        let mut owner = OwnedProcessTree::spawn(&mut command)
+            .expect("spawn an owner that never finishes its announcement");
+        let started = std::time::Instant::now();
+        let error = announced_within(
+            &mut owner,
+            SNAPSHOT_NAME_ANNOUNCEMENT,
+            std::time::Duration::from_millis(250),
+        )
+        .expect_err("an unfinished line is not an announcement");
+        assert!(error.contains("no announcement within"), "{error}");
+        // A coarse liveness oracle only: the owner holds its pipe open for 30
+        // seconds, so returning well inside that proves the wait was bounded
+        // rather than having simply outlasted the helper. The reap below is the
+        // precise assertion.
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(25),
+            "the watchdog did not bound the wait: {:?}",
+            started.elapsed()
+        );
+        assert!(
+            owner.try_wait().expect("owner status").is_some(),
+            "an owner that never announced must be killed and reaped, not left behind"
+        );
+    }
+
+    /// The subprocess half of `a_wedged_owners_descendant_dies_with_it`: leaves
+    /// a sleeping descendant behind and exits immediately.
+    ///
+    /// The descendant inherits this process's stdout, so the parent's pipe
+    /// stays open after this process is gone. That is the oracle the parent
+    /// uses: end-of-output cannot arrive until the descendant dies too.
+    #[test]
+    #[ignore = "spawned as a subprocess by a_wedged_owners_descendant_dies_with_it"]
+    #[expect(
+        clippy::zombie_processes,
+        reason = "leaving the descendant unreaped is the fixture: the parent's kill has to reach it"
+    )]
+    fn owner_that_leaves_a_descendant_helper() {
+        if env::var_os("UPSTROKE_LEAVE_DESCENDANT").is_none() {
+            return;
+        }
+        Command::new(env::current_exe().expect("test executable"))
+            .args([
+                "--exact",
+                "workspace::tests::sleeping_descendant_helper",
+                "--ignored",
+                "--nocapture",
+            ])
+            .env("UPSTROKE_SLEEPING_DESCENDANT", "1")
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn a sleeping descendant");
+    }
+
+    #[test]
+    #[ignore = "spawned as a subprocess by owner_that_leaves_a_descendant_helper"]
+    fn sleeping_descendant_helper() {
+        if env::var_os("UPSTROKE_SLEEPING_DESCENDANT").is_none() {
+            return;
+        }
+        std::thread::sleep(std::time::Duration::from_secs(30));
+    }
+
+    #[test]
+    fn a_wedged_owners_descendant_dies_with_it() {
+        // `Child::kill` reaches one process. A helper wedged on `git` has that
+        // `git` under it, and killing only the helper leaves it running against
+        // a repository the test is about to delete.
+        let mut command = Command::new(env::current_exe().expect("test executable"));
+        command
+            .args([
+                "--exact",
+                "workspace::tests::owner_that_leaves_a_descendant_helper",
+                "--ignored",
+                "--nocapture",
+            ])
+            .env("UPSTROKE_LEAVE_DESCENDANT", "1")
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null());
+        let mut owner =
+            OwnedProcessTree::spawn(&mut command).expect("spawn an owner that leaves a descendant");
+
+        let error = announced_within(
+            &mut owner,
+            SNAPSHOT_NAME_ANNOUNCEMENT,
+            std::time::Duration::from_secs(3),
+        )
+        .expect_err("this owner announces nothing");
+
+        // Two failures are possible here and they mean opposite things.
+        assert!(
+            !error.contains("outlived the kill"),
+            "termination reached the helper but not its descendant: {error}"
+        );
+        // And this is what keeps the test from proving nothing: had the
+        // descendant not been holding the inherited pipe, the owner's own exit
+        // would have closed it and the failure would have been end-of-output
+        // rather than a timeout.
+        assert!(
+            error.contains("no announcement within"),
+            "the descendant was never holding the pipe, so this proved nothing: {error}"
+        );
+    }
+
+    /// Spawns a snapshot owner against `repo` and `store`, waits for it to name
+    /// its snapshot, and returns the owner alongside the snapshot path rebuilt
+    /// from `store`.
+    fn spawn_snapshot_owner(repo: &Path, store: &Path) -> (OwnedProcessTree, PathBuf) {
+        let mut command = Command::new(env::current_exe().expect("test executable"));
+        command
+            .args([
+                "--exact",
+                "workspace::tests::gate_snapshot_owner_helper",
+                "--ignored",
+                "--nocapture",
+            ])
+            .env("UPSTROKE_SNAPSHOT_OWNER", "1")
+            .env("UPSTROKE_REPO", repo)
+            .env("UPSTROKE_SNAPSHOT_STORE", store)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null());
+        let mut owner =
+            OwnedProcessTree::spawn(&mut command).expect("spawn disposable snapshot owner");
+
+        // Block until the owner names its snapshot, rather than waiting for a
+        // file to appear and hoping its bytes arrived with it. `announced_within`
+        // has already terminated the owner's tree on any error path.
+        let announced =
+            announced_within(&mut owner, SNAPSHOT_NAME_ANNOUNCEMENT, ANNOUNCEMENT_TIMEOUT)
+                .unwrap_or_else(|error| {
+                    panic!("snapshot owner never announced a snapshot: {error}")
+                });
+        assert!(
+            valid_snapshot_name(&announced),
+            "the owner announced a name the engine itself would refuse: {announced:?}"
+        );
+        // Rebuilt from the store the caller already holds, so nothing but the
+        // generated ASCII name has to survive the wire.
+        let snapshot_path = store.join("worktrees").join(&announced);
+        assert!(snapshot_path.exists(), "snapshot was not materialized");
+        (owner, snapshot_path)
+    }
+
+    /// The hard-kill reclamation contract in full, including the linked-worktree
+    /// registrations, driven against an arbitrary `store`.
+    fn hard_kill_and_reclaim(repo: &Path, store: &Path) {
+        let workspace = Workspace::open(repo).expect("open");
         let registrations_before = workspace
             .git(&["worktree", "list", "--porcelain"])
             .expect("registrations before");
-        let mut owner = Command::new(env::current_exe().expect("test executable"))
-            .args(["gate_snapshot_owner_helper", "--ignored", "--nocapture"])
-            .env("UPSTROKE_SNAPSHOT_OWNER", "1")
-            .env("UPSTROKE_REPO", &repo)
-            .env("UPSTROKE_SNAPSHOT_STORE", &store)
-            .env("UPSTROKE_READY", &ready)
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
-            .expect("spawn disposable snapshot owner");
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
-        while !ready.exists() && std::time::Instant::now() < deadline {
-            std::thread::sleep(std::time::Duration::from_millis(10));
-        }
-        assert!(ready.exists(), "snapshot owner never published readiness");
-        let snapshot_path = PathBuf::from(
-            String::from_utf8(fs::read(&ready).expect("read snapshot path"))
-                .expect("test temp path is UTF-8"),
-        );
-        assert!(snapshot_path.exists(), "snapshot was not materialized");
+        let (mut owner, snapshot_path) = spawn_snapshot_owner(repo, store);
         assert_ne!(
             workspace
                 .git(&["worktree", "list", "--porcelain"])
@@ -3013,15 +3466,14 @@ mod tests {
             "helper did not register a linked worktree"
         );
 
-        owner.kill().expect("hard-kill snapshot owner");
-        owner.wait().expect("reap snapshot owner");
+        owner.terminate().expect("hard-kill the snapshot owner");
         assert!(
             snapshot_path.exists(),
             "hard kill unexpectedly ran the snapshot destructor"
         );
         assert_eq!(
             workspace
-                .reclaim_gate_workspaces(&store)
+                .reclaim_gate_workspaces(store)
                 .expect("resume reclaims durable intents"),
             1
         );
@@ -3035,12 +3487,86 @@ mod tests {
         );
         assert_eq!(
             workspace
-                .reclaim_gate_workspaces(&store)
+                .reclaim_gate_workspaces(store)
                 .expect("reclamation is idempotent"),
             0
         );
-        let _ = fs::remove_file(ready);
-        let _ = fs::remove_dir_all(store);
+    }
+
+    #[test]
+    fn hard_killed_snapshot_owner_is_reclaimed_before_resume() {
+        let repo = temp_repo("snapshot-hard-kill");
+        let owned = OwnedTempDir::new("snapshot-store");
+        hard_kill_and_reclaim(&repo, &owned.path().join("store"));
+    }
+
+    /// Drives the hard-kill contract with the store under a directory named
+    /// `hostile`, which the caller has chosen to be something a line protocol
+    /// could not carry.
+    #[cfg(unix)]
+    fn reclaim_with_the_store_under(hostile: &std::ffi::OsStr, tag: &str) {
+        let owned = OwnedTempDir::new(tag);
+        // The hostile component lives inside a uniquely owned root, so the
+        // guard's cleanup can only ever reach this test's own fixture.
+        let ancestor = owned.path().join(hostile);
+        fs::create_dir_all(&ancestor).expect("create the hostile ancestor");
+        let repo = temp_repo(tag);
+        hard_kill_and_reclaim(&repo, &ancestor.join("store"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_store_under_a_newline_ancestor_is_still_reclaimed() {
+        use std::os::unix::ffi::OsStrExt;
+
+        // A newline in an ancestor would truncate the announcement if the path
+        // were the thing announced. It is not: the owner sends its snapshot's
+        // generated ASCII name and the parent rebuilds the path from the store
+        // it already holds, so no ancestor ever reaches the wire.
+        reclaim_with_the_store_under(
+            std::ffi::OsStr::from_bytes(b"newline\n-ancestor"),
+            "hostile-newline",
+        );
+    }
+
+    /// Linux only, for the reason `gate_snapshot_accepts_non_utf8_tmpdir_on_linux`
+    /// is: APFS enforces UTF-8 filenames, so 0xff cannot be a macOS path
+    /// component. The newline half above runs on every Unix.
+    ///
+    /// This one stops short of the registration comparisons the full contract
+    /// makes. `Workspace::git` decodes `git worktree list --porcelain` as UTF-8,
+    /// so it cannot describe a worktree under this ancestor at all — a standing
+    /// limit of the engine, and unrelated to how the owner announces itself.
+    /// What is under test here is that the announcement survives ancestors
+    /// `Path::display` would replace with U+FFFD, leaving a path that does not
+    /// exist.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_store_under_a_non_utf8_ancestor_still_announces_and_is_reclaimed() {
+        use std::os::unix::ffi::OsStrExt;
+
+        let owned = OwnedTempDir::new("hostile-non-utf8");
+        let ancestor = owned
+            .path()
+            .join(std::ffi::OsStr::from_bytes(b"non-utf8\n-\xff-ancestor"));
+        fs::create_dir_all(&ancestor).expect("create the hostile ancestor");
+        let repo = temp_repo("hostile-non-utf8");
+        let store = ancestor.join("store");
+        let workspace = Workspace::open(&repo).expect("open");
+        let (mut owner, snapshot_path) = spawn_snapshot_owner(&repo, &store);
+
+        owner.terminate().expect("hard-kill the snapshot owner");
+        assert!(
+            snapshot_path.exists(),
+            "hard kill unexpectedly ran the snapshot destructor"
+        );
+        assert_eq!(
+            workspace
+                .reclaim_gate_workspaces(&store)
+                .expect("resume reclaims durable intents"),
+            1
+        );
+        assert!(!snapshot_path.exists(), "snapshot directory was reclaimed");
     }
 
     #[cfg(unix)]
