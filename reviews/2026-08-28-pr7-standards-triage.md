@@ -137,7 +137,7 @@ same section are explicitly MUST-tagged: *"Path containment checks MUST account 
 preserve or deliberately migrate supported historical runs"*. The author distinguished
 MUST from untagged inside one section, so the untagged bullet is at most SHOULD.
 
-### (a) The lossy-path class — **REOPENED IN FULL and escalated**, 14 findings
+### (a) The lossy-path class — **REOPENED IN FULL and escalated**
 
 **This section has now been wrong three times, in three different ways, and the third
 correction is the one that generalises.** The first revision rejected twelve and struck
@@ -170,11 +170,12 @@ its absence is the reason a list is given at all rather than a number:
 | 264 | `src/rundir.rs` | `CreatingMarker`'s canonical private-directory identity |
 | 267 | `src/runner/container.rs` | a Docker **bind-mount source** |
 
-**Three failure modes, and they are not interchangeable.** An earlier revision applied
+**The failure modes, and they are not interchangeable.** An earlier revision applied
 one sequence to the whole class, which is how it ended up on the wrong site.
 
-- **A — the string is read back and a path is reconstructed** (47, 51, 112, 198, 201, 224,
-  264). A replaced byte produces a **different path** after restart. This is the sequence
+- **A — the string is read back and a path is reconstructed** (the run-started and marker
+  private directories, the `RunStarted4` path fields, the legacy record fields and the
+  repo-relative path). A replaced byte produces a **different path** after restart. This is the sequence
   the owner described, and its clearest instance is `RunStarted4.private_dir`: written with
   `to_string_lossy` at `create.rs:1647`, and turned back into a path by
   `PathBuf::from(&started.private_dir)` at `recover.rs:335`. It bites `DESIGN.md` §4's
@@ -185,7 +186,7 @@ one sequence to the whole class, which is how it ended up on the wrong site.
   never reads it**: recovery derives the slot from the key and generation at
   `recover.rs:2642`. Row 93's `scaffold.rs` writes fixture events and nothing there reads
   the strings back. Both are recorded below as **D**.
-- **B — both sides render lossily and only compare** (50). `canonical_string` writes
+- **B — both sides render lossily and only compare** (`canonical_string`'s `public_dir`). `canonical_string` writes
   `public_dir`, but recovery does **not** reconstruct a path from that record: it derives
   the public directory from `repo_root` and `run_id` at `recover.rs:280`, renders *that*
   lossily through `canonical_display`, and compares strings at `:632`. Both sides produce
@@ -198,13 +199,14 @@ one sequence to the whole class, which is how it ended up on the wrong site.
   lossily and the values it compares against are not independently rendered; worse, that
   same basename builds the expected private path at `:1532`. Neither half of the class
   description holds. It is class **C**.
-- **C — the lossy string selects a target** (149, 156, 237, 258, 267). It is not read back;
+- **C — the lossy string selects a target** (the settings path, the schema path, the
+  executable probe, the ownership proof's basename and the mount source). It is not read back;
   it is handed to a subprocess, an executable probe, a constructed path, or Docker's mount
   syntax. A replaced byte **names a different or nonexistent object** at the moment of use.
   The `claude.rs` row is the sharpest: a settings file under a directory containing raw
   byte `0x80`, and a sibling whose name contains a literal U+FFFD, render to the same
   spelling — so the agent loads the wrong settings file, possibly a more permissive one.
-- **D — written and never read** (59, 93). The value is durable or fixture-only and no
+- **D — written and never read** (the dispatched worktree path and the scaffold fixture). The value is durable or fixture-only and no
   production path reconstructs it. **Recorded, not dismissed**: §8's rule is that a lossy
   display string is never identity, and these are identity fields whose current consumers
   happen not to depend on them. A future consumer is one commit away, which is a weaker
@@ -230,20 +232,37 @@ consistently, it does not stop at `canonical_string`:
 - `scaffold.rs:151` **independently chooses** `.to_string_lossy()`. An earlier revision
   of this file said it "makes no identity decision of its own"; it does, and that claim is
   **withdrawn**.
-- The class-C sites (156, 237, 267) have no field-level rationale available to them at
-  all: a subprocess argument, an executable probe and a Docker mount source are not
-  `RunStarted4` or `TaskDispatched` fields, so the rationale that discharged the durable
-  records cannot reach them even in principle.
+- The class-C sites have no field-level rationale available to them at all: a settings
+  path, a schema path, an executable probe, an ownership proof's basename and a Docker
+  mount source are not `RunStarted4` or `TaskDispatched` fields, so the rationale that
+  discharged the durable records cannot reach them even in principle.
 
 **Disposition: OPEN, escalated to the owner, and no rejection is claimed.** This seat has
-no standing to reverse an owner ruling, and it is not doing so — it is reporting that the
-ruling's own test, applied to the call sites, does not sustain the twelve rejections, and
-asking for the narrower question to be decided: **is a documented `String`-over-`PathBuf`
-choice also a documented defence of `to_string_lossy`?** If yes, class A and the
-`scaffold.rs` row return to rejected and only classes B and C stand. If no, the class is
-open and the sweep is the wrong venue for at least class A.
+no standing to reverse an owner ruling and is not doing so — it reports that the ruling's
+own test, applied to the call sites, does not sustain the rejections, and asks for the
+narrower question to be decided: **is a documented `String`-over-`PathBuf` choice also a
+documented defence of `to_string_lossy`?**
 
-Until that ruling, the fourteen rows stay filed in the work-list with this triage beside
+**The question is fairly premised.** A `String` in this codebase demonstrably can carry a
+faithful encoding of non-UTF-8 bytes: `runner/container/intent.rs` percent-encodes a path
+injectively at `:160` and decodes it at `:230`. So "we chose `String` for cross-platform
+legibility" does not by itself decide "and therefore losing bytes is acceptable".
+
+**A "yes" would not return the class to rejected, and an earlier revision said it would.**
+Only `TaskDispatched.worktree_path` and `RunStarted4`'s fields carry the cited rationale at
+all. The marker's private directory, the legacy record fields and the repo-relative path
+have **no such rationale to extend**, so they are undocumented on either answer. A "yes"
+returns the rows whose fields carry it and leaves the rest exactly where they are.
+
+**And the repair is not a one-line conversion change**, which an earlier revision also
+claimed. An encoded representation has to be decoded at every consumer — `PathBuf::from`
+at `recover.rs:335` among them — or byte `0x80` written as `%80` becomes the literal path
+`%80`; and adding decoding without a tagged or versioned representation reinterprets a
+historical path genuinely named `%80`, which is the compatibility migration §8 makes a
+MUST. What is owed is a **two-sided, backward-compatible representation**, and that is a
+design decision rather than a sweep item.
+
+Until that ruling, the rows above stay filed in the work-list with this triage beside
 them, and **no `reviews/FINDINGS.md` row is added by this pull request** — #42 owns that
 file in this sequence.
 
@@ -378,10 +397,13 @@ other two are independent of it and each remains sufficient on its own:
 
 **And the reopened class does not reach W4 either**, which is why withdrawing the first
 reason changes no outcome. W4 widens **one** field, `CommandSpec.program`, from `String`
-to `OsString`. Not one of the fourteen rows in §1(a) is about that field: they are event
-and marker records, a subprocess argument, an executable probe and a mount source. Their
-repair — where the owner rules one is owed — is a **conversion** change at the call site,
-choosing a faithful encoding instead of `to_string_lossy`, which is a different act from
+to `OsString`. No row in §1(a) is about that field: they are event and
+marker records, subprocess arguments, an executable probe and a mount source. Their repair
+— where the owner rules one is owed — is **a two-sided, backward-compatible representation**
+and not a writer-side conversion, for the reason §1(a) gives: an encoded value has to be
+decoded at every consumer or the encoding becomes the path, and decoding untagged
+reinterprets a historical path that genuinely carries the escape. That is a different act
+from
 widening a type in the frozen design and needs no `DESIGN.md:222` edit.
 
 What the ruling added instead is a clause, not a record: the two live documents reason
