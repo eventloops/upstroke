@@ -5,7 +5,7 @@ production code, tests, examples, build support, and code-generation inputs. It 
 project-specific: official Rust guidance is the foundation, while upstroke's product invariants,
 failure modes, and supported platforms determine the stricter rules.
 
-Last reconciled with the sources listed below: 2026-08-27.
+Last reconciled with the sources listed below: 2026-08-28.
 
 ## 1. Authority and scope
 
@@ -78,15 +78,17 @@ Lint policy:
   those groups intentionally contain contextual, experimental, or mutually incompatible lints.
 - Do not rewrite clear code merely to satisfy a stylistic lint. Configure or narrowly suppress
   the lint, with rationale, when its premise does not hold.
-- A `clippy.toml` denylist, when present, is effect-funnel enforcement rather than style. Every
+- The `clippy.toml` denylist is effect-funnel enforcement rather than style. Every
   denied path MUST resolve under a Clippy CI leg that compiles the platform where the symbol
   exists. An unresolved denial enforces nothing; Clippy reports it only as a bare configuration
   warning, and `-D warnings` does not promote that warning.
 - A denylist MUST have a resolution census run by a named gate. The census links the probe against
   every dependency needed to resolve its paths, enumerates the declared platform exceptions, and
   injects a misspelled control that it must detect. These requirements attach to `disallowed-*`
-  entries: `clippy.toml` carries only the `allow-*-in-tests` booleans today, and the census
-  activates in the same change that introduces the first denied path.
+  entries, and they are active: `clippy.toml` carries 104 denied paths — 97 methods, 3 types
+  and 4 macros — beside the `allow-*-in-tests` booleans, and the census is
+  `effects::tests` in `src/effects/tests.rs`, which resolves every denied path
+  against a linked probe and injects a misspelled control it must detect.
 
 ## 3. Rust-native design principles
 
@@ -129,8 +131,8 @@ The following rules cut across every section:
 Wall-clock time, monotonic time, environment variables, and randomness are effects under rule 4.
 Production reads of them live in a deliberately small set of boundary modules, and decision logic
 receives values or injected capabilities instead of asking the machine. A change that adds a read
-site outside the existing set MUST say why the funnel cannot serve it; the future `clippy.toml`
-denylist pins the funnel once its platform legs and census exist.
+site outside the existing set MUST say why the funnel cannot serve it; the `clippy.toml` denylist
+pins the funnel, with its platform legs and census in place.
 
 Deadlines, timeouts, and elapsed measurements use `Instant`. `SystemTime` appears only where a
 recorded timestamp or a minted identifier needs wall-clock meaning. The two are never compared,
@@ -582,15 +584,15 @@ assistance is not the same as enforcement, and a green gate is not evidence for 
 | §1 authority, precedence, and known conflicts | Pull-request review; `test-docs-consistency.sh` for the document relationships it explicitly enumerates | Review-only unless the named Bash fixture contains the claim |
 | §2 formatting | `cargo fmt --check` / rustfmt | Automated on all formatted Rust inputs; default configuration at adoption |
 | §2 compiler and ordinary lint baseline | `cargo clippy --all-targets --all-features -- -D warnings` | Automated for code compiled by the lint job |
-| §2 effect denylist | `clippy.toml` disallowed methods, types, and macros; denylist resolution census with an injected typo control | Conditional: `clippy.toml` holds only test-allowance booleans; automated only after denied paths, their platform Clippy legs, and the census land |
+| §2 effect denylist | `clippy.toml` disallowed methods, types, and macros; denylist resolution census with an injected typo control | **Active.** 104 denied paths, the census in `src/effects/tests.rs`, and Clippy legs on all three platforms — `lint`, `lint (windows)` and `lint (macos)`. A path this host cannot resolve is caught by the census, not by `-D warnings` |
 | §§3–6 design, types, APIs, ownership, and resources | rustc ownership/type checking and targeted Clippy lints where applicable; tests; pull-request review | Partly automated; semantic and abstraction rules are review-only, and the ambient-authority funnel is review-enforced until denylist entries pin it |
-| §7 errors and panics | `[lints]`-denied `unwrap_used`, `expect_used`, `panic`, `todo`, `unimplemented`, and `dbg_macro`; type checking; tests | Panic policy automated for code the Clippy leg compiles, with `#[expect]` marking each documented §7 exception; context quality and error taxonomy stay review-only |
-| §§8–9 filesystem, persistence, and processes | behavioural tests; platform CI; effect denylist once active | Partly automated; atomicity, durability, ownership, parsing, and protocol completeness require review |
+| §7 errors and panics | `[lints]`-denied `unwrap_used`, `expect_used`, `panic`, `todo`, `unimplemented`, and `dbg_macro`; type checking; tests | Panic policy automated on all three platforms' Clippy legs, with `#[expect]` marking each documented §7 exception; before `lint (macos)` landed, `#[cfg(target_os = "macos")]` code was compiled by no Clippy job at all; context quality and error taxonomy stay review-only |
+| §§8–9 filesystem, persistence, and processes | behavioural tests; platform CI; the active effect denylist | Partly automated; atomicity, durability, ownership, parsing, and protocol completeness require review |
 | §10 concurrency and async code | rustc `Send`/`Sync` and borrowing checks; deterministic concurrency tests | Partly automated; protocol, cancellation safety, bounds, and ordering require review. `.await`-specific rows are N/A until async production code lands |
 | §11 unsafe and platform code | rustc unsafe checks, `unsafe_op_in_unsafe_fn` denied via `[lints]`, native tests; Miri or sanitizer only when a named leg exists; `undocumented_unsafe_blocks` pending its ratchet commit | Partly automated; safety proofs and tool triggers require review |
 | §12 tests, instruments, and censuses | `cargo test --all-targets --all-features`; each instrument's positive control and named test or Bash gate | Execution is automated; sufficiency, independence, complete domains, oracle quality, `#[ignore]` reasons, and the periodic mutation pass require review |
 | §13 documentation | `test-docs-consistency.sh` for its enumerated contracts; rustdoc/compiler where a compiled example target exists; `print_stdout`/`print_stderr` deny output outside the named modules | Otherwise review-only; doctests are not run by the baseline |
-| §14 security and trust boundaries | behavioural/security tests; effect denylist once active; pull-request review | Review-only where no named test or denial is cited |
+| §14 security and trust boundaries | behavioural/security tests; the active effect denylist; pull-request review | Review-only where no named test or denial is cited |
 | §15 dependencies and features | locked MSRV check, all-feature compiler/test gates, and dependency diff review; SHA-pinned actions (review-verified); `cargo deny` once its configuration lands | Compatibility is partly automated; maintenance, licence, security, and capability assessment are review-only |
 | Contribution, PR, and release policy | `test-pr-policy.sh`, `test-pr-ledger-evidence.sh`, and `test-release-record.sh` | Automated by the lint job |
 
