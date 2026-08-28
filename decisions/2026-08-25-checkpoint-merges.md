@@ -31,9 +31,14 @@ attestation rule (`2026-08-23-retire-app-attestation.md`) are unchanged.
   Post-pass, post-sweep, post-gate is the most-verified state the codebase
   reaches; holding the merge until v0.2 completion means that attested state
   never lands on master as a state, only as history under later slices.
-- **Two smaller attested merges beat one giant one.** Review quality
-  degrades superlinearly with diff size; the v0.2-complete diff would be
-  nearly double the G2 diff.
+- **Two smaller attested merges beat one giant one.** *Assumed:* review
+  quality degrades superlinearly with diff size. This project has taken no
+  measurement of that curve; the claim rests on the general shape of the review
+  record, not on a number, and nothing here turns on the exponent — only on the
+  direction. *Measured:* the G2 diff stands at **143 files, +189,280/−18,460**
+  (`git diff --shortstat e644b72 26c6e6c`, taken 2026-08-28). *Assumed:* a
+  v0.2-complete diff would be near double that, projected from the §21 items
+  still unbuilt rather than from any cut of them; no such diff exists to measure.
 - **The split-brain is a measured cost.** In one week the master/branch
   divergence produced: `reviews/FINDINGS.md` and `clippy.toml` invisible
   from master, a three-vs-four gates discrepancy, two `CLAUDE.md` realities,

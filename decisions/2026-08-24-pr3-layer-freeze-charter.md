@@ -14,16 +14,21 @@ ruling with a written one.
 2. **The challenge of 2026-08-24**
    (`reviews/2026-08-24-unfreeze-challenge-request.md`) **is adjudicated.** PR7's
    `src/topology/fold.rs` footprint — ten delegating readers, one packet-conforming
-   conjunct, and the eleventh reader at the branch tip — is **accepted as a disclosed
-   deviation**, measured and blessed below. The **standing self-serve rule its Claim 5
-   proposed is rejected.** Its Claim 1 finding — that the freeze had no authoritative
-   charter — is **accepted**, and this record is the repair.
+   conjunct, and the eleventh reader at `3362f65`, the branch tip when the challenge
+   was filed — is **accepted as a disclosed deviation**, measured and blessed below.
+   The **standing self-serve rule its Claim 5 proposed is rejected.** Its Claim 1
+   finding — that the freeze had no authoritative charter — is **accepted**, and this
+   record is the repair.
 3. **The G2 pass over PR3's layer is brought forward** and runs as the next slice,
    **before PR8**. Scope, workstreams and exit criteria are
    `proposals/2026-08-24-v0.2-g2-pr3-layer-pass.md`. The bar is the owner's, stated
    2026-08-24: the best code and test coverage this project can produce, with effort
-   explicitly not a constraint. Until the pass lands, **reader accretion stops** — the
-   eleventh reader is the last outside the pass.
+   explicitly not a constraint. Until the pass lands, **reader accretion stops**: from
+   this record forward, no reader lands outside the pass. The moratorium binds from this
+   record, not from the 2026-08-24 adjudication it transcribes, and one reader landed in
+   between — `open_no_attempt` at `ffcc74a` (2026-08-25), the twelfth, disclosed and
+   approved per-instance under Class A as `PR7-FOLD-OPEN-NO-ATTEMPT`
+   (`reviews/FINDINGS.md` §3). It, not the eleventh, is the last outside the pass.
 4. **A Rust coding-standards document lands on master first**, and the cleanliness
    review of the layer runs as the **final** workstream of the pass, enforcing that
    document — never interleaved with behaviour commits. Cleanliness churn must be
@@ -120,9 +125,11 @@ classes above govern slices *outside* a pass; the freeze protects the layer from
 piecemeal edits, not from its own scheduled redesign.
 
 **What is blessed today, retroactively and by name:** the ten readers and the Class-B
-conjunct at `3c09f6e`, and the eleventh reader at `3362f65` — the last with the note
-that its half-rule shape is exactly what workstreams W2 and W5 of the pass must
-collapse back into a full delegation. Nothing else.
+conjunct at `3c09f6e`, the eleventh reader at `3362f65` — with the note that its
+half-rule shape is exactly what workstreams W2 and W5 of the pass must collapse back
+into a full delegation — and the twelfth reader `open_no_attempt` at `ffcc74a`, which
+landed after the 2026-08-24 adjudication and carries its own per-instance Class A row
+(`PR7-FOLD-OPEN-NO-ATTEMPT`). Nothing else.
 
 ## Rejected options
 
