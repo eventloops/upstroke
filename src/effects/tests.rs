@@ -1337,6 +1337,18 @@ fn the_workflow_that_runs_these_tests_installs_the_compiler_they_need() {
 /// anything: the job exists and runs on that runner, `merge-gate` lists it in
 /// `needs`, and `merge-gate`'s own loop names it.
 ///
+/// **What this test does NOT refuse.** It reads `ci.yml` as text, and YAML has
+/// unbounded ways to say the same thing. `if: ${{ false }}` or an
+/// expression-valued conditional disables a gate step without matching the
+/// literal this checks; a decoy value inside the `env:` mapping itself would
+/// satisfy the binding assertion. Those are recorded, not closed: this
+/// repository spent five review rounds on PR #25 establishing that a text
+/// checker over an open-ended surface does not converge, and the lesson filed
+/// was to scope such gates to finite mechanical contracts. The finite contract
+/// here is the wiring's *shape* — a job per platform, on that platform's
+/// runner, named in `needs`, bound in `env`, and named in the deciding loop.
+/// The gate's *effect* is proven by CI running it, not by this test.
+///
 /// **Why this is a loop and not three tests.** `PR5D-MSVC-CLIPPY-NEVER-RUN`
 /// and `PR5-MACOS-CLIPPY-NEVER-RUN` are the same defect on two platforms, found
 /// apart, because the Windows repair was written as
@@ -1464,8 +1476,13 @@ fn every_platform_that_needs_the_effect_denial_gate_has_one_the_aggregate_requir
             .find(|(n, _)| n == gate_job)
             .expect("the gate job")
             .1;
+        // Whitespace-normalised, because `if:  false` is the same YAML. This
+        // is a text check and cannot refuse every disabling form -- `if:
+        // ${{ false }}` and an `env`-driven expression both evade it. Stated
+        // here rather than claimed away; see the doc comment.
+        let normalised = block.split_whitespace().collect::<Vec<_>>().join(" ");
         assert!(
-            !block.contains("if: false"),
+            !normalised.contains("if: false"),
             "`{gate_job}` carries `if: false`, so it reports success without running \
              the denial gate on {runner}"
         );
@@ -1486,8 +1503,17 @@ fn every_platform_that_needs_the_effect_denial_gate_has_one_the_aggregate_requir
         // required check green over a red leaf. Measured: the previous version
         // of this assertion accepted exactly that.
         let binding = format!("{looped}_RESULT: ${{{{ needs.{gate_job}.result }}}}");
+        // Scoped to the `env:` mapping, not the whole job: searching the block
+        // let an inert `echo` step carrying the expected text satisfy this while
+        // the real binding read a sibling's result.
+        let env_block = merge
+            .split_once("        env:\n")
+            .map_or(merge, |(_, rest)| {
+                rest.split_once("\n        run:")
+                    .map_or(rest, |(env, _)| env)
+            });
         assert!(
-            merge.contains(&binding),
+            env_block.contains(&binding),
             "`merge-gate` does not bind `{looped}_RESULT` to `needs.{gate_job}.result`. \
              A binding that reads another job's result passes an existence check and \
              reports green over this platform's failure."
@@ -1534,20 +1560,33 @@ fn platform_cfgs_in_production() -> BTreeSet<String> {
         // structure and passes.
         let text = &source;
         let blanked = blank_comments_and_strings(&source);
-        for capture in text.match_indices("cfg(") {
-            if !blanked.as_bytes()[capture.0..].starts_with(b"cfg(") {
+
+        // Every `target_os = "..."` at a CODE position, at any nesting depth,
+        // rather than parsing cfg structure. The tree really does carry
+        // `#[cfg(not(any(target_os = "linux", target_os = "macos")))]`
+        // (`src/agent/proc.rs`), and a parser that required the predicate to sit
+        // directly inside `cfg(` contributed nothing for it. Scanning for the
+        // key is both simpler and strictly wider: nested, negated and
+        // `cfg_attr` forms all carry it.
+        for (at, _) in text.match_indices("target_os = \"") {
+            // The KEY survives blanking; the quotes do not. `blank_comments_and_strings`
+            // copies code up to the opening quote and resumes after the closing
+            // one, so `target_os = "macos"` blanks to `target_os = ` plus
+            // spaces -- measured, and the reason an earlier gate here matched
+            // nothing at all.
+            if !blanked.as_bytes()[at..].starts_with(b"target_os =") {
                 continue;
             }
-            let rest = &text[capture.0..];
-            let Some(end) = rest.find(')') else { continue };
-            let inner = &rest[4..end];
-            if inner == "windows" {
+            let rest = &text[at + "target_os = \"".len()..];
+            let Some(end) = rest.find('"') else { continue };
+            found.insert(rest[..end].to_owned());
+        }
+        // `windows` is a bare predicate with no key, so it is matched on the
+        // cfg form. `unix` is deliberately absent: both the macOS and Linux legs
+        // compile it, so it adds no platform requirement of its own.
+        for (at, _) in text.match_indices("cfg(windows)") {
+            if blanked.as_bytes()[at..].starts_with(b"cfg(windows)") {
                 found.insert("windows".to_owned());
-            } else if let Some(os) = inner
-                .strip_prefix("target_os = \"")
-                .and_then(|rest| rest.strip_suffix('"'))
-            {
-                found.insert(os.to_owned());
             }
         }
     }
