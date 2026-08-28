@@ -59,8 +59,14 @@ alter signal delivery in `agent::proc`.
 This is a **structural** argument, not a probabilistic one, and the distinction
 matters: §12 forbids "it passed on re-run" as a merge justification precisely because
 that launders a real intermittent defect the change *could* have caused. Here the
-change provably could not. #40's basis is its ten green legs plus a diff that cannot
-reach the failing code; the re-run's green is **corroborating, not load-bearing**.
+change provably could not. #40's basis is that diff plus the eight leaf successes this
+run did have — the `CI` workflow has **nine** leaf jobs, three `lint`, three `msrv` and
+three `test`, besides the `upstroke-ci` aggregate, and attempt 1 was eight successes and
+one failure with `upstroke-pr-policy` green in its own workflow. An earlier revision of
+this record said "ten green legs", a number that counts nothing on this run; #40's body
+retracted the same phrase, and repeating it here would have left the retraction
+half-applied across two documents. The re-run's green is **corroborating, not
+load-bearing**.
 
 ## The class — this is the third, and the second on macOS
 
