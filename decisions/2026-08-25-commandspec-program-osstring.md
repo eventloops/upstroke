@@ -72,9 +72,10 @@ Three grounds, in descending weight:
   documents deleted with its cause. It is still in the tree
   (`src/agent/bin.rs`) and still correct, because the refusal is still the
   behaviour `DESIGN.md` specifies.
-- `CODING_STANDARDS.md`'s Known Conflicts block **will be** removed in the same
-  motion the widening lands (a one-line master docs edit citing this
-  record). It stands until then.
+- `CODING_STANDARDS.md`'s "Known conflicts at adoption" block **will be** removed in
+  the same motion the widening lands — the **whole block, heading and paragraph
+  together**, not a one-line edit under a retained heading. It stands until then, and
+  the pass proposal's W4 carries the same instruction so the two cannot drift.
 - Packet side: W4 greps the packet for any `CommandSpec` shape mention as a
   completeness check; the errata batch
   (`upstroke-lab:packet/2026-08-25-g2-pass-errata.md`) records that none is
