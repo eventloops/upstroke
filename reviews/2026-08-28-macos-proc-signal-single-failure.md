@@ -19,10 +19,31 @@ visible, not to license re-running until green.
 | Retrieve it | `gh run view 33162906210 --attempt 1 --log-failed` (rc=0, 330,968 bytes) |
 | Preserved | `~/tactus-artifacts/flakes/2026-08-28-macos-proc-signal-attempt1-run33162906210.log` |
 
-**143 is 128+15 — SIGTERM.** The helper was *terminated*, not failed: it asserted
-nothing false, it was killed on a bound. With the test's own name — a blocked terminal
-signal waking a *suspended* host — the signature is a suspended process that did not
-wake inside its timeout on a loaded runner.
+**143 is 128+15 — SIGTERM, and the SIGTERM is the test's own.** An earlier revision of
+this record said the helper "was killed on a bound", i.e. a timeout. That is wrong, and
+the test's source disproves it:
+
+- the test **sends SIGTERM itself** — `libc::kill(-pid, libc::SIGTERM)` at
+  `src/agent/proc.rs:7960`;
+- `wait_for_exit` returns `None` on expiry, so a timeout would have panicked at the
+  `.expect("guard with an unblocked mask wakes the suspended host")` on line **7963**,
+  a different message at a different line;
+- the panic was at **7966**, `assert!(status.success(), "helper status: {status}…")`.
+
+So `wait_for_exit` returned `Some(143)`. The helper **exited inside the bound**, killed
+by the signal the test sent, and then failed the success assertion. No timeout occurred
+and nothing was killed on a bound.
+
+**What that makes it.** The helper died from the deliberate SIGTERM instead of handling
+it and exiting cleanly — which is exactly the contract the test's name asserts, that a
+guard with an unblocked mask wakes the suspended host and it terminates successfully.
+The likely shape is a race between the guard unblocking its signal mask and SIGTERM
+arriving. That is a **signal-delivery race in `agent::proc`**, not runner load.
+
+**This raises the stakes rather than lowering them.** The earlier reading implied a
+harmless environmental artifact. The corrected one is closer to a real defect in the
+code the test exists to guard — which is a stronger reason to measure it, not a weaker
+one. The mechanism remains unexplained and no rate is measured.
 
 **A red matching this fingerprint is this failure until shown otherwise; a red that
 does not match it is a regression until shown otherwise.** That is §12's rule and it
@@ -51,7 +72,8 @@ reach the failing code; the re-run's green is **corroborating, not load-bearing*
 
 This one sits at the **intersection of the first two**: it is in the same module as
 §12's and turns on the same subject — a *suspended* process that must be woken or
-reaped — and it is macOS-only like `PR7-MACOS-PROCESS-GROUP-FLAKE`. That is the
+reaped — and it is macOS-only like `PR7-MACOS-PROCESS-GROUP-FLAKE`. Unlike either, its
+corrected mechanism points at the **code under test** rather than at the environment. That is the
 observation worth carrying: `agent::proc`'s supervision code has now produced two
 distinct suspended-process timing failures, and macOS has produced two distinct
 process failures. Neither pattern is visible from one record alone.
