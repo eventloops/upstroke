@@ -412,11 +412,12 @@ other two are independent of it and each remains sufficient on its own:
 **And the reopened class does not reach W4 either**, which is why withdrawing the first
 reason changes no outcome. W4 widens **one** field, `CommandSpec.program`, from `String`
 to `OsString`. No row in §1(a) is about that field: they are event and
-marker records, subprocess arguments, an executable probe and a mount source. Their repair
-— where the owner rules one is owed — is **a two-sided, backward-compatible representation**
-and not a writer-side conversion, for the reason §1(a) gives: an encoded value has to be
-decoded at every consumer or the encoding becomes the path, and decoding untagged
-reinterprets a historical path that genuinely carries the escape. That is a different act
+marker records, subprocess arguments, an executable probe and a mount source. Their repair —
+where the owner rules one is owed — is **whatever §1(a)'s boundary split prescribes for each
+of them**, and not one remedy for all: a two-sided, backward-compatible representation where
+a value is persisted and read back, and the OS-native type carried to the call where it is
+used at hand-off. An earlier revision of this paragraph named the durable remedy for the
+whole class, which is the over-generalisation §1(a) records. Either way it is a different act
 from
 widening a type in the frozen design and needs no `DESIGN.md:222` edit.
 
