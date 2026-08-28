@@ -37,7 +37,11 @@ Three grounds, in descending weight:
    through `Command::new` unchanged and a non-Unicode installation ran;
    under the frozen `String` shape that invariant is unsatisfiable — the
    value cannot be represented, and PR4 could only choose which way to fail.
-   Widening makes the invariant true again as written. The alternative is a
+   Widening makes the invariant true again as written. **What is restored is
+   the representability of the value, not the pre-PR4 division of labour**:
+   an adapter still names its CLI and the executing boundary still resolves
+   it, which is `PR4-ADAPTER-RESOLVES-ON-THE-HOST`'s repair and is untouched
+   here. The alternative is a
    permanent erratum narrowing it, where a mechanical repair exists.
 2. **The normative standard already rules on the type.** `CODING_STANDARDS.md`
    §8, on master since `02b0752`: *"Represent paths with `Path`, `PathBuf`,
