@@ -3,7 +3,7 @@
 | field | value |
 |---|---|
 | **Verdict** | **CHANGES_REQUIRED, four findings** |
-| **Reviewed SHA** | `bdd64f5` |
+| **Reviewed SHA** | `bdd64f5479e9a78aa03bb486d6ccec024a878c7d` |
 | Pull request | eventloops/upstroke#34, into `codex/parallelism-design` |
 | Reviewer | `gpt-5.6-sol`, `model_reasoning_effort=max`, read-only sandbox |
 | Transport | `codex exec` via `~/bin/review-pr.sh 34`, 90-minute per-pass limit |
