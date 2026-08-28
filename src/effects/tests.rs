@@ -129,7 +129,7 @@ struct ClippyToml {
     disallowed_types: Vec<DeniedPath>,
     #[serde(default, rename = "disallowed-macros")]
     disallowed_macros: Vec<DeniedPath>,
-    // The §7 panic-policy allowances (CODING_STANDARDS.md §2), which arrived
+    // The §7 panic-policy allowances (CODING_STANDARDS.md §7), which arrived
     // with master's lint mechanization. They configure clippy's own lints
     // rather than naming an effect primitive, so `all()` deliberately excludes
     // them. They are declared because `deny_unknown_fields` above is the
@@ -146,30 +146,36 @@ struct ClippyToml {
     allow_print_in_tests: bool,
 }
 
-/// The three allowances are on, and `.unwrap()` has none.
+/// `clippy.toml` turns the three §7 allowances on, and gives `.unwrap()` none.
 ///
-/// CODING_STANDARDS.md §2: tests fail their own setup with `.expect(` and a
+/// **It reads `clippy.toml`, not the standard**, and is named for that. An
+/// earlier name claimed the allowances were "exactly what the standard
+/// states", which this test cannot know: parsing §7's prose to compare would
+/// be a text checker over an open-ended surface, and PR #25 is five review
+/// rounds of evidence that those do not converge.
+///
+/// CODING_STANDARDS.md §7: tests fail their own setup with `.expect(` and a
 /// message, use `panic!` in their own assertion helpers, and may print;
 /// `.unwrap()` "is denied everywhere, tests included" because it carries no
-/// diagnostic. A `false` here would silently re-deny a form 4,400 call sites
+/// diagnostic. A `false` here would silently re-deny a form 4,100 call sites
 /// use, and an `unwrap` allowance appearing would silently permit one the
 /// standard refuses -- so both directions are asserted rather than assumed.
 #[test]
-fn the_panic_policy_allowances_are_exactly_what_the_standard_states() {
+fn clippy_toml_turns_the_allowances_on_and_gives_unwrap_none() {
     let clippy = denylist();
     assert!(
         clippy.allow_expect_in_tests,
-        "§2 allows .expect( with a message in tests"
+        "§7 allows .expect( with a message in tests"
     );
     assert!(
         clippy.allow_panic_in_tests,
-        "§2 allows panic! in a test's own assertion helpers"
+        "§7 allows panic! in a test's own assertion helpers"
     );
-    assert!(clippy.allow_print_in_tests, "§2 allows printing from tests");
+    assert!(clippy.allow_print_in_tests, "§7 allows printing from tests");
     let text = fs::read_to_string(repo_root().join(CLIPPY_TOML)).expect("clippy.toml");
     assert!(
         !text.contains("allow-unwrap-in-tests"),
-        "§2: .unwrap() has no allowance -- it is denied everywhere, tests included"
+        "§7: .unwrap() has no allowance -- it is denied everywhere, tests included"
     );
 }
 
@@ -1098,7 +1104,7 @@ fn every_platform_conditional_denial_names_something_real() {
             // Real on Linux, no module on Darwin: `libc` does not define `pipe2`
             // for macOS. Added after CI's macOS job found it -- this project has
             // a Windows guest and no macOS host, which is `PR5-MACOS-CLIPPY-NEVER-
-            // RUN`. The suppression is what keeps a future macOS lint job green;
+            // RUN`. The suppression is what keeps the `lint (macos)` job green;
             // `host_conditional_paths` still asserts the path is unresolved there,
             // because that test strips `allow-invalid` before it probes.
             "libc::pipe2",
@@ -1323,46 +1329,37 @@ fn the_workflow_that_runs_these_tests_installs_the_compiler_they_need() {
     );
 }
 
-/// The denial command runs on a runner that compiles `#[cfg(windows)]`, and the
-/// merge gate requires that job (`PR5-CONF-014`).
+/// Every platform that needs the effect-denial gate has one, and the merge
+/// aggregate requires each.
 ///
-/// `mechanism` (1) makes the enforcement **rustc-resolved**, which is a strength
-/// and a boundary at once: a denial denies exactly what the compiler compiled.
-/// `lint` is `runs-on: ubuntu-latest` and was the only job invoking clippy, so
-/// every `#[cfg(windows)]` body in the crate was outside the denylist's reach on
-/// every job CI runs — measured with a positive control, a raw `std::fs::write`
-/// in `src/topology/paths.rs`: **unconditional** it fails Ubuntu clippy with
-/// `use of a disallowed method`; under `#[cfg(windows)]` it passes Ubuntu clippy,
-/// the `test` job on all three platforms and the `msrv` job on all three
-/// platforms, and is refused by MSVC clippy with the `UPSTROKE-EFFECT R21/R18`
-/// note. `expected_failures_refusals[5]` and `[6]` were therefore undischarged
-/// for that half of the tree.
+/// It pins three separable things per platform, because a gate that can be
+/// dropped from the merge aggregate is a gate that can fail without blocking
+/// anything: the job exists and runs on that runner, `merge-gate` lists it in
+/// `needs`, and `merge-gate`'s own loop names it.
 ///
-/// [`the_workflow_that_runs_these_tests_installs_the_compiler_they_need`] holds
-/// the sibling axis — *which command* runs the fixtures — constant on one
-/// platform. This one holds that same command constant and varies **the platform
-/// it runs on**, which is the field that was never crossed: coverage of the
-/// command read as coverage of the pair.
-///
-/// It pins three separable things, because a gate that can be dropped from the
-/// merge aggregate is a gate that can fail without blocking anything: the job
-/// exists and runs on a Windows runner, `merge-gate` lists it in `needs`, and
-/// `merge-gate`'s own loop names it.
-///
-/// **Known remaining hole, recorded rather than claimed**: `macos-latest` still
-/// runs no clippy, so the five `#[cfg(target_os = "macos")]` regions are in the
-/// same position this repair takes Windows out of. `reviews/FINDINGS.md` §2
-/// carries it as `PR5-MACOS-CLIPPY-NEVER-RUN` with an owner.
+/// **Why this is a loop and not three tests.** `PR5D-MSVC-CLIPPY-NEVER-RUN`
+/// and `PR5-MACOS-CLIPPY-NEVER-RUN` are the same defect on two platforms, found
+/// eighteen months of process apart, because the Windows repair was written as
+/// an instance rather than a class. A per-platform table makes the next
+/// platform's omission a failure here rather than a third finding.
 #[test]
-fn a_windows_runner_runs_the_effect_denial_gate_and_the_merge_gate_requires_it() {
+fn every_platform_that_needs_the_effect_denial_gate_has_one_the_aggregate_requires() {
     const GATE: &str = "cargo clippy --all-targets --all-features -- -D warnings";
+    // The runner, never the job name: what discharges the clause is the platform
+    // that compiles the `#[cfg(...)]` bodies, and a name is a label.
+    const RUNNERS: [(&str, &str); 3] = [
+        ("windows-latest", "#[cfg(windows)]"),
+        ("macos-latest", "#[cfg(target_os = \"macos\")]"),
+        ("ubuntu-latest", "#[cfg(unix)] on Linux"),
+    ];
+
     let workflow = fs::read_to_string(repo_root().join(".github/workflows/ci.yml"))
         .expect(".github/workflows/ci.yml");
 
-    // YAML comments run from an unquoted `#` to end of line, and the job this
-    // test is about carries a comment that names the denial command and the
-    // finding in prose. A census that reads prose is `PR4-CENSUS-COMMENT-ORACLE`,
-    // so the strip comes first and is itself asserted to have bitten.
+    // YAML comments run from an unquoted `#` to end of line, and the jobs this
+    // test is about carry comments that name the denial command and the findings
+    // in prose. A census that reads prose is `PR4-CENSUS-COMMENT-ORACLE`, so the
+    // strip comes first and is itself asserted to have bitten.
     let code: String = workflow
         .lines()
         .map(|line| line.split('#').next().unwrap_or_default())
@@ -1400,26 +1397,10 @@ fn a_windows_runner_runs_the_effect_denial_gate_and_the_merge_gate_requires_it()
         }
     }
     assert!(
-        jobs.len() >= 4,
+        jobs.len() >= 5,
         "only {} job(s) parsed out of ci.yml; the splitter is reading the wrong shape",
         jobs.len()
     );
-
-    // By the runner, never by the job's name: what discharges the clause is the
-    // platform that compiles the `#[cfg(windows)]` bodies, and a name is a label.
-    let windows_gates: Vec<&str> = jobs
-        .iter()
-        .filter(|(_, block)| block.contains(GATE) && block.contains("windows-latest"))
-        .map(|(name, _)| name.as_str())
-        .collect();
-    assert_eq!(
-        windows_gates.len(),
-        1,
-        "expected exactly one job running `{GATE}` on a Windows runner, found {windows_gates:?}. \
-         Without it every `#[cfg(windows)]` body in the crate is outside the denylist's reach \
-         on every job CI runs (PR5-CONF-014)."
-    );
-    let gate_job = windows_gates[0];
 
     let merge = jobs
         .iter()
@@ -1430,29 +1411,46 @@ fn a_windows_runner_runs_the_effect_denial_gate_and_the_merge_gate_requires_it()
         .lines()
         .find(|line| line.trim_start().starts_with("needs:"))
         .expect("merge-gate declares its dependencies");
-    assert!(
-        needs.contains(gate_job),
-        "`merge-gate` does not depend on `{gate_job}`, so branch protection would settle \
-         green while the Windows denial gate failed: {needs}"
-    );
-
-    // `needs` alone is not enough: the aggregate's own loop decides which
-    // results are *required*, and a job listed but not looped over may fail
-    // freely. The loop names gates in the shape its env vars use.
-    let looped = gate_job.to_uppercase().replace('-', "_");
-    assert!(
-        merge.contains(&format!("{looped}_RESULT:")),
-        "`merge-gate` does not read `{gate_job}`'s result into `{looped}_RESULT`"
-    );
     let requires = merge
         .lines()
         .find(|line| line.contains("for gate in "))
         .expect("merge-gate's required-gate loop");
-    assert!(
-        requires.split_whitespace().any(|word| word == looped),
-        "`merge-gate`'s required-gate loop does not name `{looped}`, so `{gate_job}` \
-         can fail without failing the aggregate: {requires}"
-    );
+
+    for (runner, regions) in RUNNERS {
+        let gates: Vec<&str> = jobs
+            .iter()
+            .filter(|(_, block)| block.contains(GATE) && block.contains(runner))
+            .map(|(name, _)| name.as_str())
+            .collect();
+        assert_eq!(
+            gates.len(),
+            1,
+            "expected exactly one job running `{GATE}` on `{runner}`, found {gates:?}. \
+             Without it every {regions} body in the crate is outside the denylist's \
+             reach on every job CI runs."
+        );
+        let gate_job = gates[0];
+
+        assert!(
+            needs.contains(gate_job),
+            "`merge-gate` does not depend on `{gate_job}`, so branch protection would \
+             settle green while the {runner} denial gate failed: {needs}"
+        );
+
+        // `needs` alone is not enough: the aggregate's own loop decides which
+        // results are *required*, and a job listed but not looped over may fail
+        // freely. The loop names gates in the shape its env vars use.
+        let looped = gate_job.to_uppercase().replace('-', "_");
+        assert!(
+            merge.contains(&format!("{looped}_RESULT:")),
+            "`merge-gate` does not read `{gate_job}`'s result into `{looped}_RESULT`"
+        );
+        assert!(
+            requires.split_whitespace().any(|word| word == looped),
+            "`merge-gate`'s required-gate loop does not name `{looped}`, so `{gate_job}` \
+             can fail without failing the aggregate: {requires}"
+        );
+    }
 }
 
 /// The crate's own rlib and the directory its dependencies are in.
