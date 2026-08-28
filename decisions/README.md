@@ -71,10 +71,11 @@ artifacts (§15); records promoted here are the durable subset.
 - [2026-08-24 — the PR3-layer freeze: charter, adjudication, and the G2 pass](2026-08-24-pr3-layer-freeze-charter.md): three
   deviation classes charter what the freeze admits; PR7's `fold.rs` footprint is
   blessed as a disclosed deviation; the pass over the layer runs before PR8.
-- [2026-08-25 — `CommandSpec.program` widens to `OsString`](2026-08-25-commandspec-program-osstring.md):
-  settles the direction for `PR4-PROGRAM-PATH-NOT-UNICODE` and schedules it at the
-  pass's W4. Scheduled, not in force: `DESIGN.md:222` still reads `String` and the
-  known-conflict block in `CODING_STANDARDS.md` §1 still stands; both move at W4.
+- [2026-08-25 — `CommandSpec.program` stays `String`](2026-08-25-commandspec-program-stays-string.md):
+  closes `PR4-PROGRAM-PATH-NOT-UNICODE` as not reproducible in production. The field
+  holds a bare CLI name and never a path, so `DESIGN.md:222` is unchanged and §8 does
+  not govern it. An earlier revision of this record decided the opposite and is
+  withdrawn; `CODING_STANDARDS.md` §1's known-conflict block retires on its own motion.
 - [2026-08-25 — integration merges happen at attested checkpoints](2026-08-25-checkpoint-merges.md):
   `codex/parallelism-design` merges to `master` at the G2 checkpoint and again at
   v0.2 completion, rather than once at the end.
