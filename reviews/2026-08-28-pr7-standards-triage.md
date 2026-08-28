@@ -254,13 +254,27 @@ all. The marker's private directory, the legacy record fields and the repo-relat
 have **no such rationale to extend**, so they are undocumented on either answer. A "yes"
 returns the rows whose fields carry it and leaves the rest exactly where they are.
 
-**And the repair is not a one-line conversion change**, which an earlier revision also
-claimed. An encoded representation has to be decoded at every consumer — `PathBuf::from`
-at `recover.rs:335` among them — or byte `0x80` written as `%80` becomes the literal path
-`%80`; and adding decoding without a tagged or versioned representation reinterprets a
-historical path genuinely named `%80`, which is the compatibility migration §8 makes a
-MUST. What is owed is a **two-sided, backward-compatible representation**, and that is a
-design decision rather than a sweep item.
+**And the repair is not a one-line conversion change** — but it is also not the *same*
+repair everywhere, which a later revision wrongly implied by prescribing one remedy for the
+whole class. **The remedy depends on which boundary the value crosses.**
+
+- **A value that is persisted and read back** — class A, and the comparison in class B —
+  needs a **two-sided, backward-compatible representation**. An encoding has to be decoded
+  at every consumer, `PathBuf::from` at `recover.rs:335` among them, or a byte written as
+  `%80` becomes the literal path `%80`; and adding decoding without a tagged or versioned
+  form reinterprets a historical path genuinely named `%80`, which is the compatibility
+  migration §8 makes a MUST. That is a design decision rather than a sweep item.
+- **A value used at the moment of construction or hand-off** — class C — needs **no
+  encoding at all**, and prescribing one would make it worse. `gates.rs`'s executable probe
+  builds a candidate locally through `base.display()`; it has no writer, no persisted form
+  and no second consumer, so carrying the OS-native type to the append fixes it outright.
+  The settings path handed to an agent CLI is the sharper case: an external process cannot
+  decode a representation private to this engine, so percent-encoding it would name a
+  literal `%80` to the tool. `Command::arg` takes an `OsStr`, which is the whole repair.
+
+Treating class C as a versioned-format decision would defer a local fix indefinitely while
+a valid executable under a non-UTF-8 path stays undetected. That is why the classes are
+split by failure mode and not merged into one remedy.
 
 Until that ruling, the rows above stay filed in the work-list with this triage beside
 them, and **no `reviews/FINDINGS.md` row is added by this pull request** — #42 owns that
