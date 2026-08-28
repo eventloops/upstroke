@@ -67,12 +67,14 @@ Three grounds, in descending weight:
   per-platform encoding costs nothing real.
 - `agent::bin::tests::a_program_path_a_string_cannot_carry_is_refused_by_name`
   — deliberately left unchanged by PR4 round 6 because changing it would
-  have resolved an owner question inside a repair round — is now resolved
-  the other way: it is replaced by the test that the path is carried
-  through, and the refusal it documented is deleted with its cause.
-- `CODING_STANDARDS.md`'s Known Conflicts block is removed in the same
+  have resolved an owner question inside a repair round — **will be** replaced
+  at W4 by the test that the path is carried through, and the refusal it
+  documents deleted with its cause. It is still in the tree
+  (`src/agent/bin.rs`) and still correct, because the refusal is still the
+  behaviour `DESIGN.md` specifies.
+- `CODING_STANDARDS.md`'s Known Conflicts block **will be** removed in the same
   motion the widening lands (a one-line master docs edit citing this
-  record).
+  record). It stands until then.
 - Packet side: W4 greps the packet for any `CommandSpec` shape mention as a
   completeness check; the errata batch
   (`upstroke-lab:packet/2026-08-25-g2-pass-errata.md`) records that none is
