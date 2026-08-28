@@ -1363,7 +1363,8 @@ fn the_workflow_that_runs_these_tests_installs_the_compiler_they_need() {
 /// owner decision rather than a patch.
 ///
 /// **What it does hold, stated as the substring predicates it actually is.**
-/// For each of three hard-coded runners: some job block contains both the
+/// For each of three hard-coded runners: **exactly one** job block contains
+/// both the
 /// literal gate command and the literal runner string; `merge-gate`'s `needs:`
 /// line contains that job's name as a substring; `merge-gate`'s `env:` mapping
 /// contains the literal `<JOB>_RESULT: ${{ needs.<job>.result }}`; the
