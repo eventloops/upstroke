@@ -1,10 +1,29 @@
 # 2026-08-28 — two unexplained Windows failures in the topology kill tests, not yet a flake
 
 **Status: a single observed run in which two tests failed together, with their
-fingerprints recorded. No rate has been measured, so under `CODING_STANDARDS.md` §12
-this is *not* named a flake.** Two failures in one run is one observation of a run,
-not two observations of a rate: they share a job, a runner, a temp root and a test
-binary, so they are not independent trials. n=1 run is not a rate.
+fingerprints recorded. No rate has been measured, so this is *not* named a flake.**
+
+**The authority for that, corrected.** An earlier revision cited `CODING_STANDARDS.md`
+§12. **That section says nothing about flakes, rates, re-runs or intermittency** — the
+words "flake", "numerator" and "denominator" appear nowhere in that document. The
+practice being followed is this repository's own, at **`reviews/FINDINGS.md` §12**,
+which measures a flake at *"one failure in ~31 runs (~3%)"* and says *"which is why the
+rate is written down here as a number instead of as 'occasionally'"*. Precedent, not
+rule, and cited as such.
+
+Two failures in one run is one observation of a run, not two observations of a rate:
+they share a job, a runner, a temp root and a test binary, so they are not independent
+trials.
+
+**The denominator that is visible, and why it is still not a rate.** The two sibling
+jobs cited below as a control are also two more observations of this leg on this source:
+one failure in three same-source Windows jobs. That number is stated rather than hidden.
+It is **not** called a rate because the three were not a designed trial — they ran hours
+apart on different hosted allocations, and this record's own control argument treats
+them as evidence about *attribution*, which needs only that the source was identical,
+not as draws from one distribution, which would need much more. **Observations 3,
+failures 1, rate unmeasured** is the honest line, and it is weaker than a rate on
+purpose.
 
 It is recorded for the same reason as its companion record in this pull request: a
 fingerprint is what makes the next red judgeable. It is **not** recorded to license
@@ -43,11 +62,23 @@ calls it with the site `"retry"` at line 1683. The helper spawns the test binary
 child, sets `UPSTROKE_TEST_KILL_SITE`, and requires the child to die by
 `std::process::abort()` at that site.
 
-- **B is the injection not firing.** `died_by_abort` failed with `ExitStatus(101)`.
-  101 is the Rust panic exit code, and the helper's own message at
-  `src/engine/topology/scaffold.rs:1356` states the interpretation the code itself
-  intends: a child that *reached its own `unreachable!`* panics rather than aborting,
-  "which means the injection stopped killing". So the child ran **past** the kill site.
+- **B is a child that panicked instead of aborting — and on Windows the oracle cannot
+  say why.** `died_by_abort` failed with `ExitStatus(101)`. The message at
+  `src/engine/topology/scaffold.rs:1356` reads that as the injection having stopped
+  killing, and **this record does not repeat that reading**, because on Windows the
+  oracle cannot support it. `died_by_abort` there is `!status.success() && status.code()
+  != Some(101)` (`src/workspace_manager.rs:3884`) — a pure negation of the panic code,
+  chosen because Windows exposes no portable `abort` signature. And `run_kill_child`
+  sets `.stdout(Stdio::null())` and `.stderr(Stdio::null())` (`:3774-3775`), so the
+  child's panic message is discarded and the parent sees only the code.
+
+  **Therefore any child panic produces this exact message.** A child that panicked
+  *before* the kill site was armed — a `settle_retry` returning something the arm
+  expects not to, say — exits 101 and yields Message B verbatim, while being a genuine
+  regression rather than an injection failure. What is established is only: **the child
+  exited 101, which is a Rust panic, and the parent required an abort.** Whether it ran
+  past the kill site is *not* established, and an earlier revision of this record said
+  it was.
 - **A is a reclaim failing after a kill.** `settle_interrupted` returned
   `Git { message: "git worktree prune failed … fatal: not a git repository" }` for the
   fixture repo under the job's temp root. The path it names,
@@ -55,10 +86,23 @@ child, sets `UPSTROKE_TEST_KILL_SITE`, and requires the child to die by
   `git` reports it is not one.
 
 **What is *not* established.** Whether the two share a cause; whether either is a
-production defect or a fixture-lifecycle fault on Windows; and whether the `-7784-`
+production defect or a fixture-lifecycle fault on Windows; whether the `-7784-`
 component of that temp path — which has the shape of a process id — indicates a
-collision between the parent and an adopted child. Each is a hypothesis this record
-deliberately does not assert, because nothing here measures it.
+collision; and, per the correction above, whether B's child reached the kill site at
+all. Each is a hypothesis this record deliberately does not assert, because nothing
+here measures it.
+
+**The matching rule, stated so the fingerprint can be applied.** Match Message A on the
+test name, the assertion site `src/engine/topology/attempt/tests.rs:1656`, and the shape
+`git worktree prune failed in <temp>\repo: fatal: not a git repository` — **normalise
+the whole temp path away.** `upstroke-wm-killattempt-7784-0` embeds a process id and an
+ordinal that differ on every run, so a literal match on it can never fire twice and
+would report every recurrence as a new failure. Match Message B on the test name, the
+site `src/engine/topology/scaffold.rs:1356`, and exit code **101** — and note that this
+signature is *broad*: it also matches a child that panicked for an unrelated reason, so
+a red matching B is this observation **or** a regression, and the two are not separable
+from the parent's output alone. That is a limitation of the oracle, recorded here rather
+than papered over.
 
 ## Why it is not attributable to the change it appeared under
 
@@ -75,10 +119,18 @@ under `src/`, verified by the same command. Their `test (windows-latest)` legs �
 11:57:15Z. Identical source, same platform, two successes and one failure, and no
 change in between.
 
-That is a **structural** argument about attribution, not a rate. §12 forbids "it passed
-on re-run" as a merge justification because that launders an intermittent defect the
-change *could* have caused; here the change provably could not, which is a different
-claim and the only one made.
+That is a **structural** argument about attribution, not a rate. The recorded practice
+refuses "it passed on re-run" as a merge justification because that launders an
+intermittent defect the change *could* have caused; here the change could not, which is
+a different claim and the only one made.
+
+**And this record's structural claim is stronger than its companion's**, which is worth
+stating because the companion's had to be weakened. `DESIGN.md` and
+`decisions/README.md` are compiled into the test binary by `include_str!`
+(`src/export.rs:1091`, `:1153`, `:1168`), so a markdown edit to *those* files does change
+the binary. **This diff touches neither**: it adds two files under `reviews/`, which no
+`include_str!` in the tree reads. The binary here really is byte-identical to the base's,
+which is the property "provably could not reach the failing code" actually requires.
 
 ## The class
 
