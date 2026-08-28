@@ -133,12 +133,22 @@ test. That is a concrete path, however thin, by which a markdown change can alte
 whether a race manifests. It does not attribute the failure to #40; it removes the word
 "provably".
 
-**What survives, and is the actual claim.** No markdown change alters the *logic* of
-signal delivery in `agent::proc`: the handler at `proc.rs:2288-2301`, the mask
-manipulation and `wait_for_exit` are untouched, and `git diff` proves no file under
-`src/` differs. So the failure cannot be a behavioural regression introduced by that
-diff. It can only be a pre-existing condition, possibly perturbed in timing by a
-different test workload — which is a reason to measure it, not a reason to attribute it.
+**What survives, and it is weaker than the previous sentence made it sound.** No markdown
+change alters the *logic* of signal delivery in `agent::proc`: the handler, the mask
+manipulation and `wait_for_exit` are untouched, and `git diff` proves no file under `src/`
+differs. So **no new defect was introduced into that code**.
+
+That is the whole of it. An earlier revision went on to say the failure therefore "cannot"
+be a behavioural regression and "can only" be pre-existing — **and that does not follow from
+the paragraph above it**, which had just conceded that changed embedded text alters the
+binary and the concurrent workload. A latent race that manifests *because* the workload
+changed is caused, in the ordinary sense a maintainer cares about, by the change that
+altered it. Both sentences are withdrawn.
+
+**What is left is a distinction, not an exoneration:** the diff cannot have introduced the
+defect, and it may well have changed whether the defect showed. Which of those happened is
+unmeasured, and that is the reason to measure rather than a reason to attribute or to
+dismiss.
 
 This is a **structural** argument about the code, not a probabilistic one, and the
 **On "it passed on re-run", corrected a second time.** An earlier revision said
