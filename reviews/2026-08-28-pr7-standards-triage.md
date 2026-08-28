@@ -52,13 +52,24 @@ takes it directly — the partition is one file, `lens-manifest.sh`.
   instructs the pass to edit a frozen file, and no lens produced a diff.
 
 **What the review's own artifacts cannot show you from this repository.** The lens
-manifest, the fourteen prompts, the raw lens logs and `findings.json` are **not** in
-the tree. Three claims rest on them and are therefore **seat-attested rather than
-repository-verifiable**: the exclusive file partition, the fifteen source files that
-drew no finding, and the eight-gate run that preceded the lenses. They are stated as
-attestations, not as things this pull request lets you check. What the repository *does*
-let you check is every filed row: its file, its region hash, and that the hash relocates
-to exactly one contiguous region at `3e5212d`.
+manifest, the fourteen prompts, the raw lens logs and `findings.json` are **not** in the
+tree, and everything that rests on them is **seat-attested rather than
+repository-verifiable**. An earlier revision said "three claims" and enumerated three;
+that count was wrong and is replaced by the criterion, because a count of unverifiable
+claims is itself the kind of thing that goes stale:
+
+**Every claim about how the review was conducted is seat-attested.** That includes the
+exclusive file partition; the fifteen source files that drew no finding; the eight-gate
+run that preceded the lenses; that no lens produced a diff; that each row is faithful to
+the lens that raised it and carries the lens's own wording; the fourteen per-lens totals;
+and the local gate results and embedded-binary check reported in the pull request body.
+None of those can be checked from this repository, because the artifacts that would
+settle them are outside it.
+
+**What the repository *does* let you check** is every filed row: its file, its region
+hash, and that the hash relocates to exactly one contiguous region at `3e5212d`. That is
+a claim about the tree, not about the review, and it is the only class of claim here that
+a reader can verify without trusting this seat.
 
 **Citation wording varies** — 26 distinct section strings for 12 actual sections
 (`§12 tests`, `§12 Tests`, `§12 testing strategy`, …). Rows are filed verbatim rather
@@ -68,23 +79,42 @@ than silently normalised. Normalised: §12 102, §7 59, §8 42, §14 36, §5 20,
 ## 0b. What this file is, and what it is not
 
 **This document is a report, not an authority.** It records rulings the owner made; it
-does not make them and it does not constitute them. Every ruling it reports is
-constituted by a decision record — `decisions/2026-08-25-commandspec-program-osstring.md`,
-`decisions/2026-08-25-checkpoint-merges.md`, `decisions/2026-08-24-pr3-layer-freeze-charter.md`
-— and **none of those three exists in this tree.** They land in pull request #40.
+does not make them and it does not constitute them.
 
-An earlier revision of this file wrote its rulings in a voice that made a review
-document read as living product authority, which `decisions/README.md` reserves to
-`DESIGN.md` and the records. Two consequences follow and both are now stated wherever
-they bite:
+**The authority model, corrected.** An earlier revision said living authority is reserved
+to *"`DESIGN.md` and the records"*. `decisions/README.md` says something narrower in its
+first contract bullet: **"DESIGN.md remains the only living authority for product design.
+Records here are history, not spec."** A decision record is where a ruling's reasoning is
+kept; where the ruling changes the spec, `DESIGN.md` takes the compressed edit at decision
+time, citing the record. A *review* document is neither, and this one claims to be
+neither.
 
-1. **Merge order: #40, then #42, then #41 — a hard dependency, not a recommendation.**
-   An earlier ruling called it soft and ordered only #42 before #41; the owner
-   corrected both on 2026-08-28. #40 must land first because the three records above
-   are its content; merging this pull request first would leave a review document as
-   the only statement of rulings whose records do not exist. #42 must land before this
-   one because §1(b) below says the trust-boundary cluster *"routes to
-   `reviews/FINDINGS.md` §2"*, and that is true only once #42 lands.
+**What that means for the rulings reported here.** Three are recorded in decision records
+— `decisions/2026-08-25-commandspec-program-osstring.md`,
+`decisions/2026-08-25-checkpoint-merges.md`,
+`decisions/2026-08-24-pr3-layer-freeze-charter.md` — and **none of those three exists in
+this tree.** They land in pull request #40, so every citation of them here **dangles until
+#40 lands**. That is the accurate statement of the hazard, and it is narrower than the one
+an earlier revision made.
+
+**No `DESIGN.md` edit is owed by anything in this file**, and the reason is worth stating
+because a reader could reasonably expect one. §2's clause says durable wire-facing log
+identity **stays** `String` — it records that the existing spec is unchanged, so there is
+no compressed edit to make. The one ruling here that *would* change the spec, the
+`OsString` widening, is scheduled to `DESIGN.md:222` at W4 by its own record and is
+deliberately not made now.
+
+Two consequences follow and both are now stated wherever they bite:
+
+1. **Merge order: #40, then #42, then #41.** This is **the owner's ruling of
+   2026-08-28**, correcting an earlier ruling of their own that called the dependency
+   soft and ordered only #42 before #41. #40 first, because the three records cited above
+   are its content and the citations here dangle until it lands. #42 before this one,
+   because §1(b) says the trust-boundary cluster *"routes to `reviews/FINDINGS.md` §2"* in
+   the present tense, and that is true only once #42 lands. **What this tree can show is
+   that the three records are absent from it**; that they land in #40, and what #40 and
+   #42 currently contain, are the owner's statements about mutable branches this document
+   does not pin to a head.
 2. **Where this file states a ruling, it cites the record that will carry it.** Where
    no record exists yet, it says the ruling is reported and pending its record rather
    than writing it as settled law.
@@ -107,91 +137,100 @@ same section are explicitly MUST-tagged: *"Path containment checks MUST account 
 preserve or deliberately migrate supported historical runs"*. The author distinguished
 MUST from untagged inside one section, so the untagged bullet is at most SHOULD.
 
-### (a) The lossy-path class — **SPLIT**: 12 rejected, 1 reopened as a live defect
+### (a) The lossy-path class — **REOPENED IN FULL and escalated**, 14 findings
 
-Thirteen findings said path identity reaches a durable record through
-`to_string_lossy`. An earlier revision of this file rejected twelve and **struck** the
-thirteenth. The owner corrected both halves on 2026-08-28. The class now splits on a
-single question, applied per site: **does the code carry a rationale that addresses the
-lossy conversion or the `String` choice itself?**
+**This section has now been wrong three times, in three different ways, and the third
+correction is the one that generalises.** The first revision rejected twelve and struck
+one. The owner amended that on 2026-08-28: the strike was on a ground the standard
+refuses, and `create.rs`'s `canonical_string` is a live defect rather than a compliant
+deviation. The second review of this pull request then checked the call sites and found
+that **the amendment landed on the wrong site**, and that the test it states does not
+stop where either revision stopped.
 
-**The arithmetic, stated because an earlier revision's did not close.** The class holds
-**thirteen** findings. Twelve are rejected — the eleven the earlier revision rejected
-other than `canonical_string`, plus the scaffold row it wrongly struck — and one,
-`canonical_string`, is reopened. An earlier revision opened this section with "the 28
-findings escalated here have been ruled on" while accounting for twenty, and that
-sentence is withdrawn: **28 counted findings, and the class lists below count sites**,
-which are not the same unit and were never going to add up. The three classes are
-thirteen lossy-path findings, seven routed trust-boundary findings, and nine
-unbounded-input **sites**; no total is claimed across units it cannot be taken over.
+**The membership, because an earlier revision asserted a count without one.** Fourteen
+filed rows cite §8 and belong to this family. They are listed here so the arithmetic can
+be checked rather than believed:
 
-**Twelve are compliant documented deviations from a SHOULD — this half stands.** The
-reason is on the field. `src/topology/events.rs`'s `TaskDispatched::worktree_path` says
-it is *"recorded as the string a later process compares and re-derives… a platform path
-type here would make a log written on one operating system a question on another"*, and
-`src/engine/topology/dispatch.rs` cites that doc **by name at the call site**.
-`RunStarted4`'s `execution_root` carries the same argument in its own words — *"A string
-rather than a `std::path::PathBuf`, exactly as `private_dir` and `worktree_path` are: a
-recorded root has to mean the same thing on the Windows machine that resumes the run as
-on the Linux one that wrote it"* — and `private_dir` shares that doc by reference. Those
-docs address the representation decision the rows attack, so `§1`'s SHOULD test is met.
+| work-list line | file | what the lossy value becomes |
+|---|---|---|
+| 47 | `src/engine/topology/create.rs` | `run_started`'s `private_dir` |
+| 50 | `src/engine/topology/create.rs` | `canonical_string` → owner and commit `public_dir` |
+| 51 | `src/engine/topology/create.rs` | `CreatingMarker.private_dir` |
+| 59 | `src/engine/topology/dispatch.rs` | `task_dispatched` worktree identity |
+| 93 | `src/engine/topology/scaffold.rs` | `RunStarted4`'s `execution_root` and `private_dir` |
+| 112 | `src/topology/events.rs` | `RunStarted4`'s path fields as `String` |
+| 156 | `src/agent/codex.rs` | a schema path in a **subprocess argument** |
+| 198 | `src/engine/coordinator.rs` | the operational private-directory path |
+| 201 | `src/engine/preflight.rs` | plan and configuration paths in a record |
+| 224 | `src/events/mod.rs` | persisted plan and configuration paths |
+| 237 | `src/gates.rs` | executable suffix probing through `display()` |
+| 258 | `src/rundir.rs` | the ownership proof's run identity |
+| 264 | `src/rundir.rs` | `CreatingMarker`'s canonical private-directory identity |
+| 267 | `src/runner/container.rs` | a Docker **bind-mount source** |
 
-**One is reopened as a live defect: `create.rs`'s `canonical_string`.** An earlier
-revision rejected it with the others on the grounds that it "documents its fallback as
-deliberate". Read again what the doc actually defends:
+**Three failure modes, and they are not interchangeable.** An earlier revision applied
+one sequence to the whole class, which is how it ended up on the wrong site.
 
-> the proof compares the record against `canonicalize(<public>)` with the same
-> fallback, so a filesystem that will not canonicalize produces two equal non-canonical
-> strings
+- **A — the string is read back and a path is reconstructed** (47, 51, 59, 93, 112, 198,
+  201, 224, 264). A replaced byte produces a **different path** after restart. This is
+  the sequence the owner described, and its clearest instance is `RunStarted4.private_dir`:
+  written with `to_string_lossy` at `create.rs:1647`, and turned back into a path by
+  `PathBuf::from(&started.private_dir)` at `recover.rs:335`. It bites `DESIGN.md` §4's
+  replay invariant.
+- **B — both sides render lossily and only compare** (50, 258). `canonical_string` writes
+  `public_dir`, but recovery does **not** reconstruct a path from that record: it derives
+  the public directory from `repo_root` and `run_id` at `recover.rs:280`, renders *that*
+  lossily through `canonical_display`, and compares strings at `:632`. Both sides produce
+  U+FFFD, so they agree, and no different path is reconstructed. The failure here is
+  narrower and still real: **two distinct non-UTF-8 directories whose lossy renderings
+  collide authenticate against each other's owner record**, and the disagreement refusal
+  never fires.
+- **C — the lossy string selects a target** (156, 237, 267). It is not read back at all;
+  it is handed to a subprocess, an executable probe, or Docker's mount syntax. A replaced
+  byte **names a different or nonexistent object** at the moment of use.
 
-That defends the **`unwrap_or_else` fallback**, and it defends it well — the two sides
-fall back together, so they still agree. It says **nothing whatever about
-`to_string_lossy`**, which runs on *both* branches:
+**Why `canonical_string` was the wrong home for the replay sequence, stated plainly.**
+The owner's amendment is right that its doc defends only the `unwrap_or_else` fallback
+and says nothing about `to_string_lossy`. It is wrong that this produces a different
+reconstructed path, because nothing reconstructs a path from `public_dir`. The finding
+survives with the class-B sequence above; the class-A sequence belongs to
+`RunStarted4.private_dir`, which the same amendment left rejected as compliant.
 
-```rust
-fn canonical_string(path: &Path) -> String {
-    std::fs::canonicalize(path)
-        .unwrap_or_else(|_| path.to_path_buf())
-        .to_string_lossy()
-        .into_owned()
-}
-```
+**And that is why the whole class is reopened rather than re-split.** The test the owner
+states is *"does the code carry a rationale that addresses the lossy conversion?"* Applied
+consistently, it does not stop at `canonical_string`:
 
-So the lossy conversion after a **successful** canonicalize is undocumented, and `§1`
-does not discharge an undocumented deviation at any requirement strength.
+- `TaskDispatched::worktree_path` and `RunStarted4::execution_root` argue for **`String`
+  rather than `std::path::PathBuf`** — *"a recorded root has to mean the same thing on the
+  Windows machine that resumes the run as on the Linux one that wrote it, and a platform
+  path type would make that a question about separators"*. That is an argument about the
+  **type**, and a `String` field can hold a faithful encoding of non-UTF-8 bytes. Neither
+  doc mentions `to_string_lossy` or defends discarding identity bytes.
+- `scaffold.rs:151` **independently chooses** `.to_string_lossy()`. An earlier revision
+  of this file said it "makes no identity decision of its own"; it does, and that claim is
+  **withdrawn**.
+- The class-C sites (156, 237, 267) have no field-level rationale available to them at
+  all: a subprocess argument, an executable probe and a Docker mount source are not
+  `RunStarted4` or `TaskDispatched` fields, so the rationale that discharged the durable
+  records cannot reach them even in principle.
 
-**The concrete failure, and it is not a style matter.** A run rooted beneath a valid
-Unix filename containing byte `0x80` canonicalizes fine and is then recorded as a path
-containing U+FFFD. After a restart, recovery reconstructs a **different** path from the
-record than the one the run used. That contradicts `DESIGN.md` §4's replay invariant —
-state is derived by replaying the log, so a log that cannot name the run's own root
-cannot reconstruct it.
+**Disposition: OPEN, escalated to the owner, and no rejection is claimed.** This seat has
+no standing to reverse an owner ruling, and it is not doing so — it is reporting that the
+ruling's own test, applied to the call sites, does not sustain the twelve rejections, and
+asking for the narrower question to be decided: **is a documented `String`-over-`PathBuf`
+choice also a documented defence of `to_string_lossy`?** If yes, class A and the
+`scaffold.rs` row return to rejected and only classes B and C stand. If no, the class is
+open and the sweep is the wrong venue for at least class A.
 
-`canonical_string` has exactly two callers, both writing `public_dir`: the owner record
-at `create.rs:1503` and the commit record at `:1689`. It does **not** feed `RunStarted4`,
-so this reopening and the twelve rejections do not overlap — the boundary is real, not
-a compromise. Its comparison-side twin, `recover.rs`'s `canonical_display`, is already
-routed to `reviews/FINDINGS.md` §2 as `PR7-STD-OWNER-RECORD-LEXICAL-AUTH`; **the write
-side belongs beside it**, and this is the recommendation carried to the owner.
+Until that ruling, the fourteen rows stay filed in the work-list with this triage beside
+them, and **no `reviews/FINDINGS.md` row is added by this pull request** — #42 owns that
+file in this sequence.
 
-**The scaffold row is restored, and disposed on merits.** An earlier revision struck
-`src/engine/topology/scaffold.rs` on the ground that it is `#[cfg(test)]` and therefore
-not production. **That is not a ground.** `CODING_STANDARDS.md` says in its opening
-lines that *"It applies to production code, tests, examples, build support, and
-code-generation inputs."* Striking it was this seat's error, of the same class it has
-been catching in others, and the owner corrected it. Disposed under the same test as
-the twelve: `scaffold.rs:154` and `:156` convert into `RunStarted4`'s `execution_root`
-and `private_dir` with no canonicalize step and no independent identity decision of
-their own, so the fields' own documented rationale covers them. **Rejected as a
-compliant documented deviation — on merits, not on venue.**
-
-**The lens failure mode is worth naming**, because it is the reason twelve rows were
-filed against a rule they satisfy: each lens cited `§8` and none engaged the rationale
-sitting on the field it was citing. A reader that quotes a clause without reading the
-justification the code offers against that clause will file a compliant deviation as a
-violation every time — and `§1` makes that justification the whole test for a SHOULD.
-**The symmetric failure is this seat's**, and `canonical_string` is the instance: it
-read that a rationale existed and did not check *which* clause the rationale defended.
+**The lens failure mode is still worth naming.** Each lens cited `§8` and none engaged
+the rationale sitting on the field it was citing, which is how a compliant deviation gets
+filed as a violation. **The symmetric failure is this seat's, twice**: the first revision
+read that a rationale existed and did not check which clause it defended; the second read
+the amendment and did not check which call site the sequence fits.
 
 ### (b) The trust-boundary class — **ROUTING CHANGED**, 7 findings
 
@@ -210,6 +249,17 @@ capacity, or state-transition authority"* and its final bullet *"Security-sensit
 comparisons and decisions MUST fail closed on malformed, contradictory, or unavailable
 evidence; availability fallbacks must not silently grant more authority."* What was
 false was the evidence sentence, not the verdict.
+
+**An eighth row joins them, and the miss it exposes is the same shape.** The routing test
+— which requirement keyword does the cited clause carry — was applied to §8 and §14 and
+**not to §9**. `src/runner/container.rs`'s `exec_streams` row (work-list line 272) cites
+*"§9 Processes and external tools"*, and §9 says *"Every subprocess integration MUST
+define and test: … timeout, cancellation, and descendant-process cleanup"*, plus
+stdout/stderr size behaviour. That is a MUST; §1 sends it to an owner exactly as it sent
+the other seven; and `exec_streams`'s doc comment argues only about **stream separation**,
+so there is no rationale to weigh even at SHOULD strength. It is routed as
+`PR7-STD-CONTAINER-EXEC-UNBOUNDED`, and it is also **removed from §1(c)'s list below**,
+where an earlier revision left it as sweep work.
 
 They are therefore **not** the sweep's work. They route to `reviews/FINDINGS.md` §2 as
 contract rows with a named owner. **That routing is a claim about pull request #42, and
@@ -263,11 +313,14 @@ the site carries a concrete reason in the code.
 | `src/engine/attempt.rs` and `src/review.rs`, agent-authored artifacts read into prompts | no | **OPEN**, undocumented, and the input is model output — the least trusted class this engine handles. |
 | `src/config.rs` | no — the nearby doc is about modification time, not bounds | **OPEN**, undocumented. |
 | `src/topology/schema.rs` header probe | not checked to the same depth | **OPEN, and the check is owed.** Recorded as unverified rather than asserted either way. |
-| `src/runner/container.rs` `exec_streams` | no — its doc is about stream separation | **OPEN**, undocumented; `Command::output` captures both streams with no pre-allocation bound and no timeout. |
+| `src/runner/container.rs` `exec_streams` | no — its doc is about stream separation | **ROUTED, not sweep work.** Its filed row cites §9, whose subprocess requirements are MUST-tagged, so §1 sends it to an owner. It is `PR7-STD-CONTAINER-EXEC-UNBOUNDED` in `reviews/FINDINGS.md` §2 — see §1(b). Listing it here as a SHOULD was the miss that §1(b) now records. |
 | `src/validate.rs` cycle detection over the untrusted task graph | not checked to the same depth | **OPEN, and the check is owed.** |
 
-**What the seat verified and what it did not.** The first five rows above were read at
-the cited sites in this tree; the last two were not audited to that depth and say so.
+**What the seat verified and what it did not.** The table has **eight** rows. Rows 1-5
+and row 7 were read at the cited sites in this tree. **Rows 6 and 8** —
+`src/topology/schema.rs`'s header probe and `src/validate.rs`'s cycle detection — were
+not audited to that depth and say so in their own cells. An earlier revision said "the
+last two", which named the wrong two once row 7 was routed out.
 An earlier revision's error was to let a class disappear rather than say "unresolved",
 and a disposition that overstates its own evidence would repeat that in the other
 direction.
@@ -297,10 +350,13 @@ other two are independent of it and each remains sufficient on its own:
 - The `OsString` record scopes itself to *"the one measured field"* with *"no
   speculative widening"*, so it cannot authorise what it expressly declined to cover.
 
-**And the reopened finding does not reach W4 either**, which is why withdrawing the
-first reason changes no outcome: `canonical_string` writes `public_dir` in the owner
-and commit records, not `CommandSpec.program`, and its repair is a conversion change at
-one call site rather than a type widening in the frozen design.
+**And the reopened class does not reach W4 either**, which is why withdrawing the first
+reason changes no outcome. W4 widens **one** field, `CommandSpec.program`, from `String`
+to `OsString`. Not one of the fourteen rows in §1(a) is about that field: they are event
+and marker records, a subprocess argument, an executable probe and a mount source. Their
+repair — where the owner rules one is owed — is a **conversion** change at the call site,
+choosing a faithful encoding instead of `to_string_lossy`, which is a different act from
+widening a type in the frozen design and needs no `DESIGN.md:222` edit.
 
 What the ruling added instead is a clause, not a record: the two live documents reason
 oppositely about one trade-off — `events.rs` argues cross-platform log legibility for
