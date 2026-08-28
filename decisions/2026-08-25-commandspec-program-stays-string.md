@@ -53,9 +53,16 @@ the field as path-shaped; the runner's own comment had already said otherwise.
   constructor is ever added, the boundary fails closed rather than spawning a lossily
   converted path that names something else. An earlier revision ordered it deleted; deleting
   it would remove the guard that makes adding such a constructor safe.
-- **§1's "Known conflicts at adoption" block is still owed a retirement**, but no longer as
-  cargo on a spec edit that is not happening. It retires on its own motion, by its own pull
-  request to `master`, recording that the conflict was resolved by finding there was none.
+- **§1's "Known conflicts at adoption" block is owed a retirement**, no longer as cargo on a
+  spec edit that is not happening. It retires on its own motion, by its own pull request to
+  `master`, recording that the conflict resolved by there being none.
+
+  **That block is now inaccurate, where a ruling of 2026-08-28 found it merely incomplete.**
+  It says the conflict "is unresolved", names `PR4-PROGRAM-PATH-NOT-UNICODE` "the open owner
+  question", and gives W4 as the decision venue. None of the three is true after this record.
+  The earlier ruling was right about the document as it then stood; this is a supersession by
+  later evidence rather than a reversal, and it raises the retirement from tidying to a
+  correctness repair.
 - **`PR4-PROGRAM-PATH-NOT-UNICODE` closes** as not reproducible in production. The standing
   ledger carries the superseding disposition; this record carries the reasoning.
 
