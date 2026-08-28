@@ -136,7 +136,7 @@ struct ClippyToml {
     // mechanism that turns an unclassified clippy.toml key into a failure --
     // the correct response to a new key is to classify it here, never to
     // relax the attribute -- and they are asserted by
-    // `the_panic_policy_allowances_are_exactly_what_the_standard_states` so a
+    // `clippy_toml_turns_the_allowances_on_and_gives_unwrap_none` so a
     // field this file merely parses cannot drift unobserved.
     #[serde(default, rename = "allow-expect-in-tests")]
     allow_expect_in_tests: bool,
@@ -1339,7 +1339,7 @@ fn the_workflow_that_runs_these_tests_installs_the_compiler_they_need() {
 ///
 /// **Why this is a loop and not three tests.** `PR5D-MSVC-CLIPPY-NEVER-RUN`
 /// and `PR5-MACOS-CLIPPY-NEVER-RUN` are the same defect on two platforms, found
-/// eighteen months of process apart, because the Windows repair was written as
+/// apart, because the Windows repair was written as
 /// an instance rather than a class. A per-platform table makes the next
 /// platform's omission a failure here rather than a third finding.
 #[test]
@@ -1347,11 +1347,37 @@ fn every_platform_that_needs_the_effect_denial_gate_has_one_the_aggregate_requir
     const GATE: &str = "cargo clippy --all-targets --all-features -- -D warnings";
     // The runner, never the job name: what discharges the clause is the platform
     // that compiles the `#[cfg(...)]` bodies, and a name is a label.
+    //
+    // The DOMAIN is derived from production source, not written down here. A
+    // hand-written platform list is `OFFERS_WORK` — a list nothing forces an
+    // author to extend — which is exactly what the previous repair of this test
+    // shipped. `platform_cfgs_in_production` reads the cfgs the crate actually
+    // uses, and the assertion below refuses any it cannot map to a runner, so
+    // adding `#[cfg(target_os = "freebsd")]` to `src/` fails HERE until a job
+    // covers it.
     const RUNNERS: [(&str, &str); 3] = [
-        ("windows-latest", "#[cfg(windows)]"),
-        ("macos-latest", "#[cfg(target_os = \"macos\")]"),
-        ("ubuntu-latest", "#[cfg(unix)] on Linux"),
+        ("windows-latest", "windows"),
+        ("macos-latest", "macos"),
+        ("ubuntu-latest", "linux"),
     ];
+
+    let domain = platform_cfgs_in_production();
+    assert!(
+        domain.len() >= 3,
+        "only {} platform cfg(s) found in src/; the census is reading the wrong shape: {domain:?}",
+        domain.len()
+    );
+    let covered: BTreeSet<&str> = RUNNERS.iter().map(|(_, platform)| *platform).collect();
+    let uncovered: Vec<&String> = domain
+        .iter()
+        .filter(|p| !covered.contains(p.as_str()))
+        .collect();
+    assert!(
+        uncovered.is_empty(),
+        "production code carries platform cfg(s) {uncovered:?} that no runner in this \
+         test covers, so their bodies are outside the denylist's reach on every job CI \
+         runs. Add the platform's Clippy job and its entry here."
+    );
 
     let workflow = fs::read_to_string(repo_root().join(".github/workflows/ci.yml"))
         .expect(".github/workflows/ci.yml");
@@ -1431,6 +1457,19 @@ fn every_platform_that_needs_the_effect_denial_gate_has_one_the_aggregate_requir
         );
         let gate_job = gates[0];
 
+        // A step conditional turns the job green without running the gate.
+        // `.github/scripts/test-docs-consistency.sh` records this escape class.
+        let block = &jobs
+            .iter()
+            .find(|(n, _)| n == gate_job)
+            .expect("the gate job")
+            .1;
+        assert!(
+            !block.contains("if: false"),
+            "`{gate_job}` carries `if: false`, so it reports success without running \
+             the denial gate on {runner}"
+        );
+
         assert!(
             needs.contains(gate_job),
             "`merge-gate` does not depend on `{gate_job}`, so branch protection would \
@@ -1441,9 +1480,17 @@ fn every_platform_that_needs_the_effect_denial_gate_has_one_the_aggregate_requir
         // results are *required*, and a job listed but not looped over may fail
         // freely. The loop names gates in the shape its env vars use.
         let looped = gate_job.to_uppercase().replace('-', "_");
+        // The BINDING, not its existence. `LINT_MACOS_RESULT: needs.lint-windows.result`
+        // is a copy-paste that satisfies an existence check, reads a passing
+        // sibling, and — with `if: always()` on the aggregate — reports the
+        // required check green over a red leaf. Measured: the previous version
+        // of this assertion accepted exactly that.
+        let binding = format!("{looped}_RESULT: ${{{{ needs.{gate_job}.result }}}}");
         assert!(
-            merge.contains(&format!("{looped}_RESULT:")),
-            "`merge-gate` does not read `{gate_job}`'s result into `{looped}_RESULT`"
+            merge.contains(&binding),
+            "`merge-gate` does not bind `{looped}_RESULT` to `needs.{gate_job}.result`. \
+             A binding that reads another job's result passes an existence check and \
+             reports green over this platform's failure."
         );
         assert!(
             requires.split_whitespace().any(|word| word == looped),
@@ -1451,6 +1498,60 @@ fn every_platform_that_needs_the_effect_denial_gate_has_one_the_aggregate_requir
              can fail without failing the aggregate: {requires}"
         );
     }
+}
+
+/// The platform `cfg`s production code actually uses.
+///
+/// The domain for the CI-gate test above. Derived rather than listed, because a
+/// listed domain is a list nothing forces an author to extend — `OFFERS_WORK`,
+/// which this repository has already paid for once. `cfg(unix)` is deliberately
+/// absent: it is compiled by both the macOS and Linux legs, so it adds no
+/// platform requirement of its own.
+fn platform_cfgs_in_production() -> BTreeSet<String> {
+    let mut found = BTreeSet::new();
+    for (_, source) in scanned_sources() {
+        // RAW source, deliberately, and not `production_code`. Two reasons, and
+        // the second is the load-bearing one. First, `production_code` blanks
+        // string literals, so `cfg(target_os = "macos")` would arrive here as
+        // `cfg(target_os = "     ")` with the platform name erased -- measured,
+        // and the reason the first version of this census found only `windows`.
+        // Second, the gate is `cargo clippy --all-targets`, which compiles test
+        // code too: a platform cfg inside a test module needs that platform's
+        // lint leg exactly as much as one in production does.
+        // Raw for the NAME, blanked for the POSITION.
+        //
+        // `blank_comments_and_strings` erases the platform name -- a raw read is
+        // the only way to see `macos` at all. But a raw read also sees this very
+        // census's own explanatory comments, and did: an earlier version
+        // reported `freebsd` and a blanked string, both quoted from the prose
+        // beside it. That is the repository's recorded "a comment that spells
+        // the token a census greps for" class, and this file is its fourth
+        // occurrence.
+        //
+        // So the name comes from raw text and the POSITION is gated on the
+        // blanked text still carrying `cfg(` at the same offset. A comment
+        // blanks to spaces and fails that gate; an attribute keeps its
+        // structure and passes.
+        let text = &source;
+        let blanked = blank_comments_and_strings(&source);
+        for capture in text.match_indices("cfg(") {
+            if !blanked.as_bytes()[capture.0..].starts_with(b"cfg(") {
+                continue;
+            }
+            let rest = &text[capture.0..];
+            let Some(end) = rest.find(')') else { continue };
+            let inner = &rest[4..end];
+            if inner == "windows" {
+                found.insert("windows".to_owned());
+            } else if let Some(os) = inner
+                .strip_prefix("target_os = \"")
+                .and_then(|rest| rest.strip_suffix('"'))
+            {
+                found.insert(os.to_owned());
+            }
+        }
+    }
+    found
 }
 
 /// The crate's own rlib and the directory its dependencies are in.
