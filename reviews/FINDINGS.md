@@ -208,33 +208,49 @@ programmer defect, not a currently reachable panic. The lens found no reachable 
 suppressed by it.
 
 **Why the alternatives lost.** Refactoring the `expect` away is a larger edit to the same
-frozen file, and a behaviour-adjacent one. A module-level `allow` would have to live in
-`effects/allowlist.toml`, weakening the mechanism the whole governed-effect system rests
-on. Leaving it unannotated fails `clippy -D warnings` on the integration branch, because
+frozen file, and a behaviour-adjacent one. A module-level `#![allow(clippy::expect_used)]` is a Rust
+attribute, not an allowlist entry — `effects/allowlist.toml` governs the effect-denial
+lints only, and an earlier draft of this row said otherwise. It loses on its own
+terms instead: it suppresses the lint for every call in the module rather than
+the one that needs it. Leaving it unannotated fails `clippy -D warnings` on the integration branch, because
 master's `[lints.clippy]` denies `expect_used` — so the branch could not pass its own
 gate.
 
-### 2026-08-28 — `PR5-MACOS-CLIPPY-NEVER-RUN` fired, and is carried
+### 2026-08-28 — `PR5-MACOS-CLIPPY-NEVER-RUN` fired, and is REPAIRED
 
-Its owner clause names the slice that next opens `ci.yml`. The master merge carries a
-`ci.yml` change, so the trigger has fired. **It is recorded here and NOT repaired in this
-pull request**: adding a macOS Clippy job to a merge-only bridge is scope creep, and the
-bridge's whole argument is that it changes nothing but what the merge forced.
+Its owner clause names the slice that next opens `.github/workflows/ci.yml`. The
+master merge carries a `ci.yml` change, so the trigger fired and **this slice was
+the named owner**. An earlier draft of this row recorded it as "carried, with an
+owner" and declined the repair as scope creep. The delta review of `d46e48f`
+rejected that, correctly: the row named no successor owner, no concrete
+follow-up, and carried no owner re-ruling authorising another deferral. A
+deferral by the named owner, to nobody, is not a disposition.
 
-The `lints` lens supplied the concrete escape this row previously described only in the
-abstract. No Clippy job compiles the macOS-only production regions of
-`src/agent/proc.rs` — `last_errno`, `group_has_non_zombie_members`,
-`process_is_stopped`, `create_cloexec_pipe`, `clear_nonblocking`, and the non-Linux
-`groups_are_quiescent`. Ubuntu Clippy configures them out, the new Windows Clippy job
-configures them out, and macOS runs tests and MSRV but not Clippy. So:
+**The repair is the `lint (macos)` job.** The hole was precise. Ubuntu Clippy
+configures out every `#[cfg(target_os = "macos")]` region; the Windows leg
+configures out the same; macOS ran tests and MSRV but **no Clippy job at all**.
+So a denied call in a macOS-only region — the lens's own example is an
+`.expect()` inside the macOS `create_cloexec_pipe` at `src/agent/proc.rs:3870`
+— could ship with every required check green.
 
-> add an `.expect()` inside macOS `create_cloexec_pipe`; if no test executes that branch,
-> every required check passes and a production panic the standard prohibits ships.
+`ci.yml` gains a `lint (macos)` job mirroring `lint (windows)` exactly, and —
+because a dependency whose result nothing inspects is a job that enforces
+nothing — it is added to the `merge-gate` aggregate in all three places that
+matter: `needs`, the `LINT_MACOS_RESULT` env, and the loop that decides the
+aggregate's exit.
 
-The lens checked and found **no currently denied call** in those regions, so the hole is
-open but unoccupied. The repository already records it at `src/effects/tests.rs:1352`.
-Carried, with an owner, rather than left silent.
+**The line number in an earlier draft was wrong**, and the delta review caught
+it: `src/agent/proc.rs:3857` is the **Linux** `create_cloexec_pipe`. The macOS
+implementation begins at **3870**. The six macOS-only production regions the
+lens named are `last_errno`, `group_has_non_zombie_members`,
+`process_is_stopped`, `create_cloexec_pipe`, `clear_nonblocking`, and the
+non-Linux `groups_are_quiescent`; it verified no currently denied call sits in
+any of them, so the hole was open and unoccupied.
 
+**What this row cannot claim until CI reports.** macOS Clippy has never run in
+this repository's history. Whether the tree is clean under it is a measurement,
+not an assumption, and the first run of the new leg is that measurement. If it
+fails, the failure is a finding about the tree and not about this row.
 ### 2026-08-27 — `candidate_prepared` is the sole successful settlement, per-instance Class B approval
 
 **The owner's ruling, quoted:**

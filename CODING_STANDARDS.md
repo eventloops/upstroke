@@ -85,8 +85,10 @@ Lint policy:
 - A denylist MUST have a resolution census run by a named gate. The census links the probe against
   every dependency needed to resolve its paths, enumerates the declared platform exceptions, and
   injects a misspelled control that it must detect. These requirements attach to `disallowed-*`
-  entries: `clippy.toml` carries only the `allow-*-in-tests` booleans today, and the census
-  activates in the same change that introduces the first denied path.
+  entries, and they are active: `clippy.toml` carries 104 denied paths — 97 methods, 3 types
+  and 4 macros — beside the `allow-*-in-tests` booleans, and the census is
+  `effects::tests` in `src/effects/tests.rs`, which resolves every denied path
+  against a linked probe and injects a misspelled control it must detect.
 
 ## 3. Rust-native design principles
 
@@ -582,9 +584,9 @@ assistance is not the same as enforcement, and a green gate is not evidence for 
 | §1 authority, precedence, and known conflicts | Pull-request review; `test-docs-consistency.sh` for the document relationships it explicitly enumerates | Review-only unless the named Bash fixture contains the claim |
 | §2 formatting | `cargo fmt --check` / rustfmt | Automated on all formatted Rust inputs; default configuration at adoption |
 | §2 compiler and ordinary lint baseline | `cargo clippy --all-targets --all-features -- -D warnings` | Automated for code compiled by the lint job |
-| §2 effect denylist | `clippy.toml` disallowed methods, types, and macros; denylist resolution census with an injected typo control | Conditional: `clippy.toml` holds only test-allowance booleans; automated only after denied paths, their platform Clippy legs, and the census land |
+| §2 effect denylist | `clippy.toml` disallowed methods, types, and macros; denylist resolution census with an injected typo control | **Active.** 104 denied paths, the census in `src/effects/tests.rs`, and Clippy legs on all three platforms — `lint`, `lint (windows)` and `lint (macos)`. A path this host cannot resolve is caught by the census, not by `-D warnings` |
 | §§3–6 design, types, APIs, ownership, and resources | rustc ownership/type checking and targeted Clippy lints where applicable; tests; pull-request review | Partly automated; semantic and abstraction rules are review-only, and the ambient-authority funnel is review-enforced until denylist entries pin it |
-| §7 errors and panics | `[lints]`-denied `unwrap_used`, `expect_used`, `panic`, `todo`, `unimplemented`, and `dbg_macro`; type checking; tests | Panic policy automated for code the Clippy leg compiles, with `#[expect]` marking each documented §7 exception; context quality and error taxonomy stay review-only |
+| §7 errors and panics | `[lints]`-denied `unwrap_used`, `expect_used`, `panic`, `todo`, `unimplemented`, and `dbg_macro`; type checking; tests | Panic policy automated on all three platforms' Clippy legs, with `#[expect]` marking each documented §7 exception; before `lint (macos)` landed, `#[cfg(target_os = "macos")]` code was compiled by no Clippy job at all; context quality and error taxonomy stay review-only |
 | §§8–9 filesystem, persistence, and processes | behavioural tests; platform CI; effect denylist once active | Partly automated; atomicity, durability, ownership, parsing, and protocol completeness require review |
 | §10 concurrency and async code | rustc `Send`/`Sync` and borrowing checks; deterministic concurrency tests | Partly automated; protocol, cancellation safety, bounds, and ordering require review. `.await`-specific rows are N/A until async production code lands |
 | §11 unsafe and platform code | rustc unsafe checks, `unsafe_op_in_unsafe_fn` denied via `[lints]`, native tests; Miri or sanitizer only when a named leg exists; `undocumented_unsafe_blocks` pending its ratchet commit | Partly automated; safety proofs and tool triggers require review |
