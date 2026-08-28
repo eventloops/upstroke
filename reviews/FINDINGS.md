@@ -172,6 +172,60 @@ direct question about scope and answered it as a disposition, which is now settl
 claim about the PR3 round, not about PR4's second confirmation, whose two findings —
 `PR4-CONF-003` and `PR4-CONF-004` — were both accepted and repaired in round 5.)*
 
+### 2026-08-28 — `BRIDGE-CI-SHAPE-TEST-IS-A-SUBSTRING-ORACLE`, open, owner decision
+
+**The finding, and the ruling it overturned.** Six review rounds of PR #34
+examined the test that pins the platform Clippy legs into `merge-gate`.
+`~/tactus-artifacts/pr34/review-delta6.md` established two escapes it does not
+close, and defeated the ruling that had declined to close them.
+
+**The escapes, both concrete.**
+
+1. `- run: echo cargo clippy --all-targets --all-features -- -D warnings`
+   satisfies the command check. The job echoes, succeeds, and the aggregate
+   passes while Clippy never examines a denied call in that platform's code.
+2. The cfg census collects `target_os` names without evaluating `all`/`any`/
+   `not`, so `#[cfg(not(any(target_os = "linux", target_os = "macos", target_os
+   = "windows")))]` reports all three platforms covered while **no** runner
+   compiles the body. The inverse also misfires: `#[cfg(not(target_os =
+   "freebsd"))]` would demand a FreeBSD runner for a body specifically excluded
+   there, and a plain `let target_os = "android";` is misclassified because the
+   scan never confirms it sits in cfg syntax.
+
+**The ruling that was wrong, recorded because the reasoning matters.** An
+earlier round declined to close these, arguing from PR #25 that a text checker
+over an open-ended surface does not converge. The review rejected that and was
+right. PR #25's *withdrawn* half compared prose across an open document set and
+had a trusted workflow rerunning the real gates behind it — machinery since
+retired. Its *retained* half kept C1–C4 as **equalities and exact pins**. So
+PR #25's lesson supports structural equality here; it does not license
+repeated `contains` checks. The ruling is withdrawn, in this row and in the
+test's own doc comment.
+
+**The bounded repair, as the review specified it.** Parse the workflow as
+YAML 1.2 with duplicate-key rejection and compare the relevant mappings
+structurally: exact `runs-on`, an exact `run` scalar, absence of job- and
+step-level `if` and `continue-on-error`, the exact `needs` set, and exact env
+key-to-expression mappings, rejecting unexpected fields. Separately, evaluate
+parsed cfg predicates against the finite CI target tuples rather than
+collecting names, with a permanent injected control fixture as
+`CODING_STANDARDS.md` §12 requires of a census.
+
+**Why it is not done here, and what the owner must decide.** The repair needs a
+YAML parser. This crate has no YAML dependency and no `[dev-dependencies]`
+section at all, so it is a **dependency decision**, not a patch — and a project
+whose thesis includes a small trusted surface should take that deliberately.
+The owner's options are to authorise the dependency and the structural repair;
+to merge with this row as the recorded disposition and schedule the repair; or
+to delete the test on the ground that an oracle claiming more than it enforces
+is worse than none, leaving CI as the only claim.
+
+**What is not in doubt.** `lint (macos)` exists, is wired into the aggregate,
+and **passed on its first run in this repository's history** — the tree is
+clean under macOS Clippy by measurement. `PR5-MACOS-CLIPPY-NEVER-RUN` is closed
+by that leg. This row is about the strength of the regression oracle guarding
+the wiring, not about whether the wiring is correct today.
+
 ### 2026-08-28 — `BRIDGE-FROZEN-LINT-ATTRIBUTE`, per-instance Class B approval
 
 **The owner's ruling, quoted:**

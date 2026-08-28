@@ -1337,17 +1337,30 @@ fn the_workflow_that_runs_these_tests_installs_the_compiler_they_need() {
 /// anything: the job exists and runs on that runner, `merge-gate` lists it in
 /// `needs`, and `merge-gate`'s own loop names it.
 ///
-/// **What this test does NOT refuse.** It reads `ci.yml` as text, and YAML has
-/// unbounded ways to say the same thing. `if: ${{ false }}` or an
-/// expression-valued conditional disables a gate step without matching the
-/// literal this checks; a decoy value inside the `env:` mapping itself would
-/// satisfy the binding assertion. Those are recorded, not closed: this
-/// repository spent five review rounds on PR #25 establishing that a text
-/// checker over an open-ended surface does not converge, and the lesson filed
-/// was to scope such gates to finite mechanical contracts. The finite contract
-/// here is the wiring's *shape* — a job per platform, on that platform's
-/// runner, named in `needs`, bound in `env`, and named in the deciding loop.
-/// The gate's *effect* is proven by CI running it, not by this test.
+/// **What this test does NOT establish, stated without hedging.** It does not
+/// establish that the job runs Clippy: `- run: echo cargo clippy ...` satisfies
+/// the command check while the job merely echoes. It does not establish that
+/// the env entry binds *this* job's result, because a decoy elsewhere in the
+/// mapping satisfies the search. It does not establish that every platform
+/// whose code CI compiles has a leg, because the census collects `target_os`
+/// names without evaluating `all`/`any`/`not` — so
+/// `#[cfg(not(any(target_os = "linux", target_os = "macos", target_os =
+/// "windows")))]` reports all three covered while no runner compiles the body.
+///
+/// **These are not unbounded-surface problems, and an earlier version of this
+/// doc wrongly claimed they were.** It cited PR #25 to argue that a text
+/// checker cannot converge. That misread the lesson: PR #25's narrowed pass
+/// kept its C1–C4 contracts as *equalities and exact pins*, and its withdrawn
+/// half compared prose across an open document set — not one machine-readable
+/// file. The bounded repair is named in `reviews/FINDINGS.md`: parse the
+/// workflow structurally and evaluate cfg predicates against the CI target
+/// tuples. It needs a YAML dependency this crate does not have, which is an
+/// owner decision rather than a patch.
+///
+/// What it does hold: a job named per platform, on that platform's runner,
+/// present in `needs`, present in the deciding loop, and free of a literal
+/// `if: false`. That is a shape check, and it earns its place only by being
+/// honest about being one.
 ///
 /// **Why this is a loop and not three tests.** `PR5D-MSVC-CLIPPY-NEVER-RUN`
 /// and `PR5-MACOS-CLIPPY-NEVER-RUN` are the same defect on two platforms, found
