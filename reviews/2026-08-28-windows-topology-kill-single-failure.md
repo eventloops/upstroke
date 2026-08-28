@@ -139,9 +139,11 @@ how a rate never gets measured.
 stating because the companion's had to be weakened. `DESIGN.md` and
 `decisions/README.md` are compiled into the test binary by `include_str!`
 (`src/export.rs:1091`, `:1153`, `:1168`), so a markdown edit to *those* files does change
-the binary. **This diff touches neither**: it adds two files under `reviews/`, which no
+the binary. **This diff touches neither**: everything it adds is under `reviews/`, which no
 `include_str!` in the tree reads. The binary here really is byte-identical to the base's,
-which is the property "provably could not reach the failing code" actually requires.
+which is the property "provably could not reach the failing code" actually requires. No
+file count is stated, because the count changes as this branch commits the reviews of its
+own heads and an earlier revision of this sentence went stale exactly that way.
 
 ## The class
 

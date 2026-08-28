@@ -79,21 +79,30 @@ exiting 0, which is what `assert!(status.success(), …)` at line 7966 requires.
   completes before the supervised child is spawned and long before the test's `kill`, so
   that sequence does not fit. Withdrawn and not replaced.
 
-An earlier revision also said *"every other `_exit` in that file passes 0 or 1"*. That is
-false — there are four `_exit(127)` calls — and it is withdrawn. It was never load-bearing
-for 143, which is uniquely constructed, but it was stated as a checked fact and was not
-one.
+An earlier revision also claimed that every other `_exit` in that file passes zero or one.
+That is false, and **the correction an intervening revision offered was itself a wrong
+count** — arrived at by a `grep -c` that counted a mention in a doc comment alongside the
+calls. Both are withdrawn, and no count replaces them: the claim was never load-bearing,
+because the construction that yields this status is unique in the file, and asserting an
+incidental tally is how a checked-sounding fact enters without being checked.
 
 **What is left is smaller and still worth recording.** A supervised helper reached the
 terminating path when the test required a clean exit, on macOS only, once. The route is
 unknown, the rate is unmeasured, and this record says so rather than choosing among the
 candidates.
 
-**A red matching this fingerprint is this failure until shown otherwise; a red that
-does not match it is a regression until shown otherwise.** That is the rule
-`reviews/FINDINGS.md` §12 applies to the flake it measures — *"A red on this test after
-a push is **this flake until proven otherwise**"* — carried here by analogy, and it is
-why the fingerprint is recorded before any rate is.
+**The rule, stated once, because an earlier revision stated two and they contradicted.**
+It first carried `reviews/FINDINGS.md` §12's rule by analogy — *"this flake until proven
+otherwise"* — and then said the opposite a few lines later. **The analogy does not hold and
+is withdrawn.** §12's oracle identifies its flake; this fingerprint does not identify
+anything, so the rule here is weaker and is the only one:
+
+> **A failure matching this fingerprint is *unresolved* until the reaper-cleanup path is
+> ruled out.** It is not this observation until shown so, and it is not a regression until
+> shown so. What the match establishes is which monitor path ran, and the cause is open.
+
+A failure that does **not** match — in particular one reading a signal termination rather
+than an exit status — is a different failure and this record does not cover it.
 
 **The fingerprint's matching rule, stated so it can be applied — and its width, stated so
 it is not trusted too far.** Match on the test name, the assertion site
