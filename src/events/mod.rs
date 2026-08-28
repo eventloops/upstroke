@@ -1907,18 +1907,18 @@ pub(crate) fn ensure_supported_schema(
                     }
                     _ => {}
                 }
-                if failed
-                    && !valid_attempt_decision(
+                if let Some(failure) = data.failure.as_ref() {
+                    if !valid_attempt_decision(
                         task,
-                        data.failure.as_ref().expect("checked failed"),
+                        failure,
                         transition.as_deref(),
                         parking.as_deref(),
-                    )
-                {
-                    return Err(UpstrokeError::EventLog {
-                        path: path.to_path_buf(),
-                        message: "event schema 3 attempt_finished carries a ladder/parking decision inconsistent with its failure".to_owned(),
-                    });
+                    ) {
+                        return Err(UpstrokeError::EventLog {
+                            path: path.to_path_buf(),
+                            message: "event schema 3 attempt_finished carries a ladder/parking decision inconsistent with its failure".to_owned(),
+                        });
+                    }
                 }
             }
             EventBody::QuestionAnswered { data }

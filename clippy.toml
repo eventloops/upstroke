@@ -1,3 +1,15 @@
+# Test allowances for the §7 panic-policy lints (CODING_STANDARDS.md §2, §7):
+# tests fail their own setup with `.expect(` and a message, use `panic!` in
+# their own assertion helpers, and may print. `.unwrap()` has no allowance —
+# it is denied everywhere, tests included.
+#
+# These booleans are not a denylist. The §2 resolution-census requirements
+# attach to `disallowed-*` entries and activate in the change that introduces
+# the first one.
+allow-expect-in-tests = true
+allow-panic-in-tests = true
+allow-print-in-tests = true
+
 # The rustc-resolved effect denylist.
 #
 # `decisions.effect_site_inventory.mechanism` (1): "enforcement is rustc-resolved

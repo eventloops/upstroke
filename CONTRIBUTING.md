@@ -27,9 +27,11 @@ Use the pull-request template to record the exact commands, implementation prove
 SHA, review model and effort, evidence link, risk, and rollback. Resolve every review conversation;
 merge commits are the only accepted merge method.
 
-Conventions worth knowing: edition 2024, no panicking `.unwrap()` or `.expect()` calls outside
-tests, `anyhow` only at the binary edge (libraries return `thiserror` types), and all paths through
-`std::path` — Windows is a first-class target, not an afterthought.
+[`CODING_STANDARDS.md`](CODING_STANDARDS.md) is the normative implementation standard; read it
+before changing Rust code. Among its hard requirements: edition 2024 with MSRV 1.85, no
+`.unwrap()` or `.expect()` in production, `anyhow` only at the binary edge (libraries return typed
+`thiserror` errors), and paths represented with `std::path` types. Windows, macOS, and Linux are
+supported targets. The four commands above are the automated baseline, not the whole standard.
 
 ## Contributor Licence Agreement
 

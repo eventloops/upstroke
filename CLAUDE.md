@@ -44,11 +44,20 @@ estimate and report; nothing routes on it yet.
 The build order is `DESIGN.md` §21 and it is deliberate. Check where the
 project actually is before adding something out of sequence.
 
-**`DESIGN.md` is the only living authority.** `decisions/` are dated, immutable
-records of why; `proposals/` are inputs that bind nothing until a decision
-cites them. When a decision changes the spec, `DESIGN.md` gets the compressed
-edit and the record is cited. Read `decisions/README.md` and
-`proposals/README.md` before adding to either.
+**`DESIGN.md` is the only living authority for product design.**
+`CODING_STANDARDS.md` is normative for implementation quality, and
+`MAINTAINING.md` is authoritative for the change lifecycle. `decisions/` are
+dated, immutable records of why; `proposals/` are inputs that bind nothing
+until a decision cites them. When a decision changes the spec, `DESIGN.md`
+gets the compressed edit and the record is cited. Read `decisions/README.md`
+before adding a record.
+
+**New proposals are filed privately**, in a private companion repository,
+engine mechanisms included
+(`decisions/2026-08-27-proposals-private.md`). The proposals already in
+`proposals/` stay there because decision records cite them as inputs; read
+`proposals/README.md` before touching those. Decisions stay public and still
+name their inputs.
 
 ## Gates
 
@@ -70,21 +79,29 @@ use the CI form regardless, so the two stay equivalent when that changes.
 toolchain selection is explicit at call sites, so nothing auto-corrects a wrong
 default. Install 1.85.0 alongside stable.
 
-Three bash gates in `.github/scripts/test-*.sh` also run in CI's `lint` job.
+4 `test-*.sh` gates in `.github/scripts/` also run in CI's `lint` job.
 Invoke them **from the repository root**, the way `ci.yml` does:
 
 ```bash
 bash .github/scripts/test-pr-policy.sh
 ```
 
-Not from inside `.github/scripts/` — the scripts derive their own location with
-`${BASH_SOURCE[0]%/*}`, which strips nothing when the argument carries no slash,
-and they fail. One of the three, `test-release-record.sh`, needs `jq`.
+Repository-root invocation is the convention, not a shared implementation
+requirement: most of the gates resolve their own directory and run from anywhere.
+The one that does not is `test-pr-policy.sh`, which derives its location with
+`${BASH_SOURCE[0]%/*}` -- that strips nothing when the argument carries no slash,
+so it fails outright from inside `.github/scripts/`. Run them all the way `ci.yml`
+does and the difference never matters. One of the four, `test-release-record.sh`,
+needs `jq`.
 
 ## Hard conventions
 
+Read and follow `CODING_STANDARDS.md` before changing Rust. In particular:
+
 - **Edition 2024**, MSRV 1.85.
-- **No panicking `.unwrap()` or `.expect()` outside tests.**
+- **The §7 panic policy is lint-enforced.** `.unwrap()` is denied everywhere — tests included —
+  and `.expect()`/`panic!` are denied outside tests, via Cargo.toml's `[lints]`;
+  `#[expect(..., reason)]` marks the few documented invariant sites.
 - **`anyhow` only at the binary edge.** Libraries return `thiserror` types.
 - **All paths through `std::path`.** Windows is a first-class target — CI runs
   the full test and MSRV matrix on ubuntu, macos and windows.
@@ -112,19 +129,29 @@ exact canonical header. `validate-pr-body.sh` rejects anything else; run it
 locally against your body before pushing.
 
 **A new push invalidates the review and restarts the sequence** — review the
-new head. Agents never merge to `master`: merging is the owner's act, and an
-agent session has no standing to do it even when it runs on the owner's token.
+new head — with one exception: a push whose entire diff from the reviewed head
+is confined to `reviews/FINDINGS.md` (not yet on master; it arrives with the
+parallelism slice) keeps the review; record both SHAs in the PR's review
+evidence and confirm the exempt-only diff yourself before merging
+(`decisions/2026-08-20-review-invalidation-scope.md`). The exemption is about
+the path, not about the file already existing: a push that only *adds*
+`reviews/FINDINGS.md` -- it arrives with the parallelism slice -- is itself
+exempt-only, which is how that standing ledger can land without costing the
+review it is meant to record. Everything else invalidates, deliberately.
+Agents never merge to `master`: merging is the owner's act, and an agent
+session has no standing to do it even when it runs on the owner's token.
 
 ## Where things are
 
 | Path | What |
 |---|---|
 | `DESIGN.md` | The design; §4 invariants, §21 build order |
+| `CODING_STANDARDS.md` | Normative Rust implementation and review standard |
 | `MAINTAINING.md` | Full merge lifecycle, trust boundary, release contract |
 | `CONTRIBUTING.md` | Contributor rules and CLA |
 | `decisions/` | Dated, immutable decision records |
-| `proposals/` | Dated design proposals and their critiques |
-| `.github/scripts/` | The 3 `test-*.sh` gates and the `validate-*` helpers they exercise |
+| `proposals/` | Design proposals filed before 2026-08-27; new ones are private |
+| `.github/scripts/` | The 4 `test-*.sh` gates and the `validate-*` helpers they exercise |
 | `acceptance/RESULT.md` | The v0.1 acceptance run write-up |
 | `reviews/` | Review records, and the standing finding ledger once it lands |
 

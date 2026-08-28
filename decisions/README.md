@@ -5,9 +5,9 @@ assumed named explicitly, rejected options recorded with why.
 
 The contract that keeps this folder safe:
 
-- **DESIGN.md remains the only living authority.** Records here are history, not
-  spec. When a record's outcome changes the spec, DESIGN.md gets the compressed
-  edit at the time of the decision, citing the record.
+- **DESIGN.md remains the only living authority for product design.**
+  Records here are history, not spec. When a record's outcome changes the spec,
+  DESIGN.md gets the compressed edit at the time of the decision, citing the record.
 - **One decision per file**, named `YYYY-MM-DD-<slug>.md`. Do not accumulate
   addenda about unrelated decisions in one file. This is not filing tidiness: an
   append-only ledger in a single file conflicts on every concurrent branch, and
@@ -18,10 +18,12 @@ The contract that keeps this folder safe:
   sections appended to *their own* record, never silent edits. A record whose
   conclusion is later overturned says so and links forward; it does not get
   rewritten to look right.
-- **Design documents do not live here.** Proposals live in
-  [`proposals/`](../proposals/README.md) and reach this folder only as a
-  decision record citing the proposal and its critiques as inputs. (Convention
-  since 2026-08-13; before that, drafts stayed outside the repo entirely.)
+- **Design documents do not live here.** A proposal reaches this folder only
+  as a decision record citing the proposal and its critiques as inputs.
+  Proposals filed before 2026-08-27 are in [`proposals/`](../proposals/README.md);
+  new ones are filed privately ([2026-08-27](2026-08-27-proposals-private.md)),
+  and a record may cite one without reproducing it. (Convention since
+  2026-08-13; before that, drafts stayed outside the repo entirely.)
 - **Cross-link freely.** A decision that constrains another should say so in both
   directions.
 

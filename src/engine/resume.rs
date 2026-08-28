@@ -551,6 +551,10 @@ pub(super) fn resume_harness_inner_on(
     // the object and appending AttemptFinished. It has no authority to move
     // HEAD and is removed with an expected-old-value CAS before retrying.
     for interrupted in replayed.state.interrupted_attempts() {
+        #[expect(
+            clippy::expect_used,
+            reason = "interrupted_attempts() yields tasks of this same replayed state"
+        )]
         let task_index = replayed
             .state
             .index_of(&interrupted.task)

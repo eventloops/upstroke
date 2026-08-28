@@ -8,6 +8,10 @@
 // `effects/allowlist.toml`, which carries its justification and the condition
 // under which the section shrinks. `decisions.effect_site_inventory.mechanism` (2).
 #![allow(clippy::disallowed_macros)]
+#![expect(
+    clippy::print_stdout,
+    reason = "an example exists to print what it demonstrates; its output is its contract (§13)"
+)]
 
 use upstroke::agent;
 use upstroke::runner::host::HostRunner;

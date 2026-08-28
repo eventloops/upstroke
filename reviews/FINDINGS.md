@@ -172,6 +172,160 @@ direct question about scope and answered it as a disposition, which is now settl
 claim about the PR3 round, not about PR4's second confirmation, whose two findings —
 `PR4-CONF-003` and `PR4-CONF-004` — were both accepted and repaired in round 5.)*
 
+### 2026-08-28 — `BRIDGE-CI-SHAPE-TEST-IS-A-SUBSTRING-ORACLE`, **deferred**
+
+**The finding, and the ruling it overturned.** Six review rounds of PR #34
+examined the test that pins the platform Clippy legs into `merge-gate`.
+`~/tactus-artifacts/pr34/review-delta6.md` established two escapes it does not
+close, and defeated the ruling that had declined to close them.
+
+**The escapes, both concrete.**
+
+1. `- run: echo cargo clippy --all-targets --all-features -- -D warnings`
+   satisfies the command check. The job echoes, succeeds, and the aggregate
+   passes while Clippy never examines a denied call in that platform's code.
+2. The cfg census collects `target_os` names without evaluating `all`/`any`/
+   `not`, so `#[cfg(not(any(target_os = "linux", target_os = "macos", target_os
+   = "windows")))]` reports all three platforms covered while **no** runner
+   compiles the body. The inverse also misfires: `#[cfg(not(target_os =
+   "freebsd"))]` would demand a FreeBSD runner for a body specifically excluded
+   there, and a plain `let target_os = "android";` is misclassified because the
+   scan never confirms it sits in cfg syntax.
+
+**The ruling that was wrong, recorded because the reasoning matters.** An
+earlier round declined to close these, arguing from PR #25 that a text checker
+over an open-ended surface does not converge. The review rejected that and was
+right. PR #25's *withdrawn* half compared prose across an open document set and
+had a trusted workflow rerunning the real gates behind it — machinery since
+retired. Its *retained* half kept C1–C4 as **equalities and exact pins**. So
+PR #25's lesson supports structural equality here; it does not license
+repeated `contains` checks. The ruling is withdrawn, in this row and in the
+test's own doc comment.
+
+**The bounded repair, as the review specified it.** Parse the workflow as
+YAML 1.2 with duplicate-key rejection and compare the relevant mappings
+structurally: exact `runs-on`, an exact `run` scalar, absence of job- and
+step-level `if` and `continue-on-error`, the exact `needs` set, and exact env
+key-to-expression mappings, rejecting unexpected fields. Separately, evaluate
+parsed cfg predicates against the finite CI target tuples rather than
+collecting names, with a permanent injected control fixture as
+`CODING_STANDARDS.md` §12 requires of a census.
+
+**Disposition: DEFERRED, and this row is that disposition rather than a menu.**
+The repair needs a YAML parser; this crate has no YAML dependency and no
+`[dev-dependencies]` section at all, so it cannot be made without adding one.
+Adding a dependency is a judgement about what the crate should carry, and
+`DESIGN.md` does not settle it — an earlier draft of this row asserted a
+"small trusted surface" thesis and `grep -ci 'trusted surface' DESIGN.md`
+returns 0, so that was an owner tradeoff dressed as an established premise. It
+is withdrawn.
+
+**Owner:** the slice that next adds a dependency to `Cargo.toml`, or the G2
+pass, whichever comes first. **Condition on the deferral:** the test must not
+grow further substring predicates in the meantime — the escapes are enumerated
+above and in its doc, and adding heuristics to chase them is what six review
+rounds established does not work here.
+
+**Why deferring is defensible rather than convenient.** The oracle guards
+wiring that is *correct at this head and proven so by execution*: at this head
+three distinct platform Clippy jobs — `lint`, `lint (windows)` and
+`lint (macos)` — were green in the same run. `lint (macos)` itself runs only on
+`macos-latest`; an earlier draft of this row said it "ran green on all three
+platforms", which is not a thing a single job can do. `lint (windows)` is green
+at this head, and was *not* green throughout: it failed on the first run of this
+pull request, over the three annotations the merge had dropped, which the body
+records. A weak regression oracle risks a *future* silent change, not a present
+defect, and the row names exactly what that change would look like. The
+alternative dispositions were considered and rejected: `accepted-risk` overstates
+the acceptance, because the repair is specified and intended rather than waived;
+and deleting the test would regress `PR5D-MSVC-CLIPPY-NEVER-RUN`, whose Windows
+guard this test contains.
+
+**What is not in doubt.** `lint (macos)` exists, is wired into the aggregate,
+and **passed on its first run in this repository's history** — the tree is
+clean under macOS Clippy by measurement. `PR5-MACOS-CLIPPY-NEVER-RUN` is closed
+by that leg. This row is about the strength of the regression oracle guarding
+the wiring, not about whether the wiring is correct today.
+
+### 2026-08-28 — `BRIDGE-FROZEN-LINT-ATTRIBUTE`, per-instance Class B approval
+
+**The owner's ruling, quoted:**
+
+> **RULED — Class B per-instance approval, granted by this message:** the
+> `#[expect(clippy::expect_used)]` attribute on `src/topology/effects.rs` stands. That
+> file is one of the two the 2026-08-20 ruling froze BY NAME, so this carries full
+> ceremony.
+
+Raised by the `lints` lens of the five-lens review of `bdd64f5`
+(`~/tactus-artifacts/pr34/review-lints.md`, finding 1), which was correct on the point
+the bridge got wrong: the touch is not Class A's additive reader and this pull request is
+not the chartered pass, so the class is arguable — and an arguable class is **Class B
+until ruled otherwise**, which requires per-instance approval *before* landing. The
+bridge's own reasoning, that the freeze binds feature slices and a master merge is not
+one, is not an exemption the 2026-08-20 ruling grants. Deferring the question to the G2
+pass would have been too late, because this lands first.
+
+**Why the file matters more than "somewhere under `src/topology/`".** The 2026-08-20
+ruling froze **two named things**, and `src/topology/effects.rs` is one of them. This is
+not the directory-wide reading; it is the explicit one.
+
+**What changed, measured at the commit that carries this text.**
+
+| file | +/− | what |
+|---|---|---|
+| `src/topology/effects.rs` | **+4/−0** | one `#[expect(clippy::expect_used, reason = …)]` attribute on the statement `let hook = phase.hook_phase()`, carrying that call's existing message. No statement, signature, type or behaviour changes. |
+
+**The annotation is honest, and that was audited rather than asserted.** The `lints`
+lens verified the reason is true: `required` is constructed only from `Before`, `After`
+and `Point`; all three map to `Some(HookPhase)`; `Residue` and `NoExecution` cannot enter
+the loop, and the mapping has a focused test. The `expect` is a tripwire for a future
+programmer defect, not a currently reachable panic. The lens found no reachable failure
+suppressed by it.
+
+**Why the alternatives lost.** Refactoring the `expect` away is a larger edit to the same
+frozen file, and a behaviour-adjacent one. A module-level `#![allow(clippy::expect_used)]` is a Rust
+attribute, not an allowlist entry — `effects/allowlist.toml` governs the effect-denial
+lints only, and an earlier draft of this row said otherwise. It loses on its own
+terms instead: it suppresses the lint for every call in the module rather than
+the one that needs it. Leaving it unannotated fails `clippy -D warnings` on the integration branch, because
+master's `[lints.clippy]` denies `expect_used` — so the branch could not pass its own
+gate.
+
+### 2026-08-28 — `PR5-MACOS-CLIPPY-NEVER-RUN` fired, and is REPAIRED
+
+Its owner clause names the slice that next opens `.github/workflows/ci.yml`. The
+master merge carries a `ci.yml` change, so the trigger fired and **this slice was
+the named owner**. An earlier draft of this row recorded it as "carried, with an
+owner" and declined the repair as scope creep. The delta review of `d46e48f`
+rejected that, correctly: the row named no successor owner, no concrete
+follow-up, and carried no owner re-ruling authorising another deferral. A
+deferral by the named owner, to nobody, is not a disposition.
+
+**The repair is the `lint (macos)` job.** The hole was precise. Ubuntu Clippy
+configures out every `#[cfg(target_os = "macos")]` region; the Windows leg
+configures out the same; macOS ran tests and MSRV but **no Clippy job at all**.
+So a denied call in a macOS-only region — the lens's own example is an
+`.expect()` inside the macOS `create_cloexec_pipe` at `src/agent/proc.rs:3870`
+— could ship with every required check green.
+
+`ci.yml` gains a `lint (macos)` job mirroring `lint (windows)` exactly, and —
+because a dependency whose result nothing inspects is a job that enforces
+nothing — it is added to the `merge-gate` aggregate in all three places that
+matter: `needs`, the `LINT_MACOS_RESULT` env, and the loop that decides the
+aggregate's exit.
+
+**The line number in an earlier draft was wrong**, and the delta review caught
+it: `src/agent/proc.rs:3857` is the **Linux** `create_cloexec_pipe`. The macOS
+implementation begins at **3870**. The six macOS-only production regions the
+lens named are `last_errno`, `group_has_non_zombie_members`,
+`process_is_stopped`, `create_cloexec_pipe`, `clear_nonblocking`, and the
+non-Linux `groups_are_quiescent`; it verified no currently denied call sits in
+any of them, so the hole was open and unoccupied.
+
+**What this row cannot claim until CI reports.** macOS Clippy has never run in
+this repository's history. Whether the tree is clean under it is a measurement,
+not an assumption, and the first run of the new leg is that measurement. If it
+fails, the failure is a finding about the tree and not about this row.
 ### 2026-08-27 — `candidate_prepared` is the sole successful settlement, per-instance Class B approval
 
 **The owner's ruling, quoted:**
@@ -757,7 +911,7 @@ failed for the intended reason or a typo", one level up, inside the witness itse
 | PR5D-FUNNEL-RETURNS-A-COMMAND | `runner::host::build_command` is `pub(crate)` and **returns a `std::process::Command`** to the rest of the crate. `decisions.effect_site_inventory.mechanism` (2) reviews each funnel module "to perform effects only inside site-taking APIs **and never to return writable handles**", and `src/runner/host.rs` is in that list by name. A `Command` is the writable handle for R22 | PR6/PR7 implementer (the slice that owns `src/runner/**`) | **A live passage the current shape fails, and therefore a defect by the boundary rule — but not one PR5 may repair.** `src/runner/**` is frozen under the owner ruling of 2026-08-20, and the repair is architectural: `agent::proc` and `agent::bin` consume the `Command` `build_command` hands out, so removing it means moving spawn construction inside the funnel. **The mitigation that is available is taken**: `upstroke::runner::host::build_command` is on the denylist, so every caller must be an allowlisted module — which forced `src/agent/bin.rs` into the enumerated legacy section, where it is visible as debt rather than invisible as convenience. The allowlist entry for `src/runner/host.rs` states the residual rather than claiming the clause is satisfied |
 | PR5D-PROCESS-FUNNEL-TAKES-NO-SITE | `decisions.effect_site_inventory.identity`: "**every effectful funnel API takes its group's site by value**, and the funnel itself calls hook(Before, site) -> primitive -> hook(After, site)". PR4's process funnel does neither: `HostRunner::run` threads a `SpawnHooks` observer and consults the eight containment sub-effect points by name, and `ProcessSite` appears in the production half of the tree **nowhere** — `Process.Spawn` and `Process.Terminate` are the only two claimed sites in the inventory that no funnel names. Measured by `effects::tests::every_site_the_inventory_declares_has_a_funnel_that_names_it_or_is_recorded_absent`, which accepts *both* shapes the other lanes built (the variant literal and the site-as-parameter) and still finds these two | PR6/PR7 implementer | **A shape gap, not a coverage one, and the distinction is load-bearing.** The hooks fire, and PR4's grids drive all eight containment points on both platforms under witness and under fault (`runner::host::tests::every_role_reaches_the_containment_points_of_this_platform`, `a_fault_armed_at_any_containment_point_stops_any_role`). What is missing is the site *travelling with the call*, which is what makes `effect_sites.json`'s `module` column true of `Process.*`. `src/runner/**` is frozen; the repair is PR4's funnel signature |
 | PR5D-ROW-MAPPING-REFUSAL-UNFIXTURED | `expected_failures_refusals[7]` is "a site without a row mapping **fails to compile**", and there is **no fixture in the tree for it**. The refusal is structural and real — `EffectSiteId::row()` and each group's `row()` are `const fn` matches over their own variants with no wildcard, so a variant added without a row is `error[E0004]` — but nothing executes that claim, and the other four build refusals each have a fixture that pins its reason | PR6/PR7 implementer (the slice that next edits `src/topology/effects.rs`) | **Cannot be fixtured from here.** The fixture has to add a variant to a frozen enum in a frozen file, which the owner ruling of 2026-08-20 forbids; a fixture that added the variant in a *separate* crate would be testing its own enum, not this one. Recorded rather than claimed: `reconciliation-D.md` §B says "not a fixture, and this row says so" instead of pointing at a test that does not exist. One line for whichever slice next opens that file |
-| PR5D-MSVC-CLIPPY-NEVER-RUN | **`cargo clippy` has never run against the Windows target on this project**, so every `#[cfg(windows)]` line in the crate is unlinted. `ci.yml`'s `lint` job runs on `ubuntu-latest` only; the local gate set runs `cargo check --target x86_64-pc-windows-msvc` — `check`, not `clippy`. Running `cargo clippy --target x86_64-pc-windows-msvc --all-targets --all-features -- -D warnings` from this box found two things at once: a real `disallowed_types` violation in `src/main.rs`'s `#[cfg(windows)]` test region (repaired in-slice by widening that file's recorded allow — the union-over-platforms case the allowlist header predicts), and a **pre-existing** `error: items after a test module` at `src/agent/proc.rs:1097` that no gate has ever seen | project owner / PR6–PR7 implementer | **The `main.rs` half is repaired; the `proc.rs` half is not, deliberately.** Clearing `clippy::items_after_test_module` means moving ~250 lines of Windows-only code above an inline `mod tests` in `src/agent/**` — a reordering with no behavioural content, in a file this slice does not own, that would put a large diff in a lane whose `production_effect` is "none in behavior". **Adding the gate is therefore also deferred**, because a gate that fails on arrival is not a gate. What this slice does instead is *measure* it and record the numbers: with the unrelated lint suppressed, the three denial lints are **clean** on the msvc target and **nine of the twelve `windows_sys` denials fire on real code** — which is the evidence the Windows half of the denylist is not decorative. **CLOSED by repair round 3 (`PR5-CONF-014`).** Both halves it deferred are done: `src/agent/proc.rs`'s `items after a test module` is cleared by moving that `#[cfg(test)] mod tests` to the end of `mod windows_job` (a pure reordering, no behavioural content, and `cargo fmt` clean), and `ci.yml` gained a `lint (windows)` job running `cargo clippy --all-targets --all-features -- -D warnings` on `windows-latest`, required by `merge-gate`. Verified on the Windows Server 2025 guest: clippy rc=0 on the repaired tree. `effects::tests::a_windows_runner_runs_the_effect_denial_gate_and_the_merge_gate_requires_it` pins the job, its `needs` entry and its place in the aggregate's required-gate loop, and each of the three was witnessed dying to its own mutation. The **macOS** half of the same hole is new row `PR5-MACOS-CLIPPY-NEVER-RUN` |
+| PR5D-MSVC-CLIPPY-NEVER-RUN | **`cargo clippy` has never run against the Windows target on this project**, so every `#[cfg(windows)]` line in the crate is unlinted. `ci.yml`'s `lint` job runs on `ubuntu-latest` only; the local gate set runs `cargo check --target x86_64-pc-windows-msvc` — `check`, not `clippy`. Running `cargo clippy --target x86_64-pc-windows-msvc --all-targets --all-features -- -D warnings` from this box found two things at once: a real `disallowed_types` violation in `src/main.rs`'s `#[cfg(windows)]` test region (repaired in-slice by widening that file's recorded allow — the union-over-platforms case the allowlist header predicts), and a **pre-existing** `error: items after a test module` at `src/agent/proc.rs:1097` that no gate has ever seen | project owner / PR6–PR7 implementer | **The `main.rs` half is repaired; the `proc.rs` half is not, deliberately.** Clearing `clippy::items_after_test_module` means moving ~250 lines of Windows-only code above an inline `mod tests` in `src/agent/**` — a reordering with no behavioural content, in a file this slice does not own, that would put a large diff in a lane whose `production_effect` is "none in behavior". **Adding the gate is therefore also deferred**, because a gate that fails on arrival is not a gate. What this slice does instead is *measure* it and record the numbers: with the unrelated lint suppressed, the three denial lints are **clean** on the msvc target and **nine of the twelve `windows_sys` denials fire on real code** — which is the evidence the Windows half of the denylist is not decorative. **CLOSED by repair round 3 (`PR5-CONF-014`).** Both halves it deferred are done: `src/agent/proc.rs`'s `items after a test module` is cleared by moving that `#[cfg(test)] mod tests` to the end of `mod windows_job` (a pure reordering, no behavioural content, and `cargo fmt` clean), and `ci.yml` gained a `lint (windows)` job running `cargo clippy --all-targets --all-features -- -D warnings` on `windows-latest`, required by `merge-gate`. Verified on the Windows Server 2025 guest: clippy rc=0 on the repaired tree. `effects::tests::ci_yml_lexically_names_a_clippy_job_per_platform_and_the_aggregate_lists_it` pins the job, its `needs` entry and its place in the aggregate's required-gate loop, and each of the three was witnessed dying to its own mutation. The **macOS** half of the same hole is new row `PR5-MACOS-CLIPPY-NEVER-RUN` |
 | PR5D-TOOLBOX-DISCARDS-CLIPPY-OUTPUT | **`~/bin/upstroke-build` silently discards the stderr of every command it runs.** Line 85 is `exec {slotfd}>"$lock" 2>/dev/null`; an `exec` with only redirections applies them to the *current shell*, so `2>/dev/null` permanently rebinds the wrapper's stderr, and the `exec`ed cargo inherits it. `upstroke-build cargo clippy … > log 2>&1` therefore produces an **empty log**: the exit code survives, every diagnostic is lost. The same is true of `cargo +1.85.0 check` and of `cargo test`'s compile errors. The evidence it already left: `pr5/gates-merged/clippy.log`, `fmt.log` and `msrv.log` are all **0 bytes**, and this lane's first two builds reported `exit=101` with a zero-byte log | project owner (the box's tooling, not the tree) | **Not a defect in the tree and not repairable in it.** Recorded because the ledger is the union of what has been learned, and because the failure mode is the one this project keeps paying for: a gate whose *result* is trustworthy and whose *evidence* is empty. The workaround used throughout this lane is `--message-format=json`, which puts diagnostics on **stdout**, or `CARGO_TARGET_DIR=<the private pool slot> cargo …` run directly. A one-character fix exists (`exec {slotfd}>"$lock" 2>&-` is not it; the redirection wants to be scoped to the `exec` alone, e.g. by testing the lock in a subshell) but the file is outside this repository |
 | PR5D-PROOF-TESTS-COUNT | `prompts/reconciliation-obligation.md` §C says "the contract's `proof_tests`, **all nine**". `decisions.pr_sequence[6].slice_contract.proof_tests` has **ten**. `reconciliation-A.md` §C repeats the nine, and `A-report.md` §7 says "none of this lane's **nine** `proof_tests` entries begins with a snake_case identifier". The tenth is `proof_tests[9]`, the Event-funnel row — lane C's | recorded, no owner needed | **Trivial and recorded anyway**, because the obligation file's own rule is "if this file's list and the packet's disagree, **the packet wins and you say so**", and an undercount nobody re-derived is how `PR3-RUNSTARTED-FIELDS` shipped. `reconciliation-D.md` §C carries ten rows |
 

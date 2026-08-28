@@ -16,6 +16,10 @@
 // carries this module's review clause -- effects only inside site-taking APIs,
 // no writable handle returned. `decisions.effect_site_inventory.mechanism` (2).
 #![allow(clippy::disallowed_methods, clippy::disallowed_macros)]
+#![expect(
+    clippy::print_stderr,
+    reason = "terminal question delivery and the answer prompt are this module's §13 output surface"
+)]
 
 use std::fmt;
 use std::io::{IsTerminal, Write};

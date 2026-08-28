@@ -4,13 +4,23 @@ Dated design proposals: the entry point of the design lifecycle.
 
 ```
 proposal  →  council critique  →  decision record  →  implementation  →  review
-(here)       (files beside it)     (decisions/)        (commits/PRs)     (reviews/)
+(private)    (files beside it)     (decisions/)        (commits/PRs)     (reviews/)
 ```
+
+**Closed to new filings since 2026-08-27.** Proposals are now filed in the
+private companion repository, engine mechanisms included — see
+[the decision](../decisions/2026-08-27-proposals-private.md). The proposals
+below stay here: decision records cite them as inputs and those citations must
+keep resolving. The first stage of the lifecycle happens privately; every later
+stage is unchanged and public.
+
+The rest of this file describes the conventions those filings follow, which the
+private folder inherited unchanged.
 
 The contract that keeps this folder safe:
 
-- **DESIGN.md remains the only living authority.** A proposal binds nothing.
-  When one survives the council, the verdict lands as a record in
+- **DESIGN.md remains the only living authority for product design.**
+  A proposal binds nothing. When one survives the council, the verdict lands as a record in
   [`decisions/`](../decisions/README.md) citing the proposal and its critiques
   as inputs, and DESIGN.md gets the compressed edit at decision time.
 - **One proposal per file**, named `YYYY-MM-DD-vN.M-<slug>.md`.
