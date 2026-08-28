@@ -78,7 +78,7 @@ Lint policy:
   those groups intentionally contain contextual, experimental, or mutually incompatible lints.
 - Do not rewrite clear code merely to satisfy a stylistic lint. Configure or narrowly suppress
   the lint, with rationale, when its premise does not hold.
-- A `clippy.toml` denylist, when present, is effect-funnel enforcement rather than style. Every
+- The `clippy.toml` denylist is effect-funnel enforcement rather than style. Every
   denied path MUST resolve under a Clippy CI leg that compiles the platform where the symbol
   exists. An unresolved denial enforces nothing; Clippy reports it only as a bare configuration
   warning, and `-D warnings` does not promote that warning.
