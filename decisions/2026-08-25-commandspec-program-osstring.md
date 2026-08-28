@@ -79,6 +79,23 @@ Three grounds, in descending weight:
   completeness check; the errata batch
   (`upstroke-lab:packet/2026-08-25-g2-pass-errata.md`) records that none is
   expected.
+- **The widening stops at spawn-time identity; the durable log keeps `String`.**
+  Two live documents reason oppositely about one trade-off and W4 must not have
+  to guess which governs. `src/topology/events.rs`'s `TaskDispatched::worktree_path`
+  argues that *"a platform path type here would make a log written on one operating
+  system a question on another"*, and this record argues three days later that
+  *"cross-platform replay of a non-UTF-8 program was never meaningful — the path
+  cannot exist on the other platform"*. Both are right about their own subject and
+  neither generalises: the program is **ephemeral spawn-time identity**, consumed on
+  the machine that resolved it, so per-platform encoding costs nothing; a recorded
+  worktree path is **durable wire-facing identity**, read back by a later process and
+  potentially on another platform, so it stays `String` under the reason its own
+  field documents. W4 widens the first and leaves the second alone. Owner ruling,
+  2026-08-28, on a standards-review finding that read the second as the same defect
+  as the first: `CODING_STANDARDS.md` §8's path-representation bullet carries no
+  requirement keyword where two sibling bullets in that section are MUST-tagged, so
+  it is at most a SHOULD, and §1 admits a SHOULD deviation on a concrete reason in
+  the code — which is on the field.
 
 ## Rejected
 

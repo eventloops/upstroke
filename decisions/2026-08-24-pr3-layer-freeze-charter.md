@@ -103,6 +103,15 @@ the failure direction is asking, not landing.
   named, and rustdoc attachment checked (two of PR7's eleven insertions detached a
   neighbour's doc comment; the class has already broken a build once via a duplicated
   `#[test]` attribute).
+
+  **Suspended while the moratorium runs.** Item 3 stops reader accretion from this
+  record until the pass lands. This class states the *ceremony* a disclosed reader
+  carries, not an exemption from that stop: the two answer different questions —
+  Class A asks what ceremony a reader carries, item 3 asks whether a reader may land
+  at all right now — and a permission-with-ceremony does not survive suspension of
+  the underlying permission. During the window there is no self-serve reader route
+  and the twelfth reader stands as the last. Class A is dormant, not deleted, and
+  revives by item 3's own terms when the pass lands.
 - **Class B — behaviour changes toward the packet.** A repair that changes what the
   layer *does*, even where the packet demands it (PR7's
   `&& self.pipeline_reservable()` conjunct is the worked example). Only inside a
