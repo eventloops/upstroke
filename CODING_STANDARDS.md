@@ -59,10 +59,13 @@ bash .github/scripts/test-docs-consistency.sh
 Run all eight commands from the repository root. `CLAUDE.md`'s Gates section records the known
 root-invocation trap and the extra `jq` prerequisite for the release-record fixture.
 
-These eight commands run on one operating system. They establish nothing about a `cfg` region
-compiled only for another target: an inactive `cfg` block is not compiled, so neither its
-diagnostics nor its lint attributes exist for that run. §11 states what platform-gated code and
-its annotations require instead.
+These eight commands run on one operating system, which bounds what they can establish about a
+`cfg` region compiled only for another target. Parsing and formatting still reach an inactive
+inline block — `cfg` stripping happens after parsing, and rustfmt formats disabled source — so a
+syntax error or a formatting violation inside one fails the baseline on any host. Nothing past
+that does: a stripped block is never type-checked, its lint attributes are never evaluated, and
+its behaviour is never run. §11 states what platform-gated code and its annotations require
+instead.
 
 The project uses Rust edition 2024 and has an MSRV of 1.85.0. Code and dependencies MUST remain
 compatible with both the MSRV and the current stable toolchain. A green baseline is necessary,
@@ -506,7 +509,8 @@ When a test is observed failing without a change that explains it:
   one. "It passed on re-run" MUST NOT be the reason a change merges.
 - **Fingerprint an occurrence by platform and by the assertion or error it produced**, not by test
   name alone. One name can cover several causes, and one cause can surface under several names, so
-  record the failing assertion and the error code and match on those.
+  match on the failing assertion, together with the error code where the failure carries one — a
+  panicked assertion has a message and a location and no code, and is fingerprinted by those.
 - **Name an owner and state the consequence**, so a later red is triaged instead of re-diagnosed:
   which fingerprint, and that a failure matching it is this flake until proven otherwise. A red
   that does not match the recorded fingerprint is a regression until someone shows otherwise.
@@ -516,8 +520,8 @@ When a test is observed failing without a change that explains it:
   the category arguable.
 - **Preserve the evidence a rate is made of.** A harness that writes every run to one path cannot
   measure a rate, because the next run destroys the failure the last one caught. Write per-run
-  output, and quote the diagnostic — the message and its error code — rather than the bare fact
-  of a failure.
+  output, and quote the diagnostic — the message, and the error code when the failure has one —
+  rather than the bare fact of a failure.
 
 A red that recurs with no rate, no owner, and no stated consequence trains reviewers to discount
 CI, which costs more than the test does.
