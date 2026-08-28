@@ -55,16 +55,42 @@ Three grounds, in descending weight:
 
 ## Consequences, enumerated for W4
 
-- Adapters hand the resolved `PathBuf` through; no lossy conversion enters
-  identity. Diagnostics use `to_string_lossy`, documented as display-only
-  (§8's own carve-out).
-- The runner-policy canonical digests define the program's canonical bytes
-  explicitly — OS-native (raw bytes on Unix, WTF-8 on Windows) — and the
-  pinned samples (`HOST/CONTAINER_CANONICAL`, `SAMPLE_DIGEST`,
-  `SAMPLE_CANONICAL_BYTES`) re-pin mechanically, the same class of edit the
-  rename required. Cross-platform replay of a non-UTF-8 program was never
-  meaningful — the path cannot exist on the other platform — so the
-  per-platform encoding costs nothing real.
+- **Adapters keep naming their CLI; they do not resolve it.** An earlier revision
+  of this list said adapters "hand the resolved `PathBuf` through", and that is
+  **withdrawn** — it would reinstate the defect `PR4-ADAPTER-RESOLVES-ON-THE-HOST`
+  records as repaired. `DESIGN.md:117` makes an adapter produce a *data-only*
+  `CommandSpec`, `src/agent/bin.rs` says in its own opening that the module
+  deliberately no longer locates the CLI, and the boundary that executes decides
+  which file a name is. The container case is the one that bites: `codex` may exist
+  only inside the configured image, so a coordinator that resolves on the host
+  either refuses because the host lacks it or passes a host path the container does
+  not have.
+
+  What the widening is actually for is the **path-shaped** case: an adapter or a
+  configuration that names a CLI *by path* rather than by bare name, where the
+  bytes cannot round-trip through `String`. `CommandSpec.program` widens so that
+  such a name survives; nothing about who resolves a bare name changes, and no
+  lossy conversion enters identity. Diagnostics use `to_string_lossy`, documented
+  as display-only.
+- **W4 does not touch `RunnerPolicy` or the topology-registry samples.** An earlier
+  revision ordered "runner-policy canonical digests" to define the program's
+  canonical bytes and named `HOST/CONTAINER_CANONICAL`, `SAMPLE_DIGEST` and
+  `SAMPLE_CANONICAL_BYTES` for re-pinning. **Both halves are withdrawn.**
+  `RunnerPolicy` is the execution identity of a run, resolved once before the
+  worktree lock and carrying no program at all, while programs vary per spawn — so
+  there is nothing there to encode. And those constants live in
+  `src/topology/registry.rs`, where they pin the topology registry's own digest;
+  they are unrelated to runner policy and re-pinning them would encode an
+  unrelated change.
+
+  What remains true is the narrow encoding point, and it is stated without a
+  mechanism: wherever the program's bytes are digested, the canonical form is
+  OS-native — raw bytes on Unix, WTF-8 on Windows. Cross-platform replay of a
+  non-UTF-8 program was never meaningful, because the path cannot exist on the
+  other platform, so a per-platform encoding costs nothing real. **Which digest, if
+  any, that reaches is a W4 question and is deliberately not decided here** — the
+  earlier revision decided it wrongly by naming a structure that does not hold a
+  program.
 - `agent::bin::tests::a_program_path_a_string_cannot_carry_is_refused_by_name`
   — deliberately left unchanged by PR4 round 6 because changing it would
   have resolved an owner question inside a repair round — **will be** replaced
