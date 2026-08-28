@@ -16,7 +16,10 @@ and this record is its scheduled venue and settled direction, not its closure. A
 W4 implementer therefore has one authority, `DESIGN.md`, and one instruction,
 this record's direction — never two live documents disagreeing about the type.
 
-This addresses
+This addresses `PR4-PROGRAM-PATH-NOT-UNICODE` — open since 2026-08-20 as one
+of the two accepted deviations the owner ruling of that date carried to G2.
+Neither it nor the known-conflict block above is retired here; both are
+retired at W4, in the same commit that moves the spec.
 
 The scope is deliberately the one measured field. `args: Vec<String>` and the
 `env` pairs are audited in W4 under the same standard (§8) and widened only
