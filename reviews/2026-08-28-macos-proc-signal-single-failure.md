@@ -51,33 +51,43 @@ terminated by a signal and **`exit status: N`** for one that exited with a code.
 says `exit status: 143`. So the helper was **not** killed by a signal: it **exited, with
 code 143**.
 
-Where 143 comes from is not a guess. `128 + 15` is constructed in exactly one place in
-`src/agent/proc.rs` — line **2301**, `libc::_exit(128 + terminating)` — at the end of the
-terminal-signal handler, after it SIGKILLs the isolated groups, restores `SIG_DFL` and
-calls `raise(terminating)`. Every other `_exit` in that file passes 0 or 1. The comment
-above it calls that line *"a defensive fallback if a platform returns from `raise`"*.
+Where 143 is constructed is not a guess: `128 + terminating` appears once, at
+`src/agent/proc.rs:2301`, in the monitor's terminating path, and it runs when the atomic
+`PENDING_TERMINATION` holds a signal number. **Everything past that point is where the
+three earlier readings went wrong, and this one deliberately stops there.**
 
-What the evidence therefore supports, and no more:
+**What the evidence establishes:** the helper reached the monitor's terminating path with
+`PENDING_TERMINATION == SIGTERM` and exited 143, rather than finishing its work and
+exiting 0, which is what `assert!(status.success(), …)` at line 7966 requires.
 
-- the helper **ran the terminal-signal handler** rather than finishing its work and
-  exiting 0, which is what `assert!(status.success(), …)` at line 7966 requires;
-- it left that handler through the **`_exit(143)` fallback** rather than dying inside
-  `raise` — otherwise the status would read `signal: 15`. On this run that fallback was
-  **not** dead code.
+**What it does not establish, and what earlier revisions wrongly asserted:**
 
-**What is not established, and is no longer asserted.** Whether `raise` returned or the
-handler reached `_exit` by some other route. Whether the helper's taking the handler at
-all is a race with the `finish` write that releases the supervised worker, which happens
-one line after the test's `kill`. And in particular the **guard-mask initialisation
-race** an earlier revision named: guard initialisation and unblocking complete before
-the supervised child is spawned and long before the test sends SIGTERM, so that
-sequence does not fit. That hypothesis is withdrawn.
+- **Which route set `PENDING_TERMINATION`.** It has several writers. One is the
+  terminal-signal handler. Another is `Supervisor::finish` at
+  `src/agent/proc.rs:1883-1889`, which assigns SIGTERM when `reaper.cleanup` fails —
+  **no signal need have been handled at all.** A released worker exiting normally, a
+  reaper cleanup failure, and the monitor reaching `_exit(143)` produces this exact
+  fingerprint. A third revision of this record said the handler "ran"; it is not shown.
+- **That reaching `_exit` rather than dying in `raise` means anything.** It does not, and
+  the reason is in this test's own setup: the helper is spawned with
+  `UPSTROKE_BLOCK_SIGNAL` set to **SIGTERM** — its tag `job-control-blocked` selects
+  SIGTERM at `proc.rs:7466` — and the monitor unblocks **only SIGCONT**
+  (`proc.rs:2127`). A blocked signal stays pending and `raise` returns zero, so falling
+  through to `_exit` is the **expected** behaviour here, not an anomaly. The claim that
+  a "defensive fallback" fired unexpectedly is **withdrawn**.
+- **The guard-mask initialisation race** an earlier revision named. Guard initialisation
+  completes before the supervised child is spawned and long before the test's `kill`, so
+  that sequence does not fit. Withdrawn and not replaced.
 
-**Why the correction still raises rather than lowers the stakes.** The first reading
-implied a harmless environmental artifact. This one says a documented *defensive*
-fallback in production signal-handling code executed on a supported platform, in a test
-whose entire subject is signal delivery under a blocked mask. The mechanism remains
-unexplained, and it is a better reason to measure than either earlier reading was.
+An earlier revision also said *"every other `_exit` in that file passes 0 or 1"*. That is
+false — there are four `_exit(127)` calls — and it is withdrawn. It was never load-bearing
+for 143, which is uniquely constructed, but it was stated as a checked fact and was not
+one.
+
+**What is left is smaller and still worth recording.** A supervised helper reached the
+terminating path when the test required a clean exit, on macOS only, once. The route is
+unknown, the rate is unmeasured, and this record says so rather than choosing among the
+candidates.
 
 **A red matching this fingerprint is this failure until shown otherwise; a red that
 does not match it is a regression until shown otherwise.** That is the rule
@@ -85,12 +95,19 @@ does not match it is a regression until shown otherwise.** That is the rule
 a push is **this flake until proven otherwise**"* — carried here by analogy, and it is
 why the fingerprint is recorded before any rate is.
 
-**The fingerprint's matching rule, stated so it can be applied.** Match on the test
-name, the assertion site (`src/agent/proc.rs:7966`), and the status **form** —
-`exit status: 143`, not `signal: 15 (SIGTERM)`, because that distinction is the whole
-correction above. Do **not** match on the suite totals or the elapsed time; those move
-with the tree. A red at 7966 reading `signal: 15` is a *different* failure and this
-record does not cover it.
+**The fingerprint's matching rule, stated so it can be applied — and its width, stated so
+it is not trusted too far.** Match on the test name, the assertion site
+(`src/agent/proc.rs:7966`), and the status **form**: `exit status: 143`, never
+`signal: 15 (SIGTERM)`, because that distinction is the whole correction above. Do **not**
+match on the suite totals or the elapsed time; those move with the tree.
+
+**A match does not identify the cause.** Because `PENDING_TERMINATION` has several
+writers, a red matching this fingerprint is **this observation *or* a regression in reaper
+cleanup**, and the two are not separable from the test's output. So the rule is: a
+matching red is not automatically "this failure" — it is *this fingerprint*, and it still
+needs the cleanup path ruled out. That is weaker than the rule
+`reviews/FINDINGS.md` §12 states for the flake it measured, and it is weaker on purpose:
+that flake's oracle identifies its cause and this one's does not.
 
 ## Why it is not attributable to the change it appeared under
 
@@ -115,9 +132,17 @@ diff. It can only be a pre-existing condition, possibly perturbed in timing by a
 different test workload — which is a reason to measure it, not a reason to attribute it.
 
 This is a **structural** argument about the code, not a probabilistic one, and the
-distinction matters: the recorded practice refuses "it passed on re-run" as a merge
-justification precisely because that launders a real intermittent defect the change
-*could* have caused. #40's basis is that diff plus the eight leaf successes this
+**On "it passed on re-run", corrected a second time.** An earlier revision said
+`CODING_STANDARDS.md` §12 forbids that reasoning; it contains no such rule. A later
+revision replaced that with "the recorded practice refuses" it, and **that is also
+unsupported** — no document in this repository forbids it, and `reviews/FINDINGS.md` §12
+says the opposite for the flake it measured: *"check the failing test name before
+treating it as a regression, and **re-run** rather than repairing forward."* So the
+restraint this record practises is **this seat's choice, not a repository rule**, and it is stated as a
+choice: a green re-run is not offered here as evidence of anything, because the failure it
+would launder is unattributed rather than measured. Where §12's flake has a rate and a
+ruled-out cause, this one has neither, and re-running an unidentified failure to green is
+how a rate never gets measured. #40's basis is that diff plus the eight leaf successes this
 run did have — the `CI` workflow has **nine** leaf jobs, three `lint`, three `msrv` and
 three `test`, besides the `upstroke-ci` aggregate, and attempt 1 was eight successes and
 one failure with `upstroke-pr-policy` green in its own workflow. An earlier revision of

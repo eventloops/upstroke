@@ -119,10 +119,21 @@ under `src/`, verified by the same command. Their `test (windows-latest)` legs �
 11:57:15Z. Identical source, same platform, two successes and one failure, and no
 change in between.
 
-That is a **structural** argument about attribution, not a rate. The recorded practice
-refuses "it passed on re-run" as a merge justification because that launders an
-intermittent defect the change *could* have caused; here the change could not, which is
-a different claim and the only one made.
+That is a **structural** argument about attribution, not a rate: the change could not have
+caused this failure, which is a different claim from "it passed on re-run" and is the only
+one made here.
+
+**On "it passed on re-run", corrected a second time.** An earlier revision said
+`CODING_STANDARDS.md` §12 forbids that reasoning; it contains no such rule. A later
+revision replaced that with "the recorded practice refuses" it, and **that is also
+unsupported** — no document in this repository forbids it, and `reviews/FINDINGS.md` §12
+says the opposite for the flake it measured: *"check the failing test name before
+treating it as a regression, and **re-run** rather than repairing forward."* So the
+restraint this record practises is **this seat's choice, not a repository rule**, and it is stated as a
+choice: a green re-run is not offered here as evidence of anything, because the failure it
+would launder is unattributed rather than measured. Where §12's flake has a rate and a
+ruled-out cause, this one has neither, and re-running an unidentified failure to green is
+how a rate never gets measured.
 
 **And this record's structural claim is stronger than its companion's**, which is worth
 stating because the companion's had to be weakened. `DESIGN.md` and
