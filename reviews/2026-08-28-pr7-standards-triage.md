@@ -48,63 +48,95 @@ takes it directly — the partition is one file, `lens-manifest.sh`.
 than silently normalised. Normalised: §12 102, §7 59, §8 42, §14 36, §5 20, §9 16,
 §4 13, §3 12, §10 8, §13 7, §6 5, §11 1.
 
-## 1. Findings that cite a section but read as defects
+## 1. The defect-shaped findings, after the owner's ruling of 2026-08-28
 
-**28 of 321** describe a security or correctness consequence rather than a style
-miss. They are correctly filed — each cites a real §8/§9/§14 clause — but "the
-cleanliness sweep will decide" may be the wrong disposition and the wrong venue.
-They fall in three classes.
+The 28 findings escalated here have been ruled on, and the ruling **split them the
+opposite way round from how they were filed**. What decides is not how alarming a
+finding reads but which requirement keyword its clause carries, because `§1` grades
+the evidence a deviation needs to the strength of the rule it deviates from:
 
-### (a) Lexical path comparison standing in for a security decision — 5 sites
+> A `SHOULD` deviation needs a concrete reason in the code or pull request. A `MUST`
+> deviation needs an explicit, reviewed change to this standard or to the controlling
+> design—not an ad hoc exception.
 
-Canonicalisation fails, and the code silently compares spellings instead:
+`§8`'s path-representation bullet — *"Represent paths with `Path`, `PathBuf`, `OsStr`,
+or `OsString`"* — carries **no requirement keyword**, while two sibling bullets in the
+same section are explicitly MUST-tagged: *"Path containment checks MUST account for
+`..`, absolute paths, symlinks/reparse points…"* and *"Event schema changes MUST
+preserve or deliberately migrate supported historical runs"*. The author distinguished
+MUST from untagged inside one section, so the untagged bullet is at most SHOULD.
 
-| file | what |
-|---|---|
-| `src/runner/container/exec.rs` | **confinement uses a lexical prefix comparison as its entire filesystem-containment decision** |
-| `src/engine/topology/recover.rs` | private-root comparison falls back to lexical equality on every canonicalisation error |
-| `src/engine/topology/recover.rs` | owner-record public-directory authentication falls back to lexical spelling |
-| `src/engine/topology/create.rs` | `canonical_string` substitutes an unverified lexical path when evidence is unavailable |
-| `src/rundir.rs` | the private-half ownership proof falls back to an uncanonicalised public path |
+### (a) The lossy-path class — **REJECTED**, 12 findings
 
-The `exec.rs` one is the container's confinement boundary, which `DESIGN.md` §4
-treats as a trust boundary rather than a convenience.
+Thirteen findings said path identity reaches a durable record through
+`to_string_lossy`. One is struck outright (below) and the other twelve are compliant
+documented deviations from a SHOULD, not defects. The reason is on the field:
+`src/topology/events.rs`'s `TaskDispatched::worktree_path` says it is *"recorded as the
+string a later process compares and re-derives… a platform path type here would make a
+log written on one operating system a question on another"*, and
+`src/engine/topology/dispatch.rs` cites that doc **by name at the call site**.
+`create.rs`'s `canonical_string` likewise documents its fallback as deliberate and
+paired with the matching fallback on the comparison side, so a filesystem that will not
+canonicalise yields two equal non-canonical strings rather than one of each.
 
-### (b) Unbounded reads on input that crosses a trust boundary — 9 sites
+**The lens failure mode is worth naming**, because it is the reason 12 rows were filed
+against a rule they satisfy: each lens cited `§8` and none engaged the rationale
+sitting on the field it was citing. A reader that quotes a clause without reading the
+justification the code offers against that clause will file a compliant deviation as a
+violation every time — and `§1` makes that justification the whole test for a SHOULD.
 
-`src/events/log.rs` (whole-log read bounded only by an attacker-controlled file size;
-unbounded `read_to_end` on the growing log), `src/engine/topology/recover.rs`
-(persisted owner/commit records), `src/config.rs`, `src/engine/attempt.rs` and
-`src/review.rs` (agent-authored artifacts into prompts, no per-artifact or aggregate
-bound), `src/topology/schema.rs` (arbitrarily long header line),
-`src/runner/container.rs` (both streams captured with no pre-allocation bound and no
-timeout), and `src/validate.rs` (cycle detection recurses the untrusted task graph
-with no depth bound).
+**One row is struck, not rejected**: `src/engine/topology/scaffold.rs` is not
+production. Its own header reads *"The schema-4 run a dispatch or attempt test
+drives"*, and `src/engine/topology.rs` declares it `#[cfg(test)] mod scaffold;`. It was
+tabled here without that being checked — this seat's error, of the same class it has
+been catching in others.
 
-### (c) Lossy UTF-8 conversion of path **identity** into durable records — 10 sites
+### (b) The trust-boundary class — **ROUTING CHANGED**, 7 findings
 
-§8 says a lossy display string is for diagnostics only, **never identity**:
-`engine/topology/create.rs` (×3: creation marker, `run_started`, owner/commit
-identity), `engine/topology/dispatch.rs` (`task_dispatched` worktree identity),
-`engine/topology/scaffold.rs`, `engine/coordinator.rs`, `engine/preflight.rs`,
-`rundir.rs`, `gates.rs`, `agent/codex.rs`, `runner/container.rs` (bind-mount source
-inside Docker's comma-delimited mount syntax).
+These cite the bullet that **is** MUST-tagged, and they sit on a security boundary.
+`§1` refuses an ad hoc exception for a MUST, so the documented in-code rationale that
+discharges class (a) does **not** discharge these — and several of them are documented.
+`recover.rs`'s `normalize` carries a substantial argument for its lexical fallback; it
+is still an ad hoc exception, and the standard says so in as many words. The same kind
+of evidence settles a SHOULD and cannot settle a MUST.
 
-## 2. The lossy-path class versus W4's scope
+They are therefore **not** the sweep's work. They route to `reviews/FINDINGS.md` §2 as
+contract/correctness rows with a named owner:
 
-Class (c) is the same class as `CommandSpec.program`, and it is wider than the record
-that just settled that field. The `OsString` record scopes itself to "the one
-measured field", with `args` and `env` audited in W4 and "no speculative widening".
-These ten sites are not mentioned.
+| file | § | observation | region sha256 |
+|---|---|---|---|
+| `src/engine/topology/recover.rs` | §14 | The explicit private-root comparison falls back to lexical equality on every canonicalization error. | `31b6eba9705daa9e…` |
+| `src/engine/topology/recover.rs` | §14 | Owner-record public-directory authentication falls back to lexical spelling when canonical evidence is unavailable. | `388c5fbd6fab41a9…` |
+| `src/engine/topology/recover.rs` | §8 | The recorded private-root locator is accepted without absolute-path or symlink/reparse-point containment validation. | `f2aa6763a72ff901…` |
+| `src/rundir.rs` | §14 | The question-payload write boundary interpolates an unvalidated component into an authoritative path. | `1e5f413d6388eaee…` |
+| `src/rundir.rs` | §14 | The answer staging boundary uses an unvalidated component as part of its write path. | `975a3033271821f9…` |
+| `src/rundir.rs` | §14 | The private-half ownership proof falls back to an uncanonicalized public path when canonicalization evidence is unavailable. | `eb0463a6ae63dc8b…` |
+| `src/runner/container/exec.rs` | §8 | Confinement uses a lexical prefix comparison as its entire filesystem-containment decision. | `3e0c3df5db999002…` |
 
-The one that changes the character of the question: `src/topology/events.rs` records
-path identity as `String`/`Option<String>` in `RunStarted4`. That module is
-**serde-visible**, and recorded runs replay from it — so under the freeze charter a
-type change there is **Class C and a schema bump**, not the mechanical widening W4
-contemplates.
+`§8`'s own words on why a documented fallback is not enough here: *"Lexical
+normalization alone does not prove filesystem containment."*
 
-Whether W4's scope grows to cover the durable event schema, or that becomes its own
-decision record, is the owner's call and is not made here.
+Not repaired by this seat, and not carried by #40 or #41.
+
+## 2. W4's scope does not grow
+
+The escalation asked whether W4 should absorb the lossy-path class, since one of its
+sites — `src/topology/events.rs` — is serde-visible and a type change there would be
+Class C and a schema bump rather than a widening.
+
+**Ruled: it does not**, for three independent reasons, any one sufficient. There is
+nothing to fix, per (a). Even if there were, `§8`'s *own* MUST makes an event-schema
+change a migration of supported historical runs, categorically not the one-field
+widening W4 is chartered for. And the `OsString` record scopes itself to *"the one
+measured field"* with *"no speculative widening"*, so it cannot authorise what it
+expressly declined to cover.
+
+What the ruling added instead is a clause, not a record: the two live documents reason
+oppositely about one trade-off — `events.rs` argues cross-platform log legibility for
+`String`, the `OsString` record argues cross-platform replay of a non-UTF-8 program was
+never meaningful — and both are right about their own subject. Ephemeral spawn-time
+identity widens; durable wire-facing log identity stays `String`. That clause is in the
+record's Consequences list, which W4 already opens.
 
 ## 3. Frozen-layer edits
 
