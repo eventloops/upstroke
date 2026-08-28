@@ -172,6 +172,69 @@ direct question about scope and answered it as a disposition, which is now settl
 claim about the PR3 round, not about PR4's second confirmation, whose two findings —
 `PR4-CONF-003` and `PR4-CONF-004` — were both accepted and repaired in round 5.)*
 
+### 2026-08-28 — `BRIDGE-FROZEN-LINT-ATTRIBUTE`, per-instance Class B approval
+
+**The owner's ruling, quoted:**
+
+> **RULED — Class B per-instance approval, granted by this message:** the
+> `#[expect(clippy::expect_used)]` attribute on `src/topology/effects.rs` stands. That
+> file is one of the two the 2026-08-20 ruling froze BY NAME, so this carries full
+> ceremony.
+
+Raised by the `lints` lens of the five-lens review of `bdd64f5`
+(`~/tactus-artifacts/pr34/review-lints.md`, finding 1), which was correct on the point
+the bridge got wrong: the touch is not Class A's additive reader and this pull request is
+not the chartered pass, so the class is arguable — and an arguable class is **Class B
+until ruled otherwise**, which requires per-instance approval *before* landing. The
+bridge's own reasoning, that the freeze binds feature slices and a master merge is not
+one, is not an exemption the 2026-08-20 ruling grants. Deferring the question to the G2
+pass would have been too late, because this lands first.
+
+**Why the file matters more than "somewhere under `src/topology/`".** The 2026-08-20
+ruling froze **two named things**, and `src/topology/effects.rs` is one of them. This is
+not the directory-wide reading; it is the explicit one.
+
+**What changed, measured at the commit that carries this text.**
+
+| file | +/− | what |
+|---|---|---|
+| `src/topology/effects.rs` | **+4/−0** | one `#[expect(clippy::expect_used, reason = …)]` attribute on the statement `let hook = phase.hook_phase()`, carrying that call's existing message. No statement, signature, type or behaviour changes. |
+
+**The annotation is honest, and that was audited rather than asserted.** The `lints`
+lens verified the reason is true: `required` is constructed only from `Before`, `After`
+and `Point`; all three map to `Some(HookPhase)`; `Residue` and `NoExecution` cannot enter
+the loop, and the mapping has a focused test. The `expect` is a tripwire for a future
+programmer defect, not a currently reachable panic. The lens found no reachable failure
+suppressed by it.
+
+**Why the alternatives lost.** Refactoring the `expect` away is a larger edit to the same
+frozen file, and a behaviour-adjacent one. A module-level `allow` would have to live in
+`effects/allowlist.toml`, weakening the mechanism the whole governed-effect system rests
+on. Leaving it unannotated fails `clippy -D warnings` on the integration branch, because
+master's `[lints.clippy]` denies `expect_used` — so the branch could not pass its own
+gate.
+
+### 2026-08-28 — `PR5-MACOS-CLIPPY-NEVER-RUN` fired, and is carried
+
+Its owner clause names the slice that next opens `ci.yml`. The master merge carries a
+`ci.yml` change, so the trigger has fired. **It is recorded here and NOT repaired in this
+pull request**: adding a macOS Clippy job to a merge-only bridge is scope creep, and the
+bridge's whole argument is that it changes nothing but what the merge forced.
+
+The `lints` lens supplied the concrete escape this row previously described only in the
+abstract. No Clippy job compiles the macOS-only production regions of
+`src/agent/proc.rs` — `last_errno`, `group_has_non_zombie_members`,
+`process_is_stopped`, `create_cloexec_pipe`, `clear_nonblocking`, and the non-Linux
+`groups_are_quiescent`. Ubuntu Clippy configures them out, the new Windows Clippy job
+configures them out, and macOS runs tests and MSRV but not Clippy. So:
+
+> add an `.expect()` inside macOS `create_cloexec_pipe`; if no test executes that branch,
+> every required check passes and a production panic the standard prohibits ships.
+
+The lens checked and found **no currently denied call** in those regions, so the hole is
+open but unoccupied. The repository already records it at `src/effects/tests.rs:1352`.
+Carried, with an owner, rather than left silent.
+
 ### 2026-08-27 — `candidate_prepared` is the sole successful settlement, per-instance Class B approval
 
 **The owner's ruling, quoted:**

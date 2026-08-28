@@ -1371,7 +1371,7 @@ fn the_rebuild_refuses_an_incomplete_record_before_asking_the_runtime_anything()
     let host = crate::runner::policy::host_policy();
     assert_eq!(
         rebuild_by_inspection(&runtime, &host, &selection(), &mut warnings)
-            .expect_err("a host policy is not a container selection"),
+            .expect_err("a host record cannot be rebuilt as a container"),
         InspectionRefusal::NotAContainerSelection {
             kind: RunnerKind::Host
         }
