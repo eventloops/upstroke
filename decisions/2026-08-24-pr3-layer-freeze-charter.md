@@ -100,7 +100,8 @@ the failure direction is asking, not landing.
   deletion, no visibility widening of anything else. Permitted without pre-approval
   **only** with the ceremony PR5 and PR7 already used, in the same commit: a ledger
   row carrying the measured split (code / comments / tests), the delegation target
-  named, and rustdoc attachment checked (two of PR7's eleven insertions detached a
+  named, and rustdoc attachment checked (two of PR7's **first eleven** insertions —
+  the count at `3362f65`, before `ffcc74a` added the twelfth — detached a
   neighbour's doc comment; the class has already broken a build once via a duplicated
   `#[test]` attribute).
 
