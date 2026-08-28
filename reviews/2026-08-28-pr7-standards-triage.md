@@ -147,9 +147,10 @@ deviation. The second review of this pull request then checked the call sites an
 that **the amendment landed on the wrong site**, and that the test it states does not
 stop where either revision stopped.
 
-**The membership, because an earlier revision asserted a count without one.** Fourteen
-filed rows cite §8 and belong to this family. They are listed here so the arithmetic can
-be checked rather than believed:
+**The membership, because an earlier revision asserted a count without one — and the first
+list was still short.** The rows below cite §8 and belong to this family. The
+`src/agent/claude.rs` settings-path row was missing from the previous revision's list, and
+its absence is the reason a list is given at all rather than a number:
 
 | work-list line | file | what the lossy value becomes |
 |---|---|---|
@@ -159,6 +160,7 @@ be checked rather than believed:
 | 59 | `src/engine/topology/dispatch.rs` | `task_dispatched` worktree identity |
 | 93 | `src/engine/topology/scaffold.rs` | `RunStarted4`'s `execution_root` and `private_dir` |
 | 112 | `src/topology/events.rs` | `RunStarted4`'s path fields as `String` |
+| 149 | `src/agent/claude.rs` | a settings path in a **subprocess argument** |
 | 156 | `src/agent/codex.rs` | a schema path in a **subprocess argument** |
 | 198 | `src/engine/coordinator.rs` | the operational private-directory path |
 | 201 | `src/engine/preflight.rs` | plan and configuration paths in a record |
@@ -171,13 +173,19 @@ be checked rather than believed:
 **Three failure modes, and they are not interchangeable.** An earlier revision applied
 one sequence to the whole class, which is how it ended up on the wrong site.
 
-- **A — the string is read back and a path is reconstructed** (47, 51, 59, 93, 112, 198,
-  201, 224, 264). A replaced byte produces a **different path** after restart. This is
-  the sequence the owner described, and its clearest instance is `RunStarted4.private_dir`:
-  written with `to_string_lossy` at `create.rs:1647`, and turned back into a path by
+- **A — the string is read back and a path is reconstructed** (47, 51, 112, 198, 201, 224,
+  264). A replaced byte produces a **different path** after restart. This is the sequence
+  the owner described, and its clearest instance is `RunStarted4.private_dir`: written with
+  `to_string_lossy` at `create.rs:1647`, and turned back into a path by
   `PathBuf::from(&started.private_dir)` at `recover.rs:335`. It bites `DESIGN.md` §4's
   replay invariant.
-- **B — both sides render lossily and only compare** (50, 258). `canonical_string` writes
+
+  **Two rows an earlier revision put here do not belong.** Row 59's
+  `TaskDispatched.worktree_path` is written at `dispatch.rs:398` and **production replay
+  never reads it**: recovery derives the slot from the key and generation at
+  `recover.rs:2642`. Row 93's `scaffold.rs` writes fixture events and nothing there reads
+  the strings back. Both are recorded below as **D**.
+- **B — both sides render lossily and only compare** (50). `canonical_string` writes
   `public_dir`, but recovery does **not** reconstruct a path from that record: it derives
   the public directory from `repo_root` and `run_id` at `recover.rs:280`, renders *that*
   lossily through `canonical_display`, and compares strings at `:632`. Both sides produce
@@ -185,9 +193,22 @@ one sequence to the whole class, which is how it ended up on the wrong site.
   narrower and still real: **two distinct non-UTF-8 directories whose lossy renderings
   collide authenticate against each other's owner record**, and the disagreement refusal
   never fires.
-- **C — the lossy string selects a target** (156, 237, 267). It is not read back at all;
-  it is handed to a subprocess, an executable probe, or Docker's mount syntax. A replaced
-  byte **names a different or nonexistent object** at the moment of use.
+
+  **Row 258 was put here and is not class B.** `rundir.rs:1472` renders **one** basename
+  lossily and the values it compares against are not independently rendered; worse, that
+  same basename builds the expected private path at `:1532`. Neither half of the class
+  description holds. It is class **C**.
+- **C — the lossy string selects a target** (149, 156, 237, 258, 267). It is not read back;
+  it is handed to a subprocess, an executable probe, a constructed path, or Docker's mount
+  syntax. A replaced byte **names a different or nonexistent object** at the moment of use.
+  The `claude.rs` row is the sharpest: a settings file under a directory containing raw
+  byte `0x80`, and a sibling whose name contains a literal U+FFFD, render to the same
+  spelling — so the agent loads the wrong settings file, possibly a more permissive one.
+- **D — written and never read** (59, 93). The value is durable or fixture-only and no
+  production path reconstructs it. **Recorded, not dismissed**: §8's rule is that a lossy
+  display string is never identity, and these are identity fields whose current consumers
+  happen not to depend on them. A future consumer is one commit away, which is a weaker
+  finding than A but not none.
 
 **Why `canonical_string` was the wrong home for the replay sequence, stated plainly.**
 The owner's amendment is right that its doc defends only the `unwrap_or_else` fallback
@@ -298,7 +319,13 @@ without disposing of it**, while §1's opening said all 28 escalated findings ha
 ruled on. They had not: 12 + 1 + 7 is 20. The nine are restored here with a disposition
 each, which is what was missing.
 
-All nine cite `§14`, and the clause they land on — *"Bound input size, recursion,
+**One of the original nine is not in this table, and an earlier revision said so while
+leaving the row in place.** `src/runner/container.rs`'s `exec_streams` cites **§9**, whose
+subprocess requirements are MUST-tagged, so §1 sends it to an owner rather than to the
+sweep. It is routed as `PR7-STD-CONTAINER-EXEC-UNBOUNDED` — see §1(b). Leaving it here
+also made the sentence below false about its own table.
+
+The rows that remain here cite `§14`, and the clause they land on — *"Bound input size, recursion,
 collection growth, output capture, concurrency, and retry work before allocating or
 spawning from untrusted values"* — carries **no requirement keyword**, while a sibling
 bullet in the same section is explicitly MUST-tagged. By exactly the reasoning applied
@@ -313,14 +340,13 @@ the site carries a concrete reason in the code.
 | `src/engine/attempt.rs` and `src/review.rs`, agent-authored artifacts read into prompts | no | **OPEN**, undocumented, and the input is model output — the least trusted class this engine handles. |
 | `src/config.rs` | no — the nearby doc is about modification time, not bounds | **OPEN**, undocumented. |
 | `src/topology/schema.rs` header probe | not checked to the same depth | **OPEN, and the check is owed.** Recorded as unverified rather than asserted either way. |
-| `src/runner/container.rs` `exec_streams` | no — its doc is about stream separation | **ROUTED, not sweep work.** Its filed row cites §9, whose subprocess requirements are MUST-tagged, so §1 sends it to an owner. It is `PR7-STD-CONTAINER-EXEC-UNBOUNDED` in `reviews/FINDINGS.md` §2 — see §1(b). Listing it here as a SHOULD was the miss that §1(b) now records. |
 | `src/validate.rs` cycle detection over the untrusted task graph | not checked to the same depth | **OPEN, and the check is owed.** |
 
-**What the seat verified and what it did not.** The table has **eight** rows. Rows 1-5
-and row 7 were read at the cited sites in this tree. **Rows 6 and 8** —
-`src/topology/schema.rs`'s header probe and `src/validate.rs`'s cycle detection — were
-not audited to that depth and say so in their own cells. An earlier revision said "the
-last two", which named the wrong two once row 7 was routed out.
+**What the seat verified and what it did not.** Every row above was read at its cited site
+in this tree **except** `src/topology/schema.rs`'s header probe and `src/validate.rs`'s
+cycle detection, which say so in their own cells. They are named rather than numbered here
+because two earlier revisions referred to them by position and both went stale — first when
+a row was routed out, then when the ordinals shifted behind it.
 An earlier revision's error was to let a class disappear rather than say "unresolved",
 and a disposition that overstates its own evidence would repeat that in the other
 direction.
