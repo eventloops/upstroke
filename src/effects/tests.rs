@@ -1350,8 +1350,17 @@ exit "$failed"
 /// rather than a finding.
 const GATE_JOB_FIELDS: [&str; 4] = ["name", "runs-on", "steps", "timeout-minutes"];
 
-/// The fields any step in a job this section pins may declare. Same reasoning.
-const STEP_FIELDS: [&str; 6] = ["env", "name", "run", "shell", "uses", "with"];
+/// The fields a step of a *gate* job may declare. Same reasoning, and `env:` is
+/// absent for a reason of its own: a step-level environment is enough to
+/// retarget the compile the gate performs -- `CARGO_BUILD_TARGET` on the macOS
+/// leg lints a target no `#[cfg(target_os = "macos")]` body belongs to, while
+/// the `run:` scalar still matches character for character. Measured,
+/// `MUT-GATE-STEP-RETARGETED`.
+const STEP_FIELDS: [&str; 5] = ["name", "run", "shell", "uses", "with"];
+
+/// The fields the aggregate's one step may declare. It is the only step in this
+/// contract that needs an environment, and the mapping is pinned key by key.
+const AGGREGATE_STEP_FIELDS: [&str; 4] = ["env", "name", "run", "shell"];
 
 /// The fields the aggregate declares. `if:` is *required* here and pinned to
 /// `always()` below: without it a failed dependency skips the aggregate, which
@@ -1666,7 +1675,7 @@ fn aggregate_complaints(jobs: &Yaml, job_names: &BTreeSet<String>) -> Vec<String
         return out;
     }
     let step = &steps[0];
-    let strange = unexpected(&field_names(step), &STEP_FIELDS);
+    let strange = unexpected(&field_names(step), &AGGREGATE_STEP_FIELDS);
     if !strange.is_empty() {
         out.push(format!(
             "[unexpected-step-field] `{AGGREGATE_JOB}`'s step declares {strange:?}"
@@ -1933,6 +1942,18 @@ const WORKFLOW_ESCAPES: &[WorkflowEscape] = &[
         anchor: "      - run: cargo clippy --all-targets --all-features -- -D warnings\n",
         replacement: "      - run: cargo clippy --all-targets --all-features -- -D warnings\n\
                       \x20       continue-on-error: true\n",
+        refused_as: "unexpected-step-field",
+    },
+    WorkflowEscape {
+        name: "MUT-GATE-STEP-RETARGETED",
+        escape: "a step-level environment retargets the compile. The `run:` scalar still \
+                 matches character for character, the job is green, and Clippy examined a \
+                 target whose `#[cfg]` bodies are not this platform's.",
+        job: "lint-macos",
+        anchor: "      - run: cargo clippy --all-targets --all-features -- -D warnings\n",
+        replacement: "      - run: cargo clippy --all-targets --all-features -- -D warnings\n\
+                      \x20       env:\n\
+                      \x20         CARGO_BUILD_TARGET: x86_64-unknown-linux-gnu\n",
         refused_as: "unexpected-step-field",
     },
     WorkflowEscape {
