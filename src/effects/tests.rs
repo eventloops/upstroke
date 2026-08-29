@@ -2364,6 +2364,37 @@ fn ci_msrv_job_complaints(doc: &Yaml) -> Vec<String> {
             declared_rust_version()
         ));
     }
+
+    // Order, not merely presence. `dtolnay/rust-toolchain` selects the toolchain
+    // for the steps that FOLLOW it, so a check above it compiles on whatever the
+    // runner image preinstalled -- stable -- while both steps are present, both
+    // are exact, and every equality above passes. Measured,
+    // `MUT-MSRV-CHECK-BEFORE-TOOLCHAIN`.
+    //
+    // The install step is located by the toolchain it installs, not merely by the
+    // action it uses: an install of something other than the derived floor is
+    // already refused above, and pairing the order claim to the same exact value
+    // keeps the two from drifting apart.
+    let install_at = steps_of(job).iter().position(|step| {
+        scalar(step, "uses").is_some_and(|uses| uses.starts_with("dtolnay/rust-toolchain@"))
+            && field(step, "with").and_then(|with| scalar(with, "toolchain"))
+                == Some(expected.as_str())
+    });
+    let check_at = steps_of(job)
+        .iter()
+        .position(|step| scalar(step, "run") == Some(MSRV_COMMAND));
+    if let Some((install_at, check_at)) = install_at
+        .zip(check_at)
+        .filter(|(install, check)| install > check)
+    {
+        out.push(format!(
+            "[msrv-job-order] the `{MSRV_JOB}` job runs `{MSRV_COMMAND}` at step {check_at} \
+             and installs toolchain `{expected}` at step {install_at}. The install selects the \
+             toolchain for the steps that follow it, so a check above it compiles on whatever \
+             the runner image shipped and the leg reports green about a version this crate \
+             publishes no floor for."
+        ));
+    }
     out
 }
 
@@ -2413,12 +2444,35 @@ fn rustflags_complaints(doc: &Yaml) -> Vec<String> {
                 )),
                 Some(Some(_)) => {}
             }
-            if field_names(env).contains(ENCODED_RUSTFLAGS_KEY) {
+            // Every other guarded binding at workflow scope, case-insensitively.
+            // Two distinct defects share this arm: `CARGO_ENCODED_RUSTFLAGS`,
+            // which Cargo reads instead of the pinned name, and a case variant of
+            // `RUSTFLAGS` itself, which collides with the pinned line on Windows
+            // and does nothing on Linux. The pinned key is skipped because the
+            // match above already decided it.
+            for key in field_names(env) {
+                let Some(guarded) = guarded_env_key(&key) else {
+                    continue;
+                };
+                if key == RUSTFLAGS_KEY {
+                    continue;
+                }
+                let why = if guarded == ENCODED_RUSTFLAGS_KEY {
+                    format!(
+                        "Cargo reads `{ENCODED_RUSTFLAGS_KEY}` in preference to \
+                         `{RUSTFLAGS_KEY}` and ignores `{RUSTFLAGS_KEY}` entirely when it is \
+                         set, so the pinned line is read past rather than obeyed"
+                    )
+                } else {
+                    format!(
+                        "`{key}` and `{RUSTFLAGS_KEY}` are one variable on `windows-latest`, \
+                         where the process environment is case-insensitive, so which value \
+                         the Windows legs compile under is not decided by this document"
+                    )
+                };
                 out.push(format!(
-                    "[rustflags] the workflow binds `{ENCODED_RUSTFLAGS_KEY}` at workflow \
-                     scope. Cargo reads it in preference to `{RUSTFLAGS_KEY}` and ignores \
-                     `{RUSTFLAGS_KEY}` entirely when it is set, so the pinned line above would \
-                     be read past rather than obeyed."
+                    "[rustflags] the workflow's `env:` binds `{key}` beside the pinned \
+                     `{RUSTFLAGS_KEY}: {RUSTFLAGS_VALUE}`. {why}."
                 ));
             }
         }
@@ -2433,29 +2487,142 @@ fn rustflags_complaints(doc: &Yaml) -> Vec<String> {
         };
         out.extend(rustflags_override_complaints(job, &format!("job `{name}`")));
         for (index, step) in steps_of(job).iter().enumerate() {
-            out.extend(rustflags_override_complaints(
-                step,
-                &format!("`{name}` step {index}"),
-            ));
+            let named = format!("`{name}` step {index}");
+            out.extend(rustflags_override_complaints(step, &named));
+            if let Some(script) = scalar(step, "run") {
+                out.extend(rustflags_script_complaints(script, &named));
+            }
         }
     }
     out
 }
 
-/// The two names a node's own `env:` may not bind, wherever that node sits.
+/// The canonical guarded name `key` is, ignoring case, or `None`.
+///
+/// Whole-key equality, never a substring. `RUSTFLAGS_EXTRA`, `RUST_FLAGS` and
+/// `CARGO_TERM_COLOR` are unrelated variables and a `contains` reading would
+/// refuse bindings that never touch the warning policy.
+///
+/// Case-insensitive, because the environment on `windows-latest` is. GitHub
+/// merges `env:` mappings by exact key and hands the result to the runner, which
+/// sets them into a process environment where `rustflags` and `RUSTFLAGS` are one
+/// variable. A lowercase job-level binding is therefore inert on Linux and
+/// authoritative on Windows -- exactly the half of a mutation that only ever gets
+/// measured on Linux, and the reason this comparison is not `==`.
+fn guarded_env_key(key: &str) -> Option<&'static str> {
+    [RUSTFLAGS_KEY, ENCODED_RUSTFLAGS_KEY]
+        .into_iter()
+        .find(|guarded| key.eq_ignore_ascii_case(guarded))
+}
+
+/// Every `[A-Za-z0-9_]` run of `script`, so a variable name is matched whole.
+///
+/// A `run:` scalar is an opaque script rather than a mapping, so the finest
+/// granularity available over it is a token. Tokens are still enough to keep the
+/// discipline the rest of this section keeps: `RUSTFLAGS_EXTRA` is one token and
+/// is not `RUSTFLAGS`, which a `contains` reading could not tell apart.
+fn env_name_tokens(script: &str) -> BTreeSet<String> {
+    script
+        .split(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+        .filter(|token| !token.is_empty())
+        .map(str::to_owned)
+        .collect()
+}
+
+/// Whether `script` names the job-scoped environment file, in any of its forms.
+///
+/// `$GITHUB_ENV`, `${GITHUB_ENV}`, `$env:GITHUB_ENV`, `%GITHUB_ENV%` and
+/// `${{ github.env }}` are one file, reached from bash, pwsh and cmd
+/// respectively. A line written to it becomes an environment variable for every
+/// later step of the same job.
+fn writes_the_job_env_file(script: &str) -> bool {
+    let lowered = script.to_ascii_lowercase();
+    lowered.contains("github_env") || lowered.contains("github.env")
+}
+
+/// Every way a `run:` step reaches the warning policy from inside its script.
+///
+/// The `env:` mappings this contract compares are declarations. A `run:` scalar
+/// is not, and one line of one --
+/// `echo "RUSTFLAGS=-A warnings" >> "$GITHUB_ENV"` -- rebinds the variable for
+/// **every later step of the same job** while the document declares an `env:`
+/// nowhere. Every field-set equality passes, the pinned workflow line is
+/// untouched, and the Cargo steps that follow compile under a policy no mapping
+/// in this file states. `MUT-RUSTFLAGS-PERSISTED-VIA-GITHUB-ENV` and its three
+/// siblings are that line in bash, in a bash heredoc, in PowerShell and through
+/// the `${{ github.env }}` expression.
+///
+/// Position is deliberately not a precondition. Refusing the write wherever it
+/// appears is strictly stronger than refusing it only where a Cargo step
+/// follows -- which a reorder would defeat -- and no leg of this workflow has a
+/// benign reason to name the variable at all.
+///
+/// **What a token scan over an opaque script can and cannot do**, stated rather
+/// than left to be discovered. It refuses every form that spells the name,
+/// including forms that are not writes at all: `RUSTFLAGS=-A warnings cargo
+/// build` scopes the flags to one command without touching the env file, and it
+/// is refused too, because the policy is set once at workflow scope and a script
+/// that names it is doing something this contract has no model for. It does
+/// **not** refuse a script that assembles the name from pieces. That residual is
+/// the same one `AGGREGATE_SCRIPT`'s pin carries: a script is not a document, and
+/// the honest bound is the one written down.
+fn rustflags_script_complaints(script: &str, named: &str) -> Vec<String> {
+    let named_keys: BTreeSet<&'static str> = env_name_tokens(script)
+        .iter()
+        .filter_map(|token| guarded_env_key(token))
+        .collect();
+    let persists = writes_the_job_env_file(script);
+    named_keys
+        .into_iter()
+        .map(|key| {
+            if persists {
+                format!(
+                    "[rustflags-persisted] {named} names `{key}` in a script that writes the \
+                     job-scoped environment file. A line written there binds the variable for \
+                     every later step of this job, so the workflow-scope \
+                     `{RUSTFLAGS_KEY}: {RUSTFLAGS_VALUE}` is narrowed without any `env:` \
+                     mapping in this document saying so, and every field-set equality here \
+                     still passes."
+                )
+            } else {
+                format!(
+                    "[rustflags-in-script] {named} names `{key}` in its script. The warning \
+                     policy is set once, at workflow scope; a script that names it is either \
+                     scoping different flags to its own command or persisting them, and this \
+                     workflow has no leg that does either."
+                )
+            }
+        })
+        .collect()
+}
+
+/// The guarded names a node's own `env:` may not bind, wherever that node sits.
+///
+/// Keys are matched case-insensitively and whole. A `RustFlags:` binding is a
+/// no-op on the two Unix legs and the authoritative value on `windows-latest`,
+/// so a case-sensitive reading refuses it on no platform and a substring reading
+/// would refuse `RUSTFLAGS_EXTRA` on all three.
 fn rustflags_override_complaints(node: &Yaml, named: &str) -> Vec<String> {
     let Some(env) = field(node, "env") else {
         return Vec::new();
     };
-    let declared = field_names(env);
-    [RUSTFLAGS_KEY, ENCODED_RUSTFLAGS_KEY]
+    field_names(env)
         .into_iter()
-        .filter(|key| declared.contains(*key))
-        .map(|key| {
+        .filter_map(|key| guarded_env_key(&key).map(|guarded| (key, guarded)))
+        .map(|(key, guarded)| {
+            let case = if key == guarded {
+                String::new()
+            } else {
+                format!(
+                    " `{key}` and `{guarded}` are one variable on `windows-latest`, where the \
+                     process environment is case-insensitive, so this binding is inert on the \
+                     Unix legs and authoritative on the Windows one."
+                )
+            };
             format!(
                 "[rustflags-override] {named} binds `{key}` in its own `env:`, which shadows \
                  the workflow-scope `{RUSTFLAGS_KEY}: {RUSTFLAGS_VALUE}` for everything that \
-                 node covers. `CODING_STANDARDS.md` §11 records that narrowing the \
+                 node covers.{case} `CODING_STANDARDS.md` §11 records that narrowing the \
                  workflow-scope setting takes the `#[expect]` self-retirement guarantee with \
                  it, silently."
             )
@@ -2917,6 +3084,134 @@ const WORKFLOW_ESCAPES: &[WorkflowEscape] = &[
                       \x20       continue-on-error: true\n",
         refused_as: "msrv-job-step-field",
     },
+    WorkflowEscape {
+        name: "MUT-RUSTFLAGS-PERSISTED-VIA-GITHUB-ENV",
+        escape: "the narrowing with no `env:` mapping anywhere in the document. One `run:` \
+                 line writes the job-scoped environment file, and every step after it in the \
+                 job -- the `cargo check` on the next line -- compiles under `-A warnings`. \
+                 Every field-set equality passes, the pinned workflow line is untouched, and \
+                 the whole defect lives inside a scalar this contract used to treat as \
+                 opaque.",
+        job: Some("msrv"),
+        anchor: "      - run: cargo check --locked --all-targets --all-features\n",
+        replacement: "      - run: echo \"RUSTFLAGS=-A warnings\" >> \"$GITHUB_ENV\"\n\
+                      \x20     - run: cargo check --locked --all-targets --all-features\n",
+        refused_as: "rustflags-persisted",
+    },
+    WorkflowEscape {
+        name: "MUT-RUSTFLAGS-PERSISTED-VIA-EXPRESSION",
+        escape: "the same write through `${{ github.env }}`, the expression form of the same \
+                 file, and under the name Cargo prefers. Nothing in the line spells \
+                 `GITHUB_ENV`, so a reading that looks for that one token misses it entirely.",
+        job: Some("lint"),
+        anchor: "      - run: cargo fmt --check\n",
+        replacement: "      - run: echo \"CARGO_ENCODED_RUSTFLAGS=\" >> ${{ github.env }}\n\
+                      \x20     - run: cargo fmt --check\n",
+        refused_as: "rustflags-persisted",
+    },
+    WorkflowEscape {
+        name: "MUT-RUSTFLAGS-PERSISTED-VIA-POWERSHELL",
+        escape: "the same write in PowerShell, on the leg whose default shell is `pwsh`. \
+                 `Add-Content -Path $env:GITHUB_ENV` is how the file is reached there, and it \
+                 shares no syntax at all with the bash form -- which is the point of covering \
+                 the shells the runners actually resolve to.",
+        job: Some("lint-windows"),
+        anchor: "      - run: cargo clippy --all-targets --all-features -- -D warnings\n",
+        replacement: "      - run: Add-Content -Path $env:GITHUB_ENV -Value \"RUSTFLAGS=-A warnings\"\n\
+                      \x20     - run: cargo clippy --all-targets --all-features -- -D warnings\n",
+        refused_as: "rustflags-persisted",
+    },
+    WorkflowEscape {
+        name: "MUT-RUSTFLAGS-PERSISTED-VIA-HEREDOC",
+        escape: "the same write with the name and the redirection on different lines. A \
+                 heredoc is the form that defeats any reading anchored to `echo` or to a \
+                 single line, and the job it lands in is the one that runs these fixtures.",
+        job: Some("test"),
+        anchor: "      - run: cargo test --all-targets --all-features\n",
+        replacement: "      - run: |\n\
+                      \x20         cat >> \"$GITHUB_ENV\" <<'EOF'\n\
+                      \x20         RUSTFLAGS=-A warnings\n\
+                      \x20         EOF\n\
+                      \x20     - run: cargo test --all-targets --all-features\n",
+        refused_as: "rustflags-persisted",
+    },
+    WorkflowEscape {
+        name: "MUT-RUSTFLAGS-COMMAND-SCOPED",
+        escape: "the narrowing without the env file at all: the flags are scoped to one \
+                 command on one line. It persists nothing, so it is the arm that proves the \
+                 script scan is not merely a `GITHUB_ENV` detector -- and a leg that names the \
+                 variable at all is doing something this contract has no model for.",
+        job: Some("lint-macos"),
+        anchor: "      - run: cargo clippy --all-targets --all-features -- -D warnings\n",
+        replacement: "      - run: RUSTFLAGS=-A warnings cargo build --all-targets\n\
+                      \x20     - run: cargo clippy --all-targets --all-features -- -D warnings\n",
+        refused_as: "rustflags-in-script",
+    },
+    WorkflowEscape {
+        name: "MUT-RUSTFLAGS-JOB-OVERRIDE-LOWERCASE",
+        escape: "the job-level narrowing spelled in lower case. On the two Unix legs it binds \
+                 a different variable and does nothing; on `windows-latest` the process \
+                 environment is case-insensitive and it *is* `RUSTFLAGS`. A case-sensitive \
+                 reading refuses it on no platform, which is the Linux-only half of a \
+                 platform-shaped mutation.",
+        job: Some("msrv"),
+        anchor: "    timeout-minutes: 15\n",
+        replacement: "    timeout-minutes: 15\n\
+                      \x20   env:\n\
+                      \x20     rustflags: -A warnings\n",
+        refused_as: "rustflags-override",
+    },
+    WorkflowEscape {
+        name: "MUT-RUSTFLAGS-STEP-OVERRIDE-MIXED-CASE",
+        escape: "the same in mixed case, one level down, in the one step this contract allows \
+                 an `env:` at all",
+        job: Some("merge-gate"),
+        anchor: "          LINT_RESULT: ${{ needs.lint.result }}\n",
+        replacement: "          LINT_RESULT: ${{ needs.lint.result }}\n\
+                      \x20         RustFlags: -A warnings\n",
+        refused_as: "rustflags-override",
+    },
+    WorkflowEscape {
+        name: "MUT-RUSTFLAGS-WORKFLOW-CASE-VARIANT",
+        escape: "a case variant beside the pinned line at workflow scope. The pin still reads \
+                 back character for character, and on `windows-latest` the two keys are one \
+                 variable whose winner this document does not decide.",
+        job: None,
+        anchor: "  RUSTFLAGS: -D warnings\n",
+        replacement: "  RUSTFLAGS: -D warnings\n  Rustflags: -A warnings\n",
+        refused_as: "rustflags",
+    },
+    WorkflowEscape {
+        name: "MUT-RUSTFLAGS-ENCODED-LOWERCASE",
+        escape: "the encoded name in lower case. `MUT-RUSTFLAGS-ENCODED-AT-WORKFLOW-SCOPE` \
+                 covers the upper-case form; this is the one an exact-key reading would let \
+                 through on the platform where it works.",
+        job: None,
+        anchor: "  RUSTFLAGS: -D warnings\n",
+        replacement: "  RUSTFLAGS: -D warnings\n  cargo_encoded_rustflags: ''\n",
+        refused_as: "rustflags",
+    },
+    WorkflowEscape {
+        name: "MUT-MSRV-CHECK-BEFORE-TOOLCHAIN",
+        escape: "both steps present, both exact, and the check above the install. \
+                 `dtolnay/rust-toolchain` selects the toolchain for the steps that follow it, \
+                 so the check compiles on whatever the runner image preinstalled -- stable -- \
+                 and the leg is green about a version this crate publishes no floor for. \
+                 Nothing in the presence-and-equality contract could see it: the step count, \
+                 the command, the matrix and the toolchain scalar are all unchanged.",
+        job: Some("msrv"),
+        anchor: "      - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable\n\
+                 \x20       with:\n\
+                 \x20         toolchain: 1.85.0\n\
+                 \x20     - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2\n\
+                 \x20     - run: cargo check --locked --all-targets --all-features\n",
+        replacement: "      - run: cargo check --locked --all-targets --all-features\n\
+                      \x20     - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable\n\
+                      \x20       with:\n\
+                      \x20         toolchain: 1.85.0\n\
+                      \x20     - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2\n",
+        refused_as: "msrv-job-order",
+    },
 ];
 
 /// Replace `anchor` with `replacement` inside one job's block.
@@ -3153,6 +3448,29 @@ fn the_msrv_leg_checks_the_floor_the_manifest_publishes_on_every_platform() {
          `{expected}`; the `{MSRV_JOB}` leg installs {installed:?}",
         declared_rust_version()
     );
+
+    // The order, as the indices themselves. `MUT-MSRV-CHECK-BEFORE-TOOLCHAIN`
+    // executes the refusal; this is the positive control beside it, and it fails
+    // with both positions named rather than with a complaint about them.
+    let steps = field(&doc, "jobs")
+        .and_then(|jobs| field(jobs, MSRV_JOB))
+        .map(steps_of)
+        .unwrap_or_default();
+    let install_at = steps.iter().position(|step| {
+        scalar(step, "uses").is_some_and(|uses| uses.starts_with("dtolnay/rust-toolchain@"))
+            && field(step, "with").and_then(|with| scalar(with, "toolchain"))
+                == Some(expected.as_str())
+    });
+    let check_at = steps
+        .iter()
+        .position(|step| scalar(step, "run") == Some(MSRV_COMMAND));
+    assert!(
+        matches!((install_at, check_at), (Some(install), Some(check)) if install < check),
+        "the `{MSRV_JOB}` leg installs toolchain `{expected}` at step {install_at:?} and runs \
+         `{MSRV_COMMAND}` at step {check_at:?}. The install has to come first: it selects the \
+         toolchain for the steps that follow it, and a check above it compiles on whatever \
+         the runner image shipped."
+    );
 }
 
 /// The workflow-scope `-D warnings` is pinned, and nothing narrows it.
@@ -3265,6 +3583,94 @@ fn the_workflow_scope_rustflags_pin_refuses_weakening_and_every_override() {
             ),
             "rustflags-override",
         ),
+        (
+            "a job-level rebinding in lower case, which is `RUSTFLAGS` on Windows",
+            probe(
+                PINNED,
+                "    runs-on: windows-latest\n    env:\n      rustflags: -A warnings\n    \
+                 steps:\n      - run: cargo check\n",
+            ),
+            "rustflags-override",
+        ),
+        (
+            "a step-level rebinding in mixed case",
+            probe(
+                PINNED,
+                "    runs-on: windows-latest\n    steps:\n      - run: cargo check\n        \
+                 env:\n          RustFlags: -A warnings\n",
+            ),
+            "rustflags-override",
+        ),
+        (
+            "a case variant beside the pinned line at workflow scope",
+            probe(
+                "env:\n  RUSTFLAGS: -D warnings\n  Rustflags: -A warnings\n",
+                PLAIN,
+            ),
+            "rustflags",
+        ),
+        (
+            "the encoded name in lower case at workflow scope",
+            probe(
+                "env:\n  RUSTFLAGS: -D warnings\n  cargo_encoded_rustflags: ''\n",
+                PLAIN,
+            ),
+            "rustflags",
+        ),
+        (
+            "a bash write to the job environment file",
+            probe(
+                PINNED,
+                "    runs-on: ubuntu-latest\n    steps:\n      - run: echo \
+                 \"RUSTFLAGS=-A warnings\" >> \"$GITHUB_ENV\"\n",
+            ),
+            "rustflags-persisted",
+        ),
+        (
+            "the same write through the `github.env` expression",
+            probe(
+                PINNED,
+                "    runs-on: ubuntu-latest\n    steps:\n      - run: echo \
+                 \"CARGO_ENCODED_RUSTFLAGS=\" >> ${{ github.env }}\n",
+            ),
+            "rustflags-persisted",
+        ),
+        (
+            "the PowerShell form, which shares no syntax with the bash one",
+            probe(
+                PINNED,
+                "    runs-on: windows-latest\n    steps:\n      - run: Add-Content -Path \
+                 $env:GITHUB_ENV -Value \"RUSTFLAGS=-A warnings\"\n",
+            ),
+            "rustflags-persisted",
+        ),
+        (
+            "the cmd form, where the file is reached as a percent variable",
+            probe(
+                PINNED,
+                "    runs-on: windows-latest\n    steps:\n      - run: echo \
+                 RUSTFLAGS=-A warnings>>%GITHUB_ENV%\n        shell: cmd\n",
+            ),
+            "rustflags-persisted",
+        ),
+        (
+            "a heredoc, with the name and the redirection on different lines",
+            probe(
+                PINNED,
+                "    runs-on: ubuntu-latest\n    steps:\n      - run: |\n          cat >> \
+                 \"$GITHUB_ENV\" <<'EOF'\n          RUSTFLAGS=-A warnings\n          EOF\n",
+            ),
+            "rustflags-persisted",
+        ),
+        (
+            "flags scoped to one command, with no env file in sight",
+            probe(
+                PINNED,
+                "    runs-on: ubuntu-latest\n    steps:\n      - run: RUSTFLAGS=-A warnings \
+                 cargo build\n",
+            ),
+            "rustflags-in-script",
+        ),
     ] {
         let parsed = parse_workflow(&document).expect(shape);
         let complaints = rustflags_complaints(&parsed);
@@ -3273,6 +3679,53 @@ fn the_workflow_scope_rustflags_pin_refuses_weakening_and_every_override() {
             codes.contains(code),
             "{shape} was not refused as `{code}`. Document:\n{document}\nComplaints: {:#?}",
             complaints
+        );
+    }
+
+    // The other half of a scan that matches whole names case-insensitively: it
+    // must not fire on names that merely resemble the guarded ones. Each of these
+    // is a real thing a workflow could carry, and none of them is the warning
+    // policy. Without this block the case-insensitive widening above could be
+    // satisfied by a scan that refuses everything containing `rustflags`.
+    for (shape, document) in [
+        (
+            "an unrelated variable whose name contains the guarded one",
+            probe(
+                "env:\n  RUSTFLAGS: -D warnings\n  RUSTFLAGS_EXTRA: -C debuginfo=0\n",
+                PLAIN,
+            ),
+        ),
+        (
+            "an unrelated variable the guarded one is a prefix of, at job scope",
+            probe(
+                PINNED,
+                "    runs-on: ubuntu-latest\n    env:\n      MY_RUSTFLAGS: -A warnings\n      \
+                 RUST_FLAGS: -A warnings\n    steps:\n      - run: cargo check\n",
+            ),
+        ),
+        (
+            "a script that writes the env file without touching the policy",
+            probe(
+                PINNED,
+                "    runs-on: ubuntu-latest\n    steps:\n      - run: echo \
+                 \"CARGO_TERM_COLOR=never\" >> \"$GITHUB_ENV\"\n",
+            ),
+        ),
+        (
+            "a script naming a variable the guarded one is only a prefix of",
+            probe(
+                PINNED,
+                "    runs-on: ubuntu-latest\n    steps:\n      - run: echo \
+                 \"RUSTFLAGS_EXTRA=1\" >> \"$GITHUB_ENV\"\n",
+            ),
+        ),
+    ] {
+        let parsed = parse_workflow(&document).expect(shape);
+        let complaints = rustflags_complaints(&parsed);
+        assert!(
+            complaints.is_empty(),
+            "{shape} was refused, so this scan reads substrings rather than whole names. \
+             Document:\n{document}\nComplaints: {complaints:#?}"
         );
     }
 }
