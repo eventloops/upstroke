@@ -55,9 +55,17 @@ rather than inheriting this closure.
 `PR40-PROGRAM-PUBLIC-ADAPTER-SEAM`, in the parallelism workstream's `reviews/FINDINGS.md`, asks
 whether the public `AgentAdapter` trait — which a crate outside this repository may implement — may
 carry a path in that field at all. It is accepted as real and deferred by owner disposition of
-2026-08-29, and it is routed to the project owner. **No venue is selected here.** This standard
-records that the question is open and who holds it, not where it will be answered; a venue is the
-owner's to name, and naming one from this document would assert a routing no record establishes.
+2026-08-29, held by the project owner, and **that row is where its venue is recorded**: its owner
+column reads *"project owner, carried by G2 W4"* and its disposition says *"Revisit at G2 W4"*.
+The two records do not conflict.
+`decisions/2026-08-25-commandspec-program-stays-string.md` withdrew the **original PR4 widening**
+mandate and nothing else, so it leaves that workstream free to take a later, distinct question.
+
+**The representation decision itself remains pending, and this standard makes no part of it.**
+Whether the public seam may carry a path, and in what type, is decided at that venue and recorded
+there. §1 reports where the question sits; it selects nothing. The field's rule here is unchanged
+and remains the one the retirement above states — every route this repository takes puts a bare
+name in the field, and §8 governs it the moment a path-valued input exists.
 
 ## 2. Automated baseline
 
