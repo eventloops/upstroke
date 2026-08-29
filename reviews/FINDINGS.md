@@ -3460,3 +3460,21 @@ repair pass committed as `4119612`. The owner-authorized final dispositions afte
 
 The other review findings are fixed by the delivered pass: Process sites are release-validated and carried
 through termination, and the writable-`Command` export guard is structural rather than spelling-based.
+
+## 26. 2026-08-29 G2 W1 — fold-door and probe-pair obligations
+
+This append-only disposition applies the owner-authorized W1 acceptance matrix derived on-box from the
+authoritative private packet. Private packet text is not reproduced here. The slice starts from integration
+`bc30d7c38e5ed69939315a05bf870a9bf745b139`; independent review and exact-head hosted evidence remain
+required before these implementation dispositions become final.
+
+| stable ID | disposition | exact scope and evidence |
+|---|---|---|
+| `TASK-DISPATCHED-REGION-UNVALIDATED` | **implementation-fixed at `185e392`** | Dispatch validation derives the predicted region from the frozen fold state and refuses an event-carried region that differs. Shape, round-trip, and mutation witnesses exercise the derivation boundary. |
+| `PR7-G2-W1-SUCCESS-IGNORES-THE-FROZEN-PLAN` | **implementation-fixed at `c0ec940`** | Candidate success is judged against the task's frozen review plan: configured passes must be present and successful, so a partial or empty recorded pass set cannot satisfy the door. Focused and mutation witnesses cover the plan-presence gate. |
+| `PR7-G2-W1-RETAINED-ARM-UNGUARDED` | **implementation-fixed at `46780ea`** | The retained settlement arm now validates the record/envelope identity and the retained settlement claim rather than inheriting the closed-arm assumption. Focused witnesses and mutations cover the sibling arm explicitly. |
+| `PR7-G2-W1-PROBE-PAIR-NOT-OBLIGED` | **implementation-fixed at `6c6cb3d`** | Probe registration authority is structural: the caller grants the slot/ledger pair and supplies the resulting boundary, preventing an implementation from substituting an unrelated pair while the closing balance reads another. Focused witnesses and six mutation checks exercise construction, use, aliasing, and balance. |
+
+The four rows are one collision set and one W1 PR. Their exact public head is
+`6c6cb3dabcb8f30ef8ae7e24703eb36ba762b86f`; the single independent review, any one bounded repair,
+globally serialized full suite, and final hosted gates will be recorded in the PR and phase audit.
