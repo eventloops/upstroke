@@ -914,7 +914,6 @@ effect_free = [
     "replay",
     "review_cost_incomplete",
     "review_cost_usd",
-    "is_failed",
     "is_successful",
     "review_models",
     "settle_interrupted",

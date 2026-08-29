@@ -661,14 +661,15 @@ impl AttemptRecord {
         self.failure.is_none() && self.reviews.iter().all(|pass| pass.outcome.passed())
     }
 
-    /// Whether this record says the attempt **failed**.
-    ///
-    /// The complement, named rather than written as `!is_successful()` at each
-    /// call site, so that a settlement door reads the question it is asking.
-    #[must_use]
-    pub fn is_failed(&self) -> bool {
-        !self.is_successful()
-    }
+    // **There is deliberately no `is_failed`.** It was added as the
+    // complement of the predicate above and never acquired a caller, and the
+    // caller it was waiting for is the fold's `Retained` arm — which does not
+    // want it. A retained attempt is *unsettled*: the generation stays open and
+    // the next attempt resumes the same session, so its record makes no success
+    // claim and no terminal-failure claim, and asking it to say "failed" would
+    // be requiring an outcome the settlement does not record. The `Closed` arm
+    // asks `is_successful()` directly, which is the question that arm is
+    // actually asking.
 
     /// Total review spend for this attempt, or `None` when nothing reported any
     /// — which is not the same as nothing costing anything (§13: the Copilot

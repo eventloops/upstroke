@@ -2032,6 +2032,16 @@ fn attempt_finished(attempt: u32, settlement: AttemptSettlement) -> TopologyEven
         reason: "the fixture's judged failure".to_owned(),
         detail: None,
     });
+    // The settlement's retained session and the record's `session_id` are one
+    // value in production — both come from `assessed.outcome.session_id` — and
+    // the fold refuses a retained settlement whose halves name different
+    // conversations.
+    if let AttemptSettlement::Retained {
+        retained_session, ..
+    } = &settlement
+    {
+        record.session_id = Some(retained_session.0.clone());
+    }
     TopologyEventBody::AttemptFinished {
         data: Box::new(AttemptFinished4 {
             key: ALPHA,

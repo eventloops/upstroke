@@ -1984,8 +1984,8 @@ impl RunState {
 
         match &finished.settlement {
             AttemptSettlement::Retained {
+                retained_session,
                 retained_incarnation,
-                ..
             } => {
                 if *retained_incarnation != self.epoch {
                     return Err(FoldError::StaleIncarnation {
@@ -1995,6 +1995,62 @@ impl RunState {
                             "it retains the session for incarnation {} and this run has resumed \
                              {} time(s)",
                             retained_incarnation.0, self.epoch.0
+                        ),
+                    });
+                }
+                // **The envelope and the record name one attempt, on this arm
+                // too.** This arm checked the epoch and stopped, so a
+                // current-epoch retained settlement could carry a ledger line
+                // belonging to a different attempt of the same generation —
+                // the same disagreement the `Closed` arm has refused since
+                // round 6, one arm over. Every one of that round's four new
+                // refusal witnesses constructs `Closed`, which is why this arm
+                // was undriven; the `cfa1be8` review found it as its second P1.
+                //
+                // **A door is not fixed until every arm through it asks the
+                // same question.**
+                if finished.record.attempt != finished.attempt.0 {
+                    return Err(FoldError::WrongAttempt {
+                        kind: KIND,
+                        key: finished.key.0,
+                        generation: finished.generation.0,
+                        attempt: finished.record.attempt,
+                        expected: finished.attempt.0.to_string(),
+                    });
+                }
+                // **And the record names the conversation the settlement
+                // keeps.** A `Retained` settlement exists to hold a session for
+                // a same-session retry, and `check_attempt_started` will make
+                // the retry name the *generation's* session — the one this
+                // event puts there. If the ledger line names another session,
+                // or none, then the two halves of one event disagree about
+                // which conversation was left open, and the half a person reads
+                // is not the half the fold enforces.
+                //
+                // **What this arm deliberately does not ask.** The `Closed`
+                // arm requires `!is_successful()` — "the record must say the
+                // attempt failed" — because a closed generation has reached a
+                // terminal outcome and the record is that outcome's ledger
+                // line. A retained attempt is *unsettled*: the generation
+                // stays open, the lease stays taken, and the next attempt
+                // resumes the same conversation. So a retained record makes no
+                // success claim and no terminal-failure claim, and requiring
+                // either would be manufacturing a claim the settlement does not
+                // make. `AttemptRecord::is_failed` existed for a caller this
+                // arm would have been; it is deleted rather than given one.
+                if finished.record.session_id.as_deref() != Some(retained_session.0.as_str()) {
+                    return Err(FoldError::InconsistentRecord {
+                        kind: KIND,
+                        detail: format!(
+                            "attempt {} of generation {} retains session `{retained_session}` \
+                             and its record names {}; a retained settlement holds the session \
+                             its own ledger line reports",
+                            finished.attempt.0,
+                            finished.generation.0,
+                            match finished.record.session_id.as_deref() {
+                                Some(other) => format!("`{other}`"),
+                                None => "no session at all".to_owned(),
+                            }
                         ),
                     });
                 }
@@ -4906,6 +4962,23 @@ mod tests {
         })
     }
 
+    /// [`attempt_started`], resuming `session` — the same-generation retry a
+    /// `Retained` settlement exists to admit.
+    fn attempt_started_resuming(
+        fold: &TopologyFold,
+        key: TaskKey,
+        generation: u32,
+        attempt: u32,
+        rung: u32,
+        session: &str,
+    ) -> TopologyEvent {
+        let mut event = attempt_started(fold, key, generation, attempt, rung);
+        if let TopologyEventBody::AttemptStarted { data } = &mut event.body {
+            data.resume_session = Some(SessionId(session.to_owned()));
+        }
+        event
+    }
+
     /// `attempt_finished`, whose record **says the attempt failed**.
     ///
     /// Every settlement this can build is a failure — `candidate_prepared` is the
@@ -4927,6 +5000,19 @@ mod tests {
             reason: "the fixture's judged failure".to_owned(),
             detail: None,
         });
+        // **One session, in both places the event carries it.** Production
+        // takes the settlement's `retained_session` and the record's
+        // `session_id` from one value — `assessed.outcome.session_id` — and the
+        // fold refuses a retained settlement whose two halves disagree about
+        // which conversation was left open. A builder that left the record's
+        // stock id in place would be constructing that disagreement in every
+        // retained fixture in this file.
+        if let AttemptSettlement::Retained {
+            retained_session, ..
+        } = &settlement
+        {
+            record.session_id = Some(retained_session.0.clone());
+        }
         ev(TopologyEventBody::AttemptFinished {
             data: Box::new(AttemptFinished4 {
                 key,
@@ -5176,6 +5262,292 @@ mod tests {
             "a retained generation is retried, never re-dispatched"
         );
         assert!(fold.structurally_admissible());
+    }
+
+    // --- the Retained arm asks what the Closed arm asks ---------------------
+    //
+    // `PR7-G2-W1-RETAINED-ARM-UNGUARDED` (§2, §22e). Round 6's four new
+    // settlement refusals all construct `Closed`, which is why this arm was
+    // undriven: it checked the epoch and stopped.
+
+    /// A `Retained` settlement of `key`'s first attempt, session and all.
+    fn retain(key: TaskKey, attempt: u32, session: &str, incarnation: Epoch) -> TopologyEvent {
+        settle(
+            key,
+            0,
+            attempt,
+            AttemptSettlement::Retained {
+                retained_session: SessionId(session.to_owned()),
+                retained_incarnation: incarnation,
+            },
+        )
+    }
+
+    /// **The Retained arm asks the same questions the Closed arm asks.**
+    ///
+    /// A settlement carries an envelope and a ledger line, and this arm bound
+    /// them to each other in one field — the incarnation — and left the rest
+    /// free. So a current-epoch retained settlement could carry a record
+    /// belonging to a different attempt of the same generation, and could name
+    /// a conversation the ledger line does not report.
+    ///
+    /// The positive premise is asserted first in every row, so each refusal is
+    /// about the one field the row moves.
+    #[test]
+    fn a_retained_settlement_binds_its_envelope_to_its_record() {
+        let base = sha("base");
+        let session = "sess-ÜNI-retained";
+        let mut fold = started();
+        apply(&mut fold, &dispatch(ZETA, 0, &base));
+        let start = attempt_started(&fold, ZETA, 0, 1, 0);
+        apply(&mut fold, &start);
+
+        // The premise: the coherent settlement applies.
+        accepts(&fold, &retain(ZETA, 1, session, Epoch(0)));
+
+        // The record's attempt is not the envelope's.
+        let mut wrong_attempt = retain(ZETA, 1, session, Epoch(0));
+        let TopologyEventBody::AttemptFinished { data } = &mut wrong_attempt.body else {
+            unreachable!("built as an attempt_finished")
+        };
+        data.record.attempt = 2;
+        assert!(
+            matches!(
+                refuse(&fold, &wrong_attempt),
+                FoldError::WrongAttempt { attempt: 2, .. }
+            ),
+            "a retained settlement carried another attempt's ledger line"
+        );
+
+        // The record names another conversation.
+        let mut wrong_session = retain(ZETA, 1, session, Epoch(0));
+        let TopologyEventBody::AttemptFinished { data } = &mut wrong_session.body else {
+            unreachable!("built as an attempt_finished")
+        };
+        data.record.session_id = Some("sess-somebody-elses".to_owned());
+        let error = refuse(&fold, &wrong_session);
+        assert!(
+            matches!(error, FoldError::InconsistentRecord { .. }),
+            "a retained settlement kept a session its record does not report: {error:?}"
+        );
+
+        // And names none at all, which is the shape the scaffold emitted.
+        let mut sessionless = retain(ZETA, 1, session, Epoch(0));
+        let TopologyEventBody::AttemptFinished { data } = &mut sessionless.body else {
+            unreachable!("built as an attempt_finished")
+        };
+        data.record.session_id = None;
+        let error = refuse(&fold, &sessionless);
+        assert!(
+            matches!(error, FoldError::InconsistentRecord { .. }),
+            "a retained settlement reported no session to retain: {error:?}"
+        );
+
+        // The envelope's generation is not the open one.
+        let mut wrong_generation = retain(ZETA, 1, session, Epoch(0));
+        let TopologyEventBody::AttemptFinished { data } = &mut wrong_generation.body else {
+            unreachable!("built as an attempt_finished")
+        };
+        data.generation = GenerationId(1);
+        assert!(
+            matches!(
+                refuse(&fold, &wrong_generation),
+                FoldError::NotTheOpenGeneration { .. }
+            ),
+            "a retained settlement named a generation this task does not hold open"
+        );
+
+        // The incarnation is not this run's.
+        assert!(
+            matches!(
+                refuse(&fold, &retain(ZETA, 1, session, Epoch(7))),
+                FoldError::StaleIncarnation { .. }
+            ),
+            "a retained settlement claimed an incarnation this run is not in"
+        );
+
+        // Nothing moved on any of them: the generation is still in flight.
+        let generation = fold
+            .task(ZETA)
+            .and_then(|task| task.generations.first())
+            .expect("the generation is open");
+        assert!(matches!(generation.class, GenerationClass::InFlight { .. }));
+    }
+
+    /// **A retained settlement makes no success claim and no terminal-failure
+    /// claim, and the arm does not require either.**
+    ///
+    /// This is the design decision the row named as the repair's first, and it
+    /// is not a mechanical one. The `Closed` arm requires `!is_successful()` —
+    /// "the record must say the attempt failed" — because a closed generation
+    /// reached a terminal outcome and its record is that outcome's ledger line.
+    /// A retained attempt is *unsettled*: the generation stays open, the lease
+    /// stays taken, and the next attempt resumes the same conversation. So the
+    /// answer taken here is that a retained record makes **no** success claim,
+    /// and `AttemptRecord::is_failed` — which had no caller anywhere in the
+    /// tree, and whose only plausible caller was this arm — is deleted rather
+    /// than given one.
+    ///
+    /// Written as a test because "the arm does not require a failure" is
+    /// otherwise a claim about absent code, which nothing would notice being
+    /// added. A record with no failure and every configured pass green — the
+    /// shape both other doors call successful — is accepted here.
+    #[test]
+    fn a_retained_settlement_neither_claims_nor_denies_an_outcome() {
+        let base = sha("base");
+        let session = "sess-ÜNI-unsettled";
+        let mut fold = started();
+        apply(&mut fold, &dispatch(ZETA, 0, &base));
+        let start = attempt_started(&fold, ZETA, 0, 1, 0);
+        apply(&mut fold, &start);
+
+        for (label, failure) in [
+            ("a judged failure", true),
+            // The shape `scaffold.rs` emits, and the shape the `Closed` arm
+            // refuses: no failure, and the frozen obligation all green.
+            ("no failure at all", false),
+        ] {
+            let mut event = retain(ZETA, 1, session, Epoch(0));
+            let TopologyEventBody::AttemptFinished { data } = &mut event.body else {
+                unreachable!("built as an attempt_finished")
+            };
+            if !failure {
+                data.record.failure = None;
+                data.record.reviews = vec![review_pass("review", ReviewPassOutcome::Passed)];
+                assert!(
+                    data.record.is_successful(),
+                    "{label}: the premise is not the shape the other doors call successful"
+                );
+            }
+            accepts(&fold, &event);
+        }
+
+        // The same record, settled `Closed`, **is** refused — so the acceptance
+        // above is this arm's answer and not a check that stopped working.
+        let mut closed = settle(
+            ZETA,
+            0,
+            1,
+            AttemptSettlement::Closed {
+                transition: SettlementTransition::Retry,
+                lease: LeaseDisposition::PredictedReleased,
+            },
+        );
+        let TopologyEventBody::AttemptFinished { data } = &mut closed.body else {
+            unreachable!("built as an attempt_finished")
+        };
+        data.record.failure = None;
+        data.record.reviews = vec![review_pass("review", ReviewPassOutcome::Passed)];
+        assert!(
+            matches!(refuse(&fold, &closed), FoldError::InconsistentRecord { .. }),
+            "the Closed arm stopped requiring the record to say the attempt failed"
+        );
+    }
+
+    /// **What a Retained settlement does to the run: pipeline released, lease
+    /// retained, generation open, task not terminal — and once.**
+    ///
+    /// The row's other half. "Releases only the pipeline entitlement" is a
+    /// claim about the state after the arm applies, and the negatives are
+    /// double release (a second settlement of a generation that is no longer in
+    /// flight) and a new-process retry (a resume by an incarnation that did not
+    /// retain the session). Both are refusals the fold already makes and
+    /// neither was driven from this arm.
+    #[test]
+    fn a_retained_settlement_releases_the_pipeline_and_nothing_else() {
+        let base = sha("base");
+        let session = "sess-ÜNI-held";
+        let mut fold = started();
+        apply(&mut fold, &dispatch(ZETA, 0, &base));
+        let held = fold.predicted_region(ZETA).expect("the run has a registry");
+        let start = attempt_started(&fold, ZETA, 0, 1, 0);
+        apply(&mut fold, &start);
+        assert_eq!(
+            fold.pipeline_held(),
+            1,
+            "the in-flight generation holds the entitlement, or the release below is unobservable"
+        );
+
+        apply(&mut fold, &retain(ZETA, 1, session, Epoch(0)));
+
+        // Released, exactly once, and nothing else went with it.
+        assert_eq!(fold.pipeline_held(), 0, "the entitlement was not released");
+        let owner = LeaseOwner::Generation {
+            key: ZETA,
+            generation: GenerationId(0),
+        };
+        let leases = fold.leases().expect("the run has started");
+        assert!(
+            leases.holds(owner),
+            "a retained generation keeps its worktree, so it keeps its predicted lease"
+        );
+        assert!(
+            leases.overlaps_another(
+                LeaseOwner::Generation {
+                    key: ALPHA,
+                    generation: GenerationId(0)
+                },
+                &held,
+                &path_policy(),
+            ),
+            "the retained region no longer blocks another owner, so the lease is held in name only"
+        );
+        assert_eq!(
+            fold.task_state(ZETA),
+            Some(TaskState::Pending),
+            "a retained attempt is unsettled: the task is neither merged nor failed"
+        );
+        assert_eq!(
+            fold.derived_outcome(),
+            DerivedOutcome::NotEnding,
+            "a retained generation leaves the run running"
+        );
+
+        // Double release: the generation is no longer in flight, so a second
+        // settlement of it — retained or closed — is refused.
+        assert!(matches!(
+            refuse(&fold, &retain(ZETA, 1, session, Epoch(0))),
+            FoldError::NotTheOpenGeneration { .. }
+        ));
+        assert!(matches!(
+            refuse(
+                &fold,
+                &settle(
+                    ZETA,
+                    0,
+                    1,
+                    AttemptSettlement::Closed {
+                        transition: SettlementTransition::Retry,
+                        lease: LeaseDisposition::PredictedReleased,
+                    }
+                )
+            ),
+            FoldError::NotTheOpenGeneration { .. }
+        ));
+
+        // Same-generation retry: accepted in the retaining incarnation, and
+        // only there. The second half is the new-process refusal.
+        let retry = attempt_started_resuming(&fold, ZETA, 0, 2, 0, session);
+        accepts(&fold, &retry);
+        let mut resumed = fold.clone();
+        let runner = fold.started().expect("the run has started").runner.clone();
+        apply(&mut resumed, &resume(runner));
+        assert!(matches!(
+            refuse(
+                &resumed,
+                &attempt_started_resuming(&resumed, ZETA, 0, 2, 0, session)
+            ),
+            FoldError::StaleIncarnation { .. }
+        ));
+        // And a retry naming some other conversation is refused in the
+        // retaining incarnation too.
+        assert!(matches!(
+            refuse(
+                &fold,
+                &attempt_started_resuming(&fold, ZETA, 0, 2, 0, "sess-somebody-elses")
+            ),
+            FoldError::StaleIncarnation { .. }
+        ));
     }
 
     /// A poisoned fold authorises nothing.
@@ -12167,6 +12539,25 @@ mod tests {
                     *lease = LeaseDisposition::LineageHeld;
                     case(
                         "settlement.lease",
+                        TopologyEventBody::AttemptFinished { data: moved },
+                    );
+                }
+                // The Retained arm's own two cells. `long_trace` carries a
+                // retained settlement, and until this arm bound the envelope to
+                // the record a hostile log could move either past it.
+                let mut moved = data.clone();
+                if matches!(moved.settlement, AttemptSettlement::Retained { .. }) {
+                    moved.record.attempt = moved.record.attempt.saturating_add(1);
+                    case(
+                        "record.attempt",
+                        TopologyEventBody::AttemptFinished { data: moved },
+                    );
+                }
+                let mut moved = data.clone();
+                if matches!(moved.settlement, AttemptSettlement::Retained { .. }) {
+                    moved.record.session_id = Some("sess-somebody-elses".to_owned());
+                    case(
+                        "record.session_id",
                         TopologyEventBody::AttemptFinished { data: moved },
                     );
                 }
