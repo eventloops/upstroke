@@ -207,7 +207,7 @@ impl<'a> RunPreflight<'a> {
         Registering {
             inner: self.runner,
             ledger: &self.ledger,
-            slots: &self.slots,
+            slots: Some(&self.slots),
         }
     }
 }
@@ -309,7 +309,17 @@ fn refused(policy: &RunnerPolicy, what: &str) -> UpstrokeError {
 pub(super) struct Registering<'a> {
     pub(super) inner: &'a dyn Runner,
     pub(super) ledger: &'a Mutex<InvocationLedger>,
-    pub(super) slots: &'a Mutex<SlotAssertion>,
+    /// R4's slots, or `None` on a boundary that has none.
+    ///
+    /// **`Option` because INV-23's asymmetry is a real one**: "one non-slotted
+    /// shell probe (the recorded shell executing `exit 0`) **and** one slotted
+    /// probe per recorded agent". A boundary built for the shell probe holds no
+    /// slots at all — [`super::create::ShellProbe`] is that boundary — so a
+    /// slotted invocation arriving on it is refused rather than quietly run
+    /// unslotted. The alternative was a second copy of register/slot/run/settle
+    /// for the non-slotted case, and this file's own header is that there is
+    /// **one place**.
+    pub(super) slots: Option<&'a Mutex<SlotAssertion>>,
 }
 
 impl Runner for Registering<'_> {
@@ -328,6 +338,21 @@ impl Runner for Registering<'_> {
             ledger.register(&request.invocation)?;
         }
         if is_slotted(&request.invocation) {
+            // The non-slotted boundary cannot account a slotted invocation, and
+            // running it anyway would put an agent probe through a path that
+            // takes no pair — the process would execute with `permits.
+            // agent_pool_slots` never consulted.
+            let Some(slots) = self.slots else {
+                let mut ledger = self.ledger.lock().unwrap_or_else(PoisonError::into_inner);
+                let _ = ledger.cancel(&request.invocation);
+                return Err(UpstrokeError::Refused {
+                    message: format!(
+                        "`{}` is a slotted invocation and this boundary holds no slots; INV-23's \
+                         non-slotted probe is the recorded shell alone",
+                        request.invocation
+                    ),
+                });
+            };
             let pair = SlotPair {
                 // The agent whose per-agent slot this is. A slotted invocation
                 // without an agent binding cannot be accounted, and refusing is
@@ -351,7 +376,7 @@ impl Runner for Registering<'_> {
                 // substrate's assertion, which is what R3 is here.
                 pool: None,
             };
-            let mut slots = self.slots.lock().unwrap_or_else(PoisonError::into_inner);
+            let mut slots = slots.lock().unwrap_or_else(PoisonError::into_inner);
             if let Err(error) = slots.acquire(&request.invocation, pair) {
                 drop(slots);
                 let mut ledger = self.ledger.lock().unwrap_or_else(PoisonError::into_inner);
@@ -362,8 +387,8 @@ impl Runner for Registering<'_> {
 
         let outcome = self.inner.run(request);
 
-        if is_slotted(&request.invocation) {
-            let mut slots = self.slots.lock().unwrap_or_else(PoisonError::into_inner);
+        if let (true, Some(slots)) = (is_slotted(&request.invocation), self.slots) {
+            let mut slots = slots.lock().unwrap_or_else(PoisonError::into_inner);
             slots.release(&request.invocation)?;
         }
         let mut ledger = self.ledger.lock().unwrap_or_else(PoisonError::into_inner);
