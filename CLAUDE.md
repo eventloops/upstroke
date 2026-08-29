@@ -81,12 +81,16 @@ toolchain selection is explicit at call sites, so nothing auto-corrects a wrong
 default. Install 1.85.0 alongside stable.
 
 4 `test-*.sh` gates in `.github/scripts/` also run in CI's `lint` job. With the
-four cargo commands above they are the eight-command baseline `CODING_STANDARDS.md`
-§2 states normatively and `CONTRIBUTING.md` and the pull-request template list.
-Invoke them **from the repository root**, the way `ci.yml` does:
+four cargo commands above they are the eight-command baseline — the same eight
+`CODING_STANDARDS.md` §2 states normatively and `CONTRIBUTING.md` and the
+pull-request template carry. Invoke them **from the repository root**, the way
+`ci.yml` does:
 
 ```bash
+bash .github/scripts/test-release-record.sh
 bash .github/scripts/test-pr-policy.sh
+bash .github/scripts/test-pr-ledger-evidence.sh
+bash .github/scripts/test-docs-consistency.sh
 ```
 
 Repository-root invocation is the convention, not a shared implementation

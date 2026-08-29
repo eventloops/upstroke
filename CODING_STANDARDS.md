@@ -55,7 +55,9 @@ rather than inheriting this closure.
 `PR40-PROGRAM-PUBLIC-ADAPTER-SEAM`, in the parallelism workstream's `reviews/FINDINGS.md`, asks
 whether the public `AgentAdapter` trait — which a crate outside this repository may implement — may
 carry a path in that field at all. It is accepted as real and deferred by owner disposition of
-2026-08-29, and workstream W4 of the G2 pass is the venue that owns it.
+2026-08-29, and it is routed to the project owner. **No venue is selected here.** This standard
+records that the question is open and who holds it, not where it will be answered; a venue is the
+owner's to name, and naming one from this document would assert a routing no record establishes.
 
 ## 2. Automated baseline
 
@@ -73,13 +75,12 @@ bash .github/scripts/test-docs-consistency.sh
 ```
 
 Run all eight commands from the repository root. `CLAUDE.md`'s Gates section records the known
-root-invocation trap and the extra `jq` prerequisite for the release-record fixture; it lists the
-four cargo commands and states the gate half as a count, while `CONTRIBUTING.md` and
-`.github/pull_request_template.md` list all eight verbatim. This section is the normative
-statement all three follow. CI splits the eight across its jobs — `lint` runs `cargo fmt`,
-`cargo clippy` and the four Bash gates, `test` runs `cargo test`, `msrv` runs the locked `check`,
-and `lint (windows)` and `lint (macos)` run Clippy again on their own platforms — and
-`upstroke-ci` aggregates every leg.
+root-invocation trap and the extra `jq` prerequisite for the release-record fixture.
+`CLAUDE.md`, `CONTRIBUTING.md` and `.github/pull_request_template.md` each list all eight
+verbatim, and this section is the normative statement all three follow. CI splits the eight
+across its jobs — `lint` runs `cargo fmt`, `cargo clippy` and the four Bash gates, `test` runs
+`cargo test`, `msrv` runs the locked `check`, and `lint (windows)` and `lint (macos)` run Clippy
+again on their own platforms — and `upstroke-ci` aggregates every leg.
 
 **No gate checks that those copies agree.** `test-docs-consistency.sh` names that claim among
 the ones it withdrew deliberately: it asserts nothing about which cargo commands CI runs, whether
@@ -722,7 +723,7 @@ assistance is not the same as enforcement, and a green gate is not evidence for 
 
 | Rule area | Mechanism | Enforcement status |
 |---|---|---|
-| §1 authority, precedence, and retired conflicts | Pull-request review. `test-docs-consistency.sh` enumerates exactly four claims, and they are about other documents: C1, that every repository path `CLAUDE.md` and `CONTRIBUTING.md` name in backticks exists at this head or is qualified at that occurrence, plus one named stale-cross-reference sentence; C2, the msrv job's toolchain against `Cargo.toml`; C3, the gate inventory and count; C4, the workflow trigger contract | **Review-only.** That gate never opens this document, so no §1 claim is automated by it — precedence, the same-change reconciliation duty, and the retirement of the `CommandSpec.program` conflict are all read by a human |
+| §1 authority, precedence, and retired conflicts | Pull-request review. `test-docs-consistency.sh` enumerates exactly four claims, and they are about other documents: C1, that two fixed classes of backticked name in `CLAUDE.md` and `CONTRIBUTING.md` resolve at this head or are qualified in a window around each occurrence — a path under one of ten enumerated directory prefixes (`src`, `infra`, `.github`, `acceptance`, `decisions`, `proposals`, `reviews`, `examples`, `fixtures`, `docs`), and a bare `.md`, `.toml` or `.lock` filename at the root — plus one named stale-cross-reference sentence; a name outside those two patterns is never extracted and is not checked at all; C2, the msrv job's toolchain against `Cargo.toml`; C3, the gate inventory and count; C4, the workflow trigger contract | **Review-only.** That gate never opens this document, so no §1 claim is automated by it — precedence, the same-change reconciliation duty, and the retirement of the `CommandSpec.program` conflict are all read by a human |
 | §2 formatting | `cargo fmt --check` / rustfmt | Automated on all formatted Rust inputs; default configuration at adoption |
 | §2 compiler and ordinary lint baseline | `cargo clippy --all-targets --all-features -- -D warnings` | Automated for code compiled by the lint job |
 | §2 effect denylist | `clippy.toml` disallowed methods, types, and macros; denylist resolution census with an injected typo control | **Active.** 102 denied paths, the census in `src/effects/tests.rs`, and Clippy legs on all three platforms — `lint`, `lint (windows)` and `lint (macos)`. A path this host cannot resolve is caught by the census, not by `-D warnings` |
