@@ -412,6 +412,17 @@ and its live-probe test prints to stderr."""
 shrinks_when = "the configuration write moves under a RunDir site."
 
 [[legacy]]
+path = "src/agent/bin.rs"
+allows = ["clippy::disallowed_methods"]
+packet = "effect_site_inventory.mechanism (2): and any other module the PR5 review enumerates"
+legacy_effect = """
+LEGACY-EFFECT limited to the `#[cfg(test)]` module: the Windows batch-shim \
+witness creates a scratch directory, writes a local `.cmd`, and executes it. \
+The allow is an outer attribute on that test module, so production remains \
+governed and carries only `CommandSpec` data into the Process funnel."""
+shrinks_when = "the Windows batch-shim witness can exercise the platform translation without direct filesystem and process primitives."
+
+[[legacy]]
 path = "src/capacity.rs"
 allows = []
 packet = "effect_site_inventory.mechanism (2): src/capacity.rs"
