@@ -966,12 +966,18 @@ pub(crate) mod tests {
                 review: Effort::Medium,
             },
             reviews: ReviewPlan {
-                enabled: Some(false),
+                // Enabled: this fixture's successful attempts record a passed
+                // `review` pass, and a run that froze verification off obliges
+                // none. The two together were a shape production cannot write.
+                enabled: Some(true),
                 alternative_available: Some(false),
                 pass_timeout_secs: Some(89),
                 primary: Some(PassBinding::new("aleph-Mid-agent", "aleph-Mid-model")),
                 alternative: None,
-                second_opinion: vec![None, None],
+                // One entry per task: the registry refuses a plan whose
+                // second-opinion list is not aligned with `plan.tasks`, and
+                // this fixture's plan has three.
+                second_opinion: vec![None, None, None],
             },
         }
     }

@@ -705,7 +705,15 @@ mod tests {
                 review: Effort::Medium,
             },
             reviews: ReviewPlan {
-                enabled: Some(false),
+                // **Enabled, because the fixture's attempt records are
+                // reviewed.** This froze verification *off* while every
+                // `candidate_prepared` the census builds carries a passed
+                // `review` — a combination production never produces
+                // (`plan_for`'s disabled branch resolves no `primary` at all)
+                // and one `check_candidate_prepared` now refuses, because a run
+                // that judged nothing obliges no pass and a record that names
+                // one is claiming a review the run never ran.
+                enabled: Some(true),
                 alternative_available: Some(false),
                 pass_timeout_secs: Some(97),
                 primary: Some(PassBinding::new("aleph-Mid-agent", "aleph-Mid-model")),

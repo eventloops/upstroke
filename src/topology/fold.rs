@@ -2218,6 +2218,58 @@ impl RunState {
                 ),
             });
         }
+        // **And it must have run the passes the run froze for this task.**
+        // `is_successful` above asks `all` over *the passes the record happens
+        // to carry*, which is a predicate the record's own author chooses the
+        // domain of: a `candidate_prepared` carrying a lone passed
+        // `second-opinion` — or an empty list — satisfies it, and the fold
+        // charges the rung, enters `Promoting`, and permits
+        // `task_candidate_created` for a tree the configured primary reviewer
+        // never read. Round 6 of the `cfa1be8` review found it as its first P1;
+        // that round fixed the *outcome* half — a pass recorded `Failed` or
+        // `Unavailable` is refused — and this is the *presence* half.
+        //
+        // **Fold-side, and taking `(record, frozen)`.** The predicate needs the
+        // plan and `AttemptRecord` does not carry it, so it cannot be a method
+        // on the record; the entry is already in hand here for the lease and
+        // lineage relations below.
+        //
+        // The comparison is the ordered list of pass names, so it refuses in
+        // one place every way a record can disagree with its obligation: a
+        // configured pass omitted, a pass duplicated, a pass nobody configured,
+        // and the configured passes in another order. §11.3's own reason for
+        // the order is that "a later pass only exists because every earlier one
+        // approved" — a record whose second opinion precedes its acceptance
+        // pass describes a review that did not happen.
+        //
+        // `FrozenReviews::obliged_lenses` is `review::passes_for`'s answer
+        // rather than a second reading of §11.2/§11.3, and it is the same
+        // reader the plan assembler dispatches from. That is the whole of why
+        // this is safe to enforce: the obligation the fold requires and the
+        // passes the driver runs are one derivation.
+        let obliged: Vec<&str> = entry
+            .reviews
+            .obliged_lenses()
+            .iter()
+            .map(|lens| lens.name())
+            .collect();
+        let recorded: Vec<&str> = prepared
+            .attempt
+            .reviews
+            .iter()
+            .map(|pass| pass.pass.as_str())
+            .collect();
+        if recorded != obliged {
+            return Err(FoldError::InconsistentRecord {
+                kind: KIND,
+                detail: format!(
+                    "attempt {} of generation {} records the review pass(es) {:?} and this task \
+                     is frozen to require {:?}, in that order — every configured pass runs and \
+                     passes, and a record does not choose which ones it is judged on",
+                    prepared.attempt.attempt, prepared.generation.0, recorded, obliged
+                ),
+            });
+        }
         // ST-06: a candidate is prepared *by the attempt that succeeded*, so
         // the embedded record names the generation's current attempt. Without
         // this the record is inert data and a candidate can be published
@@ -8113,6 +8165,317 @@ mod tests {
         }
     }
 
+    // --- the frozen review plan is the success domain ----------------------
+    //
+    // `PR7-G2-W1-SUCCESS-IGNORES-THE-FROZEN-PLAN` (§2, §22e). The witnesses
+    // above are round 6's *outcome* half — a configured pass that ran and did
+    // not pass. These are the *presence* half: a pass the plan configured and
+    // the record does not carry at all.
+
+    /// A run whose frozen plan obliges **nothing**: verification off.
+    ///
+    /// `plan_for`'s disabled branch resolves no `primary` either, so this is
+    /// the shape production writes and not merely `enabled = false` bolted onto
+    /// a resolved reviewer.
+    fn reviews_off_started() -> TopologyFold {
+        let plan = plan();
+        let unauthenticated = RunStarted4 {
+            reviews: ReviewPlan {
+                second_opinion: vec![None; plan.tasks.len()],
+                ..ReviewPlan::default()
+            },
+            registry_digest: String::new(),
+            ..run_started_unauthenticated()
+        };
+        let digest = TaskRegistry::originals_with_agents(
+            &plan,
+            &unauthenticated.registry_record(),
+            &unauthenticated.probed_agents,
+        )
+        .expect("a review-free record derives a registry")
+        .digest();
+        let event = ev(TopologyEventBody::RunStarted {
+            data: Box::new(RunStarted4 {
+                registry_digest: digest,
+                ..unauthenticated
+            }),
+        });
+        let mut fold = TopologyFold::new(inputs());
+        apply(&mut fold, &event);
+        fold
+    }
+
+    /// One row of the obligation grid: a label, the fold whose frozen plan is
+    /// under test, the task, the passes that plan obliges, and the labelled
+    /// lists it refuses.
+    type ObligationRow = (
+        &'static str,
+        TopologyFold,
+        TaskKey,
+        Vec<(&'static str, ReviewPassOutcome)>,
+        Vec<(&'static str, Vec<(&'static str, ReviewPassOutcome)>)>,
+    );
+
+    /// A `candidate_prepared` for `key` carrying exactly `passes`, all passed.
+    fn prepared_with_passes(
+        key: TaskKey,
+        base: &CommitSha,
+        passes: &[(&str, ReviewPassOutcome)],
+    ) -> TopologyEvent {
+        let mut event = candidate_prepared(key, 0, base);
+        let TopologyEventBody::CandidatePrepared { data } = &mut event.body else {
+            unreachable!("built as a candidate_prepared")
+        };
+        data.attempt.reviews = passes
+            .iter()
+            .map(|(pass, outcome)| review_pass(pass, *outcome))
+            .collect();
+        event
+    }
+
+    /// A fold with `key`'s first attempt in flight, ready for its settlement.
+    fn in_flight_at(fold: &mut TopologyFold, key: TaskKey, base: &CommitSha) {
+        apply(fold, &dispatch(key, 0, base));
+        let start = attempt_started(fold, key, 0, 1, 0);
+        apply(fold, &start);
+    }
+
+    /// **Zero, one and many configured passes: the record carries the frozen
+    /// obligation and nothing else.**
+    ///
+    /// The arity grid, because the defect is about the *domain* of a predicate
+    /// and a one-pass fixture cannot show a domain. `review_plan` configures a
+    /// second opinion for index 2 alone, so `MID` obliges two passes and `ZETA`
+    /// one; a run that froze verification off obliges none.
+    ///
+    /// Each row asserts both directions: the obliged list is accepted, and the
+    /// same event carrying any other list is refused. The negative half is what
+    /// makes the positive half a measurement — `is_successful` was true of every
+    /// one of these records, which is exactly why it could not tell them apart.
+    #[test]
+    fn candidate_success_is_judged_against_the_tasks_frozen_review_plan() {
+        let base = sha("base");
+        const REVIEW: &str = "review";
+        const SECOND: &str = "second-opinion";
+        let pass = |name: &'static str| (name, ReviewPassOutcome::Passed);
+
+        // (label, the fold's frozen plan, the task, what it obliges, what it refuses)
+        let rows: Vec<ObligationRow> = vec![
+            (
+                "none configured",
+                reviews_off_started(),
+                ZETA,
+                vec![],
+                vec![
+                    ("a pass nobody configured", vec![pass(REVIEW)]),
+                    ("a second opinion nobody configured", vec![pass(SECOND)]),
+                ],
+            ),
+            (
+                "one configured",
+                started(),
+                ZETA,
+                vec![pass(REVIEW)],
+                vec![
+                    // The finding's own shape: a lone passed second opinion.
+                    // Every entry green, and the pass §11.2 requires absent.
+                    ("a lone second opinion", vec![pass(SECOND)]),
+                    // An empty list: `all` over nothing is true.
+                    ("no passes at all", vec![]),
+                    (
+                        "the configured pass duplicated",
+                        vec![pass(REVIEW), pass(REVIEW)],
+                    ),
+                    (
+                        "a pass nobody configured, beside it",
+                        vec![pass(REVIEW), pass(SECOND)],
+                    ),
+                    (
+                        "a pass name nobody has ever configured",
+                        vec![pass("security")],
+                    ),
+                    (
+                        "the configured pass, failed",
+                        vec![(REVIEW, ReviewPassOutcome::Failed)],
+                    ),
+                ],
+            ),
+            (
+                "two configured",
+                started(),
+                MID,
+                vec![pass(REVIEW), pass(SECOND)],
+                vec![
+                    ("the primary omitted", vec![pass(SECOND)]),
+                    ("the second opinion omitted", vec![pass(REVIEW)]),
+                    ("both in the other order", vec![pass(SECOND), pass(REVIEW)]),
+                    (
+                        "one of the two failed",
+                        vec![pass(REVIEW), (SECOND, ReviewPassOutcome::Failed)],
+                    ),
+                    (
+                        "an unconfigured third",
+                        vec![pass(REVIEW), pass(SECOND), pass("security")],
+                    ),
+                ],
+            ),
+        ];
+
+        for (label, mut fold, key, obliged, refusals) in rows {
+            in_flight_at(&mut fold, key, &base);
+
+            // The premise: the obliged list is what the door takes.
+            accepts(&fold, &prepared_with_passes(key, &base, &obliged));
+
+            for (why, passes) in refusals {
+                let error = refuse(&fold, &prepared_with_passes(key, &base, &passes));
+                assert!(
+                    matches!(error, FoldError::InconsistentRecord { .. }),
+                    "{label}/{why}: refused as {error:?} rather than as a record disagreement"
+                );
+                // Nothing moved: the generation is still in flight and holds no
+                // candidate, so a refusal cannot have charged the rung.
+                let generation = fold
+                    .task(key)
+                    .and_then(|task| task.generations.first())
+                    .expect("the generation is open");
+                assert!(
+                    matches!(generation.class, GenerationClass::InFlight { .. }),
+                    "{label}/{why}: the refused event promoted the generation anyway"
+                );
+                assert!(generation.candidate.is_none(), "{label}/{why}");
+            }
+        }
+    }
+
+    /// **A run that froze verification off obliges no pass, whatever it
+    /// resolved.**
+    ///
+    /// The `enabled` flag and the resolved bindings are independent fields, and
+    /// `plan_for`'s disabled branch happens to leave `primary` unset — so a
+    /// grid built only from what that function produces cannot tell the flag
+    /// from the absence of a reviewer. The fold reads **logs**, and
+    /// `enabled: false` beside a resolved primary and a resolved second opinion
+    /// is a shape the wire admits: `run_started(4).reviews` carries both, and a
+    /// `task_spawned` embeds a whole frozen entry.
+    ///
+    /// Three of this file's fixtures froze exactly that combination while their
+    /// records carried a passed `review`, which is what makes this the shape
+    /// worth pinning rather than a hypothetical: read one way it obliges a pass
+    /// nobody ran, read the other it obliges none.
+    #[test]
+    fn a_run_that_froze_verification_off_obliges_no_pass_whatever_it_resolved() {
+        let base = sha("base");
+        let plan = plan();
+        // Resolved reviewers, and the switch off. The second opinion is
+        // resolved for `MID` too, so the "many" arm is off as well as the
+        // "one" arm.
+        let unauthenticated = RunStarted4 {
+            reviews: ReviewPlan {
+                enabled: Some(false),
+                ..review_plan(plan.tasks.len())
+            },
+            registry_digest: String::new(),
+            ..run_started_unauthenticated()
+        };
+        let digest = TaskRegistry::originals_with_agents(
+            &plan,
+            &unauthenticated.registry_record(),
+            &unauthenticated.probed_agents,
+        )
+        .expect("the record derives a registry")
+        .digest();
+        let event = ev(TopologyEventBody::RunStarted {
+            data: Box::new(RunStarted4 {
+                registry_digest: digest,
+                ..unauthenticated
+            }),
+        });
+
+        for key in [ZETA, MID] {
+            let mut fold = TopologyFold::new(inputs());
+            apply(&mut fold, &event);
+
+            // The premise: the reviewers *are* resolved on this entry, so an
+            // obligation derived from the bindings alone would not be empty.
+            let entry = fold
+                .registry()
+                .and_then(|registry| registry.get(key))
+                .expect("a registered task")
+                .clone();
+            assert!(
+                entry.reviews.primary.is_some(),
+                "task {}: the fixture resolved no primary, so the flag is not what is under test",
+                key.0
+            );
+            assert!(
+                entry.reviews.obliged_lenses().is_empty(),
+                "task {}: a run that judged nothing obliged a pass",
+                key.0
+            );
+
+            in_flight_at(&mut fold, key, &base);
+            accepts(&fold, &prepared_with_passes(key, &base, &[]));
+            for present in [
+                vec![("review", ReviewPassOutcome::Passed)],
+                vec![("second-opinion", ReviewPassOutcome::Passed)],
+            ] {
+                let error = refuse(&fold, &prepared_with_passes(key, &base, &present));
+                assert!(
+                    matches!(error, FoldError::InconsistentRecord { .. }),
+                    "task {}: a pass the run never configured was admitted: {error:?}",
+                    key.0
+                );
+            }
+        }
+    }
+
+    /// **The obligation is the plan's, read through the plan's own reader.**
+    ///
+    /// The round trip: whatever `FrozenReviews::obliged_lenses` says a task
+    /// owes is exactly what the door accepts, and the door accepts nothing
+    /// else. It is deliberately *not* how
+    /// [`candidate_success_is_judged_against_the_tasks_frozen_review_plan`]
+    /// is written — that grid transcribes the obligation by hand, so the two
+    /// together say both "the fold agrees with the reader" and "the reader says
+    /// what §11.2 says".
+    #[test]
+    fn the_door_accepts_exactly_the_passes_the_frozen_entry_obliges() {
+        let base = sha("base");
+        for key in [ZETA, ALPHA, MID] {
+            let mut fold = started();
+            in_flight_at(&mut fold, key, &base);
+            let entry = fold
+                .registry()
+                .and_then(|registry| registry.get(key))
+                .expect("a registered task")
+                .clone();
+            let obliged: Vec<(&str, ReviewPassOutcome)> = entry
+                .reviews
+                .obliged_lenses()
+                .iter()
+                .map(|lens| (lens.name(), ReviewPassOutcome::Passed))
+                .collect();
+            accepts(&fold, &prepared_with_passes(key, &base, &obliged));
+            assert!(
+                !obliged.is_empty(),
+                "task {} obliges nothing under a plan that enabled review",
+                key.0
+            );
+            // And one fewer is refused, whichever pass is dropped.
+            for dropped in 0..obliged.len() {
+                let mut short = obliged.clone();
+                short.remove(dropped);
+                let error = refuse(&fold, &prepared_with_passes(key, &base, &short));
+                assert!(
+                    matches!(error, FoldError::InconsistentRecord { .. }),
+                    "task {} without its pass {dropped} was admitted: {error:?}",
+                    key.0
+                );
+            }
+        }
+    }
+
     /// **A failed settlement whose record says the attempt succeeded is refused.**
     ///
     /// The mirror of the candidate door, through the same predicate. This door
@@ -11842,6 +12205,16 @@ mod tests {
                 moved.parent_sha = sha("somewhere-else");
                 case(
                     "parent_sha",
+                    TopologyEventBody::CandidatePrepared { data: moved },
+                );
+                // The configured passes, emptied. Every remaining entry is
+                // green — there are none — so `is_successful` is true of this
+                // record and only the frozen plan can tell it apart from a
+                // reviewed one.
+                let mut moved = data.clone();
+                moved.attempt.reviews.clear();
+                case(
+                    "attempt.reviews",
                     TopologyEventBody::CandidatePrepared { data: moved },
                 );
             }

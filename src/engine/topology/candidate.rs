@@ -1830,7 +1830,11 @@ mod tests {
                 review: Effort::Medium,
             },
             reviews: ReviewPlan {
-                enabled: Some(false),
+                // Enabled: this fixture's `candidate_prepared` records carry a
+                // passed `review` pass, and a run that froze verification off
+                // obliges none — a combination `plan_for` cannot produce, since
+                // its disabled branch resolves no `primary` either.
+                enabled: Some(true),
                 alternative_available: Some(false),
                 pass_timeout_secs: Some(97),
                 primary: Some(PassBinding::new("alpha-agent", "alpha-model")),

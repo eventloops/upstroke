@@ -211,6 +211,44 @@ pub struct FrozenReviews {
     pub second_opinion: Option<PassBinding>,
 }
 
+impl FrozenReviews {
+    /// The three bindings pass selection reads, or `None` when this run froze
+    /// verification off.
+    ///
+    /// **The one place `enabled` gates the plan.** It was read at the plan
+    /// assembler and nowhere else, so anything else that wanted to know what
+    /// this entry's review standard *is* had to remember the flag on its own.
+    /// Two readers of one rule is how the two disagree, and the disagreement
+    /// this closes is a live one: the fold judges a candidate's success against
+    /// the obligation and the assembler dispatches the passes that discharge
+    /// it.
+    ///
+    /// The flag is load-bearing here even though `plan_for`'s disabled branch
+    /// resolves no `primary` either — `enabled: false` beside a resolved
+    /// reviewer is a shape the *wire* admits, and a fold reads logs rather than
+    /// configurations.
+    #[must_use]
+    pub fn bindings(&self) -> Option<crate::review::ReviewBindings<'_>> {
+        self.enabled.then_some(crate::review::ReviewBindings {
+            primary: self.primary.as_ref(),
+            alternative: self.alternative.as_ref(),
+            second_opinion: self.second_opinion.as_ref(),
+        })
+    }
+
+    /// The lenses this entry obliges, in order — `[]` when it obliges none.
+    ///
+    /// What a successful attempt's record has to carry, and the reason it can
+    /// be asked without the implementer's binding is
+    /// [`crate::review::obliged_lenses`]'s.
+    #[must_use]
+    pub fn obliged_lenses(&self) -> Vec<crate::review::Lens> {
+        self.bindings()
+            .map(crate::review::obliged_lenses)
+            .unwrap_or_default()
+    }
+}
+
 /// One registered task.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
