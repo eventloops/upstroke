@@ -2144,6 +2144,78 @@ fn every_site_the_inventory_declares_has_a_funnel_that_names_it_or_is_recorded_a
     );
 }
 
+/// No production module may return a writable process handle through public or
+/// crate-visible API, directly or behind a function pointer.
+///
+/// This is structural over signatures, not a builder-name denylist. Renaming
+/// `build_command`, adding a second builder, or returning `fn() -> Command`
+/// therefore cannot make the finding disappear. Private construction inside a
+/// funnel and APIs that *consume* a Command remain permitted.
+#[test]
+fn no_production_api_exports_a_writable_process_command() {
+    fn command_returning_public_signatures(source: &str) -> Vec<String> {
+        let code = blank_comments_and_strings(&production_region(source));
+        let mut found = Vec::new();
+        for (at, _) in code.match_indices("pub") {
+            let before_ok = at == 0
+                || !(code.as_bytes()[at - 1].is_ascii_alphanumeric()
+                    || code.as_bytes()[at - 1] == b'_');
+            let tail = &code[at..];
+            if !before_ok {
+                continue;
+            }
+            let after_pub = tail["pub".len()..].trim_start();
+            let item = if let Some(restricted) = after_pub.strip_prefix('(') {
+                let Some(close) = restricted.find(')') else {
+                    continue;
+                };
+                if restricted[..close].trim() != "crate" {
+                    continue;
+                }
+                restricted[close + 1..].trim_start()
+            } else {
+                after_pub
+            };
+            if !item.starts_with("fn ") {
+                continue;
+            }
+            let end = tail.find(['{', ';']).unwrap_or(tail.len());
+            let signature = &tail[..end];
+            let Some(arrow) = signature.find("->") else {
+                continue;
+            };
+            let returns = &signature[arrow + 2..];
+            let names_command = returns
+                .split(|ch: char| !(ch.is_ascii_alphanumeric() || ch == '_'))
+                .any(|token| token == "Command");
+            if names_command {
+                found.push(signature.split_whitespace().collect::<Vec<_>>().join(" "));
+            }
+        }
+        found
+    }
+
+    let mut escapes = Vec::new();
+    for (path, source) in scanned_sources() {
+        for signature in command_returning_public_signatures(&source) {
+            escapes.push(format!("{path}: {signature}"));
+        }
+    }
+    assert!(escapes.is_empty(), "writable Command escapes: {escapes:#?}");
+
+    assert_eq!(
+        command_returning_public_signatures(
+            "pub fn renamed() -> std::process::Command { todo!() }\n\
+             pub ( crate )\n fn pointer() -> fn() -> Command { todo!() }\n\
+             fn private() -> Command { todo!() }\n\
+             pub fn consumes(_: Command) -> ProcessOutput { todo!() }"
+        )
+        .len(),
+        2,
+        "the structural control must catch direct and function-pointer returns only"
+    );
+}
+
 /// The module a group's funnel bodies are actually in.
 ///
 /// `FunnelGroup::module()` is PR3's answer and is frozen. For one group it is
@@ -2180,15 +2252,6 @@ const SITES_WITHOUT_A_FUNNEL: &[&str] = &[
     // `reviews/FINDINGS.md` is the standing entry for the two names on one file
     // and is the owner's, not this slice's.
     "Report.Write",
-    // The Process group. `identity` says "every effectful funnel API takes its
-    // group's site by value", and PR4's process funnel does not: `HostRunner`
-    // threads a `SpawnHooks` observer and consults the containment sub-effect
-    // points by name, while `ProcessSite` is named in production nowhere. The
-    // hooks fire and PR4's grids drive them, so this is a *shape* gap and not a
-    // coverage one — filed as `PR5D-PROCESS-FUNNEL-TAKES-NO-SITE` in
-    // `reviews/FINDINGS.md` with `src/runner/**` frozen under the owner ruling.
-    "Process.Spawn",
-    "Process.Terminate",
 ];
 
 /// `outputs`: "the residue-class evidence record (per element: constructed,

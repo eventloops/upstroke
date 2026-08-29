@@ -361,7 +361,6 @@ path = "src/runner/host.rs"
 crate_path = "upstroke::runner::host"
 funnel = []
 effectful = [
-    "build_command",
 ]
 effectful_unnameable = []
 effect_free = [
@@ -623,11 +622,11 @@ path = "src/gates.rs"
 crate_path = "upstroke::gates"
 funnel = []
 effectful = [
-    "ShellKind::command",
     "run_all",
 ]
 effectful_unnameable = []
 effect_free = [
+    "ShellKind::command",
     "check",
     "derive",
     "diff_adds_tests",
@@ -675,7 +674,9 @@ effect_free = [
 [[module]]
 path = "src/agent/proc.rs"
 crate_path = "upstroke::agent::proc"
-funnel = []
+funnel = [
+    "run_with_timeout_at",
+]
 effectful = []
 effectful_unnameable = []
 effect_free = [
@@ -701,8 +702,6 @@ effect_free = [
     "poison_ambient_for_tests",
     "process_alive",
     "process_creation_time",
-    "run_with_timeout",
-    "run_with_timeout_hooked",
     # Writes a value into a process-local `OnceLock<Mutex<..>>` that every
     # cleanup reaper started afterwards renders into argv before its `fork`.
     # No effect outside this process: the reaper performs the effect, inside

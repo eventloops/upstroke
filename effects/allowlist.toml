@@ -65,9 +65,20 @@ allows = ["clippy::disallowed_methods", "clippy::disallowed_types", "clippy::dis
 packet = "effect_site_inventory.mechanism (2): src/runner/{host,container,invocation}.rs"
 review = """
 The Process funnel: `FunnelGroup::Process.module()` is this file. Process start \
-is `HostRunner::run`, which threads `SpawnHooks` and consults every containment \
-sub-effect point; the primitives it calls live in `src/agent/proc.rs`, which is \
-frozen in the legacy section beneath it."""
+is `HostRunner::run`, which passes `ProcessSite::Spawn` by value and threads \
+`SpawnHooks` through every containment sub-effect point. The site-taking \
+supervision primitives live in `src/agent/proc.rs`, the second Process-funnel \
+module listed below."""
+
+[[funnel]]
+path = "src/agent/proc.rs"
+allows = ["clippy::disallowed_methods", "clippy::disallowed_types", "clippy::disallowed_macros"]
+packet = "effect_site_inventory.mechanism (2): Process funnel primitives beneath src/runner/host.rs"
+review = """
+The Process supervision primitives. Spawn enters through an API taking \
+`ProcessSite::Spawn` by value; every tree-termination primitive takes \
+`ProcessSite::Terminate` by value. No writable process handle leaves this \
+combined funnel."""
 
 [[funnel]]
 path = "src/runner/container.rs"
@@ -358,10 +369,10 @@ path = "src/gates.rs"
 allows = ["clippy::disallowed_methods", "clippy::disallowed_types"]
 packet = "effect_site_inventory.mechanism (2): src/gates.rs"
 legacy_effect = """
-LEGACY-EFFECT: gate execution builds a `std::process::Command` for the gate \
-shell and writes gate logs with `fs::write`. PR4 routed the gate's *process* \
-through the Runner; the log write and the `command()` builder are still direct."""
-shrinks_when = "gate logs move under a RunDir site and `ShellGate::command` stops handing out a Command."
+LEGACY-EFFECT: gate execution writes gate logs with `fs::write`. PR4 routed \
+the gate's process through the Runner, and the former production `command()` \
+builder is now test-only."""
+shrinks_when = "gate logs move under a RunDir site."
 
 [[legacy]]
 path = "src/review.rs"
@@ -371,21 +382,6 @@ legacy_effect = """
 LEGACY-EFFECT: review transcript writes and the review scratch directories its \
 tests build. Frozen with the legacy engine that calls it."""
 shrinks_when = "review transcripts move under a RunDir site."
-
-[[legacy]]
-path = "src/agent/proc.rs"
-allows = ["clippy::disallowed_methods", "clippy::disallowed_types", "clippy::disallowed_macros"]
-packet = "effect_site_inventory.mechanism (2): src/agent supervision until PR4 lands the process funnel"
-legacy_effect = """
-LEGACY-EFFECT, and the clause that names it deserves reading precisely. PR4 DID \
-land the process funnel, and the funnel it landed is `src/runner/host.rs` — \
-which is what `FunnelGroup::Process.module()` says and what the packet's own \
-funnel list names. This file is the supervision PRIMITIVE layer beneath that \
-funnel: `fork`, `setpgid`, `exec`, the reaper, the Job Objects, `LockFileEx`. \
-Its public API takes `SpawnHooks`, not a `ProcessSite`, so it does not satisfy \
-the funnel section's "effects only inside site-taking APIs" and is frozen here \
-instead of promoted."""
-shrinks_when = "the supervision primitives take a ProcessSite by value, at which point this file joins the funnel section rather than leaving the allowlist."
 
 [[legacy]]
 path = "src/agent/claude.rs"
@@ -414,6 +410,17 @@ legacy_effect = """
 LEGACY-EFFECT: the adapter writes its configuration through `util::write_json`, \
 and its live-probe test prints to stderr."""
 shrinks_when = "the configuration write moves under a RunDir site."
+
+[[legacy]]
+path = "src/agent/bin.rs"
+allows = ["clippy::disallowed_methods"]
+packet = "effect_site_inventory.mechanism (2): and any other module the PR5 review enumerates"
+legacy_effect = """
+LEGACY-EFFECT limited to the `#[cfg(test)]` module: the Windows batch-shim \
+witness creates a scratch directory, writes a local `.cmd`, and executes it. \
+The allow is an outer attribute on that test module, so production remains \
+governed and carries only `CommandSpec` data into the Process funnel."""
+shrinks_when = "the Windows batch-shim witness can exercise the platform translation without direct filesystem and process primitives."
 
 [[legacy]]
 path = "src/capacity.rs"
@@ -559,14 +566,3 @@ LEGACY-EFFECT: an example binary whose entire output is `println!`. Outside \
 `cargo clippy --all-targets` compiles it and an ungoverned example is a hole in \
 the same wall."""
 shrinks_when = "never, on current reading: an example that printed nothing would demonstrate nothing."
-
-[[legacy]]
-path = "src/agent/bin.rs"
-allows = ["clippy::disallowed_methods"]
-packet = "effect_site_inventory.mechanism (2): and any other module the PR5 review enumerates"
-legacy_effect = """
-LEGACY-EFFECT: its test region calls `runner::host::build_command`, which is a \
-denied wrapper because it hands out a `std::process::Command`. Enumerated so \
-that the denial of `build_command` — which is the honest response to a funnel \
-module returning a writable handle — does not have to be weakened."""
-shrinks_when = "`build_command` stops returning a Command, which is PR5D-FUNNEL-RETURNS-A-COMMAND in reviews/FINDINGS.md."

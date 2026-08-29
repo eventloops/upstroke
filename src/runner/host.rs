@@ -42,6 +42,7 @@ use crate::gates::ShellKind;
 use crate::runner::invocation::InvocationId;
 use crate::runner::policy::{host_policy, runner_policy_sha256};
 use crate::runner::{AgentId, CommandSpec, ExecutionRole, ProbeTarget, Runner, RunnerRequest};
+use crate::topology::effects::ProcessSite;
 use crate::topology::events::RunnerPolicy;
 
 /// The command the `RunnerPreflight` shell probe runs.
@@ -694,7 +695,9 @@ impl Runner for HostRunner {
         command.env_clear();
         command.envs(composed);
         let mut hooks = self.hooks.lock().unwrap_or_else(PoisonError::into_inner);
-        proc::run_with_timeout_hooked(
+        proc::run_with_timeout_at(
+            ProcessSite::Spawn,
+            ProcessSite::Terminate,
             command,
             &request.command.stdin,
             request.timeout,
@@ -718,15 +721,7 @@ impl Runner for HostRunner {
 ///
 /// Everything else, and every argument on Unix, goes through `Command::arg`.
 ///
-/// Crate-visible rather than private because it is the one place that knows
-/// this rule: [`crate::gates::ShellKind::command`] is now derived from it, and
-/// the `bin` adapter seam pins its arguments against the `Command` this
-/// produces rather than against the spec alone.
-pub(crate) fn build_command(spec: &CommandSpec) -> Command {
-    build_command_at(spec, Path::new(&spec.program))
-}
-
-/// [`build_command`] for a spec whose program the runner has already resolved
+/// Build a command for a spec whose program the runner has already resolved
 /// to a file.
 ///
 /// The split exists because the resolved program is a [`Path`] and
@@ -1345,6 +1340,17 @@ pub fn run_shell_probe(
         });
     }
     Ok(())
+}
+
+#[cfg(test)]
+pub(crate) mod test_support {
+    use super::*;
+
+    /// Test-only translation witness. Production construction stays inside
+    /// the Process funnel.
+    pub(crate) fn build_command(spec: &CommandSpec) -> Command {
+        build_command_at(spec, Path::new(&spec.program))
+    }
 }
 
 #[cfg(test)]
@@ -2742,8 +2748,11 @@ mod tests {
             // drain, so `duration <= elapsed` holds however slow or loaded the
             // machine is. See the duration assertions below.
             let direct_started = std::time::Instant::now();
-            let expected = proc::run_with_timeout(direct, fixture.stdin, fixture.timeout)
-                .unwrap_or_else(|error| panic!("{}: direct supervision: {error}", fixture.name));
+            let expected =
+                proc::test_support::run_with_timeout(direct, fixture.stdin, fixture.timeout)
+                    .unwrap_or_else(|error| {
+                        panic!("{}: direct supervision: {error}", fixture.name)
+                    });
             let direct_elapsed = direct_started.elapsed();
 
             let template = shell.command(fixture.script);
@@ -3234,7 +3243,7 @@ mod tests {
             .args(helper_args)
             .env("UPSTROKE_EXCESSIVE_OUTPUT_HELPER", &budget);
         let started = std::time::Instant::now();
-        let direct = proc::run_with_timeout(direct, "", Duration::from_secs(120))
+        let direct = proc::test_support::run_with_timeout(direct, "", Duration::from_secs(120))
             .expect("direct supervision of a noisy child");
         let direct_elapsed = started.elapsed();
 

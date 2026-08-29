@@ -15,7 +15,6 @@
 
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::process::Command;
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
@@ -103,7 +102,7 @@ impl ShellKind {
     /// runner never saw — the same hole the adapter seam closes.
     ///
     /// There is exactly one place that knows `cmd.exe`'s `/C` tail must reach
-    /// the child un-re-quoted, and it is [`crate::runner::host::build_command`]
+    /// the child un-re-quoted, and it is the host runner's command translation
     /// rather than here. Two copies of that rule would be two chances for a
     /// gate command containing a quote to mean one thing when it is probed and
     /// another when it is run.
@@ -124,14 +123,6 @@ impl ShellKind {
             env: Vec::new(),
             stdin: Vec::new(),
         }
-    }
-
-    /// [`Self::spec`] as the host runner would execute it.
-    ///
-    /// Kept because a `Command` is what several callers still want to inspect,
-    /// and derived rather than written twice so the two can never disagree.
-    pub fn command(self, cmdline: &str) -> Command {
-        crate::runner::host::build_command(&self.spec(cmdline))
     }
 }
 
@@ -600,6 +591,19 @@ fn is_testish_path(path: &str) -> bool {
         || file.contains("_test.")
         || file.contains(".test.")
         || file.contains(".spec.")
+}
+
+#[cfg(test)]
+mod test_support {
+    use super::ShellKind;
+
+    impl ShellKind {
+        /// Test witness for the host runner's translation. Production carries
+        /// the data-only spec into the Process funnel.
+        pub(crate) fn command(self, cmdline: &str) -> std::process::Command {
+            crate::runner::host::test_support::build_command(&self.spec(cmdline))
+        }
+    }
 }
 
 #[cfg(test)]

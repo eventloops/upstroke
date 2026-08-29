@@ -1545,15 +1545,17 @@ mod tests {
                 "src/agent/proc.rs",
                 1,
                 2,
-                5,
+                3,
                 "the process funnel itself: two `command.spawn()` (Unix and \
-                 Windows), the `run_with_timeout*` entry points — five \
-                 mentions in CODE: `run_with_timeout` and its delegation to \
-                 `run_with_timeout_hooked`, `run_with_timeout_hooked` and its \
-                 delegation to `run_with_timeout_and_limit` (the plain entry \
-                 delegates rather than calling the private limit-taking one \
-                 beside it, so there is one bounded-capture value rather than \
-                 two), and that private entry's own declaration — and one \
+                 Windows), and three `run_with_timeout*` mentions in \
+                 production CODE: `run_with_timeout_at`, its delegation \
+                 to `run_with_timeout_and_limit`, and that private entry's \
+                 declaration. The former plain `run_with_timeout` entry and \
+                 its delegation are now inside a `#[cfg(test)]` support \
+                 module; production callers must provide both Process sites \
+                 explicitly, so counting those two test-only mentions as \
+                 production would preserve the writable-handle-era fixture \
+                 rather than the repaired boundary. There is also one \
                  `/bin/ps` on macOS that asks the kernel whether a process \
                  group has settled: a kernel query inside the reaper, not a \
                  CLI or a gate. It was **eight** while this census counted \

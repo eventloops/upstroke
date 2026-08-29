@@ -172,12 +172,10 @@ disallowed-methods = [
     { path = "upstroke::workspace::Workspace::prepared_commit_matches", reason = "UPSTROKE-WRAPPER: legacy git subprocess" },
     { path = "upstroke::workspace::Workspace::prepared_pin_target", reason = "UPSTROKE-WRAPPER: legacy git subprocess" },
     { path = "upstroke::workspace::Workspace::ensure_run_exclusions", reason = "UPSTROKE-WRAPPER: writes the run-exclusion file and creates its directory outside any RunDir site" },
-    { path = "upstroke::gates::ShellKind::command", reason = "UPSTROKE-WRAPPER: hands out a std::process::Command; every gate process goes through the Runner" },
     { path = "upstroke::gates::run_all", reason = "UPSTROKE-WRAPPER: writes gate logs with fs::write outside any RunDir site" },
     { path = "upstroke::review::run_review", reason = "UPSTROKE-WRAPPER: writes review transcripts through util::write_text" },
     { path = "upstroke::answer::answer", reason = "UPSTROKE-WRAPPER: creates the answers directory before staging" },
     { path = "upstroke::connect::run_with", reason = "UPSTROKE-WRAPPER: creates a directory and writes the operator's upstroke.toml" },
-    { path = "upstroke::runner::host::build_command", reason = "UPSTROKE-WRAPPER: RETURNS a std::process::Command -- the one thing the funnel section's review clause forbids. Recorded as PR5D-FUNNEL-RETURNS-A-COMMAND in reviews/FINDINGS.md; denied here so every caller is an allowlisted module" },
 
     # -- docker invocation helpers ------------------------------------------
     # `mechanism` (1) names "docker invocation helpers" in its own enumeration,
