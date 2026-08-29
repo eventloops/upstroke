@@ -4121,7 +4121,7 @@ fn real_docker_prints_the_transcribed_unreachable_diagnostics() {
             .arg("ps")
             .arg("--all")
             .arg("--quiet");
-        let output = host::build_command(&spec)
+        let output = host::test_support::build_command(&spec)
             .env("DOCKER_HOST", host)
             .output()
             .expect("docker starts");
@@ -4196,7 +4196,7 @@ fn container_lock_probe_child_holds_the_run() {
 /// process. `rundir::tests::a_second_process_is_refused_the_run_lock` spawns a
 /// child for the same reason, and this borrows its shape.
 ///
-/// The child is started through [`host::build_command`], the crate's one
+/// The child is started through [`host::test_support::build_command`], the crate's one
 /// producer of a `std::process::Command`, so this file never names the
 /// disallowed type.
 ///
@@ -4222,7 +4222,7 @@ fn the_production_lock_probe_sees_a_lock_another_process_holds() {
         .arg("--exact")
         .arg("runner::container::tests::container_lock_probe_child_holds_the_run")
         .arg("--ignored");
-    let mut child = host::build_command(&spec)
+    let mut child = host::test_support::build_command(&spec)
         .env("UPSTROKE_TEST_LOCK_DIR", &paths.public)
         .env("UPSTROKE_TEST_READY", &ready)
         .spawn()

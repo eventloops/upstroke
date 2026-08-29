@@ -31,11 +31,6 @@
 //! grant that no longer matches the command it is meant to authorize. The
 //! module comment used to argue that two copies of the quoting logic would be
 //! two chances to get it wrong. The right number was zero.
-// LEGACY-EFFECT: this module is in the **frozen legacy section** of
-// `effects/allowlist.toml`, which carries its justification and the condition
-// under which the section shrinks. `decisions.effect_site_inventory.mechanism` (2).
-#![allow(clippy::disallowed_methods)]
-
 use std::path::PathBuf;
 
 use crate::error::UpstrokeError;
@@ -252,7 +247,7 @@ mod tests {
 
     #[test]
     fn arguments_reach_the_command_untouched() {
-        use crate::runner::host::build_command;
+        use crate::runner::host::test_support::build_command;
 
         // The property the deleted quoting code kept breaking. These are the
         // exact shapes Copilot's permission surface produces: a gate command
@@ -430,7 +425,7 @@ mod tests {
         // about plumbing rather than about batch re-parsing.
         std::fs::write(&shim, "@echo off\r\necho GOT:%~1\r\n").expect("write shim");
 
-        let out = crate::runner::host::build_command(
+        let out = crate::runner::host::test_support::build_command(
             &invocation(&shim.to_string_lossy())
                 .spec(&["hello world".to_owned()])
                 .expect("a Unicode path"),

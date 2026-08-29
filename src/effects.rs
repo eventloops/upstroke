@@ -814,8 +814,6 @@ pub const FROZEN_LEGACY_ALLOWLIST: &[&str] = &[
     "src/workspace.rs",
     "src/gates.rs",
     "src/review.rs",
-    "src/agent/proc.rs",
-    "src/agent/bin.rs",
     "src/agent/claude.rs",
     "src/agent/codex.rs",
     "src/agent/copilot.rs",

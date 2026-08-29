@@ -2144,6 +2144,24 @@ fn every_site_the_inventory_declares_has_a_funnel_that_names_it_or_is_recorded_a
     );
 }
 
+/// A Process-funnel constructor may exist as a private implementation detail,
+/// but production must not export the writable `Command` it creates. Keeping
+/// this separate from the denied-wrapper list matters: deleting the wrapper
+/// denial while leaving the export would otherwise make the lint green by
+/// forgetting the defect. Mutation witness: removing `#[cfg(test)]` from the
+/// enclosing `runner::host::test_support` module makes this assertion fail.
+#[test]
+fn the_process_funnel_exports_no_writable_command_builder() {
+    let source = fs::read_to_string(repo_root().join("src/runner/host.rs"))
+        .expect("read the Process funnel");
+    let production = blank_comments_and_strings(&production_region(&source));
+    assert!(
+        !production.contains("pub(crate) fn build_command")
+            && !production.contains("pub fn build_command"),
+        "the Process funnel exports its writable Command builder"
+    );
+}
+
 /// The module a group's funnel bodies are actually in.
 ///
 /// `FunnelGroup::module()` is PR3's answer and is frozen. For one group it is
@@ -2180,15 +2198,6 @@ const SITES_WITHOUT_A_FUNNEL: &[&str] = &[
     // `reviews/FINDINGS.md` is the standing entry for the two names on one file
     // and is the owner's, not this slice's.
     "Report.Write",
-    // The Process group. `identity` says "every effectful funnel API takes its
-    // group's site by value", and PR4's process funnel does not: `HostRunner`
-    // threads a `SpawnHooks` observer and consults the containment sub-effect
-    // points by name, while `ProcessSite` is named in production nowhere. The
-    // hooks fire and PR4's grids drive them, so this is a *shape* gap and not a
-    // coverage one — filed as `PR5D-PROCESS-FUNNEL-TAKES-NO-SITE` in
-    // `reviews/FINDINGS.md` with `src/runner/**` frozen under the owner ruling.
-    "Process.Spawn",
-    "Process.Terminate",
 ];
 
 /// `outputs`: "the residue-class evidence record (per element: constructed,
