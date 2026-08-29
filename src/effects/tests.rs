@@ -1371,27 +1371,75 @@ const AGGREGATE_JOB_FIELDS: [&str; 6] =
 /// The fields the job that runs these fixtures declares.
 const TEST_JOB_FIELDS: [&str; 5] = ["name", "runs-on", "steps", "strategy", "timeout-minutes"];
 
-/// A runner CI uses, and the target it compiles.
+/// The one field a job -- or the workflow itself -- may declare in addition to
+/// its required set.
+///
+/// `defaults:` is optional rather than forbidden because forbidding it would
+/// make the effective-shell resolution below unreachable, and an unreachable
+/// resolution is an untested one. It is modelled instead: declared, its shape is
+/// checked and the shell it resolves to is compared against what this contract
+/// expects for that runner.
+const OPTIONAL_DEFAULTS_FIELD: [&str; 1] = ["defaults"];
+
+/// The workflow's own top-level fields: required, then the same optional one.
+const WORKFLOW_FIELDS: [&str; 6] = ["concurrency", "env", "jobs", "name", "on", "permissions"];
+
+/// The fields a `defaults:` mapping and its `run:` mapping may declare.
+const DEFAULTS_FIELDS: [&str; 1] = ["run"];
+const DEFAULTS_RUN_FIELDS: [&str; 2] = ["shell", "working-directory"];
+
+/// The shell keywords GitHub resolves to an interpreter it defines.
+///
+/// Anything else is a **custom shell**: GitHub builds the command line
+/// `<template> {0}` where `{0}` is the file it wrote the script to. So
+/// `shell: true` runs `true /path/to/script` -- the step succeeds and the script
+/// never executes. On a Clippy gate that is a green job that never linted, and
+/// on the aggregate it is a required check that never read a single result.
+/// Measured, `MUT-GATE-STEP-CUSTOM-SHELL`.
+const KNOWN_SHELLS: [&str; 6] = ["bash", "cmd", "powershell", "pwsh", "python", "sh"];
+
+/// The shell the aggregate's script needs. It is written in bash -- `[[ ]]` and
+/// `${!name}` are bash, not POSIX sh and not PowerShell.
+const AGGREGATE_SHELL: &str = "bash";
+
+/// A runner CI uses, the target it compiles, and the shell its `run:` steps get.
 ///
 /// The tuple is the load-bearing half. What discharges a platform's clause is
 /// not a job *name* but the target whose `#[cfg(...)]` bodies that job compiles,
-/// and [`cfg_sites`] evaluates predicates against these tuples rather than
-/// collecting the names that appear inside them.
+/// and [`cfg_regions`] evaluates predicates against the valuations these
+/// invocations actually set rather than collecting the names inside them.
 struct CiTarget {
     /// The `runs-on:` value.
     runner: &'static str,
     /// The target tuple that runner's stable toolchain builds by default.
     triple: &'static str,
-    /// The `key = "value"` cfg pairs that are true on it. A key present here is
-    /// decided; a key absent is unknown, and unknown never claims coverage.
+    /// The shell a `run:` step resolves to on this runner when neither the step,
+    /// the job nor the workflow declares one. GitHub's documented default is
+    /// `bash` on Linux and macOS and `pwsh` on Windows, and it is pinned rather
+    /// than assumed because a resolved shell that is not what this contract
+    /// expects is a step that may not run the command at all.
+    default_shell: &'static str,
+    /// The `key = "value"` cfg pairs this runner's compilations set. **Every**
+    /// key this census models is listed: a key absent from this table is not
+    /// set by the invocation, which makes `key = "value"` false rather than
+    /// unknown.
     keys: &'static [(&'static str, &'static str)],
-    /// The bare cfg flags that are true on it.
+    /// The bare cfg flags set by every compilation this runner performs.
     flags: &'static [&'static str],
+    /// The flags set by *some* compilation and not others.
+    ///
+    /// `cargo clippy --all-targets` and `cargo test --all-targets` compile the
+    /// library twice: once as a library, and once as a test harness with `test`
+    /// set. Coverage asks whether **some** invocation compiles the body, so the
+    /// valuations are enumerated rather than merged -- merging them would make
+    /// `all(test, not(test))` look reachable.
+    per_invocation_flags: &'static [&'static [&'static str]],
 }
 
 const CI_TARGETS: [CiTarget; 3] = [
     CiTarget {
         runner: "ubuntu-latest",
+        default_shell: "bash",
         triple: "x86_64-unknown-linux-gnu",
         keys: &[
             ("target_os", "linux"),
@@ -1403,9 +1451,11 @@ const CI_TARGETS: [CiTarget; 3] = [
             ("target_endian", "little"),
         ],
         flags: &["unix"],
+        per_invocation_flags: &[&[], &["test"]],
     },
     CiTarget {
         runner: "macos-latest",
+        default_shell: "bash",
         triple: "aarch64-apple-darwin",
         keys: &[
             ("target_os", "macos"),
@@ -1417,9 +1467,11 @@ const CI_TARGETS: [CiTarget; 3] = [
             ("target_endian", "little"),
         ],
         flags: &["unix"],
+        per_invocation_flags: &[&[], &["test"]],
     },
     CiTarget {
         runner: "windows-latest",
+        default_shell: "pwsh",
         triple: "x86_64-pc-windows-msvc",
         keys: &[
             ("target_os", "windows"),
@@ -1431,6 +1483,7 @@ const CI_TARGETS: [CiTarget; 3] = [
             ("target_endian", "little"),
         ],
         flags: &["windows"],
+        per_invocation_flags: &[&[], &["test"]],
     },
 ];
 
@@ -1531,6 +1584,118 @@ fn unexpected(found: &BTreeSet<String>, allowed: &[&str]) -> Vec<String> {
         .collect()
 }
 
+/// Every field the contract requires but the node does not declare, and every
+/// field it declares that the contract does not know about.
+fn field_complaints(node: &Yaml, required: &[&str], optional: &[&str]) -> Vec<String> {
+    let declared = field_names(node);
+    let allowed: Vec<&str> = required.iter().chain(optional.iter()).copied().collect();
+    let mut out: Vec<String> = unexpected(&declared, &allowed)
+        .into_iter()
+        .map(|name| format!("declares `{name}`, which this contract does not model"))
+        .collect();
+    for name in required {
+        if !declared.contains(*name) {
+            out.push(format!("does not declare `{name}`"));
+        }
+    }
+    out
+}
+
+/// The `shell:` a `defaults:` mapping sets, and every way its shape is wrong.
+fn defaults_shell<'a>(node: &'a Yaml, where_: &str, out: &mut Vec<String>) -> Option<&'a str> {
+    let defaults = field(node, "defaults")?;
+    for complaint in field_complaints(defaults, &DEFAULTS_FIELDS, &[]) {
+        out.push(format!(
+            "[defaults-shape] {where_}'s `defaults:` {complaint}"
+        ));
+    }
+    let run = field(defaults, "run")?;
+    for complaint in field_complaints(run, &[], &DEFAULTS_RUN_FIELDS) {
+        out.push(format!(
+            "[defaults-shape] {where_}'s `defaults.run:` {complaint}"
+        ));
+    }
+    scalar(run, "shell")
+}
+
+/// The shell a `run:` step actually executes under.
+///
+/// GitHub resolves it step, then job `defaults.run.shell`, then workflow
+/// `defaults.run.shell`, then the runner's platform default. Reading only the
+/// step is how a workflow-level default silently swaps the interpreter under
+/// every gate at once -- measured, `MUT-WORKFLOW-DEFAULT-SHELL-SWAPPED`.
+fn effective_shell(
+    doc: &Yaml,
+    job: &Yaml,
+    step: &Yaml,
+    target: &CiTarget,
+    out: &mut Vec<String>,
+) -> String {
+    let job_default = defaults_shell(job, "the job", out);
+    let workflow_default = defaults_shell(doc, "the workflow", out);
+    scalar(step, "shell")
+        .or(job_default)
+        .or(workflow_default)
+        .unwrap_or(target.default_shell)
+        .to_owned()
+}
+
+/// Complain unless `step` resolves to exactly `expected`, and unless that is a
+/// shell GitHub defines rather than a command template it will run instead.
+fn shell_complaints(
+    doc: &Yaml,
+    job: &Yaml,
+    step: &Yaml,
+    target: &CiTarget,
+    named: &str,
+    expected: &str,
+) -> Vec<String> {
+    let mut out = Vec::new();
+    // A `shell:` key whose value is not a string resolves to nothing at all
+    // here, and this contract would then read the platform default and pass.
+    // YAML reads the bare word `true` as a boolean, so that is not hypothetical.
+    if field(step, "shell").is_some() && scalar(step, "shell").is_none() {
+        out.push(format!(
+            "[step-shell] {named} declares a `shell:` that is not a string, so what it \
+             resolves to is not something this contract can read"
+        ));
+    }
+    let resolved = effective_shell(doc, job, step, target, &mut out);
+    if !KNOWN_SHELLS.contains(&resolved.as_str()) {
+        out.push(format!(
+            "[step-shell] {named} resolves to shell `{resolved}`, which is not one GitHub \
+             defines. A custom shell is a command template run as `<template> <script file>`, \
+             so it can succeed without executing the script at all."
+        ));
+    } else if resolved != expected {
+        out.push(format!(
+            "[step-shell] {named} resolves to shell `{resolved}` on `{}`, not `{expected}`. \
+             The resolution is step, then job `defaults.run.shell`, then workflow \
+             `defaults.run.shell`, then the platform default.",
+            target.runner
+        ));
+    }
+    out
+}
+
+/// The job ids whose gate stems collide.
+///
+/// `gate_stem` upper-cases and turns `-` into `_`, so `lint-windows` and
+/// `lint_windows` are one variable name. Every collection built from stems is a
+/// map or a set, so a collision **collapses** rather than duplicating: the env
+/// mapping loses an entry, the loop's expected set loses a member, and both
+/// equalities below compare a shorter list against a shorter list and pass. The
+/// collision is therefore checked before anything is derived from the stems.
+/// Measured, `MUT-AGGREGATE-STEM-COLLISION`.
+fn stem_collisions(jobs: &BTreeSet<String>) -> BTreeMap<String, Vec<String>> {
+    let mut by_stem: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    for job in jobs {
+        by_stem.entry(gate_stem(job)).or_default().push(job.clone());
+    }
+    by_stem.retain(|_, named| named.len() > 1);
+    by_stem
+}
+
 /// Every way the parsed workflow fails the gate-wiring contract.
 ///
 /// One function so the same contract runs against the real document and against
@@ -1540,12 +1705,19 @@ fn unexpected(found: &BTreeSet<String>, allowed: &[&str]) -> Vec<String> {
 /// mutation that fails for an unrelated reason does not count as refused.
 fn ci_gate_complaints(doc: &Yaml) -> Vec<String> {
     let mut out = Vec::new();
+    for complaint in field_complaints(doc, &WORKFLOW_FIELDS, &OPTIONAL_DEFAULTS_FIELD) {
+        out.push(format!(
+            "[unexpected-workflow-field] the workflow {complaint}"
+        ));
+    }
     let Some(jobs) = field(doc, "jobs") else {
-        return vec!["[jobs] the workflow declares no `jobs:` mapping".to_owned()];
+        out.push("[jobs] the workflow declares no `jobs:` mapping".to_owned());
+        return out;
     };
     let job_names = field_names(jobs);
     if job_names.is_empty() {
-        return vec!["[jobs] `jobs:` is not a mapping with named jobs".to_owned()];
+        out.push("[jobs] `jobs:` is not a mapping with named jobs".to_owned());
+        return out;
     }
 
     for target in &CI_TARGETS {
@@ -1576,13 +1748,11 @@ fn ci_gate_complaints(doc: &Yaml) -> Vec<String> {
             continue;
         };
 
-        let declared = field_names(job);
-        if declared != GATE_JOB_FIELDS.iter().map(|f| (*f).to_owned()).collect() {
+        for complaint in field_complaints(job, &GATE_JOB_FIELDS, &OPTIONAL_DEFAULTS_FIELD) {
             out.push(format!(
-                "[unexpected-job-field] `{gate}` declares {declared:?}, not exactly \
-                 {GATE_JOB_FIELDS:?}. A field this contract does not know about can disable \
-                 the job (`if:`) or absolve its failure (`continue-on-error:`) while every \
-                 other check here still passes."
+                "[unexpected-job-field] `{gate}` {complaint}. A field this contract does not \
+                 model can disable the job (`if:`) or absolve its failure \
+                 (`continue-on-error:`) while every other check here still passes."
             ));
         }
         for (index, step) in steps_of(job).iter().enumerate() {
@@ -1595,15 +1765,26 @@ fn ci_gate_complaints(doc: &Yaml) -> Vec<String> {
                      absent from the allowed set deliberately."
                 ));
             }
+            // Only `run:` steps have a shell; a `uses:` step runs an action.
+            if scalar(step, "run").is_some() {
+                out.extend(shell_complaints(
+                    doc,
+                    job,
+                    step,
+                    target,
+                    &format!("`{gate}` step {index}"),
+                    target.default_shell,
+                ));
+            }
         }
     }
 
-    out.extend(aggregate_complaints(jobs, &job_names));
+    out.extend(aggregate_complaints(doc, jobs, &job_names));
     out
 }
 
 /// Every way the aggregate fails to make each gate a required one.
-fn aggregate_complaints(jobs: &Yaml, job_names: &BTreeSet<String>) -> Vec<String> {
+fn aggregate_complaints(doc: &Yaml, jobs: &Yaml, job_names: &BTreeSet<String>) -> Vec<String> {
     let mut out = Vec::new();
     let Some(aggregate) = field(jobs, AGGREGATE_JOB) else {
         return vec![format!(
@@ -1612,16 +1793,9 @@ fn aggregate_complaints(jobs: &Yaml, job_names: &BTreeSet<String>) -> Vec<String
         )];
     };
 
-    let declared = field_names(aggregate);
-    if declared
-        != AGGREGATE_JOB_FIELDS
-            .iter()
-            .map(|f| (*f).to_owned())
-            .collect()
-    {
+    for complaint in field_complaints(aggregate, &AGGREGATE_JOB_FIELDS, &OPTIONAL_DEFAULTS_FIELD) {
         out.push(format!(
-            "[unexpected-job-field] `{AGGREGATE_JOB}` declares {declared:?}, not exactly \
-             {AGGREGATE_JOB_FIELDS:?}"
+            "[unexpected-job-field] `{AGGREGATE_JOB}` {complaint}"
         ));
     }
     if scalar(aggregate, "name") != Some(REQUIRED_CONTEXT) {
@@ -1646,6 +1820,23 @@ fn aggregate_complaints(jobs: &Yaml, job_names: &BTreeSet<String>) -> Vec<String
     // wire it is the same defect as dropping one, and this equality refuses both.
     let mut expected_needs: BTreeSet<String> = job_names.clone();
     expected_needs.remove(AGGREGATE_JOB);
+
+    // Before ANY collection is derived from the stems. Two job ids that
+    // normalise to one variable name collapse every set and map built below, and
+    // a collapsed expectation compares equal to a collapsed reality.
+    let collisions = stem_collisions(&expected_needs);
+    if !collisions.is_empty() {
+        out.push(format!(
+            "[aggregate-stem-collision] these job ids share a gate variable stem: \
+             {collisions:?}. `{AGGREGATE_JOB}` reads one `<STEM>_RESULT` per gate, so one of \
+             each colliding pair is unreadable -- and because the expected env mapping and \
+             the expected loop list are built from the same stems, both would compare equal \
+             to a workflow that checks only one of them. Nothing below is derived while this \
+             holds."
+        ));
+        return out;
+    }
+
     let needs = field(aggregate, "needs").and_then(scalar_set);
     if needs.as_ref() != Some(&expected_needs) {
         out.push(format!(
@@ -1680,6 +1871,29 @@ fn aggregate_complaints(jobs: &Yaml, job_names: &BTreeSet<String>) -> Vec<String
         out.push(format!(
             "[unexpected-step-field] `{AGGREGATE_JOB}`'s step declares {strange:?}"
         ));
+    }
+
+    // The aggregate runs on `ubuntu-latest`, and its script is bash. The check
+    // is on the RESOLVED shell, not on the declaration: a workflow-level
+    // `defaults.run.shell` reaches this step too, and a custom shell would let
+    // the required check pass without reading a single gate result.
+    let on_ubuntu = CI_TARGETS
+        .iter()
+        .find(|target| Some(target.runner) == scalar(aggregate, "runs-on"));
+    match on_ubuntu {
+        Some(target) => out.extend(shell_complaints(
+            doc,
+            aggregate,
+            step,
+            target,
+            &format!("`{AGGREGATE_JOB}`'s step"),
+            AGGREGATE_SHELL,
+        )),
+        None => out.push(format!(
+            "[step-shell] `{AGGREGATE_JOB}` runs on {:?}, which is not a runner this contract \
+             models, so the shell its script resolves to is undecidable here",
+            scalar(aggregate, "runs-on")
+        )),
     }
 
     // The binding, not its existence. `LINT_MACOS_RESULT: ${{ needs.lint-windows
@@ -1762,12 +1976,8 @@ fn ci_test_job_complaints(doc: &Yaml) -> Vec<String> {
         return vec!["[test-job-missing] no `test` job, so nothing runs these fixtures".to_owned()];
     };
 
-    let declared = field_names(job);
-    if declared != TEST_JOB_FIELDS.iter().map(|f| (*f).to_owned()).collect() {
-        out.push(format!(
-            "[unexpected-job-field] `test` declares {declared:?}, not exactly \
-             {TEST_JOB_FIELDS:?}"
-        ));
+    for complaint in field_complaints(job, &TEST_JOB_FIELDS, &OPTIONAL_DEFAULTS_FIELD) {
+        out.push(format!("[unexpected-job-field] `test` {complaint}"));
     }
     for (index, step) in steps_of(job).iter().enumerate() {
         let strange = unexpected(&field_names(step), &STEP_FIELDS);
@@ -1775,6 +1985,22 @@ fn ci_test_job_complaints(doc: &Yaml) -> Vec<String> {
             out.push(format!(
                 "[unexpected-step-field] `test` step {index} declares {strange:?}"
             ));
+        }
+        // This job is a matrix, so each `run:` step resolves a shell once per
+        // runner. All three must be the platform default: a workflow-level
+        // default swaps every one of them at once, which is the mutation the
+        // step-only reading could not see.
+        if scalar(step, "run").is_some() {
+            for target in &CI_TARGETS {
+                out.extend(shell_complaints(
+                    doc,
+                    job,
+                    step,
+                    target,
+                    &format!("`test` step {index} on `{}`", target.runner),
+                    target.default_shell,
+                ));
+            }
         }
     }
 
@@ -1797,6 +2023,42 @@ fn ci_test_job_complaints(doc: &Yaml) -> Vec<String> {
         .iter()
         .map(|target| target.runner.to_owned())
         .collect();
+    // The WHOLE strategy mapping, not just `matrix.os`. `exclude:` removes
+    // combinations that `os:` still lists, so a job that names three platforms
+    // can run on one while every check that reads `os:` passes; `include:` can
+    // add a fourth nobody declared, and `max-parallel`/`fail-fast` are the rest
+    // of what a strategy may say. An equality over the field set refuses all of
+    // them, including the ones GitHub adds next. Measured,
+    // `MUT-TEST-MATRIX-EXCLUDED`.
+    match field(job, "strategy") {
+        None => out.push(
+            "[test-job-matrix] the `test` job declares no `strategy:`, so it runs on one \
+             platform"
+                .to_owned(),
+        ),
+        Some(strategy) => {
+            for complaint in field_complaints(strategy, &["fail-fast", "matrix"], &[]) {
+                out.push(format!(
+                    "[test-job-matrix] the `test` job's `strategy:` {complaint}. `exclude:` \
+                     removes a runner `os:` still lists and `include:` adds one it does not."
+                ));
+            }
+            if field(strategy, "fail-fast").and_then(Yaml::as_bool) != Some(false) {
+                out.push(
+                    "[test-job-matrix] the `test` job's `fail-fast:` is not `false`, so one \
+                     platform's failure cancels the other two before they report"
+                        .to_owned(),
+                );
+            }
+            if let Some(matrix) = field(strategy, "matrix") {
+                for complaint in field_complaints(matrix, &["os"], &[]) {
+                    out.push(format!(
+                        "[test-job-matrix] the `test` job's `matrix:` {complaint}"
+                    ));
+                }
+            }
+        }
+    }
     let matrix = field(job, "strategy").and_then(|strategy| field(strategy, "matrix"));
     let listed = matrix
         .and_then(|matrix| field(matrix, "os"))
@@ -1889,8 +2151,11 @@ struct WorkflowEscape {
     name: &'static str,
     /// What passes while the gate does not run.
     escape: &'static str,
-    /// The job whose block the anchor must appear in, exactly once.
-    job: &'static str,
+    /// The job whose block the anchor must appear in exactly once, or `None`
+    /// when the mutation is above the jobs (a workflow-level `defaults:`) or
+    /// spans a job header (a whole added job), where the anchor must be unique
+    /// in the document instead.
+    job: Option<&'static str>,
     anchor: &'static str,
     replacement: &'static str,
     /// The complaint code the contract must produce. A code, not a phrase: a
@@ -1904,7 +2169,7 @@ const WORKFLOW_ESCAPES: &[WorkflowEscape] = &[
         escape: "the job echoes the gate command, succeeds, and the aggregate settles green \
                  while Clippy never examines a denied call in that platform's code. The \
                  standing row's first escape, verbatim.",
-        job: "lint-macos",
+        job: Some("lint-macos"),
         anchor: "      - run: cargo clippy --all-targets --all-features -- -D warnings\n",
         replacement: "      - run: echo cargo clippy --all-targets --all-features -- -D warnings\n",
         refused_as: "no-gate-job",
@@ -1912,7 +2177,7 @@ const WORKFLOW_ESCAPES: &[WorkflowEscape] = &[
     WorkflowEscape {
         name: "MUT-GATE-JOB-DISABLED",
         escape: "a job-level `if: false` reports success without running the gate",
-        job: "lint-windows",
+        job: Some("lint-windows"),
         anchor: "    runs-on: windows-latest\n",
         replacement: "    runs-on: windows-latest\n    if: false\n",
         refused_as: "unexpected-job-field",
@@ -1922,7 +2187,7 @@ const WORKFLOW_ESCAPES: &[WorkflowEscape] = &[
         escape: "the same disabling written as an expression. The predecessor searched the \
                  whitespace-normalised block for the literal `if: false` and could not refuse \
                  this form; the field-set equality does not have to know the form.",
-        job: "lint-macos",
+        job: Some("lint-macos"),
         anchor: "    runs-on: macos-latest\n",
         replacement: "    runs-on: macos-latest\n    if: ${{ false }}\n",
         refused_as: "unexpected-job-field",
@@ -1930,7 +2195,7 @@ const WORKFLOW_ESCAPES: &[WorkflowEscape] = &[
     WorkflowEscape {
         name: "MUT-GATE-JOB-ABSOLVED",
         escape: "`continue-on-error` at job level: the gate runs, fails, and reports success",
-        job: "lint",
+        job: Some("lint"),
         anchor: "    runs-on: ubuntu-latest\n",
         replacement: "    runs-on: ubuntu-latest\n    continue-on-error: true\n",
         refused_as: "unexpected-job-field",
@@ -1938,7 +2203,7 @@ const WORKFLOW_ESCAPES: &[WorkflowEscape] = &[
     WorkflowEscape {
         name: "MUT-GATE-STEP-ABSOLVED",
         escape: "the same absolution one level down, on the step that runs the gate",
-        job: "lint-windows",
+        job: Some("lint-windows"),
         anchor: "      - run: cargo clippy --all-targets --all-features -- -D warnings\n",
         replacement: "      - run: cargo clippy --all-targets --all-features -- -D warnings\n\
                       \x20       continue-on-error: true\n",
@@ -1949,7 +2214,7 @@ const WORKFLOW_ESCAPES: &[WorkflowEscape] = &[
         escape: "a step-level environment retargets the compile. The `run:` scalar still \
                  matches character for character, the job is green, and Clippy examined a \
                  target whose `#[cfg]` bodies are not this platform's.",
-        job: "lint-macos",
+        job: Some("lint-macos"),
         anchor: "      - run: cargo clippy --all-targets --all-features -- -D warnings\n",
         replacement: "      - run: cargo clippy --all-targets --all-features -- -D warnings\n\
                       \x20       env:\n\
@@ -1957,11 +2222,63 @@ const WORKFLOW_ESCAPES: &[WorkflowEscape] = &[
         refused_as: "unexpected-step-field",
     },
     WorkflowEscape {
+        name: "MUT-GATE-STEP-CUSTOM-SHELL",
+        escape: "a custom shell. GitHub runs `<template> <script file>`, so `shell: 'true'` \
+                 runs `true /path/to/script`: the step succeeds, Clippy never runs, and the \
+                 `run:` scalar still matches this contract character for character.",
+        job: Some("lint-macos"),
+        anchor: "      - run: cargo clippy --all-targets --all-features -- -D warnings\n",
+        replacement: "      - run: cargo clippy --all-targets --all-features -- -D warnings\n\
+                      \x20       shell: 'true'\n",
+        refused_as: "step-shell",
+    },
+    WorkflowEscape {
+        name: "MUT-WORKFLOW-DEFAULT-SHELL-SWAPPED",
+        escape: "a workflow-level `defaults.run.shell` swaps the interpreter under every \
+                 `run:` step at once, and no step declares anything for a step-only reading \
+                 to notice. The aggregate's bash script is the one that breaks loudest; the \
+                 gates are the ones that break quietly.",
+        job: None,
+        anchor: "\njobs:\n",
+        replacement: "\ndefaults:\n  run:\n    shell: pwsh\n\njobs:\n",
+        refused_as: "step-shell",
+    },
+    WorkflowEscape {
+        name: "MUT-TEST-MATRIX-EXCLUDED",
+        escape: "`exclude:` removes a runner that `os:` still lists. Every check that reads \
+                 `os:` passes while the fixtures never run on that platform -- the matrix \
+                 half of `PR5-MACOS-CLIPPY-NEVER-RUN`.",
+        job: Some("test"),
+        anchor: "        os: [windows-latest, ubuntu-latest, macos-latest]\n",
+        replacement: "        os: [windows-latest, ubuntu-latest, macos-latest]\n\
+                      \x20       exclude:\n\
+                      \x20         - os: macos-latest\n",
+        refused_as: "test-job-matrix",
+    },
+    WorkflowEscape {
+        name: "MUT-AGGREGATE-STEM-COLLISION",
+        escape: "two job ids that normalise to one gate variable stem. Every collection the \
+                 aggregate's checks derive from stems is a set or a map, so the collision \
+                 collapses both the expectation and the reality and the equalities compare \
+                 equal -- one of the two gates is then unreadable and unrequired.",
+        job: None,
+        anchor: "  merge-gate:\n",
+        replacement: "  lint_windows:\n\
+                      \x20   name: lint (collision)\n\
+                      \x20   runs-on: ubuntu-latest\n\
+                      \x20   timeout-minutes: 5\n\
+                      \x20   steps:\n\
+                      \x20     - run: echo collision\n\
+                      \n\
+                      \x20 merge-gate:\n",
+        refused_as: "aggregate-stem-collision",
+    },
+    WorkflowEscape {
         name: "MUT-GATE-RUNNER-DRIFT",
         escape: "the macOS leg moved to Ubuntu: two jobs run the gate on one platform and no \
                  job compiles `#[cfg(target_os = \"macos\")]` under Clippy. \
                  `PR5-MACOS-CLIPPY-NEVER-RUN` is the ledger row for the state this restores.",
-        job: "lint-macos",
+        job: Some("lint-macos"),
         anchor: "    runs-on: macos-latest\n",
         replacement: "    runs-on: ubuntu-latest\n",
         refused_as: "no-gate-job",
@@ -1970,7 +2287,7 @@ const WORKFLOW_ESCAPES: &[WorkflowEscape] = &[
         name: "MUT-AGGREGATE-NEEDS-DROPPED",
         escape: "a gate the aggregate does not depend on: branch protection settles green \
                  while the Windows denial gate is red. `PR5D-MSVC-CLIPPY-NEVER-RUN`.",
-        job: "merge-gate",
+        job: Some("merge-gate"),
         anchor: "    needs: [lint, lint-windows, lint-macos, msrv, test]\n",
         replacement: "    needs: [lint, lint-macos, msrv, test]\n",
         refused_as: "aggregate-needs",
@@ -1981,7 +2298,7 @@ const WORKFLOW_ESCAPES: &[WorkflowEscape] = &[
                  existence check, reads a passing sibling, and with `always()` on the \
                  aggregate reports the required check green over a red leaf. Measured: the \
                  predecessor of this assertion accepted exactly this.",
-        job: "merge-gate",
+        job: Some("merge-gate"),
         anchor: "          LINT_MACOS_RESULT: ${{ needs.lint-macos.result }}\n",
         replacement: "          LINT_MACOS_RESULT: ${{ needs.lint-windows.result }}\n",
         refused_as: "aggregate-env",
@@ -1992,7 +2309,7 @@ const WORKFLOW_ESCAPES: &[WorkflowEscape] = &[
                  shape the predecessor's doc enumerated as the escape it could not close: \
                  `requires.split_whitespace().any(|word| word == looped)` passes on the \
                  trailing mention.",
-        job: "merge-gate",
+        job: Some("merge-gate"),
         anchor: "          for gate in LINT LINT_WINDOWS LINT_MACOS MSRV TEST; do\n",
         replacement: "          for gate in LINT LINT_WINDOWS MSRV TEST; do : LINT_MACOS\n",
         refused_as: "aggregate-loop",
@@ -2001,7 +2318,7 @@ const WORKFLOW_ESCAPES: &[WorkflowEscape] = &[
         name: "MUT-AGGREGATE-ALWAYS-DROPPED",
         escape: "without `always()` a failed dependency skips the aggregate, and a skipped \
                  required check never settles at all",
-        job: "merge-gate",
+        job: Some("merge-gate"),
         anchor: "    if: always()\n",
         replacement: "    if: success()\n",
         refused_as: "aggregate-condition",
@@ -2010,7 +2327,7 @@ const WORKFLOW_ESCAPES: &[WorkflowEscape] = &[
         name: "MUT-AGGREGATE-CONTEXT-RENAMED",
         escape: "branch protection requires one context name; a renamed job publishes a \
                  different one and the required check waits forever",
-        job: "merge-gate",
+        job: Some("merge-gate"),
         anchor: "    name: upstroke-ci\n",
         replacement: "    name: upstroke-ci-aggregate\n",
         refused_as: "aggregate-context-name",
@@ -2020,7 +2337,7 @@ const WORKFLOW_ESCAPES: &[WorkflowEscape] = &[
         escape: "a second `runs-on:` in the same job. Under a last-one-wins parser every \
                  equality in this section reads the winner and the mutation hides in the \
                  loser; this is the property the dependency was chosen for, executed.",
-        job: "lint-windows",
+        job: Some("lint-windows"),
         anchor: "    runs-on: windows-latest\n",
         replacement: "    runs-on: windows-latest\n    runs-on: ubuntu-latest\n",
         refused_as: "parse",
@@ -2030,7 +2347,7 @@ const WORKFLOW_ESCAPES: &[WorkflowEscape] = &[
         escape: "the job that runs these fixtures stops running them. Named in \
                  `test-docs-consistency.sh` as a mutation that gate's withdrawn claim could \
                  not kill.",
-        job: "test",
+        job: Some("test"),
         anchor: "      - run: cargo test --all-targets --all-features\n",
         replacement: "",
         refused_as: "test-job-command",
@@ -2039,7 +2356,7 @@ const WORKFLOW_ESCAPES: &[WorkflowEscape] = &[
         name: "MUT-CI-CARGO-TEST-STEP-SKIPPED",
         escape: "the same, by disabling the job rather than deleting the step. The other \
                  mutation `test-docs-consistency.sh` kept as history.",
-        job: "test",
+        job: Some("test"),
         anchor: "    runs-on: ${{ matrix.os }}\n",
         replacement: "    runs-on: ${{ matrix.os }}\n    if: false\n",
         refused_as: "unexpected-job-field",
@@ -2051,7 +2368,7 @@ const WORKFLOW_ESCAPES: &[WorkflowEscape] = &[
                  text and the nine-line comment above the line spelled it, so deleting the \
                  line left the test green -- `PR4-CENSUS-COMMENT-ORACLE`, in the test whose \
                  purpose is to answer which command runs this.",
-        job: "test",
+        job: Some("test"),
         anchor: "          components: clippy\n",
         replacement: "",
         refused_as: "test-job-toolchain",
@@ -2060,7 +2377,7 @@ const WORKFLOW_ESCAPES: &[WorkflowEscape] = &[
         name: "MUT-CI-TEST-MATRIX-NARROWED",
         escape: "the fixtures run on one platform and the other two go unexercised, while \
                  every check that names the command still passes",
-        job: "test",
+        job: Some("test"),
         anchor: "        os: [windows-latest, ubuntu-latest, macos-latest]\n",
         replacement: "        os: [ubuntu-latest]\n",
         refused_as: "test-job-matrix",
@@ -2073,6 +2390,21 @@ const WORKFLOW_ESCAPES: &[WorkflowEscape] = &[
 /// that lands somewhere unintended, or that no longer matches because the
 /// workflow moved, is a mutation nobody measured. Both are failures here rather
 /// than a quietly weaker test.
+fn mutate_workflow(text: &str, job: Option<&str>, anchor: &str, replacement: &str) -> String {
+    match job {
+        Some(job) => mutate_job(text, job, anchor, replacement),
+        None => {
+            let hits = text.matches(anchor).count();
+            assert_eq!(
+                hits, 1,
+                "the workflow contains {hits} copies of the mutation anchor, not one. It \
+                 moved and this mutation measures nothing:\n{anchor}"
+            );
+            text.replacen(anchor, replacement, 1)
+        }
+    }
+}
+
 fn mutate_job(text: &str, job: &str, anchor: &str, replacement: &str) -> String {
     let jobs_at = text
         .find("\njobs:\n")
@@ -2188,7 +2520,7 @@ fn the_workflow_shape_oracle_refuses_every_escape_the_ledger_names() {
 
     let mut refused: BTreeSet<&str> = BTreeSet::new();
     for escape in WORKFLOW_ESCAPES {
-        let mutated = mutate_job(&text, escape.job, escape.anchor, escape.replacement);
+        let mutated = mutate_workflow(&text, escape.job, escape.anchor, escape.replacement);
         assert_ne!(
             mutated, text,
             "{}: the mutation changed nothing, so it measures nothing",
@@ -2236,7 +2568,7 @@ fn the_workflow_that_runs_these_tests_installs_the_compiler_they_need() {
 }
 
 // ---------------------------------------------------------------------------
-// The cfg census: predicates evaluated, not names collected
+// The cfg census: effective predicates, decided against real valuations
 // ---------------------------------------------------------------------------
 //
 // The predecessor collected `target_os = "..."` names wherever they appeared at
@@ -2248,14 +2580,29 @@ fn the_workflow_that_runs_these_tests_installs_the_compiler_they_need() {
 //     reported all three platforms covered while **no** runner compiles the body;
 //   * `not(target_os = "freebsd")` would demand a FreeBSD runner for a body every
 //     runner compiles;
-//   * `let target_os = "android";` is code, passes the position gate, and was
+//   * `let target_os = "android";` is code, passes a position gate, and was
 //     reported as a platform.
 //
-// Evaluating the predicate against the finite CI target tuples answers all three
-// with one mechanism, and [`the_cfg_census_evaluates_predicates_instead_of_
-// collecting_platform_names`] holds each as a row.
+// Three further corrections come from the review of that repair, and each is a
+// claim the first structural version got wrong rather than a refinement:
+//
+//   * **Coverage is decided, never assumed.** The first version evaluated under
+//     three-valued logic and counted `Unknown` as coverage, so a predicate whose
+//     truth it could not decide was reported as compiled. Every valuation below
+//     is COMPLETE for the names this census models, an unmodelled name is a hard
+//     failure rather than an optimistic guess, and `test` is enumerated per
+//     invocation because `--all-targets` compiles the library twice.
+//   * **A `#[cfg]` is not the only cfg, and not every cfg gates.** `cfg!(P)` is a
+//     boolean expression: the code around it is compiled everywhere. `#[cfg_attr(
+//     P, attr)]` applies an attribute conditionally; the item is compiled
+//     everywhere. Counting either as a gated region invents platform demands the
+//     tree does not make.
+//   * **An item's predicate is not the attribute written on it.** Stacked
+//     `#[cfg]`s conjoin, and so does every enclosing guard -- the module block it
+//     sits in, and, for a whole-file module, the `#[cfg(test)] mod name;` that
+//     declares the file. Seventeen files in this tree are reached only that way.
 
-/// A `cfg` predicate, parsed.
+/// A cfg predicate, parsed.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum CfgPred {
     All(Vec<CfgPred>),
@@ -2283,96 +2630,158 @@ impl CfgPred {
             .collect::<Vec<_>>()
             .join(", ")
     }
+
+    /// The conjunction of `parts`, without an `all(...)` around a single one.
+    fn conjunction(mut parts: Vec<CfgPred>) -> CfgPred {
+        match parts.len() {
+            1 => parts.remove(0),
+            _ => CfgPred::All(parts),
+        }
+    }
 }
 
-/// Three-valued, because a CI target decides `target_os` and says nothing about
-/// `test`, `feature = "..."` or `debug_assertions`.
+/// The bare cfg flags this census models. Anything else is a hard failure.
 ///
-/// `Unknown` is the honest answer for a key the tuple does not carry, and it is
-/// deliberately optimistic in one direction only: a predicate that *might* be
-/// true on a runner counts as reachable there, so this census never demands a
-/// platform leg for a body that may already be compiled. It refuses only what is
-/// definitely false everywhere.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Tri {
-    True,
-    False,
-    Unknown,
+/// The list is short because the tree is: `test`, `unix` and `windows` are every
+/// bare flag any `#[cfg]` in `src/` and `examples/` names. Keeping it exactly
+/// that short is the point -- a census that guesses at `debug_assertions` or
+/// `miri` would be asserting what CI sets rather than reading it, and the right
+/// answer to a new flag is to decide it here, once, in front of a reviewer.
+const MODELLED_FLAGS: [&str; 3] = ["test", "unix", "windows"];
+
+/// The `key = "value"` cfg keys this census models. Same rule.
+const MODELLED_KEYS: [&str; 7] = [
+    "target_arch",
+    "target_endian",
+    "target_env",
+    "target_family",
+    "target_os",
+    "target_pointer_width",
+    "target_vendor",
+];
+
+/// One compilation's **complete** cfg valuation.
+///
+/// Complete is the load-bearing word. A name this valuation does not carry is
+/// not "unknown": rustc leaves it unset, so `cfg(name)` is **false**. That is
+/// only sound while the set of names is closed, which is what [`MODELLED_FLAGS`]
+/// and [`MODELLED_KEYS`] close and what [`holds`] refuses to guess past.
+struct Valuation {
+    runner: &'static str,
+    /// What the invocation is, for a failure message that can be acted on.
+    invocation: String,
+    flags: BTreeSet<&'static str>,
+    keys: &'static [(&'static str, &'static str)],
 }
 
-impl Tri {
-    fn and(self, other: Self) -> Self {
-        match (self, other) {
-            (Tri::False, _) | (_, Tri::False) => Tri::False,
-            (Tri::Unknown, _) | (_, Tri::Unknown) => Tri::Unknown,
-            (Tri::True, Tri::True) => Tri::True,
-        }
-    }
-
-    fn or(self, other: Self) -> Self {
-        match (self, other) {
-            (Tri::True, _) | (_, Tri::True) => Tri::True,
-            (Tri::Unknown, _) | (_, Tri::Unknown) => Tri::Unknown,
-            (Tri::False, Tri::False) => Tri::False,
-        }
-    }
-
-    fn negate(self) -> Self {
-        match self {
-            Tri::True => Tri::False,
-            Tri::False => Tri::True,
-            Tri::Unknown => Tri::Unknown,
-        }
-    }
-}
-
-/// The bare cfg flags a target tuple decides. Every other bare flag -- `test`,
-/// `doc`, `miri`, `debug_assertions` -- is `Unknown` and constrains nothing.
-const TARGET_FLAGS: [&str; 2] = ["unix", "windows"];
-
-fn evaluate(pred: &CfgPred, target: &CiTarget) -> Tri {
-    match pred {
-        CfgPred::All(list) => list
-            .iter()
-            .map(|inner| evaluate(inner, target))
-            .fold(Tri::True, Tri::and),
-        CfgPred::Any(list) => list
-            .iter()
-            .map(|inner| evaluate(inner, target))
-            .fold(Tri::False, Tri::or),
-        CfgPred::Not(inner) => evaluate(inner, target).negate(),
-        CfgPred::Flag(name) => {
-            if target.flags.contains(&name.as_str()) {
-                Tri::True
-            } else if TARGET_FLAGS.contains(&name.as_str()) {
-                Tri::False
+/// Every compilation CI performs, as a valuation.
+///
+/// Two per runner, because `cargo clippy --all-targets` and `cargo test
+/// --all-targets` each compile the library twice -- once as a library, once as a
+/// test harness with `test` set. They are kept apart rather than merged: merging
+/// would set `test` and `not(test)` in one valuation and make `all(test,
+/// not(test))` look reachable.
+fn ci_valuations() -> Vec<Valuation> {
+    let mut out = Vec::new();
+    for target in &CI_TARGETS {
+        for extra in target.per_invocation_flags {
+            let mut flags: BTreeSet<&'static str> = target.flags.iter().copied().collect();
+            flags.extend(extra.iter().copied());
+            let invocation = if extra.is_empty() {
+                "the library and binary targets".to_owned()
             } else {
-                Tri::Unknown
-            }
+                format!("the {} target(s)", extra.join(" + "))
+            };
+            out.push(Valuation {
+                runner: target.runner,
+                invocation,
+                flags,
+                keys: target.keys,
+            });
         }
-        CfgPred::Pair(key, value) => match target.keys.iter().find(|(name, _)| name == key) {
-            Some((_, actual)) => {
-                if actual == value {
-                    Tri::True
-                } else {
-                    Tri::False
+    }
+    out
+}
+
+/// Whether `pred` holds under `valuation`, or the name that made it undecidable.
+///
+/// There is no third answer. An unmodelled name returns `Err` and fails the
+/// census, which is the difference between this and the version it replaces:
+/// that one returned `Unknown` and the caller counted `Unknown` as coverage, so
+/// a predicate nobody could decide was reported as compiled by every runner.
+fn holds(pred: &CfgPred, valuation: &Valuation) -> Result<bool, String> {
+    match pred {
+        CfgPred::All(list) => {
+            for inner in list {
+                if !holds(inner, valuation)? {
+                    return Ok(false);
                 }
             }
-            None => Tri::Unknown,
-        },
+            Ok(true)
+        }
+        CfgPred::Any(list) => {
+            for inner in list {
+                if holds(inner, valuation)? {
+                    return Ok(true);
+                }
+            }
+            Ok(false)
+        }
+        CfgPred::Not(inner) => Ok(!holds(inner, valuation)?),
+        CfgPred::Flag(name) => {
+            if !MODELLED_FLAGS.contains(&name.as_str()) {
+                return Err(format!(
+                    "`{name}` is a bare cfg flag this census does not model. Decide what \
+                     each CI invocation sets it to and add it to `MODELLED_FLAGS`; guessing \
+                     is how the predecessor reported bodies as covered that nothing compiles."
+                ));
+            }
+            Ok(valuation.flags.contains(name.as_str()))
+        }
+        CfgPred::Pair(key, value) => {
+            if !MODELLED_KEYS.contains(&key.as_str()) {
+                return Err(format!(
+                    "`{key} = \"{value}\"` names a cfg key this census does not model. Add it \
+                     to `MODELLED_KEYS` and give every target tuple a value for it."
+                ));
+            }
+            Ok(valuation
+                .keys
+                .iter()
+                .any(|(name, set)| name == key && set == value))
+        }
     }
 }
 
-/// The runners that may compile a body guarded by `pred`.
-fn compiled_by(pred: &CfgPred) -> BTreeSet<&'static str> {
-    CI_TARGETS
-        .iter()
-        .filter(|target| evaluate(pred, target) != Tri::False)
-        .map(|target| target.runner)
-        .collect()
+/// The runners that **actually compile** a body guarded by `pred`.
+///
+/// A runner is in the set when some invocation it performs makes the predicate
+/// true. Not "might" -- the predecessor's `might` is what let an undecidable
+/// predicate claim three platforms.
+fn compiled_by(pred: &CfgPred) -> Result<BTreeSet<&'static str>, String> {
+    let mut out = BTreeSet::new();
+    for valuation in ci_valuations() {
+        let decided = holds(pred, &valuation).map_err(|error| {
+            format!(
+                "{error} (deciding `{}` for {} on `{}`)",
+                pred.render(),
+                valuation.invocation,
+                valuation.runner
+            )
+        })?;
+        if decided {
+            out.insert(valuation.runner);
+        }
+    }
+    Ok(out)
 }
 
 /// A recursive-descent reader for the cfg predicate grammar.
+///
+/// Hand-written on purpose. The alternative is a Rust parser crate, and the only
+/// dependency this crate was authorised to add is the YAML one; the grammar
+/// `cfg` accepts is small enough that reading it exactly costs less than
+/// carrying `syn`, and every form it accepts is exercised below.
 struct CfgReader<'a> {
     text: &'a str,
     at: usize,
@@ -2438,9 +2847,20 @@ impl<'a> CfgReader<'a> {
         &self.text[start..self.at]
     }
 
-    fn quoted(&mut self) -> Result<String, String> {
+    /// A cfg value: any Rust string literal, raw or escaped.
+    ///
+    /// `#[cfg(target_os = r"linux")]` and `#[cfg(target_os = "li\x6eux")]` are
+    /// both valid Rust naming the same platform, and a reader that handles only
+    /// `"..."` with a backslash passed through verbatim decodes the second to a
+    /// different platform than rustc does. Neither form appears in this tree
+    /// today, which is exactly why the control fixture carries both: a lexical
+    /// gap that nothing exercises is a gap nobody notices.
+    fn value(&mut self) -> Result<String, String> {
+        if self.peek() == Some(b'r') {
+            return self.raw_value();
+        }
         if self.peek() != Some(b'"') {
-            return Err(format!("expected a quoted value at byte {}", self.at));
+            return Err(format!("expected a string value at byte {}", self.at));
         }
         self.at += 1;
         let mut out = String::new();
@@ -2453,13 +2873,7 @@ impl<'a> CfgReader<'a> {
                 }
                 Some(b'\\') => {
                     self.at += 1;
-                    match self.peek() {
-                        Some(byte) => {
-                            out.push(char::from(byte));
-                            self.at += 1;
-                        }
-                        None => return Err("trailing escape in a value".to_owned()),
-                    }
+                    self.escape(&mut out)?;
                 }
                 Some(_) => {
                     let ch = self.text[self.at..]
@@ -2471,6 +2885,104 @@ impl<'a> CfgReader<'a> {
                 }
             }
         }
+    }
+
+    /// One escape sequence, already past its backslash.
+    fn escape(&mut self, out: &mut String) -> Result<(), String> {
+        let Some(byte) = self.peek() else {
+            return Err("a value ends in a backslash".to_owned());
+        };
+        self.at += 1;
+        let simple = match byte {
+            b'n' => Some('\n'),
+            b'r' => Some('\r'),
+            b't' => Some('\t'),
+            b'0' => Some('\0'),
+            b'\\' => Some('\\'),
+            b'\'' => Some('\''),
+            b'"' => Some('"'),
+            _ => None,
+        };
+        if let Some(ch) = simple {
+            out.push(ch);
+            return Ok(());
+        }
+        match byte {
+            // `\x41`: exactly two hex digits, and only ASCII in a string.
+            b'x' => {
+                let digits = self.take_hex(2)?;
+                let code = u32::from_str_radix(&digits, 16)
+                    .map_err(|error| format!("`\\x{digits}`: {error}"))?;
+                char::from_u32(code)
+                    .filter(char::is_ascii)
+                    .map(|ch| out.push(ch))
+                    .ok_or_else(|| format!("`\\x{digits}` is not an ASCII escape"))
+            }
+            // `\u{1F600}`: one to six hex digits in braces.
+            b'u' => {
+                if self.peek() != Some(b'{') {
+                    return Err("`\\u` is not followed by `{`".to_owned());
+                }
+                self.at += 1;
+                let start = self.at;
+                while self.peek().is_some_and(|byte| byte.is_ascii_hexdigit()) {
+                    self.at += 1;
+                }
+                let digits = self.text[start..self.at].to_owned();
+                if self.peek() != Some(b'}') {
+                    return Err(format!("`\\u{{{digits}` is not closed"));
+                }
+                self.at += 1;
+                let code = u32::from_str_radix(&digits, 16)
+                    .map_err(|error| format!("`\\u{{{digits}}}`: {error}"))?;
+                char::from_u32(code)
+                    .map(|ch| out.push(ch))
+                    .ok_or_else(|| format!("`\\u{{{digits}}}` is not a character"))
+            }
+            // A backslash before a newline eats the following whitespace.
+            b'\n' => {
+                while self.peek().is_some_and(|byte| byte.is_ascii_whitespace()) {
+                    self.at += 1;
+                }
+                Ok(())
+            }
+            other => Err(format!("`\\{}` is not an escape", char::from(other))),
+        }
+    }
+
+    fn take_hex(&mut self, count: usize) -> Result<String, String> {
+        let start = self.at;
+        for _ in 0..count {
+            if !self.peek().is_some_and(|byte| byte.is_ascii_hexdigit()) {
+                return Err(format!("expected {count} hex digits at byte {start}"));
+            }
+            self.at += 1;
+        }
+        Ok(self.text[start..self.at].to_owned())
+    }
+
+    /// `r"..."`, `r#"..."#`, `r##"..."##` — no escapes inside.
+    fn raw_value(&mut self) -> Result<String, String> {
+        self.at += 1;
+        let hashes_at = self.at;
+        while self.peek() == Some(b'#') {
+            self.at += 1;
+        }
+        let hashes = self.at - hashes_at;
+        if self.peek() != Some(b'"') {
+            return Err(format!("`r` at byte {hashes_at} opens no raw string"));
+        }
+        self.at += 1;
+        let close: String = std::iter::once('"')
+            .chain(std::iter::repeat_n('#', hashes))
+            .collect();
+        let rest = &self.text[self.at..];
+        let Some(end) = rest.find(&close) else {
+            return Err("unterminated raw value".to_owned());
+        };
+        let out = rest[..end].to_owned();
+        self.at += end + close.len();
+        Ok(out)
     }
 
     fn predicate(&mut self) -> Result<CfgPred, String> {
@@ -2497,7 +3009,7 @@ impl<'a> CfgReader<'a> {
             Some(b'=') => {
                 self.at += 1;
                 self.skip_space();
-                Ok(CfgPred::Pair(name, self.quoted()?))
+                Ok(CfgPred::Pair(name, self.value()?))
             }
             _ => Ok(CfgPred::Flag(name)),
         }
@@ -2550,149 +3062,502 @@ fn parse_cfg(inside: &str, attribute_form: bool) -> Result<CfgPred, String> {
     }
 }
 
-/// One `cfg(...)` occurrence in the tree.
+/// What a `cfg` occurrence does to the code around it.
+///
+/// Only one of the three gates, and conflating them is the defect this
+/// distinction repairs: a census that counts all three demands a Clippy runner
+/// for platforms whose bodies are compiled everywhere.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum CfgForm {
+    /// `#[cfg(P)]` and `#![cfg(P)]`. The item exists only where `P` holds, so
+    /// this is the only form whose predicate is a platform demand.
+    Gate,
+    /// `#[cfg_attr(P, attr)]`. The **attribute** is conditional; the item is
+    /// compiled everywhere. `#[cfg_attr(not(windows), allow(dead_code))]` in
+    /// this tree does not make its function Windows-only.
+    Attribute,
+    /// `cfg!(P)`. A compile-time boolean *expression*: both arms of the `if`
+    /// around it are compiled and type-checked on every platform.
+    Macro,
+}
+
+/// One `cfg` occurrence, with the predicate that actually decides it.
 struct CfgSite {
     path: String,
     line: usize,
+    form: CfgForm,
+    /// The predicate as written on this occurrence.
+    written: String,
+    /// The predicate that decides whether the item is compiled: `written`
+    /// conjoined with every stacked attribute, every enclosing guard, and the
+    /// file's own guard when it is a whole-file module. Equal to `written` for
+    /// the non-gating forms, which decide nothing.
     rendered: String,
     pred: CfgPred,
 }
 
-/// Every `cfg` predicate the scanned sources contain, and every one that could
-/// not be read.
+/// The index of the byte closing the group `open` at `at`.
+fn balanced(bytes: &[u8], at: usize, open: u8, close: u8) -> Option<usize> {
+    let mut depth = 0_usize;
+    let mut cursor = at;
+    while cursor < bytes.len() {
+        if bytes[cursor] == open {
+            depth += 1;
+        } else if bytes[cursor] == close {
+            depth -= 1;
+            if depth == 0 {
+                return Some(cursor);
+            }
+        }
+        cursor += 1;
+    }
+    None
+}
+
+/// The directory a file's `mod name;` declarations resolve inside.
+fn module_dir(path: &str) -> String {
+    let (parent, file) = path.rsplit_once('/').unwrap_or(("", path));
+    let stem = file.strip_suffix(".rs").unwrap_or(file);
+    if matches!(stem, "mod" | "lib" | "main") {
+        parent.to_owned()
+    } else if parent.is_empty() {
+        stem.to_owned()
+    } else {
+        format!("{parent}/{stem}")
+    }
+}
+
+/// Every `cfg` occurrence in `sources`, and every one that could not be read.
 ///
-/// Two views of each file, and which one answers which question is the part
-/// that has cost this repository time before:
+/// Two passes, because a file's guard is written in another file. Pass one reads
+/// the `#[cfg(P)] mod name;` declarations and resolves each to the file it
+/// governs; pass two scans every file with the guard it inherited. Seventeen
+/// files in this tree exist only under `#[cfg(test)] mod name;` -- the count
+/// `the_declared_whole_file_test_modules_are_seventeen_and_three_are_not_called_tests`
+/// derives independently -- and a census that missed it would read every
+/// predicate in them as unconditional.
 ///
-///   * **position and nesting** come from `blank_comments_and_strings`, where a
-///     `cfg(` inside prose or inside a string literal is spaces. That is what
-///     keeps this census off its own explanatory comments -- an earlier version
-///     of the predecessor reported `freebsd` quoted from the paragraph beside it
-///     -- and it is what balances the parens, so a paren inside a comment or a
-///     string cannot move the span.
+/// Two views of each file, and which one answers which question is the part that
+/// has cost this repository time before:
+///
+///   * **position, nesting and brace depth** come from
+///     `blank_comments_and_strings`, where a `cfg(` inside prose or inside a
+///     string literal is spaces, and so is a brace. That is what keeps this
+///     census off its own explanatory comments -- an earlier version reported
+///     `freebsd` quoted from the paragraph beside it.
 ///   * **the predicate text** is the raw span, because
 ///     `blank_comments_and_strings` erases the platform name along with the
 ///     quotes: reading the name from the blanked view is why the first version
-///     of the predecessor found only `windows`. [`CfgReader`] skips comments on
-///     its own, which is the part the comment blanker cannot do here -- it
-///     deletes comment bytes rather than blanking them, so it does not preserve
-///     the positions this scan is built on.
-///
-/// Test code is scanned along with production code, deliberately: the gate is
-/// `cargo clippy --all-targets`, which compiles test code too, so a platform cfg
-/// in a test module needs that platform's lint leg exactly as much.
-fn cfg_sites(sources: &[(String, String)]) -> (Vec<CfgSite>, Vec<String>) {
-    let mut sites = Vec::new();
+///     found only `windows`. [`CfgReader`] skips comments on its own, which is
+///     the part the comment blanker cannot do here -- it deletes comment bytes
+///     rather than blanking them, so it does not preserve the positions this
+///     scan is built on.
+fn cfg_regions(sources: &[(String, String)]) -> (Vec<CfgSite>, Vec<String>) {
     let mut unreadable = Vec::new();
+    let known: BTreeSet<&str> = sources.iter().map(|(path, _)| path.as_str()).collect();
+
+    // Pass one: which file each `#[cfg(P)] mod name;` governs.
+    let mut declared: Vec<(String, String, CfgPred)> = Vec::new();
     for (path, source) in sources {
-        let blanked = blank_comments_and_strings(source);
-        assert_eq!(
-            blanked.len(),
-            source.len(),
-            "{path}: the blanker moved positions, so every span below is wrong"
+        let mut declarations = Vec::new();
+        scan_file(
+            path,
+            source,
+            None,
+            &mut Vec::new(),
+            &mut Vec::new(),
+            &mut declarations,
         );
-        let bytes = blanked.as_bytes();
-        let mut at = 0;
-        while at < bytes.len() {
-            let byte = bytes[at];
-            let opens_ident = (byte.is_ascii_alphabetic() || byte == b'_')
-                && (at == 0 || !(bytes[at - 1].is_ascii_alphanumeric() || bytes[at - 1] == b'_'));
-            if !opens_ident {
-                at += 1;
-                continue;
-            }
-            let mut end = at;
-            while end < bytes.len() && (bytes[end].is_ascii_alphanumeric() || bytes[end] == b'_') {
-                end += 1;
-            }
-            let word = &blanked[at..end];
-            let attribute_form = word == "cfg_attr";
-            if word != "cfg" && !attribute_form {
-                at = end;
-                continue;
-            }
-            // `cfg!(...)`, `#[cfg(...)]` and `#[cfg (...)]` are all this form.
-            let mut open = end;
-            if bytes.get(open) == Some(&b'!') {
-                open += 1;
-            }
-            while bytes.get(open).is_some_and(u8::is_ascii_whitespace) {
-                open += 1;
-            }
-            if bytes.get(open) != Some(&b'(') {
-                at = end;
-                continue;
-            }
-            let mut depth = 0_usize;
-            let mut cursor = open;
-            let mut closed = None;
-            while cursor < bytes.len() {
-                match bytes[cursor] {
-                    b'(' => depth += 1,
-                    b')' => {
-                        depth -= 1;
-                        if depth == 0 {
-                            closed = Some(cursor);
-                            break;
-                        }
-                    }
-                    _ => {}
-                }
-                cursor += 1;
-            }
-            let line = source[..at].matches('\n').count() + 1;
-            let Some(close) = closed else {
-                unreadable.push(format!("{path}:{line}: `{word}(` is never closed"));
-                at = end;
-                continue;
-            };
-            let inside = &source[open + 1..close];
-            match parse_cfg(inside, attribute_form) {
-                Ok(pred) => sites.push(CfgSite {
-                    path: path.clone(),
-                    line,
-                    rendered: pred.render(),
-                    pred,
-                }),
-                Err(error) => unreadable.push(format!(
-                    "{path}:{line}: `{word}({})` did not parse: {error}. A predicate this \
-                     census cannot read is a body whose platform coverage it cannot decide, \
-                     so extend the grammar rather than skipping it.",
-                    inside.split_whitespace().collect::<Vec<_>>().join(" ")
+        for (name, pred) in declarations {
+            let dir = module_dir(path);
+            let candidates = [format!("{dir}/{name}.rs"), format!("{dir}/{name}/mod.rs")];
+            let present: Vec<&String> = candidates
+                .iter()
+                .filter(|candidate| known.contains(candidate.as_str()))
+                .collect();
+            match present.as_slice() {
+                [child] => declared.push((path.clone(), (*child).clone(), pred)),
+                [] => unreadable.push(format!(
+                    "{path} declares `#[cfg({})] mod {name};` and neither {candidates:?} is \
+                     in the scanned domain, so the guard on that file is unaccounted for",
+                    pred.render()
+                )),
+                _ => unreadable.push(format!(
+                    "{path} declares `mod {name};` and {} candidate files exist",
+                    present.len()
                 )),
             }
-            at = close + 1;
         }
+    }
+
+    // A guarded file may itself declare a guarded module, so the guards compose.
+    // Bounded rather than recursive, and the bound is checked: a cycle here
+    // would otherwise be an infinite loop inside a test.
+    let mut guards: BTreeMap<String, CfgPred> = BTreeMap::new();
+    let mut settled = false;
+    for _ in 0..8 {
+        let mut next: BTreeMap<String, CfgPred> = BTreeMap::new();
+        for (parent, child, pred) in &declared {
+            let mut parts: Vec<CfgPred> = Vec::new();
+            if let Some(inherited) = guards.get(parent) {
+                parts.push(inherited.clone());
+            }
+            parts.push(pred.clone());
+            next.insert(child.clone(), CfgPred::conjunction(parts));
+        }
+        if next == guards {
+            settled = true;
+            break;
+        }
+        guards = next;
+    }
+    if !settled {
+        unreadable.push(
+            "the module guards did not settle in eight rounds; `mod` declarations may be \
+             cyclic and no file's guard can be trusted"
+                .to_owned(),
+        );
+    }
+
+    // Pass two: every occurrence, under the guard its file inherited.
+    let mut sites = Vec::new();
+    for (path, source) in sources {
+        scan_file(
+            path,
+            source,
+            guards.get(path),
+            &mut sites,
+            &mut unreadable,
+            &mut Vec::new(),
+        );
     }
     (sites, unreadable)
 }
 
-/// The predicates in this tree that no CI runner compiles, and why each is
-/// deliberate.
+/// One file's occurrences.
+///
+/// `declarations` collects `#[cfg(P)] mod name;` for the caller's first pass;
+/// `sites` and `unreadable` are the second pass's output. A pass wanting only
+/// one of the two hands the other an empty vector it then discards.
+fn scan_file(
+    path: &str,
+    source: &str,
+    file_guard: Option<&CfgPred>,
+    sites: &mut Vec<CfgSite>,
+    unreadable: &mut Vec<String>,
+    declarations: &mut Vec<(String, CfgPred)>,
+) {
+    let blanked = blank_comments_and_strings(source);
+    assert_eq!(
+        blanked.len(),
+        source.len(),
+        "{path}: the blanker moved positions, so every span below is wrong"
+    );
+    let bytes = blanked.as_bytes();
+    let line_of = |at: usize| source[..at].matches('\n').count() + 1;
+
+    let mut depth = 0_usize;
+    // Active while the current depth is INSIDE the body the item opened.
+    let mut item_scopes: Vec<(usize, CfgPred)> = Vec::new();
+    // `#![cfg(P)]`: active from the depth it was written at, downward.
+    let mut inner_scopes: Vec<(usize, CfgPred)> = Vec::new();
+    // The `#[cfg]`s stacked on the item being read, in source order.
+    let mut pending: Vec<(usize, CfgPred)> = Vec::new();
+
+    let mut i = 0;
+    while i < bytes.len() {
+        let byte = bytes[i];
+        if byte.is_ascii_whitespace() {
+            i += 1;
+            continue;
+        }
+
+        // -- an attribute ---------------------------------------------------
+        if byte == b'#' {
+            let mut open = i + 1;
+            let inner = bytes.get(open) == Some(&b'!');
+            if inner {
+                open += 1;
+            }
+            if bytes.get(open) != Some(&b'[') {
+                i += 1;
+                continue;
+            }
+            let Some(close) = balanced(bytes, open, b'[', b']') else {
+                unreadable.push(format!(
+                    "{path}:{}: an attribute is never closed",
+                    line_of(i)
+                ));
+                i += 1;
+                continue;
+            };
+            let span = &source[open + 1..close];
+            let mut reader = CfgReader::new(span);
+            reader.skip_space();
+            let name = reader.ident().to_owned();
+            let rest = &span[reader.at..];
+            let inside = rest
+                .trim_start()
+                .strip_prefix('(')
+                .and_then(|body| body.strip_suffix(')'));
+            match (name.as_str(), inside) {
+                ("cfg", Some(inside)) => match parse_cfg(inside, false) {
+                    Ok(pred) => {
+                        if inner {
+                            inner_scopes.push((depth, pred));
+                        } else {
+                            pending.push((i, pred));
+                        }
+                    }
+                    Err(error) => {
+                        unreadable.push(unreadable_cfg(path, line_of(i), "cfg", inside, &error))
+                    }
+                },
+                ("cfg_attr", Some(inside)) => match parse_cfg(inside, true) {
+                    Ok(pred) => sites.push(CfgSite {
+                        path: path.to_owned(),
+                        line: line_of(i),
+                        form: CfgForm::Attribute,
+                        written: pred.render(),
+                        rendered: pred.render(),
+                        pred,
+                    }),
+                    Err(error) => {
+                        unreadable.push(unreadable_cfg(
+                            path,
+                            line_of(i),
+                            "cfg_attr",
+                            inside,
+                            &error,
+                        ));
+                    }
+                },
+                _ => {}
+            }
+            i = close + 1;
+            continue;
+        }
+
+        // -- the item those attributes belong to -----------------------------
+        if !pending.is_empty() {
+            let mut parts: Vec<CfgPred> = Vec::new();
+            if let Some(guard) = file_guard {
+                parts.push(guard.clone());
+            }
+            parts.extend(inner_scopes.iter().map(|(_, pred)| pred.clone()));
+            parts.extend(item_scopes.iter().map(|(_, pred)| pred.clone()));
+            parts.extend(pending.iter().map(|(_, pred)| pred.clone()));
+            let own = CfgPred::conjunction(pending.iter().map(|(_, p)| p.clone()).collect());
+            let effective = CfgPred::conjunction(parts);
+            let at = pending[0].0;
+            sites.push(CfgSite {
+                path: path.to_owned(),
+                line: line_of(at),
+                form: CfgForm::Gate,
+                written: own.render(),
+                rendered: effective.render(),
+                pred: effective.clone(),
+            });
+            match item_shape(bytes, i) {
+                ItemShape::Module { name, body: None } => {
+                    declarations.push((name, effective.clone()));
+                }
+                ItemShape::Module { body: Some(_), .. } | ItemShape::Block => {
+                    item_scopes.push((depth, effective));
+                }
+                ItemShape::Flat => {}
+            }
+            pending.clear();
+        }
+
+        // -- ordinary tokens --------------------------------------------------
+        if byte == b'{' {
+            depth += 1;
+            i += 1;
+            continue;
+        }
+        if byte == b'}' {
+            depth = depth.saturating_sub(1);
+            item_scopes.retain(|(open, _)| depth > *open);
+            inner_scopes.retain(|(at, _)| depth >= *at);
+            i += 1;
+            continue;
+        }
+        if byte.is_ascii_alphabetic() || byte == b'_' {
+            let start = i;
+            let mut end = i;
+            while end < bytes.len() && (bytes[end].is_ascii_alphanumeric() || bytes[end] == b'_') {
+                end += 1;
+            }
+            // `cfg!(P)`, and ONLY with the `!`. A bare `cfg(` is an ordinary
+            // call or a function named `cfg`, which is not an attribute and not
+            // a macro; treating it as one is how a census invents a predicate
+            // out of `fn cfg(bits: u32)`.
+            if &blanked[start..end] == "cfg" {
+                let mut cursor = end;
+                while bytes.get(cursor).is_some_and(u8::is_ascii_whitespace) {
+                    cursor += 1;
+                }
+                if bytes.get(cursor) == Some(&b'!') {
+                    cursor += 1;
+                    while bytes.get(cursor).is_some_and(u8::is_ascii_whitespace) {
+                        cursor += 1;
+                    }
+                    if bytes.get(cursor) == Some(&b'(') {
+                        if let Some(close) = balanced(bytes, cursor, b'(', b')') {
+                            let inside = &source[cursor + 1..close];
+                            match parse_cfg(inside, false) {
+                                Ok(pred) => sites.push(CfgSite {
+                                    path: path.to_owned(),
+                                    line: line_of(start),
+                                    form: CfgForm::Macro,
+                                    written: pred.render(),
+                                    rendered: pred.render(),
+                                    pred,
+                                }),
+                                Err(error) => unreadable.push(unreadable_cfg(
+                                    path,
+                                    line_of(start),
+                                    "cfg!",
+                                    inside,
+                                    &error,
+                                )),
+                            }
+                            i = close + 1;
+                            continue;
+                        }
+                    }
+                }
+            }
+            i = end;
+            continue;
+        }
+        i += 1;
+    }
+}
+
+fn unreadable_cfg(path: &str, line: usize, form: &str, inside: &str, error: &str) -> String {
+    format!(
+        "{path}:{line}: `{form}({})` did not parse: {error}. A predicate this census cannot \
+         read is a body whose platform coverage it cannot decide, so extend the grammar \
+         rather than skipping it.",
+        inside.split_whitespace().collect::<Vec<_>>().join(" ")
+    )
+}
+
+/// What the item starting at `at` is, as far as scoping cares.
+enum ItemShape {
+    /// `mod name { … }` or `mod name;`.
+    Module { name: String, body: Option<usize> },
+    /// Anything else with a braced body: a function, an `impl`, a `struct`, a
+    /// bare block. Its guard reaches everything inside it.
+    Block,
+    /// Anything that ends before a brace: a `use`, a `const`, a struct field, a
+    /// match arm. Nothing is nested under it.
+    Flat,
+}
+
+/// Read far enough to tell those three apart.
+///
+/// The scan stops at the first `;` or `,` outside any bracket, which is what
+/// ends a flat item, and at the first `{` outside any bracket, which opens a
+/// body. Brackets are tracked because `const X: [u8; 2]` puts a `;` inside one
+/// and `fn f(a: u8, b: u8)` puts a `,` inside one.
+fn item_shape(bytes: &[u8], at: usize) -> ItemShape {
+    let mut cursor = at;
+    let mut brackets = 0_usize;
+    let mut words: Vec<String> = Vec::new();
+    while cursor < bytes.len() {
+        match bytes[cursor] {
+            b'(' | b'[' => brackets += 1,
+            b')' | b']' => brackets = brackets.saturating_sub(1),
+            b';' | b',' if brackets == 0 => break,
+            b'{' if brackets == 0 => {
+                let module = words
+                    .iter()
+                    .position(|word| word == "mod")
+                    .and_then(|index| words.get(index + 1).cloned());
+                return match module {
+                    Some(name) => ItemShape::Module {
+                        name,
+                        body: Some(cursor),
+                    },
+                    None => ItemShape::Block,
+                };
+            }
+            byte if byte.is_ascii_alphabetic() || byte == b'_' => {
+                let start = cursor;
+                while cursor < bytes.len()
+                    && (bytes[cursor].is_ascii_alphanumeric() || bytes[cursor] == b'_')
+                {
+                    cursor += 1;
+                }
+                words.push(String::from_utf8_lossy(&bytes[start..cursor]).into_owned());
+                continue;
+            }
+            _ => {}
+        }
+        cursor += 1;
+    }
+    match words.iter().position(|word| word == "mod") {
+        Some(index) => match words.get(index + 1) {
+            Some(name) => ItemShape::Module {
+                name: name.clone(),
+                body: None,
+            },
+            None => ItemShape::Flat,
+        },
+        None => ItemShape::Flat,
+    }
+}
+
+/// The effective predicates in this tree that no CI runner compiles, and why
+/// each is deliberate.
 ///
 /// An equality, not a filter. A new predicate that no runner compiles fails this
 /// census until someone adds the platform's Clippy leg or writes the reason down
 /// here, which is the check the predecessor could not make at all: it collected
 /// `target_os` names, `not(any(unix, windows))` carries none, and five
 /// production regions the denylist has never examined were invisible to it.
-const NO_CI_RUNNER_COMPILES: [(&str, &str); 1] = [(
-    "not(any(unix, windows))",
-    "the else-arm of a `unix` / `windows` / otherwise split. `DESIGN.md` §3 makes the \
-     crate first-class on Windows, macOS and Linux and claims no fourth family, so the \
-     arm exists to keep the crate compiling on a target the project does not ship and \
-     nothing CI runs can reach it. Clippy never examines these bodies -- which is the \
-     fact this row records rather than repairs.",
-)];
+const NO_CI_RUNNER_COMPILES: [(&str, &str); 2] = [
+    (
+        "all(unix, not(any(target_os = \"linux\", target_os = \"macos\")))",
+        "the else-arm of `agent::proc`'s `last_errno()`, which reads `errno` through \
+         `__errno_location` on Linux, `__error` on macOS, and falls back to \
+         `std::io::Error::last_os_error()` on any other Unix. **Found by conjoining the \
+         guards, and invisible without it**: the attribute on the arm is \
+         `not(any(target_os = \"linux\", target_os = \"macos\"))`, which is true on Windows, \
+         so an oracle reading the attribute alone reports the Windows leg as compiling it. \
+         The `#[cfg(unix)]` module around it is what makes the conjunction unreachable -- a \
+         Unix that is neither Linux nor macOS, which is a target this project does not ship \
+         and no runner provides.",
+    ),
+    (
+        "not(any(unix, windows))",
+        "the else-arm of a `unix` / `windows` / otherwise split. `DESIGN.md` §3 makes the \
+         crate first-class on Windows, macOS and Linux and claims no fourth family, so the \
+         arm exists to keep the crate compiling on a target the project does not ship and \
+         nothing CI runs can reach it. Clippy never examines these bodies -- which is the \
+         fact this row records rather than repairs.",
+    ),
+];
 
 /// The census's permanent positive control.
 ///
 /// Injected into the **whole** scanned domain rather than parsed on its own:
 /// `CODING_STANDARDS.md` §12 says a control inside a truncated domain does not
 /// prove the domain was scanned, so the control rides along with every real file
-/// and must still be found. It carries one of each thing the predecessor got
-/// wrong -- an uncompilable predicate, a predicate every runner compiles, a
-/// `target_os` binding that is not a cfg at all, and the same token in a comment
-/// and in a string literal.
+/// and must still be found.
+///
+/// Every row of it is a thing a version of this census got wrong. The first four
+/// are the standing ledger's: a predicate nothing compiles, one everything
+/// compiles, a `target_os` binding that is not a predicate, and the same token
+/// in prose and in a string literal. The rest are the review's: stacked
+/// attributes, a guard on the module rather than the item, the two non-gating
+/// forms, and the two literal shapes a `"..."`-only reader decodes wrongly.
+/// `fn cfg` is there because an ordinary function may be called `cfg`, and a
+/// scanner that reads any `cfg(` as an attribute invents a predicate from its
+/// parameter list.
 const CFG_CENSUS_CONTROL: &str = r##"//! A control fixture. It is not compiled; it is scanned.
 
 // Prose that spells #[cfg(target_os = "haiku")] and must not become a site.
@@ -2704,17 +3569,56 @@ fn no_runner_compiles_this() {}
 #[cfg(not(target_os = "freebsd"))]
 fn every_runner_compiles_this() {}
 
+#[cfg(unix)]
+#[cfg(target_os = "macos")]
+fn stacked_attributes_conjoin() {}
+
+#[cfg(windows)]
+mod only_on_windows {
+    #[cfg(test)]
+    fn nested_under_the_module_guard() {}
+}
+
+#[cfg(target_os = r"linux")]
+fn a_raw_string_value() {}
+
+#[cfg(target_os = "ma\x63os")]
+fn an_escaped_value() {}
+
+#[cfg_attr(target_os = "haiku", allow(dead_code))]
+fn the_attribute_is_conditional_not_the_item() {}
+
+fn the_macro_is_an_expression() -> bool {
+    cfg!(target_os = "plan9")
+}
+
+fn cfg(bits: u32) -> u32 {
+    bits
+}
+
 fn a_binding_is_not_a_predicate() {
     let target_os = "android";
     let _ = target_os;
+    let _ = cfg(1);
 }
 "##;
 
-/// The predicate rows the standing ledger names, with the runners that compile
-/// each.
+/// The gate predicates the control fixture must produce, in source order.
+const CONTROL_GATES: [&str; 7] = [
+    "not(any(target_os = \"linux\", target_os = \"macos\", target_os = \"windows\"))",
+    "not(target_os = \"freebsd\")",
+    "all(unix, target_os = \"macos\")",
+    "windows",
+    "all(windows, test)",
+    "target_os = \"linux\"",
+    "target_os = \"macos\"",
+];
+
+/// The predicate rows the standing ledger and the review name, with the runners
+/// that actually compile each.
 ///
-/// `(predicate, the runners that may compile it, why the row is here)`.
-const CFG_ESCAPES: [(&str, &[&str], &str); 10] = [
+/// `(predicate, the runners that compile it, why the row is here)`.
+const CFG_ESCAPES: [(&str, &[&str], &str); 12] = [
     (
         "not(any(target_os = \"linux\", target_os = \"macos\", target_os = \"windows\"))",
         &[],
@@ -2752,7 +3656,15 @@ const CFG_ESCAPES: [(&str, &[&str], &str); 10] = [
     (
         "all(windows, test)",
         &["windows-latest"],
-        "`test` is unknown on every tuple and constrains nothing; `windows` decides it",
+        "`test` is set by the test-harness invocation and not by the library one, so this \
+         is decided rather than unknown -- the answer the three-valued version could not \
+         give",
+    ),
+    (
+        "all(test, not(test))",
+        &[],
+        "the reason the invocations are enumerated instead of merged. A single valuation \
+         carrying every flag any invocation sets would make this reachable",
     ),
     (
         "all(unix, not(target_os = \"macos\"))",
@@ -2765,27 +3677,39 @@ const CFG_ESCAPES: [(&str, &[&str], &str); 10] = [
         "every runner, so it demands nothing",
     ),
     (
-        "feature = \"unshipped\"",
+        "all(unix, windows)",
+        &[],
+        "no target is both, so an effective predicate that conjoins a module guard with an \
+         item guard can be uncompilable even though each half is compiled somewhere",
+    ),
+    (
+        "not(test)",
         &["macos-latest", "ubuntu-latest", "windows-latest"],
-        "an unknown key constrains no platform; unknown is never read as false",
+        "the library invocation does not set `test`, so the negation is true there",
     ),
 ];
 
-/// The floor on the census's domain.
+/// The floor on the census's gate domain.
 ///
 /// A count, because a scan that silently stops reading is a scan that reports
-/// nothing uncovered. The tree carries several hundred `cfg(...)` occurrences and
-/// the number moves with ordinary edits, so this is a floor rather than a pin;
-/// the boundary assertions beside it are what pin the shape.
-const CFG_SITE_FLOOR: usize = 400;
+/// nothing uncovered. The tree carries several hundred gating attributes and the
+/// number moves with ordinary edits, so this is a floor rather than a pin; the
+/// boundary assertions beside it are what pin the shape.
+const CFG_GATE_FLOOR: usize = 350;
 
-/// The cfg census reads predicates, not the names inside them.
+/// The number of files this tree reaches only through `#[cfg(test)] mod name;`.
 ///
-/// Each row of [`CFG_ESCAPES`] is a predicate the standing ledger names, with the
-/// runner set the evaluation must produce, and the control fixture is scanned
-/// inside the full domain.
+/// Derived independently by
+/// `the_declared_whole_file_test_modules_are_seventeen_and_three_are_not_called_tests`,
+/// and pinned here because every predicate in those files is `all(test, …)`
+/// rather than what it says: a census that resolved none of them would read
+/// several hundred predicates as unconditional and never notice.
+const WHOLE_FILE_TEST_MODULES: usize = 17;
+
+/// The cfg census reads effective predicates, decides them, and knows which
+/// forms gate.
 #[test]
-fn the_cfg_census_evaluates_predicates_instead_of_collecting_platform_names() {
+fn the_cfg_census_evaluates_effective_predicates_against_the_valuations_ci_sets() {
     for (text, expected, why) in CFG_ESCAPES {
         let pred = parse_cfg(text, false).unwrap_or_else(|error| {
             panic!("the census cannot read `cfg({text})`, which it must: {error}")
@@ -2796,12 +3720,20 @@ fn the_cfg_census_evaluates_predicates_instead_of_collecting_platform_names() {
             "`cfg({text})` did not round-trip through the parser"
         );
         let expected: BTreeSet<&str> = expected.iter().copied().collect();
-        assert_eq!(
-            compiled_by(&pred),
-            expected,
-            "`cfg({text})` is compiled by the wrong runners -- {why}"
-        );
+        let compiled = compiled_by(&pred)
+            .unwrap_or_else(|error| panic!("`cfg({text})` is undecidable: {error}"));
+        assert_eq!(compiled, expected, "`cfg({text})` -- {why}");
     }
+
+    // An unmodelled name is a hard failure, not an optimistic guess. This is the
+    // review's fourth finding as a control: the version this replaces answered
+    // `Unknown` here and the caller read `Unknown` as "every runner compiles it".
+    let unmodelled = parse_cfg("feature = \"unshipped\"", false).expect("a parseable predicate");
+    let refused = compiled_by(&unmodelled);
+    assert!(
+        refused.is_err(),
+        "a cfg key no valuation models was decided anyway, as {refused:?}"
+    );
 
     // The control rides along with the whole domain, so finding it proves the
     // scan reaches injected content in the presence of every real file rather
@@ -2810,40 +3742,85 @@ fn the_cfg_census_evaluates_predicates_instead_of_collecting_platform_names() {
     let real = domain.len();
     let fixture = "fixtures/cfg-census-control.rs";
     domain.push((fixture.to_owned(), CFG_CENSUS_CONTROL.to_owned()));
-    let (sites, unreadable) = cfg_sites(&domain);
+    let (sites, unreadable) = cfg_regions(&domain);
     assert!(
         unreadable.is_empty(),
-        "the census could not read {} predicate(s):\n{}",
+        "the census could not read {} occurrence(s):\n{}",
         unreadable.len(),
         unreadable.join("\n")
     );
+    let gates: Vec<&CfgSite> = sites
+        .iter()
+        .filter(|site| site.form == CfgForm::Gate)
+        .collect();
     assert!(
-        real > 30 && sites.len() > CFG_SITE_FLOOR,
-        "the control was scanned inside a truncated domain: {real} files, {} sites",
-        sites.len()
+        real > 30 && gates.len() > CFG_GATE_FLOOR,
+        "the control was scanned inside a truncated domain: {real} files, {} gates",
+        gates.len()
     );
 
     let injected: Vec<&CfgSite> = sites.iter().filter(|site| site.path == fixture).collect();
-    let rendered: Vec<&str> = injected.iter().map(|site| site.rendered.as_str()).collect();
+    let rendered: Vec<&str> = injected
+        .iter()
+        .filter(|site| site.form == CfgForm::Gate)
+        .map(|site| site.rendered.as_str())
+        .collect();
     assert_eq!(
-        rendered,
-        vec![
-            "not(any(target_os = \"linux\", target_os = \"macos\", target_os = \"windows\"))",
-            "not(target_os = \"freebsd\")",
-        ],
-        "the control fixture produced the wrong sites. `haiku` or `plan9` here is a census \
-         reading its own prose or a string literal; `android` is a `let` binding read as a \
-         predicate, which is the third escape the standing row names."
+        rendered, CONTROL_GATES,
+        "the control fixture produced the wrong gates. `haiku` or `plan9` among them is a \
+         non-gating form counted as a gate; a missing `all(...)` is a stacked attribute or a \
+         module guard the scan did not conjoin; `android` is a `let` binding read as a \
+         predicate, and a `cfg(` from `fn cfg(bits: u32)` is a parameter list read as one."
     );
-    assert!(
-        compiled_by(&injected[0].pred).is_empty(),
-        "the injected violation was reported as covered, so this census has no positive \
-         control at all"
+
+    // The two non-gating forms are RECORDED and not counted. Recording them is
+    // what makes their exclusion measurable: `target_os = "plan9"` and
+    // `target_os = "haiku"` are compiled by no runner, so if either were read as
+    // a gate the census below would report an uncovered predicate.
+    let by_form: BTreeMap<CfgForm, Vec<&str>> =
+        injected
+            .iter()
+            .fold(BTreeMap::new(), |mut acc: BTreeMap<_, Vec<&str>>, site| {
+                acc.entry(site.form)
+                    .or_default()
+                    .push(site.written.as_str());
+                acc
+            });
+    assert_eq!(
+        by_form.get(&CfgForm::Attribute).map(Vec::as_slice),
+        Some(["target_os = \"haiku\""].as_slice()),
+        "`#[cfg_attr(P, attr)]` applies an attribute conditionally; the item is compiled \
+         everywhere and it is not a platform demand"
     );
     assert_eq!(
-        compiled_by(&injected[1].pred).len(),
-        CI_TARGETS.len(),
-        "the injected non-violation was reported as demanding a runner"
+        by_form.get(&CfgForm::Macro).map(Vec::as_slice),
+        Some(["target_os = \"plan9\""].as_slice()),
+        "`cfg!(P)` is an expression: both arms around it compile on every platform"
+    );
+
+    // Two of the gates exist only because a guard was conjoined from somewhere
+    // other than the attribute itself.
+    let stacked = injected
+        .iter()
+        .find(|site| site.rendered == "all(unix, target_os = \"macos\")")
+        .expect("the stacked control");
+    assert_eq!(
+        stacked.written, "all(unix, target_os = \"macos\")",
+        "stacked `#[cfg]`s are one item's predicate, not two items'"
+    );
+    let nested = injected
+        .iter()
+        .find(|site| site.rendered == "all(windows, test)")
+        .expect("the nested control");
+    assert_eq!(
+        nested.written, "test",
+        "the nested item writes only `test`; `windows` comes from the module around it"
+    );
+    assert_eq!(
+        compiled_by(&nested.pred).expect("decidable"),
+        BTreeSet::from(["windows-latest"]),
+        "an item inside a `#[cfg(windows)] mod` is not compiled by the Linux leg, whatever \
+         its own attribute says"
     );
 }
 
@@ -2853,7 +3830,7 @@ fn the_cfg_census_evaluates_predicates_instead_of_collecting_platform_names() {
 /// The domain is derived from the tree rather than listed here: a written-down
 /// platform list is one nothing forces an author to extend, which is what the
 /// previous repair of this test shipped. The two halves join at the target
-/// tuple -- [`cfg_sites`] decides which runners may compile each body, and the
+/// tuple -- [`cfg_regions`] decides which runners compile each body, and the
 /// workflow contract requires a gate job whose `runs-on:` is that runner.
 ///
 /// **Why this is one test and not three.** `PR5D-MSVC-CLIPPY-NEVER-RUN` and
@@ -2864,33 +3841,58 @@ fn the_cfg_census_evaluates_predicates_instead_of_collecting_platform_names() {
 #[test]
 fn every_platform_this_crate_configures_for_has_a_clippy_gate_the_aggregate_requires() {
     let sources = scanned_sources();
-    let (sites, unreadable) = cfg_sites(&sources);
+    let (sites, unreadable) = cfg_regions(&sources);
     assert!(
         unreadable.is_empty(),
-        "the census could not read {} predicate(s):\n{}",
+        "the census could not read {} occurrence(s):\n{}",
         unreadable.len(),
         unreadable.join("\n")
     );
+    let gates: Vec<&CfgSite> = sites
+        .iter()
+        .filter(|site| site.form == CfgForm::Gate)
+        .collect();
     assert!(
-        sites.len() > CFG_SITE_FLOOR,
-        "only {} cfg predicate(s) found across {} files; the census is reading the wrong \
-         shape",
-        sites.len(),
+        gates.len() > CFG_GATE_FLOOR,
+        "only {} gating cfg attribute(s) found across {} files; the census is reading the \
+         wrong shape",
+        gates.len(),
         sources.len()
     );
     // A boundary, not a count: the tree carries nested, negated predicates and a
     // census that only reads flat ones would pass every other assertion here.
     assert!(
-        sites
+        gates
             .iter()
-            .any(|site| site.rendered == "not(any(target_os = \"linux\", target_os = \"macos\"))"),
+            .any(|site| site.written == "not(any(target_os = \"linux\", target_os = \"macos\"))"),
         "the census did not find the nested negated predicate this tree is known to carry, \
          so it is reading a narrower grammar than the tree uses"
     );
+    // The whole-file guards are the other boundary. Every predicate in those
+    // files is `all(test, …)`, and a census that resolved none of them would
+    // read them all as unconditional.
+    let under_a_file_guard: BTreeSet<&str> = gates
+        .iter()
+        .filter(|site| site.rendered.starts_with("all(test,") || site.rendered == "test")
+        .map(|site| site.path.as_str())
+        .collect();
+    assert!(
+        under_a_file_guard.len() >= WHOLE_FILE_TEST_MODULES,
+        "only {} file(s) carry a `test` guard the census resolved, and \
+         `the_declared_whole_file_test_modules_are_seventeen_and_three_are_not_called_tests` \
+         derives {WHOLE_FILE_TEST_MODULES} whole-file test modules on its own",
+        under_a_file_guard.len()
+    );
 
     let mut uncovered: BTreeMap<&str, Vec<String>> = BTreeMap::new();
-    for site in &sites {
-        if compiled_by(&site.pred).is_empty() {
+    for site in &gates {
+        let compiled = compiled_by(&site.pred).unwrap_or_else(|error| {
+            panic!(
+                "{}:{}: `cfg({})` cannot be decided: {error}",
+                site.path, site.line, site.rendered
+            )
+        });
+        if compiled.is_empty() {
             uncovered
                 .entry(site.rendered.as_str())
                 .or_default()
@@ -2904,9 +3906,9 @@ fn every_platform_this_crate_configures_for_has_a_clippy_gate_the_aggregate_requ
     let found: BTreeSet<&str> = uncovered.keys().copied().collect();
     assert_eq!(
         found, acknowledged,
-        "the set of predicates no CI runner compiles moved. Every such body is outside the \
-         effect denylist's reach on every job CI runs: add the platform's Clippy leg, or add \
-         a row to `NO_CI_RUNNER_COMPILES` saying why the body is unreachable on \
+        "the set of effective predicates no CI runner compiles moved. Every such body is \
+         outside the effect denylist's reach on every job CI runs: add the platform's Clippy \
+         leg, or add a row to `NO_CI_RUNNER_COMPILES` saying why the body is unreachable on \
          purpose.\n{uncovered:#?}"
     );
 
@@ -2915,10 +3917,9 @@ fn every_platform_this_crate_configures_for_has_a_clippy_gate_the_aggregate_requ
     // compiles is why that runner's leg cannot be dropped.
     for target in &CI_TARGETS {
         let only = BTreeSet::from([target.runner]);
-        let witness = sites
+        let witness = gates
             .iter()
-            .find(|site| compiled_by(&site.pred) == only)
-            .map(|site| format!("{}:{} `cfg({})`", site.path, site.line, site.rendered));
+            .find(|site| compiled_by(&site.pred).is_ok_and(|compiled| compiled == only));
         assert!(
             witness.is_some(),
             "no body in this tree is compiled by `{}` alone, so nothing here establishes \
