@@ -3038,23 +3038,28 @@ mod tests {
         let registrations_before = workspace
             .git(&["worktree", "list", "--porcelain"])
             .expect("registrations before");
-        let mut owner = Command::new(env::current_exe().expect("test executable"))
-            .args(["gate_snapshot_owner_helper", "--ignored", "--nocapture"])
-            .env("UPSTROKE_SNAPSHOT_OWNER", "1")
-            .env("UPSTROKE_REPO", &repo)
-            .env("UPSTROKE_SNAPSHOT_STORE", &store)
-            .env("UPSTROKE_READY", &ready)
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
-            .expect("spawn disposable snapshot owner");
+        // Adopted, so a panicking assertion anywhere below still terminates and
+        // reaps this child rather than leaving it to sleep out its thirty
+        // seconds holding a registered worktree.
+        let mut owner = readiness::Producer::adopt(
+            Command::new(env::current_exe().expect("test executable"))
+                .args(["gate_snapshot_owner_helper", "--ignored", "--nocapture"])
+                .env("UPSTROKE_SNAPSHOT_OWNER", "1")
+                .env("UPSTROKE_REPO", &repo)
+                .env("UPSTROKE_SNAPSHOT_STORE", &store)
+                .env("UPSTROKE_READY", &ready)
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+                .expect("spawn disposable snapshot owner"),
+        );
         // Producer-aware, and the bound is the one this test already used. The
         // wait it replaces polled only for the path, so an owner that died
         // before publishing -- a failed `Workspace::open`, a store the helper
         // could not create -- was reported fifteen seconds later as a producer
         // that had never published, which is the clock talking rather than the
         // death (CODING_STANDARDS.md §12).
-        let published = readiness::await_signal(&ready, &mut owner, Duration::from_secs(15))
+        let published = readiness::await_signal(&ready, owner.child(), Duration::from_secs(15))
             .or_fail("the snapshot owner never published readiness");
         let [name] = published.as_slice() else {
             panic!("the readiness record is one field, not {published:?}")
@@ -3070,8 +3075,8 @@ mod tests {
             "helper did not register a linked worktree"
         );
 
-        owner.kill().expect("hard-kill snapshot owner");
-        owner.wait().expect("reap snapshot owner");
+        owner.child().kill().expect("hard-kill snapshot owner");
+        owner.child().wait().expect("reap snapshot owner");
         assert!(
             snapshot_path.exists(),
             "hard kill unexpectedly ran the snapshot destructor"

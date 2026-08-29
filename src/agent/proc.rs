@@ -5402,8 +5402,7 @@ pub(crate) mod test_support {
     ///   fire while that read is blocked, which is the one case §12 says the
     ///   bound exists for: "the fast path is a producer that fails and closes
     ///   its channel; the bound is for the one that stays alive and silent".
-    ///   [`await_line`] reads on a thread and bounds the *wait*, so the
-    ///   deadline is effective against a live-silent producer.
+    ///   [`Producer::await_line`] reads on a thread and bounds the *wait*.
     ///
     /// **Durability is deliberately not part of this.** §8 separates the
     /// guarantees — "a successful rename is not automatically a durability
@@ -5419,15 +5418,15 @@ pub(crate) mod test_support {
     /// The two waits differ in what they can learn about the producer, and the
     /// split follows §12's two sound publication forms rather than taste. A
     /// pipe has a channel, so EOF *is* the sanctioned fast path and
-    /// [`await_line`] needs nothing else. A file has no channel to close, so a
-    /// producer's exit is the only liveness fact available and
+    /// [`Producer::await_line`] needs nothing else. A file has no channel to
+    /// close, so a producer's exit is the only liveness fact available and
     /// [`await_signal`] takes the [`Child`] in order to have one.
     pub(crate) mod readiness {
-        use std::io::{BufRead, BufReader, Write};
+        use std::io::{BufRead, BufReader, Read, Write};
         use std::path::{Path, PathBuf};
         use std::process::{Child, ChildStdout};
-        use std::sync::mpsc::{self, RecvTimeoutError};
-        use std::thread;
+        use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
+        use std::thread::{self, JoinHandle};
         use std::time::{Duration, Instant};
 
         /// How often a path-shaped wait re-stats its signal.
@@ -5441,7 +5440,7 @@ pub(crate) mod test_support {
         /// The record terminator. A record is complete only once it arrives.
         const TERMINATOR: char = '\n';
 
-        /// The suffix of the staging name [`publish`] renames from.
+        /// The suffix every staging name ends in, so residue is recognisable.
         const STAGING: &str = ".publishing";
 
         /// How a bounded wait ended.
@@ -5462,7 +5461,8 @@ pub(crate) mod test_support {
             /// The producer is still alive and has published nothing. This is
             /// the outcome the bound exists for, and the bound is the caller's.
             TimedOut(Duration),
-            /// The signal appeared but its bytes are not a whole record.
+            /// The signal appeared but its bytes are not a whole record, or the
+            /// producer spent the whole output allowance without framing one.
             Torn(String),
         }
 
@@ -5487,14 +5487,26 @@ pub(crate) mod test_support {
             }
         }
 
-        /// The sibling `publish` stages at, in `signal`'s own directory so the
-        /// rename cannot cross a filesystem.
+        /// The staging name for **one** publication, in `signal`'s own directory
+        /// so the rename cannot cross a filesystem.
+        ///
+        /// Unique per call, not per signal. A fixed `<signal>.publishing` is one
+        /// name shared by every publisher of that signal: two concurrent
+        /// publications interleave in it, and — worse — the failure path of
+        /// either one deletes whatever is there, which by then may be the other
+        /// one's staged record. The process id and a ULID make the name this
+        /// call's alone, which is what lets the cleanup below run
+        /// unconditionally without ever removing somebody else's file.
         fn staging_for(signal: &Path) -> PathBuf {
             let name = signal
                 .file_name()
                 .expect("a readiness signal is a file, so it has a file name");
             let mut staged = name.to_os_string();
-            staged.push(STAGING);
+            staged.push(format!(
+                ".{}.{}{STAGING}",
+                std::process::id(),
+                crate::ulid::ulid()
+            ));
             signal.with_file_name(staged)
         }
 
@@ -5508,9 +5520,7 @@ pub(crate) mod test_support {
         /// two records where one was sent, both look complete.
         ///
         /// Prefer sending an identifier the waiter can rejoin to a root it
-        /// already knows over sending a path. Where a path is unavoidable this
-        /// refusal is what keeps it honest — a `TMPDIR` with a newline in it
-        /// fails the publish loudly instead of handing the waiter a short path.
+        /// already knows over sending a path.
         ///
         /// # Errors
         ///
@@ -5519,6 +5529,29 @@ pub(crate) mod test_support {
         /// the signal name is never created, so a failed publish is not a
         /// readiness claim.
         pub(crate) fn publish(signal: &Path, fields: &[&str]) -> std::io::Result<()> {
+            publish_between(signal, fields, &mut || {})
+        }
+
+        /// [`publish`], with `between` run after the record is staged and before
+        /// it is renamed into place.
+        ///
+        /// The seam exists so the atomicity claim can be tested by *arranging*
+        /// the interleaving rather than by racing for it. At the moment
+        /// `between` runs, the record's bytes are entirely written and the
+        /// signal name does not exist — which is the whole of what "published
+        /// atomically" means, and a test holding this point can assert it
+        /// without depending on the scheduler. It is also the only place a
+        /// post-staging failure can be arranged, which is what gives the
+        /// cleanup path below a witness.
+        ///
+        /// # Errors
+        ///
+        /// As [`publish`].
+        pub(crate) fn publish_between(
+            signal: &Path,
+            fields: &[&str],
+            between: &mut dyn FnMut(),
+        ) -> std::io::Result<()> {
             let mut record = String::new();
             for field in fields {
                 if field.contains('\n') || field.contains('\r') {
@@ -5534,17 +5567,21 @@ pub(crate) mod test_support {
                 record.push(TERMINATOR);
             }
             let staged = staging_for(signal);
-            let write = (|| -> std::io::Result<()> {
-                let mut file = std::fs::File::create(&staged)?;
-                file.write_all(record.as_bytes())?;
-                file.flush()
-            })();
-            if let Err(error) = write {
-                // Cleanup, so a failed publish leaves neither the name nor the
-                // staging residue for the next one to inherit.
+            // `create_new`, and the `?` rather than a cleanup: if this fails
+            // nothing was created, and removing the name anyway would be
+            // removing a file this call does not own. Past this line the staging
+            // file is provably ours — a name unique to this call, brought into
+            // existence exclusively — so every failure below may remove it.
+            let mut file = std::fs::File::create_new(&staged)?;
+            let staged_write = file
+                .write_all(record.as_bytes())
+                .and_then(|()| file.flush());
+            drop(file);
+            if let Err(error) = staged_write {
                 let _ = std::fs::remove_file(&staged);
                 return Err(error);
             }
+            between();
             if let Err(error) = std::fs::rename(&staged, signal) {
                 let _ = std::fs::remove_file(&staged);
                 return Err(error);
@@ -5655,85 +5692,177 @@ pub(crate) mod test_support {
             Unterminated(String),
             /// The channel closed cleanly. §12's fast path.
             Eof,
+            /// The producer spent the whole output allowance without framing a
+            /// record. Terminal, so the reader stops rather than growing.
+            Flooded(usize),
             /// The read itself failed.
             Failed(String),
         }
 
-        /// Await the line `wanted` on `stdout`, bounded by `bound`.
+        /// Drain `stdout` into `framed`, one record at a time, bounded.
         ///
-        /// Lines that are not `wanted` are skipped rather than refused: a child
-        /// run under `--nocapture` prints its own harness chatter on the same
-        /// pipe, and a waiter that treated the first line as the answer would be
-        /// reading the harness.
-        ///
-        /// **The bound is effective.** The blocking read happens on a thread and
-        /// the deadline bounds the *wait*, so it fires while the producer is
-        /// still holding the pipe open — the live-silent case §12 says the bound
-        /// exists for, and the one a deadline checked after `read_line` returns
-        /// can never reach. The reader is abandoned on that path rather than
-        /// joined; it ends on its own when the last write handle closes, which
-        /// is the idiom [`Drain::collect`] already uses in this module.
-        pub(crate) fn await_line(stdout: ChildStdout, wanted: &str, bound: Duration) -> Waited {
-            let (framed, arrived) = mpsc::channel();
-            thread::spawn(move || {
-                let mut reader = BufReader::new(stdout);
-                loop {
-                    let mut line = String::new();
-                    let read = match reader.read_line(&mut line) {
-                        Ok(read) => read,
-                        Err(error) => {
-                            let _ = framed.send(Framed::Failed(error.to_string()));
-                            return;
-                        }
-                    };
-                    if read == 0 {
-                        let _ = framed.send(Framed::Eof);
+        /// The bound is `super::super::OUTPUT_LIMIT_BYTES` — this module's own
+        /// per-stream output allowance, reused rather than a second cap
+        /// introduced beside it. It matters because `read_line` against a
+        /// producer that never frames anything grows a `String` without limit:
+        /// the same shape `rundir::first_line` already refuses, and a fixture
+        /// that ran the machine out of memory while waiting would be a worse
+        /// failure than the one the wait is bounding.
+        fn read_frames(stdout: ChildStdout, framed: &Sender<Framed>) {
+            let mut reader = BufReader::new(stdout);
+            let mut drained = 0_usize;
+            loop {
+                let allowance = super::super::OUTPUT_LIMIT_BYTES.saturating_sub(drained);
+                if allowance == 0 {
+                    let _ = framed.send(Framed::Flooded(drained));
+                    return;
+                }
+                let mut line = String::new();
+                let read = match (&mut reader).take(allowance as u64).read_line(&mut line) {
+                    Ok(read) => read,
+                    Err(error) => {
+                        let _ = framed.send(Framed::Failed(error.to_string()));
                         return;
                     }
-                    let complete = line.ends_with(TERMINATOR);
-                    let message = if complete {
-                        Framed::Line(line)
-                    } else {
-                        Framed::Unterminated(line)
-                    };
-                    // A closed receiver means the waiter has already ended.
-                    if framed.send(message).is_err() || !complete {
-                        return;
+                };
+                if read == 0 {
+                    let _ = framed.send(Framed::Eof);
+                    return;
+                }
+                drained = drained.saturating_add(read);
+                let complete = line.ends_with(TERMINATOR);
+                let message = if complete {
+                    Framed::Line(line)
+                } else if drained >= super::super::OUTPUT_LIMIT_BYTES {
+                    // Cut by the allowance rather than by the producer ending.
+                    Framed::Flooded(drained)
+                } else {
+                    Framed::Unterminated(line)
+                };
+                // Only a complete record leaves the reader anything to do next;
+                // every other message is terminal, and a closed receiver means
+                // the waiter has already ended.
+                if framed.send(message).is_err() || !complete {
+                    return;
+                }
+            }
+        }
+
+        /// An adopted child, plus the reader draining its pipe.
+        ///
+        /// The type exists for its destructor. A reader thread blocked in
+        /// `read_line` cannot be joined by asking it to stop — only the last
+        /// write handle closing ends it — so terminating the child, reaping it
+        /// and joining the reader are one ordered operation, and the only place
+        /// that ordering can be guaranteed on a panicking path is a `Drop`.
+        pub(crate) struct Producer {
+            child: Child,
+            reader: Option<JoinHandle<()>>,
+            framed: Receiver<Framed>,
+        }
+
+        impl Producer {
+            /// Adopt `child`, draining its stdout if it was piped.
+            pub(crate) fn adopt(mut child: Child) -> Self {
+                let (sender, framed) = mpsc::channel();
+                let reader = child
+                    .stdout
+                    .take()
+                    .map(|stdout| thread::spawn(move || read_frames(stdout, &sender)));
+                Self {
+                    child,
+                    reader,
+                    framed,
+                }
+            }
+
+            /// The adopted child, for a test that drives the process directly.
+            pub(crate) fn child(&mut self) -> &mut Child {
+                &mut self.child
+            }
+
+            /// Whether the producer is still running.
+            pub(crate) fn alive(&mut self) -> bool {
+                self.child
+                    .try_wait()
+                    .expect("wait on the readiness producer")
+                    .is_none()
+            }
+
+            /// Await the line `wanted`, bounded by `bound`.
+            ///
+            /// Lines that are not `wanted` are skipped rather than refused: a
+            /// child run under `--nocapture` prints its own harness chatter on
+            /// the same pipe, and a waiter that treated the first line as the
+            /// answer would be reading the harness.
+            ///
+            /// **The bound is effective on both paths.** The blocking read
+            /// happens on the reader thread, so the deadline fires while the
+            /// producer is still holding the pipe open — the live-silent case
+            /// §12 says the bound exists for. And the noise path is bounded
+            /// too: once `remaining` reaches zero `recv_timeout` degenerates to
+            /// a non-blocking poll, so a producer that frames records faster
+            /// than the bound would keep returning `Ok` and the loop would run
+            /// past its own deadline for ever. The explicit check below is what
+            /// stops that, and it is the difference between a deadline and a
+            /// hope.
+            pub(crate) fn await_line(&mut self, wanted: &str, bound: Duration) -> Waited {
+                let deadline = Instant::now() + bound;
+                loop {
+                    let remaining = deadline.saturating_duration_since(Instant::now());
+                    match self.framed.recv_timeout(remaining) {
+                        Ok(Framed::Line(line)) => {
+                            if line.trim() == wanted {
+                                return Waited::Ready(vec![line.trim().to_owned()]);
+                            }
+                            if Instant::now() >= deadline {
+                                return Waited::TimedOut(bound);
+                            }
+                        }
+                        Ok(Framed::Unterminated(partial)) => {
+                            return Waited::Torn(format!(
+                                "the producer's channel ended mid-record: {partial:?} is a \
+                                 truncated write, not a line"
+                            ));
+                        }
+                        Ok(Framed::Flooded(bytes)) => {
+                            return Waited::Torn(format!(
+                                "the producer wrote {bytes} byte(s) without ever framing \
+                                 `{wanted}`, which is the whole per-stream output allowance"
+                            ));
+                        }
+                        Ok(Framed::Eof) => {
+                            return Waited::ProducerGone(format!(
+                                "it closed its channel without framing `{wanted}`"
+                            ));
+                        }
+                        Ok(Framed::Failed(error)) => {
+                            return Waited::ProducerGone(format!(
+                                "reading its channel failed: {error}"
+                            ));
+                        }
+                        Err(RecvTimeoutError::Timeout) => return Waited::TimedOut(bound),
+                        Err(RecvTimeoutError::Disconnected) => {
+                            return Waited::ProducerGone(
+                                "the reader ended without reaching a verdict".to_owned(),
+                            );
+                        }
                     }
                 }
-            });
+            }
+        }
 
-            let deadline = Instant::now() + bound;
-            loop {
-                let remaining = deadline.saturating_duration_since(Instant::now());
-                match arrived.recv_timeout(remaining) {
-                    Ok(Framed::Line(line)) => {
-                        if line.trim() == wanted {
-                            return Waited::Ready(vec![line.trim().to_owned()]);
-                        }
-                    }
-                    Ok(Framed::Unterminated(partial)) => {
-                        return Waited::Torn(format!(
-                            "the producer's channel ended mid-record: {partial:?} is a truncated \
-                             write, not a line"
-                        ));
-                    }
-                    Ok(Framed::Eof) => {
-                        return Waited::ProducerGone(format!(
-                            "it closed its channel without framing `{wanted}`"
-                        ));
-                    }
-                    Ok(Framed::Failed(error)) => {
-                        return Waited::ProducerGone(format!(
-                            "reading its channel failed: {error}"
-                        ));
-                    }
-                    Err(RecvTimeoutError::Timeout) => return Waited::TimedOut(bound),
-                    Err(RecvTimeoutError::Disconnected) => {
-                        return Waited::ProducerGone(
-                            "the reader ended without reaching a verdict".to_owned(),
-                        );
-                    }
+        impl Drop for Producer {
+            fn drop(&mut self) {
+                // Ordered, and the order is the whole point. Killing the child
+                // closes the pipe's last write handle, which is what lets a
+                // reader blocked in `read_line` reach EOF and end; joining
+                // first would deadlock on exactly the live-silent producer this
+                // module exists to bound.
+                let _ = self.child.kill();
+                let _ = self.child.wait();
+                if let Some(reader) = self.reader.take() {
+                    let _ = reader.join();
                 }
             }
         }
@@ -5743,598 +5872,11 @@ pub(crate) mod test_support {
 #[cfg(test)]
 mod tests {
     use std::path::{Path, PathBuf};
+    use std::sync::mpsc;
 
     use super::test_support::readiness;
     use super::test_support::run_with_timeout;
     use super::*;
-
-    // =======================================================================
-    // CODING_STANDARDS.md §12 readiness protocols
-    //
-    // The primitives live in `test_support::readiness` because four fixtures in
-    // three modules had each re-derived them; these are their witnesses, and
-    // each one names the subcase it covers. Every claim about a bound is made
-    // load-independently: what is asserted is which outcome ended the wait and
-    // whether the producer was still alive when it did, never that a machine
-    // finished something inside a window.
-    // =======================================================================
-
-    /// Where [`readiness_producer_helper`] takes its role from.
-    const READINESS_ROLE: &str = "UPSTROKE_READINESS_ROLE";
-
-    /// Where [`readiness_producer_helper`] publishes, when its role publishes.
-    const READINESS_SIGNAL: &str = "UPSTROKE_READINESS_SIGNAL";
-
-    /// A scratch directory for one readiness fixture, removed when it ends
-    /// however it ends.
-    ///
-    /// §12 asks for "unique temporary directories with RAII cleanup", and the
-    /// difference shows up on the failing path rather than the passing one: a
-    /// trailing `remove_dir_all` is the line a panicking assertion skips, and
-    /// these fixtures publish 64 KiB payloads sixteen at a time.
-    struct Scratch(PathBuf);
-
-    impl Scratch {
-        fn new(tag: &str) -> Self {
-            let dir = std::env::temp_dir().join(format!(
-                "upstroke-readiness-{tag}-{}-{}",
-                std::process::id(),
-                crate::ulid::ulid()
-            ));
-            std::fs::create_dir_all(&dir).expect("readiness scratch directory");
-            Self(dir)
-        }
-    }
-
-    impl Deref for Scratch {
-        type Target = Path;
-
-        fn deref(&self) -> &Path {
-            &self.0
-        }
-    }
-
-    impl Drop for Scratch {
-        fn drop(&mut self) {
-            let _ = std::fs::remove_dir_all(&self.0);
-        }
-    }
-
-    /// The producer half of the readiness tests.
-    ///
-    /// One helper and four roles, because what these tests vary is the
-    /// producer's behaviour and nothing else. §12's bound has to tell three
-    /// producers apart — one that is alive and silent, one that is already
-    /// gone, and one that is merely slow — and a helper per case would let them
-    /// drift into differing in something other than the case.
-    #[test]
-    #[ignore = "subprocess helper"]
-    fn readiness_producer_helper() {
-        let Some(role) = std::env::var_os(READINESS_ROLE) else {
-            return;
-        };
-        // Longer than any bound these tests set, and finite, so a helper
-        // abandoned by a failing parent cannot outlive the suite.
-        const ALIVE: Duration = Duration::from_secs(120);
-        // Long enough to be observed as "not yet", short enough that a healthy
-        // producer still lands well inside a generous bound.
-        const SLOW: Duration = Duration::from_millis(200);
-        let signal = || {
-            PathBuf::from(std::env::var_os(READINESS_SIGNAL).expect("the signal path to publish"))
-        };
-        match role.to_string_lossy().as_ref() {
-            // Alive, and publishes nothing at all: only the bound can end a
-            // wait on this one.
-            "silent" => thread::sleep(ALIVE),
-            // Gone at once, having published nothing. §12's fast path.
-            "dead" => {}
-            // Healthy but slow. A bound that ended either of these waits would
-            // be timing a producer that was fine.
-            "signal-after" => {
-                thread::sleep(SLOW);
-                readiness::publish(&signal(), &["published"]).expect("publish the signal");
-                thread::sleep(ALIVE);
-            }
-            "line-after" => {
-                thread::sleep(SLOW);
-                println!("held");
-                std::io::stdout().flush().expect("frame the line");
-                thread::sleep(ALIVE);
-            }
-            other => panic!("unknown readiness producer role `{other}`"),
-        }
-        std::process::exit(0);
-    }
-
-    /// A spawned [`readiness_producer_helper`], killed when the test ends
-    /// however it ends.
-    struct Producer(Child);
-
-    impl Producer {
-        fn spawn(role: &str, signal: Option<&Path>, stdout: Stdio) -> Self {
-            let mut command = Command::new(std::env::current_exe().expect("test executable"));
-            command
-                .args([
-                    "--exact",
-                    "agent::proc::tests::readiness_producer_helper",
-                    "--ignored",
-                    "--nocapture",
-                ])
-                .env(READINESS_ROLE, role)
-                .stdin(Stdio::null())
-                .stdout(stdout)
-                .stderr(Stdio::null());
-            if let Some(signal) = signal {
-                command.env(READINESS_SIGNAL, signal);
-            }
-            Self(command.spawn().expect("spawn the readiness producer"))
-        }
-
-        fn child(&mut self) -> &mut Child {
-            &mut self.0
-        }
-
-        /// Whether the producer is still running.
-        fn alive(&mut self) -> bool {
-            self.0
-                .try_wait()
-                .expect("wait on the readiness producer")
-                .is_none()
-        }
-    }
-
-    impl Drop for Producer {
-        fn drop(&mut self) {
-            let _ = self.0.kill();
-            let _ = self.0.wait();
-        }
-    }
-
-    /// **Partial writes.** A truncated record is refused rather than read as a
-    /// short whole one, and a field the framing cannot carry is refused at the
-    /// producer.
-    ///
-    /// §12: "a partial record MUST NOT be readable as a whole one … an
-    /// unterminated final record is a truncated write and MUST fail rather than
-    /// yield a short value". The first block is the positive control, and it is
-    /// what every hand-rolled reader in this crate did: `str::lines` hands the
-    /// truncated tail back as a value, and a path is exactly the payload for
-    /// which a short value still looks like a plausible one.
-    #[test]
-    fn a_partial_record_is_refused_rather_than_read_as_a_short_one() {
-        let scratch = Scratch::new("partial");
-        let signal = scratch.join("signal");
-
-        let torn = "/tmp/upstroke-snapsho";
-        std::fs::write(&signal, torn).expect("plant a truncated write");
-        assert_eq!(
-            std::fs::read_to_string(&signal)
-                .expect("read the truncated write")
-                .lines()
-                .next(),
-            Some(torn),
-            "the control is sharp: `lines` yields a truncated tail as a whole field, so a \
-             reader built on it cannot tell this from a complete record"
-        );
-        let error = readiness::read_published(&signal).expect_err("a partial record is refused");
-        assert_eq!(error.kind(), std::io::ErrorKind::UnexpectedEof, "{error}");
-        assert!(error.to_string().contains("truncated write"), "{error}");
-
-        // The same fields, framed and published, read back whole.
-        readiness::publish(&signal, &["/tmp/upstroke-snapshot", "cafe"]).expect("publish");
-        assert_eq!(
-            readiness::read_published(&signal).expect("a whole record reads"),
-            ["/tmp/upstroke-snapshot", "cafe"]
-        );
-
-        // And the payload is kept inside what the framing can carry, at the
-        // producer — the only place it can still be told apart from two fields.
-        let error = readiness::publish(&signal, &["two\nfields"])
-            .expect_err("a field carrying the delimiter is refused");
-        assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput, "{error}");
-        assert_eq!(
-            readiness::read_published(&signal).expect("the refused publish changed nothing"),
-            ["/tmp/upstroke-snapshot", "cafe"]
-        );
-    }
-
-    /// **A live but silent producer.** The bound ends the wait, and the
-    /// producer is still running when it does.
-    ///
-    /// §12: "the bound MUST bound a producer that has wedged rather than time
-    /// one that is healthy … the fast path is a producer that fails and closes
-    /// its channel; the bound is for the one that stays alive and silent."
-    ///
-    /// The pipe half is the one that could not be written before these
-    /// primitives existed. Three waits in `src/rundir.rs` checked their
-    /// deadline only after a blocking `read_line` returned, so against this
-    /// producer the read blocked and the deadline was never reached at all —
-    /// the bound was unreachable in exactly the case it was written for.
-    #[test]
-    fn a_live_but_silent_producer_ends_the_wait_at_the_bound() {
-        // Small and caller-supplied. A producer that publishes nothing can only
-        // ever reach its bound, so nothing here depends on machine speed.
-        const BOUND: Duration = Duration::from_millis(250);
-        let scratch = Scratch::new("silent");
-        let signal = scratch.join("signal");
-
-        let mut producer = Producer::spawn("silent", Some(&signal), Stdio::null());
-        let started = Instant::now();
-        let waited = readiness::await_signal(&signal, producer.child(), BOUND);
-        let elapsed = started.elapsed();
-        match waited {
-            readiness::Waited::TimedOut(reported) => assert_eq!(reported, BOUND),
-            other => panic!("a live silent producer must time the wait out, not give {other:?}"),
-        }
-        assert!(
-            elapsed >= BOUND,
-            "the wait ended before its own bound: {elapsed:?}"
-        );
-        assert!(
-            producer.alive(),
-            "the producer must still be running: a wait that only ever ends once its producer \
-             has died is not bounding the live-silent case at all"
-        );
-        drop(producer);
-
-        let mut producer = Producer::spawn("silent", None, Stdio::piped());
-        let stdout = producer.child().stdout.take().expect("piped stdout");
-        let started = Instant::now();
-        let waited = readiness::await_line(stdout, "held", BOUND);
-        let elapsed = started.elapsed();
-        match waited {
-            readiness::Waited::TimedOut(reported) => assert_eq!(reported, BOUND),
-            other => panic!("a live silent producer must time the wait out, not give {other:?}"),
-        }
-        assert!(
-            elapsed >= BOUND,
-            "the wait ended before its own bound: {elapsed:?}"
-        );
-        assert!(
-            producer.alive(),
-            "the producer is still holding the pipe open, which is the case a deadline checked \
-             after `read_line` returns can never reach"
-        );
-    }
-
-    /// **A dead producer.** The wait ends on the producer's death rather than
-    /// on the clock, and says so.
-    ///
-    /// §12's fast path. The bound is set far past anything this suite could
-    /// spend, so the claim is that the wait does not wait it out: a waiter that
-    /// only watched its signal would report "nothing published in five
-    /// minutes", which is the clock talking rather than the death.
-    #[test]
-    fn a_dead_producer_ends_the_wait_without_spending_the_bound() {
-        const BOUND: Duration = Duration::from_secs(300);
-        let scratch = Scratch::new("dead");
-        let signal = scratch.join("signal");
-
-        let mut producer = Producer::spawn("dead", Some(&signal), Stdio::null());
-        let started = Instant::now();
-        let waited = readiness::await_signal(&signal, producer.child(), BOUND);
-        let elapsed = started.elapsed();
-        match waited {
-            readiness::Waited::ProducerGone(why) => assert!(
-                why.contains("without publishing"),
-                "the report must name the death, not the clock: {why}"
-            ),
-            other => panic!("a producer that exited without publishing is not {other:?}"),
-        }
-        assert!(
-            elapsed < BOUND,
-            "the wait spent its whole bound: {elapsed:?}"
-        );
-        drop(producer);
-
-        let mut producer = Producer::spawn("dead", None, Stdio::piped());
-        let stdout = producer.child().stdout.take().expect("piped stdout");
-        let started = Instant::now();
-        let waited = readiness::await_line(stdout, "held", BOUND);
-        let elapsed = started.elapsed();
-        match waited {
-            readiness::Waited::ProducerGone(why) => assert!(
-                why.contains("closed its channel"),
-                "a closed channel is the pipe's own fast path: {why}"
-            ),
-            other => panic!("a producer that closed its channel is not {other:?}"),
-        }
-        assert!(
-            elapsed < BOUND,
-            "the wait spent its whole bound: {elapsed:?}"
-        );
-    }
-
-    /// **Effective deadlines.** The bound is the caller's, it bounds the wait
-    /// rather than the producer, and it does not time a producer that is merely
-    /// slow.
-    ///
-    /// §12: "a deadline short enough to expire on a loaded runner has become
-    /// the signal itself, which is the failure this rule exists to prevent."
-    /// Two claims, and the second is the one that keeps the first honest — a
-    /// wait that always returned at its bound would satisfy the timing half and
-    /// still be useless.
-    #[test]
-    fn the_bound_is_the_callers_and_it_does_not_time_a_healthy_producer() {
-        let scratch = Scratch::new("deadline");
-
-        // Two bounds against one silent producer: each wait ends at the value
-        // its caller passed, and the longer bound spends longer.
-        let silent = scratch.join("never");
-        let mut producer = Producer::spawn("silent", Some(&silent), Stdio::null());
-        let mut spent = Vec::new();
-        for bound in [Duration::from_millis(120), Duration::from_millis(480)] {
-            let started = Instant::now();
-            match readiness::await_signal(&silent, producer.child(), bound) {
-                readiness::Waited::TimedOut(reported) => assert_eq!(reported, bound),
-                other => panic!("a silent producer must time the wait out, not give {other:?}"),
-            }
-            let elapsed = started.elapsed();
-            assert!(
-                elapsed >= bound,
-                "ended before its own bound: {elapsed:?} < {bound:?}"
-            );
-            spent.push(elapsed);
-        }
-        assert!(
-            spent[1] > spent[0],
-            "the wait spends the bound it was given, not one of its own: {spent:?}"
-        );
-        drop(producer);
-
-        // And a producer that is slow but fine is not timed out, at the bound
-        // `src/rundir.rs`'s waits already use.
-        const GENEROUS: Duration = Duration::from_secs(30);
-        let signal = scratch.join("eventually");
-        let mut producer = Producer::spawn("signal-after", Some(&signal), Stdio::null());
-        let started = Instant::now();
-        let waited = readiness::await_signal(&signal, producer.child(), GENEROUS);
-        let elapsed = started.elapsed();
-        assert_eq!(
-            waited.or_fail("the slow producer published and was still refused"),
-            ["published"]
-        );
-        assert!(
-            elapsed < GENEROUS,
-            "the wait returned when the signal landed, not at its bound: {elapsed:?}"
-        );
-        drop(producer);
-
-        let mut producer = Producer::spawn("line-after", None, Stdio::piped());
-        let stdout = producer.child().stdout.take().expect("piped stdout");
-        let started = Instant::now();
-        let waited = readiness::await_line(stdout, "held", GENEROUS);
-        let elapsed = started.elapsed();
-        assert_eq!(
-            waited.or_fail("the slow producer framed its line and was still refused"),
-            ["held"]
-        );
-        assert!(
-            elapsed < GENEROUS,
-            "the wait returned when the line landed, not at its bound: {elapsed:?}"
-        );
-    }
-
-    /// Create the signal in place and fill it afterwards: §12's unsound form.
-    ///
-    /// The gap models the separation rather than inventing it. `fs::write` is
-    /// create-then-write with no gap at all, which makes the window narrow —
-    /// not absent, which is the whole point of the rule.
-    fn write_in_place(signal: &Path, payload: &str) {
-        let mut file = std::fs::File::create(signal).expect("create the signal in place");
-        thread::sleep(Duration::from_millis(10));
-        file.write_all(payload.as_bytes())
-            .expect("fill it afterwards");
-    }
-
-    /// Stage elsewhere and rename: §12's sound form.
-    fn publish_atomically(signal: &Path, payload: &str) {
-        readiness::publish(signal, &[payload]).expect("publish");
-    }
-
-    /// Produce `rounds` signals with `produce`, watching for each from this
-    /// thread, and count the times a visible signal did not yet carry its whole
-    /// payload.
-    fn incomplete_observations(
-        scratch: &Path,
-        rounds: usize,
-        payload: &str,
-        produce: fn(&Path, &str),
-    ) -> usize {
-        let mut incomplete = 0;
-        for round in 0..rounds {
-            let signal = scratch.join(format!("observed-{round}"));
-            let producing = signal.clone();
-            let content = payload.to_owned();
-            let producer = thread::spawn(move || produce(&producing, &content));
-            let deadline = Instant::now() + Duration::from_secs(30);
-            let mut saw = false;
-            while Instant::now() < deadline {
-                if signal.exists() {
-                    saw = true;
-                    let whole = matches!(
-                        std::fs::read_to_string(&signal),
-                        Ok(ref seen) if seen.trim_end_matches('\n') == payload
-                    );
-                    if !whole {
-                        incomplete += 1;
-                    }
-                    break;
-                }
-                thread::yield_now();
-            }
-            producer.join().expect("the producer thread");
-            assert!(
-                saw,
-                "the producer never made round {round}'s signal visible"
-            );
-        }
-        incomplete
-    }
-
-    /// **Publication before notification.** A signal becomes visible only once
-    /// the state it announces is complete — its own bytes, and the state it
-    /// names.
-    ///
-    /// §12: "a readiness signal MUST be published only after the state it
-    /// announces is complete and observable by the waiter. Publish it last, not
-    /// alongside the work it describes", and "a file's existence is a readiness
-    /// signal only if the file is published atomically."
-    ///
-    /// The control is what makes this more than an assertion that nothing went
-    /// wrong: the unsound form is run through the same watcher first and MUST
-    /// be caught, so a watcher too slow to see a torn publication cannot pass
-    /// the sound half by never looking hard enough.
-    #[test]
-    fn a_signal_is_visible_only_after_the_state_it_announces() {
-        const ROUNDS: usize = 16;
-        let scratch = Scratch::new("ordering");
-        // Large enough that a reader catching it half-written sees that it did.
-        let payload = "x".repeat(64 * 1024);
-
-        let control = Scratch::new("ordering-control");
-        let caught = incomplete_observations(&control, ROUNDS, &payload, write_in_place);
-        assert!(
-            caught > 0,
-            "the watcher never caught the unsound form mid-write, so it is not sharp enough \
-             for the sound half below to mean anything"
-        );
-        drop(control);
-
-        let torn = incomplete_observations(&scratch, ROUNDS, &payload, publish_atomically);
-        assert_eq!(
-            torn, 0,
-            "a published signal was visible before its own bytes were, in {torn} of {ROUNDS} \
-             rounds the same watcher caught the unsound form in {caught} of"
-        );
-
-        // The other half of the ordering: the state a signal *names* is
-        // complete whenever the signal is visible. This is what the adoption
-        // sites stand on — `workspace::tests::
-        // hard_killed_snapshot_owner_is_reclaimed_before_resume` asserts the
-        // snapshot directory exists the moment it reads the identifier.
-        let mut early = 0;
-        for round in 0..ROUNDS {
-            let state = scratch.join(format!("state-{round}"));
-            let signal = scratch.join(format!("announce-{round}"));
-            let (producing, announcing, content) = (state.clone(), signal.clone(), payload.clone());
-            let producer = thread::spawn(move || {
-                let mut file = std::fs::File::create(&producing).expect("the announced state");
-                file.write_all(content.as_bytes()).expect("fill the state");
-                drop(file);
-                // Published last, not alongside the work it describes.
-                let name = producing
-                    .file_name()
-                    .and_then(std::ffi::OsStr::to_str)
-                    .expect("the state's identifier");
-                readiness::publish(&announcing, &[name]).expect("announce the state");
-            });
-            let deadline = Instant::now() + Duration::from_secs(30);
-            while !signal.exists() && Instant::now() < deadline {
-                thread::yield_now();
-            }
-            assert!(
-                signal.exists(),
-                "the producer never announced round {round}"
-            );
-            let named = readiness::read_published(&signal).expect("the announcement reads whole");
-            let [name] = named.as_slice() else {
-                panic!("the announcement names one state, not {named:?}")
-            };
-            let announced = scratch.join(name);
-            let complete = matches!(
-                std::fs::read_to_string(&announced),
-                Ok(ref seen) if seen == &payload
-            );
-            if !complete {
-                early += 1;
-            }
-            producer.join().expect("the producer thread");
-        }
-        assert_eq!(
-            early, 0,
-            "a signal was visible while the state it announces was not yet whole, in {early} of \
-             {ROUNDS} rounds"
-        );
-    }
-
-    /// **Cleanup.** A publication leaves no staging residue, a refused one
-    /// leaves neither the name nor the residue, and the marker form is not
-    /// mistaken for a truncated record.
-    ///
-    /// The residue matters beyond tidiness: a staging file left under a
-    /// predictable name is the next publication's starting content, and a
-    /// refused publish that created the signal name would be a readiness claim
-    /// nobody meant to make.
-    #[test]
-    fn publication_leaves_no_residue_and_a_refused_one_leaves_no_claim() {
-        let scratch = Scratch::new("cleanup");
-        let signal = scratch.join("signal");
-
-        readiness::publish(&signal, &["field"]).expect("publish");
-        assert!(signal.exists(), "the signal is published");
-        assert!(
-            !scratch.join("signal.publishing").exists(),
-            "the staging name is spent by the rename, not left behind"
-        );
-
-        // A refused publish creates nothing at all. The framing check runs
-        // before the staging write, so this is "there was no file to clean up"
-        // rather than "the file was cleaned up" -- the stronger of the two, and
-        // worth pinning in that form so a later refactor that moved the check
-        // after the write would have to move this assertion too.
-        let refused = scratch.join("refused");
-        readiness::publish(&refused, &["two\nfields"]).expect_err("refused");
-        assert!(
-            !refused.exists(),
-            "a refused publish must not create the name: an empty signal is still a claim"
-        );
-        assert!(
-            !scratch.join("refused.publishing").exists(),
-            "nor the staging name"
-        );
-
-        // And a publish whose staging write fails leaves the same nothing.
-        let unreachable = scratch.join("no-such-directory").join("signal");
-        readiness::publish(&unreachable, &["field"])
-            .expect_err("a signal under a directory that does not exist cannot be published");
-        assert!(!unreachable.exists(), "the failed publish is not a claim");
-        assert!(
-            !scratch.join("no-such-directory").exists(),
-            "and publishing creates no directories on the way"
-        );
-
-        // The marker form: an empty published file reads as no fields rather
-        // than as a truncated record, and it is unambiguous because `publish`
-        // renames — a partial record is never given this name.
-        let marker = scratch.join("marker");
-        readiness::publish_marker(&marker).expect("publish a marker");
-        assert!(marker.exists(), "the marker is published");
-        assert!(
-            readiness::read_published(&marker)
-                .expect("a marker reads")
-                .is_empty(),
-            "a marker announces state it has nothing to say about"
-        );
-
-        // Republishing replaces the record whole.
-        readiness::publish(&signal, &["second"]).expect("republish");
-        assert_eq!(
-            readiness::read_published(&signal).expect("read back"),
-            ["second"]
-        );
-
-        let mut left: Vec<String> = std::fs::read_dir(&*scratch)
-            .expect("the scratch directory")
-            .filter_map(|entry| Some(entry.ok()?.file_name().to_string_lossy().into_owned()))
-            .collect();
-        left.sort();
-        assert_eq!(
-            left,
-            ["marker", "signal"],
-            "the directory holds exactly what was published"
-        );
-    }
 
     /// A memoised establishment failure is reported to **every** later caller.
     ///
@@ -6980,6 +6522,7 @@ mod tests {
         }
         drop(stderr);
         drop(tree);
+        let _ = std::fs::remove_dir_all(&scratch);
         assert!(
             settled,
             "kill_tree returned while a member of the child's process group was still \
@@ -7376,6 +6919,7 @@ mod tests {
             let _ = libc::kill(agent_pid, libc::SIGKILL);
             let _ = libc::kill(-agent_pid, libc::SIGKILL);
         }
+        let _ = std::fs::remove_dir_all(&scratch);
         assert!(
             settled,
             "the reaper waited for a pipe EOF that a surviving fork will never \
@@ -7520,6 +7064,7 @@ mod tests {
         assert!(ready.exists(), "the descendant never began executing");
         thread::sleep(Duration::from_millis(1300));
         let leaked = marker.exists();
+        let _ = std::fs::remove_dir_all(&scratch);
         assert!(
             !leaked,
             "a Windows descendant outlived its successful parent"
@@ -7562,6 +7107,7 @@ mod tests {
 
         thread::sleep(Duration::from_millis(1300));
         let leaked = marker.exists();
+        let _ = std::fs::remove_dir_all(&scratch);
         assert!(
             !leaked,
             "kill-on-close did not terminate the owned descendant"
@@ -7761,6 +7307,7 @@ mod tests {
         // instead, and fail in words.
         if tree.job.contains(std::process::id()) != Some(false) {
             std::mem::forget(tree);
+            let _ = std::fs::remove_dir_all(&scratch);
             panic!(
                 "the coordinator is a member of the per-invocation job: a timeout \
                  on one invocation would terminate the coordinator and every other \
@@ -7783,6 +7330,7 @@ mod tests {
         }
         let in_job = tree.job.contains(pid);
         drop(tree);
+        let _ = std::fs::remove_dir_all(&scratch);
         assert!(
             !escaped,
             "kill_tree returned while a member of the job was still running \
@@ -7808,6 +7356,7 @@ mod tests {
         .expect("supervise the tree");
         let (pid, created) = read_windows_identity(&ready, Duration::from_secs(30));
         let escaped = still_running_after(pid, created, Duration::from_secs(3));
+        let _ = std::fs::remove_dir_all(&scratch);
         assert!(output.timed_out, "{output:?}");
         assert!(
             !output.stderr.contains("ESCAPED"),
@@ -7844,6 +7393,7 @@ mod tests {
         .expect("supervise the tree");
         let (pid, created) = read_windows_identity(&ready, Duration::from_secs(30));
         let escaped = still_running_after(pid, created, Duration::from_secs(3));
+        let _ = std::fs::remove_dir_all(&scratch);
         assert!(output.output_limited, "{output:?}");
         assert!(
             !output.stderr.contains("ESCAPED"),
@@ -7967,6 +7517,7 @@ mod tests {
         let _ = job.terminate_and_wait();
         let _ = child.kill();
         let _ = child.wait();
+        let _ = std::fs::remove_dir_all(&scratch);
 
         let observed = &shared.borrow().rows;
         let expected = vec![
@@ -8057,6 +7608,7 @@ mod tests {
                 .unwrap_or_else(|| panic!("the child was created before the {step}"));
             let alive = process_alive(pid, created);
             let ran = ready.exists();
+            let _ = std::fs::remove_dir_all(&scratch);
             assert!(
                 !alive,
                 "a suspended stub outlived the failed {step} ({error}): pid {pid} is still running"
@@ -8466,6 +8018,7 @@ mod tests {
                 .expect("clock after epoch")
                 .as_nanos()
         ));
+        let _ = std::fs::remove_dir_all(&scratch);
         std::fs::create_dir_all(&scratch).expect("scratch dir");
         let ready = scratch.join("ready");
         let marker = scratch.join("leaked");
@@ -8789,6 +8342,7 @@ mod tests {
             !ready.exists(),
             "an agent launched under the unsafe signal policy"
         );
+        let _ = std::fs::remove_dir_all(&scratch);
     }
 
     #[cfg(unix)]
@@ -9482,5 +9036,720 @@ mod tests {
                 "the container half replaced the process half: the agent group survived"
             );
         }
+    }
+
+    // =======================================================================
+    // CODING_STANDARDS.md §12 readiness protocols
+    //
+    // The primitives live in `test_support::readiness` because several fixtures
+    // in three modules had each re-derived them; these are their witnesses, and
+    // each one names the subcase it covers. No claim about a bound is made from
+    // wall-clock coincidence: what is asserted is which outcome ended a wait and
+    // whether the producer was still alive when it did, and where an
+    // interleaving is the subject it is *arranged* through a handshake rather
+    // than raced for.
+    // =======================================================================
+
+    /// Where [`readiness_producer_helper`] takes its role from.
+    const READINESS_ROLE: &str = "UPSTROKE_READINESS_ROLE";
+
+    /// Where [`readiness_producer_helper`] publishes, when its role publishes.
+    const READINESS_SIGNAL: &str = "UPSTROKE_READINESS_SIGNAL";
+
+    /// A scratch directory for one readiness fixture, removed when it ends
+    /// however it ends.
+    ///
+    /// §12 asks for "unique temporary directories with RAII cleanup", and the
+    /// difference shows up on the failing path rather than the passing one: a
+    /// trailing `remove_dir_all` is the line a panicking assertion skips, and
+    /// these fixtures publish 64 KiB payloads sixteen at a time.
+    struct Scratch(PathBuf);
+
+    impl Scratch {
+        fn new(tag: &str) -> Self {
+            let dir = std::env::temp_dir().join(format!(
+                "upstroke-readiness-{tag}-{}-{}",
+                std::process::id(),
+                crate::ulid::ulid()
+            ));
+            std::fs::create_dir_all(&dir).expect("readiness scratch directory");
+            Self(dir)
+        }
+    }
+
+    impl Deref for Scratch {
+        type Target = Path;
+
+        fn deref(&self) -> &Path {
+            &self.0
+        }
+    }
+
+    impl Drop for Scratch {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    /// The producer half of the readiness tests.
+    ///
+    /// One helper and five roles, because what these tests vary is the
+    /// producer's behaviour and nothing else. §12's bound has to tell three
+    /// producers apart — one that is alive and silent, one that is already
+    /// gone, and one that is merely slow — and a helper per case would let them
+    /// drift into differing in something other than the case.
+    #[test]
+    #[ignore = "subprocess helper"]
+    fn readiness_producer_helper() {
+        let Some(role) = std::env::var_os(READINESS_ROLE) else {
+            return;
+        };
+        // Longer than any bound these tests set, and finite, so a helper
+        // abandoned by a failing parent cannot outlive the suite.
+        const ALIVE: Duration = Duration::from_secs(120);
+        // Long enough to be observed as "not yet", short enough that a healthy
+        // producer still lands well inside a generous bound.
+        const SLOW: Duration = Duration::from_millis(200);
+        let signal = || {
+            PathBuf::from(std::env::var_os(READINESS_SIGNAL).expect("the signal path to publish"))
+        };
+        match role.to_string_lossy().as_ref() {
+            // Alive, and publishes nothing at all: only the bound can end a
+            // wait on this one.
+            "silent" => thread::sleep(ALIVE),
+            // Gone at once, having published nothing. §12's fast path.
+            "dead" => {}
+            // Healthy but slow. A bound that ended either of these waits would
+            // be timing a producer that was fine.
+            "signal-after" => {
+                thread::sleep(SLOW);
+                readiness::publish(&signal(), &["published"]).expect("publish the signal");
+                thread::sleep(ALIVE);
+            }
+            "line-after" => {
+                thread::sleep(SLOW);
+                println!("held");
+                std::io::stdout().flush().expect("frame the line");
+                thread::sleep(ALIVE);
+            }
+            // Frames records as fast as it can, none of them the wanted one.
+            // The waiter's `recv_timeout` never has to block against this, so
+            // it is the producer that finds out whether the deadline is
+            // checked on the noise path or only on the idle one.
+            "noise" => {
+                // Block-buffered, deliberately. `println!` goes through a
+                // `LineWriter` and pays a syscall per record, which is slower
+                // than a waiter draining the channel -- so the channel keeps
+                // emptying and the deadline never has to be checked on the
+                // noise arm at all. Batching the records is what makes this
+                // producer actually outrun its reader, which is the condition
+                // the arm exists for.
+                let mut out = std::io::BufWriter::with_capacity(1 << 16, std::io::stdout());
+                let record = "not-the-line\n".repeat(512);
+                loop {
+                    if out.write_all(record.as_bytes()).is_err() {
+                        break;
+                    }
+                }
+            }
+            other => panic!("unknown readiness producer role `{other}`"),
+        }
+        std::process::exit(0);
+    }
+
+    /// Spawn [`readiness_producer_helper`] in `role`, adopted by the RAII
+    /// producer so it is terminated, reaped and its reader joined on every path.
+    fn readiness_producer(role: &str, signal: Option<&Path>, stdout: Stdio) -> readiness::Producer {
+        let mut command = Command::new(std::env::current_exe().expect("test executable"));
+        command
+            .args([
+                "--exact",
+                "agent::proc::tests::readiness_producer_helper",
+                "--ignored",
+                "--nocapture",
+            ])
+            .env(READINESS_ROLE, role)
+            .stdin(Stdio::null())
+            .stdout(stdout)
+            .stderr(Stdio::null());
+        if let Some(signal) = signal {
+            command.env(READINESS_SIGNAL, signal);
+        }
+        readiness::Producer::adopt(command.spawn().expect("spawn the readiness producer"))
+    }
+
+    /// **Partial writes.** A truncated record is refused rather than read as a
+    /// short whole one, and a field the framing cannot carry is refused at the
+    /// producer.
+    ///
+    /// §12: "a partial record MUST NOT be readable as a whole one … an
+    /// unterminated final record is a truncated write and MUST fail rather than
+    /// yield a short value". The first block is the positive control, and it is
+    /// what every hand-rolled reader in this crate did: `str::lines` hands the
+    /// truncated tail back as a value, and a path is exactly the payload for
+    /// which a short value still looks like a plausible one.
+    #[test]
+    fn a_partial_record_is_refused_rather_than_read_as_a_short_one() {
+        let scratch = Scratch::new("partial");
+        let signal = scratch.join("signal");
+
+        let torn = "/tmp/upstroke-snapsho";
+        std::fs::write(&signal, torn).expect("plant a truncated write");
+        assert_eq!(
+            std::fs::read_to_string(&signal)
+                .expect("read the truncated write")
+                .lines()
+                .next(),
+            Some(torn),
+            "the control is sharp: `lines` yields a truncated tail as a whole field, so a \
+             reader built on it cannot tell this from a complete record"
+        );
+        let error = readiness::read_published(&signal).expect_err("a partial record is refused");
+        assert_eq!(error.kind(), std::io::ErrorKind::UnexpectedEof, "{error}");
+        assert!(error.to_string().contains("truncated write"), "{error}");
+
+        // The same fields, framed and published, read back whole.
+        readiness::publish(&signal, &["/tmp/upstroke-snapshot", "cafe"]).expect("publish");
+        assert_eq!(
+            readiness::read_published(&signal).expect("a whole record reads"),
+            ["/tmp/upstroke-snapshot", "cafe"]
+        );
+
+        // And the payload is kept inside what the framing can carry, at the
+        // producer — the only place it can still be told apart from two fields.
+        let error = readiness::publish(&signal, &["two\nfields"])
+            .expect_err("a field carrying the delimiter is refused");
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput, "{error}");
+        assert_eq!(
+            readiness::read_published(&signal).expect("the refused publish changed nothing"),
+            ["/tmp/upstroke-snapshot", "cafe"]
+        );
+    }
+
+    /// **A live but silent producer.** The bound ends the wait, and the
+    /// producer is still running when it does.
+    ///
+    /// §12: "the bound MUST bound a producer that has wedged rather than time
+    /// one that is healthy … the fast path is a producer that fails and closes
+    /// its channel; the bound is for the one that stays alive and silent."
+    ///
+    /// The pipe half is the one that could not be written before these
+    /// primitives existed. Three waits in `src/rundir.rs` checked their
+    /// deadline only after a blocking `read_line` returned, so against this
+    /// producer the read blocked and the deadline was never reached at all —
+    /// the bound was unreachable in exactly the case it was written for.
+    #[test]
+    fn a_live_but_silent_producer_ends_the_wait_at_the_bound() {
+        // Small and caller-supplied. A producer that publishes nothing can only
+        // ever reach its bound, so nothing here depends on machine speed.
+        const BOUND: Duration = Duration::from_millis(250);
+        let scratch = Scratch::new("silent");
+        let signal = scratch.join("signal");
+
+        let mut producer = readiness_producer("silent", Some(&signal), Stdio::null());
+        let started = Instant::now();
+        let waited = readiness::await_signal(&signal, producer.child(), BOUND);
+        let elapsed = started.elapsed();
+        match waited {
+            readiness::Waited::TimedOut(reported) => assert_eq!(reported, BOUND),
+            other => panic!("a live silent producer must time the wait out, not give {other:?}"),
+        }
+        assert!(
+            elapsed >= BOUND,
+            "the wait ended before its own bound: {elapsed:?}"
+        );
+        assert!(
+            producer.alive(),
+            "the producer must still be running: a wait that only ever ends once its producer \
+             has died is not bounding the live-silent case at all"
+        );
+        drop(producer);
+
+        let mut producer = readiness_producer("silent", None, Stdio::piped());
+        let started = Instant::now();
+        let waited = producer.await_line("held", BOUND);
+        let elapsed = started.elapsed();
+        match waited {
+            readiness::Waited::TimedOut(reported) => assert_eq!(reported, BOUND),
+            other => panic!("a live silent producer must time the wait out, not give {other:?}"),
+        }
+        assert!(
+            elapsed >= BOUND,
+            "the wait ended before its own bound: {elapsed:?}"
+        );
+        assert!(
+            producer.alive(),
+            "the producer is still holding the pipe open, which is the case a deadline checked \
+             after `read_line` returns can never reach"
+        );
+    }
+
+    /// **A flooding producer is stopped by the output allowance.**
+    ///
+    /// The sibling above bounds an *idle* channel, where `recv_timeout` blocks
+    /// and its own timeout does the work. This is the other producer: one that
+    /// frames records faster than the waiter drains them, so the channel is
+    /// never empty and no timeout ever fires. What ends this wait is the byte
+    /// bound on the reader — `OUTPUT_LIMIT_BYTES`, this module's own per-stream
+    /// allowance — and the assertion names it, because a wait that ended at the
+    /// clock instead would mean the reader had gone on growing.
+    ///
+    /// The bound is deliberately generous so the clock cannot be the answer:
+    /// under a reader with no byte bound this test does not fail late, it fails
+    /// *differently*, reporting `TimedOut` thirty seconds later.
+    #[test]
+    fn a_flooding_producer_is_stopped_by_the_output_allowance() {
+        const GENEROUS: Duration = Duration::from_secs(30);
+        let mut producer = readiness_producer("noise", None, Stdio::piped());
+        let started = Instant::now();
+        let waited = producer.await_line("held", GENEROUS);
+        let elapsed = started.elapsed();
+        match waited {
+            readiness::Waited::Torn(why) => assert!(
+                why.contains("output allowance"),
+                "the allowance must be what it names: {why}"
+            ),
+            other => panic!(
+                "a flooding producer must be stopped by the output allowance, not by {other:?}"
+            ),
+        }
+        assert!(
+            elapsed < GENEROUS,
+            "the allowance ended the wait, not the deadline: {elapsed:?}"
+        );
+    }
+
+    /// **A dead producer.** The wait ends on the producer's death rather than
+    /// on the clock, and says so.
+    ///
+    /// §12's fast path. The bound is set far past anything this suite could
+    /// spend, so the claim is that the wait does not wait it out: a waiter that
+    /// only watched its signal would report "nothing published in five
+    /// minutes", which is the clock talking rather than the death.
+    #[test]
+    fn a_dead_producer_ends_the_wait_without_spending_the_bound() {
+        const BOUND: Duration = Duration::from_secs(300);
+        let scratch = Scratch::new("dead");
+        let signal = scratch.join("signal");
+
+        let mut producer = readiness_producer("dead", Some(&signal), Stdio::null());
+        let started = Instant::now();
+        let waited = readiness::await_signal(&signal, producer.child(), BOUND);
+        let elapsed = started.elapsed();
+        match waited {
+            readiness::Waited::ProducerGone(why) => assert!(
+                why.contains("without publishing"),
+                "the report must name the death, not the clock: {why}"
+            ),
+            other => panic!("a producer that exited without publishing is not {other:?}"),
+        }
+        assert!(
+            elapsed < BOUND,
+            "the wait spent its whole bound: {elapsed:?}"
+        );
+        drop(producer);
+
+        let mut producer = readiness_producer("dead", None, Stdio::piped());
+        let started = Instant::now();
+        let waited = producer.await_line("held", BOUND);
+        let elapsed = started.elapsed();
+        match waited {
+            readiness::Waited::ProducerGone(why) => assert!(
+                why.contains("closed its channel"),
+                "a closed channel is the pipe's own fast path: {why}"
+            ),
+            other => panic!("a producer that closed its channel is not {other:?}"),
+        }
+        assert!(
+            elapsed < BOUND,
+            "the wait spent its whole bound: {elapsed:?}"
+        );
+    }
+
+    /// **Effective deadlines.** The bound is the caller's, it bounds the wait
+    /// rather than the producer, and it does not time a producer that is merely
+    /// slow.
+    ///
+    /// §12: "a deadline short enough to expire on a loaded runner has become
+    /// the signal itself, which is the failure this rule exists to prevent."
+    /// Two claims, and the second is the one that keeps the first honest — a
+    /// wait that always returned at its bound would satisfy the timing half and
+    /// still be useless.
+    #[test]
+    fn the_bound_is_the_callers_and_it_does_not_time_a_healthy_producer() {
+        let scratch = Scratch::new("deadline");
+
+        // Two bounds against one silent producer: each wait ends at the value
+        // its caller passed, and the longer bound spends longer.
+        let silent = scratch.join("never");
+        let mut producer = readiness_producer("silent", Some(&silent), Stdio::null());
+        let mut spent = Vec::new();
+        for bound in [Duration::from_millis(120), Duration::from_millis(480)] {
+            let started = Instant::now();
+            match readiness::await_signal(&silent, producer.child(), bound) {
+                readiness::Waited::TimedOut(reported) => assert_eq!(reported, bound),
+                other => panic!("a silent producer must time the wait out, not give {other:?}"),
+            }
+            let elapsed = started.elapsed();
+            assert!(
+                elapsed >= bound,
+                "ended before its own bound: {elapsed:?} < {bound:?}"
+            );
+            spent.push(elapsed);
+        }
+        assert!(
+            spent[1] > spent[0],
+            "the wait spends the bound it was given, not one of its own: {spent:?}"
+        );
+        drop(producer);
+
+        // And a producer that is slow but fine is not timed out, at the bound
+        // `src/rundir.rs`'s waits already use.
+        const GENEROUS: Duration = Duration::from_secs(30);
+        let signal = scratch.join("eventually");
+        let mut producer = readiness_producer("signal-after", Some(&signal), Stdio::null());
+        let started = Instant::now();
+        let waited = readiness::await_signal(&signal, producer.child(), GENEROUS);
+        let elapsed = started.elapsed();
+        assert_eq!(
+            waited.or_fail("the slow producer published and was still refused"),
+            ["published"]
+        );
+        assert!(
+            elapsed < GENEROUS,
+            "the wait returned when the signal landed, not at its bound: {elapsed:?}"
+        );
+        drop(producer);
+
+        let mut producer = readiness_producer("line-after", None, Stdio::piped());
+        let started = Instant::now();
+        let waited = producer.await_line("held", GENEROUS);
+        let elapsed = started.elapsed();
+        assert_eq!(
+            waited.or_fail("the slow producer framed its line and was still refused"),
+            ["held"]
+        );
+        assert!(
+            elapsed < GENEROUS,
+            "the wait returned when the line landed, not at its bound: {elapsed:?}"
+        );
+    }
+
+    /// **Publication before notification, decided rather than raced.**
+    ///
+    /// §12: "a readiness signal MUST be published only after the state it
+    /// announces is complete and observable by the waiter", and "a file's
+    /// existence is a readiness signal only if the file is published
+    /// atomically."
+    ///
+    /// Both halves are observed at one *arranged* instant — the point at which
+    /// the record's bytes are entirely written and the publication has not yet
+    /// been committed. A producer that reaches that point hands the observer a
+    /// turn and waits for it back, so which of the two runs first is decided by
+    /// the handshake and not by the scheduler. Nothing here sleeps, spins or
+    /// polls, and the test would fail identically on a machine with one core or
+    /// a hundred.
+    ///
+    /// The unsound form is run through the same observer first and MUST be
+    /// caught, so an observer looking in the wrong place cannot pass the sound
+    /// half by seeing nothing.
+    #[test]
+    fn a_signal_is_visible_only_after_the_state_it_announces() {
+        let scratch = Scratch::new("ordering");
+        // Large enough that a reader catching it half-written sees that it did.
+        let payload = "x".repeat(64 * 1024);
+
+        // The unsound form: creation and content are separate events, so at the
+        // arranged instant the name exists and does not yet carry the payload.
+        let unsound = scratch.join("in-place");
+        let observed = at_the_uncommitted_instant(&unsound, &payload, |signal, content| {
+            let mut file = std::fs::File::create(signal).expect("create the signal in place");
+            handshake();
+            file.write_all(content.as_bytes()).expect("fill it after");
+        });
+        assert!(
+            observed.existed,
+            "the control is sharp only if the unsound form's name is observable before its \
+             content: it was not, so the sound half below proves nothing"
+        );
+        assert_ne!(
+            observed.content.as_deref(),
+            Some(payload.as_str()),
+            "the name existed and already carried the whole payload, so this control never \
+             modelled the split it exists to model"
+        );
+
+        // The sound form, at the same arranged instant: the record is entirely
+        // written and the name does not exist. That *is* atomic publication,
+        // and it is asserted rather than sampled.
+        let sound = scratch.join("published");
+        let observed = at_the_uncommitted_instant(&sound, &payload, |signal, content| {
+            readiness::publish_between(signal, &[content], &mut || handshake()).expect("publish");
+        });
+        assert!(
+            !observed.existed,
+            "the signal name existed while its publication was still uncommitted, which is the \
+             whole of what atomic publication rules out"
+        );
+
+        // And once committed it carries the record whole.
+        assert_eq!(
+            readiness::read_published(&sound).expect("the published record reads"),
+            [payload.as_str()]
+        );
+    }
+
+    /// What the observer saw at the arranged instant.
+    struct Observation {
+        existed: bool,
+        content: Option<String>,
+    }
+
+    /// A one-shot handshake: the producer hands the observer a turn and blocks
+    /// until it is given back.
+    struct Handshake {
+        reached: mpsc::Sender<()>,
+        resume: mpsc::Receiver<()>,
+    }
+
+    impl Handshake {
+        fn hand_over(&self) {
+            self.reached.send(()).expect("hand the observer its turn");
+            self.resume.recv().expect("wait for the turn back");
+        }
+    }
+
+    thread_local! {
+        /// The handshake the producer closure running on this thread should use.
+        static HANDSHAKE: std::cell::RefCell<Option<Handshake>> =
+            const { std::cell::RefCell::new(None) };
+    }
+
+    /// Use this thread's handshake at the point the producer has reached.
+    fn handshake() {
+        HANDSHAKE.with(|slot| {
+            slot.borrow()
+                .as_ref()
+                .expect("a producer runs inside an arranged instant")
+                .hand_over();
+        });
+    }
+
+    /// Run `produce` on another thread and observe `signal` at the exact
+    /// instant the producer has written its record and not yet committed it.
+    ///
+    /// The producer blocks there until the observation is taken, so the
+    /// interleaving is decided by this function rather than by the scheduler.
+    fn at_the_uncommitted_instant(
+        signal: &Path,
+        payload: &str,
+        produce: fn(&Path, &str),
+    ) -> Observation {
+        let (reached_tx, reached_rx) = mpsc::channel();
+        let (resume_tx, resume_rx) = mpsc::channel();
+        let producing = signal.to_path_buf();
+        let content = payload.to_owned();
+        let producer = thread::spawn(move || {
+            HANDSHAKE.with(|slot| {
+                *slot.borrow_mut() = Some(Handshake {
+                    reached: reached_tx,
+                    resume: resume_rx,
+                });
+            });
+            produce(&producing, &content);
+        });
+
+        reached_rx
+            .recv()
+            .expect("the producer reaches its uncommitted instant");
+        let observation = Observation {
+            existed: signal.exists(),
+            content: std::fs::read_to_string(signal).ok(),
+        };
+        resume_tx.send(()).expect("give the producer its turn back");
+        producer.join().expect("the producer thread");
+        observation
+    }
+
+    /// **Cleanup, including the branch that has something to clean.** A
+    /// publication leaves no staging residue; a refused one leaves no claim;
+    /// and a publication that fails *after* staging removes the file it made.
+    ///
+    /// The last is the branch a refusal cannot reach — the framing check runs
+    /// before anything is created, so it exercises "there was nothing to clean
+    /// up" rather than the cleanup. Failing the rename after the record is
+    /// staged is what reaches the real one, and the staging name being unique
+    /// to the call is what makes removing it safe to do unconditionally.
+    #[test]
+    fn a_publication_that_fails_after_staging_removes_what_it_made() {
+        let scratch = Scratch::new("cleanup");
+        let signal = scratch.join("signal");
+
+        readiness::publish(&signal, &["field"]).expect("publish");
+        assert!(signal.exists(), "the signal is published");
+        assert_eq!(staging_residue(&scratch), 0, "the rename spends the stage");
+
+        // A refused publish creates nothing at all: the framing check runs
+        // before the staging write.
+        let refused = scratch.join("refused");
+        readiness::publish(&refused, &["two\nfields"]).expect_err("refused");
+        assert!(
+            !refused.exists(),
+            "a refused publish must not create the name: an empty signal is still a claim"
+        );
+        assert_eq!(staging_residue(&scratch), 0, "nor a staging file");
+
+        // THE POST-STAGING FAILURE. At the seam the record is fully staged;
+        // putting a directory in the signal's place makes the rename that
+        // follows fail on every platform this ships on, which is the only
+        // reachable way to arrive at the cleanup with a file to remove.
+        let blocked = scratch.join("blocked");
+        let mut seam = || {
+            assert_eq!(
+                staging_residue(&scratch),
+                1,
+                "the record is staged at the seam, so the cleanup below has something to do"
+            );
+            std::fs::create_dir(&blocked).expect("block the rename");
+        };
+        let error = readiness::publish_between(&blocked, &["field"], &mut seam)
+            .expect_err("a rename onto a directory cannot succeed");
+        assert!(
+            blocked.is_dir(),
+            "the publication did not overwrite what blocked it: {error}"
+        );
+        assert_eq!(
+            staging_residue(&scratch),
+            0,
+            "the staging file the failed publication created was removed by it"
+        );
+
+        // The marker form: an empty published file reads as no fields rather
+        // than as a truncated record, and it is unambiguous because `publish`
+        // renames — a partial record is never given this name.
+        let marker = scratch.join("marker");
+        readiness::publish_marker(&marker).expect("publish a marker");
+        assert!(
+            readiness::read_published(&marker)
+                .expect("a marker reads")
+                .is_empty(),
+            "a marker announces state it has nothing to say about"
+        );
+
+        // Republishing replaces the record whole, and stages under a name of
+        // its own rather than a shared one.
+        readiness::publish(&signal, &["second"]).expect("republish");
+        assert_eq!(
+            readiness::read_published(&signal).expect("read back"),
+            ["second"]
+        );
+        assert_eq!(staging_residue(&scratch), 0, "and leaves nothing behind");
+    }
+
+    /// How many staging files are sitting in `dir`.
+    fn staging_residue(dir: &Path) -> usize {
+        staging_names(dir).len()
+    }
+
+    /// **Ownership-safe staging.** Concurrent publications of one signal do not
+    /// share a staging name, so neither can consume or delete the other's.
+    ///
+    /// A fixed `<signal>.publishing` made this a real collision rather than a
+    /// theoretical one: two publishers interleave in one file, and the failure
+    /// path of either removes whatever is there — by then possibly the other's
+    /// staged record.
+    ///
+    /// The overlap is *arranged*, not hoped for. Every publisher stops at the
+    /// seam and waits on a barrier for all the others, so at the instant each
+    /// one looks, all eight records are provably staged at once. A machine that
+    /// never ran two of these threads together would deadlock the barrier
+    /// rather than pass the test vacuously.
+    #[test]
+    fn concurrent_publications_do_not_share_a_staging_name() {
+        const PUBLISHERS: usize = 8;
+        let scratch = Scratch::new("staging");
+        let signal = scratch.join("contended");
+        let all_staged = std::sync::Barrier::new(PUBLISHERS);
+
+        let seen: Vec<Vec<String>> = thread::scope(|scope| {
+            let handles: Vec<_> = (0..PUBLISHERS)
+                .map(|which| {
+                    let signal = &signal;
+                    let root: &Path = &scratch;
+                    let all_staged = &all_staged;
+                    scope.spawn(move || {
+                        let mut staged_now = Vec::new();
+                        let mut seam = || {
+                            // Every publisher is here, with its record written
+                            // and its publication uncommitted.
+                            all_staged.wait();
+                            staged_now = staging_names(root);
+                            // And nobody commits until everybody has looked. A
+                            // publisher that renamed first would empty its
+                            // staging name out from under a slower one's
+                            // listing, which is a race in the *observation*
+                            // rather than in what is being observed.
+                            all_staged.wait();
+                        };
+                        readiness::publish_between(
+                            signal,
+                            &[&format!("publisher-{which}")],
+                            &mut seam,
+                        )
+                        .expect("publish");
+                        staged_now
+                    })
+                })
+                .collect();
+            handles
+                .into_iter()
+                .map(|handle| handle.join().expect("a publisher"))
+                .collect()
+        });
+
+        // Eight publications staged at once, under eight names.
+        for (which, staged_now) in seen.iter().enumerate() {
+            assert_eq!(
+                staged_now.len(),
+                PUBLISHERS,
+                "publisher {which} saw {} staged record(s) where all {PUBLISHERS} were staged: \
+                 {staged_now:?}",
+                staged_now.len()
+            );
+        }
+        let distinct: std::collections::BTreeSet<&str> =
+            seen.iter().flatten().map(String::as_str).collect();
+        assert_eq!(
+            distinct.len(),
+            PUBLISHERS,
+            "{PUBLISHERS} concurrent publications must hold {PUBLISHERS} staging names, not \
+             {}: a shared name is one file two publishers are writing: {distinct:?}",
+            distinct.len()
+        );
+        assert_eq!(
+            staging_residue(&scratch),
+            0,
+            "and every publication spent its own stage"
+        );
+        // One of them is the published record, whole, and it is a value
+        // somebody actually sent rather than a splice of two.
+        let published = readiness::read_published(&signal).expect("a whole record survives");
+        let [only] = published.as_slice() else {
+            panic!("the contended signal carries one field, not {published:?}")
+        };
+        assert!(
+            (0..PUBLISHERS).any(|which| only == &format!("publisher-{which}")),
+            "the surviving record is not one anybody published: {only}"
+        );
+    }
+
+    /// The staging names currently sitting in `dir`.
+    fn staging_names(dir: &Path) -> Vec<String> {
+        std::fs::read_dir(dir)
+            .expect("the scratch directory")
+            .filter_map(Result::ok)
+            .map(|entry| entry.file_name().to_string_lossy().into_owned())
+            .filter(|name| name.ends_with(".publishing"))
+            .collect()
     }
 }
