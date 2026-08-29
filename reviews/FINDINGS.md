@@ -3416,3 +3416,17 @@ description is §12's precedent.
 including `test (windows-latest)`, `test (macos-latest)` and all three MSRV legs — because
 the push after it was held while it executed. Everything past it is this section, the sweep
 record and the stampings it produced.
+
+## 24. 2026-08-29 actionable sweep — process funnel authority
+
+This append-only disposition was measured from integration
+`ff86d29a72ccc23e0d86c6fadabe2aa198ff46b8`. It does not rewrite the historical evidence above.
+
+| stable ID | disposition | exact scope and evidence |
+|---|---|---|
+| `PR5D-FUNNEL-RETURNS-A-COMMAND` | **fixed in this slice** | Production host and shell construction no longer exports a writable `Command`; translation helpers exist only in test-support modules. The denylist/wrapper census is fail-closed and a mutation witness refuses any production command-builder escape. |
+| `PR5D-PROCESS-FUNNEL-TAKES-NO-SITE` | **fixed in this slice** | `ProcessSite::Spawn` and `ProcessSite::Terminate` travel by value through the host/process funnel, including termination. The process funnel is classified as a funnel rather than legacy, and the two absent-site rows are removed. Existing containment-point and timeout witnesses plus the complete effects census cover the resulting path. |
+
+Implementation commit `5a460f8a6cf2deae2dc1dd08615d097dce68ea00` passed the focused effects and
+process gates; publication, exact-head CI, and bounded review evidence are carried by the PR containing this
+section.
