@@ -3482,3 +3482,17 @@ defect; root triaged all three once. The same implementor delivered the sole cod
 ledger correction is root's part of that bounded disposition. There is no second review. Exact public head,
 globally serialized full-suite results, and final hosted gates are recorded externally in the phase audit so
 the ledger does not make a self-referential commit claim.
+
+## 27. 2026-08-29 actionable sweep — structural CI workflow oracle
+
+This append-only disposition applies to integration
+`982474a4dc60ed6291c4f3394b59bdd820edec75`. It does not rewrite the historical evidence above.
+
+| stable ID | disposition | exact scope and evidence |
+|---|---|---|
+| `BRIDGE-CI-SHAPE-TEST-IS-A-SUBSTRING-ORACLE` | **implementation-fixed at `a5f3706`** | The platform-gate oracle parses the workflow as YAML 1.2 with duplicate-key rejection, validates the job/step mappings structurally, and evaluates the relevant `cfg` predicate grammar instead of collecting substrings. Concrete escape mutations and a positive uncovered-predicate control drive the new paths. The owner-authorized parser is a dev dependency only. The structural oracle found no live workflow-wiring defect, so no workflow file changed. |
+
+The implementation head is `a5f3706e191bc13041ad0e6bf4885833617ef390`. One independent exact-head
+read-only review, at most one bounded repair, root-owned final disposition, globally serialized full suite,
+and final hosted gates remain required. Exact final public head is recorded externally to avoid a
+self-referential ledger claim.
