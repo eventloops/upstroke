@@ -1505,7 +1505,13 @@ impl WorkspaceManager {
     ///
     /// The containment refusals or a Git or I/O error.
     pub fn reclaim_intents(&self, hooks: &mut dyn EffectHooks) -> Result<Vec<Slot>, UpstrokeError> {
-        self.revalidate()?;
+        // Revalidate even when there are no intents: callers rely on reclaim
+        // as a fresh containment check. Use the raw-registration path because
+        // Git-based validation makes the exact malformed registration reclaim
+        // exists to repair prevent every per-slot validation from being
+        // reached. The execution root cannot itself be a registered slot, so
+        // the optional match is deliberately ignored.
+        self.revalidate_removal(&self.execution_root)?;
         let slots = self.intents()?;
         for slot in &slots {
             self.remove_worktree(hooks, slot)?;
@@ -1804,8 +1810,8 @@ impl WorkspaceManager {
         hooks: &mut dyn EffectHooks,
         slot: &Slot,
     ) -> Result<(), UpstrokeError> {
-        self.revalidate()?;
         let path = self.slot_target(slot)?;
+        let registration = self.revalidate_removal(&path)?;
         funnel(hooks, slot.remove_site(), || {
             if path.exists() {
                 let contained = self.contained(&path)?;
@@ -1814,7 +1820,7 @@ impl WorkspaceManager {
                     source,
                 })?;
             }
-            if let Some(admin) = self.registered_admin_dir(&path)? {
+            if let Some(admin) = registration.as_ref() {
                 let locked = admin.join("locked");
                 match fs::remove_file(&locked) {
                     Ok(()) => {}
@@ -1825,6 +1831,18 @@ impl WorkspaceManager {
                             source,
                         });
                     }
+                }
+                // A killed `git worktree add` can leave an empty `commondir`.
+                // Git then cannot enumerate *any* worktree, so `prune` cannot
+                // remove this one. `revalidate_removal` bound this admin
+                // directory to the exact, contained slot from its byte-safe
+                // `gitdir` before the checkout was deleted. Only that proved
+                // registration may be removed directly.
+                if fs::metadata(admin.join("commondir")).is_ok_and(|metadata| metadata.len() == 0) {
+                    remove_tree_once_handles_close(admin).map_err(|source| UpstrokeError::Io {
+                        path: admin.clone(),
+                        source,
+                    })?;
                 }
             }
             self.git_ok(
@@ -2615,13 +2633,36 @@ impl WorkspaceManager {
         Ok(Some(PathBuf::from(target.trim())))
     }
 
-    /// The administrative directory Git keeps for a registered worktree, found
-    /// without trusting the checkout, so a removal can clear the
-    /// `initializing` lock of a worktree whose directory is already gone.
-    fn registered_admin_dir(&self, path: &Path) -> Result<Option<PathBuf>, UpstrokeError> {
-        if self.worktree_record(path)?.is_none() {
-            return Ok(None);
+    /// Revalidate containment without asking Git to parse a registration that
+    /// recovery exists to remove.
+    ///
+    /// A zero-length `commondir` makes `git worktree list` fail before it emits
+    /// any records. The registration's `gitdir` is still sufficient evidence
+    /// when read byte-for-byte: it names the checkout's `.git`, whose parent
+    /// must canonical-prefix to the exact slot target. Any unreadable, empty or
+    /// partial `gitdir` refuses; guessing from the admin directory's basename
+    /// would authorize deletion from a Git-generated, collision-suffixed name.
+    fn revalidate_removal(&self, target: &Path) -> Result<Option<PathBuf>, UpstrokeError> {
+        refuse_unreal_directory(&self.base)?;
+        refuse_reparse_points(&self.private_root, &self.execution_root)?;
+        let root = canonical_prefix(&self.execution_root)?;
+        let target = canonical_prefix(target)?;
+        let base = canonical_prefix(&self.base)?;
+        if is_at_or_inside(&base, &root) {
+            return Err(Refusal::RootInsideRepositoryWorktree {
+                root,
+                worktree: self.base.clone(),
+            }
+            .into());
         }
+        if is_at_or_inside(&root, &base) {
+            return Err(Refusal::WorktreeInsideRoot {
+                root,
+                worktree: self.base.clone(),
+            }
+            .into());
+        }
+
         let worktrees = self.common_git_dir.join("worktrees");
         let entries = match fs::read_dir(&worktrees) {
             Ok(entries) => entries,
@@ -2633,24 +2674,102 @@ impl WorkspaceManager {
                 });
             }
         };
-        let wanted = canonical_prefix(path)?;
+        let mut matched = None;
         for entry in entries {
             let entry = entry.map_err(|source| UpstrokeError::Io {
                 path: worktrees.clone(),
                 source,
             })?;
-            let gitdir = entry.path().join("gitdir");
-            let Ok(text) = fs::read_to_string(&gitdir) else {
+            let admin = entry.path();
+            let gitdir = admin.join("gitdir");
+            let bytes = fs::read(&gitdir).map_err(|source| UpstrokeError::Io {
+                path: gitdir.clone(),
+                source,
+            })?;
+            let checkout = registration_checkout(&admin, &bytes)?;
+            let worktree = canonical_prefix(&checkout)?;
+            if is_at_or_inside(&worktree, &root) {
+                return Err(Refusal::RootInsideRepositoryWorktree {
+                    root,
+                    worktree: checkout.clone(),
+                }
+                .into());
+            }
+            if is_at_or_inside(&root, &worktree) && !self.is_manager_slot_path(&root, &worktree) {
+                return Err(Refusal::WorktreeInsideRoot {
+                    root,
+                    worktree: checkout.clone(),
+                }
+                .into());
+            }
+            if worktree != target {
                 continue;
-            };
-            let recorded = PathBuf::from(text.trim());
-            let checkout = recorded.parent().unwrap_or(&recorded).to_path_buf();
-            if canonical_prefix(&checkout)? == wanted {
-                return Ok(Some(entry.path()));
+            }
+            if matched.replace(admin).is_some() {
+                return Err(UpstrokeError::Git {
+                    message: format!(
+                        "more than one worktree registration names {}",
+                        checkout.display()
+                    ),
+                });
             }
         }
-        Ok(None)
+        Ok(matched)
     }
+}
+
+fn trim_ascii(mut bytes: &[u8]) -> &[u8] {
+    while bytes.first().is_some_and(u8::is_ascii_whitespace) {
+        bytes = &bytes[1..];
+    }
+    while bytes.last().is_some_and(u8::is_ascii_whitespace) {
+        bytes = &bytes[..bytes.len() - 1];
+    }
+    bytes
+}
+
+/// Decode the authoritative checkout side of a linked-worktree registration.
+///
+/// Registration-state table used by recovery:
+///
+/// | `gitdir` state | Can bind an exact checkout? | Recovery action |
+/// |---|---:|---|
+/// | valid UTF-8 or Unix path bytes | yes | revalidate containment, then act |
+/// | absent or unreadable | no | refuse before mutation |
+/// | zero-length | no | refuse before mutation |
+/// | partial / not ending in `.git` | no | refuse before mutation |
+///
+/// `commondir` is deliberately not an input to this binding. A valid `gitdir`
+/// plus an empty `commondir` is the one safe repairable state: it identifies
+/// the checkout while explaining why Git's own enumeration cannot proceed.
+fn registration_checkout(admin: &Path, bytes: &[u8]) -> Result<PathBuf, UpstrokeError> {
+    let bytes = trim_ascii(bytes);
+    if bytes.is_empty() {
+        return Err(UpstrokeError::Git {
+            message: format!(
+                "worktree registration {} has an empty gitdir",
+                admin.display()
+            ),
+        });
+    }
+    let recorded = decode_git_path(bytes);
+    if recorded.file_name() != Some(OsStr::new(".git")) {
+        return Err(UpstrokeError::Git {
+            message: format!(
+                "worktree registration {} has a gitdir that does not name a checkout .git",
+                admin.display()
+            ),
+        });
+    }
+    let Some(checkout) = recorded.parent() else {
+        return Err(UpstrokeError::Git {
+            message: format!(
+                "worktree registration {} has a parentless gitdir",
+                admin.display()
+            ),
+        });
+    };
+    Ok(checkout.to_path_buf())
 }
 
 /// What a snapshot is checked out at.
@@ -6109,6 +6228,85 @@ mod tests {
         assert!(!fixture.manager.intent_path(&slot).exists());
     }
 
+    #[test]
+    fn reclaim_removes_the_registration_whose_commondir_is_empty() {
+        let fixture = Fixture::created("empty-commondir");
+        let slot = fixture.task("alpha", 1);
+        fixture
+            .manager
+            .write_intent(&mut NoHooks, &slot)
+            .expect("intent");
+        let path = fixture.manager.slot_path(&slot);
+        register_unpopulated(&fixture, &path);
+        let admin = fixture
+            .manager
+            .revalidate_removal(&path)
+            .expect("admin dir")
+            .expect("registered");
+        fs::write(admin.join("commondir"), []).expect("truncate commondir");
+
+        fixture
+            .manager
+            .reclaim_intents(&mut NoHooks)
+            .expect("the exact registration is recoverable without Git enumeration");
+        assert!(!path.exists(), "the unpopulated checkout stays absent");
+        assert!(!admin.exists(), "the proved registration is removed");
+        assert!(!fixture.manager.intent_path(&slot).exists());
+        fixture
+            .manager
+            .worktree_records()
+            .expect("Git enumeration works again");
+    }
+
+    #[test]
+    fn malformed_gitdir_refuses_before_removal() {
+        for (case, bytes) in [
+            ("absent", None),
+            ("empty", Some(&b""[..])),
+            ("partial", Some(&b"not-a-dot-git-path"[..])),
+        ] {
+            let fixture = Fixture::created(&format!("bad-gitdir-{case}"));
+            let slot = fixture.add_task(&mut NoHooks, "alpha", 1);
+            let path = fixture.manager.slot_path(&slot);
+            let admin = fixture
+                .manager
+                .revalidate_removal(&path)
+                .expect("admin dir")
+                .expect("registered");
+            match bytes {
+                Some(bytes) => fs::write(admin.join("gitdir"), bytes).expect("replace gitdir"),
+                None => fs::remove_file(admin.join("gitdir")).expect("remove gitdir"),
+            }
+
+            fixture
+                .manager
+                .remove_worktree(&mut NoHooks, &slot)
+                .expect_err("unbound registration refuses");
+            assert!(path.exists(), "{case}: refusal precedes checkout deletion");
+            assert!(
+                admin.exists(),
+                "{case}: refusal precedes registration deletion"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn registration_gitdir_decodes_non_utf8_path_bytes() {
+        use std::os::unix::ffi::OsStrExt as _;
+
+        let decoded = registration_checkout(
+            Path::new("/repository/.git/worktrees/example"),
+            b" /tmp/non-utf8-\xff/.git\n",
+        )
+        .expect("byte-valid registration");
+        assert_eq!(
+            decoded.as_os_str().as_bytes(),
+            b"/tmp/non-utf8-\xff",
+            "registration discovery is byte-preserving on Unix"
+        );
+    }
+
     /// Build the state a killed `git worktree add` leaves: the registration
     /// exists and Git still holds its `initializing` lock.
     fn register_unpopulated(fixture: &Fixture, path: &Path) {
@@ -6125,7 +6323,7 @@ mod tests {
         );
         let admin = fixture
             .manager
-            .registered_admin_dir(path)
+            .revalidate_removal(path)
             .expect("admin dir")
             .expect("the worktree is registered");
         fs::write(admin.join("locked"), "initializing\n").expect("hold the initializing lock");
