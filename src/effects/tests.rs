@@ -1313,6 +1313,45 @@ const CLIPPY_GATE: &str = "cargo clippy --all-targets --all-features -- -D warni
 /// The command that executes this file's fixtures, character for character.
 const TEST_COMMAND: &str = "cargo test --all-targets --all-features";
 
+/// The job that holds this crate to the floor it publishes, and the command it
+/// must run -- character for character, for `--locked`'s sake.
+///
+/// `--locked` is the load-bearing flag and the reason this is a pin rather than
+/// a prefix. Without it Cargo may resolve `Cargo.lock` forward, and this
+/// manifest carries two exact-version pins placed for precisely that hazard:
+/// `globset =0.4.19`, because 0.4.20 raised its MSRV to 1.88, and
+/// `yaml-rust2 =0.12.0`, because 0.12.0 declares 1.85.0 -- this crate's floor
+/// exactly, so its next minor is free to leave the contract. An unlocked MSRV
+/// leg compiles a dependency set no release ships and reports green over a floor
+/// it never tested. `CODING_STANDARDS.md` §2 and `CONTRIBUTING.md` both publish
+/// the command with the flag.
+const MSRV_JOB: &str = "msrv";
+const MSRV_COMMAND: &str = "cargo check --locked --all-targets --all-features";
+
+/// The workflow-scope compiler flags, and the two names that decide what any
+/// compilation in this workflow actually sees.
+///
+/// `CODING_STANDARDS.md` §11 makes this load-bearing rather than a convenience.
+/// `unfulfilled_lint_expectations` is warn-by-default, so an `#[expect(...)]` on
+/// a rustc lint "retires a suppression only where warnings are promoted to
+/// errors. `ci.yml` sets `RUSTFLAGS: -D warnings` at workflow scope, so today
+/// that is every leg -- which means narrowing it to a single job would silently
+/// take the self-retirement guarantee with it." The word in that sentence this
+/// contract answers is *silently*: nothing read the setting until now.
+///
+/// The pin is an equality because a `contains` reading is exactly what fails
+/// here. `-D warnings -A clippy::disallowed_methods` contains `-D warnings` and
+/// switches off the effect denylist this whole file exists to enforce.
+///
+/// `CARGO_ENCODED_RUSTFLAGS` is modelled because *effective* is the claim, not
+/// *declared*. Cargo reads it in preference to `RUSTFLAGS` and ignores
+/// `RUSTFLAGS` entirely when it is set, so binding it anywhere in this workflow
+/// is the same defect as rewriting the value -- with the pinned line left in
+/// place to read past.
+const RUSTFLAGS_KEY: &str = "RUSTFLAGS";
+const RUSTFLAGS_VALUE: &str = "-D warnings";
+const ENCODED_RUSTFLAGS_KEY: &str = "CARGO_ENCODED_RUSTFLAGS";
+
 /// The job that aggregates the gates, and the branch-protection context it
 /// publishes. `MAINTAINING.md` points the external rule at this one name, so a
 /// rename leaves branch protection guarding a context nothing produces.
@@ -1370,6 +1409,17 @@ const AGGREGATE_JOB_FIELDS: [&str; 6] =
 
 /// The fields the job that runs these fixtures declares.
 const TEST_JOB_FIELDS: [&str; 5] = ["name", "runs-on", "steps", "strategy", "timeout-minutes"];
+
+/// The fields the MSRV leg declares. The same shape as the `test` job, and named
+/// separately because the reason one of its absences matters is its own.
+///
+/// `continue-on-error:` is the field this refuses that nothing else would have.
+/// A *disabled* leg (`if: false`) still reports `skipped` to the aggregate,
+/// whose loop demands `success` and fails; an *absolved* leg reports `success`
+/// after its check failed, so the aggregate reads success, `upstroke-ci` settles
+/// green, and the floor `CODING_STANDARDS.md` §2 publishes went unverified on
+/// all three platforms at once.
+const MSRV_JOB_FIELDS: [&str; 5] = ["name", "runs-on", "steps", "strategy", "timeout-minutes"];
 
 /// The one field a job -- or the workflow itself -- may declare in addition to
 /// its required set.
@@ -2118,10 +2168,307 @@ fn ci_test_job_complaints(doc: &Yaml) -> Vec<String> {
     out
 }
 
-/// Both audits, so a mutation is refused by the contract as a whole.
+/// `Cargo.toml`'s `[package] rust-version`, as it is written there.
+fn declared_rust_version() -> String {
+    let text = fs::read_to_string(repo_root().join("Cargo.toml")).expect("Cargo.toml");
+    let manifest: toml::Value = toml::from_str(&text).expect("Cargo.toml parses");
+    manifest
+        .get("package")
+        .and_then(|package| package.get("rust-version"))
+        .and_then(toml::Value::as_str)
+        .expect("Cargo.toml declares a `[package] rust-version` to pin the msrv leg against")
+        .to_owned()
+}
+
+/// The toolchain name the MSRV leg must install, derived from the manifest.
+///
+/// Derived rather than transcribed: a literal `"1.85.0"` here would make this
+/// section its own oracle for the one fact it exists to hold, and a bump to
+/// `rust-version` would leave the leg checking a floor the crate no longer
+/// publishes.
+///
+/// The pin is exact, which `.github/scripts/test-docs-consistency.sh`'s C2 is
+/// deliberately not: C2 accepts `rust-version` "or a patch release of it", so it
+/// reads `toolchain: 1.85` as agreement. `dtolnay/rust-toolchain` resolves a
+/// two-component name to the newest patch in the series, which is not the
+/// `cargo +1.85.0` that `CODING_STANDARDS.md` §2, `CONTRIBUTING.md` and
+/// `CLAUDE.md` all publish.
+fn declared_msrv_toolchain() -> String {
+    three_component(&declared_rust_version())
+}
+
+/// `1.85` as the toolchain name `1.85.0`; anything else unchanged.
+///
+/// Unchanged rather than repaired. A manifest value this does not understand
+/// must reach the equality below and fail there with both strings quoted, not be
+/// normalised into agreement with whatever the workflow happens to say.
+fn three_component(version: &str) -> String {
+    if version.split('.').count() == 2 {
+        format!("{version}.0")
+    } else {
+        version.to_owned()
+    }
+}
+
+/// Every way the MSRV leg fails to check the floor this crate publishes.
+///
+/// Nothing above this function reaches that job. [`ci_gate_complaints`] selects
+/// a job by its `runs-on:` *and* a step whose `run:` is [`CLIPPY_GATE`], and
+/// `msrv` matches neither -- it runs on `${{ matrix.os }}` and it runs
+/// `cargo check`. So until this existed the only structural claim on the MSRV
+/// leg was that the aggregate needs a job with that id: its matrix could be
+/// narrowed to one runner or hollowed out with `exclude:`, its command could
+/// lose `--locked` or become an `echo`, and its step could be absolved, with
+/// every check in this section still passing.
+///
+/// One claim here is held elsewhere too, and its neighbour states its own
+/// limits. `.github/scripts/test-docs-consistency.sh` C2 compares the toolchain
+/// scalar with `rust-version` by grepping a text block; that file's `WITHDRAWN,
+/// DELIBERATELY` note records that the gate makes "NO claim about which cargo
+/// commands CI runs, whether CI executes them", because a command "can be
+/// present and skipped (`if: false`)". A parsed document is what lets that claim
+/// come back as an equality -- the same trade the rest of this section made, and
+/// the reason `MUT-CI-CARGO-TEST-STEP-SKIPPED` is already a kill here rather
+/// than history.
+fn ci_msrv_job_complaints(doc: &Yaml) -> Vec<String> {
+    let mut out = Vec::new();
+    let Some(jobs) = field(doc, "jobs") else {
+        return vec!["[jobs] the workflow declares no `jobs:` mapping".to_owned()];
+    };
+    let Some(job) = field(jobs, MSRV_JOB) else {
+        return vec![format!(
+            "[msrv-job-missing] no `{MSRV_JOB}` job, so nothing compiles this crate on the \
+             floor `Cargo.toml`'s `rust-version` publishes"
+        )];
+    };
+
+    for complaint in field_complaints(job, &MSRV_JOB_FIELDS, &OPTIONAL_DEFAULTS_FIELD) {
+        out.push(format!(
+            "[msrv-job-field] `{MSRV_JOB}` {complaint}. `continue-on-error:` reports success \
+             over a failed check -- which the aggregate then reads as success -- and `if:` \
+             stops the leg running at all."
+        ));
+    }
+    for (index, step) in steps_of(job).iter().enumerate() {
+        let strange = unexpected(&field_names(step), &STEP_FIELDS);
+        if !strange.is_empty() {
+            out.push(format!(
+                "[msrv-job-step-field] `{MSRV_JOB}` step {index} declares {strange:?}, which \
+                 this contract does not model"
+            ));
+        }
+        // A matrix job, so each `run:` step resolves a shell once per runner, and
+        // a workflow-level default reaches all three of them at once.
+        if scalar(step, "run").is_some() {
+            for target in &CI_TARGETS {
+                out.extend(shell_complaints(
+                    doc,
+                    job,
+                    step,
+                    target,
+                    &format!("`{MSRV_JOB}` step {index} on `{}`", target.runner),
+                    target.default_shell,
+                ));
+            }
+        }
+    }
+
+    let running = steps_of(job)
+        .iter()
+        .filter(|step| scalar(step, "run") == Some(MSRV_COMMAND))
+        .count();
+    if running != 1 {
+        out.push(format!(
+            "[msrv-job-command] the `{MSRV_JOB}` job has {running} steps whose `run:` is \
+             exactly `{MSRV_COMMAND}`, not one. Dropping `--locked` lets Cargo resolve past \
+             the exact pins this manifest carries for the floor, and an `echo` satisfies \
+             every substring reading of the same line."
+        ));
+    }
+
+    // The platform half, compared against the same derived runner set the Clippy
+    // legs and the `test` matrix are. A floor is a per-platform fact: a
+    // dependency that raises its MSRV behind a `cfg` fails on that target only.
+    let expected_runners: BTreeSet<String> = CI_TARGETS
+        .iter()
+        .map(|target| target.runner.to_owned())
+        .collect();
+    match field(job, "strategy") {
+        None => out.push(format!(
+            "[msrv-job-matrix] the `{MSRV_JOB}` job declares no `strategy:`, so it checks the \
+             floor on one platform"
+        )),
+        Some(strategy) => {
+            for complaint in field_complaints(strategy, &["fail-fast", "matrix"], &[]) {
+                out.push(format!(
+                    "[msrv-job-matrix] the `{MSRV_JOB}` job's `strategy:` {complaint}. \
+                     `exclude:` removes a runner `os:` still lists and `include:` adds one it \
+                     does not."
+                ));
+            }
+            if field(strategy, "fail-fast").and_then(Yaml::as_bool) != Some(false) {
+                out.push(format!(
+                    "[msrv-job-matrix] the `{MSRV_JOB}` job's `fail-fast:` is not `false`, so \
+                     one platform's floor failure cancels the other two before they report"
+                ));
+            }
+            if let Some(matrix) = field(strategy, "matrix") {
+                for complaint in field_complaints(matrix, &["os"], &[]) {
+                    out.push(format!(
+                        "[msrv-job-matrix] the `{MSRV_JOB}` job's `matrix:` {complaint}"
+                    ));
+                }
+            }
+        }
+    }
+    let listed = field(job, "strategy")
+        .and_then(|strategy| field(strategy, "matrix"))
+        .and_then(|matrix| field(matrix, "os"))
+        .and_then(scalar_set);
+    if listed.as_ref() != Some(&expected_runners) {
+        out.push(format!(
+            "[msrv-job-matrix] the `{MSRV_JOB}` job's matrix runs on {listed:?}, not exactly \
+             {expected_runners:?}"
+        ));
+    }
+    if scalar(job, "runs-on") != Some("${{ matrix.os }}") {
+        out.push(format!(
+            "[msrv-job-matrix] the `{MSRV_JOB}` job's `runs-on:` is {:?}, so the matrix above \
+             decides nothing",
+            scalar(job, "runs-on")
+        ));
+    }
+
+    let toolchains: Vec<&Yaml> = steps_of(job)
+        .iter()
+        .filter(|step| {
+            scalar(step, "uses").is_some_and(|uses| uses.starts_with("dtolnay/rust-toolchain@"))
+        })
+        .collect();
+    if toolchains.len() != 1 {
+        out.push(format!(
+            "[msrv-job-toolchain] the `{MSRV_JOB}` job has {} `dtolnay/rust-toolchain` steps, \
+             not one, so which toolchain checks the floor is not decidable here",
+            toolchains.len()
+        ));
+        return out;
+    }
+    let selected = field(toolchains[0], "with").and_then(|with| scalar(with, "toolchain"));
+    let expected = declared_msrv_toolchain();
+    if selected != Some(expected.as_str()) {
+        out.push(format!(
+            "[msrv-job-toolchain] the `{MSRV_JOB}` job installs toolchain {selected:?}, not \
+             `{expected}` -- the three-component form of `Cargo.toml`'s `rust-version`, which \
+             is `{}`. A leg named for the floor that installs something else is green about a \
+             version it never compiled.",
+            declared_rust_version()
+        ));
+    }
+    out
+}
+
+/// Every way the workflow-scope `-D warnings` fails to reach a compilation.
+///
+/// Two claims. The first is the pin: the workflow's own `env:` binds
+/// [`RUSTFLAGS_KEY`] to exactly [`RUSTFLAGS_VALUE`]. The second is what makes
+/// the first *effective*: no job and no step rebinds that name, and nothing
+/// anywhere binds [`ENCODED_RUSTFLAGS_KEY`], which Cargo reads in preference to
+/// it.
+///
+/// The override scan walks every job and every step rather than the jobs this
+/// contract models, and that is why it is written separately from the field
+/// sets. On today's document it is defence in depth -- `GATE_JOB_FIELDS`,
+/// `TEST_JOB_FIELDS`, `MSRV_JOB_FIELDS`, `AGGREGATE_JOB_FIELDS` and
+/// `STEP_FIELDS` already refuse an `env:` almost everywhere it could go. But the
+/// `msrv` leg had no field set at all until this change, the aggregate's step is
+/// the one step in this contract that is *allowed* an `env:`, and a job added
+/// tomorrow has no field set until someone writes one. A rebinding anywhere is
+/// refused by this scan on its own, which is what
+/// `the_workflow_scope_rustflags_pin_refuses_weakening_and_every_override`
+/// measures on documents the rest of the contract does not reach.
+fn rustflags_complaints(doc: &Yaml) -> Vec<String> {
+    let mut out = Vec::new();
+    match field(doc, "env") {
+        None => out.push(format!(
+            "[rustflags] the workflow declares no `env:`, so nothing sets `{RUSTFLAGS_KEY}` at \
+             workflow scope and no leg promotes a rustc warning to an error"
+        )),
+        Some(env) => {
+            match field(env, RUSTFLAGS_KEY).map(Yaml::as_str) {
+                None => out.push(format!(
+                    "[rustflags] the workflow's `env:` does not bind `{RUSTFLAGS_KEY}`. \
+                     `CODING_STANDARDS.md` §11 rests every leg's rustc-lint and \
+                     `#[expect]`-retirement evidence on this one binding."
+                )),
+                Some(None) => out.push(format!(
+                    "[rustflags] the workflow binds `{RUSTFLAGS_KEY}` to something YAML does \
+                     not read as a string, so what the legs compile under is not something \
+                     this contract can read -- and an unreadable value is not `{RUSTFLAGS_VALUE}`"
+                )),
+                Some(Some(found)) if found != RUSTFLAGS_VALUE => out.push(format!(
+                    "[rustflags] the workflow binds `{RUSTFLAGS_KEY}` to `{found}`, not exactly \
+                     `{RUSTFLAGS_VALUE}`. An equality rather than a `contains`: \
+                     `-D warnings -A clippy::disallowed_methods` contains the pinned text and \
+                     switches off the denylist this file exists to enforce."
+                )),
+                Some(Some(_)) => {}
+            }
+            if field_names(env).contains(ENCODED_RUSTFLAGS_KEY) {
+                out.push(format!(
+                    "[rustflags] the workflow binds `{ENCODED_RUSTFLAGS_KEY}` at workflow \
+                     scope. Cargo reads it in preference to `{RUSTFLAGS_KEY}` and ignores \
+                     `{RUSTFLAGS_KEY}` entirely when it is set, so the pinned line above would \
+                     be read past rather than obeyed."
+                ));
+            }
+        }
+    }
+
+    let Some(jobs) = field(doc, "jobs") else {
+        return out;
+    };
+    for name in field_names(jobs) {
+        let Some(job) = field(jobs, &name) else {
+            continue;
+        };
+        out.extend(rustflags_override_complaints(job, &format!("job `{name}`")));
+        for (index, step) in steps_of(job).iter().enumerate() {
+            out.extend(rustflags_override_complaints(
+                step,
+                &format!("`{name}` step {index}"),
+            ));
+        }
+    }
+    out
+}
+
+/// The two names a node's own `env:` may not bind, wherever that node sits.
+fn rustflags_override_complaints(node: &Yaml, named: &str) -> Vec<String> {
+    let Some(env) = field(node, "env") else {
+        return Vec::new();
+    };
+    let declared = field_names(env);
+    [RUSTFLAGS_KEY, ENCODED_RUSTFLAGS_KEY]
+        .into_iter()
+        .filter(|key| declared.contains(*key))
+        .map(|key| {
+            format!(
+                "[rustflags-override] {named} binds `{key}` in its own `env:`, which shadows \
+                 the workflow-scope `{RUSTFLAGS_KEY}: {RUSTFLAGS_VALUE}` for everything that \
+                 node covers. `CODING_STANDARDS.md` §11 records that narrowing the \
+                 workflow-scope setting takes the `#[expect]` self-retirement guarantee with \
+                 it, silently."
+            )
+        })
+        .collect()
+}
+
+/// Every audit, so a mutation is refused by the contract as a whole.
 fn workflow_complaints(doc: &Yaml) -> Vec<String> {
     let mut out = ci_gate_complaints(doc);
     out.extend(ci_test_job_complaints(doc));
+    out.extend(ci_msrv_job_complaints(doc));
+    out.extend(rustflags_complaints(doc));
     out
 }
 
@@ -2382,6 +2729,194 @@ const WORKFLOW_ESCAPES: &[WorkflowEscape] = &[
         replacement: "        os: [ubuntu-latest]\n",
         refused_as: "test-job-matrix",
     },
+    WorkflowEscape {
+        name: "MUT-RUSTFLAGS-WEAKENED",
+        escape: "warnings allowed instead of denied, at workflow scope. Every leg still runs \
+                 every command, every job is green, and `unfulfilled_lint_expectations` -- \
+                 warn-by-default -- stops retiring the `#[expect]`s that `CODING_STANDARDS.md` \
+                 §11 says self-retire, so a suppression that no longer suppresses anything \
+                 reads as enforcement forever.",
+        job: None,
+        anchor: "  RUSTFLAGS: -D warnings\n",
+        replacement: "  RUSTFLAGS: -A warnings\n",
+        refused_as: "rustflags",
+    },
+    WorkflowEscape {
+        name: "MUT-RUSTFLAGS-ALLOW-APPENDED",
+        escape: "an allow appended after the deny. The line still *contains* `-D warnings`, so \
+                 every substring reading of it passes, while the effect denylist this whole \
+                 file exists to enforce is switched off on every leg at once. The exact reason \
+                 the pin is an equality.",
+        job: None,
+        anchor: "  RUSTFLAGS: -D warnings\n",
+        replacement: "  RUSTFLAGS: -D warnings -A clippy::disallowed_methods\n",
+        refused_as: "rustflags",
+    },
+    WorkflowEscape {
+        name: "MUT-RUSTFLAGS-DELETED",
+        escape: "the binding is gone and the `env:` block it lived in stays, so the workflow \
+                 still declares the field this contract's top-level equality requires",
+        job: None,
+        anchor: "  RUSTFLAGS: -D warnings\n",
+        replacement: "",
+        refused_as: "rustflags",
+    },
+    WorkflowEscape {
+        name: "MUT-RUSTFLAGS-VALUE-EMPTIED",
+        escape: "the key stays and the value goes. YAML reads the empty value as null, so a \
+                 reader that asks whether the name is bound gets yes and a reader that asks \
+                 what it is bound to gets nothing.",
+        job: None,
+        anchor: "  RUSTFLAGS: -D warnings\n",
+        replacement: "  RUSTFLAGS:\n",
+        refused_as: "rustflags",
+    },
+    WorkflowEscape {
+        name: "MUT-RUSTFLAGS-ENCODED-AT-WORKFLOW-SCOPE",
+        escape: "`CARGO_ENCODED_RUSTFLAGS` beside the pinned line. Cargo reads it in \
+                 preference to `RUSTFLAGS` and ignores `RUSTFLAGS` entirely when it is set, so \
+                 the pin below it is read past rather than obeyed -- and it is still there, \
+                 character for character, for any equality that reads only that line.",
+        job: None,
+        anchor: "  RUSTFLAGS: -D warnings\n",
+        replacement: "  RUSTFLAGS: -D warnings\n  CARGO_ENCODED_RUSTFLAGS: ''\n",
+        refused_as: "rustflags",
+    },
+    WorkflowEscape {
+        name: "MUT-RUSTFLAGS-JOB-OVERRIDE",
+        escape: "the narrowing `CODING_STANDARDS.md` §11 names, one job at a time: a job-level \
+                 `env:` shadows the workflow-scope value for every step it covers while the \
+                 pinned line stays untouched at the top of the file. The `msrv` leg is the \
+                 mutation site because until this change it had no field set to refuse an \
+                 `env:` at all.",
+        job: Some("msrv"),
+        anchor: "    timeout-minutes: 15\n",
+        replacement: "    timeout-minutes: 15\n\
+                      \x20   env:\n\
+                      \x20     RUSTFLAGS: -A warnings\n",
+        refused_as: "rustflags-override",
+    },
+    WorkflowEscape {
+        name: "MUT-RUSTFLAGS-ENCODED-JOB-OVERRIDE",
+        escape: "the same narrowing under the name Cargo prefers, so the job's `RUSTFLAGS` is \
+                 not rewritten but ignored. Nothing in this workflow mentions `RUSTFLAGS` in \
+                 that job for a reader to notice.",
+        job: Some("test"),
+        anchor: "    timeout-minutes: 30\n",
+        replacement: "    timeout-minutes: 30\n\
+                      \x20   env:\n\
+                      \x20     CARGO_ENCODED_RUSTFLAGS: ''\n",
+        refused_as: "rustflags-override",
+    },
+    WorkflowEscape {
+        name: "MUT-RUSTFLAGS-STEP-OVERRIDE",
+        escape: "the narrowing one level down, in the one step this contract allows an `env:` \
+                 at all -- the aggregate's. A step-level binding is the smallest form of the \
+                 same defect and the one a field-set equality cannot see, because the field is \
+                 legal there.",
+        job: Some("merge-gate"),
+        anchor: "          LINT_RESULT: ${{ needs.lint.result }}\n",
+        replacement: "          LINT_RESULT: ${{ needs.lint.result }}\n\
+                      \x20         RUSTFLAGS: -A warnings\n",
+        refused_as: "rustflags-override",
+    },
+    WorkflowEscape {
+        name: "MUT-MSRV-TOOLCHAIN-DRIFTED",
+        escape: "the leg named for the floor installs `stable`. It runs, it passes, and it is \
+                 evidence about whichever compiler the runner shipped that week rather than \
+                 about the version `Cargo.toml` publishes to crates.io.",
+        job: Some("msrv"),
+        anchor: "          toolchain: 1.85.0\n",
+        replacement: "          toolchain: stable\n",
+        refused_as: "msrv-job-toolchain",
+    },
+    WorkflowEscape {
+        name: "MUT-MSRV-TOOLCHAIN-AHEAD-OF-MANIFEST",
+        escape: "a real version, above the declared floor. `test-docs-consistency.sh`'s C2 \
+                 refuses this shape too, by grepping a text block. The difference is \
+                 exactness, not coverage: C2 accepts `rust-version` \"or a patch release of \
+                 it\", so it reads `toolchain: 1.85` as agreement, and that name resolves to \
+                 the newest 1.85.x rather than to the `cargo +1.85.0` the documents publish.",
+        job: Some("msrv"),
+        anchor: "          toolchain: 1.85.0\n",
+        replacement: "          toolchain: 1.90.0\n",
+        refused_as: "msrv-job-toolchain",
+    },
+    WorkflowEscape {
+        name: "MUT-MSRV-COMMAND-UNLOCKED",
+        escape: "`--locked` dropped. Cargo re-resolves `Cargo.lock` forward past the exact \
+                 pins this manifest carries for the floor -- `globset =0.4.19` and \
+                 `yaml-rust2 =0.12.0` are both pinned against exactly this -- so the leg \
+                 compiles a dependency set no release ships and reports green over a floor it \
+                 never tested.",
+        job: Some("msrv"),
+        anchor: "      - run: cargo check --locked --all-targets --all-features\n",
+        replacement: "      - run: cargo check --all-targets --all-features\n",
+        refused_as: "msrv-job-command",
+    },
+    WorkflowEscape {
+        name: "MUT-MSRV-COMMAND-ECHOED",
+        escape: "the leg echoes its command and succeeds, `MUT-GATE-ECHOED`'s shape one job \
+                 over. `test-docs-consistency.sh` withdrew every claim about which commands CI \
+                 runs precisely because a text checker cannot tell these apart.",
+        job: Some("msrv"),
+        anchor: "      - run: cargo check --locked --all-targets --all-features\n",
+        replacement: "      - run: echo cargo check --locked --all-targets --all-features\n",
+        refused_as: "msrv-job-command",
+    },
+    WorkflowEscape {
+        name: "MUT-MSRV-MATRIX-NARROWED",
+        escape: "the floor is checked on Linux only. A dependency that raises its MSRV behind \
+                 a `cfg` -- this manifest has a `cfg(windows)` and a `cfg(unix)` dependency \
+                 table -- breaks on a platform this leg no longer visits.",
+        job: Some("msrv"),
+        anchor: "        os: [ubuntu-latest, windows-latest, macos-latest]\n",
+        replacement: "        os: [ubuntu-latest]\n",
+        refused_as: "msrv-job-matrix",
+    },
+    WorkflowEscape {
+        name: "MUT-MSRV-MATRIX-EXCLUDED",
+        escape: "the same narrowing with `os:` left listing all three, so every reading of \
+                 `os:` passes while the Windows floor is never compiled. \
+                 `MUT-TEST-MATRIX-EXCLUDED`'s shape on the leg that had no strategy contract.",
+        job: Some("msrv"),
+        anchor: "        os: [ubuntu-latest, windows-latest, macos-latest]\n",
+        replacement: "        os: [ubuntu-latest, windows-latest, macos-latest]\n\
+                      \x20       exclude:\n\
+                      \x20         - os: windows-latest\n",
+        refused_as: "msrv-job-matrix",
+    },
+    WorkflowEscape {
+        name: "MUT-MSRV-FAIL-FAST-ENABLED",
+        escape: "one platform's floor failure cancels the other two before they report, so a \
+                 break on two platforms is indistinguishable from a break on one and the \
+                 second is invisible until the first is fixed",
+        job: Some("msrv"),
+        anchor: "      fail-fast: false\n",
+        replacement: "      fail-fast: true\n",
+        refused_as: "msrv-job-matrix",
+    },
+    WorkflowEscape {
+        name: "MUT-MSRV-JOB-ABSOLVED",
+        escape: "`continue-on-error` on the leg. This is the one the aggregate cannot catch: a \
+                 *skipped* job still reports `skipped` and the aggregate's loop demands \
+                 `success`, but an absolved job reports `success` after its check failed, so \
+                 `upstroke-ci` settles green over an unmet floor on all three platforms.",
+        job: Some("msrv"),
+        anchor: "    runs-on: ${{ matrix.os }}\n",
+        replacement: "    runs-on: ${{ matrix.os }}\n    continue-on-error: true\n",
+        refused_as: "msrv-job-field",
+    },
+    WorkflowEscape {
+        name: "MUT-MSRV-STEP-ABSOLVED",
+        escape: "the same absolution one level down, on the step that runs the check: the step \
+                 fails, the job succeeds, and the leg is green",
+        job: Some("msrv"),
+        anchor: "      - run: cargo check --locked --all-targets --all-features\n",
+        replacement: "      - run: cargo check --locked --all-targets --all-features\n\
+                      \x20       continue-on-error: true\n",
+        refused_as: "msrv-job-step-field",
+    },
 ];
 
 /// Replace `anchor` with `replacement` inside one job's block.
@@ -2565,6 +3100,181 @@ fn the_workflow_that_runs_these_tests_installs_the_compiler_they_need() {
         "the `test` job does not run these fixtures the way they need:\n{}",
         complaints.join("\n")
     );
+}
+
+/// The MSRV leg checks the floor the manifest publishes, on every platform.
+///
+/// Four claims. Three were held by nothing at all before this test: that the leg
+/// is enabled and unabsolved, that its command is the documented one *including*
+/// `--locked`, and that its matrix is every supported runner. The fourth, the
+/// toolchain, was held loosely -- `.github/scripts/test-docs-consistency.sh`'s C2
+/// accepts `rust-version` "or a patch release of it" -- and is held exactly here.
+/// It is derived from the manifest and quoted from it on failure, because a
+/// literal `1.85.0` would make this its own oracle for the fact it exists to
+/// hold.
+///
+/// The refusals are executed in [`WORKFLOW_ESCAPES`] -- every row named
+/// `MUT-MSRV-*` -- so this test passing is not the claim that the contract
+/// refuses nothing.
+#[test]
+fn the_msrv_leg_checks_the_floor_the_manifest_publishes_on_every_platform() {
+    // The derivation, with its controls, before anything is asserted with it.
+    assert_eq!(three_component("1.85"), "1.85.0");
+    assert_eq!(three_component("1.85.0"), "1.85.0");
+    assert_eq!(
+        three_component("nightly"),
+        "nightly",
+        "a manifest value this does not understand must reach the equality below unchanged \
+         and fail there with both strings quoted, not be normalised into agreement"
+    );
+
+    let doc = parse_workflow(&ci_workflow_text()).expect(CI_WORKFLOW);
+    let complaints = ci_msrv_job_complaints(&doc);
+    assert!(
+        complaints.is_empty(),
+        "the `{MSRV_JOB}` job does not check the floor the way the documents publish it:\n{}",
+        complaints.join("\n")
+    );
+
+    // The toolchain claim once more as a bare equality, so its failure names the
+    // manifest and the workflow rather than only the complaint between them.
+    let installed: Vec<&str> = field(&doc, "jobs")
+        .and_then(|jobs| field(jobs, MSRV_JOB))
+        .map(steps_of)
+        .unwrap_or_default()
+        .iter()
+        .filter_map(|step| field(step, "with").and_then(|with| scalar(with, "toolchain")))
+        .collect();
+    let expected = declared_msrv_toolchain();
+    assert_eq!(
+        installed,
+        vec![expected.as_str()],
+        "`Cargo.toml` publishes `rust-version = \"{}\"`, whose toolchain name is \
+         `{expected}`; the `{MSRV_JOB}` leg installs {installed:?}",
+        declared_rust_version()
+    );
+}
+
+/// The workflow-scope `-D warnings` is pinned, and nothing narrows it.
+///
+/// The refusals are driven on synthetic documents as well as on mutations of the
+/// real one, because on the real one this scan cannot be seen working *alone*:
+/// every job and step of the live workflow that could carry an `env:` is already
+/// covered by a field set, so `MUT-RUSTFLAGS-JOB-OVERRIDE` is refused twice
+/// over. Those rows still bind to the code this scan emits and nothing else
+/// emits, so they measure it; what they cannot show is it holding somewhere no
+/// field set does. Each document below carries one job that no other check in
+/// this section reaches, which is where that is shown.
+///
+/// The positive controls come first, in both halves: the real workflow satisfies
+/// the contract, and so does the minimal conforming probe. Without them a
+/// refusal below would be evidence of nothing.
+#[test]
+fn the_workflow_scope_rustflags_pin_refuses_weakening_and_every_override() {
+    /// A workflow carrying one job the rest of this section does not model.
+    fn probe(header: &str, job_body: &str) -> String {
+        format!("{header}jobs:\n  probe:\n{job_body}")
+    }
+    /// A job that binds nothing of its own.
+    const PLAIN: &str = "    runs-on: ubuntu-latest\n    steps:\n      - run: cargo check\n";
+    /// The pinned workflow-scope binding, written as the real document writes it.
+    const PINNED: &str = "env:\n  RUSTFLAGS: -D warnings\n";
+
+    let doc = parse_workflow(&ci_workflow_text()).expect(CI_WORKFLOW);
+    let live = rustflags_complaints(&doc);
+    assert!(
+        live.is_empty(),
+        "the real workflow does not satisfy the `{RUSTFLAGS_KEY}` contract:\n{}",
+        live.join("\n")
+    );
+
+    let control = parse_workflow(&probe(PINNED, PLAIN)).expect("the control document parses");
+    let refused_control = rustflags_complaints(&control);
+    assert!(
+        refused_control.is_empty(),
+        "the conforming probe is refused, so no refusal below is evidence of anything:\n{}",
+        refused_control.join("\n")
+    );
+
+    for (shape, document, code) in [
+        ("no workflow `env:` at all", probe("", PLAIN), "rustflags"),
+        (
+            "an `env:` that binds other names but not this one",
+            probe("env:\n  CARGO_TERM_COLOR: always\n", PLAIN),
+            "rustflags",
+        ),
+        (
+            "warnings allowed instead of denied",
+            probe("env:\n  RUSTFLAGS: -A warnings\n", PLAIN),
+            "rustflags",
+        ),
+        (
+            "an allow appended after the deny, which every `contains` reading accepts",
+            probe(
+                "env:\n  RUSTFLAGS: -D warnings -A clippy::disallowed_methods\n",
+                PLAIN,
+            ),
+            "rustflags",
+        ),
+        (
+            "a value YAML does not read as a string",
+            probe("env:\n  RUSTFLAGS: true\n", PLAIN),
+            "rustflags",
+        ),
+        (
+            "the encoded form at workflow scope, which Cargo reads first",
+            probe(
+                "env:\n  RUSTFLAGS: -D warnings\n  CARGO_ENCODED_RUSTFLAGS: ''\n",
+                PLAIN,
+            ),
+            "rustflags",
+        ),
+        (
+            "a job-level rebinding",
+            probe(
+                PINNED,
+                "    runs-on: ubuntu-latest\n    env:\n      RUSTFLAGS: -A warnings\n    \
+                 steps:\n      - run: cargo check\n",
+            ),
+            "rustflags-override",
+        ),
+        (
+            "a job-level binding of the name Cargo prefers",
+            probe(
+                PINNED,
+                "    runs-on: ubuntu-latest\n    env:\n      CARGO_ENCODED_RUSTFLAGS: ''\n    \
+                 steps:\n      - run: cargo check\n",
+            ),
+            "rustflags-override",
+        ),
+        (
+            "a step-level rebinding",
+            probe(
+                PINNED,
+                "    runs-on: ubuntu-latest\n    steps:\n      - run: cargo check\n        \
+                 env:\n          RUSTFLAGS: -A warnings\n",
+            ),
+            "rustflags-override",
+        ),
+        (
+            "a step-level binding of the name Cargo prefers",
+            probe(
+                PINNED,
+                "    runs-on: ubuntu-latest\n    steps:\n      - run: cargo check\n        \
+                 env:\n          CARGO_ENCODED_RUSTFLAGS: ''\n",
+            ),
+            "rustflags-override",
+        ),
+    ] {
+        let parsed = parse_workflow(&document).expect(shape);
+        let complaints = rustflags_complaints(&parsed);
+        let codes = complaint_codes(&complaints);
+        assert!(
+            codes.contains(code),
+            "{shape} was not refused as `{code}`. Document:\n{document}\nComplaints: {:#?}",
+            complaints
+        );
+    }
 }
 
 // ---------------------------------------------------------------------------
