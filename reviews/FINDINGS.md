@@ -3501,3 +3501,26 @@ review. Globally serialized full-suite and final hosted evidence are recorded ex
 head remains external to avoid a self-referential ledger claim. The historical
 `PR5D-MSVC-CLIPPY-NEVER-RUN` test-name citation above is superseded by this structural effective-predicate
 census rather than rewritten in place.
+
+## 28. 2026-08-29 terminology correction — the Windows retry-bound row is an intermittent production defect
+
+This append-only section corrects one classification and **rewrites no historical evidence**.
+
+An earlier commit on this branch, `ce4cee15a2267c53a1981b97d7a97514567f0a00`, edited two historical
+passages in place: the trailing clause of `PR7-WIN-READ-RACING-BOUND-TOO-SHORT`'s disposition in
+§2, and the sentence about the same row in §23's "What rides with it". Both edits were narrow and
+changed no disposition, but this file's rule is append-only whatever the width of the edit, and a
+correction applied in place leaves a reader unable to see what the row said when it was settled.
+**Both passages are restored byte-for-byte to their state at
+`859fa6e046d32bcf9775f1e8ac0d90aa89f3f491`**, and the correction they attempted is carried here
+instead — the same route `PR4-PROGRAM-PATH-NOT-UNICODE-CLOSED-NARROWED` took, and the same one
+§27 used for the superseded `PR5D-MSVC-CLIPPY-NEVER-RUN` citation.
+
+| stable ID | disposition | exact scope and evidence |
+|---|---|---|
+| `PR7-WIN-READ-RACING-BOUND-TOO-SHORT-TERMINOLOGY` | **terminology corrected; the row's disposition, owner, rate, evidence and repair fork are unchanged** | `PR7-WIN-READ-RACING-BOUND-TOO-SHORT` is an **intermittent production defect**, not a flake. The head of that row already says so — it was retitled 2026-08-26 on the frontier review's judgement that calling it a flake *"understates the category"* — but two sentences kept the older word: the row's own closing clause in §2, *"§12 is the precedent for carrying a flake with its numbers rather than a description"*, and §23's *"Carrying a flake with its rate rather than a description is §12's precedent."* **Both stand exactly as written**; read them with this row. The mechanism is identified, which is what settles the category: `container.rs::read_racing` spins `RACING_ACCESS_ATTEMPTS = 64` yields on any IO error other than `NotFound`, and a competing Windows open returns `PermissionDenied` (os error 5) for as long as the winner holds the handle — its whole open/read/close cycle — which under full-suite load on a 16-vCPU guest can outlast 64 yields. `CODING_STANDARDS.md` §12 rules that a failure with an identified mechanism on a supported platform is a defect at whatever rate it occurs. **Intermittency is the symptom's shape, not the category**: the cumulative 5 red of 10 full-suite guest runs, across three heads and two tests, is what made the defect observable, not what makes it a flake — and the triage is the row's own, change the bound rather than re-run. `PR7-MACOS-PROCESS-GROUP-FLAKE` is **not** reached by this correction: no mechanism has been identified for it, so its provisional flake classification stands under the same §12 rule. |
+
+Provenance: raised as `PBLA-LEDGER-001` by the initial Lane A review of
+`ce4cee15a2267c53a1981b97d7a97514567f0a00`, one of four findings root triaged once and accepted.
+This section is the whole of the ledger's part in that bounded repair pass. No other row in this
+file is altered, and no disposition anywhere in it is reopened.
