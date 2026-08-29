@@ -2795,6 +2795,8 @@ mod tests {
 
     use std::time::{Duration, Instant};
 
+    use crate::agent::proc::test_support::readiness;
+
     fn scratch(tag: &str) -> PathBuf {
         let dir =
             std::env::temp_dir().join(format!("upstroke-rundir-{tag}-{}", std::process::id()));
@@ -3172,21 +3174,17 @@ mod tests {
             .spawn()
             .expect("spawn run A engine");
 
-        let mut out = std::io::BufReader::new(child.stdout.take().expect("stdout"));
-        let mut line = String::new();
-        let deadline = Instant::now() + Duration::from_secs(30);
-        loop {
-            line.clear();
-            let read = std::io::BufRead::read_line(&mut out, &mut line).expect("read");
-            assert!(read > 0, "run A child ended before taking its leases");
-            if line.trim() == "held" {
-                break;
-            }
-            assert!(
-                Instant::now() < deadline,
-                "run A child never took its leases"
-            );
-        }
+        // Producer-aware and *effectively* bounded, at the bound this test
+        // already used. The loop it replaces checked its deadline only after
+        // `read_line` returned, so against a producer that stayed alive and
+        // silent -- the one case CODING_STANDARDS.md §12 says the bound exists
+        // for -- the read blocked and the deadline was never reached at all.
+        readiness::await_line(
+            child.stdout.take().expect("stdout"),
+            "held",
+            Duration::from_secs(30),
+        )
+        .or_fail("run A child never took its leases");
 
         // The per-run lock alone would allow this: the identifiers and files
         // differ. The outer lease is what owns shared HEAD/index/worktree state.
@@ -3227,18 +3225,15 @@ mod tests {
             .expect("spawn the second engine");
 
         // Wait for it to say it has the lock, rather than sleeping and hoping.
-        let mut out = std::io::BufReader::new(child.stdout.take().expect("stdout"));
-        let mut line = String::new();
-        let deadline = Instant::now() + Duration::from_secs(30);
-        loop {
-            line.clear();
-            let read = std::io::BufRead::read_line(&mut out, &mut line).expect("read");
-            assert!(read > 0, "the child ended without taking the lock");
-            if line.trim() == "held" {
-                break;
-            }
-            assert!(Instant::now() < deadline, "the child never took the lock");
-        }
+        // Producer-aware and effectively bounded, at the bound this test
+        // already used; see `two_run_ids_cannot_drive_one_worktree_concurrently`
+        // for what the loop this replaces could not do.
+        readiness::await_line(
+            child.stdout.take().expect("stdout"),
+            "held",
+            Duration::from_secs(30),
+        )
+        .or_fail("the child never took the lock");
 
         let err = RunLock::acquire(&paths.public).expect_err("a second engine must be refused");
         assert!(
@@ -5946,18 +5941,15 @@ mod tests {
             .stdout(std::process::Stdio::piped())
             .spawn()
             .expect("spawn the surviving reaper");
-        let mut out = std::io::BufReader::new(child.stdout.take().expect("stdout"));
-        let mut line = String::new();
-        let deadline = Instant::now() + Duration::from_secs(30);
-        loop {
-            line.clear();
-            let read = std::io::BufRead::read_line(&mut out, &mut line).expect("read");
-            assert!(read > 0, "the reaper ended before taking its hold");
-            if line.trim() == "held" {
-                break;
-            }
-            assert!(Instant::now() < deadline, "the reaper never took its hold");
-        }
+        // Producer-aware and effectively bounded, at the bound this test
+        // already used; see `two_run_ids_cannot_drive_one_worktree_concurrently`
+        // for what the loop this replaces could not do.
+        readiness::await_line(
+            child.stdout.take().expect("stdout"),
+            "held",
+            Duration::from_secs(30),
+        )
+        .or_fail("the reaper never took its hold");
 
         assert!(
             observe_cleanup_hold(&husk, &mut NoHooks),

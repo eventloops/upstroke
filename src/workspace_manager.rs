@@ -4146,6 +4146,7 @@ mod tests {
     // this module's: `src/engine/topology/**` needs them too and cannot reach
     // an effect primitive of its own. See that module for why they moved.
     use super::fixture::{Fixture, git, git_out, scratch};
+    use crate::agent::proc::test_support::readiness;
     use crate::topology::effects::{
         ClassHistogram, Evidence, EvidenceLabel, SamplingRecord, SyntheticRecord,
     };
@@ -8176,10 +8177,13 @@ mod tests {
             !helper.status.success(),
             "the helper must die at the point rather than finish"
         );
-        let written = fs::read_to_string(&record).expect("the helper recorded its repository");
-        let mut lines = written.lines();
-        let repository = PathBuf::from(lines.next().expect("repository path"));
-        let tree = lines.next().expect("tree").to_owned();
+        let fields =
+            readiness::read_published(&record).expect("the helper recorded its repository, whole");
+        let [repository, tree] = fields.as_slice() else {
+            panic!("the record carries two framed fields, not {fields:?}")
+        };
+        let repository = PathBuf::from(repository);
+        let tree = tree.clone();
 
         // The child died at `IdUnread`: the object is in the store and no id
         // was ever recorded anywhere.
@@ -8216,8 +8220,18 @@ mod tests {
             &fixture.base,
             &["rev-parse", &format!("{}^{{tree}}", fixture.head)],
         );
-        fs::write(&record, format!("{}\n{tree}\n", fixture.base.display()))
-            .expect("record the repository before dying");
+        // Two framed fields, staged and renamed. The child goes on to abort at
+        // `IdUnread`, so a record written in place is one the kill can tear --
+        // and `str::lines`, which the parent used to read it with, hands back an
+        // unterminated tail as though it were whole (CODING_STANDARDS.md §12).
+        // The repository is a path rather than an identifier because the child
+        // chooses its own fixture root and the parent cannot know it; `publish`
+        // refusing a field that carries the delimiter is what keeps that honest.
+        readiness::publish(
+            Path::new(&record),
+            &[fixture.base.display().to_string().as_str(), tree.as_str()],
+        )
+        .expect("record the repository before dying");
         let manager = fixture.manager.clone();
         let head = fixture.head.clone();
         // Keep the repository: the parent inspects it after this process dies,
