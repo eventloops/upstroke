@@ -3482,3 +3482,22 @@ defect; root triaged all three once. The same implementor delivered the sole cod
 ledger correction is root's part of that bounded disposition. There is no second review. Exact public head,
 globally serialized full-suite results, and final hosted gates are recorded externally in the phase audit so
 the ledger does not make a self-referential commit claim.
+
+## 27. 2026-08-29 actionable sweep — structural CI workflow oracle
+
+This append-only disposition applies to integration
+`982474a4dc60ed6291c4f3394b59bdd820edec75`. It does not rewrite the historical evidence above.
+
+| stable ID | disposition | exact scope and evidence |
+|---|---|---|
+| `BRIDGE-CI-SHAPE-TEST-IS-A-SUBSTRING-ORACLE` | **implementation-fixed at `a5f3706`, review repair `647a70b`** | The platform-gate oracle parses the workflow as YAML 1.2 with duplicate-key rejection. The sole review found six implementation defects: custom/default shell escapes, matrix exclusions, non-injective result stems, unknown cfg values counted as coverage, non-conjoined item/module guards with non-gating forms conflated, and incomplete Rust cfg lexical handling. Root accepted all once; the same implementor's sole repair pins effective shells and full strategy shape, rejects stem collisions, evaluates complete per-invocation cfg valuations, conjoins effective guards, separates `cfg!`/`cfg_attr`, and reads raw/escaped literals. Focused controls cover all six. The owner-authorized parser remains a dev dependency only. No workflow file changed because the repaired oracle found no live wiring defect. |
+| `CI-CFG-UNSHIPPED-UNIX-REGION` | **deferred — deliberate unsupported-target residue discovered at `647a70b`** | The repaired effective-guard census proves `src/agent/proc.rs` contains one `unix && !linux && !macos` fallback region compiled by no Linux/macOS/Windows CI invocation. The region preserves compilation on an unshipped fourth Unix family; current project scope names Linux, macOS, and Windows only. The census now requires this exact acknowledged set and fails if it changes. Adding a BSD runner is a platform-scope decision, not an in-slice oracle repair. |
+
+The implementation head before review is `a5f3706e191bc13041ad0e6bf4885833617ef390`. The one
+independent exact-head read-only review of ledger head `6622b5f72b124963165926380e843f4d15bd979c`
+returned five P1 and two P2 findings; root triaged all seven once. Six implementation findings were repaired
+in the sole bounded pass at `647a70b`; the seventh was this ledger evidence correction. There is no second
+review. Globally serialized full-suite and final hosted evidence are recorded externally; exact final public
+head remains external to avoid a self-referential ledger claim. The historical
+`PR5D-MSVC-CLIPPY-NEVER-RUN` test-name citation above is superseded by this structural effective-predicate
+census rather than rewritten in place.
