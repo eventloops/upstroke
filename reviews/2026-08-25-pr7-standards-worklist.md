@@ -20,18 +20,21 @@ decide", not "fixed" or "rejected".
 
 ## Salvage
 
-Entries here are **salvaged by-hash against the merged head**, per the pass proposal's
-W10.4. Each row therefore records the file and the exact content hash of the region it
-cites, not a line number: PR7's own history has three occurrences of a line-anchored
-reference going stale under `cargo fmt` alone (`reviews/FINDINGS.md` §4), and a work-list
-that cannot be salvaged is a work-list that gets re-derived.
+Each row records the file and exact content hash of the region it cites so that the
+observation can be relocated without a line number. That hash is a locator, not W10.4
+salvage evidence: the pass may reuse a prior review only when the *entire reviewed file*
+is byte-identical to the reviewed SHA. If the file differs, W10.4 requires re-derivation
+even when the narrower region still matches. PR7's own history has three occurrences of
+a line-anchored reference going stale under `cargo fmt` alone (`reviews/FINDINGS.md` §4),
+which is why the locator remains useful after reuse has been refused.
 
 ## Entries
 
 ### W10.2 — the layer sweep's work-list
 
-Filed by the standards review of `3e5212d98b20e2cf72d2fc3982746c7e87de4034`. Every row is salvaged by the sha256 of the
-cited region, per W10.4: re-locate the region by hash, never by line number.
+Filed by the standards review of `3e5212d98b20e2cf72d2fc3982746c7e87de4034`.
+The sha256 relocates the cited region; W10.4 reuse separately requires the whole file
+to remain byte-identical to that reviewed tree.
 
 | Observation | File | Region sha256 | Standards section cited | Raised by / round |
 |---|---|---|---|---|
@@ -139,7 +142,8 @@ cited region, per W10.4: re-locate the region by hash, never by line number.
 
 ### W10.3 — the whole-tree sweep's work-list
 
-Same salvage rule. These rows belong to the sweep slice that follows the pass.
+Same locator and whole-file reuse rule. These rows belong to the sweep slice that
+follows the pass.
 
 | Observation | File | Region sha256 | Standards section cited | Raised by / round |
 |---|---|---|---|---|

@@ -1,8 +1,9 @@
 # 2026-08-28 — standards review of the merged head: triage for the owner
 
 The 321 rows are filed in `reviews/2026-08-25-pr7-standards-worklist.md`, routed
-101 to W10.2 and 220 to W10.3, each salvaged by the sha256 of its region. This file
-is only for the three things the rider does not decide.
+101 to W10.2 and 220 to W10.3. Each region sha256 relocates its citation; it does not
+authorize W10.4 reuse unless the entire reviewed file is byte-identical. This file is
+only for the three things the rider does not decide.
 
 Counts here are computed, not restated; the commands are in the commit message of
 `38ffdb4` and in `analyze`-style one-liners over `findings.json`.
@@ -19,9 +20,9 @@ Two consequences, and the second is the one that matters:
 1. "No material disagreement between lenses" is **not a finding of agreement**. No two
    lenses read the same text, so there was never an opportunity to disagree.
 2. **A defect missed by its lens is missed unrecoverably.** Nothing downstream can
-   catch it: no second reader covers that file, the hash gate only checks that a
-   *filed* finding's quote is real, and the salvage control only proves filed rows
-   relocate. Every one of those controls validates what was found; none of them
+   catch it: no second reader covers that file, and the region-hash gate only checks
+   that a *filed* finding's quote relocates. Whole-file identity is the separate W10.4
+   reuse condition. Every one of those controls validates what was found; none of them
    bounds what was not.
 
 So the 321 findings are a **lower bound from fourteen single passes**, not a survey
@@ -89,32 +90,22 @@ kept; where the ruling changes the spec, `DESIGN.md` takes the compressed edit a
 time, citing the record. A *review* document is neither, and this one claims to be
 neither.
 
-**What that means for the rulings reported here.** Three are recorded in decision records
-— `decisions/2026-08-25-commandspec-program-osstring.md`,
-`decisions/2026-08-25-checkpoint-merges.md`,
-`decisions/2026-08-24-pr3-layer-freeze-charter.md` — and **none of those three exists in
-this tree.** They land in pull request #40, so every citation of them here **dangles until
-#40 lands**. That is the accurate statement of the hazard, and it is narrower than the one
-an earlier revision made.
+**What that means for the rulings reported here.** The prerequisite records now exist:
+`decisions/2026-08-25-commandspec-program-stays-string.md`,
+`decisions/2026-08-25-checkpoint-merges.md`, and
+`decisions/2026-08-24-pr3-layer-freeze-charter.md`. The first records the withdrawal of
+the proposed `OsString` widening; `DESIGN.md` remains the living authority and retains
+`CommandSpec.program: String`.
 
-**No `DESIGN.md` edit is owed by anything in this file**, and the reason is worth stating
-because a reader could reasonably expect one. §2's clause says durable wire-facing log
-identity **stays** `String` — it records that the existing spec is unchanged, so there is
-no compressed edit to make. The one ruling here that *would* change the spec, the
-`OsString` widening, is scheduled to `DESIGN.md:222` at W4 by its own record and is
-deliberately not made now.
+**No `DESIGN.md` edit is owed by anything in this file.** Durable wire-facing log
+identity stays `String`, and the proposed `CommandSpec.program` widening was withdrawn.
+The pass records W4 as empty, consistent with `DESIGN.md:222`.
 
 Two consequences follow and both are now stated wherever they bite:
 
-1. **Merge order: #40, then #42, then #41.** This is **the owner's ruling of
-   2026-08-28**, correcting an earlier ruling of their own that called the dependency
-   soft and ordered only #42 before #41. #40 first, because the three records cited above
-   are its content and the citations here dangle until it lands. #42 before this one,
-   because §1(b) says the trust-boundary cluster *"routes to `reviews/FINDINGS.md` §2"* in
-   the present tense, and that is true only once #42 lands. **What this tree can show is
-   that the three records are absent from it**; that they land in #40, and what #40 and
-   #42 currently contain, are the owner's statements about mutable branches this document
-   does not pin to a head.
+1. **Merge order was #40, then #42, then #41.** At this reconciled head the prerequisite
+   records and the #42 ledger rows are present, so the dependencies this report names are
+   satisfied rather than forward promises.
 2. **Where this file states a ruling, it cites the record that will carry it.** Where
    no record exists yet, it says the ruling is reported and pending its record rather
    than writing it as settled law.
@@ -131,11 +122,10 @@ the evidence a deviation needs to the strength of the rule it deviates from:
 > design—not an ad hoc exception.
 
 `§8`'s path-representation bullet — *"Represent paths with `Path`, `PathBuf`, `OsStr`,
-or `OsString`"* — carries **no requirement keyword**, while two sibling bullets in the
-same section are explicitly MUST-tagged: *"Path containment checks MUST account for
-`..`, absolute paths, symlinks/reparse points…"* and *"Event schema changes MUST
-preserve or deliberately migrate supported historical runs"*. The author distinguished
-MUST from untagged inside one section, so the untagged bullet is at most SHOULD.
+or `OsString`"* — is an imperative requirement even though it carries no explicit RFC
+2119 keyword. The standard defines the strength of explicit keywords; it does not assign
+untagged imperatives a default SHOULD strength. This report therefore does not use §1's
+SHOULD-deviation exception to dismiss an untagged rule.
 
 ### (a) The lossy-path class — **REOPENED IN FULL and escalated**
 
@@ -316,14 +306,14 @@ so there is no rationale to weigh even at SHOULD strength. It is routed as
 where an earlier revision left it as sweep work.
 
 They are therefore **not** the sweep's work. They route to `reviews/FINDINGS.md` §2 as
-contract rows with a named owner. **That routing is a claim about pull request #42, and
-it is true only once #42 lands** — which is why the merge order in §0b puts #42 first.
-Digests are full sha256, because an elided digest cannot be checked. The row ids are
-**forward references**: #42 creates them and they do not resolve in this tree, which is
-the second reason the merge order in §0b puts #42 first. They are named anyway, because
-a routing claim that cannot be followed to a row id is not checkable at all:
+contract rows with a named owner, and those rows are present at this reconciled head.
+The digests below are full sha256 values for the regions in the original reviewed tree
+`3e5212d`; they preserve review provenance but do not claim current-tree W10.4 reuse.
+`reviews/FINDINGS.md` is canonical for each row's current target and digest after #42's
+re-derivation, so a differing digest there is expected evidence of a changed file rather
+than a second current locator:
 
-| row id (created by #42) | file | § | observation | region sha256 |
+| row id | file | § | observation | review-source region sha256 at `3e5212d` |
 |---|---|---|---|---|
 | `PR7-STD-PRIVATE-ROOT-LEXICAL-COMPARE` | `src/engine/topology/recover.rs` | §14 fail-closed | The explicit private-root comparison falls back to lexical equality on every canonicalization error. | decision site `5289194ca998e04b98b33aba06400b2abab199a6fdce2c9737693e326f6990c5`; rationale `74cb133ae3a953d0c6a7e7dcf8c25c445203f0cbe52f457c309645e4963b555f` |
 | `PR7-STD-OWNER-RECORD-LEXICAL-AUTH` | `src/engine/topology/recover.rs` | §14 fail-closed | Owner-record public-directory authentication falls back to lexical spelling when canonical evidence is unavailable. | decision site `a332d47443baaa6c12f1f74ee47e06a6b654e16a6bbbd731261d1de46971fb75`; rationale `1366553bf35fea1422476857aa79e3b8ac7c76e7e77011c01e84efcea7d0abb1` |
@@ -345,35 +335,32 @@ rows: *"Lexical normalization alone does not prove filesystem containment."*
 
 Not repaired by this seat, and not carried by #40 or #41.
 
-### (c) The unbounded-input class — 9 sites, and an explicit disposition
+### (c) The unbounded-input class — explicit dispositions
 
 An earlier revision of this file described this class and the final commit **removed it
-without disposing of it**, while §1's opening said all 28 escalated findings had been
-ruled on. They had not: 12 + 1 + 7 is 20. The nine are restored here with a disposition
-each, which is what was missing.
+without disposing of it**. The observations are restored here with a disposition each,
+which is what was missing.
 
-**One of the original nine is not in this table, and an earlier revision said so while
-leaving the row in place.** `src/runner/container.rs`'s `exec_streams` cites **§9**, whose
+`src/runner/container.rs`'s `exec_streams` is not in this table because it cites **§9**, whose
 subprocess requirements are MUST-tagged, so §1 sends it to an owner rather than to the
 sweep. It is routed as `PR7-STD-CONTAINER-EXEC-UNBOUNDED` — see §1(b). Leaving it here
 also made the sentence below false about its own table.
 
-The rows that remain here cite `§14`, and the clause they land on — *"Bound input size, recursion,
-collection growth, output capture, concurrency, and retry work before allocating or
-spawning from untrusted values"* — carries **no requirement keyword**, while a sibling
-bullet in the same section is explicitly MUST-tagged. By exactly the reasoning applied
-to `§8`'s untagged path bullet, it is **at most a SHOULD**, so `§1`'s test is whether
-the site carries a concrete reason in the code.
+The rows that remain here cite `§14`, and the clause they land on — *"Bound input size,
+recursion, collection growth, output capture, concurrency, and retry work before
+allocating or spawning from untrusted values"* — is an imperative requirement. Its lack
+of an explicit keyword does not make it a SHOULD or authorize a documented deviation.
 
 | site | reason in the code? | disposition |
 |---|---|---|
-| `src/util.rs` `read_file_bounded`, and `src/events/log.rs`'s whole-log read through it | **yes, explicitly** | **Rejected — compliant documented deviation.** The doc says the quiet part: *"It is not a cap: a regular file is read in full however large it is… the read is bounded, not the answer."* `log.rs`'s `read_bytes` cites it and says why, naming `PR5-RD-001`. |
-| `src/events/log.rs` incremental poll, `file.read_to_end(&mut buffer)` after `seek` | **no — and it contradicts its own module** | **OPEN. The strongest of the nine.** `read_bytes`'s doc states the module's rule — `read_file_bounded` *"here and at every other read of a log in this module"* — and this site is the exception to it. The surrounding code already reads `file.metadata().len()` for its truncation check and does not use it as a bound. Failure: a large or continuously appended log forces unbounded allocation and the poll need never reach EOF. |
-| `src/engine/topology/recover.rs` `read_record` (`owner.json`, `committed.json`) | no — the doc is *"Read one JSON record, or refuse naming the file."* | **OPEN**, undocumented SHOULD deviation on persisted run data, which `§14` names as a trust-boundary input. |
+| `src/util.rs` `read_file_bounded`, and `src/events/log.rs`'s whole-log read through it | **yes, explicitly** | **OPEN.** The doc accurately says *"It is not a cap: a regular file is read in full however large it is… the read is bounded, not the answer."* That rationale documents the behavior but does not satisfy §14's imperative to bound input before allocating. |
+| `src/events/log.rs` incremental poll, `file.read_to_end(&mut buffer)` after `seek` | **no — and it contradicts its own module** | **OPEN.** `read_bytes`'s doc states the module's rule — `read_file_bounded` *"here and at every other read of a log in this module"* — and this site is the exception to it. The surrounding code already reads `file.metadata().len()` for its truncation check and does not use it as a bound. Failure: a large or continuously appended log forces unbounded allocation and the poll need never reach EOF. |
+| `src/engine/topology/recover.rs` `read_record` (`owner.json`, `committed.json`) | no — the doc is *"Read one JSON record, or refuse naming the file."* | **OPEN**, unbounded persisted run data, which `§14` names as a trust-boundary input. |
 | `src/engine/attempt.rs` and `src/review.rs`, agent-authored artifacts read into prompts | no | **OPEN**, undocumented, and the input is model output — the least trusted class this engine handles. |
 | `src/config.rs` | no — the nearby doc is about modification time, not bounds | **OPEN**, undocumented. |
 | `src/topology/schema.rs` header probe | not checked to the same depth | **OPEN, and the check is owed.** Recorded as unverified rather than asserted either way. |
 | `src/validate.rs` cycle detection over the untrusted task graph | not checked to the same depth | **OPEN, and the check is owed.** |
+| `src/export.rs` `export::load`, whole normalized plan read before digest or schema validation | no | **OPEN.** Persisted run data is untrusted under §14; `std::fs::read` allocates the complete file before either integrity check. |
 
 **What the seat verified and what it did not.** Every row above was read at its cited site
 in this tree **except** `src/topology/schema.rs`'s header probe and `src/validate.rs`'s
@@ -388,7 +375,7 @@ direction.
 incremental poll deserves a `reviews/FINDINGS.md` §2 row with an owner, for the same
 reason the trust-boundary cluster got one: it has a concrete availability failure
 sequence against the artifact `DESIGN.md` §4 makes the engine's ground truth. The
-remaining open sites are undocumented SHOULD deviations and belong to the sweep, where
+remaining open sites are unbounded-input observations and belong to the sweep, where
 their rows already are. **No row is added to `reviews/FINDINGS.md` by this pull
 request** — #42 owns that file in this sequence, and two branches editing it would
 manufacture a conflict between two of this seat's own changes.
@@ -406,12 +393,12 @@ other two are independent of it and each remains sufficient on its own:
 
 - `§8`'s *own* MUST makes an event-schema change a migration of supported historical
   runs, categorically not the one-field widening W4 is chartered for.
-- The `OsString` record scopes itself to *"the one measured field"* with *"no
-  speculative widening"*, so it cannot authorise what it expressly declined to cover.
+- The `commandspec-program-stays-string` record withdraws the proposed widening and the
+  pass records W4 as empty, so it cannot authorize a different field change.
 
 **And the reopened class does not reach W4 either**, which is why withdrawing the first
-reason changes no outcome. W4 widens **one** field, `CommandSpec.program`, from `String`
-to `OsString`. No row in §1(a) is about that field: they are event and
+reason changes no outcome. W4 is empty; `CommandSpec.program` remains `String`. No row
+in §1(a) is about that field: they are event and
 marker records, subprocess arguments, an executable probe and a mount source. Their repair —
 where the owner rules one is owed — is **whatever §1(a)'s boundary split prescribes for each
 of them**, and not one remedy for all: a two-sided, backward-compatible representation where
@@ -423,10 +410,9 @@ widening a type in the frozen design and needs no `DESIGN.md:222` edit.
 
 What the ruling added instead is a clause, not a record: the two live documents reason
 oppositely about one trade-off — `events.rs` argues cross-platform log legibility for
-`String`, the `OsString` record argues cross-platform replay of a non-UTF-8 program was
-never meaningful — and both are right about their own subject. Ephemeral spawn-time
-identity widens; durable wire-facing log identity stays `String`. That clause is in the
-record's Consequences list, which W4 already opens.
+`String`, while the command-spec record preserves the existing `String` boundary after
+considering non-UTF-8 program identity. Durable wire-facing identity and
+`CommandSpec.program` both stay `String`; W4 opens neither.
 
 ## 3. Frozen-layer edits
 
