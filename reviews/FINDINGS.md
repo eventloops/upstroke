@@ -3460,3 +3460,25 @@ repair pass committed as `4119612`. The owner-authorized final dispositions afte
 
 The other review findings are fixed by the delivered pass: Process sites are release-validated and carried
 through termination, and the writable-`Command` export guard is structural rather than spelling-based.
+
+## 26. 2026-08-29 G2 W1 — fold-door and probe-pair obligations
+
+This append-only disposition applies the owner-authorized W1 acceptance matrix derived on-box from the
+authoritative private packet. Private packet text is not reproduced here. The slice starts from integration
+`bc30d7c38e5ed69939315a05bf870a9bf745b139`. Exact-head hosted evidence remains required before these
+implementation dispositions become final.
+
+| stable ID | disposition | exact scope and evidence |
+|---|---|---|
+| `TASK-DISPATCHED-REGION-UNVALIDATED` | **implementation-fixed at `185e392`** | Dispatch validation derives the predicted region from the frozen fold state and refuses an event-carried region that differs. Shape, round-trip, and mutation witnesses exercise the derivation boundary. |
+| `PR7-G2-W1-SUCCESS-IGNORES-THE-FROZEN-PLAN` | **implementation-fixed at `c0ec940`** | Candidate success is judged against the task's frozen review plan: configured passes must be present and successful, so a partial or empty recorded pass set cannot satisfy the door. Focused and mutation witnesses cover the plan-presence gate. |
+| `PR7-G2-W1-RETAINED-ARM-UNGUARDED` | **implementation-fixed at `46780ea`, review repair `d895dd5`** | The retained settlement arm validates record/envelope identity and now refuses a record whose public predicate says successful, preserving candidate preparation as the sole successful settlement. Red-first sibling-arm and mutation witnesses cover the accepted P1 repair. |
+| `PR7-G2-W1-PROBE-PAIR-NOT-OBLIGED` | **implementation-fixed at `6c6cb3d`, review repair `d895dd5`** | Probe registration authority is structural and accounted: the execution seam is sealed, the caller grants the slot/ledger capability, and P4 verifies the granted capability recorded each probe. Red-first cooperative/substitution witnesses and mutation checks cover the accepted P1 repair. |
+
+The four rows are one collision set and one W1 PR. `6c6cb3dabcb8f30ef8ae7e24703eb36ba762b86f` is the
+implementation head before the root-owned ledger commit. The single independent review of ledger head
+`e0e7ade69b0298a43d26adcea5c1b761c750d376` returned two P1 code blockers and this P2 evidence-wording
+defect; root triaged all three once. The same implementor delivered the sole code repair at `d895dd5`; this
+ledger correction is root's part of that bounded disposition. There is no second review. Exact public head,
+globally serialized full-suite results, and final hosted gates are recorded externally in the phase audit so
+the ledger does not make a self-referential commit claim.

@@ -705,7 +705,15 @@ mod tests {
                 review: Effort::Medium,
             },
             reviews: ReviewPlan {
-                enabled: Some(false),
+                // **Enabled, because the fixture's attempt records are
+                // reviewed.** This froze verification *off* while every
+                // `candidate_prepared` the census builds carries a passed
+                // `review` — a combination production never produces
+                // (`plan_for`'s disabled branch resolves no `primary` at all)
+                // and one `check_candidate_prepared` now refuses, because a run
+                // that judged nothing obliges no pass and a record that names
+                // one is claiming a review the run never ran.
+                enabled: Some(true),
                 alternative_available: Some(false),
                 pass_timeout_secs: Some(97),
                 primary: Some(PassBinding::new("aleph-Mid-agent", "aleph-Mid-model")),
@@ -750,12 +758,24 @@ mod tests {
         fold
     }
 
+    /// Region A or B — the region the entry's frozen hint **derives**, not the
+    /// hint.
+    ///
+    /// The hints are `src/aleph/` and `src/bet/`, and the derivation trims the
+    /// trailing separator, so the literal here carries no slash. It used to
+    /// carry one, which made every `task_dispatched` this fixture built record
+    /// a region the fold does not derive — refused by `check_dispatched` since
+    /// the region became derivation-checked, and invisible before that because
+    /// the two spellings name the same components to
+    /// [`crate::topology::leases::paths_overlap`]. The round trip is
+    /// [`the_fixture_region_is_the_one_the_fold_derives`], so the two cannot
+    /// drift apart again silently.
     fn region(key: TaskKey) -> PathSet {
         PathSet::Prefixes {
             paths: vec![GitPath::from(if key == ALEPH {
-                "src/aleph/"
+                "src/aleph"
             } else {
-                "src/bet/"
+                "src/bet"
             })],
         }
     }
@@ -768,7 +788,7 @@ mod tests {
     /// under which the overlap relation answers differently from the others.
     fn overlap_region() -> PathSet {
         PathSet::Prefixes {
-            paths: vec![GitPath::from("src/aleph/"), GitPath::from("src/bet/")],
+            paths: vec![GitPath::from("src/aleph"), GitPath::from("src/bet")],
         }
     }
 

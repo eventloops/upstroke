@@ -966,12 +966,18 @@ pub(crate) mod tests {
                 review: Effort::Medium,
             },
             reviews: ReviewPlan {
-                enabled: Some(false),
+                // Enabled: this fixture's successful attempts record a passed
+                // `review` pass, and a run that froze verification off obliges
+                // none. The two together were a shape production cannot write.
+                enabled: Some(true),
                 alternative_available: Some(false),
                 pass_timeout_secs: Some(89),
                 primary: Some(PassBinding::new("aleph-Mid-agent", "aleph-Mid-model")),
                 alternative: None,
-                second_opinion: vec![None, None],
+                // One entry per task: the registry refuses a plan whose
+                // second-opinion list is not aligned with `plan.tasks`, and
+                // this fixture's plan has three.
+                second_opinion: vec![None, None, None],
             },
         }
     }
@@ -1027,9 +1033,16 @@ pub(crate) mod tests {
         fold
     }
 
+    /// The region an ordinary dispatch of `key` predicts.
+    ///
+    /// The frozen hint is `src/{label}/`; the derivation trims the trailing
+    /// separator, and this is the derivation rather than the hint. The two
+    /// spellings are one region to `paths_overlap`, which is why the fixture
+    /// could carry the wrong one until `check_dispatched` began comparing the
+    /// recorded region against the derived one.
     pub(crate) fn region(key: TaskKey) -> PathSet {
         PathSet::Prefixes {
-            paths: vec![GitPath::from(format!("src/{}/", label(key)).as_str())],
+            paths: vec![GitPath::from(format!("src/{}", label(key)).as_str())],
         }
     }
 
@@ -1194,6 +1207,20 @@ pub(crate) mod tests {
         settled.event
     }
 
+    /// Give `request` a session to resume — in **both** places the attempt
+    /// carries one.
+    ///
+    /// `FinishedAttempt` holds the id twice: on `session`, which the settlement
+    /// records, and on `record.session_id`, which the ledger line reports.
+    /// Production fills both from `assessed.outcome.session_id`, so they are
+    /// one value there; a fixture that set only the first would build a
+    /// retained settlement whose two halves name different conversations, which
+    /// `check_attempt_finished` refuses.
+    pub(crate) fn resuming(request: &mut FinishedAttempt, session: &SessionId) {
+        request.session = Some(session.clone());
+        request.record.session_id = Some(session.0.clone());
+    }
+
     /// A retained generation of `key`, held by the current epoch.
     pub(crate) fn retained_generation(
         fold: &mut TopologyFold,
@@ -1203,7 +1230,7 @@ pub(crate) mod tests {
         in_flight(fold, key, generation);
         let session = SessionId(format!("sess-{}-{generation}", label(key)));
         let mut request = finished(key, generation, 1, Next::RetrySameRung { resume: true });
-        request.session = Some(session.clone());
+        resuming(&mut request, &session);
         settle_into(fold, &request);
         session
     }
@@ -1410,7 +1437,7 @@ pub(crate) mod tests {
         // `RetrySameRung { resume: true }` with a session is the one that does
         // *not* close, and it is the only one that records an incarnation.
         let mut request = finished(ALEPH, 0, 1, Next::RetrySameRung { resume: true });
-        request.session = Some(SessionId("sess-aleph".to_owned()));
+        resuming(&mut request, &SessionId("sess-aleph".to_owned()));
         let settled = settle_failed(&fold, &request).expect("settles");
         assert_eq!(
             settled.event.settlement,
@@ -1593,7 +1620,7 @@ pub(crate) mod tests {
         let closed = settle_failed(&other, &finished(ALEPH, 0, 1, Next::Fail)).expect("settles");
         assert_eq!(rematerialize_question(&closed.event), None);
         let mut retaining = finished(ALEPH, 0, 1, Next::RetrySameRung { resume: true });
-        retaining.session = Some(SessionId("sess".to_owned()));
+        resuming(&mut retaining, &SessionId("sess".to_owned()));
         let retained = settle_failed(&other, &retaining).expect("settles");
         assert_eq!(rematerialize_question(&retained.event), None);
     }
@@ -2351,7 +2378,7 @@ pub(crate) mod tests {
             // T-APPEND (s): the line is synced and the process dies. The
             // settlement is durable and nothing after it was ever attempted.
             let mut request = finished(ALEPH, 0, 1, Next::RetrySameRung { resume: true });
-            request.session = Some(SessionId("sess-aleph-retained".to_owned()));
+            resuming(&mut request, &SessionId("sess-aleph-retained".to_owned()));
             let settled = settle_failed(&fold, &request).expect("settles");
             harness
                 .lock()

@@ -86,6 +86,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
 use crate::agent::AdapterSource;
+use crate::agent::ProcessOutput;
 use crate::error::UpstrokeError;
 use crate::events::log::{
     BarrierStep, EventLog, TopologyLine, establish_stable_prefix, first_line_digest,
@@ -99,7 +100,7 @@ use crate::rundir::{
     remove_marker, remove_private_husk, remove_public_husk, stage_commit_record, stage_marker,
     stage_owner_record, write_plan,
 };
-use crate::runner::{InvocationId, Runner};
+use crate::runner::{InvocationId, Runner, RunnerRequest};
 use crate::topology::effects::EventSite;
 use crate::topology::events::{RunStarted4, TopologyEvent, TopologyEventBody};
 use crate::topology::fold::{FrozenInputs, TopologyDelta, TopologyFold};
@@ -128,7 +129,186 @@ pub use steps::Started;
 /// observable if a test can see which probe ran first. [`RunnerProbes`] is the
 /// production implementation and is a thin composition of two existing
 /// functions.
-pub trait Probes {
+/// The granted atomic pair — R3's ledger and R4's slots — as **one value**.
+///
+/// **The unit of the grant is the pair, so the pair is a type.** They were two
+/// fields on the creation request beside a `&dyn Probes`, and nothing required
+/// the probes to use them: an implementation could run its processes through a
+/// pair of its own and let the closing balance inspect the supplied one. Moving
+/// them onto the trait did not fix it either — a trait exposing `agent()`
+/// beside `ledger()` cannot force `agent()` to use what the accessor returns —
+/// and the `b1f54a5` review constructed exactly that. Both attempts phrased the
+/// obligation as a claim about a *signature*, which is what
+/// `PR7-G2-W1-PROBE-PAIR-NOT-OBLIGED` recorded as asserted-and-refuted four
+/// times.
+///
+/// What is structural, and stated no wider than it is: the caller grants the
+/// pair, builds the registration capability from it, and hands the probe **the
+/// capability** rather than its ingredients. A probe receives a
+/// [`ShellProbe`] or an [`AgentProbe`] — types whose fields are private to this
+/// module and whose only constructors are [`Self::shell_probe`] and
+/// [`Self::agent_probe`] — so the pair a probe registers into is the pair its
+/// caller bound, and the production implementation has no runner, ledger or
+/// slots of its own from which a second one could be built.
+///
+/// It is not a claim about every possible `impl Probes`: a test double may hold
+/// whatever it likes and simply *not register*, which is what
+/// `ContainerProbes` does. That is a probe running nothing through the run's
+/// boundary, which the closing balance sees as an empty ledger — a different
+/// failure from the one this closes, and one the fixture asserts on its own.
+#[derive(Clone, Copy)]
+pub struct ProbePair<'a> {
+    ledger: &'a Mutex<InvocationLedger>,
+    slots: &'a Mutex<SlotAssertion>,
+}
+
+impl<'a> ProbePair<'a> {
+    /// Grant the pair. The caller owns both halves for the run's lifetime.
+    #[must_use]
+    pub fn grant(ledger: &'a Mutex<InvocationLedger>, slots: &'a Mutex<SlotAssertion>) -> Self {
+        Self { ledger, slots }
+    }
+
+    /// The **non-slotted** capability the shell probe registers through.
+    ///
+    /// INV-23: "one non-slotted shell probe (the recorded shell executing
+    /// `exit 0`)". The capability holds no slots at all rather than holding
+    /// them and declining to use them, so "the shell probe takes no pair" is a
+    /// property of what it was handed.
+    #[must_use]
+    pub fn shell_probe(&self, runner: &'a dyn Runner) -> ShellProbe<'a> {
+        ShellProbe {
+            through: super::preflight::Registering {
+                inner: runner,
+                ledger: self.ledger,
+                slots: None,
+            },
+        }
+    }
+
+    /// The **slotted** capability one agent probe registers through.
+    ///
+    /// INV-23: "one slotted probe per recorded agent, each a registered
+    /// invocation through the run's Runner". Every request the adapter builds
+    /// is its own registered invocation with its own slot, which is why the
+    /// capability is a `Runner` handed to the adapter rather than a
+    /// registration wrapped around the whole call.
+    #[must_use]
+    pub fn agent_probe(&self, runner: &'a dyn Runner) -> AgentProbe<'a> {
+        AgentProbe {
+            through: super::preflight::Registering {
+                inner: runner,
+                ledger: self.ledger,
+                slots: Some(self.slots),
+            },
+        }
+    }
+
+    /// How many invocations this pair has accounted, settled or still running.
+    ///
+    /// **What P4 uses to tell a probe that ran from one that only said it
+    /// did.** Handing a probe a capability cannot make it call one: the trait
+    /// takes `&ShellProbe`/`&AgentProbe` and an implementation is free to
+    /// ignore the argument and execute through an authority of its own, which
+    /// is what `ContainerProbes` did in this tree and what the `6c6cb3d`
+    /// review named. So the obligation is not asserted about the signature —
+    /// it is **checked against the grant**: this count does not move unless
+    /// something was registered into the pair the caller owns, and P4 refuses
+    /// a probe that returns `Ok` without moving it.
+    ///
+    /// Registered rather than completed, so a probe whose process failed still
+    /// counts as having executed through the run's boundary. The question is
+    /// *where* it ran, not whether it succeeded — [`Self::balances`] is the
+    /// separate question of whether what ran was settled.
+    #[must_use]
+    pub fn accounted(&self) -> usize {
+        let ledger = self
+            .ledger
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        ledger.completed() + ledger.cancelled() + ledger.running().len()
+    }
+
+    /// Whether every invocation registered into **this** pair settled exactly
+    /// once, and no slot pair is still held.
+    ///
+    /// `permits.protocol` asks for "registered/completed/cancelled exactly
+    /// once", and a held pair at the end of creation means a probe took a slot
+    /// and did not give it back. Read here rather than from two fields at the
+    /// call site, so the balance and the capabilities are demonstrably the same
+    /// binding.
+    #[must_use]
+    pub fn balances(&self) -> bool {
+        self.ledger
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .balances()
+            && self
+                .slots
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .held()
+                .is_none()
+    }
+}
+
+/// The shell probe's boundary: the run's Runner, registering into the caller's
+/// ledger, with no slots.
+///
+/// A slotted invocation arriving here is **refused** —
+/// [`super::preflight::Registering`] makes that decision, because it is the one
+/// place register/slot/run/settle is implemented.
+pub struct ShellProbe<'a> {
+    through: super::preflight::Registering<'a>,
+}
+
+impl Runner for ShellProbe<'_> {
+    fn run(&self, request: &RunnerRequest) -> Result<ProcessOutput, UpstrokeError> {
+        self.through.run(request)
+    }
+}
+
+/// One agent probe's boundary: the run's Runner, registering into the caller's
+/// ledger and taking the caller's slots.
+///
+/// A **non-slotted** invocation is refused here, which is the other half of
+/// INV-23's asymmetry: the shell probe is the one non-slotted probe and it does
+/// not run on this path.
+pub struct AgentProbe<'a> {
+    through: super::preflight::Registering<'a>,
+}
+
+impl Runner for AgentProbe<'_> {
+    fn run(&self, request: &RunnerRequest) -> Result<ProcessOutput, UpstrokeError> {
+        if !super::identity::is_slotted(&request.invocation) {
+            return Err(UpstrokeError::Refused {
+                message: format!(
+                    "`{}` takes no slot and this is an agent probe's boundary; INV-23's \
+                     non-slotted probe is the recorded shell, which runs on its own path",
+                    request.invocation
+                ),
+            });
+        }
+        self.through.run(request)
+    }
+}
+
+/// Closes [`Probes`] to implementations outside this module.
+///
+/// **A seam whose contract cannot be expressed in its signature is closed
+/// instead.** `Probes` exists so a test can observe the *order* the two probes
+/// run in; what it cannot express is that an implementation must execute
+/// through the capability it is handed, and three attempts to phrase that as a
+/// property of the signature were each refuted. Sealing removes the class of
+/// implementor this module cannot check: the only `impl Probes` anywhere is one
+/// written here or in this module's own tests, where P4's grant check
+/// (`ProbePair::accounted`) is the enforcement and the doubles are read
+/// alongside it.
+mod sealed {
+    pub trait Sealed {}
+}
+
+pub trait Probes: sealed::Sealed {
     /// `runner_policy_sha256` of the policy the probes execute under.
     ///
     /// P4 refuses when this is not the digest the pre-lock checks resolved and
@@ -147,46 +327,46 @@ pub trait Probes {
     fn shell(
         &self,
         invocation: InvocationId,
-        ledger: &Mutex<InvocationLedger>,
-        slots: &Mutex<SlotAssertion>,
+        through: &ShellProbe<'_>,
     ) -> Result<(), UpstrokeError>;
 
     /// One recorded agent's probe, slotted.
     ///
-    /// **Takes the ledger and slots rather than owning them.** They lived on
-    /// this trait for one round, on the argument that "one owner" made a second
-    /// pair unrepresentable. That argument was wrong and is **retracted**: a
-    /// trait exposing `agent()` beside `ledger()` and `slots()` cannot force
-    /// `agent()` to use what the accessors return, so an implementation could
-    /// run its processes through one pair and report another — and creation's
-    /// closing balance would read the reported one. The `b1f54a5` review
-    /// constructed it.
+    /// **Takes the capability, not the pair's ingredients.** The ledger and the
+    /// slots were arguments here for one round, and before that accessors on
+    /// this trait; both phrasings claimed a signature-level guarantee and both
+    /// were false — a trait exposing `agent()` beside `ledger()` cannot force
+    /// `agent()` to use what the accessor returns, and passing the two halves
+    /// in cannot force an implementation to build its boundary out of them.
+    /// The `b1f54a5` review constructed the second case;
+    /// `PR7-G2-W1-PROBE-PAIR-NOT-OBLIGED` recorded the claim as retracted.
     ///
-    /// The claim is not restated in a narrower form here, because it has been
-    /// asserted and found false once already. What is true is smaller: the
-    /// caller owns the pair, the trait has no accessor, and so a probe has
-    /// nothing of its own to report.
+    /// What is handed in now is an [`AgentProbe`]: the run's Runner with
+    /// registration already wrapped around it, built by the caller from the
+    /// pair the caller owns. An implementation registers by *running* through
+    /// it, so the pair it registers into is the caller's — and
+    /// [`RunnerProbes`], production's only implementation, holds no runner,
+    /// ledger or slots from which a second boundary could be assembled.
     ///
-    /// The caller owns the pair and hands it in. There is no second pair to
-    /// report because the trait has nothing to report *from*, which is a
-    /// property of the signature rather than of any implementation.
+    /// The claim stops there, deliberately. A double is still free to run
+    /// nothing at all; that leaves the caller's ledger empty, which is a
+    /// different failure and is asserted against on its own.
     ///
     /// # Errors
     ///
     /// [`UpstrokeError`] when the adapter is not registered or its CLI does not
     /// answer.
-    fn agent(
-        &self,
-        agent: &str,
-        ledger: &Mutex<InvocationLedger>,
-        slots: &Mutex<SlotAssertion>,
-    ) -> Result<(), UpstrokeError>;
+    fn agent(&self, agent: &str, through: &AgentProbe<'_>) -> Result<(), UpstrokeError>;
 }
 
-/// The production [`Probes`]: both probes through the run's own `Runner`.
+/// The production [`Probes`]: both probes through the boundary they are handed.
+///
+/// **It holds no runner.** The run's Runner reaches a probe only inside the
+/// [`ShellProbe`] or [`AgentProbe`] its caller built, so this implementation has
+/// nothing from which a second boundary — or a second pair — could be
+/// assembled. That is the whole of the structural claim, and it is a property
+/// of *this type's fields* rather than of the trait's signature.
 pub struct RunnerProbes<'a> {
-    /// The run's runner — host or container, whichever P0's policy resolved to.
-    pub runner: &'a dyn Runner,
     /// The recorded shell.
     pub shell: ShellKind,
     /// Where the shell probe runs. A probe has no workspace of its own; this is
@@ -199,24 +379,7 @@ pub struct RunnerProbes<'a> {
     pub policy_digest: String,
 }
 
-impl RunnerProbes<'_> {
-    /// The runner both probes actually execute through: the run's, with R3 and
-    /// R4 wrapped around **every** request an adapter makes.
-    ///
-    /// The pair comes from the caller, so this cannot wrap one and report
-    /// another.
-    fn registering<'a>(
-        &'a self,
-        ledger: &'a Mutex<InvocationLedger>,
-        slots: &'a Mutex<SlotAssertion>,
-    ) -> super::preflight::Registering<'a> {
-        super::preflight::Registering {
-            inner: self.runner,
-            ledger,
-            slots,
-        }
-    }
-}
+impl sealed::Sealed for RunnerProbes<'_> {}
 
 impl Probes for RunnerProbes<'_> {
     fn policy_digest(&self) -> &str {
@@ -226,37 +389,30 @@ impl Probes for RunnerProbes<'_> {
     fn shell(
         &self,
         invocation: InvocationId,
-        ledger: &Mutex<InvocationLedger>,
-        slots: &Mutex<SlotAssertion>,
+        through: &ShellProbe<'_>,
     ) -> Result<(), UpstrokeError> {
         crate::runner::host::run_shell_probe(
-            &self.registering(ledger, slots),
+            through,
             self.shell,
             self.workspace.clone(),
             invocation,
         )
     }
 
-    fn agent(
-        &self,
-        agent: &str,
-        ledger: &Mutex<InvocationLedger>,
-        slots: &Mutex<SlotAssertion>,
-    ) -> Result<(), UpstrokeError> {
+    fn agent(&self, agent: &str, through: &AgentProbe<'_>) -> Result<(), UpstrokeError> {
         let adapter = self
             .adapters
             .get(agent)
             .ok_or_else(|| UpstrokeError::Agent {
                 message: format!("no adapter registered for agent `{agent}`"),
             })?;
-        // **Through the registering runner, not the raw one.** Every process the
-        // adapter builds is its own registered invocation with its own slot, so
-        // a probe that fails at its fourth request is recorded at its fourth
-        // request. Handing `self.runner` here is what made the creation ledger
-        // account one logical probe instead of the processes it ran.
-        adapter
-            .probe(&self.registering(ledger, slots))
-            .map(|_caps| ())
+        // **Through the boundary the caller built.** Every process the adapter
+        // builds is its own registered invocation with its own slot, so a probe
+        // that fails at its fourth request is recorded at its fourth request.
+        // Handing a raw runner here is what made the creation ledger account one
+        // logical probe instead of the processes it ran — and there is no raw
+        // runner here to hand.
+        adapter.probe(through).map(|_caps| ())
     }
 }
 
@@ -1336,17 +1492,24 @@ pub struct Request<'a> {
     pub refs: &'a dyn IntegrationRefs,
     /// Where `run_started`'s timestamp comes from.
     pub clock: &'a dyn TimeSource,
-    /// R3's ledger and R4's slots — **the only pair**, handed to each probe.
+    /// The run's runner — host or container, whichever P0's policy resolved to.
     ///
-    /// They were moved onto the `Probes` trait for one round so that "one
-    /// owner" would make a second pair unrepresentable. A trait cannot do that:
-    /// exposing `agent()` beside `ledger()` leaves an implementation free to run
-    /// through one pair and report another, and the balance check below would
-    /// read the reported one. Owning them here and passing them in is the
-    /// property the signature actually gives — a probe has nothing of its own to
-    /// report.
-    pub ledger: &'a Mutex<InvocationLedger>,
-    pub slots: &'a Mutex<SlotAssertion>,
+    /// Held here rather than on the probes, because the *capability* a probe
+    /// registers through is built from this and [`Self::pair`] together, by P4,
+    /// and a probes implementation that also held a runner could assemble a
+    /// second boundary.
+    pub runner: &'a dyn Runner,
+    /// R3's ledger and R4's slots — **the only pair**, and the thing each
+    /// probe's boundary is built from.
+    ///
+    /// They were two fields here beside a `&dyn Probes` that carried another
+    /// pair, then accessors on the trait, and each phrasing claimed a guarantee
+    /// the shape could not give. What P4 hands a probe now is a
+    /// [`ShellProbe`] or an [`AgentProbe`] built from this value, and the
+    /// closing balance asks this same value whether everything settled — so the
+    /// pair the probes registered into and the pair the refusal reports on are
+    /// one binding rather than two fields that happen to agree.
+    pub pair: ProbePair<'a>,
 }
 
 // ---------------------------------------------------------------------------
@@ -1523,6 +1686,28 @@ fn p3b_publish_owner_record(
     Ok(OwnerRecordPublished::new(p3a, owner))
 }
 
+/// Whether a probe executed through the pair creation granted it.
+///
+/// INV-23 requires each probe to be "a registered invocation **through the
+/// run's Runner**", and the only thing this module can observe about a probe is
+/// what reached the grant. An unmoved count means the probe ran somewhere else
+/// or ran nothing; both are the same refusal, because both leave the run
+/// uncertified and its closing balance vacuous.
+fn used_the_grant(before: usize, after: usize, what: &str) -> Result<(), UpstrokeError> {
+    if after > before {
+        return Ok(());
+    }
+    Err(UpstrokeError::Refused {
+        message: format!(
+            "pre-flight: {what} returned success and registered nothing into the invocation \
+             ledger and slot pair this run granted it. INV-23 requires each probe to be a \
+             registered invocation through the run's Runner, so a probe that executed \
+             elsewhere — or not at all — certifies nothing about the boundary this run will \
+             spawn into"
+        ),
+    })
+}
+
 /// P4 — the `RunnerPreflight`: **the shell probe, then one probe per recorded
 /// agent**, each a registered invocation.
 ///
@@ -1566,10 +1751,22 @@ fn p4_run_preflight(
     // registers itself through `Registering`, so there is nothing to settle
     // here. The identity is still built here because the *ordinal* is this
     // module's — `recovery_order` (c) puts the shell probe first.
-    if let Err(error) = request
-        .probes
-        .shell(shell_id.clone(), request.ledger, request.slots)
-    {
+    // **The capability is built here, from the pair this module owns, and its
+    // use is checked.** A probe is handed the boundary rather than its
+    // ingredients — but handing it in cannot make an implementation call it, so
+    // the grant is measured across the call. A probe that returns `Ok` without
+    // registering anything into the pair executed somewhere this run does not
+    // account, and a pre-flight that certifies it publishes a run whose closing
+    // balance is clean because nothing ever used the pair it reads.
+    //
+    // The shell's boundary carries no slots: INV-23's non-slotted probe is this
+    // one.
+    let shell_through = request.pair.shell_probe(request.runner);
+    let before = request.pair.accounted();
+    if let Err(error) = request.probes.shell(shell_id.clone(), &shell_through) {
+        return Err(p3b.abort(Prefix::P3b, error));
+    }
+    if let Err(error) = used_the_grant(before, request.pair.accounted(), "the shell probe") {
         return Err(p3b.abort(Prefix::P3b, error));
     }
 
@@ -1588,9 +1785,21 @@ fn p4_run_preflight(
     // "one place, so that 'each a registered invocation' is true of a process an
     // adapter built as much as of one this module built". This module was the
     // other place.
+    // One capability per agent, and one grant check per agent: a single check
+    // over the whole loop would be satisfied by the first agent that ran and
+    // would certify every substituted probe behind it.
     let mut probed = Vec::with_capacity(request.agents.len());
     for agent in request.agents {
-        if let Err(error) = request.probes.agent(agent, request.ledger, request.slots) {
+        let agent_through = request.pair.agent_probe(request.runner);
+        let before = request.pair.accounted();
+        if let Err(error) = request.probes.agent(agent, &agent_through) {
+            return Err(p3b.abort(Prefix::P3b, error));
+        }
+        if let Err(error) = used_the_grant(
+            before,
+            request.pair.accounted(),
+            &format!("the probe of agent `{agent}`"),
+        ) {
             return Err(p3b.abort(Prefix::P3b, error));
         }
         probed.push(agent.clone());
@@ -1759,27 +1968,15 @@ fn p6_append_run_started(
             //     here rather than being implied by calls that are no longer in
             //     view. A held pair at this point means a probe took a slot and
             //     did not give it back.
-            //     **Read off the `Request`, which owns them**, so this cannot
-            //     be checking a different pair from the one P4 used: the same
-            //     two fields are what P4 hands to `probes.shell(..)` and
-            //     `probes.agent(..)` above.
-            //
-            //     This said "read through the probes, which own them", and they
-            //     no longer do — `ledger()` and `slots()` were deleted from the
-            //     trait on 2026-08-27 precisely so a probe could not hold a pair
-            //     of its own. The sentence was left describing the arrangement
-            //     the deletion removed, by the change that removed it.
-            let balanced = request
-                .ledger
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .balances()
-                && request
-                    .slots
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner)
-                    .held()
-                    .is_none();
+            //     **Asked of the pair itself.** It used to read two fields of
+            //     the `Request` and conjoin them here, which was the same two
+            //     values but not the same *binding*: nothing tied the halves P4
+            //     built its capabilities from to the halves this reads.
+            //     `ProbePair` is the grant, `ProbePair::shell_probe` and
+            //     `ProbePair::agent_probe` are the only ways to register into
+            //     it, and `ProbePair::balances` is this question asked of it —
+            //     one value, three uses.
+            let balanced = request.pair.balances();
             // (c) The handle is dropped, unretried, and the log reopened.
             let (facts, lock, log, _record) = p5b.into_parts();
             drop(log);

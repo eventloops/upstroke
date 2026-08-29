@@ -932,9 +932,19 @@ impl Run {
         CommitSha(self.fixture.head.clone())
     }
 
-    /// The predicted region an ordinary dispatch of this fixture takes.
-    pub(super) fn predicted(&self) -> PathSet {
-        PathSet::RepoWide
+    /// The predicted region an ordinary dispatch of `key` takes.
+    ///
+    /// **Read off the fold, not restated.** It answered `RepoWide` for every
+    /// task while the fixture's entries freeze `src/{id}/` hints, so every
+    /// dispatch this scaffold emitted recorded a region the fold did not
+    /// derive — the exact disagreement `check_dispatched` now refuses. A
+    /// literal here would be a second derivation of the run's own rule, which
+    /// is what let the two drift in the first place.
+    pub(super) fn predicted(&self, key: TaskKey) -> PathSet {
+        self.emitter
+            .fold()
+            .predicted_region(key)
+            .expect("the scaffold's run has started, so its registry answers")
     }
 
     /// Whether the harness saw `site` at `phase`.
@@ -1111,7 +1121,7 @@ impl Run {
             generation: GenerationId(generation),
             base: self.base(),
             kind: DispatchKind::Ordinary {
-                paths: self.predicted(),
+                paths: self.predicted(key),
             },
         };
         dispatch(
@@ -1309,7 +1319,21 @@ impl Run {
                             reviews: Vec::new(),
                             session_id: Some(RETAINED_SESSION.to_owned()),
                             usage: None,
-                            failure: None,
+                            // **A retained attempt did not succeed.**
+                            // `settle::settle_failed` is the only producer of a
+                            // `Retained` settlement and it is reached on the
+                            // failure path, so production's record always
+                            // carries this. This fixture recorded `failure:
+                            // None` with no reviews — a record every other door
+                            // in the fold calls *successful* — which is the
+                            // shape `check_attempt_finished`'s retained arm now
+                            // refuses.
+                            failure: Some(crate::events::FailureRecord {
+                                kind: crate::ladder::FailureKind::GateFailed,
+                                origin: crate::ladder::FailureOrigin::Worker,
+                                reason: "the scaffold's judged failure".to_owned(),
+                                detail: None,
+                            }),
                         }),
                         settlement: AttemptSettlement::Retained {
                             retained_session: SessionId(RETAINED_SESSION.to_owned()),

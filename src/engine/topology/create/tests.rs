@@ -56,6 +56,9 @@ const BASE_SHA: &str = "1111111111111111111111111111111111111111";
 const OTHER_SHA: &str = "2222222222222222222222222222222222222222";
 const INTEGRATION_REF: &str = "refs/heads/upstroke/run-01KZTPR7BCREATE00000000001";
 const AGENT: &str = "codex";
+/// A second recorded agent, so P4's per-agent grant check has two agents to be
+/// per-agent about.
+const SECOND_AGENT: &str = "claude-code";
 
 // -----------------------------------------------------------------------
 // Fixed identities and a fixed clock
@@ -437,16 +440,24 @@ impl RecordingProbes {
     }
 }
 
+impl super::sealed::Sealed for RecordingProbes {}
+
 impl Probes for RecordingProbes {
     fn policy_digest(&self) -> &str {
         &self.digest
     }
 
+    /// Records the call **and runs one process through the capability**.
+    ///
+    /// It used to only record. That was enough while the seam's obligation was
+    /// documentary; it is not enough now that P4 refuses a probe which
+    /// registers nothing into the granted pair, and a double that could not
+    /// satisfy the check would be a double of something production is not.
+    /// The recorded ordering — what this exists for — is unchanged.
     fn shell(
         &self,
         invocation: InvocationId,
-        _ledger: &std::sync::Mutex<InvocationLedger>,
-        _slots: &std::sync::Mutex<SlotAssertion>,
+        through: &ShellProbe<'_>,
     ) -> Result<(), UpstrokeError> {
         self.calls
             .lock()
@@ -460,15 +471,12 @@ impl Probes for RecordingProbes {
                 message: "pre-flight: the recorded shell did not run `exit 0`".to_owned(),
             });
         }
-        Ok(())
+        through
+            .run(&probe_request_for(invocation, None))
+            .map(|_output| ())
     }
 
-    fn agent(
-        &self,
-        agent: &str,
-        _ledger: &std::sync::Mutex<InvocationLedger>,
-        _slots: &std::sync::Mutex<SlotAssertion>,
-    ) -> Result<(), UpstrokeError> {
+    fn agent(&self, agent: &str, through: &AgentProbe<'_>) -> Result<(), UpstrokeError> {
         self.calls
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
@@ -481,7 +489,12 @@ impl Probes for RecordingProbes {
                 message: format!("pre-flight: `{agent}` could not be probed"),
             });
         }
-        Ok(())
+        through
+            .run(&probe_request_for(
+                PreflightIdentities::agent(agent, 0)?,
+                Some(agent),
+            ))
+            .map(|_output| ())
     }
 }
 
@@ -760,6 +773,9 @@ struct Driver<'a> {
     refs: &'a dyn IntegrationRefs,
     agents: Vec<String>,
     runner: RunnerPolicy,
+    /// The run's Runner, which the caller owns because the capabilities it
+    /// hands the probes are built from it and the pair together.
+    execution: RecordingRunner,
     ledger: std::sync::Mutex<InvocationLedger>,
     slots: std::sync::Mutex<SlotAssertion>,
     warnings: Vec<String>,
@@ -773,10 +789,27 @@ impl<'a> Driver<'a> {
             refs,
             agents: agents(),
             runner: crate::runner::policy::host_policy(),
+            execution: RecordingRunner::default(),
             ledger: std::sync::Mutex::new(InvocationLedger::new()),
             slots: std::sync::Mutex::new(SlotAssertion::new()),
             warnings: Vec::new(),
         }
+    }
+
+    /// Leave an unsettled registration in the granted pair.
+    ///
+    /// The balance check is only worth something if it reads a **populated**
+    /// pair rather than an empty one it could never have failed on, and since a
+    /// probe registers only by running through a capability that settles what
+    /// it runs, the leak has to be seeded by whoever owns the pair. That is the
+    /// caller — here, this fixture.
+    fn leak_into_the_pair(&self, agent: &str) {
+        let id = PreflightIdentities::agent(agent, 7).expect("a probe identity");
+        self.ledger
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .register(&id)
+            .expect("the fixture's stray registration");
     }
 
     fn run(&mut self, hooks: &mut TestHooks) -> Result<Started, Refused> {
@@ -792,8 +825,8 @@ impl<'a> Driver<'a> {
             probes: self.probes,
             refs: self.refs,
             clock: &clock,
-            ledger: &self.ledger,
-            slots: &self.slots,
+            runner: &self.execution,
+            pair: ProbePair::grant(&self.ledger, &self.slots),
         };
         create_run(self.fixture.checked(), request, hooks, &mut self.warnings)
     }
@@ -1973,56 +2006,6 @@ fn the_p1_staging_label_names_the_residue_the_stat_finds() {
 // The append-error protocol
 // =======================================================================
 
-/// A `Probes` that leaves one invocation registered and never settles it.
-///
-/// The only shape that can tell "the check read the probes' ledger" from "the
-/// check read some other ledger": on a *balanced* run both answers agree, so a
-/// balanced fixture cannot discriminate. This one does not balance, and the
-/// refusal has to say so.
-#[derive(Debug)]
-struct LeakyProbes {
-    digest: String,
-}
-
-impl LeakyProbes {
-    fn new(digest: &str) -> Self {
-        Self {
-            digest: digest.to_owned(),
-        }
-    }
-}
-
-impl Probes for LeakyProbes {
-    fn policy_digest(&self) -> &str {
-        &self.digest
-    }
-
-    fn shell(
-        &self,
-        _invocation: InvocationId,
-        _ledger: &std::sync::Mutex<InvocationLedger>,
-        _slots: &std::sync::Mutex<SlotAssertion>,
-    ) -> Result<(), UpstrokeError> {
-        Ok(())
-    }
-
-    fn agent(
-        &self,
-        agent: &str,
-        ledger: &std::sync::Mutex<InvocationLedger>,
-        _slots: &std::sync::Mutex<SlotAssertion>,
-    ) -> Result<(), UpstrokeError> {
-        // Registered and never settled, **into the ledger it was handed** —
-        // which is the whole point: a probe has no ledger of its own to leak
-        // into and no second one to report instead.
-        let id = PreflightIdentities::agent(agent, 0)?;
-        ledger
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .register(&id)
-    }
-}
-
 /// **A leaked registration is reported, which is what proves the check reads the
 /// ledger the probe registered into.**
 ///
@@ -2038,7 +2021,9 @@ impl Probes for LeakyProbes {
 #[test]
 fn a_leaked_probe_registration_is_reported_by_the_append_error() {
     let fixture = Fixture::new("append-leak");
-    let probes = LeakyProbes::new(&host_digest());
+    // A probe that uses what it is handed, because P4 now refuses one that does
+    // not: the leak this test needs is seeded by the owner of the pair below.
+    let probes = RecordingProbes::new(&host_digest());
     let refs = FakeRefs::empty();
     let mut hooks = TestHooks::new();
     hooks.arm(
@@ -2047,6 +2032,11 @@ fn a_leaked_probe_registration_is_reported_by_the_append_error() {
         InjectionMode::ErrorReturn,
     );
     let mut driver = Driver::new(&fixture, &probes, &refs);
+    // Seeded by the owner of the pair, because a probe can no longer leak:
+    // what it is handed settles what it registers. The property under test is
+    // unchanged — the balance reads the granted pair — and the seam that
+    // populates it moved to the only place that can.
+    driver.leak_into_the_pair(AGENT);
     let refused = driver
         .run(&mut hooks)
         .expect_err("the append returned an error");
@@ -2063,7 +2053,7 @@ fn a_leaked_probe_registration_is_reported_by_the_append_error() {
     assert!(
         text.contains("still holds a registered invocation"),
         "the refusal did not report the leaked registration, so the balance was \
-         checked against some ledger other than the one the probes used: {text}"
+         checked against some pair other than the one creation granted: {text}"
     );
 }
 
@@ -2105,12 +2095,12 @@ fn the_append_error_balance_reads_the_ledger_the_probes_used() {
     // true for the wrong reason — which the premise assertion below refuses. This
     // is `RunnerProbes` over a runner that answers, so P4's registrations are
     // real and the balance is earned.
-    let runner = RecordingRunner::default();
     let source = OneSource::default();
-    // No pair is built here: the `Request` owns the one pair and hands it to
-    // each probe, so the witness reads `driver.ledger` below.
+    // No pair and no runner are built here: the `Request` grants the one pair,
+    // owns the run's Runner, and builds each probe's boundary from the two — so
+    // the witness reads `driver.ledger` below and `RunnerProbes` has nothing of
+    // its own to read instead.
     let probes = RunnerProbes {
-        runner: &runner,
         shell: crate::gates::ShellKind::Sh,
         workspace: fixture.repo.clone(),
         adapters: &source,
@@ -2128,15 +2118,24 @@ fn the_append_error_balance_reads_the_ledger_the_probes_used() {
         .run(&mut hooks)
         .expect_err("the append returned an error");
 
-    // The premise: P4 ran, and its registrations are in **the** ledger — the one
-    // the request owns and hands to each probe, because there is no other. A
-    // balance check over an empty ledger is true for the wrong reason, and
-    // asserting the premise is what stops that.
+    // The premise: P4 ran, and **every process it ran** is accounted in the
+    // granted pair. A count greater than zero is not enough — the shell probe
+    // alone satisfies it, so a run whose *agent* probe was bound to some other
+    // pair would pass. The claim is therefore the equality: the run's Runner
+    // executed exactly the processes the pair settled.
+    let executed = driver.execution.requests().len();
     let ledger = driver.ledger.lock().unwrap_or_else(PoisonError::into_inner);
     assert!(
-        ledger.completed() > 0,
-        "P4 settled no invocation, so the balance the refusal reports is vacuous \
-         rather than earned"
+        executed > 1,
+        "P4 ran {executed} process(es); the shell probe and one agent probe are two, and a \
+         single one cannot tell the two boundaries apart"
+    );
+    assert_eq!(
+        ledger.completed(),
+        executed,
+        "the run's Runner executed {executed} process(es) and the granted pair settled {}; \
+         a probe registered into a pair this balance does not read",
+        ledger.completed()
     );
     assert!(
         ledger.balances(),
@@ -3425,69 +3424,89 @@ fn container_runtime() -> Inventory {
 /// runtime with no daemon behind it.
 ///
 /// [`ContainerRunner`]: crate::runner::container::exec::ContainerRunner
+/// The container runner a containerized creation executes through.
+///
+/// **Built by the caller, because the caller owns the run's Runner.** It used
+/// to live on [`ContainerProbes`], which then ran its processes through it and
+/// ignored the capability P4 handed in — the in-tree instance of the
+/// substitution the `6c6cb3d` review named, and the reason its closing balance
+/// read a pair nothing had used. `hooks` is installed **on the runner**:
+/// `Runner::run` takes no observer, so the container funnel's hooks are the
+/// ones the runner was built with, and a bundle that only reached the funnel
+/// through `TopologyHooks::container` would arm nothing a probe executes.
+fn container_execution(
+    fixture: &Fixture,
+    checked: &PreLockChecked,
+    hooks: ArmedContainer,
+) -> crate::runner::container::exec::ContainerRunner {
+    let identity = crate::runner::container::exec::RunIdentity {
+        private_root: checked.private_root().to_path_buf(),
+        run_id: checked.run_id().to_owned(),
+        run_dir: fixture.public(),
+        incarnation: checked.incarnation().0.clone(),
+        repo_key: fixture.repo_key.as_str().to_owned(),
+    };
+    crate::runner::container::exec::ContainerRunner::new(
+        checked.runner_policy().clone(),
+        identity,
+        &fixture.repo,
+        crate::runner::container::env::ContainerEnvironment::from_image(vec![(
+            "PATH".to_owned(),
+            "/usr/bin:/bin".to_owned(),
+        )]),
+        Box::new(container_runtime()),
+    )
+    .expect("a container runner over the resolved policy")
+    .with_hooks(Box::new(hooks))
+}
+
+/// The containerized `Probes`: the shell probe, through the capability P4
+/// hands it, over the container runner the caller owns.
 struct ContainerProbes {
-    runner: crate::runner::container::exec::ContainerRunner,
+    policy_digest: String,
     workspace: PathBuf,
 }
 
 impl ContainerProbes {
-    /// `hooks` is installed **on the runner**: `Runner::run` takes no
-    /// observer, so the container funnel's hooks are the ones the runner
-    /// was built with. A bundle that only reached the funnel through
-    /// `TopologyHooks::container` would arm nothing a probe executes.
-    fn new(fixture: &Fixture, checked: &PreLockChecked, hooks: ArmedContainer) -> Self {
-        let identity = crate::runner::container::exec::RunIdentity {
-            private_root: checked.private_root().to_path_buf(),
-            run_id: checked.run_id().to_owned(),
-            run_dir: fixture.public(),
-            incarnation: checked.incarnation().0.clone(),
-            repo_key: fixture.repo_key.as_str().to_owned(),
-        };
-        let runner = crate::runner::container::exec::ContainerRunner::new(
-            checked.runner_policy().clone(),
-            identity,
-            &fixture.repo,
-            crate::runner::container::env::ContainerEnvironment::from_image(vec![(
-                "PATH".to_owned(),
-                "/usr/bin:/bin".to_owned(),
-            )]),
-            Box::new(container_runtime()),
-        )
-        .expect("a container runner over the resolved policy")
-        .with_hooks(Box::new(hooks));
+    fn over(runner: &crate::runner::container::exec::ContainerRunner, fixture: &Fixture) -> Self {
         Self {
-            runner,
+            policy_digest: runner.policy_digest().to_owned(),
             workspace: fixture.repo.clone(),
         }
     }
 }
 
+impl super::sealed::Sealed for ContainerProbes {}
+
 impl Probes for ContainerProbes {
     fn policy_digest(&self) -> &str {
-        self.runner.policy_digest()
+        &self.policy_digest
     }
 
     fn shell(
         &self,
         invocation: InvocationId,
-        _ledger: &std::sync::Mutex<InvocationLedger>,
-        _slots: &std::sync::Mutex<SlotAssertion>,
+        through: &ShellProbe<'_>,
     ) -> Result<(), UpstrokeError> {
+        // **Through the capability, over the caller's container runner.** This
+        // double drives a real containerized process to its death, and it does
+        // so on the boundary production uses — which is what makes the residue
+        // it leaves behind the residue a real run would leave.
         crate::runner::host::run_shell_probe(
-            &self.runner,
+            through,
             crate::gates::ShellKind::Sh,
             self.workspace.clone(),
             invocation,
         )
     }
 
-    fn agent(
-        &self,
-        _agent: &str,
-        _ledger: &std::sync::Mutex<InvocationLedger>,
-        _slots: &std::sync::Mutex<SlotAssertion>,
-    ) -> Result<(), UpstrokeError> {
-        Ok(())
+    fn agent(&self, agent: &str, through: &AgentProbe<'_>) -> Result<(), UpstrokeError> {
+        through
+            .run(&probe_request_for(
+                PreflightIdentities::agent(agent, 0)?,
+                Some(agent),
+            ))
+            .map(|_output| ())
     }
 }
 
@@ -3507,7 +3526,8 @@ fn container_probe_kill_child() {
     .expect("the container policy resolves by inspection");
     let refs = FakeRefs::empty();
     let mut hooks = TestHooks::new();
-    let probes = ContainerProbes::new(&fixture, &checked, hooks.container_double());
+    let execution = container_execution(&fixture, &checked, hooks.container_double());
+    let probes = ContainerProbes::over(&execution, &fixture);
     // A real process death **inside** the containerized probe, after
     // `Container.WriteIntent` and `Container.Create`: the durable residue is
     // an intent record and a container nobody owns.
@@ -3531,8 +3551,8 @@ fn container_probe_kill_child() {
         probes: &probes,
         refs: &refs,
         clock: &clock,
-        ledger: &ledger,
-        slots: &slots,
+        runner: &execution,
+        pair: ProbePair::grant(&ledger, &slots),
     };
     let mut warnings = Vec::new();
     let _ = create_run(checked, request, &mut hooks, &mut warnings);
@@ -3923,8 +3943,8 @@ fn the_creation_ledger_accounts_every_probe_process() {
     let source = TwoRequestSource::default();
     let ledger = std::sync::Mutex::new(InvocationLedger::new());
     let slots = std::sync::Mutex::new(SlotAssertion::new());
+    let pair = ProbePair::grant(&ledger, &slots);
     let probes = RunnerProbes {
-        runner: &runner,
         shell: crate::gates::ShellKind::Sh,
         workspace: std::env::temp_dir(),
         adapters: &source,
@@ -3932,7 +3952,7 @@ fn the_creation_ledger_accounts_every_probe_process() {
     };
 
     probes
-        .agent(AGENT, &ledger, &slots)
+        .agent(AGENT, &pair.agent_probe(&runner))
         .expect_err("the adapter's second request refuses");
 
     let ledger = ledger.lock().unwrap_or_else(PoisonError::into_inner);
@@ -4039,8 +4059,8 @@ fn the_production_probes_run_both_halves_through_the_runs_runner() {
     let source = OneSource::default();
     let ledger = std::sync::Mutex::new(InvocationLedger::new());
     let slots = std::sync::Mutex::new(SlotAssertion::new());
+    let pair = ProbePair::grant(&ledger, &slots);
     let probes = RunnerProbes {
-        runner: &runner,
         shell: crate::gates::ShellKind::Sh,
         workspace: std::env::temp_dir(),
         adapters: &source,
@@ -4050,7 +4070,7 @@ fn the_production_probes_run_both_halves_through_the_runs_runner() {
 
     let shell_id = PreflightIdentities::shell(0).expect("the shell probe identity");
     probes
-        .shell(shell_id.clone(), &ledger, &slots)
+        .shell(shell_id.clone(), &pair.shell_probe(&runner))
         .expect("the recorded shell runs `exit 0`");
     let requests = runner.requests();
     assert_eq!(requests.len(), 1, "{requests:?}");
@@ -4068,7 +4088,7 @@ fn the_production_probes_run_both_halves_through_the_runs_runner() {
     );
 
     probes
-        .agent(AGENT, &ledger, &slots)
+        .agent(AGENT, &pair.agent_probe(&runner))
         .expect("the adapter is probed");
     assert_eq!(
         *source
@@ -4093,7 +4113,7 @@ fn the_production_probes_run_both_halves_through_the_runs_runner() {
     // silently skipped: a run whose pre-flight certified nothing would still
     // record it in `probed_agents`.
     let refusal = probes
-        .agent("no-such-agent", &ledger, &slots)
+        .agent("no-such-agent", &pair.agent_probe(&runner))
         .expect_err("an unregistered agent refuses");
     assert!(
         refusal.to_string().contains("no-such-agent"),
@@ -4104,6 +4124,603 @@ fn the_production_probes_run_both_halves_through_the_runs_runner() {
         2,
         "a process was started for an agent with no adapter"
     );
+}
+
+// ===========================================================================
+// The granted pair
+// ===========================================================================
+//
+// `PR7-G2-W1-PROBE-PAIR-NOT-OBLIGED` (§2, §22e). The claim was asserted three
+// times as a property of a signature and refuted three times; what is asserted
+// now is a property of the *types a probe receives*, and these are the
+// measurements of it.
+
+/// A probes double that runs one request of each shape through whatever
+/// boundary it is handed, and records what came back.
+struct RunsThroughWhatItIsHanded {
+    digest: String,
+    shell_result: Mutex<Option<Result<(), String>>>,
+    agent_result: Mutex<Option<Result<(), String>>>,
+    /// When set, the agent probe runs a **shell** (non-slotted) identity on the
+    /// slotted path, and the shell probe runs an **agent** (slotted) identity
+    /// on the non-slotted one.
+    cross_the_paths: bool,
+}
+
+impl RunsThroughWhatItIsHanded {
+    fn new(cross_the_paths: bool) -> Self {
+        Self {
+            digest: host_digest(),
+            shell_result: Mutex::new(None),
+            agent_result: Mutex::new(None),
+            cross_the_paths,
+        }
+    }
+
+    fn taken(slot: &Mutex<Option<Result<(), String>>>) -> Result<(), String> {
+        slot.lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
+            .expect("the probe ran")
+    }
+}
+
+fn probe_request_for(id: InvocationId, agent: Option<&str>) -> crate::runner::RunnerRequest {
+    crate::runner::RunnerRequest {
+        command: crate::runner::CommandSpec {
+            program: "true".to_owned(),
+            args: Vec::new(),
+            env: Vec::new(),
+            stdin: Vec::new(),
+        },
+        workspace: std::env::temp_dir(),
+        role: match agent {
+            Some(name) => crate::runner::ExecutionRole::Probe(crate::runner::ProbeTarget::Agent(
+                crate::runner::AgentId::new(name),
+            )),
+            None => crate::runner::ExecutionRole::Probe(crate::runner::ProbeTarget::Shell),
+        },
+        timeout: std::time::Duration::from_secs(1),
+        agent: agent.map(crate::runner::AgentId::new),
+        invocation: id,
+    }
+}
+
+impl super::sealed::Sealed for RunsThroughWhatItIsHanded {}
+
+impl Probes for RunsThroughWhatItIsHanded {
+    fn policy_digest(&self) -> &str {
+        &self.digest
+    }
+
+    fn shell(
+        &self,
+        invocation: InvocationId,
+        through: &ShellProbe<'_>,
+    ) -> Result<(), UpstrokeError> {
+        let request = if self.cross_the_paths {
+            probe_request_for(
+                PreflightIdentities::agent(AGENT, 0).expect("an agent identity"),
+                Some(AGENT),
+            )
+        } else {
+            probe_request_for(invocation, None)
+        };
+        let outcome = through.run(&request).map(|_| ()).map_err(|e| e.to_string());
+        *self
+            .shell_result
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = Some(outcome.clone());
+        outcome.map_err(|message| UpstrokeError::Refused { message })
+    }
+
+    fn agent(&self, agent: &str, through: &AgentProbe<'_>) -> Result<(), UpstrokeError> {
+        let request = if self.cross_the_paths {
+            probe_request_for(
+                PreflightIdentities::shell(1).expect("a shell identity"),
+                None,
+            )
+        } else {
+            probe_request_for(
+                PreflightIdentities::agent(agent, 0).expect("an agent identity"),
+                Some(agent),
+            )
+        };
+        let outcome = through.run(&request).map(|_| ()).map_err(|e| e.to_string());
+        *self
+            .agent_result
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = Some(outcome.clone());
+        outcome.map_err(|message| UpstrokeError::Refused { message })
+    }
+}
+
+/// **An agent probe registers into the pair its caller bound, and there is no
+/// other pair for it to reach.**
+///
+/// The measurement the row asks for, and it needs two pairs to be worth
+/// anything: a witness over one pair is true however many pairs exist. So a
+/// **second** pair is granted here, over its own ledger and its own slots, and
+/// handed to nobody. The probe registers; the caller's pair accounts it; the
+/// second stays empty.
+///
+/// What this does **not** claim: that no `impl Probes` can hold a pair of its
+/// own. One can — this file's `ContainerProbes` runs a real process through a
+/// runner of its own — and the consequence is that it registers *nothing*,
+/// which the caller's pair shows as an empty ledger rather than as a balance
+/// read off the wrong locks. That distinction is the whole of what the
+/// structural change buys, and it is asserted below rather than argued.
+#[test]
+fn an_agent_probe_registers_only_into_the_pair_its_caller_bound() {
+    let runner = RecordingRunner::default();
+    let probes = RunsThroughWhatItIsHanded::new(false);
+
+    let ledger = Mutex::new(InvocationLedger::new());
+    let slots = Mutex::new(SlotAssertion::new());
+    let granted = ProbePair::grant(&ledger, &slots);
+
+    // The pair nobody is handed.
+    let other_ledger = Mutex::new(InvocationLedger::new());
+    let other_slots = Mutex::new(SlotAssertion::new());
+    let unbound = ProbePair::grant(&other_ledger, &other_slots);
+
+    probes
+        .agent(AGENT, &granted.agent_probe(&runner))
+        .expect("the probe runs through the boundary it was handed");
+    assert!(
+        RunsThroughWhatItIsHanded::taken(&probes.agent_result).is_ok(),
+        "the boundary refused the probe's own request"
+    );
+
+    let accounted = ledger.lock().unwrap_or_else(PoisonError::into_inner);
+    assert_eq!(
+        (accounted.completed(), accounted.cancelled()),
+        (1, 0),
+        "the granted pair did not account the process the probe ran"
+    );
+    drop(accounted);
+    assert!(
+        other_ledger
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .completed()
+            == 0,
+        "a pair nobody was handed accounted a probe process, so the two alias"
+    );
+    assert!(granted.balances() && unbound.balances());
+}
+
+/// **The shell probe's boundary holds no slots, and the agent probe's refuses
+/// anything that takes none.**
+///
+/// INV-23's asymmetry — "one non-slotted shell probe … and one slotted probe
+/// per recorded agent" — as two types rather than as one type and a comment.
+/// The crossing double runs an agent identity on the shell path and a shell
+/// identity on the agent path; both are refused, and neither leaves anything
+/// behind.
+#[test]
+fn the_two_probe_paths_refuse_each_others_identities() {
+    let runner = RecordingRunner::default();
+    let probes = RunsThroughWhatItIsHanded::new(true);
+    let ledger = Mutex::new(InvocationLedger::new());
+    let slots = Mutex::new(SlotAssertion::new());
+    let pair = ProbePair::grant(&ledger, &slots);
+
+    let shell_id = PreflightIdentities::shell(0).expect("the shell identity");
+    probes
+        .shell(shell_id, &pair.shell_probe(&runner))
+        .expect_err("a slotted identity on the non-slotted boundary is refused");
+    let refusal = RunsThroughWhatItIsHanded::taken(&probes.shell_result)
+        .expect_err("the boundary refused it");
+    assert!(
+        refusal.contains("holds no slots"),
+        "the shell boundary refused for some other reason: {refusal}"
+    );
+
+    probes
+        .agent(AGENT, &pair.agent_probe(&runner))
+        .expect_err("a non-slotted identity on the slotted boundary is refused");
+    let refusal = RunsThroughWhatItIsHanded::taken(&probes.agent_result)
+        .expect_err("the boundary refused it");
+    assert!(
+        refusal.contains("takes no slot"),
+        "the agent boundary refused for some other reason: {refusal}"
+    );
+
+    assert!(
+        runner.requests().is_empty(),
+        "a refused identity reached the run's Runner: {:?}",
+        runner.requests()
+    );
+    assert!(
+        pair.balances(),
+        "a refusal left the pair unbalanced: {:?}",
+        ledger
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .running()
+    );
+}
+
+/// **A shell probe that registers through its boundary takes no slot.**
+///
+/// The positive half of the pair above: the non-slotted probe really does run,
+/// really is accounted, and R4 is never consulted for it — which is why its
+/// capability can hold no slots at all.
+#[test]
+fn the_shell_probe_registers_without_taking_a_slot() {
+    let runner = RecordingRunner::default();
+    let probes = RunsThroughWhatItIsHanded::new(false);
+    let ledger = Mutex::new(InvocationLedger::new());
+    let slots = Mutex::new(SlotAssertion::new());
+    let pair = ProbePair::grant(&ledger, &slots);
+
+    let shell_id = PreflightIdentities::shell(0).expect("the shell identity");
+    probes
+        .shell(shell_id.clone(), &pair.shell_probe(&runner))
+        .expect("the shell probe runs");
+
+    let accounted = ledger.lock().unwrap_or_else(PoisonError::into_inner);
+    assert_eq!(
+        (accounted.completed(), accounted.cancelled()),
+        (1, 0),
+        "the shell probe was not accounted in the granted pair"
+    );
+    drop(accounted);
+    assert!(
+        slots
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .held()
+            .is_none(),
+        "the shell probe left a slot pair held"
+    );
+    assert_eq!(runner.requests().len(), 1);
+    assert_eq!(runner.requests()[0].invocation, shell_id);
+    assert!(pair.balances());
+}
+
+/// **A probe that registers nothing cannot reach the closing balance at all.**
+///
+/// This used to assert the residue: an implementation was free to run nothing,
+/// the granted pair stayed empty, and the balance passed *vacuously* — which is
+/// the shape the `6c6cb3d` review refused to accept as closed. It is closed
+/// now, and the assertion is the closure rather than the gap.
+///
+/// Driven at the seam rather than through `create_run`, because the point is
+/// the arithmetic P4's check is made of: the grant count does not move, so
+/// "returned `Ok`" and "executed through the run's boundary" are distinguishable
+/// facts. `a_probe_that_substitutes_its_own_authority_is_refused_at_p4` is the
+/// same claim end to end.
+#[test]
+fn a_probe_that_registers_nothing_does_not_move_the_grant() {
+    let runner = RecordingRunner::default();
+    let probes = IgnoresTheCapability::agent_only();
+    let ledger = Mutex::new(InvocationLedger::new());
+    let slots = Mutex::new(SlotAssertion::new());
+    let pair = ProbePair::grant(&ledger, &slots);
+
+    let before = pair.accounted();
+    probes
+        .agent(AGENT, &pair.agent_probe(&runner))
+        .expect("the double returns Ok having run through an authority of its own");
+    assert_eq!(
+        pair.accounted(),
+        before,
+        "the substituted probe moved the grant, so this proves nothing about the empty case"
+    );
+    assert_eq!(
+        probes.elsewhere.requests().len(),
+        1,
+        "the double ran nothing at all, so the substitution is not what is measured"
+    );
+    assert!(
+        runner.requests().is_empty(),
+        "the run's own Runner served the substituted probe"
+    );
+    assert!(
+        pair.balances(),
+        "an empty pair balances — which is exactly why the balance alone was never \
+         evidence that a probe had used it, and why P4 asks the grant instead"
+    );
+}
+
+/// A probes double that returns `Ok` having run nothing at all.
+///
+/// The shape the `6c6cb3d` review named: `Probes::shell`/`agent` could ignore
+/// the capability they were handed and substitute an authority of their own —
+/// or none — and creation would go on to publish a run whose closing balance
+/// was clean because the pair it read had never been used. A balance over an
+/// empty pair is true for the wrong reason.
+struct IgnoresTheCapability {
+    digest: String,
+    /// Which of the two seams ignores what it is handed.
+    ignore_shell: bool,
+    /// The agent whose probe substitutes, or `None` for all of them.
+    ///
+    /// Naming **one** agent is what makes the per-agent check load-bearing: a
+    /// grant check hoisted out of P4's loop is satisfied by the first agent
+    /// that ran and would certify every substituted probe behind it.
+    ignore_agent: Option<Option<String>>,
+    /// Somewhere else to run, standing in for a probe that substitutes its own
+    /// boundary.
+    elsewhere: RecordingRunner,
+}
+
+impl IgnoresTheCapability {
+    fn shell_only() -> Self {
+        Self {
+            digest: host_digest(),
+            ignore_shell: true,
+            ignore_agent: None,
+            elsewhere: RecordingRunner::default(),
+        }
+    }
+
+    fn agent_only() -> Self {
+        Self {
+            digest: host_digest(),
+            ignore_shell: false,
+            ignore_agent: Some(None),
+            elsewhere: RecordingRunner::default(),
+        }
+    }
+
+    /// Every agent probe runs through the capability except `agent`.
+    fn only_the_agent(agent: &str) -> Self {
+        Self {
+            digest: host_digest(),
+            ignore_shell: false,
+            ignore_agent: Some(Some(agent.to_owned())),
+            elsewhere: RecordingRunner::default(),
+        }
+    }
+
+    fn substitutes(&self, agent: &str) -> bool {
+        match &self.ignore_agent {
+            None => false,
+            Some(None) => true,
+            Some(Some(named)) => named == agent,
+        }
+    }
+}
+
+impl super::sealed::Sealed for IgnoresTheCapability {}
+
+impl Probes for IgnoresTheCapability {
+    fn policy_digest(&self) -> &str {
+        &self.digest
+    }
+
+    fn shell(
+        &self,
+        invocation: InvocationId,
+        through: &ShellProbe<'_>,
+    ) -> Result<(), UpstrokeError> {
+        let request = probe_request_for(invocation, None);
+        if self.ignore_shell {
+            // Substituted: a real process, run through an authority the caller
+            // never granted.
+            self.elsewhere.run(&request).map(|_| ())
+        } else {
+            through.run(&request).map(|_| ())
+        }
+    }
+
+    fn agent(&self, agent: &str, through: &AgentProbe<'_>) -> Result<(), UpstrokeError> {
+        let request = probe_request_for(
+            PreflightIdentities::agent(agent, 0).expect("an agent identity"),
+            Some(agent),
+        );
+        if self.substitutes(agent) {
+            self.elsewhere.run(&request).map(|_| ())
+        } else {
+            through.run(&request).map(|_| ())
+        }
+    }
+}
+
+/// **A probe that substitutes its own authority is refused at P4, on either
+/// seam.**
+///
+/// The obligation stops being documentary here. Passing the capability in
+/// cannot make an implementation *call* it — the review's point, and the fourth
+/// time a signature-level claim about this seam has been wrong — so the caller
+/// checks what it granted: a probe that returns `Ok` having registered nothing
+/// into the granted pair did not execute through the run's boundary, and P4
+/// refuses rather than certifying it.
+///
+/// Both halves are driven, because a check that only watched the shell probe
+/// would pass a run whose *agent* probe was the substituted one. Both leave the
+/// run removed rather than published: an uncertified pre-flight has no run.
+#[test]
+fn a_probe_that_substitutes_its_own_authority_is_refused_at_p4() {
+    for (label, probes) in [
+        ("shell", IgnoresTheCapability::shell_only()),
+        ("agent", IgnoresTheCapability::agent_only()),
+    ] {
+        let fixture = Fixture::new(&format!("substituted-{label}"));
+        let refs = FakeRefs::empty();
+        let mut hooks = TestHooks::new();
+        let mut driver = Driver::new(&fixture, &probes, &refs);
+        let refused = driver.run(&mut hooks).err().unwrap_or_else(|| {
+            panic!(
+                "{label}: creation certified a pre-flight whose probe ran nothing through the \
+                 granted pair"
+            )
+        });
+        let text = format!("{}", refused.error);
+        assert!(
+            text.contains("registered nothing"),
+            "{label}: refused for some other reason: {text}"
+        );
+        assert!(
+            matches!(*refused.disposition, Disposition::BothHalvesRemoved { .. }),
+            "{label}: {:?}",
+            refused.disposition
+        );
+        assert!(!fixture.private().exists(), "{label}");
+        assert!(!fixture.public().exists(), "{label}");
+        // The substituted authority really did run a process, so the refusal is
+        // about *where* it ran and not about a probe that did nothing.
+        assert_eq!(
+            probes.elsewhere.requests().len(),
+            1,
+            "{label}: the double did not substitute anything"
+        );
+    }
+
+    // **And the check is per agent, not per run.** The first agent's probe uses
+    // the capability, so a check hoisted out of P4's loop would see the grant
+    // move and certify the second one behind it. Two agents are the smallest
+    // fixture that can tell the two placements apart.
+    let fixture = Fixture::new("substituted-second-agent");
+    let probes = IgnoresTheCapability::only_the_agent(SECOND_AGENT);
+    let refs = FakeRefs::empty();
+    let mut hooks = TestHooks::new();
+    let mut driver = Driver::new(&fixture, &probes, &refs);
+    driver.agents = vec![AGENT.to_owned(), SECOND_AGENT.to_owned()];
+    let refused = driver
+        .run(&mut hooks)
+        .expect_err("the second agent's probe substituted its own authority");
+    let text = format!("{}", refused.error);
+    assert!(
+        text.contains("registered nothing") && text.contains(SECOND_AGENT),
+        "the refusal does not name the agent that substituted: {text}"
+    );
+    assert!(
+        !text.contains(&format!("`{AGENT}`")),
+        "the refusal blames the agent that did use its capability: {text}"
+    );
+}
+
+/// A `Runner` that refuses every request it is given.
+#[derive(Debug, Default)]
+struct RefusesEveryRequest {
+    seen: Mutex<usize>,
+}
+
+impl crate::runner::Runner for RefusesEveryRequest {
+    fn run(
+        &self,
+        _request: &crate::runner::RunnerRequest,
+    ) -> Result<crate::agent::proc::ProcessOutput, UpstrokeError> {
+        *self.seen.lock().unwrap_or_else(PoisonError::into_inner) += 1;
+        Err(UpstrokeError::Agent {
+            message: "the probe's process did not answer".to_owned(),
+        })
+    }
+}
+
+/// **The grant counts what was registered, not what succeeded.**
+///
+/// P4 asks "did this probe execute through the boundary this run granted it",
+/// and a process that started and failed answers yes. Counting completions
+/// instead would call a probe whose CLI refused a probe that never ran, and the
+/// refusal it produced would say "registered nothing" about a probe that
+/// registered — a false statement in the one place an operator reads to find
+/// out what happened.
+///
+/// The two halves of the pair answer different questions and both are asserted:
+/// the grant moved, and it still balances, because `Registering` cancels what
+/// it registered on the failure path too.
+#[test]
+fn the_grant_counts_a_probe_process_that_started_and_failed() {
+    let runner = RefusesEveryRequest::default();
+    let ledger = Mutex::new(InvocationLedger::new());
+    let slots = Mutex::new(SlotAssertion::new());
+    let pair = ProbePair::grant(&ledger, &slots);
+
+    let before = pair.accounted();
+    pair.agent_probe(&runner)
+        .run(&probe_request_for(
+            PreflightIdentities::agent(AGENT, 0).expect("an agent identity"),
+            Some(AGENT),
+        ))
+        .expect_err("the runner refuses every request");
+
+    assert_eq!(
+        *runner.seen.lock().unwrap_or_else(PoisonError::into_inner),
+        1,
+        "the request never reached the runner, so this measures nothing"
+    );
+    let accounted = ledger.lock().unwrap_or_else(PoisonError::into_inner);
+    assert_eq!(
+        (accounted.completed(), accounted.cancelled()),
+        (0, 1),
+        "the failing process was not accounted as a cancel"
+    );
+    drop(accounted);
+    assert!(
+        pair.accounted() > before,
+        "a probe process that started and failed did not move the grant, so P4 would refuse \
+         it with `registered nothing` — which is not what happened"
+    );
+    assert!(
+        pair.balances(),
+        "the failure path did not settle its registration"
+    );
+}
+
+/// **The closing balance consumes both halves of the binding.**
+///
+/// `permits.protocol` asks for "registered/completed/cancelled exactly once"
+/// and R4 for a pair given back; `ProbePair::balances` is the conjunction, and
+/// the slot half had no witness at all — the check was two field reads at the
+/// call site and every fixture that reached it had an empty `SlotAssertion`, so
+/// deleting the R4 conjunct changed nothing anybody could see.
+///
+/// Each half is driven on its own, so a balance that answered on one of them
+/// fails here rather than passing on the other's evidence.
+#[test]
+fn the_granted_pairs_balance_answers_for_the_ledger_and_the_slots() {
+    let ledger = Mutex::new(InvocationLedger::new());
+    let slots = Mutex::new(SlotAssertion::new());
+    let pair = ProbePair::grant(&ledger, &slots);
+    assert!(pair.balances(), "a fresh pair balances");
+
+    // The R3 half: a registration that never settled.
+    let id = PreflightIdentities::agent(AGENT, 0).expect("a probe identity");
+    ledger
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .register(&id)
+        .expect("the registration");
+    assert!(!pair.balances(), "an unsettled registration balanced");
+    ledger
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .complete(&id)
+        .expect("the settlement");
+    assert!(pair.balances(), "a settled registration did not balance");
+
+    // The R4 half: a pair taken and not given back. The ledger is clean
+    // throughout, so only the slot conjunct can answer.
+    slots
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .acquire(
+            &id,
+            crate::engine::topology::identity::SlotPair {
+                agent: AGENT.to_owned(),
+                pool: None,
+            },
+        )
+        .expect("the pair");
+    assert!(
+        ledger
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .balances(),
+        "the ledger half must be clean, or this proves nothing about the slot half"
+    );
+    assert!(!pair.balances(), "a held slot pair balanced");
+    slots
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .release(&id)
+        .expect("the release");
+    assert!(pair.balances(), "a released pair did not balance");
 }
 
 /// The vocabulary the report and the fault registry share.

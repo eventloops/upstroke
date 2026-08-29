@@ -390,6 +390,33 @@ pub fn passes_for(bindings: ReviewBindings<'_>, implementer: &PassBinding) -> Ve
     }
 }
 
+/// The lenses one task's frozen plan **obliges**, in the order it obliges them.
+///
+/// [`passes_for`]'s answer, projected to its lenses — not a second reading of
+/// its two rules. The projection is exact because the obligation is
+/// **invariant in the implementer**: the rebind of rule 2 chooses *which
+/// binding* applies the acceptance lens and never whether that lens runs, and
+/// rule 1 turns on a configured second opinion rather than on who wrote the
+/// code. So the set of lenses a record owes can be asked without knowing what
+/// ran, which is what lets the fold ask it —
+/// [`crate::events::AttemptRecord`] carries the passes and not the binding
+/// that produced them.
+///
+/// The stand-in implementer is `primary` for that reason: any value gives the
+/// same lenses, and using one that is certainly present keeps the call total.
+/// [`the_obliged_lenses_do_not_depend_on_who_implemented`] measures the
+/// invariance rather than asserting it here.
+#[must_use]
+pub fn obliged_lenses(bindings: ReviewBindings<'_>) -> Vec<Lens> {
+    let Some(primary) = bindings.primary.cloned() else {
+        return Vec::new();
+    };
+    passes_for(bindings, &primary)
+        .into_iter()
+        .map(|pass| pass.lens)
+        .collect()
+}
+
 /// Resolve every task's review passes (§11.2, §11.3).
 ///
 /// `has_adapter` is injected rather than read from the registry so the engine
@@ -2420,6 +2447,83 @@ mod tests {
         assert!(
             !allow.contains("Bash"),
             "reviewers run nothing, not even gates: {allow}"
+        );
+    }
+
+    /// **The obliged lenses do not depend on who implemented the change.**
+    ///
+    /// [`obliged_lenses`] hands `passes_for` the primary binding as a stand-in
+    /// implementer, and the whole of why that is sound is that the answer does
+    /// not vary in that argument: rule 2 rebinds *who applies* the acceptance
+    /// lens and never *whether it runs*, and rule 1 turns on a configured
+    /// second opinion rather than on the author. Measured over the cross
+    /// product rather than argued, because the fold now judges a candidate's
+    /// success against this answer without having the implementer's binding to
+    /// hand.
+    ///
+    /// The implementers include the primary itself — which triggers the rebind
+    /// — and the alternative, so the case that would differ if the claim were
+    /// wrong is in the grid rather than adjacent to it.
+    #[test]
+    fn the_obliged_lenses_do_not_depend_on_who_implemented() {
+        let primary = PassBinding::new("claude-code", "claude-opus-5");
+        let alternative = PassBinding::new("copilot", "gpt-5.6");
+        let second = PassBinding::new("codex", "gpt-5.6-codex");
+        let implementers = [
+            PassBinding::new("claude-code", "claude-sonnet-5"),
+            primary.clone(),
+            alternative.clone(),
+            second.clone(),
+            PassBinding::new("", ""),
+        ];
+
+        let configurations = [
+            ("nothing configured", None, None, None),
+            ("primary alone", Some(&primary), None, None),
+            (
+                "primary and alternative",
+                Some(&primary),
+                Some(&alternative),
+                None,
+            ),
+            ("primary and second", Some(&primary), None, Some(&second)),
+            (
+                "all three",
+                Some(&primary),
+                Some(&alternative),
+                Some(&second),
+            ),
+            // No primary is `None ⟺ review disabled`, and nothing else can
+            // resurrect a pass — not even a configured second opinion.
+            ("second alone", None, None, Some(&second)),
+        ];
+
+        let mut arities: std::collections::BTreeSet<usize> = std::collections::BTreeSet::new();
+        for (label, primary, alternative, second_opinion) in configurations {
+            let bindings = ReviewBindings {
+                primary,
+                alternative,
+                second_opinion,
+            };
+            let obliged = obliged_lenses(bindings);
+            arities.insert(obliged.len());
+            for implementer in &implementers {
+                let ran: Vec<Lens> = passes_for(bindings, implementer)
+                    .into_iter()
+                    .map(|pass| pass.lens)
+                    .collect();
+                assert_eq!(
+                    ran,
+                    obliged,
+                    "{label}: `{}` implementing changes the lenses the plan obliges",
+                    implementer.describe()
+                );
+            }
+        }
+        assert_eq!(
+            arities,
+            [0_usize, 1, 2].into_iter().collect(),
+            "the grid does not reach all three arities, so the invariance is untested at one of them"
         );
     }
 }

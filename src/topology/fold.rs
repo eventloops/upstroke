@@ -1033,6 +1033,15 @@ impl TopologyFold {
     /// invisible; at the first width above one it is two tasks editing the same
     /// files.
     ///
+    /// **A convention until the region became derivation-checked.** This reader
+    /// existing did not oblige anyone to read it: `check_dispatched` matched a
+    /// `task_dispatched` lease's *shape* only and `apply_dispatched` granted the
+    /// region the event carried. `check_dispatched` now refuses an ordinary
+    /// dispatch whose recorded region is not this answer, so the disagreement is
+    /// inexpressible rather than merely undocumented, and this reader is the
+    /// convenient way to obtain what the fold will accept rather than the only
+    /// way to avoid a refusal.
+    ///
     /// `None` when the run has no registry yet, which is before `run_started`.
     #[must_use]
     pub fn predicted_region(&self, key: TaskKey) -> Option<PathSet> {
@@ -1669,7 +1678,58 @@ impl RunState {
 
         let is_repair = entry.lineage.is_some();
         match (&dispatched.lease, entry.lineage) {
-            (LeaseGrant::Predicted { .. }, None) => {}
+            // **The recorded region is derivation-checked, exactly as the
+            // recorded binding is.** One event over, `check_attempt_started`
+            // refuses a binding the fold did not derive
+            // (`FoldError::BindingMismatch`); this arm used to match the
+            // lease's *shape* alone and let `apply_dispatched` grant whatever
+            // region the event carried — so the fold could admit a dispatch on
+            // one region while the lease table held another, and the lease
+            // table's is the one every later overlap check consults.
+            //
+            // That was not hypothetical. A driver that took the plan's hints
+            // literally recorded `src/auth/*.rs` as a **prefix**, which
+            // overlaps nothing, while the fold had admitted the dispatch on
+            // `src/auth`. `84a3978` made the driver read
+            // [`TopologyFold::predicted_region`] instead of deriving its own,
+            // which fixed that instance; nothing stopped the next caller — or
+            // a later slice's second writer — from constructing a
+            // `task_dispatched` the fold would accept and the lease table would
+            // honour. This is the class fix, and it is why the reader and this
+            // validator call the **same** free function rather than two copies
+            // of one rule.
+            //
+            // **Exact equality, and deliberately not a policy-aware one.** The
+            // run's frozen `PathPolicy` decides whether two regions *overlap*,
+            // case-folding component by component; it does not decide whether
+            // two regions are the same region. A recorded `SRC/Auth` that folds
+            // onto a derived `src/auth` is still a different literal, and the
+            // lease table stores literals — so an equality that folded here
+            // would admit a component set the derivation never produced and
+            // hand it to `apply_dispatched` unchanged. Order counts for the
+            // same reason: the derivation emits one prefix per hint in the
+            // frozen order, so a reordered list is a list this run's frozen
+            // hints do not derive.
+            //
+            // Live at the first width above `max_parallel = 1`, where two tasks
+            // holding non-overlapping-by-construction regions edit the same
+            // files; invisible below it.
+            (LeaseGrant::Predicted { paths }, None) => {
+                let derived = predicted_region(entry);
+                if *paths != derived {
+                    return Err(FoldError::MalformedEntry {
+                        kind: KIND,
+                        key: dispatched.key.0,
+                        detail: format!(
+                            "it takes the predicted region {} and this entry's frozen path \
+                             hints derive {}; an ordinary dispatch takes the region the fold \
+                             admitted it on",
+                            describe_region(paths),
+                            describe_region(&derived)
+                        ),
+                    });
+                }
+            }
             (LeaseGrant::InheritedLineage { root }, Some(lineage)) => {
                 if *root != lineage.root {
                     return Err(FoldError::MalformedEntry {
@@ -1924,8 +1984,8 @@ impl RunState {
 
         match &finished.settlement {
             AttemptSettlement::Retained {
+                retained_session,
                 retained_incarnation,
-                ..
             } => {
                 if *retained_incarnation != self.epoch {
                     return Err(FoldError::StaleIncarnation {
@@ -1935,6 +1995,97 @@ impl RunState {
                             "it retains the session for incarnation {} and this run has resumed \
                              {} time(s)",
                             retained_incarnation.0, self.epoch.0
+                        ),
+                    });
+                }
+                // **The envelope and the record name one attempt, on this arm
+                // too.** This arm checked the epoch and stopped, so a
+                // current-epoch retained settlement could carry a ledger line
+                // belonging to a different attempt of the same generation —
+                // the same disagreement the `Closed` arm has refused since
+                // round 6, one arm over. Every one of that round's four new
+                // refusal witnesses constructs `Closed`, which is why this arm
+                // was undriven; the `cfa1be8` review found it as its second P1.
+                //
+                // **A door is not fixed until every arm through it asks the
+                // same question.**
+                if finished.record.attempt != finished.attempt.0 {
+                    return Err(FoldError::WrongAttempt {
+                        kind: KIND,
+                        key: finished.key.0,
+                        generation: finished.generation.0,
+                        attempt: finished.record.attempt,
+                        expected: finished.attempt.0.to_string(),
+                    });
+                }
+                // **And the record does not claim the attempt succeeded.**
+                // `candidate_prepared` is the sole successful settlement
+                // (INV-07,
+                // `decisions/2026-08-12-merge-queue-execution-topology.md`),
+                // and the `Closed` arm has enforced that against the record
+                // since round 6. This arm did not, so the invariant held on one
+                // path through the door and not the other: a current-epoch
+                // retained settlement could carry a record with no failure and
+                // every configured pass green — a record
+                // `check_candidate_prepared` would itself accept — while the
+                // fold held the generation open for a retry. The ledger line an
+                // operator reads would say the work passed.
+                //
+                // **This is not a terminal-failure requirement, and the
+                // difference is the whole of the earlier hesitation.**
+                // `settle::settle_failed` is the only producer of a `Retained`
+                // settlement and it is reached on the failure path, for a
+                // same-rung retry that has a session to resume — so a retained
+                // attempt has not succeeded, by construction. Asking
+                // `!is_successful()` is the record saying that much and no
+                // more: `Retained` carries no transition, so nothing here makes
+                // the generation terminal, and the arm goes on to leave it open
+                // with its lease held.
+                //
+                // One predicate, both arms, as the candidate door and the
+                // closed settlement already share it — a door is not fixed
+                // until every arm through it asks the same question.
+                if finished.record.is_successful() {
+                    return Err(FoldError::InconsistentRecord {
+                        kind: KIND,
+                        detail: format!(
+                            "attempt {} of generation {} retains its session for a further \
+                             attempt and its record says the attempt succeeded — failure {:?}, \
+                             review outcomes {:?} — and `candidate_prepared` is the settlement \
+                             of an attempt that succeeded",
+                            finished.attempt.0,
+                            finished.generation.0,
+                            finished.record.failure.as_ref().map(|failure| failure.kind),
+                            finished
+                                .record
+                                .reviews
+                                .iter()
+                                .map(|pass| pass.outcome)
+                                .collect::<Vec<_>>()
+                        ),
+                    });
+                }
+                // **And the record names the conversation the settlement
+                // keeps.** A `Retained` settlement exists to hold a session for
+                // a same-session retry, and `check_attempt_started` will make
+                // the retry name the *generation's* session — the one this
+                // event puts there. If the ledger line names another session,
+                // or none, then the two halves of one event disagree about
+                // which conversation was left open, and the half a person reads
+                // is not the half the fold enforces.
+                if finished.record.session_id.as_deref() != Some(retained_session.0.as_str()) {
+                    return Err(FoldError::InconsistentRecord {
+                        kind: KIND,
+                        detail: format!(
+                            "attempt {} of generation {} retains session `{retained_session}` \
+                             and its record names {}; a retained settlement holds the session \
+                             its own ledger line reports",
+                            finished.attempt.0,
+                            finished.generation.0,
+                            match finished.record.session_id.as_deref() {
+                                Some(other) => format!("`{other}`"),
+                                None => "no session at all".to_owned(),
+                            }
                         ),
                     });
                 }
@@ -2155,6 +2306,58 @@ impl RunState {
                         .iter()
                         .map(|pass| pass.outcome)
                         .collect::<Vec<_>>()
+                ),
+            });
+        }
+        // **And it must have run the passes the run froze for this task.**
+        // `is_successful` above asks `all` over *the passes the record happens
+        // to carry*, which is a predicate the record's own author chooses the
+        // domain of: a `candidate_prepared` carrying a lone passed
+        // `second-opinion` — or an empty list — satisfies it, and the fold
+        // charges the rung, enters `Promoting`, and permits
+        // `task_candidate_created` for a tree the configured primary reviewer
+        // never read. Round 6 of the `cfa1be8` review found it as its first P1;
+        // that round fixed the *outcome* half — a pass recorded `Failed` or
+        // `Unavailable` is refused — and this is the *presence* half.
+        //
+        // **Fold-side, and taking `(record, frozen)`.** The predicate needs the
+        // plan and `AttemptRecord` does not carry it, so it cannot be a method
+        // on the record; the entry is already in hand here for the lease and
+        // lineage relations below.
+        //
+        // The comparison is the ordered list of pass names, so it refuses in
+        // one place every way a record can disagree with its obligation: a
+        // configured pass omitted, a pass duplicated, a pass nobody configured,
+        // and the configured passes in another order. §11.3's own reason for
+        // the order is that "a later pass only exists because every earlier one
+        // approved" — a record whose second opinion precedes its acceptance
+        // pass describes a review that did not happen.
+        //
+        // `FrozenReviews::obliged_lenses` is `review::passes_for`'s answer
+        // rather than a second reading of §11.2/§11.3, and it is the same
+        // reader the plan assembler dispatches from. That is the whole of why
+        // this is safe to enforce: the obligation the fold requires and the
+        // passes the driver runs are one derivation.
+        let obliged: Vec<&str> = entry
+            .reviews
+            .obliged_lenses()
+            .iter()
+            .map(|lens| lens.name())
+            .collect();
+        let recorded: Vec<&str> = prepared
+            .attempt
+            .reviews
+            .iter()
+            .map(|pass| pass.pass.as_str())
+            .collect();
+        if recorded != obliged {
+            return Err(FoldError::InconsistentRecord {
+                kind: KIND,
+                detail: format!(
+                    "attempt {} of generation {} records the review pass(es) {:?} and this task \
+                     is frozen to require {:?}, in that order — every configured pass runs and \
+                     passes, and a record does not choose which ones it is judged on",
+                    prepared.attempt.attempt, prepared.generation.0, recorded, obliged
                 ),
             });
         }
@@ -3441,6 +3644,12 @@ impl RunState {
     }
 
     fn apply_dispatched(&mut self, dispatched: &TaskDispatched) {
+        // The recorded region and `predicted_region(entry)` are one value by the
+        // time this runs: `check_dispatched` refuses an ordinary dispatch whose
+        // `Predicted { paths }` is anything else. Granting the event's copy is
+        // therefore granting the derivation, and it stays the event's copy so
+        // that the region in the lease table is demonstrably the region the log
+        // holds rather than a second derivation of it.
         let (lease, region) = match &dispatched.lease {
             LeaseGrant::Predicted { paths } => (GenerationLease::Own, Some(paths.clone())),
             LeaseGrant::InheritedLineage { root } => {
@@ -3926,6 +4135,24 @@ fn predicted_region(entry: &TaskEntry) -> PathSet {
         paths.push(GitPath(trimmed.to_owned()));
     }
     PathSet::Prefixes { paths }
+}
+
+/// A region as a refusal names it.
+///
+/// The empty prefix list is spelled out rather than printed as `[]`: an empty
+/// region and an unread one are different answers — [`PathSet::prefixes`] says
+/// so — and a refusal that rendered the first as an empty pair of brackets
+/// would read like a formatting accident next to `the whole repository`.
+fn describe_region(paths: &PathSet) -> String {
+    match paths.prefixes() {
+        None => "the whole repository".to_owned(),
+        Some([]) => "no path at all".to_owned(),
+        Some(prefixes) => prefixes
+            .iter()
+            .map(|path| format!("`{}`", path.as_str()))
+            .collect::<Vec<_>>()
+            .join(", "),
+    }
 }
 
 /// A ref name, for a diagnostic that has to print an `Option<GitRef>`.
@@ -4613,6 +4840,15 @@ mod tests {
         }
     }
 
+    /// An ordinary dispatch of a task **of the default [`plan`]**, taking the
+    /// region that plan's frozen hints derive.
+    ///
+    /// `region` is keyed by [`TaskKey`] and the default plan is the only plan
+    /// those keys belong to, so a fixture on another plan — [`chain_plan`] is
+    /// the one — takes [`dispatch_in`] instead, which asks the fold. The
+    /// agreement between this table and the derivation is not assumed:
+    /// [`the_dispatch_fixture_records_the_region_the_fold_derives`] round-trips
+    /// all three.
     fn dispatch(key: TaskKey, generation: u32, base: &CommitSha) -> TopologyEvent {
         ev(TopologyEventBody::TaskDispatched {
             data: TaskDispatched {
@@ -4624,6 +4860,30 @@ mod tests {
                 source_candidate: None,
             },
         })
+    }
+
+    /// [`dispatch`], with the predicted region taken from `fold` rather than
+    /// from the default plan's table.
+    ///
+    /// What a conforming driver does — `TopologyRun` reads
+    /// [`TopologyFold::predicted_region`] — and what any fixture on a plan
+    /// other than [`plan`] needs, because the keys are dense per plan and
+    /// `region`'s table is the default plan's.
+    fn dispatch_in(
+        fold: &TopologyFold,
+        key: TaskKey,
+        generation: u32,
+        base: &CommitSha,
+    ) -> TopologyEvent {
+        let mut event = dispatch(key, generation, base);
+        if let TopologyEventBody::TaskDispatched { data } = &mut event.body {
+            data.lease = LeaseGrant::Predicted {
+                paths: fold
+                    .predicted_region(key)
+                    .expect("the fixture's run has started"),
+            };
+        }
+        event
     }
 
     /// Delegates to the production reader rather than repeating its
@@ -4737,6 +4997,23 @@ mod tests {
         })
     }
 
+    /// [`attempt_started`], resuming `session` — the same-generation retry a
+    /// `Retained` settlement exists to admit.
+    fn attempt_started_resuming(
+        fold: &TopologyFold,
+        key: TaskKey,
+        generation: u32,
+        attempt: u32,
+        rung: u32,
+        session: &str,
+    ) -> TopologyEvent {
+        let mut event = attempt_started(fold, key, generation, attempt, rung);
+        if let TopologyEventBody::AttemptStarted { data } = &mut event.body {
+            data.resume_session = Some(SessionId(session.to_owned()));
+        }
+        event
+    }
+
     /// `attempt_finished`, whose record **says the attempt failed**.
     ///
     /// Every settlement this can build is a failure — `candidate_prepared` is the
@@ -4758,6 +5035,19 @@ mod tests {
             reason: "the fixture's judged failure".to_owned(),
             detail: None,
         });
+        // **One session, in both places the event carries it.** Production
+        // takes the settlement's `retained_session` and the record's
+        // `session_id` from one value — `assessed.outcome.session_id` — and the
+        // fold refuses a retained settlement whose two halves disagree about
+        // which conversation was left open. A builder that left the record's
+        // stock id in place would be constructing that disagreement in every
+        // retained fixture in this file.
+        if let AttemptSettlement::Retained {
+            retained_session, ..
+        } = &settlement
+        {
+            record.session_id = Some(retained_session.0.clone());
+        }
         ev(TopologyEventBody::AttemptFinished {
             data: Box::new(AttemptFinished4 {
                 key,
@@ -5007,6 +5297,341 @@ mod tests {
             "a retained generation is retried, never re-dispatched"
         );
         assert!(fold.structurally_admissible());
+    }
+
+    // --- the Retained arm asks what the Closed arm asks ---------------------
+    //
+    // `PR7-G2-W1-RETAINED-ARM-UNGUARDED` (§2, §22e). Round 6's four new
+    // settlement refusals all construct `Closed`, which is why this arm was
+    // undriven: it checked the epoch and stopped.
+
+    /// A `Retained` settlement of `key`'s first attempt, session and all.
+    fn retain(key: TaskKey, attempt: u32, session: &str, incarnation: Epoch) -> TopologyEvent {
+        settle(
+            key,
+            0,
+            attempt,
+            AttemptSettlement::Retained {
+                retained_session: SessionId(session.to_owned()),
+                retained_incarnation: incarnation,
+            },
+        )
+    }
+
+    /// **The Retained arm asks the same questions the Closed arm asks.**
+    ///
+    /// A settlement carries an envelope and a ledger line, and this arm bound
+    /// them to each other in one field — the incarnation — and left the rest
+    /// free. So a current-epoch retained settlement could carry a record
+    /// belonging to a different attempt of the same generation, and could name
+    /// a conversation the ledger line does not report.
+    ///
+    /// The positive premise is asserted first in every row, so each refusal is
+    /// about the one field the row moves.
+    #[test]
+    fn a_retained_settlement_binds_its_envelope_to_its_record() {
+        let base = sha("base");
+        let session = "sess-ÜNI-retained";
+        let mut fold = started();
+        apply(&mut fold, &dispatch(ZETA, 0, &base));
+        let start = attempt_started(&fold, ZETA, 0, 1, 0);
+        apply(&mut fold, &start);
+
+        // The premise: the coherent settlement applies.
+        accepts(&fold, &retain(ZETA, 1, session, Epoch(0)));
+
+        // The record's attempt is not the envelope's.
+        let mut wrong_attempt = retain(ZETA, 1, session, Epoch(0));
+        let TopologyEventBody::AttemptFinished { data } = &mut wrong_attempt.body else {
+            unreachable!("built as an attempt_finished")
+        };
+        data.record.attempt = 2;
+        assert!(
+            matches!(
+                refuse(&fold, &wrong_attempt),
+                FoldError::WrongAttempt { attempt: 2, .. }
+            ),
+            "a retained settlement carried another attempt's ledger line"
+        );
+
+        // The record names another conversation.
+        let mut wrong_session = retain(ZETA, 1, session, Epoch(0));
+        let TopologyEventBody::AttemptFinished { data } = &mut wrong_session.body else {
+            unreachable!("built as an attempt_finished")
+        };
+        data.record.session_id = Some("sess-somebody-elses".to_owned());
+        let error = refuse(&fold, &wrong_session);
+        assert!(
+            matches!(error, FoldError::InconsistentRecord { .. }),
+            "a retained settlement kept a session its record does not report: {error:?}"
+        );
+
+        // And names none at all, which is the shape the scaffold emitted.
+        let mut sessionless = retain(ZETA, 1, session, Epoch(0));
+        let TopologyEventBody::AttemptFinished { data } = &mut sessionless.body else {
+            unreachable!("built as an attempt_finished")
+        };
+        data.record.session_id = None;
+        let error = refuse(&fold, &sessionless);
+        assert!(
+            matches!(error, FoldError::InconsistentRecord { .. }),
+            "a retained settlement reported no session to retain: {error:?}"
+        );
+
+        // The envelope's generation is not the open one.
+        let mut wrong_generation = retain(ZETA, 1, session, Epoch(0));
+        let TopologyEventBody::AttemptFinished { data } = &mut wrong_generation.body else {
+            unreachable!("built as an attempt_finished")
+        };
+        data.generation = GenerationId(1);
+        assert!(
+            matches!(
+                refuse(&fold, &wrong_generation),
+                FoldError::NotTheOpenGeneration { .. }
+            ),
+            "a retained settlement named a generation this task does not hold open"
+        );
+
+        // The incarnation is not this run's.
+        assert!(
+            matches!(
+                refuse(&fold, &retain(ZETA, 1, session, Epoch(7))),
+                FoldError::StaleIncarnation { .. }
+            ),
+            "a retained settlement claimed an incarnation this run is not in"
+        );
+
+        // Nothing moved on any of them: the generation is still in flight.
+        let generation = fold
+            .task(ZETA)
+            .and_then(|task| task.generations.first())
+            .expect("the generation is open");
+        assert!(matches!(generation.class, GenerationClass::InFlight { .. }));
+    }
+
+    /// One arm of the settlement door: a label and a builder for the
+    /// settlement that reaches it.
+    type SettlementArm = (&'static str, fn() -> AttemptSettlement);
+
+    /// **No settlement of `attempt_finished` accepts a record that claims the
+    /// attempt succeeded — on either arm.**
+    ///
+    /// The sibling-arm witness. `candidate_prepared` is the sole successful
+    /// settlement (INV-07,
+    /// `decisions/2026-08-12-merge-queue-execution-topology.md`), and the
+    /// `Closed` arm has enforced that against the record since round 6. The
+    /// `Retained` arm did not, so the invariant held on one path through the
+    /// door and not the other: a retained settlement could carry a record with
+    /// no failure and every configured pass green — a record
+    /// `check_candidate_prepared` would itself accept — and the ledger line an
+    /// operator reads would say the work passed while the fold held the
+    /// generation open for a retry.
+    ///
+    /// **What "retained" means, and why requiring this is not requiring a
+    /// terminal failure.** `settle_failed` is the only producer of a `Retained`
+    /// settlement: it is reached on the failure path, for a same-rung retry
+    /// that has a session to resume. So a retained attempt has *not* succeeded,
+    /// by construction. `is_successful()` being false is the record saying that
+    /// much and no more — it does not require a `Failed` transition, which
+    /// `Retained` has no field for, and it does not make the generation
+    /// terminal.
+    ///
+    /// Driven over the identical record on both arms, because the claim is that
+    /// the two agree rather than that each refuses something.
+    #[test]
+    fn no_attempt_finished_arm_accepts_a_record_that_claims_success() {
+        let base = sha("base");
+        let session = "sess-ÜNI-unsettled";
+
+        // The one shape both arms must refuse: no failure, and the frozen
+        // obligation all green — which is exactly what `candidate_prepared`
+        // requires of the settlement that *is* a success.
+        let claims_success = |event: &mut TopologyEvent| {
+            let TopologyEventBody::AttemptFinished { data } = &mut event.body else {
+                unreachable!("built as an attempt_finished")
+            };
+            data.record.failure = None;
+            data.record.reviews = vec![review_pass("review", ReviewPassOutcome::Passed)];
+            assert!(
+                data.record.is_successful(),
+                "the fixture is not the successful shape"
+            );
+        };
+
+        let arms: Vec<SettlementArm> = vec![
+            ("retained", || AttemptSettlement::Retained {
+                retained_session: SessionId("sess-ÜNI-unsettled".to_owned()),
+                retained_incarnation: Epoch(0),
+            }),
+            ("closed", || AttemptSettlement::Closed {
+                transition: SettlementTransition::Retry,
+                lease: LeaseDisposition::PredictedReleased,
+            }),
+        ];
+
+        for (label, settlement) in arms {
+            let mut fold = started();
+            apply(&mut fold, &dispatch(ZETA, 0, &base));
+            let start = attempt_started(&fold, ZETA, 0, 1, 0);
+            apply(&mut fold, &start);
+
+            // The premise: with a record that does not claim success, this
+            // exact settlement applies — so the refusal below is about the
+            // claim and nothing else.
+            accepts(&fold, &settle(ZETA, 0, 1, settlement()));
+
+            let mut lying = settle(ZETA, 0, 1, settlement());
+            claims_success(&mut lying);
+            let error = refuse(&fold, &lying);
+            assert!(
+                matches!(error, FoldError::InconsistentRecord { .. }),
+                "{label}: a record claiming success settled an attempt: {error:?}"
+            );
+
+            // Nothing moved.
+            let generation = fold
+                .task(ZETA)
+                .and_then(|task| task.generations.first())
+                .expect("the generation is open");
+            assert!(
+                matches!(generation.class, GenerationClass::InFlight { .. }),
+                "{label}: the refused settlement moved the generation anyway"
+            );
+
+            // **And the predicate is the shared one, not half of it.** A record
+            // whose failure field is empty and whose configured pass came back
+            // `Failed` makes no success claim — §11.2's "every configured pass
+            // passes" is the other half of `is_successful`, and it is the half
+            // an arm re-deriving the question from `failure.is_none()` would
+            // lose. Both arms take this record.
+            let mut judged = settle(ZETA, 0, 1, settlement());
+            let TopologyEventBody::AttemptFinished { data } = &mut judged.body else {
+                unreachable!("built as an attempt_finished")
+            };
+            data.record.failure = None;
+            data.record.reviews = vec![review_pass("review", ReviewPassOutcome::Failed)];
+            assert!(
+                !data.record.is_successful(),
+                "{label}: the fixture claims success after all"
+            );
+            accepts(&fold, &judged);
+        }
+
+        // And the door that *does* take a successful record still takes it, so
+        // this narrows `attempt_finished` rather than closing success off
+        // altogether.
+        let mut fold = started();
+        apply(&mut fold, &dispatch(ZETA, 0, &base));
+        let start = attempt_started(&fold, ZETA, 0, 1, 0);
+        apply(&mut fold, &start);
+        accepts(&fold, &candidate_prepared(ZETA, 0, &base));
+        let _ = session;
+    }
+
+    /// **What a Retained settlement does to the run: pipeline released, lease
+    /// retained, generation open, task not terminal — and once.**
+    ///
+    /// The row's other half. "Releases only the pipeline entitlement" is a
+    /// claim about the state after the arm applies, and the negatives are
+    /// double release (a second settlement of a generation that is no longer in
+    /// flight) and a new-process retry (a resume by an incarnation that did not
+    /// retain the session). Both are refusals the fold already makes and
+    /// neither was driven from this arm.
+    #[test]
+    fn a_retained_settlement_releases_the_pipeline_and_nothing_else() {
+        let base = sha("base");
+        let session = "sess-ÜNI-held";
+        let mut fold = started();
+        apply(&mut fold, &dispatch(ZETA, 0, &base));
+        let held = fold.predicted_region(ZETA).expect("the run has a registry");
+        let start = attempt_started(&fold, ZETA, 0, 1, 0);
+        apply(&mut fold, &start);
+        assert_eq!(
+            fold.pipeline_held(),
+            1,
+            "the in-flight generation holds the entitlement, or the release below is unobservable"
+        );
+
+        apply(&mut fold, &retain(ZETA, 1, session, Epoch(0)));
+
+        // Released, exactly once, and nothing else went with it.
+        assert_eq!(fold.pipeline_held(), 0, "the entitlement was not released");
+        let owner = LeaseOwner::Generation {
+            key: ZETA,
+            generation: GenerationId(0),
+        };
+        let leases = fold.leases().expect("the run has started");
+        assert!(
+            leases.holds(owner),
+            "a retained generation keeps its worktree, so it keeps its predicted lease"
+        );
+        assert!(
+            leases.overlaps_another(
+                LeaseOwner::Generation {
+                    key: ALPHA,
+                    generation: GenerationId(0)
+                },
+                &held,
+                &path_policy(),
+            ),
+            "the retained region no longer blocks another owner, so the lease is held in name only"
+        );
+        assert_eq!(
+            fold.task_state(ZETA),
+            Some(TaskState::Pending),
+            "a retained attempt is unsettled: the task is neither merged nor failed"
+        );
+        assert_eq!(
+            fold.derived_outcome(),
+            DerivedOutcome::NotEnding,
+            "a retained generation leaves the run running"
+        );
+
+        // Double release: the generation is no longer in flight, so a second
+        // settlement of it — retained or closed — is refused.
+        assert!(matches!(
+            refuse(&fold, &retain(ZETA, 1, session, Epoch(0))),
+            FoldError::NotTheOpenGeneration { .. }
+        ));
+        assert!(matches!(
+            refuse(
+                &fold,
+                &settle(
+                    ZETA,
+                    0,
+                    1,
+                    AttemptSettlement::Closed {
+                        transition: SettlementTransition::Retry,
+                        lease: LeaseDisposition::PredictedReleased,
+                    }
+                )
+            ),
+            FoldError::NotTheOpenGeneration { .. }
+        ));
+
+        // Same-generation retry: accepted in the retaining incarnation, and
+        // only there. The second half is the new-process refusal.
+        let retry = attempt_started_resuming(&fold, ZETA, 0, 2, 0, session);
+        accepts(&fold, &retry);
+        let mut resumed = fold.clone();
+        let runner = fold.started().expect("the run has started").runner.clone();
+        apply(&mut resumed, &resume(runner));
+        assert!(matches!(
+            refuse(
+                &resumed,
+                &attempt_started_resuming(&resumed, ZETA, 0, 2, 0, session)
+            ),
+            FoldError::StaleIncarnation { .. }
+        ));
+        // And a retry naming some other conversation is refused in the
+        // retaining incarnation too.
+        assert!(matches!(
+            refuse(
+                &fold,
+                &attempt_started_resuming(&fold, ZETA, 0, 2, 0, "sess-somebody-elses")
+            ),
+            FoldError::StaleIncarnation { .. }
+        ));
     }
 
     /// A poisoned fold authorises nothing.
@@ -6390,6 +7015,382 @@ mod tests {
         ));
     }
 
+    // --- the recorded region, derivation-checked --------------------------
+    //
+    // `TASK-DISPATCHED-REGION-UNVALIDATED` (§2, §22). The sibling for the
+    // recorded *binding* is `the_frozen_rung_binding_is_what_the_validator_
+    // accepts` above; this is the same question one event earlier, and the
+    // asymmetry between the two is what the row was written about.
+
+    /// One hint shape, and the region the contract says it derives.
+    ///
+    /// **Transcribed from the rule, not from the code.** The rule is "the
+    /// plan's path hints, taken literally: a hint with no glob metacharacter is
+    /// its own literal prefix; anything else — an absent hint list, or a hint
+    /// whose literal prefix is empty — classifies repo-wide". Reading
+    /// `predicted_region`'s body to build this table would make the grid agree
+    /// with the derivation for the reason the derivation is right or wrong,
+    /// which is the self-oracle shape `CODING_STANDARDS.md` names.
+    struct HintShape {
+        /// The task's display id, which is also its fixture name.
+        id: &'static str,
+        /// What the plan froze.
+        hints: &'static [&'static str],
+        /// The prefixes the rule derives, or `None` for repo-wide.
+        derives: Option<&'static [&'static str]>,
+    }
+
+    /// Every hint shape the rule distinguishes, one axis varied at a time.
+    ///
+    /// The four glob metacharacters get a case each rather than one case with
+    /// all four, because a truncation that stopped at only three of them would
+    /// pass a combined case on the first one it did handle.
+    const HINT_SHAPES: &[HintShape] = &[
+        // A literal is its own prefix, unchanged.
+        HintShape {
+            id: "literal",
+            hints: &["src/literal"],
+            derives: Some(&["src/literal"]),
+        },
+        // A trailing separator is not part of the name of the directory.
+        HintShape {
+            id: "trailing",
+            hints: &["src/trailing/"],
+            derives: Some(&["src/trailing"]),
+        },
+        // The four metacharacters, one each. Everything from the first one is
+        // dropped, and the separator that precedes it goes with the trim.
+        HintShape {
+            id: "star",
+            hints: &["src/star/*.rs"],
+            derives: Some(&["src/star"]),
+        },
+        HintShape {
+            id: "question",
+            hints: &["src/question/?.rs"],
+            derives: Some(&["src/question"]),
+        },
+        HintShape {
+            id: "bracket",
+            hints: &["src/bracket/[ab].rs"],
+            derives: Some(&["src/bracket"]),
+        },
+        HintShape {
+            id: "brace",
+            hints: &["src/brace/{a,b}.rs"],
+            derives: Some(&["src/brace"]),
+        },
+        // A Windows-shaped hint names Git paths once its separators are.
+        HintShape {
+            id: "backslash",
+            hints: &[r"src\backslash\deep"],
+            derives: Some(&["src/backslash/deep"]),
+        },
+        // A doubled separator is **kept**: the rule trims the tail and
+        // substitutes nothing. `src/doubled//inner` and `src/doubled/inner`
+        // name one region to `paths_overlap`, which filters empty components —
+        // and they are still two different literals, which is the whole reason
+        // the comparison below is exact rather than semantic.
+        HintShape {
+            id: "doubled",
+            hints: &["src/doubled//inner/"],
+            derives: Some(&["src/doubled//inner"]),
+        },
+        // Case and non-ASCII survive: the region is the hint's own bytes.
+        HintShape {
+            id: "unicode",
+            hints: &["src/Über/"],
+            derives: Some(&["src/Über"]),
+        },
+        // Every hint contributes a prefix, in the frozen order.
+        HintShape {
+            id: "several",
+            hints: &["zz/last", "aa/first", "build.rs"],
+            derives: Some(&["zz/last", "aa/first", "build.rs"]),
+        },
+        // A leading glob leaves an empty literal prefix, which is repo-wide —
+        // and repo-wide for **one** hint is repo-wide for the task, because an
+        // unbounded region cannot be narrowed by a bounded sibling.
+        HintShape {
+            id: "leading-glob",
+            hints: &["**/anywhere.rs"],
+            derives: None,
+        },
+        HintShape {
+            id: "empty-hint",
+            hints: &[""],
+            derives: None,
+        },
+        HintShape {
+            id: "bare-separator",
+            hints: &["/"],
+            derives: None,
+        },
+        HintShape {
+            id: "one-narrow-one-wide",
+            hints: &["src/narrow", "**/wide.rs"],
+            derives: None,
+        },
+        // No hints at all: nothing was said about where the work lands.
+        HintShape {
+            id: "no-hints",
+            hints: &[],
+            derives: None,
+        },
+    ];
+
+    fn hint_shape_region(shape: &HintShape) -> PathSet {
+        match shape.derives {
+            None => PathSet::RepoWide,
+            Some(prefixes) => PathSet::Prefixes {
+                paths: prefixes.iter().copied().map(GitPath::from).collect(),
+            },
+        }
+    }
+
+    fn hint_shape_plan() -> Plan {
+        Plan {
+            source: PlanSource {
+                adapter: "markdown".to_owned(),
+                hash: "frozen-hint-shape-hash".to_owned(),
+            },
+            tasks: HINT_SHAPES
+                .iter()
+                .map(|shape| task_of(shape.id, &[], shape.hints, None))
+                .collect(),
+            artifacts: vec![Artifact {
+                id: ArtifactId::from("contract"),
+                produced_by: Some(TaskId::from(HINT_SHAPES[0].id)),
+            }],
+        }
+    }
+
+    fn hint_shape_inputs() -> FrozenInputs {
+        FrozenInputs {
+            plan: hint_shape_plan(),
+            normalized_plan_digest: NORMALIZED_DIGEST.to_owned(),
+        }
+    }
+
+    /// The hint-shape plan's `run_started`, authenticated against its own
+    /// registry — the same construction [`chain_run_started_event`] uses.
+    fn hint_shape_started() -> TopologyFold {
+        let plan = hint_shape_plan();
+        let unauthenticated = RunStarted4 {
+            plan_hash: plan.source.hash.clone(),
+            chains: plan.tasks.iter().map(|t| chain(t.id.as_str())).collect(),
+            reviews: review_plan(plan.tasks.len()),
+            registry_digest: String::new(),
+            ..run_started_unauthenticated()
+        };
+        let digest = TaskRegistry::originals_with_agents(
+            &plan,
+            &unauthenticated.registry_record(),
+            &unauthenticated.probed_agents,
+        )
+        .expect("the hint-shape record derives a registry")
+        .digest();
+        let event = ev(TopologyEventBody::RunStarted {
+            data: Box::new(RunStarted4 {
+                registry_digest: digest,
+                ..unauthenticated
+            }),
+        });
+        let mut fold = TopologyFold::new(hint_shape_inputs());
+        apply(&mut fold, &event);
+        fold
+    }
+
+    fn hint_shape_dispatch(key: TaskKey, paths: PathSet) -> TopologyEvent {
+        ev(TopologyEventBody::TaskDispatched {
+            data: TaskDispatched {
+                key,
+                generation: GenerationId(0),
+                base_sha: sha("base"),
+                worktree_path: format!("/private/workspaces/tasks/k{}-g0", key.0),
+                lease: LeaseGrant::Predicted { paths },
+                source_candidate: None,
+            },
+        })
+    }
+
+    /// **The derivation is one function of the frozen hints, and the door
+    /// accepts exactly its answer.**
+    ///
+    /// Two halves over one table. The first is that the fold's own reader
+    /// returns what the *rule* says, independently transcribed above — so a
+    /// derivation that quietly changed (a metacharacter dropped from the stop
+    /// set, a trim that also collapsed separators) fails here rather than
+    /// somewhere downstream of it. The second is that a `task_dispatched`
+    /// recording that answer is admitted, which is what makes the refusal in
+    /// the sibling test a statement about divergence rather than about the
+    /// region being checked at all.
+    #[test]
+    fn every_hint_shape_derives_the_region_the_rule_states_and_the_door_takes_it() {
+        let fold = hint_shape_started();
+        for (index, shape) in HINT_SHAPES.iter().enumerate() {
+            let key = TaskKey(u32::try_from(index).expect("a small fixture registry"));
+            let expected = hint_shape_region(shape);
+            assert_eq!(
+                fold.predicted_region(key),
+                Some(expected.clone()),
+                "`{}`: the derivation is not the region the rule states",
+                shape.id
+            );
+            accepts(&fold, &hint_shape_dispatch(key, expected));
+        }
+        assert!(
+            HINT_SHAPES.iter().any(|shape| shape.derives.is_none())
+                && HINT_SHAPES.iter().any(|shape| shape.derives.is_some()),
+            "a table with only one answer could not tell the two classifications apart"
+        );
+    }
+
+    /// **A dispatch recording any other region is refused, and the refusal
+    /// names both regions.**
+    ///
+    /// The negative half of the table above, and the finding itself:
+    /// `check_dispatched` used to match the lease's *shape* alone, so the fold
+    /// admitted on `predicted_region`'s answer and `apply_dispatched` granted
+    /// whatever the event carried — and the lease table's copy is the one every
+    /// later overlap check consults.
+    ///
+    /// Each perturbation is one axis of the way two regions can disagree:
+    /// a component missing, one added, the same components in another order,
+    /// one component rewritten to something that *overlaps identically*, the
+    /// case folded under a run whose `PathPolicy` folds case, a narrowed region
+    /// widened to repo-wide, and a repo-wide region narrowed. The last two are
+    /// the pair that matters most at width: `RepoWide` overlaps everything, so
+    /// recording a narrow region for a repo-wide prediction is how a task that
+    /// should have serialized against every other runs beside them.
+    #[test]
+    fn a_dispatch_that_records_a_region_the_hints_do_not_derive_is_refused() {
+        let fold = hint_shape_started();
+        let key_of = |id: &str| {
+            TaskKey(
+                u32::try_from(
+                    HINT_SHAPES
+                        .iter()
+                        .position(|shape| shape.id == id)
+                        .expect("a fixture shape"),
+                )
+                .expect("a small fixture registry"),
+            )
+        };
+        let narrowed = |paths: &[&str]| PathSet::Prefixes {
+            paths: paths.iter().copied().map(GitPath::from).collect(),
+        };
+
+        let cases: Vec<(&str, TaskKey, PathSet)> = vec![
+            // The literal hint, taken literally *including* the glob — the
+            // shape the driver actually wrote, and the one `84a3978` repaired
+            // in the driver while leaving the door open.
+            (
+                "the hint, unstripped",
+                key_of("star"),
+                narrowed(&["src/star/*.rs"]),
+            ),
+            // A component dropped.
+            (
+                "a component missing",
+                key_of("several"),
+                narrowed(&["zz/last", "aa/first"]),
+            ),
+            // A component added.
+            (
+                "a component added",
+                key_of("several"),
+                narrowed(&["zz/last", "aa/first", "build.rs", "src/extra"]),
+            ),
+            // The same components, sorted. Sorting is a normalisation a caller
+            // could think harmless; the frozen order is the plan's.
+            (
+                "the components reordered",
+                key_of("several"),
+                narrowed(&["aa/first", "build.rs", "zz/last"]),
+            ),
+            // Normalised to a region that overlaps identically. `paths_overlap`
+            // filters empty components, so this collides with the derived one
+            // exactly as the derived one collides with itself — and it is still
+            // not the region the frozen hints derive.
+            (
+                "a separator normalised away",
+                key_of("doubled"),
+                narrowed(&["src/doubled/inner"]),
+            ),
+            // Case-folded, under a run whose policy folds case. The policy
+            // decides what *overlaps*; it does not decide what a region is.
+            (
+                "the case folded",
+                key_of("unicode"),
+                narrowed(&["src/über"]),
+            ),
+            // A bounded prediction recorded as unbounded.
+            ("widened to repo-wide", key_of("literal"), PathSet::RepoWide),
+            // And an unbounded prediction recorded as bounded, which is the
+            // one that lets a task run beside work it should have blocked.
+            (
+                "narrowed from repo-wide",
+                key_of("leading-glob"),
+                narrowed(&["src/anywhere"]),
+            ),
+            // The empty region is a real answer and not the derived one.
+            ("emptied", key_of("literal"), narrowed(&[])),
+        ];
+
+        for (label, key, recorded) in cases {
+            let derived = fold
+                .predicted_region(key)
+                .expect("the fixture run has started");
+            assert_ne!(
+                recorded, derived,
+                "{label}: the perturbation is not a perturbation"
+            );
+            let error = refuse(&fold, &hint_shape_dispatch(key, recorded));
+            let FoldError::MalformedEntry {
+                key: named, detail, ..
+            } = &error
+            else {
+                panic!("{label}: refused as {error} rather than as a malformed entry");
+            };
+            assert_eq!(*named, key.0, "{label}: the refusal names another task");
+            assert!(
+                detail.contains("frozen path hints derive"),
+                "{label}: the refusal does not say what it derived: {detail}"
+            );
+        }
+    }
+
+    /// The default plan's dispatch fixture records the region the fold derives.
+    ///
+    /// `region` is a table and `predicted_region` is a rule, so the corpus held
+    /// two answers to one question and every `task_dispatched` in this file
+    /// depended on their agreeing. They did — for the default plan — and the
+    /// same table was wrong for [`chain_plan`], which is why [`dispatch_in`]
+    /// exists. This is the round trip that keeps the surviving table honest:
+    /// it is not what proves the door right, it is what stops a fixture edit
+    /// from silently making every other test in this file dispatch a region the
+    /// run never predicted.
+    #[test]
+    fn the_dispatch_fixture_records_the_region_the_fold_derives() {
+        let fold = started();
+        for key in [ZETA, ALPHA, MID] {
+            let event = dispatch(key, 0, &sha("base"));
+            let TopologyEventBody::TaskDispatched { data } = &event.body else {
+                panic!("the dispatch fixture builds a task_dispatched");
+            };
+            let LeaseGrant::Predicted { paths } = &data.lease else {
+                panic!("an ordinary dispatch takes a predicted lease");
+            };
+            assert_eq!(
+                Some(paths.clone()),
+                fold.predicted_region(key),
+                "the fixture region for task {} is not the one the fold derives",
+                key.0
+            );
+        }
+    }
+
     #[test]
     fn a_dispatch_takes_the_holding_its_origin_implies() {
         let base = sha("base");
@@ -7617,6 +8618,317 @@ mod tests {
                 generation.class
             );
             assert!(generation.candidate.is_none());
+        }
+    }
+
+    // --- the frozen review plan is the success domain ----------------------
+    //
+    // `PR7-G2-W1-SUCCESS-IGNORES-THE-FROZEN-PLAN` (§2, §22e). The witnesses
+    // above are round 6's *outcome* half — a configured pass that ran and did
+    // not pass. These are the *presence* half: a pass the plan configured and
+    // the record does not carry at all.
+
+    /// A run whose frozen plan obliges **nothing**: verification off.
+    ///
+    /// `plan_for`'s disabled branch resolves no `primary` either, so this is
+    /// the shape production writes and not merely `enabled = false` bolted onto
+    /// a resolved reviewer.
+    fn reviews_off_started() -> TopologyFold {
+        let plan = plan();
+        let unauthenticated = RunStarted4 {
+            reviews: ReviewPlan {
+                second_opinion: vec![None; plan.tasks.len()],
+                ..ReviewPlan::default()
+            },
+            registry_digest: String::new(),
+            ..run_started_unauthenticated()
+        };
+        let digest = TaskRegistry::originals_with_agents(
+            &plan,
+            &unauthenticated.registry_record(),
+            &unauthenticated.probed_agents,
+        )
+        .expect("a review-free record derives a registry")
+        .digest();
+        let event = ev(TopologyEventBody::RunStarted {
+            data: Box::new(RunStarted4 {
+                registry_digest: digest,
+                ..unauthenticated
+            }),
+        });
+        let mut fold = TopologyFold::new(inputs());
+        apply(&mut fold, &event);
+        fold
+    }
+
+    /// One row of the obligation grid: a label, the fold whose frozen plan is
+    /// under test, the task, the passes that plan obliges, and the labelled
+    /// lists it refuses.
+    type ObligationRow = (
+        &'static str,
+        TopologyFold,
+        TaskKey,
+        Vec<(&'static str, ReviewPassOutcome)>,
+        Vec<(&'static str, Vec<(&'static str, ReviewPassOutcome)>)>,
+    );
+
+    /// A `candidate_prepared` for `key` carrying exactly `passes`, all passed.
+    fn prepared_with_passes(
+        key: TaskKey,
+        base: &CommitSha,
+        passes: &[(&str, ReviewPassOutcome)],
+    ) -> TopologyEvent {
+        let mut event = candidate_prepared(key, 0, base);
+        let TopologyEventBody::CandidatePrepared { data } = &mut event.body else {
+            unreachable!("built as a candidate_prepared")
+        };
+        data.attempt.reviews = passes
+            .iter()
+            .map(|(pass, outcome)| review_pass(pass, *outcome))
+            .collect();
+        event
+    }
+
+    /// A fold with `key`'s first attempt in flight, ready for its settlement.
+    fn in_flight_at(fold: &mut TopologyFold, key: TaskKey, base: &CommitSha) {
+        apply(fold, &dispatch(key, 0, base));
+        let start = attempt_started(fold, key, 0, 1, 0);
+        apply(fold, &start);
+    }
+
+    /// **Zero, one and many configured passes: the record carries the frozen
+    /// obligation and nothing else.**
+    ///
+    /// The arity grid, because the defect is about the *domain* of a predicate
+    /// and a one-pass fixture cannot show a domain. `review_plan` configures a
+    /// second opinion for index 2 alone, so `MID` obliges two passes and `ZETA`
+    /// one; a run that froze verification off obliges none.
+    ///
+    /// Each row asserts both directions: the obliged list is accepted, and the
+    /// same event carrying any other list is refused. The negative half is what
+    /// makes the positive half a measurement — `is_successful` was true of every
+    /// one of these records, which is exactly why it could not tell them apart.
+    #[test]
+    fn candidate_success_is_judged_against_the_tasks_frozen_review_plan() {
+        let base = sha("base");
+        const REVIEW: &str = "review";
+        const SECOND: &str = "second-opinion";
+        let pass = |name: &'static str| (name, ReviewPassOutcome::Passed);
+
+        // (label, the fold's frozen plan, the task, what it obliges, what it refuses)
+        let rows: Vec<ObligationRow> = vec![
+            (
+                "none configured",
+                reviews_off_started(),
+                ZETA,
+                vec![],
+                vec![
+                    ("a pass nobody configured", vec![pass(REVIEW)]),
+                    ("a second opinion nobody configured", vec![pass(SECOND)]),
+                ],
+            ),
+            (
+                "one configured",
+                started(),
+                ZETA,
+                vec![pass(REVIEW)],
+                vec![
+                    // The finding's own shape: a lone passed second opinion.
+                    // Every entry green, and the pass §11.2 requires absent.
+                    ("a lone second opinion", vec![pass(SECOND)]),
+                    // An empty list: `all` over nothing is true.
+                    ("no passes at all", vec![]),
+                    (
+                        "the configured pass duplicated",
+                        vec![pass(REVIEW), pass(REVIEW)],
+                    ),
+                    (
+                        "a pass nobody configured, beside it",
+                        vec![pass(REVIEW), pass(SECOND)],
+                    ),
+                    (
+                        "a pass name nobody has ever configured",
+                        vec![pass("security")],
+                    ),
+                    (
+                        "the configured pass, failed",
+                        vec![(REVIEW, ReviewPassOutcome::Failed)],
+                    ),
+                ],
+            ),
+            (
+                "two configured",
+                started(),
+                MID,
+                vec![pass(REVIEW), pass(SECOND)],
+                vec![
+                    ("the primary omitted", vec![pass(SECOND)]),
+                    ("the second opinion omitted", vec![pass(REVIEW)]),
+                    ("both in the other order", vec![pass(SECOND), pass(REVIEW)]),
+                    (
+                        "one of the two failed",
+                        vec![pass(REVIEW), (SECOND, ReviewPassOutcome::Failed)],
+                    ),
+                    (
+                        "an unconfigured third",
+                        vec![pass(REVIEW), pass(SECOND), pass("security")],
+                    ),
+                ],
+            ),
+        ];
+
+        for (label, mut fold, key, obliged, refusals) in rows {
+            in_flight_at(&mut fold, key, &base);
+
+            // The premise: the obliged list is what the door takes.
+            accepts(&fold, &prepared_with_passes(key, &base, &obliged));
+
+            for (why, passes) in refusals {
+                let error = refuse(&fold, &prepared_with_passes(key, &base, &passes));
+                assert!(
+                    matches!(error, FoldError::InconsistentRecord { .. }),
+                    "{label}/{why}: refused as {error:?} rather than as a record disagreement"
+                );
+                // Nothing moved: the generation is still in flight and holds no
+                // candidate, so a refusal cannot have charged the rung.
+                let generation = fold
+                    .task(key)
+                    .and_then(|task| task.generations.first())
+                    .expect("the generation is open");
+                assert!(
+                    matches!(generation.class, GenerationClass::InFlight { .. }),
+                    "{label}/{why}: the refused event promoted the generation anyway"
+                );
+                assert!(generation.candidate.is_none(), "{label}/{why}");
+            }
+        }
+    }
+
+    /// **A run that froze verification off obliges no pass, whatever it
+    /// resolved.**
+    ///
+    /// The `enabled` flag and the resolved bindings are independent fields, and
+    /// `plan_for`'s disabled branch happens to leave `primary` unset — so a
+    /// grid built only from what that function produces cannot tell the flag
+    /// from the absence of a reviewer. The fold reads **logs**, and
+    /// `enabled: false` beside a resolved primary and a resolved second opinion
+    /// is a shape the wire admits: `run_started(4).reviews` carries both, and a
+    /// `task_spawned` embeds a whole frozen entry.
+    ///
+    /// Three of this file's fixtures froze exactly that combination while their
+    /// records carried a passed `review`, which is what makes this the shape
+    /// worth pinning rather than a hypothetical: read one way it obliges a pass
+    /// nobody ran, read the other it obliges none.
+    #[test]
+    fn a_run_that_froze_verification_off_obliges_no_pass_whatever_it_resolved() {
+        let base = sha("base");
+        let plan = plan();
+        // Resolved reviewers, and the switch off. The second opinion is
+        // resolved for `MID` too, so the "many" arm is off as well as the
+        // "one" arm.
+        let unauthenticated = RunStarted4 {
+            reviews: ReviewPlan {
+                enabled: Some(false),
+                ..review_plan(plan.tasks.len())
+            },
+            registry_digest: String::new(),
+            ..run_started_unauthenticated()
+        };
+        let digest = TaskRegistry::originals_with_agents(
+            &plan,
+            &unauthenticated.registry_record(),
+            &unauthenticated.probed_agents,
+        )
+        .expect("the record derives a registry")
+        .digest();
+        let event = ev(TopologyEventBody::RunStarted {
+            data: Box::new(RunStarted4 {
+                registry_digest: digest,
+                ..unauthenticated
+            }),
+        });
+
+        for key in [ZETA, MID] {
+            let mut fold = TopologyFold::new(inputs());
+            apply(&mut fold, &event);
+
+            // The premise: the reviewers *are* resolved on this entry, so an
+            // obligation derived from the bindings alone would not be empty.
+            let entry = fold
+                .registry()
+                .and_then(|registry| registry.get(key))
+                .expect("a registered task")
+                .clone();
+            assert!(
+                entry.reviews.primary.is_some(),
+                "task {}: the fixture resolved no primary, so the flag is not what is under test",
+                key.0
+            );
+            assert!(
+                entry.reviews.obliged_lenses().is_empty(),
+                "task {}: a run that judged nothing obliged a pass",
+                key.0
+            );
+
+            in_flight_at(&mut fold, key, &base);
+            accepts(&fold, &prepared_with_passes(key, &base, &[]));
+            for present in [
+                vec![("review", ReviewPassOutcome::Passed)],
+                vec![("second-opinion", ReviewPassOutcome::Passed)],
+            ] {
+                let error = refuse(&fold, &prepared_with_passes(key, &base, &present));
+                assert!(
+                    matches!(error, FoldError::InconsistentRecord { .. }),
+                    "task {}: a pass the run never configured was admitted: {error:?}",
+                    key.0
+                );
+            }
+        }
+    }
+
+    /// **The obligation is the plan's, read through the plan's own reader.**
+    ///
+    /// The round trip: whatever `FrozenReviews::obliged_lenses` says a task
+    /// owes is exactly what the door accepts, and the door accepts nothing
+    /// else. It is deliberately *not* how
+    /// [`candidate_success_is_judged_against_the_tasks_frozen_review_plan`]
+    /// is written — that grid transcribes the obligation by hand, so the two
+    /// together say both "the fold agrees with the reader" and "the reader says
+    /// what §11.2 says".
+    #[test]
+    fn the_door_accepts_exactly_the_passes_the_frozen_entry_obliges() {
+        let base = sha("base");
+        for key in [ZETA, ALPHA, MID] {
+            let mut fold = started();
+            in_flight_at(&mut fold, key, &base);
+            let entry = fold
+                .registry()
+                .and_then(|registry| registry.get(key))
+                .expect("a registered task")
+                .clone();
+            let obliged: Vec<(&str, ReviewPassOutcome)> = entry
+                .reviews
+                .obliged_lenses()
+                .iter()
+                .map(|lens| (lens.name(), ReviewPassOutcome::Passed))
+                .collect();
+            accepts(&fold, &prepared_with_passes(key, &base, &obliged));
+            assert!(
+                !obliged.is_empty(),
+                "task {} obliges nothing under a plan that enabled review",
+                key.0
+            );
+            // And one fewer is refused, whichever pass is dropped.
+            for dropped in 0..obliged.len() {
+                let mut short = obliged.clone();
+                short.remove(dropped);
+                let error = refuse(&fold, &prepared_with_passes(key, &base, &short));
+                assert!(
+                    matches!(error, FoldError::InconsistentRecord { .. }),
+                    "task {} without its pass {dropped} was admitted: {error:?}",
+                    key.0
+                );
+            }
         }
     }
 
@@ -11272,6 +12584,21 @@ mod tests {
                     "generation",
                     TopologyEventBody::TaskDispatched { data: moved },
                 );
+                // The recorded region, moved one component. Before it was
+                // derivation-checked this line was the whole finding: the fold
+                // admitted on `predicted_region`'s answer and the lease table
+                // kept the event's, so a hostile log carried one region past
+                // the door and every later overlap check consulted the other.
+                let mut moved = data.clone();
+                if let LeaseGrant::Predicted { paths } = &mut moved.lease {
+                    *paths = PathSet::Prefixes {
+                        paths: vec![GitPath::from("src/somewhere-nobody-predicted")],
+                    };
+                    case(
+                        "lease.paths",
+                        TopologyEventBody::TaskDispatched { data: moved },
+                    );
+                }
             }
             TopologyEventBody::AttemptStarted { data } => {
                 let mut moved = data.clone();
@@ -11296,6 +12623,38 @@ mod tests {
                     *lease = LeaseDisposition::LineageHeld;
                     case(
                         "settlement.lease",
+                        TopologyEventBody::AttemptFinished { data: moved },
+                    );
+                }
+                // The Retained arm's own two cells. `long_trace` carries a
+                // retained settlement, and until this arm bound the envelope to
+                // the record a hostile log could move either past it.
+                let mut moved = data.clone();
+                if matches!(moved.settlement, AttemptSettlement::Retained { .. }) {
+                    moved.record.attempt = moved.record.attempt.saturating_add(1);
+                    case(
+                        "record.attempt",
+                        TopologyEventBody::AttemptFinished { data: moved },
+                    );
+                }
+                let mut moved = data.clone();
+                if matches!(moved.settlement, AttemptSettlement::Retained { .. }) {
+                    moved.record.session_id = Some("sess-somebody-elses".to_owned());
+                    case(
+                        "record.session_id",
+                        TopologyEventBody::AttemptFinished { data: moved },
+                    );
+                }
+                // A retained record turned into one that claims the attempt
+                // succeeded. Both arms refuse this shape; only the `Closed` one
+                // did before, so a hostile log could carry it past the door on
+                // the retained path.
+                let mut moved = data.clone();
+                if matches!(moved.settlement, AttemptSettlement::Retained { .. }) {
+                    moved.record.failure = None;
+                    moved.record.reviews = vec![review_pass("review", ReviewPassOutcome::Passed)];
+                    case(
+                        "record.claims-success",
                         TopologyEventBody::AttemptFinished { data: moved },
                     );
                 }
@@ -11334,6 +12693,16 @@ mod tests {
                 moved.parent_sha = sha("somewhere-else");
                 case(
                     "parent_sha",
+                    TopologyEventBody::CandidatePrepared { data: moved },
+                );
+                // The configured passes, emptied. Every remaining entry is
+                // green — there are none — so `is_successful` is true of this
+                // record and only the frozen plan can tell it apart from a
+                // reviewed one.
+                let mut moved = data.clone();
+                moved.attempt.reviews.clear();
+                case(
+                    "attempt.reviews",
                     TopologyEventBody::CandidatePrepared { data: moved },
                 );
             }
@@ -12440,7 +13809,8 @@ mod tests {
             "the first task must not depend on the failure directly, or this proves nothing"
         );
 
-        push(&mut live, &mut trace, dispatch(CEE, 0, &base));
+        let cee_dispatch = dispatch_in(&live, CEE, 0, &base);
+        push(&mut live, &mut trace, cee_dispatch);
         let start = attempt_started(&live, CEE, 0, 1, 0);
         push(&mut live, &mut trace, start);
         assert_eq!(live.derived_outcome(), DerivedOutcome::NotEnding);

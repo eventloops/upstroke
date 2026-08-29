@@ -437,47 +437,44 @@ impl AttemptPlans for FrozenPlans<'_> {
         let implementer =
             crate::review::PassBinding::new(&request.binding.agent, &request.binding.model);
         let pass_timeout = Duration::from_secs(entry.reviews.pass_timeout_secs);
-        let reviewers = if entry.reviews.enabled {
-            crate::review::passes_for(
-                crate::review::ReviewBindings {
-                    primary: entry.reviews.primary.as_ref(),
-                    alternative: entry.reviews.alternative.as_ref(),
-                    second_opinion: entry.reviews.second_opinion.as_ref(),
-                },
-                &implementer,
-            )
-            .into_iter()
-            .map(|pass| ReviewerPlan {
-                agent: AgentId::new(&pass.binding.agent),
-                preflight_cli_version: self.cli_version(&pass.binding.agent),
-                // **The reviewer's effort, from §10's own review axis.** This
-                // said exactly that and then passed `request.binding.effort` —
-                // the *implementer's*, the rung the work ran at. A comment
-                // asserting the opposite of its line is worse than no comment:
-                // it answers the question a reader would otherwise ask.
-                //
-                // `ResolvedEffortPolicy::review` is the axis, frozen on the
-                // entry beside the implementation efforts.
-                profile: {
-                    // **A reviewer's pool is looked up from its own agent, not
-                    // inherited from the implementer.** `coordinator.rs` states
-                    // the reason on its own line and §11.3/§13 are the citation:
-                    // a cross-vendor second opinion draws on a different
-                    // subscription than the work it is reviewing.
+        // Through `FrozenReviews::bindings`, which is where `enabled` gates the
+        // plan — the same reader `FrozenReviews::obliged_lenses` projects, so
+        // the passes this dispatches and the passes the fold requires of the
+        // record are one answer rather than two.
+        let reviewers = if let Some(bindings) = entry.reviews.bindings() {
+            crate::review::passes_for(bindings, &implementer)
+                .into_iter()
+                .map(|pass| ReviewerPlan {
+                    agent: AgentId::new(&pass.binding.agent),
+                    preflight_cli_version: self.cli_version(&pass.binding.agent),
+                    // **The reviewer's effort, from §10's own review axis.** This
+                    // said exactly that and then passed `request.binding.effort` —
+                    // the *implementer's*, the rung the work ran at. A comment
+                    // asserting the opposite of its line is worse than no comment:
+                    // it answers the question a reader would otherwise ask.
                     //
-                    // The legacy caller did this and the extraction did not, so
-                    // a schema-4 reviewer drained an empty pool name — the same
-                    // class as `PR7-R3-ATTEMPT-001`, one payload over: that
-                    // dropped a **guard**, this drops a **value**. Found by
-                    // Sol's independent `seams` read, round 3.
-                    let mut profile = pass.profile(entry.ladder.effort.review);
-                    profile.pool = self.pool_for(&pass.binding.agent).unwrap_or_default();
-                    profile
-                },
-                lens: pass.lens,
-                timeout: pass_timeout,
-            })
-            .collect()
+                    // `ResolvedEffortPolicy::review` is the axis, frozen on the
+                    // entry beside the implementation efforts.
+                    profile: {
+                        // **A reviewer's pool is looked up from its own agent, not
+                        // inherited from the implementer.** `coordinator.rs` states
+                        // the reason on its own line and §11.3/§13 are the citation:
+                        // a cross-vendor second opinion draws on a different
+                        // subscription than the work it is reviewing.
+                        //
+                        // The legacy caller did this and the extraction did not, so
+                        // a schema-4 reviewer drained an empty pool name — the same
+                        // class as `PR7-R3-ATTEMPT-001`, one payload over: that
+                        // dropped a **guard**, this drops a **value**. Found by
+                        // Sol's independent `seams` read, round 3.
+                        let mut profile = pass.profile(entry.ladder.effort.review);
+                        profile.pool = self.pool_for(&pass.binding.agent).unwrap_or_default();
+                        profile
+                    },
+                    lens: pass.lens,
+                    timeout: pass_timeout,
+                })
+                .collect()
         } else {
             Vec::new()
         };
