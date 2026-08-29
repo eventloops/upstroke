@@ -68,3 +68,8 @@ artifacts (§15); records promoted here are the durable subset.
   signing environment are retired; the ruleset requires `upstroke-ci` and
   `upstroke-pr-policy` only. The review obligation is unchanged and the owner's
   merge is the attestation; 2026-08-20 §5 remains the bar for any automated return.
+- [2026-08-27 — non-UTF-8 paths are supported, and already are](2026-08-27-non-utf8-paths.md):
+  Unix path bytes need not be UTF-8; `git_path` and byte-parsed `-z` listings already
+  implement that, and `Workspace::git`'s string decode is correct for the ASCII-guaranteed
+  and quoted formats it reads. No engine change; `git worktree list --porcelain` is the one
+  raw-path format and is test-only. `-z` does not make it UTF-8.

@@ -121,6 +121,14 @@ Every piece of work lives in one unit (a "pane" in the eventual UI; a run direct
 | **Interaction** | Question/answer events, parking semantics, notifier plugins, CI degradation. |
 | **Event log** | Append-only JSONL; source of truth for state, resume, status, questions, ledger, and the future decision-export dataset. |
 
+**Path encoding.** Repository, worktree and store paths are byte strings on Unix and are
+not required to be UTF-8. Any path Git prints is decoded byte-exactly, and path listings
+are parsed from NUL-delimited byte output; the string-decoding reader is reserved for
+output Git guarantees to be ASCII — object ids, refs, object types, and the porcelain
+formats that quote unusual bytes. `git worktree list --porcelain` is the one format that
+prints a raw path, in its `-z` form too, so it must be read as bytes
+(`decisions/2026-08-27-non-utf8-paths.md`).
+
 ## 7. Core data model
 
 ```rust
