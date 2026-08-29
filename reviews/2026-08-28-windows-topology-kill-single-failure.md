@@ -34,7 +34,7 @@ re-running until green.
 | field | value |
 |---|---|
 | Tests | `engine::topology::attempt::tests::kill_after_snapshot_add_reclaims_snapshot_and_releases_its_commit` and `engine::topology::attempt::tests::kill_during_retry_attempt_closes_generation` |
-| Assertion sites | `src/engine/topology/attempt/tests.rs:1656` and `src/engine/topology/scaffold.rs:1356` |
+| Assertion sites, verbatim from the Windows log | `src\engine\topology\attempt\tests.rs:1656:10` and `src\engine\topology\scaffold.rs:1356:5` |
 | Message A | `settle: Git { message: "git worktree prune failed in C:\\Users\\runneradmin\\AppData\\Local\\Temp\\upstroke-wm-killattempt-7784-0\\repo: fatal: not a git repository (or any of the parent directories): .git" }` |
 | Message B | see below — it contains backticks and does not fit a table cell |
 | Suite result | `FAILED. 1676 passed; 2 failed; 33 ignored; 0 measured; 0 filtered out; finished in 713.10s` |
@@ -93,12 +93,14 @@ all. Each is a hypothesis this record deliberately does not assert, because noth
 here measures it.
 
 **The matching rule, stated so the fingerprint can be applied.** Match Message A on the
-test name, the assertion site `src/engine/topology/attempt/tests.rs:1656`, and the shape
+test name, the assertion-site suffix `engine/topology/attempt/tests.rs:1656:10` after
+normalising path separators, and the shape
 `git worktree prune failed in <temp>\repo: fatal: not a git repository` — **normalise
 the whole temp path away.** `upstroke-wm-killattempt-7784-0` embeds a process id and an
 ordinal that differ on every run, so a literal match on it can never fire twice and
 would report every recurrence as a new failure. Match Message B on the test name, the
-site `src/engine/topology/scaffold.rs:1356`, and exit code **101** — and note that this
+assertion-site suffix `engine/topology/scaffold.rs:1356:5` after normalising path
+separators, and exit code **101** — and note that this
 signature is *broad*: it also matches a child that panicked for an unrelated reason, so
 a red matching B is this observation **or** a regression, and the two are not separable
 from the parent's output alone. That is a limitation of the oracle, recorded here rather
@@ -170,10 +172,11 @@ because the guest's Defender exclusions are known to name a stale path, which ch
 the timing the measurement would report. Both are conditions to fix before the number
 would mean anything.
 
-**A `reviews/FINDINGS.md` §2 row**, for the same reason its companion gives: #42 is
-open with seven new rows in that table, and a second branch editing it would
-manufacture a conflict between two of this seat's own changes. The row lands once #42
-does.
+**A `reviews/FINDINGS.md` §2 row**, for the same reason its companion gives: the
+project-wide ledger has a separate exclusive writer lease while parallel pull requests
+are being reconciled. The row is deferred to that serialized ledger writer and the
+planned consolidated findings sweep; this record remains the durable provenance until
+that work lands.
 
 **A re-run is not evidence and is not offered as any.** The CI conclusion at this head
 is whatever the re-run produced; the fingerprint above is from attempt 1 and was

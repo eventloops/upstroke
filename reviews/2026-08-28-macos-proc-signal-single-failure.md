@@ -67,7 +67,10 @@ exiting 0, which is what `assert!(status.success(), …)` at line 7966 requires.
   `src/agent/proc.rs:1883-1889`, which assigns SIGTERM when `reaper.cleanup` fails —
   **no signal need have been handled at all.** A released worker exiting normally, a
   reaper cleanup failure, and the monitor reaching `_exit(143)` produces this exact
-  fingerprint. A third revision of this record said the handler "ran"; it is not shown.
+  fingerprint. The SIGCONT guard handler is another route: if its attempt to stop the
+  helper again fails, `src/agent/proc.rs:2214-2220` stores SIGTERM as a defensive
+  fallback. A third revision of this record said the terminal-signal handler "ran"; it
+  is not shown, and neither is any other writer.
 - **That reaching `_exit` rather than dying in `raise` means anything.** It does not, and
   the reason is in this test's own setup: the helper is spawned with
   `UPSTROKE_BLOCK_SIGNAL` set to **SIGTERM** — its tag `job-control-blocked` selects
@@ -97,9 +100,10 @@ otherwise"* — and then said the opposite a few lines later. **The analogy does
 is withdrawn.** §12's oracle identifies its flake; this fingerprint does not identify
 anything, so the rule here is weaker and is the only one:
 
-> **A failure matching this fingerprint is *unresolved* until the reaper-cleanup path is
-> ruled out.** It is not this observation until shown so, and it is not a regression until
-> shown so. What the match establishes is which monitor path ran, and the cause is open.
+> **A failure matching this fingerprint is *unresolved* until the writer of
+> `PENDING_TERMINATION` and the reason it wrote SIGTERM are established.** It is not this
+> observation until shown so, and it is not a regression until shown so. What the match
+> establishes is which monitor path ran, and the cause is open.
 
 A failure that does **not** match — in particular one reading a signal termination rather
 than an exit status — is a different failure and this record does not cover it.
@@ -111,10 +115,11 @@ it is not trusted too far.** Match on the test name, the assertion site
 match on the suite totals or the elapsed time; those move with the tree.
 
 **A match does not identify the cause.** Because `PENDING_TERMINATION` has several
-writers, a red matching this fingerprint is **this observation *or* a regression in reaper
-cleanup**, and the two are not separable from the test's output. So the rule is: a
-matching red is not automatically "this failure" — it is *this fingerprint*, and it still
-needs the cleanup path ruled out. That is weaker than the rule
+writers, including reaper cleanup and the SIGCONT guard fallback, the test's output does
+not separate the route that wrote SIGTERM or distinguish an environmental interruption
+from a regression in either route. So the rule is: a matching red is not automatically
+"this failure" — it is *this fingerprint*, and it still needs its writer and that
+writer's reason established. That is weaker than the rule
 `reviews/FINDINGS.md` §12 states for the flake it measured, and it is weaker on purpose:
 that flake's oracle identifies its cause and this one's does not.
 
@@ -208,10 +213,11 @@ scarcest resource here.
 **#36's harness does not transfer.** It measures Linux and a local Windows guest; this
 failure is macOS-only so far, and there is no equivalent macOS guest on the build box.
 
-**A `reviews/FINDINGS.md` §2 row** naming this with an owner. Not added here on
-purpose: pull request #42 is already open with seven new rows in that same table, and
-a second branch editing it would manufacture a conflict between two of this seat's own
-changes. The row lands once #42 does.
+**A `reviews/FINDINGS.md` §2 row** naming this with an owner. Not added here because the
+project-wide ledger has a separate exclusive writer lease while parallel pull requests
+are being reconciled. The row is deferred to that serialized ledger writer and the
+planned consolidated findings sweep; this record remains the durable provenance until
+that work lands.
 
 ## The recording hazard this exposed
 
