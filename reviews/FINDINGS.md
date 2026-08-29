@@ -3430,3 +3430,17 @@ This append-only disposition was measured from integration
 Implementation commit `5a460f8a6cf2deae2dc1dd08615d097dce68ea00` passed the focused effects and
 process gates; publication, exact-head CI, and bounded review evidence are carried by the PR containing this
 section.
+
+### PR #47 bounded-review residue
+
+The sole review of public head `a36f0890fee71286d213ff61bbd15bd6a1a55eef` was triaged once and its sole
+repair pass committed as `4119612`. Two findings remain genuine blockers after that pass:
+
+| stable ID | disposition | exact residue |
+|---|---|---|
+| `PR47-WINDOWS-TEST-ALLOW-NOT-GOVERNED` | **deferred; required gate red** | The repair's item-level Windows test exception passes Windows Clippy but violates the repository's module-level governed-allow placement rule. The final serialized suite fails `effects::tests::every_allow_of_a_governed_lint_is_module_level_and_in_the_allowlist`; no second repair pass is permitted. |
+| `PR47-PUBLIC-PROCESS-API-REMOVED` | **deferred; compatibility blocker** | The reviewed production APIs remain absent or signature-incompatible. Restoring compatibility was rejected by managed policy during the sole pass, and committing the delivered diff does not make that API break acceptable. Direct post-denial authorization is required before a later repair PR may restore the wrappers. |
+
+The other review findings are fixed by the delivered pass: Process sites are release-validated and carried
+through termination, and the writable-`Command` export guard is structural rather than spelling-based. This
+PR must not be readied or merged while either deferred blocker remains.
