@@ -44,6 +44,32 @@ sha2 = "0.10"
 thiserror = "2"
 toml = "0.8"
 
+# TEST-ONLY, and the shipped library carries no YAML parser: the CI workflow-shape
+# oracle in `src/effects/tests.rs` reads `.github/workflows/ci.yml` as a document
+# rather than as text. `BRIDGE-CI-SHAPE-TEST-IS-A-SUBSTRING-ORACLE` in
+# `reviews/FINDINGS.md` specifies the parse and names the two properties this
+# dependency is chosen for; both are asserted by execution in
+# `the_workflow_parser_rejects_duplicate_keys_and_reads_on_as_a_string`, so a
+# silent change in either fails a test rather than weakening an oracle:
+#
+#   * **duplicate-key rejection.** A second `runs-on:` in a job must be an error,
+#     not a silent last-one-wins overwrite -- otherwise every structural equality
+#     below reads the winner and a mutation hides in the loser. Measured on
+#     2026-08-29 against the three candidates: `yaml-rust2` 0.12.0 refuses
+#     (`duplicated key in mapping`), `serde_yaml_ng` 0.10.0 refuses,
+#     **`saphyr` 0.0.12 accepts and overwrites** -- which is why the nearest
+#     alternative is not this one.
+#   * **YAML 1.2.** A workflow's `on:` key is `true` under YAML 1.1's bool
+#     resolution; a 1.2 parser reads it as the string it is.
+#
+# `default-features = false` drops `encoding_rs`: the workflow is read through
+# `fs::read_to_string`, so the decoder that feature adds has nothing to decode.
+# The version is pinned exactly, for `globset`'s reason a few lines above and
+# more sharply: 0.11.1 declared MSRV 1.65 and 0.12.0 declares **1.85.0**, this
+# crate's floor exactly, so the next minor is free to leave the contract.
+[dev-dependencies]
+yaml-rust2 = { version = "=0.12.0", default-features = false }
+
 # `fcntl(F_SETLK)` for the run lock, which std does not expose — std's
 # `File::try_lock` is `flock`, and `flock` is inherited across `fork`. See
 # `src/rundir.rs` for why that difference decides the whole design of the lock.
