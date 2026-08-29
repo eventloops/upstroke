@@ -750,12 +750,24 @@ mod tests {
         fold
     }
 
+    /// Region A or B — the region the entry's frozen hint **derives**, not the
+    /// hint.
+    ///
+    /// The hints are `src/aleph/` and `src/bet/`, and the derivation trims the
+    /// trailing separator, so the literal here carries no slash. It used to
+    /// carry one, which made every `task_dispatched` this fixture built record
+    /// a region the fold does not derive — refused by `check_dispatched` since
+    /// the region became derivation-checked, and invisible before that because
+    /// the two spellings name the same components to
+    /// [`crate::topology::leases::paths_overlap`]. The round trip is
+    /// [`the_fixture_region_is_the_one_the_fold_derives`], so the two cannot
+    /// drift apart again silently.
     fn region(key: TaskKey) -> PathSet {
         PathSet::Prefixes {
             paths: vec![GitPath::from(if key == ALEPH {
-                "src/aleph/"
+                "src/aleph"
             } else {
-                "src/bet/"
+                "src/bet"
             })],
         }
     }
@@ -768,7 +780,7 @@ mod tests {
     /// under which the overlap relation answers differently from the others.
     fn overlap_region() -> PathSet {
         PathSet::Prefixes {
-            paths: vec![GitPath::from("src/aleph/"), GitPath::from("src/bet/")],
+            paths: vec![GitPath::from("src/aleph"), GitPath::from("src/bet")],
         }
     }
 

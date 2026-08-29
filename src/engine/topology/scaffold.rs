@@ -932,9 +932,19 @@ impl Run {
         CommitSha(self.fixture.head.clone())
     }
 
-    /// The predicted region an ordinary dispatch of this fixture takes.
-    pub(super) fn predicted(&self) -> PathSet {
-        PathSet::RepoWide
+    /// The predicted region an ordinary dispatch of `key` takes.
+    ///
+    /// **Read off the fold, not restated.** It answered `RepoWide` for every
+    /// task while the fixture's entries freeze `src/{id}/` hints, so every
+    /// dispatch this scaffold emitted recorded a region the fold did not
+    /// derive — the exact disagreement `check_dispatched` now refuses. A
+    /// literal here would be a second derivation of the run's own rule, which
+    /// is what let the two drift in the first place.
+    pub(super) fn predicted(&self, key: TaskKey) -> PathSet {
+        self.emitter
+            .fold()
+            .predicted_region(key)
+            .expect("the scaffold's run has started, so its registry answers")
     }
 
     /// Whether the harness saw `site` at `phase`.
@@ -1111,7 +1121,7 @@ impl Run {
             generation: GenerationId(generation),
             base: self.base(),
             kind: DispatchKind::Ordinary {
-                paths: self.predicted(),
+                paths: self.predicted(key),
             },
         };
         dispatch(

@@ -1027,9 +1027,16 @@ pub(crate) mod tests {
         fold
     }
 
+    /// The region an ordinary dispatch of `key` predicts.
+    ///
+    /// The frozen hint is `src/{label}/`; the derivation trims the trailing
+    /// separator, and this is the derivation rather than the hint. The two
+    /// spellings are one region to `paths_overlap`, which is why the fixture
+    /// could carry the wrong one until `check_dispatched` began comparing the
+    /// recorded region against the derived one.
     pub(crate) fn region(key: TaskKey) -> PathSet {
         PathSet::Prefixes {
-            paths: vec![GitPath::from(format!("src/{}/", label(key)).as_str())],
+            paths: vec![GitPath::from(format!("src/{}", label(key)).as_str())],
         }
     }
 

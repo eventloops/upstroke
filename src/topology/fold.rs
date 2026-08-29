@@ -1033,6 +1033,15 @@ impl TopologyFold {
     /// invisible; at the first width above one it is two tasks editing the same
     /// files.
     ///
+    /// **A convention until the region became derivation-checked.** This reader
+    /// existing did not oblige anyone to read it: `check_dispatched` matched a
+    /// `task_dispatched` lease's *shape* only and `apply_dispatched` granted the
+    /// region the event carried. `check_dispatched` now refuses an ordinary
+    /// dispatch whose recorded region is not this answer, so the disagreement is
+    /// inexpressible rather than merely undocumented, and this reader is the
+    /// convenient way to obtain what the fold will accept rather than the only
+    /// way to avoid a refusal.
+    ///
     /// `None` when the run has no registry yet, which is before `run_started`.
     #[must_use]
     pub fn predicted_region(&self, key: TaskKey) -> Option<PathSet> {
@@ -1669,7 +1678,58 @@ impl RunState {
 
         let is_repair = entry.lineage.is_some();
         match (&dispatched.lease, entry.lineage) {
-            (LeaseGrant::Predicted { .. }, None) => {}
+            // **The recorded region is derivation-checked, exactly as the
+            // recorded binding is.** One event over, `check_attempt_started`
+            // refuses a binding the fold did not derive
+            // (`FoldError::BindingMismatch`); this arm used to match the
+            // lease's *shape* alone and let `apply_dispatched` grant whatever
+            // region the event carried — so the fold could admit a dispatch on
+            // one region while the lease table held another, and the lease
+            // table's is the one every later overlap check consults.
+            //
+            // That was not hypothetical. A driver that took the plan's hints
+            // literally recorded `src/auth/*.rs` as a **prefix**, which
+            // overlaps nothing, while the fold had admitted the dispatch on
+            // `src/auth`. `84a3978` made the driver read
+            // [`TopologyFold::predicted_region`] instead of deriving its own,
+            // which fixed that instance; nothing stopped the next caller — or
+            // a later slice's second writer — from constructing a
+            // `task_dispatched` the fold would accept and the lease table would
+            // honour. This is the class fix, and it is why the reader and this
+            // validator call the **same** free function rather than two copies
+            // of one rule.
+            //
+            // **Exact equality, and deliberately not a policy-aware one.** The
+            // run's frozen `PathPolicy` decides whether two regions *overlap*,
+            // case-folding component by component; it does not decide whether
+            // two regions are the same region. A recorded `SRC/Auth` that folds
+            // onto a derived `src/auth` is still a different literal, and the
+            // lease table stores literals — so an equality that folded here
+            // would admit a component set the derivation never produced and
+            // hand it to `apply_dispatched` unchanged. Order counts for the
+            // same reason: the derivation emits one prefix per hint in the
+            // frozen order, so a reordered list is a list this run's frozen
+            // hints do not derive.
+            //
+            // Live at the first width above `max_parallel = 1`, where two tasks
+            // holding non-overlapping-by-construction regions edit the same
+            // files; invisible below it.
+            (LeaseGrant::Predicted { paths }, None) => {
+                let derived = predicted_region(entry);
+                if *paths != derived {
+                    return Err(FoldError::MalformedEntry {
+                        kind: KIND,
+                        key: dispatched.key.0,
+                        detail: format!(
+                            "it takes the predicted region {} and this entry's frozen path \
+                             hints derive {}; an ordinary dispatch takes the region the fold \
+                             admitted it on",
+                            describe_region(paths),
+                            describe_region(&derived)
+                        ),
+                    });
+                }
+            }
             (LeaseGrant::InheritedLineage { root }, Some(lineage)) => {
                 if *root != lineage.root {
                     return Err(FoldError::MalformedEntry {
@@ -3441,6 +3501,12 @@ impl RunState {
     }
 
     fn apply_dispatched(&mut self, dispatched: &TaskDispatched) {
+        // The recorded region and `predicted_region(entry)` are one value by the
+        // time this runs: `check_dispatched` refuses an ordinary dispatch whose
+        // `Predicted { paths }` is anything else. Granting the event's copy is
+        // therefore granting the derivation, and it stays the event's copy so
+        // that the region in the lease table is demonstrably the region the log
+        // holds rather than a second derivation of it.
         let (lease, region) = match &dispatched.lease {
             LeaseGrant::Predicted { paths } => (GenerationLease::Own, Some(paths.clone())),
             LeaseGrant::InheritedLineage { root } => {
@@ -3926,6 +3992,24 @@ fn predicted_region(entry: &TaskEntry) -> PathSet {
         paths.push(GitPath(trimmed.to_owned()));
     }
     PathSet::Prefixes { paths }
+}
+
+/// A region as a refusal names it.
+///
+/// The empty prefix list is spelled out rather than printed as `[]`: an empty
+/// region and an unread one are different answers — [`PathSet::prefixes`] says
+/// so — and a refusal that rendered the first as an empty pair of brackets
+/// would read like a formatting accident next to `the whole repository`.
+fn describe_region(paths: &PathSet) -> String {
+    match paths.prefixes() {
+        None => "the whole repository".to_owned(),
+        Some([]) => "no path at all".to_owned(),
+        Some(prefixes) => prefixes
+            .iter()
+            .map(|path| format!("`{}`", path.as_str()))
+            .collect::<Vec<_>>()
+            .join(", "),
+    }
 }
 
 /// A ref name, for a diagnostic that has to print an `Option<GitRef>`.
@@ -4613,6 +4697,15 @@ mod tests {
         }
     }
 
+    /// An ordinary dispatch of a task **of the default [`plan`]**, taking the
+    /// region that plan's frozen hints derive.
+    ///
+    /// `region` is keyed by [`TaskKey`] and the default plan is the only plan
+    /// those keys belong to, so a fixture on another plan — [`chain_plan`] is
+    /// the one — takes [`dispatch_in`] instead, which asks the fold. The
+    /// agreement between this table and the derivation is not assumed:
+    /// [`the_dispatch_fixture_records_the_region_the_fold_derives`] round-trips
+    /// all three.
     fn dispatch(key: TaskKey, generation: u32, base: &CommitSha) -> TopologyEvent {
         ev(TopologyEventBody::TaskDispatched {
             data: TaskDispatched {
@@ -4624,6 +4717,30 @@ mod tests {
                 source_candidate: None,
             },
         })
+    }
+
+    /// [`dispatch`], with the predicted region taken from `fold` rather than
+    /// from the default plan's table.
+    ///
+    /// What a conforming driver does — `TopologyRun` reads
+    /// [`TopologyFold::predicted_region`] — and what any fixture on a plan
+    /// other than [`plan`] needs, because the keys are dense per plan and
+    /// `region`'s table is the default plan's.
+    fn dispatch_in(
+        fold: &TopologyFold,
+        key: TaskKey,
+        generation: u32,
+        base: &CommitSha,
+    ) -> TopologyEvent {
+        let mut event = dispatch(key, generation, base);
+        if let TopologyEventBody::TaskDispatched { data } = &mut event.body {
+            data.lease = LeaseGrant::Predicted {
+                paths: fold
+                    .predicted_region(key)
+                    .expect("the fixture's run has started"),
+            };
+        }
+        event
     }
 
     /// Delegates to the production reader rather than repeating its
@@ -6388,6 +6505,382 @@ mod tests {
             refuse(&merged_fold, &dispatch(TaskKey(9), 0, &base)),
             FoldError::UnknownKey { key: 9, .. }
         ));
+    }
+
+    // --- the recorded region, derivation-checked --------------------------
+    //
+    // `TASK-DISPATCHED-REGION-UNVALIDATED` (§2, §22). The sibling for the
+    // recorded *binding* is `the_frozen_rung_binding_is_what_the_validator_
+    // accepts` above; this is the same question one event earlier, and the
+    // asymmetry between the two is what the row was written about.
+
+    /// One hint shape, and the region the contract says it derives.
+    ///
+    /// **Transcribed from the rule, not from the code.** The rule is "the
+    /// plan's path hints, taken literally: a hint with no glob metacharacter is
+    /// its own literal prefix; anything else — an absent hint list, or a hint
+    /// whose literal prefix is empty — classifies repo-wide". Reading
+    /// `predicted_region`'s body to build this table would make the grid agree
+    /// with the derivation for the reason the derivation is right or wrong,
+    /// which is the self-oracle shape `CODING_STANDARDS.md` names.
+    struct HintShape {
+        /// The task's display id, which is also its fixture name.
+        id: &'static str,
+        /// What the plan froze.
+        hints: &'static [&'static str],
+        /// The prefixes the rule derives, or `None` for repo-wide.
+        derives: Option<&'static [&'static str]>,
+    }
+
+    /// Every hint shape the rule distinguishes, one axis varied at a time.
+    ///
+    /// The four glob metacharacters get a case each rather than one case with
+    /// all four, because a truncation that stopped at only three of them would
+    /// pass a combined case on the first one it did handle.
+    const HINT_SHAPES: &[HintShape] = &[
+        // A literal is its own prefix, unchanged.
+        HintShape {
+            id: "literal",
+            hints: &["src/literal"],
+            derives: Some(&["src/literal"]),
+        },
+        // A trailing separator is not part of the name of the directory.
+        HintShape {
+            id: "trailing",
+            hints: &["src/trailing/"],
+            derives: Some(&["src/trailing"]),
+        },
+        // The four metacharacters, one each. Everything from the first one is
+        // dropped, and the separator that precedes it goes with the trim.
+        HintShape {
+            id: "star",
+            hints: &["src/star/*.rs"],
+            derives: Some(&["src/star"]),
+        },
+        HintShape {
+            id: "question",
+            hints: &["src/question/?.rs"],
+            derives: Some(&["src/question"]),
+        },
+        HintShape {
+            id: "bracket",
+            hints: &["src/bracket/[ab].rs"],
+            derives: Some(&["src/bracket"]),
+        },
+        HintShape {
+            id: "brace",
+            hints: &["src/brace/{a,b}.rs"],
+            derives: Some(&["src/brace"]),
+        },
+        // A Windows-shaped hint names Git paths once its separators are.
+        HintShape {
+            id: "backslash",
+            hints: &[r"src\backslash\deep"],
+            derives: Some(&["src/backslash/deep"]),
+        },
+        // A doubled separator is **kept**: the rule trims the tail and
+        // substitutes nothing. `src/doubled//inner` and `src/doubled/inner`
+        // name one region to `paths_overlap`, which filters empty components —
+        // and they are still two different literals, which is the whole reason
+        // the comparison below is exact rather than semantic.
+        HintShape {
+            id: "doubled",
+            hints: &["src/doubled//inner/"],
+            derives: Some(&["src/doubled//inner"]),
+        },
+        // Case and non-ASCII survive: the region is the hint's own bytes.
+        HintShape {
+            id: "unicode",
+            hints: &["src/Über/"],
+            derives: Some(&["src/Über"]),
+        },
+        // Every hint contributes a prefix, in the frozen order.
+        HintShape {
+            id: "several",
+            hints: &["zz/last", "aa/first", "build.rs"],
+            derives: Some(&["zz/last", "aa/first", "build.rs"]),
+        },
+        // A leading glob leaves an empty literal prefix, which is repo-wide —
+        // and repo-wide for **one** hint is repo-wide for the task, because an
+        // unbounded region cannot be narrowed by a bounded sibling.
+        HintShape {
+            id: "leading-glob",
+            hints: &["**/anywhere.rs"],
+            derives: None,
+        },
+        HintShape {
+            id: "empty-hint",
+            hints: &[""],
+            derives: None,
+        },
+        HintShape {
+            id: "bare-separator",
+            hints: &["/"],
+            derives: None,
+        },
+        HintShape {
+            id: "one-narrow-one-wide",
+            hints: &["src/narrow", "**/wide.rs"],
+            derives: None,
+        },
+        // No hints at all: nothing was said about where the work lands.
+        HintShape {
+            id: "no-hints",
+            hints: &[],
+            derives: None,
+        },
+    ];
+
+    fn hint_shape_region(shape: &HintShape) -> PathSet {
+        match shape.derives {
+            None => PathSet::RepoWide,
+            Some(prefixes) => PathSet::Prefixes {
+                paths: prefixes.iter().copied().map(GitPath::from).collect(),
+            },
+        }
+    }
+
+    fn hint_shape_plan() -> Plan {
+        Plan {
+            source: PlanSource {
+                adapter: "markdown".to_owned(),
+                hash: "frozen-hint-shape-hash".to_owned(),
+            },
+            tasks: HINT_SHAPES
+                .iter()
+                .map(|shape| task_of(shape.id, &[], shape.hints, None))
+                .collect(),
+            artifacts: vec![Artifact {
+                id: ArtifactId::from("contract"),
+                produced_by: Some(TaskId::from(HINT_SHAPES[0].id)),
+            }],
+        }
+    }
+
+    fn hint_shape_inputs() -> FrozenInputs {
+        FrozenInputs {
+            plan: hint_shape_plan(),
+            normalized_plan_digest: NORMALIZED_DIGEST.to_owned(),
+        }
+    }
+
+    /// The hint-shape plan's `run_started`, authenticated against its own
+    /// registry — the same construction [`chain_run_started_event`] uses.
+    fn hint_shape_started() -> TopologyFold {
+        let plan = hint_shape_plan();
+        let unauthenticated = RunStarted4 {
+            plan_hash: plan.source.hash.clone(),
+            chains: plan.tasks.iter().map(|t| chain(t.id.as_str())).collect(),
+            reviews: review_plan(plan.tasks.len()),
+            registry_digest: String::new(),
+            ..run_started_unauthenticated()
+        };
+        let digest = TaskRegistry::originals_with_agents(
+            &plan,
+            &unauthenticated.registry_record(),
+            &unauthenticated.probed_agents,
+        )
+        .expect("the hint-shape record derives a registry")
+        .digest();
+        let event = ev(TopologyEventBody::RunStarted {
+            data: Box::new(RunStarted4 {
+                registry_digest: digest,
+                ..unauthenticated
+            }),
+        });
+        let mut fold = TopologyFold::new(hint_shape_inputs());
+        apply(&mut fold, &event);
+        fold
+    }
+
+    fn hint_shape_dispatch(key: TaskKey, paths: PathSet) -> TopologyEvent {
+        ev(TopologyEventBody::TaskDispatched {
+            data: TaskDispatched {
+                key,
+                generation: GenerationId(0),
+                base_sha: sha("base"),
+                worktree_path: format!("/private/workspaces/tasks/k{}-g0", key.0),
+                lease: LeaseGrant::Predicted { paths },
+                source_candidate: None,
+            },
+        })
+    }
+
+    /// **The derivation is one function of the frozen hints, and the door
+    /// accepts exactly its answer.**
+    ///
+    /// Two halves over one table. The first is that the fold's own reader
+    /// returns what the *rule* says, independently transcribed above — so a
+    /// derivation that quietly changed (a metacharacter dropped from the stop
+    /// set, a trim that also collapsed separators) fails here rather than
+    /// somewhere downstream of it. The second is that a `task_dispatched`
+    /// recording that answer is admitted, which is what makes the refusal in
+    /// the sibling test a statement about divergence rather than about the
+    /// region being checked at all.
+    #[test]
+    fn every_hint_shape_derives_the_region_the_rule_states_and_the_door_takes_it() {
+        let fold = hint_shape_started();
+        for (index, shape) in HINT_SHAPES.iter().enumerate() {
+            let key = TaskKey(u32::try_from(index).expect("a small fixture registry"));
+            let expected = hint_shape_region(shape);
+            assert_eq!(
+                fold.predicted_region(key),
+                Some(expected.clone()),
+                "`{}`: the derivation is not the region the rule states",
+                shape.id
+            );
+            accepts(&fold, &hint_shape_dispatch(key, expected));
+        }
+        assert!(
+            HINT_SHAPES.iter().any(|shape| shape.derives.is_none())
+                && HINT_SHAPES.iter().any(|shape| shape.derives.is_some()),
+            "a table with only one answer could not tell the two classifications apart"
+        );
+    }
+
+    /// **A dispatch recording any other region is refused, and the refusal
+    /// names both regions.**
+    ///
+    /// The negative half of the table above, and the finding itself:
+    /// `check_dispatched` used to match the lease's *shape* alone, so the fold
+    /// admitted on `predicted_region`'s answer and `apply_dispatched` granted
+    /// whatever the event carried — and the lease table's copy is the one every
+    /// later overlap check consults.
+    ///
+    /// Each perturbation is one axis of the way two regions can disagree:
+    /// a component missing, one added, the same components in another order,
+    /// one component rewritten to something that *overlaps identically*, the
+    /// case folded under a run whose `PathPolicy` folds case, a narrowed region
+    /// widened to repo-wide, and a repo-wide region narrowed. The last two are
+    /// the pair that matters most at width: `RepoWide` overlaps everything, so
+    /// recording a narrow region for a repo-wide prediction is how a task that
+    /// should have serialized against every other runs beside them.
+    #[test]
+    fn a_dispatch_that_records_a_region_the_hints_do_not_derive_is_refused() {
+        let fold = hint_shape_started();
+        let key_of = |id: &str| {
+            TaskKey(
+                u32::try_from(
+                    HINT_SHAPES
+                        .iter()
+                        .position(|shape| shape.id == id)
+                        .expect("a fixture shape"),
+                )
+                .expect("a small fixture registry"),
+            )
+        };
+        let narrowed = |paths: &[&str]| PathSet::Prefixes {
+            paths: paths.iter().copied().map(GitPath::from).collect(),
+        };
+
+        let cases: Vec<(&str, TaskKey, PathSet)> = vec![
+            // The literal hint, taken literally *including* the glob — the
+            // shape the driver actually wrote, and the one `84a3978` repaired
+            // in the driver while leaving the door open.
+            (
+                "the hint, unstripped",
+                key_of("star"),
+                narrowed(&["src/star/*.rs"]),
+            ),
+            // A component dropped.
+            (
+                "a component missing",
+                key_of("several"),
+                narrowed(&["zz/last", "aa/first"]),
+            ),
+            // A component added.
+            (
+                "a component added",
+                key_of("several"),
+                narrowed(&["zz/last", "aa/first", "build.rs", "src/extra"]),
+            ),
+            // The same components, sorted. Sorting is a normalisation a caller
+            // could think harmless; the frozen order is the plan's.
+            (
+                "the components reordered",
+                key_of("several"),
+                narrowed(&["aa/first", "build.rs", "zz/last"]),
+            ),
+            // Normalised to a region that overlaps identically. `paths_overlap`
+            // filters empty components, so this collides with the derived one
+            // exactly as the derived one collides with itself — and it is still
+            // not the region the frozen hints derive.
+            (
+                "a separator normalised away",
+                key_of("doubled"),
+                narrowed(&["src/doubled/inner"]),
+            ),
+            // Case-folded, under a run whose policy folds case. The policy
+            // decides what *overlaps*; it does not decide what a region is.
+            (
+                "the case folded",
+                key_of("unicode"),
+                narrowed(&["src/über"]),
+            ),
+            // A bounded prediction recorded as unbounded.
+            ("widened to repo-wide", key_of("literal"), PathSet::RepoWide),
+            // And an unbounded prediction recorded as bounded, which is the
+            // one that lets a task run beside work it should have blocked.
+            (
+                "narrowed from repo-wide",
+                key_of("leading-glob"),
+                narrowed(&["src/anywhere"]),
+            ),
+            // The empty region is a real answer and not the derived one.
+            ("emptied", key_of("literal"), narrowed(&[])),
+        ];
+
+        for (label, key, recorded) in cases {
+            let derived = fold
+                .predicted_region(key)
+                .expect("the fixture run has started");
+            assert_ne!(
+                recorded, derived,
+                "{label}: the perturbation is not a perturbation"
+            );
+            let error = refuse(&fold, &hint_shape_dispatch(key, recorded));
+            let FoldError::MalformedEntry {
+                key: named, detail, ..
+            } = &error
+            else {
+                panic!("{label}: refused as {error} rather than as a malformed entry");
+            };
+            assert_eq!(*named, key.0, "{label}: the refusal names another task");
+            assert!(
+                detail.contains("frozen path hints derive"),
+                "{label}: the refusal does not say what it derived: {detail}"
+            );
+        }
+    }
+
+    /// The default plan's dispatch fixture records the region the fold derives.
+    ///
+    /// `region` is a table and `predicted_region` is a rule, so the corpus held
+    /// two answers to one question and every `task_dispatched` in this file
+    /// depended on their agreeing. They did — for the default plan — and the
+    /// same table was wrong for [`chain_plan`], which is why [`dispatch_in`]
+    /// exists. This is the round trip that keeps the surviving table honest:
+    /// it is not what proves the door right, it is what stops a fixture edit
+    /// from silently making every other test in this file dispatch a region the
+    /// run never predicted.
+    #[test]
+    fn the_dispatch_fixture_records_the_region_the_fold_derives() {
+        let fold = started();
+        for key in [ZETA, ALPHA, MID] {
+            let event = dispatch(key, 0, &sha("base"));
+            let TopologyEventBody::TaskDispatched { data } = &event.body else {
+                panic!("the dispatch fixture builds a task_dispatched");
+            };
+            let LeaseGrant::Predicted { paths } = &data.lease else {
+                panic!("an ordinary dispatch takes a predicted lease");
+            };
+            assert_eq!(
+                Some(paths.clone()),
+                fold.predicted_region(key),
+                "the fixture region for task {} is not the one the fold derives",
+                key.0
+            );
+        }
     }
 
     #[test]
@@ -11272,6 +11765,21 @@ mod tests {
                     "generation",
                     TopologyEventBody::TaskDispatched { data: moved },
                 );
+                // The recorded region, moved one component. Before it was
+                // derivation-checked this line was the whole finding: the fold
+                // admitted on `predicted_region`'s answer and the lease table
+                // kept the event's, so a hostile log carried one region past
+                // the door and every later overlap check consulted the other.
+                let mut moved = data.clone();
+                if let LeaseGrant::Predicted { paths } = &mut moved.lease {
+                    *paths = PathSet::Prefixes {
+                        paths: vec![GitPath::from("src/somewhere-nobody-predicted")],
+                    };
+                    case(
+                        "lease.paths",
+                        TopologyEventBody::TaskDispatched { data: moved },
+                    );
+                }
             }
             TopologyEventBody::AttemptStarted { data } => {
                 let mut moved = data.clone();
@@ -12440,7 +12948,8 @@ mod tests {
             "the first task must not depend on the failure directly, or this proves nothing"
         );
 
-        push(&mut live, &mut trace, dispatch(CEE, 0, &base));
+        let cee_dispatch = dispatch_in(&live, CEE, 0, &base);
+        push(&mut live, &mut trace, cee_dispatch);
         let start = attempt_started(&live, CEE, 0, 1, 0);
         push(&mut live, &mut trace, start);
         assert_eq!(live.derived_outcome(), DerivedOutcome::NotEnding);

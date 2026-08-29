@@ -500,7 +500,7 @@ fn kill_after_dispatch_recreates_worktree_without_spend() {
                 .manager
                 .slot_path(&task_slot(ALPHA, crate::topology::events::GenerationId(0))),
             kind: DispatchKind::Ordinary {
-                paths: run.predicted(),
+                paths: run.predicted(ALPHA),
             },
         };
 

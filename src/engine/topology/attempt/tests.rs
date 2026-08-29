@@ -1353,7 +1353,7 @@ fn adopted_generation(run: &Run) -> Dispatched {
                 ALPHA, GENERATION,
             )),
         kind: DispatchKind::Ordinary {
-            paths: run.predicted(),
+            paths: run.predicted(ALPHA),
         },
     }
 }
