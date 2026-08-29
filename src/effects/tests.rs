@@ -2144,21 +2144,75 @@ fn every_site_the_inventory_declares_has_a_funnel_that_names_it_or_is_recorded_a
     );
 }
 
-/// A Process-funnel constructor may exist as a private implementation detail,
-/// but production must not export the writable `Command` it creates. Keeping
-/// this separate from the denied-wrapper list matters: deleting the wrapper
-/// denial while leaving the export would otherwise make the lint green by
-/// forgetting the defect. Mutation witness: removing `#[cfg(test)]` from the
-/// enclosing `runner::host::test_support` module makes this assertion fail.
+/// No production module may return a writable process handle through public or
+/// crate-visible API, directly or behind a function pointer.
+///
+/// This is structural over signatures, not a builder-name denylist. Renaming
+/// `build_command`, adding a second builder, or returning `fn() -> Command`
+/// therefore cannot make the finding disappear. Private construction inside a
+/// funnel and APIs that *consume* a Command remain permitted.
 #[test]
-fn the_process_funnel_exports_no_writable_command_builder() {
-    let source = fs::read_to_string(repo_root().join("src/runner/host.rs"))
-        .expect("read the Process funnel");
-    let production = blank_comments_and_strings(&production_region(&source));
-    assert!(
-        !production.contains("pub(crate) fn build_command")
-            && !production.contains("pub fn build_command"),
-        "the Process funnel exports its writable Command builder"
+fn no_production_api_exports_a_writable_process_command() {
+    fn command_returning_public_signatures(source: &str) -> Vec<String> {
+        let code = blank_comments_and_strings(&production_region(source));
+        let mut found = Vec::new();
+        for (at, _) in code.match_indices("pub") {
+            let before_ok = at == 0
+                || !(code.as_bytes()[at - 1].is_ascii_alphanumeric()
+                    || code.as_bytes()[at - 1] == b'_');
+            let tail = &code[at..];
+            if !before_ok {
+                continue;
+            }
+            let after_pub = tail["pub".len()..].trim_start();
+            let item = if let Some(restricted) = after_pub.strip_prefix('(') {
+                let Some(close) = restricted.find(')') else {
+                    continue;
+                };
+                if restricted[..close].trim() != "crate" {
+                    continue;
+                }
+                restricted[close + 1..].trim_start()
+            } else {
+                after_pub
+            };
+            if !item.starts_with("fn ") {
+                continue;
+            }
+            let end = tail.find(['{', ';']).unwrap_or(tail.len());
+            let signature = &tail[..end];
+            let Some(arrow) = signature.find("->") else {
+                continue;
+            };
+            let returns = &signature[arrow + 2..];
+            let names_command = returns
+                .split(|ch: char| !(ch.is_ascii_alphanumeric() || ch == '_'))
+                .any(|token| token == "Command");
+            if names_command {
+                found.push(signature.split_whitespace().collect::<Vec<_>>().join(" "));
+            }
+        }
+        found
+    }
+
+    let mut escapes = Vec::new();
+    for (path, source) in scanned_sources() {
+        for signature in command_returning_public_signatures(&source) {
+            escapes.push(format!("{path}: {signature}"));
+        }
+    }
+    assert!(escapes.is_empty(), "writable Command escapes: {escapes:#?}");
+
+    assert_eq!(
+        command_returning_public_signatures(
+            "pub fn renamed() -> std::process::Command { todo!() }\n\
+             pub ( crate )\n fn pointer() -> fn() -> Command { todo!() }\n\
+             fn private() -> Command { todo!() }\n\
+             pub fn consumes(_: Command) -> ProcessOutput { todo!() }"
+        )
+        .len(),
+        2,
+        "the structural control must catch direct and function-pointer returns only"
     );
 }
 

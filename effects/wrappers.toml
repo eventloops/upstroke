@@ -675,7 +675,7 @@ effect_free = [
 path = "src/agent/proc.rs"
 crate_path = "upstroke::agent::proc"
 funnel = [
-    "run_with_timeout_hooked",
+    "run_with_timeout_at",
 ]
 effectful = []
 effectful_unnameable = []

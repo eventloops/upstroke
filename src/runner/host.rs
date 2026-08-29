@@ -695,7 +695,7 @@ impl Runner for HostRunner {
         command.env_clear();
         command.envs(composed);
         let mut hooks = self.hooks.lock().unwrap_or_else(PoisonError::into_inner);
-        proc::run_with_timeout_hooked(
+        proc::run_with_timeout_at(
             ProcessSite::Spawn,
             ProcessSite::Terminate,
             command,

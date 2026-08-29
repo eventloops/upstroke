@@ -417,6 +417,10 @@ mod tests {
     /// target, which is the half the old hand-rolled code got wrong.
     #[cfg(windows)]
     #[test]
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "Windows-only test fixture creates and executes a local batch shim; production carries only CommandSpec data into the Process funnel"
+    )]
     fn a_batch_shim_runs_and_receives_its_argument() {
         let dir = std::env::temp_dir().join(format!("upstroke-bin-shim-{}", std::process::id()));
         std::fs::create_dir_all(&dir).expect("scratch dir");

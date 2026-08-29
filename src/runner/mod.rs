@@ -1548,7 +1548,7 @@ mod tests {
                 3,
                 "the process funnel itself: two `command.spawn()` (Unix and \
                  Windows), and three `run_with_timeout*` mentions in \
-                 production CODE: `run_with_timeout_hooked`, its delegation \
+                 production CODE: `run_with_timeout_at`, its delegation \
                  to `run_with_timeout_and_limit`, and that private entry's \
                  declaration. The former plain `run_with_timeout` entry and \
                  its delegation are now inside a `#[cfg(test)]` support \

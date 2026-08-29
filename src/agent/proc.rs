@@ -258,27 +258,18 @@ impl DerefMut for ProcessTree {
     }
 }
 
-/// Run `command`, writing `stdin_data` to the child's stdin, with a hard
-/// wall-clock timeout. On timeout the child's owned process group is killed and
-/// the partial output captured so far is returned with `timed_out = true`
-/// (§14: timeout is an attempt failure with the partial transcript as feedback).
-/// Delegates to [`run_with_timeout_hooked`] with no observer rather than
-/// calling the private entry point beside it: `invariants_preserved[0]` is
-/// "process supervision, timeout, output capture and adapter parsing
-/// unchanged", and two call sites each passing [`OUTPUT_LIMIT_BYTES`] are two
-/// values that can drift. There is one, and it is this one.
-/// The process funnel with its containment sub-effect points observable.
+/// Run `command` through the site-authoritative process funnel, with its
+/// containment sub-effect points observable.
 ///
-/// The same supervision, timeout and capture as [`run_with_timeout`] — this is
-/// the one function both go through, which is what makes "every CLI and gate
-/// process executes through Runner" a structural claim rather than a
-/// convention. `stdin_data` is bytes here because a [`crate::runner::CommandSpec`]
-/// carries bytes.
+/// `spawn_site` and `terminate_site` are validated before any process effect;
+/// timeout and output-limit cleanup carry the validated termination site into
+/// the platform primitive. `stdin_data` is bytes because a
+/// [`crate::runner::CommandSpec`] carries bytes.
 ///
 /// # Errors
 ///
 /// Spawn failure, supervision failure, or a fault the observer injected.
-pub fn run_with_timeout_hooked(
+pub fn run_with_timeout_at(
     spawn_site: ProcessSite,
     terminate_site: ProcessSite,
     command: Command,
@@ -286,6 +277,7 @@ pub fn run_with_timeout_hooked(
     timeout: Duration,
     hooks: &mut dyn SpawnHooks,
 ) -> Result<ProcessOutput, UpstrokeError> {
+    validate_process_sites(spawn_site, terminate_site)?;
     run_with_timeout_and_limit(
         spawn_site,
         terminate_site,
@@ -297,6 +289,22 @@ pub fn run_with_timeout_hooked(
     )
 }
 
+fn validate_process_sites(
+    spawn_site: ProcessSite,
+    terminate_site: ProcessSite,
+) -> Result<(), UpstrokeError> {
+    match (spawn_site, terminate_site) {
+        (ProcessSite::Spawn, ProcessSite::Terminate) => Ok(()),
+        _ => Err(UpstrokeError::Agent {
+            message: format!(
+                "process funnel requires (Process.Spawn, Process.Terminate), got ({}, {})",
+                spawn_site.name(),
+                terminate_site.name()
+            ),
+        }),
+    }
+}
+
 fn run_with_timeout_and_limit(
     spawn_site: ProcessSite,
     terminate_site: ProcessSite,
@@ -306,8 +314,7 @@ fn run_with_timeout_and_limit(
     output_limit: usize,
     hooks: &mut dyn SpawnHooks,
 ) -> Result<ProcessOutput, UpstrokeError> {
-    debug_assert_eq!(spawn_site, ProcessSite::Spawn);
-    debug_assert_eq!(terminate_site, ProcessSite::Terminate);
+    validate_process_sites(spawn_site, terminate_site)?;
     command
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -318,7 +325,7 @@ fn run_with_timeout_and_limit(
     // waits for this registration rather than terminating Upstroke first and
     // orphaning the new process group.
     #[cfg(unix)]
-    let mut termination = termination::Supervisor::begin()?;
+    let mut termination = termination::Supervisor::begin(terminate_site)?;
     // `Spawn.ReaperStarted`: "fork of the per-invocation reaper, which takes
     // its shared cleanup hold R28". `begin` returning Ok is exactly that
     // having happened, and nothing else in this function can have happened
@@ -1655,6 +1662,7 @@ mod termination {
     use std::time::Duration;
 
     use crate::error::UpstrokeError;
+    use crate::topology::effects::ProcessSite;
 
     static PENDING_TERMINATION: AtomicI32 = AtomicI32::new(0);
     static SUSPEND_REQUESTED: AtomicBool = AtomicBool::new(false);
@@ -1818,14 +1826,26 @@ mod termination {
         state: Arc<Mutex<State>>,
         phase: Phase,
         reaper: Reaper,
+        terminate_site: ProcessSite,
     }
 
     impl Supervisor {
-        pub(super) fn begin() -> Result<Self, UpstrokeError> {
-            Self::begin_with_state(shared_state()?)
+        pub(super) fn begin(terminate_site: ProcessSite) -> Result<Self, UpstrokeError> {
+            if terminate_site != ProcessSite::Terminate {
+                return Err(UpstrokeError::Agent {
+                    message: format!(
+                        "process termination requires Process.Terminate, got {}",
+                        terminate_site.name()
+                    ),
+                });
+            }
+            Self::begin_with_state(shared_state()?, terminate_site)
         }
 
-        fn begin_with_state(state: Arc<Mutex<State>>) -> Result<Self, UpstrokeError> {
+        fn begin_with_state(
+            state: Arc<Mutex<State>>,
+            terminate_site: ProcessSite,
+        ) -> Result<Self, UpstrokeError> {
             claim_launch(&state)?;
             let reaper = match spawn_reaper() {
                 Ok(reaper) => reaper,
@@ -1838,6 +1858,7 @@ mod termination {
                 state,
                 phase: Phase::Spawning,
                 reaper,
+                terminate_site,
             })
         }
 
@@ -1882,6 +1903,14 @@ mod termination {
         }
 
         pub(super) fn finish(&mut self) -> Result<(), UpstrokeError> {
+            if self.terminate_site != ProcessSite::Terminate {
+                return Err(UpstrokeError::Agent {
+                    message: format!(
+                        "process termination requires Process.Terminate, got {}",
+                        self.terminate_site.name()
+                    ),
+                });
+            }
             let Phase::Group(pgid) = self.phase else {
                 return Ok(());
             };
@@ -5340,7 +5369,7 @@ pub(crate) mod test_support {
         stdin_data: &str,
         timeout: Duration,
     ) -> Result<ProcessOutput, UpstrokeError> {
-        run_with_timeout_hooked(
+        run_with_timeout_at(
             ProcessSite::Spawn,
             ProcessSite::Terminate,
             command,
@@ -5419,6 +5448,28 @@ mod tests {
         assert!(out.stdout.contains("hello"));
         assert!(!out.timed_out);
         assert!(!out.output_limited);
+    }
+
+    #[test]
+    fn invalid_process_site_pairs_fail_before_spawn_in_release_code() {
+        for (spawn, terminate) in [
+            (ProcessSite::Spawn, ProcessSite::Spawn),
+            (ProcessSite::Terminate, ProcessSite::Terminate),
+            (ProcessSite::Terminate, ProcessSite::Spawn),
+        ] {
+            let error = run_with_timeout_at(
+                spawn,
+                terminate,
+                Command::new("upstroke-site-validation-must-not-spawn"),
+                b"",
+                Duration::from_secs(1),
+                &mut NoHooks,
+            )
+            .expect_err("an invalid Process-site pair must fail closed");
+            let message = error.to_string();
+            assert!(message.contains("process funnel requires"), "{message}");
+            assert!(!message.contains("failed to spawn"), "{message}");
+        }
     }
 
     /// Writes `UPSTROKE_EXCESSIVE_OUTPUT_HELPER` bytes to stdout, then exits.
@@ -5652,7 +5703,7 @@ mod tests {
         command
             .args(["stdin_hex_helper", "--ignored", "--nocapture"])
             .env("UPSTROKE_STDIN_HEX", "1");
-        let out = run_with_timeout_hooked(
+        let out = run_with_timeout_at(
             ProcessSite::Spawn,
             ProcessSite::Terminate,
             command,
@@ -5735,7 +5786,8 @@ mod tests {
     fn a_child_registered_pre_exec_is_settled_when_the_parent_never_registers_it() {
         use std::os::unix::process::ExitStatusExt;
 
-        let supervisor = termination::Supervisor::begin().expect("start a private reaper");
+        let supervisor =
+            termination::Supervisor::begin(ProcessSite::Terminate).expect("start a private reaper");
         let mut command = Command::new("/bin/sh");
         command
             .args(["-c", "sleep 60"])
@@ -6121,7 +6173,7 @@ mod tests {
             "R28 is already held before the reaper exists, so this test proves nothing"
         );
         let mut hooks = observer.clone();
-        let output = run_with_timeout_hooked(
+        let output = run_with_timeout_at(
             ProcessSite::Spawn,
             ProcessSite::Terminate,
             shell("exit 0"),
@@ -6256,7 +6308,8 @@ mod tests {
             std::path::PathBuf::from(std::env::var_os("UPSTROKE_READY").expect("ready path"));
         let agent =
             std::path::PathBuf::from(std::env::var_os("UPSTROKE_AGENT").expect("agent path"));
-        let mut supervisor = termination::Supervisor::begin().expect("start a private reaper");
+        let mut supervisor =
+            termination::Supervisor::begin(ProcessSite::Terminate).expect("start a private reaper");
         let mut command = Command::new("/bin/sh");
         command
             .args(["-c", "sleep 120"])
@@ -8168,7 +8221,8 @@ mod tests {
                 .expect("a scope");
         super::set_container_reclaim_scope(Some(&scope)).expect("arm the reaper");
 
-        let mut supervisor = termination::Supervisor::begin().expect("start a private reaper");
+        let mut supervisor =
+            termination::Supervisor::begin(ProcessSite::Terminate).expect("start a private reaper");
         let mut command = Command::new("/bin/sh");
         command
             .args(["-c", "sleep 120"])
