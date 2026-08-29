@@ -14,14 +14,25 @@ candidate-controlled, so a fork's entire diff — workflow edits included — is
 
 ## Before you send a PR
 
-The project holds itself to these; CI enforces all four, verbatim:
+The project holds itself to these; CI enforces all eight, verbatim:
 
 ```bash
 cargo fmt --check
 cargo clippy --all-targets --all-features -- -D warnings
 cargo test --all-targets --all-features
 cargo +1.85.0 check --locked --all-targets --all-features
+bash .github/scripts/test-release-record.sh
+bash .github/scripts/test-pr-policy.sh
+bash .github/scripts/test-pr-ledger-evidence.sh
+bash .github/scripts/test-docs-consistency.sh
 ```
+
+Run all eight from the repository root. CI splits them across its jobs — `lint` runs rustfmt,
+Clippy and the four Bash gates, `test` runs the suite, `msrv` runs the locked check, and Clippy
+runs again on the Windows and macOS lint legs — and `upstroke-ci` aggregates every leg. `CLAUDE.md`'s Gates section records the
+root-invocation trap and the `jq` prerequisite the release-record fixture carries;
+`CODING_STANDARDS.md` §2 is the normative statement of this baseline, and no gate checks that
+these copies of it agree.
 
 Use the pull-request template to record the exact commands, implementation provenance, reviewed
 SHA, review model and effort, evidence link, risk, and rollback. Resolve every review conversation;
@@ -31,7 +42,7 @@ merge commits are the only accepted merge method.
 before changing Rust code. Among its hard requirements: edition 2024 with MSRV 1.85, no
 `.unwrap()` or `.expect()` in production, `anyhow` only at the binary edge (libraries return typed
 `thiserror` errors), and paths represented with `std::path` types. Windows, macOS, and Linux are
-supported targets. The four commands above are the automated baseline, not the whole standard.
+supported targets. The eight commands above are the automated baseline, not the whole standard.
 
 ## Contributor Licence Agreement
 

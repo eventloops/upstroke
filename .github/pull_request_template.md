@@ -12,6 +12,10 @@
 - [ ] `cargo clippy --all-targets --all-features -- -D warnings`
 - [ ] `cargo test --all-targets --all-features`
 - [ ] `cargo +1.85.0 check --locked --all-targets --all-features`
+- [ ] `bash .github/scripts/test-release-record.sh`
+- [ ] `bash .github/scripts/test-pr-policy.sh`
+- [ ] `bash .github/scripts/test-pr-ledger-evidence.sh`
+- [ ] `bash .github/scripts/test-docs-consistency.sh`
 
 Exact commands and results:
 

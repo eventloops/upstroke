@@ -71,15 +71,18 @@ cargo test --all-targets --all-features
 cargo +1.85.0 check --locked --all-targets --all-features   # MSRV
 ```
 
-`--all-features` is what CI runs, and `CONTRIBUTING.md` states the same four
-commands. The crate defines no features today, so the flag is a no-op for now —
-use the CI form regardless, so the two stay equivalent when that changes.
+`--all-features` is what CI runs, and `CONTRIBUTING.md`, the pull-request
+template and `CODING_STANDARDS.md` §2 state the same four cargo commands. The
+crate defines no features today, so the flag is a no-op for now — use the CI
+form regardless, so the two stay equivalent when that changes.
 
 `1.85.0` is required and pinned by CI. There is **no `rust-toolchain.toml`** —
 toolchain selection is explicit at call sites, so nothing auto-corrects a wrong
 default. Install 1.85.0 alongside stable.
 
-4 `test-*.sh` gates in `.github/scripts/` also run in CI's `lint` job.
+4 `test-*.sh` gates in `.github/scripts/` also run in CI's `lint` job. With the
+four cargo commands above they are the eight-command baseline `CODING_STANDARDS.md`
+§2 states normatively and `CONTRIBUTING.md` and the pull-request template list.
 Invoke them **from the repository root**, the way `ci.yml` does:
 
 ```bash
