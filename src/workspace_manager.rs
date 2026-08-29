@@ -1505,8 +1505,15 @@ impl WorkspaceManager {
     ///
     /// The containment refusals or a Git or I/O error.
     pub fn reclaim_intents(&self, hooks: &mut dyn EffectHooks) -> Result<Vec<Slot>, UpstrokeError> {
-        self.revalidate()?;
         let slots = self.intents()?;
+        // Revalidate even when there are no intents: callers rely on reclaim
+        // as a fresh containment check. With nothing to remove, Git's ordinary
+        // enumeration is safe and a repository with no linked-worktree store
+        // is an ordinary empty state. Every non-empty case is revalidated by
+        // `remove_worktree`, where a missing store must refuse before deletion.
+        if slots.is_empty() {
+            self.revalidate()?;
+        }
         for slot in &slots {
             self.remove_worktree(hooks, slot)?;
             self.remove_intent(hooks, slot)?;
@@ -1804,8 +1811,8 @@ impl WorkspaceManager {
         hooks: &mut dyn EffectHooks,
         slot: &Slot,
     ) -> Result<(), UpstrokeError> {
-        self.revalidate()?;
         let path = self.slot_target(slot)?;
+        let registration = self.revalidate_removal(&path)?;
         funnel(hooks, slot.remove_site(), || {
             if path.exists() {
                 let contained = self.contained(&path)?;
@@ -1814,7 +1821,16 @@ impl WorkspaceManager {
                     source,
                 })?;
             }
-            if let Some(admin) = self.registered_admin_dir(&path)? {
+            if let Some(admin) = registration.as_ref() {
+                if !self.registration_still_names(admin, &path)? {
+                    // Its identity metadata is already absent: forced cleanup
+                    // converges without inferring or deleting an admin path.
+                    self.git_ok(
+                        &self.base,
+                        &[OsString::from("worktree"), OsString::from("prune")],
+                    )?;
+                    return Ok(());
+                }
                 let locked = admin.join("locked");
                 match fs::remove_file(&locked) {
                     Ok(()) => {}
@@ -1825,6 +1841,25 @@ impl WorkspaceManager {
                             source,
                         });
                     }
+                }
+                // A killed `git worktree add` can leave an empty `commondir`.
+                // Git then cannot enumerate *any* worktree, so `prune` cannot
+                // remove this one. `revalidate_removal` bound this admin
+                // directory to the exact, contained slot from its byte-safe
+                // `gitdir` before the checkout was deleted. Only that proved
+                // registration may be removed directly.
+                if fs::metadata(admin.join("commondir")).is_ok_and(|metadata| metadata.len() == 0) {
+                    if !self.registration_still_names(admin, &path)? {
+                        self.git_ok(
+                            &self.base,
+                            &[OsString::from("worktree"), OsString::from("prune")],
+                        )?;
+                        return Ok(());
+                    }
+                    remove_tree_once_handles_close(admin).map_err(|source| UpstrokeError::Io {
+                        path: admin.clone(),
+                        source,
+                    })?;
                 }
             }
             self.git_ok(
@@ -2615,17 +2650,42 @@ impl WorkspaceManager {
         Ok(Some(PathBuf::from(target.trim())))
     }
 
-    /// The administrative directory Git keeps for a registered worktree, found
-    /// without trusting the checkout, so a removal can clear the
-    /// `initializing` lock of a worktree whose directory is already gone.
-    fn registered_admin_dir(&self, path: &Path) -> Result<Option<PathBuf>, UpstrokeError> {
-        if self.worktree_record(path)?.is_none() {
-            return Ok(None);
+    /// Revalidate containment without asking Git to parse a registration that
+    /// recovery exists to remove.
+    ///
+    /// A zero-length `commondir` makes `git worktree list` fail before it emits
+    /// any records. The registration's `gitdir` is still sufficient evidence
+    /// when read byte-for-byte: it names the checkout's `.git`, whose parent
+    /// must canonical-prefix to the exact slot target. Any unreadable, empty or
+    /// partial `gitdir` refuses; guessing from the admin directory's basename
+    /// would authorize deletion from a Git-generated, collision-suffixed name.
+    fn revalidate_removal(&self, target: &Path) -> Result<Option<PathBuf>, UpstrokeError> {
+        refuse_unreal_directory(&self.base)?;
+        refuse_reparse_points(&self.private_root, &self.execution_root)?;
+        let root = canonical_prefix(&self.execution_root)?;
+        let target = canonical_prefix(target)?;
+        let base = canonical_prefix(&self.base)?;
+        if is_at_or_inside(&base, &root) {
+            return Err(Refusal::RootInsideRepositoryWorktree {
+                root,
+                worktree: self.base.clone(),
+            }
+            .into());
         }
+        if is_at_or_inside(&root, &base) {
+            return Err(Refusal::WorktreeInsideRoot {
+                root,
+                worktree: self.base.clone(),
+            }
+            .into());
+        }
+
         let worktrees = self.common_git_dir.join("worktrees");
         let entries = match fs::read_dir(&worktrees) {
             Ok(entries) => entries,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound && !target.exists() => {
+                return Ok(None);
+            }
             Err(source) => {
                 return Err(UpstrokeError::Io {
                     path: worktrees,
@@ -2633,24 +2693,173 @@ impl WorkspaceManager {
                 });
             }
         };
-        let wanted = canonical_prefix(path)?;
+        let mut matched = None;
         for entry in entries {
             let entry = entry.map_err(|source| UpstrokeError::Io {
                 path: worktrees.clone(),
                 source,
             })?;
-            let gitdir = entry.path().join("gitdir");
-            let Ok(text) = fs::read_to_string(&gitdir) else {
-                continue;
+            let admin = entry.path();
+            let gitdir = admin.join("gitdir");
+            let bytes = match fs::read(&gitdir) {
+                Ok(bytes) => bytes,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(source) => {
+                    return Err(UpstrokeError::Io {
+                        path: gitdir,
+                        source,
+                    });
+                }
             };
-            let recorded = PathBuf::from(text.trim());
-            let checkout = recorded.parent().unwrap_or(&recorded).to_path_buf();
-            if canonical_prefix(&checkout)? == wanted {
-                return Ok(Some(entry.path()));
+            let checkout = registration_checkout(&admin, &bytes)?;
+            let worktree = canonical_prefix(&checkout)?;
+            if is_at_or_inside(&worktree, &root) {
+                return Err(Refusal::RootInsideRepositoryWorktree {
+                    root,
+                    worktree: checkout.clone(),
+                }
+                .into());
+            }
+            if is_at_or_inside(&root, &worktree) && !self.is_manager_slot_path(&root, &worktree) {
+                return Err(Refusal::WorktreeInsideRoot {
+                    root,
+                    worktree: checkout.clone(),
+                }
+                .into());
+            }
+            if worktree != target {
+                continue;
+            }
+            if matched.replace(admin).is_some() {
+                return Err(UpstrokeError::Git {
+                    message: format!(
+                        "more than one worktree registration names {}",
+                        checkout.display()
+                    ),
+                });
             }
         }
-        Ok(None)
+        Ok(matched)
     }
+
+    /// Re-read the registration identity at the destructive administration
+    /// boundary. `false` is convergence, not permission to select the admin by
+    /// another property: the `gitdir` or its directory is already gone.
+    fn registration_still_names(&self, admin: &Path, target: &Path) -> Result<bool, UpstrokeError> {
+        let gitdir = admin.join("gitdir");
+        let bytes = match fs::read(&gitdir) {
+            Ok(bytes) => bytes,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+            Err(source) => {
+                return Err(UpstrokeError::Io {
+                    path: gitdir,
+                    source,
+                });
+            }
+        };
+        let checkout = registration_checkout(admin, &bytes)?;
+        if canonical_prefix(&checkout)? != canonical_prefix(target)? {
+            return Err(UpstrokeError::Git {
+                message: format!(
+                    "worktree registration {} changed identity before removal",
+                    admin.display()
+                ),
+            });
+        }
+        Ok(true)
+    }
+}
+
+fn trim_ascii(mut bytes: &[u8]) -> &[u8] {
+    while bytes.first().is_some_and(u8::is_ascii_whitespace) {
+        bytes = &bytes[1..];
+    }
+    while bytes.last().is_some_and(u8::is_ascii_whitespace) {
+        bytes = &bytes[..bytes.len() - 1];
+    }
+    bytes
+}
+
+/// Decode the authoritative checkout side of a linked-worktree registration.
+///
+/// Registration-state table used by recovery:
+///
+/// | `gitdir` state | Can bind an exact checkout? | Recovery action |
+/// |---|---:|---|
+/// | valid UTF-8 or Unix path bytes | yes | revalidate containment, then act |
+/// | absent or unreadable | no | refuse before mutation |
+/// | zero-length | no | refuse before mutation |
+/// | partial / not ending in `.git` | no | refuse before mutation |
+///
+/// `commondir` is deliberately not an input to this binding. A valid `gitdir`
+/// plus an empty `commondir` is the one safe repairable state: it identifies
+/// the checkout while explaining why Git's own enumeration cannot proceed.
+fn registration_checkout(admin: &Path, bytes: &[u8]) -> Result<PathBuf, UpstrokeError> {
+    let bytes = trim_ascii(bytes);
+    if bytes.is_empty() {
+        return Err(UpstrokeError::Git {
+            message: format!(
+                "worktree registration {} has an empty gitdir",
+                admin.display()
+            ),
+        });
+    }
+    let Some(recorded) = decode_registration_path(bytes) else {
+        return Err(UpstrokeError::Git {
+            message: format!(
+                "worktree registration {} has a gitdir this platform cannot represent exactly",
+                admin.display()
+            ),
+        });
+    };
+    let normalized: PathBuf = recorded.components().collect();
+    if !recorded.is_absolute()
+        || recorded
+            .components()
+            .any(|component| component == Component::ParentDir)
+        || normalized.as_os_str() != recorded.as_os_str()
+    {
+        return Err(UpstrokeError::Git {
+            message: format!(
+                "worktree registration {} has a gitdir that is not an absolute normalized path",
+                admin.display()
+            ),
+        });
+    }
+    if recorded.file_name() != Some(OsStr::new(".git")) {
+        return Err(UpstrokeError::Git {
+            message: format!(
+                "worktree registration {} has a gitdir that does not name a checkout .git",
+                admin.display()
+            ),
+        });
+    }
+    let Some(checkout) = recorded.parent() else {
+        return Err(UpstrokeError::Git {
+            message: format!(
+                "worktree registration {} has a parentless gitdir",
+                admin.display()
+            ),
+        });
+    };
+    Ok(checkout.to_path_buf())
+}
+
+#[cfg(unix)]
+fn decode_registration_path(bytes: &[u8]) -> Option<PathBuf> {
+    Some(decode_git_path(bytes))
+}
+
+#[cfg(windows)]
+fn decode_registration_path(bytes: &[u8]) -> Option<PathBuf> {
+    std::str::from_utf8(bytes)
+        .ok()
+        .map(|path| PathBuf::from(path.replace('/', "\\")))
+}
+
+#[cfg(not(any(unix, windows)))]
+fn decode_registration_path(bytes: &[u8]) -> Option<PathBuf> {
+    std::str::from_utf8(bytes).ok().map(PathBuf::from)
 }
 
 /// What a snapshot is checked out at.
@@ -6109,6 +6318,184 @@ mod tests {
         assert!(!fixture.manager.intent_path(&slot).exists());
     }
 
+    #[test]
+    fn reclaim_removes_the_registration_whose_commondir_is_empty() {
+        let fixture = Fixture::created("empty-commondir");
+        let slot = fixture.task("alpha", 1);
+        fixture
+            .manager
+            .write_intent(&mut NoHooks, &slot)
+            .expect("intent");
+        let path = fixture.manager.slot_path(&slot);
+        register_unpopulated(&fixture, &path);
+        let admin = fixture
+            .manager
+            .revalidate_removal(&path)
+            .expect("admin dir")
+            .expect("registered");
+        fs::write(admin.join("commondir"), []).expect("truncate commondir");
+
+        fixture
+            .manager
+            .reclaim_intents(&mut NoHooks)
+            .expect("the exact registration is recoverable without Git enumeration");
+        assert!(!path.exists(), "the unpopulated checkout stays absent");
+        assert!(!admin.exists(), "the proved registration is removed");
+        assert!(!fixture.manager.intent_path(&slot).exists());
+        fixture
+            .manager
+            .worktree_records()
+            .expect("Git enumeration works again");
+    }
+
+    #[test]
+    fn malformed_gitdir_refuses_before_removal() {
+        for (case, bytes) in [("empty", &b""[..]), ("partial", &b"not-a-dot-git-path"[..])] {
+            let fixture = Fixture::created(&format!("bad-gitdir-{case}"));
+            let slot = fixture.add_task(&mut NoHooks, "alpha", 1);
+            let path = fixture.manager.slot_path(&slot);
+            let admin = fixture
+                .manager
+                .revalidate_removal(&path)
+                .expect("admin dir")
+                .expect("registered");
+            fs::write(admin.join("gitdir"), bytes).expect("replace gitdir");
+
+            fixture
+                .manager
+                .remove_worktree(&mut NoHooks, &slot)
+                .expect_err("unbound registration refuses");
+            assert!(path.exists(), "{case}: refusal precedes checkout deletion");
+            assert!(
+                admin.exists(),
+                "{case}: refusal precedes registration deletion"
+            );
+        }
+    }
+
+    #[test]
+    fn an_absent_registration_gitdir_is_already_gone_for_forced_cleanup() {
+        let fixture = Fixture::created("absent-gitdir-converges");
+        let slot = fixture.add_task(&mut NoHooks, "alpha", 1);
+        let path = fixture.manager.slot_path(&slot);
+        let admin = fixture
+            .manager
+            .revalidate_removal(&path)
+            .expect("admin dir")
+            .expect("registered");
+        fs::remove_file(admin.join("gitdir")).expect("interrupt before gitdir survives");
+
+        fixture
+            .manager
+            .remove_worktree(&mut NoHooks, &slot)
+            .expect("missing identity metadata is forced-cleanup convergence");
+        assert!(!path.exists(), "the exact contained checkout is reclaimed");
+    }
+
+    #[test]
+    fn a_missing_stored_worktree_directory_refuses_before_checkout_deletion() {
+        let fixture = Fixture::created("missing-worktrees-store");
+        let slot = fixture.add_task(&mut NoHooks, "alpha", 1);
+        let path = fixture.manager.slot_path(&slot);
+        let admin = fixture
+            .manager
+            .revalidate_removal(&path)
+            .expect("admin dir")
+            .expect("registered");
+        let worktrees = admin.parent().expect("worktrees directory").to_path_buf();
+        let moved = fixture.root.join("stored-worktrees-moved");
+        fs::rename(&worktrees, &moved).expect("move the stored metadata");
+
+        fixture
+            .manager
+            .remove_worktree(&mut NoHooks, &slot)
+            .expect_err("missing stored metadata refuses");
+        assert!(path.exists(), "refusal precedes checkout deletion");
+        fs::rename(moved, worktrees).expect("restore fixture metadata");
+    }
+
+    #[test]
+    fn a_registration_rebound_after_validation_keeps_its_admin_state() {
+        struct RebindAtBefore {
+            gitdir: PathBuf,
+            replacement: PathBuf,
+        }
+
+        impl EffectHooks for RebindAtBefore {
+            fn phase(&mut self, site: EffectSiteId, phase: HookPhase) -> Injection {
+                if site == EffectSiteId::Worktree(WorktreeSite::Remove)
+                    && phase == HookPhase::Before
+                {
+                    fs::write(&self.gitdir, format!("{}\n", self.replacement.display()))
+                        .expect("replace the registration identity");
+                }
+                Injection::Proceed
+            }
+        }
+
+        let fixture = Fixture::created("admin-rebound");
+        let slot = fixture.add_task(&mut NoHooks, "alpha", 1);
+        let path = fixture.manager.slot_path(&slot);
+        let admin = fixture
+            .manager
+            .revalidate_removal(&path)
+            .expect("admin dir")
+            .expect("registered");
+        let locked = admin.join("locked");
+        fs::write(&locked, "do not remove\n").expect("replacement state");
+        let other = fixture.root.join("other").join(".git");
+        let mut hooks = RebindAtBefore {
+            gitdir: admin.join("gitdir"),
+            replacement: other,
+        };
+
+        fixture
+            .manager
+            .remove_worktree(&mut hooks, &slot)
+            .expect_err("changed identity refuses");
+        assert!(locked.exists(), "identity is rechecked before lock removal");
+        assert!(admin.exists(), "identity is rechecked before admin removal");
+    }
+
+    #[test]
+    fn registration_gitdir_requires_an_absolute_normalized_path() {
+        let admin = Path::new("/repository/.git/worktrees/example");
+        for bytes in [
+            &b"relative/.git"[..],
+            &b"/absolute/../traversal/.git"[..],
+            &b"/absolute/./alias/.git"[..],
+        ] {
+            registration_checkout(admin, bytes).expect_err("non-normalized gitdir refuses");
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn registration_gitdir_refuses_invalid_utf8_on_windows() {
+        registration_checkout(
+            Path::new(r"C:\repository\.git\worktrees\example"),
+            b"C:\\worktree-\xff\\.git",
+        )
+        .expect_err("lossy path aliases are not registration identity");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn registration_gitdir_decodes_non_utf8_path_bytes() {
+        use std::os::unix::ffi::OsStrExt as _;
+
+        let decoded = registration_checkout(
+            Path::new("/repository/.git/worktrees/example"),
+            b" /tmp/non-utf8-\xff/.git\n",
+        )
+        .expect("byte-valid registration");
+        assert_eq!(
+            decoded.as_os_str().as_bytes(),
+            b"/tmp/non-utf8-\xff",
+            "registration discovery is byte-preserving on Unix"
+        );
+    }
+
     /// Build the state a killed `git worktree add` leaves: the registration
     /// exists and Git still holds its `initializing` lock.
     fn register_unpopulated(fixture: &Fixture, path: &Path) {
@@ -6125,7 +6512,7 @@ mod tests {
         );
         let admin = fixture
             .manager
-            .registered_admin_dir(path)
+            .revalidate_removal(path)
             .expect("admin dir")
             .expect("the worktree is registered");
         fs::write(admin.join("locked"), "initializing\n").expect("hold the initializing lock");
