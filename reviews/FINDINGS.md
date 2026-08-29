@@ -3416,3 +3416,20 @@ description is §12's precedent.
 including `test (windows-latest)`, `test (macos-latest)` and all three MSRV legs — because
 the push after it was held while it executed. Everything past it is this section, the sweep
 record and the stampings it produced.
+
+## 24. 2026-08-29 actionable sweep — workspace registration recovery
+
+This is an append-only disposition of the live §13 workspace-recovery rows, measured from
+integration `ff86d29a72ccc23e0d86c6fadabe2aa198ff46b8`. It does not rewrite their historical
+evidence.
+
+| stable ID | disposition | exact scope and evidence |
+|---|---|---|
+| `PR5-RD-002` | **fixed in this slice** | Recovery now reads registration paths byte-safely, revalidates containment of the base, private root, and every linked-worktree administration directory immediately before removal, binds a target only through an exact valid `gitdir`, and can reclaim the deterministic zero-length-`commondir` case. Mutation witnesses cover exact recovery, pre-mutation refusal, containment, idempotence, and non-UTF-8 Unix paths. |
+| `PR5-RD-003` | **partially fixed; ambiguous residue remains fail-closed** | A valid registration with an empty `commondir` is recoverable. An absent, unreadable, empty, partial, or non-`.git` `gitdir` cannot safely identify one administration directory when Git may have assigned a collision-suffixed basename; recovery therefore still refuses before checkout or administration mutation. Resolving that ambiguity requires owner/design authority for a new identity source, not a guessed deletion. |
+| `PR7-R3-ATTEMPT-003-RESIDUE-DISCARD-UNREACHED` | **blocked by packet/owner contradiction, no repair applied** | The current packet and tests classify the pre-intent ephemeral commit as Git-owned R27 and require recovery to leave it. Deleting it would contradict that explicit contract. Reclassification requires an owner packet decision. |
+
+The Linux-deterministic registration repair does not claim to resolve the separate controlled-macOS
+errno/process fingerprints. Those remain external-measurement blockers. The implementation commit is
+`2fc8678c6017031f44dce5d76cb47829a0079dae`; publication/review/CI evidence is recorded by the PR
+that carries this section.
