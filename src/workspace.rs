@@ -1785,6 +1785,9 @@ impl Drop for GateWorkspace {
 mod tests {
     use super::*;
     use std::env;
+    use std::time::Duration;
+
+    use crate::agent::proc::test_support::readiness;
 
     fn temp_repo(tag: &str) -> PathBuf {
         let dir = env::temp_dir().join(format!("upstroke-ws-{tag}-{}", std::process::id()));
@@ -3001,11 +3004,23 @@ mod tests {
         let snapshot = workspace
             .gate_snapshot_for_candidate_in_store(&parent, &tree, &store)
             .expect("create durable snapshot");
-        fs::write(
-            &ready,
-            snapshot.workspace().root().to_string_lossy().as_bytes(),
-        )
-        .expect("publish snapshot path");
+        // The snapshot's *identifier*, not its path. CODING_STANDARDS.md §12:
+        // "a path is not safely a line: an ancestor may contain the delimiter,
+        // or bytes that are not text at all. Send an identifier the receiver can
+        // rejoin to a root it already knows." The parent supplied `store`, and
+        // `create_in_store_inner` puts every snapshot at `<store>/worktrees/
+        // <name>`, so the name is all the parent is missing -- and unlike the
+        // path it is `upstroke-gates-<pid>-<ulid>`, which no ancestor can spoil.
+        let root = snapshot.workspace().root().to_path_buf();
+        let name = root
+            .file_name()
+            .expect("a snapshot root is a directory in the store")
+            .to_str()
+            .expect("the store names snapshots with an ASCII identifier");
+        // Published last, and atomically. This used to be `fs::write` straight
+        // to `ready`, which creates the name and then fills it -- so the parent,
+        // which polls for the path and then reads it, could read nothing.
+        readiness::publish(&ready, &[name]).expect("publish the snapshot identity");
         std::thread::sleep(std::time::Duration::from_secs(30));
         drop(snapshot);
     }
@@ -3023,25 +3038,34 @@ mod tests {
         let registrations_before = workspace
             .git(&["worktree", "list", "--porcelain"])
             .expect("registrations before");
-        let mut owner = Command::new(env::current_exe().expect("test executable"))
-            .args(["gate_snapshot_owner_helper", "--ignored", "--nocapture"])
-            .env("UPSTROKE_SNAPSHOT_OWNER", "1")
-            .env("UPSTROKE_REPO", &repo)
-            .env("UPSTROKE_SNAPSHOT_STORE", &store)
-            .env("UPSTROKE_READY", &ready)
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
-            .expect("spawn disposable snapshot owner");
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
-        while !ready.exists() && std::time::Instant::now() < deadline {
-            std::thread::sleep(std::time::Duration::from_millis(10));
-        }
-        assert!(ready.exists(), "snapshot owner never published readiness");
-        let snapshot_path = PathBuf::from(
-            String::from_utf8(fs::read(&ready).expect("read snapshot path"))
-                .expect("test temp path is UTF-8"),
+        // Adopted, so a panicking assertion anywhere below still terminates and
+        // reaps this child rather than leaving it to sleep out its thirty
+        // seconds holding a registered worktree.
+        let mut owner = readiness::Producer::adopt(
+            Command::new(env::current_exe().expect("test executable"))
+                .args(["gate_snapshot_owner_helper", "--ignored", "--nocapture"])
+                .env("UPSTROKE_SNAPSHOT_OWNER", "1")
+                .env("UPSTROKE_REPO", &repo)
+                .env("UPSTROKE_SNAPSHOT_STORE", &store)
+                .env("UPSTROKE_READY", &ready)
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+                .expect("spawn disposable snapshot owner"),
         );
+        // Producer-aware, and the bound is the one this test already used. The
+        // wait it replaces polled only for the path, so an owner that died
+        // before publishing -- a failed `Workspace::open`, a store the helper
+        // could not create -- was reported fifteen seconds later as a producer
+        // that had never published, which is the clock talking rather than the
+        // death (CODING_STANDARDS.md §12).
+        let published = readiness::await_signal(&ready, owner.child(), Duration::from_secs(15))
+            .or_fail("the snapshot owner never published readiness");
+        let [name] = published.as_slice() else {
+            panic!("the readiness record is one field, not {published:?}")
+        };
+        // Rejoined to the root the parent already knew.
+        let snapshot_path = store.join("worktrees").join(name);
         assert!(snapshot_path.exists(), "snapshot was not materialized");
         assert_ne!(
             workspace
@@ -3051,8 +3075,8 @@ mod tests {
             "helper did not register a linked worktree"
         );
 
-        owner.kill().expect("hard-kill snapshot owner");
-        owner.wait().expect("reap snapshot owner");
+        owner.child().kill().expect("hard-kill snapshot owner");
+        owner.child().wait().expect("reap snapshot owner");
         assert!(
             snapshot_path.exists(),
             "hard kill unexpectedly ran the snapshot destructor"

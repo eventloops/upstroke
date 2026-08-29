@@ -2795,6 +2795,8 @@ mod tests {
 
     use std::time::{Duration, Instant};
 
+    use crate::agent::proc::test_support::readiness;
+
     fn scratch(tag: &str) -> PathBuf {
         let dir =
             std::env::temp_dir().join(format!("upstroke-rundir-{tag}-{}", std::process::id()));
@@ -3158,35 +3160,33 @@ mod tests {
         run_b.create().expect("run B dirs");
 
         let exe = std::env::current_exe().expect("test binary");
-        let mut child = std::process::Command::new(exe)
-            .args([
-                "--exact",
-                "rundir::tests::worktree_lock_child_holds_run_a",
-                "--ignored",
-                "--nocapture",
-            ])
-            .env("UPSTROKE_TEST_WORKTREE_DIR", &repo)
-            .env("UPSTROKE_TEST_WORKTREE_GIT_DIR", &git_dir)
-            .env("UPSTROKE_TEST_LOCK_DIR", &run_a.public)
-            .stdout(std::process::Stdio::piped())
-            .spawn()
-            .expect("spawn run A engine");
+        // Adopted, so the child is terminated, reaped and its reader joined
+        // when this scope ends however it ends -- including a panicking
+        // assertion between here and the teardown below.
+        let mut producer = readiness::Producer::adopt(
+            std::process::Command::new(exe)
+                .args([
+                    "--exact",
+                    "rundir::tests::worktree_lock_child_holds_run_a",
+                    "--ignored",
+                    "--nocapture",
+                ])
+                .env("UPSTROKE_TEST_WORKTREE_DIR", &repo)
+                .env("UPSTROKE_TEST_WORKTREE_GIT_DIR", &git_dir)
+                .env("UPSTROKE_TEST_LOCK_DIR", &run_a.public)
+                .stdout(std::process::Stdio::piped())
+                .spawn()
+                .expect("spawn run A engine"),
+        );
 
-        let mut out = std::io::BufReader::new(child.stdout.take().expect("stdout"));
-        let mut line = String::new();
-        let deadline = Instant::now() + Duration::from_secs(30);
-        loop {
-            line.clear();
-            let read = std::io::BufRead::read_line(&mut out, &mut line).expect("read");
-            assert!(read > 0, "run A child ended before taking its leases");
-            if line.trim() == "held" {
-                break;
-            }
-            assert!(
-                Instant::now() < deadline,
-                "run A child never took its leases"
-            );
-        }
+        // Producer-aware and *effectively* bounded, at the bound this test
+        // already used. The loop it replaces checked its deadline only after
+        // `read_line` returned, so against a producer that stayed alive and
+        // silent -- the one case CODING_STANDARDS.md §12 says the bound exists
+        // for -- the read blocked and the deadline was never reached at all.
+        producer
+            .await_line("held", Duration::from_secs(30))
+            .or_fail("run A child never took its leases");
 
         // The per-run lock alone would allow this: the identifiers and files
         // differ. The outer lease is what owns shared HEAD/index/worktree state.
@@ -3199,8 +3199,7 @@ mod tests {
             "{error}"
         );
 
-        let _ = child.kill();
-        let _ = child.wait();
+        drop(producer);
     }
 
     #[test]
@@ -3214,31 +3213,30 @@ mod tests {
         paths.create().expect("create");
 
         let exe = std::env::current_exe().expect("test binary");
-        let mut child = std::process::Command::new(exe)
-            .args([
-                "--exact",
-                "rundir::tests::lock_child_holds_the_run",
-                "--ignored",
-                "--nocapture",
-            ])
-            .env("UPSTROKE_TEST_LOCK_DIR", &paths.public)
-            .stdout(std::process::Stdio::piped())
-            .spawn()
-            .expect("spawn the second engine");
+        // Adopted, so the child is terminated, reaped and its reader joined
+        // when this scope ends however it ends -- including a panicking
+        // assertion between here and the teardown below.
+        let mut producer = readiness::Producer::adopt(
+            std::process::Command::new(exe)
+                .args([
+                    "--exact",
+                    "rundir::tests::lock_child_holds_the_run",
+                    "--ignored",
+                    "--nocapture",
+                ])
+                .env("UPSTROKE_TEST_LOCK_DIR", &paths.public)
+                .stdout(std::process::Stdio::piped())
+                .spawn()
+                .expect("spawn the second engine"),
+        );
 
         // Wait for it to say it has the lock, rather than sleeping and hoping.
-        let mut out = std::io::BufReader::new(child.stdout.take().expect("stdout"));
-        let mut line = String::new();
-        let deadline = Instant::now() + Duration::from_secs(30);
-        loop {
-            line.clear();
-            let read = std::io::BufRead::read_line(&mut out, &mut line).expect("read");
-            assert!(read > 0, "the child ended without taking the lock");
-            if line.trim() == "held" {
-                break;
-            }
-            assert!(Instant::now() < deadline, "the child never took the lock");
-        }
+        // Producer-aware and effectively bounded, at the bound this test
+        // already used; see `two_run_ids_cannot_drive_one_worktree_concurrently`
+        // for what the loop this replaces could not do.
+        producer
+            .await_line("held", Duration::from_secs(30))
+            .or_fail("the child never took the lock");
 
         let err = RunLock::acquire(&paths.public).expect_err("a second engine must be refused");
         assert!(
@@ -3254,12 +3252,12 @@ mod tests {
         // would pass whatever the lock did.
         #[cfg(unix)]
         assert!(
-            err.to_string().contains(&format!("pid {}", child.id())),
+            err.to_string()
+                .contains(&format!("pid {}", producer.child().id())),
             "the refusal should name the process actually holding it: {err}"
         );
 
-        let _ = child.kill();
-        let _ = child.wait();
+        drop(producer);
     }
 
     #[cfg(unix)]
@@ -5935,29 +5933,28 @@ mod tests {
             "the reader does not return it, which is the point"
         );
 
-        let mut child = std::process::Command::new(std::env::current_exe().expect("test binary"))
-            .args([
-                "--exact",
-                "rundir::tests::cleanup_hold_child",
-                "--ignored",
-                "--nocapture",
-            ])
-            .env("UPSTROKE_TEST_CLEANUP_DIR", &husk)
-            .stdout(std::process::Stdio::piped())
-            .spawn()
-            .expect("spawn the surviving reaper");
-        let mut out = std::io::BufReader::new(child.stdout.take().expect("stdout"));
-        let mut line = String::new();
-        let deadline = Instant::now() + Duration::from_secs(30);
-        loop {
-            line.clear();
-            let read = std::io::BufRead::read_line(&mut out, &mut line).expect("read");
-            assert!(read > 0, "the reaper ended before taking its hold");
-            if line.trim() == "held" {
-                break;
-            }
-            assert!(Instant::now() < deadline, "the reaper never took its hold");
-        }
+        // Adopted, so the child is terminated, reaped and its reader joined
+        // when this scope ends however it ends -- including a panicking
+        // assertion between here and the teardown below.
+        let mut producer = readiness::Producer::adopt(
+            std::process::Command::new(std::env::current_exe().expect("test binary"))
+                .args([
+                    "--exact",
+                    "rundir::tests::cleanup_hold_child",
+                    "--ignored",
+                    "--nocapture",
+                ])
+                .env("UPSTROKE_TEST_CLEANUP_DIR", &husk)
+                .stdout(std::process::Stdio::piped())
+                .spawn()
+                .expect("spawn the surviving reaper"),
+        );
+        // Producer-aware and effectively bounded, at the bound this test
+        // already used; see `two_run_ids_cannot_drive_one_worktree_concurrently`
+        // for what the loop this replaces could not do.
+        producer
+            .await_line("held", Duration::from_secs(30))
+            .or_fail("the reaper never took its hold");
 
         assert!(
             observe_cleanup_hold(&husk, &mut NoHooks),
@@ -5992,8 +5989,7 @@ mod tests {
         let error = RunLock::acquire(&husk).expect_err("the exclusive side is refused");
         assert!(error.to_string().contains("already driving run"), "{error}");
 
-        let _ = child.kill();
-        let _ = child.wait();
+        drop(producer);
 
         // Released with the reaper, by the OS, without anybody resetting it.
         assert!(
