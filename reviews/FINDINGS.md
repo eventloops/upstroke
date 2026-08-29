@@ -3434,12 +3434,12 @@ section.
 ### PR #47 bounded-review residue
 
 The sole review of public head `a36f0890fee71286d213ff61bbd15bd6a1a55eef` was triaged once and its sole
-repair pass committed as `4119612`. Two findings remain genuine blockers after that pass:
+repair pass committed as `4119612`. The owner-authorized final dispositions after that pass are:
 
 | stable ID | disposition | exact residue |
 |---|---|---|
-| `PR47-WINDOWS-TEST-ALLOW-NOT-GOVERNED` | **deferred; required gate red** | The repair's item-level Windows test exception passes Windows Clippy but violates the repository's module-level governed-allow placement rule. The final serialized suite fails `effects::tests::every_allow_of_a_governed_lint_is_module_level_and_in_the_allowlist`; no second repair pass is permitted. |
-| `PR47-PUBLIC-PROCESS-API-REMOVED` | **deferred; compatibility blocker** | The reviewed production APIs remain absent or signature-incompatible. Restoring compatibility was rejected by managed policy during the sole pass, and committing the delivered diff does not make that API break acceptable. Direct post-denial authorization is required before a later repair PR may restore the wrappers. |
+| `PR47-WINDOWS-TEST-ALLOW-NOT-GOVERNED` | **fixed by owner-authorized mechanical exception at `ca2d702`** | The Windows-only test exception is now module-level, carries the required allowlist marker and justification, and is represented in the frozen allowlist fixture. The exact governed-allow and frozen-allowlist witnesses, native and Windows-target Clippy, MSRV, formatting, docs consistency, and PR policy pass. Full-suite and hosted exact-head evidence remain required before merge. |
+| `PR47-PUBLIC-PROCESS-API-REMOVED` | **accepted residual; deferred compatibility concern by owner ruling** | The reviewed production APIs remain absent or signature-incompatible. The owner explicitly accepts the current compatibility-wrapper behavior for this PR and defers the residual concern; the exceptional repair authority is limited to the governed-lint mechanical fix and does not authorize a broader second repair. Preserve this row for a later compatibility-owned slice rather than treating it as a gate blocker for this PR. |
 
 The other review findings are fixed by the delivered pass: Process sites are release-validated and carried
 through termination, and the writable-`Command` export guard is structural rather than spelling-based. This
