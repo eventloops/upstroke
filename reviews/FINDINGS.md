@@ -3417,7 +3417,24 @@ including `test (windows-latest)`, `test (macos-latest)` and all three MSRV legs
 the push after it was held while it executed. Everything past it is this section, the sweep
 record and the stampings it produced.
 
-## 24. 2026-08-29 actionable sweep — process funnel authority
+## 24. 2026-08-29 actionable sweep — workspace registration recovery
+
+This is an append-only disposition of the live §13 workspace-recovery rows, measured from
+integration `ff86d29a72ccc23e0d86c6fadabe2aa198ff46b8`. It does not rewrite their historical
+evidence.
+
+| stable ID | disposition | exact scope and evidence |
+|---|---|---|
+| `PR5-RD-002` | **fixed in this slice** | Recovery now reads registration paths byte-safely, revalidates containment of the base, private root, and every linked-worktree administration directory immediately before removal, binds a target only through an exact valid `gitdir`, and can reclaim the deterministic zero-length-`commondir` case. The final repair additionally rereads identity immediately before locked handling and direct empty-`commondir` admin removal. Mutation witnesses cover exact recovery, pre-mutation refusal, containment, idempotence, and non-UTF-8 Unix paths. |
+| `PR5-RD-003` | **fixed by owner-authorized convergence semantics** | A valid registration with an empty `commondir` is recoverable. A per-registration `gitdir` that is already absent is treated as already-gone forced-cleanup convergence without inferring or deleting an administration directory; Git prune handles its own metadata. A missing whole worktrees store refuses while the checkout target exists, paths must be absolute and normalized, Windows decoding is strict UTF-8, and identity movement immediately before deletion refuses. |
+| `PR7-R3-ATTEMPT-003-RESIDUE-DISCARD-UNREACHED` | **blocked by packet/owner contradiction, no repair applied** | The current packet and tests classify the pre-intent ephemeral commit as Git-owned R27 and require recovery to leave it. Deleting it would contradict that explicit contract. Reclassification requires an owner packet decision. |
+
+The Linux-deterministic registration repair does not claim to resolve the separate controlled-macOS
+errno/process fingerprints. Those remain external-measurement blockers. The implementation commit is
+`2fc8678c6017031f44dce5d76cb47829a0079dae` with sole repair `e35ea2d4b0ce03a983131b196d9eb4a3548758a3`; publication/review/CI evidence is recorded by the PR
+that carries this section.
+
+## 25. 2026-08-29 actionable sweep — process funnel authority
 
 This append-only disposition was measured from integration
 `ff86d29a72ccc23e0d86c6fadabe2aa198ff46b8`. It does not rewrite the historical evidence above.
@@ -3442,5 +3459,4 @@ repair pass committed as `4119612`. The owner-authorized final dispositions afte
 | `PR47-PUBLIC-PROCESS-API-REMOVED` | **accepted residual; deferred compatibility concern by owner ruling** | The reviewed production APIs remain absent or signature-incompatible. The owner explicitly accepts the current compatibility-wrapper behavior for this PR and defers the residual concern; the exceptional repair authority is limited to the governed-lint mechanical fix and does not authorize a broader second repair. Preserve this row for a later compatibility-owned slice rather than treating it as a gate blocker for this PR. |
 
 The other review findings are fixed by the delivered pass: Process sites are release-validated and carried
-through termination, and the writable-`Command` export guard is structural rather than spelling-based. This
-PR must not be readied or merged while either deferred blocker remains.
+through termination, and the writable-`Command` export guard is structural rather than spelling-based.
