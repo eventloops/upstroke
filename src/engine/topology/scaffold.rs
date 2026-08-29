@@ -1319,7 +1319,21 @@ impl Run {
                             reviews: Vec::new(),
                             session_id: Some(RETAINED_SESSION.to_owned()),
                             usage: None,
-                            failure: None,
+                            // **A retained attempt did not succeed.**
+                            // `settle::settle_failed` is the only producer of a
+                            // `Retained` settlement and it is reached on the
+                            // failure path, so production's record always
+                            // carries this. This fixture recorded `failure:
+                            // None` with no reviews — a record every other door
+                            // in the fold calls *successful* — which is the
+                            // shape `check_attempt_finished`'s retained arm now
+                            // refuses.
+                            failure: Some(crate::events::FailureRecord {
+                                kind: crate::ladder::FailureKind::GateFailed,
+                                origin: crate::ladder::FailureOrigin::Worker,
+                                reason: "the scaffold's judged failure".to_owned(),
+                                detail: None,
+                            }),
                         }),
                         settlement: AttemptSettlement::Retained {
                             retained_session: SessionId(RETAINED_SESSION.to_owned()),

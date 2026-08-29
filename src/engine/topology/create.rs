@@ -204,6 +204,31 @@ impl<'a> ProbePair<'a> {
         }
     }
 
+    /// How many invocations this pair has accounted, settled or still running.
+    ///
+    /// **What P4 uses to tell a probe that ran from one that only said it
+    /// did.** Handing a probe a capability cannot make it call one: the trait
+    /// takes `&ShellProbe`/`&AgentProbe` and an implementation is free to
+    /// ignore the argument and execute through an authority of its own, which
+    /// is what `ContainerProbes` did in this tree and what the `6c6cb3d`
+    /// review named. So the obligation is not asserted about the signature —
+    /// it is **checked against the grant**: this count does not move unless
+    /// something was registered into the pair the caller owns, and P4 refuses
+    /// a probe that returns `Ok` without moving it.
+    ///
+    /// Registered rather than completed, so a probe whose process failed still
+    /// counts as having executed through the run's boundary. The question is
+    /// *where* it ran, not whether it succeeded — [`Self::balances`] is the
+    /// separate question of whether what ran was settled.
+    #[must_use]
+    pub fn accounted(&self) -> usize {
+        let ledger = self
+            .ledger
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        ledger.completed() + ledger.cancelled() + ledger.running().len()
+    }
+
     /// Whether every invocation registered into **this** pair settled exactly
     /// once, and no slot pair is still held.
     ///
@@ -268,7 +293,22 @@ impl Runner for AgentProbe<'_> {
     }
 }
 
-pub trait Probes {
+/// Closes [`Probes`] to implementations outside this module.
+///
+/// **A seam whose contract cannot be expressed in its signature is closed
+/// instead.** `Probes` exists so a test can observe the *order* the two probes
+/// run in; what it cannot express is that an implementation must execute
+/// through the capability it is handed, and three attempts to phrase that as a
+/// property of the signature were each refuted. Sealing removes the class of
+/// implementor this module cannot check: the only `impl Probes` anywhere is one
+/// written here or in this module's own tests, where P4's grant check
+/// (`ProbePair::accounted`) is the enforcement and the doubles are read
+/// alongside it.
+mod sealed {
+    pub trait Sealed {}
+}
+
+pub trait Probes: sealed::Sealed {
     /// `runner_policy_sha256` of the policy the probes execute under.
     ///
     /// P4 refuses when this is not the digest the pre-lock checks resolved and
@@ -338,6 +378,8 @@ pub struct RunnerProbes<'a> {
     /// The digest of the policy `runner` executes under.
     pub policy_digest: String,
 }
+
+impl sealed::Sealed for RunnerProbes<'_> {}
 
 impl Probes for RunnerProbes<'_> {
     fn policy_digest(&self) -> &str {
@@ -1644,6 +1686,28 @@ fn p3b_publish_owner_record(
     Ok(OwnerRecordPublished::new(p3a, owner))
 }
 
+/// Whether a probe executed through the pair creation granted it.
+///
+/// INV-23 requires each probe to be "a registered invocation **through the
+/// run's Runner**", and the only thing this module can observe about a probe is
+/// what reached the grant. An unmoved count means the probe ran somewhere else
+/// or ran nothing; both are the same refusal, because both leave the run
+/// uncertified and its closing balance vacuous.
+fn used_the_grant(before: usize, after: usize, what: &str) -> Result<(), UpstrokeError> {
+    if after > before {
+        return Ok(());
+    }
+    Err(UpstrokeError::Refused {
+        message: format!(
+            "pre-flight: {what} returned success and registered nothing into the invocation \
+             ledger and slot pair this run granted it. INV-23 requires each probe to be a \
+             registered invocation through the run's Runner, so a probe that executed \
+             elsewhere — or not at all — certifies nothing about the boundary this run will \
+             spawn into"
+        ),
+    })
+}
+
 /// P4 — the `RunnerPreflight`: **the shell probe, then one probe per recorded
 /// agent**, each a registered invocation.
 ///
@@ -1687,12 +1751,22 @@ fn p4_run_preflight(
     // registers itself through `Registering`, so there is nothing to settle
     // here. The identity is still built here because the *ordinal* is this
     // module's — `recovery_order` (c) puts the shell probe first.
-    // **The capability is built here, from the pair this module owns.** A probe
-    // is handed the boundary rather than its ingredients, so what it registers
-    // into is what the closing balance reads. The shell's boundary carries no
-    // slots: INV-23's non-slotted probe is this one.
+    // **The capability is built here, from the pair this module owns, and its
+    // use is checked.** A probe is handed the boundary rather than its
+    // ingredients — but handing it in cannot make an implementation call it, so
+    // the grant is measured across the call. A probe that returns `Ok` without
+    // registering anything into the pair executed somewhere this run does not
+    // account, and a pre-flight that certifies it publishes a run whose closing
+    // balance is clean because nothing ever used the pair it reads.
+    //
+    // The shell's boundary carries no slots: INV-23's non-slotted probe is this
+    // one.
     let shell_through = request.pair.shell_probe(request.runner);
+    let before = request.pair.accounted();
     if let Err(error) = request.probes.shell(shell_id.clone(), &shell_through) {
+        return Err(p3b.abort(Prefix::P3b, error));
+    }
+    if let Err(error) = used_the_grant(before, request.pair.accounted(), "the shell probe") {
         return Err(p3b.abort(Prefix::P3b, error));
     }
 
@@ -1711,10 +1785,21 @@ fn p4_run_preflight(
     // "one place, so that 'each a registered invocation' is true of a process an
     // adapter built as much as of one this module built". This module was the
     // other place.
-    let agent_through = request.pair.agent_probe(request.runner);
+    // One capability per agent, and one grant check per agent: a single check
+    // over the whole loop would be satisfied by the first agent that ran and
+    // would certify every substituted probe behind it.
     let mut probed = Vec::with_capacity(request.agents.len());
     for agent in request.agents {
+        let agent_through = request.pair.agent_probe(request.runner);
+        let before = request.pair.accounted();
         if let Err(error) = request.probes.agent(agent, &agent_through) {
+            return Err(p3b.abort(Prefix::P3b, error));
+        }
+        if let Err(error) = used_the_grant(
+            before,
+            request.pair.accounted(),
+            &format!("the probe of agent `{agent}`"),
+        ) {
             return Err(p3b.abort(Prefix::P3b, error));
         }
         probed.push(agent.clone());

@@ -661,15 +661,13 @@ impl AttemptRecord {
         self.failure.is_none() && self.reviews.iter().all(|pass| pass.outcome.passed())
     }
 
-    // **There is deliberately no `is_failed`.** It was added as the
-    // complement of the predicate above and never acquired a caller, and the
-    // caller it was waiting for is the fold's `Retained` arm — which does not
-    // want it. A retained attempt is *unsettled*: the generation stays open and
-    // the next attempt resumes the same session, so its record makes no success
-    // claim and no terminal-failure claim, and asking it to say "failed" would
-    // be requiring an outcome the settlement does not record. The `Closed` arm
-    // asks `is_successful()` directly, which is the question that arm is
-    // actually asking.
+    // **There is deliberately no `is_failed`.** It was added as the complement
+    // of the predicate above and never acquired a caller anywhere in the tree.
+    // Every reader of this question is asking whether a record *claims success*
+    // — `check_candidate_prepared`, and both arms of `check_attempt_finished` —
+    // and each asks [`Self::is_successful`] directly, which is the question it
+    // is actually asking. A named complement would put the same predicate under
+    // two spellings, which is how two readers of one rule begin to disagree.
 
     /// Total review spend for this attempt, or `None` when nothing reported any
     /// — which is not the same as nothing costing anything (§13: the Copilot

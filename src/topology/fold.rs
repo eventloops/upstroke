@@ -2018,6 +2018,53 @@ impl RunState {
                         expected: finished.attempt.0.to_string(),
                     });
                 }
+                // **And the record does not claim the attempt succeeded.**
+                // `candidate_prepared` is the sole successful settlement
+                // (INV-07,
+                // `decisions/2026-08-12-merge-queue-execution-topology.md`),
+                // and the `Closed` arm has enforced that against the record
+                // since round 6. This arm did not, so the invariant held on one
+                // path through the door and not the other: a current-epoch
+                // retained settlement could carry a record with no failure and
+                // every configured pass green — a record
+                // `check_candidate_prepared` would itself accept — while the
+                // fold held the generation open for a retry. The ledger line an
+                // operator reads would say the work passed.
+                //
+                // **This is not a terminal-failure requirement, and the
+                // difference is the whole of the earlier hesitation.**
+                // `settle::settle_failed` is the only producer of a `Retained`
+                // settlement and it is reached on the failure path, for a
+                // same-rung retry that has a session to resume — so a retained
+                // attempt has not succeeded, by construction. Asking
+                // `!is_successful()` is the record saying that much and no
+                // more: `Retained` carries no transition, so nothing here makes
+                // the generation terminal, and the arm goes on to leave it open
+                // with its lease held.
+                //
+                // One predicate, both arms, as the candidate door and the
+                // closed settlement already share it — a door is not fixed
+                // until every arm through it asks the same question.
+                if finished.record.is_successful() {
+                    return Err(FoldError::InconsistentRecord {
+                        kind: KIND,
+                        detail: format!(
+                            "attempt {} of generation {} retains its session for a further \
+                             attempt and its record says the attempt succeeded — failure {:?}, \
+                             review outcomes {:?} — and `candidate_prepared` is the settlement \
+                             of an attempt that succeeded",
+                            finished.attempt.0,
+                            finished.generation.0,
+                            finished.record.failure.as_ref().map(|failure| failure.kind),
+                            finished
+                                .record
+                                .reviews
+                                .iter()
+                                .map(|pass| pass.outcome)
+                                .collect::<Vec<_>>()
+                        ),
+                    });
+                }
                 // **And the record names the conversation the settlement
                 // keeps.** A `Retained` settlement exists to hold a session for
                 // a same-session retry, and `check_attempt_started` will make
@@ -2026,18 +2073,6 @@ impl RunState {
                 // or none, then the two halves of one event disagree about
                 // which conversation was left open, and the half a person reads
                 // is not the half the fold enforces.
-                //
-                // **What this arm deliberately does not ask.** The `Closed`
-                // arm requires `!is_successful()` — "the record must say the
-                // attempt failed" — because a closed generation has reached a
-                // terminal outcome and the record is that outcome's ledger
-                // line. A retained attempt is *unsettled*: the generation
-                // stays open, the lease stays taken, and the next attempt
-                // resumes the same conversation. So a retained record makes no
-                // success claim and no terminal-failure claim, and requiring
-                // either would be manufacturing a claim the settlement does not
-                // make. `AttemptRecord::is_failed` existed for a caller this
-                // arm would have been; it is deleted rather than given one.
                 if finished.record.session_id.as_deref() != Some(retained_session.0.as_str()) {
                     return Err(FoldError::InconsistentRecord {
                         kind: KIND,
@@ -5374,74 +5409,123 @@ mod tests {
         assert!(matches!(generation.class, GenerationClass::InFlight { .. }));
     }
 
-    /// **A retained settlement makes no success claim and no terminal-failure
-    /// claim, and the arm does not require either.**
+    /// One arm of the settlement door: a label and a builder for the
+    /// settlement that reaches it.
+    type SettlementArm = (&'static str, fn() -> AttemptSettlement);
+
+    /// **No settlement of `attempt_finished` accepts a record that claims the
+    /// attempt succeeded — on either arm.**
     ///
-    /// This is the design decision the row named as the repair's first, and it
-    /// is not a mechanical one. The `Closed` arm requires `!is_successful()` —
-    /// "the record must say the attempt failed" — because a closed generation
-    /// reached a terminal outcome and its record is that outcome's ledger line.
-    /// A retained attempt is *unsettled*: the generation stays open, the lease
-    /// stays taken, and the next attempt resumes the same conversation. So the
-    /// answer taken here is that a retained record makes **no** success claim,
-    /// and `AttemptRecord::is_failed` — which had no caller anywhere in the
-    /// tree, and whose only plausible caller was this arm — is deleted rather
-    /// than given one.
+    /// The sibling-arm witness. `candidate_prepared` is the sole successful
+    /// settlement (INV-07,
+    /// `decisions/2026-08-12-merge-queue-execution-topology.md`), and the
+    /// `Closed` arm has enforced that against the record since round 6. The
+    /// `Retained` arm did not, so the invariant held on one path through the
+    /// door and not the other: a retained settlement could carry a record with
+    /// no failure and every configured pass green — a record
+    /// `check_candidate_prepared` would itself accept — and the ledger line an
+    /// operator reads would say the work passed while the fold held the
+    /// generation open for a retry.
     ///
-    /// Written as a test because "the arm does not require a failure" is
-    /// otherwise a claim about absent code, which nothing would notice being
-    /// added. A record with no failure and every configured pass green — the
-    /// shape both other doors call successful — is accepted here.
+    /// **What "retained" means, and why requiring this is not requiring a
+    /// terminal failure.** `settle_failed` is the only producer of a `Retained`
+    /// settlement: it is reached on the failure path, for a same-rung retry
+    /// that has a session to resume. So a retained attempt has *not* succeeded,
+    /// by construction. `is_successful()` being false is the record saying that
+    /// much and no more — it does not require a `Failed` transition, which
+    /// `Retained` has no field for, and it does not make the generation
+    /// terminal.
+    ///
+    /// Driven over the identical record on both arms, because the claim is that
+    /// the two agree rather than that each refuses something.
     #[test]
-    fn a_retained_settlement_neither_claims_nor_denies_an_outcome() {
+    fn no_attempt_finished_arm_accepts_a_record_that_claims_success() {
         let base = sha("base");
         let session = "sess-ÜNI-unsettled";
+
+        // The one shape both arms must refuse: no failure, and the frozen
+        // obligation all green — which is exactly what `candidate_prepared`
+        // requires of the settlement that *is* a success.
+        let claims_success = |event: &mut TopologyEvent| {
+            let TopologyEventBody::AttemptFinished { data } = &mut event.body else {
+                unreachable!("built as an attempt_finished")
+            };
+            data.record.failure = None;
+            data.record.reviews = vec![review_pass("review", ReviewPassOutcome::Passed)];
+            assert!(
+                data.record.is_successful(),
+                "the fixture is not the successful shape"
+            );
+        };
+
+        let arms: Vec<SettlementArm> = vec![
+            ("retained", || AttemptSettlement::Retained {
+                retained_session: SessionId("sess-ÜNI-unsettled".to_owned()),
+                retained_incarnation: Epoch(0),
+            }),
+            ("closed", || AttemptSettlement::Closed {
+                transition: SettlementTransition::Retry,
+                lease: LeaseDisposition::PredictedReleased,
+            }),
+        ];
+
+        for (label, settlement) in arms {
+            let mut fold = started();
+            apply(&mut fold, &dispatch(ZETA, 0, &base));
+            let start = attempt_started(&fold, ZETA, 0, 1, 0);
+            apply(&mut fold, &start);
+
+            // The premise: with a record that does not claim success, this
+            // exact settlement applies — so the refusal below is about the
+            // claim and nothing else.
+            accepts(&fold, &settle(ZETA, 0, 1, settlement()));
+
+            let mut lying = settle(ZETA, 0, 1, settlement());
+            claims_success(&mut lying);
+            let error = refuse(&fold, &lying);
+            assert!(
+                matches!(error, FoldError::InconsistentRecord { .. }),
+                "{label}: a record claiming success settled an attempt: {error:?}"
+            );
+
+            // Nothing moved.
+            let generation = fold
+                .task(ZETA)
+                .and_then(|task| task.generations.first())
+                .expect("the generation is open");
+            assert!(
+                matches!(generation.class, GenerationClass::InFlight { .. }),
+                "{label}: the refused settlement moved the generation anyway"
+            );
+
+            // **And the predicate is the shared one, not half of it.** A record
+            // whose failure field is empty and whose configured pass came back
+            // `Failed` makes no success claim — §11.2's "every configured pass
+            // passes" is the other half of `is_successful`, and it is the half
+            // an arm re-deriving the question from `failure.is_none()` would
+            // lose. Both arms take this record.
+            let mut judged = settle(ZETA, 0, 1, settlement());
+            let TopologyEventBody::AttemptFinished { data } = &mut judged.body else {
+                unreachable!("built as an attempt_finished")
+            };
+            data.record.failure = None;
+            data.record.reviews = vec![review_pass("review", ReviewPassOutcome::Failed)];
+            assert!(
+                !data.record.is_successful(),
+                "{label}: the fixture claims success after all"
+            );
+            accepts(&fold, &judged);
+        }
+
+        // And the door that *does* take a successful record still takes it, so
+        // this narrows `attempt_finished` rather than closing success off
+        // altogether.
         let mut fold = started();
         apply(&mut fold, &dispatch(ZETA, 0, &base));
         let start = attempt_started(&fold, ZETA, 0, 1, 0);
         apply(&mut fold, &start);
-
-        for (label, failure) in [
-            ("a judged failure", true),
-            // The shape `scaffold.rs` emits, and the shape the `Closed` arm
-            // refuses: no failure, and the frozen obligation all green.
-            ("no failure at all", false),
-        ] {
-            let mut event = retain(ZETA, 1, session, Epoch(0));
-            let TopologyEventBody::AttemptFinished { data } = &mut event.body else {
-                unreachable!("built as an attempt_finished")
-            };
-            if !failure {
-                data.record.failure = None;
-                data.record.reviews = vec![review_pass("review", ReviewPassOutcome::Passed)];
-                assert!(
-                    data.record.is_successful(),
-                    "{label}: the premise is not the shape the other doors call successful"
-                );
-            }
-            accepts(&fold, &event);
-        }
-
-        // The same record, settled `Closed`, **is** refused — so the acceptance
-        // above is this arm's answer and not a check that stopped working.
-        let mut closed = settle(
-            ZETA,
-            0,
-            1,
-            AttemptSettlement::Closed {
-                transition: SettlementTransition::Retry,
-                lease: LeaseDisposition::PredictedReleased,
-            },
-        );
-        let TopologyEventBody::AttemptFinished { data } = &mut closed.body else {
-            unreachable!("built as an attempt_finished")
-        };
-        data.record.failure = None;
-        data.record.reviews = vec![review_pass("review", ReviewPassOutcome::Passed)];
-        assert!(
-            matches!(refuse(&fold, &closed), FoldError::InconsistentRecord { .. }),
-            "the Closed arm stopped requiring the record to say the attempt failed"
-        );
+        accepts(&fold, &candidate_prepared(ZETA, 0, &base));
+        let _ = session;
     }
 
     /// **What a Retained settlement does to the run: pipeline released, lease
@@ -12558,6 +12642,19 @@ mod tests {
                     moved.record.session_id = Some("sess-somebody-elses".to_owned());
                     case(
                         "record.session_id",
+                        TopologyEventBody::AttemptFinished { data: moved },
+                    );
+                }
+                // A retained record turned into one that claims the attempt
+                // succeeded. Both arms refuse this shape; only the `Closed` one
+                // did before, so a hostile log could carry it past the door on
+                // the retained path.
+                let mut moved = data.clone();
+                if matches!(moved.settlement, AttemptSettlement::Retained { .. }) {
+                    moved.record.failure = None;
+                    moved.record.reviews = vec![review_pass("review", ReviewPassOutcome::Passed)];
+                    case(
+                        "record.claims-success",
                         TopologyEventBody::AttemptFinished { data: moved },
                     );
                 }
