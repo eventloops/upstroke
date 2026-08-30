@@ -151,9 +151,25 @@ pub const USED_GOVERNED_LINTS: &[&str] = &[
 ///
 /// `clippy::disallowed_methods` and `disallowed_methods` are the same lint;
 /// `clippy::too_many_arguments` is not governed and answers `None`.
+///
+/// **And `clippy::r#disallowed_methods` is the same lint too.** `PR74-GOVERNED\
+/// -LINT-TOKEN-001`: this took the last `::` segment verbatim, so a raw
+/// identifier -- which rustc accepts anywhere an identifier goes, and means the
+/// identifier it spells -- was a different name here and the lint went
+/// unrecognised in both readers. Measured: `#![allow(clippy::r#disallowed_\
+/// methods)]` suppresses the lint, and this answered `None` for it.
+///
+/// The segment must be a whole identifier and nothing else. `disallowed_\
+/// methods_extra` is a different lint, `rr#disallowed_methods` opens no raw
+/// identifier, and a segment with anything trailing it is not a lint name this
+/// reader will guess at.
 #[must_use]
 pub fn normalize_lint(entry: &str) -> Option<&'static str> {
-    let bare = entry.trim().rsplit("::").next()?.trim();
+    let segment = entry.trim().rsplit("::").next()?.trim();
+    let (bare, end) = identifier_token(segment, 0)?;
+    if end != segment.len() {
+        return None;
+    }
     GOVERNED_LINTS.iter().copied().find(|name| *name == bare)
 }
 
@@ -703,36 +719,25 @@ pub fn governed_allows(source: &str) -> Vec<GovernedAllow> {
         let mut keywords: Vec<&'static str> = Vec::new();
         let mut reasoned = false;
         for keyword in ["allow", "expect"] {
-            let mut at = 0;
-            while let Some(hit) = attribute[at..].find(keyword) {
-                let start = at + hit;
-                let after = start + keyword.len();
-                let is_word_start = start == 0
-                    || !attribute.as_bytes()[start - 1].is_ascii_alphanumeric()
-                        && attribute.as_bytes()[start - 1] != b'_';
-                if is_word_start && attribute.as_bytes().get(after) == Some(&b'(') {
-                    if let Some(end) = matching(attribute.as_bytes(), after, b'(', b')') {
-                        let before = lints.len();
-                        for entry in attribute[after + 1..end].split(',') {
-                            let entry = entry.trim();
-                            if entry.is_empty() {
-                                continue;
-                            }
-                            if entry.starts_with("reason") {
-                                reasoned = true;
-                                continue;
-                            }
-                            written.push(entry.to_owned());
-                            if let Some(name) = normalize_lint(entry) {
-                                lints.push(name.to_owned());
-                            }
-                        }
-                        if lints.len() > before && !keywords.contains(&keyword) {
-                            keywords.push(keyword);
-                        }
+            for group in calls_named(attribute, keyword) {
+                let before = lints.len();
+                for entry in group.split(',') {
+                    let entry = entry.trim();
+                    if entry.is_empty() {
+                        continue;
+                    }
+                    if entry.starts_with("reason") {
+                        reasoned = true;
+                        continue;
+                    }
+                    written.push(entry.to_owned());
+                    if let Some(name) = normalize_lint(entry) {
+                        lints.push(name.to_owned());
                     }
                 }
-                at = after;
+                if lints.len() > before && !keywords.contains(&keyword) {
+                    keywords.push(keyword);
+                }
             }
         }
         if !lints.is_empty() {
@@ -749,6 +754,96 @@ pub fn governed_allows(source: &str) -> Vec<GovernedAllow> {
         i = close + 1;
     }
     found
+}
+
+/// The contents of every `keyword(…)` call in `text`, left to right.
+///
+/// `PR74-GOVERNED-LINT-TOKEN-001`. This used to be a substring search that
+/// required the **very next byte** after the keyword to be `(`. Rust requires
+/// no such thing: `allow (…)`, `allow /* why */ (…)` and the same across a line
+/// break are ordinary attributes, and every one of them was invisible to
+/// [`governed_allows`] -- so a file could allow a governed lint with no
+/// `effects/allowlist.toml` row and no census would say so.
+///
+/// So the scan walks **tokens**. An identifier is read whole, which is also
+/// what makes `allowance(…)` a call named `allowance` rather than a hit on
+/// `allow` -- the old code needed a hand-written word-boundary test for that,
+/// and this needs none. A raw identifier is the identifier it spells, so
+/// `r#allow(…)` is found here exactly as `allow(…)` is.
+///
+/// **Fail closed.** A `keyword(` whose parenthesis never closes cannot be
+/// resolved, and the rest of the attribute is taken as its contents rather than
+/// dropped: an allowance nobody can parse is not an allowance nobody has. Such
+/// a file does not compile, so the arm is unreachable from a green tree -- it
+/// exists so that the unreadable case is loud instead of absent.
+fn calls_named<'a>(text: &'a str, keyword: &str) -> Vec<&'a str> {
+    let bytes = text.as_bytes();
+    let mut groups = Vec::new();
+    let mut at = 0;
+    while at < bytes.len() {
+        let Some((name, after)) = identifier_token(text, at) else {
+            at += 1;
+            continue;
+        };
+        at = after;
+        if name != keyword {
+            continue;
+        }
+        let open = skip_blank(bytes, after);
+        if bytes.get(open) != Some(&b'(') {
+            continue;
+        }
+        let close = matching(bytes, open, b'(', b')').unwrap_or(bytes.len());
+        groups.push(&text[open + 1..close]);
+        at = close.saturating_add(1).max(open + 1);
+    }
+    groups
+}
+
+/// The identifier token at `at`, normalised, and the index just past it.
+///
+/// A raw identifier is the identifier it spells -- `r#allow` is `allow` and
+/// `r#disallowed_methods` is `disallowed_methods`, measured against
+/// `clippy-driver` rather than assumed -- so the `r#` is consumed here instead
+/// of being left for a comparison downstream to trip over.
+///
+/// `None` when `at` does not open an identifier at all, `r#` included: `r#`
+/// followed by nothing an identifier may start with is not a token, and a
+/// caller that cannot tokenise an attribute treats it as unreadable rather than
+/// as saying nothing. ASCII, like every other scan in this file; a lint name is
+/// ASCII and a non-ASCII head answers `None`, which is the closed direction.
+fn identifier_token(text: &str, at: usize) -> Option<(&str, usize)> {
+    let bytes = text.as_bytes();
+    let start = if bytes.get(at) == Some(&b'r') && bytes.get(at + 1) == Some(&b'#') {
+        at + 2
+    } else {
+        at
+    };
+    if !bytes
+        .get(start)
+        .is_some_and(|byte| byte.is_ascii_alphabetic() || *byte == b'_')
+    {
+        return None;
+    }
+    let mut end = start + 1;
+    while bytes
+        .get(end)
+        .is_some_and(|byte| byte.is_ascii_alphanumeric() || *byte == b'_')
+    {
+        end += 1;
+    }
+    Some((&text[start..end], end))
+}
+
+/// The first index at or after `at` that is not whitespace.
+///
+/// Comments are spaces by the time either reader runs, so this is the whole of
+/// what may separate an attribute's name from its delimiter.
+fn skip_blank(bytes: &[u8], mut at: usize) -> usize {
+    while bytes.get(at).is_some_and(u8::is_ascii_whitespace) {
+        at += 1;
+    }
+    at
 }
 
 /// The index of the bracket closing the one at `open`, or `None`.
@@ -3131,13 +3226,9 @@ pub(crate) mod lint_levels {
     /// replaced.
     fn split_call(text: &str) -> Option<(&str, &str)> {
         let text = text.trim();
-        let open = text.find('(')?;
-        let head = text[..open].trim_end();
-        if head.is_empty()
-            || !head
-                .bytes()
-                .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
-        {
+        let (head, after) = super::identifier_token(text, 0)?;
+        let open = super::skip_blank(text.as_bytes(), after);
+        if text.as_bytes().get(open) != Some(&b'(') {
             return None;
         }
         let close = super::matching(text.as_bytes(), open, b'(', b')')?;

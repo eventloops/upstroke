@@ -4116,6 +4116,32 @@ fn the_file_level_lint_reader_is_a_census_instrument_and_not_a_shipped_api() {
          holds is a helper and stays private"
     );
 
+    // **`PR74-GOVERNED-LINT-TOKEN-001`'s tokeniser is private.** Its helpers
+    // cannot be `#[cfg(test)]` the way the level reader's are: `governed_allows`
+    // is a `pub fn` OF THE PRODUCTION REGION and calls them, so a gated helper
+    // would not compile. The claim that is available is the other half of
+    // `PR72-API-001` — they add no name to `upstroke::effects` — and it is read
+    // structurally rather than promised. `matching` is in the list as the
+    // precedent: the class is "private structural helper of this file", and it
+    // had one before this repair added three.
+    for helper in [
+        "fn calls_named",
+        "fn identifier_token",
+        "fn skip_blank",
+        "fn matching",
+    ] {
+        assert!(
+            blank_comments_and_strings(&source).contains(helper),
+            "`{helper}` is not in src/effects.rs at all, so the claim below is vacuous"
+        );
+        for visibility in ["pub ", "pub(crate) ", "pub(super) ", "pub(in "] {
+            assert!(
+                !blank_comments_and_strings(&source).contains(&format!("{visibility}{helper}")),
+                "`{helper}` is declared `{visibility}`, which puts a scan nothing outside this                  file runs on the crate's surface"
+            );
+        }
+    }
+
     // The instrument still answers where it is used, so narrowing it did not
     // narrow it out of existence — under both spellings of a line ending.
     for prologue in [
@@ -4850,6 +4876,334 @@ fn the_file_level_lint_reader_refuses_a_condition_it_cannot_prove() {
         assert_eq!(found[0].lints, ["disallowed_methods"], "{prologue:?}");
         assert!(found[0].inner, "{prologue:?}");
     }
+
+    let _ = fs::remove_dir_all(&scratch);
+}
+
+/// **Both governed-lint readers consume tokens**, and a raw identifier is the
+/// identifier it spells.
+///
+/// `PR74-GOVERNED-LINT-TOKEN-001`. Two readers decide whether a file has
+/// allowed a governed lint, and both decided it by looking at bytes rather than
+/// at tokens:
+///
+/// * [`governed_allows`] found the keyword and then required the **very next
+///   byte** to be `(`. Rust does not: `#![allow /* why */ (clippy::…)]` and the
+///   same attribute with a newline before its parenthesis are ordinary
+///   attributes, and both were invisible to the placement census — so a file
+///   could allow a governed lint with no `effects/allowlist.toml` row and
+///   nothing would say so.
+/// * [`normalize_lint`] took the last `::` segment verbatim, so
+///   `clippy::r#disallowed_methods` was not `clippy::disallowed_methods`. A raw
+///   identifier is the same identifier to rustc — it exists so a keyword can be
+///   used as a name and applies to any identifier at all — so that spelling is
+///   the governed lint, allowed or denied, and neither reader saw it.
+///
+/// The consequence is the one `PR57-FINAL-001` was about, reached by a
+/// different route: a prologue that denies the lint and then takes it back in a
+/// spelling the reader cannot see reads as a denial. Section (1) compiles both
+/// such prologues and they **build clean** — the denied `std::fs::write` really
+/// does slip.
+///
+/// # Nothing here is asserted from a rule
+///
+/// Section (1) is the same `clippy-driver` oracle
+/// [`the_file_level_lint_reader_answers_what_rustc_does`] uses, so the claim
+/// "this spelling means that" is the compiler's and not this file's. Section
+/// (2) drives the placement reader over the same spellings; section (3) is the
+/// negative half, where a near-miss must NOT be taken for the lint; section (4)
+/// is the fail-closed arm.
+#[test]
+fn the_governed_lint_readers_consume_tokens_and_normalise_raw_identifiers() {
+    use crate::effects::lint_levels::{Resolution, file_level_lint_resolution};
+
+    const BODY: &str = "pub fn go(p: &std::path::Path) { let _ = std::fs::write(p, \"x\"); }\n";
+    const LINT: &str = "clippy::disallowed_methods";
+
+    /// What the compiler must have done, if the reader's answer is right.
+    fn predict(resolution: Resolution) -> (bool, Vec<&'static str>, bool) {
+        assert!(
+            !resolution.ambiguous,
+            "every spelling in this table is one rustc accepts, so refusing it is not the \
+             fail-closed answer -- it is the reader still unable to read a token"
+        );
+        if resolution.refused_downgrade {
+            return (false, Vec::new(), true);
+        }
+        match resolution.level {
+            Some("allow" | "expect") => (true, Vec::new(), false),
+            None | Some("warn") => (true, vec!["warning"], false),
+            Some("deny" | "forbid") => (false, vec!["error"], false),
+            other => panic!("the reader answered `{other:?}`, which nothing predicts"),
+        }
+    }
+
+    let scratch = scratch_dir("lint-tokens");
+
+    // -----------------------------------------------------------------
+    // (1) Every spelling, measured. A row says only how it is written; the
+    // compiler says what it means and the reader has to agree.
+    // -----------------------------------------------------------------
+    let table: &[(&str, &str)] = &[
+        // The lint path, raw. `r#` on the lint segment, on the tool segment,
+        // and on a bare unqualified name.
+        (
+            "raw_lint_segment_allow",
+            "#![allow(clippy::r#disallowed_methods)]\n",
+        ),
+        (
+            "raw_lint_segment_deny",
+            "#![deny(clippy::r#disallowed_methods)]\n",
+        ),
+        (
+            "raw_tool_segment_allow",
+            "#![allow(r#clippy::disallowed_methods)]\n",
+        ),
+        ("raw_bare_lint_allow", "#![allow(r#disallowed_methods)]\n"),
+        // The attribute's own name, raw.
+        (
+            "raw_attribute_name_allow",
+            "#![r#allow(clippy::disallowed_methods)]\n",
+        ),
+        (
+            "raw_attribute_name_deny",
+            "#![r#deny(clippy::disallowed_methods)]\n",
+        ),
+        // The delimiter, not adjacent. A comment is blanked to spaces before
+        // either reader sees it, so this row and the next are the same claim
+        // written the two ways a file actually carries it.
+        (
+            "comment_before_delimiter",
+            "#![allow /* why not */ (clippy::disallowed_methods)]\n",
+        ),
+        (
+            "newline_before_delimiter",
+            "#![allow\n    (clippy::disallowed_methods)]\n",
+        ),
+        (
+            "comment_before_delimiter_deny",
+            "#![deny /* why */ (clippy::disallowed_methods)]\n",
+        ),
+        // The conditional forms, which is where the two repairs meet.
+        (
+            "cfg_attr_comment_before_delimiter",
+            "#![cfg_attr /* c */ (all(), deny(clippy::disallowed_methods))]\n",
+        ),
+        (
+            "cfg_attr_raw_lint",
+            "#![cfg_attr(all(), deny(clippy::r#disallowed_methods))]\n",
+        ),
+        (
+            "cfg_attr_raw_inner_level",
+            "#![cfg_attr(all(), r#deny(clippy::disallowed_methods))]\n",
+        ),
+        (
+            "raw_cfg_attr_name",
+            "#![r#cfg_attr(all(), deny(clippy::disallowed_methods))]\n",
+        ),
+        // A raw identifier in the CONDITION. `r#all` is `all`, so this is the
+        // proven-true predicate and the deny counts.
+        (
+            "raw_cfg_predicate",
+            "#![cfg_attr(r#all(), deny(clippy::disallowed_methods))]\n",
+        ),
+        // **THE TWO SLIPS.** A denial taken back in a spelling the reader could
+        // not see. Both build clean, so the effect is not denied at all.
+        (
+            "slip_by_raw_identifier",
+            "#![deny(clippy::disallowed_methods)]\n\
+             #![allow(clippy::r#disallowed_methods)]\n",
+        ),
+        (
+            "slip_by_comment_before_delimiter",
+            "#![deny(clippy::disallowed_methods)]\n\
+             #![allow /* taken back */ (clippy::disallowed_methods)]\n",
+        ),
+    ];
+
+    let mut observed_shapes: BTreeSet<(bool, Vec<String>, bool)> = BTreeSet::new();
+    for (tag, prologue) in table {
+        let source = format!("{prologue}{BODY}");
+        let resolution = file_level_lint_resolution(&source, LINT);
+        let (built, diagnostics) = compile_prologue_probe(&scratch, tag, &source);
+        let fired: Vec<String> = diagnostics
+            .iter()
+            .filter(|(_, code)| code == LINT)
+            .map(|(level, _)| level.clone())
+            .collect();
+        let rejected = diagnostics.iter().any(|(_, code)| code == "E0453");
+        let (wants_build, wants_fired, wants_rejected) = predict(resolution);
+        assert_eq!(
+            (built, fired.clone(), rejected),
+            (
+                wants_build,
+                wants_fired
+                    .iter()
+                    .map(|level| (*level).to_owned())
+                    .collect(),
+                wants_rejected
+            ),
+            "`{tag}` — the reader answered {resolution:?} and clippy-driver did something else: \
+             built={built} fired={fired:?} E0453={rejected}; all diagnostics {diagnostics:?}"
+        );
+        observed_shapes.insert((built, fired, rejected));
+
+        assert_eq!(
+            file_level_lint_resolution(&source.replace('\n', "\r\n"), LINT),
+            resolution,
+            "`{tag}` reads differently under CRLF"
+        );
+    }
+    assert!(
+        observed_shapes.len() >= 2,
+        "every spelling produced the same compiler outcome, so the table cannot separate a \
+         reader that sees them from one that does not: {observed_shapes:?}"
+    );
+
+    // -----------------------------------------------------------------
+    // (2) The placement reader sees them too, and REFUSES them where the
+    // census refuses. `mechanism` (2) permits an allowance "only as
+    // module-level attributes in files listed in effects/allowlist.toml", and
+    // `every_allow_of_a_governed_lint_is_module_level_and_in_the_allowlist`
+    // enforces both halves off this scan: an allow it cannot see is an allow
+    // that needs no row and may sit anywhere at all.
+    // -----------------------------------------------------------------
+    for (tag, attribute) in [
+        ("raw_lint_segment", "allow(clippy::r#disallowed_methods)"),
+        ("raw_tool_segment", "allow(r#clippy::disallowed_methods)"),
+        ("raw_bare_lint", "allow(r#disallowed_methods)"),
+        ("raw_attribute_name", "r#allow(clippy::disallowed_methods)"),
+        (
+            "comment_before_delimiter",
+            "allow /* why */ (clippy::disallowed_methods)",
+        ),
+        (
+            "newline_before_delimiter",
+            "allow\n    (clippy::disallowed_methods)",
+        ),
+        (
+            "raw_expect",
+            "r#expect(clippy::r#disallowed_methods, reason = \"r\")",
+        ),
+        (
+            "conditional_raw",
+            "cfg_attr(windows, allow(clippy::r#disallowed_methods))",
+        ),
+    ] {
+        // Module level: the scan must find it, so the file needs a row.
+        let inner = format!("#![{attribute}]\n{BODY}");
+        let found = governed_allows(&inner);
+        assert_eq!(
+            found.len(),
+            1,
+            "`{tag}` at module level is invisible to the placement census, so a file may allow \
+             a governed lint with no {ALLOWLIST_TOML} row"
+        );
+        assert_eq!(found[0].lints, ["disallowed_methods"], "`{tag}`");
+        assert!(found[0].inner && found[0].module_level, "`{tag}`");
+
+        // Below module level: found, and reported as NOT module level, which is
+        // the value the census refuses on.
+        let on_a_function = format!("#[{attribute}]\npub fn reaches() {{}}\n{BODY}");
+        let found = governed_allows(&on_a_function);
+        assert_eq!(found.len(), 1, "`{tag}` on a function is invisible");
+        assert!(
+            !found[0].module_level,
+            "`{tag}` on a function reads as module-level, so the placement rule admits it"
+        );
+    }
+
+    // -----------------------------------------------------------------
+    // (3) The negative half. A near-miss is not the lint, and a spelling that
+    // only looks like one governs nothing — otherwise section (2) would be
+    // satisfied by a reader that answered "yes" to everything.
+    // -----------------------------------------------------------------
+    for (tag, source) in [
+        // A longer name that ends in the lint's, and one that begins with it.
+        (
+            "longer_name",
+            "#![allow(clippy::disallowed_methods_extra)]\n",
+        ),
+        (
+            "prefixed_name",
+            "#![allow(clippy::not_disallowed_methods)]\n",
+        ),
+        // `r#` is a prefix of the token, not a substring of it.
+        ("double_r", "#![allow(clippy::rr#disallowed_methods)]\n"),
+        // A different governed lint is a different lint.
+        ("another_governed", "#![allow(clippy::disallowed_types)]\n"),
+        // The keyword is part of a longer identifier.
+        (
+            "keyword_inside_a_word",
+            "#![allowance(clippy::disallowed_methods)]\n",
+        ),
+        // And the two decoys the blanking exists for, in the token reader's
+        // own terms: a raw spelling in prose and in a string literal.
+        (
+            "raw_in_prose",
+            "//! `#![allow(clippy::r#disallowed_methods)]`\n",
+        ),
+        (
+            "raw_in_a_string",
+            "pub const S: &str = \"#![allow(clippy::r#disallowed_methods)]\";\n",
+        ),
+    ] {
+        let found = governed_allows(&format!("{source}{BODY}"));
+        assert!(
+            found
+                .iter()
+                .all(|allow| !allow.lints.iter().any(|lint| lint == "disallowed_methods")),
+            "`{tag}` was taken for an allow of `disallowed_methods`: {found:#?}"
+        );
+    }
+    // The near-misses are near: the reader answers `None` for them and `Some`
+    // for the real thing, so section (3) is not passing because the fixtures
+    // are unreadable.
+    assert_eq!(
+        normalize_lint("clippy::r#disallowed_methods"),
+        Some("disallowed_methods")
+    );
+    assert_eq!(
+        normalize_lint("r#disallowed_methods"),
+        Some("disallowed_methods")
+    );
+    assert_eq!(normalize_lint("clippy::disallowed_methods_extra"), None);
+    assert_eq!(normalize_lint("clippy::rr#disallowed_methods"), None);
+    assert_eq!(normalize_lint("r#"), None);
+
+    // -----------------------------------------------------------------
+    // (4) Fail closed on syntax neither reader can resolve. An `allow(` whose
+    // parenthesis never closes is not a file that compiles, and the answer that
+    // matters is that it is not silently read as carrying no allowance.
+    // -----------------------------------------------------------------
+    let unbalanced = format!("#![allow(clippy::disallowed_methods]\n{BODY}");
+    let found = governed_allows(&unbalanced);
+    assert_eq!(
+        found.len(),
+        1,
+        "an unresolvable `allow(` was dropped rather than reported: {found:#?}"
+    );
+    assert_eq!(found[0].lints, ["disallowed_methods"]);
+    // The level reader refuses it rather than answering a level.
+    assert_eq!(
+        file_level_lint_resolution(&unbalanced, LINT),
+        Resolution {
+            level: None,
+            refused_downgrade: false,
+            ambiguous: true,
+        },
+        "an unresolvable attribute must be a refusal"
+    );
+    // And a raw identifier that is not one refuses too.
+    assert_eq!(
+        file_level_lint_resolution(&format!("#![r#(clippy::disallowed_methods)]\n{BODY}"), LINT),
+        Resolution {
+            level: None,
+            refused_downgrade: false,
+            ambiguous: true,
+        },
+        "`r#` opening no identifier must be a refusal"
+    );
 
     let _ = fs::remove_dir_all(&scratch);
 }
