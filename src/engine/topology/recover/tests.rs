@@ -4317,7 +4317,7 @@ fn the_barrier_is_the_only_topology_route_from_a_proven_prefix_to_an_append_hand
                 }
             }
         }
-        crate::effects::census_domain::whole_file_test_modules(&all, 13)
+        crate::effects::census_domain::whole_file_test_modules(&src, &all, 13)
     };
     let mut stack = vec![src.clone()];
     let mut callers: Vec<(String, usize)> = Vec::new();
@@ -7686,7 +7686,7 @@ fn every_packet_named_recovery_action_has_a_production_caller() {
         // **eighteen** whole-file test modules and the four it missed —
         // `scaffold`, `premove`, `fake`, `readiness` — are the ones most likely
         // to name what production names. `PR7-R5-ATT-001`.
-        let test_modules = crate::effects::census_domain::whole_file_test_modules(&all, 13);
+        let test_modules = crate::effects::census_domain::whole_file_test_modules(&root, &all, 13);
         let mut out = Vec::new();
         {
             for path in all {

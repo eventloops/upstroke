@@ -2983,26 +2983,37 @@ fn walk(dir: &Path) -> Vec<PathBuf> {
     found
 }
 
-/// Which level `source` states for `lint`, or nothing.
+/// Which level `source` states for `lint` **at file-module level**, or nothing.
 ///
-/// Comments and string literals are blanked first, so a lint level quoted in a
-/// doc comment — which the file above and this one both do — is invisible.
-/// `PR4-CENSUS-COMMENT-ORACLE` is the standing entry for a census that counted
-/// its own prose.
+/// [`crate::effects::file_level_lint_state`] is the whole of it, and the
+/// delegation is the repair rather than a tidy-up. This body used to search the
+/// blanked file for `allow(` or `deny(` holding the lint name, anywhere — so an
+/// **item-level** `#[deny(clippy::disallowed_types)]` written on one `fn`
+/// satisfied a census whose entire subject is whether the *file module* states
+/// a level of its own. A lint level is scoped by the module tree: the item
+/// attribute governs that item, the file goes on inheriting the funnel's allow
+/// for everything else in it, and the census reported the hole closed.
+/// `forbid` was not recognised at all, so a file stating the strongest possible
+/// denial read as stating nothing.
+///
+/// The shared instrument walks the prologue — whitespace and inner attributes
+/// only — and stops at the first item, which is exactly the region an `#![…]`
+/// governs the file from. Comments and string literals are blanked there too,
+/// so a level quoted in prose is invisible (`PR4-CENSUS-COMMENT-ORACLE`).
 fn stated_lint_level(source: &str, lint: &str) -> Option<&'static str> {
-    let blanked = crate::effects::blank_comments_and_strings(source);
-    for (keyword, answer) in [("allow(", "allow"), ("deny(", "deny")] {
-        let mut rest = blanked.as_str();
-        while let Some(index) = rest.find(keyword) {
-            let after = &rest[index + keyword.len()..];
-            let end = after.find(')').unwrap_or(after.len());
-            if after[..end].contains(lint) {
-                return Some(answer);
-            }
-            rest = &rest[index + keyword.len()..];
-        }
-    }
-    None
+    crate::effects::file_level_lint_state(source, lint)
+}
+
+/// Whether a stated level closes `PR6-LANEF-004` for the lint it names.
+///
+/// `deny` and `forbid` are build errors and `allow` is a reviewed exception
+/// carrying an `effects/allowlist.toml` row. `warn` and `expect` are neither:
+/// they leave the module compiling and are indistinguishable from inheriting,
+/// which is the whole failure. Hoisted out of the grid so every level can be
+/// driven through it -- the tree states only two of the five, so the other
+/// three would otherwise be arms nobody has watched decide.
+fn closes_the_hole(stated: Option<&str>) -> bool {
+    matches!(stated, Some("allow" | "deny" | "forbid"))
 }
 
 /// Whether `effects/allowlist.toml` records `path` as allowing `lint`.
@@ -3116,12 +3127,22 @@ fn every_child_module_of_the_container_funnel_states_its_own_lint_level() {
         let source = fs::read_to_string(path).expect("read source");
         for lint in GOVERNED {
             cells += 1;
-            match stated_lint_level(&source, lint) {
-                None => missing.push(format!("{relative} states nothing about `{lint}`")),
-                Some("allow") if !allowlist_records(&relative, lint) => unlisted.push(format!(
+            // **A denial or a recorded allowance, and nothing else counts.** A
+            // `warn` or an `expect` is not a build error, so a module that
+            // states one has not closed the hole this census is about; it is
+            // reported as stating nothing rather than quietly accepted.
+            let stated = stated_lint_level(&source, lint);
+            if stated == Some("allow") && !allowlist_records(&relative, lint) {
+                unlisted.push(format!(
                     "{relative} allows `{lint}` and effects/allowlist.toml does not record it"
-                )),
-                Some(_) => {}
+                ));
+            } else if !closes_the_hole(stated) {
+                missing.push(match stated {
+                    None => format!("{relative} states no file-module-level level for `{lint}`"),
+                    Some(weaker) => format!(
+                        "{relative} states `{weaker}` for `{lint}`, which is not a build error"
+                    ),
+                });
             }
         }
     }
@@ -3170,11 +3191,76 @@ fn every_child_module_of_the_container_funnel_states_its_own_lint_level() {
         );
     }
 
+    // The accept/reject decision, over every level the reader can return --
+    // including the two this tree does not use, whose arms would otherwise be
+    // written and never executed.
+    assert!(closes_the_hole(Some("deny")));
+    assert!(closes_the_hole(Some("forbid")));
+    assert!(closes_the_hole(Some("allow")));
+    assert!(!closes_the_hole(Some("warn")));
+    assert!(!closes_the_hole(Some("expect")));
+    assert!(!closes_the_hole(None));
+
     // Negative controls: the predicate refuses what it is for.
     assert_eq!(
         stated_lint_level("fn go() {}\n", GOVERNED[0]),
         None,
         "a file that states nothing must read as stating nothing"
+    );
+    // **Item level is not file level**, and this is the one the scan used to
+    // accept. A lint level is scoped by the module tree, so an attribute on a
+    // single `fn` governs that `fn` and leaves the rest of the file inheriting
+    // whatever its ancestors allow -- which is `PR6-LANEF-004` still open,
+    // reported closed.
+    for item_level in [
+        "#[deny(clippy::disallowed_methods)]\nfn go() {}\n",
+        "#[allow(clippy::disallowed_methods)]\nfn go() {}\n",
+        "fn go() {\n    #[deny(clippy::disallowed_methods)]\n    let _ = ();\n}\n",
+        "mod inner {\n    #![deny(clippy::disallowed_methods)]\n}\n",
+    ] {
+        assert_eq!(
+            stated_lint_level(item_level, GOVERNED[0]),
+            None,
+            "an attribute below the file module read as the file's own level: {item_level:?}"
+        );
+    }
+    // An inner attribute AFTER the prologue governs nothing above it and is not
+    // the file module's own statement either.
+    assert_eq!(
+        stated_lint_level(
+            "fn go() {}\n#![deny(clippy::disallowed_methods)]\n",
+            GOVERNED[0]
+        ),
+        None,
+        "an inner attribute after the first item is not a file-module-level one"
+    );
+    // `forbid` is a denial and must read as one; `warn` is not and must not
+    // read as a level the census accepts.
+    assert_eq!(
+        stated_lint_level("#![forbid(clippy::disallowed_methods)]\n", GOVERNED[0]),
+        Some("forbid")
+    );
+    assert_eq!(
+        stated_lint_level("#![warn(clippy::disallowed_methods)]\n", GOVERNED[0]),
+        Some("warn")
+    );
+    // Both spellings of one lint are one lint, and a prologue of several
+    // attributes is walked through rather than stopped at.
+    assert_eq!(
+        stated_lint_level("#![deny(disallowed_methods)]\n", GOVERNED[0]),
+        Some("deny")
+    );
+    assert_eq!(
+        stated_lint_level(
+            "//! docs\n#![allow(clippy::too_many_arguments)]\n#![deny(clippy::disallowed_types)]\n",
+            GOVERNED[1]
+        ),
+        Some("deny")
+    );
+    assert_eq!(
+        stated_lint_level("#![allowance(clippy::disallowed_methods)]\n", GOVERNED[0]),
+        None,
+        "a longer attribute name that merely starts with a level is not that level"
     );
     assert_eq!(
         stated_lint_level(

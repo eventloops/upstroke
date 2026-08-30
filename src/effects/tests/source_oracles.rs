@@ -565,7 +565,7 @@ pub(super) mod oracles {
             }
         }
 
-        let modules = crate::effects::census_domain::whole_file_test_modules(&files, 13);
+        let modules = crate::effects::census_domain::whole_file_test_modules(&root, &files, 13);
         let relative = |path: &std::path::Path| {
             path.strip_prefix(&root)
                 .unwrap_or(path)
@@ -604,7 +604,8 @@ pub(super) mod oracles {
         // and the derivation must still find all fourteen after learning to read
         // structure, because a scan that resolved ancestry and lost the plain
         // case would trade one blind spot for another.
-        let declarations = crate::effects::census_domain::declared_whole_file_test_modules(&files);
+        let declarations =
+            crate::effects::census_domain::declared_whole_file_test_modules(&root, &files);
         assert_eq!(declarations.len(), 18);
         let literal: Vec<String> = declarations
             .iter()

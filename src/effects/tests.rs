@@ -2846,6 +2846,50 @@ fn the_module_scan_reads_ancestry_and_visibility_rather_than_text_after_an_attri
 
     // (10) **The word, not a prefix of one.** `models` is not `mod els`.
     assert!(scan("fn models() {}\nstruct modest;\n").is_empty());
+
+    // (11) **A macro body is discarded, not walked.** Its tokens are only
+    // *shaped* like items, so anything read out of one is invented. The
+    // discard has to be verified from both sides: nothing inside is derived,
+    // and everything outside still is.
+    let past_a_macro = only("thread_local! {\n    static X: u8 = 0;\n}\n#[cfg(test)]\nmod real;\n");
+    assert_eq!(past_a_macro.name, "real");
+    assert!(past_a_macro.inline_path.is_empty());
+    assert!(past_a_macro.test_only);
+    // Delimiters inside a macro body do not move the depth the ancestry is
+    // measured in, and an attribute above a macro belongs to the macro.
+    let after_attributed_macro = only("#[cfg(test)]\nlazy! [ a, b ]\nmod plain;\n");
+    assert_eq!(after_attributed_macro.name, "plain");
+    assert!(
+        !after_attributed_macro.test_only,
+        "a `#[cfg(test)]` above a macro invocation carried to the next item"
+    );
+    // `a != b` is not a macro: the token after `!` opens nothing.
+    let past_a_negation = only("fn f() { let _ = a != b; }\n#[cfg(test)]\nmod real;\n");
+    assert_eq!(past_a_negation.name, "real");
+    assert!(past_a_negation.test_only);
+
+    // **The discard is load-bearing, not decoration.** `mod` is an ordinary
+    // token inside a macro, and a matcher may capture it — but a scanner
+    // reading the body as *items* sees a `mod` with no name after it and
+    // refuses the whole file. So these are legal Rust that a body-walking scan
+    // cannot read, and the discard is what makes them silent.
+    for tokens in [
+        "macro_rules! m {\n    (mod $n:ident) => {\n        ()\n    };\n}\n",
+        "m! { mod }\n",
+        "outer! { inner! { mod } }\n",
+    ] {
+        assert_eq!(
+            scan_module_declarations(tokens).map(|found| found.len()),
+            Ok(0),
+            "{tokens:?} was read as items rather than discarded"
+        );
+    }
+    // And a file holding both still derives exactly the real one.
+    let beside_a_macro = only(
+        "macro_rules! m {\n    (mod $n:ident) => {\n        ()\n    };\n}\n#[cfg(test)]\nmod real;\n",
+    );
+    assert_eq!(beside_a_macro.name, "real");
+    assert!(beside_a_macro.test_only);
 }
 
 /// The resolver **refuses** every shape it cannot resolve, rather than guessing.
@@ -2860,8 +2904,8 @@ fn the_module_scan_reads_ancestry_and_visibility_rather_than_text_after_an_attri
 #[test]
 fn the_module_resolver_refuses_every_shape_it_cannot_resolve() {
     use crate::effects::census_domain::{
-        ScanRefusal, candidates_for, contained_in, declaration_cycle, parse_predicate,
-        scan_module_declarations, sole_present,
+        CandidateRefusal, ScanRefusal, candidates_for, contained_in, declaration_cycle,
+        module_directory, parse_predicate, scan_module_declarations, sole_present,
     };
 
     fn refusal(source: &str) -> ScanRefusal {
@@ -2938,6 +2982,42 @@ fn the_module_resolver_refuses_every_shape_it_cannot_resolve() {
         "a `path` attribute on a non-module item is not a module path attribute"
     );
 
+    // (3b) **A macro body holding a module-shaped sequence.** A macro invoked
+    // at item position can expand to a module, and nothing here can tell which
+    // does — so a body whose tokens *could* be one is refused rather than
+    // either walked (which invents a declaration for a file the macro never
+    // names) or silently dropped (which loses a real one). Every delimiter,
+    // and the `macro_rules!` definition form, which carries a name between the
+    // `!` and its body.
+    for shaped in [
+        "macro_rules! m {\n    () => {\n        mod x;\n    };\n}\n",
+        "macro_rules! m {\n    () => {\n        #[cfg(test)]\n        mod x;\n    };\n}\n",
+        "quote! { mod x; }\n",
+        "paste!( mod x { } );\n",
+        "items![ pub(crate) mod x; ]\n",
+        "outer! { inner! { mod x; } }\n",
+    ] {
+        assert!(
+            matches!(refusal(shaped), ScanRefusal::ModuleShapedMacroBody { .. }),
+            "{shaped:?} was read rather than refused"
+        );
+    }
+    // And a macro body with nothing module-shaped in it is discarded in
+    // silence, which is what stops the refusal from being a tax on every
+    // `vec!`, `assert!` and `format!` in the tree.
+    for ordinary in [
+        "vec![1, 2, 3];\n",
+        "assert!(a == b, \"mod x; is prose here\");\n",
+        "macro_rules! m {\n    () => {\n        fn go() {}\n    };\n}\n",
+        "modify!(x);\n",
+    ] {
+        assert_eq!(
+            scan_module_declarations(ordinary).map(|found| found.len()),
+            Ok(0),
+            "{ordinary:?} was not discarded cleanly"
+        );
+    }
+
     // (4) An inner `#![cfg(…)]` gates the module it is written in, which this
     // derivation does not model. There are none in this tree; one arriving
     // fails loudly rather than being read as ungated.
@@ -2957,48 +3037,102 @@ fn the_module_resolver_refuses_every_shape_it_cannot_resolve() {
         "two parents each declaring `x` are not a duplicate"
     );
 
-    // (6) **Candidate paths, and the flattening mutation.** The inline path is
-    // part of the directory. A resolver that dropped it looks in
-    // `agent/proc/readiness.rs`, which does not exist — so the failure is a
-    // zero-candidate refusal if you are lucky, and the wrong file if a module
-    // of that name is ever added beside it.
+    // (6) **Candidate paths, the flattening mutation, and the crate roots.**
+    // The inline path is part of the directory. A resolver that dropped it
+    // looks in `agent/proc/readiness.rs`, which does not exist — so the failure
+    // is a zero-candidate refusal if you are lucky, and the wrong file if a
+    // module of that name is ever added beside it.
+    let src = Path::new("src");
     let proc = Path::new("src/agent/proc.rs");
+    let named = |root: &Path, file: &str, inline: &[String], name: &str| {
+        candidates_for(root, Path::new(file), inline, name)
+    };
     assert_eq!(
-        candidates_for(proc, &["test_support".to_owned()], "readiness"),
-        [
+        named(
+            src,
+            "src/agent/proc.rs",
+            &["test_support".to_owned()],
+            "readiness"
+        ),
+        Ok([
             PathBuf::from("src/agent/proc/test_support/readiness.rs"),
             PathBuf::from("src/agent/proc/test_support/readiness/mod.rs"),
-        ]
+        ])
     );
     assert_eq!(
-        candidates_for(proc, &[], "readiness"),
-        [
+        named(src, "src/agent/proc.rs", &[], "readiness"),
+        Ok([
             PathBuf::from("src/agent/proc/readiness.rs"),
             PathBuf::from("src/agent/proc/readiness/mod.rs"),
-        ]
+        ])
     );
-    for flattened in candidates_for(&repo_root().join("src/agent/proc.rs"), &[], "readiness") {
+    let root = repo_root().join("src");
+    for flattened in candidates_for(&root, &root.join("agent/proc.rs"), &[], "readiness")
+        .expect("proc.rs is an ordinary module")
+    {
         assert!(
             !flattened.is_file(),
             "{} exists, so the flattening mutation would resolve instead of refusing",
             flattened.display()
         );
     }
-    // `mod.rs`, `lib.rs` and `main.rs` name their own directory rather than a
-    // child of it, which is the other half of the same computation.
+    assert!(proc.is_relative());
+
+    // **A crate root owns its directory; an ordinary module does not.**
+    // `mod.rs` is the first case wherever it sits, and `lib.rs`/`main.rs` only
+    // at the crate's source root.
     assert_eq!(
-        candidates_for(Path::new("src/engine/mod.rs"), &[], "tests")[0],
-        PathBuf::from("src/engine/tests.rs")
+        named(src, "src/engine/mod.rs", &[], "tests").map(|pair| pair[0].clone()),
+        Ok(PathBuf::from("src/engine/tests.rs"))
     );
     assert_eq!(
-        candidates_for(Path::new("src/lib.rs"), &[], "effects")[0],
-        PathBuf::from("src/effects.rs")
+        named(src, "src/lib.rs", &[], "effects").map(|pair| pair[0].clone()),
+        Ok(PathBuf::from("src/effects.rs"))
+    );
+    assert_eq!(
+        named(src, "src/main.rs", &[], "tests").map(|pair| pair[0].clone()),
+        Ok(PathBuf::from("src/tests.rs"))
+    );
+    // **The competing production sibling.** A nested `src/a/lib.rs` is the
+    // ordinary module `a::lib` unless the manifest says otherwise, so reading
+    // it as a crate root points `mod tests;` at `src/a/tests.rs` — a *different
+    // file*, a sibling that may well be production, which the derivation would
+    // then remove from every census as though `a/lib.rs` had declared it. That
+    // failure does not announce itself: with no `src/a/lib/tests.rs` present it
+    // resolves, it does not refuse. This derivation does not read `Cargo.toml`,
+    // so it refuses rather than choosing between the two readings.
+    assert_eq!(
+        named(src, "src/a/lib.rs", &[], "tests"),
+        Err(CandidateRefusal::AmbiguousCrateRoot {
+            declared_in: PathBuf::from("src/a/lib.rs")
+        })
+    );
+    assert_eq!(
+        named(src, "src/a/b/main.rs", &[], "tests"),
+        Err(CandidateRefusal::AmbiguousCrateRoot {
+            declared_in: PathBuf::from("src/a/b/main.rs")
+        })
+    );
+    // And the refusal is about *position*, not about the name: the same stem at
+    // the source root is a crate root, and `mod.rs` is never ambiguous.
+    assert!(module_directory(src, Path::new("src/lib.rs")).is_ok());
+    assert!(module_directory(src, Path::new("src/a/mod.rs")).is_ok());
+    assert_eq!(
+        module_directory(src, Path::new("src/a/mod.rs")),
+        Ok(PathBuf::from("src/a"))
+    );
+    // The sibling the wrong reading would have claimed, named so the two
+    // readings are visible side by side rather than asserted apart.
+    assert_eq!(
+        module_directory(src, Path::new("src/a/other.rs")),
+        Ok(PathBuf::from("src/a/other")),
+        "an ordinary module owns a directory named after it, never its parent"
     );
 
     // (7) **Zero and two candidates.** Two is `x.rs` and `x/mod.rs` both
     // present — a competing `mod.rs` that Rust itself refuses to compile and
     // that a resolver taking the first match would silently pick a side in.
-    let pair = candidates_for(Path::new("src/a.rs"), &[], "b");
+    let pair = named(src, "src/a.rs", &[], "b").expect("an ordinary module");
     assert_eq!(sole_present(&pair, &|_| false), Err(0));
     assert_eq!(sole_present(&pair, &|_| true), Err(2));
     assert_eq!(sole_present(&pair, &|at| at == pair[0]), Ok(&pair[0]));
@@ -3026,22 +3160,56 @@ fn the_module_resolver_refuses_every_shape_it_cannot_resolve() {
     // a cycle means a guard attributed to a file that does not inherit it. Not
     // reachable while directory-derived candidates descend, which is the reason
     // to drive it here rather than a reason to leave it unchecked.
-    let forest = vec![
-        (PathBuf::from("a.rs"), PathBuf::from("a/b.rs")),
-        (PathBuf::from("a/b.rs"), PathBuf::from("a/b/c.rs")),
-    ];
+    let edge = |from: &str, to: &str| (PathBuf::from(from), PathBuf::from(to));
+    let forest = vec![edge("a.rs", "a/b.rs"), edge("a/b.rs", "a/b/c.rs")];
     assert_eq!(declaration_cycle(&forest), None);
     assert!(
-        declaration_cycle(&[(PathBuf::from("a.rs"), PathBuf::from("a.rs"))]).is_some(),
+        declaration_cycle(&[edge("a.rs", "a.rs")]).is_some(),
         "a file declaring itself is a cycle"
     );
     assert!(
-        declaration_cycle(&[
-            (PathBuf::from("a.rs"), PathBuf::from("b.rs")),
-            (PathBuf::from("b.rs"), PathBuf::from("a.rs")),
-        ])
-        .is_some(),
+        declaration_cycle(&[edge("a.rs", "b.rs"), edge("b.rs", "a.rs")]).is_some(),
         "a two-file loop is a cycle"
+    );
+    // **A branching graph, with the cycle on the second edge out of a node.**
+    // The first version walked `edges.iter().find(…)` — one outgoing edge per
+    // node — so it followed `a -> b`, found `b` a leaf, and reported the whole
+    // graph acyclic while `a -> c -> a` sat beside it. Every node here has an
+    // outgoing edge, so a detector that merely *terminates* still passes; what
+    // separates them is which edges get walked.
+    let branching = vec![
+        edge("a.rs", "a/b.rs"),
+        edge("a.rs", "a/c.rs"),
+        edge("a/c.rs", "a.rs"),
+    ];
+    let closed = declaration_cycle(&branching).expect("the second edge closes a loop");
+    assert_eq!(
+        closed.first(),
+        closed.last(),
+        "a reported cycle must start and end at the same node: {closed:?}"
+    );
+    assert!(
+        closed.contains(&PathBuf::from("a/c.rs")),
+        "the reported cycle does not name the branch that closes it: {closed:?}"
+    );
+    // The same shape without the back edge is a tree, so the branching itself
+    // is not what the detector is reacting to.
+    assert_eq!(
+        declaration_cycle(&[edge("a.rs", "a/b.rs"), edge("a.rs", "a/c.rs")]),
+        None
+    );
+    // A cycle reachable only through a node whose *first* edge leads away from
+    // it: the depth-first walk has to come back and take the second.
+    let deferred = vec![
+        edge("a.rs", "a/b.rs"),
+        edge("a/b.rs", "a/b/leaf.rs"),
+        edge("a.rs", "a/c.rs"),
+        edge("a/c.rs", "a/d.rs"),
+        edge("a/d.rs", "a/c.rs"),
+    ];
+    assert!(
+        declaration_cycle(&deferred).is_some(),
+        "a cycle two branches deep was not reached"
     );
 }
 

@@ -1360,7 +1360,8 @@ mod tests {
         // `events::log::tests`, and a third census then wrote a *different*
         // rule — `file_stem == "tests"` — which covers fourteen of the
         // eighteen. `PR7-R5-ATT-001`.
-        let test_modules = crate::effects::census_domain::whole_file_test_modules(&files, 13);
+        let test_modules =
+            crate::effects::census_domain::whole_file_test_modules(&root.join("src"), &files, 13);
         // The control: a derivation that found nothing would silently count
         // every test file as production, which is the failure this replaces.
         assert!(

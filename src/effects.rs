@@ -798,6 +798,93 @@ fn is_module_level(blanked: &str, hash: usize, close: usize, inner: bool) -> boo
 // (2) The frozen legacy section
 // ---------------------------------------------------------------------------
 
+/// The lint level `source` states for `lint` **at file-module level**, or none.
+///
+/// "File-module level" is the whole of the claim, and it is narrower than
+/// "somewhere in the file". A lint level is scoped by the module tree, so
+/// `#![deny(clippy::disallowed_types)]` in a file's prologue governs the file
+/// and everything nested in it — while `#[deny(clippy::disallowed_types)]`
+/// written on a single `fn` governs that function and says nothing whatever
+/// about the file, which goes on inheriting whatever its ancestors allow.
+/// A scan that accepts the second in place of the first reports a module as
+/// having stated its own level when it has not, which is `PR6-LANEF-004`
+/// answered by the wrong evidence.
+///
+/// So the walk is: from the first byte, over whitespace and **inner**
+/// attributes only, stopping at the first token that is neither. That is
+/// exactly the region an `#![…]` may govern the file module from, and it is the
+/// same rule [`is_module_level`] applies to the inner half of its answer.
+///
+/// `forbid` counts, and `warn`/`expect` are reported as themselves rather than
+/// folded into `deny`: a governance census that wants a denial should be able
+/// to see that it got a warning instead.
+///
+/// Comments and string literals are blanked first, so a level quoted in a doc
+/// comment or inside a `&str` is invisible — `PR4-CENSUS-COMMENT-ORACLE`, and
+/// this crate's effect fixtures are written as exactly those two shapes.
+///
+/// `clippy::disallowed_methods` and `disallowed_methods` are the same lint;
+/// [`normalize_lint`] is the bridge, as it is everywhere else here.
+#[must_use]
+pub fn file_level_lint_state(source: &str, lint: &str) -> Option<&'static str> {
+    const LEVELS: [&str; 5] = ["allow", "expect", "warn", "deny", "forbid"];
+    let blanked = blank_comments_and_strings(source);
+    let bytes = blanked.as_bytes();
+    let mut at = 0;
+    while at < bytes.len() {
+        if bytes[at].is_ascii_whitespace() {
+            at += 1;
+            continue;
+        }
+        // The prologue ends at the first token that is not an inner attribute.
+        if bytes[at] != b'#' || bytes.get(at + 1) != Some(&b'!') {
+            return None;
+        }
+        let open = at + 2;
+        if bytes.get(open) != Some(&b'[') {
+            return None;
+        }
+        let close = matching(bytes, open, b'[', b']')?;
+        let attribute = blanked[open + 1..close].trim();
+        for level in LEVELS {
+            let Some(rest) = attribute.strip_prefix(level) else {
+                continue;
+            };
+            // `allowance(…)` strips to `ance(…)`, which opens nothing: the
+            // parenthesis is what makes the prefix an exact attribute name.
+            let Some(list) = rest
+                .trim_start()
+                .strip_prefix('(')
+                .and_then(|body| body.strip_suffix(')'))
+            else {
+                continue;
+            };
+            if list.split(',').any(|entry| names_lint(entry.trim(), lint)) {
+                return Some(match level {
+                    "allow" => "allow",
+                    "expect" => "expect",
+                    "warn" => "warn",
+                    "deny" => "deny",
+                    _ => "forbid",
+                });
+            }
+        }
+        at = close + 1;
+    }
+    None
+}
+
+/// Whether an attribute entry names `lint`, qualified either way.
+fn names_lint(entry: &str, lint: &str) -> bool {
+    if entry == lint {
+        return true;
+    }
+    match (normalize_lint(entry), normalize_lint(lint)) {
+        (Some(left), Some(right)) => left == right,
+        _ => false,
+    }
+}
+
 /// The legacy section of `effects/allowlist.toml` as PR5 freezes it.
 ///
 /// > "the legacy section may only shrink after PR5 (the test compares against
@@ -1314,10 +1401,11 @@ pub(crate) mod census_domain {
     /// the control against a derivation that has silently stopped finding
     /// anything.
     pub(crate) fn whole_file_test_modules(
+        source_root: &std::path::Path,
         files: &[PathBuf],
         floor: usize,
     ) -> std::collections::BTreeSet<PathBuf> {
-        let declarations = declared_whole_file_test_modules(files);
+        let declarations = declared_whole_file_test_modules(source_root, files);
         assert!(
             declarations.len() >= floor,
             "only {} test-only `mod …;` declarations were derived and the floor is {floor}; \
@@ -1360,7 +1448,8 @@ pub(crate) mod census_domain {
             declaration_cycle(&edges)
         );
         // **The control that binds every caller**, and it belongs here rather
-        // than at each of them. `the_declared_whole_file_test_modules_resolve_and_four_are_not_called_tests`
+        // than at each of them.
+        // `the_whole_file_test_modules_are_resolved_from_the_declarations_not_the_file_names`
         // asserts what this *returns*; it says nothing about whether a census
         // calls it, which is the defect `3a91626` repaired for two censuses and
         // this witness then reproduced one commit later (`R6-SETTLE-003`). A
@@ -1387,19 +1476,64 @@ pub(crate) mod census_domain {
     /// census control that is only ever exercised on input that satisfies it is
     /// a control nobody has seen refuse anything.
     pub(crate) fn declaration_cycle(edges: &[(PathBuf, PathBuf)]) -> Option<Vec<PathBuf>> {
-        for (from, _) in edges {
-            let mut walked = vec![from.clone()];
-            let mut at = from.clone();
-            // Bounded by the edge count: a walk longer than that has revisited.
-            for _ in 0..=edges.len() {
-                let Some((_, next)) = edges.iter().find(|(source, _)| *source == at) else {
-                    break;
+        use std::collections::{BTreeMap, BTreeSet};
+
+        /// Depth-first search state. `Grey` is "on the path being walked", and
+        /// reaching a `Grey` node is what a back edge *is*.
+        #[derive(Clone, Copy, PartialEq, Eq)]
+        enum Colour {
+            White,
+            Grey,
+            Black,
+        }
+
+        // **The full adjacency, not the first edge out of each node.** The
+        // first version followed `edges.iter().find(…)`, which walks one
+        // outgoing edge per node — so a node with two children whose *second*
+        // child closes the loop reported no cycle. `a -> b`, `a -> c`,
+        // `c -> a` was the shape, and it read as acyclic.
+        let mut adjacency: BTreeMap<&PathBuf, Vec<&PathBuf>> = BTreeMap::new();
+        let mut nodes: BTreeSet<&PathBuf> = BTreeSet::new();
+        for (from, to) in edges {
+            adjacency.entry(from).or_default().push(to);
+            nodes.insert(from);
+            nodes.insert(to);
+        }
+
+        let mut colour: BTreeMap<&PathBuf, Colour> =
+            nodes.iter().map(|node| (*node, Colour::White)).collect();
+        for start in &nodes {
+            if colour.get(start) != Some(&Colour::White) {
+                continue;
+            }
+            colour.insert(start, Colour::Grey);
+            // (node, how many of its outgoing edges have been taken). The stack
+            // IS the current path, which is what makes the cycle reportable.
+            let mut stack: Vec<(&PathBuf, usize)> = vec![(start, 0)];
+            while let Some((node, taken)) = stack.pop() {
+                let outgoing: &[&PathBuf] = adjacency
+                    .get(node)
+                    .map_or(&[][..], |edges| edges.as_slice());
+                let Some(next) = outgoing.get(taken).copied() else {
+                    colour.insert(node, Colour::Black);
+                    continue;
                 };
-                walked.push(next.clone());
-                if *next == *from {
-                    return Some(walked);
+                stack.push((node, taken + 1));
+                match colour.get(next) {
+                    Some(Colour::Grey) => {
+                        let path: Vec<&PathBuf> = stack.iter().map(|(at, _)| *at).collect();
+                        let from = path.iter().position(|at| *at == next).unwrap_or(0);
+                        let mut cycle: Vec<PathBuf> =
+                            path[from..].iter().map(|at| (*at).clone()).collect();
+                        cycle.push(next.clone());
+                        return Some(cycle);
+                    }
+                    Some(Colour::Black) => {}
+                    _ => {
+                        colour.insert(next, Colour::Grey);
+                        stack.push((next, 0));
+                    }
                 }
-                at = next.clone();
             }
         }
         None
@@ -1432,6 +1566,75 @@ pub(crate) mod census_domain {
         }
     }
 
+    /// Why a declaration's candidate files cannot be named.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub(crate) enum CandidateRefusal {
+        /// A `lib.rs` or `main.rs` that is not at the crate's source root.
+        AmbiguousCrateRoot { declared_in: PathBuf },
+    }
+
+    impl std::fmt::Display for CandidateRefusal {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            match self {
+                Self::AmbiguousCrateRoot { declared_in } => write!(
+                    f,
+                    "`{}` is named `lib.rs`/`main.rs` and is not at the crate's source root, so \
+                     whether it owns its own directory depends on the manifest, which this \
+                     derivation does not read",
+                    declared_in.display()
+                ),
+            }
+        }
+    }
+
+    /// The directory an out-of-line child of `declared_in` lives in.
+    ///
+    /// **A crate root owns its directory; an ordinary module owns a directory
+    /// named after it.** `mod.rs` is the first case wherever it sits — that is
+    /// what `mod.rs` means. `lib.rs` and `main.rs` are the first case *only at
+    /// the crate root*: Cargo's default targets are `<source_root>/lib.rs` and
+    /// `<source_root>/main.rs`, and `src/a/lib.rs` is the ordinary module
+    /// `a::lib`, whose out-of-line children live in `src/a/lib/`.
+    ///
+    /// Reading the stem alone got that wrong in the direction that matters.
+    /// `src/a/lib.rs` declaring `#[cfg(test)] mod tests;` resolved to
+    /// `src/a/tests.rs` — a **different file**, a sibling that may well be
+    /// production, which the derivation would then have removed from every
+    /// census as though `a/lib.rs` had declared it. The competing sibling is
+    /// the whole hazard: with no `src/a/lib/tests.rs` present, the wrong
+    /// reading does not fail, it resolves.
+    ///
+    /// The remaining case is refused rather than decided. A manifest may name
+    /// any path as a `[lib]` or `[[bin]]` target, so a nested `lib.rs` *could*
+    /// be a crate root; this derivation does not read `Cargo.toml`, so it does
+    /// not know which of the two readings applies. There are none in this tree
+    /// — `src/lib.rs` and `src/main.rs` are the only crate roots — and one
+    /// arriving fails loudly instead of silently picking whichever reading the
+    /// stem rule happened to encode.
+    pub(crate) fn module_directory(
+        source_root: &std::path::Path,
+        declared_in: &std::path::Path,
+    ) -> Result<PathBuf, CandidateRefusal> {
+        let parent = declared_in
+            .parent()
+            .expect("a source file has a directory")
+            .to_path_buf();
+        let stem = declared_in.file_stem().expect("a source file has a name");
+        if stem == "mod" {
+            return Ok(parent);
+        }
+        if stem == "lib" || stem == "main" {
+            return if parent == source_root {
+                Ok(parent)
+            } else {
+                Err(CandidateRefusal::AmbiguousCrateRoot {
+                    declared_in: declared_in.to_path_buf(),
+                })
+            };
+        }
+        Ok(parent.join(stem))
+    }
+
     /// The two files `mod <name>;` can name, given where it was written.
     ///
     /// `declared_in` is the declaring file; `inline_path` is the inline modules
@@ -1441,28 +1644,23 @@ pub(crate) mod census_domain {
     /// names `proc/test_support/readiness.rs`, and flattened to
     /// `proc/readiness.rs` it names nothing — a zero-candidate refusal if you
     /// are lucky and the wrong file if you are not.
+    ///
+    /// `source_root` is where the crate's roots live, and [`module_directory`]
+    /// is why that is a parameter rather than a test on the file's stem.
     pub(crate) fn candidates_for(
+        source_root: &std::path::Path,
         declared_in: &std::path::Path,
         inline_path: &[String],
         name: &str,
-    ) -> [PathBuf; 2] {
-        let parent = declared_in
-            .parent()
-            .expect("a source file has a directory")
-            .to_path_buf();
-        let stem = declared_in.file_stem().expect("a source file has a name");
-        let mut dir = if stem == "mod" || stem == "lib" || stem == "main" {
-            parent
-        } else {
-            parent.join(stem)
-        };
+    ) -> Result<[PathBuf; 2], CandidateRefusal> {
+        let mut dir = module_directory(source_root, declared_in)?;
         for enclosing in inline_path {
             dir.push(enclosing);
         }
-        [
+        Ok([
             dir.join(format!("{name}.rs")),
             dir.join(name).join("mod.rs"),
-        ]
+        ])
     }
 
     /// Whether `candidate` stays inside `base` through plain path components.
@@ -1593,6 +1791,7 @@ pub(crate) mod census_domain {
     /// means the scan does not know what the file declares, and a scan that
     /// does not know must not answer.
     pub(crate) fn declared_whole_file_test_modules(
+        source_root: &std::path::Path,
         files: &[PathBuf],
     ) -> Vec<TestModuleDeclaration> {
         let mut found = Vec::new();
@@ -1605,7 +1804,13 @@ pub(crate) mod census_domain {
                 if !declaration.test_only {
                     continue;
                 }
-                let candidates = candidates_for(path, &declaration.inline_path, &declaration.name);
+                let candidates = candidates_for(
+                    source_root,
+                    path,
+                    &declaration.inline_path,
+                    &declaration.name,
+                )
+                .unwrap_or_else(|refusal| panic!("{refusal}"));
                 for candidate in &candidates {
                     assert!(
                         contained_in(parent, candidate),
@@ -1668,6 +1873,8 @@ pub(crate) mod census_domain {
         UnsupportedInnerCfg { line: usize },
         /// One module name declared twice in one module.
         DuplicateDeclaration { line: usize, name: String },
+        /// A macro body holding a module-shaped token sequence.
+        ModuleShapedMacroBody { line: usize, macro_name: String },
     }
 
     impl std::fmt::Display for ScanRefusal {
@@ -1706,6 +1913,12 @@ pub(crate) mod census_domain {
                         "line {line}: `mod {name};` is declared twice in one module"
                     )
                 }
+                Self::ModuleShapedMacroBody { line, macro_name } => write!(
+                    f,
+                    "line {line}: the body of `{macro_name}!` holds a module-shaped token \
+                     sequence. A macro body is token trees, not items, and whether the \
+                     expansion declares a module is not readable from here"
+                ),
             }
         }
     }
@@ -1805,6 +2018,36 @@ pub(crate) mod census_domain {
                 continue;
             }
 
+            // -- a macro, whose body is token trees and not items ------------
+            //
+            // `mod x;` inside `macro_rules! m { () => { mod x; } }` is not a
+            // declaration, and `#[cfg(test)] mod x;` inside one is not a
+            // test-only declaration: the tokens are only *shaped* like an item
+            // until something expands them. Walking into a macro body therefore
+            // invents declarations, which is the direction that removes a real
+            // production file from every census below.
+            //
+            // A macro invoked at item position **can** expand to a module,
+            // though, and this scan cannot tell which does. So the body is
+            // discarded when it holds nothing module-shaped and refused when it
+            // does: the discard is what stops the false positives, and the
+            // refusal is what stops the discard from becoming a blind spot.
+            // Measured on this tree: zero macro bodies hold one.
+            if let Some(invocation) = macro_at(bytes, i) {
+                let MacroInvocation { name, open, close } = invocation;
+                if let Some(shaped) = module_shaped_between(bytes, open + 1, close) {
+                    return Err(ScanRefusal::ModuleShapedMacroBody {
+                        line: line_of(shaped),
+                        macro_name: name,
+                    });
+                }
+                // Attributes stacked above a macro invocation belong to it.
+                pending.clear();
+                pending_path = false;
+                i = close + 1;
+                continue;
+            }
+
             // -- a `mod` item, with any visibility qualifier in front of it ---
             if let Some(shape) = module_at(bytes, i) {
                 let ModuleShape {
@@ -1895,6 +2138,90 @@ pub(crate) mod census_domain {
         Ok(found)
     }
 
+    /// A macro invocation or `macro_rules!` definition and its delimited body.
+    struct MacroInvocation {
+        /// The macro's name, for the diagnostic.
+        name: String,
+        /// The index of the body's opening delimiter.
+        open: usize,
+        /// The index of the matching closing delimiter.
+        close: usize,
+    }
+
+    /// [`MacroInvocation`] beginning at `at`, or `None`.
+    ///
+    /// The shape is an identifier, `!`, an optional second identifier — that is
+    /// `macro_rules! name { … }` — and a delimited group. Requiring the group is
+    /// what keeps `a != b` out: after that `!` comes `=`, which opens nothing.
+    fn macro_at(bytes: &[u8], at: usize) -> Option<MacroInvocation> {
+        let (after_name, name) = identifier(bytes, at);
+        if name.is_empty() || bytes.get(after_name) != Some(&b'!') {
+            return None;
+        }
+        // `macro_rules! name {` carries the defined name between the two.
+        let (after_defined, _) = identifier(bytes, whitespace(bytes, after_name + 1));
+        let open = whitespace(bytes, after_defined);
+        let (opener, closer) = match bytes.get(open) {
+            Some(b'(') => (b'(', b')'),
+            Some(b'[') => (b'[', b']'),
+            Some(b'{') => (b'{', b'}'),
+            _ => return None,
+        };
+        let close = super::matching(bytes, open, opener, closer)?;
+        Some(MacroInvocation {
+            name: String::from_utf8_lossy(&bytes[at..after_name]).into_owned(),
+            open,
+            close,
+        })
+    }
+
+    /// Where a module-shaped token sequence starts inside `from..to`, if any.
+    ///
+    /// "Module-shaped" is the word `mod`, a name, and a `;` or `{` — the same
+    /// three tokens [`module_at`] reads, minus the visibility prefix, because
+    /// what matters here is only whether the body *could* expand to a module.
+    fn module_shaped_between(bytes: &[u8], from: usize, to: usize) -> Option<usize> {
+        let mut at = from;
+        while at < to {
+            if !super::is_ident_byte(bytes[at]) {
+                at += 1;
+                continue;
+            }
+            let (end, word) = identifier(bytes, at);
+            if word == b"mod" {
+                let name_at = whitespace(bytes, end);
+                if name_at > end {
+                    let (name_end, name) = identifier(bytes, name_at);
+                    if !name.is_empty()
+                        && matches!(bytes.get(whitespace(bytes, name_end)), Some(b';' | b'{'))
+                    {
+                        return Some(at);
+                    }
+                }
+            }
+            at = end;
+        }
+        None
+    }
+
+    /// The identifier at `from`, and where it ends. Empty when there is none.
+    fn identifier(bytes: &[u8], from: usize) -> (usize, &[u8]) {
+        let mut end = from;
+        while end < bytes.len() && super::is_ident_byte(bytes[end]) {
+            end += 1;
+        }
+        (end, &bytes[from..end])
+    }
+
+    /// The first non-whitespace index at or after `from`.
+    fn whitespace(bytes: &[u8], from: usize) -> usize {
+        let mut at = from;
+        while at < bytes.len() && bytes[at].is_ascii_whitespace() {
+            at += 1;
+        }
+        at
+    }
+
     /// A `mod` item beginning at `at`, past any visibility qualifier.
     struct ModuleShape {
         /// Where the module's name starts.
@@ -1912,30 +2239,15 @@ pub(crate) mod census_domain {
     /// costs a structural scan. A text rule keyed on `mod ` immediately after
     /// the attribute could not do it, and that is the hole this closes.
     fn module_at(bytes: &[u8], at: usize) -> Option<ModuleShape> {
-        fn ident(bytes: &[u8], from: usize) -> (usize, &[u8]) {
-            let mut end = from;
-            while end < bytes.len() && super::is_ident_byte(bytes[end]) {
-                end += 1;
-            }
-            (end, &bytes[from..end])
-        }
-        fn space(bytes: &[u8], from: usize) -> usize {
-            let mut at = from;
-            while at < bytes.len() && bytes[at].is_ascii_whitespace() {
-                at += 1;
-            }
-            at
-        }
-
-        let (mut cursor, mut word) = ident(bytes, at);
+        let (mut cursor, mut word) = identifier(bytes, at);
         if word == b"pub" {
-            let after = space(bytes, cursor);
+            let after = whitespace(bytes, cursor);
             cursor = if bytes.get(after) == Some(&b'(') {
                 super::matching(bytes, after, b'(', b')')? + 1
             } else {
                 after
             };
-            let (end, next) = ident(bytes, space(bytes, cursor));
+            let (end, next) = identifier(bytes, whitespace(bytes, cursor));
             cursor = end;
             word = next;
         }
@@ -1943,13 +2255,13 @@ pub(crate) mod census_domain {
             return None;
         }
         // `mod` and the name must be separated: `models` is not `mod els`.
-        let after_keyword = space(bytes, cursor);
+        let after_keyword = whitespace(bytes, cursor);
         if after_keyword == cursor {
             return None;
         }
-        let (name_end, name) = ident(bytes, after_keyword);
+        let (name_end, name) = identifier(bytes, after_keyword);
         let name = String::from_utf8_lossy(name).into_owned();
-        let terminator = space(bytes, name_end);
+        let terminator = whitespace(bytes, name_end);
         match bytes.get(terminator) {
             Some(b'{') => Some(ModuleShape {
                 name_at: after_keyword,
