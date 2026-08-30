@@ -120,57 +120,13 @@ pub(super) fn describe(event: &Event) -> String {
             parking,
             transition,
             ..
-        } => {
-            if let Some(parking) = parking {
-                let reason = data
-                    .failure
-                    .as_ref()
-                    .map(|failure| failure.reason.as_str())
-                    .unwrap_or("policy refusal");
-                if let Some(events::AttemptTransition::Escalate(escalation)) = transition.as_deref()
-                {
-                    format!(
-                        "{task}: attempt {attempt} failed — {reason}; escalating past {} to rung \
-                         {} and parked on question {}",
-                        escalation.tier, escalation.to_rung, parking.question.id
-                    )
-                } else {
-                    format!(
-                        "{task}: attempt {attempt} failed and parked on question {} — {reason}",
-                        parking.question.id
-                    )
-                }
-            } else {
-                match &data.failure {
-                    Some(failure) => match transition.as_deref() {
-                        Some(events::AttemptTransition::Retry(data)) => format!(
-                            "{task}: attempt {attempt} failed — {}; retrying on {}{}",
-                            failure.reason,
-                            data.tier,
-                            if data.resume {
-                                " in the same session"
-                            } else {
-                                ""
-                            }
-                        ),
-                        Some(events::AttemptTransition::Escalate(data)) => format!(
-                            "{task}: attempt {attempt} failed — {}; escalating past {} to rung {}",
-                            failure.reason, data.tier, data.to_rung
-                        ),
-                        Some(events::AttemptTransition::Defer(data)) => format!(
-                            "{task}: attempt {attempt} failed — {}; deferred ({}) — {}",
-                            failure.reason, data.defers, data.reason
-                        ),
-                        Some(events::AttemptTransition::Fail(data)) => format!(
-                            "{task}: attempt {attempt} failed — {}; task failed ({:?})",
-                            failure.reason, data.kind
-                        ),
-                        None => format!("{task}: attempt {attempt} failed — {}", failure.reason),
-                    },
-                    None => format!("{task}: attempt {attempt} passed"),
-                }
-            }
-        }
+        } => describe_attempt_finished(
+            task,
+            *attempt,
+            data,
+            parking.as_deref(),
+            transition.as_deref(),
+        ),
         EventBody::AttemptInterrupted { task, attempt, .. } => format!(
             "{task}: attempt {attempt} was cut off mid-flight; its spend is unknown and the \
              rung's allowance is intact"
@@ -244,6 +200,70 @@ pub(super) fn describe(event: &Event) -> String {
         ),
     };
     format!("{at}  {body}")
+}
+
+/// The line for one finished attempt: the outcome, then the decision recorded
+/// with it.
+///
+/// A parked attempt reports its park — and any escalation that landed with it
+/// atomically — in one sentence; a parked record carrying no failure is a
+/// policy refusal. Otherwise the line is the failure and what the ladder does
+/// next, or simply that the attempt passed.
+fn describe_attempt_finished(
+    task: &str,
+    attempt: u32,
+    record: &events::AttemptRecord,
+    parking: Option<&events::AttemptParking>,
+    transition: Option<&events::AttemptTransition>,
+) -> String {
+    if let Some(parking) = parking {
+        let reason = record
+            .failure
+            .as_ref()
+            .map(|failure| failure.reason.as_str())
+            .unwrap_or("policy refusal");
+        if let Some(events::AttemptTransition::Escalate(escalation)) = transition {
+            format!(
+                "{task}: attempt {attempt} failed — {reason}; escalating past {} to rung \
+                 {} and parked on question {}",
+                escalation.tier, escalation.to_rung, parking.question.id
+            )
+        } else {
+            format!(
+                "{task}: attempt {attempt} failed and parked on question {} — {reason}",
+                parking.question.id
+            )
+        }
+    } else {
+        match &record.failure {
+            Some(failure) => match transition {
+                Some(events::AttemptTransition::Retry(retry)) => format!(
+                    "{task}: attempt {attempt} failed — {}; retrying on {}{}",
+                    failure.reason,
+                    retry.tier,
+                    if retry.resume {
+                        " in the same session"
+                    } else {
+                        ""
+                    }
+                ),
+                Some(events::AttemptTransition::Escalate(escalation)) => format!(
+                    "{task}: attempt {attempt} failed — {}; escalating past {} to rung {}",
+                    failure.reason, escalation.tier, escalation.to_rung
+                ),
+                Some(events::AttemptTransition::Defer(deferral)) => format!(
+                    "{task}: attempt {attempt} failed — {}; deferred ({}) — {}",
+                    failure.reason, deferral.defers, deferral.reason
+                ),
+                Some(events::AttemptTransition::Fail(failed)) => format!(
+                    "{task}: attempt {attempt} failed — {}; task failed ({:?})",
+                    failure.reason, failed.kind
+                ),
+                None => format!("{task}: attempt {attempt} failed — {}", failure.reason),
+            },
+            None => format!("{task}: attempt {attempt} passed"),
+        }
+    }
 }
 
 fn short(sha: &str) -> String {
