@@ -6074,6 +6074,235 @@ fn the_governed_lint_reader_canonicalises_aliases_and_refuses_foreign_namespaces
     let _ = fs::remove_dir_all(&scratch);
 }
 
+/// **A bare-spelled level is counted, and the envelope in which the compilers
+/// agree with that reading is pinned.** `PR74-GOV-003`, recorded as a residual
+/// here rather than repaired, and this test is the executable record.
+///
+/// The counted reading is inherited: `names_lint` has answered "the bare
+/// spelling is the lint" since `0519514`, before this slice, and
+/// `runner::container::tests` pins the same answer over the same fixture. The
+/// convergence adjudication of 2026-08-30 measured where that reading is the
+/// compiled truth, on both toolchains this repository supports — stable
+/// clippy 0.1.97 and the 1.85.0 pin's 0.1.85 — and the answer is an envelope,
+/// not a yes:
+///
+/// * **At one scope, the two compilers agree with the reading everywhere.**
+///   `#![deny(disallowed_methods)]` uncontested denies on both; a qualified
+///   deny taken back by a bare allow in the same prologue is an allow on both.
+///   Every same-scope row in the tables above therefore reads identically
+///   under either toolchain, which is what lets those tables run on any host.
+/// * **Beneath an ancestor, the pin disagrees.** A child module whose prologue
+///   writes the bare deny under a parent that allows the lint DENIES on
+///   stable and **inherits the allow on 1.85** — the bare spelling cannot
+///   override an ancestor there, while `clippy::disallowed_methods`,
+///   `clippy::r#disallowed_methods` and the `clippy::disallowed_method` rename
+///   all override on both. The file-scoped reader cannot see an ancestor, so
+///   for exactly the files the funnel census reads — nested children — its
+///   `deny` over-claims on the MSRV toolchain.
+///
+/// # Why this is a pinned residual and not a repair
+///
+/// The spelling cannot enter the tree while today's gates run:
+/// `renamed_and_removed_lints` fires beside every bare governed spelling, and
+/// the lint gate runs stable clippy with `-D warnings`, so the divergent
+/// prologue is refused at the door. Both halves of that seal are asserted
+/// below, per toolchain, because the residual is non-blocking only while they
+/// hold. Narrowing the reader instead — counting only the spellings that
+/// override on both toolchains, refusing the rest as it already refuses a
+/// foreign namespace — flips the `runner::container::tests` fixture that pins
+/// the inherited answer, which is outside this slice's write set. The
+/// narrowing therefore needs one lease adjudication and lands as one
+/// coordinated change or not at all; this test is what keeps the two files
+/// honest in the meantime, in both directions: it goes red if the reader
+/// stops counting the bare spelling without that adjudication, and it goes
+/// red if a toolchain change moves the envelope it documents.
+#[test]
+fn the_bare_lint_spelling_is_counted_and_its_toolchain_envelope_is_pinned() {
+    use crate::effects::lint_levels::file_level_lint_resolution;
+
+    const BODY: &str = "pub fn go(p: &std::path::Path) { let _ = std::fs::write(p, \"x\"); }\n";
+    const LINT: &str = "clippy::disallowed_methods";
+    const RENAMED: &str = "renamed_and_removed_lints";
+
+    // -----------------------------------------------------------------
+    // (1) The inherited reading, stated as values. The bare spelling is
+    // counted by the level reader and seen by the placement scan — the same
+    // pair of answers `runner::container::tests` builds its census on.
+    // -----------------------------------------------------------------
+    let child = format!("#![deny(disallowed_methods)]\n{BODY}");
+    let same_scope =
+        format!("#![deny(clippy::disallowed_methods)]\n#![allow(disallowed_methods)]\n{BODY}");
+    for (tag, source, level) in [
+        ("bare_deny", &child, "deny"),
+        (
+            "bare_raw_deny",
+            &format!("#![deny(r#disallowed_methods)]\n{BODY}"),
+            "deny",
+        ),
+        ("qualified_deny_then_bare_allow", &same_scope, "allow"),
+    ] {
+        for spelling in [source.clone(), source.replace('\n', "\r\n")] {
+            let resolution = file_level_lint_resolution(&spelling, LINT);
+            assert_eq!(
+                (resolution.level, resolution.ambiguous),
+                (Some(level), false),
+                "`{tag}` — the inherited counted reading changed. If that is deliberate, it is \
+                 the coordinated narrowing this test's doc describes: re-adjudicate the lease, \
+                 flip the `runner::container::tests` fixture that pins the same answer, and \
+                 re-measure the envelope below."
+            );
+        }
+    }
+    let found = governed_allows(&format!("#![allow(disallowed_methods)]\n{BODY}"));
+    assert_eq!(
+        found.len(),
+        1,
+        "a bare-spelled allow left the placement census: {found:#?}"
+    );
+    assert_eq!(found[0].lints, ["disallowed_methods"]);
+
+    // -----------------------------------------------------------------
+    // (2) The envelope, measured per toolchain rather than on whichever
+    // toolchain happens to host the suite. Each leg locates its own
+    // `clippy-driver` and is loud when it cannot; the ambient driver decides
+    // nothing here, so the answers cannot drift with the host.
+    // -----------------------------------------------------------------
+    fn toolchain_driver(toolchain: &str) -> Option<PathBuf> {
+        let sysroot = std::process::Command::new("rustup")
+            .args(["run", toolchain, "rustc", "--print", "sysroot"])
+            .output()
+            .ok()
+            .filter(|out| out.status.success())?;
+        let driver = PathBuf::from(String::from_utf8_lossy(&sysroot.stdout).trim().to_owned())
+            .join("bin")
+            .join(if cfg!(windows) {
+                "clippy-driver.exe"
+            } else {
+                "clippy-driver"
+            });
+        driver.is_file().then_some(driver)
+    }
+
+    /// Run `driver` over `root`. `(built, diagnostic codes by level)`.
+    fn drive(driver: &Path, dir: &Path, tag: &str, root: &Path) -> (bool, Vec<(String, String)>) {
+        let out = dir.join(format!("{tag}-out"));
+        fs::create_dir_all(&out).expect("an output directory");
+        let output = std::process::Command::new(driver)
+            .env("CLIPPY_CONF_DIR", repo_root())
+            .args([
+                "--edition",
+                "2024",
+                "--crate-type",
+                "lib",
+                "--emit=metadata",
+                "--error-format=json",
+            ])
+            .arg("--out-dir")
+            .arg(&out)
+            .arg(root)
+            .output()
+            .expect("clippy-driver runs; the lint gate uses the same binary");
+        let mut diagnostics = Vec::new();
+        for line in String::from_utf8_lossy(&output.stderr).lines() {
+            let Ok(value) = serde_json::from_str::<serde_json::Value>(line) else {
+                continue;
+            };
+            let Some(code) = value
+                .get("code")
+                .and_then(|code| code.get("code"))
+                .and_then(serde_json::Value::as_str)
+            else {
+                continue;
+            };
+            let level = value
+                .get("level")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or_default();
+            diagnostics.push((level.to_owned(), code.to_owned()));
+        }
+        (output.status.success(), diagnostics)
+    }
+
+    /// Compile `child` as `mod {tag}_child;` beneath a parent whose prologue
+    /// allows the lint — the shape of every file the funnel census reads.
+    fn compile_pair(
+        driver: &Path,
+        dir: &Path,
+        tag: &str,
+        child: &str,
+    ) -> (bool, Vec<(String, String)>) {
+        let parent = dir.join(format!("{tag}.rs"));
+        fs::write(
+            &parent,
+            format!("#![allow(clippy::disallowed_methods)]\nmod {tag}_child;\n"),
+        )
+        .expect("the parent fixture");
+        fs::write(dir.join(format!("{tag}_child.rs")), child).expect("the child fixture");
+        drive(driver, dir, tag, &parent)
+    }
+
+    /// Compile `source` as its own crate root — the shape every table above
+    /// drives, which is why this leg is measured at root and nowhere else.
+    fn compile_single(
+        driver: &Path,
+        dir: &Path,
+        tag: &str,
+        source: &str,
+    ) -> (bool, Vec<(String, String)>) {
+        let root = dir.join(format!("{tag}.rs"));
+        fs::write(&root, source).expect("the fixture");
+        drive(driver, dir, tag, &root)
+    }
+
+    let scratch = scratch_dir("bare-spelling-envelope");
+    // (toolchain, the child's bare deny holds beneath the ancestor allow)
+    for (toolchain, overrides) in [("stable", true), ("1.85.0", false)] {
+        let Some(driver) = toolchain_driver(toolchain) else {
+            // Loud, not silent: CI's `test` job installs `stable` only, so the
+            // MSRV half of the envelope is evidence a host adds by having the
+            // pin installed, exactly as the alias test's MSRV leg does.
+            eprintln!(
+                "note: the {toolchain} toolchain is not installed, so that half of the \
+                 envelope in `the_bare_lint_spelling_is_counted_and_its_toolchain_envelope_\
+                 is_pinned` did not run"
+            );
+            continue;
+        };
+        let tag = format!("nested_{}", toolchain.replace('.', "_"));
+        let (built, diagnostics) = compile_pair(&driver, &scratch, &tag, &child);
+        let fired = diagnostics.iter().any(|(_, code)| code == LINT);
+        assert_eq!(
+            (built, fired),
+            (!overrides, overrides),
+            "on {toolchain}, a child's bare deny beneath an ancestor allow no longer \
+             behaves as measured on 2026-08-30 — the envelope this residual was accepted \
+             under has moved, so it must be re-adjudicated: {diagnostics:?}"
+        );
+        // The seal that keeps the residual non-blocking: the spelling cannot
+        // pass the stable `-D warnings` lint gate, because the rename warning
+        // fires beside it — on both toolchains, contested or not.
+        assert!(
+            diagnostics
+                .iter()
+                .any(|(level, code)| level == "warning" && code == RENAMED),
+            "on {toolchain}, no `{RENAMED}` fired beside the bare spelling, so the gate \
+             seal this residual relies on is gone: {diagnostics:?}"
+        );
+        // And the same-scope half, at crate root: the flip the in-suite tables
+        // rely on reads identically under both toolchains, so those tables
+        // hold on any host.
+        let tag = format!("same_scope_{}", toolchain.replace('.', "_"));
+        let (built, diagnostics) = compile_single(&driver, &scratch, &tag, &same_scope);
+        assert!(
+            built && !diagnostics.iter().any(|(_, code)| code == LINT),
+            "on {toolchain}, a same-scope bare allow no longer takes back the qualified \
+             deny, so the same-scope rows are host-relative after all: {diagnostics:?}"
+        );
+    }
+
+    let _ = fs::remove_dir_all(&scratch);
+}
+
 #[test]
 fn the_production_code_region_removes_a_configured_item_and_keeps_the_rest() {
     oracles::the_configured_item_is_removed_and_the_rest_kept();

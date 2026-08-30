@@ -3179,6 +3179,15 @@ pub(crate) mod lint_levels {
     /// green is not: the reverse hands a reviewer a guard that is not on every
     /// target, which is the one failure this reader exists to prevent.
     ///
+    /// One counted spelling is wider than the pin. A **bare** governed name is
+    /// read as the lint — [`names_lint`]'s inherited reading — and beneath an
+    /// ancestor the 1.85.0 toolchain does not honour a bare override while
+    /// stable does. `PR74-GOV-003` records that envelope as a pinned residual
+    /// rather than a repair: `tests::the_bare_lint_spelling_is_counted_and_\
+    /// its_toolchain_envelope_is_pinned` measures both toolchains, asserts the
+    /// gate seal that keeps the residual non-blocking, and states the
+    /// coordinated change a narrowing requires.
+    ///
     /// Measured, not argued —
     /// `effects::tests::the_file_level_lint_reader_refuses_a_condition_it_    /// cannot_prove` drives the provable conditions through `clippy-driver`
     /// against a body that reaches `std::fs::write`, and compiles the slip
@@ -3486,6 +3495,22 @@ pub(crate) mod lint_levels {
     }
 
     /// Whether an attribute entry names `lint`, qualified either way.
+    ///
+    /// "Either way" is the inherited reading — this arm has answered "the bare
+    /// spelling is the lint" since `0519514`, and `runner::container::tests`
+    /// pins the same answer — and it is wider than what the two supported
+    /// toolchains jointly honour. `PR74-GOV-003`, measured 2026-08-30: a bare
+    /// spelling sets and takes back levels at its own scope identically on
+    /// stable clippy 0.1.97 and the 1.85.0 pin, but beneath an ancestor that
+    /// has set the lint, the pin does not let a bare spelling override while
+    /// stable does; every `clippy::`-qualified spelling, raw and renamed forms
+    /// included, overrides on both. For nested module files — the funnel
+    /// census's whole domain — a counted bare `deny` therefore over-claims on
+    /// the MSRV toolchain. `tests::the_bare_lint_spelling_is_counted_and_its_\
+    /// toolchain_envelope_is_pinned` holds the measurement, the gate seal that
+    /// keeps the residual non-blocking, and the reason a narrowing here is a
+    /// coordinated change with that census's fixture rather than an edit to
+    /// this arm alone.
     fn names_lint(entry: &str, lint: &str) -> bool {
         if entry == lint {
             return true;
