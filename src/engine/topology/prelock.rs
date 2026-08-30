@@ -819,4 +819,137 @@ mod tests {
             "the report must name the root it could not reclaim: {message}"
         );
     }
+
+    /// The child half of
+    /// [`a_failed_reclamation_during_an_unwind_does_not_abort_the_process`].
+    ///
+    /// It drives the one corner of the guard's cross-product the two witnesses
+    /// above cannot reach: a reclamation that **fails** while a panic is
+    /// **already travelling**. `raii-reported` covers failure without an
+    /// unwind and `raii-unwind` covers an unwind without a failure; only both
+    /// at once reaches the `std::thread::panicking()` half of the assertion,
+    /// and only there does the alternative — a second panic out of `Drop` —
+    /// abort the process rather than fail a test.
+    ///
+    /// Everything asserted here is asserted **in this process**, so the parent
+    /// needs no channel back: reaching the end of this body at all is the
+    /// claim, and the harness's own result line is how the parent reads it.
+    #[test]
+    #[ignore = "spawned by a_failed_reclamation_during_an_unwind_does_not_abort_the_process"]
+    fn scratch_unwind_with_a_failed_reclamation_child() {
+        const PRIMARY: &str = "the primary failure this witness keeps observable";
+
+        let caught = std::panic::catch_unwind(|| {
+            let root = Scratch::new("raii-unwind-unreclaimable");
+            // Reclaimed out from under the live guard, through the very funnel
+            // the guard will use, so the removal it attempts while unwinding
+            // fails with `NotFound` for a real reason rather than an injected
+            // one — no fault hook, no permission trick, no timing.
+            remove_public_husk(root.path(), &mut NoHooks).expect("the tree reclaims early");
+            assert!(
+                !root.path().exists(),
+                "the guard's own removal has to be the one that fails, and it would succeed \
+                 against a root that is still there"
+            );
+            panic!("{PRIMARY}");
+        })
+        .expect_err("the closure was supposed to unwind");
+
+        // Reached at all only because the destructor did not panic a second
+        // time: a panic out of `Drop` during this unwind aborts, and an
+        // aborted process runs no assertion and prints no result line.
+        let message = caught
+            .downcast_ref::<String>()
+            .cloned()
+            .or_else(|| caught.downcast_ref::<&str>().map(|m| (*m).to_owned()))
+            .unwrap_or_default();
+        assert_eq!(
+            message, PRIMARY,
+            "the destructor's own report displaced the primary panic, so the failure a test \
+             would be diagnosing is the one that got lost"
+        );
+    }
+
+    /// A reclamation that fails **while a panic is already travelling** does
+    /// not panic a second time: the process survives it, and the primary panic
+    /// is still the one that arrives.
+    ///
+    /// Measured **from outside the process that makes the observation**, which
+    /// is forced. A second panic out of a destructor mid-unwind aborts, and an
+    /// abort takes the whole test binary — so an in-process witness for this
+    /// corner would have to survive its own subject. The child is the witness;
+    /// this is the frame that reads its exit.
+    ///
+    /// The child is spawned **through the host Runner**, not through
+    /// `std::process::Command`: `std::process::Command` is on the effect
+    /// denylist and `src/engine/topology/**` may not reach it even in tests.
+    /// The Runner is the funnel that owns `Process.Spawn`, which is exactly the
+    /// rule — the same spawn `recover::tests::kill_during_recovery_repeats_recovery`
+    /// and `create::tests::spawn_and_wait` already use.
+    ///
+    /// **Both assertions are load-bearing, and neither alone is enough.**
+    /// `abort()` takes the process before the harness prints anything about the
+    /// test, so an aborted child emits no `test result:` line — but a child
+    /// whose filter matched *nothing* also exits 0 and prints `ok. 0 passed`,
+    /// which a bare exit-code assertion would read as success. Requiring the
+    /// zero exit **and** `ok. 1 passed` separates the three outcomes: aborted,
+    /// selected-and-passed, and selected-nothing-at-all.
+    #[test]
+    fn a_failed_reclamation_during_an_unwind_does_not_abort_the_process() {
+        use crate::runner::host::HostRunner;
+        use crate::runner::{
+            CommandSpec, ExecutionRole, InvocationId, ProbeTarget, Runner, RunnerRequest,
+        };
+
+        let workspace = Scratch::new("raii-abort-isolation");
+        let exe = std::env::current_exe().expect("the test binary knows where it is");
+        let request = RunnerRequest {
+            command: CommandSpec {
+                program: exe.display().to_string(),
+                args: vec![
+                    "--exact".to_owned(),
+                    "engine::topology::prelock::tests::scratch_unwind_with_a_failed_reclamation_child"
+                        .to_owned(),
+                    "--ignored".to_owned(),
+                    "--test-threads".to_owned(),
+                    "1".to_owned(),
+                ],
+                // Nothing to pass: the child derives its own scratch root from
+                // the temp directory and its own pid, so the two processes
+                // cannot collide and there is no state to hand over.
+                env: Vec::new(),
+                stdin: Vec::new(),
+            },
+            workspace: workspace.path().to_path_buf(),
+            role: ExecutionRole::Gate,
+            timeout: std::time::Duration::from_secs(120),
+            agent: None,
+            invocation: InvocationId::probe(ProbeTarget::Shell, 11)
+                .expect("a probe identity for the spawned child"),
+        };
+        let output = HostRunner::new().run(&request).expect("the child runs");
+
+        assert!(
+            !output.timed_out,
+            "the child never finished, so nothing about the unwind was observed"
+        );
+        // `stderr` rather than the whole `ProcessOutput`: the child's stdout
+        // carries its backtrace, and a failure report that buries the one line
+        // that names the cause — `panic in a destructor during cleanup` — under
+        // fifty frames of it is a report nobody reads.
+        assert_eq!(
+            output.code,
+            Some(0),
+            "the child did not complete as designed — a destructor that panicked into the live \
+             unwind aborts it, and a process killed by that abort reports no exit code at all. \
+             Its stderr: {}",
+            output.stderr
+        );
+        assert!(
+            output.stdout.contains("test result: ok. 1 passed"),
+            "the harness printed no passing result for exactly one selected test, so the child \
+             either aborted before printing or selected nothing at all: {}",
+            output.stdout
+        );
+    }
 }
