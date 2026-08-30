@@ -272,7 +272,7 @@ mod tests {
     use std::sync::Mutex;
 
     use super::*;
-    use crate::rundir::{NoHooks, create_private_dir};
+    use crate::rundir::{NoHooks, create_private_dir, remove_public_husk};
     use crate::runner::container::runtime::{
         ContainerExecution, CreateSpec, CreatedContainer, DiscoveredContainer, ImageInspection,
         Liveness, RuntimeError, RuntimeOp, StopMode,
@@ -444,17 +444,63 @@ mod tests {
         }
     }
 
-    /// A scratch directory, created through the run-directory funnel: this file
-    /// is a `TOPOLOGY_MODULE` and `std::fs::create_dir_all` is denied in it,
-    /// tests included.
-    fn scratch(tag: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!(
-            "upstroke-prelock-{tag}-{}-{:?}",
-            std::process::id(),
-            std::thread::current().id()
-        ));
-        create_private_dir(&dir, &mut NoHooks).expect("scratch root");
-        dir
+    /// A scratch directory that **owns** its tree.
+    ///
+    /// The predecessor was a `fn scratch(&str) -> PathBuf`: it created the
+    /// directory and handed back a path nothing owned, so every invocation left
+    /// its root in the temp directory forever — on the ordinary exit, on an
+    /// early return, and on the unwind a failing assertion starts. On this
+    /// project's build box a directory leaked per test is inode exhaustion,
+    /// which `df -h` reports as 72% full while every write fails — and the leak
+    /// is not hypothetical: 5050 `upstroke-prelock-*` roots had accumulated in
+    /// the temp directory by 2026-08-30, and five runs of this module after the
+    /// repair added none.
+    ///
+    /// Both ends go through the run-directory funnel because this file is a
+    /// `TOPOLOGY_MODULE`: `std::fs::create_dir_all` and every `std::fs` removal
+    /// are denied in it, tests included. `RunDir.RemovePublicHusk` is the one
+    /// recursive delete a test here can reach — it removes a directory's
+    /// children and then the directory — because `RunDir.RemovePrivateHusk`
+    /// takes a [`crate::rundir::PrivateHalfProof`], and a pre-lock scratch root
+    /// is not the two-halves shape that mints one.
+    ///
+    /// The naming is the predecessor's, unchanged: the pid and the thread id
+    /// keep two live fixtures apart, and reclamation is what this type adds.
+    struct Scratch {
+        root: PathBuf,
+    }
+
+    impl Scratch {
+        fn new(tag: &str) -> Self {
+            let root = std::env::temp_dir().join(format!(
+                "upstroke-prelock-{tag}-{}-{:?}",
+                std::process::id(),
+                std::thread::current().id()
+            ));
+            create_private_dir(&root, &mut NoHooks).expect("scratch root");
+            Self { root }
+        }
+
+        /// The authorized private root a test hands to [`check`].
+        fn path(&self) -> &Path {
+            &self.root
+        }
+    }
+
+    impl Drop for Scratch {
+        fn drop(&mut self) {
+            let reclaimed = remove_public_husk(&self.root, &mut NoHooks);
+            // A failed reclamation is the leak this type exists to prevent, so
+            // it is reported rather than discarded — but never while a panic is
+            // already travelling. A second panic out of a destructor aborts the
+            // process, which would replace the test's own failure with an abort
+            // and lose the report that says what actually broke.
+            assert!(
+                reclaimed.is_ok() || std::thread::panicking(),
+                "the scratch root {} was not reclaimed: {reclaimed:?}",
+                self.root.display()
+            );
+        }
     }
 
     fn container_selection(image: &str, volumes: &[(&str, &str)]) -> RunnerSelection {
@@ -474,12 +520,12 @@ mod tests {
     /// and the digest is the one the marker will carry.
     #[test]
     fn a_host_selection_resolves_host_v1_and_carries_its_digest() {
-        let root = scratch("host");
+        let root = Scratch::new("host");
         let selection = RunnerSelection::host_default();
         let checked = check(&PreLock {
             selection: &selection,
             runtime: None,
-            private_root: &root,
+            private_root: root.path(),
             ids: &Ids,
         })
         .expect("the host runner resolves with nothing to inspect");
@@ -506,8 +552,8 @@ mod tests {
     /// the private half, not a lock file, not a container.
     #[test]
     fn the_pre_lock_checks_leave_no_residue() {
-        let root = scratch("residue");
-        let before = names_under(&root);
+        let root = Scratch::new("residue");
+        let before = names_under(root.path());
         let selection = container_selection(IMAGE_REFERENCE, &[("codex", "upstroke-codex")]);
         let runtime = Inventory::reachable()
             .with_image(IMAGE_REFERENCE, IMAGE_ID, Some("sha256:manifest"))
@@ -516,13 +562,13 @@ mod tests {
         let checked = check(&PreLock {
             selection: &selection,
             runtime: Some(&runtime),
-            private_root: &root,
+            private_root: root.path(),
             ids: &Ids,
         })
         .expect("a reachable runtime holding the image and the volume resolves");
 
         assert_eq!(
-            names_under(&root),
+            names_under(root.path()),
             before,
             "the pre-lock phase created something under the private root"
         );
@@ -557,7 +603,7 @@ mod tests {
     /// first failure ends it.
     #[test]
     fn the_container_inspections_run_in_order_and_the_first_failure_ends_them() {
-        let root = scratch("order");
+        let root = Scratch::new("order");
         let selection = container_selection(IMAGE_REFERENCE, &[("codex", "upstroke-codex")]);
         let runtime = Inventory::reachable()
             .with_image(IMAGE_REFERENCE, IMAGE_ID, None)
@@ -565,7 +611,7 @@ mod tests {
         check(&PreLock {
             selection: &selection,
             runtime: Some(&runtime),
-            private_root: &root,
+            private_root: root.path(),
             ids: &Ids,
         })
         .expect("resolves");
@@ -584,7 +630,7 @@ mod tests {
         let refusal = check(&PreLock {
             selection: &selection,
             runtime: Some(&unreachable),
-            private_root: &root,
+            private_root: root.path(),
             ids: &Ids,
         })
         .expect_err("an unreachable runtime refuses");
@@ -602,13 +648,13 @@ mod tests {
     /// An absent credential volume refuses, and the digest is never computed.
     #[test]
     fn an_absent_credential_volume_refuses() {
-        let root = scratch("volume");
+        let root = Scratch::new("volume");
         let selection = container_selection(IMAGE_REFERENCE, &[("codex", "upstroke-codex")]);
         let runtime = Inventory::reachable().with_image(IMAGE_REFERENCE, IMAGE_ID, None);
         let refusal = check(&PreLock {
             selection: &selection,
             runtime: Some(&runtime),
-            private_root: &root,
+            private_root: root.path(),
             ids: &Ids,
         })
         .expect_err("an absent volume refuses");
@@ -622,12 +668,12 @@ mod tests {
     /// silently proceeding as though the inspection had passed.
     #[test]
     fn a_container_selection_without_a_runtime_refuses() {
-        let root = scratch("noruntime");
+        let root = Scratch::new("noruntime");
         let selection = container_selection(IMAGE_REFERENCE, &[]);
         let refusal = check(&PreLock {
             selection: &selection,
             runtime: None,
-            private_root: &root,
+            private_root: root.path(),
             ids: &Ids,
         })
         .expect_err("no runtime to inspect");
@@ -641,13 +687,16 @@ mod tests {
     /// else is asked.
     #[test]
     fn a_private_root_that_is_not_a_real_directory_refuses_before_any_inspection() {
-        let root = scratch("root").join("absent");
+        let root = Scratch::new("root");
+        // The root the check is given is a child that was never created; the
+        // guard still owns the scratch tree that child was named under.
+        let absent = root.path().join("absent");
         let selection = container_selection(IMAGE_REFERENCE, &[]);
         let runtime = Inventory::reachable().with_image(IMAGE_REFERENCE, IMAGE_ID, None);
         let refusal = check(&PreLock {
             selection: &selection,
             runtime: Some(&runtime),
-            private_root: &root,
+            private_root: &absent,
             ids: &Ids,
         })
         .expect_err("an absent private root refuses");
@@ -665,9 +714,10 @@ mod tests {
     /// the expectation the census computes are the same value.
     #[test]
     fn the_authorized_private_root_is_canonical() {
-        let root = scratch("canonical");
-        let indirect = root.join(".").join("..").join(
-            root.file_name()
+        let root = Scratch::new("canonical");
+        let indirect = root.path().join(".").join("..").join(
+            root.path()
+                .file_name()
                 .expect("the scratch root has a basename")
                 .to_string_lossy()
                 .as_ref(),
@@ -682,10 +732,91 @@ mod tests {
         .expect("a root reachable through `.`/`..` is the same root");
         assert_eq!(
             checked.private_root(),
-            std::fs::canonicalize(&root)
+            std::fs::canonicalize(root.path())
                 .expect("the scratch root canonicalizes")
                 .as_path(),
             "the witness carries the canonical root, not the spelling it was given"
+        );
+    }
+
+    /// Every exit reclaims the scratch tree — the ordinary one and the unwind,
+    /// which is the exit a failing assertion in any test above takes.
+    ///
+    /// The panic hook is deliberately **not** silenced for the second half.
+    /// The hook is process-global and this suite runs in parallel, so a test
+    /// that takes it, installs a no-op and restores it can interleave with
+    /// another doing the same and leave the process with a no-op hook for good
+    /// — every later panic anywhere in the suite losing its message and
+    /// backtrace. The few lines this prints cost less than that.
+    #[test]
+    fn a_scratch_root_is_reclaimed_on_every_exit_including_an_unwind() {
+        let ordinary = {
+            let root = Scratch::new("raii-ordinary");
+            let path = root.path().to_path_buf();
+            // A tree rather than a bare directory: the guard reclaims what a
+            // test left under its root as well as the root itself.
+            create_private_dir(&path.join("nested"), &mut NoHooks).expect("a child of the root");
+            assert!(path.join("nested").is_dir(), "the child was not created");
+            path
+        };
+        assert!(
+            !ordinary.exists(),
+            "the scratch root {} outlived its guard on the ordinary exit",
+            ordinary.display()
+        );
+
+        // The path is recorded from inside the closure rather than re-derived
+        // here: re-deriving it would copy `Scratch::new`'s naming rule, and a
+        // witness that agrees with a rule it restates proves nothing about it.
+        let recorded = Mutex::new(None);
+        let unwound = std::panic::catch_unwind(|| {
+            let root = Scratch::new("raii-unwind");
+            let path = root.path().to_path_buf();
+            *recorded
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(path.clone());
+            // The shape of a real failure: an assertion about the run that does
+            // not hold, raised with the guard still in scope.
+            assert!(!path.is_dir(), "a deliberate failure, mid-test");
+        });
+        assert!(
+            unwound.is_err(),
+            "the closure was supposed to unwind, so nothing about the panic path was measured"
+        );
+        let path = recorded
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+            .expect("the closure recorded its root before it panicked");
+        assert!(
+            !path.exists(),
+            "the scratch root {} survived the unwind",
+            path.display()
+        );
+    }
+
+    /// A reclamation that fails is **reported**, not discarded.
+    ///
+    /// `Drop` cannot return, so the alternative to reporting is silence — and
+    /// silence here is the same leak the guard exists to close, with nothing to
+    /// say it happened. The tree is reclaimed out from under the guard through
+    /// the very funnel the guard would use, so the removal it then attempts
+    /// fails for a real reason rather than an injected one, and the panic that
+    /// carries the report is caught here rather than failing this test.
+    #[test]
+    fn a_scratch_root_that_cannot_be_reclaimed_is_reported_rather_than_discarded() {
+        let reported = std::panic::catch_unwind(|| {
+            let root = Scratch::new("raii-reported");
+            remove_public_husk(root.path(), &mut NoHooks).expect("the tree reclaims early");
+        })
+        .expect_err("the guard discarded a failed reclamation");
+
+        let message = reported
+            .downcast_ref::<String>()
+            .map_or_else(String::new, Clone::clone);
+        assert!(
+            message.contains("was not reclaimed") && message.contains("raii-reported"),
+            "the report must name the root it could not reclaim: {message}"
         );
     }
 }
