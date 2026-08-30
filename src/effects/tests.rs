@@ -35,10 +35,11 @@ use serde::Deserialize;
 
 use super::{
     ALLOWLIST_TOML, CLASSIFIED_MODULES, CLIPPY_TOML, DENIAL_CONTROL, DENIAL_FIXTURES,
-    EFFECT_SITES_JSON, FROZEN_LEGACY_ALLOWLIST, FUNNEL_MODULES_JSON, REGENERATE,
-    RESIDUE_CLASSES_JSON, TOPOLOGY_MODULES, USED_GOVERNED_LINTS, WRAPPERS_TOML, blank_comments,
-    blank_comments_and_strings, externally_reachable_fns, governed_allows, legacy_growth,
-    normalize_lint, production_code, production_region, topology_modules_among,
+    EFFECT_SITES_JSON, FROZEN_LEGACY_ALLOWLIST, FUNNEL_MODULES_JSON, PROCESS_FUNNEL_CHILDREN,
+    REGENERATE, RESIDUE_CLASSES_JSON, TOPOLOGY_MODULES, USED_GOVERNED_LINTS, WRAPPERS_TOML,
+    blank_comments, blank_comments_and_strings, externally_reachable_fns, governed_allows,
+    governed_denies, governed_lints_not_denied, legacy_growth, normalize_lint, production_code,
+    production_region, topology_modules_among,
 };
 use crate::topology::effects::{EffectSiteId, effect_sites, effect_sites_json};
 
@@ -434,6 +435,178 @@ fn the_placement_scan_refuses_an_allow_that_is_not_module_level_and_sees_through
     // that report nothing at all.
     let mechanisms = 9;
     assert_eq!(mechanisms, 9);
+}
+
+/// **Every child module of the Process funnel states each governed lint.**
+///
+/// `PR57-PROC-DRAIN-INHERITED-ALLOW`. `src/agent/proc.rs` is an allowlisted
+/// funnel module carrying `#![allow(clippy::disallowed_methods,
+/// clippy::disallowed_types, clippy::disallowed_macros)]`, and rustc propagates
+/// a lint level down the **module** tree rather than the file tree. So
+/// `mod drain;` in a file of its own inherits all three by writing nothing.
+///
+/// That is precisely the hole
+/// [`every_allow_of_a_governed_lint_is_module_level_and_in_the_allowlist`]
+/// cannot see: it walks attributes, and an inherited allow is the *absence* of
+/// one. The child appears in no section of `effects/allowlist.toml` either, so
+/// a reader checking the allowlist also finds nothing to check.
+///
+/// The rule is therefore about what a child **says**, not about what it is
+/// listed in: every `*.rs` under [`PROCESS_FUNNEL_CHILDREN`] states each lint
+/// of [`USED_GOVERNED_LINTS`] at module level. `drain.rs` denies all three,
+/// which is why it needs no allowlist entry — an entry records where an ALLOW
+/// may live, and it allows nothing.
+///
+/// The domain is the directory walk, not a list, so a child added later is
+/// covered the day it lands rather than when somebody remembers to enrol it.
+#[test]
+fn every_process_funnel_child_states_every_governed_lint() {
+    let sources = scanned_sources();
+    let children: Vec<&(String, String)> = sources
+        .iter()
+        .filter(|(path, _)| path.starts_with(PROCESS_FUNNEL_CHILDREN))
+        .collect();
+
+    // CONTROL, and the one that stops this going vacuous: name a file the walk
+    // must have found. A prefix that matched nothing would otherwise report a
+    // clean directory — `PR5-DOCKER-CENSUS-CANNOT-FAIL` in its own shape.
+    let found: BTreeSet<&str> = children.iter().map(|(path, _)| path.as_str()).collect();
+    assert!(
+        found.contains("src/agent/proc/drain.rs"),
+        "the Process funnel's child directory is not in the scanned set: {found:?}"
+    );
+
+    let mut silent: Vec<String> = Vec::new();
+    for (path, source) in &children {
+        let missing = governed_lints_not_denied(source);
+        if !missing.is_empty() {
+            silent.push(format!("    {path}: {missing:?}"));
+        }
+    }
+    assert!(
+        silent.is_empty(),
+        "a child of the Process funnel inherits `src/agent/proc.rs`'s \
+         module-level allows instead of stating the lint itself. State it: \
+         `deny` if the module reaches no denied primitive, and a reviewed \
+         `effects/allowlist.toml` entry if it does.\n{}",
+        silent.join("\n")
+    );
+
+    // And the parent really is a file whose allow would be inherited. If it
+    // ever stops allowing these three, this rule stops being load-bearing and
+    // is to be reconsidered rather than left running green over nothing.
+    let (_, parent) = sources
+        .iter()
+        .find(|(path, _)| path == "src/agent/proc.rs")
+        .expect("the Process funnel is in the tree");
+    let inherited: BTreeSet<String> = governed_allows(parent)
+        .into_iter()
+        .filter(|attribute| attribute.module_level)
+        .flat_map(|attribute| attribute.lints)
+        .collect();
+    let governed: BTreeSet<String> = USED_GOVERNED_LINTS
+        .iter()
+        .filter_map(|lint| normalize_lint(lint))
+        .map(str::to_owned)
+        .collect();
+    assert_eq!(
+        inherited, governed,
+        "src/agent/proc.rs no longer allows exactly the three governed lints \
+         its children were inheriting"
+    );
+}
+
+/// The child-lint rule refuses what it is for — red first, and on the real file.
+///
+/// Two halves, because either alone is weak. The synthetic half drives each
+/// discriminator separately, so a predicate that collapsed to "returns empty"
+/// fails on the cases rather than passing on the tree. The second half deletes
+/// one `deny` at a time from `drain.rs`'s **own source**: a control that has
+/// only ever refused a fixture has not shown it would refuse this repository.
+#[test]
+fn the_process_child_lint_rule_refuses_a_removed_deny_and_an_inherited_silence() {
+    let all: Vec<&str> = USED_GOVERNED_LINTS.to_vec();
+
+    // GREEN: the shape the repair uses.
+    let stated = "#![deny(\n    clippy::disallowed_methods,\n    \
+                  clippy::disallowed_types,\n    clippy::disallowed_macros\n)]\nfn go() {}\n";
+    assert!(
+        governed_lints_not_denied(stated).is_empty(),
+        "{:?}",
+        governed_lints_not_denied(stated)
+    );
+    assert_eq!(governed_denies(stated).len(), 1);
+
+    // (1) RED: silence. The pre-repair shape, inheriting all three.
+    assert_eq!(governed_lints_not_denied("fn go() {}\n"), all);
+
+    // (2) RED: an `allow` is not a statement of denial. This is the shape that
+    //     WOULD need an allowlist entry, and it is not what the child wrote.
+    let allowing = "#![allow(clippy::disallowed_methods)]\nfn go() {}\n";
+    assert_eq!(governed_lints_not_denied(allowing), all);
+    assert!(governed_denies(allowing).is_empty());
+
+    // (3) RED: an item-level deny governs the item; the rest of the file still
+    //     inherits, so it is not a statement about the module.
+    let on_a_function = "#[deny(clippy::disallowed_methods)]\nfn go() {}\n";
+    assert_eq!(governed_lints_not_denied(on_a_function), all);
+    assert_eq!(governed_denies(on_a_function).len(), 1);
+    assert!(!governed_denies(on_a_function)[0].module_level);
+
+    // (4) RED: a deny inside a comment or a string is not an attribute.
+    let disguised = concat!(
+        "// #![deny(clippy::disallowed_methods)]\n",
+        "/* #![deny(clippy::disallowed_types)] */\n",
+        "const F: &str = \"#![deny(clippy::disallowed_macros)]\";\n",
+    );
+    assert_eq!(governed_lints_not_denied(disguised), all);
+    assert!(governed_denies(disguised).is_empty());
+
+    // (5) GREEN: `forbid` is strictly stronger than `deny` and counts.
+    let forbidden = "#![forbid(clippy::disallowed_methods)]\n\
+                     #![forbid(clippy::disallowed_types)]\n\
+                     #![forbid(clippy::disallowed_macros)]\n";
+    assert!(governed_lints_not_denied(forbidden).is_empty());
+
+    // (6) GREEN: the bare form is the same lint — an attribute may write either.
+    let bare = "#![deny(disallowed_methods, disallowed_types, disallowed_macros)]\n";
+    assert!(governed_lints_not_denied(bare).is_empty());
+
+    // THE REAL FILE. It states all three, and it allows nothing — which
+    // together are why `effects/allowlist.toml` needs no entry for it.
+    let path = repo_root().join("src/agent/proc/drain.rs");
+    let source = fs::read_to_string(&path).expect("the Process funnel's child");
+    assert!(
+        governed_lints_not_denied(&source).is_empty(),
+        "{:?}",
+        governed_lints_not_denied(&source)
+    );
+    assert!(
+        governed_allows(&source).is_empty(),
+        "the child allows a governed lint and would need an allowlist entry: {:#?}",
+        governed_allows(&source)
+    );
+
+    // One mutation per lint: delete the line that states it, and the rule must
+    // name exactly that lint. Removing the last entry leaves a trailing comma,
+    // which the attribute reader skips — so all three shapes are exercised.
+    for lint in USED_GOVERNED_LINTS {
+        let mutated: String = source
+            .lines()
+            .filter(|line| line.trim().trim_end_matches(',') != *lint)
+            .map(|line| format!("{line}\n"))
+            .collect();
+        assert_ne!(
+            mutated, source,
+            "no line of drain.rs states `{lint}` on its own; this mutation \
+             deleted nothing and the assertion below would be vacuous"
+        );
+        assert_eq!(
+            governed_lints_not_denied(&mutated),
+            vec![*lint],
+            "removing the `{lint}` deny from drain.rs is not refused"
+        );
+    }
 }
 
 /// `clippy::style`, `clippy::all` and `warnings` are governed and unused.

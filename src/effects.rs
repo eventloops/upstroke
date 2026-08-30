@@ -113,6 +113,16 @@ pub const FUNNEL_MODULES_JSON: &str = "effects/funnel-modules.json";
 /// this, is the ordinary resolution.
 pub const REGENERATE: &str = "UPSTROKE_REGENERATE_EFFECT_ARTIFACTS";
 
+/// The Process funnel's child-module directory.
+///
+/// `src/agent/proc.rs` is an allowlisted funnel module carrying all three
+/// governed allows, and every `*.rs` beneath this path is a module *inside* it
+/// — inheriting them by default, while appearing in no section of the
+/// allowlist for a reader to check.
+/// [`tests::every_process_funnel_child_states_every_governed_lint`] is the rule
+/// over exactly this directory.
+pub const PROCESS_FUNNEL_CHILDREN: &str = "src/agent/proc/";
+
 // ---------------------------------------------------------------------------
 // (2) The governed lints and where an allow of one may live
 // ---------------------------------------------------------------------------
@@ -667,6 +677,58 @@ fn configured_item_end(bytes: &[u8], start: usize) -> usize {
 /// fixture quoted in a doc comment is invisible and a real attribute is not.
 #[must_use]
 pub fn governed_allows(source: &str) -> Vec<GovernedAllow> {
+    governed_attributes(source, &["allow", "expect"])
+}
+
+/// Every `deny`/`forbid` of a governed lint in `source`, with where it sits.
+///
+/// The other direction of the same question, and the one a *child* of a funnel
+/// module has to answer: rustc propagates a lint level down the module tree, so
+/// a file that states nothing inherits its parent's `allow` while the
+/// allow-placement scan sees no attribute to flag. `forbid` counts alongside
+/// `deny` because it is strictly stronger — a census that accepted only `deny`
+/// would refuse the one shape nobody can override, which is the wrong
+/// direction to be wrong in.
+///
+/// **One parser, two questions.** `PR5D-VISIBILITY-CHECK-DUPLICATED` is the
+/// standing entry for a parser written twice in this tree, so this and
+/// [`governed_allows`] share [`governed_attributes`] rather than each walking
+/// the attributes their own way.
+#[must_use]
+pub fn governed_denies(source: &str) -> Vec<GovernedAllow> {
+    governed_attributes(source, &["deny", "forbid"])
+}
+
+/// Which of [`USED_GOVERNED_LINTS`] `source` fails to state as a module-level
+/// `deny`/`forbid`, in the order the constant lists them.
+///
+/// `PR57-PROC-DRAIN-INHERITED-ALLOW`, as a predicate. A pure function over its
+/// input precisely so the refusal can be *executed* against a source that omits
+/// one, rather than inferred from a tree where none does — the same reason
+/// [`legacy_growth`] is a function and not a loop inside its test.
+///
+/// **Module-level, for the reason the allow rule is.** A `deny` on one item
+/// leaves every other item in the file inheriting, so an item-level attribute
+/// is not a statement about the module and is not counted as one.
+#[must_use]
+pub fn governed_lints_not_denied(source: &str) -> Vec<&'static str> {
+    let denied: BTreeSet<String> = governed_denies(source)
+        .into_iter()
+        .filter(|attribute| attribute.module_level)
+        .flat_map(|attribute| attribute.lints)
+        .collect();
+    USED_GOVERNED_LINTS
+        .iter()
+        .copied()
+        .filter(|lint| match normalize_lint(lint) {
+            Some(bare) => !denied.contains(bare),
+            None => true,
+        })
+        .collect()
+}
+
+/// Every governed-lint attribute in `source` whose keyword is one of `keywords`.
+fn governed_attributes(source: &str, keywords: &[&str]) -> Vec<GovernedAllow> {
     let blanked = blank_comments_and_strings(source);
     let bytes = blanked.as_bytes();
     let mut found = Vec::new();
@@ -689,7 +751,7 @@ pub fn governed_allows(source: &str) -> Vec<GovernedAllow> {
         let attribute = &blanked[open + 1..close];
         let mut lints = Vec::new();
         let mut written = Vec::new();
-        for keyword in ["allow", "expect"] {
+        for keyword in keywords.iter().copied() {
             let mut at = 0;
             while let Some(hit) = attribute[at..].find(keyword) {
                 let start = at + hit;

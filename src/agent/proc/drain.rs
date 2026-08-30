@@ -23,6 +23,27 @@
 //!   waited on for `grace` and then abandoned with its buffer snapshotted. An
 //!   abandoned reader owns its handle and exits when the last writer closes.
 
+// PROCESS FUNNEL CHILD. `super` carries `#![allow(clippy::disallowed_methods,
+// clippy::disallowed_types, clippy::disallowed_macros)]` as an allowlisted
+// funnel module, and rustc propagates a lint level down the MODULE tree rather
+// than the file tree. A child that says nothing therefore inherits all three
+// while appearing in no section of `effects/allowlist.toml` — nothing is
+// written for a reader to check, and the allow-placement scan cannot flag an
+// attribute that does not exist. This file states each of them itself.
+//
+// `deny`, not `allow`: the drain reaches no denied primitive — `io::Read::read`,
+// `thread::{spawn, sleep}`, `Arc`/`Mutex`/`AtomicBool` and `Instant::now` are
+// none of them — so it needs no allowlist entry. An allowlist entry records
+// where an ALLOW may live, and this module allows nothing.
+//
+// `effects::tests::every_process_funnel_child_states_every_governed_lint` holds
+// the rule for every future child, and its mutation controls run the refusal.
+#![deny(
+    clippy::disallowed_methods,
+    clippy::disallowed_types,
+    clippy::disallowed_macros
+)]
+
 use std::io::Read;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
