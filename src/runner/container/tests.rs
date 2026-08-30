@@ -3262,6 +3262,59 @@ fn every_child_module_of_the_container_funnel_states_its_own_lint_level() {
         None,
         "a longer attribute name that merely starts with a level is not that level"
     );
+    // **CRLF.** The prologue walk is over bytes, and the guest checks this tree
+    // out with `\r\n`. Every answer above is taken again over the same
+    // fixtures converted, so a walk that treated `\r` as the first token of an
+    // item -- and so ended the prologue at the first line break -- fails here
+    // rather than on the Windows leg.
+    for (fixture, lint, expected) in [
+        (
+            "#![deny(clippy::disallowed_methods)]\n",
+            GOVERNED[0],
+            Some("deny"),
+        ),
+        (
+            "#![forbid(clippy::disallowed_types)]\n",
+            GOVERNED[1],
+            Some("forbid"),
+        ),
+        (
+            "//! docs\n#![allow(clippy::disallowed_methods)]\n#![deny(clippy::disallowed_macros)]\n",
+            GOVERNED[2],
+            Some("deny"),
+        ),
+        (
+            "#[deny(clippy::disallowed_methods)]\nfn go() {}\n",
+            GOVERNED[0],
+            None,
+        ),
+        (
+            "fn go() {}\n#![deny(clippy::disallowed_methods)]\n",
+            GOVERNED[0],
+            None,
+        ),
+    ] {
+        assert_eq!(stated_lint_level(fixture, lint), expected, "{fixture:?}");
+        assert_eq!(
+            stated_lint_level(&fixture.replace('\n', "\r\n"), lint),
+            expected,
+            "CRLF changed the answer for {fixture:?}"
+        );
+    }
+    // And over the real files the census reads, both spellings.
+    for path in [
+        "src/agent/proc/test_support/readiness.rs",
+        "src/runner/container/env.rs",
+    ] {
+        let text = fs::read_to_string(root.join(path)).expect("a funnel child");
+        for lint in GOVERNED {
+            assert_eq!(
+                stated_lint_level(&text, lint),
+                stated_lint_level(&text.replace('\n', "\r\n"), lint),
+                "{path} reads differently under CRLF for `{lint}`"
+            );
+        }
+    }
     assert_eq!(
         stated_lint_level(
             "//! #![allow(clippy::disallowed_methods)]\nfn go() {}\n",
@@ -3307,78 +3360,201 @@ fn every_child_module_of_the_container_funnel_states_its_own_lint_level() {
     ));
 }
 
+/// Prose with its line endings and its wrapping taken out.
+///
+/// Two records state the same two numbers, and both wrap: the TOML with a
+/// trailing `\` and the Rust with a fresh `//`. A search for a phrase that
+/// crosses either wrap is a search for a spelling of a newline, and the guest
+/// checks this tree out with **CRLF** -- so `\n` and `\r\n` are two spellings
+/// again, and `find("… six\nsites")` matches on one platform only.
+///
+/// So nothing here reads a line ending. `str::lines` splits on `\n` and drops
+/// a trailing `\r` itself, `trim` would take any that survived, and what is
+/// rebuilt is the words: comment markers and TOML continuations removed, every
+/// whitespace run collapsed to one space. An explicit `replace('\r', "")` was
+/// written here first and deleted -- measured, it changes no answer, and a line
+/// that cannot fail is a line that says the normalisation is happening
+/// somewhere it is not.
+fn collapsed_prose(text: &str) -> String {
+    let mut out = String::new();
+    for line in text.lines() {
+        let line = line.trim();
+        let line = line
+            .strip_prefix("//!")
+            .or_else(|| line.strip_prefix("///"))
+            .or_else(|| line.strip_prefix("//"))
+            .unwrap_or(line);
+        let line = line.strip_suffix('\\').unwrap_or(line);
+        for wordish in line.split_whitespace() {
+            if !out.is_empty() {
+                out.push(' ');
+            }
+            out.push_str(wordish);
+        }
+    }
+    out
+}
+
+/// The denied-method paths `clippy.toml` names, as needles that find a call.
+///
+/// Derived from the denylist rather than written out, which is what makes the
+/// census below a **closed set**: a list of five needles can only ever confirm
+/// those five, and the question an allowance answers is "which primitives does
+/// this file reach", where a sixth is the whole risk.
+///
+/// Two needles per path, and the second only when the segment before the last
+/// is a type or a trait. `std::io::Write::write_all` is called as
+/// `.write_all(` and `std::fs::rename` as `fs::rename(`, so both forms are
+/// needed; but a method needle for `std::fs::write` would be `.write(` on any
+/// receiver at all, and `libc::write` the same, so those keep the path form
+/// only. The `(` is part of every needle, which is what keeps
+/// `File::create(` from matching `File::create_new(`.
+fn denied_call_needles() -> Vec<(String, Vec<String>)> {
+    let denylist = fs::read_to_string(
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(crate::effects::CLIPPY_TOML),
+    )
+    .expect("clippy.toml");
+    let table = denylist
+        .split("disallowed-methods = [")
+        .nth(1)
+        .expect("the disallowed-methods table")
+        .split("\n]")
+        .next()
+        .expect("the table ends");
+    let mut needles = Vec::new();
+    for line in table.lines() {
+        let Some(rest) = line.split("path = \"").nth(1) else {
+            continue;
+        };
+        let Some(path) = rest.split('"').next() else {
+            continue;
+        };
+        let segments: Vec<&str> = path.split("::").collect();
+        let Some(last) = segments.last() else {
+            continue;
+        };
+        let mut forms = Vec::new();
+        if let Some(penult) = segments.len().checked_sub(2).map(|at| segments[at]) {
+            forms.push(format!("{penult}::{last}("));
+            if penult.starts_with(char::is_uppercase) {
+                forms.push(format!(".{last}("));
+            }
+        } else {
+            forms.push(format!("{last}("));
+        }
+        needles.push((path.to_owned(), forms));
+    }
+    assert!(
+        needles.len() > 50,
+        "only {} denied methods were read out of clippy.toml",
+        needles.len()
+    );
+    needles
+}
+
+/// Every denied method `readiness.rs` reaches, and how many times.
+///
+/// Over the blanked source, so the prologue's own prose -- which spells every
+/// one of these names -- is not counted as a call. `PR4-CENSUS-COMMENT-ORACLE`.
+fn denied_calls_in(source: &str) -> BTreeMap<String, usize> {
+    let code = crate::effects::blank_comments_and_strings(source);
+    let mut found = BTreeMap::new();
+    for (path, forms) in denied_call_needles() {
+        let count: usize = forms.iter().map(|form| code.matches(form).count()).sum();
+        if count > 0 {
+            found.insert(path, count);
+        }
+    }
+    found
+}
+
 /// The readiness allowance names **exactly** the primitives it is written
 /// against, and the record's arithmetic is the tree's.
 ///
-/// `PR72-COUNT-002`. Both the allowlist row and the file's own prologue said
-/// "five calls", which is two claims run together and one of them wrong: there
-/// are five distinct denied method **paths** and six **call sites**, because
-/// `fs::remove_file` is called on each of the two failure paths. A reviewer
-/// checking the row against the file would have found six and had no way to
-/// know which number the row meant.
+/// `PR72-COUNT-002`. Both records said "five calls", which is two claims run
+/// together and one of them wrong: there are five distinct denied **paths** and
+/// six **sites**, because `fs::remove_file` is called on each of the two
+/// failure paths. A reviewer checking the row against the file would have
+/// counted six and had no way to know which number the row meant.
 ///
-/// So both numbers are asserted here rather than written down twice. The set
-/// is closed as well as counted: an allowance is a claim about which
-/// primitives a file may reach, and a sixth path arriving without the row
-/// moving is the widening the row exists to make visible.
+/// **Closed over the denylist, not over a list of five.** The set comes from
+/// `clippy.toml` and is compared for equality, so a sixth primitive appearing
+/// in this file fails here whether or not anybody edits the row -- which is the
+/// only version of this census worth having, since an allowance is a claim
+/// about what a file may reach and a list of five needles can only confirm the
+/// five it already knows.
 #[test]
 fn the_readiness_allowance_names_the_paths_it_is_written_against() {
-    // Counted over the blanked source, so the prologue's own prose about these
-    // names -- which spells every one of them -- is not counted as a call.
-    // `PR4-CENSUS-COMMENT-ORACLE`.
-    const DENIED: [(&str, usize); 5] = [
-        ("File::create_new(", 1),
-        (".write_all(", 1),
-        (".flush()", 1),
-        ("fs::rename(", 1),
-        ("fs::remove_file(", 2),
-    ];
     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     let readiness = root.join("src/agent/proc/test_support/readiness.rs");
     let source = fs::read_to_string(&readiness).expect("the readiness module");
-    let code = crate::effects::blank_comments_and_strings(&source);
 
-    let mut sites = 0;
-    for (needle, expected) in DENIED {
-        let found = code.matches(needle).count();
-        assert_eq!(
-            found, expected,
-            "readiness.rs calls `{needle}` {found} time(s) and the record says {expected}"
-        );
-        sites += found;
-    }
-    assert_eq!(DENIED.len(), 5, "five distinct denied method paths");
-    assert_eq!(sites, 6, "six call sites across those five paths");
+    let expected: BTreeMap<String, usize> = [
+        ("std::fs::File::create_new", 1),
+        ("std::io::Write::write_all", 1),
+        ("std::io::Write::flush", 1),
+        ("std::fs::rename", 1),
+        ("std::fs::remove_file", 2),
+    ]
+    .into_iter()
+    .map(|(path, count)| ((*path).to_owned(), count))
+    .collect();
 
-    // The two records carry the same two numbers, in words, so neither can be
-    // corrected without the other.
+    let found = denied_calls_in(&source);
+    assert_eq!(
+        found, expected,
+        "the denied primitives readiness.rs reaches are not the ones its allowlist row is \
+         written against"
+    );
+    assert_eq!(found.len(), 5, "five distinct denied paths");
+    assert_eq!(
+        found.values().sum::<usize>(),
+        6,
+        "six sites across those five paths"
+    );
+
+    // **CRLF.** The guest checks this tree out with `\r\n`, and every count
+    // above has to be the same there. Converted deterministically from the
+    // source just read rather than assumed to be line-ending-blind.
+    assert_eq!(
+        denied_calls_in(&source.replace('\n', "\r\n")),
+        found,
+        "the denied-call census answers differently under CRLF"
+    );
+
+    // Both records carry the same two numbers, read through the wrapping and
+    // the line endings rather than around them.
     let allowlist = fs::read_to_string(root.join("effects/allowlist.toml")).expect("the allowlist");
     let row = allowlist
         .split("[[")
         .find(|block| block.contains("path = \"src/agent/proc/test_support/readiness.rs\""))
         .expect("the readiness row");
-    for phrase in ["FIVE DISTINCT DENIED PATHS", "SIX \\\nCALL SITES"] {
-        assert!(
-            row.contains(phrase),
-            "the readiness allowlist row no longer states `{phrase}`"
-        );
-    }
-    assert!(
-        source.contains("five distinct denied method paths across six call"),
-        "the readiness prologue no longer states the same two numbers"
-    );
-
-    // And the row names each of the five paths, so the set is closed rather
-    // than merely counted.
-    for path in [
-        "std::fs::File::create_new",
-        "std::io::Write::write_all",
-        "std::io::Write::flush",
-        "std::fs::rename",
-        "std::fs::remove_file",
+    for (record, text, phrase) in [
+        (
+            "effects/allowlist.toml",
+            row,
+            "FIVE DISTINCT DENIED PATHS ACROSS SIX SITES",
+        ),
+        (
+            "readiness.rs",
+            source.as_str(),
+            "five distinct denied paths across six sites",
+        ),
     ] {
+        for spelling in [text.to_owned(), text.replace('\n', "\r\n")] {
+            assert!(
+                collapsed_prose(&spelling).contains(phrase),
+                "{record} no longer states `{phrase}`"
+            );
+        }
+    }
+
+    // And the row names each path it is written against, so the record is a
+    // closed set on its own side too.
+    let collapsed_row = collapsed_prose(row);
+    for path in expected.keys() {
         assert!(
-            row.contains(path),
+            collapsed_row.contains(path.as_str()),
             "the readiness allowlist row does not name `{path}`"
         );
     }

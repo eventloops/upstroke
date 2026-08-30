@@ -2954,6 +2954,91 @@ fn the_module_scan_reads_ancestry_and_visibility_rather_than_text_after_an_attri
     );
     assert_eq!(inside_a_negated_loop.name, "local");
     assert!(!inside_a_negated_loop.test_only);
+
+    // (13) **A negated grouped expression is not a macro body.** `if !(…)` is
+    // identifier, `!`, delimited group — the same three tokens as `foo!(…)` —
+    // and a block expression inside the group may legally declare a module.
+    // Read as a macro the group is module-shaped and the whole file is refused;
+    // read as the negation it is, the module is the module it is. A keyword
+    // cannot be a macro's path segment, which is what separates them.
+    for negated_group in [
+        "#[cfg(test)]\nmod outer {\n    fn f() -> bool {\n        if !({ mod local {} true }) { false } else { true }\n    }\n}\n",
+        "mod outer {\n    fn f() -> bool {\n        !({ mod local {} true })\n    }\n}\n",
+        "mod outer {\n    fn f() {\n        while !({ mod local {} false }) { }\n    }\n}\n",
+        "mod outer {\n    fn f() -> bool {\n        return !({ mod local {} true });\n    }\n}\n",
+    ] {
+        let read = scan_module_declarations(negated_group)
+            .unwrap_or_else(|refusal| panic!("{negated_group:?} was refused: {refusal}"));
+        assert!(
+            read.is_empty(),
+            "an inline `mod local {{}}` names no file, so it is a scope and not a declaration: \
+             {negated_group:?} -> {read:#?}"
+        );
+    }
+    // And the same shape with a real out-of-line declaration inside the group,
+    // so the walk is shown to reach it rather than merely not to refuse.
+    let through_a_negated_group = only(
+        "#[cfg(test)]\nmod outer {\n    fn f() -> bool {\n        if !({ mod local; true }) { false } else { true }\n    }\n}\n",
+    );
+    assert_eq!(through_a_negated_group.name, "local");
+    assert_eq!(
+        through_a_negated_group.inline_path,
+        vec!["outer".to_owned()],
+        "the negated group was skipped as a macro body and its declaration lost"
+    );
+    assert!(through_a_negated_group.test_only);
+
+    // (14) **Raw identifiers are one token, and their name may be a keyword.**
+    // `mod r#type;` declares a module called `type` and resolves to `type.rs`;
+    // a reader that stopped at the `#` saw `mod r` with no terminator after it
+    // and refused the file.
+    for (written, expected) in [
+        ("#[cfg(test)]\nmod r#type;\n", "type"),
+        ("#[cfg(test)]\npub(crate) mod r#fn;\n", "fn"),
+        ("#[cfg(test)]\nmod r#tests;\n", "tests"),
+    ] {
+        let raw = only(written);
+        assert_eq!(raw.name, expected, "{written:?}");
+        assert!(raw.test_only, "{written:?}");
+    }
+    // A raw `r#mod` is an identifier named `mod`, not the keyword, so it opens
+    // nothing; and `raw` is an ordinary identifier that merely starts with `r`.
+    assert!(scan("struct r#mod;\nfn f() { let raw = 1; }\n").is_empty());
+    let beside_a_raw_word = only("fn raw() {}\n#[cfg(test)]\nmod real;\n");
+    assert_eq!(beside_a_raw_word.name, "real");
+
+    // (15) **A raw macro name is still a macro.** `r#if!(…)` is a macro called
+    // `if`, so the keyword rule above must read the raw spelling as an
+    // identifier rather than as the keyword it names.
+    let past_a_raw_macro = only("r#if! { let _ = 1; }\n#[cfg(test)]\nmod real;\n");
+    assert_eq!(past_a_raw_macro.name, "real");
+    assert!(past_a_raw_macro.test_only);
+
+    // (16) **CRLF.** The guest checks this tree out with CRLF, and every
+    // structural answer above has to be the same there. Driven by converting
+    // each fixture rather than by trusting that nothing here reads a line.
+    for fixture in [
+        "#[cfg(test)]\npub(crate) mod test_support {\n    pub(crate) mod readiness;\n}\n",
+        "mod outer {\n    #[cfg(test)]\n    mod middle {\n        pub mod leaf;\n    }\n}\n",
+        "macro_rules ! m {\n    (mod $n:ident) => {\n        ()\n    };\n}\n#[cfg(test)]\nmod real;\n",
+        "#[cfg(test)]\nmod r#type;\n",
+    ] {
+        let lf = scan_module_declarations(fixture);
+        let crlf = scan_module_declarations(&fixture.replace('\n', "\r\n"));
+        assert_eq!(lf, crlf, "CRLF changed the derivation for {fixture:?}");
+        assert!(lf.is_ok_and(|found| found.len() == 1));
+    }
+    for refused in [
+        "macro_rules! m {\n    () => {\n        #[cfg(test)]\n        mod x;\n    };\n}\n",
+        "#[cfg(test)]\nmod tests;\n#[cfg(test)]\nmod tests;\n",
+    ] {
+        assert_eq!(
+            scan_module_declarations(refused).is_err(),
+            scan_module_declarations(&refused.replace('\n', "\r\n")).is_err(),
+            "CRLF changed whether {refused:?} is refused"
+        );
+        assert!(scan_module_declarations(refused).is_err());
+    }
 }
 
 /// The resolver **refuses** every shape it cannot resolve, rather than guessing.
@@ -3060,6 +3145,12 @@ fn the_module_resolver_refuses_every_shape_it_cannot_resolve() {
         "paste!( mod x { } );\n",
         "items![ pub(crate) mod x; ]\n",
         "outer! { inner! { mod x; } }\n",
+        // Raw identifiers, on both halves: a macro defined with a keyword for a
+        // name, and a module-shaped body whose module is named with one.
+        "macro_rules! r#mod {\n    () => {\n        mod x;\n    };\n}\n",
+        "macro_rules ! r#type {\n    () => {\n        #[cfg(test)]\n        mod x;\n    };\n}\n",
+        "quote! { mod r#type; }\n",
+        "r#if! { mod r#fn { } }\n",
     ] {
         assert!(
             matches!(refusal(shaped), ScanRefusal::ModuleShapedMacroBody { .. }),
@@ -3313,34 +3404,81 @@ fn the_module_resolver_refuses_every_shape_it_cannot_resolve() {
 /// typo in the needle fails the second half instead of passing the first.
 #[test]
 fn the_file_level_lint_reader_is_a_census_instrument_and_not_a_shipped_api() {
+    /// The two claims, over one spelling of the file.
+    ///
+    /// **Structural, and therefore line-ending-blind.** The first draft
+    /// searched for the literal `"#[cfg(test)]\npub(crate) mod lint_levels {"`,
+    /// which is a search for a spelling of a newline: the guest checks this
+    /// tree out with CRLF and that needle is `\r\n` there, so the assertion
+    /// held on Unix and on nothing else. What actually has to be true is that
+    /// the item is **removed by** [`crate::effects::production_code`], which is
+    /// what `#[cfg(test)]` means to every census in this crate — and that is
+    /// read from the region, not from a byte sequence spanning a line.
+    fn absent_from_production(source: &str) -> Vec<String> {
+        let production = crate::effects::production_code(source);
+        let whole = blank_comments_and_strings(source);
+        let mut wrong = Vec::new();
+        for needle in [
+            "fn file_level_lint_state(",
+            "fn names_lint(",
+            "mod lint_levels",
+        ] {
+            if !whole.contains(needle) {
+                wrong.push(format!("`{needle}` is not in src/effects.rs at all"));
+            }
+            if production.contains(needle) {
+                wrong.push(format!(
+                    "`{needle}` survives into the production region, which makes it a shipped \
+                     surface rather than a census instrument"
+                ));
+            }
+        }
+        wrong
+    }
+
     let source = fs::read_to_string(repo_root().join("src/effects.rs")).expect("src/effects.rs");
-    let production = crate::effects::production_code(&source);
-    for name in ["file_level_lint_state", "names_lint"] {
-        assert!(
-            blank_comments_and_strings(&source).contains(&format!("fn {name}(")),
-            "`{name}` is not defined in src/effects.rs at all, so the check below is vacuous"
-        );
-        assert!(
-            !production.contains(&format!("fn {name}(")),
-            "`{name}` is in this file's production region, which makes it a shipped surface \
-             rather than a census instrument"
+    assert!(
+        absent_from_production(&source).is_empty(),
+        "{:#?}",
+        absent_from_production(&source)
+    );
+    // The same file with the line endings the Windows guest gives it.
+    let crlf = source.replace('\n', "\r\n");
+    assert!(
+        absent_from_production(&crlf).is_empty(),
+        "{:#?}",
+        absent_from_production(&crlf)
+    );
+
+    // The visibility is narrow as well as gated, and that fits on one line in
+    // either spelling.
+    assert!(
+        blank_comments_and_strings(&source).contains("pub(crate) mod lint_levels"),
+        "the lint reader's module is no longer `pub(crate)`"
+    );
+    assert!(
+        !blank_comments_and_strings(&source).contains("pub mod lint_levels"),
+        "the lint reader's module is `pub`, which is the surface this repair removed"
+    );
+
+    // The instrument still answers where it is used, so narrowing it did not
+    // narrow it out of existence — under both spellings of a line ending.
+    for prologue in [
+        "#![deny(clippy::disallowed_types)]\n",
+        "#![deny(clippy::disallowed_types)]\r\n",
+        "//! docs\r\n#![allow(clippy::too_many_arguments)]\r\n#![forbid(clippy::disallowed_macros)]\r\n",
+    ] {
+        let wanted = if prologue.contains("forbid") {
+            ("clippy::disallowed_macros", Some("forbid"))
+        } else {
+            ("clippy::disallowed_types", Some("deny"))
+        };
+        assert_eq!(
+            crate::effects::lint_levels::file_level_lint_state(prologue, wanted.0),
+            wanted.1,
+            "{prologue:?}"
         );
     }
-    // And the module holding it says so, in the two ways that make it true.
-    let declaration = blank_comments_and_strings(&source);
-    assert!(
-        declaration.contains("#[cfg(test)]\npub(crate) mod lint_levels {"),
-        "the lint reader's module is no longer `#[cfg(test)] pub(crate)`"
-    );
-    // The instrument still answers where it is used, so narrowing it did not
-    // narrow it out of existence.
-    assert_eq!(
-        crate::effects::lint_levels::file_level_lint_state(
-            "#![deny(clippy::disallowed_types)]\n",
-            "clippy::disallowed_types"
-        ),
-        Some("deny")
-    );
 }
 
 #[test]

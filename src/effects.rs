@@ -2070,8 +2070,20 @@ pub(crate) mod census_domain {
     /// after `macro_rules` is what keeps `if !condition { … }` out, which
     /// otherwise reads as an invocation of `if` whose body is the block.
     fn macro_at(bytes: &[u8], at: usize) -> Option<MacroInvocation> {
-        let (after_name, name) = identifier(bytes, at);
-        if name.is_empty() {
+        let name = word(bytes, at);
+        let after_name = name.end;
+        if name.text.is_empty() {
+            return None;
+        }
+        // **A keyword before a `!` is unary negation, not a macro name.**
+        // `if !(cond)`, `while !(cond)`, `return !(x)` are identifier, `!`,
+        // delimited group -- the same three tokens as `foo!(…)` -- so reading
+        // them as macros skips the grouped expression, and a `mod` written
+        // inside it (`if !({ mod local {} true })` is valid Rust) then reads as
+        // a module-shaped macro body and refuses the whole file. A macro's path
+        // segment cannot be a keyword unless it is written raw, and `r#if!(…)`
+        // is a macro called `if`, so the test is on the plain spelling only.
+        if !name.raw && is_keyword(name.text) {
             return None;
         }
         // **Whitespace and comments may sit between the name and its `!`.**
@@ -2091,10 +2103,12 @@ pub(crate) mod census_domain {
         // what would make `if !condition { … }` an invocation of `if` once the
         // gap above is allowed: identifier, `!`, identifier, delimiter — and
         // the whole block would be skipped. Keyed on the one name that has it.
-        if name == b"macro_rules" {
-            let (after_defined, defined) = identifier(bytes, cursor);
-            if !defined.is_empty() {
-                cursor = whitespace(bytes, after_defined);
+        if !name.raw && name.text == b"macro_rules" {
+            // The defined name may itself be raw -- `macro_rules! r#mod { … }`
+            // is how a macro takes a keyword for a name.
+            let defined = word(bytes, cursor);
+            if !defined.text.is_empty() {
+                cursor = whitespace(bytes, defined.end);
             }
         }
         let (opener, closer) = match bytes.get(cursor) {
@@ -2105,7 +2119,7 @@ pub(crate) mod census_domain {
         };
         let close = super::matching(bytes, cursor, opener, closer)?;
         Some(MacroInvocation {
-            name: String::from_utf8_lossy(&bytes[at..after_name]).into_owned(),
+            name: String::from_utf8_lossy(name.text).into_owned(),
             open: cursor,
             close,
         })
@@ -2123,19 +2137,24 @@ pub(crate) mod census_domain {
                 at += 1;
                 continue;
             }
-            let (end, word) = identifier(bytes, at);
-            if word == b"mod" {
-                let name_at = whitespace(bytes, end);
-                if name_at > end {
-                    let (name_end, name) = identifier(bytes, name_at);
-                    if !name.is_empty()
-                        && matches!(bytes.get(whitespace(bytes, name_end)), Some(b';' | b'{'))
+            let keyword = word(bytes, at);
+            if !keyword.raw && keyword.text == b"mod" {
+                let name_at = whitespace(bytes, keyword.end);
+                if name_at > keyword.end {
+                    // The name may be raw: `mod r#type;` inside a macro body is
+                    // as module-shaped as `mod tests;` is.
+                    let declared = word(bytes, name_at);
+                    if !declared.text.is_empty()
+                        && matches!(
+                            bytes.get(whitespace(bytes, declared.end)),
+                            Some(b';' | b'{')
+                        )
                     {
                         return Some(at);
                     }
                 }
             }
-            at = end;
+            at = keyword.end;
         }
         None
     }
@@ -2147,6 +2166,114 @@ pub(crate) mod census_domain {
             end += 1;
         }
         (end, &bytes[from..end])
+    }
+
+    /// One identifier token, raw or plain.
+    struct Word<'a> {
+        /// Where the token ends, `r#` included.
+        end: usize,
+        /// Whether it was written `r#name`.
+        raw: bool,
+        /// The name, without any `r#`.
+        text: &'a [u8],
+    }
+
+    /// The identifier token at `from`, reading `r#name` as one token.
+    ///
+    /// **A raw identifier is one token and its name may be a keyword.** That is
+    /// the whole reason this exists: `mod r#type;` declares a module called
+    /// `type`, and a reader that stopped at the `#` saw `mod r` followed by
+    /// something that is not a terminator and refused the file. `raw` is an
+    /// ordinary identifier that merely begins with the same letter, so the
+    /// prefix counts only when a `#` and an identifier byte follow it.
+    fn word(bytes: &[u8], from: usize) -> Word<'_> {
+        if bytes.get(from) == Some(&b'r')
+            && bytes.get(from + 1) == Some(&b'#')
+            && bytes
+                .get(from + 2)
+                .is_some_and(|byte| super::is_ident_byte(*byte))
+        {
+            let (end, text) = identifier(bytes, from + 2);
+            return Word {
+                end,
+                raw: true,
+                text,
+            };
+        }
+        let (end, text) = identifier(bytes, from);
+        Word {
+            end,
+            raw: false,
+            text,
+        }
+    }
+
+    /// Rust's keywords, strict and reserved.
+    ///
+    /// **A keyword cannot be a macro's path segment**, and that is the only
+    /// structural thing separating `if !(…)` from `foo!(…)`: both are an
+    /// identifier, a `!` and a delimited group. Written raw it can --
+    /// `r#if!(…)` is a macro named `if` -- which is why [`Word`] carries that
+    /// bit rather than only the text.
+    const KEYWORDS: &[&[u8]] = &[
+        b"as",
+        b"break",
+        b"const",
+        b"continue",
+        b"crate",
+        b"dyn",
+        b"else",
+        b"enum",
+        b"extern",
+        b"false",
+        b"fn",
+        b"for",
+        b"if",
+        b"impl",
+        b"in",
+        b"let",
+        b"loop",
+        b"match",
+        b"mod",
+        b"move",
+        b"mut",
+        b"pub",
+        b"ref",
+        b"return",
+        b"self",
+        b"Self",
+        b"static",
+        b"struct",
+        b"super",
+        b"trait",
+        b"true",
+        b"type",
+        b"unsafe",
+        b"use",
+        b"where",
+        b"while",
+        b"async",
+        b"await",
+        b"dyn",
+        b"abstract",
+        b"become",
+        b"box",
+        b"do",
+        b"final",
+        b"macro",
+        b"override",
+        b"priv",
+        b"typeof",
+        b"unsized",
+        b"virtual",
+        b"yield",
+        b"try",
+        b"gen",
+    ];
+
+    /// Whether `text` is a Rust keyword written plainly.
+    fn is_keyword(text: &[u8]) -> bool {
+        KEYWORDS.contains(&text)
     }
 
     /// The first non-whitespace index at or after `from`.
@@ -2175,28 +2302,31 @@ pub(crate) mod census_domain {
     /// costs a structural scan. A text rule keyed on `mod ` immediately after
     /// the attribute could not do it, and that is the hole this closes.
     fn module_at(bytes: &[u8], at: usize) -> Option<ModuleShape> {
-        let (mut cursor, mut word) = identifier(bytes, at);
-        if word == b"pub" {
-            let after = whitespace(bytes, cursor);
-            cursor = if bytes.get(after) == Some(&b'(') {
+        // Raw-aware throughout: `r#pub` and `r#mod` are identifiers named for
+        // keywords, not the keywords, and neither opens a module item.
+        let mut token = word(bytes, at);
+        if !token.raw && token.text == b"pub" {
+            let after = whitespace(bytes, token.end);
+            let cursor = if bytes.get(after) == Some(&b'(') {
                 super::matching(bytes, after, b'(', b')')? + 1
             } else {
                 after
             };
-            let (end, next) = identifier(bytes, whitespace(bytes, cursor));
-            cursor = end;
-            word = next;
+            token = word(bytes, whitespace(bytes, cursor));
         }
-        if word != b"mod" {
+        if token.raw || token.text != b"mod" {
             return None;
         }
         // `mod` and the name must be separated: `models` is not `mod els`.
-        let after_keyword = whitespace(bytes, cursor);
-        if after_keyword == cursor {
+        let after_keyword = whitespace(bytes, token.end);
+        if after_keyword == token.end {
             return None;
         }
-        let (name_end, name) = identifier(bytes, after_keyword);
-        let name = String::from_utf8_lossy(name).into_owned();
+        // The declared name is the identifier without its `r#`: `mod r#type;`
+        // names `type.rs`, the way rustc resolves it.
+        let declared = word(bytes, after_keyword);
+        let name_end = declared.end;
+        let name = String::from_utf8_lossy(declared.text).into_owned();
         let terminator = whitespace(bytes, name_end);
         match bytes.get(terminator) {
             Some(b'{') => Some(ModuleShape {
