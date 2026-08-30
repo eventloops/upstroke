@@ -71,10 +71,11 @@
 //!
 //! It does so **without moving the whole-file module census**.
 //! `census_domain::declared_whole_file_test_modules` derives a skip only from a
-//! **terminated** module declaration, and drops any candidate whose name
-//! carries a `{` -- which an inline module with a body always does. So
-//! `the_declared_whole_file_test_modules_are_seventeen_and_three_are_not_called_tests`
-//! still counts seventeen and no pinned test is renamed.
+//! **terminated** declaration -- `mod name;` -- and an inline module with a
+//! body opens a scope the scan reads declarations *inside* rather than naming a
+//! file of its own. So
+//! `the_whole_file_test_modules_are_resolved_from_the_declarations_not_the_file_names`
+//! still resolves eighteen and no pinned test is renamed.
 //!
 //! That terminated form is deliberately not spelled out here, for the reason
 //! `policy.rs` gives: one written inside a comment is the exact shape that once

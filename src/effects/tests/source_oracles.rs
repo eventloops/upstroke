@@ -48,12 +48,16 @@
 //!
 //! It does so **without moving the whole-file module census**.
 //! `census_domain::declared_whole_file_test_modules` derives a skip only from a
-//! **terminated** module declaration, and `super` declares this file with a
-//! plain `mod` and no attribute, so no skip is derived and no file leaves any
-//! census. That matters more here than anywhere else in this directory:
-//! `the_whole_file_test_modules_are_seventeen` is one of the eleven bodies
-//! below, and a declaration written the other way would make this file the
-//! eighteenth module of the set it is itself asserting is seventeen.
+//! **terminated** declaration -- `mod name;` -- whose effective predicate
+//! entails `cfg(test)`, and `super` declares this file with a plain `mod` at
+//! its own top level: no attribute, and no inline `cfg(test)` ancestor in the
+//! file that writes the declaration. The derivation deliberately does not close
+//! over the file graph, so `super` being a test module itself does not make
+//! this one. No skip is derived and no file leaves any census. That matters
+//! more here than anywhere else in this directory:
+//! `the_whole_file_modules_are_read_from_the_declarations` is one of the eleven
+//! bodies below, and a declaration written the other way would make this file
+//! the nineteenth module of the set it is itself asserting is eighteen.
 //!
 //! That terminated form is deliberately not spelled out here, for the reason
 //! `policy.rs` gives: one written inside a comment is the exact shape that once
@@ -522,21 +526,31 @@ pub(super) mod oracles {
         );
     }
 
-    /// **The whole-file test modules a census skips are the crate's declarations,
-    /// and there are seventeen of them.**
+    /// **The whole-file test modules a census skips are the crate's own
+    /// declarations, structurally resolved — not a file-name rule.**
     ///
     /// The class boundary for `PR7-R5-ATT-001`. Four whole-tree censuses skip test
     /// files; three took the set from
     /// [`census_domain::declared_whole_file_test_modules`] and one wrote its own
-    /// rule, `path.file_stem() == "tests"`. That covers fourteen files. The crate
-    /// declares **seventeen**, and the three it misses are exactly the ones a
-    /// census is most likely to trip over — a scaffold and a fake exist to *name*
-    /// what production names, and `scaffold.rs` sits inside the `engine/topology`
-    /// domain one of those censuses walks.
+    /// rule, `path.file_stem() == "tests"`. That covers the fourteen files a
+    /// literal `#[cfg(test)] mod tests;` declares. The crate declares four more,
+    /// and they are exactly the ones a census is most likely to trip over — a
+    /// scaffold, a fake and a readiness protocol exist to *name* what production
+    /// names, and `scaffold.rs` sits inside the `engine/topology` domain one of
+    /// those censuses walks.
+    ///
+    /// `agent/proc/test_support/readiness.rs` is the fourth and the one no
+    /// **text** rule finds at all: it is declared `pub(crate) mod readiness;`,
+    /// with no attribute of its own, inside `proc`'s inline `#[cfg(test)]
+    /// pub(crate) mod test_support { … }`. Nothing in that file is
+    /// `#[cfg(test)]`, so a census that did not skip it would read 500 lines of
+    /// fixture — five denied effect calls among them — as production.
     ///
     /// Named individually rather than counted, because a count alone would pass if
-    /// the derivation swapped one file for another.
-    pub(in crate::effects::tests) fn the_whole_file_test_modules_are_seventeen() {
+    /// the derivation swapped one file for another. Counted as well, because
+    /// names alone would pass if the derivation grew a nineteenth nobody looked
+    /// at.
+    pub(in crate::effects::tests) fn the_whole_file_modules_are_read_from_the_declarations() {
         let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
         let mut files = Vec::new();
         let mut stack = vec![root.clone()];
@@ -552,20 +566,22 @@ pub(super) mod oracles {
         }
 
         let modules = crate::effects::census_domain::whole_file_test_modules(&files, 13);
+        let relative = |path: &std::path::Path| {
+            path.strip_prefix(&root)
+                .unwrap_or(path)
+                .to_string_lossy()
+                .replace('\\', "/")
+        };
         let named: Vec<String> = modules
             .iter()
             .filter(|path| path.file_stem().is_none_or(|stem| stem != "tests"))
-            .map(|path| {
-                path.strip_prefix(&root)
-                    .unwrap_or(path)
-                    .to_string_lossy()
-                    .replace('\\', "/")
-            })
+            .map(|path| relative(path))
             .collect();
 
         assert_eq!(
             named,
             vec![
+                "agent/proc/test_support/readiness.rs".to_owned(),
                 "engine/topology/scaffold.rs".to_owned(),
                 "events/log/premove.rs".to_owned(),
                 "runner/container/fake.rs".to_owned(),
@@ -575,10 +591,59 @@ pub(super) mod oracles {
         );
         assert_eq!(
             modules.len(),
-            17,
+            18,
             "the crate declares {} whole-file test modules; a census skipping fourteen of them by \
              file name leaves the rest inside its domain",
             modules.len()
+        );
+
+        // **The two halves of the eighteen, separated.** The count above is
+        // satisfied by any eighteen files; these two say *how* each was reached,
+        // which is the part the structural scan changed. Fourteen come from a
+        // literal `#[cfg(test)] mod tests;` — the form a text rule could find —
+        // and the derivation must still find all fourteen after learning to read
+        // structure, because a scan that resolved ancestry and lost the plain
+        // case would trade one blind spot for another.
+        let declarations = crate::effects::census_domain::declared_whole_file_test_modules(&files);
+        assert_eq!(declarations.len(), 18);
+        let literal: Vec<String> = declarations
+            .iter()
+            .filter(|declaration| declaration.inline_path.is_empty() && declaration.name == "tests")
+            .map(|declaration| relative(&declaration.declared_in))
+            .collect();
+        assert_eq!(
+            literal.len(),
+            14,
+            "fourteen files declare `#[cfg(test)] mod tests;` at their top level and the scan \
+             found {}: {literal:?}",
+            literal.len()
+        );
+        // And the one that is reached only through an inline ancestor, named
+        // with the ancestry it was reached through. This is the whole of what
+        // the structural scan buys, so it is asserted as a value rather than as
+        // a count.
+        let inherited: Vec<(String, String, Vec<String>, String)> = declarations
+            .iter()
+            .filter(|declaration| !declaration.inline_path.is_empty())
+            .map(|declaration| {
+                (
+                    relative(&declaration.declared_in),
+                    declaration.name.clone(),
+                    declaration.inline_path.clone(),
+                    declaration.guard.clone(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            inherited,
+            vec![(
+                "agent/proc.rs".to_owned(),
+                "readiness".to_owned(),
+                vec!["test_support".to_owned()],
+                "test".to_owned(),
+            )],
+            "the declarations reached only through an inline `cfg(test)` ancestor are not what \
+             this tree contains"
         );
     }
 
@@ -589,7 +654,7 @@ pub(super) mod oracles {
     /// count over the whole tree, so a shape it mishandles is a hole nobody would
     /// see: the count would simply be lower.
     pub(in crate::effects::tests) fn the_configured_item_is_removed_and_the_rest_kept() {
-        // A `mod tests;` declaration. Thirteen files in this tree end with one, and
+        // A `mod tests;` declaration. Fourteen files in this tree end with one, and
         // everything below it used to be outside every region that truncates.
         let region = production_code("fn above() {}\n#[cfg(test)]\nmod tests;\nfn below() {}\n");
         assert!(region.contains("fn above()"), "{region:?}");

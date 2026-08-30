@@ -31,14 +31,16 @@
 //!
 //! It does so **without moving the whole-file module census**.
 //! `census_domain::declared_whole_file_test_modules` derives a skip only from a
-//! **terminated** module declaration, and drops any candidate whose name
-//! carries a `{` -- which an inline module with a body always does. So
-//! `the_declared_whole_file_test_modules_are_seventeen_and_three_are_not_called_tests`
-//! still counts seventeen and no pinned test is renamed. Measured, not argued:
-//! declared the other way, this file joins that test's named set as a fourth
-//! `["effects/tests/classification.rs", "engine/topology/scaffold.rs",
-//! "events/log/premove.rs", "runner/container/fake.rs"]` against its expected
-//! three, and the count below it reads eighteen.
+//! **terminated** declaration -- `mod name;` -- and an inline module with a
+//! body opens a scope the scan reads declarations *inside* rather than naming a
+//! file of its own. So
+//! `the_whole_file_test_modules_are_resolved_from_the_declarations_not_the_file_names`
+//! still resolves eighteen and no pinned test is renamed. Measured, not argued:
+//! declared the other way, this file joins that test's named set as a fifth
+//! `["agent/proc/test_support/readiness.rs", "effects/tests/classification.rs",
+//! "engine/topology/scaffold.rs", "events/log/premove.rs",
+//! "runner/container/fake.rs"]` against its expected four, and the count below
+//! it reads nineteen.
 //!
 //! That terminated form is deliberately not spelled out here, for the reason
 //! `policy.rs` gives: one written inside a comment is the exact shape that once

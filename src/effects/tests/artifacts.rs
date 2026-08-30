@@ -51,8 +51,8 @@
 //! `every_production_command_spec_payload_is_classified` and
 //! `runner::container::resolve::tests::no_module_outside_the_container_runner_writes_a_container_intent`
 //! are green with this file in their domain, and
-//! `the_declared_whole_file_test_modules_are_seventeen_and_three_are_not_called_tests`
-//! still counts seventeen.
+//! `the_whole_file_test_modules_are_resolved_from_the_declarations_not_the_file_names`
+//! still resolves eighteen.
 //!
 //! The three effect denials are **restored** here rather than inherited.
 //! `super` allows them because it drives a compiler over fixtures it creates

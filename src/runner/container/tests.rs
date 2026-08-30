@@ -3024,10 +3024,11 @@ fn allowlist_records(path: &str, lint: &str) -> bool {
         })
 }
 
-/// Every child module of the Container funnel **states its own lint level**.
+/// Every child module of a Process or Container funnel **states its own lint
+/// level**.
 ///
-/// `PR6-LANEF-004`, and it is the one finding of this slice whose repair is
-/// about the *next* lane rather than this one. `src/runner/container.rs` opens
+/// `PR6-LANEF-004`, and it is the one finding of that slice whose repair is
+/// about the *next* lane rather than its own. `src/runner/container.rs` opens
 /// with `#![allow(clippy::disallowed_methods, disallowed_types,
 /// disallowed_macros)]` — an **inner** attribute — and a Rust lint level is
 /// scoped by the **module tree**, not by the file. So every out-of-line child of
@@ -3036,7 +3037,16 @@ fn allowlist_records(path: &str, lint: &str) -> bool {
 /// it exists for: a `ContainerRuntime::start` planted in a child passed
 /// `cargo clippy --all-targets --all-features -- -D warnings`, measured twice.
 ///
-/// Every file in this directory now either **denies** a governed lint or
+/// **The Process funnel is in the domain too, and was not when this was
+/// written.** `src/agent/proc.rs` carries the identical inner allow and had no
+/// out-of-line child at all, so the census that closed the hole for one funnel
+/// left the other covered by nothing but the absence of a directory. It has one
+/// now — `src/agent/proc/test_support/readiness.rs` — and a census scoped to
+/// `src/runner/container/` would have watched it inherit all three allows in
+/// silence. The domain below is derived from the funnel list rather than
+/// written out, so the next funnel to grow a child is covered by the same line.
+///
+/// Every file under a funnel's directory either **denies** a governed lint or
 /// **allows** it with an `effects/allowlist.toml` entry a reviewer reads. The
 /// grid is {file} × {which of the three governed lints}, every cell asserted:
 /// a file that states nothing about a lint is inheriting, and inheriting is the
@@ -3044,7 +3054,9 @@ fn allowlist_records(path: &str, lint: &str) -> bool {
 ///
 /// The negative controls at the end are what stop this being a census that
 /// cannot refuse: the predicate is driven over sources that state nothing, that
-/// state a level only inside a doc comment, and that state each level plainly.
+/// state a level only inside a doc comment, that state a level inside a string
+/// literal, that state each level plainly, and that allow a lint the allowlist
+/// records for a *different* file.
 #[test]
 fn every_child_module_of_the_container_funnel_states_its_own_lint_level() {
     const GOVERNED: [&str; 3] = [
@@ -3052,12 +3064,44 @@ fn every_child_module_of_the_container_funnel_states_its_own_lint_level() {
         "clippy::disallowed_types",
         "clippy::disallowed_macros",
     ];
+    // Every funnel module that allows a governed lint at file scope, and
+    // therefore every module tree an out-of-line child can inherit one through.
+    // `src/runner/host.rs` has no directory today; it is named anyway, so the
+    // day it grows one the walk finds it rather than the reviewer having to.
+    const FUNNELS: [&str; 3] = [
+        "src/runner/container.rs",
+        "src/agent/proc.rs",
+        "src/runner/host.rs",
+    ];
     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    let children = walk(&root.join("src").join("runner").join("container"));
+
+    let mut children: Vec<PathBuf> = Vec::new();
+    let mut with_children = 0_usize;
+    for funnel in FUNNELS {
+        let directory = root.join(funnel.strip_suffix(".rs").unwrap_or(funnel));
+        if !directory.is_dir() {
+            continue;
+        }
+        with_children += 1;
+        children.extend(walk(&directory));
+    }
+    children.sort();
     assert!(
-        children.len() >= 8,
+        with_children >= 2,
+        "only {with_children} funnel(s) have an out-of-line child directory; the census is \
+         scoped to fewer module trees than the tree has"
+    );
+    assert!(
+        children.len() >= 9,
         "the walk found only {} child modules; the census is measuring nothing",
         children.len()
+    );
+    // The Process funnel's child is in the domain **by name**. A count alone
+    // would stay green if the walk lost the `src/agent/proc/` arm entirely, and
+    // that arm is the one this census was widened for.
+    assert!(
+        children.contains(&root.join("src/agent/proc/test_support/readiness.rs")),
+        "the Process funnel's only child is not in the census domain: {children:#?}"
     );
 
     let mut missing = Vec::new();
@@ -3083,23 +3127,47 @@ fn every_child_module_of_the_container_funnel_states_its_own_lint_level() {
     }
     assert!(
         missing.is_empty(),
-        "a child of the Container funnel inherits its allow instead of stating a \
+        "a child of a Process or Container funnel inherits its allow instead of stating a \
          level of its own, which is `PR6-LANEF-004` reopening:\n{missing:#?}"
     );
     assert!(unlisted.is_empty(), "{unlisted:#?}");
     assert_eq!(cells, children.len() * 3);
 
-    // The funnel itself is the one file that legitimately carries the allow, and
-    // it is in the allowlist. Asserted here so "everything denies" cannot become
-    // true by the funnel quietly denying itself out of existence.
-    let funnel = fs::read_to_string(root.join("src/runner/container.rs")).expect("the funnel");
-    for lint in GOVERNED {
-        assert_eq!(
-            stated_lint_level(&funnel, lint),
-            Some("allow"),
-            "the Container funnel no longer allows `{lint}`"
+    // The funnels themselves are the files that legitimately carry the allow,
+    // and each is in the allowlist. Asserted here so "everything denies" cannot
+    // become true by a funnel quietly denying itself out of existence.
+    for funnel in FUNNELS {
+        let source = fs::read_to_string(root.join(funnel)).expect("a funnel module");
+        for lint in GOVERNED {
+            assert_eq!(
+                stated_lint_level(&source, lint),
+                Some("allow"),
+                "the funnel `{funnel}` no longer allows `{lint}`"
+            );
+            assert!(allowlist_records(funnel, lint));
+        }
+    }
+
+    // And the Process funnel's child allows **exactly** what its row records:
+    // one lint allowed, two re-denied. An entry that is merely *present* is the
+    // widening this file's own history is about — `allows` is compared for
+    // equality by `effects::tests::every_allow_of_a_governed_lint_is_module_\
+    // level_and_in_the_allowlist`, and this is the same claim read from the
+    // other end, so a row that grew a second lint fails here too.
+    let readiness = fs::read_to_string(root.join("src/agent/proc/test_support/readiness.rs"))
+        .expect("the child");
+    assert_eq!(stated_lint_level(&readiness, GOVERNED[0]), Some("allow"));
+    assert_eq!(stated_lint_level(&readiness, GOVERNED[1]), Some("deny"));
+    assert_eq!(stated_lint_level(&readiness, GOVERNED[2]), Some("deny"));
+    assert!(allowlist_records(
+        "src/agent/proc/test_support/readiness.rs",
+        GOVERNED[0]
+    ));
+    for denied in [GOVERNED[1], GOVERNED[2]] {
+        assert!(
+            !allowlist_records("src/agent/proc/test_support/readiness.rs", denied),
+            "the readiness row records `{denied}`, which the file denies rather than allows"
         );
-        assert!(allowlist_records("src/runner/container.rs", lint));
     }
 
     // Negative controls: the predicate refuses what it is for.
@@ -3117,6 +3185,14 @@ fn every_child_module_of_the_container_funnel_states_its_own_lint_level() {
         "a level quoted in a doc comment is not a level"
     );
     assert_eq!(
+        stated_lint_level(
+            "const P: &str = \"#![allow(clippy::disallowed_methods)]\";\n",
+            GOVERNED[0]
+        ),
+        None,
+        "a level quoted in a string literal is not a level"
+    );
+    assert_eq!(
         stated_lint_level("#![deny(clippy::disallowed_methods)]\n", GOVERNED[0]),
         Some("deny")
     );
@@ -3126,6 +3202,21 @@ fn every_child_module_of_the_container_funnel_states_its_own_lint_level() {
     );
     assert!(!allowlist_records(
         "src/runner/container/env.rs",
+        GOVERNED[0]
+    ));
+    // A path that is in the allowlist for one lint does not read as recorded
+    // for another, and a path that is in it at all does not vouch for a
+    // different path: both are how an "is it listed?" check goes vacuous.
+    assert!(allowlist_records(
+        "src/runner/container/tests.rs",
+        GOVERNED[0]
+    ));
+    assert!(!allowlist_records(
+        "src/runner/container/tests.rs",
+        GOVERNED[1]
+    ));
+    assert!(!allowlist_records(
+        "src/agent/proc/test_support/readiness/nowhere.rs",
         GOVERNED[0]
     ));
 }

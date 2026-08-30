@@ -545,7 +545,7 @@ pub fn production_region(source: &str) -> String {
 /// **prohibition** question must not have. Three failures a prohibition census
 /// pays for with a truncating region, all three measured on this tree:
 ///
-/// * A file that declares its tests as `#[cfg(test)] mod tests;` — thirteen of
+/// * A file that declares its tests as `#[cfg(test)] mod tests;` — fourteen of
 ///   them here — puts every line **below** that declaration outside the region.
 ///   The declaration is usually the last item, so the hole is normally empty;
 ///   appending to the file fills it. Legal Rust, no comment trick, and it
@@ -1297,20 +1297,22 @@ pub(crate) mod census_domain {
     /// The resolution loop — assert exactly one of the two candidates exists,
     /// collect it — was written out at each caller, and a third caller wrote a
     /// different rule instead: `path.file_stem() == "tests"`. That covers the
-    /// fourteen files named `tests.rs` and **not** the three that are not:
-    /// `#[cfg(test)] mod scaffold;`, `mod premove;` and `mod fake;`. Seventeen,
-    /// not fourteen, and the three it missed are the ones a census is most
-    /// likely to trip over, because a scaffold and a fake exist to *name* the
-    /// things production names. Found by S5 round 5's `seams`, `attempt` and
-    /// `settle` lenses independently; the consolidation had been filed one
-    /// commit earlier in `reviews/FINDINGS.md` §20 as tidiness.
+    /// fourteen files named `tests.rs` and **not** the four that are not:
+    /// `scaffold`, `premove`, `fake` and `readiness`. Eighteen, not fourteen,
+    /// and the four it misses are the ones a census is most likely to trip
+    /// over, because a scaffold, a fake and a readiness protocol exist to
+    /// *name* the things production names. Found by S5 round 5's `seams`,
+    /// `attempt` and `settle` lenses independently; the consolidation had been
+    /// filed one commit earlier in `reviews/FINDINGS.md` §20 as tidiness.
     ///
     /// # Panics
     ///
     /// When a declaration resolves to no file or to both candidates — a skip
-    /// path naming no file is a skip that has stopped meaning anything — or
-    /// when fewer than `floor` declarations are derived, which is the control
-    /// against a derivation that has silently stopped finding anything.
+    /// path naming no file is a skip that has stopped meaning anything — when
+    /// two declarations resolve to one file, when the declaration graph is
+    /// cyclic, or when fewer than `floor` declarations are derived, which is
+    /// the control against a derivation that has silently stopped finding
+    /// anything.
     pub(crate) fn whole_file_test_modules(
         files: &[PathBuf],
         floor: usize,
@@ -1318,28 +1320,47 @@ pub(crate) mod census_domain {
         let declarations = declared_whole_file_test_modules(files);
         assert!(
             declarations.len() >= floor,
-            "only {} `#[cfg(test)] mod …;` declarations were derived and the floor is {floor}; \
+            "only {} test-only `mod …;` declarations were derived and the floor is {floor}; \
              the derivation is finding nothing",
             declarations.len()
         );
         let mut modules = std::collections::BTreeSet::new();
-        for (declared_in, name, candidates) in &declarations {
-            let present: Vec<&PathBuf> = candidates
-                .iter()
-                .filter(|candidate| candidate.is_file())
-                .collect();
-            assert_eq!(
-                present.len(),
-                1,
-                "`{}` declares `#[cfg(test)] mod {name};` and {} of {candidates:?} exist. A skip \
-                 path naming no file is a skip that has stopped meaning anything",
-                declared_in.display(),
-                present.len()
+        let mut edges: Vec<(PathBuf, PathBuf)> = Vec::new();
+        for declaration in &declarations {
+            let resolved = sole_present(&declaration.candidates, &|path| path.is_file())
+                .unwrap_or_else(|present| {
+                    panic!(
+                        "`{}` declares `mod {};` under {} and {present} of {:?} exist. A skip \
+                         path naming no file is a skip that has stopped meaning anything",
+                        declaration.declared_in.display(),
+                        declaration.name,
+                        declaration.render_guard(),
+                        declaration.candidates
+                    )
+                })
+                .clone();
+            assert!(
+                modules.insert(resolved.clone()),
+                "two declarations resolve to `{}`; one of them is deriving a skip for a file it \
+                 does not declare",
+                resolved.display()
             );
-            modules.insert(present[0].clone());
+            edges.push((declaration.declared_in.clone(), resolved));
         }
+        // **The declaration graph is a forest.** Directory-derived candidates
+        // descend, so a cycle is not reachable from this tree — which is the
+        // reason to check rather than a reason not to: an unreachable path is
+        // one nobody would notice becoming reachable. A `#[path]` attribute is
+        // the one construct that could build one, and the scanner refuses those
+        // rather than resolving them, so this assertion and that refusal are
+        // one control with two halves.
+        assert!(
+            declaration_cycle(&edges).is_none(),
+            "the module declarations are cyclic, so no file's guard can be trusted: {:?}",
+            declaration_cycle(&edges)
+        );
         // **The control that binds every caller**, and it belongs here rather
-        // than at each of them. `the_declared_whole_file_test_modules_are_seventeen…`
+        // than at each of them. `the_declared_whole_file_test_modules_resolve_and_four_are_not_called_tests`
         // asserts what this *returns*; it says nothing about whether a census
         // calls it, which is the defect `3a91626` repaired for two censuses and
         // this witness then reproduced one commit later (`R6-SETTLE-003`). A
@@ -1355,8 +1376,147 @@ pub(crate) mod census_domain {
         modules
     }
 
-    /// Every `#[cfg(test)] mod <name>;` the crate declares, as
-    /// `(declaring file, name, [flat candidate, nested candidate])`.
+    /// A cycle in `edges`, as the path that closes it, or `None`.
+    ///
+    /// `edges` is (declaring file, declared file). The derivation treats that
+    /// relation as a forest — every guard is read from the file *above* — so a
+    /// cycle means the traversal would either not terminate or attribute a
+    /// guard to a file that does not inherit it.
+    ///
+    /// Pure and separately driven, because the real tree cannot produce one: a
+    /// census control that is only ever exercised on input that satisfies it is
+    /// a control nobody has seen refuse anything.
+    pub(crate) fn declaration_cycle(edges: &[(PathBuf, PathBuf)]) -> Option<Vec<PathBuf>> {
+        for (from, _) in edges {
+            let mut walked = vec![from.clone()];
+            let mut at = from.clone();
+            // Bounded by the edge count: a walk longer than that has revisited.
+            for _ in 0..=edges.len() {
+                let Some((_, next)) = edges.iter().find(|(source, _)| *source == at) else {
+                    break;
+                };
+                walked.push(next.clone());
+                if *next == *from {
+                    return Some(walked);
+                }
+                at = next.clone();
+            }
+        }
+        None
+    }
+
+    /// The one of `candidates` that `exists` accepts, or how many it accepted.
+    ///
+    /// Zero is a declaration naming no file, which is a skip that has stopped
+    /// meaning anything. Two is `name.rs` and `name/mod.rs` both present, which
+    /// Rust itself refuses to compile and which a resolver that took the first
+    /// match would silently pick a side in. Both are refusals.
+    ///
+    /// `exists` is a parameter rather than a `Path::is_file` call so the two
+    /// refusals can be driven: neither is reachable from this tree, and a
+    /// control that has only ever seen compliant input is a control nobody has
+    /// watched refuse anything. It is also what keeps this body free of an
+    /// effect — the funnel section of the allowlist records `allows = []` for
+    /// this file and that claim is stronger than any other entry there.
+    pub(crate) fn sole_present<'a>(
+        candidates: &'a [PathBuf; 2],
+        exists: &dyn Fn(&std::path::Path) -> bool,
+    ) -> Result<&'a PathBuf, usize> {
+        let present: Vec<&PathBuf> = candidates
+            .iter()
+            .filter(|candidate| exists(candidate))
+            .collect();
+        match present.as_slice() {
+            [only] => Ok(only),
+            other => Err(other.len()),
+        }
+    }
+
+    /// The two files `mod <name>;` can name, given where it was written.
+    ///
+    /// `declared_in` is the declaring file; `inline_path` is the inline modules
+    /// enclosing the declaration, outermost first. **The inline path is part of
+    /// the directory**, which is the half a resolver reading only the file name
+    /// gets wrong: `mod readiness;` inside `proc.rs`'s inline `test_support`
+    /// names `proc/test_support/readiness.rs`, and flattened to
+    /// `proc/readiness.rs` it names nothing — a zero-candidate refusal if you
+    /// are lucky and the wrong file if you are not.
+    pub(crate) fn candidates_for(
+        declared_in: &std::path::Path,
+        inline_path: &[String],
+        name: &str,
+    ) -> [PathBuf; 2] {
+        let parent = declared_in
+            .parent()
+            .expect("a source file has a directory")
+            .to_path_buf();
+        let stem = declared_in.file_stem().expect("a source file has a name");
+        let mut dir = if stem == "mod" || stem == "lib" || stem == "main" {
+            parent
+        } else {
+            parent.join(stem)
+        };
+        for enclosing in inline_path {
+            dir.push(enclosing);
+        }
+        [
+            dir.join(format!("{name}.rs")),
+            dir.join(name).join("mod.rs"),
+        ]
+    }
+
+    /// Whether `candidate` stays inside `base` through plain path components.
+    ///
+    /// A module name is an identifier and a candidate is `base` joined with
+    /// identifiers, so this holds by construction — and is asserted anyway,
+    /// because the construction is what a `#[path = "../.."]` attribute would
+    /// change, and the failure it would cause is a census reading a file
+    /// outside the tree as declared inside it.
+    pub(crate) fn contained_in(base: &std::path::Path, candidate: &std::path::Path) -> bool {
+        let Ok(rest) = candidate.strip_prefix(base) else {
+            return false;
+        };
+        rest.components().count() > 0
+            && rest
+                .components()
+                .all(|part| matches!(part, std::path::Component::Normal(_)))
+    }
+
+    /// One out-of-line `mod <name>;` the crate declares as test-only.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub(crate) struct TestModuleDeclaration {
+        /// The file the declaration is written in.
+        pub(crate) declared_in: PathBuf,
+        /// The declared module's name.
+        pub(crate) name: String,
+        /// The **inline** modules enclosing the declaration, outermost first.
+        /// Empty when the declaration sits at the file's top level.
+        pub(crate) inline_path: Vec<String>,
+        /// The effective `cfg` predicate, rendered — the conjunction of every
+        /// enclosing inline module's predicate and the declaration's own.
+        pub(crate) guard: String,
+        /// `[<dir>/<name>.rs, <dir>/<name>/mod.rs]`, where `<dir>` is the
+        /// declaring file's module directory joined with [`Self::inline_path`].
+        pub(crate) candidates: [PathBuf; 2],
+    }
+
+    impl TestModuleDeclaration {
+        /// The guard and the inline path it was read through, for a diagnostic.
+        fn render_guard(&self) -> String {
+            if self.inline_path.is_empty() {
+                format!("`cfg({})`", self.guard)
+            } else {
+                format!(
+                    "`cfg({})` through `{}`",
+                    self.guard,
+                    self.inline_path.join("::")
+                )
+            }
+        }
+    }
+
+    /// Every out-of-line module declaration the crate compiles **only** under
+    /// `cfg(test)`, structurally resolved.
     ///
     /// Such a file is test code end to end. A region function has nothing to
     /// remove in one, so it would count the whole of it as production — a
@@ -1373,51 +1533,648 @@ pub(crate) mod census_domain {
     /// measured, with a `git push` planted in it that the census then did not
     /// see. Over the whole tree the raw split derived 50 skip paths of which
     /// **34 named no file at all**, and a skip path naming no file is a skip
-    /// that has stopped meaning anything, so each caller asserts that exactly
-    /// one of the two candidates exists.
+    /// that has stopped meaning anything, so [`whole_file_test_modules`] asserts
+    /// that exactly one of the two candidates exists.
     ///
-    /// A declaration carrying a visibility qualifier — `#[cfg(test)]
-    /// pub(crate) mod helpers;` — is deliberately **not** matched. Failing to
-    /// derive a skip leaves a test file inside a census's domain, where a
-    /// fixture is reported as an offender and someone looks; deriving one it
-    /// should not removes a real production file, silently. Only the first
-    /// direction is safe, so the predicate stays the narrow one.
+    /// # Structure, not a literal `#[cfg(test)] mod name;`
+    ///
+    /// The predicate used to be exactly that string, and it had two holes a
+    /// **text** rule cannot close and a structural one closes together:
+    ///
+    /// * **A visibility qualifier hid the declaration.** `#[cfg(test)]
+    ///   pub(crate) mod helpers;` was not matched, because the rule read `mod `
+    ///   immediately after the attribute. That direction was chosen as the safe
+    ///   one — failing to derive a skip leaves a test file in a census's domain,
+    ///   where a fixture reads as an offender and someone looks — and it is
+    ///   still the safe direction. It stopped being *necessary*: the scan below
+    ///   reads the item, so a qualifier is transparent rather than fatal.
+    /// * **An inline ancestor carried the guard.** `#[cfg(test)] mod
+    ///   test_support { … mod readiness; }` compiles `readiness.rs` only under
+    ///   `cfg(test)`, and the declaration inside carries no attribute at all.
+    ///   `src/agent/proc/test_support/readiness.rs` is that file; without the
+    ///   ancestry it is a whole test file with no `#[cfg(test)]` anywhere in it,
+    ///   which is precisely the shape every census here exists to skip.
+    ///
+    /// So the scan walks each file's **module structure**: brace depth, the
+    /// inline modules open at each point, and the `cfg` predicates on each of
+    /// them. A declaration is test-only when the conjunction of its own
+    /// predicate and every enclosing inline module's predicate is false
+    /// wherever `test` is false — [`entails_test`].
+    ///
+    /// # What it deliberately does not do
+    ///
+    /// **No transitive closure over files.** `src/effects/tests.rs` is itself a
+    /// whole-file test module and declares `mod policy;`, so Rust compiles
+    /// `src/effects/tests/policy.rs` only under `cfg(test)` too — and this
+    /// derivation does not say so. Every census in this crate reads
+    /// [`super::production_code`], which removes `#[cfg(test)]` items from the
+    /// files it keeps, and those second-level files carry their own inline
+    /// `cfg(test)` modules and their own `#![deny]` prologues for exactly that
+    /// reason (`effects/tests/classification.rs` and its siblings say so at
+    /// length). Closing over the file graph would widen the skip set by a dozen
+    /// files whose contents no census has been measured against, which is a
+    /// change to what every census can see and not a bug fix. The measured
+    /// domain is the eighteen
+    /// `the_whole_file_test_modules_are_resolved_from_the_declarations_not_the_file_names`
+    /// names and counts — fourteen literal `#[cfg(test)] mod tests;`, plus
+    /// `scaffold`, `premove`, `fake` and `readiness`. A nineteenth arrives with
+    /// the slice that measures it.
+    ///
+    /// **No `#[path]`.** A `#[path]` attribute on a module is refused rather
+    /// than resolved: it is the one construct that can point a declaration
+    /// outside its own directory, and there are none in this tree.
+    ///
+    /// # Panics
+    ///
+    /// When a file cannot be read structurally at all — an attribute that never
+    /// closes, a brace that closes one too many, a `mod` with no name or no
+    /// terminator, a `cfg` predicate the entailment grammar cannot read, a
+    /// `#[path]`, or one name declared twice in one module. Every one of those
+    /// means the scan does not know what the file declares, and a scan that
+    /// does not know must not answer.
     pub(crate) fn declared_whole_file_test_modules(
         files: &[PathBuf],
-    ) -> Vec<(PathBuf, String, [PathBuf; 2])> {
+    ) -> Vec<TestModuleDeclaration> {
         let mut found = Vec::new();
         for path in files {
-            let blanked = super::blank_comments_and_strings(
-                &std::fs::read_to_string(path).expect("read source"),
-            );
+            let source = std::fs::read_to_string(path).expect("read source");
+            let declarations = scan_module_declarations(&source)
+                .unwrap_or_else(|refusal| panic!("{}: {refusal}", path.display()));
             let parent = path.parent().expect("a source file has a directory");
-            let stem = path.file_stem().expect("a source file has a name");
-            let dir = if stem == "mod" || stem == "lib" || stem == "main" {
-                parent.to_path_buf()
-            } else {
-                parent.join(stem)
-            };
-            for rest in blanked.split("#[cfg(test)]").skip(1) {
-                let Some(name) = rest.trim_start().strip_prefix("mod ") else {
-                    continue;
-                };
-                let Some(name) = name.split(';').next().map(str::trim) else {
-                    continue;
-                };
-                if name.is_empty() || name.contains('{') {
+            for declaration in declarations {
+                if !declaration.test_only {
                     continue;
                 }
-                found.push((
-                    path.clone(),
-                    name.to_owned(),
-                    [
-                        dir.join(format!("{name}.rs")),
-                        dir.join(name).join("mod.rs"),
-                    ],
-                ));
+                let candidates = candidates_for(path, &declaration.inline_path, &declaration.name);
+                for candidate in &candidates {
+                    assert!(
+                        contained_in(parent, candidate),
+                        "`{}` declares `mod {};` and the candidate `{}` leaves `{}`",
+                        path.display(),
+                        declaration.name,
+                        candidate.display(),
+                        parent.display()
+                    );
+                }
+                found.push(TestModuleDeclaration {
+                    declared_in: path.clone(),
+                    name: declaration.name,
+                    inline_path: declaration.inline_path,
+                    guard: declaration.guard,
+                    candidates,
+                });
             }
         }
         found
+    }
+
+    /// One `mod` declaration as the scan read it out of a file's structure.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub(crate) struct ScannedDeclaration {
+        /// The declared module's name.
+        pub(crate) name: String,
+        /// The inline modules enclosing it, outermost first.
+        pub(crate) inline_path: Vec<String>,
+        /// The effective predicate, rendered.
+        pub(crate) guard: String,
+        /// Whether that predicate is false wherever `test` is false.
+        pub(crate) test_only: bool,
+    }
+
+    /// Why a file's structure could not be read, and where.
+    ///
+    /// Every variant is a refusal rather than a guess. The direction is the one
+    /// [`declared_whole_file_test_modules`] argues for: a scan that cannot tell
+    /// what a file declares must not answer, because both wrong answers are
+    /// silent — a missing skip reports a fixture as an offender, and a spurious
+    /// one removes a production file from every census below.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub(crate) enum ScanRefusal {
+        /// `#[…` with no `]`.
+        UnclosedAttribute { line: usize },
+        /// A `}` with no `{`.
+        UnbalancedBraces { line: usize },
+        /// `mod` with no name, or a name followed by neither `;` nor `{`.
+        MalformedDeclaration { line: usize },
+        /// A `cfg` predicate the entailment grammar cannot read.
+        UnreadablePredicate {
+            line: usize,
+            written: String,
+            why: String,
+        },
+        /// `#[path = "…"]`, or a `cfg_attr` that could apply one.
+        UnsupportedPathAttribute { line: usize, name: String },
+        /// An inner `#![cfg(…)]`, which gates the module it is written in.
+        UnsupportedInnerCfg { line: usize },
+        /// One module name declared twice in one module.
+        DuplicateDeclaration { line: usize, name: String },
+    }
+
+    impl std::fmt::Display for ScanRefusal {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            match self {
+                Self::UnclosedAttribute { line } => {
+                    write!(f, "line {line}: an attribute is never closed")
+                }
+                Self::UnbalancedBraces { line } => {
+                    write!(
+                        f,
+                        "line {line}: a `}}` closes a block that was never opened"
+                    )
+                }
+                Self::MalformedDeclaration { line } => write!(
+                    f,
+                    "line {line}: a `mod` declaration has no name, or no `;` or `{{` after it"
+                ),
+                Self::UnreadablePredicate { line, written, why } => write!(
+                    f,
+                    "line {line}: `cfg({written})` cannot be decided against `test`: {why}"
+                ),
+                Self::UnsupportedPathAttribute { line, name } => write!(
+                    f,
+                    "line {line}: `mod {name}` carries a `path` attribute, which this \
+                     derivation refuses rather than resolves"
+                ),
+                Self::UnsupportedInnerCfg { line } => write!(
+                    f,
+                    "line {line}: an inner `#![cfg(…)]` gates the module it is written in, \
+                     which this derivation does not model"
+                ),
+                Self::DuplicateDeclaration { line, name } => {
+                    write!(
+                        f,
+                        "line {line}: `mod {name};` is declared twice in one module"
+                    )
+                }
+            }
+        }
+    }
+
+    /// Every `mod` declaration in `source`, with the inline modules enclosing it
+    /// and the effective `cfg` predicate it inherits.
+    ///
+    /// Pure over `&str`, which is what makes the refusals above drivable: the
+    /// tree satisfies every one of them, so the only way to see one is to hand
+    /// this a source that does not.
+    ///
+    /// Comments and string literals are blanked first —
+    /// [`super::blank_comments_and_strings`], which also handles raw strings,
+    /// byte strings and char literals — so a `mod` written in prose is spaces.
+    /// The predicate text is read from the **raw** span at the same offsets,
+    /// because blanking erases what is inside a string and `feature = "x"` would
+    /// otherwise arrive as `feature = "   "`.
+    pub(crate) fn scan_module_declarations(
+        source: &str,
+    ) -> Result<Vec<ScannedDeclaration>, ScanRefusal> {
+        /// An inline `mod name { … }` that is open at the current position.
+        struct Scope {
+            /// The brace depth *outside* the module's body.
+            open_depth: usize,
+            name: String,
+            preds: Vec<Predicate>,
+            declared: std::collections::BTreeSet<String>,
+        }
+
+        let blanked = super::blank_comments_and_strings(source);
+        debug_assert_eq!(blanked.len(), source.len());
+        let bytes = blanked.as_bytes();
+        let line_of = |at: usize| blanked[..at].matches('\n').count() + 1;
+
+        let mut found = Vec::new();
+        let mut scopes: Vec<Scope> = Vec::new();
+        let mut top_level: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+        let mut pending: Vec<Predicate> = Vec::new();
+        let mut pending_path = false;
+        let mut depth = 0_usize;
+        let mut i = 0;
+
+        while i < bytes.len() {
+            let byte = bytes[i];
+            if byte.is_ascii_whitespace() {
+                i += 1;
+                continue;
+            }
+
+            // -- an attribute, which belongs to whatever item comes next -----
+            if byte == b'#' {
+                let inner = bytes.get(i + 1) == Some(&b'!');
+                let open = if inner { i + 2 } else { i + 1 };
+                if bytes.get(open) != Some(&b'[') {
+                    i += 1;
+                    continue;
+                }
+                let Some(close) = super::matching(bytes, open, b'[', b']') else {
+                    return Err(ScanRefusal::UnclosedAttribute { line: line_of(i) });
+                };
+                let raw = &source[open + 1..close];
+                let name = raw
+                    .trim_start()
+                    .split(|ch: char| !(ch.is_alphanumeric() || ch == '_'))
+                    .next()
+                    .unwrap_or_default();
+                match name {
+                    "cfg" => {
+                        let written = raw
+                            .trim()
+                            .strip_prefix("cfg")
+                            .map(str::trim_start)
+                            .and_then(|rest| rest.strip_prefix('('))
+                            .and_then(|rest| rest.strip_suffix(')'))
+                            .unwrap_or_default()
+                            .trim();
+                        let pred = parse_predicate(written).map_err(|why| {
+                            ScanRefusal::UnreadablePredicate {
+                                line: line_of(i),
+                                written: written.to_owned(),
+                                why,
+                            }
+                        })?;
+                        if inner {
+                            return Err(ScanRefusal::UnsupportedInnerCfg { line: line_of(i) });
+                        }
+                        pending.push(pred);
+                    }
+                    // `path` names the file directly; `cfg_attr` can apply one
+                    // conditionally. Both are refused where they could reach a
+                    // module, which is decided when the item is read.
+                    "path" => pending_path = true,
+                    "cfg_attr" if raw.contains("path") => pending_path = true,
+                    _ => {}
+                }
+                i = close + 1;
+                continue;
+            }
+
+            // -- a `mod` item, with any visibility qualifier in front of it ---
+            if let Some(shape) = module_at(bytes, i) {
+                let ModuleShape {
+                    name_at,
+                    name,
+                    body,
+                } = shape;
+                if name.is_empty() {
+                    return Err(ScanRefusal::MalformedDeclaration { line: line_of(i) });
+                }
+                if pending_path {
+                    return Err(ScanRefusal::UnsupportedPathAttribute {
+                        line: line_of(i),
+                        name,
+                    });
+                }
+                let mut preds: Vec<Predicate> = scopes
+                    .iter()
+                    .flat_map(|scope| scope.preds.iter().cloned())
+                    .collect();
+                preds.extend(pending.iter().cloned());
+                match body {
+                    Some(brace) => {
+                        scopes.push(Scope {
+                            open_depth: depth,
+                            name,
+                            preds: std::mem::take(&mut pending),
+                            declared: std::collections::BTreeSet::new(),
+                        });
+                        depth += 1;
+                        i = brace + 1;
+                    }
+                    None => {
+                        let declared = match scopes.last_mut() {
+                            Some(scope) => &mut scope.declared,
+                            None => &mut top_level,
+                        };
+                        if !declared.insert(name.clone()) {
+                            return Err(ScanRefusal::DuplicateDeclaration {
+                                line: line_of(name_at),
+                                name,
+                            });
+                        }
+                        let effective = Predicate::all(preds);
+                        found.push(ScannedDeclaration {
+                            name,
+                            inline_path: scopes.iter().map(|scope| scope.name.clone()).collect(),
+                            guard: effective.render(),
+                            test_only: entails_test(&effective),
+                        });
+                        pending.clear();
+                        // Past the `;`.
+                        i = bytes[name_at..]
+                            .iter()
+                            .position(|byte| *byte == b';')
+                            .map_or(bytes.len(), |at| name_at + at + 1);
+                    }
+                }
+                pending_path = false;
+                continue;
+            }
+
+            // -- anything else: the attributes above it are not a module's ---
+            pending.clear();
+            pending_path = false;
+            if byte == b'{' {
+                depth += 1;
+                i += 1;
+                continue;
+            }
+            if byte == b'}' {
+                if depth == 0 {
+                    return Err(ScanRefusal::UnbalancedBraces { line: line_of(i) });
+                }
+                depth -= 1;
+                scopes.retain(|scope| scope.open_depth < depth);
+                i += 1;
+                continue;
+            }
+            if super::is_ident_byte(byte) {
+                while i < bytes.len() && super::is_ident_byte(bytes[i]) {
+                    i += 1;
+                }
+                continue;
+            }
+            i += 1;
+        }
+        Ok(found)
+    }
+
+    /// A `mod` item beginning at `at`, past any visibility qualifier.
+    struct ModuleShape {
+        /// Where the module's name starts.
+        name_at: usize,
+        name: String,
+        /// The index of the body's `{`, or `None` for `mod name;`.
+        body: Option<usize>,
+    }
+
+    /// [`ModuleShape`] at `at`, or `None` when this is not a `mod` item.
+    ///
+    /// `pub`, `pub(crate)`, `pub(super)` and `pub(in a::b)` are transparent:
+    /// they are read and stepped over rather than treated as the start of some
+    /// other item, which is the whole of what "visibility-qualified declaration"
+    /// costs a structural scan. A text rule keyed on `mod ` immediately after
+    /// the attribute could not do it, and that is the hole this closes.
+    fn module_at(bytes: &[u8], at: usize) -> Option<ModuleShape> {
+        fn ident(bytes: &[u8], from: usize) -> (usize, &[u8]) {
+            let mut end = from;
+            while end < bytes.len() && super::is_ident_byte(bytes[end]) {
+                end += 1;
+            }
+            (end, &bytes[from..end])
+        }
+        fn space(bytes: &[u8], from: usize) -> usize {
+            let mut at = from;
+            while at < bytes.len() && bytes[at].is_ascii_whitespace() {
+                at += 1;
+            }
+            at
+        }
+
+        let (mut cursor, mut word) = ident(bytes, at);
+        if word == b"pub" {
+            let after = space(bytes, cursor);
+            cursor = if bytes.get(after) == Some(&b'(') {
+                super::matching(bytes, after, b'(', b')')? + 1
+            } else {
+                after
+            };
+            let (end, next) = ident(bytes, space(bytes, cursor));
+            cursor = end;
+            word = next;
+        }
+        if word != b"mod" {
+            return None;
+        }
+        // `mod` and the name must be separated: `models` is not `mod els`.
+        let after_keyword = space(bytes, cursor);
+        if after_keyword == cursor {
+            return None;
+        }
+        let (name_end, name) = ident(bytes, after_keyword);
+        let name = String::from_utf8_lossy(name).into_owned();
+        let terminator = space(bytes, name_end);
+        match bytes.get(terminator) {
+            Some(b'{') => Some(ModuleShape {
+                name_at: after_keyword,
+                name,
+                body: Some(terminator),
+            }),
+            Some(b';') => Some(ModuleShape {
+                name_at: after_keyword,
+                name,
+                body: None,
+            }),
+            // A name with neither terminator is malformed, and the caller
+            // refuses it. Reported through an empty-bodied shape so the caller
+            // sees the position rather than silently skipping the item.
+            _ => Some(ModuleShape {
+                name_at: after_keyword,
+                name: String::new(),
+                body: None,
+            }),
+        }
+    }
+
+    /// A `cfg` predicate, reduced to the one question this module asks of it.
+    ///
+    /// `effects::tests::cfg` models predicates *properly* — every `target_os`,
+    /// every CI valuation, which platform compiles which body — and answers a
+    /// different question with them. This decides one: is the predicate false
+    /// wherever `test` is false. So every atom that is not `test` collapses to
+    /// [`Predicate::Other`], and the grammar below is the whole of what the
+    /// derivation reads. A predicate it cannot parse is a refusal, not a guess.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub(crate) enum Predicate {
+        /// The `test` atom itself.
+        Test,
+        /// Any other atom: a bare name, or `key = "value"`.
+        Other(String),
+        /// `all(…)`, and the conjunction an inline ancestry composes.
+        All(Vec<Predicate>),
+        /// `any(…)`.
+        Any(Vec<Predicate>),
+        /// `not(…)`.
+        Not(Box<Predicate>),
+    }
+
+    impl Predicate {
+        /// The conjunction of `parts`, flattened; the empty one is `All([])`,
+        /// which is true and entails nothing.
+        fn all(parts: Vec<Predicate>) -> Self {
+            if parts.len() == 1 {
+                parts.into_iter().next().unwrap_or(Self::All(Vec::new()))
+            } else {
+                Self::All(parts)
+            }
+        }
+
+        /// The predicate as it reads, for a diagnostic.
+        pub(crate) fn render(&self) -> String {
+            fn join(parts: &[Predicate]) -> String {
+                parts
+                    .iter()
+                    .map(Predicate::render)
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            }
+            match self {
+                Self::Test => "test".to_owned(),
+                Self::Other(written) => written.clone(),
+                Self::All(parts) if parts.is_empty() => "true".to_owned(),
+                Self::All(parts) => format!("all({})", join(parts)),
+                Self::Any(parts) => format!("any({})", join(parts)),
+                Self::Not(inner) => format!("not({})", inner.render()),
+            }
+        }
+    }
+
+    /// Whether `predicate` is false wherever `test` is false.
+    ///
+    /// Three-valued, with `test` bound to false and every other atom left
+    /// *unknown* — which is the only sound reading, because this module knows
+    /// nothing about platforms or features and must not pretend to. `all(test,
+    /// unix)` entails; `any(test, unix)` does not, because a Unix build without
+    /// `test` compiles it; `not(test)` does not.
+    pub(crate) fn entails_test(predicate: &Predicate) -> bool {
+        matches!(decide_without_test(predicate), Some(false))
+    }
+
+    /// `predicate` with `test = false` and every other atom unknown.
+    fn decide_without_test(predicate: &Predicate) -> Option<bool> {
+        match predicate {
+            Predicate::Test => Some(false),
+            Predicate::Other(_) => None,
+            Predicate::Not(inner) => decide_without_test(inner).map(|value| !value),
+            // Short-circuiting, and the `None` arms are the point: one
+            // undecidable conjunct does not make a conjunction undecidable if
+            // another is already false, and one undecidable disjunct does not
+            // make a disjunction undecidable if another is already true. The
+            // empty forms answer as `cfg` does -- `all()` is true, `any()` is
+            // false.
+            Predicate::All(parts) => {
+                let mut every_part_is_true = true;
+                for part in parts {
+                    match decide_without_test(part) {
+                        Some(false) => return Some(false),
+                        Some(true) => {}
+                        None => every_part_is_true = false,
+                    }
+                }
+                every_part_is_true.then_some(true)
+            }
+            Predicate::Any(parts) => {
+                let mut every_part_is_false = true;
+                for part in parts {
+                    match decide_without_test(part) {
+                        Some(true) => return Some(true),
+                        Some(false) => {}
+                        None => every_part_is_false = false,
+                    }
+                }
+                every_part_is_false.then_some(false)
+            }
+        }
+    }
+
+    /// `written` as a [`Predicate`], or why it cannot be read.
+    ///
+    /// The grammar is `all(…)`, `any(…)`, `not(P)`, and an atom — a bare name
+    /// or `name = "value"`. Anything else is refused: an unknown combinator, an
+    /// unbalanced paren, `not` with other than one argument, an empty atom.
+    pub(crate) fn parse_predicate(written: &str) -> Result<Predicate, String> {
+        let text = written.trim();
+        if text.is_empty() {
+            return Err("the predicate is empty".to_owned());
+        }
+        let name_end = text
+            .find(|ch: char| !(ch.is_alphanumeric() || ch == '_'))
+            .unwrap_or(text.len());
+        let (name, rest) = text.split_at(name_end);
+        let rest = rest.trim_start();
+        if !rest.starts_with('(') {
+            // An atom: `test`, `unix`, or `key = "value"`.
+            if name.is_empty() {
+                return Err(format!("`{text}` does not begin with a name"));
+            }
+            if rest.is_empty() {
+                return Ok(if name == "test" {
+                    Predicate::Test
+                } else {
+                    Predicate::Other(name.to_owned())
+                });
+            }
+            let Some(value) = rest.strip_prefix('=') else {
+                return Err(format!("`{text}` is neither an atom nor a combinator"));
+            };
+            if value.trim().is_empty() {
+                return Err(format!("`{name}` is compared with nothing"));
+            }
+            return Ok(Predicate::Other(text.to_owned()));
+        }
+        let inner = split_arguments(rest)?;
+        let parts = inner
+            .into_iter()
+            .map(parse_predicate)
+            .collect::<Result<Vec<_>, _>>()?;
+        match name {
+            "all" => Ok(Predicate::All(parts)),
+            "any" => Ok(Predicate::Any(parts)),
+            "not" => match <[Predicate; 1]>::try_from(parts) {
+                Ok([only]) => Ok(Predicate::Not(Box::new(only))),
+                Err(parts) => Err(format!("`not` takes one predicate, not {}", parts.len())),
+            },
+            other => Err(format!("`{other}(…)` is not a predicate combinator")),
+        }
+    }
+
+    /// The comma-separated arguments of a parenthesised group starting at `(`.
+    fn split_arguments(text: &str) -> Result<Vec<&str>, String> {
+        let bytes = text.as_bytes();
+        let mut depth = 0_usize;
+        let mut close = None;
+        let mut quoted = false;
+        for (at, byte) in bytes.iter().enumerate() {
+            match byte {
+                b'"' => quoted = !quoted,
+                b'(' if !quoted => depth += 1,
+                b')' if !quoted => {
+                    depth -= 1;
+                    if depth == 0 {
+                        close = Some(at);
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+        let Some(close) = close else {
+            return Err(format!("`{text}` has an unbalanced parenthesis"));
+        };
+        if !text[close + 1..].trim().is_empty() {
+            return Err(format!("`{text}` has text after its closing parenthesis"));
+        }
+        let body = &text[1..close];
+        if body.trim().is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut parts = Vec::new();
+        let mut depth = 0_usize;
+        let mut quoted = false;
+        let mut from = 0;
+        for (at, byte) in body.bytes().enumerate() {
+            match byte {
+                b'"' => quoted = !quoted,
+                b'(' if !quoted => depth += 1,
+                b')' if !quoted => depth -= 1,
+                b',' if !quoted && depth == 0 => {
+                    parts.push(&body[from..at]);
+                    from = at + 1;
+                }
+                _ => {}
+            }
+        }
+        let last = &body[from..];
+        if !last.trim().is_empty() {
+            parts.push(last);
+        }
+        Ok(parts)
     }
 }
 

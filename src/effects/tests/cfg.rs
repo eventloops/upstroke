@@ -575,11 +575,21 @@ fn module_dir(path: &str) -> String {
 ///
 /// Two passes, because a file's guard is written in another file. Pass one reads
 /// the `#[cfg(P)] mod name;` declarations and resolves each to the file it
-/// governs; pass two scans every file with the guard it inherited. Seventeen
-/// files in this tree exist only under `#[cfg(test)] mod name;` -- the count
-/// `the_declared_whole_file_test_modules_are_seventeen_and_three_are_not_called_tests`
-/// derives independently -- and a census that missed it would read every
+/// governs; pass two scans every file with the guard it inherited. Eighteen
+/// files in this tree exist only under a `cfg(test)` module declaration -- the
+/// count `the_whole_file_test_modules_are_resolved_from_the_declarations_not_the_file_names`
+/// resolves independently -- and a census that missed it would read every
 /// predicate in them as unconditional.
+///
+/// **Seventeen of the eighteen, and the difference is deliberate.** This pass
+/// reads `#[cfg(P)] mod name;` -- the attribute is on the declaration -- and
+/// `agent/proc/test_support/readiness.rs` is declared with no attribute at all,
+/// inside an inline `#[cfg(test)]` module. `census_domain` resolves that
+/// ancestry and this pass does not, because the two answer different questions:
+/// that one decides which files are test code, this one decides what predicate
+/// each `cfg` occurrence is under. The floor below is `>=`, and readiness.rs
+/// carries no `cfg` occurrence for this census to misattribute -- measured, and
+/// asserted by the census test above staying green with the file in its domain.
 ///
 /// Two views of each file, and which one answers which question is the part that
 /// has cost this repository time before:
@@ -1141,11 +1151,18 @@ pub(super) const CFG_ESCAPES: [(&str, &[&str], &str); 12] = [
 /// boundary assertions beside it are what pin the shape.
 pub(super) const CFG_GATE_FLOOR: usize = 350;
 
-/// The number of files this tree reaches only through `#[cfg(test)] mod name;`.
+/// The number of files this tree reaches only through a `cfg(test)` module
+/// declaration.
 ///
 /// Derived independently by
-/// `the_declared_whole_file_test_modules_are_seventeen_and_three_are_not_called_tests`,
+/// `the_whole_file_test_modules_are_resolved_from_the_declarations_not_the_file_names`,
 /// and pinned here because every predicate in those files is `all(test, …)`
 /// rather than what it says: a census that resolved none of them would read
 /// several hundred predicates as unconditional and never notice.
-pub(super) const WHOLE_FILE_TEST_MODULES: usize = 17;
+///
+/// A floor, compared with `>=`. One of the eighteen -- `readiness.rs`, reached
+/// through an inline ancestor rather than through an attribute on its own
+/// declaration -- is outside *this* pass's grammar and carries no `cfg`
+/// occurrence, so the two derivations agree on the number without this census
+/// having to resolve the ancestry that produces it.
+pub(super) const WHOLE_FILE_TEST_MODULES: usize = 18;

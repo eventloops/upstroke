@@ -128,10 +128,18 @@ pub mod run;
 ///
 /// **Private, and declared last.** Private because a module's own descendants
 /// can see it — `dispatch::tests` and `attempt::tests` both are — so a `pub`
-/// qualifier would widen it for nothing and would stop the two source censuses
-/// that recognise a whole-file test module by the literal `#[cfg(test)] mod `
-/// from recognising this one. Last because `effects::production_region` cuts a
-/// file at its first `#[cfg(test)]`, and a declaration higher up would take the
-/// re-exports above it out of every census that reads that region.
+/// qualifier would widen it for nothing.
+///
+/// It would no longer *hide* it. `effects::census_domain` used to recognise a
+/// whole-file test module by the literal text `#[cfg(test)] mod `, and a
+/// visibility qualifier written between the two halves defeated that rule
+/// silently; it reads the item structurally now, so `pub(crate) mod scaffold;`
+/// would resolve here exactly as the private form does. The qualifier is still
+/// not written, because widening for nothing is the thing being avoided and
+/// not the census.
+///
+/// Last because `effects::production_region` cuts a file at its first
+/// `#[cfg(test)]`, and a declaration higher up would take the re-exports above
+/// it out of every census that reads that region.
 #[cfg(test)]
 mod scaffold;

@@ -1332,7 +1332,7 @@ mod tests {
     ///   sentences in the same file. Measured — it was.
     /// * **The whole file**, because the previous region dropped everything
     ///   between a `#[cfg(test)] mod tests;` declaration and the next line that
-    ///   is exactly `}`. Thirteen files declare their tests that way, and a
+    ///   is exactly `}`. Fourteen files declare their tests that way, and a
     ///   `Command::new("git").arg("push")` appended after one was invisible
     ///   while the identical lines above it failed the census.
     /// * **Item-wise removal**, not truncation, for the same reason.
@@ -1359,7 +1359,7 @@ mod tests {
         // Through the shared resolver: this loop was written out here and in
         // `events::log::tests`, and a third census then wrote a *different*
         // rule — `file_stem == "tests"` — which covers fourteen of the
-        // seventeen. `PR7-R5-ATT-001`.
+        // eighteen. `PR7-R5-ATT-001`.
         let test_modules = crate::effects::census_domain::whole_file_test_modules(&files, 13);
         // The control: a derivation that found nothing would silently count
         // every test file as production, which is the failure this replaces.

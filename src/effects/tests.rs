@@ -1715,8 +1715,10 @@ fn the_workflow_scope_rustflags_pin_refuses_weakening_and_every_override() {
 //     tree does not make.
 //   * **An item's predicate is not the attribute written on it.** Stacked
 //     `#[cfg]`s conjoin, and so does every enclosing guard -- the module block it
-//     sits in, and, for a whole-file module, the `#[cfg(test)] mod name;` that
-//     declares the file. Seventeen files in this tree are reached only that way.
+//     sits in, and, for a whole-file module, the `mod name;` declaration that
+//     names the file -- whether the guard is written on that declaration or on
+//     an inline module enclosing it. Eighteen files in this tree are reached
+//     only that way.
 
 // The census is `cfg`, beside this file; the two tests below are what it answers
 // to. It decides predicates against `ci_model`'s targets -- the same table the
@@ -1903,8 +1905,8 @@ fn every_platform_this_crate_configures_for_has_a_clippy_gate_the_aggregate_requ
     assert!(
         under_a_file_guard.len() >= WHOLE_FILE_TEST_MODULES,
         "only {} file(s) carry a `test` guard the census resolved, and \
-         `the_declared_whole_file_test_modules_are_seventeen_and_three_are_not_called_tests` \
-         derives {WHOLE_FILE_TEST_MODULES} whole-file test modules on its own",
+         `the_whole_file_test_modules_are_resolved_from_the_declarations_not_the_file_names` \
+         resolves {WHOLE_FILE_TEST_MODULES} whole-file test modules on its own",
         under_a_file_guard.len()
     );
 
@@ -2650,8 +2652,397 @@ fn the_view_directory_has_one_definition_in_the_tree() {
 // prohibition census counts over.
 
 #[test]
-fn the_declared_whole_file_test_modules_are_seventeen_and_three_are_not_called_tests() {
-    oracles::the_whole_file_test_modules_are_seventeen();
+fn the_whole_file_test_modules_are_resolved_from_the_declarations_not_the_file_names() {
+    oracles::the_whole_file_modules_are_read_from_the_declarations();
+}
+
+// ---------------------------------------------------------------------------
+// The module resolver reads structure, and refuses what it cannot read
+// ---------------------------------------------------------------------------
+
+// **These two bodies are here rather than beside the other instrument controls
+// in `source_oracles.rs`, and the reason is that file's own rule.** It is
+// reached by a plain `mod` declaration, so it sits inside every whole-tree
+// census's domain, and it therefore refuses to spell out a terminated
+// `#[cfg(test)] mod name;` even inside a string literal -- one written in a
+// comment is the exact shape that once derived a phantom skip and removed a
+// real production file from every census below it. A scanner whose whole
+// subject is that form cannot be driven under that rule. This file is itself a
+// whole-file test module -- `effects.rs` declares it `#[cfg(test)] mod tests;`
+// -- so no census reads it and the fixtures below cost nothing.
+//
+// Every positive case carries the mutation that makes it negative, in the same
+// assertion pair: the guard deleted, the ancestry flattened, the qualifier
+// removed. A scan that answered "test-only" unconditionally passes the
+// positives and fails on every one of the negatives beside them.
+
+/// The scan reads a file's **module structure**: inline ancestry, visibility
+/// qualifiers, and the predicates that compose down the tree.
+#[test]
+fn the_module_scan_reads_ancestry_and_visibility_rather_than_text_after_an_attribute() {
+    use crate::effects::census_domain::{
+        Predicate, ScannedDeclaration, entails_test, parse_predicate, scan_module_declarations,
+    };
+
+    fn scan(source: &str) -> Vec<ScannedDeclaration> {
+        scan_module_declarations(source)
+            .unwrap_or_else(|refusal| panic!("the fixture is readable: {refusal}"))
+    }
+    fn only(source: &str) -> ScannedDeclaration {
+        let mut found = scan(source);
+        assert_eq!(found.len(), 1, "{source:?} -> {found:#?}");
+        found.remove(0)
+    }
+
+    // (1) The plain form the text rule found, still found.
+    let plain = only("#[cfg(test)]\nmod tests;\n");
+    assert_eq!(plain.name, "tests");
+    assert!(plain.inline_path.is_empty());
+    assert_eq!(plain.guard, "test");
+    assert!(plain.test_only);
+
+    // (2) **Visibility qualifiers.** The text rule read `mod ` immediately
+    // after the attribute, so every one of these was invisible to it and the
+    // file it named stayed inside every census's domain. Four spellings,
+    // because `pub(in path)` carries a `::` and `pub(crate)` carries a paren,
+    // and a scan that stepped over one shape and not the others would pass on
+    // whichever the tree happens to use today.
+    for written in [
+        "#[cfg(test)]\npub mod helpers;\n",
+        "#[cfg(test)]\npub(crate) mod helpers;\n",
+        "#[cfg(test)]\npub(super) mod helpers;\n",
+        "#[cfg(test)]\npub(in crate::a::b) mod helpers;\n",
+    ] {
+        let qualified = only(written);
+        assert_eq!(qualified.name, "helpers", "{written:?}");
+        assert!(qualified.test_only, "{written:?}");
+    }
+    // And the qualifier is not what makes it test-only: removed guard, same
+    // qualifier, decided the other way.
+    assert!(!only("pub(crate) mod helpers;\n").test_only);
+
+    // (3) **Inline ancestry**, which is the shape `agent/proc.rs` uses and the
+    // one no text rule reaches at all: the declaration carries no attribute.
+    let inherited =
+        only("#[cfg(test)]\npub(crate) mod test_support {\n    pub(crate) mod readiness;\n}\n");
+    assert_eq!(inherited.name, "readiness");
+    assert_eq!(inherited.inline_path, vec!["test_support".to_owned()]);
+    assert_eq!(inherited.guard, "test");
+    assert!(inherited.test_only);
+    // The mutation: the same file with the ancestor's guard deleted. The
+    // declaration is byte-identical and the answer flips, which is what says
+    // the ancestry is being read rather than the name.
+    let ungated = only("pub(crate) mod test_support {\n    pub(crate) mod readiness;\n}\n");
+    assert_eq!(ungated.inline_path, vec!["test_support".to_owned()]);
+    assert!(
+        !ungated.test_only,
+        "a declaration under an unguarded inline module is production code"
+    );
+
+    // (4) **Nested inline modules**, with the guard on the middle one — so
+    // neither "the outermost" nor "the declaration's own" is the rule.
+    let deep =
+        only("mod outer {\n    #[cfg(test)]\n    mod middle {\n        pub mod leaf;\n    }\n}\n");
+    assert_eq!(deep.name, "leaf");
+    assert_eq!(
+        deep.inline_path,
+        vec!["outer".to_owned(), "middle".to_owned()]
+    );
+    assert!(deep.test_only);
+
+    // (5) **The scope closes.** A declaration written after the guarded block
+    // ends does not inherit it, which is the whole of what brace depth is for.
+    let both = scan("#[cfg(test)]\nmod inner {\n    mod under;\n}\nmod beside;\n");
+    assert_eq!(both.len(), 2, "{both:#?}");
+    assert_eq!(both[0].name, "under");
+    assert_eq!(both[0].inline_path, vec!["inner".to_owned()]);
+    assert!(both[0].test_only);
+    assert_eq!(both[1].name, "beside");
+    assert!(both[1].inline_path.is_empty());
+    assert!(
+        !both[1].test_only,
+        "a declaration after the guarded block inherited a guard that had closed"
+    );
+
+    // (6) **An attribute belongs to the item it precedes.** A `#[cfg(test)]`
+    // on a function does not carry to the next `mod`, and a brace-bodied module
+    // is not a declaration of a file at all.
+    let after_a_function = scan("#[cfg(test)]\nfn helper() {}\nmod plain;\n");
+    assert_eq!(after_a_function.len(), 1, "{after_a_function:#?}");
+    assert!(!after_a_function[0].test_only);
+    assert!(
+        scan("#[cfg(test)]\nmod tests {\n    fn t() {}\n}\n").is_empty(),
+        "an inline module with a body names no file"
+    );
+
+    // (7) **The predicate is decided, never assumed.** `any` is the case that
+    // matters: a Unix build with `test` off compiles the file, so the census
+    // must keep it. Deciding it "test-only" would remove a production file from
+    // every census below, silently, which is the failure direction this whole
+    // derivation is shaped against.
+    for (written, expected) in [
+        ("#[cfg(test)]\nmod x;\n", true),
+        ("#[cfg(all(test, unix))]\nmod x;\n", true),
+        ("#[cfg(all(unix, all(test, windows)))]\nmod x;\n", true),
+        ("#[cfg(test)]\n#[cfg(unix)]\nmod x;\n", true),
+        ("#[cfg(unix)]\nmod outer {\n#[cfg(test)]\nmod x;\n}\n", true),
+        ("#[cfg(any(test, unix))]\nmod x;\n", false),
+        ("#[cfg(not(test))]\nmod x;\n", false),
+        ("#[cfg(unix)]\nmod x;\n", false),
+        ("#[cfg(feature = \"slow\")]\nmod x;\n", false),
+        ("mod x;\n", false),
+    ] {
+        assert_eq!(
+            only(written).test_only,
+            expected,
+            "{written:?} was decided the other way"
+        );
+    }
+
+    // (8) The entailment itself, driven on predicates rather than on sources.
+    for written in ["test", "all(test, unix)", "not(any(not(test), unix))"] {
+        let pred = parse_predicate(written).unwrap_or_else(|why| panic!("{written}: {why}"));
+        assert!(entails_test(&pred), "`{written}` does not entail `test`");
+    }
+    for written in [
+        "any(test, unix)",
+        "not(test)",
+        "unix",
+        "target_os = \"linux\"",
+        "all(unix, windows)",
+    ] {
+        let pred = parse_predicate(written).unwrap_or_else(|why| panic!("{written}: {why}"));
+        assert!(
+            !entails_test(&pred),
+            "`{written}` was read as entailing `test`"
+        );
+    }
+    assert_eq!(
+        parse_predicate("all(test, unix)").map(|pred| pred.render()),
+        Ok("all(test, unix)".to_owned())
+    );
+    assert_eq!(parse_predicate("test"), Ok(Predicate::Test));
+
+    // (9) **Comments and string literals are not code.** `PR4-CENSUS-COMMENT-
+    // ORACLE` is the standing entry, and this derivation is the one it was
+    // filed against: a `//` line carrying a declaration once derived a skip for
+    // a real production module and removed it from every census below.
+    for prose in [
+        "// #[cfg(test)] mod ghost;\n",
+        "/* #[cfg(test)] mod ghost; */\n",
+        "/// #[cfg(test)] mod ghost;\nfn documented() {}\n",
+        "const S: &str = \"#[cfg(test)] mod ghost;\";\n",
+        "const S: &str = r#\"#[cfg(test)] mod ghost;\"#;\n",
+        "const S: &[u8] = b\"#[cfg(test)] mod ghost;\";\n",
+    ] {
+        assert!(scan(prose).is_empty(), "{prose:?} derived a declaration");
+    }
+    // A char literal holding a brace must not move the depth the ancestry is
+    // measured in — `PR7-R2C-CHAR-LITERAL-DESYNC`'s class, one instrument over.
+    let after_a_brace_char = only("const C: char = '{';\n#[cfg(test)]\nmod real;\n");
+    assert_eq!(after_a_brace_char.name, "real");
+    assert!(after_a_brace_char.inline_path.is_empty());
+    assert!(after_a_brace_char.test_only);
+
+    // (10) **The word, not a prefix of one.** `models` is not `mod els`.
+    assert!(scan("fn models() {}\nstruct modest;\n").is_empty());
+}
+
+/// The resolver **refuses** every shape it cannot resolve, rather than guessing.
+///
+/// Both wrong answers are silent. A missing skip leaves a test file inside a
+/// census's domain, where a fixture reads as a production offender and someone
+/// looks; a spurious one removes a real production file from every census
+/// below and nothing says so. So the derivation refuses instead of choosing,
+/// and every refusal below is driven — none of them is reachable from this
+/// tree, which is exactly why they would otherwise be code nobody has watched
+/// work.
+#[test]
+fn the_module_resolver_refuses_every_shape_it_cannot_resolve() {
+    use crate::effects::census_domain::{
+        ScanRefusal, candidates_for, contained_in, declaration_cycle, parse_predicate,
+        scan_module_declarations, sole_present,
+    };
+
+    fn refusal(source: &str) -> ScanRefusal {
+        scan_module_declarations(source).expect_err("this source is refused")
+    }
+
+    // (1) Malformed input the scan cannot tokenise.
+    assert_eq!(
+        refusal("#[cfg(test)\nmod tests;\n"),
+        ScanRefusal::UnclosedAttribute { line: 1 }
+    );
+    assert_eq!(
+        refusal("mod a { }\n}\n"),
+        ScanRefusal::UnbalancedBraces { line: 2 }
+    );
+    for malformed in ["mod ;\n", "mod x = 3;\n", "mod trailing\n"] {
+        assert!(
+            matches!(refusal(malformed), ScanRefusal::MalformedDeclaration { .. }),
+            "{malformed:?} was read as a declaration"
+        );
+    }
+
+    // (2) A predicate the entailment grammar cannot read. Unresolved is
+    // refused, not treated as "not test" — because "not test" is the answer
+    // that keeps a file in a census's domain, and a scan that cannot read a
+    // guard does not know which direction is safe.
+    for unreadable in [
+        "#[cfg(sometimes(test))]\nmod x;\n",
+        "#[cfg(test]\nmod x;\n",
+        "#[cfg()]\nmod x;\n",
+        "#[cfg(not(test, unix))]\nmod x;\n",
+        "#[cfg(feature =)]\nmod x;\n",
+    ] {
+        assert!(
+            matches!(refusal(unreadable), ScanRefusal::UnreadablePredicate { .. }),
+            "{unreadable:?} was decided rather than refused"
+        );
+    }
+    // The parser's own refusals, driven directly.
+    for unreadable in [
+        "",
+        "all(test",
+        "not(test, unix)",
+        "maybe(test)",
+        "all(test) extra",
+    ] {
+        assert!(
+            parse_predicate(unreadable).is_err(),
+            "`{unreadable}` parsed"
+        );
+    }
+
+    // (3) `#[path]`, which is the one construct that can point a declaration
+    // outside its own directory — and therefore the one that could build the
+    // cycle asserted against below. Refused rather than resolved, in both the
+    // direct and the `cfg_attr` forms.
+    for pathed in [
+        "#[path = \"elsewhere.rs\"]\nmod x;\n",
+        "#[cfg_attr(unix, path = \"elsewhere.rs\")]\nmod x;\n",
+    ] {
+        assert!(
+            matches!(
+                refusal(pathed),
+                ScanRefusal::UnsupportedPathAttribute { .. }
+            ),
+            "{pathed:?} was resolved"
+        );
+    }
+    // And it is refused **because it reaches a module**: the same attribute on
+    // something else is not this derivation's business, and refusing it would
+    // be a scan that fails on files it has no claim about.
+    assert!(
+        scan_module_declarations("#[path = \"x\"]\nstruct S;\nmod y;\n").is_ok(),
+        "a `path` attribute on a non-module item is not a module path attribute"
+    );
+
+    // (4) An inner `#![cfg(…)]` gates the module it is written in, which this
+    // derivation does not model. There are none in this tree; one arriving
+    // fails loudly rather than being read as ungated.
+    assert!(matches!(
+        refusal("#![cfg(test)]\nmod x;\n"),
+        ScanRefusal::UnsupportedInnerCfg { .. }
+    ));
+
+    // (5) Duplicates, and the control that says the check is per parent module
+    // rather than per file — two modules may each declare an `x`.
+    assert!(matches!(
+        refusal("#[cfg(test)]\nmod tests;\n#[cfg(test)]\nmod tests;\n"),
+        ScanRefusal::DuplicateDeclaration { .. }
+    ));
+    assert!(
+        scan_module_declarations("mod a {\n    mod x;\n}\nmod b {\n    mod x;\n}\n").is_ok(),
+        "two parents each declaring `x` are not a duplicate"
+    );
+
+    // (6) **Candidate paths, and the flattening mutation.** The inline path is
+    // part of the directory. A resolver that dropped it looks in
+    // `agent/proc/readiness.rs`, which does not exist — so the failure is a
+    // zero-candidate refusal if you are lucky, and the wrong file if a module
+    // of that name is ever added beside it.
+    let proc = Path::new("src/agent/proc.rs");
+    assert_eq!(
+        candidates_for(proc, &["test_support".to_owned()], "readiness"),
+        [
+            PathBuf::from("src/agent/proc/test_support/readiness.rs"),
+            PathBuf::from("src/agent/proc/test_support/readiness/mod.rs"),
+        ]
+    );
+    assert_eq!(
+        candidates_for(proc, &[], "readiness"),
+        [
+            PathBuf::from("src/agent/proc/readiness.rs"),
+            PathBuf::from("src/agent/proc/readiness/mod.rs"),
+        ]
+    );
+    for flattened in candidates_for(&repo_root().join("src/agent/proc.rs"), &[], "readiness") {
+        assert!(
+            !flattened.is_file(),
+            "{} exists, so the flattening mutation would resolve instead of refusing",
+            flattened.display()
+        );
+    }
+    // `mod.rs`, `lib.rs` and `main.rs` name their own directory rather than a
+    // child of it, which is the other half of the same computation.
+    assert_eq!(
+        candidates_for(Path::new("src/engine/mod.rs"), &[], "tests")[0],
+        PathBuf::from("src/engine/tests.rs")
+    );
+    assert_eq!(
+        candidates_for(Path::new("src/lib.rs"), &[], "effects")[0],
+        PathBuf::from("src/effects.rs")
+    );
+
+    // (7) **Zero and two candidates.** Two is `x.rs` and `x/mod.rs` both
+    // present — a competing `mod.rs` that Rust itself refuses to compile and
+    // that a resolver taking the first match would silently pick a side in.
+    let pair = candidates_for(Path::new("src/a.rs"), &[], "b");
+    assert_eq!(sole_present(&pair, &|_| false), Err(0));
+    assert_eq!(sole_present(&pair, &|_| true), Err(2));
+    assert_eq!(sole_present(&pair, &|at| at == pair[0]), Ok(&pair[0]));
+    assert_eq!(sole_present(&pair, &|at| at == pair[1]), Ok(&pair[1]));
+
+    // (8) **Path escape.** A candidate must descend from the declaring file's
+    // directory through plain components. This holds by construction while
+    // `#[path]` is refused, and the two are one control with two halves.
+    let base = Path::new("src/agent");
+    assert!(contained_in(
+        base,
+        Path::new("src/agent/proc/test_support/readiness.rs")
+    ));
+    assert!(
+        !contained_in(base, base),
+        "a directory does not contain itself"
+    );
+    assert!(!contained_in(base, Path::new("src/effects.rs")));
+    assert!(
+        !contained_in(base, Path::new("src/agent/../effects.rs")),
+        "a `..` component escapes and must not read as contained"
+    );
+
+    // (9) **Cycles.** The derivation reads every guard from the file above, so
+    // a cycle means a guard attributed to a file that does not inherit it. Not
+    // reachable while directory-derived candidates descend, which is the reason
+    // to drive it here rather than a reason to leave it unchecked.
+    let forest = vec![
+        (PathBuf::from("a.rs"), PathBuf::from("a/b.rs")),
+        (PathBuf::from("a/b.rs"), PathBuf::from("a/b/c.rs")),
+    ];
+    assert_eq!(declaration_cycle(&forest), None);
+    assert!(
+        declaration_cycle(&[(PathBuf::from("a.rs"), PathBuf::from("a.rs"))]).is_some(),
+        "a file declaring itself is a cycle"
+    );
+    assert!(
+        declaration_cycle(&[
+            (PathBuf::from("a.rs"), PathBuf::from("b.rs")),
+            (PathBuf::from("b.rs"), PathBuf::from("a.rs")),
+        ])
+        .is_some(),
+        "a two-file loop is a cycle"
+    );
 }
 
 #[test]

@@ -3400,7 +3400,7 @@ fn the_stable_prefix_barrier_is_the_only_way_a_log_becomes_a_topology_fold() {
     // real production module from this census's domain.
     // Through the shared resolver. This loop stood here, in `runner::tests`
     // and — as a *third*, different rule — in `recover::tests`, which keyed on
-    // the file name and covered fourteen of the seventeen. `PR7-R5-ATT-001`.
+    // the file name and covered fourteen of the eighteen. `PR7-R5-ATT-001`.
     let test_modules: BTreeSet<PathBuf> =
         crate::effects::census_domain::whole_file_test_modules(&files, 13);
     assert!(

@@ -4347,8 +4347,8 @@ fn the_barrier_is_the_only_topology_route_from_a_proven_prefix_to_an_append_hand
             // A file the crate declares as a whole-file test module is test
             // code in full and has no production half; counting one would
             // count a fixture as a second route. **Through the crate's own
-            // declarations**, not through the file name: three of the
-            // seventeen are not called `tests.rs`, and one of those is
+            // declarations**, not through the file name: four of the
+            // eighteen are not called `tests.rs`, and one of those is
             // `engine/topology/scaffold.rs` — inside this very census's
             // `engine/topology` domain. `PR7-R5-ATT-001`.
             if test_modules.contains(&path) {
@@ -7683,9 +7683,9 @@ fn every_packet_named_recovery_action_has_a_production_caller() {
         }
         // **The crate's own declarations, not a file-name rule.** This skipped
         // by the stem `"tests"` and covered fourteen files; the crate declares
-        // **seventeen** whole-file test modules and the three it missed —
-        // `scaffold`, `premove`, `fake` — are the ones most likely to name what
-        // production names. `PR7-R5-ATT-001`.
+        // **eighteen** whole-file test modules and the four it missed —
+        // `scaffold`, `premove`, `fake`, `readiness` — are the ones most likely
+        // to name what production names. `PR7-R5-ATT-001`.
         let test_modules = crate::effects::census_domain::whole_file_test_modules(&all, 13);
         let mut out = Vec::new();
         {
@@ -7721,14 +7721,15 @@ fn every_packet_named_recovery_action_has_a_production_caller() {
     // control was silently inert — the same failure as an empty region, one
     // level up.
     assert!(
-        test_files_skipped >= 17
+        test_files_skipped >= 18
             && sources.iter().all(|(rel, _)| !rel.ends_with("tests.rs")
                 && !rel.ends_with("scaffold.rs")
                 && !rel.ends_with("premove.rs")
-                && !rel.ends_with("fake.rs")),
+                && !rel.ends_with("fake.rs")
+                && !rel.ends_with("readiness.rs")),
         "the out-of-line test modules are not being skipped ({test_files_skipped} skipped of the \
-         seventeen the crate declares), so a fixture's call can satisfy a clause on production's \
-         behalf. The three named here are the ones a file-name rule misses"
+         eighteen the crate declares), so a fixture's call can satisfy a clause on production's \
+         behalf. The four named here are the ones a file-name rule misses"
     );
 
     let mut uncalled: Vec<String> = Vec::new();
