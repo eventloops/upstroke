@@ -5,18 +5,20 @@
 // under which the section shrinks. `decisions.effect_site_inventory.mechanism` (2).
 #![allow(clippy::disallowed_methods)]
 
-use std::collections::BTreeMap;
+mod graph;
+mod render;
+
 use std::fs;
 use std::path::{Path, PathBuf};
 
 use crate::agent;
 use crate::capacity;
 use crate::config::{self, Config};
-use crate::error::{UpstrokeError, ValidationErrors};
+use crate::error::UpstrokeError;
 use crate::gates::{self, ShellGate};
-use crate::ir::{Plan, Task, TaskId};
+use crate::ir::Plan;
 use crate::plan::{self, Parsed};
-use crate::review::{self, PassBinding, ReviewPlan};
+use crate::review;
 use crate::route::{self, ResolvedChain};
 
 #[derive(Debug, Clone)]
@@ -166,7 +168,7 @@ pub fn analyze_captured(
         warnings: mut all_warnings,
     } = plan::detect(&raw)?.parse_with_warnings(&raw)?;
     let config = config::load_captured(&captured.config, opts.engine_limits, &mut all_warnings)?;
-    check_graph(&plan, &mut all_warnings)?;
+    graph::check_graph(&plan, &mut all_warnings)?;
     let config_path = || {
         opts.config_path
             .clone()
@@ -274,7 +276,7 @@ pub fn run(opts: &ValidateOptions) -> Result<Report, UpstrokeError> {
         .enumerate()
         .map(|(index, (task, chain))| {
             let second = reviews.second_opinion.get(index).and_then(Option::as_ref);
-            to_row(task, chain.clone(), second)
+            render::to_row(task, chain.clone(), second)
         })
         .collect();
     let (observations, run_id) = latest_run_observations(
@@ -285,104 +287,14 @@ pub fn run(opts: &ValidateOptions) -> Result<Report, UpstrokeError> {
     Ok(Report {
         rows,
         warnings,
-        strategy: strategy_echo(&analysis.config),
-        capacity: capacity_echo(&analysis.config, &observations, run_id.as_deref()),
-        review: review_echo(&reviews),
-        effort: effort_echo(&analysis.config),
+        strategy: render::strategy_echo(&analysis.config),
+        capacity: render::capacity_echo(&analysis.config, &observations, run_id.as_deref()),
+        review: render::review_echo(&reviews),
+        effort: render::effort_echo(&analysis.config),
         gates: analysis.gates.iter().map(|g| g.name.clone()).collect(),
         gates_from_config: analysis.gates_from_config,
         plan: analysis.plan,
     })
-}
-
-/// Who judges the work (§11.2–§11.3), for the preview.
-///
-/// Resolved against the adapters this build ships, not against binaries found
-/// on PATH: `validate` and `--dry-run` execute nothing (§18), so they cannot
-/// probe. Pre-flight is where a named reviewer has to prove it can actually
-/// run — and where a missing one either warns or refuses. The line says so,
-/// because a preview that reads as a promise is worse than one that reads as a
-/// plan.
-fn review_echo(plan: &ReviewPlan) -> String {
-    let Some(primary) = &plan.primary else {
-        return "review: disabled ([routing] review = { enabled = false })".to_owned();
-    };
-    #[expect(
-        clippy::expect_used,
-        reason = "resolve() sets a timeout on every plan it returns"
-    )]
-    let mut line = format!(
-        "review: {} ({}s independent timeout per pass)",
-        primary.describe(),
-        plan.pass_timeout_secs
-            .expect("freshly resolved review plans always record their timeout")
-    );
-    match &plan.alternative {
-        Some(alt) => line.push_str(&format!(
-            " (tasks it implements itself would be reviewed by {} instead, if installed)",
-            alt.describe()
-        )),
-        None => line.push_str(" (no cross-family reviewer exists in this build)"),
-    }
-    let demanded = plan.second_opinion.iter().flatten().count();
-    if demanded > 0 {
-        line.push_str(&format!(
-            "; {demanded} task(s) also require a second opinion, which pre-flight refuses to \
-             start without"
-        ));
-    }
-    line
-}
-
-/// §13's capacity block, for a command that executes nothing.
-///
-/// `validate` and `--dry-run` **do not probe** (§18): every figure here comes
-/// from files — the pools file, and the latest run's event log in this
-/// repository. That is a real distinction rather than a technicality, and the
-/// block says which side of it each line is on, because `upstroke capacity` shows
-/// strictly more by being allowed to spawn the vendors' CLIs.
-///
-/// The same reason the review line says "if installed": a preview that reads as
-/// a promise is worse than one that reads as a plan.
-fn capacity_echo(cfg: &Config, obs: &capacity::Observations, run: Option<&str>) -> String {
-    use std::fmt::Write as _;
-
-    if cfg.pools.is_empty() {
-        return "capacity: not connected — run `upstroke connect` to write ~/.upstroke/pools.toml"
-            .to_owned();
-    }
-    let estimates = capacity::estimate(&cfg.pools, obs);
-    let mut out = format!("capacity: {} pool(s) connected\n", cfg.pools.len());
-    for (pool, estimate) in cfg.pools.iter().zip(&estimates) {
-        let _ = writeln!(out, "  {}", pool.describe());
-        let _ = writeln!(out, "    {}", estimate.describe());
-        for note in &estimate.notes {
-            let _ = writeln!(out, "    - {note}");
-        }
-    }
-    match run {
-        Some(run_id) => {
-            let _ = writeln!(
-                out,
-                "  self-metered draw is folded from run {run_id}, the latest in this repository"
-            );
-        }
-        None => {
-            let _ = writeln!(
-                out,
-                "  no run in this repository yet, so nothing has been self-metered"
-            );
-        }
-    }
-    for line in capacity::strategy_preview(&cfg.strategy.mode, &estimates) {
-        let _ = writeln!(out, "  {line}");
-    }
-    let _ = write!(
-        out,
-        "  this preview reads files only and never probes (§18) — `upstroke capacity` asks the \
-         installed CLIs as well"
-    );
-    out
 }
 
 /// §13's observations, without executing anything: fold the latest run in this
@@ -425,273 +337,14 @@ fn latest_run_observations(
     }
 }
 
-/// Duplicate ids, unknown `depends` targets, then cycles — all collected so a
-/// broken plan reports everything in one run. On a clean graph, artifact
-/// wiring that contradicts the dependency order is surfaced as warnings.
-fn check_graph(plan: &Plan, warnings: &mut Vec<String>) -> Result<(), UpstrokeError> {
-    let mut problems = Vec::new();
-    let mut seen: BTreeMap<&str, usize> = BTreeMap::new();
-    for task in &plan.tasks {
-        *seen.entry(task.id.as_str()).or_insert(0) += 1;
-    }
-    for (id, count) in &seen {
-        if *count > 1 {
-            problems.push(format!("duplicate task id `{id}` ({count} tasks share it)"));
-        }
-    }
-    for task in &plan.tasks {
-        for dep in &task.depends_on {
-            if !seen.contains_key(dep.as_str()) {
-                problems.push(format!("task `{}` depends on unknown id `{dep}`", task.id));
-            }
-        }
-    }
-    // Cycle detection only makes sense on a graph whose edges all resolve.
-    if problems.is_empty() {
-        if let Some(cycle) = find_cycle(plan) {
-            problems.push(format!("dependency cycle: {}", cycle.join(" -> ")));
-        }
-    }
-    if !problems.is_empty() {
-        return Err(UpstrokeError::Validation(ValidationErrors(problems)));
-    }
-    check_artifact_wiring(plan, warnings);
-    Ok(())
-}
-
-/// A task that `needs` an artifact should depend — directly or transitively —
-/// on its producer, or execution order cannot guarantee the artifact exists.
-/// The plan is frozen (§5), so this warns rather than inventing edges.
-fn check_artifact_wiring(plan: &Plan, warnings: &mut Vec<String>) {
-    let index = index_by_id(plan);
-    for task in &plan.tasks {
-        for needed in &task.artifacts_in {
-            let producer = plan
-                .artifacts
-                .iter()
-                .find(|a| a.id == *needed)
-                .and_then(|a| a.produced_by.as_ref());
-            // Unknown producers already warned during parsing.
-            let Some(producer) = producer else { continue };
-            if *producer != task.id && !depends_transitively(&index, &task.id, producer) {
-                warnings.push(format!(
-                    "task `{}` needs artifact `{needed}` produced by `{producer}` but does not \
-                     depend on it (directly or transitively)",
-                    task.id
-                ));
-            }
-        }
-    }
-}
-
-/// Id → task, built once per pass and shared by the graph checks.
-fn index_by_id(plan: &Plan) -> BTreeMap<&str, &Task> {
-    plan.tasks.iter().map(|t| (t.id.as_str(), t)).collect()
-}
-
-fn depends_transitively(index: &BTreeMap<&str, &Task>, from: &TaskId, target: &TaskId) -> bool {
-    let mut queue: Vec<&TaskId> = index
-        .get(from.as_str())
-        .map(|t| t.depends_on.iter().collect())
-        .unwrap_or_default();
-    let mut visited: Vec<&str> = Vec::new();
-    while let Some(dep) = queue.pop() {
-        if dep == target {
-            return true;
-        }
-        if visited.contains(&dep.as_str()) {
-            continue;
-        }
-        visited.push(dep.as_str());
-        if let Some(task) = index.get(dep.as_str()) {
-            queue.extend(task.depends_on.iter());
-        }
-    }
-    false
-}
-
-fn find_cycle(plan: &Plan) -> Option<Vec<String>> {
-    const WHITE: u8 = 0;
-    const GRAY: u8 = 1;
-    const BLACK: u8 = 2;
-
-    let index: BTreeMap<&str, usize> = plan
-        .tasks
-        .iter()
-        .enumerate()
-        .map(|(i, t)| (t.id.as_str(), i))
-        .collect();
-
-    fn dfs(
-        current: usize,
-        plan: &Plan,
-        index: &BTreeMap<&str, usize>,
-        color: &mut [u8],
-        stack: &mut Vec<usize>,
-    ) -> Option<Vec<String>> {
-        color[current] = GRAY;
-        stack.push(current);
-        for dep in &plan.tasks[current].depends_on {
-            let Some(&next) = index.get(dep.as_str()) else {
-                continue;
-            };
-            if color[next] == GRAY {
-                let from = stack.iter().position(|&i| i == next).unwrap_or(0);
-                let mut cycle: Vec<String> = stack[from..]
-                    .iter()
-                    .map(|&i| plan.tasks[i].id.to_string())
-                    .collect();
-                cycle.push(plan.tasks[next].id.to_string());
-                return Some(cycle);
-            }
-            if color[next] == WHITE {
-                if let Some(cycle) = dfs(next, plan, index, color, stack) {
-                    return Some(cycle);
-                }
-            }
-        }
-        stack.pop();
-        color[current] = BLACK;
-        None
-    }
-
-    let mut color = vec![WHITE; plan.tasks.len()];
-    let mut stack = Vec::new();
-    for start in 0..plan.tasks.len() {
-        if color[start] == WHITE {
-            if let Some(cycle) = dfs(start, plan, &index, &mut color, &mut stack) {
-                return Some(cycle);
-            }
-        }
-    }
-    None
-}
-
-fn to_row(task: &Task, resolved: ResolvedChain, second_opinion: Option<&PassBinding>) -> Row {
-    let deps = if task.depends_on.is_empty() {
-        "-".to_owned()
-    } else {
-        task.depends_on
-            .iter()
-            .map(ToString::to_string)
-            .collect::<Vec<_>>()
-            .join(",")
-    };
-    let mut chain = resolved
-        .rungs
-        .iter()
-        .map(|rung| {
-            let binding_tag = if rung.binding.pinned {
-                "pin"
-            } else {
-                "preview"
-            };
-            format!(
-                "{}({})={}/{}({binding_tag})",
-                rung.tier, rung.source, rung.binding.agent, rung.binding.model
-            )
-        })
-        .collect::<Vec<_>>()
-        .join(" -> ");
-    for note in &resolved.notes {
-        chain.push_str(&format!(" [{note}]"));
-    }
-    // §11.3: a second reviewer is a per-task routing decision like any other,
-    // so it belongs in the column that shows what this task's paths bought it.
-    if let Some(binding) = second_opinion {
-        chain.push_str(&format!(" [second opinion: {}]", binding.describe()));
-    }
-    Row {
-        id: task.id.to_string(),
-        kind: task.kind.to_string(),
-        deps,
-        chain,
-    }
-}
-
-fn strategy_echo(cfg: &Config) -> String {
-    let mut line = format!("strategy: {}", cfg.strategy.mode);
-    if let Some(threshold) = cfg.strategy.spend_down_after {
-        line.push_str(&format!(" (spend_down_after={threshold})"));
-    }
-    line.push_str(if cfg.strategy.from_config {
-        " [from config; parsed, not acted on]"
-    } else {
-        " [derived default]"
-    });
-    line
-}
-
-fn effort_echo(cfg: &Config) -> String {
-    let policy = cfg.resolved_effort_policy();
-    let resolved = [policy.small, policy.mid, policy.frontier];
-    let implementation = if resolved.iter().all(|effort| *effort == resolved[0]) {
-        resolved[0].to_string()
-    } else {
-        format!(
-            "by tier (small={}, mid={}, frontier={})",
-            resolved[0], resolved[1], resolved[2]
-        )
-    };
-    let review = if cfg.review_enabled {
-        policy.review.to_string()
-    } else {
-        "disabled".to_owned()
-    };
-    format!("effort: implementation={implementation}, review={review}")
-}
-
 impl Report {
+    /// The rendered preview.
+    ///
+    /// The surface stays here — it is the one every caller names, and the one
+    /// `effects/wrappers.toml` classifies under this module — while the table
+    /// it produces is `render::report`.
     pub fn render(&self) -> String {
-        let id_width = column_width("id", self.rows.iter().map(|r| r.id.as_str()));
-        let kind_width = column_width("kind", self.rows.iter().map(|r| r.kind.as_str()));
-        let deps_width = column_width("deps", self.rows.iter().map(|r| r.deps.as_str()));
-
-        let mut out = String::new();
-        out.push_str(&format!(
-            "{:<id_width$}  {:<kind_width$}  {:<deps_width$}  chain\n",
-            "id", "kind", "deps"
-        ));
-        out.push_str(&format!(
-            "{:-<id_width$}  {:-<kind_width$}  {:-<deps_width$}  -----\n",
-            "", "", ""
-        ));
-        for row in &self.rows {
-            out.push_str(&format!(
-                "{:<id_width$}  {:<kind_width$}  {:<deps_width$}  {}\n",
-                row.id, row.kind, row.deps, row.chain
-            ));
-        }
-        out.push('\n');
-        if !self.warnings.is_empty() {
-            out.push_str("warnings:\n");
-            for warning in &self.warnings {
-                out.push_str(&format!("  - {warning}\n"));
-            }
-        }
-        if self.gates.is_empty() {
-            out.push_str("gates: none\n");
-        } else {
-            out.push_str(&format!(
-                "gates: {} [{}]\n",
-                self.gates.join(", "),
-                if self.gates_from_config {
-                    "from config"
-                } else {
-                    "derived"
-                }
-            ));
-        }
-        out.push_str(&self.review);
-        out.push('\n');
-        out.push_str(&self.effort);
-        out.push('\n');
-        out.push_str(&self.strategy);
-        out.push('\n');
-        out.push_str(&self.capacity);
-        out.push('\n');
-        out.push_str(&format!("ok: {} tasks, no cycles\n", self.plan.tasks.len()));
-        out
+        render::report(self)
     }
 
     pub fn write_normalized_json(&self, path: &Path) -> Result<(), UpstrokeError> {
@@ -703,10 +356,6 @@ impl Report {
             source,
         })
     }
-}
-
-fn column_width<'a>(header: &str, values: impl Iterator<Item = &'a str>) -> usize {
-    values.map(str::len).fold(header.len(), usize::max)
 }
 
 #[cfg(test)]
