@@ -18,7 +18,9 @@ pub fn ulid() -> String {
         .map(|d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX))
         .unwrap_or(0);
     let nonce = NONCE.fetch_add(1, Ordering::Relaxed);
-    ulid_from_parts(now_ms, std::process::id(), nonce)
+    let pid = std::process::id();
+    observe_sampled_parts(now_ms, pid, nonce);
+    ulid_from_parts(now_ms, pid, nonce)
 }
 
 /// The whole construction, over parts the caller supplies rather than the ones
@@ -42,6 +44,45 @@ fn ulid_from_parts(now_ms: u64, pid: u32, nonce: u64) -> String {
         .collect()
 }
 
+/// Outside tests the observation seam is nothing at all: an empty call, so
+/// `ulid` keeps the behaviour it had before the seam existed. The half that
+/// records is `observation`, below.
+#[cfg(not(test))]
+fn observe_sampled_parts(_now_ms: u64, _pid: u32, _nonce: u64) {}
+
+/// The recording half of the observation seam.
+///
+/// It is a module rather than a pair of loose items because the first
+/// test-configured attribute in a file is where `effects::production_region`
+/// truncates, and `effects::tests::
+/// every_production_region_that_stops_early_stops_at_a_module` requires that
+/// cut to land on a module. Everything above this point is the whole
+/// construction, which is what the region is for.
+#[cfg(test)]
+mod observation {
+    use std::cell::Cell;
+
+    thread_local! {
+        /// The parts of this thread's most recent `ulid` call, or `None` if it
+        /// has made none since the cell was last taken.
+        pub(super) static SAMPLED_PARTS: Cell<Option<(u64, u32, u64)>> =
+            const { Cell::new(None) };
+    }
+
+    /// Records the three parts `ulid` has just sampled, so a test can rebuild
+    /// the id from exactly those values instead of inferring them from the id
+    /// and from `NONCE`. Inference cannot distinguish a wrapper that constructs
+    /// from what it sampled from one that constructs from something else;
+    /// capture can. The record is per-thread, so tests running in parallel
+    /// never see one another's.
+    pub(super) fn observe_sampled_parts(now_ms: u64, pid: u32, nonce: u64) {
+        SAMPLED_PARTS.with(|cell| cell.set(Some((now_ms, pid, nonce))));
+    }
+}
+
+#[cfg(test)]
+use observation::observe_sampled_parts;
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -64,6 +105,11 @@ mod tests {
     /// the first ten characters of the id that came back. So these are the old
     /// wrapper's own outputs, and the extraction is what they hold to account —
     /// not this module measured against itself.
+    ///
+    /// Eighteen were recorded and checked out of tree; the six kept here are
+    /// the executable ones, two per process, and they are what this test set
+    /// proves. The other twelve are not in the repository and no test reads
+    /// them.
     const RECORDED_FROM_THE_AMBIENT_WRAPPER: &[Vector] = &[
         (FIRST_MS, 2_437_999, 0, "01M191Y2PSXY56YHDQP510FKS2"),
         (FIRST_MS + 5, 2_437_999, 5, "01M191Y2PYQRR9VKKQ9WG6DZ1W"),
@@ -88,14 +134,11 @@ mod tests {
         (FIRST_MS, 1, 1 << 47, "01M191Y2PSQJ4F5RHZ3YZPXCEB"),
     ];
 
-    /// The 48-bit timestamp field an id prints, from its first ten characters.
-    fn timestamp_field(id: &str) -> u64 {
-        id.bytes().take(10).fold(0, |acc, byte| {
-            let Some(digit) = CROCKFORD.iter().position(|&c| c == byte) else {
-                panic!("not a Crockford digit: {byte:#04x}");
-            };
-            (acc << 5) | u64::try_from(digit).unwrap_or(0)
-        })
+    /// This thread's most recent record, cleared before the call under test so
+    /// that a wrapper which stopped reaching the seam reads as absent rather
+    /// than as whatever was left behind.
+    fn take_sampled_parts() -> Option<(u64, u32, u64)> {
+        observation::SAMPLED_PARTS.with(std::cell::Cell::take)
     }
 
     #[test]
@@ -125,25 +168,49 @@ mod tests {
 
     #[test]
     fn the_public_wrapper_returns_exactly_a_parts_construction() {
-        // Both parts the wrapper samples are recoverable, so this compares all
-        // twenty-six characters rather than a shape.
-        //
-        // `now_ms`: the leading ten characters hold `now_ms & 0xFFFF_FFFF_FFFF`,
-        // and a millisecond clock does not reach that mask until the year 10889,
-        // so the decode is the exact value the wrapper mixed into its seed.
-        //
-        // `nonce`: unknown, but bracketed. `NONCE` only ever increases and a
-        // single atomic has one total modification order, so the value this call
-        // reserved lies in `low..high` however many other threads raced it.
-        let low = NONCE.load(Ordering::Relaxed);
+        // The seam reports what `ulid` sampled, so all three parts arrive
+        // independently of the id rather than being read back out of it. That
+        // is the difference that matters: a wrapper which samples one nonce and
+        // then constructs from another satisfies any test that infers its parts
+        // from its own output, and fails this one.
+        let _ = take_sampled_parts();
         let id = ulid();
-        let high = NONCE.load(Ordering::Relaxed);
-        let now_ms = timestamp_field(&id);
-        let pid = std::process::id();
-        assert!(
-            (low..high).any(|nonce| ulid_from_parts(now_ms, pid, nonce) == id),
-            "{id} is not ulid_from_parts({now_ms}, {pid}, n) for any n in {low}..{high}"
+        let Some((now_ms, pid, nonce)) = take_sampled_parts() else {
+            panic!("`ulid` returned {id} without reaching the observation seam");
+        };
+        assert_eq!(
+            ulid_from_parts(now_ms, pid, nonce),
+            id,
+            "the id is not what the parts it sampled construct"
         );
+        assert_eq!(pid, std::process::id(), "the pid sampled was not this one");
+
+        // A second call reserves a nonce of its own, and `NONCE` only ever
+        // increases, so this holds however many threads drew from it in between.
+        let _ = ulid();
+        let Some((_, _, next_nonce)) = take_sampled_parts() else {
+            panic!("the second call did not reach the observation seam");
+        };
+        assert!(
+            next_nonce > nonce,
+            "the second call reserved {next_nonce}, which does not follow {nonce}"
+        );
+    }
+
+    #[test]
+    fn reserving_a_nonce_yields_the_previous_value_and_wraps_at_the_top() {
+        // The reservation `ulid` makes, on a counter belonging to this test, so
+        // the process-wide `NONCE` other tests draw from is left alone.
+        let counter = AtomicU64::new(41);
+        assert_eq!(counter.fetch_add(1, Ordering::Relaxed), 41);
+        assert_eq!(counter.load(Ordering::Relaxed), 42);
+
+        // At the top of the range it wraps rather than trapping, so a process
+        // that draws more than `u64::MAX` ids keeps issuing them. The nonce is
+        // one of three terms in the seed, not the whole of it.
+        let at_top = AtomicU64::new(u64::MAX);
+        assert_eq!(at_top.fetch_add(1, Ordering::Relaxed), u64::MAX);
+        assert_eq!(at_top.load(Ordering::Relaxed), 0);
     }
 
     #[test]
@@ -166,9 +233,12 @@ mod tests {
                 "({now_ms}, {pid}, {nonce}) constructs something other than its recorded id"
             );
         }
-        // The mask is on the printed field and not on the seed: two clock values
-        // exactly one field apart print the same ten leading characters, and the
-        // eighty bits under them must still tell the two milliseconds apart.
+        // The printed field is forty-eight bits wide while the seed takes all of
+        // `now_ms`: two clock values exactly one field apart print the same ten
+        // leading characters, and the eighty bits under them still tell the two
+        // milliseconds apart. This asserts that width, not the mask that spells
+        // it out — `<< 80` into a `u128` discards bit 48 and above by itself, so
+        // dropping the mask entirely would change no output.
         let epoch = ulid_from_parts(0, 0, 0);
         let one_field_later = ulid_from_parts(1 << 48, 0, 0);
         assert_eq!(epoch[..10], one_field_later[..10]);
