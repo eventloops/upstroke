@@ -33,7 +33,7 @@ use super::ci_model::{
     CI_TARGETS, CI_WORKFLOW, CLIPPY_GATE, CiTarget, DEFAULTS_FIELDS, DEFAULTS_RUN_FIELDS,
     ENCODED_RUSTFLAGS_KEY, GATE_JOB_FIELDS, KNOWN_SHELLS, MSRV_COMMAND, MSRV_JOB, MSRV_JOB_FIELDS,
     OPTIONAL_DEFAULTS_FIELD, REQUIRED_CONTEXT, RUSTFLAGS_KEY, RUSTFLAGS_VALUE, STEP_FIELDS,
-    TEST_COMMAND, TEST_JOB_FIELDS, WORKFLOW_FIELDS,
+    TEST_COMMAND, TEST_JOB_COMPONENTS, TEST_JOB_FIELDS, WORKFLOW_FIELDS,
 };
 use super::repo_root;
 
@@ -627,11 +627,13 @@ pub(super) fn ci_test_job_complaints(doc: &Yaml) -> Vec<String> {
         ));
     }
 
-    // `clippy` is a TEST dependency of this job, not only a lint one:
+    // `clippy` and `rustfmt` are TEST dependencies of this job, not lint ones:
     // `every_declared_effect_denial_refuses_for_the_reason_it_declares` drives
-    // `clippy-driver` over one fixture per resolution shape, and
-    // `dtolnay/rust-toolchain` installs the minimal profile. Measured, mutation
-    // `MUT-CI-STOPS-INSTALLING-CLIPPY`.
+    // `clippy-driver` over one fixture per resolution shape, the governed-lint
+    // oracles do the same, and `the_governed_lint_readers_separate_tokens_the_
+    // way_the_lexer_does` runs `rustfmt` itself. `dtolnay/rust-toolchain`
+    // installs the minimal profile. Measured, mutations
+    // `MUT-CI-STOPS-INSTALLING-CLIPPY` and `MUT-CI-STOPS-INSTALLING-RUSTFMT`.
     let toolchains: Vec<&Yaml> = steps_of(job)
         .iter()
         .filter(|step| {
@@ -651,12 +653,16 @@ pub(super) fn ci_test_job_complaints(doc: &Yaml) -> Vec<String> {
         .and_then(|with| scalar(with, "components"))
         .map(|list| list.split(',').map(str::trim).collect())
         .unwrap_or_default();
-    if !components.contains("clippy") {
+    let required: BTreeSet<&str> = TEST_JOB_COMPONENTS.iter().copied().collect();
+    if components != required {
         out.push(format!(
-            "[test-job-toolchain] the `test` job installs components {components:?}, which \
-             do not include `clippy`, so `every_declared_effect_denial_refuses_for_the_reason\
-             _it_declares` cannot run there: `dtolnay/rust-toolchain` installs the minimal \
-             profile and `clippy-driver` is not in it."
+            "[test-job-toolchain] the `test` job installs components {components:?}, not \
+             exactly {required:?}. `dtolnay/rust-toolchain` installs the minimal profile, so \
+             a component this job's tests RUN is absent unless it is named: `clippy` for the \
+             `clippy-driver` fixtures, `rustfmt` for the `rustfmt::skip` preservation claim. \
+             An equality rather than a `contains`, which is `PR74-CI-001` -- the previous \
+             check could not see a missing `rustfmt`, and the test that needs it passed only \
+             because the hosted runner image happens to ship a full toolchain."
         ));
     }
     if with.and_then(|with| scalar(with, "toolchain")) != Some("stable") {
@@ -1383,8 +1389,33 @@ pub(super) const WORKFLOW_ESCAPES: &[WorkflowEscape] = &[
                  line left the test green -- `PR4-CENSUS-COMMENT-ORACLE`, in the test whose \
                  purpose is to answer which command runs this.",
         job: Some("test"),
-        anchor: "          components: clippy\n",
+        anchor: "          components: clippy, rustfmt\n",
         replacement: "",
+        refused_as: "test-job-toolchain",
+    },
+    WorkflowEscape {
+        name: "MUT-CI-STOPS-INSTALLING-RUSTFMT",
+        escape: "`rustfmt` is a test dependency of this job too, and the check that guarded \
+                 the components asked only whether `clippy` was present. So dropping \
+                 `rustfmt` left the oracle green while `the_governed_lint_readers_separate_\
+                 tokens_the_way_the_lexer_does` — which runs the real binary to establish \
+                 what a `rustfmt::skip` preserves — had no clean-runner guarantee at all. It \
+                 passed on hosted runners because their image ships a full toolchain, which \
+                 is a property of the image and not of this workflow. `PR74-CI-001`.",
+        job: Some("test"),
+        anchor: "          components: clippy, rustfmt\n",
+        replacement: "          components: clippy\n",
+        refused_as: "test-job-toolchain",
+    },
+    WorkflowEscape {
+        name: "MUT-CI-COMPONENTS-WIDENED",
+        escape: "an extra component is not a missing one, but the claim is an EQUALITY: what \
+                 this job installs is reviewed, so a component arriving without a reason \
+                 recorded beside it is a change to what the tests may depend on. A `contains` \
+                 cannot see this direction at all.",
+        job: Some("test"),
+        anchor: "          components: clippy, rustfmt\n",
+        replacement: "          components: clippy, rustfmt, llvm-tools\n",
         refused_as: "test-job-toolchain",
     },
     WorkflowEscape {

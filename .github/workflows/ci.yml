@@ -50,7 +50,17 @@ jobs:
           # minimal profile, so without this the fixtures could not run in the
           # job that runs the tests — which is `PR5-C-DOCTEST-FIXTURES-NEVER-RAN`
           # one step removed.
-          components: clippy
+          #
+          # `rustfmt` is a TEST dependency here for the same reason and by the
+          # same argument. `effects::tests::the_governed_lint_readers_separate_
+          # tokens_the_way_the_lexer_does` runs the real `rustfmt` binary to
+          # establish that a `rustfmt::skip` preserves the attribute spellings
+          # the governed-lint readers must handle — a claim about what the `fmt`
+          # gate does, which may only be made by running it. The minimal profile
+          # does not carry it. `PR74-CI-001`: that test passed on hosted runners
+          # only because their images happen to ship a full toolchain, which is
+          # a property of the image and not a guarantee of this workflow.
+          components: clippy, rustfmt
 
       - name: Cache cargo
         uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2

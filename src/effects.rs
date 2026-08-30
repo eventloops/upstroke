@@ -147,6 +147,26 @@ pub const USED_GOVERNED_LINTS: &[&str] = &[
     "clippy::disallowed_macros",
 ];
 
+/// Renamed clippy lints that a governed one still answers to.
+///
+/// `PR74-GOV-001`. A rename is not a spelling variant a reader may ignore:
+/// clippy still RESOLVES these, so an allow of one suppresses the governed lint
+/// and a deny of one fails the build. Measured on both toolchains this
+/// repository supports -- stable clippy 0.1.97 and the 1.85.0 pin's clippy
+/// 0.1.85 -- with identical results: `#![allow(clippy::disallowed_method)]`
+/// emits `renamed_and_removed_lints` and suppresses, and
+/// `#![deny(clippy::disallowed_method)]` emits it and errors.
+///
+/// **Only these two, and only tool-qualified.** Measured in the same run:
+/// `clippy::disallowed_macro` is `unknown_lints` and governs nothing -- there
+/// is no such rename -- and the bare `disallowed_method` without the `clippy::`
+/// segment is `unknown_lints` too. A list that guessed at either would report
+/// an allowance where the compiler sees none.
+const GOVERNED_LINT_ALIASES: &[(&str, &str)] = &[
+    ("disallowed_method", "disallowed_methods"),
+    ("disallowed_type", "disallowed_types"),
+];
+
 /// The bare lint name an attribute entry refers to, if it is governed.
 ///
 /// `clippy::disallowed_methods` and `disallowed_methods` are the same lint;
@@ -165,22 +185,43 @@ pub const USED_GOVERNED_LINTS: &[&str] = &[
 /// reader will guess at.
 #[must_use]
 pub fn normalize_lint(entry: &str) -> Option<&'static str> {
-    // **Every segment, not just the last one.** Taking `rsplit("::").next()`
-    // and validating that alone left the leading segments unread, so
-    // `allow(\u{00A0}clippy::disallowed_methods)` -- a file rustc REFUSES,
-    // because U+00A0 is not Rust whitespace -- normalised to the governed lint
-    // and the reader reported an allowance for a file that does not compile.
-    // A path is a sequence of identifier tokens; all of them are checked.
-    let mut bare = None;
+    // **The whole path, and only the shapes the compiler resolves.**
+    //
+    // Taking `rsplit("::").next()` and validating that alone left the leading
+    // segments unread, so `allow(\u{00A0}clippy::disallowed_methods)` -- a file
+    // rustc REFUSES, because U+00A0 is not Rust whitespace -- normalised to the
+    // governed lint. `PR74-GOV-002` is the larger half of the same mistake: ANY
+    // path ending in a governed name was that lint, and
+    // `rustdoc::disallowed_methods`, `rustc::disallowed_methods` and
+    // `clippy::extra::disallowed_methods` all compile while governing nothing.
+    // The wrongly-green shape is a real allow followed by a FAKE deny --
+    // measured, the file compiles CLEAN with the lint suppressed, and the
+    // reader called it a denial, which is what the two censuses act on.
+    //
+    // So: a bare governed name, or exactly `clippy::<name>`. Two segments at
+    // most and the first must be `clippy`. Anything else answers `None`, and
+    // an entry that names the lint without normalising to it is a REFUSAL
+    // rather than silence -- `read_attribute` is where that happens, so a
+    // foreign namespace is loud instead of skipped.
+    let mut segments: Vec<&str> = Vec::new();
     for segment in trim_rust(entry).split("::") {
         let segment = trim_rust(segment);
         let (name, end) = identifier_token(segment, 0)?;
         if end != segment.len() {
             return None;
         }
-        bare = Some(name);
+        segments.push(name);
     }
-    let bare = bare?;
+    let bare = match segments.as_slice() {
+        [name] => *name,
+        // The aliases are tool-qualified only, which is why the mapping lives
+        // in this arm rather than above the match.
+        ["clippy", name] => GOVERNED_LINT_ALIASES
+            .iter()
+            .find(|(alias, _)| alias == name)
+            .map_or(*name, |(_, canonical)| *canonical),
+        _ => return None,
+    };
     GOVERNED_LINTS.iter().copied().find(|name| *name == bare)
 }
 
@@ -3408,19 +3449,31 @@ pub(crate) mod lint_levels {
     /// The bare name, because an attribute may write either spelling, and
     /// bounded on both sides so `disallowed_methods_extra` is not this lint.
     fn mentions(text: &str, lint: &str) -> bool {
-        let bare = match super::normalize_lint(lint) {
+        let canonical = match super::normalize_lint(lint) {
             Some(name) => name,
             None => lint.rsplit("::").next().unwrap_or(lint),
         };
         let word = |byte: u8| byte.is_ascii_alphanumeric() || byte == b'_';
-        text.match_indices(bare).any(|(at, _)| {
-            !text.as_bytes()[..at].last().copied().is_some_and(word)
-                && !text
-                    .as_bytes()
-                    .get(at + bare.len())
-                    .copied()
-                    .is_some_and(word)
-        })
+        // The lint's own name AND every alias that resolves to it: a shape this
+        // reader could not parse is no less about the lint for having been
+        // written in the spelling clippy renamed.
+        std::iter::once(canonical)
+            .chain(
+                super::GOVERNED_LINT_ALIASES
+                    .iter()
+                    .filter(|(_, to)| *to == canonical)
+                    .map(|(alias, _)| *alias),
+            )
+            .any(|needle| {
+                text.match_indices(needle).any(|(at, _)| {
+                    !text.as_bytes()[..at].last().copied().is_some_and(word)
+                        && !text
+                            .as_bytes()
+                            .get(at + needle.len())
+                            .copied()
+                            .is_some_and(word)
+                })
+            })
     }
 
     /// The level in force for `lint` at `source`'s file-module scope, or none.

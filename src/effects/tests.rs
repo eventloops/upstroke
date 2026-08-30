@@ -5673,6 +5673,407 @@ fn the_governed_lint_readers_separate_tokens_the_way_the_lexer_does() {
     let _ = fs::remove_dir_all(&scratch);
 }
 
+/// **A lint name is what the compiler resolves it to, and nothing else.**
+///
+/// `PR74-GOV-001` and `PR74-GOV-002`. `normalize_lint` decided which lint an
+/// attribute entry names by taking the last `::` segment and looking it up.
+/// That is wrong in both directions at once.
+///
+/// **It dropped a live alias.** `clippy::disallowed_method` -- singular -- is a
+/// RENAMED lint that clippy still resolves: an allow of it suppresses
+/// `clippy::disallowed_methods` and a deny of it makes the build fail, with a
+/// `renamed_and_removed_lints` warning beside it. The reader answered `None`,
+/// so a file could allow a governed lint in that spelling with no
+/// `effects/allowlist.toml` row and no census would see it. `clippy::\
+/// disallowed_type` is the same for `disallowed_types`.
+///
+/// **It accepted names the compiler does not.** Any path ending in a governed
+/// name normalised to that lint, so `rustdoc::disallowed_methods`,
+/// `rustc::disallowed_methods` and `clippy::extra::disallowed_methods` -- none
+/// of which govern the lint, all of which compile -- read as the governed lint.
+/// The wrongly-green shape is the review's: a file with a REAL allow and a FAKE
+/// deny after it
+///
+/// ```text
+/// #![allow(clippy::disallowed_methods)]
+/// #![deny(rustdoc::disallowed_methods)]
+/// ```
+///
+/// compiles clean with the lint SUPPRESSED, and the reader called it a denial.
+/// Both censuses act on that: one admits a per-site `#[expect]` against a
+/// denial that is not there, and the other reports `PR6-LANEF-004` closed.
+///
+/// # What is accepted now
+///
+/// A bare governed name, or exactly `clippy::<name>` where `<name>` is a
+/// governed lint or one of the two measured aliases. Two segments at most, and
+/// the first must be `clippy`. Everything else refuses: extra segments and
+/// foreign namespaces are not skipped, because "this attribute says nothing
+/// about that lint" is false for text that plainly names it.
+///
+/// # Measured on both toolchains this repository supports
+///
+/// Every row below is compiled by `clippy-driver`. The alias rows were also
+/// measured by hand against the MSRV toolchain -- clippy 0.1.85, the 1.85.0
+/// pin CI runs -- and against stable clippy 0.1.97, with identical results, so
+/// the canonicalisation is not a stable-only behaviour. The MSRV leg runs here
+/// too when that toolchain is installed, and says so when it is not.
+#[test]
+fn the_governed_lint_reader_canonicalises_aliases_and_refuses_foreign_namespaces() {
+    use crate::effects::lint_levels::{Resolution, file_level_lint_resolution};
+
+    const BODY: &str = "pub fn go(p: &std::path::Path) { let _ = std::fs::write(p, \"x\"); }\n";
+    const LINT: &str = "clippy::disallowed_methods";
+
+    fn predict(resolution: Resolution) -> (bool, Vec<&'static str>, bool) {
+        assert!(
+            !resolution.ambiguous,
+            "every spelling in this table is one the compiler resolves, so a refusal is not \
+             the fail-closed answer here -- it is the reader failing to canonicalise"
+        );
+        if resolution.refused_downgrade {
+            return (false, Vec::new(), true);
+        }
+        match resolution.level {
+            Some("allow" | "expect") => (true, Vec::new(), false),
+            None | Some("warn") => (true, vec!["warning"], false),
+            Some("deny" | "forbid") => (false, vec!["error"], false),
+            other => panic!("the reader answered `{other:?}`, which nothing predicts"),
+        }
+    }
+
+    let scratch = scratch_dir("lint-aliases");
+
+    // -----------------------------------------------------------------
+    // (1) The alias resolves, in both directions, and so does every accepted
+    // spelling of every governed lint this slice uses.
+    // -----------------------------------------------------------------
+    let mut table: Vec<(String, String)> = vec![
+        (
+            "alias_allow".to_owned(),
+            "#![allow(clippy::disallowed_method)]\n".to_owned(),
+        ),
+        (
+            "alias_deny".to_owned(),
+            "#![deny(clippy::disallowed_method)]\n".to_owned(),
+        ),
+        (
+            "alias_forbid".to_owned(),
+            "#![forbid(clippy::disallowed_method)]\n".to_owned(),
+        ),
+        // The alias and the canonical name are ONE lint, so ordering across the
+        // two spellings still decides: a deny taken back by an alias-spelled
+        // allow is an allow.
+        (
+            "deny_then_alias_allow".to_owned(),
+            format!("#![deny({LINT})]\n#![allow(clippy::disallowed_method)]\n"),
+        ),
+        (
+            "alias_deny_then_allow".to_owned(),
+            format!("#![deny(clippy::disallowed_method)]\n#![allow({LINT})]\n"),
+        ),
+    ];
+    for spelling in ["disallowed_methods", "clippy::disallowed_methods"] {
+        table.push((
+            format!("accepted_{}", spelling.replace("::", "_")),
+            format!("#![allow({spelling})]\n"),
+        ));
+    }
+    for (tag, prologue) in &table {
+        let source = format!("{prologue}{BODY}");
+        let resolution = file_level_lint_resolution(&source, LINT);
+        let (built, diagnostics) = compile_prologue_probe(&scratch, tag, &source);
+        let fired: Vec<String> = diagnostics
+            .iter()
+            .filter(|(_, code)| code == LINT)
+            .map(|(level, _)| level.clone())
+            .collect();
+        let rejected = diagnostics.iter().any(|(_, code)| code == "E0453");
+        let (wants_build, wants_fired, wants_rejected) = predict(resolution);
+        assert_eq!(
+            (built, fired.clone(), rejected),
+            (
+                wants_build,
+                wants_fired
+                    .iter()
+                    .map(|level| (*level).to_owned())
+                    .collect(),
+                wants_rejected
+            ),
+            "`{tag}` — the reader answered {resolution:?} and clippy-driver did something else: \
+             built={built} fired={fired:?} E0453={rejected}; all diagnostics {diagnostics:?}"
+        );
+    }
+
+    // The other governed lint with an alias, asked about itself.
+    for (tag, prologue, lint) in [
+        (
+            "types_alias_allow",
+            "#![allow(clippy::disallowed_type)]\n",
+            "clippy::disallowed_types",
+        ),
+        (
+            "types_alias_deny",
+            "#![deny(clippy::disallowed_type)]\n",
+            "clippy::disallowed_types",
+        ),
+    ] {
+        assert_eq!(
+            crate::effects::lint_levels::file_level_lint_state(prologue, lint),
+            Some(if tag.ends_with("allow") {
+                "allow"
+            } else {
+                "deny"
+            }),
+            "`{tag}` — `clippy::disallowed_type` is a live rename of `{lint}`"
+        );
+    }
+
+    // -----------------------------------------------------------------
+    // (2) `normalize_lint` is the bridge, and it answers about NAMES rather
+    // than about files. Stated as values, both directions, so a reader that
+    // simply matched more would fail the second half.
+    // -----------------------------------------------------------------
+    for accepted in [
+        "disallowed_methods",
+        "clippy::disallowed_methods",
+        "clippy::disallowed_method",
+        " clippy :: disallowed_method ",
+        "clippy::r#disallowed_method",
+    ] {
+        assert_eq!(
+            normalize_lint(accepted),
+            Some("disallowed_methods"),
+            "`{accepted}` is a spelling the compiler resolves to this lint"
+        );
+    }
+    assert_eq!(
+        normalize_lint("clippy::disallowed_type"),
+        Some("disallowed_types")
+    );
+    for refused in [
+        // Foreign namespaces. Each compiles and none governs the lint.
+        "rustdoc::disallowed_methods",
+        "rustc::disallowed_methods",
+        // An extra segment under the right tool is still not the lint.
+        "clippy::extra::disallowed_methods",
+        "clippy::disallowed_methods::extra",
+        // An unknown tool is `E0710` and does not compile at all.
+        "foo::disallowed_methods",
+        "foo::bar::disallowed_methods",
+        // The alias only exists tool-qualified: bare `disallowed_method` is
+        // `unknown_lints` and governs nothing.
+        "disallowed_method",
+        "disallowed_type",
+        // And there is no `disallowed_macro` rename at all — measured
+        // `unknown_lints`, not `renamed_and_removed_lints`.
+        "clippy::disallowed_macro",
+        "disallowed_macro",
+    ] {
+        assert_eq!(
+            normalize_lint(refused),
+            None,
+            "`{refused}` is not a spelling the compiler resolves to a governed lint"
+        );
+    }
+
+    // -----------------------------------------------------------------
+    // (3) A foreign namespace REFUSES, loudly, rather than being skipped —
+    // and the compiler is asked what each one really does.
+    // -----------------------------------------------------------------
+    for (tag, entry, compiles) in [
+        ("rustdoc_namespace", "rustdoc::disallowed_methods", true),
+        ("rustc_namespace", "rustc::disallowed_methods", true),
+        ("extra_segment", "clippy::extra::disallowed_methods", true),
+        ("unknown_tool", "foo::disallowed_methods", false),
+    ] {
+        // What it does on its own: it does not deny, so the lint still fires
+        // (or the file does not build at all).
+        let alone = format!("#![deny({entry})]\n{BODY}");
+        let (built, diagnostics) =
+            compile_prologue_probe(&scratch, &format!("alone_{tag}"), &alone);
+        assert_eq!(
+            built, compiles,
+            "`{tag}` — build expectation wrong: {diagnostics:?}"
+        );
+        if compiles {
+            assert!(
+                diagnostics
+                    .iter()
+                    .any(|(level, code)| level == "warning" && code == LINT),
+                "`{tag}` denied the lint after all, so it is not a foreign namespace: \
+                 {diagnostics:?}"
+            );
+        }
+        // And the reader refuses it rather than reading a level from it.
+        for spelling in [alone.clone(), alone.replace('\n', "\r\n")] {
+            assert_eq!(
+                file_level_lint_resolution(&spelling, LINT),
+                Resolution {
+                    level: None,
+                    refused_downgrade: false,
+                    ambiguous: true,
+                },
+                "`{tag}` was read as a level instead of refused"
+            );
+        }
+    }
+
+    // An attribute this reader cannot resolve is a refusal, and it is no less
+    // about the lint for naming it in the spelling clippy renamed. Without the
+    // aliases in `mentions`, these read as "this attribute says nothing about
+    // that lint" — which is the reassuring answer and the false one.
+    for (tag, prologue) in [
+        (
+            "alias_under_an_unknown_head",
+            "#![allowance(clippy::disallowed_method)]\n",
+        ),
+        (
+            "alias_under_a_nested_unknown_head",
+            "#![cfg_attr(all(), lint_group(deny(clippy::disallowed_method)))]\n",
+        ),
+    ] {
+        let source = format!("{prologue}{BODY}");
+        assert_eq!(
+            file_level_lint_resolution(&source, LINT),
+            Resolution {
+                level: None,
+                refused_downgrade: false,
+                ambiguous: true,
+            },
+            "`{tag}` — an unreadable attribute naming the lint by its alias must refuse"
+        );
+    }
+
+    // -----------------------------------------------------------------
+    // (4) **The review's shape.** A real allow, then a fake deny. The compiler
+    // suppresses the lint — the file ALLOWS it — and the reader must never
+    // answer `deny`, which is what both censuses act on.
+    // -----------------------------------------------------------------
+    for (tag, fake) in [
+        ("fake_deny_rustdoc", "rustdoc::disallowed_methods"),
+        (
+            "fake_deny_extra_segment",
+            "clippy::extra::disallowed_methods",
+        ),
+    ] {
+        let source = format!("#![allow({LINT})]\n#![deny({fake})]\n{BODY}");
+        let (built, diagnostics) = compile_prologue_probe(&scratch, tag, &source);
+        assert!(built, "`{tag}` did not build: {diagnostics:?}");
+        assert!(
+            !diagnostics.iter().any(|(_, code)| code == LINT),
+            "`{tag}` — the lint fired, so the real allow did not stand and this fixture is not \
+             the shape it claims: {diagnostics:?}"
+        );
+        let resolution = file_level_lint_resolution(&source, LINT);
+        assert_ne!(
+            resolution.level,
+            Some("deny"),
+            "`{tag}` — a file the compiler compiles CLEAN, with the lint allowed, read as a \
+             denial. That is the wrongly-green answer both censuses act on."
+        );
+        assert!(
+            resolution.ambiguous,
+            "`{tag}` — a fake deny naming the lint must refuse loudly, not be skipped: \
+             {resolution:?}"
+        );
+        assert!(!file_level_denies(&source, LINT), "`{tag}`");
+    }
+
+    // -----------------------------------------------------------------
+    // (5) The placement half. An alias-spelled allow must be VISIBLE to the
+    // allowlist census — otherwise it is an allowance with no row — and a
+    // foreign-namespace one must not be, because it allows nothing.
+    // -----------------------------------------------------------------
+    let found = governed_allows(&format!("#![allow(clippy::disallowed_method)]\n{BODY}"));
+    assert_eq!(
+        found.len(),
+        1,
+        "an alias-spelled allow is invisible to the placement census, so a file may allow a \
+         governed lint with no {ALLOWLIST_TOML} row: {found:#?}"
+    );
+    assert_eq!(found[0].lints, ["disallowed_methods"]);
+    assert!(found[0].module_level && found[0].inner);
+    for silent in [
+        "rustdoc::disallowed_methods",
+        "clippy::extra::disallowed_methods",
+        "disallowed_method",
+    ] {
+        let found = governed_allows(&format!("#![allow({silent})]\n{BODY}"));
+        assert!(
+            found.iter().all(|allow| allow.lints.is_empty()),
+            "`{silent}` allows nothing the compiler recognises, so it is not a governed \
+             allowance: {found:#?}"
+        );
+    }
+
+    // -----------------------------------------------------------------
+    // (6) The MSRV leg. The alias is not a stable-only behaviour: the same
+    // fixture is compiled by the 1.85.0 toolchain CI pins whenever it is
+    // installed, and the absence is reported rather than passed over.
+    // -----------------------------------------------------------------
+    let msrv = std::process::Command::new("rustup")
+        .args(["run", "1.85.0", "rustc", "--print", "sysroot"])
+        .output();
+    let msrv_driver = msrv.ok().filter(|out| out.status.success()).map(|out| {
+        PathBuf::from(String::from_utf8_lossy(&out.stdout).trim().to_owned())
+            .join("bin")
+            .join(if cfg!(windows) {
+                "clippy-driver.exe"
+            } else {
+                "clippy-driver"
+            })
+    });
+    match msrv_driver.filter(|path| path.is_file()) {
+        Some(driver) => {
+            let file = scratch.join("msrv_alias.rs");
+            fs::write(
+                &file,
+                format!("#![deny(clippy::disallowed_method)]\n{BODY}"),
+            )
+            .expect("the fixture");
+            let out = scratch.join("msrv-out");
+            fs::create_dir_all(&out).expect("an output directory");
+            let output = std::process::Command::new(&driver)
+                .env("CLIPPY_CONF_DIR", repo_root())
+                .args([
+                    "--edition",
+                    "2024",
+                    "--crate-type",
+                    "lib",
+                    "--emit=metadata",
+                    "--error-format=json",
+                ])
+                .arg("--out-dir")
+                .arg(&out)
+                .arg(&file)
+                .output()
+                .expect("the MSRV clippy-driver runs");
+            assert!(
+                !output.status.success(),
+                "on the MSRV toolchain a deny of `clippy::disallowed_method` did not fail the \
+                 build, so the alias is stable-only and the canonicalisation must say so"
+            );
+            assert!(
+                String::from_utf8_lossy(&output.stderr).contains("clippy::disallowed_methods"),
+                "the MSRV toolchain did not resolve the alias to the canonical lint"
+            );
+        }
+        None => {
+            // Loud, not silent: the claim above is measured on stable here, and
+            // the MSRV leg is evidence this host can add when the toolchain is
+            // present. CI's `test` job installs `stable` only.
+            eprintln!(
+                "note: the 1.85.0 toolchain is not installed, so the MSRV leg of \
+                 `the_governed_lint_reader_canonicalises_aliases_and_refuses_foreign_namespaces` \
+                 did not run; the alias claim is measured on the available toolchain only"
+            );
+        }
+    }
+
+    let _ = fs::remove_dir_all(&scratch);
+}
+
 #[test]
 fn the_production_code_region_removes_a_configured_item_and_keeps_the_rest() {
     oracles::the_configured_item_is_removed_and_the_rest_kept();
