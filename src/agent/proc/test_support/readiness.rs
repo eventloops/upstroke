@@ -63,7 +63,7 @@
 //   `PR6-LANEF-004` reproducing for the Process funnel, and the deny is what
 //   closes it.
 // * Deleting `#![allow(clippy::disallowed_methods)]` changes **nothing** at the
-//   build: the same inheritance covers the five calls. So the allow is not
+//   build: the same inheritance covers all six call sites. So the allow is not
 //   load-bearing for the compiler, and it is not written for the compiler. It
 //   is the governance statement -- `effects/allowlist.toml` records the exact
 //   lint set this file names and
@@ -72,9 +72,14 @@
 //   widening the reviewed row is a build failure. Stating it also keeps this
 //   file out of the "inherits and says nothing" class that census refuses.
 //
-// The five calls the row is written against are the staged publication in
-// `publish_between`: `File::create_new`, `write_all`, `flush`, `fs::rename`,
-// `fs::remove_file`. `decisions.effect_site_inventory.mechanism` (2), and
+// What the row is written against is the staged publication in
+// `publish_between`: **five distinct denied method paths across six call
+// sites** -- `File::create_new`, `write_all`, `flush`, `fs::rename` and
+// `fs::remove_file`, the last of which is called twice, once on the write-side
+// failure path and once on the rename-side one. Distinct paths and call sites
+// are counted separately because the allowlist row is a claim about which
+// *primitives* this file may reach, and the census that reads it counts
+// occurrences. `decisions.effect_site_inventory.mechanism` (2), and
 // `runner::container::tests::every_child_module_of_the_container_funnel_states_its_own_lint_level`
 // is the census that refuses a Process- or Container-funnel child stating
 // neither level.

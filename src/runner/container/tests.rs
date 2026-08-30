@@ -2985,7 +2985,7 @@ fn walk(dir: &Path) -> Vec<PathBuf> {
 
 /// Which level `source` states for `lint` **at file-module level**, or nothing.
 ///
-/// [`crate::effects::file_level_lint_state`] is the whole of it, and the
+/// [`crate::effects::lint_levels::file_level_lint_state`] is the whole of it, and the
 /// delegation is the repair rather than a tidy-up. This body used to search the
 /// blanked file for `allow(` or `deny(` holding the lint name, anywhere — so an
 /// **item-level** `#[deny(clippy::disallowed_types)]` written on one `fn`
@@ -3001,7 +3001,7 @@ fn walk(dir: &Path) -> Vec<PathBuf> {
 /// governs the file from. Comments and string literals are blanked there too,
 /// so a level quoted in prose is invisible (`PR4-CENSUS-COMMENT-ORACLE`).
 fn stated_lint_level(source: &str, lint: &str) -> Option<&'static str> {
-    crate::effects::file_level_lint_state(source, lint)
+    crate::effects::lint_levels::file_level_lint_state(source, lint)
 }
 
 /// Whether a stated level closes `PR6-LANEF-004` for the lint it names.
@@ -3305,6 +3305,83 @@ fn every_child_module_of_the_container_funnel_states_its_own_lint_level() {
         "src/agent/proc/test_support/readiness/nowhere.rs",
         GOVERNED[0]
     ));
+}
+
+/// The readiness allowance names **exactly** the primitives it is written
+/// against, and the record's arithmetic is the tree's.
+///
+/// `PR72-COUNT-002`. Both the allowlist row and the file's own prologue said
+/// "five calls", which is two claims run together and one of them wrong: there
+/// are five distinct denied method **paths** and six **call sites**, because
+/// `fs::remove_file` is called on each of the two failure paths. A reviewer
+/// checking the row against the file would have found six and had no way to
+/// know which number the row meant.
+///
+/// So both numbers are asserted here rather than written down twice. The set
+/// is closed as well as counted: an allowance is a claim about which
+/// primitives a file may reach, and a sixth path arriving without the row
+/// moving is the widening the row exists to make visible.
+#[test]
+fn the_readiness_allowance_names_the_paths_it_is_written_against() {
+    // Counted over the blanked source, so the prologue's own prose about these
+    // names -- which spells every one of them -- is not counted as a call.
+    // `PR4-CENSUS-COMMENT-ORACLE`.
+    const DENIED: [(&str, usize); 5] = [
+        ("File::create_new(", 1),
+        (".write_all(", 1),
+        (".flush()", 1),
+        ("fs::rename(", 1),
+        ("fs::remove_file(", 2),
+    ];
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let readiness = root.join("src/agent/proc/test_support/readiness.rs");
+    let source = fs::read_to_string(&readiness).expect("the readiness module");
+    let code = crate::effects::blank_comments_and_strings(&source);
+
+    let mut sites = 0;
+    for (needle, expected) in DENIED {
+        let found = code.matches(needle).count();
+        assert_eq!(
+            found, expected,
+            "readiness.rs calls `{needle}` {found} time(s) and the record says {expected}"
+        );
+        sites += found;
+    }
+    assert_eq!(DENIED.len(), 5, "five distinct denied method paths");
+    assert_eq!(sites, 6, "six call sites across those five paths");
+
+    // The two records carry the same two numbers, in words, so neither can be
+    // corrected without the other.
+    let allowlist = fs::read_to_string(root.join("effects/allowlist.toml")).expect("the allowlist");
+    let row = allowlist
+        .split("[[")
+        .find(|block| block.contains("path = \"src/agent/proc/test_support/readiness.rs\""))
+        .expect("the readiness row");
+    for phrase in ["FIVE DISTINCT DENIED PATHS", "SIX \\\nCALL SITES"] {
+        assert!(
+            row.contains(phrase),
+            "the readiness allowlist row no longer states `{phrase}`"
+        );
+    }
+    assert!(
+        source.contains("five distinct denied method paths across six call"),
+        "the readiness prologue no longer states the same two numbers"
+    );
+
+    // And the row names each of the five paths, so the set is closed rather
+    // than merely counted.
+    for path in [
+        "std::fs::File::create_new",
+        "std::io::Write::write_all",
+        "std::io::Write::flush",
+        "std::fs::rename",
+        "std::fs::remove_file",
+    ] {
+        assert!(
+            row.contains(path),
+            "the readiness allowlist row does not name `{path}`"
+        );
+    }
 }
 
 /// Every Docker-gated test is named in the list that counts them, and every

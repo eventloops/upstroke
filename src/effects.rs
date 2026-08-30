@@ -798,93 +798,6 @@ fn is_module_level(blanked: &str, hash: usize, close: usize, inner: bool) -> boo
 // (2) The frozen legacy section
 // ---------------------------------------------------------------------------
 
-/// The lint level `source` states for `lint` **at file-module level**, or none.
-///
-/// "File-module level" is the whole of the claim, and it is narrower than
-/// "somewhere in the file". A lint level is scoped by the module tree, so
-/// `#![deny(clippy::disallowed_types)]` in a file's prologue governs the file
-/// and everything nested in it — while `#[deny(clippy::disallowed_types)]`
-/// written on a single `fn` governs that function and says nothing whatever
-/// about the file, which goes on inheriting whatever its ancestors allow.
-/// A scan that accepts the second in place of the first reports a module as
-/// having stated its own level when it has not, which is `PR6-LANEF-004`
-/// answered by the wrong evidence.
-///
-/// So the walk is: from the first byte, over whitespace and **inner**
-/// attributes only, stopping at the first token that is neither. That is
-/// exactly the region an `#![…]` may govern the file module from, and it is the
-/// same rule [`is_module_level`] applies to the inner half of its answer.
-///
-/// `forbid` counts, and `warn`/`expect` are reported as themselves rather than
-/// folded into `deny`: a governance census that wants a denial should be able
-/// to see that it got a warning instead.
-///
-/// Comments and string literals are blanked first, so a level quoted in a doc
-/// comment or inside a `&str` is invisible — `PR4-CENSUS-COMMENT-ORACLE`, and
-/// this crate's effect fixtures are written as exactly those two shapes.
-///
-/// `clippy::disallowed_methods` and `disallowed_methods` are the same lint;
-/// [`normalize_lint`] is the bridge, as it is everywhere else here.
-#[must_use]
-pub fn file_level_lint_state(source: &str, lint: &str) -> Option<&'static str> {
-    const LEVELS: [&str; 5] = ["allow", "expect", "warn", "deny", "forbid"];
-    let blanked = blank_comments_and_strings(source);
-    let bytes = blanked.as_bytes();
-    let mut at = 0;
-    while at < bytes.len() {
-        if bytes[at].is_ascii_whitespace() {
-            at += 1;
-            continue;
-        }
-        // The prologue ends at the first token that is not an inner attribute.
-        if bytes[at] != b'#' || bytes.get(at + 1) != Some(&b'!') {
-            return None;
-        }
-        let open = at + 2;
-        if bytes.get(open) != Some(&b'[') {
-            return None;
-        }
-        let close = matching(bytes, open, b'[', b']')?;
-        let attribute = blanked[open + 1..close].trim();
-        for level in LEVELS {
-            let Some(rest) = attribute.strip_prefix(level) else {
-                continue;
-            };
-            // `allowance(…)` strips to `ance(…)`, which opens nothing: the
-            // parenthesis is what makes the prefix an exact attribute name.
-            let Some(list) = rest
-                .trim_start()
-                .strip_prefix('(')
-                .and_then(|body| body.strip_suffix(')'))
-            else {
-                continue;
-            };
-            if list.split(',').any(|entry| names_lint(entry.trim(), lint)) {
-                return Some(match level {
-                    "allow" => "allow",
-                    "expect" => "expect",
-                    "warn" => "warn",
-                    "deny" => "deny",
-                    _ => "forbid",
-                });
-            }
-        }
-        at = close + 1;
-    }
-    None
-}
-
-/// Whether an attribute entry names `lint`, qualified either way.
-fn names_lint(entry: &str, lint: &str) -> bool {
-    if entry == lint {
-        return true;
-    }
-    match (normalize_lint(entry), normalize_lint(lint)) {
-        (Some(left), Some(right)) => left == right,
-        _ => false,
-    }
-}
-
 /// The legacy section of `effects/allowlist.toml` as PR5 freezes it.
 ///
 /// > "the legacy section may only shrink after PR5 (the test compares against
@@ -2151,26 +2064,49 @@ pub(crate) mod census_domain {
     /// [`MacroInvocation`] beginning at `at`, or `None`.
     ///
     /// The shape is an identifier, `!`, an optional second identifier — that is
-    /// `macro_rules! name { … }` — and a delimited group. Requiring the group is
-    /// what keeps `a != b` out: after that `!` comes `=`, which opens nothing.
+    /// `macro_rules! name { … }`, the one form that has one — and a delimited
+    /// group. Requiring the group is what keeps `a != b` out: after that `!`
+    /// comes `=`, which opens nothing. Requiring the second identifier only
+    /// after `macro_rules` is what keeps `if !condition { … }` out, which
+    /// otherwise reads as an invocation of `if` whose body is the block.
     fn macro_at(bytes: &[u8], at: usize) -> Option<MacroInvocation> {
         let (after_name, name) = identifier(bytes, at);
-        if name.is_empty() || bytes.get(after_name) != Some(&b'!') {
+        if name.is_empty() {
             return None;
         }
-        // `macro_rules! name {` carries the defined name between the two.
-        let (after_defined, _) = identifier(bytes, whitespace(bytes, after_name + 1));
-        let open = whitespace(bytes, after_defined);
-        let (opener, closer) = match bytes.get(open) {
+        // **Whitespace and comments may sit between the name and its `!`.**
+        // `macro_rules ! m { … }` and `quote /* why */ ! { … }` are both valid
+        // Rust, and `#[rustfmt::skip]` keeps either spelling in a real file —
+        // so requiring the `!` to be the very next byte made the guard miss
+        // exactly the macros somebody had gone out of their way to space out.
+        // Comments are already spaces in the view this reads, so one skip
+        // covers both.
+        let bang = whitespace(bytes, after_name);
+        if bytes.get(bang) != Some(&b'!') {
+            return None;
+        }
+        let mut cursor = whitespace(bytes, bang + 1);
+        // `macro_rules! name { … }` is the **only** form carrying a name
+        // between the `!` and the body, and reading one for every macro is
+        // what would make `if !condition { … }` an invocation of `if` once the
+        // gap above is allowed: identifier, `!`, identifier, delimiter — and
+        // the whole block would be skipped. Keyed on the one name that has it.
+        if name == b"macro_rules" {
+            let (after_defined, defined) = identifier(bytes, cursor);
+            if !defined.is_empty() {
+                cursor = whitespace(bytes, after_defined);
+            }
+        }
+        let (opener, closer) = match bytes.get(cursor) {
             Some(b'(') => (b'(', b')'),
             Some(b'[') => (b'[', b']'),
             Some(b'{') => (b'{', b'}'),
             _ => return None,
         };
-        let close = super::matching(bytes, open, opener, closer)?;
+        let close = super::matching(bytes, cursor, opener, closer)?;
         Some(MacroInvocation {
             name: String::from_utf8_lossy(&bytes[at..after_name]).into_owned(),
-            open,
+            open: cursor,
             close,
         })
     }
@@ -2487,6 +2423,107 @@ pub(crate) mod census_domain {
             parts.push(last);
         }
         Ok(parts)
+    }
+}
+
+/// The **file-module-level lint state** reader, for the governance censuses.
+///
+/// `#[cfg(test)]` and `pub(crate)`, and both halves are the point. This is a
+/// census instrument, not a product API: nothing the binary does consults it,
+/// and a `pub fn` here would have been a shipped surface added for a test to
+/// call. It sits at the BOTTOM beside [`census_domain`] for the same reason
+/// that module does — `production_region` cuts a file at its first
+/// `#[cfg(test)]` and
+/// `effects::tests::every_production_region_that_stops_early_stops_at_a_module`
+/// pins the ten files whose cut lands on something that is not a module. This
+/// file is not one of them and must not become one.
+#[cfg(test)]
+pub(crate) mod lint_levels {
+    /// The lint level `source` states for `lint` **at file-module level**, or none.
+    ///
+    /// "File-module level" is the whole of the claim, and it is narrower than
+    /// "somewhere in the file". A lint level is scoped by the module tree, so
+    /// `#![deny(clippy::disallowed_types)]` in a file's prologue governs the file
+    /// and everything nested in it — while `#[deny(clippy::disallowed_types)]`
+    /// written on a single `fn` governs that function and says nothing whatever
+    /// about the file, which goes on inheriting whatever its ancestors allow.
+    /// A scan that accepts the second in place of the first reports a module as
+    /// having stated its own level when it has not, which is `PR6-LANEF-004`
+    /// answered by the wrong evidence.
+    ///
+    /// So the walk is: from the first byte, over whitespace and **inner**
+    /// attributes only, stopping at the first token that is neither. That is
+    /// exactly the region an `#![…]` may govern the file module from, and it is the
+    /// same rule [`super::is_module_level`] applies to the inner half of its answer.
+    ///
+    /// `forbid` counts, and `warn`/`expect` are reported as themselves rather than
+    /// folded into `deny`: a governance census that wants a denial should be able
+    /// to see that it got a warning instead.
+    ///
+    /// Comments and string literals are blanked first, so a level quoted in a doc
+    /// comment or inside a `&str` is invisible — `PR4-CENSUS-COMMENT-ORACLE`, and
+    /// this crate's effect fixtures are written as exactly those two shapes.
+    ///
+    /// `clippy::disallowed_methods` and `disallowed_methods` are the same lint;
+    /// [`super::normalize_lint`] is the bridge, as it is everywhere else here.
+    #[must_use]
+    pub(crate) fn file_level_lint_state(source: &str, lint: &str) -> Option<&'static str> {
+        const LEVELS: [&str; 5] = ["allow", "expect", "warn", "deny", "forbid"];
+        let blanked = super::blank_comments_and_strings(source);
+        let bytes = blanked.as_bytes();
+        let mut at = 0;
+        while at < bytes.len() {
+            if bytes[at].is_ascii_whitespace() {
+                at += 1;
+                continue;
+            }
+            // The prologue ends at the first token that is not an inner attribute.
+            if bytes[at] != b'#' || bytes.get(at + 1) != Some(&b'!') {
+                return None;
+            }
+            let open = at + 2;
+            if bytes.get(open) != Some(&b'[') {
+                return None;
+            }
+            let close = super::matching(bytes, open, b'[', b']')?;
+            let attribute = blanked[open + 1..close].trim();
+            for level in LEVELS {
+                let Some(rest) = attribute.strip_prefix(level) else {
+                    continue;
+                };
+                // `allowance(…)` strips to `ance(…)`, which opens nothing: the
+                // parenthesis is what makes the prefix an exact attribute name.
+                let Some(list) = rest
+                    .trim_start()
+                    .strip_prefix('(')
+                    .and_then(|body| body.strip_suffix(')'))
+                else {
+                    continue;
+                };
+                if list.split(',').any(|entry| names_lint(entry.trim(), lint)) {
+                    return Some(match level {
+                        "allow" => "allow",
+                        "expect" => "expect",
+                        "warn" => "warn",
+                        "deny" => "deny",
+                        _ => "forbid",
+                    });
+                }
+            }
+            at = close + 1;
+        }
+        None
+    }
+
+    /// Whether an attribute entry names `lint`, qualified either way.
+    fn names_lint(entry: &str, lint: &str) -> bool {
+        if entry == lint {
+            return true;
+        }
+        match (super::normalize_lint(entry), super::normalize_lint(lint)) {
+            (Some(left), Some(right)) => left == right,
+            _ => false,
+        }
     }
 }
 

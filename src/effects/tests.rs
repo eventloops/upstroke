@@ -2890,6 +2890,70 @@ fn the_module_scan_reads_ancestry_and_visibility_rather_than_text_after_an_attri
     );
     assert_eq!(beside_a_macro.name, "real");
     assert!(beside_a_macro.test_only);
+
+    // (12) **A spaced or commented `!` is still a macro**, and the discard has
+    // to survive the widening: these bodies hold nothing module-shaped, so they
+    // are dropped in silence and the declaration after them is unaffected.
+    for spaced in [
+        "vec ! [1, 2];\n#[cfg(test)]\nmod real;\n",
+        "assert /* sic */ ! (a == b);\n#[cfg(test)]\nmod real;\n",
+        "macro_rules ! m {\n    () => {\n        fn go() {}\n    };\n}\n#[cfg(test)]\nmod real;\n",
+        // Discriminating: a matcher capturing the `mod` keyword. Recognised as
+        // a macro it is discarded; missed because the `!` is not the very next
+        // byte, its body is walked and the bare `mod` refuses the whole file.
+        "macro_rules ! m {\n    (mod $n:ident) => {\n        ()\n    };\n}\n#[cfg(test)]\nmod real;\n",
+        "macro_rules /* named next */ ! m {\n    (mod $n:ident) => {\n        ()\n    };\n}\n#[cfg(test)]\nmod real;\n",
+    ] {
+        let past = only(spaced);
+        assert_eq!(past.name, "real", "{spaced:?}");
+        assert!(past.test_only, "{spaced:?}");
+    }
+
+    // **`if !condition { … }` is not an invocation of `if`.** Allowing a gap
+    // before the `!` is what makes that shape reachable -- identifier, `!`,
+    // identifier, delimiter -- and reading it as a macro would skip the whole
+    // block. Only `macro_rules` carries a name between its `!` and its body, so
+    // the block below is walked as a block: the declaration inside it is still
+    // derived, with the ancestry it actually has.
+    let inside_a_negated_block = only(
+        "#[cfg(test)]\nmod outer {\n    fn f() {\n        if !ready { }\n    }\n    mod inner;\n}\n",
+    );
+    assert_eq!(inside_a_negated_block.name, "inner");
+    assert_eq!(
+        inside_a_negated_block.inline_path,
+        vec!["outer".to_owned()],
+        "a negated condition was read as a macro and swallowed the block"
+    );
+    assert!(inside_a_negated_block.test_only);
+    for negation in [
+        "fn f() { if !ready { } }\n#[cfg(test)]\nmod real;\n",
+        "fn f() { while !done { } }\n#[cfg(test)]\nmod real;\n",
+        "fn f() { let _ = !flag; }\n#[cfg(test)]\nmod real;\n",
+    ] {
+        let past = only(negation);
+        assert_eq!(past.name, "real", "{negation:?}");
+        assert!(past.test_only, "{negation:?}");
+    }
+    // And the block a negated condition guards is **walked**, not skipped. An
+    // empty block cannot tell the two apart — skipping a balanced group and
+    // walking it leave the same depth — so the discriminating shape is a
+    // declaration inside it. Read as a macro body this is module-shaped and the
+    // whole file is refused; read as a block it is the declaration it is.
+    let inside_a_negated_block = only(
+        "#[cfg(test)]\nmod outer {\n    fn f() {\n        if !ready {\n            mod local;\n        }\n    }\n}\n",
+    );
+    assert_eq!(inside_a_negated_block.name, "local");
+    assert_eq!(
+        inside_a_negated_block.inline_path,
+        vec!["outer".to_owned()],
+        "the negated block was skipped as a macro body and its declaration lost"
+    );
+    assert!(inside_a_negated_block.test_only);
+    let inside_a_negated_loop = only(
+        "mod outer {\n    fn f() {\n        while !done {\n            mod local;\n        }\n    }\n}\n",
+    );
+    assert_eq!(inside_a_negated_loop.name, "local");
+    assert!(!inside_a_negated_loop.test_only);
 }
 
 /// The resolver **refuses** every shape it cannot resolve, rather than guessing.
@@ -3002,6 +3066,27 @@ fn the_module_resolver_refuses_every_shape_it_cannot_resolve() {
             "{shaped:?} was read rather than refused"
         );
     }
+    // **The `!` need not touch the name.** Whitespace and comments between a
+    // macro's name and its `!` are valid Rust, and `#[rustfmt::skip]` keeps
+    // whatever spelling a file was written with -- so a guard keyed on the very
+    // next byte missed exactly the macros somebody had spaced out. Every
+    // spelling below is a real one a formatter would otherwise close up.
+    for spaced in [
+        "macro_rules ! m {\n    () => {\n        mod x;\n    };\n}\n",
+        "macro_rules\n! m {\n    () => {\n        #[cfg(test)]\n        mod x;\n    };\n}\n",
+        "macro_rules /* named next */ ! m {\n    () => {\n        mod x;\n    };\n}\n",
+        "#[rustfmt::skip]\nmacro_rules  !  m  {\n    () => {\n        mod x;\n    };\n}\n",
+        "quote ! { mod x; }\n",
+        "quote // why\n! { mod x; }\n",
+        "quote /* why */ ! { pub(crate) mod x; }\n",
+        "items\n    ![ mod x { } ]\n",
+    ] {
+        assert!(
+            matches!(refusal(spaced), ScanRefusal::ModuleShapedMacroBody { .. }),
+            "{spaced:?} was read rather than refused"
+        );
+    }
+
     // And a macro body with nothing module-shaped in it is discarded in
     // silence, which is what stops the refusal from being a tax on every
     // `vec!`, `assert!` and `format!` in the tree.
@@ -3210,6 +3295,51 @@ fn the_module_resolver_refuses_every_shape_it_cannot_resolve() {
     assert!(
         declaration_cycle(&deferred).is_some(),
         "a cycle two branches deep was not reached"
+    );
+}
+
+/// The file-module-level lint reader is a **census instrument**, not a shipped
+/// API.
+///
+/// `PR72-API-001`. It arrived as a `pub fn` in this file's production region,
+/// which is a public surface added so that a test could call it: the binary
+/// consults it nowhere, and `effects/allowlist.toml` records `allows = []` for
+/// this file precisely because everything above the `#[cfg(test)]` cut is meant
+/// to be the parsers and the frozen lists and nothing else. It is
+/// `#[cfg(test)] pub(crate)` now, in a module at the bottom.
+///
+/// Asserted over the region rather than by eye, and in both directions: the
+/// name is absent from the production region and present in the file, so a
+/// typo in the needle fails the second half instead of passing the first.
+#[test]
+fn the_file_level_lint_reader_is_a_census_instrument_and_not_a_shipped_api() {
+    let source = fs::read_to_string(repo_root().join("src/effects.rs")).expect("src/effects.rs");
+    let production = crate::effects::production_code(&source);
+    for name in ["file_level_lint_state", "names_lint"] {
+        assert!(
+            blank_comments_and_strings(&source).contains(&format!("fn {name}(")),
+            "`{name}` is not defined in src/effects.rs at all, so the check below is vacuous"
+        );
+        assert!(
+            !production.contains(&format!("fn {name}(")),
+            "`{name}` is in this file's production region, which makes it a shipped surface \
+             rather than a census instrument"
+        );
+    }
+    // And the module holding it says so, in the two ways that make it true.
+    let declaration = blank_comments_and_strings(&source);
+    assert!(
+        declaration.contains("#[cfg(test)]\npub(crate) mod lint_levels {"),
+        "the lint reader's module is no longer `#[cfg(test)] pub(crate)`"
+    );
+    // The instrument still answers where it is used, so narrowing it did not
+    // narrow it out of existence.
+    assert_eq!(
+        crate::effects::lint_levels::file_level_lint_state(
+            "#![deny(clippy::disallowed_types)]\n",
+            "clippy::disallowed_types"
+        ),
+        Some("deny")
     );
 }
 

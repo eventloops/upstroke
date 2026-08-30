@@ -103,7 +103,9 @@ with for equality. The calls it is written against: the atomic publication in \
 `publish_between` is `std::fs::File::create_new` of a staging sibling, \
 `std::io::Write::write_all` and `std::io::Write::flush` of the framed record, \
 `std::fs::rename` onto the signal name, and `std::fs::remove_file` of the \
-staging name on either failure path. FIVE CALLS, no others: there is no \
+staging name on either failure path. FIVE DISTINCT DENIED PATHS ACROSS SIX \
+CALL SITES -- `std::fs::remove_file` is called twice, once on the write-side \
+failure path and once on the rename-side one -- AND NO OTHERS: there is no \
 `fs::write`, no `OpenOptions`, no `create_dir`, and no durability barrier -- \
 §8 separates visibility from durability and a readiness signal needs only the \
 first, so nothing here touches `util::fsync_file`/`util::fsync_dir` or the \
