@@ -103,7 +103,8 @@ pub(crate) mod startup;
 // failed to resolve. Deleted rather than `#[allow]`-ed: an allow hides the same
 // dead code one level in.
 //
-// Seven names, all reached from test modules through the flattened path.
+// Seven names were reached, all from test modules through the flattened path.
+// What remains of the block is the three module declarations it enclosed.
 pub mod preflight;
 pub mod recover;
 pub mod run;
